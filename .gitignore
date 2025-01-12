@@ -1,0 +1,13 @@
+# Nix build outputs
+result
+result-*
+
+# Nix store paths
+.nixpkgs
+.nix-defexpr
+.nix-profile
+
+# Directory created by nix-shell
+.direnv
+
+
