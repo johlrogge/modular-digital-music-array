@@ -1,0 +1,43 @@
+[workspace]
+members = [
+    # Components (bricks)
+    "components/clock",
+    "components/time_primitives",
+    # "components/network",
+    # "components/tempo",
+    # "components/command",
+    
+    # Bases (entry points)
+    "bases/dmt-master",
+    # "bases/dmt-client",
+    
+    # Projects (deployable artifacts)
+    # "projects/mdma-909",
+    # "projects/mdma-303",
+    
+    # Development tools
+    # "development/test-helpers",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
+
+[workspace.dependencies]
+# Core dependencies
+tokio = { version = "1.36", features = ["full"] }
+rosc = "0.10"  # For OSC protocol
+tracing = "0.1"
+color-eyre = "0.6"
+thiserror = "1.0"
+
+# Component-specific dependencies
+uuid = { version = "1.7", features = ["v4"] }
+parking_lot = "0.12"
+
+# Testing dependencies
+tokio-test = "0.4"
+assert_matches = "1.5"

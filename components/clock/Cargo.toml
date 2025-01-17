@@ -1,0 +1,19 @@
+[package]
+name = "clock"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+time-primitives = { path = "../time_primitives" }
+tokio.workspace = true
+rosc.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tokio-test.workspace = true
+assert_matches.workspace = true

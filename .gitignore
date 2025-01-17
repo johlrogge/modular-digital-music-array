@@ -10,4 +10,5 @@ result-*
 # Directory created by nix-shell
 .direnv
 
-
+/target
+*.qcow2
