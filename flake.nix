@@ -1,95 +1,78 @@
+# flake.nix
 {
-  description = "Music Player NixOS Configuration";
+  description = "Modular Distributed Music Array";
 
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixos-23.11";
-    nixos-hardware.url = "github:nixos/nixos-hardware";
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-24.05";  # Updated to newer nixpkgs
+    flake-utils.url = "github:numtide/flake-utils";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.flake-utils.follows = "flake-utils";
+    };
+    crane = {
+      url = "github:ipetkov/crane";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, nixos-hardware }: {
-    # Development VM configuration (x86_64)
-    nixosConfigurations.music-player-vm = nixpkgs.lib.nixosSystem {
-      system = "x86_64-linux";
-      modules = [
-        ({ config, pkgs, ... }: {
-          # Basic system configuration
-          system.stateVersion = "23.11";
-          
-          # Sound Configuration
-          sound.enable = true;
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane }:
+    flake-utils.lib.eachDefaultSystem (system:
+      let
+        overlays = [ (import rust-overlay) ];
+        pkgs = import nixpkgs {
+          inherit system overlays;
+        };
+        
+        rustToolchain = pkgs.rust-bin.stable.latest.default;
+        craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-          # System Services
-          services = {
-            # PipeWire Configuration
-            pipewire = {
-              enable = true;
-              alsa.enable = true;
-              alsa.support32Bit = false;
-              pulse.enable = true;
-            };
-          };
+        # Common arguments for both building dependencies and the final package
+        commonArgs = {
+          src = craneLib.cleanCargoSource ./.;
+          pname = "mdma-download";
+          version = "0.1.0";
           
-          # PipeWire custom configuration
-          environment.etc."pipewire/pipewire.conf.d/92-low-latency.conf".text = ''
-            context.properties = {
-                default.clock.rate = 48000
-                default.clock.quantum = 1024
-                default.clock.min-quantum = 32
-                default.clock.max-quantum = 8192
-            }
+          buildInputs = [];
+          nativeBuildInputs = [ pkgs.pkg-config ];
+        };
+
+        # Build dependencies separately to improve caching
+        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+        # Build the actual package
+        mdma-download = craneLib.buildPackage (commonArgs // {
+          inherit cargoArtifacts;
+        });
+
+        # Wrap the binary with runtime dependencies
+        mdma-download-wrapped = pkgs.symlinkJoin {
+          name = "mdma-download";
+          paths = [ mdma-download ];
+          buildInputs = [ pkgs.makeWrapper ];
+          postBuild = ''
+            wrapProgram $out/bin/download-cli \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.yt-dlp ]}
           '';
+        };
+      in
+      {
+        packages = {
+          inherit mdma-download-wrapped;
+          default = mdma-download-wrapped;
+        };
 
-          # VM-specific settings
-          virtualisation.vmVariant = {
-            virtualisation = {
-              graphics = false;
-              cores = 4;
-              memorySize = 8192;
-              diskSize = 32768;
-            };
-          };
-
-          # System Packages
-          environment.systemPackages = with pkgs; [
+        devShells.default = pkgs.mkShell {
+          packages = with pkgs; [
+            rustToolchain
+            yt-dlp
             pipewire
-            alsa-utils
-            vim
-            git
-            htop
-            rustup
           ];
-
-          # User Configuration
-          users.users.music = {
-            isNormalUser = true;
-            extraGroups = [ "audio" "pipewire" "wheel" ];
-            initialPassword = "changeme";
-          };
-
-          # System Optimization
-          systemd.services.pipewire = {
-            serviceConfig = {
-              Nice = -11;
-              IOSchedulingClass = "realtime";
-              IOSchedulingPriority = 0;
-              CPUSchedulingPolicy = "fifo";
-              CPUSchedulingPriority = 99;
-            };
-          };
-        })
-      ];
+        };
+      }
+    ) // {
+      nixosModules.default = { config, lib, pkgs, ... }: {
+        imports = [];
+      };
     };
-
-    # Raspberry Pi deployment configuration (aarch64)
-    nixosConfigurations.music-player-pi = nixpkgs.lib.nixosSystem {
-      system = "aarch64-linux";
-      modules = [
-        ./configuration.nix
-        nixos-hardware.nixosModules.raspberry-pi-5
-      ];
-    };
-
-    # Development VM package
-    packages.x86_64-linux.default = self.nixosConfigurations.music-player-vm.config.system.build.vm;
-  };
 }

@@ -5,27 +5,26 @@ use tokio::process::Command;
 use serde::Deserialize;
 use url::Url;
 use crate::types::{DownloadError, TrackMetadata};
+use async_trait::async_trait;
 
-#[derive(Deserialize)]
-struct YtDlpMetadata {
-    title: String,
-    uploader: Option<String>,
-    duration: f64,
-    webpage_url: String,
+#[async_trait]
+pub trait Downloader {
+    async fn check_available(&self) -> Result<(), DownloadError>;
+    async fn fetch_metadata(&self, url: &Url, temp_dir: &Path) -> Result<TrackMetadata, DownloadError>;
+    async fn download_audio(&self, url: &Url, output: &Path, temp_dir: &Path) -> Result<(), DownloadError>;
 }
 
 pub struct YtDlp;
 
-impl YtDlp {
-    /// Verify yt-dlp is available
-    pub fn check_available() -> Result<(), DownloadError> {
+#[async_trait]
+impl Downloader for YtDlp {
+    async fn check_available(&self) -> Result<(), DownloadError> {
         which::which("yt-dlp")
             .map(|_| ())
             .map_err(|_| DownloadError::YtDlpNotFound)
     }
 
-    /// Fetch metadata for a URL without downloading
-    pub async fn fetch_metadata(url: &Url, temp_dir: &Path) -> Result<TrackMetadata, DownloadError> {
+    async fn fetch_metadata(&self, url: &Url, temp_dir: &Path) -> Result<TrackMetadata, DownloadError> {
         let output = Command::new("yt-dlp")
             .arg("--dump-json")
             .arg("--no-download")
@@ -54,13 +53,12 @@ impl YtDlp {
         })
     }
 
-    /// Download audio from a URL to the specified output path
-    pub async fn download_audio(url: &Url, output: &Path, temp_dir: &Path) -> Result<(), DownloadError> {
+    async fn download_audio(&self, url: &Url, output: &Path, temp_dir: &Path) -> Result<(), DownloadError> {
         let status = Command::new("yt-dlp")
-            .arg("-x")                          // Extract audio
-            .arg("--audio-format").arg("flac")  // Use FLAC for lossless quality
-            .arg("--audio-quality").arg("0")    // Best quality
-            .arg("--format").arg("bestaudio")   // Get best audio source
+            .arg("-x")
+            .arg("--audio-format").arg("flac")
+            .arg("--audio-quality").arg("0")
+            .arg("--format").arg("bestaudio")
             .arg("-o").arg(output)
             .arg(url.as_str())
             .current_dir(temp_dir)
@@ -74,5 +72,41 @@ impl YtDlp {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct YtDlpMetadata {
+    title: String,
+    uploader: Option<String>,
+    duration: f64,
+    webpage_url: String,
+}
+
+#[cfg(test)]
+pub mod stub {
+    use super::*;
+
+    pub struct DownloaderStub;
+
+    #[async_trait]
+    impl Downloader for DownloaderStub {
+        async fn check_available(&self) -> Result<(), DownloadError> {
+            Ok(())
+        }
+
+        async fn fetch_metadata(&self, _url: &Url, _temp_dir: &Path) -> Result<TrackMetadata, DownloadError> {
+            Ok(TrackMetadata {
+                title: "Test Song".to_string(),
+                artist: Some("Test Artist".to_string()),
+                duration: 180.0,
+                source_url: "https://example.com/test".to_string(),
+                download_time: chrono::Utc::now(),
+            })
+        }
+
+        async fn download_audio(&self, _url: &Url, _output: &Path, _temp_dir: &Path) -> Result<(), DownloadError> {
+            Ok(())
+        }
     }
 }
