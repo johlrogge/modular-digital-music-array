@@ -4,8 +4,10 @@ members = [
     "components/clock",
     "components/time_primitives",
     "components/playback_primitives",
+    "components/media_downloader",
     
     # Bases (entry points)
+    "bases/download_cli"
 ]
 
 [workspace.package]

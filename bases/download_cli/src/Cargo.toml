@@ -1,0 +1,13 @@
+[package]
+name = "download-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+media-downloader = { path = "../../components/media_downloader" }
+tokio = { workspace = true, features = ["full"] }
+color-eyre = { workspace = true }
+clap = { version = "4.4", features = ["derive"] }
