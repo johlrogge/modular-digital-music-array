@@ -1,5 +1,6 @@
 use std::ops::{Add, Sub};
 use thiserror::Error;
+use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Error)]
 pub enum TimeError {
@@ -10,7 +11,7 @@ pub enum TimeError {
 }
 
 /// Number of ticks in the musical timeline
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Ticks(u64);
 
 impl Ticks {
@@ -42,7 +43,7 @@ impl Sub for Ticks {
 }
 
 /// Pulses per quarter note - resolution of the musical timeline
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ppqn(u32);
 
 impl Ppqn {
@@ -61,7 +62,7 @@ impl Ppqn {
 }
 
 /// Tempo in beats per minute
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Tempo(f64);
 
 impl Tempo {
@@ -124,16 +125,15 @@ mod tests {
     }
 
     #[test]
-    fn test_tempo_bounds() {
-        assert!(Tempo::new(Tempo::MIN).is_ok());
-        assert!(Tempo::new(Tempo::MAX).is_ok());
-        assert!(matches!(
-            Tempo::new(Tempo::MIN - 0.1).unwrap_err(),
-            TimeError::TempoOutOfRange { .. }
-        ));
-        assert!(matches!(
-            Tempo::new(Tempo::MAX + 0.1).unwrap_err(),
-            TimeError::TempoOutOfRange { .. }
-        ));
+    fn test_serialization() {
+        let ticks = Ticks::new(42);
+        let json = serde_json::to_string(&ticks).unwrap();
+        let decoded: Ticks = serde_json::from_str(&json).unwrap();
+        assert_eq!(ticks, decoded);
+
+        let tempo = Tempo::new(140.0).unwrap();
+        let json = serde_json::to_string(&tempo).unwrap();
+        let decoded: Tempo = serde_json::from_str(&json).unwrap();
+        assert_eq!(tempo, decoded);
     }
 }

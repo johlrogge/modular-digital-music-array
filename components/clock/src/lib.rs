@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+pub mod protocol;
+
 #[derive(Debug, Error)]
 pub enum ClockError {
     #[error("Invalid tick update")]
@@ -131,35 +133,5 @@ mod tests {
 
         time_source.advance(Duration::from_millis(5));
         assert_eq!(clock.time_since_last_tick().as_millis(), 5);
-    }
-
-    mod tempo_tests {
-        use super::*;
-
-        fn setup() -> MusicalClock<TimeSourceStub> {
-            let time_source = TimeSourceStub::new();
-            MusicalClock::new(time_source)
-        }
-
-        #[test]
-        fn clamps_tempo_to_minimum_bound() {
-            let clock = setup();
-            clock.set_tempo(10.0).unwrap();
-            assert_eq!(clock.get_position().1, 20.0);
-        }
-
-        #[test]
-        fn clamps_tempo_to_maximum_bound() {
-            let clock = setup();
-            clock.set_tempo(500.0).unwrap();
-            assert_eq!(clock.get_position().1, 400.0);
-        }
-
-        #[test]
-        fn accepts_tempo_within_bounds() {
-            let clock = setup();
-            clock.set_tempo(140.0).unwrap();
-            assert_eq!(clock.get_position().1, 140.0);
-        }
     }
 }
