@@ -16,8 +16,12 @@ impl OutputHandler {
     }
 
     pub fn print_download_complete(&self, path: &Path, metadata: &TrackMetadata) {
-        println!("Downloaded: {} to {}", metadata.title, path.display());
-        println!("Artist: {}", metadata.artist.as_deref().unwrap_or("Unknown"));
+        println!("Downloaded: {} to {}", metadata.location.title, path.display());
+        println!("Artist: {}", metadata.location.artist);
+        
+        if let Some(album) = &metadata.location.album {
+            println!("Album: {}", album);
+        }
         println!("Duration: {:.1} seconds", metadata.duration);
         
         if self.verbose {

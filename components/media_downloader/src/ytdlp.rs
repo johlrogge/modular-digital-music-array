@@ -1,38 +1,75 @@
 // components/media_downloader/src/ytdlp.rs
-use std::path::{Path, PathBuf};
-use tokio::process::Command;
-use url::Url;
-use crate::types::{DownloadError, TrackMetadata};
+use crate::organization::TrackLocation;
+use crate::types::{DownloadError, Downloader, TrackMetadata};
 use async_trait::async_trait;
 use serde::Deserialize;
+use std::path::Path;
+use tokio::process::Command;
+use url::Url;
+use chrono::Utc;
 
-#[async_trait]
-pub trait Downloader {
-    async fn check_available(&self) -> Result<(), DownloadError>;
-    async fn fetch_metadata(&self, url: &Url, temp_dir: &Path) -> Result<TrackMetadata, DownloadError>;
-    async fn download_audio(&self, url: &Url, output: &Path, temp_dir: &Path) -> Result<(), DownloadError>;
+#[derive(Debug, Deserialize)]
+struct YtDlpMetadata {
+    title: String,
+    uploader: Option<String>,
+    album: Option<String>,
+    duration: f64,
+    webpage_url: String,
+    format_id: String,
+    ext: String,
+    release_date: Option<String>,
+    track: Option<String>,
+    artist: Option<String>,
+    creator: Option<String>,
 }
 
 pub struct YtDlp;
 
+impl YtDlp {
+    /// Verify that ffmpeg is available for format conversion
+    async fn check_ffmpeg() -> Result<(), DownloadError> {
+        which::which("ffmpeg")
+            .map(|_| ())
+            .map_err(|_| DownloadError::DependencyNotFound("ffmpeg"))
+    }
+
+    /// Select best audio format and ensure FLAC conversion
+    fn get_format_args() -> Vec<String> {
+        vec![
+            // Extract audio only
+            "-x".to_string(),
+            // Select best audio quality source
+            "--format".to_string(),
+            "bestaudio".to_string(),
+            // Force FLAC output regardless of input
+            "--audio-format".to_string(),
+            "flac".to_string(),
+            // Best quality conversion
+            "--audio-quality".to_string(),
+            "0".to_string(),
+            // Post-process with FFmpeg for reliable conversion
+            "--postprocessor-args".to_string(),
+            "-acodec flac -compression_level 12".to_string(),
+        ]
+    }
+}
+
 #[async_trait]
 impl Downloader for YtDlp {
     async fn check_available(&self) -> Result<(), DownloadError> {
+        // Check both yt-dlp and ffmpeg are available
         which::which("yt-dlp")
-            .map(|_| ())
-            .map_err(|_| DownloadError::YtDlpNotFound)
+            .map_err(|_| DownloadError::DependencyNotFound("yt-dlp"))?;
+        Self::check_ffmpeg().await?;
+        Ok(())
     }
 
     async fn fetch_metadata(&self, url: &Url, temp_dir: &Path) -> Result<TrackMetadata, DownloadError> {
-        let abs_temp_dir = temp_dir.canonicalize()
-            .map_err(|e| DownloadError::IoError(e))?;
-        println!("Fetching metadata using temp dir (absolute): {}", abs_temp_dir.display());
-        
         let output = Command::new("yt-dlp")
             .arg("--dump-json")
             .arg("--no-download")
             .arg(url.as_str())
-            .current_dir(&abs_temp_dir)
+            .current_dir(temp_dir)
             .output()
             .await?;
 
@@ -45,39 +82,41 @@ impl Downloader for YtDlp {
         let yt_meta: YtDlpMetadata = serde_json::from_slice(&output.stdout)
             .map_err(|e| DownloadError::DownloadFailed(e.to_string()))?;
 
-        println!("{:#?}", yt_meta);
+        // Try to determine the artist from various metadata fields
+        let artist = yt_meta.artist
+            .or(yt_meta.creator)
+            .or(yt_meta.uploader)
+            .unwrap_or_else(|| "Unknown Artist".to_string());
+
+        let location = if let Some(album) = yt_meta.album {
+            TrackLocation::with_album(artist, album, yt_meta.title)
+        } else {
+            TrackLocation::new(artist, yt_meta.title)
+        };
 
         Ok(TrackMetadata {
-            title: yt_meta.title,
-            artist: yt_meta.uploader,
+            location,
             duration: yt_meta.duration,
             source_url: yt_meta.webpage_url,
-            download_time: chrono::Utc::now(),
+            download_time: Utc::now(),
         })
     }
 
     async fn download_audio(&self, url: &Url, output: &Path, temp_dir: &Path) -> Result<(), DownloadError> {
-        let abs_output = output.canonicalize().unwrap_or_else(|_| output.to_path_buf());
-        let abs_temp_dir = temp_dir.canonicalize()
-            .map_err(|e| DownloadError::IoError(e))?;
-            
-        println!("Downloading to absolute path: {}", abs_output.display());
-        println!("Using absolute temp dir: {}", abs_temp_dir.display());
-
-        let output_str = output.to_str().ok_or_else(|| 
-            DownloadError::DownloadFailed("Invalid output path".to_string())
-        )?;
-
-        let status = Command::new("yt-dlp")
-            .arg("-x")
-            .arg("--audio-format").arg("flac")
-            .arg("--audio-quality").arg("0")
-            .arg("--format").arg("bestaudio")
-            .arg("-o").arg(output_str)
+        let mut cmd = Command::new("yt-dlp");
+        
+        // Add all format-related arguments
+        cmd.args(Self::get_format_args());
+        
+        // Add output and URL arguments
+        cmd.arg("-o")
+            .arg(output.to_str().ok_or_else(|| 
+                DownloadError::DownloadFailed("Invalid output path".to_string())
+            )?)
             .arg(url.as_str())
-            .current_dir(&abs_temp_dir)
-            .status()
-            .await?;
+            .current_dir(temp_dir);
+
+        let status = cmd.status().await?;
 
         if !status.success() {
             return Err(DownloadError::DownloadFailed(
@@ -85,42 +124,38 @@ impl Downloader for YtDlp {
             ));
         }
 
+        // Verify the output file exists
+        if !output.exists() {
+            return Err(DownloadError::DownloadFailed(
+                "Output file not created".to_string()
+            ));
+        }
+
         Ok(())
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct YtDlpMetadata {
-    title: String,
-    uploader: Option<String>,
-    duration: f64,
-    webpage_url: String,
-}
-
 #[cfg(test)]
-pub mod stub {
+mod tests {
     use super::*;
+    use tempfile::TempDir;
 
-    pub struct DownloaderStub;
-
-    #[async_trait]
-    impl Downloader for DownloaderStub {
-        async fn check_available(&self) -> Result<(), DownloadError> {
-            Ok(())
+    #[tokio::test]
+    async fn test_download_format() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = TempDir::new()?;
+        let downloader = YtDlp;
+        
+        // Skip if dependencies aren't available
+        if downloader.check_available().await.is_err() {
+            println!("Skipping test: yt-dlp or ffmpeg not available");
+            return Ok(());
         }
 
-        async fn fetch_metadata(&self, _url: &Url, _temp_dir: &Path) -> Result<TrackMetadata, DownloadError> {
-            Ok(TrackMetadata {
-                title: "Test Song".to_string(),
-                artist: Some("Test Artist".to_string()),
-                duration: 180.0,
-                source_url: "https://example.com/test".to_string(),
-                download_time: chrono::Utc::now(),
-            })
-        }
-
-        async fn download_audio(&self, _url: &Url, _output: &Path, _temp_dir: &Path) -> Result<(), DownloadError> {
-            Ok(())
-        }
+        // Test format arguments
+        let format_args = YtDlp::get_format_args();
+        assert!(format_args.contains(&"flac".to_string()));
+        assert!(format_args.contains(&"-x".to_string()));
+        
+        Ok(())
     }
 }

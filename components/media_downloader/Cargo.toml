@@ -18,7 +18,9 @@ tempfile = "3.8"
 which = "4.4"
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
-dunce = "1.0"  # Added this dependency
+dunce = "1.0"
+sanitize-filename = "0.5"
 
 [dev-dependencies]
 assert_matches.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

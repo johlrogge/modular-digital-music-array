@@ -1,7 +1,8 @@
 // components/media_downloader/src/lib.rs
+mod organization;
 mod types;
-mod utils;
 mod ytdlp;
+mod utils;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9,9 +10,9 @@ use tempfile::TempDir;
 use url::Url;
 use tokio::fs;
 
-pub use crate::types::{DownloadError, TrackMetadata};
-use crate::utils::generate_filename;
-use crate::ytdlp::{Downloader, YtDlp};
+pub use crate::types::{DownloadError, TrackMetadata, Downloader};
+pub use crate::organization::TrackLocation;
+use crate::ytdlp::YtDlp;
 
 pub struct MediaDownloader {
     download_path: PathBuf,
@@ -35,10 +36,6 @@ impl MediaDownloader {
         let temp_path = download_path.join("temp");
 
         // Create directories if they don't exist
-        println!("Creating directories:");
-        println!("Download path (absolute): {}", download_path.display());
-        println!("Temp path (absolute): {}", temp_path.display());
-        
         fs::create_dir_all(&download_path).await?;
         fs::create_dir_all(&temp_path).await?;
 
@@ -53,32 +50,69 @@ impl MediaDownloader {
         let url = Url::parse(url)
             .map_err(|e| DownloadError::InvalidUrl(e.to_string()))?;
 
-        println!("Created temporary directory in (absolute): {}", self.temp_path.display());
         let temp_dir = TempDir::new_in(&self.temp_path)?;
-        println!("Temp dir absolute path: {}", temp_dir.path().canonicalize()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "Failed to get absolute path".to_string()));
 
         // Get metadata first
-        let metadata = self.downloader.fetch_metadata(&url, &temp_dir.path()).await?;
-        println!("Got metadata: {:#?}", metadata);
+        let metadata = self.downloader.fetch_metadata(&url, temp_dir.path()).await?;
+        let final_path = metadata.location.to_path(&self.download_path);
 
-        // Generate final filename and path
-        let final_name = generate_filename(&metadata.title, url.as_str());
-        let final_path = self.download_path.join(&final_name);
-        println!("Final absolute path will be: {}", final_path.display());
-
-        // Download directly to final location
-        println!("Starting download...");
-        self.downloader.download_audio(&url, &final_path, temp_dir.path()).await?;
-        
-        // Verify file exists
-        match fs::metadata(&final_path).await {
-            Ok(metadata) => println!("File exists at final absolute path: {}, size: {} bytes", 
-                final_path.display(), metadata.len()),
-            Err(e) => println!("Error checking final file at {}: {}", final_path.display(), e),
+        // Create parent directories if they don't exist
+        if let Some(parent) = final_path.parent() {
+            fs::create_dir_all(parent).await?;
         }
 
+        // Download directly to final location
+        self.downloader.download_audio(&url, &final_path, temp_dir.path()).await?;
+
         Ok((final_path, metadata))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    struct TestDownloader;
+
+    #[async_trait::async_trait]
+    impl Downloader for TestDownloader {
+        async fn check_available(&self) -> Result<(), DownloadError> {
+            Ok(())
+        }
+
+        async fn fetch_metadata(&self, _url: &Url, _temp_dir: &Path) -> Result<TrackMetadata, DownloadError> {
+            Ok(TrackMetadata {
+                location: TrackLocation::new("Test Artist", "Test Song"),
+                duration: 180.0,
+                source_url: "https://example.com".to_string(),
+                download_time: chrono::Utc::now(),
+            })
+        }
+
+        async fn download_audio(&self, _url: &Url, output: &Path, _temp_dir: &Path) -> Result<(), DownloadError> {
+            // Simulate file creation
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            fs::write(output, b"test data").await?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_download_creates_directories() -> Result<(), DownloadError> {
+        let temp = tempdir()?;
+        let downloader = MediaDownloader::new_with_downloader(
+            temp.path(),
+            Arc::new(TestDownloader),
+        ).await?;
+
+        let (path, _) = downloader.download("https://example.com/test").await?;
+        
+        assert!(path.exists());
+        assert!(path.parent().unwrap().exists());
+        
+        Ok(())
     }
 }
