@@ -1,0 +1,16 @@
+[package]
+name = "media-ctl"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+color-eyre = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+nng = "1.0"
+prost = "0.11"
+anyhow = "1.0"
+media-client = { path = "../../components/media_client" }

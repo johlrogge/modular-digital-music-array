@@ -1,0 +1,17 @@
+[package]
+name = "playback-engine"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+symphonia = { version = "0.5", features = ["flac"] }
+cpal = "0.15"
+tokio = { workspace = true, features = ["full"] }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam = "0.8"
+time-primitives = { path = "../time_primitives" }
+playback-primitives = { path = "../playback_primitives" }

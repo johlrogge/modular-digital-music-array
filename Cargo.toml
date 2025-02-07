@@ -5,9 +5,12 @@ members = [
     "components/time_primitives",
     "components/playback_primitives",
     "components/media_downloader",
+    "components/media_client",
+    "components/playback_engine",
     
     # Bases (entry points)
-    "bases/download_cli"
+    "bases/download_cli",
+    "bases/media_ctl"
 ]
 
 [workspace.package]
