@@ -56,6 +56,14 @@ async fn main() -> Result<()> {
                 db
             );
         }
+        Commands::Unload { channel } => {
+            let channel = commands::parse_channel(channel)?;
+            client.unload_track(channel)?;
+            println!(
+                "Unloaded track from channel {}",
+                commands::channel_to_string(channel)
+            );
+        }
     }
 
     Ok(())

@@ -9,6 +9,7 @@ pub enum Command {
     Play { channel: Channel },
     Stop { channel: Channel },
     SetVolume { channel: Channel, db: f32 },
+    Unload { channel: Channel },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -29,6 +29,11 @@ impl MediaClient {
         self.send_command(cmd)
     }
 
+    pub fn unload_track(&self, channel: Channel) -> Result<(), ClientError> {
+        let cmd = Command::Unload { channel };
+        self.send_command(cmd)
+    }
+
     pub fn play(&self, channel: Channel) -> Result<(), ClientError> {
         let cmd = Command::Play { channel };
         self.send_command(cmd)

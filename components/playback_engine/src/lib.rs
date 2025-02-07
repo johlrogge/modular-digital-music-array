@@ -24,6 +24,10 @@ impl PlaybackEngine {
         self.audio.add_track(channel, track)
     }
 
+    pub fn unload_track(&mut self, channel: Channel) -> Result<(), PlaybackError> {
+        self.audio.remove_track(channel)
+    }
+
     pub fn play(&mut self, _channel: Channel) -> Result<(), PlaybackError> {
         Ok(())
     }
@@ -72,5 +76,11 @@ mod tests {
             engine.set_volume(Channel::A, -100.0),
             Err(PlaybackError::InvalidVolume(_))
         ));
+    }
+
+    #[test]
+    fn test_unload_nonexistent_track() {
+        let mut engine = PlaybackEngine::new().unwrap();
+        assert!(engine.unload_track(Channel::A).is_ok());
     }
 }
