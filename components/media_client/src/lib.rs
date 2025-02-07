@@ -77,7 +77,6 @@ impl MediaClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn test_channel_conversion() {

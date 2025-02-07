@@ -43,7 +43,6 @@ impl ClockState {
 pub struct MusicalClock<T: TimeSource> {
     state: Arc<RwLock<ClockState>>,
     time_source: T,
-    ppqn: u32,
 }
 
 impl<T: TimeSource> MusicalClock<T> {
@@ -51,7 +50,6 @@ impl<T: TimeSource> MusicalClock<T> {
         Self {
             state: Arc::new(RwLock::new(ClockState::new(&time_source))),
             time_source,
-            ppqn: 960,
         }
     }
 

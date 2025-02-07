@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
     color_eyre::install()?;
     let cli = Cli::parse();
 
-    let mut client = media_client::MediaClient::connect("ipc:///tmp/mdma-commands")?;
+    let client = media_client::MediaClient::connect("ipc:///tmp/mdma-commands")?;
 
     match cli.command {
         Commands::Load {

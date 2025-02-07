@@ -12,7 +12,7 @@ members = [
     "bases/download_cli",
     "bases/media_ctl"
 ]
-
+resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"

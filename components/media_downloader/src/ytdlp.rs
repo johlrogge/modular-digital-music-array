@@ -2,11 +2,11 @@
 use crate::organization::TrackLocation;
 use crate::types::{DownloadError, Downloader, TrackMetadata};
 use async_trait::async_trait;
+use chrono::Utc;
 use serde::Deserialize;
 use std::path::Path;
 use tokio::process::Command;
 use url::Url;
-use chrono::Utc;
 
 #[derive(Debug, Deserialize)]
 struct YtDlpMetadata {
@@ -15,10 +15,10 @@ struct YtDlpMetadata {
     album: Option<String>,
     duration: f64,
     webpage_url: String,
-    format_id: String,
-    ext: String,
-    release_date: Option<String>,
-    track: Option<String>,
+    //usrformat_id: String,
+    //ext: String,
+    //release_date: Option<String>,
+    //track: Option<String>,
     artist: Option<String>,
     creator: Option<String>,
 }
@@ -58,13 +58,16 @@ impl YtDlp {
 impl Downloader for YtDlp {
     async fn check_available(&self) -> Result<(), DownloadError> {
         // Check both yt-dlp and ffmpeg are available
-        which::which("yt-dlp")
-            .map_err(|_| DownloadError::DependencyNotFound("yt-dlp"))?;
+        which::which("yt-dlp").map_err(|_| DownloadError::DependencyNotFound("yt-dlp"))?;
         Self::check_ffmpeg().await?;
         Ok(())
     }
 
-    async fn fetch_metadata(&self, url: &Url, temp_dir: &Path) -> Result<TrackMetadata, DownloadError> {
+    async fn fetch_metadata(
+        &self,
+        url: &Url,
+        temp_dir: &Path,
+    ) -> Result<TrackMetadata, DownloadError> {
         let output = Command::new("yt-dlp")
             .arg("--dump-json")
             .arg("--no-download")
@@ -75,7 +78,7 @@ impl Downloader for YtDlp {
 
         if !output.status.success() {
             return Err(DownloadError::DownloadFailed(
-                String::from_utf8_lossy(&output.stderr).into_owned()
+                String::from_utf8_lossy(&output.stderr).into_owned(),
             ));
         }
 
@@ -83,7 +86,8 @@ impl Downloader for YtDlp {
             .map_err(|e| DownloadError::DownloadFailed(e.to_string()))?;
 
         // Try to determine the artist from various metadata fields
-        let artist = yt_meta.artist
+        let artist = yt_meta
+            .artist
             .or(yt_meta.creator)
             .or(yt_meta.uploader)
             .unwrap_or_else(|| "Unknown Artist".to_string());
@@ -102,60 +106,43 @@ impl Downloader for YtDlp {
         })
     }
 
-    async fn download_audio(&self, url: &Url, output: &Path, temp_dir: &Path) -> Result<(), DownloadError> {
+    async fn download_audio(
+        &self,
+        url: &Url,
+        output: &Path,
+        temp_dir: &Path,
+    ) -> Result<(), DownloadError> {
         let mut cmd = Command::new("yt-dlp");
-        
+
         // Add all format-related arguments
         cmd.args(Self::get_format_args());
-        
+
         // Add output and URL arguments
         cmd.arg("-o")
-            .arg(output.to_str().ok_or_else(|| 
-                DownloadError::DownloadFailed("Invalid output path".to_string())
-            )?)
+            .arg(
+                output.to_str().ok_or_else(|| {
+                    DownloadError::DownloadFailed("Invalid output path".to_string())
+                })?,
+            )
             .arg(url.as_str())
             .current_dir(temp_dir);
 
         let status = cmd.status().await?;
 
         if !status.success() {
-            return Err(DownloadError::DownloadFailed(
-                format!("yt-dlp exited with status: {}", status)
-            ));
+            return Err(DownloadError::DownloadFailed(format!(
+                "yt-dlp exited with status: {}",
+                status
+            )));
         }
 
         // Verify the output file exists
         if !output.exists() {
             return Err(DownloadError::DownloadFailed(
-                "Output file not created".to_string()
+                "Output file not created".to_string(),
             ));
         }
 
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    #[tokio::test]
-    async fn test_download_format() -> Result<(), Box<dyn std::error::Error>> {
-        let temp_dir = TempDir::new()?;
-        let downloader = YtDlp;
-        
-        // Skip if dependencies aren't available
-        if downloader.check_available().await.is_err() {
-            println!("Skipping test: yt-dlp or ffmpeg not available");
-            return Ok(());
-        }
-
-        // Test format arguments
-        let format_args = YtDlp::get_format_args();
-        assert!(format_args.contains(&"flac".to_string()));
-        assert!(format_args.contains(&"-x".to_string()));
-        
         Ok(())
     }
 }

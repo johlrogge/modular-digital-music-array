@@ -1,48 +1,51 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, Stream, StreamConfig};
+use crossbeam::channel::{bounded, Sender};
+use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::Duration;
-use parking_lot::RwLock;
-use crossbeam::channel::{bounded, Sender};
 
 use crate::error::PlaybackError;
 
 pub struct AudioOutput {
     _stream: Stream,
     _device: Device,
-    config: StreamConfig,
+    _config: StreamConfig,
     command_tx: Sender<AudioCommand>,
 }
 
 enum AudioCommand {
     AddTrack {
         channel: crate::Channel,
-        track: Arc<RwLock<crate::Track>>,
+        track: crate::Track,
     },
     RemoveTrack(crate::Channel),
 }
 
+type Tracks = Arc<RwLock<Vec<(crate::Channel, Arc<RwLock<crate::Track>>)>>>;
+
 impl AudioOutput {
     pub fn new() -> Result<Self, PlaybackError> {
         let host = cpal::default_host();
-        let device = host.default_output_device()
+        let device = host
+            .default_output_device()
             .ok_or_else(|| PlaybackError::AudioDevice("No output device found".into()))?;
-        
-        let config = device.default_output_config()
+
+        let config = device
+            .default_output_config()
             .map_err(|e| PlaybackError::AudioDevice(e.to_string()))?
             .config();
 
         // Create command channel
         let (command_tx, command_rx) = bounded::<AudioCommand>(32);
-        
+
         // Create mixing buffer
         let mix_buffer = vec![0f32; config.channels as usize * 1024];
         let mix_buffer = Arc::new(RwLock::new(mix_buffer));
-        
+
         // Track management
-        let tracks: Arc<RwLock<Vec<(crate::Channel, Arc<RwLock<crate::Track>>)>>> = 
-            Arc::new(RwLock::new(Vec::new()));
-        
+        let tracks: Tracks = Arc::new(RwLock::new(Vec::new()));
+
         let tracks_ref = Arc::clone(&tracks);
         let mix_buffer_ref = Arc::clone(&mix_buffer);
 
@@ -53,8 +56,8 @@ impl AudioOutput {
                 let mut tracks = tracks_ref.write();
                 match cmd {
                     AudioCommand::AddTrack { channel, track } => {
-                        tracks.push((channel, track));
-                    },
+                        tracks.push((channel, Arc::new(RwLock::new(track))));
+                    }
                     AudioCommand::RemoveTrack(channel) => {
                         tracks.retain(|(ch, _)| *ch != channel);
                     }
@@ -94,26 +97,33 @@ impl AudioOutput {
         };
 
         // Build output stream with buffer duration of 50ms
-        let stream = device.build_output_stream(
-            &config,
-            audio_callback,
-            error_callback,
-            Some(Duration::from_millis(50))
-        ).map_err(|e| PlaybackError::AudioDevice(e.to_string()))?;
+        let stream = device
+            .build_output_stream(
+                &config,
+                audio_callback,
+                error_callback,
+                Some(Duration::from_millis(50)),
+            )
+            .map_err(|e| PlaybackError::AudioDevice(e.to_string()))?;
 
         // Start the stream
-        stream.play()
+        stream
+            .play()
             .map_err(|e| PlaybackError::AudioDevice(e.to_string()))?;
 
         Ok(Self {
             _stream: stream,
             _device: device,
-            config,
+            _config: config,
             command_tx,
         })
     }
 
-    pub fn add_track(&self, channel: crate::Channel, track: Arc<RwLock<crate::Track>>) -> Result<(), PlaybackError> {
+    pub fn add_track(
+        &self,
+        channel: crate::Channel,
+        track: crate::Track,
+    ) -> Result<(), PlaybackError> {
         self.command_tx
             .send(AudioCommand::AddTrack { channel, track })
             .map_err(|_| PlaybackError::AudioDevice("Failed to send add track command".into()))
@@ -126,11 +136,11 @@ impl AudioOutput {
     }
 
     pub fn get_sample_rate(&self) -> u32 {
-        self.config.sample_rate.0
+        self._config.sample_rate.0
     }
 
     pub fn get_channels(&self) -> u16 {
-        self.config.channels
+        self._config.channels
     }
 }
 

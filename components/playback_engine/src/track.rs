@@ -26,7 +26,6 @@ impl std::fmt::Display for Channel {
 }
 
 pub struct Track {
-    path: PathBuf,
     decoder: Arc<RwLock<Box<dyn symphonia::core::codecs::Decoder>>>,
     format: Arc<RwLock<Box<dyn FormatReader>>>,
     buffer: Arc<RwLock<SampleBuffer<f32>>>,
@@ -76,7 +75,6 @@ impl Track {
         );
 
         Ok(Self {
-            path: path.to_owned(),
             decoder: Arc::new(RwLock::new(decoder)), // decoder is already a Box<dyn Decoder>
             format: Arc::new(RwLock::new(probed.format)),
             buffer: Arc::new(RwLock::new(SampleBuffer::new(1024, spec))),

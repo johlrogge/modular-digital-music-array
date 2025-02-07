@@ -2,16 +2,15 @@
 mod organization;
 mod types;
 mod ytdlp;
-mod utils;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
-use url::Url;
 use tokio::fs;
+use url::Url;
 
-pub use crate::types::{DownloadError, TrackMetadata, Downloader};
 pub use crate::organization::TrackLocation;
+pub use crate::types::{DownloadError, Downloader, TrackMetadata};
 use crate::ytdlp::YtDlp;
 
 pub struct MediaDownloader {
@@ -31,8 +30,8 @@ impl MediaDownloader {
     ) -> Result<Self, DownloadError> {
         downloader.check_available().await?;
 
-        let download_path = dunce::canonicalize(download_path.as_ref())
-            .map_err(|e| DownloadError::IoError(e))?;
+        let download_path =
+            dunce::canonicalize(download_path.as_ref()).map_err(DownloadError::IoError)?;
         let temp_path = download_path.join("temp");
 
         // Create directories if they don't exist
@@ -47,13 +46,15 @@ impl MediaDownloader {
     }
 
     pub async fn download(&self, url: &str) -> Result<(PathBuf, TrackMetadata), DownloadError> {
-        let url = Url::parse(url)
-            .map_err(|e| DownloadError::InvalidUrl(e.to_string()))?;
+        let url = Url::parse(url).map_err(|e| DownloadError::InvalidUrl(e.to_string()))?;
 
         let temp_dir = TempDir::new_in(&self.temp_path)?;
 
         // Get metadata first
-        let metadata = self.downloader.fetch_metadata(&url, temp_dir.path()).await?;
+        let metadata = self
+            .downloader
+            .fetch_metadata(&url, temp_dir.path())
+            .await?;
         let final_path = metadata.location.to_path(&self.download_path);
 
         // Create parent directories if they don't exist
@@ -62,7 +63,9 @@ impl MediaDownloader {
         }
 
         // Download directly to final location
-        self.downloader.download_audio(&url, &final_path, temp_dir.path()).await?;
+        self.downloader
+            .download_audio(&url, &final_path, temp_dir.path())
+            .await?;
 
         Ok((final_path, metadata))
     }
@@ -81,7 +84,11 @@ mod tests {
             Ok(())
         }
 
-        async fn fetch_metadata(&self, _url: &Url, _temp_dir: &Path) -> Result<TrackMetadata, DownloadError> {
+        async fn fetch_metadata(
+            &self,
+            _url: &Url,
+            _temp_dir: &Path,
+        ) -> Result<TrackMetadata, DownloadError> {
             Ok(TrackMetadata {
                 location: TrackLocation::new("Test Artist", "Test Song"),
                 duration: 180.0,
@@ -90,7 +97,12 @@ mod tests {
             })
         }
 
-        async fn download_audio(&self, _url: &Url, output: &Path, _temp_dir: &Path) -> Result<(), DownloadError> {
+        async fn download_audio(
+            &self,
+            _url: &Url,
+            output: &Path,
+            _temp_dir: &Path,
+        ) -> Result<(), DownloadError> {
             // Simulate file creation
             if let Some(parent) = output.parent() {
                 fs::create_dir_all(parent).await?;
@@ -103,16 +115,14 @@ mod tests {
     #[tokio::test]
     async fn test_download_creates_directories() -> Result<(), DownloadError> {
         let temp = tempdir()?;
-        let downloader = MediaDownloader::new_with_downloader(
-            temp.path(),
-            Arc::new(TestDownloader),
-        ).await?;
+        let downloader =
+            MediaDownloader::new_with_downloader(temp.path(), Arc::new(TestDownloader)).await?;
 
         let (path, _) = downloader.download("https://example.com/test").await?;
-        
+
         assert!(path.exists());
         assert!(path.parent().unwrap().exists());
-        
+
         Ok(())
     }
 }
