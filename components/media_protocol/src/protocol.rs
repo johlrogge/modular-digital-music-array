@@ -1,4 +1,4 @@
-use crate::Channel;
+use playback_primitives::Channel;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

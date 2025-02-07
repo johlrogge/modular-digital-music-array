@@ -50,17 +50,17 @@ mod tests {
     fn test_mute_sequence() {
         let sequence = vec![
             Message::SetMute {
-                channel: Channel::CHANNEL_A,
+                channel: Channel::ChannelA,
                 tick: Ticks::new(0),
                 muted: true,
             },
             Message::SetVolume {
-                channel: Channel::CHANNEL_A,
+                channel: Channel::ChannelB,
                 tick: Ticks::new(0),
                 volume: Volume::new(-6.0).unwrap(),
             },
             Message::SetMute {
-                channel: Channel::CHANNEL_A,
+                channel: Channel::ChannelA,
                 tick: Ticks::new(960),
                 muted: false,
             },

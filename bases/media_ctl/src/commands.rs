@@ -1,6 +1,6 @@
 use clap::Subcommand;
 use color_eyre::Result;
-use media_client::Channel;
+use playback_primitives::Channel;
 use std::path::PathBuf;
 
 #[derive(Subcommand)]
@@ -63,16 +63,16 @@ pub enum Commands {
 
 pub fn parse_channel(c: char) -> Result<Channel> {
     match c.to_uppercase().next() {
-        Some('A') => Ok(Channel::A),
-        Some('B') => Ok(Channel::B),
+        Some('A') => Ok(Channel::ChannelA),
+        Some('B') => Ok(Channel::ChannelB),
         _ => Err(color_eyre::eyre::eyre!("Invalid channel. Use 'A' or 'B'")),
     }
 }
 
 pub fn channel_to_string(channel: Channel) -> &'static str {
     match channel {
-        Channel::A => "A",
-        Channel::B => "B",
+        Channel::ChannelA => "A",
+        Channel::ChannelB => "B",
     }
 }
 

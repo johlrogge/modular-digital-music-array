@@ -986,12 +986,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "media-protocol",
  "nng",
  "playback-engine",
- "prost",
- "serde",
  "serde_json",
- "thiserror",
  "tokio",
 ]
 
@@ -1004,6 +1002,7 @@ dependencies = [
  "color-eyre",
  "media-client",
  "nng",
+ "playback-primitives",
  "prost",
  "tokio",
 ]
@@ -1026,6 +1025,16 @@ dependencies = [
  "tokio",
  "url",
  "which",
+]
+
+[[package]]
+name = "media-protocol"
+version = "0.1.0"
+dependencies = [
+ "playback-primitives",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

@@ -14,3 +14,4 @@ nng = "1.0"
 prost = "0.11"
 anyhow = "1.0"
 media-client = { path = "../../components/media_client" }
+playback-primitives = { path = "../../components/playback_primitives" }
