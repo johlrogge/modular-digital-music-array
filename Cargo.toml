@@ -11,7 +11,8 @@ members = [
     
     # Bases (entry points)
     "bases/download_cli",
-    "bases/media_ctl"
+    "bases/media_ctl",
+    "bases/playback_server"
 ]
 resolver = "2"
 [workspace.package]

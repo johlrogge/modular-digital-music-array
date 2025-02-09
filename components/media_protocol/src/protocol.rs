@@ -17,3 +17,24 @@ pub struct Response {
     pub success: bool,
     pub error_message: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_play_command_serialization() {
+        let cmd = Command::Play {
+            channel: Channel::ChannelA,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let decoded: Command = serde_json::from_str(&json).unwrap();
+
+        assert!(matches!(
+            decoded,
+            Command::Play {
+                channel: Channel::ChannelA
+            }
+        ));
+    }
+}

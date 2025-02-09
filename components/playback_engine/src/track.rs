@@ -1,5 +1,5 @@
 use parking_lot::RwLock;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use symphonia::core::audio::{Channels, SampleBuffer, SignalSpec};
 use symphonia::core::codecs::DecoderOptions;

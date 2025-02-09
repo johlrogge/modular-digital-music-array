@@ -4,7 +4,8 @@ mod track;
 
 use audio::AudioOutput;
 pub use error::PlaybackError;
-use std::path::PathBuf;
+use parking_lot::RwLock;
+use std::{path::PathBuf, sync::Arc};
 pub use track::{Channel, Track};
 
 pub struct PlaybackEngine {
@@ -28,10 +29,15 @@ impl PlaybackEngine {
         self.audio.remove_track(channel)
     }
 
-    pub fn play(&mut self, _channel: Channel) -> Result<(), PlaybackError> {
-        Ok(())
+    pub fn play(&mut self, channel: Channel) -> Result<(), PlaybackError> {
+        // Find track on specified channel and start playback
+        if let Some(track) = self.find_track(channel) {
+            track.write().play();
+            Ok(())
+        } else {
+            Err(PlaybackError::NoTrackLoaded(channel))
+        }
     }
-
     pub fn stop(&mut self, _channel: Channel) -> Result<(), PlaybackError> {
         Ok(())
     }
@@ -42,6 +48,15 @@ impl PlaybackEngine {
         }
 
         Ok(())
+    }
+    fn find_track(&self, channel: Channel) -> Option<Arc<RwLock<Track>>> {
+        // Get tracks list from audio output
+        self.audio
+            .tracks()
+            .read()
+            .iter()
+            .find(|(ch, _)| *ch == channel)
+            .map(|(_, track)| Arc::clone(track))
     }
 }
 
@@ -82,5 +97,34 @@ mod tests {
     fn test_unload_nonexistent_track() {
         let mut engine = PlaybackEngine::new().unwrap();
         assert!(engine.unload_track(Channel::A).is_ok());
+    }
+
+    #[test]
+    fn test_play_nonexistent_track() {
+        let mut engine = PlaybackEngine::new().unwrap();
+
+        // Attempting to play without loading should fail
+        assert!(matches!(
+            engine.play(Channel::A),
+            Err(PlaybackError::NoTrackLoaded(_))
+        ));
+    }
+
+    #[test]
+    fn test_play_stop_sequence() {
+        let mut engine = PlaybackEngine::new().unwrap();
+        let path = PathBuf::from("test.flac");
+
+        // Loading non-existent file should fail
+        assert!(matches!(
+            engine.load_track(path, Channel::A),
+            Err(PlaybackError::TrackNotFound(_))
+        ));
+
+        // Play should fail after failed load
+        assert!(matches!(
+            engine.play(Channel::A),
+            Err(PlaybackError::NoTrackLoaded(_))
+        ));
     }
 }

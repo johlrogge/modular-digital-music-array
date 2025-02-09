@@ -11,6 +11,7 @@ pub struct AudioOutput {
     _stream: Stream,
     _device: Device,
     _config: StreamConfig,
+    tracks: Tracks,
     command_tx: Sender<AudioCommand>,
 }
 
@@ -38,6 +39,10 @@ impl AudioOutput {
 
         // Create command channel
         let (command_tx, command_rx) = bounded::<AudioCommand>(32);
+
+        // Create tracks list
+        let tracks: Tracks = Arc::new(RwLock::new(Vec::new()));
+        let tracks_ref = Arc::clone(&tracks);
 
         // Create mixing buffer
         let mix_buffer = vec![0f32; config.channels as usize * 1024];
@@ -115,6 +120,7 @@ impl AudioOutput {
             _stream: stream,
             _device: device,
             _config: config,
+            tracks,
             command_tx,
         })
     }
@@ -141,6 +147,9 @@ impl AudioOutput {
 
     pub fn get_channels(&self) -> u16 {
         self._config.channels
+    }
+    pub fn tracks(&self) -> &Tracks {
+        &self.tracks
     }
 }
 
