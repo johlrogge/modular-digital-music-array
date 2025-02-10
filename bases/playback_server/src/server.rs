@@ -16,8 +16,8 @@ impl Server {
     // Convert protocol channel to playback channel
     fn convert_channel(protocol_channel: ProtocolChannel) -> playback_engine::Channel {
         match protocol_channel {
-            ProtocolChannel::ChannelA => playback_engine::Channel::A,
-            ProtocolChannel::ChannelB => playback_engine::Channel::B,
+            ProtocolChannel::ChannelA => playback_engine::Channel::ChannelA,
+            ProtocolChannel::ChannelB => playback_engine::Channel::ChannelB,
         }
     }
 
@@ -106,12 +106,12 @@ mod tests {
 
         assert!(matches!(
             Server::convert_channel(ProtocolChannel::ChannelA),
-            PlaybackChannel::A
+            PlaybackChannel::ChannelA
         ));
 
         assert!(matches!(
             Server::convert_channel(ProtocolChannel::ChannelB),
-            PlaybackChannel::B
+            PlaybackChannel::ChannelB
         ));
     }
 

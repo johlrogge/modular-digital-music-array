@@ -20,97 +20,81 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay, crane }:
-    let
-      # System-specific outputs (packages, devShell)
-      perSystem = flake-utils.lib.eachDefaultSystem (system:
-        let
-          overlays = [ (import rust-overlay) ];
-          pkgs = import nixpkgs {
-            inherit system overlays;
-          };
+    flake-utils.lib.eachDefaultSystem (system:
+      let
+        overlays = [ (import rust-overlay) ];
+        pkgs = import nixpkgs {
+          inherit system overlays;
+        };
+        
+        rustToolchain = pkgs.rust-bin.stable.latest.default;
+        craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+
+        commonArgs = {
+          src = craneLib.cleanCargoSource ./.;
+          pname = "download-cli";
+          version = "0.1.0";
           
-          rustToolchain = pkgs.rust-bin.stable.latest.default;
-          craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
-
-          commonArgs = {
-            src = craneLib.cleanCargoSource ./.;
-            pname = "download-cli";
-            version = "0.1.0";
-            
-            buildInputs = [];
-            nativeBuildInputs = [ pkgs.pkg-config ];
-          };
-
-          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-
-          download-cli = craneLib.buildPackage (commonArgs // {
-            inherit cargoArtifacts;
-          });
-
-          download-cli-wrapped = pkgs.symlinkJoin {
-            name = "download-cli";
-            paths = [ download-cli ];
-            buildInputs = [ pkgs.makeWrapper ];
-            postBuild = ''
-              wrapProgram $out/bin/download-cli \
-                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.yt-dlp ]}
-            '';
-          };
-        in
-        {
-          packages = {
-            inherit download-cli-wrapped;
-            default = download-cli-wrapped;
-          };
-
-          devShells.default = pkgs.mkShell {
-            packages = with pkgs; [
-              rustToolchain
-              yt-dlp
-              pipewire
-            ];
-          };
-        }
-      );
-
-      # NixOS configuration for the VM
-      nixosConfig = { config, lib, pkgs, ... }: {
-        imports = [
-          ./configuration.nix  # Import the existing NixOS configuration
-        ];
-
-        # VM-specific settings
-        virtualisation = {
-          cores = 2;
-          memorySize = 4096; # MB
-          graphics = true;   # Enable graphical output
+          buildInputs = with pkgs; [
+            alsa-lib
+            alsa-plugins
+            pipewire
+          ];
+          
+          nativeBuildInputs = with pkgs; [ 
+            pkg-config
+          ];
         };
 
-        # Auto-start services
-        systemd.services.mdma = {
-          description = "Modular Distributed Music Array";
-          wantedBy = [ "multi-user.target" ];
-          after = [ "network.target" "pipewire.service" ];
-          
-          serviceConfig = {
-            Type = "simple";
-            User = "music";
-            ExecStart = "${self.packages.${pkgs.system}.download-cli-wrapped}/bin/download-cli";
-            Restart = "on-failure";
-          };
-        };
-      };
-    in
-    {
-      # Merge the per-system outputs
-      inherit (perSystem) packages devShells;
+        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-      # Add NixOS configuration
-      nixosConfigurations.default = nixpkgs.lib.nixosSystem {
-        system = "x86_64-linux";  # You might want to make this configurable
-        modules = [
-          nixosConfig
-        ];
-      };
-    };
+        download-cli = craneLib.buildPackage (commonArgs // {
+          inherit cargoArtifacts;
+        });
+
+        download-cli-wrapped = pkgs.symlinkJoin {
+          name = "download-cli";
+          paths = [ download-cli ];
+          buildInputs = [ pkgs.makeWrapper ];
+          postBuild = ''
+            wrapProgram $out/bin/download-cli \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.yt-dlp ]}
+          '';
+        };
+      in
+      {
+        packages = {
+          inherit download-cli-wrapped;
+          default = download-cli-wrapped;
+        };
+
+        devShells.default = pkgs.mkShell {
+          packages = with pkgs; [
+            rustToolchain
+            yt-dlp
+            alsa-lib
+            alsa-plugins
+            alsa-utils
+            pipewire
+            pkg-config
+          ];
+          
+          LD_LIBRARY_PATH = with pkgs; lib.makeLibraryPath [
+            alsa-lib
+            alsa-plugins
+            pipewire
+          ];
+
+          # Add ALSA plugins path
+          ALSA_PLUGIN_DIR = "${pkgs.alsa-plugins}/lib/alsa-lib";
+        };
+
+        nixosConfigurations.default = nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = [
+            ./configuration.nix
+          ];
+        };
+      }
+    );
 }

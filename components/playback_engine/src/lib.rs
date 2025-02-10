@@ -2,16 +2,17 @@ mod audio;
 mod error;
 mod track;
 
+use std::{path::PathBuf, sync::Arc};
+
 use audio::AudioOutput;
 pub use error::PlaybackError;
 use parking_lot::RwLock;
-use std::{path::PathBuf, sync::Arc};
-pub use track::{Channel, Track};
+pub use playback_primitives::Channel;
+pub use track::Track;
 
 pub struct PlaybackEngine {
     audio: AudioOutput,
 }
-
 impl PlaybackEngine {
     pub fn new() -> Result<Self, PlaybackError> {
         let audio = AudioOutput::new()?;
@@ -26,7 +27,11 @@ impl PlaybackEngine {
     }
 
     pub fn unload_track(&mut self, channel: Channel) -> Result<(), PlaybackError> {
-        self.audio.remove_track(channel)
+        // Even if no track is loaded, unloading should succeed as a no-op
+        match self.find_track(channel) {
+            Some(_) => self.audio.remove_track(channel),
+            None => Ok(()), // No track to unload is still a success
+        }
     }
 
     pub fn play(&mut self, channel: Channel) -> Result<(), PlaybackError> {
@@ -72,7 +77,7 @@ mod tests {
 
         // First load should fail because file doesn't exist
         assert!(matches!(
-            engine.load_track(path.clone(), Channel::A),
+            engine.load_track(path.clone(), Channel::ChannelA),
             Err(PlaybackError::TrackNotFound(_))
         ));
     }
@@ -83,12 +88,12 @@ mod tests {
 
         // Test invalid volume levels
         assert!(matches!(
-            engine.set_volume(Channel::A, 1.0),
+            engine.set_volume(Channel::ChannelA, 1.0),
             Err(PlaybackError::InvalidVolume(_))
         ));
 
         assert!(matches!(
-            engine.set_volume(Channel::A, -100.0),
+            engine.set_volume(Channel::ChannelA, -100.0),
             Err(PlaybackError::InvalidVolume(_))
         ));
     }
@@ -96,7 +101,8 @@ mod tests {
     #[test]
     fn test_unload_nonexistent_track() {
         let mut engine = PlaybackEngine::new().unwrap();
-        assert!(engine.unload_track(Channel::A).is_ok());
+        // Should succeed as a no-op when no track is loaded
+        assert!(engine.unload_track(Channel::ChannelA).is_ok());
     }
 
     #[test]
@@ -105,7 +111,7 @@ mod tests {
 
         // Attempting to play without loading should fail
         assert!(matches!(
-            engine.play(Channel::A),
+            engine.play(Channel::ChannelA),
             Err(PlaybackError::NoTrackLoaded(_))
         ));
     }
@@ -117,13 +123,13 @@ mod tests {
 
         // Loading non-existent file should fail
         assert!(matches!(
-            engine.load_track(path, Channel::A),
+            engine.load_track(path, Channel::ChannelA),
             Err(PlaybackError::TrackNotFound(_))
         ));
 
         // Play should fail after failed load
         assert!(matches!(
-            engine.play(Channel::A),
+            engine.play(Channel::ChannelA),
             Err(PlaybackError::NoTrackLoaded(_))
         ));
     }

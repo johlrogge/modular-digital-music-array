@@ -1282,6 +1282,7 @@ dependencies = [
  "thiserror",
  "time-primitives",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

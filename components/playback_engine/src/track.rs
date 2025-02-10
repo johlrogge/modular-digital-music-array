@@ -1,36 +1,24 @@
 use parking_lot::RwLock;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use symphonia::core::audio::{Channels, SampleBuffer, SignalSpec};
-use symphonia::core::codecs::DecoderOptions;
-use symphonia::core::formats::{FormatOptions, FormatReader};
+use symphonia::core::audio::{Channels, SampleBuffer};
+use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 use crate::error::PlaybackError;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Channel {
-    A,
-    B,
-}
-
-impl std::fmt::Display for Channel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Channel::A => write!(f, "A"),
-            Channel::B => write!(f, "B"),
-        }
-    }
-}
+const MINUTES_TO_BUFFER: usize = 3; // Store 3 minutes of audio
 
 pub struct Track {
-    decoder: Arc<RwLock<Box<dyn symphonia::core::codecs::Decoder>>>,
-    format: Arc<RwLock<Box<dyn FormatReader>>>,
-    buffer: Arc<RwLock<SampleBuffer<f32>>>,
+    playback_buffer: Arc<Vec<f32>>,
+    buffer_position: Arc<AtomicUsize>,
     playing: Arc<RwLock<bool>>,
     volume: Arc<RwLock<f32>>,
+    sample_rate: u32,
+    channels: usize,
 }
 
 impl Track {
@@ -39,52 +27,141 @@ impl Track {
             return Err(PlaybackError::TrackNotFound(path.to_owned()));
         }
 
-        // Open media source
         let src = std::fs::File::open(path)?;
         let mss = MediaSourceStream::new(Box::new(src), Default::default());
 
-        // Create probe hint
         let mut hint = Hint::new();
         hint.with_extension("flac");
 
-        // Probe format
         let format_opts = FormatOptions::default();
         let metadata_opts = MetadataOptions::default();
-        let probed = symphonia::default::get_probe()
+
+        let mut probed = symphonia::default::get_probe()
             .format(&hint, mss, &format_opts, &metadata_opts)
             .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
 
-        // Get default track
-        let track = probed
+        let track_id = probed
             .format
             .default_track()
-            .ok_or_else(|| PlaybackError::Decoder("No default track found".into()))?;
+            .ok_or_else(|| PlaybackError::Decoder("No default track found".into()))?
+            .id;
 
-        // Get decoder
-        let decoder = symphonia::default::get_codecs()
-            .make(&track.codec_params, &DecoderOptions::default())
+        let params = probed
+            .format
+            .tracks()
+            .iter()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| PlaybackError::Decoder("Track not found".into()))?
+            .codec_params
+            .clone();
+
+        let mut decoder = symphonia::default::get_codecs()
+            .make(&params, &Default::default())
             .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
 
-        // Create sample buffer with proper signal spec
-        let spec = SignalSpec::new(
-            track.codec_params.sample_rate.unwrap_or(44100),
-            track
-                .codec_params
-                .channels
-                .unwrap_or(Channels::FRONT_LEFT | Channels::FRONT_RIGHT),
+        // Get track parameters
+        let channels = params
+            .channels
+            .unwrap_or(Channels::FRONT_LEFT | Channels::FRONT_RIGHT)
+            .count();
+        let sample_rate = params.sample_rate.unwrap_or(44100);
+
+        // Calculate buffer size for N minutes of audio
+        let samples_per_channel = sample_rate as usize * 60 * MINUTES_TO_BUFFER;
+        let total_samples = samples_per_channel * channels;
+
+        tracing::info!(
+            "Allocating buffer for {} minutes of audio ({} samples, {} channels @ {}Hz)",
+            MINUTES_TO_BUFFER,
+            total_samples,
+            channels,
+            sample_rate
+        );
+
+        // Pre-decode audio into memory
+        let mut playback_buffer = Vec::with_capacity(total_samples);
+        let mut total_frames = 0;
+
+        while let Ok(packet) = probed.format.next_packet() {
+            match decoder.decode(&packet) {
+                Ok(decoded) => {
+                    let frames = decoded.frames();
+                    let mut sample_buf =
+                        SampleBuffer::<f32>::new(frames as u64, decoded.spec().clone());
+                    sample_buf.copy_interleaved_ref(decoded);
+
+                    // Copy samples to our main buffer
+                    playback_buffer.extend_from_slice(sample_buf.samples());
+                    total_frames += frames;
+
+                    tracing::debug!(
+                        "Decoded {} frames ({} samples), total frames: {}",
+                        frames,
+                        sample_buf.samples().len(),
+                        total_frames
+                    );
+
+                    // Break if we've filled our buffer
+                    if playback_buffer.len() >= total_samples {
+                        tracing::info!("Reached buffer capacity, stopping decode");
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Error decoding packet: {}", e);
+                    break;
+                }
+            }
+        }
+
+        tracing::info!(
+            "Loaded {} samples ({:.1} seconds of audio)",
+            playback_buffer.len(),
+            playback_buffer.len() as f32 / (channels as f32 * sample_rate as f32)
         );
 
         Ok(Self {
-            decoder: Arc::new(RwLock::new(decoder)), // decoder is already a Box<dyn Decoder>
-            format: Arc::new(RwLock::new(probed.format)),
-            buffer: Arc::new(RwLock::new(SampleBuffer::new(1024, spec))),
+            playback_buffer: Arc::new(playback_buffer),
+            buffer_position: Arc::new(AtomicUsize::new(0)),
             playing: Arc::new(RwLock::new(false)),
             volume: Arc::new(RwLock::new(1.0)),
+            sample_rate,
+            channels,
         })
+    }
+
+    pub fn get_next_samples(&mut self, buffer: &mut [f32]) -> Result<usize, PlaybackError> {
+        if !self.is_playing() {
+            return Ok(0);
+        }
+
+        let position = self.buffer_position.load(Ordering::Relaxed);
+        let available = self.playback_buffer.len().saturating_sub(position);
+
+        if available == 0 {
+            tracing::info!("Reached end of buffered audio");
+            *self.playing.write() = false;
+            return Ok(0);
+        }
+
+        let len = std::cmp::min(buffer.len(), available);
+
+        // Copy samples and apply volume
+        let volume = self.get_volume();
+        for i in 0..len {
+            buffer[i] = self.playback_buffer[position + i] * volume;
+        }
+
+        // Update position
+        self.buffer_position
+            .store(position + len, Ordering::Relaxed);
+
+        Ok(len)
     }
 
     pub fn play(&mut self) {
         *self.playing.write() = true;
+        self.buffer_position.store(0, Ordering::Relaxed);
     }
 
     pub fn stop(&mut self) {
@@ -103,46 +180,5 @@ impl Track {
 
     pub fn get_volume(&self) -> f32 {
         *self.volume.read()
-    }
-
-    pub fn get_next_samples(&mut self, buffer: &mut [f32]) -> Result<usize, PlaybackError> {
-        if !self.is_playing() {
-            return Ok(0);
-        }
-
-        let mut format = self.format.write();
-        let mut decoder = self.decoder.write();
-        let mut sample_buf = self.buffer.write();
-        let volume = self.get_volume();
-
-        let packet = format
-            .next_packet()
-            .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
-
-        let decoded = decoder
-            .decode(&packet)
-            .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
-
-        sample_buf.copy_interleaved_ref(decoded);
-        let samples = sample_buf.samples();
-        let len = std::cmp::min(buffer.len(), samples.len());
-
-        for i in 0..len {
-            buffer[i] = samples[i] * volume;
-        }
-
-        Ok(len)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    #[test]
-    fn test_track_volume() {
-        let path = PathBuf::from("test.flac");
-        assert!(Track::new(&path).is_err()); // Should fail as file doesn't exist
     }
 }
