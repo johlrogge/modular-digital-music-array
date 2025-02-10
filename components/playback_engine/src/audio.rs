@@ -29,42 +29,11 @@ enum AudioCommand {
 
 impl AudioOutput {
     pub fn new() -> Result<Self, PlaybackError> {
-        let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| PlaybackError::AudioDevice("No output device found".into()))?;
+        let (device, config) = Self::initialize_audio_device()?;
 
-        let config = cpal::StreamConfig {
-            channels: CHANNELS,
-            sample_rate: cpal::SampleRate(SAMPLE_RATE),
-            buffer_size: cpal::BufferSize::Fixed(PLAYBACK_BUFFER_SIZE as u32),
-        };
-
-        let (command_tx, command_rx) = unbounded();
-
-        let tracks: Arc<RwLock<Vec<(Channel, Arc<RwLock<Track>>)>>> =
-            Arc::new(RwLock::new(Vec::new()));
-        let tracks_ref = Arc::clone(&tracks);
-        let tracks_for_commands = Arc::clone(&tracks);
-        std::thread::spawn(move || {
-            while let Ok(command) = command_rx.recv() {
-                let mut tracks = tracks_for_commands.write();
-                match command {
-                    AudioCommand::AddTrack { channel, track } => {
-                        // Remove any existing track on this channel
-                        tracks.retain(|(ch, _)| *ch != channel);
-                        // Add the new track
-                        tracks.push((channel, Arc::new(RwLock::new(track))));
-                        tracing::info!("Added track to channel {:?}", channel);
-                    }
-                    AudioCommand::RemoveTrack(channel) => {
-                        tracks.retain(|(ch, _)| *ch != channel);
-                        tracing::info!("Removed track from channel {:?}", channel);
-                    }
-                }
-            }
-            tracing::info!("Command processing stopped");
-        });
+        let tracks = Arc::new(RwLock::new(Vec::new()));
+        let command_tx = Self::initialize_command_processing(tracks.clone());
+        let tracks_ref = tracks.clone();
 
         // Mix buffer sized for decode buffer
         let mix_buffer = vec![0f32; DECODE_BUFFER_SIZE];
@@ -134,6 +103,45 @@ impl AudioOutput {
             tracks,
             command_tx,
         })
+    }
+
+    fn initialize_audio_device() -> Result<(cpal::Device, cpal::StreamConfig), PlaybackError> {
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| PlaybackError::AudioDevice("No output device found".into()))?;
+
+        let config = cpal::StreamConfig {
+            channels: CHANNELS,
+            sample_rate: cpal::SampleRate(SAMPLE_RATE),
+            buffer_size: cpal::BufferSize::Fixed(PLAYBACK_BUFFER_SIZE as u32),
+        };
+
+        Ok((device, config))
+    }
+
+    fn initialize_command_processing(tracks: Tracks) -> Sender<AudioCommand> {
+        let (command_tx, command_rx) = unbounded();
+
+        std::thread::spawn(move || {
+            while let Ok(command) = command_rx.recv() {
+                let mut tracks = tracks.write();
+                match command {
+                    AudioCommand::AddTrack { channel, track } => {
+                        tracks.retain(|(ch, _)| *ch != channel);
+                        tracks.push((channel, Arc::new(RwLock::new(track))));
+                        tracing::info!("Added track to channel {:?}", channel);
+                    }
+                    AudioCommand::RemoveTrack(channel) => {
+                        tracks.retain(|(ch, _)| *ch != channel);
+                        tracing::info!("Removed track from channel {:?}", channel);
+                    }
+                }
+            }
+            tracing::info!("Command processing stopped");
+        });
+
+        command_tx
     }
 
     pub fn add_track(
