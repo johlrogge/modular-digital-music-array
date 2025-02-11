@@ -84,12 +84,39 @@ impl AudioOutput {
         command_tx
     }
 
+    fn mix_tracks(
+        tracks: &[(Channel, Arc<RwLock<Track>>)],
+        mix_buffer: &mut [f32],
+        output: &mut [f32],
+        samples_per_callback: usize,
+    ) {
+        for (channel, track) in tracks.iter() {
+            let mut track = track.write();
+            if track.is_playing() {
+                match track.get_next_samples(&mut mix_buffer[..samples_per_callback]) {
+                    Ok(len) if len > 0 => {
+                        tracing::debug!("Got {} samples from channel {:?}", len, channel);
+                        let volume = track.get_volume();
+                        for i in 0..len {
+                            output[i] += mix_buffer[i] * volume;
+                        }
+                    }
+                    Ok(_) => {
+                        tracing::debug!("No samples from channel {:?}", channel);
+                    }
+                    Err(e) => {
+                        tracing::error!("Error getting samples from channel {:?}: {}", channel, e);
+                    }
+                }
+            }
+        }
+    }
+
     fn create_audio_callback(
         tracks: Tracks,
     ) -> impl FnMut(&mut [f32], &cpal::OutputCallbackInfo) + Send + 'static {
         let mix_buffer = vec![0f32; DECODE_BUFFER_SIZE];
         let mix_buffer = Arc::new(RwLock::new(mix_buffer));
-        let mix_buffer_ref = Arc::clone(&mix_buffer);
 
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
             data.fill(0.0);
@@ -97,33 +124,10 @@ impl AudioOutput {
             tracing::debug!("Audio callback requesting {} samples", samples_per_callback);
 
             let tracks = tracks.read();
-            let mut mix_buffer = mix_buffer_ref.write();
+            let mut mix_buffer = mix_buffer.write();
             mix_buffer.fill(0.0);
 
-            for (channel, track) in tracks.iter() {
-                let mut track = track.write();
-                if track.is_playing() {
-                    match track.get_next_samples(&mut mix_buffer[..samples_per_callback]) {
-                        Ok(len) if len > 0 => {
-                            tracing::debug!("Got {} samples from channel {:?}", len, channel);
-                            let volume = track.get_volume();
-                            for i in 0..len {
-                                data[i] += mix_buffer[i] * volume;
-                            }
-                        }
-                        Ok(_) => {
-                            tracing::debug!("No samples from channel {:?}", channel);
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Error getting samples from channel {:?}: {}",
-                                channel,
-                                e
-                            );
-                        }
-                    }
-                }
-            }
+            Self::mix_tracks(&tracks, &mut mix_buffer, data, samples_per_callback);
 
             for sample in data.iter_mut() {
                 *sample = sample.clamp(-1.0, 1.0);
