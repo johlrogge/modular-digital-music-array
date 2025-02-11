@@ -1,46 +1,43 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, Stream, StreamConfig};
 use crossbeam::channel::{unbounded, Sender};
-use parking_lot::RwLock;
 use std::sync::Arc;
 
+use crate::channels::Channels;
+use crate::commands::AudioCommand;
 use crate::error::PlaybackError;
+use crate::mixer::Mixer;
 use crate::track::Track;
 use playback_primitives::Channel;
-
-type Tracks = Arc<RwLock<Vec<(Channel, Arc<RwLock<Track>>)>>>;
 
 const SAMPLE_RATE: u32 = 48000;
 const CHANNELS: u16 = 2; // Stereo
 const PLAYBACK_BUFFER_SIZE: usize = 480; // 10ms at 48kHz
-const DECODE_BUFFER_SIZE: usize = 960; // Double for resampling headroom
 
 pub struct AudioOutput {
     _stream: Stream,
     _device: Device,
-    tracks: Tracks,
+    channels: Channels,
     command_tx: Sender<AudioCommand>,
-}
-
-enum AudioCommand {
-    AddTrack { channel: Channel, track: Track },
-    RemoveTrack(Channel),
 }
 
 impl AudioOutput {
     pub fn new() -> Result<Self, PlaybackError> {
         let (device, config) = Self::initialize_audio_device()?;
 
-        let tracks = Arc::new(RwLock::new(Vec::new()));
-        let command_tx = Self::initialize_command_processing(tracks.clone());
-        let audio_callback = Self::create_audio_callback(tracks.clone());
+        let channels = Channels::new();
+        let command_tx = Self::initialize_command_processing(channels.clone());
+        
+        let mixer = Arc::new(parking_lot::RwLock::new(Mixer::new(PLAYBACK_BUFFER_SIZE)));
+        let audio_callback = Self::create_audio_callback(channels.clone(), mixer);
+        
         let stream = Self::create_audio_stream(&device, &config, audio_callback)?;
         stream.play()?;
 
         Ok(Self {
             _stream: stream,
             _device: device,
-            tracks,
+            channels,
             command_tx,
         })
     }
@@ -60,21 +57,17 @@ impl AudioOutput {
         Ok((device, config))
     }
 
-    fn initialize_command_processing(tracks: Tracks) -> Sender<AudioCommand> {
+    fn initialize_command_processing(channels: Channels) -> Sender<AudioCommand> {
         let (command_tx, command_rx) = unbounded();
 
         std::thread::spawn(move || {
             while let Ok(command) = command_rx.recv() {
-                let mut tracks = tracks.write();
                 match command {
                     AudioCommand::AddTrack { channel, track } => {
-                        tracks.retain(|(ch, _)| *ch != channel);
-                        tracks.push((channel, Arc::new(RwLock::new(track))));
-                        tracing::info!("Added track to channel {:?}", channel);
+                        channels.assign(channel, track);
                     }
                     AudioCommand::RemoveTrack(channel) => {
-                        tracks.retain(|(ch, _)| *ch != channel);
-                        tracing::info!("Removed track from channel {:?}", channel);
+                        channels.clear(channel);
                     }
                 }
             }
@@ -84,53 +77,16 @@ impl AudioOutput {
         command_tx
     }
 
-    fn mix_tracks(
-        tracks: &[(Channel, Arc<RwLock<Track>>)],
-        mix_buffer: &mut [f32],
-        output: &mut [f32],
-        samples_per_callback: usize,
-    ) {
-        for (channel, track) in tracks.iter() {
-            let mut track = track.write();
-            if track.is_playing() {
-                match track.get_next_samples(&mut mix_buffer[..samples_per_callback]) {
-                    Ok(len) if len > 0 => {
-                        tracing::debug!("Got {} samples from channel {:?}", len, channel);
-                        let volume = track.get_volume();
-                        for i in 0..len {
-                            output[i] += mix_buffer[i] * volume;
-                        }
-                    }
-                    Ok(_) => {
-                        tracing::debug!("No samples from channel {:?}", channel);
-                    }
-                    Err(e) => {
-                        tracing::error!("Error getting samples from channel {:?}: {}", channel, e);
-                    }
-                }
-            }
-        }
-    }
-
     fn create_audio_callback(
-        tracks: Tracks,
+        channels: Channels,
+        mixer: Arc<parking_lot::RwLock<Mixer>>,
     ) -> impl FnMut(&mut [f32], &cpal::OutputCallbackInfo) + Send + 'static {
-        let mix_buffer = vec![0f32; DECODE_BUFFER_SIZE];
-        let mix_buffer = Arc::new(RwLock::new(mix_buffer));
-
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            data.fill(0.0);
             let samples_per_callback = data.len();
-            tracing::debug!("Audio callback requesting {} samples", samples_per_callback);
-
-            let tracks = tracks.read();
-            let mut mix_buffer = mix_buffer.write();
-            mix_buffer.fill(0.0);
-
-            Self::mix_tracks(&tracks, &mut mix_buffer, data, samples_per_callback);
-
-            for sample in data.iter_mut() {
-                *sample = sample.clamp(-1.0, 1.0);
+            let mut mixer = mixer.write();
+            
+            if let Err(e) = mixer.mix(&channels, data, samples_per_callback) {
+                tracing::error!("Error in audio callback: {}", e);
             }
         }
     }
@@ -147,27 +103,22 @@ impl AudioOutput {
             None,
         )?;
 
-        stream.play()?;
-
         Ok(stream)
     }
-    pub fn add_track(
-        &self,
-        channel: crate::Channel,
-        track: crate::Track,
-    ) -> Result<(), PlaybackError> {
+
+    pub fn add_track(&self, channel: Channel, track: Track) -> Result<(), PlaybackError> {
         self.command_tx
             .send(AudioCommand::AddTrack { channel, track })
             .map_err(|_| PlaybackError::AudioDevice("Failed to send add track command".into()))
     }
 
-    pub fn remove_track(&self, channel: crate::Channel) -> Result<(), PlaybackError> {
+    pub fn remove_track(&self, channel: Channel) -> Result<(), PlaybackError> {
         self.command_tx
             .send(AudioCommand::RemoveTrack(channel))
             .map_err(|_| PlaybackError::AudioDevice("Failed to send remove track command".into()))
     }
 
-    pub fn tracks(&self) -> &Tracks {
-        &self.tracks
+    pub fn channels(&self) -> &Channels {
+        &self.channels
     }
 }
