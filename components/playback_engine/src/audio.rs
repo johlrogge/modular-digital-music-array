@@ -1,5 +1,5 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, Stream};
+use cpal::{Device, Stream, StreamConfig};
 use crossbeam::channel::{unbounded, Sender};
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -33,68 +33,8 @@ impl AudioOutput {
 
         let tracks = Arc::new(RwLock::new(Vec::new()));
         let command_tx = Self::initialize_command_processing(tracks.clone());
-        let tracks_ref = tracks.clone();
-
-        // Mix buffer sized for decode buffer
-        let mix_buffer = vec![0f32; DECODE_BUFFER_SIZE];
-        let mix_buffer = Arc::new(RwLock::new(mix_buffer));
-        let mix_buffer_ref = Arc::clone(&mix_buffer);
-
-        let audio_callback = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            // Clear output buffer
-            data.fill(0.0);
-
-            // Calculate how many samples we should provide for this callback
-            // data.len() already accounts for stereo (it's the total number of samples needed)
-            let samples_per_callback = data.len();
-
-            tracing::debug!("Audio callback requesting {} samples", samples_per_callback);
-
-            // Mix all playing tracks
-            let tracks = tracks_ref.read();
-            let mut mix_buffer = mix_buffer_ref.write();
-            mix_buffer.fill(0.0);
-
-            for (channel, track) in tracks.iter() {
-                let mut track = track.write();
-                if track.is_playing() {
-                    match track.get_next_samples(&mut mix_buffer[..samples_per_callback]) {
-                        Ok(len) if len > 0 => {
-                            tracing::debug!("Got {} samples from channel {:?}", len, channel);
-                            let volume = track.get_volume();
-                            // Copy exact number of samples we got
-                            for i in 0..len {
-                                data[i] += mix_buffer[i] * volume;
-                            }
-                        }
-                        Ok(_) => {
-                            tracing::debug!("No samples from channel {:?}", channel);
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Error getting samples from channel {:?}: {}",
-                                channel,
-                                e
-                            );
-                        }
-                    }
-                }
-            }
-
-            // Apply limiter to prevent clipping
-            for sample in data.iter_mut() {
-                *sample = sample.clamp(-1.0, 1.0);
-            }
-        };
-
-        // Build output stream with minimal latency
-        let stream = device.build_output_stream(
-            &config,
-            audio_callback,
-            move |err| eprintln!("Audio stream error: {}", err),
-            None,
-        )?;
-
+        let audio_callback = Self::create_audio_callback(tracks.clone());
+        let stream = Self::create_audio_stream(&device, &config, audio_callback)?;
         stream.play()?;
 
         Ok(Self {
@@ -144,6 +84,69 @@ impl AudioOutput {
         command_tx
     }
 
+    fn create_audio_callback(
+        tracks: Tracks,
+    ) -> impl FnMut(&mut [f32], &cpal::OutputCallbackInfo) + Send + 'static {
+        let mix_buffer = vec![0f32; DECODE_BUFFER_SIZE];
+        let mix_buffer = Arc::new(RwLock::new(mix_buffer));
+        let mix_buffer_ref = Arc::clone(&mix_buffer);
+
+        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            data.fill(0.0);
+            let samples_per_callback = data.len();
+            tracing::debug!("Audio callback requesting {} samples", samples_per_callback);
+
+            let tracks = tracks.read();
+            let mut mix_buffer = mix_buffer_ref.write();
+            mix_buffer.fill(0.0);
+
+            for (channel, track) in tracks.iter() {
+                let mut track = track.write();
+                if track.is_playing() {
+                    match track.get_next_samples(&mut mix_buffer[..samples_per_callback]) {
+                        Ok(len) if len > 0 => {
+                            tracing::debug!("Got {} samples from channel {:?}", len, channel);
+                            let volume = track.get_volume();
+                            for i in 0..len {
+                                data[i] += mix_buffer[i] * volume;
+                            }
+                        }
+                        Ok(_) => {
+                            tracing::debug!("No samples from channel {:?}", channel);
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Error getting samples from channel {:?}: {}",
+                                channel,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+
+            for sample in data.iter_mut() {
+                *sample = sample.clamp(-1.0, 1.0);
+            }
+        }
+    }
+
+    fn create_audio_stream(
+        device: &Device,
+        config: &StreamConfig,
+        audio_callback: impl FnMut(&mut [f32], &cpal::OutputCallbackInfo) + Send + 'static,
+    ) -> Result<Stream, PlaybackError> {
+        let stream = device.build_output_stream(
+            config,
+            audio_callback,
+            move |err| eprintln!("Audio stream error: {}", err),
+            None,
+        )?;
+
+        stream.play()?;
+
+        Ok(stream)
+    }
     pub fn add_track(
         &self,
         channel: crate::Channel,
