@@ -1,0 +1,5 @@
+# Generated test files
+benches/test_data/*.flac
+
+# Keep the directory structure
+!benches/test_data/.gitkeep

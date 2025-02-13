@@ -16,3 +16,16 @@ crossbeam = "0.8"
 time-primitives = { path = "../time_primitives" }
 playback-primitives = { path = "../playback_primitives" }
 tracing.workspace=true
+
+
+[build-dependencies]
+hound = "3.5"    # For WAV handling
+anyhow = "1.0"
+symphonia = { version = "0.5", features = ["flac"] }
+
+[[bench]]
+name = "track_loading"
+harness = false
+
+[dev-dependencies]
+criterion = "0.5"

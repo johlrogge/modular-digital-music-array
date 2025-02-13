@@ -25,7 +25,7 @@ impl PlaybackEngine {
 
     pub fn load_track(&mut self, path: PathBuf, channel: Channel) -> Result<(), PlaybackError> {
         // Create new track
-        let track = Track::new(&path)?;
+        let (track, _) = Track::new(&path)?;
         self.audio.add_track(channel, track)
     }
 
