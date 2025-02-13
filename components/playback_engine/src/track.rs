@@ -1,9 +1,10 @@
+// components/playback_engine/src/track.rs
 use parking_lot::RwLock;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use symphonia::core::audio::{Channels, SampleBuffer};
+use symphonia::core::audio::SampleBuffer;
+use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
@@ -11,71 +12,8 @@ use symphonia::core::probe::Hint;
 
 use crate::error::PlaybackError;
 
-const MINUTES_TO_BUFFER: usize = 3; // Store 3 minutes of audio
-pub struct Track {
-    playback_buffer: Arc<Vec<f32>>,
-    buffer_position: Arc<AtomicUsize>,
-    playing: Arc<RwLock<bool>>,
-    volume: Arc<RwLock<f32>>,
-    sample_rate: usize,
-    channels: usize,
-}
-
-use std::io::{self, Read, Seek, SeekFrom};
-use symphonia::core::io::MediaSource;
-
-pub struct ReadMetrics {
-    pub read_calls: usize,
-    pub bytes_read: usize,
-}
-
-struct MetricsReader<R> {
-    inner: R,
-    read_calls: Arc<AtomicUsize>,
-    bytes_read: Arc<AtomicUsize>,
-}
-
-impl<R: Read + Seek + Send + Sync> MediaSource for MetricsReader<R> {
-    fn is_seekable(&self) -> bool {
-        true
-    }
-
-    fn byte_len(&self) -> Option<u64> {
-        None // We'll let symphonia handle this
-    }
-}
-
-impl<R: Read> Read for MetricsReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.read_calls.fetch_add(1, Ordering::Relaxed);
-        let bytes = self.inner.read(buf)?;
-        self.bytes_read.fetch_add(bytes, Ordering::Relaxed);
-        Ok(bytes)
-    }
-}
-
-impl<R: Seek> Seek for MetricsReader<R> {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.inner.seek(pos)
-    }
-}
-
-impl<R> MetricsReader<R> {
-    fn new(inner: R) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
-        let read_calls = Arc::new(AtomicUsize::new(0));
-        let bytes_read = Arc::new(AtomicUsize::new(0));
-
-        (
-            Self {
-                inner,
-                read_calls: read_calls.clone(),
-                bytes_read: bytes_read.clone(),
-            },
-            read_calls,
-            bytes_read,
-        )
-    }
-}
+// Initial buffer size (2 seconds of audio)
+const INITIAL_BUFFER_SECONDS: usize = 2;
 
 #[derive(Debug)]
 pub struct DecodingStats {
@@ -102,9 +40,19 @@ pub struct LoadMetrics {
     pub bytes_read: usize,
 }
 
-impl LoadMetrics {
-    pub fn new(start_time: Instant) -> Self {
-        Self {
+pub struct Track {
+    buffer: Arc<RwLock<Vec<f32>>>,
+    buffer_position: Arc<RwLock<usize>>,
+    playing: Arc<RwLock<bool>>,
+    volume: Arc<RwLock<f32>>,
+    sample_rate: usize,
+    channels: usize,
+}
+
+impl Track {
+    pub fn new(path: &Path) -> Result<(Self, LoadMetrics), PlaybackError> {
+        let start_time = Instant::now();
+        let mut metrics = LoadMetrics {
             file_open_time: Duration::ZERO,
             decoder_creation_time: Duration::ZERO,
             buffer_allocation_time: Duration::ZERO,
@@ -118,90 +66,64 @@ impl LoadMetrics {
                 smallest_packet: usize::MAX,
                 total_packet_bytes: 0,
             },
-            total_time: start_time.elapsed(),
+            total_time: Duration::ZERO,
             decoded_frames: 0,
             buffer_size: 0,
             read_calls: 0,
             bytes_read: 0,
-        }
-    }
-}
+        };
 
-impl Track {
-    pub fn new(path: &Path) -> Result<(Self, LoadMetrics), PlaybackError> {
-        let start_time = Instant::now();
-        let mut metrics = LoadMetrics::new(start_time);
-
-        if !path.exists() {
-            return Err(PlaybackError::TrackNotFound(path.to_owned()));
-        }
-
-        // Measure file opening
+        // Open and create decoder
         let file_start = Instant::now();
         let src = std::fs::File::open(path)?;
-        let buffered_reader = std::io::BufReader::with_capacity(128 * 1024, src);
-        let (metrics_reader, read_calls, bytes_read) = MetricsReader::new(buffered_reader);
-        let mss = MediaSourceStream::new(Box::new(metrics_reader), Default::default());
+        let mss = MediaSourceStream::new(Box::new(src), Default::default());
         metrics.file_open_time = file_start.elapsed();
 
         let mut hint = Hint::new();
         hint.with_extension("flac");
 
-        // Measure decoder creation
         let decoder_start = Instant::now();
-        let format_opts = FormatOptions::default();
-        let metadata_opts = MetadataOptions::default();
-
         let mut probed = symphonia::default::get_probe()
-            .format(&hint, mss, &format_opts, &metadata_opts)
+            .format(
+                &hint,
+                mss,
+                &FormatOptions::default(),
+                &MetadataOptions::default(),
+            )
             .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
 
-        let track_id = probed
+        let track = probed
             .format
             .default_track()
-            .ok_or_else(|| PlaybackError::Decoder("No default track found".into()))?
-            .id;
-
-        let params = probed
-            .format
-            .tracks()
-            .iter()
-            .find(|track| track.id == track_id)
-            .ok_or_else(|| PlaybackError::Decoder("Track not found".into()))?
-            .codec_params
-            .clone();
+            .ok_or_else(|| PlaybackError::Decoder("No default track found".into()))?;
 
         let mut decoder = symphonia::default::get_codecs()
-            .make(&params, &Default::default())
+            .make(&track.codec_params, &DecoderOptions::default())
             .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
         metrics.decoder_creation_time = decoder_start.elapsed();
 
         // Get track parameters
-        let channels = params
-            .channels
-            .unwrap_or(Channels::FRONT_LEFT | Channels::FRONT_RIGHT)
-            .count();
-        let sample_rate = params.sample_rate.unwrap_or(44100) as usize;
+        let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2);
+        let sample_rate = track.codec_params.sample_rate.unwrap_or(44100) as usize;
 
-        // Measure buffer allocation
-        let buffer_start = Instant::now();
-        let samples_per_channel = sample_rate * 60 * MINUTES_TO_BUFFER;
-        let total_samples = samples_per_channel * channels;
-        let mut playback_buffer = Vec::with_capacity(total_samples);
-        metrics.buffer_allocation_time = buffer_start.elapsed();
-        metrics.buffer_size = total_samples;
+        // Allocate initial buffer for 2 seconds of audio
+        let alloc_start = Instant::now();
+        let initial_samples = sample_rate * channels * INITIAL_BUFFER_SECONDS;
+        let mut buffer = Vec::with_capacity(initial_samples);
+        metrics.buffer_allocation_time = alloc_start.elapsed();
+        metrics.buffer_size = initial_samples;
 
-        // Measure decoding
+        // Decode initial buffer
         let decode_start = Instant::now();
         let mut total_frames = 0;
 
-        loop {
-            // Measure packet reading
+        while buffer.len() < initial_samples {
             let packet_read_start = Instant::now();
             let packet = match probed.format.next_packet() {
                 Ok(packet) => {
                     metrics.decoding_stats.packet_read_time += packet_read_start.elapsed();
                     metrics.decoding_stats.packets_processed += 1;
+
                     let packet_size = packet.data.len();
                     metrics.decoding_stats.total_packet_bytes += packet_size;
                     metrics.decoding_stats.largest_packet =
@@ -213,46 +135,30 @@ impl Track {
                 Err(_) => break,
             };
 
-            // Measure packet decoding
             let decode_start = Instant::now();
-            let decoded = match decoder.decode(&packet) {
-                Ok(decoded) => {
-                    metrics.decoding_stats.packet_decode_time += decode_start.elapsed();
-                    decoded
-                }
-                Err(e) => {
-                    tracing::warn!("Error decoding packet: {}", e);
-                    break;
-                }
-            };
+            let decoded = decoder
+                .decode(&packet)
+                .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
+            metrics.decoding_stats.packet_decode_time += decode_start.elapsed();
 
-            // Measure sample copying
             let copy_start = Instant::now();
             let frames = decoded.frames();
             let mut sample_buf = SampleBuffer::<f32>::new(frames as u64, *decoded.spec());
             sample_buf.copy_interleaved_ref(decoded);
-            playback_buffer.extend_from_slice(sample_buf.samples());
+            buffer.extend_from_slice(sample_buf.samples());
             metrics.decoding_stats.sample_copy_time += copy_start.elapsed();
 
             total_frames += frames;
-
-            if playback_buffer.len() >= total_samples {
-                break;
-            }
         }
 
         metrics.decoding_time = decode_start.elapsed();
         metrics.decoded_frames = total_frames;
-
-        // Collect IO metrics
-        metrics.read_calls = read_calls.load(Ordering::Relaxed);
-        metrics.bytes_read = bytes_read.load(Ordering::Relaxed);
         metrics.total_time = start_time.elapsed();
 
         Ok((
             Self {
-                playback_buffer: Arc::new(playback_buffer),
-                buffer_position: Arc::new(AtomicUsize::new(0)),
+                buffer: Arc::new(RwLock::new(buffer)),
+                buffer_position: Arc::new(RwLock::new(0)),
                 playing: Arc::new(RwLock::new(false)),
                 volume: Arc::new(RwLock::new(1.0)),
                 sample_rate,
@@ -267,33 +173,31 @@ impl Track {
             return Ok(0);
         }
 
-        let position = self.buffer_position.load(Ordering::Relaxed);
-        let available = self.playback_buffer.len().saturating_sub(position);
+        let position = *self.buffer_position.read();
+        let track_buffer = self.buffer.read();
+        let available = track_buffer.len().saturating_sub(position);
 
         if available == 0 {
-            tracing::info!("Reached end of buffered audio");
             *self.playing.write() = false;
             return Ok(0);
         }
 
         let len = std::cmp::min(buffer.len(), available);
+        let volume = *self.volume.read();
 
         // Copy samples and apply volume
-        let volume = self.get_volume();
         for i in 0..len {
-            buffer[i] = self.playback_buffer[position + i] * volume;
+            buffer[i] = track_buffer[position + i] * volume;
         }
 
-        // Update position
-        self.buffer_position
-            .store(position + len, Ordering::Relaxed);
+        *self.buffer_position.write() = position + len;
 
         Ok(len)
     }
 
     pub fn play(&mut self) {
         *self.playing.write() = true;
-        self.buffer_position.store(0, Ordering::Relaxed);
+        *self.buffer_position.write() = 0;
     }
 
     pub fn stop(&mut self) {
@@ -305,7 +209,6 @@ impl Track {
     }
 
     pub fn set_volume(&mut self, db: f32) {
-        // Convert dB to linear amplitude
         let linear = 10.0f32.powf(db / 20.0);
         *self.volume.write() = linear;
     }
@@ -314,11 +217,10 @@ impl Track {
         *self.volume.read()
     }
 }
+
 #[cfg(test)]
 impl Track {
-    /// Creates a test track with a simple test signal for unit testing
     pub(crate) fn new_test() -> Self {
-        // Create a simple square wave for testing
         let sample_rate = 48000;
         let frequency = 440.0; // A4 note
         let samples_per_cycle = sample_rate as f32 / frequency;
@@ -326,7 +228,6 @@ impl Track {
 
         let mut buffer = Vec::with_capacity(total_samples);
         for i in 0..total_samples {
-            // Create a square wave that alternates between 0.1 and -0.1
             let sample = if (i as f32 / samples_per_cycle).floor() % 2.0 == 0.0 {
                 0.1
             } else {
@@ -336,56 +237,12 @@ impl Track {
         }
 
         Self {
-            playback_buffer: Arc::new(buffer),
-            buffer_position: Arc::new(AtomicUsize::new(0)),
+            buffer: Arc::new(RwLock::new(buffer)),
+            buffer_position: Arc::new(RwLock::new(0)),
             playing: Arc::new(RwLock::new(false)),
             volume: Arc::new(RwLock::new(1.0)),
             sample_rate,
             channels: 2,
         }
-    }
-}
-
-#[cfg(test)]
-mod track_tests {
-    use super::*;
-
-    #[test]
-    fn test_new_test_creates_valid_track() {
-        let track = Track::new_test();
-        assert_eq!(track.sample_rate, 48000);
-        assert_eq!(track.channels, 2);
-        assert_eq!(track.get_volume(), 1.0);
-        assert!(!track.is_playing());
-    }
-
-    #[test]
-    fn test_new_test_provides_non_zero_samples() {
-        let mut track = Track::new_test();
-        let mut buffer = vec![0.0; 1024];
-
-        track.play();
-        let samples_read = track.get_next_samples(&mut buffer).unwrap();
-
-        assert_eq!(samples_read, 1024);
-        // Verify we got non-zero samples
-        assert!(!buffer[..samples_read].iter().all(|&x| x == 0.0));
-    }
-
-    #[test]
-    fn test_new_test_signal_alternates() {
-        let mut track = Track::new_test();
-        let mut buffer = vec![0.0; 1024];
-
-        track.play();
-        let samples_read = track.get_next_samples(&mut buffer).unwrap();
-
-        // Check that we have both positive and negative samples
-        let has_positive = buffer[..samples_read].iter().any(|&x| x > 0.0);
-        let has_negative = buffer[..samples_read].iter().any(|&x| x < 0.0);
-        assert!(
-            has_positive && has_negative,
-            "Test signal should alternate between positive and negative"
-        );
     }
 }

@@ -11,7 +11,7 @@ use audio::AudioOutput;
 pub use error::PlaybackError;
 use parking_lot::RwLock;
 pub use playback_primitives::Channel;
-pub use track::Track;
+pub use track::{DecodingStats, LoadMetrics, Track};
 
 pub struct PlaybackEngine {
     audio: AudioOutput,

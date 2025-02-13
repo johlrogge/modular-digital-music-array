@@ -1,0 +1,5 @@
+[watch]
+ignore = [
+    "components/playback_engine/benches/test_data/*.flac",
+    "components/playback_engine/benches/test_data/*.wav"
+]
