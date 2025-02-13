@@ -13,7 +13,7 @@ use symphonia::core::probe::Hint;
 use crate::error::PlaybackError;
 
 // Initial buffer size (2 seconds of audio)
-const INITIAL_BUFFER_SECONDS: usize = 2;
+const INITIAL_BUFFER_SECONDS: f32 = 0.25; // Quarter second initial buffer
 
 #[derive(Debug)]
 pub struct DecodingStats {
@@ -108,7 +108,8 @@ impl Track {
 
         // Allocate initial buffer for 2 seconds of audio
         let alloc_start = Instant::now();
-        let initial_samples = sample_rate * channels * INITIAL_BUFFER_SECONDS;
+        let initial_samples =
+            (sample_rate as f32 * channels as f32 * INITIAL_BUFFER_SECONDS) as usize;
         let mut buffer = Vec::with_capacity(initial_samples);
         metrics.buffer_allocation_time = alloc_start.elapsed();
         metrics.buffer_size = initial_samples;

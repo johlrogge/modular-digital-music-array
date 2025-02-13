@@ -123,13 +123,19 @@ mod tests {
         let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
         let server = Server::new(engine, socket);
 
+        let nonexistent_path = PathBuf::from("/this/file/does/not/exist.flac");
         let command = Command::LoadTrack {
-            path: PathBuf::from("nonexistent.flac"),
+            path: nonexistent_path.clone(),
             channel: ProtocolChannel::ChannelA,
         };
 
         let response = server.handle_command(command);
         assert!(!response.success);
-        assert!(response.error_message.contains("not found"));
+        assert!(
+            response.error_message.contains("No such file or directory"),
+            "Error message '{}' should contain path '{}'",
+            response.error_message,
+            nonexistent_path.display()
+        );
     }
 }
