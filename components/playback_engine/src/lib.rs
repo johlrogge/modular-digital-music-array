@@ -1,81 +1,152 @@
-mod audio;
-mod channels;
 mod commands;
 mod error;
 mod mixer;
 mod source;
 mod track;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
-use audio::AudioOutput;
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    Stream,
+};
 pub use error::PlaybackError;
 use parking_lot::RwLock;
 pub use playback_primitives::Deck;
 pub use track::Track;
 
 pub struct PlaybackEngine {
-    audio: AudioOutput,
+    decks: Arc<RwLock<HashMap<Deck, Arc<RwLock<Track>>>>>,
+    _audio_stream: Stream,
 }
 
 impl PlaybackEngine {
     pub fn new() -> Result<Self, PlaybackError> {
-        let audio = AudioOutput::new()?;
-        Ok(Self { audio })
+        let decks = Arc::new(RwLock::new(HashMap::new()));
+        let audio_stream = Self::create_audio_stream(decks.clone())?;
+
+        Ok(Self {
+            decks,
+            _audio_stream: audio_stream,
+        })
     }
 
-    pub fn play(&mut self, channel: Deck) -> Result<(), PlaybackError> {
-        tracing::info!("PlaybackEngine::play called for channel {:?}", channel);
-        if let Some(track) = self.find_track(channel) {
-            tracing::info!("Found track for channel {:?}, setting to play", channel);
+    fn find_track(&self, deck: Deck) -> Option<Arc<RwLock<Track>>> {
+        let decks = self.decks.read();
+        decks.get(&deck).cloned()
+    }
+
+    pub fn play(&mut self, deck: Deck) -> Result<(), PlaybackError> {
+        if let Some(track) = self.find_track(deck) {
+            tracing::info!("Playing deck {:?}", deck);
             track.write().play();
-            tracing::info!("Track set to play for channel {:?}", channel);
             Ok(())
         } else {
-            tracing::error!("No track found for channel {:?}", channel);
-            Err(PlaybackError::NoTrackLoaded(channel))
+            tracing::error!("No track loaded in deck {:?}", deck);
+            Err(PlaybackError::NoTrackLoaded(deck))
         }
     }
 
-    fn find_track(&self, channel: Deck) -> Option<Arc<RwLock<Track>>> {
-        tracing::info!("Finding track for channel {:?}", channel);
-        let result = self.audio.channels().get_track(channel);
-        tracing::info!(
-            "Track lookup result for channel {:?}: found={}",
-            channel,
-            result.is_some()
-        );
-        result
-    }
-    pub fn stop(&mut self, channel: Deck) -> Result<(), PlaybackError> {
-        if let Some(track) = self.find_track(channel) {
+    pub fn stop(&mut self, deck: Deck) -> Result<(), PlaybackError> {
+        if let Some(track) = self.find_track(deck) {
+            tracing::info!("Stopping deck {:?}", deck);
             track.write().stop();
+            Ok(())
+        } else {
+            tracing::error!("No track loaded in deck {:?}", deck);
+            Err(PlaybackError::NoTrackLoaded(deck))
         }
-        Ok(())
     }
 
-    pub fn set_volume(&mut self, channel: Deck, db: f32) -> Result<(), PlaybackError> {
+    pub fn set_volume(&mut self, deck: Deck, db: f32) -> Result<(), PlaybackError> {
         if !(-96.0..=0.0).contains(&db) {
             return Err(PlaybackError::InvalidVolume(db));
         }
 
-        if let Some(track) = self.find_track(channel) {
+        if let Some(track) = self.find_track(deck) {
+            tracing::info!("Setting volume for deck {:?} to {}dB", deck, db);
             track.write().set_volume(db);
+            Ok(())
+        } else {
+            tracing::error!("No track loaded in deck {:?}", deck);
+            Err(PlaybackError::NoTrackLoaded(deck))
         }
+    }
+
+    pub fn load_track(&mut self, deck: Deck, path: &Path) -> Result<(), PlaybackError> {
+        // Create new track
+        let track = Track::new(path)?;
+
+        // Acquire lock and insert track
+        let mut decks = self.decks.write();
+        decks.insert(deck, Arc::new(RwLock::new(track)));
+
+        tracing::info!("Loaded track from {:?} into deck {:?}", path, deck);
         Ok(())
     }
 
-    pub fn load_track(&mut self, path: PathBuf, channel: Deck) -> Result<(), PlaybackError> {
-        // Create new track
-        let track = Track::new(&path)?;
-        self.audio.add_track(channel, track)
+    pub fn unload_track(&mut self, deck: Deck) -> Result<(), PlaybackError> {
+        let mut decks = self.decks.write();
+
+        // Remove returns the old value if it existed
+        match decks.remove(&deck) {
+            Some(_) => {
+                tracing::info!("Unloaded track from deck {:?}", deck);
+                Ok(())
+            }
+            None => {
+                tracing::info!("No track to unload from deck {:?}", deck);
+                Ok(()) // No track is still a success
+            }
+        }
     }
 
-    pub fn unload_track(&mut self, channel: Deck) -> Result<(), PlaybackError> {
-        // Even if no track is loaded, unloading should succeed as a no-op
-        match self.find_track(channel) {
-            Some(_) => self.audio.remove_track(channel),
-            None => Ok(()), // No track to unload is still a success
-        }
+    fn create_audio_stream(
+        decks: Arc<RwLock<HashMap<Deck, Arc<RwLock<Track>>>>>,
+    ) -> Result<Stream, PlaybackError> {
+        const SAMPLE_RATE: u32 = 48000;
+        const CHANNELS: u16 = 2;
+        const BUFFER_SIZE: u32 = 480; // 10ms at 48kHz
+
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| PlaybackError::AudioDevice("No output device found".into()))?;
+
+        let config = cpal::StreamConfig {
+            channels: CHANNELS,
+            sample_rate: cpal::SampleRate(SAMPLE_RATE),
+            buffer_size: cpal::BufferSize::Fixed(BUFFER_SIZE),
+        };
+
+        let stream = device.build_output_stream(
+            &config,
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                // Clear output buffer
+                data.fill(0.0);
+
+                // Mix active tracks
+                let decks_guard = decks.read();
+                for (_deck, track) in decks_guard.iter() {
+                    let mut track = track.write();
+                    if track.is_playing() {
+                        let mut buffer = vec![0.0f32; data.len()];
+                        if let Ok(len) = track.get_next_samples(&mut buffer) {
+                            if len > 0 {
+                                let volume = track.get_volume();
+                                for i in 0..len {
+                                    data[i] += buffer[i] * volume;
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            move |err| eprintln!("Audio stream error: {}", err),
+            None,
+        )?;
+
+        stream.play()?;
+        Ok(stream)
     }
 }

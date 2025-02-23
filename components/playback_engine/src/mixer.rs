@@ -1,5 +1,10 @@
-use crate::channels::Channels;
+// in mixer.rs
 use crate::error::PlaybackError;
+use crate::track::Track;
+use parking_lot::RwLock;
+use playback_primitives::Deck;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 pub struct Mixer {
     mix_buffer: Vec<f32>,
@@ -12,10 +17,9 @@ impl Mixer {
         }
     }
 
-    // in components/playback_engine/src/mixer.rs
     pub fn mix(
         &mut self,
-        channels: &Channels,
+        decks: &RwLock<HashMap<Deck, Arc<RwLock<Track>>>>,
         output: &mut [f32],
         samples_per_callback: usize,
     ) -> Result<(), PlaybackError> {
@@ -23,15 +27,15 @@ impl Mixer {
         output[..samples_per_callback].fill(0.0);
 
         // Get all tracks and their lock guards
-        let tracks = channels.read();
-        tracing::debug!("Mixer: found {} tracks", tracks.len());
+        let tracks = decks.read();
+        tracing::info!("Mixer: found {} tracks", tracks.len());
+
         // Mix each active track
-        for (channel, track) in tracks.iter() {
-            let track_lock = track.clone();
-            let mut track = track_lock.write();
+        for (deck, track) in tracks.iter() {
+            let mut track = track.write();
 
             if track.is_playing() {
-                tracing::debug!("Channel {:?} is playing", channel);
+                tracing::debug!("Deck {:?} is playing", deck);
 
                 // Get samples from this track
                 self.mix_buffer[..samples_per_callback].fill(0.0);
@@ -39,15 +43,11 @@ impl Mixer {
                     Ok(len) if len > 0 => {
                         let volume = track.get_volume();
                         tracing::debug!(
-                            "Got {} samples from channel {:?}, volume: {}",
+                            "Got {} samples from deck {:?}, volume: {}",
                             len,
-                            channel,
+                            deck,
                             volume
                         );
-
-                        // Check for non-zero samples
-                        let has_audio = self.mix_buffer[..len].iter().any(|&s| s.abs() > 1e-6);
-                        tracing::debug!("Channel {:?} has audio: {}", channel, has_audio);
 
                         // Mix into output with volume
                         for i in 0..len {
@@ -55,53 +55,56 @@ impl Mixer {
                         }
                     }
                     Ok(_) => {
-                        tracing::debug!("No samples from channel {:?}", channel);
+                        tracing::debug!("No samples from deck {:?}", deck);
                     }
                     Err(e) => {
-                        tracing::error!("Error getting samples from channel {:?}: {}", channel, e);
+                        tracing::error!("Error getting samples from deck {:?}: {}", deck, e);
                         return Err(PlaybackError::AudioDevice(format!(
-                            "Mixing error on channel {:?}: {}",
-                            channel, e
+                            "Mixing error on deck {:?}: {}",
+                            deck, e
                         )));
                     }
                 }
             } else {
-                tracing::debug!("Channel {:?} is not playing", channel);
+                tracing::debug!("Deck {:?} is not playing", deck);
             }
         }
 
         Ok(())
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::track::Track;
-    use playback_primitives::Deck;
+    use std::collections::HashMap;
 
     #[test]
-    fn test_mix_empty_channels() {
-        let channels = Channels::new();
+    fn test_mix_empty_decks() {
+        let decks = RwLock::new(HashMap::new());
         let mut mixer = Mixer::new(1024);
         let mut output = vec![0.0; 1024];
 
-        mixer.mix(&channels, &mut output, 1024).unwrap();
+        mixer.mix(&decks, &mut output, 1024).unwrap();
 
         // Output should be silence
         assert!(output.iter().all(|&x| x == 0.0));
     }
 
     #[test]
-    fn test_mix_single_channel() {
-        let channels = Channels::new();
+    fn test_mix_single_deck() {
+        let decks = RwLock::new(HashMap::new());
+
+        // Setup a deck with a test track
         let mut track = Track::new_test();
         track.play(); // Start playback
-        channels.assign(Deck::A, track);
+        decks.write().insert(Deck::A, Arc::new(RwLock::new(track)));
 
         let mut mixer = Mixer::new(1024);
         let mut output = vec![0.0; 1024];
 
-        mixer.mix(&channels, &mut output, 1024).unwrap();
+        mixer.mix(&decks, &mut output, 1024).unwrap();
 
         // Output should contain samples
         assert!(!output.iter().all(|&x| x == 0.0));
@@ -109,17 +112,19 @@ mod tests {
 
     #[test]
     fn test_mix_prevents_clipping() {
-        let channels = Channels::new();
+        let decks = RwLock::new(HashMap::new());
+
+        // Setup a deck with a test track
         let mut track = Track::new_test();
         track.play();
-        channels.assign(Deck::A, track);
+        decks.write().insert(Deck::A, Arc::new(RwLock::new(track)));
 
         let mut mixer = Mixer::new(1024);
         let mut output = vec![0.0; 1024];
 
-        mixer.mix(&channels, &mut output, 1024).unwrap();
+        mixer.mix(&decks, &mut output, 1024).unwrap();
 
         // No samples should exceed [-1.0, 1.0]
-        assert!(output.iter().all(|&x| (-1.0..=1.0).contains(&x)));
+        assert!(output.iter().all(|&x| x >= -1.0 && x <= 1.0));
     }
 }

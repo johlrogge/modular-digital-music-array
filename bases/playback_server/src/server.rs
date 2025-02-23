@@ -50,7 +50,7 @@ impl Server {
         let result = match command {
             Command::LoadTrack { path, deck } => {
                 info!("Loading track {:?} on deck {:?}", path, deck);
-                engine.load_track(path, Self::convert_deck(deck))
+                engine.load_track(Self::convert_deck(deck), &path)
             }
             Command::Play { deck } => {
                 info!("Playing deck {:?}", deck);
