@@ -12,6 +12,7 @@ playback-engine = { path = "../../components/playback_engine" }
 media-protocol = { path = "../../components/media_protocol" }
 tokio = { workspace = true, features = ["full"] }
 color-eyre = { workspace = true }
+parking_lot = { workspace = true}
 nng = "1.0"
 tracing = { workspace = true }
 tracing-subscriber = "0.3"

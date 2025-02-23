@@ -1,11 +1,11 @@
+use crate::error::ServerError;
 use color_eyre::Result;
 use media_protocol::{Command, Deck as ProtocolChannel, Response};
 use nng::Socket;
+use parking_lot::Mutex;
 use playback_engine::{self, PlaybackEngine};
-use std::sync::{Arc, Mutex};
-use tracing::{error, info, warn};
-
-use crate::error::ServerError;
+use std::sync::Arc;
+use tracing::{info, warn};
 
 pub struct Server {
     engine: Arc<Mutex<PlaybackEngine>>,
@@ -45,16 +45,7 @@ impl Server {
         }
     }
     fn handle_command(&self, command: Command) -> Response {
-        let mut engine = match self.engine.lock() {
-            Ok(engine) => engine,
-            Err(e) => {
-                error!("Failed to lock engine: {}", e);
-                return Response {
-                    success: false,
-                    error_message: "Internal server error".into(),
-                };
-            }
-        };
+        let mut engine = self.engine.lock();
 
         let result = match command {
             Command::LoadTrack { path, deck } => {
@@ -80,10 +71,13 @@ impl Server {
         };
 
         match result {
-            Ok(()) => Response {
-                success: true,
-                error_message: String::new(),
-            },
+            Ok(()) => {
+                info!("Command completed successfully");
+                Response {
+                    success: true,
+                    error_message: String::new(),
+                }
+            }
             Err(e) => {
                 warn!("Command failed: {}", e);
                 Response {

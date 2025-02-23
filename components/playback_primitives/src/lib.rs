@@ -46,7 +46,7 @@ impl Db for Volume {
 }
 
 /// Identifies a playback channel (deck)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Deck {
     A,
     B,

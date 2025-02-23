@@ -1426,6 +1426,7 @@ dependencies = [
  "color-eyre",
  "media-protocol",
  "nng",
+ "parking_lot",
  "playback-engine",
  "serde_json",
  "thiserror",

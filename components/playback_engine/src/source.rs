@@ -1,8 +1,6 @@
 // In src/source.rs
 use crate::error::PlaybackError;
-use parking_lot::{MappedRwLockReadGuard, RawRwLock, RwLock, RwLockReadGuard};
 use std::path::Path;
-use std::sync::Arc;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::FormatOptions;
@@ -23,13 +21,16 @@ pub struct FlacSource {
     audio_channels: u16,
 }
 
+// in components/playback_engine/src/source.rs
 impl FlacSource {
     pub fn new(path: impl AsRef<Path>) -> Result<Self, PlaybackError> {
         let mut hint = Hint::new();
         hint.with_extension("flac");
 
         // Open the file
-        let file = std::fs::File::open(path)?;
+        let file = std::fs::File::open(&path)?;
+        tracing::info!("Opened FLAC file: {:?}", path.as_ref());
+
         let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
         // Probe and get format reader
@@ -42,23 +43,32 @@ impl FlacSource {
             )
             .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
 
+        tracing::info!("Probed audio format successfully");
+
         // Get the default track
         let track = probed
             .format
             .default_track()
             .ok_or_else(|| PlaybackError::Decoder("No default track found".into()))?;
 
+        // Get track info
+        let audio_channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2) as u16;
+        let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
+
+        tracing::info!(
+            "Track info - channels: {}, sample rate: {}",
+            audio_channels,
+            sample_rate
+        );
+
         // Create decoder
         let mut decoder = symphonia::default::get_codecs()
             .make(&track.codec_params, &DecoderOptions::default())
             .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
 
-        // Get track info
-        let audio_channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2) as u16;
-        let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
-
         // Decode all samples
         let mut samples = Vec::new();
+        let mut frame_count = 0;
         while let Ok(packet) = probed.format.next_packet() {
             let decoded = decoder
                 .decode(&packet)
@@ -67,7 +77,22 @@ impl FlacSource {
             let mut sample_buf = SampleBuffer::<f32>::new(decoded.frames() as u64, *decoded.spec());
             sample_buf.copy_interleaved_ref(decoded);
             samples.extend_from_slice(sample_buf.samples());
+            frame_count += 1;
         }
+
+        tracing::info!(
+            "Decoded {} frames, total samples: {}",
+            frame_count,
+            samples.len()
+        );
+
+        // Verify we have some non-zero samples
+        let non_zero = samples.iter().filter(|&&s| s.abs() > 1e-6).count();
+        tracing::info!(
+            "Non-zero samples: {} ({:.2}%)",
+            non_zero,
+            100.0 * non_zero as f32 / samples.len() as f32
+        );
 
         Ok(Self {
             samples,
@@ -80,10 +105,25 @@ impl FlacSource {
 impl Source for FlacSource {
     fn view_samples(&self, position: usize, len: usize) -> Result<&[f32], PlaybackError> {
         if position >= self.samples.len() {
+            tracing::info!("End of track reached at position {}", position);
             return Ok(&[]);
         }
         let end = position.saturating_add(len).min(self.samples.len());
-        Ok(&self.samples[position..end])
+        let samples = &self.samples[position..end];
+
+        // Log periodically about the samples we're returning
+        if position % 48000 == 0 {
+            // Log roughly every second
+            let non_zero = samples.iter().filter(|&&s| s.abs() > 1e-6).count();
+            tracing::info!(
+                "Returning {} samples starting at position {}, non-zero: {}",
+                samples.len(),
+                position,
+                non_zero
+            );
+        }
+
+        Ok(samples)
     }
 
     fn sample_rate(&self) -> u32 {

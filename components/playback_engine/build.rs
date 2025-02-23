@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use hound::WavWriter;
 use std::f32::consts::PI;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SAMPLE_RATE: u32 = 48000;
@@ -14,7 +14,7 @@ fn expected_size(duration_secs: f32) -> u64 {
 }
 
 /// Check if a file needs to be generated
-fn should_generate(path: &PathBuf, duration: f32) -> bool {
+fn should_generate(path: &Path, duration: f32) -> bool {
     match path.metadata() {
         Ok(metadata) => {
             let expected = expected_size(duration);
