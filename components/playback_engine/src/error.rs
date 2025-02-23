@@ -12,10 +12,10 @@ pub enum PlaybackError {
     TrackNotFound(std::path::PathBuf),
 
     #[error("Channel {0:?} already in use")]
-    ChannelInUse(crate::Channel),
+    ChannelInUse(crate::Deck),
 
     #[error("No track loaded on channel {0:?}")]
-    NoTrackLoaded(crate::Channel),
+    NoTrackLoaded(crate::Deck),
 
     #[error("Invalid volume: {0}dB")]
     InvalidVolume(f32),

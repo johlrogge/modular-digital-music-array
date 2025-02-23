@@ -47,16 +47,16 @@ impl Db for Volume {
 
 /// Identifies a playback channel (deck)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Channel {
-    ChannelA,
-    ChannelB,
+pub enum Deck {
+    A,
+    B,
 }
 
-impl Channel {
-    pub fn new(channel: u8) -> Result<Self, PlaybackError> {
-        match channel {
-            0 => Ok(Self::ChannelA),
-            1 => Ok(Self::ChannelB),
+impl Deck {
+    pub fn new(deck: u8) -> Result<Self, PlaybackError> {
+        match deck {
+            0 => Ok(Self::A),
+            1 => Ok(Self::B),
             _ => Err(PlaybackError::InvalidChannel),
         }
     }
@@ -124,27 +124,24 @@ mod tests {
 
         #[test]
         fn creates_channel_a() {
-            assert!(matches!(Channel::new(0), Ok(Channel::ChannelA)));
+            assert!(matches!(Deck::new(0), Ok(Deck::A)));
         }
 
         #[test]
         fn creates_channel_b() {
-            assert!(matches!(Channel::new(1), Ok(Channel::ChannelB)));
+            assert!(matches!(Deck::new(1), Ok(Deck::B)));
         }
 
         #[test]
         fn rejects_invalid_channel() {
-            assert!(matches!(
-                Channel::new(2),
-                Err(PlaybackError::InvalidChannel)
-            ));
+            assert!(matches!(Deck::new(2), Err(PlaybackError::InvalidChannel)));
         }
 
         #[test]
         fn test_serialization() {
-            let channel = Channel::ChannelA;
+            let channel = Deck::A;
             let json = serde_json::to_string(&channel).unwrap();
-            let decoded: Channel = serde_json::from_str(&json).unwrap();
+            let decoded: Deck = serde_json::from_str(&json).unwrap();
             assert_eq!(channel, decoded);
         }
     }

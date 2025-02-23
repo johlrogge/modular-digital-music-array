@@ -1,4 +1,4 @@
-use media_protocol::{Channel, ClientError, Command, Response};
+use media_protocol::{ClientError, Command, Deck, Response};
 use nng::{Protocol, Socket};
 use std::path::PathBuf;
 
@@ -18,28 +18,28 @@ impl MediaClient {
         Ok(Self { socket })
     }
 
-    pub fn load_track(&self, path: PathBuf, channel: Channel) -> Result<(), ClientError> {
-        let cmd = Command::LoadTrack { path, channel };
+    pub fn load_track(&self, path: PathBuf, deck: Deck) -> Result<(), ClientError> {
+        let cmd = Command::LoadTrack { path, deck };
         self.send_command(cmd)
     }
 
-    pub fn play(&self, channel: Channel) -> Result<(), ClientError> {
-        let cmd = Command::Play { channel };
+    pub fn play(&self, deck: Deck) -> Result<(), ClientError> {
+        let cmd = Command::Play { deck };
         self.send_command(cmd)
     }
 
-    pub fn stop(&self, channel: Channel) -> Result<(), ClientError> {
-        let cmd = Command::Stop { channel };
+    pub fn stop(&self, deck: Deck) -> Result<(), ClientError> {
+        let cmd = Command::Stop { deck };
         self.send_command(cmd)
     }
 
-    pub fn set_volume(&self, channel: Channel, db: f32) -> Result<(), ClientError> {
-        let cmd = Command::SetVolume { channel, db };
+    pub fn set_volume(&self, deck: Deck, db: f32) -> Result<(), ClientError> {
+        let cmd = Command::SetVolume { deck, db };
         self.send_command(cmd)
     }
 
-    pub fn unload_track(&self, channel: Channel) -> Result<(), ClientError> {
-        let cmd = Command::Unload { channel };
+    pub fn unload_track(&self, deck: Deck) -> Result<(), ClientError> {
+        let cmd = Command::Unload { deck };
         self.send_command(cmd)
     }
 

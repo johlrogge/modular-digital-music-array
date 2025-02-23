@@ -14,21 +14,22 @@ impl Mixer {
     }
 
     /// Mix audio from all active channels into the output buffer
-    pub fn mix(&mut self, 
+    pub fn mix(
+        &mut self,
         channels: &Channels,
         output: &mut [f32],
         samples_per_callback: usize,
     ) -> Result<(), PlaybackError> {
         // Clear output buffer
         output[..samples_per_callback].fill(0.0);
-        
+
         // Get channel state
         let channel_state = channels.read();
-        
+
         // Mix each active channel
         for (channel, track) in channel_state.iter() {
             let mut track = track.write();
-            
+
             if track.is_playing() {
                 // Get samples from this track
                 self.mix_buffer[..samples_per_callback].fill(0.0);
@@ -36,7 +37,7 @@ impl Mixer {
                     Ok(len) if len > 0 => {
                         tracing::debug!("Got {} samples from channel {:?}", len, channel);
                         let volume = track.get_volume();
-                        
+
                         // Mix into output with volume
                         for i in 0..len {
                             output[i] += self.mix_buffer[i] * volume;
@@ -48,7 +49,9 @@ impl Mixer {
                     Err(e) => {
                         tracing::error!("Error getting samples from channel {:?}: {}", channel, e);
                         return Err(PlaybackError::AudioDevice(format!(
-                            "Mixing error on channel {:?}: {}", channel, e)));
+                            "Mixing error on channel {:?}: {}",
+                            channel, e
+                        )));
                     }
                 }
             }
@@ -67,16 +70,16 @@ impl Mixer {
 mod tests {
     use super::*;
     use crate::track::Track;
-    use playback_primitives::Channel;
+    use playback_primitives::Deck;
 
     #[test]
     fn test_mix_empty_channels() {
         let channels = Channels::new();
         let mut mixer = Mixer::new(1024);
         let mut output = vec![0.0; 1024];
-        
+
         mixer.mix(&channels, &mut output, 1024).unwrap();
-        
+
         // Output should be silence
         assert!(output.iter().all(|&x| x == 0.0));
     }
@@ -86,13 +89,13 @@ mod tests {
         let channels = Channels::new();
         let mut track = Track::new_test();
         track.play(); // Start playback
-        channels.assign(Channel::ChannelA, track);
+        channels.assign(Deck::A, track);
 
         let mut mixer = Mixer::new(1024);
         let mut output = vec![0.0; 1024];
-        
+
         mixer.mix(&channels, &mut output, 1024).unwrap();
-        
+
         // Output should contain samples
         assert!(!output.iter().all(|&x| x == 0.0));
     }
@@ -102,13 +105,13 @@ mod tests {
         let channels = Channels::new();
         let mut track = Track::new_test();
         track.play();
-        channels.assign(Channel::ChannelA, track);
+        channels.assign(Deck::A, track);
 
         let mut mixer = Mixer::new(1024);
         let mut output = vec![0.0; 1024];
-        
+
         mixer.mix(&channels, &mut output, 1024).unwrap();
-        
+
         // No samples should exceed [-1.0, 1.0]
         assert!(output.iter().all(|&x| x >= -1.0 && x <= 1.0));
     }

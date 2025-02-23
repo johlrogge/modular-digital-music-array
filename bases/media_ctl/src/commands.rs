@@ -1,6 +1,6 @@
 use clap::Subcommand;
 use color_eyre::Result;
-use playback_primitives::Channel;
+use playback_primitives::Deck;
 use std::path::PathBuf;
 
 #[derive(Subcommand)]
@@ -61,18 +61,18 @@ pub enum Commands {
     },
 }
 
-pub fn parse_channel(c: char) -> Result<Channel> {
+pub fn parse_channel(c: char) -> Result<Deck> {
     match c.to_uppercase().next() {
-        Some('A') => Ok(Channel::ChannelA),
-        Some('B') => Ok(Channel::ChannelB),
+        Some('A') => Ok(Deck::A),
+        Some('B') => Ok(Deck::B),
         _ => Err(color_eyre::eyre::eyre!("Invalid channel. Use 'A' or 'B'")),
     }
 }
 
-pub fn channel_to_string(channel: Channel) -> &'static str {
+pub fn channel_to_string(channel: Deck) -> &'static str {
     match channel {
-        Channel::ChannelA => "A",
-        Channel::ChannelB => "B",
+        Deck::A => "A",
+        Deck::B => "B",
     }
 }
 

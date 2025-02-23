@@ -1,4 +1,4 @@
-use playback_primitives::{Channel, Volume};
+use playback_primitives::{Deck, Volume};
 use serde::{Deserialize, Serialize};
 use time_primitives::Ticks;
 
@@ -15,28 +15,28 @@ impl FileRef {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Message {
     /// Load a track into memory but don't start playback
-    LoadTrack { file: FileRef, channel: Channel },
+    LoadTrack { file: FileRef, channel: Deck },
 
     /// Begin playback of a loaded track
     StartTrack {
-        channel: Channel,
+        channel: Deck,
         start_position: Ticks,
         initial_volume: Volume,
     },
 
     /// Stop playback on a channel
-    StopChannel(Channel),
+    StopChannel(Deck),
 
     /// Set volume for a channel
     SetVolume {
-        channel: Channel,
+        channel: Deck,
         tick: Ticks,
         volume: Volume,
     },
 
     /// Set mute state for a channel
     SetMute {
-        channel: Channel,
+        channel: Deck,
         tick: Ticks,
         muted: bool,
     },
@@ -50,17 +50,17 @@ mod tests {
     fn test_mute_sequence() {
         let sequence = vec![
             Message::SetMute {
-                channel: Channel::ChannelA,
+                channel: Deck::A,
                 tick: Ticks::new(0),
                 muted: true,
             },
             Message::SetVolume {
-                channel: Channel::ChannelB,
+                channel: Deck::B,
                 tick: Ticks::new(0),
                 volume: Volume::new(-6.0).unwrap(),
             },
             Message::SetMute {
-                channel: Channel::ChannelA,
+                channel: Deck::A,
                 tick: Ticks::new(960),
                 muted: false,
             },

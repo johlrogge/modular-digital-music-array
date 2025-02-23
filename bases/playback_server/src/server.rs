@@ -1,5 +1,5 @@
 use color_eyre::Result;
-use media_protocol::{Channel as ProtocolChannel, Command, Response};
+use media_protocol::{Command, Deck as ProtocolChannel, Response};
 use nng::Socket;
 use playback_engine::{self, PlaybackEngine};
 use std::sync::{Arc, Mutex};
@@ -14,10 +14,10 @@ pub struct Server {
 
 impl Server {
     // Convert protocol channel to playback channel
-    fn convert_channel(protocol_channel: ProtocolChannel) -> playback_engine::Channel {
+    fn convert_deck(protocol_channel: ProtocolChannel) -> playback_engine::Deck {
         match protocol_channel {
-            ProtocolChannel::ChannelA => playback_engine::Channel::ChannelA,
-            ProtocolChannel::ChannelB => playback_engine::Channel::ChannelB,
+            ProtocolChannel::A => playback_engine::Deck::A,
+            ProtocolChannel::B => playback_engine::Deck::B,
         }
     }
 
@@ -57,25 +57,25 @@ impl Server {
         };
 
         let result = match command {
-            Command::LoadTrack { path, channel } => {
-                info!("Loading track {:?} on channel {:?}", path, channel);
-                engine.load_track(path, Self::convert_channel(channel))
+            Command::LoadTrack { path, deck } => {
+                info!("Loading track {:?} on deck {:?}", path, deck);
+                engine.load_track(path, Self::convert_deck(deck))
             }
-            Command::Play { channel } => {
-                info!("Playing channel {:?}", channel);
-                engine.play(Self::convert_channel(channel))
+            Command::Play { deck } => {
+                info!("Playing deck {:?}", deck);
+                engine.play(Self::convert_deck(deck))
             }
-            Command::Stop { channel } => {
-                info!("Stopping channel {:?}", channel);
-                engine.stop(Self::convert_channel(channel))
+            Command::Stop { deck } => {
+                info!("Stopping deck {:?}", deck);
+                engine.stop(Self::convert_deck(deck))
             }
-            Command::SetVolume { channel, db } => {
-                info!("Setting volume on channel {:?} to {}dB", channel, db);
-                engine.set_volume(Self::convert_channel(channel), db)
+            Command::SetVolume { deck, db } => {
+                info!("Setting volume on deck {:?} to {}dB", deck, db);
+                engine.set_volume(Self::convert_deck(deck), db)
             }
-            Command::Unload { channel } => {
-                info!("Unloading channel {:?}", channel);
-                engine.unload_track(Self::convert_channel(channel))
+            Command::Unload { deck } => {
+                info!("Unloading deck {:?}", deck);
+                engine.unload_track(Self::convert_deck(deck))
             }
         };
 
@@ -102,16 +102,16 @@ mod tests {
 
     #[test]
     fn test_channel_conversion() {
-        use playback_engine::Channel as PlaybackChannel;
+        use playback_engine::Deck as PlaybackChannel;
 
         assert!(matches!(
-            Server::convert_channel(ProtocolChannel::ChannelA),
-            PlaybackChannel::ChannelA
+            Server::convert_deck(ProtocolChannel::A),
+            PlaybackChannel::A
         ));
 
         assert!(matches!(
-            Server::convert_channel(ProtocolChannel::ChannelB),
-            PlaybackChannel::ChannelB
+            Server::convert_deck(ProtocolChannel::B),
+            PlaybackChannel::B
         ));
     }
 
@@ -126,7 +126,7 @@ mod tests {
         let nonexistent_path = PathBuf::from("/this/file/does/not/exist.flac");
         let command = Command::LoadTrack {
             path: nonexistent_path.clone(),
-            channel: ProtocolChannel::ChannelA,
+            deck: ProtocolChannel::A,
         };
 
         let response = server.handle_command(command);

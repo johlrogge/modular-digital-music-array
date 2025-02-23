@@ -8,7 +8,7 @@ use crate::commands::AudioCommand;
 use crate::error::PlaybackError;
 use crate::mixer::Mixer;
 use crate::track::Track;
-use playback_primitives::Channel;
+use playback_primitives::Deck;
 
 const SAMPLE_RATE: u32 = 48000;
 const CHANNELS: u16 = 2; // Stereo
@@ -106,13 +106,13 @@ impl AudioOutput {
         Ok(stream)
     }
 
-    pub fn add_track(&self, channel: Channel, track: Track) -> Result<(), PlaybackError> {
+    pub fn add_track(&self, channel: Deck, track: Track) -> Result<(), PlaybackError> {
         self.command_tx
             .send(AudioCommand::AddTrack { channel, track })
             .map_err(|_| PlaybackError::AudioDevice("Failed to send add track command".into()))
     }
 
-    pub fn remove_track(&self, channel: Channel) -> Result<(), PlaybackError> {
+    pub fn remove_track(&self, channel: Deck) -> Result<(), PlaybackError> {
         self.command_tx
             .send(AudioCommand::RemoveTrack(channel))
             .map_err(|_| PlaybackError::AudioDevice("Failed to send remove track command".into()))

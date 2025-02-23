@@ -1,12 +1,12 @@
 use crate::track::Track;
 use parking_lot::RwLock;
-use playback_primitives::Channel;
+use playback_primitives::Deck;
 use std::sync::Arc;
 
 /// Manages track assignments to channels and their synchronization
 #[derive(Clone)]
 pub struct Channels {
-    tracks: Arc<RwLock<Vec<(Channel, Arc<RwLock<Track>>)>>>,
+    tracks: Arc<RwLock<Vec<(Deck, Arc<RwLock<Track>>)>>>,
 }
 
 impl Channels {
@@ -16,20 +16,20 @@ impl Channels {
         }
     }
 
-    pub fn assign(&self, channel: Channel, track: Track) {
+    pub fn assign(&self, channel: Deck, track: Track) {
         let mut tracks = self.tracks.write();
         tracks.retain(|(ch, _)| *ch != channel);
         tracks.push((channel, Arc::new(RwLock::new(track))));
         tracing::info!("Assigned track to channel {:?}", channel);
     }
 
-    pub fn clear(&self, channel: Channel) {
+    pub fn clear(&self, channel: Deck) {
         let mut tracks = self.tracks.write();
         tracks.retain(|(ch, _)| *ch != channel);
         tracing::info!("Cleared channel {:?}", channel);
     }
 
-    pub fn get_track(&self, channel: Channel) -> Option<Arc<RwLock<Track>>> {
+    pub fn get_track(&self, channel: Deck) -> Option<Arc<RwLock<Track>>> {
         self.tracks
             .read()
             .iter()
@@ -37,9 +37,7 @@ impl Channels {
             .map(|(_, track)| Arc::clone(track))
     }
 
-    pub(crate) fn read(
-        &self,
-    ) -> parking_lot::RwLockReadGuard<'_, Vec<(Channel, Arc<RwLock<Track>>)>> {
+    pub(crate) fn read(&self) -> parking_lot::RwLockReadGuard<'_, Vec<(Deck, Arc<RwLock<Track>>)>> {
         self.tracks.read()
     }
 }
@@ -53,11 +51,11 @@ mod tests {
         let channels = Channels::new();
         let track = Track::new_test();
 
-        channels.assign(Channel::ChannelA, track);
+        channels.assign(Deck::A, track);
 
         let tracks = channels.read();
         assert_eq!(tracks.len(), 1);
-        assert!(matches!(tracks[0].0, Channel::ChannelA));
+        assert!(matches!(tracks[0].0, Deck::A));
     }
 
     #[test]
@@ -65,8 +63,8 @@ mod tests {
         let channels = Channels::new();
         let track = Track::new_test();
 
-        channels.assign(Channel::ChannelA, track);
-        channels.clear(Channel::ChannelA);
+        channels.assign(Deck::A, track);
+        channels.clear(Deck::A);
 
         let tracks = channels.read();
         assert_eq!(tracks.len(), 0);
@@ -77,9 +75,9 @@ mod tests {
         let channels = Channels::new();
         let track = Track::new_test();
 
-        channels.assign(Channel::ChannelA, track);
+        channels.assign(Deck::A, track);
 
-        assert!(channels.get_track(Channel::ChannelA).is_some());
-        assert!(channels.get_track(Channel::ChannelB).is_none());
+        assert!(channels.get_track(Deck::A).is_some());
+        assert!(channels.get_track(Deck::B).is_none());
     }
 }
