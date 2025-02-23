@@ -7,7 +7,7 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-symphonia = { version = "0.5", features = ["flac"] }
+symphonia = { version = "0.5", features = ["default", "flac"] }
 cpal = "0.15"
 tokio = { workspace = true, features = ["full"] }
 thiserror = { workspace = true }
@@ -16,6 +16,7 @@ crossbeam = "0.8"
 time-primitives = { path = "../time_primitives" }
 playback-primitives = { path = "../playback_primitives" }
 tracing.workspace=true
+vfs.workspace=true
 
 
 [build-dependencies]
