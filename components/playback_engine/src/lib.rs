@@ -3,6 +3,7 @@ mod channels;
 mod commands;
 mod error;
 mod mixer;
+mod source;
 mod track;
 
 use std::{path::PathBuf, sync::Arc};
