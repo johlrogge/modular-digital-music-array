@@ -37,34 +37,26 @@ impl Track {
 
     pub fn get_next_samples(&mut self, buffer: &mut [f32]) -> Result<usize, PlaybackError> {
         if !self.playing {
-            tracing::debug!("Track not playing, returning 0 samples");
             return Ok(0);
         }
 
-        // Get samples from source
-        let samples = self.source.view_samples(self.position, buffer.len())?;
-        let len = samples.len();
+        // Read samples directly into the provided buffer
+        let read = self.source.read_samples(self.position, buffer)?;
 
-        if len == 0 {
+        if read == 0 {
             self.playing = false;
-            tracing::info!("Track reached end");
             return Ok(0);
         }
 
-        // Log the first buffer we get
-        if self.position == 0 {
-            let non_zero = samples.iter().filter(|&&s| s.abs() > 1e-6).count();
-            tracing::info!("First buffer: {} samples, {} non-zero", len, non_zero);
+        // Apply volume
+        for sample in &mut buffer[..read] {
+            *sample *= self.volume;
         }
 
-        // Copy samples and apply volume
-        for i in 0..len {
-            buffer[i] = samples[i] * self.volume;
-        }
-
-        self.position += len;
-        Ok(len)
+        self.position += read;
+        Ok(read)
     }
+
     pub fn stop(&mut self) {
         self.playing = false;
     }
@@ -92,20 +84,29 @@ impl Track {
         }
 
         impl Source for TestSource {
-            fn view_samples(&self, position: usize, len: usize) -> Result<&[f32], PlaybackError> {
+            fn read_samples(
+                &self,
+                position: usize,
+                buffer: &mut [f32],
+            ) -> Result<usize, PlaybackError> {
                 if position >= self.samples.len() {
-                    return Ok(&[]);
+                    return Ok(0);
                 }
-                let end = position.saturating_add(len).min(self.samples.len());
-                Ok(&self.samples[position..end])
+                let available = self.samples.len() - position;
+                let count = buffer.len().min(available);
+
+                buffer[..count].copy_from_slice(&self.samples[position..position + count]);
+                Ok(count)
             }
 
             fn sample_rate(&self) -> u32 {
                 48000
             }
+
             fn audio_channels(&self) -> u16 {
                 2
             }
+
             fn len(&self) -> usize {
                 self.samples.len()
             }

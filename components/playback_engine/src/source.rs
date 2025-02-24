@@ -1,6 +1,7 @@
 // In src/source.rs
 use crate::error::PlaybackError;
 use std::path::Path;
+use std::sync::Arc;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::FormatOptions;
@@ -9,32 +10,37 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 pub trait Source: Send + Sync {
-    fn view_samples(&self, position: usize, len: usize) -> Result<&[f32], PlaybackError>;
+    // Change to copy samples into provided buffer
+    fn read_samples(&self, position: usize, buffer: &mut [f32]) -> Result<usize, PlaybackError>;
     fn sample_rate(&self) -> u32;
     fn audio_channels(&self) -> u16;
     fn len(&self) -> usize;
 }
 
-pub struct FlacSource {
+/// Represents a decoded audio packet with its position information
+struct DecodedPacket {
     samples: Vec<f32>,
-    sample_rate: u32,
-    audio_channels: u16,
+    position: usize, // Sample position in the overall stream
 }
 
-// in components/playback_engine/src/source.rs
+pub struct FlacSource {
+    packets: Arc<parking_lot::RwLock<Vec<DecodedPacket>>>,
+    loaded_packets: Arc<std::sync::atomic::AtomicUsize>,
+    sample_rate: u32,
+    audio_channels: u16,
+    loading_task: Option<tokio::task::JoinHandle<()>>,
+    total_samples: Arc<std::sync::atomic::AtomicUsize>,
+}
+
 impl FlacSource {
     pub fn new(path: impl AsRef<Path>) -> Result<Self, PlaybackError> {
         let mut hint = Hint::new();
         hint.with_extension("flac");
 
-        // Open the file
+        // Get track info from initial probe
         let file = std::fs::File::open(&path)?;
-        tracing::info!("Opened FLAC file: {:?}", path.as_ref());
-
         let mss = MediaSourceStream::new(Box::new(file), Default::default());
-
-        // Probe and get format reader
-        let mut probed = symphonia::default::get_probe()
+        let probed = symphonia::default::get_probe()
             .format(
                 &hint,
                 mss,
@@ -43,87 +49,168 @@ impl FlacSource {
             )
             .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
 
-        tracing::info!("Probed audio format successfully");
-
-        // Get the default track
         let track = probed
             .format
             .default_track()
             .ok_or_else(|| PlaybackError::Decoder("No default track found".into()))?;
 
-        // Get track info
         let audio_channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2) as u16;
         let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
+        let codec_params = track.codec_params.clone();
 
-        tracing::info!(
-            "Track info - channels: {}, sample rate: {}",
-            audio_channels,
-            sample_rate
-        );
+        let packets = Arc::new(parking_lot::RwLock::new(Vec::new()));
+        let total_samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loaded_packets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        // Create decoder
-        let mut decoder = symphonia::default::get_codecs()
-            .make(&track.codec_params, &DecoderOptions::default())
-            .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
-
-        // Decode all samples
-        let mut samples = Vec::new();
-        let mut frame_count = 0;
-        while let Ok(packet) = probed.format.next_packet() {
-            let decoded = decoder
-                .decode(&packet)
-                .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
-
-            let mut sample_buf = SampleBuffer::<f32>::new(decoded.frames() as u64, *decoded.spec());
-            sample_buf.copy_interleaved_ref(decoded);
-            samples.extend_from_slice(sample_buf.samples());
-            frame_count += 1;
-        }
-
-        tracing::info!(
-            "Decoded {} frames, total samples: {}",
-            frame_count,
-            samples.len()
-        );
-
-        // Verify we have some non-zero samples
-        let non_zero = samples.iter().filter(|&&s| s.abs() > 1e-6).count();
-        tracing::info!(
-            "Non-zero samples: {} ({:.2}%)",
-            non_zero,
-            100.0 * non_zero as f32 / samples.len() as f32
-        );
-
-        Ok(Self {
-            samples,
+        let mut source = Self {
+            packets: packets.clone(),
+            loaded_packets: loaded_packets.clone(),
             sample_rate,
             audio_channels,
-        })
+            loading_task: None,
+            total_samples: total_samples.clone(),
+        };
+
+        // Load initial packets with first format reader
+        let decoder_init = symphonia::default::get_codecs()
+            .make(&codec_params, &DecoderOptions::default())
+            .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
+        source.load_initial_packets(probed.format, decoder_init)?;
+
+        // Create new format reader for background loading
+        let file_bg = std::fs::File::open(&path)?;
+        let mss_bg = MediaSourceStream::new(Box::new(file_bg), Default::default());
+        let mut format_bg = symphonia::default::get_probe()
+            .format(
+                &hint,
+                mss_bg,
+                &FormatOptions::default(),
+                &MetadataOptions::default(),
+            )
+            .map_err(|e| PlaybackError::Decoder(e.to_string()))?
+            .format;
+
+        let mut decoder_bg = symphonia::default::get_codecs()
+            .make(&codec_params, &DecoderOptions::default())
+            .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
+
+        let packets_bg = packets;
+        let total_samples_bg = total_samples;
+        let loading_task = tokio::spawn(async move {
+            // Skip the packets we already loaded
+            let loaded = loaded_packets.load(std::sync::atomic::Ordering::Acquire);
+            for _ in 0..loaded {
+                let _ = format_bg.next_packet();
+            }
+
+            while let Ok(packet) = format_bg.next_packet() {
+                let decoded = match decoder_bg.decode(&packet) {
+                    Ok(decoded) => decoded,
+                    Err(_) => continue,
+                };
+
+                let mut sample_buf =
+                    SampleBuffer::<f32>::new(decoded.frames() as u64, *decoded.spec());
+                sample_buf.copy_interleaved_ref(decoded);
+
+                let current_total = total_samples_bg.load(std::sync::atomic::Ordering::Relaxed);
+                let decoded_packet = DecodedPacket {
+                    samples: sample_buf.samples().to_vec(),
+                    position: current_total,
+                };
+
+                let new_total = current_total + decoded_packet.samples.len();
+                total_samples_bg.store(new_total, std::sync::atomic::Ordering::Release);
+
+                {
+                    let mut packets_guard = packets_bg.write();
+                    packets_guard.push(decoded_packet);
+                }
+                loaded_packets.fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+        });
+
+        source.loading_task = Some(loading_task);
+        Ok(source)
+    }
+
+    fn load_initial_packets(
+        &mut self,
+        mut format: Box<dyn symphonia::core::formats::FormatReader>,
+        mut decoder: Box<dyn symphonia::core::codecs::Decoder>,
+    ) -> Result<(), PlaybackError> {
+        const INITIAL_BUFFER_SECS: f32 = 0.5;
+        let target_samples = (INITIAL_BUFFER_SECS * self.sample_rate as f32) as usize;
+        let mut current_samples = 0;
+
+        while current_samples < target_samples {
+            if let Ok(packet) = format.next_packet() {
+                let decoded = decoder
+                    .decode(&packet)
+                    .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
+
+                let mut sample_buf =
+                    SampleBuffer::<f32>::new(decoded.frames() as u64, *decoded.spec());
+                sample_buf.copy_interleaved_ref(decoded);
+
+                let decoded_packet = DecodedPacket {
+                    samples: sample_buf.samples().to_vec(),
+                    position: current_samples,
+                };
+
+                current_samples += decoded_packet.samples.len();
+                self.total_samples
+                    .store(current_samples, std::sync::atomic::Ordering::Release);
+
+                let mut packets_guard = self.packets.write();
+                packets_guard.push(decoded_packet);
+                self.loaded_packets
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+            } else {
+                break; // End of stream
+            }
+        }
+
+        Ok(())
     }
 }
 
 impl Source for FlacSource {
-    fn view_samples(&self, position: usize, len: usize) -> Result<&[f32], PlaybackError> {
-        if position >= self.samples.len() {
-            tracing::info!("End of track reached at position {}", position);
-            return Ok(&[]);
-        }
-        let end = position.saturating_add(len).min(self.samples.len());
-        let samples = &self.samples[position..end];
-
-        // Log periodically about the samples we're returning
-        if position % 48000 == 0 {
-            // Log roughly every second
-            let non_zero = samples.iter().filter(|&&s| s.abs() > 1e-6).count();
-            tracing::info!(
-                "Returning {} samples starting at position {}, non-zero: {}",
-                samples.len(),
-                position,
-                non_zero
-            );
+    fn read_samples(&self, position: usize, buffer: &mut [f32]) -> Result<usize, PlaybackError> {
+        let total = self
+            .total_samples
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if position >= total {
+            return Ok(0);
         }
 
-        Ok(samples)
+        let packets_guard = self.packets.read();
+
+        // Find the packet containing our position
+        let mut packet_idx = None;
+        for (idx, packet) in packets_guard.iter().enumerate() {
+            if packet.position + packet.samples.len() > position {
+                packet_idx = Some(idx);
+                break;
+            }
+        }
+
+        let packet_idx = match packet_idx {
+            Some(idx) => idx,
+            None => return Ok(0),
+        };
+
+        // Get samples from the packet
+        let packet = &packets_guard[packet_idx];
+        let packet_pos = position - packet.position;
+        let available = packet.samples.len() - packet_pos;
+        let sample_count = buffer.len().min(available);
+
+        // Copy samples to the provided buffer
+        buffer[..sample_count]
+            .copy_from_slice(&packet.samples[packet_pos..packet_pos + sample_count]);
+
+        Ok(sample_count)
     }
 
     fn sample_rate(&self) -> u32 {
@@ -135,9 +222,11 @@ impl Source for FlacSource {
     }
 
     fn len(&self) -> usize {
-        self.samples.len()
+        self.total_samples
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,14 +303,43 @@ mod tests {
         Ok(flac_file.into_temp_path())
     }
 
-    #[test]
-    fn test_flac_metadata() -> Result<(), PlaybackError> {
+    #[tokio::test]
+    async fn test_flac_metadata() -> Result<(), PlaybackError> {
         let path = create_test_flac()?;
         let source = FlacSource::new(path)?;
 
         assert_eq!(source.sample_rate(), 48000);
         assert_eq!(source.audio_channels(), 2);
         assert!(source.len() > 0);
+
+        Ok(())
+    }
+    #[tokio::test]
+    async fn test_packet_reading() -> Result<(), PlaybackError> {
+        let path = create_test_flac()?;
+        let source = FlacSource::new(path)?;
+        let mut buffer = vec![0.0f32; 1024];
+
+        // Test reading from start
+        let read = source.read_samples(0, &mut buffer)?;
+        assert!(read > 0);
+
+        // Test reading across packet boundary
+        let total = source
+            .total_samples
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let packets = source.packets.read();
+        let first_packet_len = packets[0].samples.len();
+        drop(packets); // Release the lock before next read
+
+        let mut cross_buffer = vec![0.0f32; 20];
+        let read = source.read_samples(first_packet_len - 10, &mut cross_buffer)?;
+        assert!(read > 0);
+
+        // Test reading beyond end
+        let mut end_buffer = vec![0.0f32; 1024];
+        let read = source.read_samples(total, &mut end_buffer)?;
+        assert_eq!(read, 0);
 
         Ok(())
     }
