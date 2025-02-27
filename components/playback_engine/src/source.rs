@@ -1,6 +1,6 @@
 // In src/source.rs
 use crate::error::PlaybackError;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
@@ -173,6 +173,12 @@ impl FlacSource {
 
         Ok(())
     }
+
+    pub fn shutdown(&mut self) {
+        if let Some(task) = self.loading_task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl Source for FlacSource {
@@ -224,6 +230,13 @@ impl Source for FlacSource {
     fn len(&self) -> usize {
         self.total_samples
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for FlacSource {
+    fn drop(&mut self) {
+        // Cancel the background loading task if it exists
+        self.shutdown();
     }
 }
 

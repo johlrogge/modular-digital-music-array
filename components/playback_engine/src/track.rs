@@ -34,6 +34,26 @@ impl Track {
             self.volume
         );
     }
+    pub fn seek(&mut self, position: usize) {
+        let max_position = self.source.len();
+        self.position = position.min(max_position);
+
+        tracing::info!(
+            "Track seeking to position={}/{}, playing={}, volume={}",
+            self.position,
+            max_position,
+            self.playing,
+            self.volume
+        );
+    }
+
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    pub fn length(&self) -> usize {
+        self.source.len()
+    }
 
     pub fn get_next_samples(&mut self, buffer: &mut [f32]) -> Result<usize, PlaybackError> {
         if !self.playing {
@@ -72,6 +92,17 @@ impl Track {
 
     pub fn get_volume(&self) -> f32 {
         self.volume
+    }
+    pub fn shutdown(&mut self) {
+        // Get a mutable reference to the underlying source
+        // This is a bit tricky since we're using Arc<dyn Source>
+        // We might need to modify the Source trait to add a shutdown method
+
+        // For now, we'll rely on Drop to handle cleanup
+        // But in a more complete implementation, we'd want something like:
+        // if let Some(flac_source) = self.source.downcast_mut::<FlacSource>() {
+        //     flac_source.shutdown();
+        // }
     }
 }
 

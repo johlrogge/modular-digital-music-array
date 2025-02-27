@@ -1,4 +1,4 @@
-use media_protocol::{ClientError, Command, Deck, Response};
+use media_protocol::{ClientError, Command, Deck, Response, ResponseData};
 use nng::{Protocol, Socket};
 use std::path::PathBuf;
 
@@ -63,5 +63,71 @@ impl MediaClient {
         }
 
         Ok(())
+    }
+    pub fn seek(&self, deck: Deck, position: usize) -> Result<(), ClientError> {
+        let cmd = Command::Seek { deck, position };
+        self.send_command(cmd)
+    }
+
+    // New helper method for commands that return data
+    fn send_command_with_response<T>(
+        &self,
+        cmd: Command,
+        extract: fn(ResponseData) -> Option<T>,
+    ) -> Result<T, ClientError> {
+        let data = serde_json::to_vec(&cmd).map_err(|e| ClientError::Protocol(e.to_string()))?;
+
+        self.socket
+            .send(&data)
+            .map_err(|e| ClientError::Connection(format!("{:?}", e)))?;
+
+        let msg = self
+            .socket
+            .recv()
+            .map_err(|e| ClientError::Connection(format!("{:?}", e)))?;
+
+        let response: Response =
+            serde_json::from_slice(&msg).map_err(|e| ClientError::Protocol(e.to_string()))?;
+
+        if !response.success {
+            return Err(ClientError::Command(response.error_message));
+        }
+
+        match response.data {
+            Some(data) => {
+                if let Some(result) = extract(data) {
+                    Ok(result)
+                } else {
+                    Err(ClientError::Protocol(
+                        "Unexpected response data type".to_string(),
+                    ))
+                }
+            }
+            None => Err(ClientError::Protocol("Missing response data".to_string())),
+        }
+    }
+
+    pub fn get_position(&self, deck: Deck) -> Result<usize, ClientError> {
+        let cmd = Command::GetPosition { deck };
+
+        self.send_command_with_response(cmd, |data| {
+            if let ResponseData::Position(pos) = data {
+                Some(pos)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn get_length(&self, deck: Deck) -> Result<usize, ClientError> {
+        let cmd = Command::GetLength { deck };
+
+        self.send_command_with_response(cmd, |data| {
+            if let ResponseData::Length(len) = data {
+                Some(len)
+            } else {
+                None
+            }
+        })
     }
 }

@@ -149,4 +149,31 @@ impl PlaybackEngine {
         stream.play()?;
         Ok(stream)
     }
+
+    pub fn seek(&mut self, deck: Deck, position: usize) -> Result<(), PlaybackError> {
+        if let Some(track) = self.find_track(deck) {
+            tracing::info!("Seeking deck {:?} to position {}", deck, position);
+            track.write().seek(position);
+            Ok(())
+        } else {
+            tracing::error!("No track loaded in deck {:?}", deck);
+            Err(PlaybackError::NoTrackLoaded(deck))
+        }
+    }
+
+    pub fn get_position(&self, deck: Deck) -> Result<usize, PlaybackError> {
+        if let Some(track) = self.find_track(deck) {
+            Ok(track.read().position())
+        } else {
+            Err(PlaybackError::NoTrackLoaded(deck))
+        }
+    }
+
+    pub fn get_length(&self, deck: Deck) -> Result<usize, PlaybackError> {
+        if let Some(track) = self.find_track(deck) {
+            Ok(track.read().length())
+        } else {
+            Err(PlaybackError::NoTrackLoaded(deck))
+        }
+    }
 }

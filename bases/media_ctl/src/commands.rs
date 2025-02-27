@@ -59,6 +59,30 @@ pub enum Commands {
         #[arg(long)]
         channel: char,
     },
+    /// Seek to a position in a track
+    Seek {
+        /// Channel (A or B)
+        #[arg(long)]
+        channel: char,
+
+        /// Position in samples
+        #[arg(long)]
+        position: usize,
+    },
+
+    /// Get current position
+    GetPosition {
+        /// Channel (A or B)
+        #[arg(long)]
+        channel: char,
+    },
+
+    /// Get track length
+    GetLength {
+        /// Channel (A or B)
+        #[arg(long)]
+        channel: char,
+    },
 }
 
 pub fn parse_channel(c: char) -> Result<Deck> {

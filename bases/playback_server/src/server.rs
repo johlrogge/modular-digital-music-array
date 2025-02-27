@@ -1,9 +1,9 @@
 use crate::error::ServerError;
 use color_eyre::Result;
-use media_protocol::{Command, Deck as ProtocolChannel, Response};
+use media_protocol::{Command, Deck as ProtocolChannel, Response, ResponseData};
 use nng::Socket;
 use parking_lot::Mutex;
-use playback_engine::{self, PlaybackEngine};
+use playback_engine::{self, PlaybackEngine, PlaybackError};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -47,35 +47,82 @@ impl Server {
     fn handle_command(&self, command: Command) -> Response {
         let mut engine = self.engine.lock();
 
-        let result = match command {
+        match command {
+            // Existing commands...
             Command::LoadTrack { path, deck } => {
                 info!("Loading track {:?} on deck {:?}", path, deck);
-                engine.load_track(Self::convert_deck(deck), &path)
+                let result = engine.load_track(Self::convert_deck(deck), &path);
+                self.create_response(result, None)
             }
             Command::Play { deck } => {
                 info!("Playing deck {:?}", deck);
-                engine.play(Self::convert_deck(deck))
+                let result = engine.play(Self::convert_deck(deck));
+                self.create_response(result, None)
             }
             Command::Stop { deck } => {
                 info!("Stopping deck {:?}", deck);
-                engine.stop(Self::convert_deck(deck))
+                let result = engine.stop(Self::convert_deck(deck));
+                self.create_response(result, None)
             }
             Command::SetVolume { deck, db } => {
                 info!("Setting volume on deck {:?} to {}dB", deck, db);
-                engine.set_volume(Self::convert_deck(deck), db)
+                let result = engine.set_volume(Self::convert_deck(deck), db);
+                self.create_response(result, None)
             }
             Command::Unload { deck } => {
                 info!("Unloading deck {:?}", deck);
-                engine.unload_track(Self::convert_deck(deck))
+                let result = engine.unload_track(Self::convert_deck(deck));
+                self.create_response(result, None)
             }
-        };
 
+            // New commands
+            Command::Seek { deck, position } => {
+                info!("Seeking deck {:?} to position {}", deck, position);
+                let result = engine.seek(Self::convert_deck(deck), position);
+                self.create_response(result, None)
+            }
+            Command::GetPosition { deck } => {
+                info!("Getting position for deck {:?}", deck);
+                match engine.get_position(Self::convert_deck(deck)) {
+                    Ok(position) => {
+                        info!("Current position: {}", position);
+                        self.create_response(Ok(()), Some(ResponseData::Position(position)))
+                    }
+                    Err(e) => {
+                        warn!("Failed to get position: {}", e);
+                        self.create_response(Err(e), None)
+                    }
+                }
+            }
+            Command::GetLength { deck } => {
+                info!("Getting length for deck {:?}", deck);
+                match engine.get_length(Self::convert_deck(deck)) {
+                    Ok(length) => {
+                        info!("Track length: {}", length);
+                        self.create_response(Ok(()), Some(ResponseData::Length(length)))
+                    }
+                    Err(e) => {
+                        warn!("Failed to get length: {}", e);
+                        self.create_response(Err(e), None)
+                    }
+                }
+            }
+        }
+    }
+
+    // Add a helper method to create responses
+    fn create_response(
+        &self,
+        result: Result<(), PlaybackError>,
+        data: Option<ResponseData>,
+    ) -> Response {
         match result {
             Ok(()) => {
                 info!("Command completed successfully");
                 Response {
                     success: true,
                     error_message: String::new(),
+                    data,
                 }
             }
             Err(e) => {
@@ -83,6 +130,7 @@ impl Server {
                 Response {
                     success: false,
                     error_message: e.to_string(),
+                    data: None,
                 }
             }
         }
@@ -131,5 +179,6 @@ mod tests {
             response.error_message,
             nonexistent_path.display()
         );
+        assert!(response.data.is_none());
     }
 }

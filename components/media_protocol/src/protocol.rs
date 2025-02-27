@@ -10,12 +10,23 @@ pub enum Command {
     Stop { deck: Deck },
     SetVolume { deck: Deck, db: f32 },
     Unload { deck: Deck },
+    Seek { deck: Deck, position: usize },
+    GetPosition { deck: Deck },
+    GetLength { deck: Deck },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
     pub success: bool,
     pub error_message: String,
+    pub data: Option<ResponseData>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type", content = "value")]
+pub enum ResponseData {
+    Position(usize),
+    Length(usize),
 }
 
 #[cfg(test)]
