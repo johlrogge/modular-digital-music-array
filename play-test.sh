@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-
+cargo build --release
 # Cleanup function
 cleanup() {
     echo "Cleaning up..."
@@ -18,24 +18,24 @@ trap cleanup EXIT
 cleanup
 
 # Start the playback server in the background
-cargo run --bin playback-server &
+target/release/playback-server &
 SERVER_PID=$!
 
 # Wait a moment for the server to start
 sleep 2
 
 # Play the downloaded song
-cargo run --bin media-ctl -- load \
+target/release/media-ctl load \
     --library ~/music \
     --artist "Rick Astley" \
     --song "Rick Astley - Never Gonna Give You Up (Official Music Video)" \
     --channel A
 
-cargo run --bin media-ctl -- play --channel A
+target/release/media-ctl play --channel A
 
 # Wait for user input to stop
 echo "Press Enter to stop playback"
 read
 
 # Stop playback (cleanup will handle server shutdown)
-cargo run --bin media-ctl -- stop --channel A
+target/release/media-ctl stop --channel A

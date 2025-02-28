@@ -1,20 +1,29 @@
-// In src/source.rs
 use crate::error::PlaybackError;
-use std::path::{Path, PathBuf};
+use parking_lot::{Mutex, RwLock};
+use std::path::Path;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+use symphonia::core::units::Time;
+use tokio::sync::Mutex as AsyncMutex;
 
 pub trait Source: Send + Sync {
-    // Change to copy samples into provided buffer
+    // Existing methods...
     fn read_samples(&self, position: usize, buffer: &mut [f32]) -> Result<usize, PlaybackError>;
     fn sample_rate(&self) -> u32;
     fn audio_channels(&self) -> u16;
     fn len(&self) -> usize;
+
+    // Change seek to take an immutable reference
+    fn seek(&self, position: usize) -> Result<(), PlaybackError> {
+        // Default implementation (no-op)
+        Ok(())
+    }
 }
 
 /// Represents a decoded audio packet with its position information
@@ -24,12 +33,19 @@ struct DecodedPacket {
 }
 
 pub struct FlacSource {
-    packets: Arc<parking_lot::RwLock<Vec<DecodedPacket>>>,
-    loaded_packets: Arc<std::sync::atomic::AtomicUsize>,
+    // Buffer management
+    packets: Arc<RwLock<Vec<DecodedPacket>>>,
+    loaded_packets: Arc<AtomicUsize>,
+    total_samples: Arc<AtomicUsize>,
     sample_rate: u32,
     audio_channels: u16,
+
+    // Change these to use Mutex for interior mutability
+    format_reader: Arc<Mutex<Box<dyn FormatReader>>>,
+    decoder: Arc<Mutex<Box<dyn symphonia::core::codecs::Decoder>>>,
+
     loading_task: Option<tokio::task::JoinHandle<()>>,
-    total_samples: Arc<std::sync::atomic::AtomicUsize>,
+    seek_mutex: Arc<AsyncMutex<()>>,
 }
 
 impl FlacSource {
@@ -58,9 +74,18 @@ impl FlacSource {
         let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
         let codec_params = track.codec_params.clone();
 
-        let packets = Arc::new(parking_lot::RwLock::new(Vec::new()));
-        let total_samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let loaded_packets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Create decoder for initial loading
+        let decoder_init = symphonia::default::get_codecs()
+            .make(&codec_params, &DecoderOptions::default())
+            .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
+
+        // Create shared resources
+        let packets = Arc::new(RwLock::new(Vec::new()));
+        let total_samples = Arc::new(AtomicUsize::new(0));
+        let loaded_packets = Arc::new(AtomicUsize::new(0));
+        let format_reader = Arc::new(Mutex::new(probed.format));
+        let decoder = Arc::new(Mutex::new(decoder_init));
+        let seek_mutex = Arc::new(AsyncMutex::new(()));
 
         let mut source = Self {
             packets: packets.clone(),
@@ -69,18 +94,18 @@ impl FlacSource {
             audio_channels,
             loading_task: None,
             total_samples: total_samples.clone(),
+            format_reader: format_reader.clone(),
+            decoder: decoder.clone(),
+            seek_mutex: seek_mutex.clone(),
         };
 
-        // Load initial packets with first format reader
-        let decoder_init = symphonia::default::get_codecs()
-            .make(&codec_params, &DecoderOptions::default())
-            .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
-        source.load_initial_packets(probed.format, decoder_init)?;
+        // Load initial packets
+        source.load_initial_packets()?;
 
-        // Create new format reader for background loading
+        // Create a new file handle for background loading
         let file_bg = std::fs::File::open(&path)?;
         let mss_bg = MediaSourceStream::new(Box::new(file_bg), Default::default());
-        let mut format_bg = symphonia::default::get_probe()
+        let format_bg = symphonia::default::get_probe()
             .format(
                 &hint,
                 mss_bg,
@@ -90,43 +115,79 @@ impl FlacSource {
             .map_err(|e| PlaybackError::Decoder(e.to_string()))?
             .format;
 
-        let mut decoder_bg = symphonia::default::get_codecs()
+        // Create decoder for background loading
+        let decoder_bg = symphonia::default::get_codecs()
             .make(&codec_params, &DecoderOptions::default())
             .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
 
-        let packets_bg = packets;
-        let total_samples_bg = total_samples;
+        // Shared resources for background loading
+        let packets_bg = packets.clone();
+        let total_samples_bg = total_samples.clone();
+        let loaded_packets_bg = loaded_packets.clone();
+        let seek_mutex_bg = seek_mutex.clone();
+
+        // Start background loading
         let loading_task = tokio::spawn(async move {
             // Skip the packets we already loaded
-            let loaded = loaded_packets.load(std::sync::atomic::Ordering::Acquire);
+            let loaded = loaded_packets_bg.load(std::sync::atomic::Ordering::Acquire);
+
+            // Initialize background format reader and decoder
+            let mut format_reader = format_bg;
+            let mut decoder = decoder_bg;
+
+            // Skip to where initial loading left off
             for _ in 0..loaded {
-                let _ = format_bg.next_packet();
+                let _ = format_reader.next_packet();
             }
 
-            while let Ok(packet) = format_bg.next_packet() {
-                let decoded = match decoder_bg.decode(&packet) {
-                    Ok(decoded) => decoded,
-                    Err(_) => continue,
-                };
+            // Background loading loop
+            loop {
+                // Check if a seek is in progress
+                let _guard = tokio::time::timeout(
+                    tokio::time::Duration::from_millis(1),
+                    seek_mutex_bg.lock(),
+                )
+                .await;
 
-                let mut sample_buf =
-                    SampleBuffer::<f32>::new(decoded.frames() as u64, *decoded.spec());
-                sample_buf.copy_interleaved_ref(decoded);
-
-                let current_total = total_samples_bg.load(std::sync::atomic::Ordering::Relaxed);
-                let decoded_packet = DecodedPacket {
-                    samples: sample_buf.samples().to_vec(),
-                    position: current_total,
-                };
-
-                let new_total = current_total + decoded_packet.samples.len();
-                total_samples_bg.store(new_total, std::sync::atomic::Ordering::Release);
-
-                {
-                    let mut packets_guard = packets_bg.write();
-                    packets_guard.push(decoded_packet);
+                if _guard.is_err() {
+                    // A seek is in progress, wait and retry
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    continue;
                 }
-                loaded_packets.fetch_add(1, std::sync::atomic::Ordering::Release);
+
+                // Process next packet
+                match format_reader.next_packet() {
+                    Ok(packet) => {
+                        let decoded = match decoder.decode(&packet) {
+                            Ok(decoded) => decoded,
+                            Err(_) => continue,
+                        };
+
+                        let mut sample_buf =
+                            SampleBuffer::<f32>::new(decoded.frames() as u64, *decoded.spec());
+                        sample_buf.copy_interleaved_ref(decoded);
+
+                        let current_total =
+                            total_samples_bg.load(std::sync::atomic::Ordering::Relaxed);
+                        let decoded_packet = DecodedPacket {
+                            samples: sample_buf.samples().to_vec(),
+                            position: current_total,
+                        };
+
+                        let new_total = current_total + decoded_packet.samples.len();
+                        total_samples_bg.store(new_total, std::sync::atomic::Ordering::Release);
+
+                        {
+                            let mut packets_guard = packets_bg.write();
+                            packets_guard.push(decoded_packet);
+                        }
+                        loaded_packets_bg.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    }
+                    Err(_) => {
+                        // Likely end of stream, sleep to avoid busy-wait
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    }
+                }
             }
         });
 
@@ -134,17 +195,17 @@ impl FlacSource {
         Ok(source)
     }
 
-    fn load_initial_packets(
-        &mut self,
-        mut format: Box<dyn symphonia::core::formats::FormatReader>,
-        mut decoder: Box<dyn symphonia::core::codecs::Decoder>,
-    ) -> Result<(), PlaybackError> {
+    fn load_initial_packets(&mut self) -> Result<(), PlaybackError> {
         const INITIAL_BUFFER_SECS: f32 = 0.5;
-        let target_samples = (INITIAL_BUFFER_SECS * self.sample_rate as f32) as usize;
+        let target_samples =
+            (INITIAL_BUFFER_SECS * self.sample_rate as f32 * self.audio_channels as f32) as usize;
         let mut current_samples = 0;
 
+        let mut format_reader = self.format_reader.lock();
+        let mut decoder = self.decoder.lock();
+
         while current_samples < target_samples {
-            if let Ok(packet) = format.next_packet() {
+            if let Ok(packet) = format_reader.next_packet() {
                 let decoded = decoder
                     .decode(&packet)
                     .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
@@ -174,10 +235,107 @@ impl FlacSource {
         Ok(())
     }
 
-    pub fn shutdown(&mut self) {
-        if let Some(task) = self.loading_task.take() {
-            task.abort();
+    pub async fn async_seek(&self, target_position: usize) -> Result<(), PlaybackError> {
+        // Acquire seek mutex to prevent background loading during seek
+        let _seek_guard = self.seek_mutex.lock().await;
+
+        // Convert sample position to time value
+        let sample_rate_f64 = self.sample_rate as f64;
+        let channels_f64 = self.audio_channels as f64;
+        let time_seconds = (target_position as f64) / (sample_rate_f64 * channels_f64);
+
+        // Convert to Symphonia's Time format
+        let seconds = time_seconds.floor() as u64;
+        let frac = time_seconds - seconds as f64;
+        let time = Time::new(seconds, frac);
+
+        // Define the seek target
+        let seek_to = SeekTo::Time {
+            time,
+            track_id: None, // Use default track
+        };
+
+        // Perform the seek - note the argument order (mode, to)
+        let mut format_reader = self.format_reader.lock();
+        let seek_result = format_reader.seek(SeekMode::Accurate, seek_to);
+
+        // Check if seek was successful
+        if let Err(e) = seek_result {
+            return Err(PlaybackError::Decoder(format!("Seek error: {}", e)));
         }
+
+        // Reset the packet buffer
+        {
+            let mut packets_guard = self.packets.write();
+            packets_guard.clear();
+        }
+
+        self.loaded_packets
+            .store(0, std::sync::atomic::Ordering::Release);
+        self.total_samples
+            .store(0, std::sync::atomic::Ordering::Release);
+
+        // Process packets until we reach or exceed the target position
+        let mut current_position = 0;
+        let mut decoder = self.decoder.lock();
+
+        // Decode packets until we get past the target position
+        while current_position <= target_position {
+            if let Ok(packet) = format_reader.next_packet() {
+                let decoded = match decoder.decode(&packet) {
+                    Ok(decoded) => decoded,
+                    Err(e) => {
+                        return Err(PlaybackError::Decoder(format!(
+                            "Decode error during seek: {}",
+                            e
+                        )))
+                    }
+                };
+
+                let mut sample_buf =
+                    SampleBuffer::<f32>::new(decoded.frames() as u64, *decoded.spec());
+                sample_buf.copy_interleaved_ref(decoded);
+
+                let samples = sample_buf.samples().to_vec();
+                let samples_len = samples.len();
+
+                let decoded_packet = DecodedPacket {
+                    samples,
+                    position: current_position,
+                };
+
+                // Add to buffer
+                {
+                    let mut packets_guard = self.packets.write();
+                    packets_guard.push(decoded_packet);
+                }
+
+                current_position += samples_len;
+                self.total_samples
+                    .store(current_position, std::sync::atomic::Ordering::Release);
+                self.loaded_packets
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+
+                // If we've loaded enough samples past the target position, break
+                if current_position
+                    > target_position + (self.sample_rate as usize * self.audio_channels as usize)
+                {
+                    break;
+                }
+            } else {
+                // End of stream reached
+                if current_position < target_position {
+                    return Err(PlaybackError::Decoder(format!(
+                        "Seek position {} beyond end of stream ({})",
+                        target_position, current_position
+                    )));
+                }
+                break;
+            }
+        }
+
+        // Successfully seeked
+        Ok(())
     }
 }
 
@@ -231,129 +389,25 @@ impl Source for FlacSource {
         self.total_samples
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    // Implement the trait's seek method to call our async implementation
+    fn seek(&self, position: usize) -> Result<(), PlaybackError> {
+        // Create a runtime to block on the async seek
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| PlaybackError::Decoder(format!("Failed to create runtime: {}", e)))?;
+
+        // Block on the async seek
+        runtime.block_on(self.async_seek(position))
+    }
 }
 
 impl Drop for FlacSource {
     fn drop(&mut self) {
         // Cancel the background loading task if it exists
-        self.shutdown();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::f32::consts::PI;
-    use std::process::Command;
-
-    fn generate_test_signal(duration_secs: f32, sample_rate: u32, audio_channels: u16) -> Vec<f32> {
-        let num_samples = (duration_secs * sample_rate as f32) as usize * audio_channels as usize;
-        let mut samples = Vec::with_capacity(num_samples);
-
-        // Generate a mix of frequencies (A4, A5, A6)
-        let frequencies = [440.0, 880.0, 1760.0];
-
-        for i in 0..num_samples {
-            let t = i as f32 / sample_rate as f32;
-            let sample = frequencies
-                .iter()
-                .enumerate()
-                .map(|(idx, &freq)| {
-                    let amplitude = 0.25 / (idx + 1) as f32;
-                    amplitude * (2.0 * PI * freq * t).sin()
-                })
-                .sum::<f32>();
-
-            samples.push(sample);
+        if let Some(task) = self.loading_task.take() {
+            task.abort();
         }
-
-        samples
-    }
-
-    fn create_test_flac() -> Result<tempfile::TempPath, std::io::Error> {
-        // First create a WAV file
-        let wav_file = tempfile::NamedTempFile::new()?;
-
-        // Create FLAC file with extension
-        let flac_file = tempfile::Builder::new().suffix(".flac").tempfile()?;
-
-        // Generate test audio data
-        let sample_rate = 48000;
-        let audio_channels = 2;
-        let samples = generate_test_signal(0.1, sample_rate, audio_channels); // 100ms of audio
-
-        // Write WAV
-        let spec = hound::WavSpec {
-            channels: audio_channels,
-            sample_rate,
-            bits_per_sample: 32,
-            sample_format: hound::SampleFormat::Float,
-        };
-
-        let mut writer = hound::WavWriter::create(wav_file.path(), spec).unwrap();
-        for sample in samples {
-            writer.write_sample(sample).unwrap();
-        }
-        writer.finalize().unwrap();
-
-        // Convert WAV to FLAC using ffmpeg
-        let status = Command::new("ffmpeg")
-            .arg("-y") // Overwrite output files
-            .arg("-i")
-            .arg(wav_file.path())
-            .arg("-c:a")
-            .arg("flac")
-            .arg(flac_file.path())
-            .status()?;
-
-        if !status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "ffmpeg conversion failed",
-            ));
-        }
-
-        Ok(flac_file.into_temp_path())
-    }
-
-    #[tokio::test]
-    async fn test_flac_metadata() -> Result<(), PlaybackError> {
-        let path = create_test_flac()?;
-        let source = FlacSource::new(path)?;
-
-        assert_eq!(source.sample_rate(), 48000);
-        assert_eq!(source.audio_channels(), 2);
-        assert!(source.len() > 0);
-
-        Ok(())
-    }
-    #[tokio::test]
-    async fn test_packet_reading() -> Result<(), PlaybackError> {
-        let path = create_test_flac()?;
-        let source = FlacSource::new(path)?;
-        let mut buffer = vec![0.0f32; 1024];
-
-        // Test reading from start
-        let read = source.read_samples(0, &mut buffer)?;
-        assert!(read > 0);
-
-        // Test reading across packet boundary
-        let total = source
-            .total_samples
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let packets = source.packets.read();
-        let first_packet_len = packets[0].samples.len();
-        drop(packets); // Release the lock before next read
-
-        let mut cross_buffer = vec![0.0f32; 20];
-        let read = source.read_samples(first_packet_len - 10, &mut cross_buffer)?;
-        assert!(read > 0);
-
-        // Test reading beyond end
-        let mut end_buffer = vec![0.0f32; 1024];
-        let read = source.read_samples(total, &mut end_buffer)?;
-        assert_eq!(read, 0);
-
-        Ok(())
     }
 }

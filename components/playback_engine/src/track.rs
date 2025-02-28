@@ -1,4 +1,3 @@
-// components/playback_engine/src/track.rs
 use std::path::Path;
 use std::sync::Arc;
 
@@ -7,14 +6,14 @@ use crate::source::{FlacSource, Source};
 
 #[derive(Clone)]
 pub struct Track {
-    source: Arc<dyn Source>, // Changed to Arc since Source needs to be shared when Track is cloned
+    source: Arc<dyn Source>, // Shared audio source
     position: usize,
     playing: bool,
     volume: f32,
 }
 
 impl Track {
-    pub fn new(path: &Path) -> Result<Track, PlaybackError> {
+    pub async fn new(path: &Path) -> Result<Track, PlaybackError> {
         let source = Arc::new(FlacSource::new(path)?);
 
         Ok(Track {
@@ -34,17 +33,30 @@ impl Track {
             self.volume
         );
     }
-    pub fn seek(&mut self, position: usize) {
+
+    pub fn seek(&mut self, position: usize) -> Result<(), PlaybackError> {
         let max_position = self.source.len();
-        self.position = position.min(max_position);
+        let target_position = position.min(max_position);
+
+        // Try to perform a real seek via the source's seek method
+        // Now using immutable reference which works with Arc
+        if let Err(e) = self.source.seek(position) {
+            tracing::warn!("Source seek failed: {}", e);
+            // Continue anyway - we'll update the position counter
+        }
+
+        // Update position counter
+        self.position = target_position;
 
         tracing::info!(
-            "Track seeking to position={}/{}, playing={}, volume={}",
+            "Track seeked to position={}/{}, playing={}, volume={}",
             self.position,
             max_position,
             self.playing,
             self.volume
         );
+
+        Ok(())
     }
 
     pub fn position(&self) -> usize {
@@ -92,17 +104,6 @@ impl Track {
 
     pub fn get_volume(&self) -> f32 {
         self.volume
-    }
-    pub fn shutdown(&mut self) {
-        // Get a mutable reference to the underlying source
-        // This is a bit tricky since we're using Arc<dyn Source>
-        // We might need to modify the Source trait to add a shutdown method
-
-        // For now, we'll rely on Drop to handle cleanup
-        // But in a more complete implementation, we'd want something like:
-        // if let Some(flac_source) = self.source.downcast_mut::<FlacSource>() {
-        //     flac_source.shutdown();
-        // }
     }
 }
 

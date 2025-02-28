@@ -8,7 +8,7 @@ use nng::{Protocol, Socket};
 use playback_engine::PlaybackEngine;
 use server::Server;
 
-use parking_lot::Mutex;
+use tokio::sync::Mutex;
 
 #[tokio::main]
 async fn main() -> Result<()> {

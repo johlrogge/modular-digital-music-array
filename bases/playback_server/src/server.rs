@@ -2,9 +2,9 @@ use crate::error::ServerError;
 use color_eyre::Result;
 use media_protocol::{Command, Deck as ProtocolChannel, Response, ResponseData};
 use nng::Socket;
-use parking_lot::Mutex;
 use playback_engine::{self, PlaybackEngine, PlaybackError};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 pub struct Server {
@@ -35,7 +35,7 @@ impl Server {
             info!("Received command: {:?}", command);
 
             // Process command
-            let response = self.handle_command(command);
+            let response = self.handle_command(command).await;
 
             // Send response
             let response_data = serde_json::to_vec(&response)?;
@@ -44,46 +44,67 @@ impl Server {
                 .map_err(ServerError::from)?;
         }
     }
-    fn handle_command(&self, command: Command) -> Response {
-        let mut engine = self.engine.lock();
 
+    async fn handle_command(&self, command: Command) -> Response {
         match command {
-            // Existing commands...
             Command::LoadTrack { path, deck } => {
                 info!("Loading track {:?} on deck {:?}", path, deck);
-                let result = engine.load_track(Self::convert_deck(deck), &path);
+                // Use .await to acquire the lock asynchronously
+                let result = self
+                    .engine
+                    .lock()
+                    .await
+                    .load_track(Self::convert_deck(deck), &path)
+                    .await;
                 self.create_response(result, None)
-            }
+            } // For non-async operations, keep the original pattern
             Command::Play { deck } => {
                 info!("Playing deck {:?}", deck);
-                let result = engine.play(Self::convert_deck(deck));
+                let result = self.engine.lock().await.play(Self::convert_deck(deck));
                 self.create_response(result, None)
             }
             Command::Stop { deck } => {
                 info!("Stopping deck {:?}", deck);
-                let result = engine.stop(Self::convert_deck(deck));
+                let result = self.engine.lock().await.stop(Self::convert_deck(deck));
                 self.create_response(result, None)
             }
             Command::SetVolume { deck, db } => {
                 info!("Setting volume on deck {:?} to {}dB", deck, db);
-                let result = engine.set_volume(Self::convert_deck(deck), db);
+                let result = self
+                    .engine
+                    .lock()
+                    .await
+                    .set_volume(Self::convert_deck(deck), db);
                 self.create_response(result, None)
             }
             Command::Unload { deck } => {
                 info!("Unloading deck {:?}", deck);
-                let result = engine.unload_track(Self::convert_deck(deck));
+                let result = self
+                    .engine
+                    .lock()
+                    .await
+                    .unload_track(Self::convert_deck(deck));
                 self.create_response(result, None)
             }
 
             // New commands
             Command::Seek { deck, position } => {
                 info!("Seeking deck {:?} to position {}", deck, position);
-                let result = engine.seek(Self::convert_deck(deck), position);
+                let result = self
+                    .engine
+                    .lock()
+                    .await
+                    .seek(Self::convert_deck(deck), position);
                 self.create_response(result, None)
             }
             Command::GetPosition { deck } => {
                 info!("Getting position for deck {:?}", deck);
-                match engine.get_position(Self::convert_deck(deck)) {
+                match self
+                    .engine
+                    .lock()
+                    .await
+                    .get_position(Self::convert_deck(deck))
+                {
                     Ok(position) => {
                         info!("Current position: {}", position);
                         self.create_response(Ok(()), Some(ResponseData::Position(position)))
@@ -96,7 +117,12 @@ impl Server {
             }
             Command::GetLength { deck } => {
                 info!("Getting length for deck {:?}", deck);
-                match engine.get_length(Self::convert_deck(deck)) {
+                match self
+                    .engine
+                    .lock()
+                    .await
+                    .get_length(Self::convert_deck(deck))
+                {
                     Ok(length) => {
                         info!("Track length: {}", length);
                         self.create_response(Ok(()), Some(ResponseData::Length(length)))
@@ -157,8 +183,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_handle_nonexistent_track() {
+    #[tokio::test]
+    async fn test_handle_nonexistent_track() {
         let engine = PlaybackEngine::new().unwrap();
         let engine = Arc::new(Mutex::new(engine));
 
@@ -171,7 +197,7 @@ mod tests {
             deck: ProtocolChannel::A,
         };
 
-        let response = server.handle_command(command);
+        let response = server.handle_command(command).await;
         assert!(!response.success);
         assert!(
             response.error_message.contains("No such file or directory"),

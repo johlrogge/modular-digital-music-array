@@ -20,7 +20,7 @@ fn bench_track_loading(c: &mut Criterion) {
         let path = test_file_path(name);
 
         // Get initial metrics once before benchmarking
-        let track = rt.block_on(async { Track::new(&path).expect("Failed to load track") });
+        let track = rt.block_on(async { Track::new(&path).await.expect("Failed to load track") });
 
         // Drop the track immediately after use to clean up resources
         drop(track);
@@ -30,7 +30,9 @@ fn bench_track_loading(c: &mut Criterion) {
             let path = test_file_path(name);
             b.iter_with_large_drop(|| {
                 let track = rt.block_on(async {
-                    Track::new(black_box(&path)).expect("Failed to load track")
+                    Track::new(black_box(&path))
+                        .await
+                        .expect("Failed to load track")
                 });
 
                 // The iter_with_large_drop will drop the track after each iteration
@@ -53,7 +55,8 @@ fn bench_time_to_playable(c: &mut Criterion) {
 
         // Print metrics once before benchmarking
         let start = Instant::now();
-        let mut track = rt.block_on(async { Track::new(&path).expect("Failed to load track") });
+        let mut track =
+            rt.block_on(async { Track::new(&path).await.expect("Failed to load track") });
         track.play();
         let ready_time = start.elapsed();
         let mut buffer = vec![0.0f32; 1024];
@@ -71,7 +74,9 @@ fn bench_time_to_playable(c: &mut Criterion) {
             b.iter_with_large_drop(|| {
                 let start = Instant::now();
                 let mut track = rt.block_on(async {
-                    Track::new(black_box(&path)).expect("Failed to load track")
+                    Track::new(black_box(&path))
+                        .await
+                        .expect("Failed to load track")
                 });
                 track.play();
                 let ready_time = start.elapsed();
@@ -94,7 +99,8 @@ fn bench_seeking(c: &mut Criterion) {
         let path = test_file_path(name);
 
         // Create a track for testing
-        let mut track = rt.block_on(async { Track::new(&path).expect("Failed to load track") });
+        let mut track =
+            rt.block_on(async { Track::new(&path).await.expect("Failed to load track") });
         let length = track.length();
 
         // Benchmark seeking to different positions

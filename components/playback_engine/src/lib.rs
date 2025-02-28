@@ -73,9 +73,9 @@ impl PlaybackEngine {
         }
     }
 
-    pub fn load_track(&mut self, deck: Deck, path: &Path) -> Result<(), PlaybackError> {
+    pub async fn load_track(&mut self, deck: Deck, path: &Path) -> Result<(), PlaybackError> {
         // Create new track
-        let track = Track::new(path)?;
+        let track = Track::new(path).await?;
 
         // Acquire lock and insert track
         let mut decks = self.decks.write();
@@ -153,7 +153,7 @@ impl PlaybackEngine {
     pub fn seek(&mut self, deck: Deck, position: usize) -> Result<(), PlaybackError> {
         if let Some(track) = self.find_track(deck) {
             tracing::info!("Seeking deck {:?} to position {}", deck, position);
-            track.write().seek(position);
+            track.write().seek(position)?;
             Ok(())
         } else {
             tracing::error!("No track loaded in deck {:?}", deck);
