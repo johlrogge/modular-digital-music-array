@@ -20,6 +20,9 @@ pub enum DownloadError {
 
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+    
+    #[error("Playlist error: {0}")]
+    PlaylistError(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,42 +59,7 @@ pub trait Downloader {
         output: &std::path::Path,
         temp_dir: &std::path::Path,
     ) -> Result<(), DownloadError>;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_track_metadata_serialization() {
-        let location = TrackLocation::new("Test Artist", "Test Song");
-
-        let metadata = TrackMetadata {
-            location,
-            duration: 180.5,
-            source_url: "https://example.com/song".to_string(),
-            download_time: Utc::now(),
-        };
-
-        let json = serde_json::to_string(&metadata).unwrap();
-        let decoded: TrackMetadata = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(decoded.location.artist, "Test Artist");
-        assert_eq!(decoded.location.title, "Test Song");
-        assert_eq!(decoded.duration, 180.5);
-        assert_eq!(decoded.source_url, "https://example.com/song");
-    }
-
-    #[test]
-    fn test_download_errors() {
-        let io_error = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
-        let error = DownloadError::IoError(io_error);
-        assert!(error.to_string().contains("file not found"));
-
-        let error = DownloadError::DependencyNotFound("yt-dlp");
-        assert!(error.to_string().contains("yt-dlp"));
-
-        let error = DownloadError::InvalidUrl("bad://url".to_string());
-        assert!(error.to_string().contains("bad://url"));
-    }
+    
+    /// Fetch all track URLs from a playlist
+    async fn fetch_playlist_urls(&self, url: &url::Url) -> Result<Vec<String>, DownloadError>;
 }

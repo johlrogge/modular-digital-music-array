@@ -15,10 +15,6 @@ struct YtDlpMetadata {
     album: Option<String>,
     duration: f64,
     webpage_url: String,
-    //usrformat_id: String,
-    //ext: String,
-    //release_date: Option<String>,
-    //track: Option<String>,
     artist: Option<String>,
     creator: Option<String>,
 }
@@ -144,5 +140,67 @@ impl Downloader for YtDlp {
         }
 
         Ok(())
+    }
+    
+    async fn fetch_playlist_urls(&self, url: &Url) -> Result<Vec<String>, DownloadError> {
+        // Check if this is a SoundCloud URL
+        let is_soundcloud = url.host_str()
+            .map(|host| host.contains("soundcloud.com"))
+            .unwrap_or(false);
+            
+        // For SoundCloud, we need to get the track URLs differently
+        let output = if is_soundcloud {
+            Command::new("yt-dlp")
+                .arg("--flat-playlist")
+                .arg("--dump-json")
+                .arg(url.as_str())
+                .output()
+                .await?
+        } else {
+            Command::new("yt-dlp")
+                .arg("--flat-playlist")
+                .arg("--get-url")
+                .arg(url.as_str())
+                .output()
+                .await?
+        };
+
+        if !output.status.success() {
+            return Err(DownloadError::DownloadFailed(
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ));
+        }
+
+        // Process output differently based on site
+        let urls = if is_soundcloud {
+            // Each line is a JSON entry, we need to extract webpage_url
+            let json_lines = String::from_utf8_lossy(&output.stdout);
+            let mut track_urls = Vec::new();
+            
+            for line in json_lines.lines() {
+                if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(track_url) = entry.get("webpage_url").and_then(|u| u.as_str()) {
+                        track_urls.push(track_url.to_string());
+                    }
+                }
+            }
+            
+            track_urls
+        } else {
+            // Each line is a direct URL
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        
+        if urls.is_empty() {
+            return Err(DownloadError::PlaylistError(
+                "No tracks found in playlist".to_string(),
+            ));
+        }
+        
+        Ok(urls)
     }
 }

@@ -16,12 +16,21 @@ impl App {
     }
 
     pub async fn run(&self) -> Result<()> {
-        self.output.print_download_start(&self.args.url);
-
         let downloader = MediaDownloader::new(&self.args.output_dir).await?;
-        let (path, metadata) = downloader.download(&self.args.url).await?;
-
-        self.output.print_download_complete(&path, &metadata);
+        
+        if self.args.playlist {
+            self.output.print_playlist_download_start(&self.args.url);
+            
+            let results = downloader.download_playlist(&self.args.url).await?;
+            
+            self.output.print_playlist_download_complete(&results);
+        } else {
+            self.output.print_download_start(&self.args.url);
+            
+            let (path, metadata) = downloader.download(&self.args.url).await?;
+            
+            self.output.print_download_complete(&path, &metadata);
+        }
 
         Ok(())
     }

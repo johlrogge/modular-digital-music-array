@@ -69,6 +69,30 @@ impl MediaDownloader {
 
         Ok((final_path, metadata))
     }
+    
+    pub async fn download_playlist(&self, url: &str) -> Result<Vec<(PathBuf, TrackMetadata)>, DownloadError> {
+        let url = Url::parse(url).map_err(|e| DownloadError::InvalidUrl(e.to_string()))?;
+        
+        // Get list of tracks in the playlist
+        let track_urls = self.downloader.fetch_playlist_urls(&url).await?;
+        
+        let mut results = Vec::new();
+        
+        // Download each track
+        for track_url in track_urls {
+            match self.download(&track_url).await {
+                Ok((path, metadata)) => {
+                    results.push((path, metadata));
+                }
+                Err(e) => {
+                    eprintln!("Error downloading track {}: {}", track_url, e);
+                    // Continue with other tracks even if one fails
+                }
+            }
+        }
+        
+        Ok(results)
+    }
 }
 
 #[cfg(test)]
@@ -109,6 +133,13 @@ mod tests {
             }
             fs::write(output, b"test data").await?;
             Ok(())
+        }
+        
+        async fn fetch_playlist_urls(&self, _url: &Url) -> Result<Vec<String>, DownloadError> {
+            Ok(vec![
+                "https://example.com/track1".to_string(),
+                "https://example.com/track2".to_string(),
+            ])
         }
     }
 

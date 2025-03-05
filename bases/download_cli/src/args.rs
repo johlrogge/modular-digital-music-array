@@ -13,6 +13,10 @@ pub struct Args {
     /// URL to download from
     pub url: String,
 
+    /// Download entire playlist if URL is a playlist
+    #[arg(short, long)]
+    pub playlist: bool,
+
     /// Enable verbose output
     #[arg(short, long)]
     pub verbose: bool,
