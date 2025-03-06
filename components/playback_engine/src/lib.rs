@@ -13,10 +13,11 @@ use cpal::{
 pub use error::PlaybackError;
 use parking_lot::RwLock;
 pub use playback_primitives::Deck;
+pub use source::{FlacSource, Source};
 pub use track::Track;
 
 pub struct PlaybackEngine {
-    decks: Arc<RwLock<HashMap<Deck, Arc<RwLock<Track>>>>>,
+    decks: Arc<RwLock<HashMap<Deck, Arc<RwLock<Track<FlacSource>>>>>>,
     _audio_stream: Stream,
 }
 
@@ -31,7 +32,7 @@ impl PlaybackEngine {
         })
     }
 
-    fn find_track(&self, deck: Deck) -> Option<Arc<RwLock<Track>>> {
+    fn find_track(&self, deck: Deck) -> Option<Arc<RwLock<Track<FlacSource>>>> {
         let decks = self.decks.read();
         decks.get(&deck).cloned()
     }
@@ -75,7 +76,7 @@ impl PlaybackEngine {
 
     pub async fn load_track(&mut self, deck: Deck, path: &Path) -> Result<(), PlaybackError> {
         // Create new track
-        let track = Track::new(path).await?;
+        let track = Track::<FlacSource>::new(path).await?;
 
         // Acquire lock and insert track
         let mut decks = self.decks.write();
@@ -102,7 +103,7 @@ impl PlaybackEngine {
     }
 
     fn create_audio_stream(
-        decks: Arc<RwLock<HashMap<Deck, Arc<RwLock<Track>>>>>,
+        decks: Arc<RwLock<HashMap<Deck, Arc<RwLock<Track<FlacSource>>>>>>,
     ) -> Result<Stream, PlaybackError> {
         const SAMPLE_RATE: u32 = 48000;
         const CHANNELS: u16 = 2;

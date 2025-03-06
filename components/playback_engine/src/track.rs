@@ -5,15 +5,15 @@ use crate::error::PlaybackError;
 use crate::source::{FlacSource, Source};
 
 #[derive(Clone)]
-pub struct Track {
-    source: Arc<dyn Source>, // Shared audio source
+pub struct Track<S: Source + Send + Sync> {
+    source: Arc<S>, // Shared audio source
     position: usize,
     playing: bool,
     volume: f32,
 }
 
-impl Track {
-    pub async fn new(path: &Path) -> Result<Track, PlaybackError> {
+impl<S: Source + Send + Sync> Track<S> {
+    pub async fn new(path: &Path) -> Result<Track<FlacSource>, PlaybackError> {
         let source = Arc::new(FlacSource::new(path)?);
 
         Ok(Track {
@@ -108,41 +108,40 @@ impl Track {
 }
 
 #[cfg(test)]
-impl Track {
+pub struct TestSource {
+    samples: Vec<f32>,
+}
+
+#[cfg(test)]
+impl Source for TestSource {
+    fn read_samples(&self, position: usize, buffer: &mut [f32]) -> Result<usize, PlaybackError> {
+        if position >= self.samples.len() {
+            return Ok(0);
+        }
+        let available = self.samples.len() - position;
+        let count = buffer.len().min(available);
+
+        buffer[..count].copy_from_slice(&self.samples[position..position + count]);
+        Ok(count)
+    }
+
+    fn sample_rate(&self) -> u32 {
+        48000
+    }
+
+    fn audio_channels(&self) -> u16 {
+        2
+    }
+
+    fn len(&self) -> usize {
+        self.samples.len()
+    }
+}
+
+#[cfg(test)]
+impl Track<TestSource> {
     pub(crate) fn new_test() -> Self {
         // Create a simple 1-second sine wave source
-        struct TestSource {
-            samples: Vec<f32>,
-        }
-
-        impl Source for TestSource {
-            fn read_samples(
-                &self,
-                position: usize,
-                buffer: &mut [f32],
-            ) -> Result<usize, PlaybackError> {
-                if position >= self.samples.len() {
-                    return Ok(0);
-                }
-                let available = self.samples.len() - position;
-                let count = buffer.len().min(available);
-
-                buffer[..count].copy_from_slice(&self.samples[position..position + count]);
-                Ok(count)
-            }
-
-            fn sample_rate(&self) -> u32 {
-                48000
-            }
-
-            fn audio_channels(&self) -> u16 {
-                2
-            }
-
-            fn len(&self) -> usize {
-                self.samples.len()
-            }
-        }
 
         // Generate 1 second of 440Hz test tone
         let sample_rate = 48000;

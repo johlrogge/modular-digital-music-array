@@ -1,5 +1,6 @@
 // in mixer.rs
 use crate::error::PlaybackError;
+use crate::source::Source;
 use crate::track::Track;
 use parking_lot::RwLock;
 use playback_primitives::Deck;
@@ -17,9 +18,9 @@ impl Mixer {
         }
     }
 
-    pub fn mix(
+    pub fn mix<S: Source + Send + Sync>(
         &mut self,
-        decks: &RwLock<HashMap<Deck, Arc<RwLock<Track>>>>,
+        decks: &RwLock<HashMap<Deck, Arc<RwLock<Track<S>>>>>,
         output: &mut [f32],
         samples_per_callback: usize,
     ) -> Result<(), PlaybackError> {
@@ -77,7 +78,7 @@ impl Mixer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::track::Track;
+    use crate::{source::FlacSource, track::Track};
     use std::collections::HashMap;
 
     #[test]
@@ -86,7 +87,7 @@ mod tests {
         let mut mixer = Mixer::new(1024);
         let mut output = vec![0.0; 1024];
 
-        mixer.mix(&decks, &mut output, 1024).unwrap();
+        mixer.mix::<FlacSource>(&decks, &mut output, 1024).unwrap();
 
         // Output should be silence
         assert!(output.iter().all(|&x| x == 0.0));
