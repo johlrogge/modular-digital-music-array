@@ -18,6 +18,9 @@ pub trait Source: Send + Sync {
     fn sample_rate(&self) -> u32;
     fn audio_channels(&self) -> u16;
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     // Change seek to take an immutable reference
     fn seek(&self, _position: usize) -> Result<(), PlaybackError> {
