@@ -38,6 +38,12 @@ impl<S: Source + Send + Sync> Track<S> {
 
     pub fn play(&mut self) {
         self.playing = true;
+
+        // Pre-fill buffer when playback starts
+        if let Err(e) = self.prefill_buffer() {
+            tracing::warn!("Failed to prefill buffer: {}", e);
+        }
+
         tracing::info!(
             "Track playback started: playing={}, position={}, volume={}",
             self.playing,
@@ -51,7 +57,6 @@ impl<S: Source + Send + Sync> Track<S> {
         let target_position = position.min(max_position);
 
         // Try to perform a real seek via the source's seek method
-        // Now using immutable reference which works with Arc
         if let Err(e) = self.source.seek(position) {
             tracing::warn!("Source seek failed: {}", e);
             // Continue anyway - we'll update the position counter
@@ -59,6 +64,14 @@ impl<S: Source + Send + Sync> Track<S> {
 
         // Update position counter
         self.position = target_position;
+
+        // Reset buffer by draining it
+        while self.consumer.pop().is_some() {}
+
+        // Refill buffer after seek
+        if let Err(e) = self.prefill_buffer() {
+            tracing::warn!("Failed to refill buffer after seek: {}", e);
+        }
 
         tracing::info!(
             "Track seeked to position={}/{}, playing={}, volume={}",
@@ -126,11 +139,40 @@ impl<S: Source + Send + Sync> Track<S> {
         self.position += total_read;
 
         // Try to fill the buffer with new data for next time
-        self.fill_buffer()?;
+        if self.consumer.len() < self.consumer.capacity() / 4 {
+            for _ in 0..2 {
+                // Try to fill more when buffer is low
+                let filled = self.fill_buffer()?;
+                if filled == 0 {
+                    break; // Nothing more to read
+                }
+            }
+        } else {
+            // Regular buffer filling
+            self.fill_buffer()?;
+        }
 
         Ok(total_read)
     }
+    fn prefill_buffer(&mut self) -> Result<usize, PlaybackError> {
+        // Clear any existing buffer data
+        while self.consumer.pop().is_some() {}
 
+        // Fill the buffer completely
+        let mut total_filled = 0;
+
+        for _ in 0..3 {
+            // Try up to 3 times to fill the buffer
+            let filled = self.fill_buffer()?;
+            total_filled += filled;
+
+            if filled == 0 {
+                break; // Nothing more to read
+            }
+        }
+
+        Ok(total_filled)
+    }
     // Simple method to fill the buffer
     fn fill_buffer(&mut self) -> Result<usize, PlaybackError> {
         // Get the available space in the producer
