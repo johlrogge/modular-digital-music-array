@@ -1,7 +1,7 @@
 use crate::{source::Source, track::Track};
 use playback_primitives::Deck;
 
-pub enum AudioCommand<S: Source + Send + Sync> {
+pub enum AudioCommand<S: Source + Send + Sync + 'static> {
     /// Add a new track to a channel
     AddTrack {
         /// The channel to add the track to

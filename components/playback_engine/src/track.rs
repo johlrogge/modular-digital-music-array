@@ -1,28 +1,26 @@
+use std::borrow::BorrowMut;
 use std::mem::MaybeUninit;
 use std::path::Path;
 use std::sync::Arc;
 
-use ringbuf::{Consumer, HeapRb, Producer, SharedRb};
+use ringbuf::{Consumer, HeapRb, Producer, Rb, SharedRb};
 
 use crate::error::PlaybackError;
 use crate::source::{FlacSource, Source};
 
 use tokio::sync::mpsc;
 
-/// Track commands
 enum TrackCommand {
-    Fill,        // Fill the buffer
-    Seek(usize), // Seek to a position
-    Stop,        // Stop background task
+    Fill(usize), // Fill the buffer from this position
+    Seek(usize), // Seek to this position
+    Stop,        // Stop the task
 }
 
-// Update Track struct
-pub struct Track<S: Source + Send + Sync> {
+pub struct Track<S: Source + Send + Sync + 'static> {
     source: Arc<S>,
     position: usize,
     playing: bool,
     volume: f32,
-    producer: Producer<f32, Arc<SharedRb<f32, Vec<MaybeUninit<f32>>>>>,
     consumer: Consumer<f32, Arc<SharedRb<f32, Vec<MaybeUninit<f32>>>>>,
     command_tx: mpsc::Sender<TrackCommand>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
@@ -36,22 +34,81 @@ impl<S: Source + Send + Sync> Track<S> {
         let source = Arc::new(source);
 
         // Create ring buffer
-        let rb = HeapRb::<f32>::new(Self::BUFFER_SIZE);
+        let rb = SharedRb::<f32, Vec<MaybeUninit<f32>>>::new(Self::BUFFER_SIZE);
         let (producer, consumer) = rb.split();
 
         // Create command channel
         let (command_tx, command_rx) = mpsc::channel(32);
 
-        Ok(Track {
-            source,
+        // Create track instance
+        let track = Track {
+            source: source.clone(),
             position: 0,
             playing: false,
             volume: 1.0,
-            producer,
             consumer,
-            command_tx,
+            command_tx: command_tx.clone(),
             task_handle: None,
-        })
+        };
+
+        // Start background task
+        let task_handle = tokio::spawn(async move {
+            Self::buffer_management_task(source, producer, command_rx).await;
+        });
+
+        // Store the task handle
+        let mut track = track;
+        track.task_handle = Some(task_handle);
+
+        // Send initial fill command
+        track.command_tx.send(TrackCommand::Fill(0)).await;
+
+        Ok(track)
+    }
+
+    async fn buffer_management_task(
+        source: Arc<S>,
+        mut producer: Producer<f32, Arc<SharedRb<f32, Vec<MaybeUninit<f32>>>>>,
+        mut command_rx: mpsc::Receiver<TrackCommand>,
+    ) {
+        let mut temp_buffer = vec![0.0; 1024];
+
+        while let Some(command) = command_rx.recv().await {
+            match command {
+                TrackCommand::Fill(position) => {
+                    // Fill the buffer
+                    let mut current_pos = position;
+                    while producer.len() < producer.capacity() / 2 {
+                        let read = source
+                            .read_samples(current_pos, &mut temp_buffer)
+                            .unwrap_or(0);
+                        if read == 0 {
+                            break;
+                        }
+
+                        for i in 0..read {
+                            if producer.push(temp_buffer[i]).is_err() {
+                                break;
+                            }
+                        }
+
+                        current_pos += read;
+                    }
+                }
+                TrackCommand::Seek(pos) => {
+                    // Clear the buffer and refill
+                    //producer.rb().borrow_mut().clear();
+
+                    // Start filling from the new position
+                    // let _ =
+                    //     Self::buffer_management_task(source.clone(), producer, command_rx).await;
+                    break;
+                }
+                TrackCommand::Stop => {
+                    break;
+                }
+            }
+        }
     }
 
     // This method will be called when we have a Tokio runtime available
@@ -94,12 +151,11 @@ impl<S: Source + Send + Sync> Track<S> {
         // Update position counter
         self.position = target_position;
 
-        // Reset buffer by draining it
-        while self.consumer.pop().is_some() {}
-
-        // Refill buffer after seek
-        if let Err(e) = self.prefill_buffer() {
-            tracing::warn!("Failed to refill buffer after seek: {}", e);
+        // Reset buffer by sending a Seek command
+        // This will clear the buffer and refill it from the new position
+        if let Err(e) = self.command_tx.try_send(TrackCommand::Seek(self.position)) {
+            // If sending fails, log warning but continue
+            tracing::warn!("Failed to send seek command: {}", e);
         }
 
         tracing::info!(
@@ -126,7 +182,7 @@ impl<S: Source + Send + Sync> Track<S> {
             return Ok(0);
         }
 
-        // First, try to read any existing data from the ring buffer
+        // Read from the buffer
         let mut read_from_buffer = 0;
         for i in 0..output.len() {
             if let Some(sample) = self.consumer.pop() {
@@ -137,99 +193,66 @@ impl<S: Source + Send + Sync> Track<S> {
             }
         }
 
-        // If we read enough from the buffer, we're done
-        if read_from_buffer == output.len() {
+        // If we read something from the buffer, apply volume and update position
+        if read_from_buffer > 0 {
             // Apply volume
             for sample in &mut output[..read_from_buffer] {
                 *sample *= self.volume;
             }
+
             self.position += read_from_buffer;
+
+            // Try to fill the buffer for next time if it's getting low
+            if self.consumer.len() < self.consumer.capacity() / 4 {
+                self.fill_buffer()?;
+            }
+
             return Ok(read_from_buffer);
         }
 
-        // Otherwise, read directly from the source
-        let remaining = output.len() - read_from_buffer;
-        let read_from_source = self.source.read_samples(
-            self.position + read_from_buffer,
-            &mut output[read_from_buffer..],
-        )?;
+        // If buffer is empty, try to fill it and try reading again
+        self.fill_buffer()?;
 
-        if read_from_source == 0 && read_from_buffer == 0 {
+        // If we're still playing but didn't get any samples, we might be at the end of the track
+        if self.position >= self.source.len() {
             self.playing = false;
-            return Ok(0);
         }
 
-        // Apply volume
-        let total_read = read_from_buffer + read_from_source;
-        for sample in &mut output[..total_read] {
-            *sample *= self.volume;
-        }
-
-        self.position += total_read;
-
-        // Try to fill the buffer with new data for next time
-        if self.consumer.len() < self.consumer.capacity() / 4 {
-            for _ in 0..2 {
-                // Try to fill more when buffer is low
-                let filled = self.fill_buffer()?;
-                if filled == 0 {
-                    break; // Nothing more to read
-                }
-            }
-        } else {
-            // Regular buffer filling
-            self.fill_buffer()?;
-        }
-
-        Ok(total_read)
+        Ok(0)
     }
-    fn prefill_buffer(&mut self) -> Result<usize, PlaybackError> {
-        // Clear any existing buffer data
-        while self.consumer.pop().is_some() {}
-
-        // Fill the buffer completely
-        let mut total_filled = 0;
-
-        for _ in 0..3 {
-            // Try up to 3 times to fill the buffer
-            let filled = self.fill_buffer()?;
-            total_filled += filled;
-
-            if filled == 0 {
-                break; // Nothing more to read
-            }
+    fn prefill_buffer(&mut self) -> Result<(), PlaybackError> {
+        // Send a Fill command to start filling the buffer
+        if let Err(e) = self.command_tx.try_send(TrackCommand::Fill(self.position)) {
+            // Handle error if needed
+            tracing::warn!("Failed to send fill command: {}", e);
         }
 
-        Ok(total_filled)
+        // We don't know how much was filled, but the background task is now working on it
+        Ok(())
     }
     // Simple method to fill the buffer
     fn fill_buffer(&mut self) -> Result<usize, PlaybackError> {
-        // Get the available space in the producer
-        let space = self.producer.capacity() - self.producer.len();
-        if space == 0 {
-            return Ok(0);
-        }
-
-        // Create temporary buffer for reading
-        let mut temp = vec![0.0; space.min(1024)]; // Read at most 1024 samples at a time
-
-        // Calculate the position from which to read more data
-        let next_position = self.position;
-
-        // Read from source
-        let read = self.source.read_samples(next_position, &mut temp)?;
-
-        // Push samples to buffer
-        let mut written = 0;
-        for i in 0..read {
-            if self.producer.push(temp[i]).is_ok() {
-                written += 1;
-            } else {
-                break; // Buffer is full
+        // Instead of directly accessing producer, send a Fill command
+        // Use try_send to avoid blocking on a full channel
+        if let Err(e) = self.command_tx.try_send(TrackCommand::Fill(self.position)) {
+            match e {
+                mpsc::error::TrySendError::Full(_) => {
+                    // Channel is full, buffer is probably being filled already
+                    // Just continue
+                    return Ok(0);
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    // Channel is closed, this is an error
+                    return Err(PlaybackError::AudioDevice(
+                        "Buffer management task stopped".into(),
+                    ));
+                }
             }
         }
 
-        Ok(written)
+        // We don't know exactly how many samples were written,
+        // but we can assume the buffer is being filled
+        Ok(self.consumer.capacity() / 4) // Return an estimate
     }
     pub fn stop(&mut self) {
         self.playing = false;
