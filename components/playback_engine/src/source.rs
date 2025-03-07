@@ -50,6 +50,16 @@ pub struct FlacSource {
     seek_mutex: Arc<AsyncMutex<()>>,
 }
 
+type DecoderResult = Result<
+    (
+        Box<dyn FormatReader>,
+        Box<dyn symphonia::core::codecs::Decoder>,
+        u32,
+        u16,
+    ),
+    PlaybackError,
+>;
+
 impl FlacSource {
     pub fn new(path: impl AsRef<Path>) -> Result<Self, PlaybackError> {
         // Create shared resources
@@ -204,17 +214,7 @@ impl FlacSource {
 
         Ok(())
     }
-    fn init_decoder(
-        path: &Path,
-    ) -> Result<
-        (
-            Box<dyn FormatReader>,
-            Box<dyn symphonia::core::codecs::Decoder>,
-            u32,
-            u16,
-        ),
-        PlaybackError,
-    > {
+    fn init_decoder(path: &Path) -> DecoderResult {
         let mut hint = Hint::new();
         hint.with_extension("flac");
 

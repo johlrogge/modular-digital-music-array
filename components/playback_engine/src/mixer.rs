@@ -29,7 +29,6 @@ impl Mixer {
 
         // Get all tracks and their lock guards
         let tracks = decks.read();
-        tracing::info!("Mixer: found {} tracks", tracks.len());
 
         // Mix each active track
         for (deck, track) in tracks.iter() {
@@ -51,9 +50,13 @@ impl Mixer {
                         );
 
                         // Mix into output with volume
-                        for i in 0..len {
-                            output[i] += self.mix_buffer[i] * volume;
-                        }
+                        output
+                            .iter_mut()
+                            .zip(self.mix_buffer.iter())
+                            .take(len)
+                            .for_each(|(out, &input)| {
+                                *out += input * volume;
+                            });
                     }
                     Ok(_) => {
                         tracing::debug!("No samples from deck {:?}", deck);
@@ -100,7 +103,28 @@ mod tests {
         // Setup a deck with a test track
         let mut track = Track::new_test().await.unwrap();
         track.play(); // Start playback
-        decks.write().insert(Deck::A, Arc::new(RwLock::new(track)));
+
+        // Insert track into decks and get a reference to it
+        let track_ref = Arc::new(RwLock::new(track));
+        decks.write().insert(Deck::A, track_ref.clone());
+
+        // Wait for track to be ready
+        let timeout = std::time::Duration::from_millis(100);
+        let start = std::time::Instant::now();
+
+        let mut ready = false;
+        while !ready {
+            if start.elapsed() > timeout {
+                panic!("Timeout waiting for track to be ready");
+            }
+
+            // Check if track is ready
+            ready = track_ref.read().is_ready();
+
+            if !ready {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
 
         let mut mixer = Mixer::new(1024);
         let mut output = vec![0.0; 1024];

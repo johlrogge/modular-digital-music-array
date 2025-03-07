@@ -11,7 +11,8 @@ use cpal::{
     Stream,
 };
 pub use error::PlaybackError;
-use parking_lot::RwLock;
+use mixer::Mixer;
+use parking_lot::{Mutex, RwLock};
 pub use playback_primitives::Deck;
 pub use source::{FlacSource, Source};
 pub use track::Track;
@@ -120,27 +121,21 @@ impl PlaybackEngine {
             buffer_size: cpal::BufferSize::Fixed(BUFFER_SIZE),
         };
 
+        // Create a mixer that will be shared across audio callbacks
+        let mixer = Arc::new(Mutex::new(Mixer::new(
+            BUFFER_SIZE as usize * CHANNELS as usize,
+        )));
+
         let stream = device.build_output_stream(
             &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                // Clear output buffer
-                data.fill(0.0);
+                let mut mixer = mixer.lock();
 
-                // Mix active tracks
-                let decks_guard = decks.read();
-                for (_deck, track) in decks_guard.iter() {
-                    let mut track = track.write();
-                    if track.is_playing() {
-                        let mut buffer = vec![0.0f32; data.len()];
-                        if let Ok(len) = track.get_next_samples(&mut buffer) {
-                            if len > 0 {
-                                let volume = track.get_volume();
-                                for i in 0..len {
-                                    data[i] += buffer[i] * volume;
-                                }
-                            }
-                        }
-                    }
+                // Use the mixer to mix all active tracks
+                if let Err(e) = mixer.mix(&decks, data, data.len()) {
+                    tracing::error!("Error during mixing: {}", e);
+                    // If mixing fails, output silence
+                    data.fill(0.0);
                 }
             },
             move |err| eprintln!("Audio stream error: {}", err),

@@ -1,27 +1,26 @@
-use std::borrow::BorrowMut;
 use std::mem::MaybeUninit;
-use std::path::Path;
 use std::sync::Arc;
 
-use ringbuf::{Consumer, HeapRb, Producer, Rb, SharedRb};
+use ringbuf::{Consumer, Producer, SharedRb};
 
 use crate::error::PlaybackError;
-use crate::source::{FlacSource, Source};
+use crate::source::Source;
 
 use tokio::sync::mpsc;
 
-enum TrackCommand {
-    Fill(usize), // Fill the buffer from this position
-    Seek(usize), // Seek to this position
-    Stop,        // Stop the task
+pub enum TrackCommand {
+    FillFrom(usize), // Fill the buffer starting from this position
+    Shutdown,
 }
 
+type SampleConsumer = Consumer<f32, Arc<SharedRb<f32, Vec<MaybeUninit<f32>>>>>;
+type SampleProducer = Producer<f32, Arc<SharedRb<f32, Vec<MaybeUninit<f32>>>>>;
 pub struct Track<S: Source + Send + Sync + 'static> {
     source: Arc<S>,
     position: usize,
     playing: bool,
     volume: f32,
-    consumer: Consumer<f32, Arc<SharedRb<f32, Vec<MaybeUninit<f32>>>>>,
+    consumer: SampleConsumer,
     command_tx: mpsc::Sender<TrackCommand>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -60,23 +59,39 @@ impl<S: Source + Send + Sync> Track<S> {
         let mut track = track;
         track.task_handle = Some(task_handle);
 
-        // Send initial fill command
-        track.command_tx.send(TrackCommand::Fill(0)).await;
+        // Send initial fill command and wait for buffer to start filling
+        track
+            .command_tx
+            .send(TrackCommand::FillFrom(0))
+            .await
+            .expect("failed to send track command");
+
+        // Wait for initial buffer to fill with timeout
+        let timeout = tokio::time::Duration::from_millis(100);
+        let start = tokio::time::Instant::now();
+
+        while track.consumer.len() < track.consumer.capacity() / 4 {
+            if tokio::time::Instant::now() - start > timeout {
+                tracing::warn!("Timeout waiting for initial buffer to fill");
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+        }
 
         Ok(track)
     }
 
     async fn buffer_management_task(
         source: Arc<S>,
-        mut producer: Producer<f32, Arc<SharedRb<f32, Vec<MaybeUninit<f32>>>>>,
+        mut producer: SampleProducer,
         mut command_rx: mpsc::Receiver<TrackCommand>,
     ) {
         let mut temp_buffer = vec![0.0; 1024];
 
         while let Some(command) = command_rx.recv().await {
             match command {
-                TrackCommand::Fill(position) => {
-                    // Fill the buffer
+                TrackCommand::FillFrom(position) => {
+                    // Fill the buffer from this position
                     let mut current_pos = position;
                     while producer.len() < producer.capacity() / 2 {
                         let read = source
@@ -86,8 +101,8 @@ impl<S: Source + Send + Sync> Track<S> {
                             break;
                         }
 
-                        for i in 0..read {
-                            if producer.push(temp_buffer[i]).is_err() {
+                        for &sample in temp_buffer.iter().take(read) {
+                            if producer.push(sample).is_err() {
                                 break;
                             }
                         }
@@ -95,16 +110,7 @@ impl<S: Source + Send + Sync> Track<S> {
                         current_pos += read;
                     }
                 }
-                TrackCommand::Seek(pos) => {
-                    // Clear the buffer and refill
-                    //producer.rb().borrow_mut().clear();
-
-                    // Start filling from the new position
-                    // let _ =
-                    //     Self::buffer_management_task(source.clone(), producer, command_rx).await;
-                    break;
-                }
-                TrackCommand::Stop => {
+                TrackCommand::Shutdown => {
                     break;
                 }
             }
@@ -114,7 +120,7 @@ impl<S: Source + Send + Sync> Track<S> {
     // This method will be called when we have a Tokio runtime available
     pub fn start_background_task(
         &mut self,
-        command_rx: mpsc::Receiver<TrackCommand>,
+        _command_rx: mpsc::Receiver<TrackCommand>,
     ) -> tokio::task::JoinHandle<()> {
         // The implementation will go here, but for now just a placeholder
         tokio::spawn(async move {
@@ -123,18 +129,35 @@ impl<S: Source + Send + Sync> Track<S> {
     }
 
     pub fn play(&mut self) {
-        self.playing = true;
-
-        // Pre-fill buffer when playback starts
+        // Start filling the buffer first
         if let Err(e) = self.prefill_buffer() {
             tracing::warn!("Failed to prefill buffer: {}", e);
         }
 
+        // Wait for buffer to fill with a timeout
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(100);
+
+        while self.consumer.len() < self.consumer.capacity() / 4 {
+            // Check for timeout
+            if start.elapsed() > timeout {
+                tracing::warn!("Buffer fill timeout - starting playback with partial buffer");
+                break;
+            }
+
+            // Short sleep to avoid busy waiting
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // Now mark as playing
+        self.playing = true;
+
         tracing::info!(
-            "Track playback started: playing={}, position={}, volume={}",
+            "Track playback started: playing={}, position={}, volume={}, buffer_fill={}%",
             self.playing,
             self.position,
-            self.volume
+            self.volume,
+            self.consumer.len() * 100 / self.consumer.capacity()
         );
     }
 
@@ -142,22 +165,22 @@ impl<S: Source + Send + Sync> Track<S> {
         let max_position = self.source.len();
         let target_position = position.min(max_position);
 
-        // Try to perform a real seek via the source's seek method
-        if let Err(e) = self.source.seek(position) {
-            tracing::warn!("Source seek failed: {}", e);
-            // Continue anyway - we'll update the position counter
-        }
+        // Perform seek in the source - this should handle all the internal buffers
+        self.source.seek(target_position)?;
 
-        // Update position counter
+        // Update our position counter
         self.position = target_position;
 
-        // Reset buffer by sending a Seek command
-        // This will clear the buffer and refill it from the new position
-        if let Err(e) = self.command_tx.try_send(TrackCommand::Seek(self.position)) {
-            // If sending fails, log warning but continue
-            tracing::warn!("Failed to send seek command: {}", e);
-        }
+        // Clear our buffer by draining it
+        while self.consumer.pop().is_some() {}
 
+        // Tell the background task to fill from the new position
+        if let Err(e) = self
+            .command_tx
+            .try_send(TrackCommand::FillFrom(self.position))
+        {
+            tracing::warn!("Failed to send fill command after seek: {}", e);
+        }
         tracing::info!(
             "Track seeked to position={}/{}, playing={}, volume={}",
             self.position,
@@ -177,6 +200,12 @@ impl<S: Source + Send + Sync> Track<S> {
         self.source.len()
     }
 
+    // Add this new method
+    pub fn is_ready(&self) -> bool {
+        // A track is considered ready if it's playing and has at least 25% of the buffer filled
+        self.playing && self.consumer.len() >= self.consumer.capacity() / 4
+    }
+
     pub fn get_next_samples(&mut self, output: &mut [f32]) -> Result<usize, PlaybackError> {
         if !self.playing {
             return Ok(0);
@@ -184,9 +213,9 @@ impl<S: Source + Send + Sync> Track<S> {
 
         // Read from the buffer
         let mut read_from_buffer = 0;
-        for i in 0..output.len() {
+        for out in output.iter_mut() {
             if let Some(sample) = self.consumer.pop() {
-                output[i] = sample;
+                *out = sample;
                 read_from_buffer += 1;
             } else {
                 break;
@@ -210,19 +239,35 @@ impl<S: Source + Send + Sync> Track<S> {
             return Ok(read_from_buffer);
         }
 
-        // If buffer is empty, try to fill it and try reading again
+        // Buffer underrun detected!
+        tracing::warn!(
+            "Buffer underrun detected at position={}/{}",
+            self.position,
+            self.source.len()
+        );
+
+        // Try to fill the buffer
         self.fill_buffer()?;
 
-        // If we're still playing but didn't get any samples, we might be at the end of the track
+        // Check if we're at the end of the track
         if self.position >= self.source.len() {
             self.playing = false;
+            tracing::info!("End of track reached");
+        } else {
+            // If we're not at the end, this is a true underrun
+            // We could output silence or try waiting a bit
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
         Ok(0)
     }
+
     fn prefill_buffer(&mut self) -> Result<(), PlaybackError> {
         // Send a Fill command to start filling the buffer
-        if let Err(e) = self.command_tx.try_send(TrackCommand::Fill(self.position)) {
+        if let Err(e) = self
+            .command_tx
+            .try_send(TrackCommand::FillFrom(self.position))
+        {
             // Handle error if needed
             tracing::warn!("Failed to send fill command: {}", e);
         }
@@ -234,7 +279,10 @@ impl<S: Source + Send + Sync> Track<S> {
     fn fill_buffer(&mut self) -> Result<usize, PlaybackError> {
         // Instead of directly accessing producer, send a Fill command
         // Use try_send to avoid blocking on a full channel
-        if let Err(e) = self.command_tx.try_send(TrackCommand::Fill(self.position)) {
+        if let Err(e) = self
+            .command_tx
+            .try_send(TrackCommand::FillFrom(self.position))
+        {
             match e {
                 mpsc::error::TrySendError::Full(_) => {
                     // Channel is full, buffer is probably being filled already
@@ -269,6 +317,21 @@ impl<S: Source + Send + Sync> Track<S> {
 
     pub fn get_volume(&self) -> f32 {
         self.volume
+    }
+}
+
+impl<S: Source + Send + Sync + 'static> Drop for Track<S> {
+    fn drop(&mut self) {
+        // Send shutdown command
+        // Use try_send to avoid blocking if the receiver is gone
+        let _ = self.command_tx.try_send(TrackCommand::Shutdown);
+
+        // Abort task if it's still running
+        if let Some(task) = self.task_handle.take() {
+            // Use try_cancel which is safer than abort
+            // This properly handles test contexts where no runtime exists
+            task.abort();
+        }
     }
 }
 

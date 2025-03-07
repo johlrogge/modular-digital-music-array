@@ -9,7 +9,6 @@ use playback_engine::PlaybackEngine;
 use server::Server;
 
 use tokio::runtime::Runtime;
-use tokio::sync::Mutex;
 
 // In playback_server/src/main.rs
 fn main() -> Result<()> {
@@ -21,8 +20,7 @@ fn main() -> Result<()> {
     let runtime = Runtime::new()?;
 
     // Create the playback engine
-    let engine = Arc::new(Mutex::new(PlaybackEngine::new()?));
-
+    let engine = Arc::new(tokio::sync::Mutex::new(PlaybackEngine::new()?));
     // Create NNG socket for receiving commands
     let socket = Socket::new(Protocol::Rep0)?;
     socket.listen("ipc:///tmp/mdma-commands")?;
