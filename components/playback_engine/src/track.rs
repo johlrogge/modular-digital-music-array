@@ -7,13 +7,25 @@ use ringbuf::{Consumer, HeapRb, Producer, SharedRb};
 use crate::error::PlaybackError;
 use crate::source::{FlacSource, Source};
 
+use tokio::sync::mpsc;
+
+/// Track commands
+enum TrackCommand {
+    Fill,        // Fill the buffer
+    Seek(usize), // Seek to a position
+    Stop,        // Stop background task
+}
+
+// Update Track struct
 pub struct Track<S: Source + Send + Sync> {
-    source: Arc<S>,  // Shared audio source
-    position: usize, // Current playback position
-    playing: bool,   // Playback state
-    volume: f32,     // Volume multiplier
+    source: Arc<S>,
+    position: usize,
+    playing: bool,
+    volume: f32,
     producer: Producer<f32, Arc<SharedRb<f32, Vec<MaybeUninit<f32>>>>>,
     consumer: Consumer<f32, Arc<SharedRb<f32, Vec<MaybeUninit<f32>>>>>,
+    command_tx: mpsc::Sender<TrackCommand>,
+    task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl<S: Source + Send + Sync> Track<S> {
@@ -22,9 +34,14 @@ impl<S: Source + Send + Sync> Track<S> {
     pub async fn new(path: &Path) -> Result<Track<FlacSource>, PlaybackError> {
         let source = Arc::new(FlacSource::new(path)?);
 
-        // Create the ring buffer and wrap it in Arc
+        // Create ring buffer
         let rb = HeapRb::<f32>::new(Self::BUFFER_SIZE);
         let (producer, consumer) = rb.split();
+
+        // Create command channel
+        let (command_tx, command_rx) = mpsc::channel(32);
+
+        // We'll create the background task later when we have access to the shared runtime
 
         Ok(Track {
             source,
@@ -33,6 +50,19 @@ impl<S: Source + Send + Sync> Track<S> {
             volume: 1.0,
             producer,
             consumer,
+            command_tx,
+            task_handle: None,
+        })
+    }
+
+    // This method will be called when we have a Tokio runtime available
+    pub fn start_background_task(
+        &mut self,
+        command_rx: mpsc::Receiver<TrackCommand>,
+    ) -> tokio::task::JoinHandle<()> {
+        // The implementation will go here, but for now just a placeholder
+        tokio::spawn(async move {
+            // Background task logic will go here
         })
     }
 
@@ -270,6 +300,8 @@ impl Track<TestSource> {
         // Create the ring buffer and wrap it in Arc
         let rb = HeapRb::<f32>::new(Self::BUFFER_SIZE);
         let (producer, consumer) = rb.split();
+        // Create command channel
+        let (command_tx, command_rx) = mpsc::channel(32);
         Self {
             source: Arc::new(TestSource { samples }),
             position: 0,
@@ -277,6 +309,8 @@ impl Track<TestSource> {
             volume: 1.0,
             producer,
             consumer,
+            command_tx,
+            task_handle: None,
         }
     }
 }
