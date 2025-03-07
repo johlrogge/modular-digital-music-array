@@ -8,13 +8,17 @@ use nng::{Protocol, Socket};
 use playback_engine::PlaybackEngine;
 use server::Server;
 
+use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+// In playback_server/src/main.rs
+fn main() -> Result<()> {
     // Initialize error handling and logging
     color_eyre::install()?;
     tracing_subscriber::fmt::init();
+
+    // Create a Tokio runtime explicitly
+    let runtime = Runtime::new()?;
 
     // Create the playback engine
     let engine = Arc::new(Mutex::new(PlaybackEngine::new()?));
@@ -25,7 +29,7 @@ async fn main() -> Result<()> {
 
     // Create and run server
     let server = Server::new(engine, socket);
-    server.run().await?;
+    runtime.block_on(server.run())?;
 
     Ok(())
 }

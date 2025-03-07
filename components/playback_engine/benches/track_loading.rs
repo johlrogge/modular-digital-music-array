@@ -21,7 +21,7 @@ fn bench_track_loading(c: &mut Criterion) {
 
         // Get initial metrics once before benchmarking
         let track = rt.block_on(async {
-            Track::<FlacSource>::new(&path)
+            Track::<FlacSource>::new(FlacSource::new(&path).unwrap())
                 .await
                 .expect("Failed to load track")
         });
@@ -34,7 +34,7 @@ fn bench_track_loading(c: &mut Criterion) {
             let path = test_file_path(name);
             b.iter_with_large_drop(|| {
                 let track = rt.block_on(async {
-                    Track::<FlacSource>::new(black_box(&path))
+                    Track::<FlacSource>::new(black_box(FlacSource::new(&path).unwrap()))
                         .await
                         .expect("Failed to load track")
                 });
@@ -60,7 +60,7 @@ fn bench_time_to_playable(c: &mut Criterion) {
         // Print metrics once before benchmarking
         let start = Instant::now();
         let mut track = rt.block_on(async {
-            Track::<FlacSource>::new(&path)
+            Track::<FlacSource>::new(FlacSource::new(&path).unwrap())
                 .await
                 .expect("Failed to load track")
         });
@@ -81,7 +81,7 @@ fn bench_time_to_playable(c: &mut Criterion) {
             b.iter_with_large_drop(|| {
                 let start = Instant::now();
                 let mut track = rt.block_on(async {
-                    Track::<FlacSource>::new(black_box(&path))
+                    Track::<FlacSource>::new(black_box(FlacSource::new(&path).unwrap()))
                         .await
                         .expect("Failed to load track")
                 });
@@ -107,7 +107,7 @@ fn bench_seeking(c: &mut Criterion) {
 
         // Create a track for testing
         let mut track = rt.block_on(async {
-            Track::<FlacSource>::new(&path)
+            Track::<FlacSource>::new(FlacSource::new(&path).unwrap())
                 .await
                 .expect("Failed to load track")
         });

@@ -76,7 +76,7 @@ impl PlaybackEngine {
 
     pub async fn load_track(&mut self, deck: Deck, path: &Path) -> Result<(), PlaybackError> {
         // Create new track
-        let track = Track::<FlacSource>::new(path).await?;
+        let track = Track::<FlacSource>::new(FlacSource::new(path)?).await?;
 
         // Acquire lock and insert track
         let mut decks = self.decks.write();

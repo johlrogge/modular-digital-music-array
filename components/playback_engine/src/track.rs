@@ -31,8 +31,9 @@ pub struct Track<S: Source + Send + Sync> {
 impl<S: Source + Send + Sync> Track<S> {
     const BUFFER_SIZE: usize = 4096; // Small buffer size to start with
 
-    pub async fn new(path: &Path) -> Result<Track<FlacSource>, PlaybackError> {
-        let source = Arc::new(FlacSource::new(path)?);
+    // Make this method generic over the Source type
+    pub async fn new(source: S) -> Result<Self, PlaybackError> {
+        let source = Arc::new(source);
 
         // Create ring buffer
         let rb = HeapRb::<f32>::new(Self::BUFFER_SIZE);
@@ -40,8 +41,6 @@ impl<S: Source + Send + Sync> Track<S> {
 
         // Create command channel
         let (command_tx, command_rx) = mpsc::channel(32);
-
-        // We'll create the background task later when we have access to the shared runtime
 
         Ok(Track {
             source,
@@ -283,7 +282,7 @@ impl Source for TestSource {
 
 #[cfg(test)]
 impl Track<TestSource> {
-    pub(crate) fn new_test() -> Self {
+    pub(crate) async fn new_test() -> Result<Self, PlaybackError> {
         // Create a simple 1-second sine wave source
 
         // Generate 1 second of 440Hz test tone
@@ -297,20 +296,6 @@ impl Track<TestSource> {
             samples.push(sample);
         }
 
-        // Create the ring buffer and wrap it in Arc
-        let rb = HeapRb::<f32>::new(Self::BUFFER_SIZE);
-        let (producer, consumer) = rb.split();
-        // Create command channel
-        let (command_tx, command_rx) = mpsc::channel(32);
-        Self {
-            source: Arc::new(TestSource { samples }),
-            position: 0,
-            playing: false,
-            volume: 1.0,
-            producer,
-            consumer,
-            command_tx,
-            task_handle: None,
-        }
+        Self::new(TestSource { samples }).await
     }
 }

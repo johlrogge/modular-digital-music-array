@@ -93,12 +93,12 @@ mod tests {
         assert!(output.iter().all(|&x| x == 0.0));
     }
 
-    #[test]
-    fn test_mix_single_deck() {
+    #[tokio::test]
+    async fn test_mix_single_deck() {
         let decks = RwLock::new(HashMap::new());
 
         // Setup a deck with a test track
-        let mut track = Track::new_test();
+        let mut track = Track::new_test().await.unwrap();
         track.play(); // Start playback
         decks.write().insert(Deck::A, Arc::new(RwLock::new(track)));
 
@@ -111,12 +111,12 @@ mod tests {
         assert!(!output.iter().all(|&x| x == 0.0));
     }
 
-    #[test]
-    fn test_mix_prevents_clipping() {
+    #[tokio::test]
+    async fn test_mix_prevents_clipping() {
         let decks = RwLock::new(HashMap::new());
 
         // Setup a deck with a test track
-        let mut track = Track::new_test();
+        let mut track = Track::new_test().await.unwrap();
         track.play();
         decks.write().insert(Deck::A, Arc::new(RwLock::new(track)));
 
@@ -126,6 +126,6 @@ mod tests {
         mixer.mix(&decks, &mut output, 1024).unwrap();
 
         // No samples should exceed [-1.0, 1.0]
-        assert!(output.iter().all(|&x| x >= -1.0 && x <= 1.0));
+        assert!(output.iter().all(|&x| (-1.0..=1.0).contains(&x)));
     }
 }

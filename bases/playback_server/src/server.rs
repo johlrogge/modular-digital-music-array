@@ -24,6 +24,7 @@ impl Server {
     pub fn new(engine: Arc<Mutex<PlaybackEngine>>, socket: Socket) -> Self {
         Self { engine, socket }
     }
+
     pub async fn run(&self) -> Result<(), ServerError> {
         info!("Playback server starting...");
 
