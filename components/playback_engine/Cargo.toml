@@ -16,6 +16,7 @@ crossbeam = "0.8"
 time-primitives = { path = "../time_primitives" }
 playback-primitives = { path = "../playback_primitives" }
 tracing.workspace=true
+ringbuf = "0.3"
 
 [build-dependencies]
 hound = "3.5"    # For WAV handling

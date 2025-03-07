@@ -1,26 +1,38 @@
+use std::mem::MaybeUninit;
 use std::path::Path;
 use std::sync::Arc;
+
+use ringbuf::{Consumer, HeapRb, Producer, SharedRb};
 
 use crate::error::PlaybackError;
 use crate::source::{FlacSource, Source};
 
-#[derive(Clone)]
 pub struct Track<S: Source + Send + Sync> {
-    source: Arc<S>, // Shared audio source
-    position: usize,
-    playing: bool,
-    volume: f32,
+    source: Arc<S>,  // Shared audio source
+    position: usize, // Current playback position
+    playing: bool,   // Playback state
+    volume: f32,     // Volume multiplier
+    producer: Producer<f32, Arc<SharedRb<f32, Vec<MaybeUninit<f32>>>>>,
+    consumer: Consumer<f32, Arc<SharedRb<f32, Vec<MaybeUninit<f32>>>>>,
 }
 
 impl<S: Source + Send + Sync> Track<S> {
+    const BUFFER_SIZE: usize = 4096; // Small buffer size to start with
+
     pub async fn new(path: &Path) -> Result<Track<FlacSource>, PlaybackError> {
         let source = Arc::new(FlacSource::new(path)?);
+
+        // Create the ring buffer and wrap it in Arc
+        let rb = HeapRb::<f32>::new(Self::BUFFER_SIZE);
+        let (producer, consumer) = rb.split();
 
         Ok(Track {
             source,
             position: 0,
             playing: false,
             volume: 1.0,
+            producer,
+            consumer,
         })
     }
 
@@ -67,28 +79,87 @@ impl<S: Source + Send + Sync> Track<S> {
         self.source.len()
     }
 
-    pub fn get_next_samples(&mut self, buffer: &mut [f32]) -> Result<usize, PlaybackError> {
+    pub fn get_next_samples(&mut self, output: &mut [f32]) -> Result<usize, PlaybackError> {
         if !self.playing {
             return Ok(0);
         }
 
-        // Read samples directly into the provided buffer
-        let read = self.source.read_samples(self.position, buffer)?;
+        // First, try to read any existing data from the ring buffer
+        let mut read_from_buffer = 0;
+        for i in 0..output.len() {
+            if let Some(sample) = self.consumer.pop() {
+                output[i] = sample;
+                read_from_buffer += 1;
+            } else {
+                break;
+            }
+        }
 
-        if read == 0 {
+        // If we read enough from the buffer, we're done
+        if read_from_buffer == output.len() {
+            // Apply volume
+            for sample in &mut output[..read_from_buffer] {
+                *sample *= self.volume;
+            }
+            self.position += read_from_buffer;
+            return Ok(read_from_buffer);
+        }
+
+        // Otherwise, read directly from the source
+        let remaining = output.len() - read_from_buffer;
+        let read_from_source = self.source.read_samples(
+            self.position + read_from_buffer,
+            &mut output[read_from_buffer..],
+        )?;
+
+        if read_from_source == 0 && read_from_buffer == 0 {
             self.playing = false;
             return Ok(0);
         }
 
         // Apply volume
-        for sample in &mut buffer[..read] {
+        let total_read = read_from_buffer + read_from_source;
+        for sample in &mut output[..total_read] {
             *sample *= self.volume;
         }
 
-        self.position += read;
-        Ok(read)
+        self.position += total_read;
+
+        // Try to fill the buffer with new data for next time
+        self.fill_buffer()?;
+
+        Ok(total_read)
     }
 
+    // Simple method to fill the buffer
+    fn fill_buffer(&mut self) -> Result<usize, PlaybackError> {
+        // Get the available space in the producer
+        let space = self.producer.capacity() - self.producer.len();
+        if space == 0 {
+            return Ok(0);
+        }
+
+        // Create temporary buffer for reading
+        let mut temp = vec![0.0; space.min(1024)]; // Read at most 1024 samples at a time
+
+        // Calculate the position from which to read more data
+        let next_position = self.position;
+
+        // Read from source
+        let read = self.source.read_samples(next_position, &mut temp)?;
+
+        // Push samples to buffer
+        let mut written = 0;
+        for i in 0..read {
+            if self.producer.push(temp[i]).is_ok() {
+                written += 1;
+            } else {
+                break; // Buffer is full
+            }
+        }
+
+        Ok(written)
+    }
     pub fn stop(&mut self) {
         self.playing = false;
     }
@@ -154,11 +225,16 @@ impl Track<TestSource> {
             samples.push(sample);
         }
 
+        // Create the ring buffer and wrap it in Arc
+        let rb = HeapRb::<f32>::new(Self::BUFFER_SIZE);
+        let (producer, consumer) = rb.split();
         Self {
             source: Arc::new(TestSource { samples }),
             position: 0,
             playing: false,
             volume: 1.0,
+            producer,
+            consumer,
         }
     }
 }
