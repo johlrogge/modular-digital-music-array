@@ -117,17 +117,6 @@ impl<S: Source + Send + Sync> Track<S> {
         }
     }
 
-    // This method will be called when we have a Tokio runtime available
-    pub fn start_background_task(
-        &mut self,
-        _command_rx: mpsc::Receiver<TrackCommand>,
-    ) -> tokio::task::JoinHandle<()> {
-        // The implementation will go here, but for now just a placeholder
-        tokio::spawn(async move {
-            // Background task logic will go here
-        })
-    }
-
     pub fn play(&mut self) {
         // Start filling the buffer first
         if let Err(e) = self.prefill_buffer() {
