@@ -134,20 +134,7 @@ impl<S: Source + Send + Sync> Track<S> {
             tracing::warn!("Failed to prefill buffer: {}", e);
         }
 
-        // Wait for buffer to fill with a timeout
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_millis(100);
-
-        while self.consumer.len() < self.consumer.capacity() / 4 {
-            // Check for timeout
-            if start.elapsed() > timeout {
-                tracing::warn!("Buffer fill timeout - starting playback with partial buffer");
-                break;
-            }
-
-            // Short sleep to avoid busy waiting
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        self.await_ready();
 
         // Now mark as playing
         self.playing = true;
@@ -161,18 +148,28 @@ impl<S: Source + Send + Sync> Track<S> {
         );
     }
 
+    /// Wait for buffer to fill with a timeout
+    fn await_ready(&mut self) {
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(100);
+
+        while !self.is_ready() {
+            if start.elapsed() > timeout {
+                tracing::warn!("Buffer fill timeout - starting playback with partial buffer");
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     pub async fn seek(&mut self, position: usize) -> Result<(), PlaybackError> {
         let max_position = self.source.len();
         let target_position = position.min(max_position);
 
-        // Perform async seek in the source
         self.source.seek(target_position).await?;
-
-        // Rest of the method stays the same
         self.position = target_position;
 
-        // Clear our buffer by draining it
-        while self.consumer.pop().is_some() {}
+        self.drain_buffer();
 
         // Tell the background task to fill from the new position
         if let Err(e) = self
@@ -193,6 +190,10 @@ impl<S: Source + Send + Sync> Track<S> {
         Ok(())
     }
 
+    fn drain_buffer(&mut self) {
+        while self.consumer.pop().is_some() {}
+    }
+
     pub fn position(&self) -> usize {
         self.position
     }
@@ -201,10 +202,9 @@ impl<S: Source + Send + Sync> Track<S> {
         self.source.len()
     }
 
-    // Add this new method
+    /// A track is considered ready if has at least 25% of the buffer filled
     pub fn is_ready(&self) -> bool {
-        // A track is considered ready if it's playing and has at least 25% of the buffer filled
-        self.playing && self.consumer.len() >= self.consumer.capacity() / 4
+        self.consumer.len() >= self.consumer.capacity() / 4
     }
 
     pub fn get_next_samples(&mut self, output: &mut [f32]) -> Result<usize, PlaybackError> {
