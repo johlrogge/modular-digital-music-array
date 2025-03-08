@@ -161,14 +161,14 @@ impl<S: Source + Send + Sync> Track<S> {
         );
     }
 
-    pub fn seek(&mut self, position: usize) -> Result<(), PlaybackError> {
+    pub async fn seek(&mut self, position: usize) -> Result<(), PlaybackError> {
         let max_position = self.source.len();
         let target_position = position.min(max_position);
 
-        // Perform seek in the source - this should handle all the internal buffers
-        self.source.seek(target_position)?;
+        // Perform async seek in the source
+        self.source.seek(target_position).await?;
 
-        // Update our position counter
+        // Rest of the method stays the same
         self.position = target_position;
 
         // Clear our buffer by draining it
@@ -181,6 +181,7 @@ impl<S: Source + Send + Sync> Track<S> {
         {
             tracing::warn!("Failed to send fill command after seek: {}", e);
         }
+
         tracing::info!(
             "Track seeked to position={}/{}, playing={}, volume={}",
             self.position,

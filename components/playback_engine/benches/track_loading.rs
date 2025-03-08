@@ -1,7 +1,9 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use parking_lot::Mutex;
 use playback_engine::FlacSource;
 use playback_engine::Track;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 fn test_file_path(name: &str) -> PathBuf {
@@ -21,7 +23,7 @@ fn bench_track_loading(c: &mut Criterion) {
 
         // Get initial metrics once before benchmarking
         let track = rt.block_on(async {
-            Track::<FlacSource>::new(FlacSource::new(&path).unwrap())
+            Track::<FlacSource>::new(FlacSource::new(&path).await.unwrap())
                 .await
                 .expect("Failed to load track")
         });
@@ -33,14 +35,13 @@ fn bench_track_loading(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(name), name, |b, name| {
             let path = test_file_path(name);
             b.iter_with_large_drop(|| {
-                let track = rt.block_on(async {
-                    Track::<FlacSource>::new(black_box(FlacSource::new(&path).unwrap()))
+                rt.block_on(async {
+                    Track::<FlacSource>::new(black_box(FlacSource::new(&path).await.unwrap()))
                         .await
                         .expect("Failed to load track")
                 });
 
                 // The iter_with_large_drop will drop the track after each iteration
-                track
             });
         });
     }
@@ -60,7 +61,7 @@ fn bench_time_to_playable(c: &mut Criterion) {
         // Print metrics once before benchmarking
         let start = Instant::now();
         let mut track = rt.block_on(async {
-            Track::<FlacSource>::new(FlacSource::new(&path).unwrap())
+            Track::<FlacSource>::new(FlacSource::new(&path).await.unwrap())
                 .await
                 .expect("Failed to load track")
         });
@@ -81,7 +82,7 @@ fn bench_time_to_playable(c: &mut Criterion) {
             b.iter_with_large_drop(|| {
                 let start = Instant::now();
                 let mut track = rt.block_on(async {
-                    Track::<FlacSource>::new(black_box(FlacSource::new(&path).unwrap()))
+                    Track::<FlacSource>::new(black_box(FlacSource::new(&path).await.unwrap()))
                         .await
                         .expect("Failed to load track")
                 });
@@ -99,21 +100,21 @@ fn bench_time_to_playable(c: &mut Criterion) {
 fn bench_seeking(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("seeking");
-    group.warm_up_time(Duration::from_secs(1));
-    group.measurement_time(Duration::from_secs(5));
 
     for name in ["short.flac", "medium.flac", "long.flac"] {
         let path = test_file_path(name);
 
         // Create a track for testing
-        let mut track = rt.block_on(async {
-            Track::<FlacSource>::new(FlacSource::new(&path).unwrap())
+        let track = rt.block_on(async {
+            Track::<FlacSource>::new(FlacSource::new(&path).await.unwrap())
                 .await
                 .expect("Failed to load track")
         });
-        let length = track.length();
 
-        // Benchmark seeking to different positions
+        // Create a shared reference that can be cloned for each benchmark
+        let track = Arc::new(Mutex::new(track));
+        let length = rt.block_on(async { track.lock().length() });
+
         let positions = [
             ("start", 0),
             ("quarter", length / 4),
@@ -123,27 +124,38 @@ fn bench_seeking(c: &mut Criterion) {
         ];
 
         for (label, pos) in positions {
+            // Simple seek benchmark
+            let track_clone = track.clone();
             group.bench_with_input(
                 BenchmarkId::new(format!("seek_to_{}", label), name),
                 &pos,
                 |b, &pos| {
+                    // Use black_box to ensure the compiler doesn't optimize away the calls
+                    let pos = black_box(pos);
                     b.iter(|| {
-                        track.seek(pos);
+                        // Use the runtime to block_on the async seek operation
+                        rt.block_on(async {
+                            let mut track = track_clone.lock();
+                            track.seek(pos).await.unwrap();
+                        });
                     });
                 },
             );
-        }
 
-        // Benchmark seek and read (more realistic)
-        for (label, pos) in positions {
+            // Seek and read benchmark
+            let track_clone = track.clone();
             group.bench_with_input(
                 BenchmarkId::new(format!("seek_and_read_{}", label), name),
                 &pos,
                 |b, &pos| {
                     let mut buffer = vec![0.0f32; 1024];
+                    let pos = black_box(pos);
                     b.iter(|| {
-                        track.seek(pos);
-                        track.get_next_samples(&mut buffer).unwrap();
+                        rt.block_on(async {
+                            let mut track = track_clone.lock();
+                            track.seek(pos).await.unwrap();
+                            track.get_next_samples(&mut buffer).unwrap();
+                        });
                     });
                 },
             );

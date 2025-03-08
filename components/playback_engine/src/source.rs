@@ -13,7 +13,6 @@ use symphonia::core::units::Time;
 use tokio::sync::Mutex as AsyncMutex;
 
 pub trait Source: Send + Sync {
-    // Existing methods...
     fn read_samples(&self, position: usize, buffer: &mut [f32]) -> Result<usize, PlaybackError>;
     fn sample_rate(&self) -> u32;
     fn audio_channels(&self) -> u16;
@@ -23,7 +22,7 @@ pub trait Source: Send + Sync {
     }
 
     // Change seek to take an immutable reference
-    fn seek(&self, _position: usize) -> Result<(), PlaybackError> {
+    async fn seek(&self, _position: usize) -> Result<(), PlaybackError> {
         // Default implementation (no-op)
         Ok(())
     }
@@ -61,7 +60,7 @@ type DecoderResult = Result<
 >;
 
 impl FlacSource {
-    pub fn new(path: impl AsRef<Path>) -> Result<Self, PlaybackError> {
+    pub async fn new(path: impl AsRef<Path>) -> Result<Self, PlaybackError> {
         // Create shared resources
         let packets = Arc::new(RwLock::new(Vec::new()));
         let total_samples = Arc::new(AtomicUsize::new(0));
@@ -93,7 +92,7 @@ impl FlacSource {
         source.loading_task = Some(loading_task);
 
         // Wait for initial buffer to fill
-        source.wait_for_initial_buffer()?;
+        source.wait_for_initial_buffer().await?;
 
         Ok(source)
     }
@@ -187,13 +186,13 @@ impl FlacSource {
         Ok(loading_task)
     }
 
-    fn wait_for_initial_buffer(&self) -> Result<(), PlaybackError> {
-        const INITIAL_BUFFER_SECS: f32 = 0.5;
+    async fn wait_for_initial_buffer(&self) -> Result<(), PlaybackError> {
+        const INITIAL_BUFFER_SECS: f32 = 0.05; // Reduced from 0.5
         let target_samples =
             (INITIAL_BUFFER_SECS * self.sample_rate as f32 * self.audio_channels as f32) as usize;
 
-        // Create a timeout for waiting
-        let timeout = std::time::Duration::from_secs(5);
+        // Create a shorter timeout
+        let timeout = std::time::Duration::from_millis(20); // Just 20ms instead of 5 seconds!
         let start = std::time::Instant::now();
 
         // Wait until we have enough samples or timeout
@@ -203,17 +202,19 @@ impl FlacSource {
             < target_samples
         {
             if start.elapsed() > timeout {
-                return Err(PlaybackError::Decoder(
-                    "Timeout waiting for initial buffer".into(),
-                ));
+                // Don't error out - just continue with what we have
+                tracing::warn!(
+                    "Buffer fill timeout after {:?} - continuing with partial buffer",
+                    start.elapsed()
+                );
+                break;
             }
-
-            // Short sleep to avoid busy waiting
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            tokio::time::sleep(tokio::time::Duration::from_micros(500)).await;
         }
 
         Ok(())
     }
+
     fn init_decoder(path: &Path) -> DecoderResult {
         let mut hint = Hint::new();
         hint.with_extension("flac");
@@ -303,7 +304,7 @@ impl FlacSource {
 
         // Wait for the background loader to fill the buffer
         // The background loader will automatically start loading from the new position
-        self.wait_for_initial_buffer()?;
+        self.wait_for_initial_buffer().await?;
 
         Ok(())
     }
@@ -360,15 +361,8 @@ impl Source for FlacSource {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn seek(&self, position: usize) -> Result<(), PlaybackError> {
-        // Create a runtime to block on the async seek
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| PlaybackError::Decoder(format!("Failed to create runtime: {}", e)))?;
-
-        // Block on the async seek
-        runtime.block_on(self.async_seek(position))
+    async fn seek(&self, position: usize) -> Result<(), PlaybackError> {
+        self.async_seek(position).await
     }
 }
 

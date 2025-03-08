@@ -87,15 +87,14 @@ impl Server {
                     .unload_track(Self::convert_deck(deck));
                 self.create_response(result, None)
             }
-
-            // New commands
             Command::Seek { deck, position } => {
                 info!("Seeking deck {:?} to position {}", deck, position);
                 let result = self
                     .engine
                     .lock()
                     .await
-                    .seek(Self::convert_deck(deck), position);
+                    .seek(Self::convert_deck(deck), position)
+                    .await; // Now awaiting the seek operation
                 self.create_response(result, None)
             }
             Command::GetPosition { deck } => {

@@ -77,7 +77,7 @@ impl PlaybackEngine {
 
     pub async fn load_track(&mut self, deck: Deck, path: &Path) -> Result<(), PlaybackError> {
         // Create new track
-        let track = Track::<FlacSource>::new(FlacSource::new(path)?).await?;
+        let track = Track::<FlacSource>::new(FlacSource::new(path).await?).await?;
 
         // Acquire lock and insert track
         let mut decks = self.decks.write();
@@ -146,11 +146,14 @@ impl PlaybackEngine {
         Ok(stream)
     }
 
-    pub fn seek(&mut self, deck: Deck, position: usize) -> Result<(), PlaybackError> {
+    pub async fn seek(&mut self, deck: Deck, position: usize) -> Result<(), PlaybackError> {
         if let Some(track) = self.find_track(deck) {
             tracing::info!("Seeking deck {:?} to position {}", deck, position);
-            track.write().seek(position)?;
-            Ok(())
+            // We need to pass the RwLockWriteGuard to the async context, which is tricky
+            // We'll need to get a write lock, perform the seek, and release
+            let mut track_guard = track.write();
+            let result = track_guard.seek(position).await;
+            result
         } else {
             tracing::error!("No track loaded in deck {:?}", deck);
             Err(PlaybackError::NoTrackLoaded(deck))
