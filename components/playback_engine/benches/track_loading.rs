@@ -142,7 +142,7 @@ fn bench_seeking(c: &mut Criterion) {
                     b.iter(|| {
                         rt.block_on(async {
                             let mut track = track_clone.lock();
-                            track.seek(pos).await.unwrap();
+                            track.seek(pos).unwrap();
                         });
                     });
                 },
@@ -159,7 +159,7 @@ fn bench_seeking(c: &mut Criterion) {
                     b.iter(|| {
                         rt.block_on(async {
                             let mut track = track_clone.lock();
-                            track.seek(pos).await.unwrap();
+                            track.seek(pos).unwrap();
                             track.get_next_samples(&mut buffer).unwrap();
                         });
                     });

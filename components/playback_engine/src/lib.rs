@@ -152,8 +152,7 @@ impl PlaybackEngine {
             // We need to pass the RwLockWriteGuard to the async context, which is tricky
             // We'll need to get a write lock, perform the seek, and release
             let mut track_guard = track.write();
-            let result = track_guard.seek(position).await;
-            result
+            track_guard.seek(position)
         } else {
             tracing::error!("No track loaded in deck {:?}", deck);
             Err(PlaybackError::NoTrackLoaded(deck))

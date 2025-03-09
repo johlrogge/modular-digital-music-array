@@ -4,7 +4,9 @@ use std::sync::Arc;
 use ringbuf::{Consumer, Producer, SharedRb};
 
 use crate::error::PlaybackError;
-use crate::source::Source;
+#[cfg(test)]
+use crate::source::{AudioSegment, DecodedSegment, SegmentIndex};
+use crate::source::{Source, SEGMENT_SIZE};
 
 use tokio::sync::mpsc;
 
@@ -86,28 +88,33 @@ impl<S: Source + Send + Sync> Track<S> {
         mut producer: SampleProducer,
         mut command_rx: mpsc::Receiver<TrackCommand>,
     ) {
-        let mut temp_buffer = vec![0.0; 1024];
-
         while let Some(command) = command_rx.recv().await {
             match command {
                 TrackCommand::FillFrom(position) => {
-                    // Fill the buffer from this position
-                    let mut current_pos = position;
-                    while producer.len() < producer.capacity() / 2 {
-                        let read = source
-                            .read_samples(current_pos, &mut temp_buffer)
-                            .unwrap_or(0);
-                        if read == 0 {
-                            break;
-                        }
+                    // Seek to the position first
+                    if let Err(e) = source.seek(position) {
+                        tracing::error!("Failed to seek source: {}", e);
+                        continue;
+                    }
 
-                        for &sample in temp_buffer.iter().take(read) {
-                            if producer.push(sample).is_err() {
-                                break;
+                    // Calculate how many segments we need
+                    let segments_to_decode = (producer.capacity() / 2) / SEGMENT_SIZE;
+
+                    // Decode segments
+                    match source.decode_segments(segments_to_decode) {
+                        Ok(segments) => {
+                            for decoded in segments {
+                                // Convert segment to samples and push to producer
+                                for sample in &decoded.segment.samples {
+                                    if producer.push(*sample).is_err() {
+                                        break; // Buffer is full
+                                    }
+                                }
                             }
                         }
-
-                        current_pos += read;
+                        Err(e) => {
+                            tracing::error!("Failed to decode segments: {}", e);
+                        }
                     }
                 }
                 TrackCommand::Shutdown => {
@@ -151,11 +158,11 @@ impl<S: Source + Send + Sync> Track<S> {
         }
     }
 
-    pub async fn seek(&mut self, position: usize) -> Result<(), PlaybackError> {
-        let max_position = self.source.len();
-        let target_position = position.min(max_position);
+    pub fn seek(&mut self, position: usize) -> Result<(), PlaybackError> {
+        let target_position = position;
 
-        self.source.seek(target_position).await?;
+        // Seek the source
+        self.source.seek(target_position)?; // No more .await here
         self.position = target_position;
 
         self.drain_buffer();
@@ -169,9 +176,8 @@ impl<S: Source + Send + Sync> Track<S> {
         }
 
         tracing::info!(
-            "Track seeked to position={}/{}, playing={}, volume={}",
+            "Track seeked to position={}, playing={}, volume={}",
             self.position,
-            max_position,
             self.playing,
             self.volume
         );
@@ -188,7 +194,8 @@ impl<S: Source + Send + Sync> Track<S> {
     }
 
     pub fn length(&self) -> usize {
-        self.source.len()
+        // Use total_samples() instead of len()
+        self.source.total_samples().unwrap_or(0)
     }
 
     /// A track is considered ready if has at least 25% of the buffer filled
@@ -229,18 +236,21 @@ impl<S: Source + Send + Sync> Track<S> {
             return Ok(read_from_buffer);
         }
 
+        // Try to fill the buffer
+        self.fill_buffer()?;
+
+        let total_len = match self.source.total_samples() {
+            Some(len) => len,
+            None => usize::MAX, // Assume unlimited length if unknown
+        };
         // Buffer underrun detected!
         tracing::warn!(
             "Buffer underrun detected at position={}/{}",
             self.position,
-            self.source.len()
+            total_len
         );
 
-        // Try to fill the buffer
-        self.fill_buffer()?;
-
-        // Check if we're at the end of the track
-        if self.position >= self.source.len() {
+        if self.position >= total_len {
             self.playing = false;
             tracing::info!("End of track reached");
         } else {
@@ -332,15 +342,64 @@ pub struct TestSource {
 
 #[cfg(test)]
 impl Source for TestSource {
-    fn read_samples(&self, position: usize, buffer: &mut [f32]) -> Result<usize, PlaybackError> {
-        if position >= self.samples.len() {
-            return Ok(0);
+    fn decode_segments(&self, max_segments: usize) -> Result<Vec<DecodedSegment>, PlaybackError> {
+        // Early return if no more data
+        if self.samples.is_empty() {
+            return Ok(Vec::new());
         }
-        let available = self.samples.len() - position;
-        let count = buffer.len().min(available);
 
-        buffer[..count].copy_from_slice(&self.samples[position..position + count]);
-        Ok(count)
+        let mut result = Vec::new();
+        let mut remaining_samples = self.samples.len();
+        let mut current_position = 0;
+
+        // Create segments until we run out of samples or reach max_segments
+        for _ in 0..max_segments {
+            if remaining_samples == 0 {
+                break;
+            }
+
+            // Calculate segment index
+            let segment_index = SegmentIndex::from_sample_position(current_position);
+
+            // Create a segment
+            let mut segment = AudioSegment {
+                samples: [0.0; SEGMENT_SIZE],
+            };
+
+            // Calculate how many samples to copy
+            let samples_to_copy = std::cmp::min(remaining_samples, SEGMENT_SIZE);
+
+            // Copy samples to segment (zero-padded if needed)
+            for i in 0..samples_to_copy {
+                segment.samples[i] = self.samples[current_position + i];
+            }
+
+            // For any remaining samples in the segment, fill with zeros
+            for i in samples_to_copy..SEGMENT_SIZE {
+                segment.samples[i] = 0.0;
+            }
+
+            // Add segment to result
+            result.push(DecodedSegment {
+                index: segment_index,
+                segment,
+            });
+
+            // Update position and remaining count
+            current_position += samples_to_copy;
+            remaining_samples -= samples_to_copy;
+        }
+
+        Ok(result)
+    }
+
+    fn seek(&self, position: usize) -> Result<(), PlaybackError> {
+        // For TestSource, seek is a no-op since we have all samples in memory
+        // Just validate the position is within bounds
+        if position > self.samples.len() {
+            return Err(PlaybackError::Decoder("Seek position out of bounds".into()));
+        }
+        Ok(())
     }
 
     fn sample_rate(&self) -> u32 {
@@ -351,16 +410,14 @@ impl Source for TestSource {
         2
     }
 
-    fn len(&self) -> usize {
-        self.samples.len()
+    fn total_samples(&self) -> Option<usize> {
+        Some(self.samples.len())
     }
 }
 
 #[cfg(test)]
 impl Track<TestSource> {
     pub(crate) async fn new_test() -> Result<Self, PlaybackError> {
-        // Create a simple 1-second sine wave source
-
         // Generate 1 second of 440Hz test tone
         let sample_rate = 48000;
         let frequency = 440.0; // A4 note
