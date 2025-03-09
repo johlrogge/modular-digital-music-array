@@ -2,10 +2,12 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use parking_lot::Mutex;
 use playback_engine::FlacSource;
 use playback_engine::Track;
+use playback_primitives::PlaybackError;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
+
 fn test_file_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("benches/test_data")
@@ -19,29 +21,21 @@ fn bench_track_loading(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(5));
 
     for name in ["short.flac", "medium.flac", "long.flac"] {
-        let path = test_file_path(name);
-
-        // Get initial metrics once before benchmarking
-        let track = rt.block_on(async {
-            Track::<FlacSource>::new(FlacSource::new(&path).await.unwrap())
-                .await
-                .expect("Failed to load track")
-        });
-
-        // Drop the track immediately after use to clean up resources
-        drop(track);
-
         // Run the actual benchmark with explicit cleanup
         group.bench_with_input(BenchmarkId::from_parameter(name), name, |b, name| {
             let path = test_file_path(name);
             b.iter_with_large_drop(|| {
                 rt.block_on(async {
-                    Track::<FlacSource>::new(black_box(FlacSource::new(&path).await.unwrap()))
-                        .await
-                        .expect("Failed to load track")
-                });
+                    // Create a FlacSource
+                    let source = FlacSource::new(&path).expect("Could not create source");
 
-                // The iter_with_large_drop will drop the track after each iteration
+                    // Create a Track with the source
+                    let track = Track::new(source).await.expect("Could not create track");
+
+                    // Return the track
+                    Ok::<_, PlaybackError>(track)
+                })
+                .expect("Failed to create track")
             });
         });
     }
@@ -61,19 +55,28 @@ fn bench_time_to_playable(c: &mut Criterion) {
         // Print metrics once before benchmarking
         let start = Instant::now();
         let mut track = rt.block_on(async {
-            Track::<FlacSource>::new(FlacSource::new(&path).await.unwrap())
-                .await
-                .expect("Failed to load track")
+            let source = FlacSource::new(&path).unwrap();
+            Track::new(source).await.expect("Failed to create track")
         });
+        let load_time = start.elapsed();
+
+        let start = Instant::now();
         track.play();
-        let ready_time = start.elapsed();
+        let play_time = start.elapsed();
+
+        let ready_time = load_time + play_time;
+
         let mut buffer = vec![0.0f32; 1024];
         let first_read = track
             .get_next_samples(&mut buffer)
             .expect("Failed to get samples");
+
         println!("\nInitial playability check for {}:", name);
-        println!("  Time to playable: {:?}", ready_time);
+        println!("  Time to load: {:?}", load_time);
+        println!("  Time to play: {:?}", play_time);
+        println!("  Total time to playable: {:?}", ready_time);
         println!("  First buffer read: {} samples", first_read);
+
         drop(track);
 
         // Run the actual benchmark without printing
@@ -81,14 +84,20 @@ fn bench_time_to_playable(c: &mut Criterion) {
             let path = test_file_path(name);
             b.iter_with_large_drop(|| {
                 let start = Instant::now();
+
+                // Load track
                 let mut track = rt.block_on(async {
-                    Track::<FlacSource>::new(black_box(FlacSource::new(&path).await.unwrap()))
-                        .await
-                        .expect("Failed to load track")
+                    let source = FlacSource::new(&path).unwrap();
+                    Track::new(source).await.expect("Failed to create track")
                 });
+
+                // Start playback
                 track.play();
+
+                // Measure time to playable
                 let ready_time = start.elapsed();
                 black_box(ready_time);
+
                 track
             });
         });
@@ -106,9 +115,8 @@ fn bench_seeking(c: &mut Criterion) {
 
         // Create a track for testing
         let track = rt.block_on(async {
-            Track::<FlacSource>::new(FlacSource::new(&path).await.unwrap())
-                .await
-                .expect("Failed to load track")
+            let source = FlacSource::new(&path).unwrap();
+            Track::new(source).await.expect("Failed to create track")
         });
 
         // Create a shared reference that can be cloned for each benchmark
@@ -124,16 +132,14 @@ fn bench_seeking(c: &mut Criterion) {
         ];
 
         for (label, pos) in positions {
-            // Simple seek benchmark
+            // Seek benchmark
             let track_clone = track.clone();
             group.bench_with_input(
                 BenchmarkId::new(format!("seek_to_{}", label), name),
                 &pos,
                 |b, &pos| {
-                    // Use black_box to ensure the compiler doesn't optimize away the calls
                     let pos = black_box(pos);
                     b.iter(|| {
-                        // Use the runtime to block_on the async seek operation
                         rt.block_on(async {
                             let mut track = track_clone.lock();
                             track.seek(pos).await.unwrap();
