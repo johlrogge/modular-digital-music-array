@@ -1,7 +1,7 @@
 use crate::error::PlaybackError;
 use parking_lot::{Mutex, RwLock};
 use std::path::Path;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
@@ -35,12 +35,11 @@ struct DecodedPacket {
 }
 
 pub struct FlacSource {
-    // Keep these fields
-    packets: Arc<RwLock<Vec<DecodedPacket>>>,
-    total_samples: Arc<AtomicUsize>,
+    packets: RwLock<Vec<DecodedPacket>>,
+    total_samples: AtomicUsize,
     sample_rate: u32,
     audio_channels: u16,
-    format_reader: Arc<Mutex<Box<dyn FormatReader>>>,
+    format_reader: Mutex<Box<dyn FormatReader>>,
 }
 
 type DecoderResult = Result<
@@ -56,14 +55,14 @@ type DecoderResult = Result<
 impl FlacSource {
     pub fn new(path: impl AsRef<Path>) -> Result<Self, PlaybackError> {
         // Initialize the decoder and format reader
-        let (format_reader, _decoder, sample_rate, audio_channels) =
+        let (format_reader, decoder, sample_rate, audio_channels) =
             Self::init_decoder(path.as_ref())?;
 
-        let format_reader = Arc::new(Mutex::new(format_reader));
-        let packets = Arc::new(RwLock::new(Vec::new()));
-        let total_samples = Arc::new(AtomicUsize::new(0));
+        let format_reader = Mutex::new(format_reader);
+        let packets = RwLock::new(Vec::new());
+        let total_samples = AtomicUsize::new(0);
 
-        // Create new instance without the loading task
+        // Create new instance
         let source = Self {
             packets,
             total_samples,
@@ -81,18 +80,21 @@ impl FlacSource {
         Ok(source)
     }
 
-    // Add a method to decode the next packet on demand
-    fn decode_next_packet(&self) -> Result<(), PlaybackError> {
+    fn decode_next_packet(&self) -> Result<bool, PlaybackError> {
         let mut format_reader = self.format_reader.lock();
 
         // Try to get the next packet
         let packet = match format_reader.next_packet() {
             Ok(packet) => packet,
+            Err(symphonia::core::errors::Error::ResetRequired) => {
+                // This is normal at end of file, not an error
+                return Ok(false);
+            }
             Err(e) => {
                 return Err(PlaybackError::Decoder(format!(
                     "Error getting next packet: {}",
                     e
-                )))
+                )));
             }
         };
 
@@ -102,10 +104,7 @@ impl FlacSource {
             .ok_or_else(|| PlaybackError::Decoder("No default track found".into()))?;
 
         let mut decoder = symphonia::default::get_codecs()
-            .make(
-                &track.codec_params,
-                &symphonia::core::codecs::DecoderOptions::default(),
-            )
+            .make(&track.codec_params, &DecoderOptions::default())
             .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
 
         // Decode the packet
@@ -115,7 +114,7 @@ impl FlacSource {
                 return Err(PlaybackError::Decoder(format!(
                     "Error decoding packet: {}",
                     e
-                )))
+                )));
             }
         };
 
@@ -125,9 +124,7 @@ impl FlacSource {
         let samples = sample_buf.samples().to_vec();
 
         // Get the current position for this packet
-        let position = self
-            .total_samples
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let position = self.total_samples.load(Ordering::Relaxed);
 
         // Create a decoded packet
         let decoded_packet = DecodedPacket {
@@ -137,7 +134,7 @@ impl FlacSource {
 
         // Update total samples
         self.total_samples
-            .fetch_add(samples.len(), std::sync::atomic::Ordering::Release);
+            .fetch_add(samples.len(), Ordering::Release);
 
         // Store the decoded packet
         {
@@ -145,7 +142,7 @@ impl FlacSource {
             packets_guard.push(decoded_packet);
         }
 
-        Ok(())
+        Ok(true)
     }
 
     fn init_decoder(path: &Path) -> DecoderResult {
@@ -228,56 +225,52 @@ impl FlacSource {
 
 impl Source for FlacSource {
     fn read_samples(&self, position: usize, buffer: &mut [f32]) -> Result<usize, PlaybackError> {
-        let total = self
-            .total_samples
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if position >= total {
-            // Try to decode more data if we're at the end of what we've already decoded
-            self.decode_next_packet()?;
+        // Check if position is beyond what we've decoded
+        if position >= self.total_samples.load(Ordering::Relaxed) {
+            // Try to decode more
+            if !self.decode_next_packet()? {
+                return Ok(0); // No more data available
+            }
 
             // Check again after decoding
-            let total = self
-                .total_samples
-                .load(std::sync::atomic::Ordering::Relaxed);
-            if position >= total {
-                return Ok(0); // Still at the end, no more data
+            if position >= self.total_samples.load(Ordering::Relaxed) {
+                return Ok(0); // Still beyond available data
             }
         }
-
-        let packets_guard = self.packets.read();
 
         // Find the packet containing our position
-        let mut packet_idx = None;
-        for (idx, packet) in packets_guard.iter().enumerate() {
-            if packet.position + packet.samples.len() > position {
-                packet_idx = Some(idx);
-                break;
+        let packets_guard = self.packets.read();
+
+        let packet_idx = packets_guard
+            .iter()
+            .position(|packet| packet.position + packet.samples.len() > position);
+
+        match packet_idx {
+            Some(idx) => {
+                // Get samples from the packet
+                let packet = &packets_guard[idx];
+                let packet_pos = position - packet.position;
+                let available = packet.samples.len() - packet_pos;
+                let sample_count = buffer.len().min(available);
+
+                // Copy samples to the provided buffer
+                buffer[..sample_count]
+                    .copy_from_slice(&packet.samples[packet_pos..packet_pos + sample_count]);
+
+                Ok(sample_count)
+            }
+            None => {
+                // No packet found, try to decode more (after releasing the read lock)
+                drop(packets_guard);
+
+                if self.decode_next_packet()? {
+                    // Retry after decoding
+                    self.read_samples(position, buffer)
+                } else {
+                    Ok(0) // No more data
+                }
             }
         }
-
-        let packet_idx = match packet_idx {
-            Some(idx) => idx,
-            None => {
-                // No packet found, try to decode more
-                drop(packets_guard); // Drop the read lock before attempting to decode
-                self.decode_next_packet()?;
-
-                // Retry after decoding
-                return self.read_samples(position, buffer);
-            }
-        };
-
-        // Get samples from the packet
-        let packet = &packets_guard[packet_idx];
-        let packet_pos = position - packet.position;
-        let available = packet.samples.len() - packet_pos;
-        let sample_count = buffer.len().min(available);
-
-        // Copy samples to the provided buffer
-        buffer[..sample_count]
-            .copy_from_slice(&packet.samples[packet_pos..packet_pos + sample_count]);
-
-        Ok(sample_count)
     }
 
     fn sample_rate(&self) -> u32 {
