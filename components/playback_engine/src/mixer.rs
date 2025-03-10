@@ -27,27 +27,56 @@ impl Mixer {
         // Clear output buffer
         output[..samples_per_callback].fill(0.0);
 
+        // Add timing information
+        let start_time = std::time::Instant::now();
+
         // Get all tracks and their lock guards
         let tracks = decks.read();
+        let read_lock_time = start_time.elapsed();
+
+        if read_lock_time > std::time::Duration::from_micros(100) {
+            tracing::warn!("Slow read lock acquisition: {:?}", read_lock_time);
+        }
 
         // Mix each active track
         for (deck, track) in tracks.iter() {
+            let track_start = std::time::Instant::now();
             let mut track = track.write();
+            let track_lock_time = track_start.elapsed();
+
+            if track_lock_time > std::time::Duration::from_micros(100) {
+                tracing::warn!("Slow track lock for deck {:?}: {:?}", deck, track_lock_time);
+            }
 
             if track.is_playing() {
-                tracing::debug!("Deck {:?} is playing", deck);
-
                 // Get samples from this track
                 self.mix_buffer[..samples_per_callback].fill(0.0);
+                let buffer_start = std::time::Instant::now();
+
                 match track.get_next_samples(&mut self.mix_buffer[..samples_per_callback]) {
                     Ok(len) if len > 0 => {
+                        let get_samples_time = buffer_start.elapsed();
+
+                        if get_samples_time > std::time::Duration::from_micros(500) {
+                            tracing::warn!(
+                                "Slow sample retrieval for deck {:?}: {:?}, got {} samples",
+                                deck,
+                                get_samples_time,
+                                len
+                            );
+                        }
+
+                        if len < samples_per_callback {
+                            tracing::warn!(
+                                "Buffer underrun on deck {:?}: requested {}, got {}",
+                                deck,
+                                samples_per_callback,
+                                len
+                            );
+                        }
+
+                        // Continue with mixing as normal...
                         let volume = track.get_volume();
-                        tracing::debug!(
-                            "Got {} samples from deck {:?}, volume: {}",
-                            len,
-                            deck,
-                            volume
-                        );
 
                         // Mix into output with volume
                         output
@@ -69,9 +98,12 @@ impl Mixer {
                         )));
                     }
                 }
-            } else {
-                tracing::debug!("Deck {:?} is not playing", deck);
             }
+        }
+
+        let total_time = start_time.elapsed();
+        if total_time > std::time::Duration::from_millis(1) {
+            tracing::warn!("Audio callback took too long: {:?}", total_time);
         }
 
         Ok(())

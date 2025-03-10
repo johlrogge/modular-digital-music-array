@@ -17,14 +17,13 @@ impl SegmentedBuffer {
 
     /// Add a decoded segment to the buffer
     pub fn add_segment(&mut self, segment: DecodedSegment) {
+        // Log to help diagnose what's happening
+        tracing::debug!(
+            "Adding segment {} at sample position {}",
+            segment.index.0,
+            segment.index.start_position()
+        );
         self.segments.insert(segment.index, segment.segment);
-    }
-
-    /// Add multiple segments to the buffer
-    pub fn add_segments(&mut self, segments: Vec<DecodedSegment>) {
-        for segment in segments {
-            self.add_segment(segment);
-        }
     }
 
     /// Get samples from the buffer starting at the given position
@@ -33,6 +32,14 @@ impl SegmentedBuffer {
         let mut samples_read = 0;
         let mut current_pos = position;
 
+        // Log request details for debugging
+        tracing::trace!(
+            "Request samples: pos={}, len={}, segments={}",
+            position,
+            output.len(),
+            self.segments.len()
+        );
+
         while samples_read < output.len() {
             // Calculate which segment and offset within that segment
             let segment_index = SegmentIndex::from_sample_position(current_pos);
@@ -40,6 +47,11 @@ impl SegmentedBuffer {
 
             // If we don't have this segment, we're done
             if !self.segments.contains_key(&segment_index) {
+                tracing::debug!(
+                    "Missing segment {} at position {}",
+                    segment_index.0,
+                    current_pos
+                );
                 break;
             }
 
@@ -52,9 +64,9 @@ impl SegmentedBuffer {
             let samples_to_copy = std::cmp::min(samples_available, samples_needed);
 
             // Copy samples
-            for i in 0..samples_to_copy {
-                output[samples_read + i] = segment.samples[offset_in_segment + i];
-            }
+            output[samples_read..samples_read + samples_to_copy].copy_from_slice(
+                &segment.samples[offset_in_segment..offset_in_segment + samples_to_copy],
+            );
 
             // Update position and count
             current_pos += samples_to_copy;
@@ -62,6 +74,33 @@ impl SegmentedBuffer {
         }
 
         samples_read
+    }
+
+    // Add a method to get a range of segments that should be loaded
+    pub fn get_segments_to_load(
+        &self,
+        position: usize,
+        ahead_segments: usize,
+    ) -> Vec<SegmentIndex> {
+        let mut to_load = Vec::new();
+        let start_segment = SegmentIndex::from_sample_position(position);
+
+        // Check which segments need to be loaded
+        for i in 0..ahead_segments {
+            let segment_index = SegmentIndex(start_segment.0 + i);
+            if !self.is_segment_loaded(segment_index) {
+                to_load.push(segment_index);
+            }
+        }
+
+        to_load
+    }
+
+    /// Add multiple segments to the buffer
+    pub fn add_segments(&mut self, segments: Vec<DecodedSegment>) {
+        for segment in segments {
+            self.add_segment(segment);
+        }
     }
 
     /// Check if a segment is loaded

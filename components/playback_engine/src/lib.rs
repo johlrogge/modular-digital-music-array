@@ -106,21 +106,33 @@ impl PlaybackEngine {
         }
     }
 
+    // In PlaybackEngine::create_audio_stream
     fn create_audio_stream(decks: Decks) -> Result<Stream, PlaybackError> {
         const SAMPLE_RATE: u32 = 48000;
         const CHANNELS: u16 = 2;
-        const BUFFER_SIZE: u32 = 480; // 10ms at 48kHz
+
+        // Increase buffer size from 480 to 960 (20ms at 48kHz instead of 10ms)
+        // This gives more time for the background task to fill the buffer
+        const BUFFER_SIZE: u32 = 960;
 
         let host = cpal::default_host();
         let device = host
             .default_output_device()
             .ok_or_else(|| PlaybackError::AudioDevice("No output device found".into()))?;
 
+        // Log available buffer sizes to help diagnose
+        tracing::info!(
+            "Available buffer sizes: {:?}",
+            device.default_output_config()
+        );
+
         let config = cpal::StreamConfig {
             channels: CHANNELS,
             sample_rate: cpal::SampleRate(SAMPLE_RATE),
             buffer_size: cpal::BufferSize::Fixed(BUFFER_SIZE),
         };
+
+        tracing::info!("Creating audio stream with buffer size: {}", BUFFER_SIZE);
 
         // Create a mixer that will be shared across audio callbacks
         let mixer = Arc::new(Mutex::new(Mixer::new(
@@ -130,13 +142,24 @@ impl PlaybackEngine {
         let stream = device.build_output_stream(
             &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let callback_start = std::time::Instant::now();
                 let mut mixer = mixer.lock();
+                let lock_time = callback_start.elapsed();
+
+                if lock_time > std::time::Duration::from_micros(100) {
+                    tracing::warn!("Slow mixer lock acquisition: {:?}", lock_time);
+                }
 
                 // Use the mixer to mix all active tracks
                 if let Err(e) = mixer.mix(&decks, data, data.len()) {
                     tracing::error!("Error during mixing: {}", e);
                     // If mixing fails, output silence
                     data.fill(0.0);
+                }
+
+                let total_time = callback_start.elapsed();
+                if total_time > std::time::Duration::from_millis(1) {
+                    tracing::warn!("Audio callback total time: {:?}", total_time);
                 }
             },
             move |err| eprintln!("Audio stream error: {}", err),

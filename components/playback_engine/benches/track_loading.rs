@@ -2,7 +2,6 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use parking_lot::Mutex;
 use playback_engine::FlacSource;
 use playback_engine::Track;
-use playback_primitives::PlaybackError;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,8 +30,7 @@ fn bench_track_loading(c: &mut Criterion) {
                     let source = FlacSource::new(&path).expect("Could not create source");
 
                     // Create a Track with the source
-                    let track = Track::new(source).await.expect("Could not create track");
-                    track
+                    Track::new(source).await.expect("Could not create track")
                 });
 
                 // Explicitly drop the track

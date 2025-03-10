@@ -67,8 +67,16 @@ impl<S: Source + Send + Sync> Track<S> {
     ) {
         tracing::info!("Buffer management task started");
 
-        // Start with frequent polling, then back off
-        let mut poll_interval_ms = 10;
+        // Start with very frequent polling to get the buffer filled quickly
+        let mut poll_interval_ms = 2;
+
+        // Configuration for buffer management
+        let ahead_segments = 10; // Keep 10 segments ahead during playback
+        let mut current_position = 0;
+        let mut last_prefetch_position = 0;
+
+        // Track needs a health flag
+        let mut buffer_healthy = false;
 
         loop {
             // Use timeout to periodically check even if no commands are received
@@ -78,47 +86,30 @@ impl<S: Source + Send + Sync> Track<S> {
             )
             .await;
 
-            // If buffer is full enough, gradually increase poll interval
-            // to reduce CPU usage (up to 100ms max)
-            if poll_interval_ms < 100 {
-                poll_interval_ms = (poll_interval_ms + 5).min(100);
+            // Adaptive polling - if buffer is healthy, reduce polling frequency
+            if buffer_healthy {
+                poll_interval_ms = (poll_interval_ms + 1).min(20);
+            } else {
+                // If buffer isn't healthy, poll more aggressively
+                poll_interval_ms = 2;
             }
 
-            // Check if we should continue processing
+            // Process commands
             match command {
                 Ok(Some(TrackCommand::FillFrom(position))) => {
-                    // For initial buffer fill, fetch less data but faster
-                    let segments_per_batch = if position == 0 {
-                        // Only fetch a few segments to get started quickly
-                        2
-                    } else {
-                        // For continued filling, fetch more at once
-                        10
-                    };
+                    // Update our tracking of the current playback position
+                    current_position = position;
+                    last_prefetch_position = position;
 
-                    // Seek to position
-                    if let Err(e) = source.seek(position) {
-                        tracing::error!("Failed to seek source: {}", e);
-                        continue;
-                    }
+                    tracing::debug!("Fill command for position {}", position);
 
-                    // Decode segments with adjusted batch size
-                    match source.decode_segments(segments_per_batch) {
-                        Ok(segments) => {
-                            if segments.is_empty() {
-                                tracing::debug!("No segments decoded");
-                            } else {
-                                tracing::debug!("Decoded {} segments", segments.len());
+                    // Prefetch segments ahead of this position
+                    Self::prefetch_segments_helper(&source, &buffer, position, ahead_segments)
+                        .await;
 
-                                // Add segments to buffer
-                                let mut buffer = buffer.write();
-                                buffer.add_segments(segments);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to decode segments: {}", e);
-                        }
-                    }
+                    // Check buffer health after filling
+                    buffer_healthy =
+                        Self::check_buffer_health_helper(&buffer, position, ahead_segments).await;
                 }
                 Ok(Some(TrackCommand::Shutdown)) => {
                     tracing::info!("Shutdown command received");
@@ -130,8 +121,29 @@ impl<S: Source + Send + Sync> Track<S> {
                     break;
                 }
                 Err(_) => {
-                    // Timeout occurred - just continue and check for next command
-                    tracing::trace!("Timeout waiting for command");
+                    // Timeout - check if we need to prefetch more segments
+                    if last_prefetch_position < current_position {
+                        // Position has advanced since last prefetch, update prefetch position
+                        last_prefetch_position = current_position;
+
+                        // Prefetch more segments
+                        tracing::trace!("Background prefetch at position {}", current_position);
+                        Self::prefetch_segments_helper(
+                            &source,
+                            &buffer,
+                            current_position,
+                            ahead_segments,
+                        )
+                        .await;
+
+                        // Update buffer health status
+                        buffer_healthy = Self::check_buffer_health_helper(
+                            &buffer,
+                            current_position,
+                            ahead_segments,
+                        )
+                        .await;
+                    }
 
                     // Yield to allow task cancellation to be detected
                     tokio::task::yield_now().await;
@@ -141,17 +153,103 @@ impl<S: Source + Send + Sync> Track<S> {
 
         tracing::info!("Buffer management task shutting down");
 
-        // Cleanup before exit
+        // Cleanup
         {
-            // Clear the buffer to release memory
             let mut buffer_lock = buffer.write();
             buffer_lock.clear();
         }
 
-        // Explicitly drop our reference to the source
         drop(source);
 
         tracing::info!("Buffer management task shut down, all resources released");
+    }
+
+    // Helper function to prefetch segments - now with a different name
+    async fn prefetch_segments_helper(
+        source: &Arc<S>,
+        buffer: &Arc<RwLock<SegmentedBuffer>>,
+        position: usize,
+        ahead_segments: usize,
+    ) {
+        // Determine which segments need to be loaded
+        let segments_to_load = {
+            let buffer_read = buffer.read();
+            buffer_read.get_segments_to_load(position, ahead_segments)
+        };
+
+        if segments_to_load.is_empty() {
+            return; // Nothing to load
+        }
+
+        // Log the segments we're going to load
+        tracing::debug!(
+            "Prefetching {} segments starting from {}",
+            segments_to_load.len(),
+            segments_to_load.first().unwrap().0
+        );
+
+        // For each segment we need, seek and decode
+        for segment_index in segments_to_load {
+            let segment_start = segment_index.start_position();
+
+            // Seek to the segment start
+            if let Err(e) = source.seek(segment_start) {
+                tracing::error!("Failed to seek to segment {}: {}", segment_index.0, e);
+                continue;
+            }
+
+            // Decode segments (just one at a time for better control)
+            match source.decode_segments(1) {
+                Ok(segments) => {
+                    if !segments.is_empty() {
+                        // Add all decoded segments to the buffer
+                        let mut buffer_write = buffer.write();
+                        buffer_write.add_segments(segments);
+
+                        tracing::trace!("Added segment {}", segment_index.0);
+                    } else {
+                        tracing::debug!("No segments decoded for index {}", segment_index.0);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Error decoding segment {}: {}", segment_index.0, e);
+                }
+            }
+        }
+    }
+
+    // Helper function to check buffer health - now with a different name
+    async fn check_buffer_health_helper(
+        buffer: &Arc<RwLock<SegmentedBuffer>>,
+        position: usize,
+        ahead_segments: usize,
+    ) -> bool {
+        let buffer_read = buffer.read();
+        let mut loaded_segments = 0;
+
+        // Count loaded segments
+        for i in 0..ahead_segments {
+            let segment_index = crate::source::SegmentIndex::from_sample_position(
+                position + i * crate::source::SEGMENT_SIZE,
+            );
+            if buffer_read.is_segment_loaded(segment_index) {
+                loaded_segments += 1;
+            } else {
+                break; // Stop at first missing segment
+            }
+        }
+
+        // Buffer is healthy if we have at least half the target segments loaded
+        let is_healthy = loaded_segments >= ahead_segments / 2;
+
+        tracing::debug!(
+            "Buffer health: {}/{} segments loaded ({})",
+            loaded_segments,
+            ahead_segments,
+            if is_healthy { "healthy" } else { "unhealthy" }
+        );
+
+        is_healthy
     }
 
     pub fn play(&mut self) {
@@ -239,9 +337,12 @@ impl<S: Source + Send + Sync> Track<S> {
         buffer.is_ready_at(self.position)
     }
 
+    // In track.rs - modify get_next_samples
     pub fn get_next_samples(&mut self, output: &mut [f32]) -> Result<usize, PlaybackError> {
         if !self.playing {
-            return Ok(0);
+            // Fill with zeros if not playing
+            output.fill(0.0);
+            return Ok(output.len()); // Return full length
         }
 
         // Read from the buffer
@@ -259,29 +360,36 @@ impl<S: Source + Send + Sync> Track<S> {
             // Update position
             self.position += samples_read;
 
-            // If we didn't read enough samples, request more
+            // If we didn't read enough samples, fill rest with zeros
             if samples_read < output.len() {
+                // Zero-fill the remainder
+                for i in samples_read..output.len() {
+                    output[i] = 0.0;
+                }
+
+                // Log the underrun
+                tracing::warn!(
+                    "Buffer underrun: wanted {}, got {} (filling rest with silence)",
+                    output.len(),
+                    samples_read
+                );
+
+                // Request more data
                 self.fill_buffer()?;
             }
 
-            return Ok(samples_read);
+            // Return full buffer size to avoid audio stuttering
+            return Ok(output.len());
         }
 
-        // Buffer didn't have our data, try to fill it
+        // If no samples read, fill with zeros
+        output.fill(0.0);
+
+        // Try to fill buffer for next time
         self.fill_buffer()?;
 
-        // Check if we've reached the end
-        let total_samples = self.source.total_samples();
-        if let Some(len) = total_samples {
-            if self.position >= len {
-                self.playing = false;
-                tracing::info!("End of track reached");
-                return Ok(0);
-            }
-        }
-
-        // No samples read this time
-        Ok(0)
+        // Return full buffer of silence
+        Ok(output.len())
     }
 
     fn fill_buffer(&mut self) -> Result<(), PlaybackError> {
