@@ -106,21 +106,19 @@ impl PlaybackEngine {
         }
     }
 
-    // In PlaybackEngine::create_audio_stream
     fn create_audio_stream(decks: Decks) -> Result<Stream, PlaybackError> {
         const SAMPLE_RATE: u32 = 48000;
         const CHANNELS: u16 = 2;
 
-        // Increase buffer size from 480 to 960 (20ms at 48kHz instead of 10ms)
-        // This gives more time for the background task to fill the buffer
-        const BUFFER_SIZE: u32 = 960;
+        // Double the buffer size from 960 to 1920
+        // This gives more time for the decoder to fill the buffer between callbacks
+        const BUFFER_SIZE: u32 = 1920;
 
         let host = cpal::default_host();
         let device = host
             .default_output_device()
             .ok_or_else(|| PlaybackError::AudioDevice("No output device found".into()))?;
 
-        // Log available buffer sizes to help diagnose
         tracing::info!(
             "Available buffer sizes: {:?}",
             device.default_output_config()
@@ -134,7 +132,7 @@ impl PlaybackEngine {
 
         tracing::info!("Creating audio stream with buffer size: {}", BUFFER_SIZE);
 
-        // Create a mixer that will be shared across audio callbacks
+        // Create a mixer with the appropriate buffer size
         let mixer = Arc::new(Mutex::new(Mixer::new(
             BUFFER_SIZE as usize * CHANNELS as usize,
         )));
