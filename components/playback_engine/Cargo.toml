@@ -31,3 +31,7 @@ harness = false
 criterion = "0.5"
 tempfile = "3.8"
 hound = "3.5"
+tracing-subscriber = "0.3"  # Add this line
+
+[[example]]
+name = "file_leak_test"

@@ -1,3 +1,4 @@
+mod buffer;
 mod commands;
 mod error;
 mod mixer;
@@ -17,8 +18,10 @@ pub use playback_primitives::Deck;
 pub use source::{FlacSource, Source};
 pub use track::Track;
 
+type Decks = Arc<RwLock<HashMap<Deck, Arc<RwLock<Track<FlacSource>>>>>>;
+
 pub struct PlaybackEngine {
-    decks: Arc<RwLock<HashMap<Deck, Arc<RwLock<Track<FlacSource>>>>>>,
+    decks: Decks,
     _audio_stream: Stream,
 }
 
@@ -103,9 +106,7 @@ impl PlaybackEngine {
         }
     }
 
-    fn create_audio_stream(
-        decks: Arc<RwLock<HashMap<Deck, Arc<RwLock<Track<FlacSource>>>>>>,
-    ) -> Result<Stream, PlaybackError> {
+    fn create_audio_stream(decks: Decks) -> Result<Stream, PlaybackError> {
         const SAMPLE_RATE: u32 = 48000;
         const CHANNELS: u16 = 2;
         const BUFFER_SIZE: u32 = 480; // 10ms at 48kHz

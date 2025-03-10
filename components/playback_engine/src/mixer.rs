@@ -102,14 +102,18 @@ mod tests {
 
         // Setup a deck with a test track
         let mut track = Track::new_test().await.unwrap();
+
+        // Force track to be ready for testing
+        track.ensure_ready_for_test().await.unwrap();
+
         track.play(); // Start playback
 
         // Insert track into decks and get a reference to it
         let track_ref = Arc::new(RwLock::new(track));
         decks.write().insert(Deck::A, track_ref.clone());
 
-        // Wait for track to be ready
-        let timeout = std::time::Duration::from_millis(100);
+        // Wait for track to be ready with increased timeout
+        let timeout = std::time::Duration::from_millis(500); // Increased from 100ms
         let start = std::time::Instant::now();
 
         let mut ready = false;

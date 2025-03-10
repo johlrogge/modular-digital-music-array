@@ -24,18 +24,27 @@ fn bench_track_loading(c: &mut Criterion) {
         // Run the actual benchmark with explicit cleanup
         group.bench_with_input(BenchmarkId::from_parameter(name), name, |b, name| {
             let path = test_file_path(name);
-            b.iter_with_large_drop(|| {
-                rt.block_on(async {
+            b.iter(|| {
+                // Create Track in a block to ensure it's dropped right after use
+                let track = rt.block_on(async {
                     // Create a FlacSource
                     let source = FlacSource::new(&path).expect("Could not create source");
 
                     // Create a Track with the source
                     let track = Track::new(source).await.expect("Could not create track");
+                    track
+                });
 
-                    // Return the track
-                    Ok::<_, PlaybackError>(track)
-                })
-                .expect("Failed to create track")
+                // Explicitly drop the track
+                drop(track);
+
+                // Give runtime a chance to clean up
+                rt.block_on(async {
+                    tokio::task::yield_now().await;
+                });
+
+                // Force GC-like cleanup
+                std::thread::sleep(std::time::Duration::from_millis(1));
             });
         });
     }

@@ -1,16 +1,16 @@
 use crate::error::PlaybackError;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::DecoderOptions;
-use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, SeekedTo};
-use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
-use symphonia::core::units::Time;
-use tokio::sync::Mutex as AsyncMutex;
+use symphonia::core::{
+    audio::SampleBuffer,
+    codecs::DecoderOptions,
+    formats::{FormatOptions, FormatReader, SeekMode, SeekTo},
+    io::MediaSourceStream,
+    meta::MetadataOptions,
+    probe::Hint,
+    units::Time,
+};
 
 pub const SEGMENT_SIZE: usize = 1024;
 
@@ -65,12 +65,6 @@ pub trait Source: Send + Sync {
     fn total_samples(&self) -> Option<usize>; // May not be known until file is fully decoded
 }
 
-/// Represents a decoded audio packet with its position information
-struct DecodedPacket {
-    samples: Vec<f32>,
-    position: usize, // Sample position in the overall stream
-}
-
 pub struct FlacSource {
     // Decoder state (format reader + decoder)
     decoder_state: Mutex<DecoderState>,
@@ -108,6 +102,7 @@ impl FlacSource {
     const TYPICAL_FRAME_SIZE: usize = 8192;
 
     pub fn new(path: impl AsRef<Path>) -> Result<Self, PlaybackError> {
+        tracing::debug!("Opening file: {:?}", path.as_ref());
         // Initialize the decoder and format reader
         let (format_reader, decoder, sample_rate, audio_channels) =
             Self::init_decoder(path.as_ref())?;
@@ -398,5 +393,11 @@ impl Source for FlacSource {
         // We might not know the total until we've decoded the whole file
         // This would typically be extracted from metadata if available
         None
+    }
+}
+
+impl Drop for FlacSource {
+    fn drop(&mut self) {
+        tracing::trace!("FlacSource dropped - decoder_state will be dropped automatically");
     }
 }
