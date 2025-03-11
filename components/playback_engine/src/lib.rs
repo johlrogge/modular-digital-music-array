@@ -188,12 +188,4 @@ impl PlaybackEngine {
             Err(PlaybackError::NoTrackLoaded(deck))
         }
     }
-
-    pub fn get_length(&self, deck: Deck) -> Result<usize, PlaybackError> {
-        if let Some(track) = self.find_track(deck) {
-            Ok(track.read().length())
-        } else {
-            Err(PlaybackError::NoTrackLoaded(deck))
-        }
-    }
 }

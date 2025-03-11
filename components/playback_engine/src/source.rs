@@ -62,7 +62,6 @@ pub trait Source: Send + Sync {
     // Basic metadata
     fn sample_rate(&self) -> u32;
     fn audio_channels(&self) -> u16;
-    fn total_samples(&self) -> Option<usize>; // May not be known until file is fully decoded
 }
 
 pub struct FlacSource {
@@ -177,208 +176,11 @@ impl FlacSource {
 
 impl Source for FlacSource {
     fn decode_segments(&self, max_segments: usize) -> Result<Vec<DecodedSegment>, PlaybackError> {
-        // Early return if we've already reached EOF
-        if self.is_eof.load(Ordering::Relaxed) {
-            return Ok(Vec::new());
-        }
-
-        let mut result = Vec::new();
-        let mut segments_created = 0;
-
-        // Try to decode until we have the requested number of segments
-        // or reach the end of the file
-        while segments_created < max_segments {
-            // Current position tells us what segment index we're at
-            let current_position = self.current_position.load(Ordering::Relaxed);
-            let current_segment_index = SegmentIndex::from_sample_position(current_position);
-            let offset_in_segment = current_position % SEGMENT_SIZE;
-
-            // Process any existing buffered samples first
-            {
-                let mut sample_buffer = self.sample_buffer.lock();
-
-                if !sample_buffer.is_empty() {
-                    // Create a segment from the buffered data
-                    let mut segment = AudioSegment {
-                        samples: [0.0; SEGMENT_SIZE],
-                    };
-
-                    // Zero-fill the segment first (for partial segments)
-                    for i in 0..SEGMENT_SIZE {
-                        segment.samples[i] = 0.0;
-                    }
-
-                    // Calculate how many samples we can use from the buffer
-                    let samples_needed = SEGMENT_SIZE - offset_in_segment;
-                    let samples_available = sample_buffer.len();
-                    let samples_to_use = std::cmp::min(samples_needed, samples_available);
-
-                    // Copy samples from buffer
-                    for i in 0..samples_to_use {
-                        segment.samples[offset_in_segment + i] = sample_buffer[i];
-                    }
-
-                    // Update buffer
-                    if samples_to_use < samples_available {
-                        // We used part of the buffer, keep the rest
-                        *sample_buffer = sample_buffer[samples_to_use..].to_vec();
-                    } else {
-                        // We used all of the buffer
-                        sample_buffer.clear();
-                    }
-
-                    // If we filled the segment completely
-                    if offset_in_segment + samples_to_use == SEGMENT_SIZE {
-                        result.push(DecodedSegment {
-                            index: current_segment_index,
-                            segment,
-                        });
-
-                        segments_created += 1;
-                        self.current_position
-                            .fetch_add(samples_to_use, Ordering::Release);
-
-                        // If we've created enough segments, we're done
-                        if segments_created == max_segments {
-                            break;
-                        }
-                    } else {
-                        // Segment is not complete - we just added what we had
-                        self.current_position
-                            .fetch_add(samples_to_use, Ordering::Release);
-                    }
-                }
-            }
-
-            // We need to decode more data
-            // Decode next packet from format reader
-            let mut decoder_state = self.decoder_state.lock();
-
-            // Try to get the next packet
-            let packet = match decoder_state.format_reader.next_packet() {
-                Ok(packet) => packet,
-                Err(symphonia::core::errors::Error::ResetRequired) => {
-                    // This is normal at end of file
-                    // Any partial segment data will be handled on the next call
-                    self.is_eof.store(true, Ordering::Release);
-                    break;
-                }
-                Err(e) => {
-                    return Err(PlaybackError::Decoder(format!(
-                        "Error getting next packet: {}",
-                        e
-                    )));
-                }
-            };
-
-            // Decode the packet
-            let decoded = match decoder_state.decoder.decode(&packet) {
-                Ok(decoded) => decoded,
-                Err(e) => {
-                    return Err(PlaybackError::Decoder(format!(
-                        "Error decoding packet: {}",
-                        e
-                    )));
-                }
-            };
-
-            // Convert to interleaved f32 samples
-            let mut sample_buf = SampleBuffer::<f32>::new(decoded.frames() as u64, *decoded.spec());
-            sample_buf.copy_interleaved_ref(decoded);
-            let samples = sample_buf.samples();
-
-            // Add samples to buffer
-            {
-                let mut sample_buffer = self.sample_buffer.lock();
-                sample_buffer.extend_from_slice(samples);
-
-                // Process complete segments
-                while sample_buffer.len() >= SEGMENT_SIZE && segments_created < max_segments {
-                    let current_position = self.current_position.load(Ordering::Relaxed);
-                    let current_segment_index =
-                        SegmentIndex::from_sample_position(current_position);
-
-                    let mut segment = AudioSegment {
-                        samples: [0.0; SEGMENT_SIZE],
-                    };
-
-                    // Copy samples from buffer
-                    segment
-                        .samples
-                        .copy_from_slice(&sample_buffer[0..SEGMENT_SIZE]);
-
-                    // Update buffer
-                    if sample_buffer.len() > SEGMENT_SIZE {
-                        *sample_buffer = sample_buffer[SEGMENT_SIZE..].to_vec();
-                    } else {
-                        sample_buffer.clear();
-                    }
-
-                    result.push(DecodedSegment {
-                        index: current_segment_index,
-                        segment,
-                    });
-
-                    segments_created += 1;
-                    self.current_position
-                        .fetch_add(SEGMENT_SIZE, Ordering::Release);
-                }
-            }
-        }
-
-        // If we've created no segments and reached EOF, return empty Vec
-        if result.is_empty() && self.is_eof.load(Ordering::Relaxed) {
-            return Ok(Vec::new());
-        }
-
-        Ok(result)
+        todo!("implement decode segments")
     }
 
     fn seek(&self, position: usize) -> Result<(), PlaybackError> {
-        // Reset EOF flag
-        self.is_eof.store(false, Ordering::Release);
-
-        // Clear sample buffer
-        {
-            let mut sample_buffer = self.sample_buffer.lock();
-            sample_buffer.clear();
-        }
-
-        // Convert sample position to time value
-        let time = self.position_to_time(position);
-
-        // Perform the seek
-        {
-            let mut state = self.decoder_state.lock();
-
-            // Define seek target
-            let seek_to = SeekTo::Time {
-                time,
-                track_id: None, // Use default track
-            };
-
-            // Perform the seek
-            state
-                .format_reader
-                .seek(SeekMode::Accurate, seek_to)
-                .map_err(|e| PlaybackError::Decoder(format!("Seek error: {}", e)))?;
-
-            // After seeking, we may need to recreate the decoder
-            // because the internal state might be invalidated
-            let track = state
-                .format_reader
-                .default_track()
-                .ok_or_else(|| PlaybackError::Decoder("No default track found".into()))?;
-
-            state.decoder = symphonia::default::get_codecs()
-                .make(&track.codec_params, &DecoderOptions::default())
-                .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
-        }
-
-        // Update current position
-        self.current_position.store(position, Ordering::Release);
-
-        Ok(())
+        todo!("implement seek")
     }
 
     fn sample_rate(&self) -> u32 {
@@ -387,12 +189,6 @@ impl Source for FlacSource {
 
     fn audio_channels(&self) -> u16 {
         self.audio_channels
-    }
-
-    fn total_samples(&self) -> Option<usize> {
-        // We might not know the total until we've decoded the whole file
-        // This would typically be extracted from metadata if available
-        None
     }
 }
 

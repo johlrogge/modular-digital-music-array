@@ -117,21 +117,7 @@ impl Server {
             }
             Command::GetLength { deck } => {
                 info!("Getting length for deck {:?}", deck);
-                match self
-                    .engine
-                    .lock()
-                    .await
-                    .get_length(Self::convert_deck(deck))
-                {
-                    Ok(length) => {
-                        info!("Track length: {}", length);
-                        self.create_response(Ok(()), Some(ResponseData::Length(length)))
-                    }
-                    Err(e) => {
-                        warn!("Failed to get length: {}", e);
-                        self.create_response(Err(e), None)
-                    }
-                }
+                todo!("get length of track, or remove opportunity")
             }
         }
     }

@@ -128,7 +128,7 @@ fn bench_seeking(c: &mut Criterion) {
 
         // Create a shared reference that can be cloned for each benchmark
         let track = Arc::new(Mutex::new(track));
-        let length = rt.block_on(async { track.lock().length() });
+        let length: usize = todo!("use known lengths for short, medium and long");
 
         let positions = [
             ("start", 0),
