@@ -50,6 +50,64 @@ fn generate_test_signal(duration_secs: f32) -> Vec<f32> {
 
     samples
 }
+// Add these to build.rs
+fn generate_test_pattern_wav(path: PathBuf, pattern_type: &str) -> Result<()> {
+    // Create parent directories if they don't exist
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let spec = hound::WavSpec {
+        channels: CHANNELS,
+        sample_rate: SAMPLE_RATE,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+
+    let mut writer = WavWriter::create(&path, spec)
+        .with_context(|| format!("Failed to create WAV file: {}", path.display()))?;
+
+    // Generate 0.5 seconds of audio with specific patterns (48000 samples per sec * 0.5 * 2 channels)
+    let sample_count = (SAMPLE_RATE as usize * CHANNELS as usize) / 2;
+
+    match pattern_type {
+        "alternating" => {
+            // Alternating max, zero, min pattern
+            for i in 0..sample_count {
+                let sample = match i % 3 {
+                    0 => 0.9,  // Near max (+1.0)
+                    1 => 0.0,  // Zero
+                    _ => -0.9, // Near min (-1.0)
+                };
+                writer.write_sample(sample)?;
+            }
+        }
+        "ascending" => {
+            // Ascending ramp from -0.9 to 0.9
+            for i in 0..sample_count {
+                let sample = -0.9 + (1.8 * i as f32 / sample_count as f32);
+                writer.write_sample(sample)?;
+            }
+        }
+        "silence" => {
+            // All zeros
+            for _ in 0..sample_count {
+                writer.write_sample(0.0)?;
+            }
+        }
+        "impulses" => {
+            // Periodic impulses (good for checking segmentation)
+            for i in 0..sample_count {
+                let sample = if i % 100 == 0 { 0.9 } else { 0.0 };
+                writer.write_sample(sample)?;
+            }
+        }
+        _ => return Err(anyhow::anyhow!("Unknown pattern type")),
+    }
+
+    writer.finalize()?;
+    Ok(())
+}
 
 /// Write samples to a WAV file
 fn write_test_wav(path: PathBuf, duration: f32) -> Result<()> {
@@ -144,5 +202,26 @@ fn main() -> Result<()> {
         }
     }
 
+    // Then in main() add:
+    let test_patterns = vec![
+        ("alternating.flac", "alternating"),
+        ("ascending.flac", "ascending"),
+        ("silence.flac", "silence"),
+        ("impulses.flac", "impulses"),
+    ];
+
+    for (name, pattern) in test_patterns {
+        let flac_path = out_dir.join(name);
+
+        if should_generate(&flac_path, 0.5) {
+            // 0.5 seconds duration
+            println!("cargo:warning=Generating pattern file {}", name);
+            let wav_path = out_dir.join(format!("{}.wav", name.strip_suffix(".flac").unwrap()));
+            generate_test_pattern_wav(wav_path.clone(), pattern)?;
+            convert_to_flac(&wav_path, &flac_path)?;
+        } else {
+            println!("cargo:warning=Skipping {} (already exists)", name);
+        }
+    }
     Ok(())
 }
