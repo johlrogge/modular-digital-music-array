@@ -50,11 +50,13 @@ fn generate_test_signal(duration_secs: f32) -> Vec<f32> {
 
     samples
 }
-// Add these to build.rs
+use std::fs;
+
+// Add this function to build.rs
 fn generate_test_pattern_wav(path: PathBuf, pattern_type: &str) -> Result<()> {
     // Create parent directories if they don't exist
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)?;
     }
 
     let spec = hound::WavSpec {
@@ -202,7 +204,7 @@ fn main() -> Result<()> {
         }
     }
 
-    // Then in main() add:
+    // Create test pattern files
     let test_patterns = vec![
         ("alternating.flac", "alternating"),
         ("ascending.flac", "ascending"),
@@ -223,5 +225,6 @@ fn main() -> Result<()> {
             println!("cargo:warning=Skipping {} (already exists)", name);
         }
     }
+
     Ok(())
 }
