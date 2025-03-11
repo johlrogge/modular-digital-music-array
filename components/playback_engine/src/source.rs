@@ -43,7 +43,7 @@ pub struct AudioSegment {
 }
 
 // A decoded segment with its position information
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DecodedSegment {
     // The segment index
     pub index: SegmentIndex,
@@ -53,8 +53,9 @@ pub struct DecodedSegment {
 }
 
 pub trait Source: Send + Sync {
-    // Try to decode segments starting at the current position
-    fn decode_segments(&self, max_segments: usize) -> Result<Vec<DecodedSegment>, PlaybackError>;
+    // Decode the next frame of audio data into segments
+    // Returns the segments from the frame, or empty vec at EOF
+    fn decode_next_frame(&self) -> Result<Vec<DecodedSegment>, PlaybackError>;
 
     // Seek to a specific sample position
     fn seek(&self, position: usize) -> Result<(), PlaybackError>;
@@ -179,7 +180,7 @@ impl FlacSource {
 }
 
 impl Source for FlacSource {
-    fn decode_segments(&self, max_segments: usize) -> Result<Vec<DecodedSegment>, PlaybackError> {
+    fn decode_next_frame(&self) -> Result<Vec<DecodedSegment>, PlaybackError> {
         // Always return exactly one segment with index 0, regardless of current position
         let mut segments = Vec::with_capacity(1);
 
@@ -232,14 +233,19 @@ mod tests {
     #[test]
     fn first_segment_is_at_position_zero() {
         // Create a source from the alternating pattern file
-        let source =
+        let mut source =
             FlacSource::new(file_path("alternating.flac")).expect("Failed to create source");
 
         // Decode a single segment
-        let segments = source.decode_segments(1).expect("Failed to decode segment");
+        let segments = source
+            .decode_next_frame()
+            .expect("Failed to decode segment");
 
         // Verify we got a segment
-        assert_eq!(segments.len(), 1, "Should have decoded exactly one segment");
+        assert!(
+            segments.len() > 0,
+            "Should have decoded atleast one segment"
+        );
 
         // Verify the segment index corresponds to position 0
         assert_eq!(
@@ -252,33 +258,22 @@ mod tests {
     #[test]
     fn second_segment_follows_first() {
         // Create a source from the alternating pattern file
-        let source =
+        let mut source =
             FlacSource::new(file_path("alternating.flac")).expect("Failed to create source");
 
         // Decode the first segment
         let first_segments = source
-            .decode_segments(1)
+            .decode_next_frame()
             .expect("Failed to decode first segment");
-        assert_eq!(
-            first_segments.len(),
-            1,
-            "Should have decoded exactly one segment"
-        );
-
-        // Decode the second segment
-        let second_segments = source
-            .decode_segments(1)
-            .expect("Failed to decode second segment");
-        assert_eq!(
-            second_segments.len(),
-            1,
-            "Should have decoded exactly one segment"
+        assert!(
+            first_segments.len() > 1,
+            "Should have at least two segments"
         );
 
         // Verify the second segment follows the first
         assert_eq!(
-            second_segments[0].index,
             first_segments[0].index.next(),
+            first_segments[1].index,
             "Second segment should follow the first"
         );
     }
@@ -286,32 +281,20 @@ mod tests {
     #[test]
     fn segment_data_matches_expected_pattern() {
         // Create a source from the alternating pattern file
-        let source =
+        let mut source =
             FlacSource::new(file_path("alternating.flac")).expect("Failed to create source");
 
         // Decode a segment
-        let segments = source.decode_segments(1).expect("Failed to decode segment");
-        assert_eq!(segments.len(), 1, "Should have decoded exactly one segment");
+        let segments = source
+            .decode_next_frame()
+            .expect("Failed to decode segment");
 
         // Get the first segment's samples
         let samples = &segments[0].segment.samples;
 
-        // Find the first non-zero sample (to handle any potential padding)
-        let mut start_idx = 0;
-        while start_idx < samples.len() && samples[start_idx].abs() < 0.01 {
-            start_idx += 1;
-        }
-
-        // Ensure we found a non-zero sample and have enough samples to check the pattern
-        if start_idx + 6 >= samples.len() {
-            panic!("Couldn't find starting pattern in segment data");
-        }
-
         // Verify alternating pattern (high, zero, low)
         assert!(
-            samples[start_idx] > 0.5
-                && samples[start_idx + 1].abs() < 0.01
-                && samples[start_idx + 2] < -0.5,
+            samples[0] > 0.5 && samples[1].abs() < 0.01 && samples[2] < -0.5,
             "First three samples should follow high, zero, low pattern"
         );
     }
@@ -319,16 +302,19 @@ mod tests {
     #[test]
     fn multiple_segments_decode_correctly() {
         // Create a source from the alternating pattern file
-        let source =
+        let mut source =
             FlacSource::new(file_path("alternating.flac")).expect("Failed to create source");
 
         // Decode three segments at once
         let segments = source
-            .decode_segments(3)
+            .decode_next_frame()
             .expect("Failed to decode segments");
 
         // Should get three segments
-        assert_eq!(segments.len(), 3, "Should have decoded three segments");
+        assert!(
+            segments.len() > 3,
+            "Should have decoded at least three segments"
+        );
 
         // Segments should be sequential
         for i in 1..segments.len() {
@@ -343,11 +329,12 @@ mod tests {
     #[test]
     fn segment_boundaries_are_seamless() {
         // Create a source from the ascending pattern file (continuous pattern)
-        let source = FlacSource::new(file_path("ascending.flac")).expect("Failed to create source");
+        let mut source =
+            FlacSource::new(file_path("ascending.flac")).expect("Failed to create source");
 
         // Decode two segments
         let segments = source
-            .decode_segments(2)
+            .decode_next_frame()
             .expect("Failed to decode segments");
         assert_eq!(segments.len(), 2, "Should have decoded two segments");
 
@@ -373,14 +360,14 @@ mod tests {
     #[test]
     fn partial_segment_at_eof() {
         // Create a very short custom test file (or use existing one)
-        let source =
+        let mut source =
             FlacSource::new(file_path("alternating.flac")).expect("Failed to create source");
 
         // Decode all segments
         let mut all_segments = Vec::new();
         loop {
             let segments = source
-                .decode_segments(2)
+                .decode_next_frame()
                 .expect("Failed to decode segments");
             if segments.is_empty() {
                 break;
@@ -400,12 +387,12 @@ mod tests {
     }
 
     // Helper function to decode all segments from a source
-    fn decode_all_segments(source: &FlacSource) -> Vec<DecodedSegment> {
+    fn decode_all_segments(source: &mut FlacSource) -> Vec<DecodedSegment> {
         let mut all_segments = Vec::new();
 
         // Decode segments until we reach the end of the file
         loop {
-            match source.decode_segments(5) {
+            match source.decode_next_frame() {
                 Ok(segments) => {
                     if segments.is_empty() {
                         // No more segments, we've reached the end
@@ -425,10 +412,10 @@ mod tests {
     #[test]
     fn decode_reaches_eof() {
         // Test with a short file
-        let source = FlacSource::new(file_path("short.flac")).expect("Failed to create source");
+        let mut source = FlacSource::new(file_path("short.flac")).expect("Failed to create source");
 
         // Decode all segments
-        let segments = decode_all_segments(&source);
+        let segments = decode_all_segments(&mut source);
 
         // Verify we've got some segments
         assert!(
@@ -445,9 +432,9 @@ mod tests {
 
     #[test]
     fn segments_are_sequential() {
-        let source = FlacSource::new(file_path("short.flac")).expect("Failed to create source");
+        let mut source = FlacSource::new(file_path("short.flac")).expect("Failed to create source");
 
-        let segments = decode_all_segments(&source);
+        let segments = decode_all_segments(&mut source);
 
         // Skip test if fewer than 2 segments
         if segments.len() < 2 {
@@ -466,10 +453,10 @@ mod tests {
 
     #[test]
     fn alternating_pattern_preserved() {
-        let source =
+        let mut source =
             FlacSource::new(file_path("alternating.flac")).expect("Failed to create source");
 
-        let segments = decode_all_segments(&source);
+        let segments = decode_all_segments(&mut source);
         assert!(
             !segments.is_empty(),
             "Should have decoded at least one segment"
@@ -519,9 +506,10 @@ mod tests {
 
     #[test]
     fn ascending_pattern_preserved() {
-        let source = FlacSource::new(file_path("ascending.flac")).expect("Failed to create source");
+        let mut source =
+            FlacSource::new(file_path("ascending.flac")).expect("Failed to create source");
 
-        let segments = decode_all_segments(&source);
+        let segments = decode_all_segments(&mut source);
         assert!(
             !segments.is_empty(),
             "Should have decoded at least one segment"
@@ -545,9 +533,10 @@ mod tests {
 
     #[test]
     fn silence_preserved() {
-        let source = FlacSource::new(file_path("silence.flac")).expect("Failed to create source");
+        let mut source =
+            FlacSource::new(file_path("silence.flac")).expect("Failed to create source");
 
-        let segments = decode_all_segments(&source);
+        let segments = decode_all_segments(&mut source);
         assert!(
             !segments.is_empty(),
             "Should have decoded at least one segment"
@@ -567,9 +556,10 @@ mod tests {
 
     #[test]
     fn impulses_preserved() {
-        let source = FlacSource::new(file_path("impulses.flac")).expect("Failed to create source");
+        let mut source =
+            FlacSource::new(file_path("impulses.flac")).expect("Failed to create source");
 
-        let segments = decode_all_segments(&source);
+        let segments = decode_all_segments(&mut source);
         assert!(
             !segments.is_empty(),
             "Should have decoded at least one segment"
@@ -600,9 +590,9 @@ mod tests {
 
     #[test]
     fn segment_size_consistency() {
-        let source = FlacSource::new(file_path("short.flac")).expect("Failed to create source");
+        let mut source = FlacSource::new(file_path("short.flac")).expect("Failed to create source");
 
-        let segments = decode_all_segments(&source);
+        let segments = decode_all_segments(&mut source);
         assert!(
             !segments.is_empty(),
             "Should have decoded at least one segment"
