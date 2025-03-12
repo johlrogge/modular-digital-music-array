@@ -181,19 +181,39 @@ impl FlacSource {
 
 impl Source for FlacSource {
     fn decode_next_frame(&self) -> Result<Vec<DecodedSegment>, PlaybackError> {
-        // Always return exactly one segment with index 0, regardless of current position
-        let mut segments = Vec::with_capacity(1);
+        // Get the current position
+        let current_position = self.current_position.load(Ordering::Relaxed);
 
-        // Create a segment with default data (all zeros)
-        let segment = AudioSegment {
+        // Calculate the segment index for the current position
+        let segment_index = SegmentIndex::from_sample_position(current_position);
+
+        // Create two segments (we'll return two in the first frame)
+        let mut segments = Vec::with_capacity(2);
+
+        // First segment
+        let segment1 = AudioSegment {
             samples: [0.0; SEGMENT_SIZE],
         };
 
-        // Add segment with hardcoded index 0
         segments.push(DecodedSegment {
-            index: SegmentIndex::from_sample_position(0),
-            segment,
+            index: segment_index,
+            segment: segment1,
         });
+
+        // Second segment
+        let segment2 = AudioSegment {
+            samples: [0.0; SEGMENT_SIZE],
+        };
+
+        segments.push(DecodedSegment {
+            index: segment_index.next(),
+            segment: segment2,
+        });
+
+        // Update the position for the next call
+        // We increment by two segments since we're returning two
+        self.current_position
+            .store(current_position + SEGMENT_SIZE * 2, Ordering::Relaxed);
 
         Ok(segments)
     }
