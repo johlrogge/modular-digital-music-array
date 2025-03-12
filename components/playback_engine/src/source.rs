@@ -177,45 +177,82 @@ impl FlacSource {
     pub fn is_eof(&self) -> bool {
         self.is_eof.load(Ordering::Relaxed)
     }
+
+    fn extract_segments(
+        &self,
+        decoded: symphonia::core::audio::AudioBufferRef<'_>,
+    ) -> Result<Vec<DecodedSegment>, PlaybackError> {
+        // Get decoded buffer specification
+        let spec = *decoded.spec();
+
+        // Create a sample buffer
+        let mut sample_buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+        sample_buffer.copy_interleaved_ref(decoded);
+        let samples = sample_buffer.samples();
+        let current_position = self.current_position.load(Ordering::Relaxed);
+
+        // Break the samples into segments
+        let mut segments = Vec::new();
+        let mut sample_idx = 0;
+
+        while sample_idx < samples.len() {
+            // Calculate the start of this segment in the overall stream
+            let current_segment_index =
+                SegmentIndex::from_sample_position(current_position + sample_idx);
+
+            // Create a new segment
+            let mut segment = AudioSegment {
+                samples: [0.0; SEGMENT_SIZE],
+            };
+
+            // Determine how many samples to copy (either remaining or segment size)
+            let samples_to_copy = std::cmp::min(SEGMENT_SIZE, samples.len() - sample_idx);
+
+            // Copy samples into segment
+            segment.samples[0..samples_to_copy]
+                .copy_from_slice(&samples[sample_idx..sample_idx + samples_to_copy]);
+
+            // Add the segment
+            segments.push(DecodedSegment {
+                index: current_segment_index,
+                segment,
+            });
+
+            sample_idx += samples_to_copy;
+        }
+
+        // Update the current position
+        self.current_position
+            .store(current_position + samples.len(), Ordering::Relaxed);
+
+        Ok(segments)
+    }
 }
 
 impl Source for FlacSource {
     fn decode_next_frame(&self) -> Result<Vec<DecodedSegment>, PlaybackError> {
-        // Get the current position
-        let current_position = self.current_position.load(Ordering::Relaxed);
+        if self.is_eof.load(Ordering::Relaxed) {
+            return Ok(Vec::new());
+        }
 
-        // Calculate the segment index for the current position
-        let segment_index = SegmentIndex::from_sample_position(current_position);
-
-        // Create two segments (we'll return two in the first frame)
-        let mut segments = Vec::with_capacity(2);
-
-        // First segment
-        let segment1 = AudioSegment {
-            samples: [0.0; SEGMENT_SIZE],
+        let mut decoder_state = self.decoder_state.lock();
+        let packet = match decoder_state.format_reader.next_packet() {
+            Ok(packet) => packet,
+            Err(symphonia::core::errors::Error::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                self.is_eof.store(true, Ordering::Relaxed);
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(PlaybackError::Decoder(e.to_string())),
         };
 
-        segments.push(DecodedSegment {
-            index: segment_index,
-            segment: segment1,
-        });
-
-        // Second segment
-        let segment2 = AudioSegment {
-            samples: [0.0; SEGMENT_SIZE],
+        let decoded = match decoder_state.decoder.decode(&packet) {
+            Ok(decoded) => decoded,
+            Err(e) => return Err(PlaybackError::Decoder(e.to_string())),
         };
 
-        segments.push(DecodedSegment {
-            index: segment_index.next(),
-            segment: segment2,
-        });
-
-        // Update the position for the next call
-        // We increment by two segments since we're returning two
-        self.current_position
-            .store(current_position + SEGMENT_SIZE * 2, Ordering::Relaxed);
-
-        Ok(segments)
+        self.extract_segments(decoded)
     }
 
     fn seek(&self, position: usize) -> Result<(), PlaybackError> {
@@ -356,7 +393,10 @@ mod tests {
         let segments = source
             .decode_next_frame()
             .expect("Failed to decode segments");
-        assert_eq!(segments.len(), 2, "Should have decoded two segments");
+        assert!(
+            segments.len() >= 2,
+            "Should have decoded at least two segments"
+        );
 
         // The last sample of the first segment should be close to the first sample of the second segment
         // (allowing for a small delta due to compression artifacts)
