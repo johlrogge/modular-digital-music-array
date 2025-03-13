@@ -71,7 +71,7 @@ impl<S: Source + Send + Sync> Track<S> {
     }
 
     pub fn play(&mut self) {
-        todo!("Implement play")
+        self.playing = true;
     }
 
     pub fn seek(&mut self, position: usize) -> Result<(), PlaybackError> {
@@ -408,6 +408,96 @@ impl Track<TestSource> {
 mod tests {
     use super::*;
     use crate::source::SegmentIndex;
+    #[tokio::test]
+    async fn test_track_play_stop() {
+        // Create a test source
+        let source = TestSource::new_with_pattern("ascending", 1.0);
+
+        // Create a track with this source
+        let mut track = Track::new(source).await.unwrap();
+
+        // Track should not be playing initially
+        assert!(!track.is_playing(), "Track should not be playing initially");
+
+        // Play the track
+        track.play();
+
+        // Track should now be playing
+        assert!(
+            track.is_playing(),
+            "Track should be playing after play() call"
+        );
+
+        // Stop the track
+        track.stop();
+
+        // Track should no longer be playing
+        assert!(
+            !track.is_playing(),
+            "Track should not be playing after stop() call"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_next_samples() {
+        // Create a test source with a known pattern
+        let source = TestSource::new_with_pattern("alternating", 1.0);
+
+        // Create a track with this source
+        let mut track = Track::new(source).await.unwrap();
+
+        // Set track to playing state
+        track.play();
+
+        // Create a buffer to hold samples
+        let mut output_buffer = vec![0.0; 100];
+
+        // Read the first batch of samples
+        let samples_read = track.get_next_samples(&mut output_buffer).unwrap();
+
+        // Should have read samples
+        assert!(samples_read > 0, "Should have read samples");
+        assert_eq!(
+            samples_read,
+            output_buffer.len(),
+            "Should have filled the buffer"
+        );
+
+        // Check that the samples follow the alternating pattern
+        // (high, zero, low) for the first few samples
+        assert!(output_buffer[0] > 0.5, "First sample should be high");
+        assert!(
+            output_buffer[1].abs() < 0.01,
+            "Second sample should be near zero"
+        );
+        assert!(output_buffer[2] < -0.5, "Third sample should be low");
+
+        // Track's position should have advanced
+        assert_eq!(
+            track.position(),
+            samples_read,
+            "Position should have advanced"
+        );
+
+        // Read another batch of samples
+        let previous_position = track.position();
+        let samples_read_2 = track.get_next_samples(&mut output_buffer).unwrap();
+
+        // Should have read more samples
+        assert!(samples_read_2 > 0, "Should have read more samples");
+
+        // Position should have advanced again
+        assert_eq!(
+            track.position(),
+            previous_position + samples_read_2,
+            "Position should have advanced again"
+        );
+
+        // When stopped, should not read samples
+        track.stop();
+        let samples_read_3 = track.get_next_samples(&mut output_buffer).unwrap();
+        assert_eq!(samples_read_3, 0, "Should not read samples when stopped");
+    }
 
     #[tokio::test]
     async fn test_load_segment() {
@@ -531,5 +621,73 @@ mod tests {
             segments[0].index, expected_segment_index,
             "Should get segment at the requested position"
         );
+    }
+
+    #[tokio::test]
+    async fn test_load_already_loaded_segment() {
+        // Create a test source
+        let source = TestSource::new_with_pattern("ascending", 1.0);
+
+        // Create a track with this source
+        let track = Track::new(source).await.unwrap();
+
+        // Load segment at position 0
+        let target_segment = SegmentIndex(0);
+        track.load_segment(target_segment).await.unwrap();
+
+        // Check that segment 0 is loaded
+        {
+            let buffer = track.buffer.read();
+            assert!(buffer.is_segment_loaded(target_segment));
+        }
+
+        // Now try to load the same segment again
+        // This should be efficient (not require seeking or decoding again)
+        // We don't have a direct way to test this efficiency in the current structure,
+        // but we can at least ensure it doesn't fail
+        track.load_segment(target_segment).await.unwrap();
+
+        // Segment should still be loaded
+        {
+            let buffer = track.buffer.read();
+            assert!(buffer.is_segment_loaded(target_segment));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_load_multiple_segments() {
+        // Create a test source
+        let source = TestSource::new_with_pattern("ascending", 1.0);
+
+        // Create a track with this source
+        let track = Track::new(source).await.unwrap();
+
+        // Load multiple segments in sequence
+        for i in 0..3 {
+            let target_segment = SegmentIndex(i);
+            track.load_segment(target_segment).await.unwrap();
+        }
+
+        // Check that all segments are loaded
+        {
+            let buffer = track.buffer.read();
+            for i in 0..3 {
+                assert!(
+                    buffer.is_segment_loaded(SegmentIndex(i)),
+                    "Segment {} should be loaded",
+                    i
+                );
+            }
+        }
+
+        // Load a non-sequential segment
+        let target_segment = SegmentIndex(5);
+        track.load_segment(target_segment).await.unwrap();
+
+        // Check that the new segment is loaded
+        {
+            let buffer = track.buffer.read();
+            assert!(buffer.is_segment_loaded(target_segment));
+        }
     }
 }
