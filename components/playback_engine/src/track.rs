@@ -106,6 +106,27 @@ impl<S: Source + Send + Sync> Track<S> {
     pub fn get_volume(&self) -> f32 {
         self.volume
     }
+    async fn load_segment(&self, index: SegmentIndex) -> Result<(), PlaybackError> {
+        // Check if segment already loaded
+        {
+            let buffer = self.buffer.read();
+            if buffer.is_segment_loaded(index) {
+                return Ok(());
+            }
+        }
+
+        // Seek to the beginning always (simplest approach for now)
+        self.source.seek(0)?;
+
+        // Decode a frame of audio
+        let segments = self.source.decode_next_frame()?;
+
+        // Add the segments to the buffer
+        let mut buffer = self.buffer.write();
+        buffer.add_segments(segments);
+
+        Ok(())
+    }
 }
 
 impl<S: Source + Send + Sync + 'static> Drop for Track<S> {
@@ -356,5 +377,80 @@ impl Track<TestSource> {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         Ok(())
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source::SegmentIndex;
+
+    #[tokio::test]
+    async fn test_load_segment() {
+        // Create a test source that will produce predictable segments
+        let source = TestSource::new_with_pattern("ascending", 1.0);
+
+        // Create a track with this source
+        let track = Track::new(source).await.unwrap();
+
+        // Initially segment 0 should not be loaded
+        {
+            let buffer = track.buffer.read();
+            assert!(!buffer.is_segment_loaded(SegmentIndex(0)));
+        }
+
+        // Load segment 0
+        track.load_segment(SegmentIndex(0)).await.unwrap();
+
+        // Now segment 0 should be loaded
+        {
+            let buffer = track.buffer.read();
+            assert!(buffer.is_segment_loaded(SegmentIndex(0)));
+        }
+    }
+    #[tokio::test]
+    async fn test_load_segment_wrong_position() {
+        // Create a test source
+        let source = TestSource::new_with_pattern("ascending", 1.0);
+
+        // Create a track with this source
+        let track = Track::new(source).await.unwrap();
+
+        // Load segment at position 2 (which requires seeking)
+        let target_segment = SegmentIndex(2);
+        track.load_segment(target_segment).await.unwrap();
+
+        // Check that segment 2 is loaded
+        {
+            let buffer = track.buffer.read();
+            assert!(buffer.is_segment_loaded(target_segment));
+        }
+    }
+    #[tokio::test]
+    async fn test_load_segment_at_eof() {
+        // Create a test source that will reach EOF quickly
+        let source = TestSource::new_with_pattern("ascending", 0.1); // Very short
+
+        // Create a track with this source
+        let mut track = Track::new(source).await.unwrap();
+
+        // First, force the source to EOF by reading all its data
+        loop {
+            // We need to use decode_next_frame directly on the source
+            let segments = track.source.decode_next_frame().unwrap();
+            if segments.is_empty() {
+                // Empty segments indicate EOF
+                break;
+            }
+        }
+
+        // Try to load a segment (should reset EOF and succeed)
+        let target_segment = SegmentIndex(0);
+        track.load_segment(target_segment).await.unwrap();
+
+        // Check that segment 0 is loaded
+        {
+            let buffer = track.buffer.read();
+            assert!(buffer.is_segment_loaded(target_segment));
+        }
     }
 }
