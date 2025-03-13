@@ -115,8 +115,11 @@ impl<S: Source + Send + Sync> Track<S> {
             }
         }
 
-        // Seek to the beginning always (simplest approach for now)
-        self.source.seek(0)?;
+        // Calculate position to seek to
+        let seek_position = index.start_position();
+
+        // Seek to the calculated position
+        self.source.seek(seek_position)?;
 
         // Decode a frame of audio
         let segments = self.source.decode_next_frame()?;
@@ -164,16 +167,18 @@ impl<S: Source + Send + Sync + 'static> Drop for Track<S> {
 pub struct TestSource {
     position: AtomicUsize,
     samples: Vec<Vec<DecodedSegment>>,
+    // New field to track the target sample position for seeking
+    seek_sample_position: AtomicUsize,
 }
 
 #[cfg(test)]
 impl TestSource {
-    // Create a new TestSource from raw samples
     pub fn new_from_samples(samples: Vec<f32>) -> Self {
         let segments = Self::create_segments_from_samples(samples);
         Self {
             position: AtomicUsize::new(0),
             samples: vec![segments], // Wrap in vector to simulate frames
+            seek_sample_position: AtomicUsize::new(0),
         }
     }
 
@@ -187,6 +192,7 @@ impl TestSource {
         Self {
             position: AtomicUsize::new(0),
             samples: frames_of_segments,
+            seek_sample_position: AtomicUsize::new(0),
         }
     }
 
@@ -240,7 +246,25 @@ impl TestSource {
 
         segments
     }
+    fn adjust_segment_indices(&self, segments: Vec<DecodedSegment>) -> Vec<DecodedSegment> {
+        let seek_pos = self.seek_sample_position.load(Ordering::Relaxed);
+        if seek_pos == 0 {
+            return segments; // No adjustment needed
+        }
 
+        // Create base segment index from seek position
+        let base_index = SegmentIndex::from_sample_position(seek_pos);
+
+        // Adjust each segment's index
+        segments
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut segment)| {
+                segment.index = SegmentIndex(base_index.0 + i);
+                segment
+            })
+            .collect()
+    }
     // Convenience method to generate various test patterns
     pub fn new_with_pattern(pattern: &str, seconds: f32) -> Self {
         let sample_rate = 48000;
@@ -317,22 +341,23 @@ impl Source for TestSource {
         }
 
         // Get the current frame's segments
-        let result = self.samples[pos].clone();
+        let segments = self.samples[pos].clone();
+
+        // Adjust segment indices based on seek position
+        let adjusted_segments = self.adjust_segment_indices(segments);
 
         // Move to next frame
         self.position.store(pos + 1, Ordering::Relaxed);
 
-        Ok(result)
+        Ok(adjusted_segments)
     }
 
     fn seek(&self, position: usize) -> Result<(), PlaybackError> {
-        // For TestSource, position refers to frame index
-        if position >= self.samples.len() {
-            return Err(PlaybackError::Decoder("Seek position out of bounds".into()));
-        }
+        // Store the target sample position
+        self.seek_sample_position.store(position, Ordering::Relaxed);
 
-        // Update position
-        self.position.store(position, Ordering::Relaxed);
+        // Reset frame position to beginning
+        self.position.store(0, Ordering::Relaxed);
 
         Ok(())
     }
@@ -431,7 +456,7 @@ mod tests {
         let source = TestSource::new_with_pattern("ascending", 0.1); // Very short
 
         // Create a track with this source
-        let mut track = Track::new(source).await.unwrap();
+        let track = Track::new(source).await.unwrap();
 
         // First, force the source to EOF by reading all its data
         loop {
@@ -452,5 +477,59 @@ mod tests {
             let buffer = track.buffer.read();
             assert!(buffer.is_segment_loaded(target_segment));
         }
+    }
+
+    #[test]
+    fn test_seek() {
+        // Create a test source with an ascending pattern
+        let source = TestSource::new_with_pattern("ascending", 1.0);
+
+        // Verify initial state
+        let initial_segments = source.decode_next_frame().unwrap();
+        assert!(!initial_segments.is_empty(), "Should have initial segments");
+
+        // Seek to a specific position (in TestSource, this is the frame index)
+        let seek_position = 0; // Reset to first frame
+        source.seek(seek_position).unwrap();
+
+        // Decode again and verify we're back at the beginning
+        let segments_after_seek = source.decode_next_frame().unwrap();
+        assert!(
+            !segments_after_seek.is_empty(),
+            "Should have segments after seeking"
+        );
+
+        // The segments should be the same as our initial segments
+        assert_eq!(
+            initial_segments[0].index, segments_after_seek[0].index,
+            "Segment indices should match after seeking to beginning"
+        );
+    }
+    #[test]
+    fn test_seek_sample_position() {
+        // Create a test source with a pattern that has multiple segments
+        let source = TestSource::new_with_pattern("ascending", 1.0);
+
+        // Sample position that would be in the 3rd segment
+        let sample_position = SEGMENT_SIZE * 2 + 100; // 2 full segments + 100 samples
+
+        source
+            .seek(sample_position)
+            .expect("Should handle sample position seeks");
+
+        // Decode a frame after seeking
+        let segments = source
+            .decode_next_frame()
+            .expect("Should decode after seeking");
+
+        // Should still get segments
+        assert!(!segments.is_empty(), "Should get segments after seeking");
+
+        // First segment should be at or close to the requested position
+        let expected_segment_index = SegmentIndex::from_sample_position(sample_position);
+        assert_eq!(
+            segments[0].index, expected_segment_index,
+            "Should get segment at the requested position"
+        );
     }
 }

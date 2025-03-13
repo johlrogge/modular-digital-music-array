@@ -256,7 +256,31 @@ impl Source for FlacSource {
     }
 
     fn seek(&self, position: usize) -> Result<(), PlaybackError> {
-        todo!("implement seek")
+        // Calculate the time to seek to
+        let seek_time = self.position_to_time(position);
+
+        // Reset EOF flag since we're seeking
+        self.is_eof.store(false, Ordering::Relaxed);
+
+        // Update current position
+        self.current_position.store(position, Ordering::Relaxed);
+
+        // Acquire lock on decoder state
+        let mut decoder_state = self.decoder_state.lock();
+
+        // Seek the format reader to the specified time
+        decoder_state
+            .format_reader
+            .seek(
+                SeekMode::Accurate,
+                SeekTo::Time {
+                    time: seek_time,
+                    track_id: None,
+                },
+            )
+            .map_err(|e| PlaybackError::Decoder(format!("Seek error: {}", e)))?;
+
+        Ok(())
     }
 
     fn sample_rate(&self) -> u32 {
@@ -670,5 +694,42 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn seek() {
+        // Create a source from the ascending pattern file (continuous pattern)
+        let source = FlacSource::new(file_path("ascending.flac")).expect("Failed to create source");
+
+        // Seek to a specific position
+        let seek_position = 1000; // 1000 samples into the file
+        source.seek(seek_position).expect("Failed to seek");
+
+        // Decode a frame after seeking
+        let segments = source.decode_next_frame().expect("Failed to decode frame");
+
+        // Verify we got a segment
+        assert!(
+            !segments.is_empty(),
+            "Should have decoded at least one segment"
+        );
+
+        // Check that the segment starts at or near the seek position
+        // The segment index should correspond to our seek position
+        let expected_index = SegmentIndex::from_sample_position(seek_position);
+        assert_eq!(
+            segments[0].index, expected_index,
+            "Segment should start at or near the seek position"
+        );
+
+        // Test that samples follow the ascending pattern
+        // For the ascending pattern, later samples should be larger than earlier ones
+        let samples = &segments[0].segment.samples;
+        let first_quarter_idx = SEGMENT_SIZE / 4;
+        let last_quarter_idx = SEGMENT_SIZE * 3 / 4;
+
+        assert!(
+            samples[last_quarter_idx] > samples[first_quarter_idx],
+            "Samples should follow ascending pattern after seeking"
+        );
     }
 }
