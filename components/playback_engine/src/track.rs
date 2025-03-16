@@ -691,3 +691,32 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod ringbuffer_tests {
+    use ringbuf::HeapRb;
+
+    #[test]
+    fn test_basic_ringbuffer_usage() {
+        // Create a heap-allocated ringbuffer with capacity for 10 samples
+        let rb = HeapRb::<f32>::new(10);
+        let (mut producer, mut consumer) = rb.split();
+
+        // Push some samples
+        for i in 0..5 {
+            assert!(producer.push(i as f32).is_ok());
+        }
+
+        // Should have 5 items
+        assert_eq!(consumer.len(), 5);
+
+        // Read some samples
+        let mut output = vec![0.0; 3];
+        let read = consumer.pop_slice(&mut output);
+        assert_eq!(read, 3);
+        assert_eq!(output, vec![0.0, 1.0, 2.0]);
+
+        // Should have 2 items left
+        assert_eq!(consumer.len(), 2);
+    }
+}
