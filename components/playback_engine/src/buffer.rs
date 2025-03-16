@@ -29,7 +29,48 @@ impl SegmentedBuffer {
     /// Get samples from the buffer starting at the given position
     /// Returns the number of samples read
     pub fn get_samples(&self, position: usize, output: &mut [f32]) -> usize {
-        todo!("implement get_samples")
+        // Calculate which segment we need to start with
+        let start_segment_index = SegmentIndex::from_sample_position(position);
+
+        // Calculate offset within the first segment
+        let offset_in_segment = position - start_segment_index.start_position();
+
+        // Track how many samples we've written to output
+        let mut samples_written = 0;
+
+        // Keep reading segments until we've filled the output buffer or run out of segments
+        let mut current_segment_index = start_segment_index;
+
+        while samples_written < output.len() {
+            // Check if the current segment exists
+            if let Some(segment) = self.segments.get(&current_segment_index) {
+                // Calculate how many samples we can copy from this segment
+                let segment_offset = if current_segment_index == start_segment_index {
+                    offset_in_segment
+                } else {
+                    0
+                };
+
+                let samples_available = SEGMENT_SIZE - segment_offset;
+                let samples_to_copy =
+                    std::cmp::min(samples_available, output.len() - samples_written);
+
+                // Copy samples from this segment to the output buffer
+                output[samples_written..samples_written + samples_to_copy].copy_from_slice(
+                    &segment.samples[segment_offset..segment_offset + samples_to_copy],
+                );
+
+                // Update counters
+                samples_written += samples_to_copy;
+                current_segment_index = current_segment_index.next();
+            } else {
+                // If segment is missing, we can't read any more samples
+                break;
+            }
+        }
+
+        // Return the number of samples we were able to read
+        samples_written
     }
 
     /// Add multiple segments to the buffer
@@ -46,9 +87,10 @@ impl SegmentedBuffer {
 
     /// Check if buffer is ready for playback at position
     pub fn is_ready_at(&self, position: usize) -> bool {
-        todo!("implement is ready at")
+        // To be ready at a position, we need at least one segment starting at or before that position
+        let segment_index = SegmentIndex::from_sample_position(position);
+        self.segments.contains_key(&segment_index)
     }
-
     /// Clear all segments from the buffer
     pub fn clear(&mut self) {
         self.segments.clear();
