@@ -796,6 +796,136 @@ mod tests {
             assert!(buffer_read.is_segment_loaded(segment_index));
         }
     }
+
+    #[tokio::test]
+    async fn test_segment_content_verification() {
+        // Create a test source with the alternating pattern
+        // The alternating pattern generates: [0.9, 0.0, -0.9, 0.9, 0.0, -0.9, ...]
+        let source = Arc::new(TestSource::new_with_pattern("alternating", 1.0));
+        let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
+
+        // Load a segment
+        let loaded = load_segments_with(&source, &buffer, 0, 1).await;
+        assert_eq!(loaded, 1, "Should successfully load one segment");
+
+        // Create a buffer to read samples into
+        let mut output = vec![0.0; 12]; // Read 4 complete cycles
+
+        // Read samples from the buffer
+        let samples_read = buffer.read().get_samples(0, &mut output);
+
+        // Verify we got all requested samples
+        assert_eq!(samples_read, 12, "Should read all requested samples");
+
+        // Define expected values for alternating pattern
+        // Pattern repeats: [0.9, 0.0, -0.9, 0.9, 0.0, -0.9, ...]
+        let expected_values = [
+            0.9, 0.0, -0.9, 0.9, 0.0, -0.9, 0.9, 0.0, -0.9, 0.9, 0.0, -0.9,
+        ];
+
+        // Verify each sample exactly matches the expected value
+        // Use a small epsilon for floating point comparison
+        const EPSILON: f32 = 1e-6;
+
+        for i in 0..expected_values.len() {
+            assert!(
+                (output[i] - expected_values[i]).abs() < EPSILON,
+                "Sample at position {} should be {}, got {}",
+                i,
+                expected_values[i],
+                output[i]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_segment_content_ascending() {
+        // Create a test source with the ascending pattern
+        // The ascending pattern generates a ramp from -0.9 to 0.9
+        let source = Arc::new(TestSource::new_with_pattern("ascending", 1.0));
+        let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
+
+        // Load a segment
+        let loaded = load_segments_with(&source, &buffer, 0, 1).await;
+        assert_eq!(loaded, 1, "Should successfully load one segment");
+
+        // Create a buffer to read samples into
+        let mut output = vec![0.0; 5]; // Sample a few points along the ramp
+
+        // Read samples from the buffer
+        let samples_read = buffer.read().get_samples(0, &mut output);
+        assert_eq!(samples_read, 5, "Should read all requested samples");
+
+        // With ascending pattern, each sample should be greater than the previous
+        for i in 1..output.len() {
+            assert!(
+                output[i] > output[i - 1],
+                "Sample at position {} ({}) should be greater than position {} ({})",
+                i,
+                output[i],
+                i - 1,
+                output[i - 1]
+            );
+        }
+
+        // First sample should be near -0.9 and last sample should be higher
+        const EPSILON: f32 = 0.01;
+        assert!(
+            (output[0] + 0.9).abs() < EPSILON,
+            "First sample should be near -0.9, got {}",
+            output[0]
+        );
+    }
+    #[tokio::test]
+    async fn test_segment_boundary_content() {
+        // Create a test source with the alternating pattern
+        let source = Arc::new(TestSource::new_with_pattern("alternating", 1.0));
+        let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
+
+        // Load two consecutive segments
+        let loaded = load_segments_with(&source, &buffer, 0, 2).await;
+        assert_eq!(loaded, 2, "Should successfully load two segments");
+
+        // Create a buffer to read samples across segment boundary
+        // Assuming SEGMENT_SIZE is 1024, read 10 samples before and after boundary
+        let boundary_position = SEGMENT_SIZE - 5;
+        let mut output = vec![0.0; 10];
+
+        // Read samples spanning the boundary
+        let samples_read = buffer.read().get_samples(boundary_position, &mut output);
+        assert_eq!(samples_read, 10, "Should read all requested samples");
+
+        // Test pattern should continue seamlessly across boundary
+        // For alternating pattern, we should see the continuing [0.9, 0.0, -0.9] pattern
+
+        // Define expected values based on where in the pattern we expect to be
+        // This needs to be calculated based on the boundary_position
+        let pattern_position = boundary_position % 3; // Since pattern repeats every 3 samples
+
+        let mut expected_values = Vec::with_capacity(10);
+        for i in 0..10 {
+            let pattern_index = (pattern_position + i) % 3;
+            let value = match pattern_index {
+                0 => 0.9,
+                1 => 0.0,
+                2 => -0.9,
+                _ => unreachable!(),
+            };
+            expected_values.push(value);
+        }
+
+        // Verify values across boundary
+        const EPSILON: f32 = 1e-6;
+        for i in 0..10 {
+            assert!(
+                (output[i] - expected_values[i]).abs() < EPSILON,
+                "Sample at boundary+{} should be {}, got {}",
+                i - 5,
+                expected_values[i],
+                output[i]
+            );
+        }
+    }
 }
 
 #[cfg(test)]
