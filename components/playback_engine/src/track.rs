@@ -8,7 +8,8 @@ use tokio::sync::mpsc;
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tracing::warn; // Using parking_lot for better RwLock performance
+
+use ringbuf::HeapRb;
 
 pub struct Track<S: Source + Send + Sync + 'static> {
     source: Arc<S>,
@@ -18,6 +19,10 @@ pub struct Track<S: Source + Send + Sync + 'static> {
     buffer: Arc<RwLock<SegmentedBuffer>>,
     command_tx: mpsc::Sender<TrackCommand>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
+    // Add the ringbuffer with producers/consumers
+    sample_buffer: Arc<RwLock<HeapRb<f32>>>,
+    ready_tx: tokio::sync::watch::Sender<bool>,
+    ready_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 // Update TrackCommand to include potential new commands
@@ -32,13 +37,22 @@ impl<S: Source + Send + Sync> Track<S> {
         let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
         let (command_tx, command_rx) = mpsc::channel(32);
 
-        // Add a dedicated shutdown channel
+        // Create a ringbuffer for audio samples (2 seconds of stereo audio at 48kHz)
+        let rb_capacity = 2 * 48000 * 2;
+        let sample_buffer = Arc::new(RwLock::new(HeapRb::<f32>::new(rb_capacity)));
 
         let source_clone = Arc::clone(&source);
         let buffer_clone = Arc::clone(&buffer);
 
+        // Add ready state tracking
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+
+        // Pass ready_tx to the background task
+        let ready_tx_clone = ready_tx.clone();
+
         let task_handle = tokio::spawn(async move {
-            Self::buffer_management_task(source_clone, buffer_clone, command_rx).await;
+            Self::buffer_management_task(source_clone, buffer_clone, command_rx, ready_tx_clone)
+                .await;
         });
 
         let track = Self {
@@ -49,6 +63,9 @@ impl<S: Source + Send + Sync> Track<S> {
             buffer,
             command_tx,
             task_handle: Some(task_handle),
+            sample_buffer,
+            ready_tx,
+            ready_rx,
         };
 
         // Send initial fill command
@@ -61,13 +78,149 @@ impl<S: Source + Send + Sync> Track<S> {
         Ok(track)
     }
 
-    // In track.rs - modify the buffer_management_task
     async fn buffer_management_task(
         source: Arc<S>,
         buffer: Arc<RwLock<SegmentedBuffer>>,
         mut command_rx: mpsc::Receiver<TrackCommand>,
+        ready_tx: tokio::sync::watch::Sender<bool>,
     ) {
-        todo!("implement background loading")
+        let mut current_position = 0;
+        let mut is_ready = false;
+
+        // Simple loop to process commands and load segments
+        while let Some(command) = command_rx.recv().await {
+            match command {
+                TrackCommand::FillFrom(position) => {
+                    current_position = position;
+
+                    // Set not ready when starting to fill from a new position
+                    if is_ready {
+                        is_ready = false;
+                        let _ = ready_tx.send(false);
+                    }
+
+                    // Try to load at least 3 segments ahead (initial minimum for playback)
+                    let mut loaded_count = 0;
+                    let segments_to_load = 3;
+
+                    for offset in 0..segments_to_load {
+                        let segment_index = SegmentIndex::from_sample_position(
+                            current_position + offset * SEGMENT_SIZE,
+                        );
+
+                        // Check if segment already loaded
+                        let needs_loading = {
+                            let buffer = buffer.read();
+                            !buffer.is_segment_loaded(segment_index)
+                        };
+
+                        if needs_loading {
+                            // Seek and decode
+                            if let Err(e) = source.seek(segment_index.start_position()) {
+                                tracing::error!("Error seeking: {}", e);
+                                break;
+                            }
+
+                            match source.decode_next_frame() {
+                                Ok(segments) => {
+                                    if segments.is_empty() {
+                                        // EOF reached
+                                        break;
+                                    }
+
+                                    // Add to buffer
+                                    let mut buffer = buffer.write();
+                                    buffer.add_segments(segments);
+
+                                    loaded_count += 1;
+                                }
+                                Err(e) => {
+                                    tracing::error!("Error decoding: {}", e);
+                                    break;
+                                }
+                            }
+                        } else {
+                            // Segment already loaded, count it
+                            loaded_count += 1;
+                        }
+                    }
+
+                    // Signal ready if we loaded enough segments
+                    if loaded_count > 0 && !is_ready {
+                        is_ready = true;
+                        let _ = ready_tx.send(true);
+                        tracing::debug!(
+                            "Track ready for playback at position {}",
+                            current_position
+                        );
+                    }
+
+                    // Continue loading more segments in background (for smooth playback)
+                    // This loads segments 3-10 after we've signaled readiness
+                    for offset in segments_to_load..10 {
+                        let segment_index = SegmentIndex::from_sample_position(
+                            current_position + offset * SEGMENT_SIZE,
+                        );
+
+                        let needs_loading = {
+                            let buffer = buffer.read();
+                            !buffer.is_segment_loaded(segment_index)
+                        };
+
+                        if needs_loading {
+                            if let Err(e) = source.seek(segment_index.start_position()) {
+                                tracing::debug!("Error seeking to additional segment: {}", e);
+                                break;
+                            }
+
+                            match source.decode_next_frame() {
+                                Ok(segments) => {
+                                    if segments.is_empty() {
+                                        break; // EOF
+                                    }
+
+                                    let mut buffer = buffer.write();
+                                    buffer.add_segments(segments);
+                                }
+                                Err(e) => {
+                                    tracing::debug!("Error decoding additional segment: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                TrackCommand::Shutdown => {
+                    tracing::info!("Buffer management task received shutdown command");
+                    break;
+                }
+            }
+        }
+
+        tracing::info!("Buffer management task completed");
+    }
+
+    pub async fn ensure_ready(&self) -> Result<(), PlaybackError> {
+        // Get a clone of the receiver
+        let mut rx = self.ready_rx.clone();
+
+        // If already ready, return immediately
+        if *rx.borrow() {
+            return Ok(());
+        }
+
+        // Otherwise wait for the ready signal
+        loop {
+            // Wait for a change in the ready state
+            rx.changed()
+                .await
+                .map_err(|_| PlaybackError::TaskCancelled)?;
+
+            // Check if we're ready now
+            if *rx.borrow() {
+                return Ok(());
+            }
+        }
     }
 
     pub fn play(&mut self) {
@@ -75,7 +228,15 @@ impl<S: Source + Send + Sync> Track<S> {
     }
 
     pub fn seek(&mut self, position: usize) -> Result<(), PlaybackError> {
-        todo!("implement seek")
+        // Update position
+        self.position = position;
+
+        // Request buffer filling from new position
+        if let Err(e) = self.command_tx.try_send(TrackCommand::FillFrom(position)) {
+            tracing::error!("Failed to send fill command after seek: {}", e);
+        }
+
+        Ok(())
     }
 
     pub fn position(&self) -> usize {
@@ -83,11 +244,37 @@ impl<S: Source + Send + Sync> Track<S> {
     }
 
     pub fn is_ready(&self) -> bool {
-        todo!("impement is_ready")
+        *self.ready_rx.borrow()
     }
 
     pub fn get_next_samples(&mut self, output: &mut [f32]) -> Result<usize, PlaybackError> {
-        todo!("implememnt get next samples")
+        if !self.playing {
+            return Ok(0);
+        }
+
+        // Read from the segmented buffer
+        let samples_read = {
+            let buffer = self.buffer.read();
+            buffer.get_samples(self.position, output)
+        };
+
+        // Update position
+        if samples_read > 0 {
+            self.position += samples_read;
+        }
+
+        // If we couldn't read enough samples, request more
+        if samples_read < output.len() {
+            // Try to load more data starting from current position
+            if let Err(e) = self
+                .command_tx
+                .try_send(TrackCommand::FillFrom(self.position))
+            {
+                tracing::debug!("Failed to send fill command: {}", e);
+            }
+        }
+
+        Ok(samples_read)
     }
 
     pub fn stop(&mut self) {
@@ -445,6 +632,9 @@ mod tests {
 
         // Create a track with this source
         let mut track = Track::new(source).await.unwrap();
+
+        // Wait for the track to be ready for playback
+        track.ensure_ready().await.unwrap();
 
         // Set track to playing state
         track.play();
