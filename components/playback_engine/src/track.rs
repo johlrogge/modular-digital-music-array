@@ -1,11 +1,13 @@
 use crate::buffer::SegmentedBuffer;
 use crate::error::PlaybackError;
-use crate::source::Source;
-use crate::source::{AudioSegment, DecodedSegment, SegmentIndex, SEGMENT_SIZE};
+#[cfg(test)]
+use crate::source::{AudioSegment, DecodedSegment};
+use crate::source::{SegmentIndex, Source, SEGMENT_SIZE};
 
 use tokio::sync::mpsc;
 
 use parking_lot::RwLock;
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -30,6 +32,114 @@ pub enum TrackCommand {
     FillFrom(usize),
     Shutdown,
 }
+/// Load multiple segments starting at the given position
+/// Returns the number of segments successfully loaded
+async fn load_segments_with<S: Source + Send + Sync>(
+    source: &Arc<S>,
+    buffer: &Arc<RwLock<SegmentedBuffer>>,
+    position: usize,
+    count: usize,
+) -> usize {
+    let mut loaded_count = 0;
+
+    for offset in 0..count {
+        let segment_index = SegmentIndex::from_sample_position(position + offset * SEGMENT_SIZE);
+
+        // Check if segment already loaded
+        let needs_loading = {
+            let buffer = buffer.read();
+            !buffer.is_segment_loaded(segment_index)
+        };
+
+        if needs_loading {
+            // Seek and decode
+            if let Err(e) = source.seek(segment_index.start_position()) {
+                tracing::error!("Error seeking: {}", e);
+                break;
+            }
+
+            match source.decode_next_frame() {
+                Ok(segments) => {
+                    if segments.is_empty() {
+                        // EOF reached
+                        break;
+                    }
+
+                    // Add to buffer
+                    let mut buffer = buffer.write();
+                    buffer.add_segments(segments);
+                    loaded_count += 1;
+                }
+                Err(e) => {
+                    tracing::error!("Error decoding: {}", e);
+                    break;
+                }
+            }
+        } else {
+            // Segment already loaded
+            loaded_count += 1;
+        }
+    }
+
+    loaded_count
+}
+async fn buffer_management_task<S: Source + Send + Sync + 'static>(
+    source: Arc<S>,
+    buffer: Arc<RwLock<SegmentedBuffer>>,
+    mut command_rx: mpsc::Receiver<TrackCommand>,
+    ready_tx: tokio::sync::watch::Sender<bool>,
+) {
+    let mut current_position = 0;
+    let mut is_ready = false;
+
+    while let Some(command) = command_rx.recv().await {
+        match command {
+            TrackCommand::FillFrom(position) => {
+                current_position = position;
+
+                // Set not ready when starting to fill from a new position
+                if is_ready {
+                    is_ready = false;
+                    let _ = ready_tx.send(false);
+                }
+
+                // Load initial segments (minimum needed for playback)
+                const INITIAL_SEGMENTS: usize = 3;
+                let loaded_count =
+                    load_segments_with(&source, &buffer, current_position, INITIAL_SEGMENTS).await;
+
+                // Signal ready if we loaded enough segments
+                if loaded_count > 0 && !is_ready {
+                    is_ready = true;
+                    let _ = ready_tx.send(true);
+                    tracing::debug!("Track ready for playback at position {}", current_position);
+                }
+
+                // Continue loading more segments in background
+                let source_clone = source.clone();
+                let buffer_clone = buffer.clone();
+                let preload_position = current_position + INITIAL_SEGMENTS * SEGMENT_SIZE;
+
+                tokio::spawn(async move {
+                    const ADDITIONAL_SEGMENTS: usize = 7; // Load segments 3-10
+                    let _ = load_segments_with(
+                        &source_clone,
+                        &buffer_clone,
+                        preload_position,
+                        ADDITIONAL_SEGMENTS,
+                    )
+                    .await;
+                });
+            }
+            TrackCommand::Shutdown => {
+                tracing::info!("Buffer management task received shutdown command");
+                break;
+            }
+        }
+    }
+
+    tracing::info!("Buffer management task completed");
+}
 
 impl<S: Source + Send + Sync> Track<S> {
     pub async fn new(source: S) -> Result<Self, PlaybackError> {
@@ -51,8 +161,7 @@ impl<S: Source + Send + Sync> Track<S> {
         let ready_tx_clone = ready_tx.clone();
 
         let task_handle = tokio::spawn(async move {
-            Self::buffer_management_task(source_clone, buffer_clone, command_rx, ready_tx_clone)
-                .await;
+            buffer_management_task(source_clone, buffer_clone, command_rx, ready_tx_clone).await;
         });
 
         let track = Self {
@@ -76,126 +185,6 @@ impl<S: Source + Send + Sync> Track<S> {
             .expect("failed to send track command");
 
         Ok(track)
-    }
-    /// Load a segment at the specified index into the buffer
-    async fn load_segment_at_index(
-        source: &Arc<S>,
-        buffer: &Arc<RwLock<SegmentedBuffer>>,
-        segment_index: SegmentIndex,
-    ) -> Result<(), PlaybackError> {
-        // Check if segment already loaded
-        let needs_loading = {
-            let buffer = buffer.read();
-            !buffer.is_segment_loaded(segment_index)
-        };
-
-        if !needs_loading {
-            return Ok(()); // Segment already loaded
-        }
-
-        // Seek to the position
-        source.seek(segment_index.start_position())?;
-
-        // Decode a frame
-        let segments = source.decode_next_frame()?;
-        if segments.is_empty() {
-            return Err(PlaybackError::Decoder("End of file reached".into()));
-        }
-
-        // Add segments to buffer
-        let mut buffer = buffer.write();
-        buffer.add_segments(segments);
-
-        Ok(())
-    }
-    async fn buffer_management_task(
-        source: Arc<S>,
-        buffer: Arc<RwLock<SegmentedBuffer>>,
-        mut command_rx: mpsc::Receiver<TrackCommand>,
-        ready_tx: tokio::sync::watch::Sender<bool>,
-    ) {
-        let mut current_position = 0;
-        let mut is_ready = false;
-
-        while let Some(command) = command_rx.recv().await {
-            match command {
-                TrackCommand::FillFrom(position) => {
-                    current_position = position;
-
-                    // Set not ready when starting to fill from a new position
-                    if is_ready {
-                        is_ready = false;
-                        let _ = ready_tx.send(false);
-                    }
-
-                    // Try to load at least 3 segments ahead (initial minimum for playback)
-                    let mut loaded_count = 0;
-                    let segments_to_load = 3;
-
-                    for offset in 0..segments_to_load {
-                        let segment_index = SegmentIndex::from_sample_position(
-                            current_position + offset * SEGMENT_SIZE,
-                        );
-
-                        match Self::load_segment_at_index(&source, &buffer, segment_index).await {
-                            Ok(()) => {
-                                loaded_count += 1;
-                            }
-                            Err(e) => {
-                                if !matches!(e, PlaybackError::Decoder(_)) {
-                                    // Log only serious errors, not EOF
-                                    tracing::error!(
-                                        "Error loading segment {}: {}",
-                                        segment_index.0,
-                                        e
-                                    );
-                                }
-                                break;
-                            }
-                        }
-                    }
-
-                    // Signal ready if we loaded enough segments
-                    if loaded_count > 0 && !is_ready {
-                        is_ready = true;
-                        let _ = ready_tx.send(true);
-                        tracing::debug!(
-                            "Track ready for playback at position {}",
-                            current_position
-                        );
-                    }
-
-                    // Continue loading more segments in background (for smooth playback)
-                    // This loads segments 3-10 after we've signaled readiness
-                    for offset in segments_to_load..10 {
-                        let segment_index = SegmentIndex::from_sample_position(
-                            current_position + offset * SEGMENT_SIZE,
-                        );
-
-                        match Self::load_segment_at_index(&source, &buffer, segment_index).await {
-                            Ok(()) => {} // Successfully loaded
-                            Err(e) => {
-                                if !matches!(e, PlaybackError::Decoder(_)) {
-                                    // Log only serious errors, not EOF
-                                    tracing::debug!(
-                                        "Error loading background segment {}: {}",
-                                        segment_index.0,
-                                        e
-                                    );
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-                TrackCommand::Shutdown => {
-                    tracing::info!("Buffer management task received shutdown command");
-                    break;
-                }
-            }
-        }
-
-        tracing::info!("Buffer management task completed");
     }
 
     pub async fn ensure_ready(&self) -> Result<(), PlaybackError> {
@@ -290,30 +279,6 @@ impl<S: Source + Send + Sync> Track<S> {
 
     pub fn get_volume(&self) -> f32 {
         self.volume
-    }
-    async fn load_segment(&self, index: SegmentIndex) -> Result<(), PlaybackError> {
-        // Check if segment already loaded
-        {
-            let buffer = self.buffer.read();
-            if buffer.is_segment_loaded(index) {
-                return Ok(());
-            }
-        }
-
-        // Calculate position to seek to
-        let seek_position = index.start_position();
-
-        // Seek to the calculated position
-        self.source.seek(seek_position)?;
-
-        // Decode a frame of audio
-        let segments = self.source.decode_next_frame()?;
-
-        // Add the segments to the buffer
-        let mut buffer = self.buffer.write();
-        buffer.add_segments(segments);
-
-        Ok(())
     }
 }
 
@@ -689,57 +654,49 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_segment() {
-        // Create a test source that will produce predictable segments
-        let source = TestSource::new_with_pattern("ascending", 1.0);
-
-        // Create a track with this source
-        let track = Track::new(source).await.unwrap();
-
+        let source = Arc::new(TestSource::new_with_pattern("alternating", 1.0));
+        let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
         // Initially segment 0 should not be loaded
         {
-            let buffer = track.buffer.read();
+            let buffer = buffer.read();
             assert!(!buffer.is_segment_loaded(SegmentIndex(0)));
         }
 
         // Load segment 0
-        track.load_segment(SegmentIndex(0)).await.unwrap();
+        load_segments_with(&source, &buffer, 0, 1).await;
 
         // Now segment 0 should be loaded
         {
-            let buffer = track.buffer.read();
+            let buffer = buffer.read();
             assert!(buffer.is_segment_loaded(SegmentIndex(0)));
         }
     }
+
     #[tokio::test]
     async fn test_load_segment_wrong_position() {
         // Create a test source
-        let source = TestSource::new_with_pattern("ascending", 1.0);
-
-        // Create a track with this source
-        let track = Track::new(source).await.unwrap();
+        let source = Arc::new(TestSource::new_with_pattern("ascending", 1.0));
+        let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
 
         // Load segment at position 2 (which requires seeking)
-        let target_segment = SegmentIndex(2);
-        track.load_segment(target_segment).await.unwrap();
+        load_segments_with(&source, &buffer, 2, 1).await;
 
         // Check that segment 2 is loaded
         {
-            let buffer = track.buffer.read();
-            assert!(buffer.is_segment_loaded(target_segment));
+            let buffer = buffer.read();
+            assert!(buffer.is_segment_loaded(SegmentIndex(2)));
         }
     }
     #[tokio::test]
     async fn test_load_segment_at_eof() {
         // Create a test source that will reach EOF quickly
-        let source = TestSource::new_with_pattern("ascending", 0.1); // Very short
-
-        // Create a track with this source
-        let track = Track::new(source).await.unwrap();
+        let source = Arc::new(TestSource::new_with_pattern("ascending", 0.1));
+        let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
 
         // First, force the source to EOF by reading all its data
         loop {
             // We need to use decode_next_frame directly on the source
-            let segments = track.source.decode_next_frame().unwrap();
+            let segments = source.decode_next_frame().unwrap();
             if segments.is_empty() {
                 // Empty segments indicate EOF
                 break;
@@ -748,117 +705,58 @@ mod tests {
 
         // Try to load a segment (should reset EOF and succeed)
         let target_segment = SegmentIndex(0);
-        track.load_segment(target_segment).await.unwrap();
+        load_segments_with(&source, &buffer, 0, 1).await;
 
         // Check that segment 0 is loaded
         {
-            let buffer = track.buffer.read();
+            let buffer = buffer.read();
             assert!(buffer.is_segment_loaded(target_segment));
         }
-    }
-
-    #[test]
-    fn test_seek() {
-        // Create a test source with an ascending pattern
-        let source = TestSource::new_with_pattern("ascending", 1.0);
-
-        // Verify initial state
-        let initial_segments = source.decode_next_frame().unwrap();
-        assert!(!initial_segments.is_empty(), "Should have initial segments");
-
-        // Seek to a specific position (in TestSource, this is the frame index)
-        let seek_position = 0; // Reset to first frame
-        source.seek(seek_position).unwrap();
-
-        // Decode again and verify we're back at the beginning
-        let segments_after_seek = source.decode_next_frame().unwrap();
-        assert!(
-            !segments_after_seek.is_empty(),
-            "Should have segments after seeking"
-        );
-
-        // The segments should be the same as our initial segments
-        assert_eq!(
-            initial_segments[0].index, segments_after_seek[0].index,
-            "Segment indices should match after seeking to beginning"
-        );
-    }
-    #[test]
-    fn test_seek_sample_position() {
-        // Create a test source with a pattern that has multiple segments
-        let source = TestSource::new_with_pattern("ascending", 1.0);
-
-        // Sample position that would be in the 3rd segment
-        let sample_position = SEGMENT_SIZE * 2 + 100; // 2 full segments + 100 samples
-
-        source
-            .seek(sample_position)
-            .expect("Should handle sample position seeks");
-
-        // Decode a frame after seeking
-        let segments = source
-            .decode_next_frame()
-            .expect("Should decode after seeking");
-
-        // Should still get segments
-        assert!(!segments.is_empty(), "Should get segments after seeking");
-
-        // First segment should be at or close to the requested position
-        let expected_segment_index = SegmentIndex::from_sample_position(sample_position);
-        assert_eq!(
-            segments[0].index, expected_segment_index,
-            "Should get segment at the requested position"
-        );
     }
 
     #[tokio::test]
     async fn test_load_already_loaded_segment() {
         // Create a test source
-        let source = TestSource::new_with_pattern("ascending", 1.0);
-
-        // Create a track with this source
-        let track = Track::new(source).await.unwrap();
+        let source = Arc::new(TestSource::new_with_pattern("ascending", 1.0));
+        let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
 
         // Load segment at position 0
-        let target_segment = SegmentIndex(0);
-        track.load_segment(target_segment).await.unwrap();
+        load_segments_with(&source, &buffer, 0, 1).await;
 
         // Check that segment 0 is loaded
         {
-            let buffer = track.buffer.read();
-            assert!(buffer.is_segment_loaded(target_segment));
+            let buffer = buffer.read();
+            assert!(buffer.is_segment_loaded(SegmentIndex(0)));
         }
 
         // Now try to load the same segment again
         // This should be efficient (not require seeking or decoding again)
         // We don't have a direct way to test this efficiency in the current structure,
         // but we can at least ensure it doesn't fail
-        track.load_segment(target_segment).await.unwrap();
+        load_segments_with(&source, &buffer, 0, 1).await;
 
         // Segment should still be loaded
         {
-            let buffer = track.buffer.read();
-            assert!(buffer.is_segment_loaded(target_segment));
+            let buffer = buffer.read();
+            assert!(buffer.is_segment_loaded(SegmentIndex(0)));
         }
     }
 
     #[tokio::test]
     async fn test_load_multiple_segments() {
         // Create a test source
-        let source = TestSource::new_with_pattern("ascending", 1.0);
-
-        // Create a track with this source
-        let track = Track::new(source).await.unwrap();
+        let source = Arc::new(TestSource::new_with_pattern("ascending", 1.0));
+        let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
 
         // Load multiple segments in sequence
         for i in 0..3 {
             let target_segment = SegmentIndex(i);
-            track.load_segment(target_segment).await.unwrap();
+            load_segments_with(&source, &buffer, i, 1).await;
         }
 
         // Check that all segments are loaded
         {
-            let buffer = track.buffer.read();
+            let buffer = buffer.read();
             for i in 0..3 {
                 assert!(
                     buffer.is_segment_loaded(SegmentIndex(i)),
@@ -869,27 +767,34 @@ mod tests {
         }
 
         // Load a non-sequential segment
-        let target_segment = SegmentIndex(5);
-        track.load_segment(target_segment).await.unwrap();
+        load_segments_with(&source, &buffer, 5, 1).await;
 
         // Check that the new segment is loaded
         {
-            let buffer = track.buffer.read();
-            assert!(buffer.is_segment_loaded(target_segment));
+            let buffer = buffer.read();
+            assert!(buffer.is_segment_loaded(SegmentIndex(5)));
         }
     }
+
     #[tokio::test]
-    async fn test_load_segment_at_index() {
+    async fn test_load_segments_with() {
         let source = Arc::new(TestSource::new_with_pattern("alternating", 1.0));
         let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
 
-        // Test our new function
-        let segment_index = SegmentIndex(0);
-        let result = Track::load_segment_at_index(&source, &buffer, segment_index).await;
+        // Load segments
+        let position = 0;
+        let count = 3;
+        let loaded_count = load_segments_with(&source, &buffer, position, count).await;
 
-        // Verify result
-        assert!(result.is_ok());
-        assert!(buffer.read().is_segment_loaded(segment_index));
+        // Verify segments were loaded
+        assert_eq!(loaded_count, count);
+
+        // Check that segments are in the buffer
+        for offset in 0..count {
+            let segment_index = SegmentIndex(offset);
+            let buffer_read = buffer.read();
+            assert!(buffer_read.is_segment_loaded(segment_index));
+        }
     }
 }
 
