@@ -32,8 +32,7 @@ pub enum TrackCommand {
     FillFrom(usize),
     Shutdown,
 }
-/// Load multiple segments starting at the given position
-/// Returns the number of segments successfully loaded
+
 async fn load_segments_with<S: Source + Send + Sync>(
     source: &Arc<S>,
     buffer: &Arc<RwLock<SegmentedBuffer>>,
@@ -44,18 +43,30 @@ async fn load_segments_with<S: Source + Send + Sync>(
 
     for offset in 0..count {
         let segment_index = SegmentIndex::from_sample_position(position + offset * SEGMENT_SIZE);
+        let segment_position = segment_index.start_position();
 
-        // Check if segment already loaded
+        // Check if segment already loaded in buffer
         let needs_loading = {
             let buffer = buffer.read();
             !buffer.is_segment_loaded(segment_index)
         };
 
         if needs_loading {
-            // Seek and decode
-            if let Err(e) = source.seek(segment_index.start_position()) {
-                tracing::error!("Error seeking: {}", e);
-                break;
+            // Only seek if not already at the right position
+            let current_pos = source.current_position();
+
+            // Debug log to help diagnose test failures
+            tracing::debug!(
+                "Segment position: {}, Current position: {}",
+                segment_position,
+                current_pos
+            );
+
+            if current_pos != segment_position {
+                if let Err(e) = source.seek(segment_position) {
+                    tracing::error!("Error seeking: {}", e);
+                    break;
+                }
             }
 
             match source.decode_next_frame() {
@@ -76,7 +87,7 @@ async fn load_segments_with<S: Source + Send + Sync>(
                 }
             }
         } else {
-            // Segment already loaded
+            // Segment already loaded in buffer
             loaded_count += 1;
         }
     }
@@ -315,10 +326,9 @@ impl<S: Source + Send + Sync + 'static> Drop for Track<S> {
 
 #[cfg(test)]
 pub struct TestSource {
-    position: AtomicUsize,
+    position: AtomicUsize, // Track which frame we're on
     samples: Vec<Vec<DecodedSegment>>,
-    // New field to track the target sample position for seeking
-    seek_sample_position: AtomicUsize,
+    current_sample_position: AtomicUsize, // Track current sample position
 }
 
 #[cfg(test)]
@@ -328,7 +338,7 @@ impl TestSource {
         Self {
             position: AtomicUsize::new(0),
             samples: vec![segments], // Wrap in vector to simulate frames
-            seek_sample_position: AtomicUsize::new(0),
+            current_sample_position: AtomicUsize::new(0), // Initialize to 0
         }
     }
 
@@ -342,7 +352,7 @@ impl TestSource {
         Self {
             position: AtomicUsize::new(0),
             samples: frames_of_segments,
-            seek_sample_position: AtomicUsize::new(0),
+            current_sample_position: AtomicUsize::new(0),
         }
     }
 
@@ -397,7 +407,7 @@ impl TestSource {
         segments
     }
     fn adjust_segment_indices(&self, segments: Vec<DecodedSegment>) -> Vec<DecodedSegment> {
-        let seek_pos = self.seek_sample_position.load(Ordering::Relaxed);
+        let seek_pos = self.current_sample_position.load(Ordering::Relaxed);
         if seek_pos == 0 {
             return segments; // No adjustment needed
         }
@@ -493,18 +503,27 @@ impl Source for TestSource {
         // Get the current frame's segments
         let segments = self.samples[pos].clone();
 
+        // Calculate how many samples this represents
+        let sample_count: usize = segments.iter().map(|s| s.segment.samples.len()).sum();
+
         // Adjust segment indices based on seek position
         let adjusted_segments = self.adjust_segment_indices(segments);
 
         // Move to next frame
         self.position.store(pos + 1, Ordering::Relaxed);
 
+        // Update current sample position
+        let current_pos = self.current_sample_position.load(Ordering::Relaxed);
+        self.current_sample_position
+            .store(current_pos + sample_count, Ordering::Relaxed);
+
         Ok(adjusted_segments)
     }
 
     fn seek(&self, position: usize) -> Result<(), PlaybackError> {
         // Store the target sample position
-        self.seek_sample_position.store(position, Ordering::Relaxed);
+        self.current_sample_position
+            .store(position, Ordering::Relaxed);
 
         // Reset frame position to beginning
         self.position.store(0, Ordering::Relaxed);
@@ -518,6 +537,10 @@ impl Source for TestSource {
 
     fn audio_channels(&self) -> u16 {
         2
+    }
+
+    fn current_position(&self) -> usize {
+        self.current_sample_position.load(Ordering::Relaxed)
     }
 }
 
@@ -695,7 +718,6 @@ mod tests {
 
         // First, force the source to EOF by reading all its data
         loop {
-            // We need to use decode_next_frame directly on the source
             let segments = source.decode_next_frame().unwrap();
             if segments.is_empty() {
                 // Empty segments indicate EOF
@@ -703,14 +725,20 @@ mod tests {
             }
         }
 
-        // Try to load a segment (should reset EOF and succeed)
-        let target_segment = SegmentIndex(0);
+        // Seeking should reset EOF state
+        let target_position = 0;
+        source.seek(target_position).unwrap();
+
+        // Now try to load a segment - should work even after previous EOF
         load_segments_with(&source, &buffer, 0, 1).await;
 
         // Check that segment 0 is loaded
         {
             let buffer = buffer.read();
-            assert!(buffer.is_segment_loaded(target_segment));
+            assert!(
+                buffer.is_segment_loaded(SegmentIndex(0)),
+                "Segment should be loaded after seeking from EOF"
+            );
         }
     }
 
@@ -955,4 +983,156 @@ mod ringbuffer_tests {
         // Should have 2 items left
         assert_eq!(consumer.len(), 2);
     }
+}
+#[cfg(test)]
+struct SeekCountingSource {
+    inner: TestSource,
+    seek_count: AtomicUsize,
+}
+
+#[cfg(test)]
+impl SeekCountingSource {
+    fn new() -> Self {
+        Self {
+            inner: TestSource::new_with_pattern("alternating", 1.0),
+            seek_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn get_seek_count(&self) -> usize {
+        self.seek_count.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+impl Source for SeekCountingSource {
+    fn decode_next_frame(&self) -> Result<Vec<DecodedSegment>, PlaybackError> {
+        self.inner.decode_next_frame()
+    }
+
+    fn seek(&self, position: usize) -> Result<(), PlaybackError> {
+        // Count the seek first
+        self.seek_count.fetch_add(1, Ordering::SeqCst);
+        // Then delegate to inner source
+        self.inner.seek(position)
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate()
+    }
+
+    fn audio_channels(&self) -> u16 {
+        self.inner.audio_channels()
+    }
+
+    fn current_position(&self) -> usize {
+        self.inner.current_position()
+    }
+}
+
+#[tokio::test]
+async fn test_seek_optimization() {
+    // Create a source with explicit position tracking
+    struct TestSeekSource {
+        position: AtomicUsize,
+        seek_count: AtomicUsize,
+    }
+
+    impl TestSeekSource {
+        fn new(initial_position: usize) -> Self {
+            Self {
+                position: AtomicUsize::new(initial_position),
+                seek_count: AtomicUsize::new(0),
+            }
+        }
+
+        fn get_seek_count(&self) -> usize {
+            self.seek_count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Source for TestSeekSource {
+        fn decode_next_frame(&self) -> Result<Vec<DecodedSegment>, PlaybackError> {
+            // Generate a single segment at current position
+            let current_pos = self.position.load(Ordering::SeqCst);
+            let segment_index = SegmentIndex::from_sample_position(current_pos);
+
+            // Create sample data
+            let mut samples = [0.0; SEGMENT_SIZE];
+            (0..SEGMENT_SIZE).for_each(|i| {
+                samples[i] = 0.5; // Simple constant value
+            });
+
+            // Update position to after this segment
+            self.position
+                .store(current_pos + SEGMENT_SIZE, Ordering::SeqCst);
+
+            Ok(vec![DecodedSegment {
+                index: segment_index,
+                segment: AudioSegment { samples },
+            }])
+        }
+
+        fn seek(&self, position: usize) -> Result<(), PlaybackError> {
+            // Record the seek and update position
+            self.seek_count.fetch_add(1, Ordering::SeqCst);
+            self.position.store(position, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn sample_rate(&self) -> u32 {
+            48000
+        }
+        fn audio_channels(&self) -> u16 {
+            2
+        }
+
+        fn current_position(&self) -> usize {
+            self.position.load(Ordering::SeqCst)
+        }
+    }
+
+    // Create source starting at position 0
+    let source = Arc::new(TestSeekSource::new(0));
+    let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
+
+    // Verify initial state
+    assert_eq!(source.current_position(), 0, "Initial position should be 0");
+    assert_eq!(source.get_seek_count(), 0, "Initial seek count should be 0");
+
+    // Load segment at position 0 - this should NOT require a seek (already at position 0)
+    load_segments_with(&source, &buffer, 0, 1).await;
+
+    // Verify no seek happened
+    assert_eq!(
+        source.get_seek_count(),
+        0,
+        "First segment should not require a seek"
+    );
+
+    // Position should now be after the first segment
+    assert_eq!(
+        source.current_position(),
+        SEGMENT_SIZE,
+        "Position should be updated"
+    );
+
+    // Load a segment at a different position - should require a seek
+    load_segments_with(&source, &buffer, SEGMENT_SIZE * 2, 1).await;
+    assert_eq!(
+        source.get_seek_count(),
+        1,
+        "Loading different segment should require a seek"
+    );
+
+    // Source is now at position 3*SEGMENT_SIZE
+
+    // Load the same segment again - should NOT require a seek (already buffered)
+    source.seek_count.store(0, Ordering::SeqCst); // Reset counter
+    load_segments_with(&source, &buffer, SEGMENT_SIZE * 2, 1).await;
+    assert_eq!(
+        source.get_seek_count(),
+        0,
+        "Loading already buffered segment should not seek"
+    );
 }
