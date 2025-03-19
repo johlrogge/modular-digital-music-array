@@ -12,7 +12,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use ringbuf::HeapRb;
-
+type SampleRb = HeapRb<f32>;
+type SampleProducer =
+    ringbuf::Producer<f32, Arc<ringbuf::SharedRb<f32, Vec<std::mem::MaybeUninit<f32>>>>>;
+type SampleConsumer =
+    ringbuf::Consumer<f32, Arc<ringbuf::SharedRb<f32, Vec<std::mem::MaybeUninit<f32>>>>>;
 pub struct Track<S: Source + Send + Sync + 'static> {
     source: Arc<S>,
     position: usize,
@@ -21,8 +25,8 @@ pub struct Track<S: Source + Send + Sync + 'static> {
     buffer: Arc<RwLock<SegmentedBuffer>>,
     command_tx: mpsc::Sender<TrackCommand>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
-    // Add the ringbuffer with producers/consumers
-    sample_buffer: Arc<RwLock<HeapRb<f32>>>,
+    // Add ringbuffer consumer
+    sample_consumer: SampleConsumer,
     ready_tx: tokio::sync::watch::Sender<bool>,
     ready_rx: tokio::sync::watch::Receiver<bool>,
 }
@@ -94,6 +98,37 @@ async fn load_segments_with<S: Source + Send + Sync>(
 
     loaded_count
 }
+
+/// Fill the ringbuffer with samples from the segmented buffer
+fn fill_ringbuffer_from_segments(
+    segmented_buffer: &SegmentedBuffer,
+    producer: &mut SampleProducer,
+    position: usize,
+    length: usize,
+) -> usize {
+    // Create a temporary buffer to hold samples from SegmentedBuffer
+    let mut temp_buffer = vec![0.0; length];
+
+    // Get samples from the SegmentedBuffer
+    let samples_read = segmented_buffer.get_samples(position, &mut temp_buffer);
+
+    // Push the samples to the ringbuffer
+    let mut samples_pushed = 0;
+    for i in 0..samples_read {
+        match producer.push(temp_buffer[i]) {
+            Ok(()) => {
+                samples_pushed += 1;
+            }
+            Err(_) => {
+                // Ringbuffer is full
+                break;
+            }
+        }
+    }
+
+    samples_pushed
+}
+
 async fn buffer_management_task<S: Source + Send + Sync + 'static>(
     source: Arc<S>,
     buffer: Arc<RwLock<SegmentedBuffer>>,
@@ -160,15 +195,16 @@ impl<S: Source + Send + Sync> Track<S> {
 
         // Create a ringbuffer for audio samples (2 seconds of stereo audio at 48kHz)
         let rb_capacity = 2 * 48000 * 2;
-        let sample_buffer = Arc::new(RwLock::new(HeapRb::<f32>::new(rb_capacity)));
+        let sample_rb = SampleRb::new(rb_capacity);
 
-        let source_clone = Arc::clone(&source);
-        let buffer_clone = Arc::clone(&buffer);
+        // Split the ringbuffer to get producer and consumer
+        let (producer, consumer) = sample_rb.split();
 
         // Add ready state tracking
         let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
 
-        // Pass ready_tx to the background task
+        let source_clone = Arc::clone(&source);
+        let buffer_clone = Arc::clone(&buffer);
         let ready_tx_clone = ready_tx.clone();
 
         let task_handle = tokio::spawn(async move {
@@ -183,7 +219,7 @@ impl<S: Source + Send + Sync> Track<S> {
             buffer,
             command_tx,
             task_handle: Some(task_handle),
-            sample_buffer,
+            sample_consumer: consumer,
             ready_tx,
             ready_rx,
         };
