@@ -1,99 +1,175 @@
 // src/buffer.rs
 use crate::source::{AudioSegment, DecodedSegment, SegmentIndex, SEGMENT_SIZE};
-use std::collections::HashMap;
 
-/// A buffer that stores audio data in fixed-size segments
 pub struct SegmentedBuffer {
-    segments: HashMap<SegmentIndex, AudioSegment>,
+    // Vec of optional AudioSegments, stored in order
+    segments: Vec<Option<AudioSegment>>,
+    // Index of the first segment in the buffer (head)
+    head_index: SegmentIndex,
+    // Index where the next segment should be added (tail)
+    tail_index: SegmentIndex,
+    // Maximum number of segments to keep
+    capacity: usize,
 }
 
 impl SegmentedBuffer {
-    /// Create a new empty buffer
     pub fn new() -> Self {
+        let capacity = 500;
+
         Self {
-            segments: HashMap::new(),
+            segments: Vec::with_capacity(capacity),
+            head_index: SegmentIndex(0),
+            tail_index: SegmentIndex(0),
+            capacity,
         }
     }
 
-    /// Add a decoded segment to the buffer
-    pub fn add_segment(&mut self, segment: DecodedSegment) {
-        // Log to help diagnose what's happening
-        tracing::debug!(
-            "Adding segment {} at sample position {}",
-            segment.index.0,
-            segment.index.start_position()
-        );
-        self.segments.insert(segment.index, segment.segment);
-    }
-
-    /// Get samples from the buffer starting at the given position
-    /// Returns the number of samples read
-    pub fn get_samples(&self, position: usize, output: &mut [f32]) -> usize {
-        // Calculate which segment we need to start with
-        let start_segment_index = SegmentIndex::from_sample_position(position);
-
-        // Calculate offset within the first segment
-        let offset_in_segment = position - start_segment_index.start_position();
-
-        // Track how many samples we've written to output
-        let mut samples_written = 0;
-
-        // Keep reading segments until we've filled the output buffer or run out of segments
-        let mut current_segment_index = start_segment_index;
-
-        while samples_written < output.len() {
-            // Check if the current segment exists
-            if let Some(segment) = self.segments.get(&current_segment_index) {
-                // Calculate how many samples we can copy from this segment
-                let segment_offset = if current_segment_index == start_segment_index {
-                    offset_in_segment
-                } else {
-                    0
-                };
-
-                let samples_available = SEGMENT_SIZE - segment_offset;
-                let samples_to_copy =
-                    std::cmp::min(samples_available, output.len() - samples_written);
-
-                // Copy samples from this segment to the output buffer
-                output[samples_written..samples_written + samples_to_copy].copy_from_slice(
-                    &segment.samples[segment_offset..segment_offset + samples_to_copy],
-                );
-
-                // Update counters
-                samples_written += samples_to_copy;
-                current_segment_index = current_segment_index.next();
-            } else {
-                // If segment is missing, we can't read any more samples
-                break;
-            }
-        }
-
-        // Return the number of samples we were able to read
-        samples_written
-    }
-
-    /// Add multiple segments to the buffer
     pub fn add_segments(&mut self, segments: Vec<DecodedSegment>) {
         for segment in segments {
             self.add_segment(segment);
         }
     }
 
-    /// Check if a segment is loaded
-    pub fn is_segment_loaded(&self, index: SegmentIndex) -> bool {
-        self.segments.contains_key(&index)
+    pub fn add_segment(&mut self, segment: DecodedSegment) {
+        if self.segments.is_empty() {
+            // First segment, initialize buffer
+            self.head_index = segment.index;
+            self.tail_index = SegmentIndex(segment.index.0 + 1);
+            self.segments.push(Some(segment.segment));
+            return;
+        }
+
+        // Calculate where this segment should go relative to head
+        let relative_index = segment.index.0 as isize - self.head_index.0 as isize;
+
+        if relative_index < 0 {
+            // This segment comes before our head
+            if -relative_index as usize > self.capacity / 2 {
+                // If it's too far back, reset the buffer
+                self.segments.clear();
+                self.head_index = segment.index;
+                self.tail_index = SegmentIndex(segment.index.0 + 1);
+                self.segments.push(Some(segment.segment));
+            } else {
+                // Prepend with Nones and then add our segment
+                let missing_segments = -relative_index as usize;
+                let mut new_segments = vec![None; missing_segments];
+                new_segments[0] = Some(segment.segment);
+                new_segments.extend(self.segments.drain(..));
+                self.segments = new_segments;
+                self.head_index = segment.index;
+
+                // Trim if we've exceeded capacity
+                if self.segments.len() > self.capacity {
+                    let excess = self.segments.len() - self.capacity;
+                    self.segments.truncate(self.capacity);
+                    self.tail_index = SegmentIndex(self.head_index.0 + self.segments.len());
+                }
+            }
+        } else if relative_index as usize >= self.segments.len() {
+            // This segment comes after our current tail
+            let current_size = self.segments.len();
+            let target_position = relative_index as usize;
+
+            if target_position - current_size > self.capacity / 2 {
+                // If it's too far ahead, reset the buffer
+                self.segments.clear();
+                self.head_index = segment.index;
+                self.tail_index = SegmentIndex(segment.index.0 + 1);
+                self.segments.push(Some(segment.segment));
+            } else {
+                // Extend with Nones and then add our segment
+                let new_size = target_position + 1;
+                self.segments.resize_with(new_size, || None);
+                self.segments[target_position] = Some(segment.segment);
+                self.tail_index = SegmentIndex(self.head_index.0 + new_size);
+
+                // Trim from the beginning if we've exceeded capacity
+                if self.segments.len() > self.capacity {
+                    let excess = self.segments.len() - self.capacity;
+                    self.segments.drain(0..excess);
+                    self.head_index = SegmentIndex(self.head_index.0 + excess);
+                }
+            }
+        } else {
+            // This segment is within our current range, just replace it
+            self.segments[relative_index as usize] = Some(segment.segment);
+        }
     }
 
-    /// Check if buffer is ready for playback at position
-    pub fn is_ready_at(&self, position: usize) -> bool {
-        // To be ready at a position, we need at least one segment starting at or before that position
-        let segment_index = SegmentIndex::from_sample_position(position);
-        self.segments.contains_key(&segment_index)
+    pub fn get_samples(&self, position: usize, output: &mut [f32]) -> usize {
+        if self.segments.is_empty() {
+            return 0;
+        }
+
+        let start_segment_index = SegmentIndex::from_sample_position(position);
+        let offset_in_segment = position - start_segment_index.start_position();
+
+        // Calculate relative position to our head
+        let relative_index = start_segment_index.0 as isize - self.head_index.0 as isize;
+
+        if relative_index < 0 || relative_index >= self.segments.len() as isize {
+            // Position is outside our buffered range
+            return 0;
+        }
+
+        let mut samples_written = 0;
+        let mut current_segment_idx = relative_index as usize;
+
+        while samples_written < output.len() && current_segment_idx < self.segments.len() {
+            if let Some(segment) = &self.segments[current_segment_idx] {
+                // Calculate offset within segment
+                let segment_offset = if current_segment_idx == relative_index as usize {
+                    offset_in_segment
+                } else {
+                    0
+                };
+
+                // Calculate samples to copy
+                let samples_available = SEGMENT_SIZE - segment_offset;
+                let samples_to_copy =
+                    std::cmp::min(samples_available, output.len() - samples_written);
+
+                // Copy samples
+                output[samples_written..samples_written + samples_to_copy].copy_from_slice(
+                    &segment.samples[segment_offset..segment_offset + samples_to_copy],
+                );
+
+                samples_written += samples_to_copy;
+            } else {
+                // Found a gap (None), can't continue
+                break;
+            }
+
+            current_segment_idx += 1;
+        }
+
+        samples_written
     }
-    /// Clear all segments from the buffer
+
+    pub fn is_segment_loaded(&self, index: SegmentIndex) -> bool {
+        if self.segments.is_empty() {
+            return false;
+        }
+
+        let relative_index = index.0 as isize - self.head_index.0 as isize;
+        if relative_index < 0 || relative_index >= self.segments.len() as isize {
+            return false;
+        }
+
+        self.segments[relative_index as usize].is_some()
+    }
+
+    pub fn is_ready_at(&self, position: usize) -> bool {
+        let segment_index = SegmentIndex::from_sample_position(position);
+        self.is_segment_loaded(segment_index)
+    }
+
     pub fn clear(&mut self) {
         self.segments.clear();
+        // Reset indices when clearing
+        self.head_index = SegmentIndex(0);
+        self.tail_index = SegmentIndex(0);
     }
 }
 
