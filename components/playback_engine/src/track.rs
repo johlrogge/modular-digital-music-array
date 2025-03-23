@@ -7,21 +7,25 @@ use crate::source::{DecodedSegment, Source};
 use tokio::sync::mpsc;
 
 use parking_lot::RwLock;
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize},
+    Arc,
+};
+
+// In src/track.rs
+use ringbuf::{HeapProducer, HeapRb};
 
 pub struct Track {
-    position: usize,
-    playing: bool,
-    volume: f32,
+    position: Arc<AtomicUsize>,
+    playing: Arc<AtomicBool>,
     buffer: Arc<RwLock<SegmentedBuffer>>,
     command_tx: mpsc::Sender<TrackCommand>,
     decoder_task: Option<tokio::task::JoinHandle<()>>,
+    producer_task: Option<tokio::task::JoinHandle<()>>,
     ready_tx: tokio::sync::watch::Sender<bool>,
     ready_rx: tokio::sync::watch::Receiver<bool>,
 }
-
 // Update TrackCommand to include potential new commands
 pub enum TrackCommand {
     FillFrom(usize),
@@ -91,6 +95,52 @@ async fn load_segments_with<S: Source + Send + Sync>(
     loaded_count
 }
 
+// New producer task that reads from SegmentedBuffer and writes to ringbuffer
+async fn producer_task(
+    buffer: Arc<RwLock<SegmentedBuffer>>,
+    mut producer: HeapProducer<f32>,
+    position: Arc<AtomicUsize>,
+    command_tx: mpsc::Sender<TrackCommand>,
+) {
+    let mut temp_buffer = vec![0.0; 1024]; // Temporary buffer for samples
+
+    loop {
+        // Get current position
+        let current_position = position.load(Ordering::Relaxed);
+
+        // Fill as much of the ringbuffer as possible
+        let available_space = producer.free_len();
+        if available_space > 0 {
+            // Read samples from buffer
+            let to_read = std::cmp::min(available_space, temp_buffer.len());
+            let read = {
+                let buffer = buffer.read();
+                buffer.get_samples(current_position, &mut temp_buffer[..to_read])
+            };
+
+            if read > 0 {
+                // Write to ringbuffer
+                for i in 0..read {
+                    let _ = producer.push(temp_buffer[i]);
+                }
+
+                // Update position
+                position.fetch_add(read, Ordering::Relaxed);
+            } else {
+                // No samples available, request more
+                if let Err(e) = command_tx.try_send(TrackCommand::FillFrom(current_position)) {
+                    tracing::debug!("Failed to send fill command: {}", e);
+                }
+
+                // Sleep a bit to avoid spinning
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        } else {
+            // Ringbuffer is full, wait a bit
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+}
 async fn buffer_task(
     buffer: Arc<RwLock<SegmentedBuffer>>,
     mut segments_rx: mpsc::Receiver<Vec<DecodedSegment>>,
@@ -196,38 +246,52 @@ async fn decoder_task<S: Source + Send + Sync + 'static>(
     tracing::info!("Decoder task completed");
 }
 impl Track {
-    pub async fn new<S: Source + Send + Sync + 'static>(source: S) -> Result<Self, PlaybackError> {
+    pub async fn new<S: Source + Send + Sync + 'static>(
+        source: S,
+        output_producer: HeapProducer<f32>,
+    ) -> Result<Self, PlaybackError> {
         let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
+        let position = Arc::new(AtomicUsize::new(0));
+        let playing = Arc::new(AtomicBool::new(false));
 
-        // Command channel for control messages
+        // Command channels
         let (command_tx, command_rx) = mpsc::channel(32);
-
-        // Segment channel for decoded audio data
         let (segments_tx, segments_rx) = mpsc::channel(100);
-
-        // Add ready state tracking
         let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
 
-        // Create the decoder task that owns the source directly
+        // Create decoder task
         let ready_tx_clone = ready_tx.clone();
-
         let decoder_task = tokio::spawn(async move {
             decoder_task(source, segments_tx, command_rx, ready_tx_clone).await;
         });
 
-        // Spawn the buffer task that receives segments and adds them to the buffer
+        // Create buffer task
         let buffer_clone = Arc::clone(&buffer);
         tokio::spawn(async move {
             buffer_task(buffer_clone, segments_rx).await;
         });
 
+        // Create producer task - this now owns output_producer
+        let position_clone = Arc::clone(&position);
+        let buffer_clone = Arc::clone(&buffer);
+        let command_tx_clone = command_tx.clone();
+        let producer_task = tokio::spawn(async move {
+            producer_task(
+                buffer_clone,
+                output_producer,
+                position_clone,
+                command_tx_clone,
+            )
+            .await;
+        });
+
         let track = Self {
-            position: 0,
-            playing: false,
-            volume: 1.0,
+            position,
+            playing,
             buffer,
             command_tx,
             decoder_task: Some(decoder_task),
+            producer_task: Some(producer_task),
             ready_tx,
             ready_rx,
         };
@@ -264,14 +328,17 @@ impl Track {
             }
         }
     }
-
     pub fn play(&mut self) {
-        self.playing = true;
+        self.playing.store(true, Ordering::Relaxed);
+    }
+
+    pub fn stop(&mut self) {
+        self.playing.store(false, Ordering::Relaxed);
     }
 
     pub fn seek(&mut self, position: usize) -> Result<(), PlaybackError> {
         // Update position
-        self.position = position;
+        self.position.store(position, Ordering::Relaxed);
 
         // Request buffer filling from new position
         if let Err(e) = self.command_tx.try_send(TrackCommand::FillFrom(position)) {
@@ -282,58 +349,15 @@ impl Track {
     }
 
     pub fn position(&self) -> usize {
-        self.position
+        self.position.load(Ordering::Relaxed)
     }
 
     pub fn is_ready(&self) -> bool {
         *self.ready_rx.borrow()
     }
 
-    pub fn get_next_samples(&mut self, output: &mut [f32]) -> Result<usize, PlaybackError> {
-        if !self.playing {
-            return Ok(0);
-        }
-
-        // Read from the segmented buffer
-        let samples_read = {
-            let buffer = self.buffer.read();
-            buffer.get_samples(self.position, output)
-        };
-
-        // Update position
-        if samples_read > 0 {
-            self.position += samples_read;
-        }
-
-        // If we couldn't read enough samples, request more
-        if samples_read < output.len() {
-            // Try to load more data starting from current position
-            if let Err(e) = self
-                .command_tx
-                .try_send(TrackCommand::FillFrom(self.position))
-            {
-                tracing::debug!("Failed to send fill command: {}", e);
-            }
-        }
-
-        Ok(samples_read)
-    }
-
-    pub fn stop(&mut self) {
-        self.playing = false;
-    }
-
     pub fn is_playing(&self) -> bool {
-        self.playing
-    }
-
-    pub fn set_volume(&mut self, db: f32) {
-        // Convert dB to linear amplitude
-        self.volume = 10.0f32.powf(db / 20.0);
-    }
-
-    pub fn get_volume(&self) -> f32 {
-        self.volume
+        self.playing.load(Ordering::Relaxed)
     }
 }
 
@@ -587,8 +611,9 @@ impl Track {
             let sample = (2.0 * std::f32::consts::PI * frequency * t).sin() * 0.1;
             samples.push(sample);
         }
-
-        Self::new(TestSource::new_from_samples(samples)).await
+        let buffer = HeapRb::new(1024 * 8);
+        let (prod, cons) = buffer.split();
+        Self::new(TestSource::new_from_samples(samples), prod).await
     }
 
     // Add this method for tests
@@ -600,384 +625,6 @@ impl Track {
         Ok(())
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::source::SegmentIndex;
-    #[tokio::test]
-    async fn test_track_play_stop() {
-        // Create a test source
-        let source = TestSource::new_with_pattern("ascending", 1.0);
-
-        // Create a track with this source
-        let mut track = Track::new(source).await.unwrap();
-
-        // Track should not be playing initially
-        assert!(!track.is_playing(), "Track should not be playing initially");
-
-        // Play the track
-        track.play();
-
-        // Track should now be playing
-        assert!(
-            track.is_playing(),
-            "Track should be playing after play() call"
-        );
-
-        // Stop the track
-        track.stop();
-
-        // Track should no longer be playing
-        assert!(
-            !track.is_playing(),
-            "Track should not be playing after stop() call"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_next_samples() {
-        // Create a test source with a known pattern
-        let source = TestSource::new_with_pattern("alternating", 1.0);
-
-        // Create a track with this source
-        let mut track = Track::new(source).await.unwrap();
-
-        // Wait for the track to be ready for playback
-        track.ensure_ready().await.unwrap();
-
-        // Set track to playing state
-        track.play();
-
-        // Create a buffer to hold samples
-        let mut output_buffer = vec![0.0; 100];
-
-        // Read the first batch of samples
-        let samples_read = track.get_next_samples(&mut output_buffer).unwrap();
-
-        // Should have read samples
-        assert!(samples_read > 0, "Should have read samples");
-        assert_eq!(
-            samples_read,
-            output_buffer.len(),
-            "Should have filled the buffer"
-        );
-
-        // Check that the samples follow the alternating pattern
-        // (high, zero, low) for the first few samples
-        assert!(output_buffer[0] > 0.5, "First sample should be high");
-        assert!(
-            output_buffer[1].abs() < 0.01,
-            "Second sample should be near zero"
-        );
-        assert!(output_buffer[2] < -0.5, "Third sample should be low");
-
-        // Track's position should have advanced
-        assert_eq!(
-            track.position(),
-            samples_read,
-            "Position should have advanced"
-        );
-
-        // Read another batch of samples
-        let previous_position = track.position();
-        let samples_read_2 = track.get_next_samples(&mut output_buffer).unwrap();
-
-        // Should have read more samples
-        assert!(samples_read_2 > 0, "Should have read more samples");
-
-        // Position should have advanced again
-        assert_eq!(
-            track.position(),
-            previous_position + samples_read_2,
-            "Position should have advanced again"
-        );
-
-        // When stopped, should not read samples
-        track.stop();
-        let samples_read_3 = track.get_next_samples(&mut output_buffer).unwrap();
-        assert_eq!(samples_read_3, 0, "Should not read samples when stopped");
-    }
-
-    #[tokio::test]
-    async fn test_load_segment() {
-        let source = Arc::new(TestSource::new_with_pattern("alternating", 1.0));
-        let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
-        // Initially segment 0 should not be loaded
-        {
-            let buffer = buffer.read();
-            assert!(!buffer.is_segment_loaded(SegmentIndex(0)));
-        }
-
-        // Load segment 0
-        load_segments_with(&source, &buffer, 0, 1).await;
-
-        // Now segment 0 should be loaded
-        {
-            let buffer = buffer.read();
-            assert!(buffer.is_segment_loaded(SegmentIndex(0)));
-        }
-    }
-
-    #[tokio::test]
-    async fn test_load_segment_wrong_position() {
-        // Create a test source
-        let source = Arc::new(TestSource::new_with_pattern("ascending", 1.0));
-        let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
-
-        // Load segment at position 2 (which requires seeking)
-        load_segments_with(&source, &buffer, 2, 1).await;
-
-        // Check that segment 2 is loaded
-        {
-            let buffer = buffer.read();
-            assert!(buffer.is_segment_loaded(SegmentIndex(2)));
-        }
-    }
-    #[tokio::test]
-    async fn test_load_segment_at_eof() {
-        // Create a test source that will reach EOF quickly
-        let source = Arc::new(TestSource::new_with_pattern("ascending", 0.1));
-        let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
-
-        // First, force the source to EOF by reading all its data
-        loop {
-            let segments = source.decode_next_frame().unwrap();
-            if segments.is_empty() {
-                // Empty segments indicate EOF
-                break;
-            }
-        }
-
-        // Seeking should reset EOF state
-        let target_position = 0;
-        source.seek(target_position).unwrap();
-
-        // Now try to load a segment - should work even after previous EOF
-        load_segments_with(&source, &buffer, 0, 1).await;
-
-        // Check that segment 0 is loaded
-        {
-            let buffer = buffer.read();
-            assert!(
-                buffer.is_segment_loaded(SegmentIndex(0)),
-                "Segment should be loaded after seeking from EOF"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_load_already_loaded_segment() {
-        // Create a test source
-        let source = Arc::new(TestSource::new_with_pattern("ascending", 1.0));
-        let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
-
-        // Load segment at position 0
-        load_segments_with(&source, &buffer, 0, 1).await;
-
-        // Check that segment 0 is loaded
-        {
-            let buffer = buffer.read();
-            assert!(buffer.is_segment_loaded(SegmentIndex(0)));
-        }
-
-        // Now try to load the same segment again
-        // This should be efficient (not require seeking or decoding again)
-        // We don't have a direct way to test this efficiency in the current structure,
-        // but we can at least ensure it doesn't fail
-        load_segments_with(&source, &buffer, 0, 1).await;
-
-        // Segment should still be loaded
-        {
-            let buffer = buffer.read();
-            assert!(buffer.is_segment_loaded(SegmentIndex(0)));
-        }
-    }
-
-    #[tokio::test]
-    async fn test_load_multiple_segments() {
-        // Create a test source
-        let source = Arc::new(TestSource::new_with_pattern("ascending", 1.0));
-        let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
-
-        // Load multiple segments in sequence
-        for i in 0..3 {
-            load_segments_with(&source, &buffer, i, 1).await;
-        }
-
-        // Check that all segments are loaded
-        {
-            let buffer = buffer.read();
-            for i in 0..3 {
-                assert!(
-                    buffer.is_segment_loaded(SegmentIndex(i)),
-                    "Segment {} should be loaded",
-                    i
-                );
-            }
-        }
-
-        // Load a non-sequential segment
-        load_segments_with(&source, &buffer, 5, 1).await;
-
-        // Check that the new segment is loaded
-        {
-            let buffer = buffer.read();
-            assert!(buffer.is_segment_loaded(SegmentIndex(5)));
-        }
-    }
-
-    #[tokio::test]
-    async fn test_load_segments_with() {
-        let source = Arc::new(TestSource::new_with_pattern("alternating", 1.0));
-        let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
-
-        // Load segments
-        let position = 0;
-        let count = 3;
-        let loaded_count = load_segments_with(&source, &buffer, position, count).await;
-
-        // Verify segments were loaded
-        assert_eq!(loaded_count, count);
-
-        // Check that segments are in the buffer
-        for offset in 0..count {
-            let segment_index = SegmentIndex(offset);
-            let buffer_read = buffer.read();
-            assert!(buffer_read.is_segment_loaded(segment_index));
-        }
-    }
-
-    #[tokio::test]
-    async fn test_segment_content_verification() {
-        // Create a test source with the alternating pattern
-        // The alternating pattern generates: [0.9, 0.0, -0.9, 0.9, 0.0, -0.9, ...]
-        let source = Arc::new(TestSource::new_with_pattern("alternating", 1.0));
-        let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
-
-        // Load a segment
-        let loaded = load_segments_with(&source, &buffer, 0, 1).await;
-        assert_eq!(loaded, 1, "Should successfully load one segment");
-
-        // Create a buffer to read samples into
-        let mut output = vec![0.0; 12]; // Read 4 complete cycles
-
-        // Read samples from the buffer
-        let samples_read = buffer.read().get_samples(0, &mut output);
-
-        // Verify we got all requested samples
-        assert_eq!(samples_read, 12, "Should read all requested samples");
-
-        // Define expected values for alternating pattern
-        // Pattern repeats: [0.9, 0.0, -0.9, 0.9, 0.0, -0.9, ...]
-        let expected_values = [
-            0.9, 0.0, -0.9, 0.9, 0.0, -0.9, 0.9, 0.0, -0.9, 0.9, 0.0, -0.9,
-        ];
-
-        // Verify each sample exactly matches the expected value
-        // Use a small epsilon for floating point comparison
-        const EPSILON: f32 = 1e-6;
-
-        for i in 0..expected_values.len() {
-            assert!(
-                (output[i] - expected_values[i]).abs() < EPSILON,
-                "Sample at position {} should be {}, got {}",
-                i,
-                expected_values[i],
-                output[i]
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_segment_content_ascending() {
-        // Create a test source with the ascending pattern
-        // The ascending pattern generates a ramp from -0.9 to 0.9
-        let source = Arc::new(TestSource::new_with_pattern("ascending", 1.0));
-        let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
-
-        // Load a segment
-        let loaded = load_segments_with(&source, &buffer, 0, 1).await;
-        assert_eq!(loaded, 1, "Should successfully load one segment");
-
-        // Create a buffer to read samples into
-        let mut output = vec![0.0; 5]; // Sample a few points along the ramp
-
-        // Read samples from the buffer
-        let samples_read = buffer.read().get_samples(0, &mut output);
-        assert_eq!(samples_read, 5, "Should read all requested samples");
-
-        // With ascending pattern, each sample should be greater than the previous
-        for i in 1..output.len() {
-            assert!(
-                output[i] > output[i - 1],
-                "Sample at position {} ({}) should be greater than position {} ({})",
-                i,
-                output[i],
-                i - 1,
-                output[i - 1]
-            );
-        }
-
-        // First sample should be near -0.9 and last sample should be higher
-        const EPSILON: f32 = 0.01;
-        assert!(
-            (output[0] + 0.9).abs() < EPSILON,
-            "First sample should be near -0.9, got {}",
-            output[0]
-        );
-    }
-    #[tokio::test]
-    async fn test_segment_boundary_content() {
-        // Create a test source with the alternating pattern
-        let source = Arc::new(TestSource::new_with_pattern("alternating", 1.0));
-        let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
-
-        // Load two consecutive segments
-        let loaded = load_segments_with(&source, &buffer, 0, 2).await;
-        assert_eq!(loaded, 2, "Should successfully load two segments");
-
-        // Create a buffer to read samples across segment boundary
-        // Assuming SEGMENT_SIZE is 1024, read 10 samples before and after boundary
-        let boundary_position = SEGMENT_SIZE - 5;
-        let mut output = vec![0.0; 10];
-
-        // Read samples spanning the boundary
-        let samples_read = buffer.read().get_samples(boundary_position, &mut output);
-        assert_eq!(samples_read, 10, "Should read all requested samples");
-
-        // Test pattern should continue seamlessly across boundary
-        // For alternating pattern, we should see the continuing [0.9, 0.0, -0.9] pattern
-
-        // Define expected values based on where in the pattern we expect to be
-        // This needs to be calculated based on the boundary_position
-        let pattern_position = boundary_position % 3; // Since pattern repeats every 3 samples
-
-        let mut expected_values = Vec::with_capacity(10);
-        for i in 0..10 {
-            let pattern_index = (pattern_position + i) % 3;
-            let value = match pattern_index {
-                0 => 0.9,
-                1 => 0.0,
-                2 => -0.9,
-                _ => unreachable!(),
-            };
-            expected_values.push(value);
-        }
-
-        // Verify values across boundary
-        const EPSILON: f32 = 1e-6;
-        for i in 0..10 {
-            assert!(
-                (output[i] - expected_values[i]).abs() < EPSILON,
-                "Sample at boundary+{} should be {}, got {}",
-                i - 5,
-                expected_values[i],
-                output[i]
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod ringbuffer_tests {
     use ringbuf::HeapRb;

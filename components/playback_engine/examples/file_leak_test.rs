@@ -1,5 +1,6 @@
 // Enhanced examples/file_leak_test.rs
 use playback_engine::{FlacSource, Track};
+use ringbuf::HeapRb;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -27,8 +28,12 @@ async fn main() {
 
     for i in 0..10 {
         println!("Creating track {}...", i);
+        let buffer = HeapRb::new(8 * 1024);
+        let (prod, mut cons) = buffer.split();
         let source = FlacSource::new(&path).expect("Failed to create source");
-        let mut track = Track::new(source).await.expect("Failed to create track");
+        let mut track = Track::new(source, prod)
+            .await
+            .expect("Failed to create track");
 
         // Play the track to ensure background task is active
         track.play();

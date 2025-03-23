@@ -2,6 +2,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use parking_lot::Mutex;
 use playback_engine::FlacSource;
 use playback_engine::Track;
+use ringbuf::HeapRb;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,13 +25,17 @@ fn bench_track_loading(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(name), name, |b, name| {
             let path = test_file_path(name);
             b.iter(|| {
+                let buffer = HeapRb::new(1024 * 8);
+                let (prod, cons) = buffer.split();
                 // Create Track in a block to ensure it's dropped right after use
                 let track = rt.block_on(async {
                     // Create a FlacSource
                     let source = FlacSource::new(&path).expect("Could not create source");
 
                     // Create a Track with the source
-                    Track::new(source).await.expect("Could not create track")
+                    Track::new(source, prod)
+                        .await
+                        .expect("Could not create track")
                 });
 
                 // Explicitly drop the track
@@ -58,12 +63,15 @@ fn bench_time_to_playable(c: &mut Criterion) {
 
     for name in ["short.flac", "medium.flac", "long.flac"] {
         let path = test_file_path(name);
-
+        let buffer = HeapRb::new(1024 * 8);
+        let (prod, mut cons) = buffer.split();
         // Print metrics once before benchmarking
         let start = Instant::now();
         let mut track = rt.block_on(async {
             let source = FlacSource::new(&path).unwrap();
-            Track::new(source).await.expect("Failed to create track")
+            Track::new(source, prod)
+                .await
+                .expect("Failed to create track")
         });
         let load_time = start.elapsed();
 
@@ -73,10 +81,9 @@ fn bench_time_to_playable(c: &mut Criterion) {
 
         let ready_time = load_time + play_time;
 
-        let mut buffer = vec![0.0f32; 1024];
-        let first_read = track
-            .get_next_samples(&mut buffer)
-            .expect("Failed to get samples");
+        let mut buffer = [0.0f32; 1024];
+        let first_read = cons.pop_slice(&mut buffer);
+        assert_eq!(first_read, 1024);
 
         println!("\nInitial playability check for {}:", name);
         println!("  Time to load: {:?}", load_time);
@@ -91,11 +98,14 @@ fn bench_time_to_playable(c: &mut Criterion) {
             let path = test_file_path(name);
             b.iter_with_large_drop(|| {
                 let start = Instant::now();
-
+                let buffer = HeapRb::new(8 * 1024);
+                let (prod, cons) = buffer.split();
                 // Load track
                 let mut track = rt.block_on(async {
                     let source = FlacSource::new(&path).unwrap();
-                    Track::new(source).await.expect("Failed to create track")
+                    Track::new(source, prod)
+                        .await
+                        .expect("Failed to create track")
                 });
 
                 // Start playback
@@ -120,10 +130,14 @@ fn bench_seeking(c: &mut Criterion) {
     for name in ["short.flac", "medium.flac", "long.flac"] {
         let path = test_file_path(name);
 
+        let buffer = HeapRb::new(8 * 1024);
+        let (prod, mut cons) = buffer.split();
         // Create a track for testing
         let track = rt.block_on(async {
             let source = FlacSource::new(&path).unwrap();
-            Track::new(source).await.expect("Failed to create track")
+            Track::new(source, prod)
+                .await
+                .expect("Failed to create track")
         });
 
         // Create a shared reference that can be cloned for each benchmark
@@ -167,7 +181,7 @@ fn bench_seeking(c: &mut Criterion) {
                         rt.block_on(async {
                             let mut track = track_clone.lock();
                             track.seek(pos).unwrap();
-                            track.get_next_samples(&mut buffer).unwrap();
+                            cons.pop_slice(&mut buffer);
                         });
                     });
                 },
