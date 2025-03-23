@@ -115,7 +115,7 @@ fn bench_time_to_playable(c: &mut Criterion) {
 
 fn bench_seeking(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let mut group = c.benchmark_group("seeking");
+    let group = c.benchmark_group("seeking");
 
     for name in ["short.flac", "medium.flac", "long.flac"] {
         let path = test_file_path(name);

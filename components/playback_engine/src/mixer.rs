@@ -1,6 +1,5 @@
 // in mixer.rs
 use crate::error::PlaybackError;
-use crate::source::Source;
 use crate::track::Track;
 use parking_lot::RwLock;
 use playback_primitives::Deck;
@@ -113,7 +112,7 @@ impl Mixer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{source::FlacSource, track::Track};
+    use crate::track::Track;
     use std::collections::HashMap;
 
     #[test]

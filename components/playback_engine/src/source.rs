@@ -74,9 +74,6 @@ pub struct FlacSource {
     // Current sample position in the stream
     current_position: AtomicUsize,
 
-    // Pre-allocated buffer for samples between segments
-    sample_buffer: Mutex<Vec<f32>>,
-
     // Basic metadata
     sample_rate: u32,
     audio_channels: u16,
@@ -115,14 +112,10 @@ impl FlacSource {
             decoder,
         });
 
-        // Create pre-allocated buffer with reasonable capacity
-        let sample_buffer = Mutex::new(Vec::with_capacity(Self::TYPICAL_FRAME_SIZE));
-
         // Create the source
         let source = Self {
             decoder_state,
             current_position: AtomicUsize::new(0),
-            sample_buffer,
             sample_rate,
             audio_channels,
             is_eof: AtomicBool::new(false),
@@ -319,7 +312,7 @@ mod tests {
     #[test]
     fn first_segment_is_at_position_zero() {
         // Create a source from the alternating pattern file
-        let mut source =
+        let source =
             FlacSource::new(file_path("alternating.flac")).expect("Failed to create source");
 
         // Decode a single segment
@@ -344,7 +337,7 @@ mod tests {
     #[test]
     fn second_segment_follows_first() {
         // Create a source from the alternating pattern file
-        let mut source =
+        let source =
             FlacSource::new(file_path("alternating.flac")).expect("Failed to create source");
 
         // Decode the first segment
@@ -367,7 +360,7 @@ mod tests {
     #[test]
     fn segment_data_matches_expected_pattern() {
         // Create a source from the alternating pattern file
-        let mut source =
+        let source =
             FlacSource::new(file_path("alternating.flac")).expect("Failed to create source");
 
         // Decode a segment
@@ -388,7 +381,7 @@ mod tests {
     #[test]
     fn multiple_segments_decode_correctly() {
         // Create a source from the alternating pattern file
-        let mut source =
+        let source =
             FlacSource::new(file_path("alternating.flac")).expect("Failed to create source");
 
         // Decode three segments at once
@@ -415,8 +408,7 @@ mod tests {
     #[test]
     fn segment_boundaries_are_seamless() {
         // Create a source from the ascending pattern file (continuous pattern)
-        let mut source =
-            FlacSource::new(file_path("ascending.flac")).expect("Failed to create source");
+        let source = FlacSource::new(file_path("ascending.flac")).expect("Failed to create source");
 
         // Decode two segments
         let segments = source
@@ -449,7 +441,7 @@ mod tests {
     #[test]
     fn partial_segment_at_eof() {
         // Create a very short custom test file (or use existing one)
-        let mut source =
+        let source =
             FlacSource::new(file_path("alternating.flac")).expect("Failed to create source");
 
         // Decode all segments
@@ -828,13 +820,11 @@ mod tests {
             let source = FlacSource::new(test_file_path("short.flac")).unwrap();
 
             // Read until EOF
-            let mut total_segments = 0;
             loop {
                 let segments = source.decode_next_frame().unwrap();
                 if segments.is_empty() {
                     break;
                 }
-                total_segments += segments.len();
             }
 
             // Get the final position

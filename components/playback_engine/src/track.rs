@@ -1,8 +1,8 @@
 use crate::buffer::SegmentedBuffer;
 use crate::error::PlaybackError;
 #[cfg(test)]
-use crate::source::AudioSegment;
-use crate::source::{DecodedSegment, SegmentIndex, Source, SEGMENT_SIZE};
+use crate::source::{AudioSegment, SegmentIndex, SEGMENT_SIZE};
+use crate::source::{DecodedSegment, Source};
 
 use tokio::sync::mpsc;
 
@@ -28,6 +28,7 @@ pub enum TrackCommand {
     Shutdown,
 }
 
+#[cfg(test)]
 async fn load_segments_with<S: Source + Send + Sync>(
     source: &Arc<S>,
     buffer: &Arc<RwLock<SegmentedBuffer>>,
@@ -90,64 +91,6 @@ async fn load_segments_with<S: Source + Send + Sync>(
     loaded_count
 }
 
-async fn buffer_management_task<S: Source + Send + Sync + 'static>(
-    source: Arc<S>,
-    buffer: Arc<RwLock<SegmentedBuffer>>,
-    mut command_rx: mpsc::Receiver<TrackCommand>,
-    ready_tx: tokio::sync::watch::Sender<bool>,
-) {
-    let mut current_position = 0;
-    let mut is_ready = false;
-
-    while let Some(command) = command_rx.recv().await {
-        match command {
-            TrackCommand::FillFrom(position) => {
-                current_position = position;
-
-                // Set not ready when starting to fill from a new position
-                if is_ready {
-                    is_ready = false;
-                    let _ = ready_tx.send(false);
-                }
-
-                // Load initial segments (minimum needed for playback)
-                const INITIAL_SEGMENTS: usize = 3;
-                let loaded_count =
-                    load_segments_with(&source, &buffer, current_position, INITIAL_SEGMENTS).await;
-
-                // Signal ready if we loaded enough segments
-                if loaded_count > 0 && !is_ready {
-                    is_ready = true;
-                    let _ = ready_tx.send(true);
-                    tracing::debug!("Track ready for playback at position {}", current_position);
-                }
-
-                // Continue loading more segments in background
-                let source_clone = source.clone();
-                let buffer_clone = buffer.clone();
-                let preload_position = current_position + INITIAL_SEGMENTS * SEGMENT_SIZE;
-
-                tokio::spawn(async move {
-                    const ADDITIONAL_SEGMENTS: usize = 7; // Load segments 3-10
-                    let _ = load_segments_with(
-                        &source_clone,
-                        &buffer_clone,
-                        preload_position,
-                        ADDITIONAL_SEGMENTS,
-                    )
-                    .await;
-                });
-            }
-            TrackCommand::Shutdown => {
-                tracing::info!("Buffer management task received shutdown command");
-                break;
-            }
-        }
-    }
-
-    tracing::info!("Buffer management task completed");
-}
-
 async fn buffer_task(
     buffer: Arc<RwLock<SegmentedBuffer>>,
     mut segments_rx: mpsc::Receiver<Vec<DecodedSegment>>,
@@ -161,12 +104,12 @@ async fn buffer_task(
 }
 
 async fn decoder_task<S: Source + Send + Sync + 'static>(
-    mut source: S, // Direct ownership, may need to be mutable
+    source: S,
     segments_tx: mpsc::Sender<Vec<DecodedSegment>>,
     mut command_rx: mpsc::Receiver<TrackCommand>,
     ready_tx: tokio::sync::watch::Sender<bool>,
 ) {
-    let mut current_position = 0;
+    let mut current_position;
     let mut is_ready = false;
 
     while let Some(command) = command_rx.recv().await {
@@ -443,20 +386,6 @@ impl TestSource {
         }
     }
 
-    // Create a test source with multiple frames (for more complex testing)
-    pub fn new_with_frames(frames: Vec<Vec<f32>>) -> Self {
-        let frames_of_segments = frames
-            .into_iter()
-            .map(Self::create_segments_from_samples)
-            .collect();
-
-        Self {
-            position: AtomicUsize::new(0),
-            samples: frames_of_segments,
-            current_sample_position: AtomicUsize::new(0),
-        }
-    }
-
     // Create decoded segments from a flat vector of samples
     fn create_segments_from_samples(samples: Vec<f32>) -> Vec<DecodedSegment> {
         let mut segments = Vec::new();
@@ -664,17 +593,10 @@ impl Track {
 
     // Add this method for tests
     pub(crate) async fn ensure_ready_for_test(&mut self) -> Result<(), PlaybackError> {
-        // For test tracks, explicitly fill the buffer immediately
-        let segment = self.source.decode_next_frame()?;
-
-        {
-            let mut buffer = self.buffer.write();
-            buffer.add_segments(segment);
+        while !self.buffer.read().is_ready_at(0) {
+            // Wait a bit to ensure buffer management task processes the data
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-
-        // Wait a bit to ensure buffer management task processes the data
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
         Ok(())
     }
 }
@@ -879,7 +801,6 @@ mod tests {
 
         // Load multiple segments in sequence
         for i in 0..3 {
-            let target_segment = SegmentIndex(i);
             load_segments_with(&source, &buffer, i, 1).await;
         }
 
@@ -1083,51 +1004,6 @@ mod ringbuffer_tests {
 
         // Should have 2 items left
         assert_eq!(consumer.len(), 2);
-    }
-}
-#[cfg(test)]
-struct SeekCountingSource {
-    inner: TestSource,
-    seek_count: AtomicUsize,
-}
-
-#[cfg(test)]
-impl SeekCountingSource {
-    fn new() -> Self {
-        Self {
-            inner: TestSource::new_with_pattern("alternating", 1.0),
-            seek_count: AtomicUsize::new(0),
-        }
-    }
-
-    fn get_seek_count(&self) -> usize {
-        self.seek_count.load(Ordering::SeqCst)
-    }
-}
-
-#[cfg(test)]
-impl Source for SeekCountingSource {
-    fn decode_next_frame(&self) -> Result<Vec<DecodedSegment>, PlaybackError> {
-        self.inner.decode_next_frame()
-    }
-
-    fn seek(&self, position: usize) -> Result<(), PlaybackError> {
-        // Count the seek first
-        self.seek_count.fetch_add(1, Ordering::SeqCst);
-        // Then delegate to inner source
-        self.inner.seek(position)
-    }
-
-    fn sample_rate(&self) -> u32 {
-        self.inner.sample_rate()
-    }
-
-    fn audio_channels(&self) -> u16 {
-        self.inner.audio_channels()
-    }
-
-    fn current_position(&self) -> usize {
-        self.inner.current_position()
     }
 }
 

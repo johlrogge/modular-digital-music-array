@@ -55,13 +55,12 @@ impl SegmentedBuffer {
                 let missing_segments = -relative_index as usize;
                 let mut new_segments = vec![None; missing_segments];
                 new_segments[0] = Some(segment.segment);
-                new_segments.extend(self.segments.drain(..));
+                new_segments.append(&mut self.segments);
                 self.segments = new_segments;
                 self.head_index = segment.index;
 
                 // Trim if we've exceeded capacity
                 if self.segments.len() > self.capacity {
-                    let excess = self.segments.len() - self.capacity;
                     self.segments.truncate(self.capacity);
                     self.tail_index = SegmentIndex(self.head_index.0 + self.segments.len());
                 }
