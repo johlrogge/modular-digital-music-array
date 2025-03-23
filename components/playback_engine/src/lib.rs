@@ -18,7 +18,7 @@ pub use playback_primitives::Deck;
 pub use source::{FlacSource, Source};
 pub use track::Track;
 
-type Decks = Arc<RwLock<HashMap<Deck, Arc<RwLock<Track<FlacSource>>>>>>;
+type Decks = Arc<RwLock<HashMap<Deck, Arc<RwLock<Track>>>>>;
 
 pub struct PlaybackEngine {
     decks: Decks,
@@ -36,7 +36,7 @@ impl PlaybackEngine {
         })
     }
 
-    fn find_track(&self, deck: Deck) -> Option<Arc<RwLock<Track<FlacSource>>>> {
+    fn find_track(&self, deck: Deck) -> Option<Arc<RwLock<Track>>> {
         let decks = self.decks.read();
         decks.get(&deck).cloned()
     }
@@ -80,7 +80,7 @@ impl PlaybackEngine {
 
     pub async fn load_track(&mut self, deck: Deck, path: &Path) -> Result<(), PlaybackError> {
         // Create new track
-        let track = Track::<FlacSource>::new(FlacSource::new(path)?).await?;
+        let track = Track::new(FlacSource::new(path)?).await?;
 
         // Acquire lock and insert track
         let mut decks = self.decks.write();

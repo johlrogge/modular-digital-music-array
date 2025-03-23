@@ -1,21 +1,21 @@
 use crate::{source::Source, track::Track};
 use playback_primitives::Deck;
 
-pub enum AudioCommand<S: Source + Send + Sync + 'static> {
+pub enum AudioCommand {
     /// Add a new track to a channel
     AddTrack {
         /// The channel to add the track to
         channel: Deck,
         /// The track to add
-        track: Track<S>,
+        track: Track,
     },
     /// Remove a track from a channel
     RemoveTrack(Deck),
 }
 
-impl<S: Source + Send + Sync> AudioCommand<S> {
+impl AudioCommand {
     /// Create a new AddTrack command
-    pub fn add_track(channel: Deck, track: Track<S>) -> Self {
+    pub fn add_track(channel: Deck, track: Track) -> Self {
         Self::AddTrack { channel, track }
     }
 

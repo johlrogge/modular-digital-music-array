@@ -18,9 +18,9 @@ impl Mixer {
         }
     }
 
-    pub fn mix<S: Source + Send + Sync>(
+    pub fn mix(
         &mut self,
-        decks: &RwLock<HashMap<Deck, Arc<RwLock<Track<S>>>>>,
+        decks: &RwLock<HashMap<Deck, Arc<RwLock<Track>>>>,
         output: &mut [f32],
         samples_per_callback: usize,
     ) -> Result<(), PlaybackError> {
@@ -122,7 +122,7 @@ mod tests {
         let mut mixer = Mixer::new(1024);
         let mut output = vec![0.0; 1024];
 
-        mixer.mix::<FlacSource>(&decks, &mut output, 1024).unwrap();
+        mixer.mix(&decks, &mut output, 1024).unwrap();
 
         // Output should be silence
         assert!(output.iter().all(|&x| x == 0.0));

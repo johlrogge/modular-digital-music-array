@@ -1,8 +1,8 @@
 use crate::buffer::SegmentedBuffer;
 use crate::error::PlaybackError;
 #[cfg(test)]
-use crate::source::{AudioSegment, DecodedSegment};
-use crate::source::{SegmentIndex, Source, SEGMENT_SIZE};
+use crate::source::AudioSegment;
+use crate::source::{DecodedSegment, SegmentIndex, Source, SEGMENT_SIZE};
 
 use tokio::sync::mpsc;
 
@@ -11,22 +11,13 @@ use parking_lot::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use ringbuf::HeapRb;
-type SampleRb = HeapRb<f32>;
-type SampleProducer =
-    ringbuf::Producer<f32, Arc<ringbuf::SharedRb<f32, Vec<std::mem::MaybeUninit<f32>>>>>;
-type SampleConsumer =
-    ringbuf::Consumer<f32, Arc<ringbuf::SharedRb<f32, Vec<std::mem::MaybeUninit<f32>>>>>;
-pub struct Track<S: Source + Send + Sync + 'static> {
-    source: Arc<S>,
+pub struct Track {
     position: usize,
     playing: bool,
     volume: f32,
     buffer: Arc<RwLock<SegmentedBuffer>>,
     command_tx: mpsc::Sender<TrackCommand>,
-    task_handle: Option<tokio::task::JoinHandle<()>>,
-    // Add ringbuffer consumer
-    sample_consumer: SampleConsumer,
+    decoder_task: Option<tokio::task::JoinHandle<()>>,
     ready_tx: tokio::sync::watch::Sender<bool>,
     ready_rx: tokio::sync::watch::Receiver<bool>,
 }
@@ -99,36 +90,6 @@ async fn load_segments_with<S: Source + Send + Sync>(
     loaded_count
 }
 
-/// Fill the ringbuffer with samples from the segmented buffer
-fn fill_ringbuffer_from_segments(
-    segmented_buffer: &SegmentedBuffer,
-    producer: &mut SampleProducer,
-    position: usize,
-    length: usize,
-) -> usize {
-    // Create a temporary buffer to hold samples from SegmentedBuffer
-    let mut temp_buffer = vec![0.0; length];
-
-    // Get samples from the SegmentedBuffer
-    let samples_read = segmented_buffer.get_samples(position, &mut temp_buffer);
-
-    // Push the samples to the ringbuffer
-    let mut samples_pushed = 0;
-    for i in 0..samples_read {
-        match producer.push(temp_buffer[i]) {
-            Ok(()) => {
-                samples_pushed += 1;
-            }
-            Err(_) => {
-                // Ringbuffer is full
-                break;
-            }
-        }
-    }
-
-    samples_pushed
-}
-
 async fn buffer_management_task<S: Source + Send + Sync + 'static>(
     source: Arc<S>,
     buffer: Arc<RwLock<SegmentedBuffer>>,
@@ -187,39 +148,143 @@ async fn buffer_management_task<S: Source + Send + Sync + 'static>(
     tracing::info!("Buffer management task completed");
 }
 
-impl<S: Source + Send + Sync> Track<S> {
-    pub async fn new(source: S) -> Result<Self, PlaybackError> {
-        let source = Arc::new(source);
+async fn buffer_task(
+    buffer: Arc<RwLock<SegmentedBuffer>>,
+    mut segments_rx: mpsc::Receiver<Vec<DecodedSegment>>,
+) {
+    while let Some(segments) = segments_rx.recv().await {
+        let mut buffer = buffer.write();
+        buffer.add_segments(segments);
+    }
+
+    tracing::info!("Buffer task completed");
+}
+
+async fn decoder_task<S: Source + Send + Sync + 'static>(
+    mut source: S, // Direct ownership, may need to be mutable
+    segments_tx: mpsc::Sender<Vec<DecodedSegment>>,
+    mut command_rx: mpsc::Receiver<TrackCommand>,
+    ready_tx: tokio::sync::watch::Sender<bool>,
+) {
+    let mut current_position = 0;
+    let mut is_ready = false;
+
+    while let Some(command) = command_rx.recv().await {
+        match command {
+            TrackCommand::FillFrom(position) => {
+                current_position = position;
+
+                // Set not ready when starting to fill from a new position
+                if is_ready {
+                    is_ready = false;
+                    let _ = ready_tx.send(false);
+                }
+
+                // Seek to the requested position
+                if let Err(e) = source.seek(current_position) {
+                    tracing::error!("Error seeking: {}", e);
+                    continue;
+                }
+
+                // Load initial segments
+                const INITIAL_SEGMENTS: usize = 3;
+                let mut segments_loaded = 0;
+
+                for _ in 0..INITIAL_SEGMENTS {
+                    match source.decode_next_frame() {
+                        Ok(segments) => {
+                            if segments.is_empty() {
+                                // EOF reached
+                                break;
+                            }
+
+                            // Send segments to Track
+                            if let Err(e) = segments_tx.send(segments).await {
+                                tracing::error!("Error sending segments: {}", e);
+                                break;
+                            }
+
+                            segments_loaded += 1;
+                        }
+                        Err(e) => {
+                            tracing::error!("Error decoding: {}", e);
+                            break;
+                        }
+                    }
+                }
+
+                // Signal ready if we loaded enough segments
+                if segments_loaded > 0 && !is_ready {
+                    is_ready = true;
+                    let _ = ready_tx.send(true);
+                    tracing::debug!("Track ready for playback at position {}", current_position);
+                }
+
+                // Continue loading more segments in background
+                // We no longer spawn a task here since we can't clone the source
+                // Instead, we continue loading in this task
+                for _ in 0..7 {
+                    // ADDITIONAL_SEGMENTS = 7
+                    match source.decode_next_frame() {
+                        Ok(segments) => {
+                            if segments.is_empty() {
+                                break; // EOF
+                            }
+
+                            if let Err(e) = segments_tx.send(segments).await {
+                                tracing::error!("Error sending segments: {}", e);
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Error decoding: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+            TrackCommand::Shutdown => {
+                tracing::info!("Decoder task received shutdown command");
+                break;
+            }
+        }
+    }
+
+    tracing::info!("Decoder task completed");
+}
+impl Track {
+    pub async fn new<S: Source + Send + Sync + 'static>(source: S) -> Result<Self, PlaybackError> {
         let buffer = Arc::new(RwLock::new(SegmentedBuffer::new()));
+
+        // Command channel for control messages
         let (command_tx, command_rx) = mpsc::channel(32);
 
-        // Create a ringbuffer for audio samples (2 seconds of stereo audio at 48kHz)
-        let rb_capacity = 2 * 48000 * 2;
-        let sample_rb = SampleRb::new(rb_capacity);
-
-        // Split the ringbuffer to get producer and consumer
-        let (producer, consumer) = sample_rb.split();
+        // Segment channel for decoded audio data
+        let (segments_tx, segments_rx) = mpsc::channel(100);
 
         // Add ready state tracking
         let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
 
-        let source_clone = Arc::clone(&source);
-        let buffer_clone = Arc::clone(&buffer);
+        // Create the decoder task that owns the source directly
         let ready_tx_clone = ready_tx.clone();
 
-        let task_handle = tokio::spawn(async move {
-            buffer_management_task(source_clone, buffer_clone, command_rx, ready_tx_clone).await;
+        let decoder_task = tokio::spawn(async move {
+            decoder_task(source, segments_tx, command_rx, ready_tx_clone).await;
+        });
+
+        // Spawn the buffer task that receives segments and adds them to the buffer
+        let buffer_clone = Arc::clone(&buffer);
+        tokio::spawn(async move {
+            buffer_task(buffer_clone, segments_rx).await;
         });
 
         let track = Self {
-            source,
             position: 0,
             playing: false,
             volume: 1.0,
             buffer,
             command_tx,
-            task_handle: Some(task_handle),
-            sample_consumer: consumer,
+            decoder_task: Some(decoder_task),
             ready_tx,
             ready_rx,
         };
@@ -329,7 +394,7 @@ impl<S: Source + Send + Sync> Track<S> {
     }
 }
 
-impl<S: Source + Send + Sync + 'static> Drop for Track<S> {
+impl Drop for Track {
     fn drop(&mut self) {
         tracing::info!("Track drop beginning");
 
@@ -343,9 +408,9 @@ impl<S: Source + Send + Sync + 'static> Drop for Track<S> {
         let _ = std::mem::replace(&mut self.command_tx, dummy_tx);
         tracing::info!("Command channel closed");
 
-        // 3. Abort the task
-        if let Some(task) = self.task_handle.take() {
-            tracing::info!("Aborting background task");
+        // 3. Abort the decoder task
+        if let Some(task) = self.decoder_task.take() {
+            tracing::info!("Aborting decoder task");
             task.abort();
         }
 
@@ -581,7 +646,7 @@ impl Source for TestSource {
 }
 
 #[cfg(test)]
-impl Track<TestSource> {
+impl Track {
     pub(crate) async fn new_test() -> Result<Self, PlaybackError> {
         // Generate 1 second of 440Hz test tone
         let sample_rate = 48000;
