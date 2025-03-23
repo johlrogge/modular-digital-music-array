@@ -28,23 +28,44 @@ impl Mixer {
         // Clear output buffer
         output[..samples_per_callback].fill(0.0);
 
+        // Active tracks counter for debug
+        let mut active_tracks = 0;
+
         // Mix each active track
         for (deck, consumer) in consumers.iter_mut() {
             // Get volume (default to 1.0 if not set)
             let volume = *self.volumes.get(deck).unwrap_or(&1.0);
 
             // Read from consumer and mix with volume
-            let available = consumer.len().min(samples_per_callback);
-            for i in 0..available {
-                if let Some(sample) = consumer.pop() {
-                    output[i] += sample * volume;
+            let available = consumer.len();
+            let to_mix = std::cmp::min(available, samples_per_callback);
+
+            if to_mix > 0 {
+                tracing::debug!("Mixing {} samples from deck {:?}", to_mix, deck);
+                active_tracks += 1;
+
+                for i in 0..to_mix {
+                    if let Some(sample) = consumer.pop() {
+                        output[i] += sample * volume;
+                    }
                 }
             }
         }
 
         // Write mixed output to the output producer
+        let mut written = 0;
         for i in 0..samples_per_callback {
-            let _ = self.output_producer.push(output[i]);
+            if self.output_producer.push(output[i]).is_ok() {
+                written += 1;
+            }
+        }
+
+        if written > 0 {
+            tracing::debug!(
+                "Wrote {} samples to mixer output, from {} active tracks",
+                written,
+                active_tracks
+            );
         }
 
         Ok(())

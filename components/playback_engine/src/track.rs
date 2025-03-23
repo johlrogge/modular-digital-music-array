@@ -95,7 +95,6 @@ async fn load_segments_with<S: Source + Send + Sync>(
     loaded_count
 }
 
-// New producer task that reads from SegmentedBuffer and writes to ringbuffer
 async fn producer_task(
     buffer: Arc<RwLock<SegmentedBuffer>>,
     mut producer: HeapProducer<f32>,
@@ -104,12 +103,15 @@ async fn producer_task(
 ) {
     let mut temp_buffer = vec![0.0; 1024]; // Temporary buffer for samples
 
+    tracing::info!("Producer task started"); // Add logging
+
     loop {
         // Get current position
         let current_position = position.load(Ordering::Relaxed);
 
         // Fill as much of the ringbuffer as possible
         let available_space = producer.free_len();
+
         if available_space > 0 {
             // Read samples from buffer
             let to_read = std::cmp::min(available_space, temp_buffer.len());
@@ -126,18 +128,26 @@ async fn producer_task(
 
                 // Update position
                 position.fetch_add(read, Ordering::Relaxed);
+
+                tracing::debug!("Pushed {} samples to ringbuffer", read);
             } else {
                 // No samples available, request more
+                tracing::debug!(
+                    "No samples at position {}, requesting more",
+                    current_position
+                );
+
                 if let Err(e) = command_tx.try_send(TrackCommand::FillFrom(current_position)) {
                     tracing::debug!("Failed to send fill command: {}", e);
                 }
 
                 // Sleep a bit to avoid spinning
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         } else {
             // Ringbuffer is full, wait a bit
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            tracing::debug!("Ringbuffer full, waiting");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     }
 }
@@ -214,10 +224,8 @@ async fn decoder_task<S: Source + Send + Sync + 'static>(
                 }
 
                 // Continue loading more segments in background
-                // We no longer spawn a task here since we can't clone the source
-                // Instead, we continue loading in this task
-                for _ in 0..7 {
-                    // ADDITIONAL_SEGMENTS = 7
+                const ADDITIONAL_SEGMENTS: usize = 7;
+                for _ in 0..ADDITIONAL_SEGMENTS {
                     match source.decode_next_frame() {
                         Ok(segments) => {
                             if segments.is_empty() {
@@ -328,8 +336,20 @@ impl Track {
             }
         }
     }
+
     pub fn play(&mut self) {
+        // Wait for the track to be ready - but since we can't await here,
+        // we'll just log and continue
+        if !self.is_ready() {
+            tracing::warn!("Playing track that's not ready yet");
+        }
+
         self.playing.store(true, Ordering::Relaxed);
+        tracing::info!("Track set to playing state");
+    }
+
+    pub fn is_ready(&self) -> bool {
+        *self.ready_rx.borrow()
     }
 
     pub fn stop(&mut self) {
@@ -350,10 +370,6 @@ impl Track {
 
     pub fn position(&self) -> usize {
         self.position.load(Ordering::Relaxed)
-    }
-
-    pub fn is_ready(&self) -> bool {
-        *self.ready_rx.borrow()
     }
 
     pub fn is_playing(&self) -> bool {

@@ -5,7 +5,14 @@ mod mixer;
 mod source;
 mod track;
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -24,11 +31,12 @@ type Decks = Arc<RwLock<HashMap<Deck, Arc<RwLock<Track>>>>>;
 pub struct PlaybackEngine {
     decks: Decks,
     _audio_stream: Stream,
-    audio_consumers: HashMap<Deck, HeapConsumer<f32>>,
-    mixer: Option<Mixer>,                           // Add mixer instance
-    _mix_task: Option<std::thread::JoinHandle<()>>, // Add background mix task
+    // Remove direct audio_consumers field
+    // Remove direct mixer field
+    mixer_shared: Arc<parking_lot::Mutex<Mixer>>,
+    consumers_shared: Arc<parking_lot::Mutex<HashMap<Deck, HeapConsumer<f32>>>>,
+    _mix_task: Option<std::thread::JoinHandle<()>>,
 }
-
 impl PlaybackEngine {
     pub fn new() -> Result<Self, PlaybackError> {
         // Create ringbuffer for mixer output
@@ -43,59 +51,72 @@ impl PlaybackEngine {
         let audio_stream = Self::create_audio_stream(mixer_consumer)?;
 
         let decks = Arc::new(RwLock::new(HashMap::new()));
-        let audio_consumers = HashMap::new();
 
-        // Create an Arc<Mutex<Option<Mixer>>> for sharing with the mix thread
-        let mixer_shared = Arc::new(parking_lot::Mutex::new(Some(mixer)));
-        let mixer_clone = mixer_shared.clone();
+        // Create shared objects
+        let mixer_shared = Arc::new(parking_lot::Mutex::new(mixer));
+        let consumers_shared = Arc::new(parking_lot::Mutex::new(
+            HashMap::<Deck, HeapConsumer<f32>>::new(),
+        ));
 
-        // Create a shared map for the audio consumers
-        let consumers_shared = Arc::new(parking_lot::Mutex::new(audio_consumers));
-        let consumers_clone = consumers_shared.clone();
+        // Clone for the mix thread
+        let mixer_clone = Arc::clone(&mixer_shared);
+        let consumers_clone = Arc::clone(&consumers_shared);
 
-        // Start the mix thread (using std::thread for real-time reliability)
+        // Start the mix thread
         let mix_task = std::thread::spawn(move || {
             let mut temp_buffer = vec![0.0; 1920 * 2];
 
+            tracing::info!("Mix thread started");
+
             loop {
-                // Try to lock the mixer
-                if let Some(mixer) = &mut *mixer_clone.lock() {
-                    let buffer_len = temp_buffer.len();
-                    let _ = mixer.mix(&mut temp_buffer, buffer_len, &mut *consumers_clone.lock());
-                } else {
-                    // Mixer has been taken, exit the thread
-                    break;
+                // Lock the mixer
+                let mut mixer_guard = mixer_clone.lock();
+                let buffer_len = temp_buffer.len();
+
+                // Lock consumers
+                let mut consumers_guard = consumers_clone.lock();
+
+                // Log consumers status for debugging
+                if !consumers_guard.is_empty() {
+                    tracing::debug!("Mix thread: Have {} consumers", consumers_guard.len());
+                    for (deck, consumer) in consumers_guard.iter() {
+                        tracing::debug!("Deck {:?} has {} samples available", deck, consumer.len());
+                    }
                 }
 
-                // Sleep for a short time
+                // Mix
+                if let Err(e) = mixer_guard.mix(&mut temp_buffer, buffer_len, &mut *consumers_guard)
+                {
+                    tracing::error!("Mix error: {}", e);
+                }
+
+                // Sleep a bit to avoid spinning
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         });
 
-        // Extract the mixer from the shared container
-        let mixer = mixer_shared.lock().take();
-
-        // Extract the consumers from the shared container
-        let audio_consumers = std::mem::take(&mut *consumers_shared.lock());
-
+        // Return the engine
         Ok(Self {
             decks,
             _audio_stream: audio_stream,
-            audio_consumers,
-            mixer,
+            mixer_shared,
+            consumers_shared,
             _mix_task: Some(mix_task),
         })
     }
 
     pub fn mix(&mut self) -> Result<(), PlaybackError> {
-        if let Some(mixer) = &mut self.mixer {
-            // Create a temporary buffer for mixing
-            let mut temp_buffer = vec![0.0; 1920 * 2];
-            let buffer_len = temp_buffer.len(); // Calculate length before borrowing
+        // Get the mixer and consumers
+        let mut mixer = self.mixer_shared.lock();
+        let mut consumers = self.consumers_shared.lock();
 
-            // Mix all active tracks
-            mixer.mix(&mut temp_buffer, buffer_len, &mut self.audio_consumers)?;
-        }
+        // Create a temporary buffer for mixing
+        let mut temp_buffer = vec![0.0; 1920 * 2];
+        let buffer_len = temp_buffer.len();
+
+        // Mix all active tracks
+        mixer.mix(&mut temp_buffer, buffer_len, &mut consumers)?;
+
         Ok(())
     }
 
@@ -132,27 +153,33 @@ impl PlaybackEngine {
         }
 
         // Get mixer and set volume
-        if let Some(mixer) = &mut self.mixer {
-            mixer.set_volume(deck, db);
-            tracing::info!("Setting volume for deck {:?} to {}dB", deck, db);
-            Ok(())
-        } else {
-            Err(PlaybackError::AudioDevice("Mixer not initialized".into()))
-        }
+        let mut mixer = self.mixer_shared.lock();
+        mixer.set_volume(deck, db);
+        tracing::info!("Setting volume for deck {:?} to {}dB", deck, db);
+        Ok(())
     }
+
     pub async fn load_track(&mut self, deck: Deck, path: &Path) -> Result<(), PlaybackError> {
         // Create ringbuffer for this deck
         const BUFFER_SIZE: usize = 16384; // 16K samples (~170ms at 48kHz stereo)
         let rb = HeapRb::<f32>::new(BUFFER_SIZE);
         let (producer, consumer) = rb.split();
 
-        // Create new track with producer - pass both arguments
-        let track = Track::new(FlacSource::new(path)?, producer).await?;
+        // Create new track with producer
+        let mut track = Track::new(FlacSource::new(path)?, producer).await?;
 
-        // Store the track and consumer
+        // Wait for the track to be ready (some initial data loaded)
+        track.ensure_ready().await?;
+
+        tracing::info!("Track is ready for playback");
+
+        // Store the track
         let mut decks = self.decks.write();
         decks.insert(deck, Arc::new(RwLock::new(track)));
-        self.audio_consumers.insert(deck, consumer);
+
+        // Store the consumer in the shared map
+        let mut consumers = self.consumers_shared.lock();
+        consumers.insert(deck, consumer);
 
         tracing::info!("Loaded track from {:?} into deck {:?}", path, deck);
         Ok(())
@@ -195,6 +222,17 @@ impl PlaybackEngine {
         // Create a thread-safe wrapper for the consumer
         let consumer = Arc::new(parking_lot::Mutex::new(mixer_consumer));
 
+        // Add debug counter
+        let read_samples = Arc::new(AtomicUsize::new(0));
+        let read_samples_clone = read_samples.clone();
+
+        // Create periodic logging task
+        std::thread::spawn(move || loop {
+            let samples = read_samples_clone.swap(0, Ordering::Relaxed);
+            tracing::info!("Audio callback read {} samples in the last second", samples);
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        });
+
         let stream = device.build_output_stream(
             &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -203,9 +241,32 @@ impl PlaybackEngine {
                 // Get consumer lock
                 let mut consumer = consumer.lock();
 
+                // Count available samples
+                let available = consumer.len();
+
                 // Read from consumer to fill output buffer
+                let mut read = 0;
                 for sample_idx in 0..data.len() {
-                    data[sample_idx] = consumer.pop().unwrap_or(0.0);
+                    if let Some(sample) = consumer.pop() {
+                        data[sample_idx] = sample;
+                        read += 1;
+                    } else {
+                        // Underrun - fill with silence
+                        data[sample_idx] = 0.0;
+                    }
+                }
+
+                // Update read counter
+                read_samples.fetch_add(read, Ordering::Relaxed);
+
+                // Log if we had an underrun
+                if read < data.len() && available == 0 {
+                    tracing::warn!(
+                        "Audio underrun: read {}/{} samples (available: {})",
+                        read,
+                        data.len(),
+                        available
+                    );
                 }
 
                 let total_time = callback_start.elapsed();
