@@ -24,6 +24,9 @@ pub enum PlaybackError {
     Io(#[from] std::io::Error),
     #[error("Task cancelled")]
     TaskCancelled,
+
+    #[error("Track is not ready for playback")]
+    TrackNotReady,
 }
 
 // Add conversions for CPAL errors

@@ -11,6 +11,7 @@ use symphonia::core::{
     probe::Hint,
     units::Time,
 };
+use tracing::Instrument;
 
 pub const SEGMENT_SIZE: usize = 1024;
 
@@ -21,7 +22,9 @@ pub struct SegmentIndex(pub usize);
 impl SegmentIndex {
     // Convert a sample position to a segment index
     pub fn from_sample_position(position: usize) -> Self {
-        Self(position / SEGMENT_SIZE)
+        let index = position / SEGMENT_SIZE;
+        tracing::debug!("Segment index {index} for position {position}");
+        Self(index)
     }
 
     // Get the sample position at the start of this segment
@@ -50,6 +53,12 @@ pub struct DecodedSegment {
 
     // The segment data
     pub segment: AudioSegment,
+}
+
+impl DecodedSegment {
+    pub fn is_empty(&self) -> bool {
+        self.segment.samples.iter().filter(|s| **s != 0.0).count() > 0
+    }
 }
 
 pub trait Source: Send + Sync {
@@ -98,8 +107,6 @@ type DecoderResult = Result<
 >;
 
 impl FlacSource {
-    const TYPICAL_FRAME_SIZE: usize = 8192;
-
     pub fn new(path: impl AsRef<Path>) -> Result<Self, PlaybackError> {
         tracing::debug!("Opening file: {:?}", path.as_ref());
         // Initialize the decoder and format reader
@@ -177,6 +184,7 @@ impl FlacSource {
         &self,
         decoded: symphonia::core::audio::AudioBufferRef<'_>,
     ) -> Result<Vec<DecodedSegment>, PlaybackError> {
+        tracing::debug!("extract segments called");
         // Get decoded buffer specification
         let spec = *decoded.spec();
 
@@ -202,16 +210,23 @@ impl FlacSource {
 
             // Determine how many samples to copy (either remaining or segment size)
             let samples_to_copy = std::cmp::min(SEGMENT_SIZE, samples.len() - sample_idx);
+            tracing::debug!("Samples to copy {samples_to_copy}");
 
             // Copy samples into segment
             segment.samples[0..samples_to_copy]
                 .copy_from_slice(&samples[sample_idx..sample_idx + samples_to_copy]);
 
             // Add the segment
-            segments.push(DecodedSegment {
+            let decoded_segment = DecodedSegment {
                 index: current_segment_index,
                 segment,
-            });
+            };
+            tracing::debug!(
+                "Decoded segment at {:?}, was empty: {}",
+                current_segment_index,
+                decoded_segment.is_empty()
+            );
+            segments.push(decoded_segment);
 
             sample_idx += samples_to_copy;
         }
@@ -226,6 +241,7 @@ impl FlacSource {
 
 impl Source for FlacSource {
     fn decode_next_frame(&self) -> Result<Vec<DecodedSegment>, PlaybackError> {
+        tracing::debug!("decode_next_frame");
         if self.is_eof.load(Ordering::Relaxed) {
             return Ok(Vec::new());
         }

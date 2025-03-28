@@ -60,8 +60,9 @@ impl Server {
                 self.create_response(result, None)
             } // For non-async operations, keep the original pattern
             Command::Play { deck } => {
-                info!("Playing deck {:?}", deck);
+                info!("About to play deck {:?}", deck);
                 let result = self.engine.lock().await.play(Self::convert_deck(deck));
+                info!("Play command completed for deck {:?}: {:?}", deck, result);
                 self.create_response(result, None)
             }
             Command::Stop { deck } => {
