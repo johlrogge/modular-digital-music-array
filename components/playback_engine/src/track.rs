@@ -38,7 +38,6 @@ async fn decoder_task<S: Source + Send + Sync + 'static>(
     mut output: HeapProducer<f32>,
     mut command_rx: mpsc::Receiver<TrackCommand>,
 ) {
-    let mut current_position = source.current_position();
     let mut decoded_segments = VecDeque::new();
     let mut next_segment: Option<DecodedSegment> = None;
     let mut written: usize = 0;
@@ -84,7 +83,7 @@ async fn decoder_task<S: Source + Send + Sync + 'static>(
                     if let Err(res) = source.seek(position) {
                         tracing::error!("failed to seek {res}");
                     } else {
-                        current_position = position;
+                        //current_position = position;
                         tracing::debug!("seeked to position {position}");
                     }
                 }

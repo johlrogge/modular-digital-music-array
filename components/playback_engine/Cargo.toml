@@ -8,7 +8,6 @@ license.workspace = true
 
 [dependencies]
 symphonia = { version = "0.5", features = ["default", "flac"] }
-cpal = "0.15"
 tokio = { workspace = true, features = ["full"] }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
@@ -17,6 +16,7 @@ time-primitives = { path = "../time_primitives" }
 playback-primitives = { path = "../playback_primitives" }
 tracing.workspace=true
 ringbuf = "0.3"
+pipewire = "0.8"
 
 [build-dependencies]
 hound = "3.5"    # For WAV handling

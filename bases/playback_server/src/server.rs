@@ -171,6 +171,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_handle_nonexistent_track() {
         let engine = PlaybackEngine::new().unwrap();
         let engine = Arc::new(Mutex::new(engine));

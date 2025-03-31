@@ -2,10 +2,7 @@
 use crate::{error::PlaybackError, position::PlaybackPosition};
 use playback_primitives::Deck;
 use ringbuf::{HeapConsumer, HeapProducer};
-use std::{
-    collections::HashMap,
-    sync::{atomic::Ordering, Arc},
-};
+use std::{collections::HashMap, sync::Arc};
 
 pub struct Mixer {
     volumes: HashMap<Deck, f32>,
@@ -37,7 +34,6 @@ impl Mixer {
         output[..samples_per_callback].fill(0.0);
 
         // Mix each active track
-        let mut active_tracks = 0;
 
         for (deck, consumer) in consumers.iter_mut() {
             // Get volume
@@ -48,10 +44,8 @@ impl Mixer {
             let to_mix = std::cmp::min(available, samples_per_callback);
 
             if to_mix > 0 {
-                active_tracks += 1;
-
                 // Mix samples
-                for i in 0..to_mix {
+                (0..to_mix).for_each(|i| {
                     if let Some(sample) = consumer.pop() {
                         output[i] += sample * volume;
 
@@ -60,7 +54,7 @@ impl Mixer {
                             tracker.record_consumption(1);
                         }
                     }
-                }
+                });
             }
         }
 

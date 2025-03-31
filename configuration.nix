@@ -7,7 +7,7 @@
 {
   # System Configuration
   system.stateVersion = "23.11"; # Please read the documentation before changing
-
+  security.rtkit.enable = true;
   # Hardware Configuration will be provided by nixos-hardware module
 
   # Sound Configuration
@@ -31,7 +31,14 @@
       "threadirqs"
       "isolcpus=3" # Isolate last CPU core for audio processing
     ];
-    
+    ot.kernelParams = [
+  "console=ttyAMA0,115200"
+  "console=tty1"
+  "threadirqs"
+  "isolcpus=3" 
+  "usbcore.autosuspend=-1"  # Disable USB autosuspend for audio devices
+  "snd_usb_audio.nrpacks=1" # Optimize USB audio performance
+];
     # Kernel Modules
     kernelModules = [ "snd-usb-audio" ];
   };
@@ -84,13 +91,35 @@
   # System Services
   services = {
     # PipeWire Configuration
-    pipewire = {
+    services.pipewire = {
       enable = true;
       alsa.enable = true;
       alsa.support32Bit = false;
       pulse.enable = true;
-      
-      # Basic PipeWire setup, configuration is in /etc/pipewire/pipewire.conf.d/
+      jack.enable = true;  # Added JACK support
+      wireplumber.enable = true;  # Added session manager
+  
+      # High-quality audio configuration
+      configPackages = [
+        (pkgs.writeTextFile {
+          name = "audio-audiophile-conf";
+          text = ''
+            {
+              "context.properties": {
+                "default.clock.rate": 96000,
+                "default.clock.quantum": 64,
+                "default.clock.min-quantum": 32,
+                "default.clock.max-quantum": 2048,
+                "default.float.format": "F64"
+              },
+              "stream.properties": {
+                "resample.quality": 10
+              }
+            }
+          '';
+          destination = "/share/pipewire/minimal.conf.d/91-audiophile.conf";
+        })
+      ];
     };
 
     # Enable OpenSSH for remote management
@@ -116,7 +145,10 @@
     extraGroups = [ "audio" "pipewire" "networkmanager" "wheel" ];
     initialPassword = "changeme";
   };
-
+  users.groups = {
+    audio.gid = 18;
+    pipewire = {};
+  };
   # System Optimization
   systemd = {
     # Optimize services for audio
@@ -132,6 +164,20 @@
           IOSchedulingPriority = 0;
           CPUSchedulingPolicy = "fifo";
           CPUSchedulingPriority = 99;
+          LimitMEMLOCK = "infinity";
+          LimitRTPRIO = "infinity";
+        };
+      };
+
+      wireplumber = {
+        serviceConfig = {
+          Nice = -11;
+          IOSchedulingClass = "realtime";
+          IOSchedulingPriority = 0;
+          CPUSchedulingPolicy = "fifo";
+          CPUSchedulingPriority = 99;
+          LimitMEMLOCK = "infinity";
+          LimitRTPRIO = "infinity";
         };
       };
     };

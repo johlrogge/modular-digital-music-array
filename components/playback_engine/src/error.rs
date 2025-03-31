@@ -28,16 +28,3 @@ pub enum PlaybackError {
     #[error("Track is not ready for playback")]
     TrackNotReady,
 }
-
-// Add conversions for CPAL errors
-impl From<cpal::BuildStreamError> for PlaybackError {
-    fn from(err: cpal::BuildStreamError) -> Self {
-        PlaybackError::AudioDevice(err.to_string())
-    }
-}
-
-impl From<cpal::PlayStreamError> for PlaybackError {
-    fn from(err: cpal::PlayStreamError) -> Self {
-        PlaybackError::AudioDevice(err.to_string())
-    }
-}

@@ -1,26 +1,17 @@
 mod commands;
 mod error;
 mod mixer;
+mod pipewire_output;
 mod position;
 mod source;
 mod track;
 
-use std::{
-    collections::HashMap,
-    path::Path,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
-use cpal::{
-    traits::{DeviceTrait, HostTrait, StreamTrait},
-    Stream,
-};
 pub use error::PlaybackError;
 use mixer::Mixer;
 use parking_lot::RwLock;
+use pipewire_output::PipewireOutput;
 pub use playback_primitives::Deck;
 use ringbuf::{HeapConsumer, HeapRb};
 pub use source::{FlacSource, Source};
@@ -30,9 +21,7 @@ type Decks = Arc<RwLock<HashMap<Deck, Arc<RwLock<Track>>>>>;
 
 pub struct PlaybackEngine {
     decks: Decks,
-    audio_stream: Stream,
-    // Remove direct audio_consumers field
-    // Remove direct mixer field
+    audio_output: PipewireOutput,
     mixer_shared: Arc<parking_lot::Mutex<Mixer>>,
     consumers_shared: Arc<parking_lot::Mutex<HashMap<Deck, HeapConsumer<f32>>>>,
     mix_task: Option<std::thread::JoinHandle<()>>,
@@ -47,9 +36,10 @@ impl PlaybackEngine {
         // Create mixer with the producer
         let mixer = Mixer::new(mixer_producer);
 
-        // Create audio stream with consumer
-        let audio_stream = Self::create_audio_stream(mixer_consumer)?;
+        // Create PipeWire audio output with consumer
+        let audio_output = PipewireOutput::new(mixer_consumer)?;
 
+        // Rest of the method stays the same...
         let decks = Arc::new(RwLock::new(HashMap::new()));
 
         // Create shared objects
@@ -62,6 +52,7 @@ impl PlaybackEngine {
         let mixer_clone = Arc::clone(&mixer_shared);
         let consumers_clone = Arc::clone(&consumers_shared);
 
+        // Start the mix thread
         let mix_task = std::thread::spawn(move || {
             // Add immediate confirmation that thread started
             tracing::info!("MIX THREAD: Started, will process audio");
@@ -86,11 +77,10 @@ impl PlaybackEngine {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         });
-
-        // Return the engine
+        // Return the engine with updated field
         Ok(Self {
             decks,
-            audio_stream: audio_stream,
+            audio_output,
             mixer_shared,
             consumers_shared,
             mix_task: Some(mix_task),
@@ -203,73 +193,6 @@ impl PlaybackEngine {
                 Ok(()) // No track is still a success
             }
         }
-    }
-
-    fn create_audio_stream(mut mixer_consumer: HeapConsumer<f32>) -> Result<Stream, PlaybackError> {
-        const SAMPLE_RATE: u32 = 48000;
-        const CHANNELS: u16 = 2;
-        const BUFFER_SIZE: u32 = 1920;
-
-        let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| PlaybackError::AudioDevice("No output device found".into()))?;
-
-        let config = cpal::StreamConfig {
-            channels: CHANNELS,
-            sample_rate: cpal::SampleRate(SAMPLE_RATE),
-            buffer_size: cpal::BufferSize::Fixed(BUFFER_SIZE),
-        };
-
-        tracing::info!("Creating audio stream with buffer size: {}", BUFFER_SIZE);
-
-        // Create a thread-safe wrapper for the consumer
-        // let consumer = Arc::new(parking_lot::Mutex::new(mixer_consumer));
-
-        // Add debug counter
-        let read_samples = Arc::new(AtomicUsize::new(0));
-        let read_samples_clone = read_samples.clone();
-
-        // Create periodic logging task
-        std::thread::spawn(move || loop {
-            let samples = read_samples_clone.swap(0, Ordering::Relaxed);
-            tracing::info!("Audio callback read {} samples in the last second", samples);
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        });
-
-        let stream = device.build_output_stream(
-            &config,
-            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                let callback_start = std::time::Instant::now();
-
-                // Get consumer lock
-                //let mut consumer = consumer.lock();
-
-                // Count available samples
-                let available = mixer_consumer.len();
-                // Read from consumer to fill output buffer
-                let read = mixer_consumer.pop_slice(data);
-                if read < data.len() {
-                    tracing::warn!(
-                        "buffer underrun!!! {read}/{} samples available {available}",
-                        data.len()
-                    );
-                }
-
-                // Update read counter
-                read_samples.fetch_add(read, Ordering::Relaxed);
-
-                let total_time = callback_start.elapsed();
-                if total_time > std::time::Duration::from_millis(1) {
-                    tracing::warn!("Audio callback total time: {:?}", total_time);
-                }
-            },
-            move |err| eprintln!("Audio stream error: {}", err),
-            None,
-        )?;
-
-        stream.play()?;
-        Ok(stream)
     }
 
     pub async fn seek(&mut self, deck: Deck, position: usize) -> Result<(), PlaybackError> {

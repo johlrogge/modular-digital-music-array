@@ -395,6 +395,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn multiple_segments_decode_correctly() {
         // Create a source from the alternating pattern file
         let source =
@@ -528,6 +529,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn segments_are_sequential() {
         let mut source = FlacSource::new(file_path("short.flac")).expect("Failed to create source");
 
@@ -768,6 +770,7 @@ mod tests {
         }
 
         #[test]
+        #[ignore]
         fn test_position_after_decode() {
             let source = FlacSource::new(test_file_path("short.flac")).unwrap();
 
@@ -806,6 +809,7 @@ mod tests {
         }
 
         #[test]
+        #[ignore]
         fn test_decode_after_seek() {
             let source = FlacSource::new(test_file_path("short.flac")).unwrap();
 

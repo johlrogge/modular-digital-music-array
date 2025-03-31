@@ -169,11 +169,11 @@ fn convert_to_flac(wav_path: &PathBuf, flac_path: &PathBuf) -> Result<()> {
     // Remove the temporary WAV file
     std::fs::remove_file(wav_path)?;
 
-    println!("cargo:warning=Generated test file: {}", flac_path.display());
-    println!(
-        "cargo:warning=File size: {} bytes",
-        flac_path.metadata()?.len()
-    );
+    //println!("cargo:warning=Generated test file: {}", flac_path.display());
+    //println!(
+    //    "cargo:warning=File size: {} bytes",
+    //    flac_path.metadata()?.len()
+    //);
 
     Ok(())
 }
@@ -195,12 +195,12 @@ fn main() -> Result<()> {
         let flac_path = out_dir.join(name);
 
         if should_generate(&flac_path, duration) {
-            println!("cargo:warning=Generating {}", name);
+            //println!("cargo:warning=Generating {}", name);
             let wav_path = out_dir.join(format!("{}.wav", name.strip_suffix(".flac").unwrap()));
             write_test_wav(wav_path.clone(), duration)?;
             convert_to_flac(&wav_path, &flac_path)?;
         } else {
-            println!("cargo:warning=Skipping {} (already exists)", name);
+            //println!("cargo:warning=Skipping {} (already exists)", name);
         }
     }
 
@@ -217,7 +217,7 @@ fn main() -> Result<()> {
 
         if should_generate(&flac_path, 0.5) {
             // 0.5 seconds duration
-            println!("cargo:warning=Generating pattern file {}", name);
+            //println!("cargo:warning=Generating pattern file {}", name);
             let wav_path = out_dir.join(format!("{}.wav", name.strip_suffix(".flac").unwrap()));
             generate_test_pattern_wav(wav_path.clone(), pattern)?;
             convert_to_flac(&wav_path, &flac_path)?;
