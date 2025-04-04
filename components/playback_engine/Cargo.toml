@@ -17,6 +17,7 @@ playback-primitives = { path = "../playback_primitives" }
 tracing.workspace=true
 ringbuf = "0.3"
 pipewire = "0.8"
+spa_sys = { package = "libspa-sys", version = "0.8" }
 
 [build-dependencies]
 hound = "3.5"    # For WAV handling

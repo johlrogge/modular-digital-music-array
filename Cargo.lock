@@ -1386,6 +1386,7 @@ dependencies = [
  "criterion",
  "crossbeam",
  "hound",
+ "libspa-sys",
  "parking_lot",
  "pipewire",
  "playback-primitives",

@@ -1,12 +1,18 @@
-use pipewire as pw;
-use pw::properties::properties;
-use ringbuf::HeapConsumer;
 use std::thread;
+
+use pipewire as pw;
+use pw::{properties::properties, spa};
+use ringbuf::HeapConsumer;
+use spa::pod::Pod;
 use tracing::{debug, info};
+
+pub const DEFAULT_RATE: u32 = 48000;
+pub const DEFAULT_CHANNELS: u32 = 2;
+pub const CHAN_SIZE: usize = std::mem::size_of::<i16>();
 
 pub struct PipewireOutput {
     // Thread handle to keep the PipeWire thread alive
-    _pw_thread: thread::JoinHandle<()>,
+    _pw_thread: thread::JoinHandle<Result<(), pw::Error>>,
 }
 
 impl PipewireOutput {
@@ -15,163 +21,137 @@ impl PipewireOutput {
         info!("create pipe wire thread");
         // Spawn PipeWire thread
         let pw_thread = thread::spawn(move || {
-            // Initialize PipeWire
-
-            info!("Initialize pipewoire");
             pw::init();
+            let mainloop = pw::main_loop::MainLoop::new(None)?;
+            let context = pw::context::Context::new(&mainloop)?;
+            let core = context.connect(None)?;
 
-            // Create main loop
-            let mainloop =
-                pw::main_loop::MainLoop::new(None).expect("Failed to create PipeWire main loop");
+            // Create user data struct to hold consumer
+            struct UserData {
+                consumer: HeapConsumer<f32>,
+                frame_count: usize, // For debugging
+            }
 
-            // Create context
-            let context =
-                pw::context::Context::new(&mainloop).expect("Failed to create PipeWire context");
+            let user_data = UserData {
+                consumer: sample_consumer,
+                frame_count: 0,
+            };
 
-            // Connect core
-            let core = context
-                .connect(None)
-                .expect("Failed to connect to PipeWire core");
-
-            info!("connected to pipewire core");
-
-            // Prepare audio format
-            let obj = pw::spa::pod::object!(
-                pw::spa::utils::SpaTypes::ObjectParamFormat,
-                pw::spa::param::ParamType::EnumFormat,
-                pw::spa::pod::property!(
-                    pw::spa::param::format::FormatProperties::MediaType,
-                    Id,
-                    pw::spa::param::format::MediaType::Audio
-                ),
-                pw::spa::pod::property!(
-                    pw::spa::param::format::FormatProperties::MediaSubtype,
-                    Id,
-                    pw::spa::param::format::MediaSubtype::Raw
-                ),
-                pw::spa::pod::property!(
-                    pw::spa::param::format::FormatProperties::AudioFormat,
-                    Id,
-                    pw::spa::param::audio::AudioFormat::F32P
-                ),
-                pw::spa::pod::property!(
-                    pw::spa::param::format::FormatProperties::AudioRate,
-                    Int,
-                    48000
-                ),
-                pw::spa::pod::property!(
-                    pw::spa::param::format::FormatProperties::AudioChannels,
-                    Int,
-                    2
-                )
-            );
-
-            // Serialize the object
-            let values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
-                std::io::Cursor::new(Vec::new()),
-                &pw::spa::pod::Value::Object(obj),
-            )
-            .unwrap()
-            .0
-            .into_inner();
-
-            // Create params
-            let mut params = [pw::spa::pod::Pod::from_bytes(&values).unwrap()];
-
-            // Create stream
             let stream = pw::stream::Stream::new(
                 &core,
                 "mdma-audio-output",
                 properties! {
                     *pw::keys::MEDIA_TYPE => "Audio",
+                    *pw::keys::MEDIA_ROLE => "Music",
                     *pw::keys::MEDIA_CATEGORY => "Playback",
-                    *pw::keys::MEDIA_ROLE => "Music"
+                    *pw::keys::AUDIO_CHANNELS => "2",
                 },
-            )
-            .expect("Failed to create stream");
-            info!("stream created");
-            // Prepare user data for the stream
-            struct UserData {
-                sample_consumer: HeapConsumer<f32>,
-            }
+            )?;
 
-            let user_data = UserData { sample_consumer };
-
-            // Create stream listener
             let _listener = stream
                 .add_local_listener_with_user_data(user_data)
-                .state_changed(|_, _, old, new| {
-                    println!("Stream state changed: {:?} -> {:?}", old, new);
+                .process(|stream, user_data| match stream.dequeue_buffer() {
+                    None => println!("No buffer received"),
+                    Some(mut buffer) => {
+                        let datas = buffer.datas_mut();
+                        let stride = CHAN_SIZE * DEFAULT_CHANNELS as usize;
+                        let data = &mut datas[0];
+
+                        let n_frames = if let Some(slice) = data.data() {
+                            let n_frames = slice.len() / stride;
+
+                            // Log every 100 frames for debugging
+                            user_data.frame_count += 1;
+                            if user_data.frame_count % 100 == 0 {
+                                debug!(
+                                    "Processing {} frames, consumer has {} samples",
+                                    n_frames,
+                                    user_data.consumer.len()
+                                );
+                            }
+
+                            // Temporary buffer to read from consumer
+                            let mut f32_buffer = vec![0.0f32; n_frames * DEFAULT_CHANNELS as usize];
+
+                            // Read from consumer
+                            let samples_read = user_data.consumer.pop_slice(&mut f32_buffer);
+
+                            if user_data.frame_count % 100 == 0 && samples_read > 0 {
+                                debug!("Read {} samples from consumer", samples_read);
+                            }
+
+                            // Convert f32 samples to i16 and copy to output buffer
+                            for i in 0..n_frames {
+                                for c in 0..DEFAULT_CHANNELS {
+                                    // Calculate index in f32 buffer
+                                    let f32_idx = i * DEFAULT_CHANNELS as usize + c as usize;
+
+                                    // Get sample (or 0 if we've read all samples)
+                                    let f32_sample = if f32_idx < samples_read {
+                                        f32_buffer[f32_idx]
+                                    } else {
+                                        0.0
+                                    };
+
+                                    // Convert to i16 (-1.0..1.0 -> -32767..32767)
+                                    let val =
+                                        (f32_sample * 32767.0).clamp(-32767.0, 32767.0) as i16;
+
+                                    // Copy to output buffer
+                                    let start = i * stride + (c as usize * CHAN_SIZE);
+                                    let end = start + CHAN_SIZE;
+                                    let chan = &mut slice[start..end];
+                                    chan.copy_from_slice(&i16::to_le_bytes(val));
+                                }
+                            }
+
+                            n_frames
+                        } else {
+                            0
+                        };
+
+                        let chunk = data.chunk_mut();
+                        *chunk.offset_mut() = 0;
+                        *chunk.stride_mut() = stride as _;
+                        *chunk.size_mut() = (stride * n_frames) as _;
+                    }
                 })
-                .process(|stream, user_data| {
-                    // Get buffer from stream
-                    let mut buffer = match stream.dequeue_buffer() {
-                        None => return,
-                        Some(buffer) => buffer,
-                    };
+                .register()?;
 
-                    // Get buffer data
-                    let datas = buffer.datas_mut();
-                    if datas.is_empty() {
-                        return;
-                    }
+            let mut audio_info = spa::param::audio::AudioInfoRaw::new();
+            audio_info.set_format(spa::param::audio::AudioFormat::S16LE);
+            audio_info.set_rate(DEFAULT_RATE);
+            audio_info.set_channels(DEFAULT_CHANNELS);
+            let mut position = [0; spa::param::audio::MAX_CHANNELS];
+            position[0] = spa_sys::SPA_AUDIO_CHANNEL_FL;
+            position[1] = spa_sys::SPA_AUDIO_CHANNEL_FR;
+            audio_info.set_position(position);
 
-                    let data = &mut datas[0];
+            let values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
+                std::io::Cursor::new(Vec::new()),
+                &pw::spa::pod::Value::Object(pw::spa::pod::Object {
+                    type_: spa_sys::SPA_TYPE_OBJECT_Format,
+                    id: spa_sys::SPA_PARAM_EnumFormat,
+                    properties: audio_info.into(),
+                }),
+            )
+            .unwrap()
+            .0
+            .into_inner();
 
-                    // Determine buffer size and sample count
-                    let chunk = data.chunk();
-                    let n_frames = chunk.size() / 4; // Assuming 4 bytes per sample (f32)
-                    let sample_count: usize = (n_frames * 2) as usize; // stereo
+            let mut params = [Pod::from_bytes(&values).unwrap()];
 
-                    debug!("sample count {}", 0);
-                    if sample_count == 0 {
-                        return;
-                    }
+            stream.connect(
+                spa::utils::Direction::Output,
+                None,
+                pw::stream::StreamFlags::AUTOCONNECT
+                    | pw::stream::StreamFlags::MAP_BUFFERS
+                    | pw::stream::StreamFlags::RT_PROCESS,
+                &mut params,
+            )?;
 
-                    // Get data pointer as slice
-                    let slice = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            data.data().unwrap().as_mut_ptr() as *mut f32,
-                            sample_count,
-                        )
-                    };
-
-                    debug!("got beffer slice {}", slice.len());
-
-                    // Fill buffer from ring buffer
-                    let read = user_data
-                        .sample_consumer
-                        .pop_slice(&mut slice[..sample_count]);
-
-                    debug!("Read {} bytes", read);
-
-                    // Zero out any remaining space
-                    if read < slice.len() {
-                        slice[read..].fill(0.0);
-                    }
-                })
-                .register()
-                .expect("Failed to register stream listener");
-
-            // Connect the stream
-            stream
-                .connect(
-                    pw::spa::utils::Direction::Output,
-                    None,
-                    pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
-                    &mut params,
-                )
-                .expect("Failed to connect stream");
-
-            // Run the main loop (this will block)
-            info!("Starting pipewire main loop");
             mainloop.run();
-
-            // Cleanup (this won't be reached until mainloop is stopped)
-            println!("PipeWire thread exiting");
-            unsafe {
-                pw::deinit();
-            }
+            Ok(())
         });
 
         Ok(Self {

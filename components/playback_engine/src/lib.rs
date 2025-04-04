@@ -20,6 +20,7 @@ pub use playback_primitives::Deck;
 use position::PlaybackPosition;
 use ringbuf::{HeapConsumer, HeapRb};
 pub use source::{FlacSource, Source};
+use tracing::info;
 pub use track::Track;
 
 type Decks = Arc<RwLock<HashMap<Deck, Arc<RwLock<Track>>>>>;
@@ -47,12 +48,13 @@ impl PlaybackEngine {
         let (command_sender, command_receiver) = std::sync::mpsc::channel();
 
         // Create ringbuffer for mixer output
-        const MIXER_BUFFER_SIZE: usize = 4096;
+        const MIXER_BUFFER_SIZE: usize = 32768;
         let mixer_rb = HeapRb::<f32>::new(MIXER_BUFFER_SIZE);
         let (mixer_producer, mixer_consumer) = mixer_rb.split();
 
         // Create PipeWire audio output with consumer
         // Need to add conversion from pipewire::Error to PlaybackError
+        info!("spawn pipewire output");
         let audio_output = match PipewireOutput::new(mixer_consumer) {
             Ok(output) => output,
             Err(e) => return Err(PlaybackError::AudioDevice(format!("PipeWire error: {}", e))),
@@ -92,7 +94,7 @@ impl PlaybackEngine {
                 }
 
                 // Sleep briefly
-                std::thread::sleep(std::time::Duration::from_millis(5));
+                std::thread::sleep(std::time::Duration::from_micros(500)); // 0.5ms instead of 5ms
             }
         });
 
