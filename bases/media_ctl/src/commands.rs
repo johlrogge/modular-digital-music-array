@@ -93,11 +93,8 @@ pub fn parse_channel(c: char) -> Result<Deck> {
     }
 }
 
-pub fn channel_to_string(channel: Deck) -> &'static str {
-    match channel {
-        Deck::A => "A",
-        Deck::B => "B",
-    }
+pub fn channel_to_string(channel: Deck) -> String {
+    format!("{channel}")
 }
 
 pub fn construct_path(

@@ -6,13 +6,18 @@ mod position;
 mod source;
 mod track;
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{mpsc, Arc},
+};
 
 pub use error::PlaybackError;
 use mixer::Mixer;
 use parking_lot::RwLock;
 use pipewire_output::PipewireOutput;
 pub use playback_primitives::Deck;
+use position::PlaybackPosition;
 use ringbuf::{HeapConsumer, HeapRb};
 pub use source::{FlacSource, Source};
 pub use track::Track;
@@ -22,69 +27,137 @@ type Decks = Arc<RwLock<HashMap<Deck, Arc<RwLock<Track>>>>>;
 pub struct PlaybackEngine {
     decks: Decks,
     audio_output: PipewireOutput,
-    mixer_shared: Arc<parking_lot::Mutex<Mixer>>,
-    consumers_shared: Arc<parking_lot::Mutex<HashMap<Deck, HeapConsumer<f32>>>>,
+    command_sender: mpsc::Sender<MixerCommand>,
     mix_task: Option<std::thread::JoinHandle<()>>,
+}
+enum MixerCommand {
+    RegisterTrack {
+        deck: Deck,
+        consumer: HeapConsumer<f32>,
+        position_tracker: Arc<PlaybackPosition>,
+    },
+    SetVolume {
+        deck: Deck,
+        db: f32,
+    },
 }
 impl PlaybackEngine {
     pub fn new() -> Result<Self, PlaybackError> {
+        // Create a channel for mixer commands - std::sync::mpsc doesn't take a capacity
+        let (command_sender, command_receiver) = std::sync::mpsc::channel();
+
         // Create ringbuffer for mixer output
-        const MIXER_BUFFER_SIZE: usize = 4096; // Larger than audio callback
+        const MIXER_BUFFER_SIZE: usize = 4096;
         let mixer_rb = HeapRb::<f32>::new(MIXER_BUFFER_SIZE);
         let (mixer_producer, mixer_consumer) = mixer_rb.split();
 
-        // Create mixer with the producer
-        let mixer = Mixer::new(mixer_producer);
-
         // Create PipeWire audio output with consumer
-        let audio_output = PipewireOutput::new(mixer_consumer)?;
+        // Need to add conversion from pipewire::Error to PlaybackError
+        let audio_output = match PipewireOutput::new(mixer_consumer) {
+            Ok(output) => output,
+            Err(e) => return Err(PlaybackError::AudioDevice(format!("PipeWire error: {}", e))),
+        };
 
-        // Rest of the method stays the same...
-        let decks = Arc::new(RwLock::new(HashMap::new()));
-
-        // Create shared objects
-        let mixer_shared = Arc::new(parking_lot::Mutex::new(mixer));
-        let consumers_shared = Arc::new(parking_lot::Mutex::new(
-            HashMap::<Deck, HeapConsumer<f32>>::new(),
-        ));
-
-        // Clone for the mix thread
-        let mixer_clone = Arc::clone(&mixer_shared);
-        let consumers_clone = Arc::clone(&consumers_shared);
-
-        // Start the mix thread
+        // Start the mix thread with command receiver
         let mix_task = std::thread::spawn(move || {
-            // Add immediate confirmation that thread started
-            tracing::info!("MIX THREAD: Started, will process audio");
-
+            let mut mixer = Mixer::new(mixer_producer);
+            let mut consumers = HashMap::<Deck, HeapConsumer<f32>>::new();
             let mut temp_buffer = vec![0.0; 1920 * 2];
 
+            tracing::info!("MIX THREAD: Started, will process audio");
+
             loop {
-                // CHANGE: First lock the consumers, then the mixer
-                let mut consumers_guard = consumers_clone.lock();
+                // Process any pending commands
+                while let Ok(cmd) = command_receiver.try_recv() {
+                    match cmd {
+                        MixerCommand::RegisterTrack {
+                            deck,
+                            consumer,
+                            position_tracker,
+                        } => {
+                            tracing::info!("MIX THREAD: Registering track for deck {:?}", deck);
+                            consumers.insert(deck, consumer);
+                            mixer.register_position_tracker(deck, position_tracker);
+                        }
+                        MixerCommand::SetVolume { deck, db } => {
+                            mixer.set_volume(deck, db);
+                        }
+                    }
+                }
+                let l = temp_buffer.len();
 
-                // Now lock the mixer
-                let mut mixer_guard = mixer_clone.lock(); // Calculate buffer length once
-                let buffer_len = temp_buffer.len();
-
-                // Mix (handle errors properly)
-                if let Err(e) = mixer_guard.mix(&mut temp_buffer, buffer_len, &mut consumers_guard)
-                {
+                // Mix audio
+                if let Err(e) = mixer.mix(&mut temp_buffer, l, &mut consumers) {
                     tracing::error!("MIX THREAD: Error mixing: {}", e);
                 }
 
-                // Sleep a bit to avoid spinning
+                // Sleep briefly
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         });
-        // Return the engine with updated field
+
+        // Return the engine
         Ok(Self {
-            decks,
+            decks: Arc::new(RwLock::new(HashMap::new())),
             audio_output,
-            mixer_shared,
-            consumers_shared,
+            command_sender,
             mix_task: Some(mix_task),
         })
+    }
+
+    pub async fn load_track(&mut self, deck: Deck, path: &Path) -> Result<(), PlaybackError> {
+        tracing::info!("Starting track load for deck {:?}", deck);
+
+        // Create ringbuffer for this deck
+        const BUFFER_SIZE: usize = 16384;
+        let rb = HeapRb::<f32>::new(BUFFER_SIZE);
+        let (producer, consumer) = rb.split();
+
+        // Create new track with producer
+        let track = Track::new(FlacSource::new(path)?, producer).await?;
+        tracing::info!("Track is ready for playback");
+
+        // Get position tracker
+        let position_tracker = Arc::clone(&track.position_tracker);
+
+        // Store the track - no lock conflicts possible with mix thread now
+        let mut decks = self.decks.write();
+        decks.insert(deck, Arc::new(RwLock::new(track)));
+        drop(decks);
+
+        // Send consumer to mix thread via command - using standard send, not try_send
+        self.command_sender
+            .send(MixerCommand::RegisterTrack {
+                deck,
+                consumer,
+                position_tracker,
+            })
+            .map_err(|_| PlaybackError::TaskCancelled)?;
+
+        tracing::info!("Loaded track from {:?} into deck {:?}", path, deck);
+        Ok(())
+    }
+
+    pub fn set_volume(&mut self, deck: Deck, db: f32) -> Result<(), PlaybackError> {
+        // Validate the volume value first
+        if !(-96.0..=0.0).contains(&db) {
+            return Err(PlaybackError::InvalidVolume(db));
+        }
+
+        // Send the volume command through the channel - use send instead of try_send
+        match self
+            .command_sender
+            .send(MixerCommand::SetVolume { deck, db })
+        {
+            Ok(_) => {
+                tracing::info!("Setting volume for deck {:?} to {}dB", deck, db);
+                Ok(())
+            }
+            Err(_) => {
+                tracing::error!("Failed to send volume command for deck {:?}", deck);
+                Err(PlaybackError::TaskCancelled)
+            }
+        }
     }
 
     fn find_track(&self, deck: Deck) -> Option<Arc<RwLock<Track>>> {
@@ -97,20 +170,6 @@ impl PlaybackEngine {
             tracing::info!("DEBUG PLAY: About to set track to playing state");
             track.write().play();
             tracing::info!("DEBUG PLAY: Track set to playing state");
-
-            // Add debugging for mix thread
-            {
-                let consumers = self.consumers_shared.lock();
-                tracing::info!("DEBUG PLAY: Consumer map has {} entries", consumers.len());
-
-                for (d, consumer) in consumers.iter() {
-                    tracing::info!(
-                        "DEBUG PLAY: Deck {:?} has {} samples available",
-                        d,
-                        consumer.len()
-                    );
-                }
-            }
 
             Ok(())
         } else {
@@ -128,55 +187,6 @@ impl PlaybackEngine {
             tracing::error!("No track loaded in deck {:?}", deck);
             Err(PlaybackError::NoTrackLoaded(deck))
         }
-    }
-
-    pub fn set_volume(&mut self, deck: Deck, db: f32) -> Result<(), PlaybackError> {
-        if !(-96.0..=0.0).contains(&db) {
-            return Err(PlaybackError::InvalidVolume(db));
-        }
-
-        // Get mixer and set volume
-        let mut mixer = self.mixer_shared.lock();
-        mixer.set_volume(deck, db);
-        tracing::info!("Setting volume for deck {:?} to {}dB", deck, db);
-        Ok(())
-    }
-
-    pub async fn load_track(&mut self, deck: Deck, path: &Path) -> Result<(), PlaybackError> {
-        // Create ringbuffer for this deck (unchanged)
-        const BUFFER_SIZE: usize = 16384; // 16K samples (~170ms at 48kHz stereo)
-        let rb = HeapRb::<f32>::new(BUFFER_SIZE);
-        let (producer, consumer) = rb.split();
-
-        // Create new track with producer
-        let track = Track::new(FlacSource::new(path)?, producer).await?;
-
-        // Wait for the track to be ready (unchanged)
-        tracing::info!("Track is ready for playback");
-
-        // Get position tracker from the track
-        let position_tracker = Arc::clone(&track.position_tracker);
-
-        // Store the track (unchanged)
-        let mut decks = self.decks.write();
-        decks.insert(deck, Arc::new(RwLock::new(track)));
-
-        // Store the consumer in the shared map
-        let mut consumers = self.consumers_shared.lock();
-        let old_size = consumers.len();
-        consumers.insert(deck, consumer);
-        tracing::info!(
-            "TRACK STATE: Consumer map changed from {} to {} entries",
-            old_size,
-            consumers.len()
-        );
-
-        // Register position tracker with the mixer
-        let mut mixer = self.mixer_shared.lock();
-        mixer.register_position_tracker(deck, position_tracker);
-
-        tracing::info!("Loaded track from {:?} into deck {:?}", path, deck);
-        Ok(())
     }
 
     pub fn unload_track(&mut self, deck: Deck) -> Result<(), PlaybackError> {

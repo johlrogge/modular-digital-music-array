@@ -38,11 +38,13 @@ impl Server {
             // Process command
             let response = self.handle_command(command).await;
 
+            info!("Handled command, response {:?}", response);
             // Send response
             let response_data = serde_json::to_vec(&response)?;
             self.socket
                 .send(&response_data)
                 .map_err(ServerError::from)?;
+            info!("sent response");
         }
     }
 
@@ -57,6 +59,7 @@ impl Server {
                     .await
                     .load_track(Self::convert_deck(deck), &path)
                     .await;
+                info!("Track loaded");
                 self.create_response(result, None)
             } // For non-async operations, keep the original pattern
             Command::Play { deck } => {

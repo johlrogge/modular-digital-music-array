@@ -36,6 +36,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Play { channel } => {
+            println!("Play channel {channel}");
             let channel = commands::parse_channel(channel)?;
             client.play(channel)?;
             println!("Playing channel {}", commands::channel_to_string(channel));

@@ -1,6 +1,6 @@
 use media_protocol::{ClientError, Command, Deck, Response, ResponseData};
 use nng::{Protocol, Socket};
-use std::path::PathBuf;
+use std::{hash::Hash, path::PathBuf};
 
 pub struct MediaClient {
     socket: Socket,
@@ -23,11 +23,6 @@ impl MediaClient {
         self.send_command(cmd)
     }
 
-    pub fn play(&self, deck: Deck) -> Result<(), ClientError> {
-        let cmd = Command::Play { deck };
-        self.send_command(cmd)
-    }
-
     pub fn stop(&self, deck: Deck) -> Result<(), ClientError> {
         let cmd = Command::Stop { deck };
         self.send_command(cmd)
@@ -43,18 +38,34 @@ impl MediaClient {
         self.send_command(cmd)
     }
 
+    pub fn play(&self, deck: Deck) -> Result<(), ClientError> {
+        tracing::info!("Client: Sending Play command for deck {:?}", deck);
+        let cmd = Command::Play { deck };
+        let result = self.send_command(cmd);
+        tracing::info!("Client: Play command result: {:?}", result);
+        result
+    }
+
     fn send_command(&self, cmd: Command) -> Result<(), ClientError> {
+        println!("Client: Serializing command: {:?}", cmd);
         let data = serde_json::to_vec(&cmd).map_err(|e| ClientError::Protocol(e.to_string()))?;
+        println!("Client: Sending {} bytes to server", data.len());
 
-        self.socket
-            .send(&data)
-            .map_err(|e| ClientError::Connection(format!("{:?}", e)))?;
+        match self.socket.send(&data) {
+            Ok(_) => println!("Client: Command sent successfully"),
+            Err(e) => return Err(ClientError::Connection(format!("Send error: {:?}", e))),
+        }
 
-        let msg = self
-            .socket
-            .recv()
-            .map_err(|e| ClientError::Connection(format!("{:?}", e)))?;
+        println!("Client: Waiting for response...");
+        let msg = match self.socket.recv() {
+            Ok(msg) => {
+                println!("Client: Received response of {} bytes", msg.len());
+                msg
+            }
+            Err(e) => return Err(ClientError::Connection(format!("Receive error: {:?}", e))),
+        };
 
+        println!("Client: Deserializing response");
         let response: Response =
             serde_json::from_slice(&msg).map_err(|e| ClientError::Protocol(e.to_string()))?;
 

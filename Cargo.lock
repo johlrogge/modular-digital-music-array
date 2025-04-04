@@ -1131,6 +1131,7 @@ dependencies = [
  "playback-engine",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

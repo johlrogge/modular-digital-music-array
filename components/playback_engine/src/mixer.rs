@@ -62,6 +62,7 @@ impl Mixer {
         let mut written = 0;
         let to_write = samples_per_callback;
 
+        let mut write_attempts = 0;
         while written < to_write {
             let remaining = to_write - written;
             let pushed = self.output_producer.push_slice(&output[written..to_write]);
@@ -70,11 +71,15 @@ impl Mixer {
 
             // If we couldn't write everything, yield and retry
             if pushed < remaining {
-                tracing::debug!(
-                    "Output buffer full, wrote {}/{} samples, yielding and retrying",
-                    pushed,
-                    remaining
-                );
+                write_attempts += 1;
+                if write_attempts % 1_000_000 == 0 {
+                    tracing::debug!(
+                        "Output buffer full attempt {}, wrote {}/{} samples, yielding and retrying",
+                        write_attempts,
+                        pushed,
+                        remaining
+                    );
+                }
                 std::thread::yield_now(); // Standard library yield, not tokio
             }
         }
