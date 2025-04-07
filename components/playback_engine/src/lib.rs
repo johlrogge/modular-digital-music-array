@@ -2,7 +2,6 @@ mod commands;
 mod error;
 mod mixer;
 mod pipewire_output;
-mod position;
 mod source;
 mod track;
 
@@ -17,7 +16,6 @@ use mixer::Mixer;
 use parking_lot::RwLock;
 use pipewire_output::PipewireOutput;
 pub use playback_primitives::Deck;
-use position::PlaybackPosition;
 use ringbuf::{HeapConsumer, HeapRb};
 pub use source::{FlacSource, Source};
 use tracing::info;
@@ -27,7 +25,7 @@ type Decks = Arc<RwLock<HashMap<Deck, Arc<RwLock<Track>>>>>;
 
 pub struct PlaybackEngine {
     decks: Decks,
-    audio_output: PipewireOutput,
+    _audio_output: PipewireOutput,
     command_sender: mpsc::Sender<MixerCommand>,
     mix_task: Option<std::thread::JoinHandle<()>>,
 }
@@ -35,7 +33,6 @@ enum MixerCommand {
     RegisterTrack {
         deck: Deck,
         consumer: HeapConsumer<f32>,
-        position_tracker: Arc<PlaybackPosition>,
     },
     SetVolume {
         deck: Deck,
@@ -72,14 +69,9 @@ impl PlaybackEngine {
                 // Process any pending commands
                 while let Ok(cmd) = command_receiver.try_recv() {
                     match cmd {
-                        MixerCommand::RegisterTrack {
-                            deck,
-                            consumer,
-                            position_tracker,
-                        } => {
+                        MixerCommand::RegisterTrack { deck, consumer } => {
                             tracing::info!("MIX THREAD: Registering track for deck {:?}", deck);
                             consumers.insert(deck, consumer);
-                            mixer.register_position_tracker(deck, position_tracker);
                         }
                         MixerCommand::SetVolume { deck, db } => {
                             mixer.set_volume(deck, db);
@@ -101,7 +93,7 @@ impl PlaybackEngine {
         // Return the engine
         Ok(Self {
             decks: Arc::new(RwLock::new(HashMap::new())),
-            audio_output,
+            _audio_output: audio_output,
             command_sender,
             mix_task: Some(mix_task),
         })
@@ -119,9 +111,6 @@ impl PlaybackEngine {
         let track = Track::new(FlacSource::new(path)?, producer).await?;
         tracing::info!("Track is ready for playback");
 
-        // Get position tracker
-        let position_tracker = Arc::clone(&track.position_tracker);
-
         // Store the track - no lock conflicts possible with mix thread now
         let mut decks = self.decks.write();
         decks.insert(deck, Arc::new(RwLock::new(track)));
@@ -129,11 +118,7 @@ impl PlaybackEngine {
 
         // Send consumer to mix thread via command - using standard send, not try_send
         self.command_sender
-            .send(MixerCommand::RegisterTrack {
-                deck,
-                consumer,
-                position_tracker,
-            })
+            .send(MixerCommand::RegisterTrack { deck, consumer })
             .map_err(|_| PlaybackError::TaskCancelled)?;
 
         tracing::info!("Loaded track from {:?} into deck {:?}", path, deck);
@@ -216,14 +201,6 @@ impl PlaybackEngine {
             track_guard.seek(position)
         } else {
             tracing::error!("No track loaded in deck {:?}", deck);
-            Err(PlaybackError::NoTrackLoaded(deck))
-        }
-    }
-
-    pub fn get_position(&self, deck: Deck) -> Result<usize, PlaybackError> {
-        if let Some(track) = self.find_track(deck) {
-            Ok(track.read().position())
-        } else {
             Err(PlaybackError::NoTrackLoaded(deck))
         }
     }

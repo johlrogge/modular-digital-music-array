@@ -78,27 +78,6 @@ async fn main() -> Result<()> {
             );
         }
 
-        Commands::GetPosition { channel } => {
-            let channel = commands::parse_channel(channel)?;
-            let position = client.get_position(channel)?;
-
-            // Present the position in a more human-readable way
-            let sample_rate = 48000; // Assuming 48kHz
-            let channels = 2; // Assuming stereo
-
-            let seconds = position as f64 / (sample_rate as f64 * channels as f64);
-            let minutes = (seconds / 60.0).floor();
-            let seconds = seconds % 60.0;
-
-            println!(
-                "Position of channel {}: {} samples ({:02}:{:05.2})",
-                commands::channel_to_string(channel),
-                position,
-                minutes as u32,
-                seconds
-            );
-        }
-
         Commands::GetLength { channel } => {
             let channel = commands::parse_channel(channel)?;
             let length = client.get_length(channel)?;

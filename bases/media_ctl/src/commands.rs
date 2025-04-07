@@ -70,13 +70,6 @@ pub enum Commands {
         position: usize,
     },
 
-    /// Get current position
-    GetPosition {
-        /// Channel (A or B)
-        #[arg(long)]
-        channel: char,
-    },
-
     /// Get track length
     GetLength {
         /// Channel (A or B)

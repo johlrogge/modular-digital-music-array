@@ -11,7 +11,6 @@ pub enum Command {
     SetVolume { deck: Deck, db: f32 },
     Unload { deck: Deck },
     Seek { deck: Deck, position: usize },
-    GetPosition { deck: Deck },
     GetLength { deck: Deck },
 }
 

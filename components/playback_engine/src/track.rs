@@ -1,5 +1,4 @@
 use crate::error::PlaybackError;
-use crate::position::PlaybackPosition;
 #[cfg(test)]
 use crate::source::{AudioSegment, SegmentIndex, SEGMENT_SIZE};
 use crate::source::{DecodedSegment, Source};
@@ -18,8 +17,6 @@ use ringbuf::HeapProducer;
 use ringbuf::HeapRb;
 
 pub struct Track {
-    // Replace position with the new tracker
-    pub position_tracker: Arc<PlaybackPosition>,
     playing: Arc<AtomicBool>,
     command_tx: mpsc::Sender<TrackCommand>,
     decoder_task: Option<tokio::task::JoinHandle<()>>,
@@ -100,7 +97,6 @@ impl Track {
         source: S,
         output_producer: HeapProducer<f32>,
     ) -> Result<Self, PlaybackError> {
-        let position_tracker = Arc::new(PlaybackPosition::new());
         let playing = Arc::new(AtomicBool::new(false));
 
         // Command channels
@@ -113,7 +109,6 @@ impl Track {
         });
 
         let track = Self {
-            position_tracker,
             playing,
             command_tx,
             decoder_task: Some(decoder_task),
@@ -124,16 +119,8 @@ impl Track {
         Ok(track)
     }
 
-    // Update position() to use the tracker
-    pub fn position(&self) -> usize {
-        self.position_tracker.position()
-    }
-
     // Update seek to use the tracker
     pub fn seek(&mut self, position: usize) -> Result<(), PlaybackError> {
-        // Update the position tracker
-        self.position_tracker.seek(position);
-
         // Request buffer filling from new position (unchanged)
         if let Err(e) = self.command_tx.try_send(TrackCommand::FillFrom(position)) {
             tracing::error!("Failed to send fill command after seek: {}", e);

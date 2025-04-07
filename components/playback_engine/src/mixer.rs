@@ -1,13 +1,12 @@
 // in mixer.rs
-use crate::{error::PlaybackError, position::PlaybackPosition};
+use crate::error::PlaybackError;
 use playback_primitives::Deck;
 use ringbuf::{HeapConsumer, HeapProducer};
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 pub struct Mixer {
     volumes: HashMap<Deck, f32>,
     output_producer: HeapProducer<f32>, // Mixer output
-    position_trackers: HashMap<Deck, Arc<PlaybackPosition>>, // NEW
 }
 
 impl Mixer {
@@ -15,13 +14,7 @@ impl Mixer {
         Self {
             volumes: HashMap::new(),
             output_producer,
-            position_trackers: HashMap::new(), // Initialize empty
         }
-    }
-
-    // Add method to register position tracker
-    pub fn register_position_tracker(&mut self, deck: Deck, tracker: Arc<PlaybackPosition>) {
-        self.position_trackers.insert(deck, tracker);
     }
 
     pub fn mix(
@@ -48,11 +41,6 @@ impl Mixer {
                 (0..to_mix).for_each(|i| {
                     if let Some(sample) = consumer.pop() {
                         output[i] += sample * volume;
-
-                        // If we have a position tracker for this deck, record consumption
-                        if let Some(tracker) = self.position_trackers.get(deck) {
-                            tracker.record_consumption(1);
-                        }
                     }
                 });
             }

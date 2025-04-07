@@ -118,18 +118,6 @@ impl MediaClient {
         }
     }
 
-    pub fn get_position(&self, deck: Deck) -> Result<usize, ClientError> {
-        let cmd = Command::GetPosition { deck };
-
-        self.send_command_with_response(cmd, |data| {
-            if let ResponseData::Position(pos) = data {
-                Some(pos)
-            } else {
-                None
-            }
-        })
-    }
-
     pub fn get_length(&self, deck: Deck) -> Result<usize, ClientError> {
         let cmd = Command::GetLength { deck };
 

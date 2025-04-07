@@ -101,24 +101,6 @@ impl Server {
                     .await; // Now awaiting the seek operation
                 self.create_response(result, None)
             }
-            Command::GetPosition { deck } => {
-                info!("Getting position for deck {:?}", deck);
-                match self
-                    .engine
-                    .lock()
-                    .await
-                    .get_position(Self::convert_deck(deck))
-                {
-                    Ok(position) => {
-                        info!("Current position: {}", position);
-                        self.create_response(Ok(()), Some(ResponseData::Position(position)))
-                    }
-                    Err(e) => {
-                        warn!("Failed to get position: {}", e);
-                        self.create_response(Err(e), None)
-                    }
-                }
-            }
             Command::GetLength { deck } => {
                 info!("Getting length for deck {:?}", deck);
                 todo!("get length of track, or remove opportunity")
