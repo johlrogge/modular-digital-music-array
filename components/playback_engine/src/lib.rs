@@ -1,4 +1,3 @@
-mod commands;
 mod error;
 mod mixer;
 mod pipewire_output;
@@ -27,7 +26,7 @@ pub struct PlaybackEngine {
     decks: Decks,
     _audio_output: PipewireOutput,
     command_sender: mpsc::Sender<MixerCommand>,
-    mix_task: Option<std::thread::JoinHandle<()>>,
+    _mix_task: Option<std::thread::JoinHandle<()>>,
 }
 enum MixerCommand {
     RegisterTrack {
@@ -95,7 +94,7 @@ impl PlaybackEngine {
             decks: Arc::new(RwLock::new(HashMap::new())),
             _audio_output: audio_output,
             command_sender,
-            mix_task: Some(mix_task),
+            _mix_task: Some(mix_task),
         })
     }
 
