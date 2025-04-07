@@ -20,8 +20,6 @@ pub struct Track {
     playing: Arc<AtomicBool>,
     command_tx: mpsc::Sender<TrackCommand>,
     decoder_task: Option<tokio::task::JoinHandle<()>>,
-    ready_tx: tokio::sync::watch::Sender<bool>,
-    ready_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 // Update TrackCommand to include potential new commands
@@ -101,7 +99,6 @@ impl Track {
 
         // Command channels
         let (command_tx, command_rx) = mpsc::channel(32);
-        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
 
         // Create decoder task
         let decoder_task = tokio::spawn(async move {
@@ -112,8 +109,6 @@ impl Track {
             playing,
             command_tx,
             decoder_task: Some(decoder_task),
-            ready_tx,
-            ready_rx,
         };
 
         Ok(track)
@@ -130,18 +125,8 @@ impl Track {
     }
 
     pub fn play(&mut self) {
-        // Wait for the track to be ready - but since we can't await here,
-        // we'll just log and continue
-        if !self.is_ready() {
-            tracing::warn!("Playing track that's not ready yet");
-        }
-
         self.playing.store(true, Ordering::Relaxed);
         tracing::info!("Track set to playing state");
-    }
-
-    pub fn is_ready(&self) -> bool {
-        *self.ready_rx.borrow()
     }
 
     pub fn stop(&mut self) {
