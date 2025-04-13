@@ -29,9 +29,16 @@
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
         # Shared environment variables for both build and dev shell
+
+        # Use pkgs.lib instead of lib directly
         commonEnv = {
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           BINDGEN_EXTRA_CLANG_ARGS = "-I${pkgs.llvmPackages.libclang.dev}/include -I${pkgs.pipewire.dev}/include";
+  
+          # Add explicit paths to headers, which are necessary for nng's cmake build
+          NIX_CFLAGS_COMPILE = "-isystem ${pkgs.glibc.dev}/include -isystem ${pkgs.gcc}/lib/gcc/${pkgs.stdenv.hostPlatform.config}/${pkgs.gcc.version}/include";
+          CMAKE_C_FLAGS = "-isystem ${pkgs.glibc.dev}/include -isystem ${pkgs.gcc}/lib/gcc/${pkgs.stdenv.hostPlatform.config}/${pkgs.gcc.version}/include";
+          CMAKE_CXX_FLAGS = "-isystem ${pkgs.glibc.dev}/include -isystem ${pkgs.gcc}/lib/gcc/${pkgs.stdenv.hostPlatform.config}/${pkgs.gcc.version}/include";
         };
 
         # Common dependencies for both build and dev shell
@@ -40,6 +47,8 @@
           alsa-plugins
           pipewire
           llvmPackages.libclang
+          # Add NNG if available in nixpkgs
+          nng
         ];
 
         commonNativeDeps = with pkgs; [
@@ -47,6 +56,10 @@
           cmake
           llvmPackages.clang
           ffmpeg
+          # Add the following packages:
+          glibc.dev
+          gcc
+          stdenv.cc.cc.lib
         ];
 
         commonArgs = {
@@ -85,18 +98,33 @@
           default = download-cli-wrapped;
         };
 
-        devShells.default = pkgs.mkShell ({
-          packages = with pkgs; [
-            rustToolchain
-            yt-dlp
-          ] ++ commonDeps ++ commonNativeDeps;
-          
-          inherit (commonEnv) LIBCLANG_PATH;
-          inherit (commonEnv) BINDGEN_EXTRA_CLANG_ARGS;
-          
-          LD_LIBRARY_PATH = with pkgs; lib.makeLibraryPath commonDeps;
-          ALSA_PLUGIN_DIR = "${pkgs.alsa-plugins}/lib/alsa-lib";
-        });
+        devShells.default = pkgs.mkShell {
+          # For build-time dependencies that provide tools
+          nativeBuildInputs = with pkgs; [
+            pkg-config
+            cmake
+            rustc
+            cargo
+          ];
+  
+          # For runtime and compile-time library dependencies
+          buildInputs = with pkgs; [
+            # Add the standard C development tools - this is the important part!
+            stdenv.cc.cc.lib
+            glibc
+            glibc.dev
+            # Other dependencies
+            alsa-lib
+            pipewire
+          ];
+  
+          # Only set truly necessary environment variables
+          shellHook = ''
+            export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
+            # This is what actually fixes your headers issue:
+            export NIX_CFLAGS_COMPILE="-isystem ${pkgs.glibc.dev}/include -isystem ${pkgs.stdenv.cc.cc}/lib/gcc/${pkgs.stdenv.targetPlatform.config}/${pkgs.stdenv.cc.version}/include"
+          '';
+        };
 
         nixosConfigurations.default = nixpkgs.lib.nixosSystem {
           inherit system;
