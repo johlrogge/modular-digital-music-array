@@ -8,12 +8,12 @@ members = [
     "components/playback_engine",
     "components/playback_primitives",
     "components/time_primitives",
-    
+    "components/flac_metadata",  
     # Bases (entry points)
     "bases/download_cli",
     "bases/media_ctl",
-    "bases/playback_server"
-]
+    "bases/playback_server",
+    "bases/library_crawler"]
 resolver = "2"
 [workspace.package]
 version = "0.1.0"

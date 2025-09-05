@@ -1,0 +1,14 @@
+[package]
+name = "library-crawler"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+flac-metadata = { path = "../../components/flac_metadata" }
+clap = { version = "4.4", features = ["derive"] }
+color-eyre = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+walkdir = "2.4"

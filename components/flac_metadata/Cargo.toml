@@ -1,0 +1,11 @@
+[package]
+name = "flac-metadata"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+symphonia = { version = "0.5", features = ["default", "flac"] }
+thiserror = { workspace = true }
