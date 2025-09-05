@@ -7,5 +7,5 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-symphonia = { version = "0.5", features = ["default", "flac"] }
+lofty = {workspace = true }
 thiserror = { workspace = true }
