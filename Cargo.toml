@@ -13,7 +13,7 @@ members = [
     "bases/download_cli",
     "bases/media_ctl",
     "bases/playback_server",
-    "bases/library_crawler"]
+    "bases/library_crawler", "components/audio_fingerprint"]
 resolver = "2"
 [workspace.package]
 version = "0.1.0"
