@@ -1,0 +1,16 @@
+[package]
+name = "music-facts"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+music-primitives = { path = "../music_primitives" }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }

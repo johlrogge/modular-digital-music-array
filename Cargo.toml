@@ -2,13 +2,15 @@
 members = [
     # Components (bricks)
     "components/clock",
+    "components/flac_metadata",  
     "components/media_client",
     "components/media_downloader",
     "components/media_protocol",
+    "components/music_facts",
+    "components/music_primitives",
     "components/playback_engine",
     "components/playback_primitives",
     "components/time_primitives",
-    "components/flac_metadata",  
     # Bases (entry points)
     "bases/download_cli",
     "bases/media_ctl",
@@ -29,5 +31,8 @@ color-eyre = "0.6"
 thiserror = "1.0"
 parking_lot = "0.12"
 assert_matches = "1.5"
-serde_json= "1.0"
+serde = "1"
+serde_json = "1.0"
 lofty = "0.18"
+chrono = "0.4"
+ 

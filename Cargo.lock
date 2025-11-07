@@ -1311,6 +1311,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "music-facts"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "music-primitives",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "music-primitives"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "nix"
 version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
