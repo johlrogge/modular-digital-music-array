@@ -11,7 +11,6 @@ use symphonia::core::{
     probe::Hint,
     units::Time,
 };
-use tracing::Instrument;
 
 pub const SEGMENT_SIZE: usize = 1024;
 

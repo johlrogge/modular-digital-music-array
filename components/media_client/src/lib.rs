@@ -1,6 +1,6 @@
 use media_protocol::{ClientError, Command, Deck, Response, ResponseData};
 use nng::{Protocol, Socket};
-use std::{hash::Hash, path::PathBuf};
+use std::path::PathBuf;
 
 pub struct MediaClient {
     socket: Socket,

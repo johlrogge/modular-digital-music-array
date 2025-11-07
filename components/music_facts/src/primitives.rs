@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 /// Content hash of audio file (SHA256)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]

@@ -39,7 +39,7 @@ impl Bpm {
     /// # Ok::<(), BpmError>(())
     /// ```
     pub fn from_f32(bpm: f32) -> Result<Self, BpmError> {
-        if bpm < Self::MIN || bpm > Self::MAX {
+        if !(Self::MIN..=Self::MAX).contains(&bpm) {
             return Err(BpmError::OutOfRange(bpm));
         }
 
@@ -59,7 +59,7 @@ impl Bpm {
     /// ```
     pub fn from_u32(bpm: u32) -> Result<Self, BpmError> {
         let bpm_f32 = bpm as f32;
-        if bpm_f32 < Self::MIN || bpm_f32 > Self::MAX {
+        if !(Self::MIN..=Self::MAX).contains(&bpm_f32) {
             return Err(BpmError::OutOfRange(bpm_f32));
         }
 
