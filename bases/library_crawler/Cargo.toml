@@ -7,8 +7,22 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
+# Existing dependencies
 flac-metadata = { path = "../../components/flac_metadata" }
 clap = { version = "4.4", features = ["derive"] }
 color-eyre = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 walkdir = "2.4"
+
+# New dependencies for fact generation
+music-facts = { path = "../../components/music_facts" }
+music-primitives = { path = "../../components/music_primitives" }
+sha2 = "0.10"
+hex = "0.4"
+chrono = { workspace = true, features = ["serde"] }
+serde_json = { workspace = true }
+serde.workspace = true
+stainless-facts = {path="../../../stainless-facts"}
+
+[dev-dependencies]
+tempfile = "3"

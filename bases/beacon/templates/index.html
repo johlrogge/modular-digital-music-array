@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Welcome to MDMA</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 600px;
+            width: 100%;
+            padding: 40px;
+        }
+        
+        h1 {
+            color: #2c3e50;
+            margin-bottom: 10px;
+            font-size: 2.5em;
+        }
+        
+        .subtitle {
+            color: #7f8c8d;
+            margin-bottom: 30px;
+            font-size: 0.9em;
+        }
+        
+        .section {
+            margin-bottom: 25px;
+        }
+        
+        .section-title {
+            color: #34495e;
+            font-size: 1.1em;
+            margin-bottom: 12px;
+            font-weight: 600;
+        }
+        
+        .hardware-info {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .hardware-item {
+            display: flex;
+            align-items: center;
+            padding: 8px 0;
+            color: #2c3e50;
+        }
+        
+        .hardware-item::before {
+            content: "✓";
+            color: #27ae60;
+            font-weight: bold;
+            margin-right: 10px;
+            font-size: 1.2em;
+        }
+        
+        .hardware-item.warning::before {
+            content: "⚠";
+            color: #f39c12;
+        }
+        
+        label {
+            display: block;
+            color: #34495e;
+            font-weight: 500;
+            margin-bottom: 8px;
+        }
+        
+        input, select, textarea {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 6px;
+            font-size: 1em;
+            transition: border-color 0.3s;
+            font-family: inherit;
+        }
+        
+        input:focus, select:focus, textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        textarea {
+            resize: vertical;
+            min-height: 100px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+        }
+        
+        button {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 1.1em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        
+        button:active {
+            transform: translateY(0);
+        }
+        
+        .help-text {
+            color: #7f8c8d;
+            font-size: 0.85em;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Welcome to MDMA</h1>
+        <p class="subtitle">Modular Distributed Music Architecture</p>
+        
+        <div class="section">
+            <div class="section-title">Detected Hardware</div>
+            <div class="hardware-info">
+                <div class="hardware-item">{{ hardware.model }}</div>
+                {% match hardware.memory_mb %}
+                {% when Some with (mem) %}
+                <div class="hardware-item">{{ mem }} MB RAM</div>
+                {% when None %}
+                {% endmatch %}
+                
+                {% if hardware.nvme_drives.is_empty() %}
+                <div class="hardware-item warning">No NVMe drives detected</div>
+                {% else %}
+                    {% for drive in hardware.nvme_drives %}
+                    <div class="hardware-item">
+                        NVMe Drive {{ loop.index }}: {{ drive.capacity }}
+                        {% if drive.is_formatted %}(formatted){% else %}(unformatted){% endif %}
+                        {% match drive.model %}
+                        {% when Some with (model) %}
+                        - {{ model }}
+                        {% when None %}
+                        {% endmatch %}
+                    </div>
+                    {% endfor %}
+                {% endif %}
+            </div>
+        </div>
+        
+        <form action="/provision" method="post">
+            <div class="section">
+                <label for="unit_type">Unit Type</label>
+                <select name="unit_type" id="unit_type" required>
+                    <option value="mdma-909">MDMA-909 (Main Unit - Dual NVMe)</option>
+                    <option value="mdma-101">MDMA-101 (Browser/Controller)</option>
+                    <option value="mdma-303">MDMA-303 (Satellite Node)</option>
+                </select>
+            </div>
+            
+            <div class="section">
+                <label for="hostname">Hostname</label>
+                <input 
+                    type="text" 
+                    name="hostname" 
+                    id="hostname" 
+                    placeholder="mdma-909-studio"
+                    pattern="[a-zA-Z0-9.-]+"
+                    required
+                >
+                <div class="help-text">Will be accessible as hostname.local via mDNS</div>
+            </div>
+            
+            <div class="section">
+                <label for="ssh_key">SSH Public Key (required)</label>
+                <textarea 
+                    name="ssh_key" 
+                    id="ssh_key" 
+                    placeholder="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5..."
+                    required
+                ></textarea>
+                <div class="help-text">Paste your public key from ~/.ssh/id_ed25519.pub or ~/.ssh/id_rsa.pub</div>
+            </div>
+            
+            <button type="submit">Provision System</button>
+        </form>
+    </div>
+</body>
+</html>

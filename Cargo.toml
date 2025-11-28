@@ -1,3 +1,4 @@
+# Root Cargo.toml with beacon added
 [workspace]
 members = [
     # Components (bricks)
@@ -11,12 +12,16 @@ members = [
     "components/playback_engine",
     "components/playback_primitives",
     "components/time_primitives",
+    "components/audio_fingerprint",
     # Bases (entry points)
     "bases/download_cli",
     "bases/media_ctl",
     "bases/playback_server",
-    "bases/library_crawler", "components/audio_fingerprint"]
+    "bases/library_crawler",
+    "bases/beacon",
+]
 resolver = "2"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
@@ -31,8 +36,12 @@ color-eyre = "0.6"
 thiserror = "1.0"
 parking_lot = "0.12"
 assert_matches = "1.5"
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 lofty = "0.18"
 chrono = "0.4"
- 
+
+# Beacon-specific dependencies
+axum = "0.7"
+askama = "0.12"
+tower-http = { version = "0.5", features = ["fs"] }
