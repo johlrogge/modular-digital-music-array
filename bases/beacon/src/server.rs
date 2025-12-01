@@ -20,7 +20,7 @@ use serde::Deserialize;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, oneshot};
 use tower_http::services::ServeDir;
 use tracing::info;
 
@@ -31,6 +31,8 @@ struct AppState {
     config: Config,
     /// Broadcast channel for streaming provisioning logs to clients
     log_tx: broadcast::Sender<String>,
+    /// Oneshot sender to signal provisioning can start (protected by mutex)
+    provision_start: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
 
 /// Main template for the welcome page
@@ -57,11 +59,13 @@ pub async fn run(hardware: HardwareInfo, config: Config) -> color_eyre::Result<(
         hardware: Arc::new(Mutex::new(hardware)),
         config: config.clone(),
         log_tx,
+        provision_start: Arc::new(Mutex::new(None)),
     };
 
     let app = Router::new()
         .route("/", get(index))
         .route("/provision", post(provision))
+        .route("/provision/start", post(provision_start))
         .route("/stream", get(stream_events))
         .route("/test-stream", get(test_stream))  // Test endpoint!
         .nest_service("/static", ServeDir::new("static"))
@@ -168,21 +172,27 @@ async fn provision(
     let execution_mode = state.config.execution_mode;
     let log_tx = state.log_tx.clone();
     
-    // Spawn provisioning in background
+    // Create oneshot channel for start signal
+    let (start_tx, start_rx) = oneshot::channel();
+    *state.provision_start.lock().await = Some(start_tx);
+    
+    // Spawn provisioning in background, waiting for start signal
     tokio::spawn(async move {
-        // Send initial message
-        let _ = log_tx.send("🚀 Starting provisioning...".to_string());
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait for JavaScript to signal it's ready
+        if start_rx.await.is_err() {
+            tracing::error!("Start signal channel closed unexpectedly");
+            return;
+        }
         
-        // TODO: Call the actual provisioning with log_tx
-        // For now, send some test messages
-        let _ = log_tx.send(format!("Unit type: {}", config.unit_type));
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let _ = log_tx.send(format!("Hostname: {}", config.hostname));
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let _ = log_tx.send("Validating hardware...".to_string());
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let _ = log_tx.send("✅ Provisioning completed successfully!".to_string());
+        match provisioning::provision_system(config, hardware, execution_mode, log_tx.clone()).await {
+            Ok(()) => {
+                info!("Provisioning completed successfully");
+            }
+            Err(e) => {
+                tracing::error!("Provisioning failed: {}", e);
+                let _ = log_tx.send(format!("❌ Provisioning failed: {}", e));
+            }
+        }
     });
     
     let mode_notice = if execution_mode == crate::actions::ExecutionMode::DryRun {
@@ -259,9 +269,26 @@ async fn provision(
             
             eventSource.onopen = function() {{
                 console.log('EventSource opened');
-                statusDiv.textContent = '✓ Connected';
+                statusDiv.textContent = '✓ Connected - Starting provisioning...';
                 statusDiv.style.background = '#d4edda';
                 log('✓ Connected to stream');
+                
+                // Send start signal to server
+                fetch('/provision/start', {{ method: 'POST' }})
+                    .then(response => {{
+                        if (response.ok) {{
+                            console.log('Provisioning start signal sent');
+                            statusDiv.textContent = '✓ Provisioning started';
+                        }} else {{
+                            console.error('Failed to start provisioning');
+                            statusDiv.textContent = '✗ Failed to start';
+                            statusDiv.style.background = '#f8d7da';
+                        }}
+                    }})
+                    .catch(err => {{
+                        console.error('Error sending start signal:', err);
+                        log('✗ Error starting provisioning', true);
+                    }});
             }};
             
             eventSource.onmessage = function(event) {{
@@ -286,6 +313,19 @@ async fn provision(
     "#, mode_notice = mode_notice);
     
     Ok(Html(html))
+}
+
+/// Handler for provision start signal from JavaScript
+async fn provision_start(State(state): State<AppState>) -> Result<StatusCode, AppError> {
+    // Take the sender out of the mutex and signal start
+    if let Some(tx) = state.provision_start.lock().await.take() {
+        let _ = tx.send(());
+        info!("Provisioning start signal received");
+        Ok(StatusCode::OK)
+    } else {
+        tracing::warn!("Provision start called but no provisioning task waiting");
+        Err(AppError::Validation("No provisioning task waiting".to_string()))
+    }
 }
 
 fn parse_unit_type(s: &str) -> Result<UnitType, AppError> {
