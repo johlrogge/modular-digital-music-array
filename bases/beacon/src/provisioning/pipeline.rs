@@ -23,12 +23,54 @@ macro_rules! send_log {
 // Stage 1: Validated Hardware
 // ============================================================================
 
+/// Validated NVMe drives after hardware detection
+/// 
+/// The type makes it impossible to have invalid drive configurations
+#[derive(Debug, Clone)]
+pub enum ValidatedDrives {
+    /// Single NVMe drive
+    /// 
+    /// Used for MDMA-101, MDMA-303, or MDMA-909 with combined layout
+    OneDrive(crate::hardware::NvmeDrive),
+    
+    /// Two NVMe drives (optimal for MDMA-909)
+    /// 
+    /// First drive is primary (OS + music), second is CDJ export
+    TwoDrives(crate::hardware::NvmeDrive, crate::hardware::NvmeDrive),
+}
+
+impl ValidatedDrives {
+    /// Get number of drives
+    pub fn count(&self) -> usize {
+        match self {
+            ValidatedDrives::OneDrive(_) => 1,
+            ValidatedDrives::TwoDrives(_, _) => 2,
+        }
+    }
+    
+    /// Get primary drive (always exists)
+    pub fn primary(&self) -> &crate::hardware::NvmeDrive {
+        match self {
+            ValidatedDrives::OneDrive(drive) => drive,
+            ValidatedDrives::TwoDrives(primary, _) => primary,
+        }
+    }
+    
+    /// Get secondary drive (only if it exists)
+    pub fn secondary(&self) -> Option<&crate::hardware::NvmeDrive> {
+        match self {
+            ValidatedDrives::OneDrive(_) => None,
+            ValidatedDrives::TwoDrives(_, secondary) => Some(secondary),
+        }
+    }
+}
+
 /// Hardware that has been validated for provisioning
 /// 
 /// Can only be constructed after validation passes
 pub struct ValidatedHardware {
     pub config: ProvisionConfig,
-    pub hardware: HardwareInfo,
+    pub drives: ValidatedDrives,
 }
 
 impl ValidatedHardware {
@@ -36,27 +78,46 @@ impl ValidatedHardware {
     /// 
     /// Returns ValidatedHardware only if all checks pass
     pub fn validate(config: ProvisionConfig, hardware: HardwareInfo, log_tx: &broadcast::Sender<String>) -> Result<Self> {
-        // All unit types need at least one NVMe drive
-        if hardware.nvme_drives.is_empty() {
-            return Err(BeaconError::HardwareInfo(
-                "No NVMe drives found - cannot provision".to_string()
-            ));
-        }
+        // Build ValidatedDrives enum based on what we found
+        let drives = match hardware.nvme_drives.len() {
+            0 => {
+                return Err(BeaconError::HardwareInfo(
+                    "No NVMe drives found - cannot provision".to_string()
+                ));
+            }
+            1 => {
+                let drive = hardware.nvme_drives.into_iter().next().unwrap();
+                
+                if config.unit_type.requires_dual_nvme() {
+                    send_log!(log_tx, "  ⚠️  MDMA-909 with single NVMe - will use combined partition layout");
+                    send_log!(log_tx, "  ⚠️  For optimal performance, add a second NVMe drive");
+                }
+                
+                if drive.is_formatted {
+                    send_log!(log_tx, "  ⚠️  NVMe drive appears to be formatted - will overwrite!");
+                }
+                
+                ValidatedDrives::OneDrive(drive)
+            }
+            _ => {
+                // 2 or more drives - use first two
+                let mut iter = hardware.nvme_drives.into_iter();
+                let primary = iter.next().unwrap();
+                let secondary = iter.next().unwrap();
+                
+                if config.unit_type.requires_dual_nvme() {
+                    send_log!(log_tx, "  ✓ MDMA-909 with dual NVMe setup - optimal configuration");
+                }
+                
+                if primary.is_formatted || secondary.is_formatted {
+                    send_log!(log_tx, "  ⚠️  Some NVMe drives appear to be formatted - will overwrite!");
+                }
+                
+                ValidatedDrives::TwoDrives(primary, secondary)
+            }
+        };
         
-        // MDMA-909 prefers two drives but can work with one
-        if config.unit_type.requires_dual_nvme() && hardware.nvme_drives.len() >= 2 {
-            send_log!(log_tx, "  ✓ MDMA-909 with dual NVMe setup - optimal configuration");
-        } else if config.unit_type.requires_dual_nvme() && hardware.nvme_drives.len() == 1 {
-            send_log!(log_tx, "  ⚠️  MDMA-909 with single NVMe - will use combined partition layout");
-            send_log!(log_tx, "  ⚠️  For optimal performance, add a second NVMe drive");
-        }
-        
-        // Check if any drive is already formatted
-        if hardware.nvme_drives.iter().any(|d| d.is_formatted) {
-            send_log!(log_tx, "  ⚠️  Some NVMe drives appear to be formatted - will overwrite!");
-        }
-        
-        Ok(ValidatedHardware { config, hardware })
+        Ok(ValidatedHardware { config, drives })
     }
 }
 
@@ -104,27 +165,26 @@ impl PartitionedDrives {
     /// 
     /// This is the ONLY way to get a PartitionedDrives instance
     pub async fn partition(validated: ValidatedHardware, log_tx: &broadcast::Sender<String>) -> Result<Self> {
-        let layout = match validated.config.unit_type {
-            UnitType::Mdma909 if validated.hardware.nvme_drives.len() >= 2 => {
-                // Dual NVMe setup
+        let layout = match (&validated.config.unit_type, &validated.drives) {
+            // MDMA-909 with dual drives - optimal layout
+            (UnitType::Mdma909, ValidatedDrives::TwoDrives(primary, secondary)) => {
                 send_log!(log_tx, "  Using dual NVMe configuration");
-                let primary = &validated.hardware.nvme_drives[0].device;
-                let secondary = &validated.hardware.nvme_drives[1].device;
-                
-                Self::partition_dual_drive(primary, secondary, log_tx).await?
+                Self::partition_dual_drive(&primary.device, &secondary.device, log_tx).await?
             }
-            UnitType::Mdma909 => {
-                // Single NVMe with combined layout
+            // MDMA-909 with single drive - combined layout
+            (UnitType::Mdma909, ValidatedDrives::OneDrive(drive)) => {
                 send_log!(log_tx, "  Using single NVMe configuration (combined layout)");
-                let device = &validated.hardware.nvme_drives[0].device;
-                
-                Self::partition_combined_drive(device, log_tx).await?
+                Self::partition_combined_drive(&drive.device, log_tx).await?
             }
-            UnitType::Mdma101 | UnitType::Mdma303 => {
-                // Standard single NVMe
-                let device = &validated.hardware.nvme_drives[0].device;
-                
-                Self::partition_standard_drive(device, log_tx).await?
+            // MDMA-101 or MDMA-303 - standard single drive
+            (_, ValidatedDrives::OneDrive(drive)) => {
+                send_log!(log_tx, "  Using standard single NVMe configuration");
+                Self::partition_standard_drive(&drive.device, log_tx).await?
+            }
+            // MDMA-101 or MDMA-303 with two drives - just use first one
+            (_, ValidatedDrives::TwoDrives(primary, _)) => {
+                send_log!(log_tx, "  Using standard single NVMe configuration (ignoring second drive)");
+                Self::partition_standard_drive(&primary.device, log_tx).await?
             }
         };
         
