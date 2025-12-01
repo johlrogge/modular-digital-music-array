@@ -7,7 +7,17 @@
 use crate::error::{BeaconError, Result};
 use crate::hardware::HardwareInfo;
 use crate::types::{DevicePath, ProvisionConfig, UnitType};
+use tokio::sync::broadcast;
 use tracing::{info, warn};
+
+/// Send a log message to both tracing and the broadcast channel
+macro_rules! send_log {
+    ($tx:expr, $($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        tracing::info!("{}", msg);
+        let _ = $tx.send(msg);
+    }};
+}
 
 // ============================================================================
 // Stage 1: Validated Hardware
@@ -25,7 +35,7 @@ impl ValidatedHardware {
     /// Validate hardware meets requirements
     /// 
     /// Returns ValidatedHardware only if all checks pass
-    pub fn validate(config: ProvisionConfig, hardware: HardwareInfo) -> Result<Self> {
+    pub fn validate(config: ProvisionConfig, hardware: HardwareInfo, log_tx: &broadcast::Sender<String>) -> Result<Self> {
         // All unit types need at least one NVMe drive
         if hardware.nvme_drives.is_empty() {
             return Err(BeaconError::HardwareInfo(
@@ -35,15 +45,15 @@ impl ValidatedHardware {
         
         // MDMA-909 prefers two drives but can work with one
         if config.unit_type.requires_dual_nvme() && hardware.nvme_drives.len() >= 2 {
-            info!("✓ MDMA-909 with dual NVMe setup - optimal configuration");
+            send_log!(log_tx, "  ✓ MDMA-909 with dual NVMe setup - optimal configuration");
         } else if config.unit_type.requires_dual_nvme() && hardware.nvme_drives.len() == 1 {
-            warn!("⚠️  MDMA-909 with single NVMe - will use combined partition layout");
-            warn!("⚠️  For optimal performance, add a second NVMe drive");
+            send_log!(log_tx, "  ⚠️  MDMA-909 with single NVMe - will use combined partition layout");
+            send_log!(log_tx, "  ⚠️  For optimal performance, add a second NVMe drive");
         }
         
         // Check if any drive is already formatted
         if hardware.nvme_drives.iter().any(|d| d.is_formatted) {
-            warn!("⚠️  Some NVMe drives appear to be formatted - will overwrite!");
+            send_log!(log_tx, "  ⚠️  Some NVMe drives appear to be formatted - will overwrite!");
         }
         
         Ok(ValidatedHardware { config, hardware })
@@ -93,38 +103,36 @@ impl PartitionedDrives {
     /// Partition drives based on unit type and available hardware
     /// 
     /// This is the ONLY way to get a PartitionedDrives instance
-    pub async fn partition(validated: ValidatedHardware) -> Result<Self> {
-        info!("📦 Partitioning NVMe drives...");
-        
+    pub async fn partition(validated: ValidatedHardware, log_tx: &broadcast::Sender<String>) -> Result<Self> {
         let layout = match validated.config.unit_type {
             UnitType::Mdma909 if validated.hardware.nvme_drives.len() >= 2 => {
                 // Dual NVMe setup
-                info!("  Using dual NVMe configuration");
+                send_log!(log_tx, "  Using dual NVMe configuration");
                 let primary = &validated.hardware.nvme_drives[0].device;
                 let secondary = &validated.hardware.nvme_drives[1].device;
                 
-                Self::partition_dual_drive(primary, secondary).await?
+                Self::partition_dual_drive(primary, secondary, log_tx).await?
             }
             UnitType::Mdma909 => {
                 // Single NVMe with combined layout
-                info!("  Using single NVMe configuration (combined layout)");
+                send_log!(log_tx, "  Using single NVMe configuration (combined layout)");
                 let device = &validated.hardware.nvme_drives[0].device;
                 
-                Self::partition_combined_drive(device).await?
+                Self::partition_combined_drive(device, log_tx).await?
             }
             UnitType::Mdma101 | UnitType::Mdma303 => {
                 // Standard single NVMe
                 let device = &validated.hardware.nvme_drives[0].device;
                 
-                Self::partition_standard_drive(device).await?
+                Self::partition_standard_drive(device, log_tx).await?
             }
         };
         
         Ok(PartitionedDrives { validated, layout })
     }
     
-    async fn partition_standard_drive(device: &DevicePath) -> Result<PartitionLayout> {
-        info!("  Partitioning drive: {}", device);
+    async fn partition_standard_drive(device: &DevicePath, log_tx: &broadcast::Sender<String>) -> Result<PartitionLayout> {
+        send_log!(log_tx, "    Partitioning drive: {}", device);
         
         // TODO: Actually run parted commands
         // For now, just describe the layout
@@ -162,8 +170,8 @@ impl PartitionedDrives {
         })
     }
     
-    async fn partition_combined_drive(device: &DevicePath) -> Result<PartitionLayout> {
-        info!("  Partitioning combined drive: {}", device);
+    async fn partition_combined_drive(device: &DevicePath, log_tx: &broadcast::Sender<String>) -> Result<PartitionLayout> {
+        send_log!(log_tx, "    Partitioning combined drive: {}", device);
         
         let partitions = vec![
             Partition {
@@ -207,9 +215,10 @@ impl PartitionedDrives {
     async fn partition_dual_drive(
         primary: &DevicePath,
         secondary: &DevicePath,
+        log_tx: &broadcast::Sender<String>,
     ) -> Result<PartitionLayout> {
-        info!("  Partitioning primary drive: {}", primary);
-        info!("  Partitioning secondary drive: {}", secondary);
+        send_log!(log_tx, "    Partitioning primary drive: {}", primary);
+        send_log!(log_tx, "    Partitioning secondary drive: {}", secondary);
         
         let primary_partitions = vec![
             Partition {
@@ -272,13 +281,11 @@ impl FormattedSystem {
     /// Format all partitions with ext4
     /// 
     /// This is the ONLY way to get a FormattedSystem instance
-    pub async fn format(partitioned: PartitionedDrives) -> Result<Self> {
-        info!("💾 Formatting partitions...");
-        
+    pub async fn format(partitioned: PartitionedDrives, log_tx: &broadcast::Sender<String>) -> Result<Self> {
         match &partitioned.layout {
             PartitionLayout::SingleDrive { partitions, .. } => {
                 for partition in partitions {
-                    info!("  Formatting {}: {}", partition.device, partition.label);
+                    send_log!(log_tx, "    Formatting {}: {}", partition.device, partition.label);
                     // TODO: Actually run mkfs.ext4
                 }
             }
@@ -288,7 +295,7 @@ impl FormattedSystem {
                 ..
             } => {
                 for partition in primary_partitions.iter().chain(secondary_partitions.iter()) {
-                    info!("  Formatting {}: {}", partition.device, partition.label);
+                    send_log!(log_tx, "    Formatting {}: {}", partition.device, partition.label);
                     // TODO: Actually run mkfs.ext4
                 }
             }
@@ -314,11 +321,9 @@ impl InstalledSystem {
     /// Install Void Linux base system
     /// 
     /// This is the ONLY way to get an InstalledSystem instance
-    pub async fn install(formatted: FormattedSystem) -> Result<Self> {
-        info!("📥 Installing Void Linux base system...");
-        
+    pub async fn install(formatted: FormattedSystem, log_tx: &broadcast::Sender<String>) -> Result<Self> {
         // TODO: Mount partitions, extract tarball, chroot, install bootloader
-        info!("  Installing base system (placeholder)");
+        send_log!(log_tx, "    Installing base system (placeholder)");
         
         Ok(InstalledSystem { formatted })
     }
@@ -340,21 +345,19 @@ impl ConfiguredSystem {
     /// Configure hostname, SSH, and boot settings
     /// 
     /// This is the ONLY way to get a ConfiguredSystem instance
-    pub async fn configure(installed: InstalledSystem) -> Result<Self> {
-        info!("⚙️  Configuring system...");
-        
+    pub async fn configure(installed: InstalledSystem, log_tx: &broadcast::Sender<String>) -> Result<Self> {
         let config = &installed.formatted.partitioned.validated.config;
         
         // Configure hostname
-        info!("  Setting hostname: {}", config.hostname);
+        send_log!(log_tx, "    Setting hostname: {}", config.hostname);
         // TODO: Write /etc/hostname, configure avahi
         
         // Setup SSH
-        info!("  Setting up SSH key");
+        send_log!(log_tx, "    Setting up SSH key");
         // TODO: Write authorized_keys
         
         // Update boot config
-        info!("  Updating boot configuration");
+        send_log!(log_tx, "    Updating boot configuration");
         // TODO: Modify /boot/cmdline.txt
         
         Ok(ConfiguredSystem { installed })
@@ -377,9 +380,7 @@ impl ProvisionedSystem {
     /// Finalize provisioning
     /// 
     /// This is the ONLY way to get a ProvisionedSystem instance
-    pub async fn finalize(configured: ConfiguredSystem) -> Result<Self> {
-        info!("✅ Provisioning complete!");
-        
+    pub async fn finalize(configured: ConfiguredSystem, _log_tx: &broadcast::Sender<String>) -> Result<Self> {
         Ok(ProvisionedSystem {
             _configured: configured,
         })
@@ -389,7 +390,6 @@ impl ProvisionedSystem {
     /// 
     /// Only available after successful provisioning
     pub async fn reboot(self) -> Result<()> {
-        info!("🔄 Rebooting system in 10 seconds...");
         // TODO: Trigger actual reboot
         Ok(())
     }

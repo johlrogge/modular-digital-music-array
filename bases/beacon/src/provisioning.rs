@@ -13,7 +13,17 @@ use crate::actions::ExecutionMode;
 use crate::error::Result;
 use crate::hardware::HardwareInfo;
 use crate::types::ProvisionConfig;
+use tokio::sync::broadcast;
 use tracing::info;
+
+/// Send a log message to both tracing and the broadcast channel
+macro_rules! send_log {
+    ($tx:expr, $($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        tracing::info!("{}", msg);
+        let _ = $tx.send(msg);
+    }};
+}
 
 mod pipeline;
 pub use pipeline::*;
@@ -25,43 +35,52 @@ pub async fn provision_system(
     config: ProvisionConfig,
     hardware: HardwareInfo,
     mode: ExecutionMode,
+    log_tx: broadcast::Sender<String>,
 ) -> Result<()> {
-    info!("Starting provisioning for {} ({})", config.hostname, config.unit_type);
+    send_log!(log_tx, "Starting provisioning for {} ({})", config.hostname, config.unit_type);
     
     if mode == ExecutionMode::DryRun {
-        info!("🚧 DRY RUN MODE - No actual changes will be made");
+        send_log!(log_tx, "🚧 DRY RUN MODE - No actual changes will be made");
     }
     
     // Stage 1: Validate hardware
-    let validated = ValidatedHardware::validate(config, hardware)?;
+    send_log!(log_tx, "🔍 Validating hardware...");
+    let validated = ValidatedHardware::validate(config, hardware, &log_tx)?;
     
     // Stage 2: Partition drives
     // Can ONLY be called with ValidatedHardware!
-    let partitioned = PartitionedDrives::partition(validated).await?;
+    send_log!(log_tx, "📦 Partitioning NVMe drives...");
+    let partitioned = PartitionedDrives::partition(validated, &log_tx).await?;
     
     // Stage 3: Format partitions
     // Can ONLY be called with PartitionedDrives!
-    let formatted = FormattedSystem::format(partitioned).await?;
+    send_log!(log_tx, "💾 Formatting partitions...");
+    let formatted = FormattedSystem::format(partitioned, &log_tx).await?;
     
     // Stage 4: Install base system
     // Can ONLY be called with FormattedSystem!
-    let installed = InstalledSystem::install(formatted).await?;
+    send_log!(log_tx, "📥 Installing Void Linux base system...");
+    let installed = InstalledSystem::install(formatted, &log_tx).await?;
     
     // Stage 5: Configure system
     // Can ONLY be called with InstalledSystem!
-    let configured = ConfiguredSystem::configure(installed).await?;
+    send_log!(log_tx, "⚙️  Configuring system...");
+    let configured = ConfiguredSystem::configure(installed, &log_tx).await?;
     
     // Stage 6: Finalize provisioning
     // Can ONLY be called with ConfiguredSystem!
-    let provisioned = ProvisionedSystem::finalize(configured).await?;
+    let provisioned = ProvisionedSystem::finalize(configured, &log_tx).await?;
     
     // Reboot (only available after successful provisioning!)
     if mode == ExecutionMode::Apply {
+        send_log!(log_tx, "🔄 Rebooting system in 10 seconds...");
         provisioned.reboot().await?;
     } else {
-        info!("🚧 DRY RUN complete - see logs above for what would have been done");
+        send_log!(log_tx, "🚧 DRY RUN complete - see logs above for what would have been done");
         // In dry run, we drop the ProvisionedSystem without rebooting
     }
+    
+    send_log!(log_tx, "✅ Provisioning completed successfully!");
     
     Ok(())
 }
