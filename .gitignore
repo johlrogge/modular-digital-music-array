@@ -10,5 +10,40 @@ result-*
 # Directory created by nix-shell
 .direnv
 
+# Rust build artifacts
 /target
+Cargo.lock
+
+# Audio test data (auto-generated in benchmarks)
+*/benches/test_data/
+*/tests/test_data/
+*.flac
+*.wav
+*.mp3
+*.aiff
+
+# Test data files
+*.jsonl
+
+# Disk images and archives
 *.qcow2
+*.iso
+*.img
+*.tar.gz
+*.tar
+
+# Dependencies
+node_modules/
+.cargo/registry/
+.cargo/git/
+
+# Editor and IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

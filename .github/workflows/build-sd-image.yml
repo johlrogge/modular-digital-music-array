@@ -1,0 +1,268 @@
+name: Build MDMA SD Card Image
+
+on:
+  push:
+    branches: [main, dev]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-rust-packages:
+    name: Build Rust Binaries (aarch64)
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install cross-compilation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Configure Cargo for cross-compilation
+        run: |
+          mkdir -p .cargo
+          cat >> .cargo/config.toml << EOF
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-release
+
+      - name: Build workspace for aarch64
+        run: cargo build --release --target aarch64-unknown-linux-gnu
+
+      - name: Strip binaries
+        run: |
+          aarch64-linux-gnu-strip target/aarch64-unknown-linux-gnu/release/beacon || true
+          aarch64-linux-gnu-strip target/aarch64-unknown-linux-gnu/release/playback_server || true
+          aarch64-linux-gnu-strip target/aarch64-unknown-linux-gnu/release/media_ctl || true
+          aarch64-linux-gnu-strip target/aarch64-unknown-linux-gnu/release/download_cli || true
+          aarch64-linux-gnu-strip target/aarch64-unknown-linux-gnu/release/library_crawler || true
+
+      - name: Upload built binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: mdma-binaries-aarch64
+          path: |
+            target/aarch64-unknown-linux-gnu/release/beacon
+            target/aarch64-unknown-linux-gnu/release/playback_server
+            target/aarch64-unknown-linux-gnu/release/media_ctl
+            target/aarch64-unknown-linux-gnu/release/download_cli
+            target/aarch64-unknown-linux-gnu/release/library_crawler
+          retention-days: 7
+
+  build-void-packages:
+    name: Build Void Linux Packages
+    needs: build-rust-packages
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download built binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: mdma-binaries-aarch64
+          path: ./binaries
+
+      - name: Set up Void Linux build environment
+        run: |
+          # Install xbps-src dependencies
+          sudo apt-get update
+          sudo apt-get install -y git xz-utils
+
+      - name: Clone void-packages repository
+        run: |
+          git clone --depth=1 https://github.com/void-linux/void-packages.git
+          cd void-packages
+          ./xbps-src binary-bootstrap
+
+      - name: Create MDMA package templates
+        run: |
+          mkdir -p void-packages/srcpkgs/mdma-beacon
+          mkdir -p void-packages/srcpkgs/mdma-playback
+          mkdir -p void-packages/srcpkgs/mdma-tools
+          
+          # Package templates will be created here
+          # TODO: Add xbps package templates
+
+      - name: Build packages with xbps-src
+        run: |
+          cd void-packages
+          # TODO: Build actual packages
+          # ./xbps-src pkg mdma-beacon
+          # ./xbps-src pkg mdma-playback
+          # ./xbps-src pkg mdma-tools
+
+      - name: Create package repository
+        run: |
+          mkdir -p repo/aarch64
+          # TODO: Index packages for repository
+          # xbps-rindex -a repo/aarch64/*.xbps
+
+      - name: Upload package repository
+        uses: actions/upload-artifact@v4
+        with:
+          name: mdma-void-repo
+          path: repo/
+          retention-days: 7
+
+  build-sd-image:
+    name: Build Bootable SD Card Image
+    needs: build-void-packages
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download package repository
+        uses: actions/download-artifact@v4
+        with:
+          name: mdma-void-repo
+          path: ./repo
+
+      - name: Install image building tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-user-static \
+            binfmt-support \
+            debootstrap \
+            dosfstools \
+            e2fsprogs \
+            parted \
+            wget \
+            xz-utils
+
+      - name: Download Void Linux ARM rootfs
+        run: |
+          # Download minimal Void Linux rootfs for aarch64
+          VOID_VERSION="20210930"
+          wget "https://repo-default.voidlinux.org/live/current/void-aarch64-ROOTFS-${VOID_VERSION}.tar.xz"
+          mkdir -p rootfs
+          sudo tar -xf "void-aarch64-ROOTFS-${VOID_VERSION}.tar.xz" -C rootfs
+
+      - name: Create SD card image
+        run: |
+          # Create 2GB image (SD card size)
+          dd if=/dev/zero of=mdma-sd.img bs=1M count=2048
+          
+          # Partition the image
+          sudo parted mdma-sd.img --script \
+            mklabel msdos \
+            mkpart primary fat32 1MiB 513MiB \
+            mkpart primary fat32 513MiB 1025MiB \
+            set 1 boot on
+
+      - name: Setup loop devices
+        run: |
+          sudo losetup -fP mdma-sd.img
+          LOOP_DEV=$(losetup -j mdma-sd.img | cut -d: -f1)
+          echo "LOOP_DEV=${LOOP_DEV}" >> $GITHUB_ENV
+          
+          # Format partitions
+          sudo mkfs.vfat -F 32 -n BOOT "${LOOP_DEV}p1"
+          sudo mkfs.vfat -F 32 -n BOOT-SPARE "${LOOP_DEV}p2"
+
+      - name: Mount and populate boot partition
+        run: |
+          mkdir -p boot
+          sudo mount "${LOOP_DEV}p1" boot
+          
+          # Copy Raspberry Pi 5 firmware
+          # TODO: Download and install RPi5 firmware
+          # TODO: Install bootloader configuration
+          # TODO: Copy kernel and initramfs
+          
+          sudo umount boot
+
+      - name: Install base system
+        run: |
+          # TODO: Install minimal Void Linux base
+          # TODO: Configure network (mDNS, static IP options)
+          # TODO: Install SSH with deployment keys
+          # TODO: Add MDMA beacon service
+          echo "Base system installation placeholder"
+
+      - name: Cleanup loop device
+        run: |
+          sudo losetup -d "${LOOP_DEV}"
+
+      - name: Compress image
+        run: |
+          xz -9 -T0 mdma-sd.img
+          mv mdma-sd.img.xz mdma-sd-$(date +%Y%m%d-%H%M%S).img.xz
+
+      - name: Upload SD card image
+        uses: actions/upload-artifact@v4
+        with:
+          name: mdma-sd-image
+          path: mdma-sd-*.img.xz
+          retention-days: 30
+
+  publish-repository:
+    name: Publish Package Repository
+    needs: build-void-packages
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    
+    steps:
+      - name: Download package repository
+        uses: actions/download-artifact@v4
+        with:
+          name: mdma-void-repo
+          path: ./repo
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./repo
+          force_orphan: true
+          user_name: 'github-actions[bot]'
+          user_email: 'github-actions[bot]@users.noreply.github.com'
+          commit_message: 'Update MDMA package repository'
+
+  create-release:
+    name: Create GitHub Release
+    needs: [build-sd-image, publish-repository]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Download SD card image
+        uses: actions/download-artifact@v4
+        with:
+          name: mdma-sd-image
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: mdma-sd-*.img.xz
+          draft: false
+          prerelease: false
+          generate_release_notes: true
