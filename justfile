@@ -346,7 +346,6 @@ ci-check-deps:
             FOUND_PATHS=1
         fi
     done
-    
     if [ $FOUND_PATHS -eq 1 ]; then
         echo ""
         echo "❌ ERROR: Local path dependencies found!"

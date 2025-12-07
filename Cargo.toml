@@ -45,3 +45,8 @@ chrono = "0.4"
 axum = "0.7"
 askama = "0.12"
 tower-http = { version = "0.5", features = ["fs"] }
+clap = { version="4.5", features = ["derive"] }
+tokio-util = "0.7"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-stream = "0.3"
+futures = "0.3"
