@@ -2226,6 +2226,7 @@ checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
 [[package]]
 name = "stainless-facts"
 version = "0.2.0"
+source = "git+https://github.com/johlrogge/stainless_facts#8d88e445b70046d46b07702d29786373092bcdf1"
 dependencies = [
  "chrono",
  "fs2",
