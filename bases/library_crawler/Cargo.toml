@@ -22,7 +22,7 @@ hex = "0.4"
 chrono = { workspace = true, features = ["serde"] }
 serde_json = { workspace = true }
 serde.workspace = true
-stainless-facts = {path="../../../stainless-facts"}
+stainless-facts = {path="https://github.com/johlrogge/stainless_facts"}
 
 [dev-dependencies]
 tempfile = "3"
