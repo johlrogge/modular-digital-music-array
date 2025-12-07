@@ -329,3 +329,30 @@ archive:
     mv "/tmp/${ARCHIVE_NAME}" .
     echo "✅ Created: ${ARCHIVE_NAME}"
     ls -lh "${ARCHIVE_NAME}"
+# Add this to your justfile
+
+# Check for local path dependencies (fails CI)
+[group('ci')]
+ci-check-deps:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "🔍 Checking for local path dependencies..."
+    
+    FOUND_PATHS=0
+    for file in $(find . -name "Cargo.toml" -not -path "./target/*"); do
+        if grep -E '^\s*path\s*=\s*"' "$file" | grep -v "workspace = true" > /dev/null 2>&1; then
+            echo "❌ Found local path dependency in: $file"
+            grep -n -E '^\s*path\s*=\s*"' "$file" | grep -v "workspace = true"
+            FOUND_PATHS=1
+        fi
+    done
+    
+    if [ $FOUND_PATHS -eq 1 ]; then
+        echo ""
+        echo "❌ ERROR: Local path dependencies found!"
+        echo "These will fail in CI. Use git dependencies instead:"
+        echo '  stainless-facts = { git = "https://github.com/johlrogge/stainless_facts" }'
+        exit 1
+    fi
+    
+    echo "✅ No local path dependencies found"
