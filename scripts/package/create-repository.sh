@@ -36,7 +36,8 @@ cp "$PACKAGES_DIR"/*.xbps "$REPO_DIR/aarch64/"
 # Generate repository index
 echo "  → Generating repository index..."
 cd "$REPO_DIR"
-xbps-rindex -a aarch64/*.xbps
+# For cross-architecture, set XBPS_TARGET_ARCH environment variable
+XBPS_TARGET_ARCH=aarch64 xbps-rindex -a aarch64/*.xbps
 cd - > /dev/null
 
 echo ""

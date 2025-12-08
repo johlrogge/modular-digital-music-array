@@ -325,3 +325,12 @@ archive:
     mv "/tmp/${ARCHIVE_NAME}" .
     echo "✅ Created: ${ARCHIVE_NAME}"
     ls -lh "${ARCHIVE_NAME}"
+
+# ============================================================================
+# Image Creation
+# ============================================================================
+
+# Create SD card image with beacon installed via xbps
+[group('image')]
+create-image: check-prereqs pkg-build-all
+    ./scripts/image/create-image-with-xbps.sh

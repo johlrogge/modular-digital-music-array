@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Create Void package for beacon
+# Create Void package for beacon with proper xbps metadata
 
 set -euo pipefail
 
@@ -20,7 +20,6 @@ fi
 rm -rf "$PACKAGE_DIR"
 mkdir -p "$PACKAGE_DIR/usr/bin"
 mkdir -p "$PACKAGE_DIR/etc/sv/beacon"
-mkdir -p "$PACKAGE_DIR/var/db/xbps/pkgdb"
 
 # Copy beacon binary
 echo "  → Copying beacon binary..."
@@ -54,23 +53,86 @@ fi
 FULLVERSION="${VERSION}_${REVISION}"
 SIZE=$(stat -c%s "$PACKAGE_DIR/usr/bin/beacon" 2>/dev/null || stat -f%z "$PACKAGE_DIR/usr/bin/beacon")
 
+# Create proper xbps package metadata (props.plist in root)
 echo "  → Creating package metadata..."
-cat > "$PACKAGE_DIR/var/db/xbps/pkgdb/beacon-${FULLVERSION}.plist" <<PLIST
+cat > "$PACKAGE_DIR/props.plist" <<PROPS
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>pkgname</key>
-  <string>beacon</string>
-  <key>version</key>
-  <string>${FULLVERSION}</string>
-  <key>architecture</key>
-  <string>aarch64</string>
-  <key>installed_size</key>
-  <integer>${SIZE}</integer>
+	<key>architecture</key>
+	<string>aarch64</string>
+	<key>archive-compression-type</key>
+	<string>gzip</string>
+	<key>build-date</key>
+	<string>$(date -u +"%Y-%m-%d %H:%M %Z")</string>
+	<key>filename-size</key>
+	<integer>0</integer>
+	<key>homepage</key>
+	<string>https://github.com/johlrogge/modular-digital-music-array</string>
+	<key>installed_size</key>
+	<integer>${SIZE}</integer>
+	<key>license</key>
+	<string>MIT</string>
+	<key>maintainer</key>
+	<string>Joakim Rohlén</string>
+	<key>pkgname</key>
+	<string>beacon</string>
+	<key>pkgver</key>
+	<string>beacon-${FULLVERSION}</string>
+	<key>run_depends</key>
+	<array>
+		<string>avahi&gt;=0</string>
+		<string>dbus&gt;=0</string>
+	</array>
+	<key>short_desc</key>
+	<string>MDMA provisioning beacon</string>
+	<key>version</key>
+	<string>${FULLVERSION}</string>
 </dict>
 </plist>
-PLIST
+PROPS
+
+# Create file list
+echo "  → Creating file list..."
+cat > "$PACKAGE_DIR/files.plist" <<FILES
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>dirs</key>
+	<array>
+		<dict>
+			<key>file</key>
+			<string>./etc/sv/beacon</string>
+			<key>type</key>
+			<string>dir</string>
+		</dict>
+		<dict>
+			<key>file</key>
+			<string>./usr/bin</string>
+			<key>type</key>
+			<string>dir</string>
+		</dict>
+	</array>
+	<key>files</key>
+	<array>
+		<dict>
+			<key>file</key>
+			<string>./etc/sv/beacon/run</string>
+			<key>type</key>
+			<string>file</string>
+		</dict>
+		<dict>
+			<key>file</key>
+			<string>./usr/bin/beacon</string>
+			<key>type</key>
+			<string>file</string>
+		</dict>
+	</array>
+</dict>
+</plist>
+FILES
 
 # Create xbps package
 echo "  → Creating xbps package archive..."
