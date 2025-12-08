@@ -326,11 +326,16 @@ archive:
     echo "✅ Created: ${ARCHIVE_NAME}"
     ls -lh "${ARCHIVE_NAME}"
 
+# Check prerequisites including image creation tools
+[group('setup')]
+check-prereqs-image:
+    ./scripts/utils/check-prerequisites.sh --image
+
 # ============================================================================
 # Image Creation
 # ============================================================================
 
 # Create SD card image with beacon installed via xbps
 [group('image')]
-create-image: check-prereqs pkg-build-all
-    ./scripts/image/create-image-with-xbps.sh
+create-image: check-prereqs-image pkg-build-all
+    ./scripts/image/create-sd-card-simple.sh

@@ -1,0 +1,157 @@
+name: Build and Publish Packages
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    # Add environment for GitHub Pages deployment
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc-aarch64-linux-gnu wget
+    
+    - name: Install xbps tools
+      run: |
+        echo "Downloading xbps static binaries..."
+        wget -q https://repo-default.voidlinux.org/static/xbps-static-latest.x86_64-musl.tar.xz
+        
+        echo "Extracting to /usr/local..."
+        sudo tar -xf xbps-static-latest.x86_64-musl.tar.xz -C /usr/local --strip-components=2
+        
+        echo "Making binaries executable..."
+        sudo chmod +x /usr/local/bin/xbps*
+        
+        echo "Verifying installation:"
+        xbps-rindex --version
+    
+    - name: Install Rust with ARM64 target
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: aarch64-unknown-linux-gnu
+    
+    - name: Install just
+      uses: extractions/setup-just@v2
+    
+    - name: Verify all prerequisites
+      run: |
+        echo "Checking all tools:"
+        just --version
+        xbps-rindex --version
+        aarch64-linux-gnu-gcc --version | head -1
+    
+    - name: Build packages
+      env:
+        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      run: |
+        just pkg-build-all
+    
+    - name: Setup signing key
+      env:
+        SIGNING_KEY: ${{ secrets.XBPS_SIGNING_KEY }}
+      run: |
+        if [ -n "$SIGNING_KEY" ]; then
+          echo "Setting up RSA signing key for xbps-rindex..."
+          
+          # Create .ssh directory
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          
+          # Write private key
+          echo "$SIGNING_KEY" > ~/.ssh/mdma-signing-key.pem
+          chmod 600 ~/.ssh/mdma-signing-key.pem
+          
+          echo "✅ Signing key configured"
+          echo "HAS_SIGNING_KEY=true" >> $GITHUB_ENV
+        else
+          echo "⚠️  No XBPS_SIGNING_KEY secret found"
+          echo "⚠️  Packages will not be signed (insecure)"
+          echo "HAS_SIGNING_KEY=false" >> $GITHUB_ENV
+        fi
+    
+    - name: Sign packages
+      if: env.HAS_SIGNING_KEY == 'true'
+      run: |
+        cd build/repository
+        
+        echo "Signing packages with RSA key..."
+        for pkg in aarch64/*.xbps; do
+          echo "  Signing $(basename $pkg)..."
+          # xbps-rindex looks for key in ~/.ssh/ by default
+          xbps-rindex --privkey ~/.ssh/mdma-signing-key.pem --sign-pkg "$pkg"
+        done
+        
+        echo "Rebuilding repository index..."
+        xbps-rindex -a aarch64/*.xbps
+        
+        echo "Verifying signatures created:"
+        ls -lh aarch64/*.sig2
+    
+    - name: Export public key
+      if: env.HAS_SIGNING_KEY == 'true'
+      run: |
+        mkdir -p build/repository/keys
+        
+        # Extract public key from private key
+        openssl rsa -in ~/.ssh/mdma-signing-key.pem -pubout -out build/repository/keys/mdma.pub
+        
+        echo "Public key exported:"
+        cat build/repository/keys/mdma.pub
+    
+    - name: Create dummy signatures (fallback if no signing key)
+      if: env.HAS_SIGNING_KEY == 'false'
+      run: |
+        cd build/repository/aarch64
+        echo "⚠️  WARNING: Creating dummy signatures (no XBPS_SIGNING_KEY configured)"
+        echo "⚠️  This is insecure - add XBPS_SIGNING_KEY secret for proper signing"
+        
+        for pkg in *.xbps; do
+          if [ ! -f "${pkg}.sig2" ]; then
+            touch "${pkg}.sig2"
+            echo "  Created dummy signature for $pkg"
+          fi
+        done
+    
+    - name: Verify repository
+      run: |
+        echo "Repository contents:"
+        find build/repository -type f
+        
+        echo ""
+        echo "Package index:"
+        ls -lh build/repository/aarch64/aarch64-repodata
+    
+    - name: Setup Pages
+      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+      uses: actions/configure-pages@v4
+    
+    - name: Upload artifact
+      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+      uses: actions/upload-pages-artifact@v3
+      with:
+        path: ./build/repository
+    
+    - name: Deploy to GitHub Pages
+      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+      id: deployment
+      uses: actions/deploy-pages@v4
