@@ -1,0 +1,35 @@
+# Template file for beacon package
+pkgname=beacon
+version=0.1.0
+revision=1
+archs="aarch64"
+build_style=cargo
+hostmakedepends="cargo"
+makedepends="rust-std"
+depends="avahi-daemon dbus"
+short_desc="MDMA provisioning beacon"
+maintainer="Joakim Rohlén <your@email>"
+license="MIT"
+homepage="https://github.com/johlrogge/modular-digital-music-array"
+
+# Set this to your actual git tag/commit
+distfiles="https://github.com/johlrogge/modular-digital-music-array/archive/v${version}.tar.gz"
+checksum="SKIP"  # For development; use real checksum for production
+
+# Build only the beacon binary
+do_build() {
+    cargo build --release --bin beacon --target aarch64-unknown-linux-gnu
+}
+
+do_install() {
+    # Install beacon binary
+    vbin target/aarch64-unknown-linux-gnu/release/beacon
+    
+    # Install runit service
+    vsv beacon
+}
+
+post_install() {
+    # The service will be enabled by bootstrap script
+    :
+}

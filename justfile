@@ -1,6 +1,11 @@
 default:
     just --list
 
+# Check prerequisites for package building
+[group('setup')]
+check-prereqs:
+    ./scripts/utils/check-prerequisites.sh
+
 # watch and run check, test, build and clippy when files change
 [group('build')]
 watch:
@@ -10,11 +15,6 @@ watch:
 [group('build')]
 build:
     cargo build
-
-    
-    
-# MDMA Build Recipes - Beacon Focus
-# Simplified for Milestone 1: Just get beacon running
 
 # Quick cross-compile beacon using cross-rs (recommended for Arch)
 [group('build')]
@@ -128,10 +128,6 @@ beacon-run:
 beacon-dev:
     cargo build --bin beacon
     @ls -lh target/debug/beacon
-# CI/CD Justfile Recipes
-# These recipes are designed to work both locally AND in GitHub Actions
-# Test locally: `just ci-build-beacon`
-# GitHub Actions will call the same recipes
 
 # ============================================================================
 # CI/CD Build Recipes (Work Locally and in GitHub Actions)
@@ -140,31 +136,14 @@ beacon-dev:
 # Build beacon for CI/CD (local or GitHub Actions)
 [group('ci')]
 ci-build-beacon:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo "🔨 Building beacon for aarch64 (Raspberry Pi 5)..."
-    cargo build --release --target aarch64-unknown-linux-gnu --bin beacon
-    echo "✅ Build complete"
-    file target/aarch64-unknown-linux-gnu/release/beacon
-    ls -lh target/aarch64-unknown-linux-gnu/release/beacon
+    ./scripts/ci/build-beacon.sh
 
 # Strip beacon for CI/CD deployment
 [group('ci')]
 ci-strip-beacon:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo "🔪 Stripping beacon binary..."
-    BEACON="target/aarch64-unknown-linux-gnu/release/beacon"
-    if [ ! -f "$BEACON" ]; then
-        echo "❌ Beacon not built. Run 'just ci-build-beacon' first"
-        exit 1
-    fi
-    # Try multiple strip commands (different platforms)
-    aarch64-linux-gnu-strip "$BEACON" 2>/dev/null || strip "$BEACON" || echo "⚠️  Strip not available"
-    echo "✅ Stripped"
-    ls -lh "$BEACON"
+    ./scripts/ci/strip-beacon.sh
 
-# Package beacon into deployable archive
+# Package beacon into deployable archive (legacy tar.gz format)
 [group('ci')]
 ci-package-beacon:
     #!/usr/bin/env bash
@@ -181,7 +160,7 @@ ci-package-beacon:
     echo "✅ Packaged: dist/${PACKAGE_NAME}"
     ls -lh "dist/${PACKAGE_NAME}"
 
-# Full CI pipeline (build + strip + package)
+# Full CI pipeline (build + strip + package) - legacy tar.gz
 [group('ci')]
 ci-pipeline: ci-build-beacon ci-strip-beacon ci-package-beacon
     @echo ""
@@ -222,10 +201,6 @@ ci-clean:
     rm -rf target/aarch64-unknown-linux-gnu/release/beacon
     @echo "✅ CI artifacts cleaned"
 
-# ============================================================================
-# Local Development Helpers
-# ============================================================================
-
 # Simulate full CI pipeline locally
 [group('ci')]
 ci-simulate:
@@ -240,67 +215,88 @@ ci-simulate:
     echo "✅ Local CI simulation complete!"
     echo "   This is exactly what GitHub Actions will run"
 
-# ============================================================================
-# SD Card Image Creation (Future)
-# ============================================================================
-
-# Download Void Linux ARM rootfs
+# Check for local path dependencies (fails CI)
 [group('ci')]
-ci-download-void-rootfs:
+ci-check-deps:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "⬇️  Downloading Void Linux ARM rootfs..."
-    VOID_VERSION="20210930"
-    ROOTFS_URL="https://repo-default.voidlinux.org/live/current/void-aarch64-ROOTFS-${VOID_VERSION}.tar.xz"
+    echo "🔍 Checking for local path dependencies..."
     
-    mkdir -p cache
-    if [ ! -f "cache/void-rootfs.tar.xz" ]; then
-        wget -O "cache/void-rootfs.tar.xz" "$ROOTFS_URL"
-        echo "✅ Downloaded"
-    else
-        echo "✅ Already cached"
+    FOUND_PATHS=0
+    for file in $(find . -name "Cargo.toml" -not -path "./target/*"); do
+        if grep -E '^\s*path\s*=\s*"' "$file" | grep -v "workspace = true" > /dev/null 2>&1; then
+            echo "❌ Found local path dependency in: $file"
+            grep -n -E '^\s*path\s*=\s*"' "$file" | grep -v "workspace = true"
+            FOUND_PATHS=1
+        fi
+    done
+    if [ $FOUND_PATHS -eq 1 ]; then
+        echo ""
+        echo "❌ ERROR: Local path dependencies found!"
+        echo "These will fail in CI. Use git dependencies instead:"
+        echo '  stainless-facts = { git = "https://github.com/johlrogge/stainless_facts" }'
+        exit 1
     fi
-    ls -lh cache/void-rootfs.tar.xz
-
-# Create minimal SD card image (TODO: implement)
-[group('ci')]
-ci-create-sd-image:
-    @echo "🚧 TODO: SD card image creation"
-    @echo "This will create a bootable image with beacon installed"
+    
+    echo "✅ No local path dependencies found"
 
 # ============================================================================
-# GitHub Migration Helpers
+# Void Package Building (Scripts-Based - No Auto-Install!)
 # ============================================================================
 
-# Prepare repository for GitHub migration
-[group('maintenance')]
-prepare-github-migration:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo "🚀 Preparing for GitHub Migration"
-    echo "================================="
-    echo ""
-    echo "Step 1: Check current repository size..."
-    du -sh .git
-    echo ""
-    echo "Step 2: Run cleanup script..."
-    echo "   Execute: chmod +x cleanup-git-history.sh && ./cleanup-git-history.sh"
-    echo ""
-    echo "Step 3: Verify build still works..."
-    echo "   Execute: cargo build"
-    echo ""
-    echo "Step 4: Set up GitHub remote..."
-    echo "   Execute: git remote add github git@github.com:username/mdma.git"
-    echo ""
-    echo "Step 5: Push to GitHub..."
-    echo "   Execute: git push github --all --force"
-    echo "   Execute: git push github --tags --force"
+# Build beacon Void package
+[group('package')]
+pkg-beacon: ci-build-beacon ci-strip-beacon
+    ./scripts/package/create-package.sh
+
+# Create repository structure and index
+[group('package')]
+pkg-repository: pkg-beacon
+    ./scripts/package/create-repository.sh
+
+# Full package build pipeline (what CI runs!)
+[group('package')]
+pkg-build-all: check-prereqs pkg-repository
+    @echo ""
+    @echo "🎉 Package build complete!"
+    @echo ""
+    @echo "Repository ready at: build/repository/"
+    @echo ""
+    @echo "To test locally:"
+    @echo "  1. Serve repository: just pkg-serve"
+    @echo "  2. On Pi: configure and install"
+
+# Serve repository locally for testing
+[group('package')]
+pkg-serve:
+    ./scripts/package/serve-repository.sh
+
+# Test package installation on local Pi
+[group('package')]
+pkg-test-install PI_HOST:
+    ./scripts/package/test-install.sh {{PI_HOST}}
+
+# Show package version
+[group('package')]
+pkg-version:
+    ./scripts/utils/get-version.sh
+
+# Bump package revision (for same version)
+[group('package')]
+pkg-bump-revision:
+    ./scripts/utils/bump-revision.sh
+
+# Clean package build artifacts
+[group('package')]
+pkg-clean:
+    rm -rf build/
+    @echo "🧹 Package build directory cleaned"
 
 # ============================================================================
-# Archive Management
+# Maintenance
 # ============================================================================
 
-# Create archive (already in your justfile, kept for reference)
+# Create archive
 [group('maintenance')]
 archive:
     #!/usr/bin/env bash
@@ -329,29 +325,3 @@ archive:
     mv "/tmp/${ARCHIVE_NAME}" .
     echo "✅ Created: ${ARCHIVE_NAME}"
     ls -lh "${ARCHIVE_NAME}"
-# Add this to your justfile
-
-# Check for local path dependencies (fails CI)
-[group('ci')]
-ci-check-deps:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo "🔍 Checking for local path dependencies..."
-    
-    FOUND_PATHS=0
-    for file in $(find . -name "Cargo.toml" -not -path "./target/*"); do
-        if grep -E '^\s*path\s*=\s*"' "$file" | grep -v "workspace = true" > /dev/null 2>&1; then
-            echo "❌ Found local path dependency in: $file"
-            grep -n -E '^\s*path\s*=\s*"' "$file" | grep -v "workspace = true"
-            FOUND_PATHS=1
-        fi
-    done
-    if [ $FOUND_PATHS -eq 1 ]; then
-        echo ""
-        echo "❌ ERROR: Local path dependencies found!"
-        echo "These will fail in CI. Use git dependencies instead:"
-        echo '  stainless-facts = { git = "https://github.com/johlrogge/stainless_facts" }'
-        exit 1
-    fi
-    
-    echo "✅ No local path dependencies found"
