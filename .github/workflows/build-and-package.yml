@@ -97,25 +97,37 @@ jobs:
         echo "Creating repository index..."
         XBPS_TARGET_ARCH=aarch64 xbps-rindex -a aarch64/*.xbps
         
+        # CD into aarch64 directory where repodata file is
+        cd aarch64
+        
+        echo ""
+        echo "=== Debug: Current directory and contents ==="
+        pwd
+        ls -la
+        
+        echo ""
+        echo "=== Debug: Checking for repodata file ==="
+        file aarch64-repodata
+        
         echo ""
         echo "Signing repository (embeds public key in metadata)..."
-        # Sign from repository root (.), not subdirectory
-        xbps-rindex --privkey ~/.ssh/mdma-signing-key.pem --sign --signedby "MDMA Package Signing" .
+        echo "Running: xbps-rindex --debug --privkey ~/.ssh/mdma-signing-key.pem --sign --signedby 'MDMA Package Signing' ."
+        xbps-rindex --debug --privkey ~/.ssh/mdma-signing-key.pem --sign --signedby "MDMA Package Signing" .
         
         echo ""
         echo "Signing individual packages..."
-        for pkg in aarch64/*.xbps; do
+        for pkg in *.xbps; do
           echo "  Signing $(basename $pkg)..."
           xbps-rindex --privkey ~/.ssh/mdma-signing-key.pem --sign-pkg "$pkg"
         done
         
         echo ""
         echo "Verifying signatures created:"
-        ls -lh aarch64/*.sig2
+        ls -lh *.sig2
         
         echo ""
         echo "Repository metadata (contains public key):"
-        ls -lh aarch64/aarch64-repodata
+        ls -lh aarch64-repodata
     
     - name: Verify repository
       run: |
