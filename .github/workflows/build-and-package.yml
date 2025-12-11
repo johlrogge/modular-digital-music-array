@@ -95,32 +95,31 @@ jobs:
         cd build/repository
         
         echo "Creating repository index..."
-        XBPS_TARGET_ARCH=aarch64 xbps-rindex -a aarch64/*.xbps
+        XBPS_TARGET_ARCH=aarch64 xbps-rindex -a *.xbps
         
         echo ""
-        echo "=== Debug: Repository structure ==="
+        echo "=== Debug: Repository contents ==="
         pwd
-        ls -la aarch64/
+        ls -la
         
         echo ""
         echo "Signing repository (embeds public key in metadata)..."
-        echo "Using absolute path: $PWD/aarch64"
-        xbps-rindex --debug --privkey ~/.ssh/mdma-signing-key.pem --sign --signedby "MDMA Package Signing" "$PWD/aarch64"
+        xbps-rindex --debug --privkey ~/.ssh/mdma-signing-key.pem --sign --signedby "MDMA Package Signing" .
         
         echo ""
         echo "Signing individual packages..."
-        for pkg in aarch64/*.xbps; do
+        for pkg in *.xbps; do
           echo "  Signing $(basename $pkg)..."
           xbps-rindex --privkey ~/.ssh/mdma-signing-key.pem --sign-pkg "$pkg"
         done
         
         echo ""
         echo "Verifying signatures created:"
-        ls -lh aarch64/*.sig2
+        ls -lh *.sig2
         
         echo ""
         echo "Repository metadata (contains public key):"
-        ls -lh aarch64/aarch64-repodata
+        ls -lh *-repodata
     
     - name: Verify repository
       run: |
