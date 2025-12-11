@@ -94,28 +94,28 @@ jobs:
       run: |
         cd build/repository
         
-        echo "Signing packages with RSA key..."
+        echo "Creating repository index..."
+        XBPS_TARGET_ARCH=aarch64 xbps-rindex -a aarch64/*.xbps
+        
+        echo ""
+        echo "Signing repository (embeds public key in metadata)..."
+        # Sign from repository root (.), not subdirectory
+        xbps-rindex --privkey ~/.ssh/mdma-signing-key.pem --sign --signedby "MDMA Package Signing" .
+        
+        echo ""
+        echo "Signing individual packages..."
         for pkg in aarch64/*.xbps; do
           echo "  Signing $(basename $pkg)..."
           xbps-rindex --privkey ~/.ssh/mdma-signing-key.pem --sign-pkg "$pkg"
         done
         
-        echo "Rebuilding repository index..."
-        XBPS_TARGET_ARCH=aarch64 xbps-rindex -a aarch64/*.xbps
-        
+        echo ""
         echo "Verifying signatures created:"
         ls -lh aarch64/*.sig2
-    
-    - name: Export public key
-      if: env.HAS_SIGNING_KEY == 'true'
-      run: |
-        mkdir -p build/repository/keys
         
-        # Extract public key from private key
-        openssl rsa -in ~/.ssh/mdma-signing-key.pem -pubout -out build/repository/keys/mdma.pub
-        
-        echo "Public key exported:"
-        cat build/repository/keys/mdma.pub
+        echo ""
+        echo "Repository metadata (contains public key):"
+        ls -lh aarch64/aarch64-repodata
     
     - name: Verify repository
       run: |

@@ -126,27 +126,10 @@ echo ""
 echo "📦 Updating xbps..."
 sudo XBPS_TARGET_ARCH=aarch64 xbps-install -r "$MOUNT_POINT" -Suy xbps
 
-# Import MDMA signing public key
-echo "🔑 Importing MDMA package signing key..."
-sudo mkdir -p "$MOUNT_POINT/var/db/xbps/keys"
-
-# Download public key from GitHub Pages
-if curl -sS https://johlrogge.github.io/modular-digital-music-array/keys/mdma.plist | \
-   sudo tee "$MOUNT_POINT/var/db/xbps/keys/mdma.plist" > /dev/null; then
-    echo "✅ Signing key imported"
-    echo "   Key saved to: /var/db/xbps/keys/mdma.plist"
-else
-    echo "⚠️  Warning: Could not download signing key"
-    echo "   Packages will be installed without signature verification"
-fi
-
-# Verify key was written
-if [ -f "$MOUNT_POINT/var/db/xbps/keys/mdma.plist" ]; then
-    echo "   Key file size: $(sudo wc -c < "$MOUNT_POINT/var/db/xbps/keys/mdma.plist") bytes"
-else
-    echo "⚠️  Key file not found after download!"
-fi
-
+# Note: Public key is embedded in repository metadata by xbps-rindex --sign
+# xbps-install will download it automatically when syncing the repository
+echo "📦 Installing beacon from online repository..."
+echo "   (Public key is embedded in repository metadata)"
 echo ""
 
 # Install beacon from online repo with VERBOSE output
