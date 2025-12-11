@@ -97,12 +97,11 @@ jobs:
         echo "Signing packages with RSA key..."
         for pkg in aarch64/*.xbps; do
           echo "  Signing $(basename $pkg)..."
-          # xbps-rindex looks for key in ~/.ssh/ by default
           xbps-rindex --privkey ~/.ssh/mdma-signing-key.pem --sign-pkg "$pkg"
         done
         
         echo "Rebuilding repository index..."
-        xbps-rindex -a aarch64/*.xbps
+        XBPS_TARGET_ARCH=aarch64 xbps-rindex -a aarch64/*.xbps
         
         echo "Verifying signatures created:"
         ls -lh aarch64/*.sig2
@@ -117,20 +116,6 @@ jobs:
         
         echo "Public key exported:"
         cat build/repository/keys/mdma.pub
-    
-    - name: Create dummy signatures (fallback if no signing key)
-      if: env.HAS_SIGNING_KEY == 'false'
-      run: |
-        cd build/repository/aarch64
-        echo "⚠️  WARNING: Creating dummy signatures (no XBPS_SIGNING_KEY configured)"
-        echo "⚠️  This is insecure - add XBPS_SIGNING_KEY secret for proper signing"
-        
-        for pkg in *.xbps; do
-          if [ ! -f "${pkg}.sig2" ]; then
-            touch "${pkg}.sig2"
-            echo "  Created dummy signature for $pkg"
-          fi
-        done
     
     - name: Verify repository
       run: |
