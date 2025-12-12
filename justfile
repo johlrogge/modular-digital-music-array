@@ -315,12 +315,20 @@ archive:
       --exclude='.cargo/git' \
       --exclude='*.tar.gz' \
       --exclude='*.tar' \
+      --exclude='*.tar.bz2' \
       --exclude='*/benches/test_data/*' \
       --exclude='*/tests/test_data/*' \
       --exclude='*.flac' \
       --exclude='*.wav' \
       --exclude='*.mp3' \
       --exclude='*.jsonl' \
+      --exclude='build' \
+      --exclude='phantomjs' \
+      --exclude='node-compile-cache' \
+      --exclude='hsperfdata_*' \
+      --exclude='dist' \
+      --exclude='*.xbps' \
+      --exclude='uv-*.lock' \
       -czf "/tmp/${ARCHIVE_NAME}" .
     mv "/tmp/${ARCHIVE_NAME}" .
     echo "✅ Created: ${ARCHIVE_NAME}"

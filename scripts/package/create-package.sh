@@ -21,6 +21,10 @@ rm -rf "$PACKAGE_DIR"
 mkdir -p "$PACKAGE_DIR/usr/bin"
 mkdir -p "$PACKAGE_DIR/etc/sv/beacon"
 
+echo "  → Cleaning any leftover metadata files..."
+# Remove any leftover plist files from old manual packaging approach
+rm -f "$PACKAGE_DIR/props.plist" "$PACKAGE_DIR/files.plist"
+
 # Copy beacon binary
 echo "  → Copying beacon binary..."
 cp "$BEACON" "$PACKAGE_DIR/usr/bin/"
@@ -51,95 +55,71 @@ else
 fi
 
 FULLVERSION="${VERSION}_${REVISION}"
-SIZE=$(stat -c%s "$PACKAGE_DIR/usr/bin/beacon" 2>/dev/null || stat -f%z "$PACKAGE_DIR/usr/bin/beacon")
 
-# Create proper xbps package metadata (props.plist in root)
-echo "  → Creating package metadata..."
-cat > "$PACKAGE_DIR/props.plist" <<PROPS
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>architecture</key>
-	<string>aarch64</string>
-	<key>archive-compression-type</key>
-	<string>gzip</string>
-	<key>build-date</key>
-	<string>$(date -u +"%Y-%m-%d %H:%M %Z")</string>
-	<key>filename-size</key>
-	<integer>0</integer>
-	<key>homepage</key>
-	<string>https://github.com/johlrogge/modular-digital-music-array</string>
-	<key>installed_size</key>
-	<integer>${SIZE}</integer>
-	<key>license</key>
-	<string>MIT</string>
-	<key>maintainer</key>
-	<string>Joakim Rohlén</string>
-	<key>pkgname</key>
-	<string>beacon</string>
-	<key>pkgver</key>
-	<string>beacon-${FULLVERSION}</string>
-	<key>run_depends</key>
-	<array>
-		<string>avahi&gt;=0</string>
-		<string>dbus&gt;=0</string>
-	</array>
-	<key>short_desc</key>
-	<string>MDMA provisioning beacon</string>
-	<key>version</key>
-	<string>${FULLVERSION}</string>
-</dict>
-</plist>
-PROPS
+# xbps-create will handle all metadata automatically
+echo "  → Package version: ${FULLVERSION}"
 
-# Create file list
-echo "  → Creating file list..."
-cat > "$PACKAGE_DIR/files.plist" <<FILES
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>dirs</key>
-	<array>
-		<dict>
-			<key>file</key>
-			<string>./etc/sv/beacon</string>
-			<key>type</key>
-			<string>dir</string>
-		</dict>
-		<dict>
-			<key>file</key>
-			<string>./usr/bin</string>
-			<key>type</key>
-			<string>dir</string>
-		</dict>
-	</array>
-	<key>files</key>
-	<array>
-		<dict>
-			<key>file</key>
-			<string>./etc/sv/beacon/run</string>
-			<key>type</key>
-			<string>file</string>
-		</dict>
-		<dict>
-			<key>file</key>
-			<string>./usr/bin/beacon</string>
-			<key>type</key>
-			<string>file</string>
-		</dict>
-	</array>
-</dict>
-</plist>
-FILES
-
-# Create xbps package
-echo "  → Creating xbps package archive..."
+# Create xbps package using xbps-create (proper way!)
+echo "  → Creating xbps package with xbps-create..."
 mkdir -p "$PACKAGES_DIR"
-cd "$PACKAGE_DIR"
-tar -czf "../packages/beacon-${FULLVERSION}.aarch64.xbps" .
+
+# Get absolute paths to avoid any confusion
+PACKAGE_DIR_ABS=$(realpath "$PACKAGE_DIR")
+PACKAGES_DIR_ABS=$(realpath "$PACKAGES_DIR")
+
+echo "  → Verifying source directory..."
+echo "  → Package directory: $PACKAGE_DIR_ABS"
+if [ ! -d "$PACKAGE_DIR_ABS" ]; then
+    echo "  ❌ Package directory doesn't exist!"
+    exit 1
+fi
+
+echo "  → Directory contents:"
+ls -lR "$PACKAGE_DIR_ABS" | head -30
+
+# Use xbps-create to build the package properly
+# xbps-create outputs to current directory, so cd there first
+cd "$PACKAGES_DIR_ABS"
+
+echo "  → Running xbps-create in: $(pwd)"
+echo "  → Source directory: $PACKAGE_DIR_ABS"
+
+# Run xbps-create with CORRECT syntax
+# Required: -A (arch), -n (pkgver), -s (desc)
+if XBPS_TARGET_ARCH=aarch64 xbps-create \
+    -A aarch64 \
+    -n "beacon-${FULLVERSION}" \
+    -s "MDMA provisioning beacon" \
+    -H "https://github.com/johlrogge/modular-digital-music-array" \
+    -l MIT \
+    -m "Joakim Rohlén <joakim@roehlen.com>" \
+    -D "avahi>=0" \
+    -D "dbus>=0" \
+    "$PACKAGE_DIR_ABS" 2>&1; then
+    echo "  → xbps-create succeeded"
+else
+    XBPS_EXIT_CODE=$?
+    echo "  ❌ xbps-create failed with exit code: $XBPS_EXIT_CODE"
+    echo "  → Directory contents:"
+    ls -la
+    exit 1
+fi
+
+echo "  → Package creation complete"
+echo "  → Files in $(pwd):"
+ls -la
+
+# Return to original directory
 cd - > /dev/null
+
+# Verify package was created
+if [ ! -f "$PACKAGES_DIR/beacon-${FULLVERSION}.aarch64.xbps" ]; then
+    echo "❌ Error: Package not created!"
+    echo "   Expected: $PACKAGES_DIR/beacon-${FULLVERSION}.aarch64.xbps"
+    echo "   Directory contents:"
+    ls -la "$PACKAGES_DIR/"
+    exit 1
+fi
 
 echo ""
 echo "✅ Package created: $PACKAGES_DIR/beacon-${FULLVERSION}.aarch64.xbps"
