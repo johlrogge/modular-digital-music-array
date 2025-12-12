@@ -104,7 +104,7 @@ jobs:
         
         echo ""
         echo "Signing repository (embeds public key in metadata)..."
-        xbps-rindex --sign \
+        XBPS_TARGET_ARCH=aarch64 xbps-rindex --sign \
           --signedby "MDMA Package Signing" \
           --privkey ~/.ssh/mdma-signing-key.pem \
           ${REPOSITORY_DIR}
@@ -113,7 +113,7 @@ jobs:
         echo "Signing individual packages..."
         for pkg in ${REPOSITORY_DIR}/*.xbps; do
           echo "  Signing $(basename $pkg)..."
-          xbps-rindex --privkey ~/.ssh/mdma-signing-key.pem --sign-pkg ${pkg}
+          XBPS_TARGET_ARCH=aarch64 xbps-rindex --privkey ~/.ssh/mdma-signing-key.pem --sign-pkg ${pkg}
         done
         
         echo ""
