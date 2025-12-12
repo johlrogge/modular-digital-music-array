@@ -44,6 +44,31 @@ RUNSCRIPT
 fi
 chmod +x "$PACKAGE_DIR/etc/sv/beacon/run"
 
+# Create INSTALL script for proper service management (the Void way!)
+echo "  → Creating INSTALL script..."
+cat > "$PACKAGE_DIR/INSTALL" <<'INSTALLSCRIPT'
+#!/bin/sh
+# INSTALL script for beacon package
+# Handles service enablement the Void Linux way
+
+case "${ACTION}" in
+post)
+    # Enable beacon service by creating symlink to /var/service
+    # This is the standard Void Linux method for enabling runit services
+    if [ ! -d /var/service ]; then
+        mkdir -p /var/service
+    fi
+    
+    # Enable beacon service
+    if [ ! -e /var/service/beacon ]; then
+        ln -sf /etc/sv/beacon /var/service/beacon
+        echo "beacon service enabled (will start on next boot)"
+    fi
+    ;;
+esac
+INSTALLSCRIPT
+chmod +x "$PACKAGE_DIR/INSTALL"
+
 # Get version info
 if [ -f "void-packages/srcpkgs/beacon/template" ]; then
     VERSION=$(grep '^version=' void-packages/srcpkgs/beacon/template | cut -d= -f2)

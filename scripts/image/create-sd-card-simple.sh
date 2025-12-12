@@ -52,11 +52,12 @@ mkdir -p "$WORK_DIR" "$OUTPUT_DIR" "$MOUNT_POINT"
 
 # Download base Void image (PLATFORMFS tarball for Raspberry Pi)
 # Latest as of 2025-02-02 from https://repo-default.voidlinux.org/live/current/
-VOID_IMAGE="void-rpi-aarch64-musl-PLATFORMFS-20250202.tar.xz"
+# Using GLIBC version to match beacon binary (compiled with aarch64-linux-gnu-gcc)
+VOID_IMAGE="void-rpi-aarch64-PLATFORMFS-20250202.tar.xz"
 BASE_IMAGE_URL="https://repo-default.voidlinux.org/live/current/${VOID_IMAGE}"
 
-echo "📥 Downloading base Void Linux PLATFORMFS..."
-echo "   Image: $VOID_IMAGE (106 MB)"
+echo "📥 Downloading base Void Linux PLATFORMFS (glibc)..."
+echo "   Image: $VOID_IMAGE (116 MB)"
 
 if [ ! -f "$WORK_DIR/$VOID_IMAGE" ]; then
     echo "   Downloading from Void Linux repository..."
@@ -216,13 +217,22 @@ sudo XBPS_ARCH=aarch64 chroot "$MOUNT_POINT" xbps-install -Sy beacon
 echo ""
 echo "✅ Packages installed with post-install scripts executed!"
 
-# Enable services from within chroot
 echo ""
-echo "🔧 Enabling services..."
-sudo chroot "$MOUNT_POINT" ln -sf /etc/sv/beacon /var/service/beacon
-sudo chroot "$MOUNT_POINT" ln -sf /etc/sv/dbus /var/service/dbus
-sudo chroot "$MOUNT_POINT" ln -sf /etc/sv/avahi-daemon /var/service/avahi-daemon
-echo "✅ Services enabled"
+echo "✅ Packages installed with post-install scripts executed!"
+echo ""
+
+# Enable dependency services (dbus and avahi)
+# Note: beacon service is automatically enabled by its INSTALL script
+echo "🔧 Enabling dependency services..."
+
+echo "   Enabling dbus..."
+sudo chroot "$MOUNT_POINT" ln -sf /etc/sv/dbus /var/service/dbus || true
+
+echo "   Enabling avahi-daemon..."
+sudo chroot "$MOUNT_POINT" ln -sf /etc/sv/avahi-daemon /var/service/avahi-daemon || true
+
+echo "   beacon service enabled by package INSTALL script ✅"
+echo "✅ Dependency services enabled"
 echo ""
 
 # Unmount chroot filesystems
