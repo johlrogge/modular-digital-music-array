@@ -73,12 +73,12 @@ esac
 INSTALLSCRIPT
 chmod +x "$PACKAGE_DIR/INSTALL"
 
-# Get version from workspace Cargo.toml (single source of truth!)
-if [ -f "Cargo.toml" ]; then
-    VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-    echo "  📦 Version from Cargo.toml: ${VERSION}"
+# Get version from beacon's Cargo.toml (single source of truth!)
+if [ -f "bases/beacon/Cargo.toml" ]; then
+    VERSION=$(grep '^version = ' bases/beacon/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+    echo "  📦 Version from bases/beacon/Cargo.toml: ${VERSION}"
 else
-    echo "  ❌ Error: Cargo.toml not found in workspace root!"
+    echo "  ❌ Error: bases/beacon/Cargo.toml not found!"
     exit 1
 fi
 
