@@ -44,6 +44,10 @@ RUNSCRIPT
 fi
 chmod +x "$PACKAGE_DIR/etc/sv/beacon/run"
 
+# Create supervise symlink (required by runit)
+echo "  → Creating supervise symlink..."
+ln -sf /run/runit/supervise.beacon "$PACKAGE_DIR/etc/sv/beacon/supervise"
+
 # Create INSTALL script for proper service management (the Void way!)
 echo "  → Creating INSTALL script..."
 cat > "$PACKAGE_DIR/INSTALL" <<'INSTALLSCRIPT'

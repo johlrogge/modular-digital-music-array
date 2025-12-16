@@ -50,13 +50,12 @@ echo ""
 # Create directories
 mkdir -p "$WORK_DIR" "$OUTPUT_DIR" "$MOUNT_POINT"
 
-# Download base Void image (PLATFORMFS tarball for Raspberry Pi)
+# Download Void Pi bootable image (complete disk image, not just filesystem!)
 # Latest as of 2025-02-02 from https://repo-default.voidlinux.org/live/current/
-# Using GLIBC version to match beacon binary (compiled with aarch64-linux-gnu-gcc)
-VOID_IMAGE="void-rpi-aarch64-PLATFORMFS-20250202.tar.xz"
+VOID_IMAGE="void-rpi-aarch64-20250202.img.xz"
 BASE_IMAGE_URL="https://repo-default.voidlinux.org/live/current/${VOID_IMAGE}"
 
-echo "📥 Downloading base Void Linux PLATFORMFS (glibc)..."
+echo "📥 Downloading Void Linux bootable image..."
 echo "   Image: $VOID_IMAGE (116 MB)"
 
 if [ ! -f "$WORK_DIR/$VOID_IMAGE" ]; then
@@ -79,7 +78,7 @@ if [ ! -f "$WORK_DIR/$VOID_IMAGE" ]; then
         echo ""
         echo "Manual workaround:"
         echo "  1. Visit: https://voidlinux.org/download/"
-        echo "  2. Download: Raspberry Pi (aarch64) PLATFORMFS (musl)"
+        echo "  2. Download: Raspberry Pi (aarch64) bootable image"
         echo "  3. Or direct link: $BASE_IMAGE_URL"
         echo "  4. Save to: $WORK_DIR/$VOID_IMAGE"
         echo "  5. Re-run: just create-image"
@@ -104,53 +103,43 @@ if [ ! -f "$WORK_DIR/$VOID_IMAGE" ]; then
     FILE_SIZE=$(du -h "$WORK_DIR/$VOID_IMAGE" | cut -f1)
     echo "   Size: $FILE_SIZE"
 else
-    echo "✅ Using cached PLATFORMFS: $VOID_IMAGE"
+    echo "✅ Using cached image: $VOID_IMAGE"
     FILE_SIZE=$(du -h "$WORK_DIR/$VOID_IMAGE" | cut -f1)
     echo "   Size: $FILE_SIZE"
 fi
 echo ""
 
-# Create work image
+# Extract the bootable image
+EXTRACTED_IMG="${WORK_DIR}/void-rpi-aarch64-20250202.img"
+if [ ! -f "$EXTRACTED_IMG" ]; then
+    echo "📦 Extracting bootable image..."
+    xz -d -k "$WORK_DIR/$VOID_IMAGE"
+    echo "✅ Image extracted"
+else
+    echo "✅ Using cached extracted image"
+fi
+echo ""
+
+# Create work copy of the image
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 WORK_IMAGE="${WORK_DIR}/mdma-beacon-${TIMESTAMP}-rpi5.img"
 OUTPUT_IMAGE="${OUTPUT_DIR}/mdma-beacon-${TIMESTAMP}-rpi5.img.xz"
 
-echo "💾 Creating disk image..."
-# Create 32GB sparse image
-dd if=/dev/zero of="$WORK_IMAGE" bs=1 count=0 seek=32G status=none
-echo "✅ Image created"
+echo "💾 Creating work copy of image..."
+cp "$EXTRACTED_IMG" "$WORK_IMAGE"
+echo "✅ Work image created"
 echo ""
 
-# Partition the image
-echo "🗂️  Partitioning..."
-sudo parted "$WORK_IMAGE" --script mklabel msdos
-sudo parted "$WORK_IMAGE" --script mkpart primary fat32 1MiB 256MiB
-sudo parted "$WORK_IMAGE" --script set 1 boot on
-sudo parted "$WORK_IMAGE" --script mkpart primary ext4 256MiB 100%
-echo "✅ Partitioned"
-echo ""
-
-# Setup loop device
+# Setup loop device for the existing partitions
+echo "📍 Setting up loop device..."
 LOOP_DEV=$(sudo losetup --show -fP "$WORK_IMAGE")
-echo "📍 Loop device: $LOOP_DEV"
-
-# Format partitions
-echo "💿 Formatting partitions..."
-sudo mkfs.vfat -F 32 "${LOOP_DEV}p1" > /dev/null 2>&1
-sudo mkfs.ext4 -F "${LOOP_DEV}p2" > /dev/null 2>&1
-echo "✅ Formatted"
+echo "   Loop device: $LOOP_DEV"
 echo ""
 
-# Mount root filesystem
+# Mount root filesystem (partition 2)
 echo "📂 Mounting root filesystem..."
 sudo guestmount -a "$WORK_IMAGE" -m /dev/sda2 --rw "$MOUNT_POINT"
 echo "✅ Mounted at $MOUNT_POINT"
-echo ""
-
-# Extract base system
-echo "📦 Extracting base Void Linux system..."
-sudo tar -xJf "$WORK_DIR/$VOID_IMAGE" -C "$MOUNT_POINT" --strip-components=1
-echo "✅ Base system extracted"
 echo ""
 
 # Configure repository
@@ -211,28 +200,42 @@ echo "Updating xbps..."
 sudo XBPS_ARCH=aarch64 chroot "$MOUNT_POINT" xbps-install -Suy xbps
 
 echo ""
-echo "Installing beacon and dependencies..."
-sudo XBPS_ARCH=aarch64 chroot "$MOUNT_POINT" xbps-install -Sy beacon
+echo "Installing dependencies (dbus, avahi)..."
+sudo XBPS_ARCH=aarch64 chroot "$MOUNT_POINT" xbps-install -y dbus avahi
+
+echo ""
+echo "Installing beacon..."
+sudo XBPS_ARCH=aarch64 chroot "$MOUNT_POINT" xbps-install -y beacon
 
 echo ""
 echo "✅ Packages installed with post-install scripts executed!"
-
-echo ""
-echo "✅ Packages installed with post-install scripts executed!"
 echo ""
 
-# Enable dependency services (dbus and avahi)
-# Note: beacon service is automatically enabled by its INSTALL script
-echo "🔧 Enabling dependency services..."
+# Enable services explicitly (in case INSTALL scripts had issues in chroot)
+echo "🔧 Ensuring services are enabled..."
+sudo chroot "$MOUNT_POINT" bash -c '
+# Ensure /var/service exists as a directory
+if [ ! -d /var/service ]; then
+    # Remove if it exists as a file/symlink
+    rm -f /var/service
+    mkdir -p /var/service
+fi
 
-echo "   Enabling dbus..."
-sudo chroot "$MOUNT_POINT" ln -sf /etc/sv/dbus /var/service/dbus || true
+# Enable services by creating symlinks
+cd /var/service
+ln -sf /etc/sv/beacon .
+ln -sf /etc/sv/dbus .
+ln -sf /etc/sv/avahi-daemon .
+'
+echo "✅ Services enabled"
+echo ""
 
-echo "   Enabling avahi-daemon..."
-sudo chroot "$MOUNT_POINT" ln -sf /etc/sv/avahi-daemon /var/service/avahi-daemon || true
-
-echo "   beacon service enabled by package INSTALL script ✅"
-echo "✅ Dependency services enabled"
+# Set default hostname for beacon discovery mode
+# All fresh units boot as "welcome-to-mdma.local" for initial discovery
+# Beacon provisioning process assigns final hostname (mdma-909-studio, etc.)
+echo "🏷️  Setting hostname to 'welcome-to-mdma'..."
+echo "welcome-to-mdma" | sudo tee "$MOUNT_POINT/etc/hostname" > /dev/null
+echo "✅ Hostname configured"
 echo ""
 
 # Unmount chroot filesystems

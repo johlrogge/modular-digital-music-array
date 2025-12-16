@@ -347,3 +347,339 @@ check-prereqs-image:
 [group('image')]
 create-image: check-prereqs-image pkg-build-all
     ./scripts/image/create-sd-card-simple.sh
+
+# Network scanning recipes for finding Raspberry Pi
+
+# Scan network for Raspberry Pi devices
+pi-scan:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    
+    echo "🔍 Scanning for Raspberry Pi devices on network..."
+    echo ""
+    
+    # Get local network range
+    NETWORK=$(ip route | grep default | awk '{print $3}' | cut -d. -f1-3)
+    
+    if [ -z "$NETWORK" ]; then
+        echo "❌ Could not detect network range"
+        exit 1
+    fi
+    
+    echo "Network: $NETWORK.0/24"
+    echo ""
+    
+    # Check if nmap is installed
+    if ! command -v nmap &> /dev/null; then
+        echo "❌ nmap not found. Install it with:"
+        echo "   sudo pacman -S nmap"
+        exit 1
+    fi
+    
+    echo "Scanning... (this takes ~30 seconds)"
+    echo ""
+    
+    # Scan for devices and filter for Raspberry Pi
+    sudo nmap -sn $NETWORK.0/24 | grep -B 2 "Raspberry\|DC:A6:32\|B8:27:EB\|E4:5F:01" || {
+        echo "❌ No Raspberry Pi devices found"
+        echo ""
+        echo "Make sure:"
+        echo "  - Pi is powered on"
+        echo "  - Ethernet cable is connected"
+        echo "  - Pi has had 60 seconds to boot"
+        exit 1
+    }
+    
+    echo ""
+    echo "💡 To connect:"
+    echo "   ssh root@<IP>"
+    echo "   Password: voidlinux"
+
+# Quick scan showing all devices (faster, less detailed)
+pi-scan-quick:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    
+    echo "🔍 Quick network scan..."
+    echo ""
+    
+    NETWORK=$(ip route | grep default | awk '{print $3}' | cut -d. -f1-3)
+    
+    if [ -z "$NETWORK" ]; then
+        echo "❌ Could not detect network range"
+        exit 1
+    fi
+    
+    # Use arp-scan if available (faster)
+    if command -v arp-scan &> /dev/null; then
+        sudo arp-scan --localnet | grep -i "raspberry\|b8:27:eb\|dc:a6:32\|e4:5f:01" || {
+            echo "No Raspberry Pi found"
+            exit 1
+        }
+    else
+        echo "Install arp-scan for faster scanning:"
+        echo "  sudo pacman -S arp-scan"
+        echo ""
+        echo "Using nmap instead..."
+        just pi-scan
+    fi
+
+# Scan and auto-connect to first found Pi
+pi-connect:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    
+    echo "🔍 Finding Raspberry Pi..."
+    
+    NETWORK=$(ip route | grep default | awk '{print $3}' | cut -d. -f1-3)
+    
+    if ! command -v nmap &> /dev/null; then
+        echo "❌ nmap not found. Install: sudo pacman -S nmap"
+        exit 1
+    fi
+    
+    # Scan and extract IP
+    PI_IP=$(sudo nmap -sn $NETWORK.0/24 | grep -B 2 "Raspberry\|DC:A6:32\|B8:27:EB\|E4:5F:01" | grep "Nmap scan report" | head -1 | awk '{print $5}')
+    
+    if [ -z "$PI_IP" ]; then
+        echo "❌ No Raspberry Pi found"
+        exit 1
+    fi
+    
+    echo "✅ Found Pi at: $PI_IP"
+    echo ""
+    echo "Connecting... (password: voidlinux)"
+    echo ""
+    
+    ssh root@$PI_IP
+
+# Check if specific IP is a Raspberry Pi
+pi-check IP:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    
+    echo "🔍 Checking {{IP}}..."
+    echo ""
+    
+    if ! command -v nmap &> /dev/null; then
+        echo "❌ nmap not found. Install: sudo pacman -S nmap"
+        exit 1
+    fi
+    
+    # Check if host is up
+    if ! ping -c 1 -W 1 {{IP}} &> /dev/null; then
+        echo "❌ Host {{IP}} is not responding"
+        exit 1
+    fi
+    
+    echo "Host is up, checking details..."
+    echo ""
+    
+    # Get MAC and manufacturer
+    sudo nmap -sn {{IP}} | grep -A 1 "{{IP}}"
+    
+    echo ""
+    echo "💡 To connect:"
+    echo "   ssh root@{{IP}}"
+
+# Show network scanning help
+pi-scan-help:
+    @echo "📡 Network Scanning Commands"
+    @echo ""
+    @echo "Find Raspberry Pi on your network:"
+    @echo ""
+    @echo "  just pi-scan           # Full scan (recommended, ~30s)"
+    @echo "  just pi-scan-quick     # Quick scan (if arp-scan installed)"
+    @echo "  just pi-connect        # Find and auto-connect"
+    @echo "  just pi-check <IP>     # Check if specific IP is a Pi"
+    @echo ""
+    @echo "Installation:"
+    @echo "  sudo pacman -S nmap         # Required"
+    @echo "  sudo pacman -S arp-scan     # Optional (faster scanning)"
+    @echo ""
+    @echo "Troubleshooting:"
+    @echo "  - Make sure Pi is powered on"
+    @echo "  - Wait 60 seconds after power-on"
+    @echo "  - Use ethernet (WiFi not configured yet)"
+    @echo "  - Check router's DHCP leases"
+    @echo ""
+    @echo "Default credentials:"
+    @echo "  Username: root"
+    @echo "  Password: voidlinux"
+
+# Monitor for Pi appearing on network
+pi-wait:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    
+    echo "⏳ Waiting for Raspberry Pi to appear on network..."
+    echo "   (Press Ctrl+C to stop)"
+    echo ""
+    
+    NETWORK=$(ip route | grep default | awk '{print $3}' | cut -d. -f1-3)
+    
+    if ! command -v nmap &> /dev/null; then
+        echo "❌ nmap not found. Install: sudo pacman -S nmap"
+        exit 1
+    fi
+    
+    COUNT=0
+    while true; do
+        COUNT=$((COUNT + 1))
+        echo "Scan #$COUNT..."
+        
+        PI_IP=$(sudo nmap -sn $NETWORK.0/24 | grep -B 2 "Raspberry\|DC:A6:32\|B8:27:EB\|E4:5F:01" | grep "Nmap scan report" | head -1 | awk '{print $5}' || true)
+        
+        if [ -n "$PI_IP" ]; then
+            echo ""
+            echo "✅ Found Pi at: $PI_IP"
+            echo ""
+            echo "To connect:"
+            echo "   ssh root@$PI_IP"
+            echo "   Password: voidlinux"
+            break
+        fi
+        
+        sleep 5
+    done
+
+    # Golden Image Workflow - Create bootable image from working SD card
+
+# Copy setup script to Pi
+golden-copy-script PI_IP:
+    @echo "📤 Copying setup script to Pi..."
+    scp scripts/setup-beacon-on-pi.sh root@{{PI_IP}}:/root/
+    @echo "✅ Script copied!"
+    @echo ""
+    @echo "Now SSH in and run it:"
+    @echo "  ssh root@{{PI_IP}}"
+    @echo "  chmod +x setup-beacon-on-pi.sh"
+    @echo "  ./setup-beacon-on-pi.sh"
+
+# SSH to Pi for manual setup
+golden-ssh PI_IP:
+    ssh root@{{PI_IP}}
+
+# Create image from SD card (after Pi is shutdown and SD card in dev machine)
+golden-create-image DEVICE:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    
+    # Verify device exists
+    if [ ! -b "{{DEVICE}}" ]; then
+        echo "❌ Device {{DEVICE}} not found"
+        echo "   Use: lsblk to find your SD card"
+        exit 1
+    fi
+    
+    # Safety check
+    echo "⚠️  About to read entire device {{DEVICE}}"
+    echo "   This will create an image of the SD card"
+    read -p "Continue? (yes/no): " confirm
+    
+    if [ "$confirm" != "yes" ]; then
+        echo "Aborted"
+        exit 1
+    fi
+    
+    TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+    OUTPUT_DIR=~/mdma-images/golden
+    mkdir -p "$OUTPUT_DIR"
+    
+    IMAGE_FILE="$OUTPUT_DIR/mdma-beacon-golden-$TIMESTAMP.img"
+    
+    echo ""
+    echo "📀 Reading SD card..."
+    sudo dd if={{DEVICE}} of="$IMAGE_FILE" bs=4M status=progress conv=fsync
+    
+    # Fix ownership so compression works
+    sudo chown $(whoami):$(whoami) "$IMAGE_FILE"
+    
+    # Check if PiShrink is available
+    PISHRINK=""
+    if [ -f ~/mdma-images/pishrink.sh ]; then
+        PISHRINK=~/mdma-images/pishrink.sh
+    elif command -v pishrink.sh &> /dev/null; then
+        PISHRINK=pishrink.sh
+    fi
+    
+    if [ -n "$PISHRINK" ]; then
+        echo ""
+        echo "🔧 Shrinking image with PiShrink..."
+        echo "   (This may take a few minutes)"
+        sudo "$PISHRINK" "$IMAGE_FILE"
+        echo "✅ Image shrunk"
+    else
+        echo ""
+        echo "⚠️  PiShrink not found - image not shrunk"
+        echo "   Image will be ~32GB when extracted"
+        echo ""
+        echo "   To install PiShrink:"
+        echo "   curl -L https://raw.githubusercontent.com/Drewsif/PiShrink/master/pishrink.sh -o ~/mdma-images/pishrink.sh"
+        echo "   chmod +x ~/mdma-images/pishrink.sh"
+        echo ""
+        read -p "Continue without shrinking? (yes/no): " continue_unshrunk
+        if [ "$continue_unshrunk" != "yes" ]; then
+            echo "Aborted - image saved at: $IMAGE_FILE"
+            exit 1
+        fi
+    fi
+    
+    echo ""
+    echo "🗜️  Compressing image..."
+    xz -9 -T0 "$IMAGE_FILE"
+    
+    echo ""
+    echo "✅ Golden image created!"
+    echo "   Location: $IMAGE_FILE.xz"
+    
+    SIZE=$(du -h "$IMAGE_FILE.xz" | cut -f1)
+    echo "   Compressed size: $SIZE"
+    
+    if [ -n "$PISHRINK" ]; then
+        echo "   Extracted size: ~3-4GB (shrunk)"
+    else
+        echo "   Extracted size: ~32GB (not shrunk)"
+    fi
+    
+    echo ""
+    echo "🎯 To flash this image:"
+    echo "   xz -dc $IMAGE_FILE.xz | sudo dd of=/dev/sdX bs=4M status=progress"
+
+# Complete golden image workflow guide
+golden-help:
+    @echo "📋 Golden Image Workflow"
+    @echo ""
+    @echo "This creates a 'golden master' image from a working Pi."
+    @echo ""
+    @echo "Steps:"
+    @echo "  1. Flash vanilla Void to SD card"
+    @echo "     curl -LO https://repo-default.voidlinux.org/live/current/void-rpi-aarch64-20250202.img.xz"
+    @echo "     xz -dc void-rpi-aarch64-20250202.img.xz | sudo dd of=/dev/sdX bs=4M status=progress"
+    @echo ""
+    @echo "  2. Boot Pi, find its IP (check router or use nmap)"
+    @echo ""
+    @echo "  3. Copy setup script to Pi"
+    @echo "     just golden-copy-script 192.168.0.XXX"
+    @echo ""
+    @echo "  4. SSH to Pi and run setup"
+    @echo "     just golden-ssh 192.168.0.XXX"
+    @echo "     chmod +x setup-beacon-on-pi.sh"
+    @echo "     ./setup-beacon-on-pi.sh"
+    @echo ""
+    @echo "  5. Test everything works"
+    @echo "     ping welcome-to-mdma.local"
+    @echo "     http://welcome-to-mdma.local/"
+    @echo ""
+    @echo "  6. Shutdown Pi"
+    @echo "     shutdown -h now"
+    @echo ""
+    @echo "  7. Remove SD card, put in dev machine"
+    @echo ""
+    @echo "  8. Create golden image"
+    @echo "     just golden-create-image /dev/sdX"
+    @echo ""
+    @echo "  9. Result: ~/mdma-images/golden/mdma-beacon-golden-TIMESTAMP.img.xz"
+    @echo ""
+    @echo "🎉 Now you have a working golden image to flash to all Pis!"
+
