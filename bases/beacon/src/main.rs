@@ -9,6 +9,7 @@ mod hardware;
 mod provisioning;
 mod server;
 mod types;
+mod update;
 
 #[tokio::main]
 async fn main() -> Result<()> {

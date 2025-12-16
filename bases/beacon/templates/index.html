@@ -136,6 +136,36 @@
             font-size: 0.85em;
             margin-top: 5px;
         }
+        
+        .dev-tools {
+            background: #fff3cd;
+            border: 2px solid #ffc107;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 25px;
+        }
+        
+        .dev-tools-title {
+            color: #856404;
+            font-size: 1.1em;
+            margin-bottom: 12px;
+            font-weight: 600;
+        }
+        
+        .update-button {
+            background: linear-gradient(135deg, #f39c12 0%, #e67e22 100%);
+            margin-top: 10px;
+        }
+        
+        .update-button:hover {
+            box-shadow: 0 5px 15px rgba(243, 156, 18, 0.4);
+        }
+        
+        .dev-hint {
+            color: #856404;
+            font-size: 0.85em;
+            margin-top: 8px;
+        }
     </style>
 </head>
 <body>
@@ -169,6 +199,19 @@
                     {% endfor %}
                 {% endif %}
             </div>
+        </div>
+        
+        <div class="section dev-tools">
+            <div class="dev-tools-title">🛠️ Developer Tools</div>
+            <p class="dev-hint">Rapid iteration during development - update beacon from repository</p>
+            <form action="/update" method="post">
+                <button type="submit" class="update-button">
+                    🔄 Update Beacon Now
+                </button>
+            </form>
+            <p class="dev-hint" style="margin-top: 12px;">
+                Current version: <strong>{{ version }}</strong>
+            </p>
         </div>
         
         <form action="/provision" method="post">

@@ -40,6 +40,7 @@ struct AppState {
 #[template(path = "index.html")]
 struct IndexTemplate {
     hardware: HardwareInfo,
+    version: &'static str,
 }
 
 /// Provisioning form submission
@@ -66,6 +67,7 @@ pub async fn run(hardware: HardwareInfo, config: Config) -> color_eyre::Result<(
         .route("/", get(index))
         .route("/provision", post(provision))
         .route("/provision/start", post(provision_start))
+        .route("/update", post(update_beacon))
         .route("/stream", get(stream_events))
         .route("/test-stream", get(test_stream))  // Test endpoint!
         .nest_service("/static", ServeDir::new("static"))
@@ -96,6 +98,7 @@ async fn index(State(state): State<AppState>) -> Result<Html<String>, AppError> 
     let hardware = state.hardware.lock().await;
     let template = IndexTemplate {
         hardware: hardware.clone(),
+        version: crate::update::current_version(),
     };
     
     let html = template.render()
@@ -326,6 +329,183 @@ async fn provision_start(State(state): State<AppState>) -> Result<StatusCode, Ap
         tracing::warn!("Provision start called but no provisioning task waiting");
         Err(AppError::Validation("No provisioning task waiting".to_string()))
     }
+}
+
+/// Handler for beacon self-update request
+async fn update_beacon(State(state): State<AppState>) -> Result<Html<String>, AppError> {
+    info!("Received beacon update request");
+    
+    let log_tx = state.log_tx.clone();
+    
+    // Create oneshot channel for start signal
+    let (start_tx, start_rx) = oneshot::channel();
+    *state.provision_start.lock().await = Some(start_tx);
+    
+    // Spawn update in background, waiting for start signal
+    tokio::spawn(async move {
+        // Wait for JavaScript to signal it's ready
+        if start_rx.await.is_err() {
+            tracing::error!("Start signal channel closed unexpectedly");
+            return;
+        }
+        
+        match crate::update::update_beacon_from_repo(log_tx.clone()).await {
+            Ok(()) => {
+                info!("Beacon update completed successfully");
+            }
+            Err(e) => {
+                tracing::error!("Beacon update failed: {}", e);
+                let _ = log_tx.send(format!("❌ Beacon update failed: {}", e));
+            }
+        }
+    });
+    
+    let html = format!(r#"
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Updating Beacon</title>
+        <meta charset="utf-8">
+        <style>
+            body {{ font-family: sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }}
+            .success {{ color: #27ae60; }}
+            .warning {{ background: #fff3cd; border: 2px solid #ffc107; padding: 15px; margin: 20px 0; border-radius: 6px; }}
+            #log-container {{
+                background: #1e1e1e;
+                color: #d4d4d4;
+                font-family: 'Courier New', monospace;
+                padding: 20px;
+                border-radius: 6px;
+                margin: 20px 0;
+                height: 400px;
+                overflow-y: auto;
+                white-space: pre-wrap;
+                border: 2px solid #333;
+            }}
+            .log-line {{ 
+                margin: 4px 0;
+                padding: 2px 0;
+            }}
+            .status {{
+                margin: 10px 0;
+                padding: 10px;
+                background: #f0f0f0;
+                border-radius: 4px;
+                font-size: 0.9em;
+            }}
+        </style>
+    </head>
+    <body>
+        <h1 class="success">🔄 Updating Beacon</h1>
+        
+        <div class="warning">
+            <strong>⚠️  Note:</strong> The beacon service will restart automatically after the update.
+            This page will reload once the update is complete.
+        </div>
+        
+        <div class="status" id="status">Connecting to stream...</div>
+        
+        <p>Live log:</p>
+        <div id="log-container"></div>
+        
+        <script>
+            const logContainer = document.getElementById('log-container');
+            const statusDiv = document.getElementById('status');
+            let updateComplete = false;
+            
+            // Log to both console and container
+            function log(msg, isError) {{
+                console.log(msg);
+                const line = document.createElement('div');
+                line.className = 'log-line';
+                if (isError) {{
+                    line.style.color = '#ff6b6b';
+                }}
+                line.textContent = msg;
+                logContainer.appendChild(line);
+                logContainer.scrollTop = logContainer.scrollHeight;
+                
+                // Check if update is complete
+                if (msg.includes('Beacon updated successfully')) {{
+                    updateComplete = true;
+                }}
+                
+                // Check if we should reload
+                if (msg.includes('Page will reload automatically')) {{
+                    setTimeout(() => {{
+                        console.log('Reloading page...');
+                        window.location.href = '/';
+                    }}, 3000);
+                }}
+            }}
+            
+            log('Initializing EventSource...');
+            statusDiv.textContent = 'Connecting...';
+            
+            const eventSource = new EventSource('/stream');
+            
+            eventSource.onopen = function() {{
+                console.log('EventSource opened');
+                statusDiv.textContent = '✓ Connected - Starting update...';
+                statusDiv.style.background = '#d4edda';
+                log('✓ Connected to stream');
+                
+                // Send start signal to server
+                fetch('/provision/start', {{ method: 'POST' }})
+                    .then(response => {{
+                        if (response.ok) {{
+                            console.log('Update start signal sent');
+                            statusDiv.textContent = '✓ Update started';
+                        }} else {{
+                            console.error('Failed to start update');
+                            statusDiv.textContent = '✗ Failed to start';
+                            statusDiv.style.background = '#f8d7da';
+                        }}
+                    }})
+                    .catch(err => {{
+                        console.error('Error sending start signal:', err);
+                        log('✗ Error starting update', true);
+                    }});
+            }};
+            
+            eventSource.onmessage = function(event) {{
+                console.log('Message:', event.data);
+                log(event.data);
+            }};
+            
+            eventSource.onerror = function(error) {{
+                console.error('EventSource error:', error);
+                console.log('ReadyState:', eventSource.readyState);
+                
+                // If update was complete, treat error as expected (server restarting)
+                if (updateComplete) {{
+                    statusDiv.textContent = '✓ Update complete - Beacon restarting';
+                    statusDiv.style.background = '#d4edda';
+                    log('✓ Beacon is restarting...');
+                    
+                    // Force reload after a delay
+                    setTimeout(() => {{
+                        console.log('Reloading page after restart...');
+                        window.location.href = '/';
+                    }}, 5000);
+                }} else {{
+                    statusDiv.textContent = '✗ Connection error';
+                    statusDiv.style.background = '#f8d7da';
+                    log('✗ Connection error (see console)', true);
+                }}
+                
+                if (eventSource.readyState === EventSource.CLOSED) {{
+                    if (!updateComplete) {{
+                        log('Stream closed', true);
+                    }}
+                }}
+            }};
+        </script>
+    </body>
+    </html>
+    "#);
+    
+    Ok(Html(html))
 }
 
 fn parse_unit_type(s: &str) -> Result<UnitType, AppError> {
