@@ -44,9 +44,9 @@ RUNSCRIPT
 fi
 chmod +x "$PACKAGE_DIR/etc/sv/beacon/run"
 
-# Create supervise symlink (required by runit)
-echo "  → Creating supervise symlink..."
-ln -sf /run/runit/supervise.beacon "$PACKAGE_DIR/etc/sv/beacon/supervise"
+# NOTE: We don't create the supervise symlink in the package!
+# Runit creates /etc/sv/beacon/supervise automatically when the service starts.
+# Packaging it causes "Directory not empty" errors on upgrades.
 
 # Create INSTALL script for proper service management (the Void way!)
 echo "  → Creating INSTALL script..."
