@@ -73,15 +73,17 @@ esac
 INSTALLSCRIPT
 chmod +x "$PACKAGE_DIR/INSTALL"
 
-# Get version info
-if [ -f "void-packages/srcpkgs/beacon/template" ]; then
-    VERSION=$(grep '^version=' void-packages/srcpkgs/beacon/template | cut -d= -f2)
-    REVISION=$(grep '^revision=' void-packages/srcpkgs/beacon/template | cut -d= -f2)
+# Get version from workspace Cargo.toml (single source of truth!)
+if [ -f "Cargo.toml" ]; then
+    VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+    echo "  📦 Version from Cargo.toml: ${VERSION}"
 else
-    VERSION="0.1.0"
-    REVISION="1"
-    echo "  ⚠️  No template found, using default version ${VERSION}_${REVISION}"
+    echo "  ❌ Error: Cargo.toml not found in workspace root!"
+    exit 1
 fi
+
+# Revision defaults to 1 (increment only for package-only changes)
+REVISION="1"
 
 FULLVERSION="${VERSION}_${REVISION}"
 
