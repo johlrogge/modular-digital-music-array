@@ -1,6 +1,6 @@
 // bases/beacon/src/main.rs
-use color_eyre::Result;
 use clap::Parser;
+use color_eyre::Result;
 
 mod actions;
 mod config;
@@ -14,11 +14,11 @@ mod update;
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
-    
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "beacon=info,tower_http=info".into())
+                .unwrap_or_else(|_| "beacon=info,tower_http=info".into()),
         )
         .init();
 
@@ -27,19 +27,22 @@ async fn main() -> Result<()> {
     let config = config::Config::from_args(args);
 
     if config.is_check_mode() {
-        tracing::warn!("🔍 CHECK MODE: Running on port {}, DRY RUN only (no changes will be made)", config.port);
+        tracing::warn!(
+            "🔍 CHECK MODE: Running on port {}, DRY RUN only (no changes will be made)",
+            config.port
+        );
         tracing::warn!("   Use --apply to actually provision the system");
     } else {
         tracing::warn!("⚠️  APPLY MODE: Changes WILL be made to your system!");
         tracing::info!("   Starting MDMA Beacon in production mode...");
     }
-    
+
     // Detect hardware
     let hardware_info = hardware::detect_hardware().await?;
     tracing::info!("Detected hardware: {:?}", hardware_info);
-    
+
     // Start HTTP server
     server::run(hardware_info, config).await?;
-    
+
     Ok(())
 }

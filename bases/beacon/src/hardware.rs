@@ -171,3 +171,115 @@ pub async fn detect_hardware() -> Result<HardwareInfo> {
         nvme_drives,
     })
 }
+// Add these functions to bases/beacon/src/hardware.rs
+// (append to the end of the file, before the closing brace if any)
+
+/// Check if we're running on a Raspberry Pi
+/// 
+/// Returns true only if we can confirm we're on a Pi.
+/// This is a SAFETY CHECK to prevent accidental execution on dev machines.
+/// 
+/// # Examples
+/// 
+/// ```no_run
+/// use beacon::hardware::is_raspberry_pi;
+/// 
+/// #[tokio::main]
+/// async fn main() {
+///     if is_raspberry_pi().await {
+///         println!("Running on Raspberry Pi - safe to proceed");
+///     } else {
+///         println!("NOT on Raspberry Pi - refusing destructive operations");
+///     }
+/// }
+/// ```
+pub async fn is_raspberry_pi() -> bool {
+    // Check for Raspberry Pi device tree
+    if tokio::fs::metadata("/proc/device-tree/model").await.is_err() {
+        tracing::debug!("No /proc/device-tree/model - not a Raspberry Pi");
+        return false;
+    }
+    
+    // Read model string
+    let model = match tokio::fs::read_to_string("/proc/device-tree/model").await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!("Could not read device tree model: {}", e);
+            return false;
+        }
+    };
+    
+    // Must contain "Raspberry Pi"
+    let is_pi = model.contains("Raspberry Pi");
+    
+    if is_pi {
+        tracing::info!("✅ Confirmed running on Raspberry Pi: {}", model.trim_end_matches('\0'));
+    } else {
+        tracing::warn!("❌ Not running on Raspberry Pi (model: {})", model.trim_end_matches('\0'));
+    }
+    
+    is_pi
+}
+
+/// Require that we're on a Raspberry Pi, or return error
+/// 
+/// This is a CRITICAL SAFETY CHECK for destructive operations.
+/// Use this at the start of any action that modifies hardware.
+/// 
+/// # Examples
+/// 
+/// ```no_run
+/// use beacon::hardware::require_raspberry_pi;
+/// use beacon::error::Result;
+/// 
+/// async fn dangerous_operation() -> Result<()> {
+///     // SAFETY: Only proceed if we're on a Pi
+///     require_raspberry_pi().await?;
+///     
+///     // Safe to proceed with destructive operations
+///     Ok(())
+/// }
+/// ```
+/// 
+/// # Errors
+/// 
+/// Returns `BeaconError::Safety` if not running on a Raspberry Pi.
+pub async fn require_raspberry_pi() -> Result<()> {
+    if !is_raspberry_pi().await {
+        return Err(BeaconError::Safety(
+            "Not running on a Raspberry Pi! Refusing to execute destructive operations. \
+             This safety check prevents accidentally running provisioning on development machines."
+                .to_string()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod pi_safety_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_is_raspberry_pi_detection() {
+        // This test will pass or fail depending on the machine
+        // On a Pi: should return true
+        // On dev machine: should return false
+        let result = is_raspberry_pi().await;
+        
+        // Just verify it returns without panicking
+        // The actual value depends on the hardware
+        println!("is_raspberry_pi() returned: {}", result);
+    }
+
+    #[tokio::test]
+    async fn test_require_raspberry_pi() {
+        let result = require_raspberry_pi().await;
+        
+        // On a Pi: should succeed
+        // On dev machine: should fail with Safety error
+        match result {
+            Ok(()) => println!("Running on Raspberry Pi"),
+            Err(e) => println!("Not on Raspberry Pi: {}", e),
+        }
+    }
+}

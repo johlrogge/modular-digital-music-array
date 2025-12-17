@@ -24,6 +24,9 @@ pub enum BeaconError {
     #[error("failed to install base system: {0}")]
     Installation(String),
     
+    #[error("safety check failed: {0}")]
+    Safety(String),
+    
     #[error("io error")]
     Io(#[from] std::io::Error),
 }

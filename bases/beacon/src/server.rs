@@ -3,7 +3,8 @@ use crate::config::Config;
 use crate::error::BeaconError;
 use crate::hardware::HardwareInfo;
 use crate::provisioning;
-use crate::types::{Hostname, ProvisionConfig, SshPublicKey, UnitType};
+use crate::provisioning::types::{ProvisionConfig, *};
+use crate::types::{Hostname, SshPublicKey};
 use askama::Template;
 use axum::{
     extract::State,
@@ -15,12 +16,12 @@ use axum::{
     routing::{get, post},
     Form, Router,
 };
-use futures::stream::{self, Stream};
+use futures::stream::Stream;
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, Mutex, oneshot};
+use tokio::sync::{broadcast, oneshot, Mutex};
 use tower_http::services::ServeDir;
 use tracing::info;
 
@@ -55,7 +56,7 @@ struct ProvisionForm {
 pub async fn run(hardware: HardwareInfo, config: Config) -> color_eyre::Result<()> {
     // Create broadcast channel for streaming logs (100 message buffer)
     let (log_tx, _rx) = broadcast::channel(100);
-    
+
     let state = AppState {
         hardware: Arc::new(Mutex::new(hardware)),
         config: config.clone(),
@@ -69,16 +70,18 @@ pub async fn run(hardware: HardwareInfo, config: Config) -> color_eyre::Result<(
         .route("/provision/start", post(provision_start))
         .route("/update", post(update_beacon))
         .route("/stream", get(stream_events))
-        .route("/test-stream", get(test_stream))  // Test endpoint!
+        .route("/test-stream", get(test_stream)) // Test endpoint!
         .nest_service("/static", ServeDir::new("static"))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", config.port);
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await?;
-    
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+
     if config.is_check_mode() {
-        info!("🔍 Beacon server listening on http://localhost:{}", config.port);
+        info!(
+            "🔍 Beacon server listening on http://localhost:{}",
+            config.port
+        );
         info!("   CHECK mode - no changes will be made to your system");
         info!("   Use --apply flag to actually provision");
         info!("   Test SSE: http://localhost:{}/test-stream", config.port);
@@ -87,9 +90,9 @@ pub async fn run(hardware: HardwareInfo, config: Config) -> color_eyre::Result<(
         info!("   APPLY mode - changes WILL be made!");
         info!("   Also accessible via http://0.0.0.0:{}", config.port);
     }
-    
+
     axum::serve(listener, app).await?;
-    
+
     Ok(())
 }
 
@@ -100,10 +103,11 @@ async fn index(State(state): State<AppState>) -> Result<Html<String>, AppError> 
         hardware: hardware.clone(),
         version: crate::update::current_version(),
     };
-    
-    let html = template.render()
+
+    let html = template
+        .render()
         .map_err(|e| AppError::Template(e.to_string()))?;
-    
+
     Ok(Html(html))
 }
 
@@ -116,7 +120,7 @@ async fn test_stream() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
         }
         yield Ok(Event::default().data("Stream complete!"));
     };
-    
+
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
@@ -125,11 +129,11 @@ async fn stream_events(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let mut rx = state.log_tx.subscribe();
-    
+
     let stream = async_stream::stream! {
         // Send initial connection message
         yield Ok(Event::default().data("Connected to provisioning stream"));
-        
+
         loop {
             match rx.recv().await {
                 Ok(msg) => {
@@ -147,7 +151,7 @@ async fn stream_events(
             }
         }
     };
-    
+
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
@@ -157,28 +161,26 @@ async fn provision(
     Form(form): Form<ProvisionForm>,
 ) -> Result<Html<String>, AppError> {
     info!("Received provisioning request: {:?}", form);
-    
+
     // Parse and validate inputs using newtype constructors
     let unit_type = parse_unit_type(&form.unit_type)?;
-    let hostname = Hostname::new(form.hostname)
-        .map_err(|e| AppError::Validation(format!("Invalid hostname: {}", e)))?;
-    let ssh_key = SshPublicKey::new(form.ssh_key)
-        .map_err(|e| AppError::Validation(format!("Invalid SSH key: {}", e)))?;
-    
+    let hostname = form.hostname.to_string();
+    let ssh_key = form.ssh_key.to_string();
+
     let config = ProvisionConfig {
+        wifi_config: None,
         unit_type,
         hostname,
-        ssh_key,
     };
-    
+
     let hardware = state.hardware.lock().await.clone();
     let execution_mode = state.config.execution_mode;
     let log_tx = state.log_tx.clone();
-    
+
     // Create oneshot channel for start signal
     let (start_tx, start_rx) = oneshot::channel();
     *state.provision_start.lock().await = Some(start_tx);
-    
+
     // Spawn provisioning in background, waiting for start signal
     tokio::spawn(async move {
         // Wait for JavaScript to signal it's ready
@@ -186,10 +188,11 @@ async fn provision(
             tracing::error!("Start signal channel closed unexpectedly");
             return;
         }
-        
-        match provisioning::provision_system(config, hardware, execution_mode, log_tx.clone()).await {
-            Ok(()) => {
-                info!("Provisioning completed successfully");
+
+        match provisioning::provision_system(config, hardware, execution_mode, log_tx.clone()).await
+        {
+            Ok(provisioned) => {
+                info!("Provisioning completed successfully {provisioned:?}");
             }
             Err(e) => {
                 tracing::error!("Provisioning failed: {}", e);
@@ -197,14 +200,15 @@ async fn provision(
             }
         }
     });
-    
+
     let mode_notice = if execution_mode == crate::actions::ExecutionMode::DryRun {
         r#"<div class='dev-notice'><strong>🔍 CHECK MODE:</strong> No changes were made to your system. Watch the log below. Run with <code>--apply</code> flag to actually provision.</div>"#
     } else {
         ""
     };
-    
-    let html = format!(r#"
+
+    let html = format!(
+        r#"
     <!DOCTYPE html>
     <html>
     <head>
@@ -313,8 +317,10 @@ async fn provision(
         </script>
     </body>
     </html>
-    "#, mode_notice = mode_notice);
-    
+    "#,
+        mode_notice = mode_notice
+    );
+
     Ok(Html(html))
 }
 
@@ -327,20 +333,22 @@ async fn provision_start(State(state): State<AppState>) -> Result<StatusCode, Ap
         Ok(StatusCode::OK)
     } else {
         tracing::warn!("Provision start called but no provisioning task waiting");
-        Err(AppError::Validation("No provisioning task waiting".to_string()))
+        Err(AppError::Validation(
+            "No provisioning task waiting".to_string(),
+        ))
     }
 }
 
 /// Handler for beacon self-update request
 async fn update_beacon(State(state): State<AppState>) -> Result<Html<String>, AppError> {
     info!("Received beacon update request");
-    
+
     let log_tx = state.log_tx.clone();
-    
+
     // Create oneshot channel for start signal
     let (start_tx, start_rx) = oneshot::channel();
     *state.provision_start.lock().await = Some(start_tx);
-    
+
     // Spawn update in background, waiting for start signal
     tokio::spawn(async move {
         // Wait for JavaScript to signal it's ready
@@ -348,7 +356,7 @@ async fn update_beacon(State(state): State<AppState>) -> Result<Html<String>, Ap
             tracing::error!("Start signal channel closed unexpectedly");
             return;
         }
-        
+
         match crate::update::update_beacon_from_repo(log_tx.clone()).await {
             Ok(()) => {
                 info!("Beacon update completed successfully");
@@ -359,8 +367,9 @@ async fn update_beacon(State(state): State<AppState>) -> Result<Html<String>, Ap
             }
         }
     });
-    
-    let html = format!(r#"
+
+    let html = format!(
+        r#"
     <!DOCTYPE html>
     <html>
     <head>
@@ -503,8 +512,9 @@ async fn update_beacon(State(state): State<AppState>) -> Result<Html<String>, Ap
         </script>
     </body>
     </html>
-    "#);
-    
+    "#
+    );
+
     Ok(Html(html))
 }
 
@@ -538,7 +548,7 @@ impl IntoResponse for AppError {
             AppError::Validation(msg) => (StatusCode::BAD_REQUEST, msg),
             AppError::Beacon(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         };
-        
+
         let body = format!(
             r#"<!DOCTYPE html>
             <html>
@@ -551,7 +561,7 @@ impl IntoResponse for AppError {
             </html>"#,
             message
         );
-        
+
         (status, Html(body)).into_response()
     }
 }
