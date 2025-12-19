@@ -28,7 +28,7 @@ impl Action<ValidatedHardware, PartitionedDrives> for PartitionDrivesAction {
 
         // Try to read partition table
         let output = tokio::process::Command::new("parted")
-            .args(&[&primary.device, "print"])
+            .args([&primary.device, "print"])
             .output()
             .await?;
 
@@ -48,7 +48,7 @@ impl Action<ValidatedHardware, PartitionedDrives> for PartitionDrivesAction {
 
         // Create GPT partition table
         tokio::process::Command::new("parted")
-            .args(&[&primary.device, "-s", "mklabel", "gpt"])
+            .args([&primary.device, "-s", "mklabel", "gpt"])
             .spawn()?
             .wait()
             .await?;
@@ -57,7 +57,7 @@ impl Action<ValidatedHardware, PartitionedDrives> for PartitionDrivesAction {
 
         // Create root partition (16GB)
         tokio::process::Command::new("parted")
-            .args(&[
+            .args([
                 &primary.device,
                 "-s",
                 "mkpart",
@@ -72,7 +72,7 @@ impl Action<ValidatedHardware, PartitionedDrives> for PartitionDrivesAction {
 
         // Create /var partition (8GB)
         tokio::process::Command::new("parted")
-            .args(&[
+            .args([
                 &primary.device,
                 "-s",
                 "mkpart",
@@ -87,7 +87,7 @@ impl Action<ValidatedHardware, PartitionedDrives> for PartitionDrivesAction {
 
         // Create /music partition (400GB)
         tokio::process::Command::new("parted")
-            .args(&[
+            .args([
                 &primary.device,
                 "-s",
                 "mkpart",
@@ -102,7 +102,7 @@ impl Action<ValidatedHardware, PartitionedDrives> for PartitionDrivesAction {
 
         // Create /metadata partition (rest)
         tokio::process::Command::new("parted")
-            .args(&[
+            .args([
                 &primary.device,
                 "-s",
                 "mkpart",
@@ -148,16 +148,19 @@ impl Action<ValidatedHardware, PartitionedDrives> for PartitionDrivesAction {
             },
             ValidatedDrives::TwoDrives(primary_drive, secondary_drive) => {
                 // Partition secondary drive for CDJ export
-                tracing::info!("Creating partition on secondary drive {}", secondary_drive.device);
+                tracing::info!(
+                    "Creating partition on secondary drive {}",
+                    secondary_drive.device
+                );
 
                 tokio::process::Command::new("parted")
-                    .args(&[&secondary_drive.device, "-s", "mklabel", "gpt"])
+                    .args([&secondary_drive.device, "-s", "mklabel", "gpt"])
                     .spawn()?
                     .wait()
                     .await?;
 
                 tokio::process::Command::new("parted")
-                    .args(&[
+                    .args([
                         &secondary_drive.device,
                         "-s",
                         "mkpart",
