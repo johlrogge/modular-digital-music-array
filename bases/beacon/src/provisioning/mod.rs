@@ -24,9 +24,7 @@ pub use stage4_install::InstallSystemAction;
 pub use stage5_configure::ConfigureSystemAction;
 pub use stage6_finalize::FinalizeProvisioningAction;
 
-pub use types::{
-    DriveInfo, ProvisionConfig, ProvisionedSystem, UnitType, ValidatedDrives, WifiConfig,
-};
+pub use types::{DriveInfo, ProvisionConfig, ProvisionedSystem, UnitType, ValidatedDrives};
 
 /// Build a provisioning plan for the given configuration and hardware
 ///
