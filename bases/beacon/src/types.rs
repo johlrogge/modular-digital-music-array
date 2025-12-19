@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Newtype for hostname to ensure validity
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hostname(String);
 
 impl Hostname {
@@ -37,7 +37,7 @@ impl fmt::Display for Hostname {
 }
 
 /// Newtype for SSH public key
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SshPublicKey(String);
 
 impl SshPublicKey {
@@ -101,7 +101,7 @@ impl fmt::Display for UnitType {
 }
 
 /// Device path newtype
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DevicePath(String);
 
 impl DevicePath {
@@ -121,7 +121,7 @@ impl fmt::Display for DevicePath {
 }
 
 /// Storage capacity in bytes
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct StorageBytes(u64);
 
 impl StorageBytes {
@@ -145,9 +145,27 @@ impl fmt::Display for StorageBytes {
 }
 
 /// Provisioning configuration submitted by user
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProvisionConfig {
     pub unit_type: UnitType,
     pub hostname: Hostname,
     pub ssh_key: SshPublicKey,
+}
+
+impl From<&str> for DevicePath {
+    fn from(s: &str) -> Self {
+        DevicePath(s.to_string())
+    }
+}
+
+impl From<String> for DevicePath {
+    fn from(s: String) -> Self {
+        DevicePath(s)
+    }
+}
+
+impl From<u64> for StorageBytes {
+    fn from(bytes: u64) -> Self {
+        StorageBytes(bytes)
+    }
 }

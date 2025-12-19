@@ -683,3 +683,8 @@ golden-help:
     @echo ""
     @echo "🎉 Now you have a working golden image to flash to all Pis!"
 
+
+# run beacon
+[group("run")]
+run-beacon:
+    cargo run --bin beacon

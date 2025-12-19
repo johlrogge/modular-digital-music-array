@@ -6,7 +6,7 @@ use std::path::Path;
 use tokio::fs;
 use tokio::process::Command;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NvmeDrive {
     pub device: DevicePath,
     pub capacity: StorageBytes,
@@ -14,7 +14,7 @@ pub struct NvmeDrive {
     pub is_formatted: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HardwareInfo {
     pub model: String,
     pub serial: Option<String>,
