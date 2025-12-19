@@ -33,9 +33,10 @@ pub use types::{DriveInfo, ProvisionConfig, ProvisionedSystem, UnitType, Validat
 pub async fn build_provisioning_plan(
     config: ProvisionConfig,
     hardware: HardwareInfo,
+    execution_mode: crate::actions::ExecutionMode,
 ) -> Result<ProvisioningPlan> {
     // Stage 0: Safety check
-    let check_pi = CheckRaspberryPiAction;
+    let check_pi = CheckRaspberryPiAction { execution_mode };
     let stage0 = check_pi.plan(&hardware).await?;
 
     // Stage 1: Validate hardware
@@ -89,7 +90,7 @@ pub async fn provision_system(
     use crate::actions::ExecutionProgress;
 
     // Build the plan
-    let plan = build_provisioning_plan(config.clone(), hardware.clone()).await?;
+    let plan = build_provisioning_plan(config.clone(), hardware.clone(), execution_mode).await?;
 
     // Show plan summary via logs (broadcast::send is sync, no .await)
     let _ = log_tx.send("📋 Provisioning Plan:".to_string());
@@ -197,10 +198,10 @@ pub async fn provision_system(
     // Forward progress to logs
     while let Some(progress) = progress_rx.recv().await {
         match progress {
-            ExecutionProgress::Started { id, description } => {
+            ExecutionProgress::Started { id: _, description } => {
                 let _ = log_tx.send(format!("🚀 Starting: {}", description));
             }
-            ExecutionProgress::Progress { id, message } => {
+            ExecutionProgress::Progress { id: _, message } => {
                 let _ = log_tx.send(format!("   {}", message));
             }
             ExecutionProgress::Complete { id } => {
@@ -213,9 +214,12 @@ pub async fn provision_system(
     }
 
     // Wait for execution to complete
-    execution_handle.await.map_err(|e| {
-        crate::error::BeaconError::Provisioning(format!("Execution task panicked: {}", e))
-    })?;
+    execution_handle
+        .await
+        .map_err(|e| {
+            crate::error::BeaconError::Provisioning(format!("Execution task panicked: {}", e))
+        })?
+        .expect("should succeed");
 
     let _ = log_tx.send("✅ Provisioning complete!".to_string());
 
@@ -340,7 +344,8 @@ mod tests {
         let config = mock_config();
         let hardware = mock_hardware();
 
-        let result = build_provisioning_plan(config, hardware).await;
+        let result =
+            build_provisioning_plan(config, hardware, crate::actions::ExecutionMode::DryRun).await;
 
         // On non-Pi systems, expect safety check failure
         if result.is_err() {
