@@ -1,8 +1,6 @@
 // bases/beacon/src/error.rs
 use thiserror::Error;
 
-use crate::actions::PlanExecutionError;
-
 #[derive(Error, Debug)]
 pub enum BeaconError {
     #[error("failed to detect NVMe drives: {0}")]

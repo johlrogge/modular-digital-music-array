@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 // ============================================================================
 // Core Types (NEW Architecture)
 // ============================================================================
@@ -23,10 +23,6 @@ pub struct ActionId(String);
 impl ActionId {
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
     }
 }
 
@@ -61,10 +57,10 @@ pub enum ExecutionMode {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "data")]
 pub enum ExecutionProgress {
-    StageStarted { id: ActionId, description: String },
-    StageProgress { id: ActionId, message: String },
-    StageComplete { id: ActionId },
-    StageFailed { id: ActionId, error: String },
+    Started { id: ActionId, description: String },
+    Progress { id: ActionId, message: String },
+    Complete { id: ActionId },
+    Failed { id: ActionId, error: String },
 }
 
 /// Errors during plan execution
@@ -129,7 +125,7 @@ where
         feedback: &mpsc::Sender<ExecutionProgress>,
     ) -> std::result::Result<(), PlanExecutionError> {
         feedback
-            .send(ExecutionProgress::StageStarted {
+            .send(ExecutionProgress::Started {
                 id: self.id(),
                 description: self.description.clone(),
             })
@@ -152,7 +148,7 @@ where
         }
 
         feedback
-            .send(ExecutionProgress::StageComplete { id: self.id() })
+            .send(ExecutionProgress::Complete { id: self.id() })
             .await
             .map_err(|e| PlanExecutionError::FeedbackChannelClosed(e.to_string()))?;
 
@@ -168,8 +164,11 @@ where
 pub trait Action<Input: Debug, Output: Debug>: Clone + Send + Sync + Debug + 'static {
     fn id(&self) -> ActionId;
     fn description(&self) -> String;
-    
-    fn plan(&self, input: &Input) -> impl std::future::Future<Output = Result<PlannedAction<Input, Output, Self>>> + Send;
+
+    fn plan(
+        &self,
+        input: &Input,
+    ) -> impl std::future::Future<Output = Result<PlannedAction<Input, Output, Self>>> + Send;
     fn apply(&self, input: Input) -> impl std::future::Future<Output = Result<Output>> + Send;
 }
 
@@ -244,12 +243,9 @@ impl ProvisioningPlan {
         self
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.stages.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.stages.is_empty()
     }
 
     pub fn summary(&self) -> Vec<StageSummary> {
@@ -279,66 +275,6 @@ pub struct StageSummary {
     pub id: ActionId,
     pub description: String,
     pub details: String,
-}
-
-// ============================================================================
-// LEGACY Support (OLD Architecture - for backward compatibility)
-// ============================================================================
-
-/// Send a log message to both tracing and broadcast channel
-macro_rules! send_log {
-    ($tx:expr, $($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        tracing::info!("{}", msg);
-        let _ = $tx.send(msg);
-    }};
-}
-
-pub(crate) use send_log;
-
-/// Legacy trait for backward compatibility
-pub trait ActionLegacy<Input, Output> {
-    fn description(&self) -> String;
-    async fn check(&self, input: &Input) -> Result<bool>;
-    async fn apply(&self, input: Input) -> Result<Output>;
-    async fn preview(&self, input: Input) -> Result<Output>;
-}
-
-/// Legacy execute function
-pub async fn execute_action<I, O, A>(
-    action: &A,
-    input: I,
-    mode: ExecutionMode,
-    log_tx: &broadcast::Sender<String>,
-) -> Result<O>
-where
-    A: ActionLegacy<I, O>,
-    I: Clone,
-{
-    send_log!(log_tx, "🔍 {}", action.description());
-
-    match mode {
-        ExecutionMode::DryRun => {
-            send_log!(log_tx, "   [DRY RUN] Previewing...");
-            let output = action.preview(input).await?;
-            send_log!(log_tx, "   ✅ Preview complete");
-            Ok(output)
-        }
-        ExecutionMode::Apply => {
-            let needed = action.check(&input).await?;
-
-            if needed {
-                send_log!(log_tx, "   ⚙️  Executing...");
-                let output = action.apply(input).await?;
-                send_log!(log_tx, "   ✅ Complete");
-                Ok(output)
-            } else {
-                send_log!(log_tx, "   ⏭️  Already done, skipping");
-                let output = action.preview(input).await?;
-                Ok(output)
-            }
-        }
-    }
 }
 
 // ============================================================================
@@ -410,10 +346,10 @@ mod tests {
         planned.execute(&tx).await.unwrap();
 
         let started = rx.recv().await.unwrap();
-        assert!(matches!(started, ExecutionProgress::StageStarted { .. }));
+        assert!(matches!(started, ExecutionProgress::Started { .. }));
 
         let complete = rx.recv().await.unwrap();
-        assert!(matches!(complete, ExecutionProgress::StageComplete { .. }));
+        assert!(matches!(complete, ExecutionProgress::Complete { .. }));
     }
 
     #[tokio::test]

@@ -78,34 +78,6 @@ pub async fn build_provisioning_plan(
     Ok(plan)
 }
 
-/// Show the provisioning plan summary
-pub fn show_plan_summary(plan: &ProvisioningPlan) {
-    tracing::info!("📋 Provisioning Plan ({} stages):", plan.len());
-    tracing::info!("");
-
-    for summary in plan.summary() {
-        tracing::info!("  {} - {}", summary.id, summary.description);
-        tracing::info!("    {}", summary.details);
-    }
-
-    tracing::info!("");
-}
-
-/// Execute a provisioning plan with progress feedback
-pub async fn execute_plan(
-    plan: ProvisioningPlan,
-    progress_tx: mpsc::Sender<crate::actions::ExecutionProgress>,
-) -> Result<()> {
-    tracing::info!("🚀 Executing provisioning plan...");
-
-    plan.execute(progress_tx).await.map_err(|e| {
-        crate::error::BeaconError::Provisioning(format!("could not extecute plan: {}", e))
-    })?;
-
-    tracing::info!("✅ Provisioning complete!");
-    Ok(())
-}
-
 /// Legacy API wrapper for server.rs compatibility
 ///
 /// This function wraps the new plan-then-execute API to match the old
@@ -227,16 +199,16 @@ pub async fn provision_system(
     // Forward progress to logs
     while let Some(progress) = progress_rx.recv().await {
         match progress {
-            ExecutionProgress::StageStarted { id, description } => {
+            ExecutionProgress::Started { id, description } => {
                 let _ = log_tx.send(format!("🚀 Starting: {}", description));
             }
-            ExecutionProgress::StageProgress { id, message } => {
+            ExecutionProgress::Progress { id, message } => {
                 let _ = log_tx.send(format!("   {}", message));
             }
-            ExecutionProgress::StageComplete { id } => {
+            ExecutionProgress::Complete { id } => {
                 let _ = log_tx.send(format!("✅ Complete: {}", id));
             }
-            ExecutionProgress::StageFailed { id, error } => {
+            ExecutionProgress::Failed { id, error } => {
                 let _ = log_tx.send(format!("❌ Failed: {} - {}", id, error));
             }
         }
