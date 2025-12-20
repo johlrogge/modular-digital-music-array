@@ -35,6 +35,9 @@ pub enum BeaconError {
 
     #[error("failed to provision: {0}")]
     Provisioning(String),
+
+    #[error("failed to validate: {0}")]
+    Validation(String),
 }
 
 pub type Result<T> = std::result::Result<T, BeaconError>;

@@ -76,7 +76,11 @@ pub struct ValidatedHardware {
 
 impl std::fmt::Display for ValidatedHardware {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "✅ Validated {} with {}", self.config.unit_type, self.drives)
+        write!(
+            f,
+            "✅ Validated {} with {}",
+            self.config.unit_type, self.drives
+        )
     }
 }
 
@@ -201,12 +205,83 @@ impl std::fmt::Display for PartitionLayout {
     }
 }
 
+/// Device path newtype
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevicePath(pub String);
+
+impl std::fmt::Display for DevicePath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Mount point newtype
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountPoint(pub &'static str);
+
+impl std::fmt::Display for MountPoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Partition label newtype
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionLabel(pub &'static str);
+
+impl std::fmt::Display for PartitionLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Partition size in bytes with smart display formatting
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionSize(pub u64);
+
+impl PartitionSize {
+    pub const fn from_gb(gb: u64) -> Self {
+        Self(gb * 1_000_000_000)
+    }
+
+    pub const fn from_mb(mb: u64) -> Self {
+        Self(mb * 1_000_000)
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.0
+    }
+
+    pub fn gigabytes(&self) -> u64 {
+        self.0 / 1_000_000_000
+    }
+}
+
+impl std::fmt::Display for PartitionSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const MB: u64 = 1_000_000;
+        const GB: u64 = 1_000_000_000;
+        const TB: u64 = 1_000_000_000_000;
+
+        if self.0 >= TB {
+            let tb = self.0 as f64 / TB as f64;
+            write!(f, "{:.1} TB", tb)
+        } else if self.0 >= GB {
+            write!(f, "{} GB", self.0 / GB)
+        } else if self.0 >= MB {
+            write!(f, "{} MB", self.0 / MB)
+        } else {
+            write!(f, "{} bytes", self.0)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Partition {
-    pub device: String,
-    pub mount_point: &'static str,
-    pub label: &'static str,
-    pub size_description: &'static str,
+    pub device: DevicePath,
+    pub mount_point: MountPoint,
+    pub label: PartitionLabel,
+    pub size: PartitionSize,
 }
 
 impl std::fmt::Display for Partition {
@@ -214,7 +289,7 @@ impl std::fmt::Display for Partition {
         write!(
             f,
             "{} → {} ({}, label: {})",
-            self.device, self.mount_point, self.size_description, self.label
+            self.device, self.mount_point, self.size, self.label
         )
     }
 }
