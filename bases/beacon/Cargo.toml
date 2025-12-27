@@ -9,6 +9,7 @@ license.workspace = true
 
 [dependencies]
 # Workspace dependencies
+storage_primitives = {path="../../components/storage_primitives"}
 tokio = { workspace = true }
 color-eyre = { workspace = true }
 tracing = { workspace = true }
@@ -27,3 +28,6 @@ tokio-util = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 async-stream = {workspace = true}
 futures = {workspace = true}
+
+[dev-dependencies]
+rstest = {workspace = true}

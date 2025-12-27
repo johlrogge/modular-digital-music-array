@@ -164,11 +164,11 @@ async fn provision(
 
     // Parse and validate inputs using newtype constructors
     let unit_type = parse_unit_type(&form.unit_type)?;
-    let hostname = form.hostname.to_string();
-    let ssh_key = form.ssh_key.to_string();
+    let hostname = Hostname::new(form.hostname)?;
+    let ssh_key = SshPublicKey::new(form.ssh_key)?;
 
     let config = ProvisionConfig {
-        wifi_config: None,
+        ssh_key,
         unit_type,
         hostname,
     };
@@ -538,6 +538,11 @@ enum AppError {
 impl From<BeaconError> for AppError {
     fn from(err: BeaconError) -> Self {
         AppError::Beacon(err)
+    }
+}
+impl From<ValidationError> for AppError {
+    fn from(err: ValidationError) -> Self {
+        AppError::Validation(err.to_string())
     }
 }
 

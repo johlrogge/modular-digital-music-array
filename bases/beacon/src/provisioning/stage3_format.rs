@@ -33,10 +33,49 @@ impl Action<PartitionedDrives, FormattedSystem> for FormatPartitionsAction {
         })
     }
 
-    async fn apply(&self, input: PartitionedDrives) -> Result<FormattedSystem> {
-        // Stub: Would use mkfs.ext4 here
-        tracing::info!("Would format partitions here");
+    async fn apply(&self, planned_output: &FormattedSystem) -> Result<FormattedSystem> {
+        tracing::info!("Stage 3: Format partitions - executing plan");
 
-        Ok(FormattedSystem { partitioned: input })
+        // Format all partitions from the plan
+        match &planned_output.partitioned.plan {
+            crate::provisioning::types::PartitionPlan::SingleDrive { partitions, .. } => {
+                for partition in partitions {
+                    tracing::info!(
+                        "Would execute: mkfs.ext4 -L {} {}",
+                        partition.label,
+                        partition.device
+                    );
+                    // TODO: Real implementation:
+                    // Command::new("mkfs.ext4")
+                    //     .arg("-L")
+                    //     .arg(partition.label.0)
+                    //     .arg(&partition.device.0)
+                    //     .output()?;
+                }
+            }
+            crate::provisioning::types::PartitionPlan::DualDrive {
+                primary_partitions,
+                secondary_partitions,
+                ..
+            } => {
+                for partition in primary_partitions {
+                    tracing::info!(
+                        "Would execute: mkfs.ext4 -L {} {}",
+                        partition.label,
+                        partition.device
+                    );
+                }
+                for partition in secondary_partitions {
+                    tracing::info!(
+                        "Would execute: mkfs.ext4 -L {} {}",
+                        partition.label,
+                        partition.device
+                    );
+                }
+            }
+        }
+
+        tracing::info!("Format stage complete (simulated)");
+        Ok(planned_output.clone())
     }
 }

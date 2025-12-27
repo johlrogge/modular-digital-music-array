@@ -1,37 +1,30 @@
-// bases/beacon/src/provisioning/types.rs
-//! Pipeline stage types
+//! Provisioning pipeline stage types
 //!
 //! Each type represents a stage in the provisioning pipeline.
 //! The type system ensures stages are executed in order.
+//!
+//! ## Type Safety Philosophy
+//!
+//! This module re-exports domain types from crate::types but NEVER redefines them.
+//! All newtypes have private fields enforced at the crate::types level.
+
+use std::path::PathBuf;
 
 use crate::hardware::HardwareInfo;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
-/// Configuration for provisioning
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ProvisionConfig {
-    pub hostname: String,
-    pub unit_type: UnitType,
-    pub wifi_config: Option<WifiConfig>,
-}
+// ============================================================================
+// Re-exports from crate::types (SINGLE SOURCE OF TRUTH)
+// ============================================================================
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum UnitType {
-    Mdma909,
-    Mdma101,
-    Mdma303,
-}
+pub use crate::types::{
+    ByteSize, DevicePath, Hostname, MountPoint, PartitionLabel, PartitionSize, ProvisionConfig,
+    SshPublicKey, StorageCapacity, UnitType, ValidationError,
+};
 
-impl std::fmt::Display for UnitType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            UnitType::Mdma909 => write!(f, "MDMA-909"),
-            UnitType::Mdma101 => write!(f, "MDMA-101"),
-            UnitType::Mdma303 => write!(f, "MDMA-303"),
-        }
-    }
-}
+// ============================================================================
+// WiFi Configuration (provisioning-specific)
+// ============================================================================
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WifiConfig {
@@ -113,10 +106,10 @@ impl std::fmt::Display for ValidatedDrives {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ValidatedDrives::OneDrive(drive) => {
-                write!(f, "Validated 1 drive: {}", drive)
+                write!(f, "1 drive: {}", drive)
             }
             ValidatedDrives::TwoDrives(primary, secondary) => {
-                write!(f, "Validated 2 drives: {}, {}", primary, secondary)
+                write!(f, "2 drives: {}, {}", primary, secondary)
             }
         }
     }
@@ -124,8 +117,8 @@ impl std::fmt::Display for ValidatedDrives {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DriveInfo {
-    pub device: String,
-    pub size_bytes: u64,
+    pub device: DevicePath,   // Using validated type from crate::types
+    pub size_bytes: ByteSize, // Using shared type from storage_primitives
     pub model: String,
 }
 
@@ -133,10 +126,8 @@ impl std::fmt::Display for DriveInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} ({} GB, model: {})",
-            self.device,
-            self.size_bytes / 1_000_000_000,
-            self.model
+            "{} ({}, model: {})",
+            self.device, self.size_bytes, self.model
         )
     }
 }
@@ -148,130 +139,62 @@ impl std::fmt::Display for DriveInfo {
 /// Drives that have been partitioned
 ///
 /// This type can only be constructed after creating partitions
-/// using parted/gdisk.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PartitionedDrives {
     pub validated: ValidatedHardware,
-    pub layout: PartitionLayout,
+    pub plan: PartitionPlan,
 }
 
 impl std::fmt::Display for PartitionedDrives {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "✅ Partitioned drives:\n{}", self.layout)
+        write!(f, "✅ Partitioned drives:\n{}", self.plan)
     }
 }
 
+/// Partition plan for either single or dual drive configurations
 #[derive(Debug, Clone, PartialEq)]
-pub enum PartitionLayout {
+pub enum PartitionPlan {
+    /// All partitions on a single drive
     SingleDrive {
-        device: String,
+        device: DriveInfo,
         partitions: Vec<Partition>,
     },
+    /// Partitions split across primary and secondary drives
     DualDrive {
-        primary_device: String,
+        primary_device: DriveInfo,
         primary_partitions: Vec<Partition>,
-        secondary_device: String,
+        secondary_device: DriveInfo,
         secondary_partitions: Vec<Partition>,
     },
 }
 
-impl std::fmt::Display for PartitionLayout {
+impl std::fmt::Display for PartitionPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PartitionLayout::SingleDrive { device, partitions } => {
-                writeln!(f, "Single drive: {}", device)?;
+            PartitionPlan::SingleDrive { device, partitions } => {
+                writeln!(f, "Single Drive Configuration {}:", device)?;
                 for partition in partitions {
                     writeln!(f, "  {}", partition)?;
                 }
                 Ok(())
             }
-            PartitionLayout::DualDrive {
+            PartitionPlan::DualDrive {
                 primary_device,
                 primary_partitions,
                 secondary_device,
                 secondary_partitions,
             } => {
-                writeln!(f, "Primary drive: {}", primary_device)?;
+                writeln!(f, "Dual Drive Configuration:")?;
+                writeln!(f, "Primary Drive {}:", primary_device)?;
                 for partition in primary_partitions {
                     writeln!(f, "  {}", partition)?;
                 }
-                writeln!(f, "Secondary drive: {}", secondary_device)?;
+                writeln!(f, "Secondary Drive {}:", secondary_device)?;
                 for partition in secondary_partitions {
                     writeln!(f, "  {}", partition)?;
                 }
                 Ok(())
             }
-        }
-    }
-}
-
-/// Device path newtype
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DevicePath(pub String);
-
-impl std::fmt::Display for DevicePath {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Mount point newtype
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MountPoint(pub &'static str);
-
-impl std::fmt::Display for MountPoint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Partition label newtype
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PartitionLabel(pub &'static str);
-
-impl std::fmt::Display for PartitionLabel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Partition size in bytes with smart display formatting
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PartitionSize(pub u64);
-
-impl PartitionSize {
-    pub const fn from_gb(gb: u64) -> Self {
-        Self(gb * 1_000_000_000)
-    }
-
-    pub const fn from_mb(mb: u64) -> Self {
-        Self(mb * 1_000_000)
-    }
-
-    pub fn bytes(&self) -> u64 {
-        self.0
-    }
-
-    pub fn gigabytes(&self) -> u64 {
-        self.0 / 1_000_000_000
-    }
-}
-
-impl std::fmt::Display for PartitionSize {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        const MB: u64 = 1_000_000;
-        const GB: u64 = 1_000_000_000;
-        const TB: u64 = 1_000_000_000_000;
-
-        if self.0 >= TB {
-            let tb = self.0 as f64 / TB as f64;
-            write!(f, "{:.1} TB", tb)
-        } else if self.0 >= GB {
-            write!(f, "{} GB", self.0 / GB)
-        } else if self.0 >= MB {
-            write!(f, "{} MB", self.0 / MB)
-        } else {
-            write!(f, "{} bytes", self.0)
         }
     }
 }
@@ -321,24 +244,23 @@ impl std::fmt::Display for FormattedSystem {
 }
 
 // ============================================================================
-// Stage 4: Installation
+// Stage 4: Base Installation
 // ============================================================================
 
-/// System with OS installed
-///
-/// This type can only be constructed after:
-/// - Mounting partitions
-/// - Installing base system
-/// - Installing bootloader
+/// System with base Void Linux installed
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstalledSystem {
     pub formatted: FormattedSystem,
-    pub mount_point: PathBuf,
+}
+impl InstalledSystem {
+    pub(crate) fn mount_point(&self) -> PathBuf {
+        todo!()
+    }
 }
 
 impl std::fmt::Display for InstalledSystem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "✅ OS installed at {:?}", self.mount_point)
+        write!(f, "✅ Base system installed")
     }
 }
 
@@ -346,13 +268,7 @@ impl std::fmt::Display for InstalledSystem {
 // Stage 5: Configuration
 // ============================================================================
 
-/// System that has been configured
-///
-/// This type can only be constructed after:
-/// - Setting hostname
-/// - Configuring network
-/// - Setting up users
-/// - Installing packages
+/// System with configuration applied
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfiguredSystem {
     pub installed: InstalledSystem,
@@ -360,7 +276,7 @@ pub struct ConfiguredSystem {
 
 impl std::fmt::Display for ConfiguredSystem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "✅ System configured and ready")
+        write!(f, "✅ System configured")
     }
 }
 
@@ -369,29 +285,13 @@ impl std::fmt::Display for ConfiguredSystem {
 // ============================================================================
 
 /// Fully provisioned system ready to boot
-///
-/// This is the final stage output.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProvisionedSystem {
     pub configured: ConfiguredSystem,
-    pub summary: ProvisioningSummary,
 }
 
 impl std::fmt::Display for ProvisionedSystem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "✅ {} ({}) fully provisioned on {}",
-            self.summary.hostname, self.summary.unit_type, self.summary.primary_drive
-        )
+        write!(f, "✅ System fully provisioned and ready to boot!")
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProvisioningSummary {
-    pub hostname: String,
-    pub unit_type: UnitType,
-    pub primary_drive: String,
-    pub secondary_drive: Option<String>,
-    pub total_partitions: usize,
 }

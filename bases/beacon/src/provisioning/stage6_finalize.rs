@@ -3,7 +3,7 @@
 
 use crate::actions::{Action, ActionId, PlannedAction};
 use crate::error::Result;
-use crate::provisioning::types::{ConfiguredSystem, ProvisionedSystem, ProvisioningSummary};
+use crate::provisioning::types::{ConfiguredSystem, ProvisionedSystem};
 
 #[derive(Clone, Debug)]
 pub struct FinalizeProvisioningAction;
@@ -21,28 +21,8 @@ impl Action<ConfiguredSystem, ProvisionedSystem> for FinalizeProvisioningAction 
         &self,
         input: &ConfiguredSystem,
     ) -> Result<PlannedAction<ConfiguredSystem, ProvisionedSystem, Self>> {
-        let config = &input.installed.formatted.partitioned.validated.config;
-        let primary_drive = input
-            .installed
-            .formatted
-            .partitioned
-            .validated
-            .drives
-            .primary()
-            .device
-            .clone();
-
-        let summary = ProvisioningSummary {
-            hostname: config.hostname.clone(),
-            unit_type: config.unit_type.clone(),
-            primary_drive,
-            secondary_drive: None,
-            total_partitions: 2, // Stub value
-        };
-
         let assumed_output = ProvisionedSystem {
             configured: input.clone(),
-            summary,
         };
 
         Ok(PlannedAction {
@@ -53,32 +33,51 @@ impl Action<ConfiguredSystem, ProvisionedSystem> for FinalizeProvisioningAction 
         })
     }
 
-    async fn apply(&self, input: ConfiguredSystem) -> Result<ProvisionedSystem> {
-        // Stub: Would verify everything and generate summary
-        tracing::info!("Would finalize provisioning here");
+    async fn apply(&self, planned_output: &ProvisionedSystem) -> Result<ProvisionedSystem> {
+        tracing::info!("Stage 6: Finalize provisioning - executing plan");
 
-        let config = &input.installed.formatted.partitioned.validated.config;
-        let primary_drive = input
-            .installed
-            .formatted
-            .partitioned
-            .validated
-            .drives
-            .primary()
-            .device
-            .clone();
+        let mount_point = &planned_output.configured.installed.mount_point();
 
-        let summary = ProvisioningSummary {
-            hostname: config.hostname.clone(),
-            unit_type: config.unit_type.clone(),
-            primary_drive,
-            secondary_drive: None,
-            total_partitions: 2,
-        };
+        // Install bootloader
+        tracing::info!(
+            "Would execute: grub-install --root-directory={} /dev/nvme0n1",
+            mount_point.display()
+        );
+        // TODO: Real implementation:
+        // let boot_device = &planned_output.summary.primary_drive;
+        // Command::new("grub-install")
+        //     .arg(format!("--root-directory={}", mount_point.display()))
+        //     .arg(boot_device)
+        //     .output()?;
 
-        Ok(ProvisionedSystem {
-            configured: input,
-            summary,
-        })
+        // Generate fstab
+        tracing::info!(
+            "Would execute: genfstab -U {} > {}/etc/fstab",
+            mount_point.display(),
+            mount_point.display()
+        );
+        // TODO: Real implementation:
+        // Command::new("genfstab")
+        //     .args(["-U", mount_point.to_str().unwrap()])
+        //     .output()
+        //     .and_then(|output| {
+        //         std::fs::write(
+        //             mount_point.join("etc/fstab"),
+        //             output.stdout
+        //         )
+        //     })?;
+
+        // Unmount all filesystems
+        tracing::info!("Would execute: umount -R {}", mount_point.display());
+        // TODO: Real implementation:
+        // Command::new("umount")
+        //     .args(["-R", mount_point.to_str().unwrap()])
+        //     .output()?;
+
+        // Verify summary
+        tracing::info!("Provisioning complete!");
+
+        tracing::info!("Finalize stage complete (simulated)");
+        Ok(planned_output.clone())
     }
 }

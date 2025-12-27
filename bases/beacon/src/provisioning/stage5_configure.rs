@@ -33,10 +33,62 @@ impl Action<InstalledSystem, ConfiguredSystem> for ConfigureSystemAction {
         })
     }
 
-    async fn apply(&self, input: InstalledSystem) -> Result<ConfiguredSystem> {
-        // Stub: Would configure hostname, network, users here
-        tracing::info!("Would configure system here");
+    async fn apply(&self, planned_output: &ConfiguredSystem) -> Result<ConfiguredSystem> {
+        tracing::info!("Stage 5: Configure system - executing plan");
 
-        Ok(ConfiguredSystem { installed: input })
+        let mount_point = &planned_output.installed.mount_point();
+        let unit_type = &planned_output
+            .installed
+            .formatted
+            .partitioned
+            .validated
+            .config
+            .unit_type;
+
+        // Configure hostname based on unit type
+        let hostname = format!("mdma-{}", unit_type.to_string().to_lowercase());
+        tracing::info!(
+            "Would execute: echo '{}' > {}/etc/hostname",
+            hostname,
+            mount_point.display()
+        );
+        // TODO: Real implementation:
+        // std::fs::write(mount_point.join("etc/hostname"), hostname)?;
+
+        // Configure network
+        tracing::info!(
+            "Would execute: configure DHCP in {}/etc/rc.conf",
+            mount_point.display()
+        );
+        // TODO: Real implementation:
+        // let rc_conf = mount_point.join("etc/rc.conf");
+        // std::fs::write(&rc_conf, "NETWORKING=yes\n")?;
+
+        // Create mdma user
+        tracing::info!(
+            "Would execute: chroot {} useradd -m -G audio,video mdma",
+            mount_point.display()
+        );
+        // TODO: Real implementation:
+        // Command::new("chroot")
+        //     .arg(mount_point)
+        //     .arg("useradd")
+        //     .args(["-m", "-G", "audio,video", "mdma"])
+        //     .output()?;
+
+        // Install required packages
+        tracing::info!(
+            "Would execute: xbps-install -Sy -r {} dbus avahi void-repo-nonfree",
+            mount_point.display()
+        );
+        // TODO: Real implementation:
+        // Command::new("xbps-install")
+        //     .args(["-Sy", "-r"])
+        //     .arg(mount_point)
+        //     .args(["dbus", "avahi", "void-repo-nonfree"])
+        //     .output()?;
+
+        tracing::info!("Configure stage complete (simulated)");
+        Ok(planned_output.clone())
     }
 }

@@ -4,6 +4,7 @@
 use crate::actions::{Action, ProvisioningPlan};
 use crate::error::Result;
 use crate::hardware::HardwareInfo;
+use crate::provisioning::types::PartitionPlan;
 use tokio::sync::mpsc;
 
 pub mod types;
@@ -111,16 +112,16 @@ pub async fn provision_system(
                 if hardware.nvme_drives.len() >= 2 {
                     ValidatedDrives::TwoDrives(
                         DriveInfo {
-                            device: hardware.nvme_drives[0].device.as_str().to_string(),
-                            size_bytes: hardware.nvme_drives[0].capacity.bytes(),
+                            device: hardware.nvme_drives[0].device.clone(),
+                            size_bytes: hardware.nvme_drives[0].capacity,
                             model: hardware.nvme_drives[0]
                                 .model
                                 .clone()
                                 .unwrap_or_else(|| "Unknown".to_string()),
                         },
                         DriveInfo {
-                            device: hardware.nvme_drives[1].device.as_str().to_string(),
-                            size_bytes: hardware.nvme_drives[1].capacity.bytes(),
+                            device: hardware.nvme_drives[1].device.clone(),
+                            size_bytes: hardware.nvme_drives[1].capacity,
                             model: hardware.nvme_drives[1]
                                 .model
                                 .clone()
@@ -129,8 +130,8 @@ pub async fn provision_system(
                     )
                 } else if !hardware.nvme_drives.is_empty() {
                     ValidatedDrives::OneDrive(DriveInfo {
-                        device: hardware.nvme_drives[0].device.as_str().to_string(),
-                        size_bytes: hardware.nvme_drives[0].capacity.bytes(),
+                        device: hardware.nvme_drives[0].device.clone(),
+                        size_bytes: hardware.nvme_drives[0].capacity,
                         model: hardware.nvme_drives[0]
                             .model
                             .clone()
@@ -149,8 +150,8 @@ pub async fn provision_system(
                     ));
                 }
                 ValidatedDrives::OneDrive(DriveInfo {
-                    device: hardware.nvme_drives[0].device.as_str().to_string(),
-                    size_bytes: hardware.nvme_drives[0].capacity.bytes(),
+                    device: hardware.nvme_drives[0].device.clone(),
+                    size_bytes: hardware.nvme_drives[0].capacity,
                     model: hardware.nvme_drives[0]
                         .model
                         .clone()
@@ -159,33 +160,35 @@ pub async fn provision_system(
             }
         };
 
-        let primary_drive = drives.primary().device.clone();
-        let secondary_drive = drives.secondary().map(|d| d.device.clone());
-
-        let summary = types::ProvisioningSummary {
-            hostname: config.hostname.clone(),
-            unit_type: config.unit_type.clone(),
-            primary_drive: primary_drive.clone(),
-            secondary_drive,
-            total_partitions: 4, // Mock value
-        };
-
         return Ok(types::ProvisionedSystem {
             configured: types::ConfiguredSystem {
                 installed: types::InstalledSystem {
                     formatted: types::FormattedSystem {
                         partitioned: types::PartitionedDrives {
-                            validated: types::ValidatedHardware { config, drives },
-                            layout: types::PartitionLayout::SingleDrive {
-                                device: primary_drive,
-                                partitions: vec![], // Mock
+                            validated: types::ValidatedHardware {
+                                config,
+                                drives: drives.clone(),
+                            },
+                            plan: match drives {
+                                ValidatedDrives::OneDrive(drive_info) => {
+                                    PartitionPlan::SingleDrive {
+                                        device: drive_info,
+                                        partitions: vec![],
+                                    }
+                                }
+                                ValidatedDrives::TwoDrives(primary_device, secondary_device) => {
+                                    PartitionPlan::DualDrive {
+                                        primary_device,
+                                        primary_partitions: vec![],
+                                        secondary_device,
+                                        secondary_partitions: vec![],
+                                    }
+                                }
                             },
                         },
                     },
-                    mount_point: std::path::PathBuf::from("/mnt"),
                 },
             },
-            summary,
         });
     }
 
@@ -230,16 +233,16 @@ pub async fn provision_system(
             if hardware.nvme_drives.len() >= 2 {
                 ValidatedDrives::TwoDrives(
                     DriveInfo {
-                        device: hardware.nvme_drives[0].device.as_str().to_string(),
-                        size_bytes: hardware.nvme_drives[0].capacity.bytes(),
+                        device: hardware.nvme_drives[0].device.clone(),
+                        size_bytes: hardware.nvme_drives[0].capacity,
                         model: hardware.nvme_drives[0]
                             .model
                             .clone()
                             .unwrap_or_else(|| "Unknown".to_string()),
                     },
                     DriveInfo {
-                        device: hardware.nvme_drives[1].device.as_str().to_string(),
-                        size_bytes: hardware.nvme_drives[1].capacity.bytes(),
+                        device: hardware.nvme_drives[1].device.clone(),
+                        size_bytes: hardware.nvme_drives[1].capacity,
                         model: hardware.nvme_drives[1]
                             .model
                             .clone()
@@ -248,8 +251,8 @@ pub async fn provision_system(
                 )
             } else if !hardware.nvme_drives.is_empty() {
                 ValidatedDrives::OneDrive(DriveInfo {
-                    device: hardware.nvme_drives[0].device.as_str().to_string(),
-                    size_bytes: hardware.nvme_drives[0].capacity.bytes(),
+                    device: hardware.nvme_drives[0].device.clone(),
+                    size_bytes: hardware.nvme_drives[0].capacity,
                     model: hardware.nvme_drives[0]
                         .model
                         .clone()
@@ -268,8 +271,8 @@ pub async fn provision_system(
                 ));
             }
             ValidatedDrives::OneDrive(DriveInfo {
-                device: hardware.nvme_drives[0].device.as_str().to_string(),
-                size_bytes: hardware.nvme_drives[0].capacity.bytes(),
+                device: hardware.nvme_drives[0].device.clone(),
+                size_bytes: hardware.nvme_drives[0].capacity,
                 model: hardware.nvme_drives[0]
                     .model
                     .clone()
@@ -278,33 +281,34 @@ pub async fn provision_system(
         }
     };
 
-    let primary_drive = drives.primary().device.clone();
-    let secondary_drive = drives.secondary().map(|d| d.device.clone());
-
-    let summary = types::ProvisioningSummary {
-        hostname: config.hostname.clone(),
-        unit_type: config.unit_type.clone(),
-        primary_drive: primary_drive.clone(),
-        secondary_drive,
-        total_partitions: 4,
-    };
-
     Ok(types::ProvisionedSystem {
         configured: types::ConfiguredSystem {
             installed: types::InstalledSystem {
                 formatted: types::FormattedSystem {
                     partitioned: types::PartitionedDrives {
-                        validated: types::ValidatedHardware { config, drives },
-                        layout: types::PartitionLayout::SingleDrive {
-                            device: primary_drive,
-                            partitions: vec![],
+                        validated: types::ValidatedHardware {
+                            config,
+                            drives: drives.clone(),
+                        },
+                        plan: match drives {
+                            ValidatedDrives::OneDrive(device) => PartitionPlan::SingleDrive {
+                                device,
+                                partitions: vec![],
+                            },
+
+                            ValidatedDrives::TwoDrives(primary_device, secondary_device) => {
+                                PartitionPlan::DualDrive {
+                                    primary_device,
+                                    primary_partitions: vec![],
+                                    secondary_device,
+                                    secondary_partitions: vec![],
+                                }
+                            }
                         },
                     },
                 },
-                mount_point: std::path::PathBuf::from("/mnt"),
             },
         },
-        summary,
     })
 }
 
@@ -313,14 +317,15 @@ mod tests {
     use super::*;
     use crate::hardware::NvmeDrive;
     use crate::provisioning::types::UnitType;
-    use crate::types::{DevicePath, StorageBytes};
+    use crate::types::{DevicePath, Hostname, SshPublicKey};
+    use storage_primitives::StorageCapacity;
 
     fn mock_hardware() -> HardwareInfo {
         HardwareInfo {
             model: "Raspberry Pi 5 Model B".to_string(),
             nvme_drives: vec![NvmeDrive {
                 device: DevicePath::from("/dev/nvme0n1"),
-                capacity: StorageBytes::from(512_000_000_000u64),
+                capacity: StorageCapacity::from(512_000_000_000u64),
                 model: Some("Test NVMe".to_string()),
                 is_formatted: false,
             }],
@@ -331,9 +336,9 @@ mod tests {
 
     fn mock_config() -> ProvisionConfig {
         ProvisionConfig {
-            hostname: "test-909".to_string(),
+            hostname: Hostname::new("test-909".to_string()).unwrap(),
             unit_type: UnitType::Mdma909,
-            wifi_config: None,
+            ssh_key: SshPublicKey::new("public key".to_string()).unwrap(),
         }
     }
 

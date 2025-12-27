@@ -1,15 +1,18 @@
-// bases/beacon/src/hardware.rs
+//! Hardware detection module
+//!
+//! Uses consolidated types from crate::types and storage_primitives.
+
 use crate::error::{BeaconError, Result};
-use crate::types::{DevicePath, StorageBytes};
+use crate::types::{ByteSize, DevicePath};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NvmeDrive {
     pub device: DevicePath,
-    pub capacity: StorageBytes,
+    pub capacity: ByteSize,
     pub model: Option<String>,
     pub is_formatted: bool,
 }
@@ -62,9 +65,13 @@ pub async fn detect_nvme_drives() -> Result<Vec<NvmeDrive>> {
         let nvme_name = format!("nvme{}", i);
         let model = get_device_model(&nvme_name).await.ok();
 
+        // Use validated DevicePath constructor
+        let device = DevicePath::new(device_path)
+            .map_err(|e| BeaconError::Hardware(format!("Invalid device path: {}", e)))?;
+
         drives.push(NvmeDrive {
-            device: DevicePath::new(device_path),
-            capacity: StorageBytes::new(capacity),
+            device,
+            capacity: ByteSize::new(capacity),
             model,
             is_formatted,
         });
@@ -81,20 +88,20 @@ async fn get_device_capacity(device: &str) -> Result<u64> {
         .args(["-b", "-d", "-n", "-o", "SIZE", device])
         .output()
         .await
-        .map_err(|e| BeaconError::HardwareInfo(format!("lsblk failed: {}", e)))?;
+        .map_err(|e| BeaconError::command_failed("lsblk", e))?;
 
     if !output.status.success() {
-        return Err(BeaconError::HardwareInfo(format!(
-            "lsblk command failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
+        return Err(BeaconError::CommandExitCode {
+            command: format!("lsblk -b -d -n -o SIZE {}", device),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        });
     }
 
     let size_str = String::from_utf8_lossy(&output.stdout);
     size_str
         .trim()
         .parse()
-        .map_err(|e| BeaconError::HardwareInfo(format!("invalid size: {}", e)))
+        .map_err(|e| BeaconError::Hardware(format!("invalid size format: {}", e)))
 }
 
 async fn has_partitions(device: &str) -> Result<bool> {
@@ -103,30 +110,29 @@ async fn has_partitions(device: &str) -> Result<bool> {
         .arg(device)
         .output()
         .await
-        .map_err(|e| BeaconError::HardwareInfo(format!("blkid failed: {}", e)))?;
+        .map_err(|e| BeaconError::command_failed("blkid", e))?;
 
     // If blkid succeeds, device has filesystem/partition table
     Ok(output.status.success())
 }
 
 async fn get_device_model(nvme_name: &str) -> Result<String> {
-    let model_path = format!("/sys/class/nvme/{}/model", nvme_name);
+    let model_path = PathBuf::from(format!("/sys/class/nvme/{}/model", nvme_name));
     let model = fs::read_to_string(&model_path)
         .await
-        .map_err(|e| BeaconError::HardwareInfo(format!("read model failed: {}", e)))?;
+        .map_err(|e| BeaconError::hardware_info(&model_path, e))?;
 
     Ok(model.trim().to_string())
 }
 
 /// Get Raspberry Pi model information
 async fn get_pi_model() -> Result<String> {
-    let model = fs::read_to_string("/proc/device-tree/model")
-        .await
-        .unwrap_or_else(|_| {
-            // Not a Raspberry Pi, try to get generic system info
-            std::fs::read_to_string("/sys/devices/virtual/dmi/id/product_name")
-                .unwrap_or_else(|_| "Unknown (Development Machine)".to_string())
-        });
+    let model_path = PathBuf::from("/proc/device-tree/model");
+    let model = fs::read_to_string(&model_path).await.unwrap_or_else(|_| {
+        // Not a Raspberry Pi, try to get generic system info
+        std::fs::read_to_string("/sys/devices/virtual/dmi/id/product_name")
+            .unwrap_or_else(|_| "Unknown (Development Machine)".to_string())
+    });
 
     Ok(model.trim_end_matches('\0').to_string())
 }

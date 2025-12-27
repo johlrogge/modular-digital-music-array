@@ -49,8 +49,8 @@ impl ValidateHardwareAction {
             .nvme_drives
             .iter()
             .map(|nvme| DriveInfo {
-                device: nvme.device.as_str().to_string(),
-                size_bytes: nvme.capacity.bytes(),
+                device: nvme.device.clone(),
+                size_bytes: nvme.capacity,
                 model: nvme.model.clone().unwrap_or_else(|| "Unknown".to_string()),
             })
             .collect()
@@ -86,14 +86,27 @@ impl Action<SafeHardware, ValidatedHardware> for ValidateHardwareAction {
         })
     }
 
-    async fn apply(&self, input: SafeHardware) -> Result<ValidatedHardware> {
-        // Re-validate during execution (matches plan)
-        let drive_infos = Self::build_drive_infos(&input);
-        let drives = self.validate_drives(&drive_infos)?;
+    async fn apply(&self, planned_output: &ValidatedHardware) -> Result<ValidatedHardware> {
+        tracing::info!("Stage 1: Validate hardware - executing plan");
 
-        Ok(ValidatedHardware {
-            config: self.config.clone(),
-            drives,
-        })
+        // The validation already happened in plan()
+        // Just log what was validated
+        match &planned_output.drives {
+            ValidatedDrives::OneDrive(drive) => {
+                tracing::info!("Validated 1 drive: {} ({})", drive.device, drive.size_bytes);
+            }
+            ValidatedDrives::TwoDrives(primary, secondary) => {
+                tracing::info!("Validated 2 drives:");
+                tracing::info!("  Primary: {} ({})", primary.device, primary.size_bytes);
+                tracing::info!(
+                    "  Secondary: {} ({})",
+                    secondary.device,
+                    secondary.size_bytes
+                );
+            }
+        }
+
+        tracing::info!("Validate stage complete");
+        Ok(planned_output.clone())
     }
 }
