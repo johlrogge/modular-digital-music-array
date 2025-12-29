@@ -4,12 +4,11 @@
 use crate::actions::{Action, ActionId, PlannedAction};
 use crate::error::Result;
 use crate::provisioning::types::{FormattedSystem, InstalledSystem};
-use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
 pub struct InstallSystemAction;
 
-impl Action<FormattedSystem, InstalledSystem> for InstallSystemAction {
+impl Action<FormattedSystem, InstalledSystem, InstalledSystem> for InstallSystemAction {
     fn id(&self) -> ActionId {
         ActionId::new("install-system")
     }
@@ -21,7 +20,7 @@ impl Action<FormattedSystem, InstalledSystem> for InstallSystemAction {
     async fn plan(
         &self,
         input: &FormattedSystem,
-    ) -> Result<PlannedAction<FormattedSystem, InstalledSystem, Self>> {
+    ) -> Result<PlannedAction<FormattedSystem, InstalledSystem, InstalledSystem, Self>> {
         let assumed_output = InstalledSystem {
             formatted: input.clone(),
         };
@@ -30,6 +29,7 @@ impl Action<FormattedSystem, InstalledSystem> for InstallSystemAction {
             description: self.description(),
             action: self.clone(),
             input: input.clone(),
+            planned_work: assumed_output.clone(),
             assumed_output,
         })
     }
@@ -39,7 +39,7 @@ impl Action<FormattedSystem, InstalledSystem> for InstallSystemAction {
 
         // Mount filesystems from the plan
         let mount_point = match &planned_output.formatted.partitioned.plan {
-            crate::provisioning::types::PartitionPlan::SingleDrive { device, partitions } => {
+            crate::provisioning::types::CompletedPartitionPlan::SingleDrive { device, partitions } => {
                 for partition in partitions {
                     let target_path = partition.device.join(partition.mount_point);
                     tracing::info!(
@@ -57,7 +57,7 @@ impl Action<FormattedSystem, InstalledSystem> for InstallSystemAction {
                 }
                 device.device.clone()
             }
-            crate::provisioning::types::PartitionPlan::DualDrive {
+            crate::provisioning::types::CompletedPartitionPlan::DualDrive {
                 primary_device,
                 primary_partitions,
                 secondary_partitions,

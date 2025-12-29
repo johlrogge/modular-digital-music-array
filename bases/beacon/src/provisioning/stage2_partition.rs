@@ -3,13 +3,83 @@
 
 use crate::actions::{Action, ActionId, PlannedAction};
 use crate::error::Result;
-use crate::provisioning::types::{Partition, PartitionPlan, PartitionedDrives, ValidatedHardware};
+use crate::provisioning::types::{
+    CompletedPartitionedDrives, Partition, PartitionPlan, PartitionState, PartitionedDrives,
+    ValidatedHardware,
+};
 use crate::types::ValidationError;
+use serde::Deserialize;
+use std::process::Command;
+
+/// Represents a partition as reported by lsblk
+#[derive(Debug, Deserialize)]
+struct LsblkPartition {
+    name: String,
+    size: u64,
+    #[serde(rename = "fstype")]
+    fs_type: Option<String>,
+    label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LsblkDevice {
+    name: String,
+    children: Option<Vec<LsblkPartition>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LsblkOutput {
+    blockdevices: Vec<LsblkDevice>,
+}
+
+/// Read existing partitions from a device using lsblk
+async fn read_existing_partitions(device_path: &str) -> Result<Vec<(String, u64)>> {
+    let output = Command::new("lsblk")
+        .args(&[
+            "-J", // JSON output
+            "-b", // bytes
+            "-o", // output columns
+            "NAME,SIZE,FSTYPE,LABEL",
+            device_path,
+        ])
+        .output()
+        .map_err(|e| {
+            crate::error::BeaconError::Provisioning(format!("Failed to run lsblk: {}", e))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(crate::error::BeaconError::Provisioning(format!(
+            "lsblk failed: {}",
+            stderr
+        )));
+    }
+
+    let lsblk: LsblkOutput = serde_json::from_slice(&output.stdout).map_err(|e| {
+        crate::error::BeaconError::Provisioning(format!("Failed to parse lsblk output: {}", e))
+    })?;
+
+    // Extract partitions with their labels
+    let mut partitions = Vec::new();
+    if let Some(device) = lsblk.blockdevices.first() {
+        if let Some(children) = &device.children {
+            for child in children {
+                if let Some(label) = &child.label {
+                    partitions.push((label.clone(), child.size));
+                }
+            }
+        }
+    }
+
+    Ok(partitions)
+}
 
 #[derive(Clone, Debug)]
 pub struct PartitionDrivesAction;
 
-impl Action<ValidatedHardware, PartitionedDrives> for PartitionDrivesAction {
+impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
+    for PartitionDrivesAction
+{
     fn id(&self) -> ActionId {
         ActionId::new("partition-drives")
     }
@@ -21,7 +91,8 @@ impl Action<ValidatedHardware, PartitionedDrives> for PartitionDrivesAction {
     async fn plan(
         &self,
         input: &ValidatedHardware,
-    ) -> Result<PlannedAction<ValidatedHardware, PartitionedDrives, Self>> {
+    ) -> Result<PlannedAction<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives, Self>>
+    {
         use crate::provisioning::types::{
             DevicePath, MountPoint, PartitionLabel, PartitionSize, UnitType,
         };
@@ -71,30 +142,30 @@ impl Action<ValidatedHardware, PartitionedDrives> for PartitionDrivesAction {
                         let music_size = remaining_bytes;
 
                         vec![
-                            Partition {
+                            PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p1", primary_device))?,
                                 mount_point: MountPoint::new("/"),
                                 label: PartitionLabel::new("root"),
                                 size: PartitionSize::from_gb(ROOT_SIZE_GB),
-                            },
-                            Partition {
+                            }),
+                            PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p2", primary_device))?,
                                 mount_point: MountPoint::new("/var"),
                                 label: PartitionLabel::new("var"),
                                 size: PartitionSize::from_gb(VAR_SIZE_GB),
-                            },
-                            Partition {
+                            }),
+                            PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p3", primary_device))?,
                                 mount_point: MountPoint::new("/metadata"),
                                 label: PartitionLabel::new("metadata"),
                                 size: PartitionSize::from_gb(METADATA_SIZE_GB),
-                            },
-                            Partition {
+                            }),
+                            PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p4", primary_device))?,
                                 mount_point: MountPoint::new("/music"),
                                 label: PartitionLabel::new("music"),
                                 size: music_size,
-                            },
+                            }),
                         ]
                     } else {
                         // Secondary dedicated to music (clean separation worth preserving)
@@ -112,30 +183,30 @@ impl Action<ValidatedHardware, PartitionedDrives> for PartitionDrivesAction {
                         let cdj_size = remaining_bytes;
 
                         vec![
-                            Partition {
+                            PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p1", primary_device))?,
                                 mount_point: MountPoint::new("/"),
                                 label: PartitionLabel::new("root"),
                                 size: PartitionSize::from_gb(ROOT_SIZE_GB),
-                            },
-                            Partition {
+                            }),
+                            PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p2", primary_device))?,
                                 mount_point: MountPoint::new("/var"),
                                 label: PartitionLabel::new("var"),
                                 size: PartitionSize::from_gb(VAR_SIZE_GB),
-                            },
-                            Partition {
+                            }),
+                            PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p3", primary_device))?,
                                 mount_point: MountPoint::new("/metadata"),
                                 label: PartitionLabel::new("metadata"),
                                 size: PartitionSize::from_gb(METADATA_SIZE_GB),
-                            },
-                            Partition {
+                            }),
+                            PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p4", primary_device))?,
                                 mount_point: MountPoint::new("/cdj-export"),
                                 label: PartitionLabel::new("cdj-export"),
                                 size: cdj_size,
-                            },
+                            }),
                         ]
                     }
                 } else {
@@ -179,36 +250,36 @@ impl Action<ValidatedHardware, PartitionedDrives> for PartitionDrivesAction {
                     );
 
                     vec![
-                        Partition {
+                        PartitionState::Planned(Partition {
                             device: DevicePath::new(format!("{}p1", primary_device))?,
                             mount_point: MountPoint::new("/"),
                             label: PartitionLabel::new("root"),
                             size: PartitionSize::from_gb(ROOT_SIZE_GB),
-                        },
-                        Partition {
+                        }),
+                        PartitionState::Planned(Partition {
                             device: DevicePath::new(format!("{}p2", primary_device))?,
                             mount_point: MountPoint::new("/var"),
                             label: PartitionLabel::new("var"),
                             size: PartitionSize::from_gb(VAR_SIZE_GB),
-                        },
-                        Partition {
+                        }),
+                        PartitionState::Planned(Partition {
                             device: DevicePath::new(format!("{}p3", primary_device))?,
                             mount_point: MountPoint::new("/music"),
                             label: PartitionLabel::new("music"),
                             size: PartitionSize::from_gb(music_size_gb),
-                        },
-                        Partition {
+                        }),
+                        PartitionState::Planned(Partition {
                             device: DevicePath::new(format!("{}p4", primary_device))?,
                             mount_point: MountPoint::new("/metadata"),
                             label: PartitionLabel::new("metadata"),
                             size: PartitionSize::from_gb(METADATA_SIZE_GB),
-                        },
-                        Partition {
+                        }),
+                        PartitionState::Planned(Partition {
                             device: DevicePath::new(format!("{}p5", primary_device))?,
                             mount_point: MountPoint::new("/cdj-export"),
                             label: PartitionLabel::new("cdj-export"),
                             size: PartitionSize::from_gb(cdj_size_gb),
-                        },
+                        }),
                     ]
                 }
             }
@@ -219,24 +290,24 @@ impl Action<ValidatedHardware, PartitionedDrives> for PartitionDrivesAction {
                 let cache_size = remaining_bytes;
 
                 vec![
-                    Partition {
+                    PartitionState::Planned(Partition {
                         device: DevicePath::new(format!("{}p1", primary_device))?,
                         mount_point: MountPoint::new("/"),
                         label: PartitionLabel::new("root"),
                         size: PartitionSize::from_gb(ROOT_SIZE_GB),
-                    },
-                    Partition {
+                    }),
+                    PartitionState::Planned(Partition {
                         device: DevicePath::new(format!("{}p2", primary_device))?,
                         mount_point: MountPoint::new("/var"),
                         label: PartitionLabel::new("var"),
                         size: PartitionSize::from_gb(VAR_SIZE_GB),
-                    },
-                    Partition {
+                    }),
+                    PartitionState::Planned(Partition {
                         device: DevicePath::new(format!("{}p3", primary_device))?,
                         mount_point: MountPoint::new("/cache"),
                         label: PartitionLabel::new("cache"),
                         size: cache_size,
-                    },
+                    }),
                 ]
             }
         };
@@ -252,20 +323,20 @@ impl Action<ValidatedHardware, PartitionedDrives> for PartitionDrivesAction {
 
             let secondary_partitions = if primary_much_larger {
                 // Music on primary → secondary gets CDJ export (full drive)
-                vec![Partition {
+                vec![PartitionState::Planned(Partition {
                     device: DevicePath::new(format!("{}p1", secondary.device))?,
                     mount_point: MountPoint::new("/cdj-export"),
                     label: PartitionLabel::new("cdj-export"),
                     size: secondary.size_bytes,
-                }]
+                })]
             } else {
                 // Music on secondary → secondary gets music (full drive, dedicated)
-                vec![Partition {
+                vec![PartitionState::Planned(Partition {
                     device: DevicePath::new(format!("{}p1", secondary.device))?,
                     mount_point: MountPoint::new("/music"),
                     label: PartitionLabel::new("music"),
                     size: secondary.size_bytes,
-                }]
+                })]
             };
 
             PartitionPlan::DualDrive {
@@ -282,43 +353,284 @@ impl Action<ValidatedHardware, PartitionedDrives> for PartitionDrivesAction {
             }
         };
 
-        let assumed_output = PartitionedDrives {
+        // Read existing partitions to mark which ones already exist (idempotency)
+        let existing = read_existing_partitions(primary_device.as_path().to_str().unwrap())
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to read existing partitions, will create all: {}", e);
+                Vec::new()
+            });
+
+        tracing::info!(
+            "Found {} existing partitions on {}",
+            existing.len(),
+            primary_device
+        );
+        for (label, size) in &existing {
+            tracing::info!("  - {} ({} bytes)", label, size);
+        }
+
+        fn mark_existing_partitions(
+            partitions: &mut [PartitionState],
+            existing: &[(String, u64)],
+            context: &str,
+        ) {
+            for partition_state in partitions.iter_mut() {
+                // First check if we should convert (immutable borrow via &*)
+                let should_mark = if let PartitionState::Planned(p) = &*partition_state {
+                    existing.iter().any(|(label, _)| label == p.label.as_str())
+                } else {
+                    false
+                };
+
+                // Then convert if needed (mutable access, after immutable borrow ends)
+                if should_mark {
+                    if let PartitionState::Planned(partition) = partition_state {
+                        let p_clone = partition.clone();
+                        *partition_state = PartitionState::Exists(p_clone.clone());
+                        let msg = if context.is_empty() {
+                            format!(
+                                "Partition {} already exists, will skip creation",
+                                p_clone.label
+                            )
+                        } else {
+                            format!(
+                                "{} partition {} already exists, will skip creation",
+                                context, p_clone.label
+                            )
+                        };
+                        tracing::info!("{}", msg);
+                    }
+                }
+            }
+        }
+
+        // Mark existing partitions in the plan
+        let mut plan = plan;
+        match &mut plan {
+            PartitionPlan::SingleDrive {
+                ref mut partitions, ..
+            } => {
+                mark_existing_partitions(partitions, &existing, "");
+            }
+            PartitionPlan::DualDrive {
+                ref mut primary_partitions,
+                ref mut secondary_partitions,
+                secondary_device,
+                ..
+            } => {
+                // Check primary partitions
+                mark_existing_partitions(primary_partitions, &existing, "Primary");
+
+                // Check secondary partitions
+                let secondary_existing =
+                    read_existing_partitions(secondary_device.device.as_path().to_str().unwrap())
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(
+                                "Failed to read existing secondary partitions, will create all: {}",
+                                e
+                            );
+                            Vec::new()
+                        });
+
+                mark_existing_partitions(secondary_partitions, &secondary_existing, "Secondary");
+            }
+        }
+
+        // Build the planned work WITH workflow state (PartitionState)
+        let planned_work = PartitionedDrives {
             validated: input.clone(),
             plan,
         };
+
+        // Build the assumed output WITHOUT workflow state (just Partition)
+        let assumed_output = planned_work.clone().into_completed();
 
         Ok(PlannedAction {
             description: self.description(),
             action: self.clone(),
             input: input.clone(),
-            assumed_output,
+            planned_work,   // What apply() will use
+            assumed_output, // What next stage receives
         })
     }
 
-    async fn apply(&self, planned_output: &PartitionedDrives) -> Result<PartitionedDrives> {
-        tracing::info!("Stage 2: Partition disks - executing plan");
+    async fn apply(
+        &self,
+        planned_output: &PartitionedDrives,
+    ) -> Result<CompletedPartitionedDrives> {
+        tracing::info!("Stage 2: Partition drives - executing plan");
 
-        // Execute the plan that was already calculated in plan()
+        // Helper to create a single partition
+        async fn create_partition(
+            device_path: &str,
+            partition_number: usize,
+            label: &str,
+            start_mb: u64,
+            end_mb: u64,
+        ) -> Result<()> {
+            // Create GPT partition
+            let status = Command::new("parted")
+                .args(&[
+                    "-s", // script mode (no interactive)
+                    "--align",
+                    "optimal",
+                    device_path,
+                    "mkpart",
+                    "primary",
+                    "ext4",
+                    &format!("{}MiB", start_mb),
+                    &format!("{}MiB", end_mb),
+                ])
+                .status()
+                .map_err(|e| {
+                    crate::error::BeaconError::Provisioning(format!("Failed to run parted: {}", e))
+                })?;
+
+            if !status.success() {
+                return Err(crate::error::BeaconError::Provisioning(format!(
+                    "parted failed to create partition {}",
+                    partition_number
+                )));
+            }
+
+            // Wait a moment for partition to appear
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            tracing::info!(
+                "Created partition {} with label {}",
+                format!("{}p{}", device_path, partition_number),
+                label
+            );
+            Ok(())
+        }
+
+        // Helper to ensure GPT table exists
+        async fn ensure_gpt_table(device_path: &str) -> Result<()> {
+            // Check if device already has a partition table
+            let output = Command::new("parted")
+                .args(&["-s", device_path, "print"])
+                .output()
+                .map_err(|e| {
+                    crate::error::BeaconError::Provisioning(format!(
+                        "Failed to check partition table: {}",
+                        e
+                    ))
+                })?;
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+
+            // If no partition table exists, create GPT
+            if stdout.contains("unrecognised disk label") || !stdout.contains("Partition Table:") {
+                tracing::info!("Creating GPT partition table on {}", device_path);
+
+                let status = Command::new("parted")
+                    .args(&["-s", device_path, "mklabel", "gpt"])
+                    .status()
+                    .map_err(|e| {
+                        crate::error::BeaconError::Provisioning(format!(
+                            "Failed to create GPT table: {}",
+                            e
+                        ))
+                    })?;
+
+                if !status.success() {
+                    return Err(crate::error::BeaconError::Provisioning(format!(
+                        "Failed to create GPT partition table on {}",
+                        device_path
+                    )));
+                }
+            } else {
+                tracing::info!("GPT partition table already exists on {}", device_path);
+            }
+
+            Ok(())
+        }
+
+        /// Apply partitions to a single device
+        async fn apply_partitions_to_device(
+            device_path: &str,
+            partitions: &[PartitionState],
+            context: &str,
+        ) -> Result<()> {
+            ensure_gpt_table(device_path).await?;
+
+            let mut start_mb = 1u64; // Start at 1MiB for alignment
+            let mut partition_num = 1;
+
+            for partition_state in partitions {
+                match partition_state {
+                    PartitionState::Planned(partition) => {
+                        let size_mb = partition.size.megabytes();
+                        let end_mb = start_mb + size_mb;
+
+                        let log_msg = if context.is_empty() {
+                            format!(
+                                "Creating partition {}: {} ({}MiB-{}MiB, label: {})",
+                                partition_num,
+                                partition.mount_point,
+                                start_mb,
+                                end_mb,
+                                partition.label
+                            )
+                        } else {
+                            format!(
+                                "Creating {} partition {}: {} ({}MiB-{}MiB, label: {})",
+                                context,
+                                partition_num,
+                                partition.mount_point,
+                                start_mb,
+                                end_mb,
+                                partition.label
+                            )
+                        };
+                        tracing::info!("{}", log_msg);
+
+                        create_partition(
+                            device_path,
+                            partition_num,
+                            partition.label.as_str(),
+                            start_mb,
+                            end_mb,
+                        )
+                        .await?;
+
+                        start_mb += size_mb;
+                        partition_num += 1;
+                    }
+                    PartitionState::Exists(partition) => {
+                        let log_msg = if context.is_empty() {
+                            format!(
+                                "Skipping partition {}: {} (already exists)",
+                                partition_num, partition.mount_point
+                            )
+                        } else {
+                            format!(
+                                "Skipping {} partition {}: {} (already exists)",
+                                context, partition_num, partition.mount_point
+                            )
+                        };
+                        tracing::info!("{}", log_msg);
+
+                        start_mb += partition.size.megabytes();
+                        partition_num += 1;
+                    }
+                }
+            }
+
+            Ok(())
+        }
+
+        // Process the plan based on drive configurtion
         match &planned_output.plan {
             PartitionPlan::SingleDrive { device, partitions } => {
-                for partition in partitions {
-                    tracing::info!(
-                        "Would execute: parted {} mkpart primary {} {}B {}B",
-                        device,
-                        partition.label,
-                        0, // TODO: Calculate actual start position
-                        partition.size.bytes()
-                    );
-                    // TODO: Real implementation:
-                    // Command::new("parted")
-                    //     .arg(device.as_str())
-                    //     .arg("mkpart")
-                    //     .arg("primary")
-                    //     .arg(partition.label.0)
-                    //     .arg(format!("{}B", start_pos))
-                    //     .arg(format!("{}B", end_pos))
-                    //     .output()?;
-                }
+                apply_partitions_to_device(
+                    device.device.as_path().to_str().unwrap(),
+                    partitions,
+                    "",
+                )
+                .await?;
             }
             PartitionPlan::DualDrive {
                 primary_device,
@@ -326,34 +638,24 @@ impl Action<ValidatedHardware, PartitionedDrives> for PartitionDrivesAction {
                 secondary_device,
                 secondary_partitions,
             } => {
-                tracing::info!("Partitioning primary drive: {}", primary_device);
-                for partition in primary_partitions {
-                    tracing::info!(
-                        "Would execute: parted {} mkpart primary {} {}B {}B",
-                        primary_device,
-                        partition.label,
-                        0,
-                        partition.size.bytes()
-                    );
-                }
+                apply_partitions_to_device(
+                    primary_device.device.as_path().to_str().unwrap(),
+                    primary_partitions,
+                    "primary",
+                )
+                .await?;
 
-                tracing::info!("Partitioning secondary drive: {}", secondary_device);
-                for partition in secondary_partitions {
-                    tracing::info!(
-                        "Would execute: parted {} mkpart primary {} {}B {}B",
-                        secondary_device,
-                        partition.label,
-                        0,
-                        partition.size.bytes()
-                    );
-                }
+                apply_partitions_to_device(
+                    secondary_device.device.as_path().to_str().unwrap(),
+                    secondary_partitions,
+                    "secondary",
+                )
+                .await?;
             }
         }
 
-        tracing::info!("Partition stage complete (simulated)");
-
-        // Return the executed plan (which matches what we planned)
-        Ok(planned_output.clone())
+        tracing::info!("Partition stage complete");
+        Ok(planned_output.clone().into_completed())
     }
 }
 
@@ -387,7 +689,7 @@ mod tests {
             config: crate::provisioning::ProvisionConfig {
                 hostname: Hostname::new("mdma-909".to_owned()).expect("works"),
                 unit_type: UnitType::Mdma909,
-                ssh_key: SshPublicKey::new("public key".to_owned()).expect("works"),
+                ssh_key: SshPublicKey::new("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA96k1y1Y1326DtI4csBGXSqu57wjNuBYEkyjUQ3uS7x mdma-pi-access".to_owned()).expect("ssh key did not validate"),
             },
             drives: secondary
                 .map(|s| ValidatedDrives::TwoDrives(primary.clone(), s))
@@ -403,7 +705,10 @@ mod tests {
             PartitionPlan::SingleDrive { partitions, .. } => {
                 let primary_info: Vec<_> = partitions
                     .iter()
-                    .map(|p| (p.mount_point.to_string(), p.size.gigabytes()))
+                    .map(|ps| {
+                        let p = ps.partition();
+                        (p.mount_point.to_string(), p.size.gigabytes())
+                    })
                     .collect();
                 (primary_info, None)
             }
@@ -414,11 +719,17 @@ mod tests {
             } => {
                 let primary_info: Vec<_> = primary_partitions
                     .iter()
-                    .map(|p| (p.mount_point.to_string(), p.size.gigabytes()))
+                    .map(|ps| {
+                        let p = ps.partition();
+                        (p.mount_point.to_string(), p.size.gigabytes())
+                    })
                     .collect();
                 let secondary_info: Vec<_> = secondary_partitions
                     .iter()
-                    .map(|p| (p.mount_point.to_string(), p.size.gigabytes()))
+                    .map(|ps| {
+                        let p = ps.partition();
+                        (p.mount_point.to_string(), p.size.gigabytes())
+                    })
                     .collect();
                 (primary_info, Some(secondary_info))
             }
@@ -480,7 +791,7 @@ mod tests {
         let action = PartitionDrivesAction;
 
         let planned = action.plan(&input).await.expect("Planning should succeed");
-        let (primary_info, secondary_info) = get_partition_info(&planned.assumed_output.plan);
+        let (primary_info, secondary_info) = get_partition_info(&planned.planned_work.plan);
 
         // Verify primary partitions
         assert_eq!(
@@ -554,7 +865,7 @@ mod tests {
         let action = PartitionDrivesAction;
 
         let planned = action.plan(&input).await.expect("Planning should succeed");
-        let (primary_info, secondary_info) = get_partition_info(&planned.assumed_output.plan);
+        let (primary_info, secondary_info) = get_partition_info(&planned.planned_work.plan);
 
         assert!(
             secondary_info.is_none(),
@@ -572,12 +883,12 @@ mod tests {
             let (actual_mount, actual_gb) = &primary_info[i];
             assert_eq!(
                 actual_mount, mount,
-                "{}: Partition {} mount point mismatch",
+                "{}: PartitionState::Planned(Partition {} mount point mismatch",
                 description, i
             );
             assert_eq!(
                 *actual_gb, *expected_gb,
-                "{}: Partition {} size mismatch (expected {}GB, got {}GB)",
+                "{}: PartitionState::Planned(Partition {} size mismatch (expected {}GB, got {}GB)",
                 description, i, expected_gb, actual_gb
             );
         }
@@ -590,7 +901,7 @@ mod tests {
         let action = PartitionDrivesAction;
 
         let planned = action.plan(&input).await.unwrap();
-        let (primary_info, secondary_info) = get_partition_info(&planned.assumed_output.plan);
+        let (primary_info, secondary_info) = get_partition_info(&planned.planned_work.plan);
 
         // Music should be on primary with 732 GB
         let music_partition = primary_info.iter().find(|(mount, _)| mount == "/music");
@@ -626,7 +937,7 @@ mod tests {
         let action = PartitionDrivesAction;
 
         let planned = action.plan(&input).await.unwrap();
-        let (primary_info, secondary_info) = get_partition_info(&planned.assumed_output.plan);
+        let (primary_info, secondary_info) = get_partition_info(&planned.planned_work.plan);
 
         // Music should be on secondary (dedicated)
         let music_on_primary = primary_info.iter().any(|(mount, _)| mount == "/music");
@@ -647,7 +958,7 @@ mod tests {
         let action = PartitionDrivesAction;
 
         let planned = action.plan(&input).await.unwrap();
-        let (primary_info, secondary_info) = get_partition_info(&planned.assumed_output.plan);
+        let (primary_info, secondary_info) = get_partition_info(&planned.planned_work.plan);
 
         // Should use clean separation pattern
         let cdj_on_primary = primary_info.iter().any(|(mount, _)| mount == "/cdj-export");

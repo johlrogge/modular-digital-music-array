@@ -90,9 +90,9 @@ pub enum PlanExecutionError {
 
 /// A planned action ready for execution
 #[derive(Debug)]
-pub struct PlannedAction<Input: Debug, Output: Debug, A: Debug>
+pub struct PlannedAction<Input: Debug, PlannedWork: Debug, Output: Debug, A: Debug>
 where
-    A: Action<Input, Output>,
+    A: Action<Input, PlannedWork, Output>,
 {
     /// Human-readable description
     pub description: String,
@@ -103,14 +103,18 @@ where
     /// Input captured during planning
     pub(crate) input: Input,
 
+    /// What apply() will use to execute (may contain workflow state)
+    pub(crate) planned_work: PlannedWork,
+
     /// What we expect to produce
     pub assumed_output: Output,
 }
 
-impl<Input, Output, A> PlannedAction<Input, Output, A>
+impl<Input, PlannedWork, Output, A> PlannedAction<Input, PlannedWork, Output, A>
 where
-    A: Action<Input, Output> + Debug,
+    A: Action<Input, PlannedWork, Output> + Debug,
     Input: Clone + Send + Sync + Debug + 'static,
+    PlannedWork: Clone + Send + Sync + Debug + 'static,
     Output: PartialEq + std::fmt::Display + Send + Sync + Debug + 'static,
 {
     /// Get the action's ID
@@ -137,7 +141,7 @@ where
             .map_err(|e| PlanExecutionError::FeedbackChannelClosed(e.to_string()))?;
 
         // Execute the PLAN, not recalculate from input!
-        let actual_output = self.action.apply(&self.assumed_output).await.map_err(|e| {
+        let actual_output = self.action.apply(&self.planned_work).await.map_err(|e| {
             PlanExecutionError::ExecutionFailed {
                 stage_id: self.id(),
                 error: e.to_string(),
@@ -166,19 +170,21 @@ where
 // ============================================================================
 
 /// An action that can be planned and executed
-pub trait Action<Input: Debug, Output: Debug>: Clone + Send + Sync + Debug + 'static {
+pub trait Action<Input: Debug, PlannedWork: Debug, Output: Debug>:
+    Clone + Send + Sync + Debug + 'static
+{
     fn id(&self) -> ActionId;
     fn description(&self) -> String;
 
     fn plan(
         &self,
         input: &Input,
-    ) -> impl std::future::Future<Output = Result<PlannedAction<Input, Output, Self>>> + Send;
+    ) -> impl std::future::Future<Output = Result<PlannedAction<Input, PlannedWork, Output, Self>>> + Send;
 
     /// Execute the planned output (not recalculate from input!)
     fn apply(
         &self,
-        planned_output: &Output,
+        planned_work: &PlannedWork,
     ) -> impl std::future::Future<Output = Result<Output>> + Send;
 }
 
@@ -196,10 +202,11 @@ pub trait ExecutableStage: Send + Sync + std::fmt::Debug {
     ) -> Pin<Box<dyn Future<Output = std::result::Result<(), PlanExecutionError>> + Send + 'a>>;
 }
 
-impl<I, O, A> ExecutableStage for PlannedAction<I, O, A>
+impl<I, PW, O, A> ExecutableStage for PlannedAction<I, PW, O, A>
 where
-    A: Action<I, O> + Debug,
+    A: Action<I, PW, O> + Debug,
     I: Clone + Send + Sync + Debug + 'static,
+    PW: Clone + Send + Sync + Debug + 'static,
     O: PartialEq + std::fmt::Display + Send + Sync + Debug + 'static,
 {
     fn id(&self) -> ActionId {
@@ -232,10 +239,11 @@ pub struct ProvisioningPlan {
 }
 
 impl ProvisioningPlan {
-    pub fn new<I, O, A>(first_stage: PlannedAction<I, O, A>) -> Self
+    pub fn new<I, PW, O, A>(first_stage: PlannedAction<I, PW, O, A>) -> Self
     where
-        A: Action<I, O> + Debug,
+        A: Action<I, PW, O> + Debug,
         I: Clone + Send + Sync + Debug + 'static,
+        PW: Clone + Send + Sync + Debug + 'static,
         O: PartialEq + std::fmt::Display + Send + Sync + Debug + 'static,
     {
         Self {
@@ -243,10 +251,11 @@ impl ProvisioningPlan {
         }
     }
 
-    pub fn append<I, O, A>(mut self, stage: PlannedAction<I, O, A>) -> Self
+    pub fn append<I, PW, O, A>(mut self, stage: PlannedAction<I, PW, O, A>) -> Self
     where
-        A: Action<I, O> + Debug,
+        A: Action<I, PW, O> + Debug,
         I: Clone + Send + Sync + Debug + 'static,
+        PW: Clone + Send + Sync + Debug + 'static,
         O: PartialEq + std::fmt::Display + Send + Sync + Debug + 'static,
     {
         self.stages.push(Box::new(stage));
@@ -379,7 +388,7 @@ mod tests {
     #[derive(Clone, Debug)]
     struct DoubleAction;
 
-    impl Action<TestInput, TestOutput> for DoubleAction {
+    impl Action<TestInput, TestOutput, TestOutput> for DoubleAction {
         fn id(&self) -> ActionId {
             ActionId::new("double")
         }
@@ -391,13 +400,14 @@ mod tests {
         async fn plan(
             &self,
             input: &TestInput,
-        ) -> Result<PlannedAction<TestInput, TestOutput, Self>> {
+        ) -> Result<PlannedAction<TestInput, TestOutput, TestOutput, Self>> {
             let assumed_output = TestOutput(input.0 * 2);
 
             Ok(PlannedAction {
                 description: self.description(),
                 action: self.clone(),
                 input: input.clone(),
+                planned_work: assumed_output.clone(),
                 assumed_output,
             })
         }

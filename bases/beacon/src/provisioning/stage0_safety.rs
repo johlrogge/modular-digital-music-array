@@ -11,7 +11,7 @@ pub struct CheckRaspberryPiAction {
     pub execution_mode: ExecutionMode,
 }
 
-impl Action<HardwareInfo, SafeHardware> for CheckRaspberryPiAction {
+impl Action<HardwareInfo, SafeHardware, SafeHardware> for CheckRaspberryPiAction {
     fn id(&self) -> ActionId {
         ActionId::new("check-raspberry-pi")
     }
@@ -23,7 +23,7 @@ impl Action<HardwareInfo, SafeHardware> for CheckRaspberryPiAction {
     async fn plan(
         &self,
         input: &HardwareInfo,
-    ) -> Result<PlannedAction<HardwareInfo, SafeHardware, Self>> {
+    ) -> Result<PlannedAction<HardwareInfo, SafeHardware, SafeHardware, Self>> {
         let cpuinfo = tokio::fs::read_to_string("/proc/cpuinfo")
             .await
             .map_err(|source| BeaconError::io(self.id().as_str(), source))?;
@@ -39,6 +39,7 @@ impl Action<HardwareInfo, SafeHardware> for CheckRaspberryPiAction {
             description: self.description(),
             action: self.clone(),
             input: input.clone(),
+            planned_work: assumed_output.clone(),
             assumed_output,
         })
     }

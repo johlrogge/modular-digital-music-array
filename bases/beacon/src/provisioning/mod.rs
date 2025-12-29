@@ -4,7 +4,7 @@
 use crate::actions::{Action, ProvisioningPlan};
 use crate::error::Result;
 use crate::hardware::HardwareInfo;
-use crate::provisioning::types::PartitionPlan;
+use crate::provisioning::types::{CompletedPartitionPlan, PartitionPlan};
 use tokio::sync::mpsc;
 
 pub mod types;
@@ -164,20 +164,20 @@ pub async fn provision_system(
             configured: types::ConfiguredSystem {
                 installed: types::InstalledSystem {
                     formatted: types::FormattedSystem {
-                        partitioned: types::PartitionedDrives {
+                        partitioned: types::CompletedPartitionedDrives {
                             validated: types::ValidatedHardware {
                                 config,
                                 drives: drives.clone(),
                             },
                             plan: match drives {
                                 ValidatedDrives::OneDrive(drive_info) => {
-                                    PartitionPlan::SingleDrive {
+                                    CompletedPartitionPlan::SingleDrive {
                                         device: drive_info,
                                         partitions: vec![],
                                     }
                                 }
                                 ValidatedDrives::TwoDrives(primary_device, secondary_device) => {
-                                    PartitionPlan::DualDrive {
+                                    CompletedPartitionPlan::DualDrive {
                                         primary_device,
                                         primary_partitions: vec![],
                                         secondary_device,
@@ -285,19 +285,21 @@ pub async fn provision_system(
         configured: types::ConfiguredSystem {
             installed: types::InstalledSystem {
                 formatted: types::FormattedSystem {
-                    partitioned: types::PartitionedDrives {
+                    partitioned: types::CompletedPartitionedDrives {
                         validated: types::ValidatedHardware {
                             config,
                             drives: drives.clone(),
                         },
                         plan: match drives {
-                            ValidatedDrives::OneDrive(device) => PartitionPlan::SingleDrive {
-                                device,
-                                partitions: vec![],
-                            },
+                            ValidatedDrives::OneDrive(device) => {
+                                CompletedPartitionPlan::SingleDrive {
+                                    device,
+                                    partitions: vec![],
+                                }
+                            }
 
                             ValidatedDrives::TwoDrives(primary_device, secondary_device) => {
-                                PartitionPlan::DualDrive {
+                                CompletedPartitionPlan::DualDrive {
                                     primary_device,
                                     primary_partitions: vec![],
                                     secondary_device,
@@ -338,7 +340,7 @@ mod tests {
         ProvisionConfig {
             hostname: Hostname::new("test-909".to_string()).unwrap(),
             unit_type: UnitType::Mdma909,
-            ssh_key: SshPublicKey::new("public key".to_string()).unwrap(),
+            ssh_key: SshPublicKey::new("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA96k1y1Y1326DtI4csBGXSqu57wjNuBYEkyjUQ3uS7x mdma-pi-access".to_string()).unwrap(),
         }
     }
 

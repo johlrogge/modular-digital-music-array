@@ -3,12 +3,12 @@
 
 use crate::actions::{Action, ActionId, PlannedAction};
 use crate::error::Result;
-use crate::provisioning::types::{FormattedSystem, PartitionedDrives};
+use crate::provisioning::types::{CompletedPartitionedDrives, FormattedSystem};
 
 #[derive(Clone, Debug)]
 pub struct FormatPartitionsAction;
 
-impl Action<PartitionedDrives, FormattedSystem> for FormatPartitionsAction {
+impl Action<CompletedPartitionedDrives, FormattedSystem, FormattedSystem> for FormatPartitionsAction {
     fn id(&self) -> ActionId {
         ActionId::new("format-partitions")
     }
@@ -19,8 +19,8 @@ impl Action<PartitionedDrives, FormattedSystem> for FormatPartitionsAction {
 
     async fn plan(
         &self,
-        input: &PartitionedDrives,
-    ) -> Result<PlannedAction<PartitionedDrives, FormattedSystem, Self>> {
+        input: &CompletedPartitionedDrives,
+    ) -> Result<PlannedAction<CompletedPartitionedDrives, FormattedSystem, FormattedSystem, Self>> {
         let assumed_output = FormattedSystem {
             partitioned: input.clone(),
         };
@@ -29,6 +29,7 @@ impl Action<PartitionedDrives, FormattedSystem> for FormatPartitionsAction {
             description: self.description(),
             action: self.clone(),
             input: input.clone(),
+            planned_work: assumed_output.clone(),
             assumed_output,
         })
     }
@@ -38,7 +39,7 @@ impl Action<PartitionedDrives, FormattedSystem> for FormatPartitionsAction {
 
         // Format all partitions from the plan
         match &planned_output.partitioned.plan {
-            crate::provisioning::types::PartitionPlan::SingleDrive { partitions, .. } => {
+            crate::provisioning::types::CompletedPartitionPlan::SingleDrive { partitions, .. } => {
                 for partition in partitions {
                     tracing::info!(
                         "Would execute: mkfs.ext4 -L {} {}",
@@ -53,7 +54,7 @@ impl Action<PartitionedDrives, FormattedSystem> for FormatPartitionsAction {
                     //     .output()?;
                 }
             }
-            crate::provisioning::types::PartitionPlan::DualDrive {
+            crate::provisioning::types::CompletedPartitionPlan::DualDrive {
                 primary_partitions,
                 secondary_partitions,
                 ..

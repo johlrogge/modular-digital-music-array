@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 // ============================================================================
 
 pub use crate::types::{
-    ByteSize, DevicePath, Hostname, MountPoint, PartitionLabel, PartitionSize, ProvisionConfig,
-    SshPublicKey, StorageCapacity, UnitType, ValidationError,
+    ByteSize, DevicePath, MountPoint, PartitionLabel, PartitionSize, ProvisionConfig, UnitType,
+    ValidationError,
 };
 
 // ============================================================================
@@ -145,7 +145,36 @@ pub struct PartitionedDrives {
     pub plan: PartitionPlan,
 }
 
+impl PartitionedDrives {
+    /// Convert to completed partitions (strips workflow state)
+    ///
+    /// After partitioning is complete, downstream stages don't need
+    /// to know about Planned vs Exists state. This method converts
+    /// the plan to contain just Partition data.
+    pub fn into_completed(self) -> CompletedPartitionedDrives {
+        CompletedPartitionedDrives {
+            validated: self.validated,
+            plan: self.plan.into_completed(),
+        }
+    }
+}
+
 impl std::fmt::Display for PartitionedDrives {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "✅ Partitioned drives:\n{}", self.plan)
+    }
+}
+
+/// Drives with completed partitioning (no workflow state)
+///
+/// Used by stages after partitioning is complete
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompletedPartitionedDrives {
+    pub validated: ValidatedHardware,
+    pub plan: CompletedPartitionPlan,
+}
+
+impl std::fmt::Display for CompletedPartitionedDrives {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "✅ Partitioned drives:\n{}", self.plan)
     }
@@ -157,14 +186,14 @@ pub enum PartitionPlan {
     /// All partitions on a single drive
     SingleDrive {
         device: DriveInfo,
-        partitions: Vec<Partition>,
+        partitions: Vec<PartitionState>,
     },
     /// Partitions split across primary and secondary drives
     DualDrive {
         primary_device: DriveInfo,
-        primary_partitions: Vec<Partition>,
+        primary_partitions: Vec<PartitionState>,
         secondary_device: DriveInfo,
-        secondary_partitions: Vec<Partition>,
+        secondary_partitions: Vec<PartitionState>,
     },
 }
 
@@ -195,6 +224,136 @@ impl std::fmt::Display for PartitionPlan {
                 }
                 Ok(())
             }
+        }
+    }
+}
+
+impl PartitionPlan {
+    /// Convert from workflow state (PartitionState) to completed partitions
+    ///
+    /// After stage 2 completes, all partitions exist on disk. This method
+    /// strips the workflow state wrapper, giving downstream stages clean
+    /// Partition data without caring about Planned vs Exists.
+    pub fn into_completed(self) -> CompletedPartitionPlan {
+        match self {
+            PartitionPlan::SingleDrive { device, partitions } => {
+                CompletedPartitionPlan::SingleDrive {
+                    device,
+                    partitions: partitions
+                        .into_iter()
+                        .map(|state| state.into_partition())
+                        .collect(),
+                }
+            }
+            PartitionPlan::DualDrive {
+                primary_device,
+                primary_partitions,
+                secondary_device,
+                secondary_partitions,
+            } => CompletedPartitionPlan::DualDrive {
+                primary_device,
+                primary_partitions: primary_partitions
+                    .into_iter()
+                    .map(|state| state.into_partition())
+                    .collect(),
+                secondary_device,
+                secondary_partitions: secondary_partitions
+                    .into_iter()
+                    .map(|state| state.into_partition())
+                    .collect(),
+            },
+        }
+    }
+}
+
+/// Partition plan after all partitions have been created
+///
+/// This is the same structure as PartitionPlan but contains Vec<Partition>
+/// instead of Vec<PartitionState>. Used by stages after partitioning is complete.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompletedPartitionPlan {
+    /// All partitions on a single drive
+    SingleDrive {
+        device: DriveInfo,
+        partitions: Vec<Partition>,
+    },
+    /// Partitions split across primary and secondary drives
+    DualDrive {
+        primary_device: DriveInfo,
+        primary_partitions: Vec<Partition>,
+        secondary_device: DriveInfo,
+        secondary_partitions: Vec<Partition>,
+    },
+}
+
+impl std::fmt::Display for CompletedPartitionPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompletedPartitionPlan::SingleDrive { device, partitions } => {
+                writeln!(f, "Single Drive Configuration {}:", device)?;
+                for partition in partitions {
+                    writeln!(f, "  {}", partition)?;
+                }
+                Ok(())
+            }
+            CompletedPartitionPlan::DualDrive {
+                primary_device,
+                primary_partitions,
+                secondary_device,
+                secondary_partitions,
+            } => {
+                writeln!(f, "Dual Drive Configuration:")?;
+                writeln!(f, "Primary Drive {}:", primary_device)?;
+                for partition in primary_partitions {
+                    writeln!(f, "  {}", partition)?;
+                }
+                writeln!(f, "Secondary Drive {}:", secondary_device)?;
+                for partition in secondary_partitions {
+                    writeln!(f, "  {}", partition)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Represents a partition's state during provisioning
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartitionState {
+    /// Partition needs to be created
+    Planned(Partition),
+    /// Partition already exists on disk
+    Exists(Partition),
+}
+
+impl PartitionState {
+    /// Get the underlying partition regardless of state
+    pub fn partition(&self) -> &Partition {
+        match self {
+            PartitionState::Planned(p) => p,
+            PartitionState::Exists(p) => p,
+        }
+    }
+
+    /// Extract the underlying partition, consuming self
+    pub fn into_partition(self) -> Partition {
+        match self {
+            PartitionState::Planned(p) => p,
+            PartitionState::Exists(p) => p,
+        }
+    }
+
+    /// Check if this partition needs creation
+    pub fn needs_creation(&self) -> bool {
+        matches!(self, PartitionState::Planned(_))
+    }
+}
+
+impl std::fmt::Display for PartitionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PartitionState::Planned(p) => write!(f, "[PLANNED] {}", p),
+            PartitionState::Exists(p) => write!(f, "[EXISTS] {}", p),
         }
     }
 }
@@ -234,7 +393,7 @@ impl Partition {
 /// with mkfs.ext4.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FormattedSystem {
-    pub partitioned: PartitionedDrives,
+    pub partitioned: CompletedPartitionedDrives,
 }
 
 impl std::fmt::Display for FormattedSystem {

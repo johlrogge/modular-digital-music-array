@@ -8,7 +8,7 @@ use crate::provisioning::types::{ConfiguredSystem, ProvisionedSystem};
 #[derive(Clone, Debug)]
 pub struct FinalizeProvisioningAction;
 
-impl Action<ConfiguredSystem, ProvisionedSystem> for FinalizeProvisioningAction {
+impl Action<ConfiguredSystem, ProvisionedSystem, ProvisionedSystem> for FinalizeProvisioningAction {
     fn id(&self) -> ActionId {
         ActionId::new("finalize-provisioning")
     }
@@ -20,7 +20,7 @@ impl Action<ConfiguredSystem, ProvisionedSystem> for FinalizeProvisioningAction 
     async fn plan(
         &self,
         input: &ConfiguredSystem,
-    ) -> Result<PlannedAction<ConfiguredSystem, ProvisionedSystem, Self>> {
+    ) -> Result<PlannedAction<ConfiguredSystem, ProvisionedSystem, ProvisionedSystem, Self>> {
         let assumed_output = ProvisionedSystem {
             configured: input.clone(),
         };
@@ -29,6 +29,7 @@ impl Action<ConfiguredSystem, ProvisionedSystem> for FinalizeProvisioningAction 
             description: self.description(),
             action: self.clone(),
             input: input.clone(),
+            planned_work: assumed_output.clone(),
             assumed_output,
         })
     }

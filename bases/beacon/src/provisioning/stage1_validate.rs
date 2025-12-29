@@ -57,7 +57,7 @@ impl ValidateHardwareAction {
     }
 }
 
-impl Action<SafeHardware, ValidatedHardware> for ValidateHardwareAction {
+impl Action<SafeHardware, ValidatedHardware, ValidatedHardware> for ValidateHardwareAction {
     fn id(&self) -> ActionId {
         ActionId::new("validate-hardware")
     }
@@ -69,7 +69,7 @@ impl Action<SafeHardware, ValidatedHardware> for ValidateHardwareAction {
     async fn plan(
         &self,
         input: &SafeHardware,
-    ) -> Result<PlannedAction<SafeHardware, ValidatedHardware, Self>> {
+    ) -> Result<PlannedAction<SafeHardware, ValidatedHardware, ValidatedHardware, Self>> {
         let drive_infos = Self::build_drive_infos(input);
         let drives = self.validate_drives(&drive_infos)?;
 
@@ -82,6 +82,7 @@ impl Action<SafeHardware, ValidatedHardware> for ValidateHardwareAction {
             description: self.description(),
             action: self.clone(),
             input: input.clone(),
+            planned_work: assumed_output.clone(),
             assumed_output,
         })
     }

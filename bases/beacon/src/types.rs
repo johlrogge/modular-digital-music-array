@@ -199,9 +199,13 @@ impl DevicePath {
     }
 
     pub(crate) fn join(&self, mount_point: MountPoint) -> PathBuf {
+        self.as_path()
+            .join(mount_point.as_str().trim_start_matches("/"))
+    }
+
+    pub(crate) fn as_path(&self) -> PathBuf {
         PathBuf::from_str(self.as_str())
             .expect("conversion from str to pathbuf should be infallible")
-            .join(mount_point.as_str().trim_start_matches("/"))
     }
 }
 
