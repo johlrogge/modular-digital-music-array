@@ -18,7 +18,8 @@ struct LsblkPartition {
     size: u64,
     #[serde(rename = "fstype")]
     fs_type: Option<String>,
-    label: Option<String>,
+    label: Option<String>,     // Filesystem label (set by mkfs.ext4 -L)
+    partlabel: Option<String>, // GPT partition name (set by sfdisk name=)
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,11 +36,11 @@ struct LsblkOutput {
 /// Read existing partitions from a device using lsblk
 async fn read_existing_partitions(device_path: &str) -> Result<Vec<(String, u64)>> {
     let output = Command::new("lsblk")
-        .args(&[
-            "-J", // JSON output
-            "-b", // bytes
-            "-o", // output columns
-            "NAME,SIZE,FSTYPE,LABEL",
+        .args([
+            "-J",                               // JSON output
+            "-b",                               // bytes
+            "-o",                               // output columns
+            "NAME,SIZE,FSTYPE,LABEL,PARTLABEL", // Include GPT partition name
             device_path,
         ])
         .output()
@@ -59,12 +60,17 @@ async fn read_existing_partitions(device_path: &str) -> Result<Vec<(String, u64)
         crate::error::BeaconError::Provisioning(format!("Failed to parse lsblk output: {}", e))
     })?;
 
-    // Extract partitions with their labels
+    // Extract partitions with their GPT partition names
     let mut partitions = Vec::new();
     if let Some(device) = lsblk.blockdevices.first() {
         if let Some(children) = &device.children {
             for child in children {
-                if let Some(label) = &child.label {
+                // Check GPT partition name first (set by sfdisk), fallback to filesystem label
+                if let Some(partlabel) = &child.partlabel {
+                    partitions.push((partlabel.clone(), child.size));
+                } else if let Some(label) = &child.label {
+                    // Fallback: Check filesystem label if no GPT name
+                    // (supports partitions formatted but not created via our sfdisk)
                     partitions.push((label.clone(), child.size));
                 }
             }
