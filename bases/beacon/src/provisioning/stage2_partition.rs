@@ -462,88 +462,144 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
     ) -> Result<CompletedPartitionedDrives> {
         tracing::info!("Stage 2: Partition drives - executing plan");
 
-        // Helper to create a single partition
-        async fn create_partition(
+        // Helper to write entire partition table atomically with sfdisk
+        async fn write_partition_table_sfdisk(
             device_path: &str,
-            partition_number: usize,
-            label: &str,
-            start_mb: u64,
-            end_mb: u64,
+            partitions: &[PartitionState],
+            context: &str,
         ) -> Result<()> {
-            // Create GPT partition
-            let status = Command::new("parted")
-                .args(&[
-                    "-s", // script mode (no interactive)
-                    "--align",
-                    "optimal",
-                    device_path,
-                    "mkpart",
-                    "primary",
-                    "ext4",
-                    &format!("{}MiB", start_mb),
-                    &format!("{}MiB", end_mb),
-                ])
-                .status()
-                .map_err(|e| {
-                    crate::error::BeaconError::Provisioning(format!("Failed to run parted: {}", e))
-                })?;
+            use std::process::Stdio;
+            use tokio::io::AsyncWriteExt;
 
-            if !status.success() {
-                return Err(crate::error::BeaconError::Provisioning(format!(
-                    "parted failed to create partition {}",
-                    partition_number
-                )));
+            // Collect partitions that need to be created
+            let mut planned_partitions = Vec::new();
+            let mut partition_num = 1;
+
+            for partition_state in partitions {
+                match partition_state {
+                    PartitionState::Planned(partition) => {
+                        planned_partitions.push((partition_num, partition.clone()));
+                    }
+                    PartitionState::Exists(partition) => {
+                        let log_msg = if context.is_empty() {
+                            format!(
+                                "Partition {} already exists: {} (label: {})",
+                                partition_num, partition.mount_point, partition.label
+                            )
+                        } else {
+                            format!(
+                                "{} partition {} already exists: {} (label: {})",
+                                context, partition_num, partition.mount_point, partition.label
+                            )
+                        };
+                        tracing::info!("{}", log_msg);
+                    }
+                }
+                partition_num += 1;
             }
 
-            // Wait a moment for partition to appear
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // If no partitions to create, we're done
+            if planned_partitions.is_empty() {
+                tracing::info!("All partitions already exist on {}", device_path);
+                return Ok(());
+            }
 
-            tracing::info!(
-                "Created partition {} with label {}",
-                format!("{}p{}", device_path, partition_number),
-                label
-            );
-            Ok(())
-        }
+            // Build sfdisk input - complete partition table
+            let mut sfdisk_input = String::from("label: gpt\n");
+            let mut start_mb = 1u64; // Start at 1MB for alignment
 
-        // Helper to ensure GPT table exists
-        async fn ensure_gpt_table(device_path: &str) -> Result<()> {
-            // Check if device already has a partition table
-            let output = Command::new("parted")
-                .args(&["-s", device_path, "print"])
-                .output()
+            // Include ALL partitions (existing and planned) in proper order
+            partition_num = 1;
+            for partition_state in partitions {
+                let partition = partition_state.partition();
+                let size_mb = partition.size.megabytes();
+
+                // sfdisk format: start=X, size=Y, type=linux, name=label
+                sfdisk_input.push_str(&format!(
+                    "start={}M, size={}M, type=linux, name={}\n",
+                    start_mb, size_mb, partition.label
+                ));
+
+                start_mb += size_mb;
+                partition_num += 1;
+            }
+
+            // Log what we're creating
+            for (num, partition) in &planned_partitions {
+                let log_msg = if context.is_empty() {
+                    format!(
+                        "Will create partition {}: {} ({} MB, label: {})",
+                        num,
+                        partition.mount_point,
+                        partition.size.megabytes(),
+                        partition.label
+                    )
+                } else {
+                    format!(
+                        "Will create {} partition {}: {} ({} MB, label: {})",
+                        context,
+                        num,
+                        partition.mount_point,
+                        partition.size.megabytes(),
+                        partition.label
+                    )
+                };
+                tracing::info!("{}", log_msg);
+            }
+
+            tracing::info!("Writing partition table to {} with sfdisk", device_path);
+            tracing::debug!("sfdisk input:\n{}", sfdisk_input);
+
+            // Run sfdisk with stdin
+            let mut child = tokio::process::Command::new("sfdisk")
+                .arg(device_path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
                 .map_err(|e| {
                     crate::error::BeaconError::Provisioning(format!(
-                        "Failed to check partition table: {}",
+                        "Failed to spawn sfdisk: {}",
                         e
                     ))
                 })?;
 
-            let stdout = String::from_utf8_lossy(&output.stdout);
-
-            // If no partition table exists, create GPT
-            if stdout.contains("unrecognised disk label") || !stdout.contains("Partition Table:") {
-                tracing::info!("Creating GPT partition table on {}", device_path);
-
-                let status = Command::new("parted")
-                    .args(&["-s", device_path, "mklabel", "gpt"])
-                    .status()
+            // Write partition table to stdin
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(sfdisk_input.as_bytes())
+                    .await
                     .map_err(|e| {
                         crate::error::BeaconError::Provisioning(format!(
-                            "Failed to create GPT table: {}",
+                            "Failed to write to sfdisk stdin: {}",
                             e
                         ))
                     })?;
-
-                if !status.success() {
-                    return Err(crate::error::BeaconError::Provisioning(format!(
-                        "Failed to create GPT partition table on {}",
-                        device_path
-                    )));
-                }
-            } else {
-                tracing::info!("GPT partition table already exists on {}", device_path);
+                drop(stdin); // Close stdin to signal EOF
             }
+
+            // Wait for sfdisk to complete
+            let output = child.wait_with_output().await.map_err(|e| {
+                crate::error::BeaconError::Provisioning(format!("Failed to wait for sfdisk: {}", e))
+            })?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                return Err(crate::error::BeaconError::Provisioning(format!(
+                    "sfdisk failed to create partitions on {}:\nstdout: {}\nstderr: {}",
+                    device_path, stdout, stderr
+                )));
+            }
+
+            tracing::info!(
+                "Successfully created {} partition(s) on {}",
+                planned_partitions.len(),
+                device_path
+            );
+
+            // Wait for kernel to re-read partition table
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
             Ok(())
         }
@@ -554,72 +610,8 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
             partitions: &[PartitionState],
             context: &str,
         ) -> Result<()> {
-            ensure_gpt_table(device_path).await?;
-
-            let mut start_mb = 1u64; // Start at 1MiB for alignment
-            let mut partition_num = 1;
-
-            for partition_state in partitions {
-                match partition_state {
-                    PartitionState::Planned(partition) => {
-                        let size_mb = partition.size.megabytes();
-                        let end_mb = start_mb + size_mb;
-
-                        let log_msg = if context.is_empty() {
-                            format!(
-                                "Creating partition {}: {} ({}MiB-{}MiB, label: {})",
-                                partition_num,
-                                partition.mount_point,
-                                start_mb,
-                                end_mb,
-                                partition.label
-                            )
-                        } else {
-                            format!(
-                                "Creating {} partition {}: {} ({}MiB-{}MiB, label: {})",
-                                context,
-                                partition_num,
-                                partition.mount_point,
-                                start_mb,
-                                end_mb,
-                                partition.label
-                            )
-                        };
-                        tracing::info!("{}", log_msg);
-
-                        create_partition(
-                            device_path,
-                            partition_num,
-                            partition.label.as_str(),
-                            start_mb,
-                            end_mb,
-                        )
-                        .await?;
-
-                        start_mb += size_mb;
-                        partition_num += 1;
-                    }
-                    PartitionState::Exists(partition) => {
-                        let log_msg = if context.is_empty() {
-                            format!(
-                                "Skipping partition {}: {} (already exists)",
-                                partition_num, partition.mount_point
-                            )
-                        } else {
-                            format!(
-                                "Skipping {} partition {}: {} (already exists)",
-                                context, partition_num, partition.mount_point
-                            )
-                        };
-                        tracing::info!("{}", log_msg);
-
-                        start_mb += partition.size.megabytes();
-                        partition_num += 1;
-                    }
-                }
-            }
-
-            Ok(())
+            // Write all partitions atomically with sfdisk
+            write_partition_table_sfdisk(device_path, partitions, context).await
         }
 
         // Process the plan based on drive configurtion
@@ -689,7 +681,7 @@ mod tests {
             config: crate::provisioning::ProvisionConfig {
                 hostname: Hostname::new("mdma-909".to_owned()).expect("works"),
                 unit_type: UnitType::Mdma909,
-                ssh_key: SshPublicKey::new("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA96k1y1Y1326DtI4csBGXSqu57wjNuBYEkyjUQ3uS7x mdma-pi-access".to_owned()).expect("ssh key did not validate"),
+                ssh_key: SshPublicKey::new("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA96k1y1Y1326DtI4csBGXSqu57wjNuBYEkyjUQ3uS7x mdma-pi-access".to_owned()).expect("works"),
             },
             drives: secondary
                 .map(|s| ValidatedDrives::TwoDrives(primary.clone(), s))
