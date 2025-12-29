@@ -11,7 +11,6 @@
 use std::path::PathBuf;
 
 use crate::hardware::HardwareInfo;
-use serde::{Deserialize, Serialize};
 
 // ============================================================================
 // Re-exports from crate::types (SINGLE SOURCE OF TRUTH)

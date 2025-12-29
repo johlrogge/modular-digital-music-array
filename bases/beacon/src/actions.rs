@@ -61,10 +61,22 @@ pub enum ExecutionMode {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "data")]
 pub enum ExecutionProgress {
-    Started { id: ActionId, description: String },
-    Progress { id: ActionId, message: String },
-    Complete { id: ActionId, summary: Option<String> },
-    Failed { id: ActionId, error: String },
+    Started {
+        id: ActionId,
+        description: String,
+    },
+    Progress {
+        id: ActionId,
+        message: String,
+    },
+    Complete {
+        id: ActionId,
+        summary: Option<String>,
+    },
+    Failed {
+        id: ActionId,
+        error: String,
+    },
 }
 
 /// Errors during plan execution
@@ -114,7 +126,7 @@ impl<Input, PlannedWork, Output, A> PlannedAction<Input, PlannedWork, Output, A>
 where
     A: Action<Input, PlannedWork, Output> + Debug,
     Input: Clone + Send + Sync + Debug + 'static,
-    PlannedWork: Clone + Send + Sync + Debug + 'static,
+    PlannedWork: Clone + Send + Sync + std::fmt::Display + Debug + 'static,
     Output: PartialEq + std::fmt::Display + Send + Sync + Debug + 'static,
 {
     /// Get the action's ID
@@ -124,7 +136,7 @@ where
 
     /// Get details about what this action will do
     pub fn details(&self) -> String {
-        self.assumed_output.to_string()
+        self.planned_work.to_string()
     }
 
     /// Execute this planned action
@@ -157,7 +169,7 @@ where
         }
 
         feedback
-            .send(ExecutionProgress::Complete { 
+            .send(ExecutionProgress::Complete {
                 id: self.id(),
                 summary: Some(actual_output.to_string()),
             })
@@ -173,7 +185,9 @@ where
 // ============================================================================
 
 /// An action that can be planned and executed
-pub trait Action<Input: Debug, PlannedWork: Debug, Output: Debug>: Clone + Send + Sync + Debug + 'static {
+pub trait Action<Input: Debug, PlannedWork: Debug, Output: Debug>:
+    Clone + Send + Sync + Debug + 'static
+{
     fn id(&self) -> ActionId;
     fn description(&self) -> String;
 
@@ -207,7 +221,7 @@ impl<I, PW, O, A> ExecutableStage for PlannedAction<I, PW, O, A>
 where
     A: Action<I, PW, O> + Debug,
     I: Clone + Send + Sync + Debug + 'static,
-    PW: Clone + Send + Sync + Debug + 'static,
+    PW: Clone + Send + Sync + Debug + std::fmt::Display + 'static,
     O: PartialEq + std::fmt::Display + Send + Sync + Debug + 'static,
 {
     fn id(&self) -> ActionId {
@@ -244,8 +258,8 @@ impl ProvisioningPlan {
     where
         A: Action<I, PW, O> + Debug,
         I: Clone + Send + Sync + Debug + 'static,
-    PW: Clone + Send + Sync + Debug + 'static,
-    O: PartialEq + std::fmt::Display + Send + Sync + Debug + 'static,
+        PW: Clone + Send + Sync + Debug + std::fmt::Display + 'static,
+        O: PartialEq + std::fmt::Display + Send + Sync + Debug + 'static,
     {
         Self {
             stages: vec![Box::new(first_stage)],
@@ -256,8 +270,8 @@ impl ProvisioningPlan {
     where
         A: Action<I, PW, O> + Debug,
         I: Clone + Send + Sync + Debug + 'static,
-    PW: Clone + Send + Sync + Debug + 'static,
-    O: PartialEq + std::fmt::Display + Send + Sync + Debug + 'static,
+        PW: Clone + Send + Sync + Debug + std::fmt::Display + 'static,
+        O: PartialEq + std::fmt::Display + Send + Sync + Debug + 'static,
     {
         self.stages.push(Box::new(stage));
         self
