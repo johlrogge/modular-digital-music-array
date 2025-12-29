@@ -207,8 +207,12 @@ pub async fn provision_system(
             ExecutionProgress::Progress { id: _, message } => {
                 let _ = log_tx.send(format!("   {}", message));
             }
-            ExecutionProgress::Complete { id } => {
-                let _ = log_tx.send(format!("✅ Complete: {}", id));
+            ExecutionProgress::Complete { id, summary } => {
+                if let Some(summary) = summary {
+                    let _ = log_tx.send(format!("✅ Complete: {}", summary));
+                } else {
+                    let _ = log_tx.send(format!("✅ Complete: {}", id));
+                }
             }
             ExecutionProgress::Failed { id, error } => {
                 let _ = log_tx.send(format!("❌ Failed: {} - {}", id, error));

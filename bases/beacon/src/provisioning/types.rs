@@ -23,16 +23,6 @@ pub use crate::types::{
 };
 
 // ============================================================================
-// WiFi Configuration (provisioning-specific)
-// ============================================================================
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WifiConfig {
-    pub ssid: String,
-    pub password: String,
-}
-
-// ============================================================================
 // Stage 0: Safety Check
 // ============================================================================
 
@@ -199,9 +189,35 @@ pub enum PartitionPlan {
 
 impl std::fmt::Display for PartitionPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn count_planned_and_exists(partitions: &[PartitionState]) -> (usize, usize) {
+            let planned = partitions
+                .iter()
+                .filter(|p| matches!(p, PartitionState::Planned(_)))
+                .count();
+            let exists = partitions
+                .iter()
+                .filter(|p| matches!(p, PartitionState::Exists(_)))
+                .count();
+            (planned, exists)
+        }
+
         match self {
             PartitionPlan::SingleDrive { device, partitions } => {
-                writeln!(f, "Single Drive Configuration {}:", device)?;
+                let (planned, exists) = count_planned_and_exists(partitions);
+
+                if planned > 0 && exists > 0 {
+                    writeln!(
+                        f,
+                        "📝 Plan: Create {} partition(s), skip {} (already exist)",
+                        planned, exists
+                    )?;
+                } else if planned > 0 {
+                    writeln!(f, "📝 Plan: Create {} partition(s)", planned)?;
+                } else {
+                    writeln!(f, "📝 Plan: All {} partition(s) already exist", exists)?;
+                }
+                writeln!(f)?;
+                writeln!(f, "{}:", device)?;
                 for partition in partitions {
                     writeln!(f, "  {}", partition)?;
                 }
@@ -213,12 +229,35 @@ impl std::fmt::Display for PartitionPlan {
                 secondary_device,
                 secondary_partitions,
             } => {
-                writeln!(f, "Dual Drive Configuration:")?;
-                writeln!(f, "Primary Drive {}:", primary_device)?;
+                let (primary_planned, primary_exists) =
+                    count_planned_and_exists(primary_partitions);
+                let (secondary_planned, secondary_exists) =
+                    count_planned_and_exists(secondary_partitions);
+                let total_planned = primary_planned + secondary_planned;
+                let total_exists = primary_exists + secondary_exists;
+
+                if total_planned > 0 && total_exists > 0 {
+                    writeln!(
+                        f,
+                        "📝 Plan: Create {} partition(s), skip {} (already exist)",
+                        total_planned, total_exists
+                    )?;
+                } else if total_planned > 0 {
+                    writeln!(f, "📝 Plan: Create {} partition(s)", total_planned)?;
+                } else {
+                    writeln!(
+                        f,
+                        "📝 Plan: All {} partition(s) already exist",
+                        total_exists
+                    )?;
+                }
+                writeln!(f)?;
+                writeln!(f, "Primary {}:", primary_device)?;
                 for partition in primary_partitions {
                     writeln!(f, "  {}", partition)?;
                 }
-                writeln!(f, "Secondary Drive {}:", secondary_device)?;
+                writeln!(f)?;
+                writeln!(f, "Secondary {}:", secondary_device)?;
                 for partition in secondary_partitions {
                     writeln!(f, "  {}", partition)?;
                 }
@@ -268,8 +307,9 @@ impl PartitionPlan {
 
 /// Partition plan after all partitions have been created
 ///
-/// This is the same structure as PartitionPlan but contains Vec<Partition>
-/// instead of Vec<PartitionState>. Used by stages after partitioning is complete.
+/// This structure tracks what actually happened during partitioning:
+/// - Which partitions were created
+/// - Which partitions already existed and were skipped
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompletedPartitionPlan {
     /// All partitions on a single drive
@@ -290,11 +330,12 @@ impl std::fmt::Display for CompletedPartitionPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CompletedPartitionPlan::SingleDrive { device, partitions } => {
-                writeln!(f, "Single Drive Configuration {}:", device)?;
-                for partition in partitions {
-                    writeln!(f, "  {}", partition)?;
-                }
-                Ok(())
+                write!(
+                    f,
+                    "{} partition(s) verified on {}",
+                    partitions.len(),
+                    device.device.as_path().display()
+                )
             }
             CompletedPartitionPlan::DualDrive {
                 primary_device,
@@ -302,16 +343,14 @@ impl std::fmt::Display for CompletedPartitionPlan {
                 secondary_device,
                 secondary_partitions,
             } => {
-                writeln!(f, "Dual Drive Configuration:")?;
-                writeln!(f, "Primary Drive {}:", primary_device)?;
-                for partition in primary_partitions {
-                    writeln!(f, "  {}", partition)?;
-                }
-                writeln!(f, "Secondary Drive {}:", secondary_device)?;
-                for partition in secondary_partitions {
-                    writeln!(f, "  {}", partition)?;
-                }
-                Ok(())
+                write!(
+                    f,
+                    "{} partition(s) verified on {} (primary), {} on {} (secondary)",
+                    primary_partitions.len(),
+                    primary_device.device.as_path().display(),
+                    secondary_partitions.len(),
+                    secondary_device.device.as_path().display()
+                )
             }
         }
     }
@@ -342,18 +381,13 @@ impl PartitionState {
             PartitionState::Exists(p) => p,
         }
     }
-
-    /// Check if this partition needs creation
-    pub fn needs_creation(&self) -> bool {
-        matches!(self, PartitionState::Planned(_))
-    }
 }
 
 impl std::fmt::Display for PartitionState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PartitionState::Planned(p) => write!(f, "[PLANNED] {}", p),
-            PartitionState::Exists(p) => write!(f, "[EXISTS] {}", p),
+            PartitionState::Planned(p) => write!(f, "✨ {} [will create]", p),
+            PartitionState::Exists(p) => write!(f, "⏭️  {} [will skip - already exists]", p),
         }
     }
 }
@@ -373,13 +407,6 @@ impl std::fmt::Display for Partition {
             "{} → {} ({}, label: {})",
             self.device, self.mount_point, self.size, self.label
         )
-    }
-}
-
-impl Partition {
-    /// Format this partition for formatting preview (as opposed to partitioning)
-    pub fn format_display(&self) -> String {
-        format!("{} -> ext4 (label: {})", self.device, self.label)
     }
 }
 

@@ -8,7 +8,9 @@ use crate::provisioning::types::{CompletedPartitionedDrives, FormattedSystem};
 #[derive(Clone, Debug)]
 pub struct FormatPartitionsAction;
 
-impl Action<CompletedPartitionedDrives, FormattedSystem, FormattedSystem> for FormatPartitionsAction {
+impl Action<CompletedPartitionedDrives, FormattedSystem, FormattedSystem>
+    for FormatPartitionsAction
+{
     fn id(&self) -> ActionId {
         ActionId::new("format-partitions")
     }
@@ -20,7 +22,8 @@ impl Action<CompletedPartitionedDrives, FormattedSystem, FormattedSystem> for Fo
     async fn plan(
         &self,
         input: &CompletedPartitionedDrives,
-    ) -> Result<PlannedAction<CompletedPartitionedDrives, FormattedSystem, FormattedSystem, Self>> {
+    ) -> Result<PlannedAction<CompletedPartitionedDrives, FormattedSystem, FormattedSystem, Self>>
+    {
         let assumed_output = FormattedSystem {
             partitioned: input.clone(),
         };
@@ -39,44 +42,32 @@ impl Action<CompletedPartitionedDrives, FormattedSystem, FormattedSystem> for Fo
 
         // Format all partitions from the plan
         match &planned_output.partitioned.plan {
-            crate::provisioning::types::CompletedPartitionPlan::SingleDrive { partitions, .. } => {
-                for partition in partitions {
-                    tracing::info!(
-                        "Would execute: mkfs.ext4 -L {} {}",
-                        partition.label,
-                        partition.device
-                    );
-                    // TODO: Real implementation:
-                    // Command::new("mkfs.ext4")
-                    //     .arg("-L")
-                    //     .arg(partition.label.0)
-                    //     .arg(&partition.device.0)
-                    //     .output()?;
-                }
+            crate::provisioning::types::CompletedPartitionPlan::SingleDrive {
+                partitions, ..
+            } => {
+                format_partitions(partitions);
             }
             crate::provisioning::types::CompletedPartitionPlan::DualDrive {
                 primary_partitions,
                 secondary_partitions,
                 ..
             } => {
-                for partition in primary_partitions {
-                    tracing::info!(
-                        "Would execute: mkfs.ext4 -L {} {}",
-                        partition.label,
-                        partition.device
-                    );
-                }
-                for partition in secondary_partitions {
-                    tracing::info!(
-                        "Would execute: mkfs.ext4 -L {} {}",
-                        partition.label,
-                        partition.device
-                    );
-                }
+                format_partitions(primary_partitions);
+                format_partitions(secondary_partitions);
             }
         }
 
         tracing::info!("Format stage complete (simulated)");
         Ok(planned_output.clone())
+    }
+}
+
+fn format_partitions(partitions: &Vec<super::types::Partition>) {
+    for partition in partitions {
+        tracing::info!(
+            "Would execute: mkfs.ext4 -L {} {}",
+            partition.label,
+            partition.device
+        )
     }
 }

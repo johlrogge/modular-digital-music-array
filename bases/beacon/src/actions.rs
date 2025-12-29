@@ -63,7 +63,7 @@ pub enum ExecutionMode {
 pub enum ExecutionProgress {
     Started { id: ActionId, description: String },
     Progress { id: ActionId, message: String },
-    Complete { id: ActionId },
+    Complete { id: ActionId, summary: Option<String> },
     Failed { id: ActionId, error: String },
 }
 
@@ -157,7 +157,10 @@ where
         }
 
         feedback
-            .send(ExecutionProgress::Complete { id: self.id() })
+            .send(ExecutionProgress::Complete { 
+                id: self.id(),
+                summary: Some(actual_output.to_string()),
+            })
             .await
             .map_err(|e| PlanExecutionError::FeedbackChannelClosed(e.to_string()))?;
 
@@ -170,9 +173,7 @@ where
 // ============================================================================
 
 /// An action that can be planned and executed
-pub trait Action<Input: Debug, PlannedWork: Debug, Output: Debug>:
-    Clone + Send + Sync + Debug + 'static
-{
+pub trait Action<Input: Debug, PlannedWork: Debug, Output: Debug>: Clone + Send + Sync + Debug + 'static {
     fn id(&self) -> ActionId;
     fn description(&self) -> String;
 
@@ -243,8 +244,8 @@ impl ProvisioningPlan {
     where
         A: Action<I, PW, O> + Debug,
         I: Clone + Send + Sync + Debug + 'static,
-        PW: Clone + Send + Sync + Debug + 'static,
-        O: PartialEq + std::fmt::Display + Send + Sync + Debug + 'static,
+    PW: Clone + Send + Sync + Debug + 'static,
+    O: PartialEq + std::fmt::Display + Send + Sync + Debug + 'static,
     {
         Self {
             stages: vec![Box::new(first_stage)],
@@ -255,8 +256,8 @@ impl ProvisioningPlan {
     where
         A: Action<I, PW, O> + Debug,
         I: Clone + Send + Sync + Debug + 'static,
-        PW: Clone + Send + Sync + Debug + 'static,
-        O: PartialEq + std::fmt::Display + Send + Sync + Debug + 'static,
+    PW: Clone + Send + Sync + Debug + 'static,
+    O: PartialEq + std::fmt::Display + Send + Sync + Debug + 'static,
     {
         self.stages.push(Box::new(stage));
         self

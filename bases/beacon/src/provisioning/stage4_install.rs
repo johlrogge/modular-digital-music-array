@@ -39,22 +39,11 @@ impl Action<FormattedSystem, InstalledSystem, InstalledSystem> for InstallSystem
 
         // Mount filesystems from the plan
         let mount_point = match &planned_output.formatted.partitioned.plan {
-            crate::provisioning::types::CompletedPartitionPlan::SingleDrive { device, partitions } => {
-                for partition in partitions {
-                    let target_path = partition.device.join(partition.mount_point);
-                    tracing::info!(
-                        "Would execute: mkdir -p {} && mount {} {}",
-                        target_path.display(),
-                        partition.device,
-                        target_path.display()
-                    );
-                    // TODO: Real implementation:
-                    // std::fs::create_dir_all(&target_path)?;
-                    // Command::new("mount")
-                    //     .arg(&partition.device.0)
-                    //     .arg(&target_path)
-                    //     .output()?;
-                }
+            crate::provisioning::types::CompletedPartitionPlan::SingleDrive {
+                device,
+                partitions,
+            } => {
+                mount_partitions(partitions);
                 device.device.clone()
             }
             crate::provisioning::types::CompletedPartitionPlan::DualDrive {
@@ -63,24 +52,8 @@ impl Action<FormattedSystem, InstalledSystem, InstalledSystem> for InstallSystem
                 secondary_partitions,
                 ..
             } => {
-                for partition in primary_partitions {
-                    let target_path = partition.device.join(partition.mount_point);
-                    tracing::info!(
-                        "Would execute: mkdir -p {} && mount {} {}",
-                        target_path.display(),
-                        partition.device,
-                        target_path.display()
-                    );
-                }
-                for partition in secondary_partitions {
-                    let target_path = partition.device.join(partition.mount_point);
-                    tracing::info!(
-                        "Would execute: mkdir -p {} && mount {} {}",
-                        target_path.display(),
-                        partition.device,
-                        target_path.display()
-                    );
-                }
+                mount_partitions(primary_partitions);
+                mount_partitions(secondary_partitions);
                 primary_device.device.clone()
             }
         };
@@ -98,5 +71,17 @@ impl Action<FormattedSystem, InstalledSystem, InstalledSystem> for InstallSystem
 
         tracing::info!("Install stage complete (simulated)");
         Ok(planned_output.clone())
+    }
+}
+
+fn mount_partitions(partitions: &Vec<super::types::Partition>) {
+    for partition in partitions {
+        let target_path = partition.device.join(partition.mount_point);
+        tracing::info!(
+            "Would execute: mkdir -p {} && mount {} {}",
+            target_path.display(),
+            partition.device,
+            target_path.display()
+        )
     }
 }
