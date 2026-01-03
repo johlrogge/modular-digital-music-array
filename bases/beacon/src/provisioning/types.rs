@@ -395,7 +395,6 @@ impl std::fmt::Display for PartitionState {
 pub struct Partition {
     pub device: DevicePath,
     pub mount_point: MountPoint,
-    pub label: PartitionLabel,
     pub size: PartitionSize,
 }
 
@@ -407,6 +406,15 @@ impl Partition {
     pub fn filesystem_type(&self) -> FilesystemType {
         self.mount_point.filesystem_type()
     }
+
+    /// Get the partition label
+    ///
+    /// Derived from the mount point using kebab-case naming.
+    /// All MDMA hosts use the same labels for the same purpose
+    /// partitions, making lsblk output consistent and recognizable.
+    pub fn label(&self) -> PartitionLabel {
+        self.mount_point.label()
+    }
 }
 
 impl std::fmt::Display for Partition {
@@ -414,7 +422,10 @@ impl std::fmt::Display for Partition {
         write!(
             f,
             "{} → {} ({}, label: {})",
-            self.device, self.mount_point, self.size, self.label
+            self.device,
+            self.mount_point,
+            self.size,
+            self.label()
         )
     }
 }

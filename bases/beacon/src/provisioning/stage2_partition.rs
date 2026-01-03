@@ -151,25 +151,21 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                             PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p1", primary_device))?,
                                 mount_point: MountPoint::Root,
-                                label: PartitionLabel::new("root"),
                                 size: PartitionSize::from_gb(ROOT_SIZE_GB),
                             }),
                             PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p2", primary_device))?,
                                 mount_point: MountPoint::Var,
-                                label: PartitionLabel::new("var"),
                                 size: PartitionSize::from_gb(VAR_SIZE_GB),
                             }),
                             PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p3", primary_device))?,
                                 mount_point: MountPoint::Metadata,
-                                label: PartitionLabel::new("metadata"),
                                 size: PartitionSize::from_gb(METADATA_SIZE_GB),
                             }),
                             PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p4", primary_device))?,
                                 mount_point: MountPoint::Music,
-                                label: PartitionLabel::new("music"),
                                 size: music_size,
                             }),
                         ]
@@ -192,25 +188,21 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                             PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p1", primary_device))?,
                                 mount_point: MountPoint::Root,
-                                label: PartitionLabel::new("root"),
                                 size: PartitionSize::from_gb(ROOT_SIZE_GB),
                             }),
                             PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p2", primary_device))?,
                                 mount_point: MountPoint::Var,
-                                label: PartitionLabel::new("var"),
                                 size: PartitionSize::from_gb(VAR_SIZE_GB),
                             }),
                             PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p3", primary_device))?,
                                 mount_point: MountPoint::Metadata,
-                                label: PartitionLabel::new("metadata"),
                                 size: PartitionSize::from_gb(METADATA_SIZE_GB),
                             }),
                             PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p4", primary_device))?,
                                 mount_point: MountPoint::CdjExport,
-                                label: PartitionLabel::new("cdj-export"),
                                 size: cdj_size,
                             }),
                         ]
@@ -259,31 +251,26 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                         PartitionState::Planned(Partition {
                             device: DevicePath::new(format!("{}p1", primary_device))?,
                             mount_point: MountPoint::Root,
-                            label: PartitionLabel::new("root"),
                             size: PartitionSize::from_gb(ROOT_SIZE_GB),
                         }),
                         PartitionState::Planned(Partition {
                             device: DevicePath::new(format!("{}p2", primary_device))?,
                             mount_point: MountPoint::Var,
-                            label: PartitionLabel::new("var"),
                             size: PartitionSize::from_gb(VAR_SIZE_GB),
                         }),
                         PartitionState::Planned(Partition {
                             device: DevicePath::new(format!("{}p3", primary_device))?,
                             mount_point: MountPoint::Music,
-                            label: PartitionLabel::new("music"),
                             size: PartitionSize::from_gb(music_size_gb),
                         }),
                         PartitionState::Planned(Partition {
                             device: DevicePath::new(format!("{}p4", primary_device))?,
                             mount_point: MountPoint::Metadata,
-                            label: PartitionLabel::new("metadata"),
                             size: PartitionSize::from_gb(METADATA_SIZE_GB),
                         }),
                         PartitionState::Planned(Partition {
                             device: DevicePath::new(format!("{}p5", primary_device))?,
                             mount_point: MountPoint::CdjExport,
-                            label: PartitionLabel::new("cdj-export"),
                             size: PartitionSize::from_gb(cdj_size_gb),
                         }),
                     ]
@@ -299,19 +286,16 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                     PartitionState::Planned(Partition {
                         device: DevicePath::new(format!("{}p1", primary_device))?,
                         mount_point: MountPoint::Root,
-                        label: PartitionLabel::new("root"),
                         size: PartitionSize::from_gb(ROOT_SIZE_GB),
                     }),
                     PartitionState::Planned(Partition {
                         device: DevicePath::new(format!("{}p2", primary_device))?,
                         mount_point: MountPoint::Var,
-                        label: PartitionLabel::new("var"),
                         size: PartitionSize::from_gb(VAR_SIZE_GB),
                     }),
                     PartitionState::Planned(Partition {
                         device: DevicePath::new(format!("{}p3", primary_device))?,
                         mount_point: MountPoint::Cache,
-                        label: PartitionLabel::new("cache"),
                         size: cache_size,
                     }),
                 ]
@@ -332,7 +316,6 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                 vec![PartitionState::Planned(Partition {
                     device: DevicePath::new(format!("{}p1", secondary.device))?,
                     mount_point: MountPoint::CdjExport,
-                    label: PartitionLabel::new("cdj-export"),
                     size: secondary.size_bytes,
                 })]
             } else {
@@ -340,7 +323,6 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                 vec![PartitionState::Planned(Partition {
                     device: DevicePath::new(format!("{}p1", secondary.device))?,
                     mount_point: MountPoint::Music,
-                    label: PartitionLabel::new("music"),
                     size: secondary.size_bytes,
                 })]
             };
@@ -384,7 +366,7 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
             for partition_state in partitions.iter_mut() {
                 // First check if we should convert (immutable borrow via &*)
                 let should_mark = if let PartitionState::Planned(p) = &*partition_state {
-                    existing.iter().any(|(label, _)| label == p.label.as_str())
+                    existing.iter().any(|(label, _)| label == p.label().as_str())
                 } else {
                     false
                 };
@@ -397,12 +379,12 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                         let msg = if context.is_empty() {
                             format!(
                                 "Partition {} already exists, will skip creation",
-                                p_clone.label
+                                p_clone.label()
                             )
                         } else {
                             format!(
                                 "{} partition {} already exists, will skip creation",
-                                context, p_clone.label
+                                context, p_clone.label()
                             )
                         };
                         tracing::info!("{}", msg);
@@ -490,12 +472,12 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                         let log_msg = if context.is_empty() {
                             format!(
                                 "Partition {} already exists: {} (label: {})",
-                                partition_num, partition.mount_point, partition.label
+                                partition_num, partition.mount_point, partition.label()
                             )
                         } else {
                             format!(
                                 "{} partition {} already exists: {} (label: {})",
-                                context, partition_num, partition.mount_point, partition.label
+                                context, partition_num, partition.mount_point, partition.label()
                             )
                         };
                         tracing::info!("{}", log_msg);
@@ -523,7 +505,7 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                 // sfdisk format: start=X, size=Y, type=linux, name=label
                 sfdisk_input.push_str(&format!(
                     "start={}M, size={}M, type=linux, name={}\n",
-                    start_mb, size_mb, partition.label
+                    start_mb, size_mb, partition.label()
                 ));
 
                 start_mb += size_mb;
@@ -538,7 +520,7 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                         num,
                         partition.mount_point,
                         partition.size.megabytes(),
-                        partition.label
+                        partition.label()
                     )
                 } else {
                     format!(
@@ -547,7 +529,7 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                         num,
                         partition.mount_point,
                         partition.size.megabytes(),
-                        partition.label
+                        partition.label()
                     )
                 };
                 tracing::info!("{}", log_msg);

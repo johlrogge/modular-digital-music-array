@@ -75,7 +75,8 @@ async fn format_partition(partition: &super::types::Partition) -> Result<()> {
 
     let fs_type = partition.filesystem_type();
     let device = partition.device.as_str();
-    let label = partition.label.as_str();
+    let label = partition.label();
+    let label = label.as_str();
 
     tracing::info!(
         "Formatting {} as {} with label '{}'",

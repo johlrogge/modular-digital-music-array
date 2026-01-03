@@ -281,6 +281,28 @@ impl MountPoint {
             | MountPoint::Cache => FilesystemType::Ext4,
         }
     }
+
+    /// Get the default partition label for this mount point
+    /// Get the partition label for this mount point
+    ///
+    /// Labels use kebab-case naming convention:
+    /// - Boot → "boot"
+    /// - CdjExport → "cdj-export"
+    ///
+    /// Labels are consistent across all MDMA hosts, making
+    /// lsblk output instantly recognizable.
+    pub fn label(&self) -> PartitionLabel {
+        let label = match self {
+            MountPoint::Boot => "boot",
+            MountPoint::Root => "root",
+            MountPoint::Var => "var",
+            MountPoint::Music => "music",
+            MountPoint::Metadata => "metadata",
+            MountPoint::CdjExport => "cdj-export",
+            MountPoint::Cache => "cache",
+        };
+        PartitionLabel::new(label)
+    }
 }
 
 impl fmt::Display for MountPoint {
@@ -301,19 +323,19 @@ impl AsRef<std::path::Path> for MountPoint {
 
 /// Partition label
 ///
-/// A static partition label. Inner field is private for consistency.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PartitionLabel(&'static str);
+/// A partition label. Inner field is private for consistency.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PartitionLabel(String);
 
 impl PartitionLabel {
     /// Create a new partition label
-    pub const fn new(label: &'static str) -> Self {
-        PartitionLabel(label)
+    pub fn new(label: impl Into<String>) -> Self {
+        PartitionLabel(label.into())
     }
 
     /// Get the label as a string slice
-    pub const fn as_str(&self) -> &str {
-        self.0
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -457,9 +479,15 @@ mod tests {
         assert_eq!(mp.as_str(), "/music");
         assert_eq!(mp.to_string(), "/music");
         assert_eq!(mp.filesystem_type(), FilesystemType::Ext4);
+        assert_eq!(mp.label().as_str(), "music");
         
         // Boot partition should use FAT32
         assert_eq!(MountPoint::Boot.filesystem_type(), FilesystemType::Fat32);
+        assert_eq!(MountPoint::Boot.label().as_str(), "boot");
+        
+        // Test PascalCase to kebab-case conversion
+        assert_eq!(MountPoint::CdjExport.label().as_str(), "cdj-export");
+        assert_eq!(MountPoint::Metadata.label().as_str(), "metadata");
     }
 
     #[test]
