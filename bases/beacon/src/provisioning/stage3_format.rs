@@ -16,7 +16,7 @@ impl Action<CompletedPartitionedDrives, FormattedSystem, FormattedSystem>
     }
 
     fn description(&self) -> String {
-        "Format partitions with ext4".to_string()
+        "Format partitions (FAT32 for boot, ext4 for others)".to_string()
     }
 
     async fn plan(
@@ -45,29 +45,78 @@ impl Action<CompletedPartitionedDrives, FormattedSystem, FormattedSystem>
             crate::provisioning::types::CompletedPartitionPlan::SingleDrive {
                 partitions, ..
             } => {
-                format_partitions(partitions);
+                format_partitions(partitions).await?;
             }
             crate::provisioning::types::CompletedPartitionPlan::DualDrive {
                 primary_partitions,
                 secondary_partitions,
                 ..
             } => {
-                format_partitions(primary_partitions);
-                format_partitions(secondary_partitions);
+                format_partitions(primary_partitions).await?;
+                format_partitions(secondary_partitions).await?;
             }
         }
 
-        tracing::info!("Format stage complete (simulated)");
+        tracing::info!("Format stage complete");
         Ok(planned_output.clone())
     }
 }
 
-fn format_partitions(partitions: &Vec<super::types::Partition>) {
+async fn format_partitions(partitions: &[super::types::Partition]) -> Result<()> {
     for partition in partitions {
-        tracing::info!(
-            "Would execute: mkfs.ext4 -L {} {}",
-            partition.label,
-            partition.device
-        )
+        format_partition(partition).await?;
     }
+    Ok(())
+}
+
+async fn format_partition(partition: &super::types::Partition) -> Result<()> {
+    use super::types::FilesystemType;
+    use tokio::process::Command;
+
+    let fs_type = partition.filesystem_type;
+    let device = partition.device.as_str();
+    let label = partition.label.as_str();
+
+    tracing::info!(
+        "Formatting {} as {} with label '{}'",
+        device,
+        fs_type,
+        label
+    );
+
+    let output = match fs_type {
+        FilesystemType::Fat32 => {
+            // mkfs.vfat -F 32 -n LABEL /dev/device
+            Command::new("mkfs.vfat")
+                .arg("-F")
+                .arg("32")
+                .arg("-n")
+                .arg(label)
+                .arg(device)
+                .output()
+                .await
+                .map_err(|e| crate::error::BeaconError::command_failed("mkfs.vfat", e))?
+        }
+        FilesystemType::Ext4 => {
+            // mkfs.ext4 -L LABEL /dev/device
+            Command::new("mkfs.ext4")
+                .arg("-L")
+                .arg(label)
+                .arg(device)
+                .output()
+                .await
+                .map_err(|e| crate::error::BeaconError::command_failed("mkfs.ext4", e))?
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(crate::error::BeaconError::Formatting {
+            partition: device.to_string(),
+            reason: stderr.to_string(),
+        });
+    }
+
+    tracing::info!("Successfully formatted {} as {}", device, fs_type);
+    Ok(())
 }
