@@ -397,15 +397,24 @@ pub struct Partition {
     pub mount_point: MountPoint,
     pub label: PartitionLabel,
     pub size: PartitionSize,
-    pub filesystem_type: FilesystemType,
+}
+
+impl Partition {
+    /// Get the filesystem type for this partition
+    ///
+    /// Currently determined by mount point, but may become
+    /// customizable in future versions without changing call sites.
+    pub fn filesystem_type(&self) -> FilesystemType {
+        self.mount_point.filesystem_type()
+    }
 }
 
 impl std::fmt::Display for Partition {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} → {} ({}, label: {}, fs: {})",
-            self.device, self.mount_point, self.size, self.label, self.filesystem_type
+            "{} → {} ({}, label: {})",
+            self.device, self.mount_point, self.size, self.label
         )
     }
 }

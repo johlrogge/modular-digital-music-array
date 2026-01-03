@@ -73,7 +73,7 @@ async fn format_partition(partition: &super::types::Partition) -> Result<()> {
     use super::types::FilesystemType;
     use tokio::process::Command;
 
-    let fs_type = partition.filesystem_type;
+    let fs_type = partition.filesystem_type();
     let device = partition.device.as_str();
     let label = partition.label.as_str();
 

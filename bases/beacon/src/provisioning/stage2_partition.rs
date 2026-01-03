@@ -153,28 +153,24 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                                 mount_point: MountPoint::Root,
                                 label: PartitionLabel::new("root"),
                                 size: PartitionSize::from_gb(ROOT_SIZE_GB),
-                                filesystem_type: MountPoint::Root.filesystem_type(),
                             }),
                             PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p2", primary_device))?,
                                 mount_point: MountPoint::Var,
                                 label: PartitionLabel::new("var"),
                                 size: PartitionSize::from_gb(VAR_SIZE_GB),
-                                filesystem_type: MountPoint::Var.filesystem_type(),
                             }),
                             PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p3", primary_device))?,
                                 mount_point: MountPoint::Metadata,
                                 label: PartitionLabel::new("metadata"),
                                 size: PartitionSize::from_gb(METADATA_SIZE_GB),
-                                filesystem_type: MountPoint::Metadata.filesystem_type(),
                             }),
                             PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p4", primary_device))?,
                                 mount_point: MountPoint::Music,
                                 label: PartitionLabel::new("music"),
                                 size: music_size,
-                                filesystem_type: MountPoint::Music.filesystem_type(),
                             }),
                         ]
                     } else {
@@ -198,28 +194,24 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                                 mount_point: MountPoint::Root,
                                 label: PartitionLabel::new("root"),
                                 size: PartitionSize::from_gb(ROOT_SIZE_GB),
-                                filesystem_type: MountPoint::Root.filesystem_type(),
                             }),
                             PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p2", primary_device))?,
                                 mount_point: MountPoint::Var,
                                 label: PartitionLabel::new("var"),
                                 size: PartitionSize::from_gb(VAR_SIZE_GB),
-                                filesystem_type: MountPoint::Var.filesystem_type(),
                             }),
                             PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p3", primary_device))?,
                                 mount_point: MountPoint::Metadata,
                                 label: PartitionLabel::new("metadata"),
                                 size: PartitionSize::from_gb(METADATA_SIZE_GB),
-                                filesystem_type: MountPoint::Metadata.filesystem_type(),
                             }),
                             PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p4", primary_device))?,
                                 mount_point: MountPoint::CdjExport,
                                 label: PartitionLabel::new("cdj-export"),
                                 size: cdj_size,
-                                filesystem_type: MountPoint::CdjExport.filesystem_type(),
                             }),
                         ]
                     }
@@ -269,35 +261,30 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                             mount_point: MountPoint::Root,
                             label: PartitionLabel::new("root"),
                             size: PartitionSize::from_gb(ROOT_SIZE_GB),
-                            filesystem_type: MountPoint::Root.filesystem_type(),
                         }),
                         PartitionState::Planned(Partition {
                             device: DevicePath::new(format!("{}p2", primary_device))?,
                             mount_point: MountPoint::Var,
                             label: PartitionLabel::new("var"),
                             size: PartitionSize::from_gb(VAR_SIZE_GB),
-                            filesystem_type: MountPoint::Var.filesystem_type(),
                         }),
                         PartitionState::Planned(Partition {
                             device: DevicePath::new(format!("{}p3", primary_device))?,
                             mount_point: MountPoint::Music,
                             label: PartitionLabel::new("music"),
                             size: PartitionSize::from_gb(music_size_gb),
-                            filesystem_type: MountPoint::Music.filesystem_type(),
                         }),
                         PartitionState::Planned(Partition {
                             device: DevicePath::new(format!("{}p4", primary_device))?,
                             mount_point: MountPoint::Metadata,
                             label: PartitionLabel::new("metadata"),
                             size: PartitionSize::from_gb(METADATA_SIZE_GB),
-                            filesystem_type: MountPoint::Metadata.filesystem_type(),
                         }),
                         PartitionState::Planned(Partition {
                             device: DevicePath::new(format!("{}p5", primary_device))?,
                             mount_point: MountPoint::CdjExport,
                             label: PartitionLabel::new("cdj-export"),
                             size: PartitionSize::from_gb(cdj_size_gb),
-                            filesystem_type: MountPoint::CdjExport.filesystem_type(),
                         }),
                     ]
                 }
@@ -314,21 +301,18 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                         mount_point: MountPoint::Root,
                         label: PartitionLabel::new("root"),
                         size: PartitionSize::from_gb(ROOT_SIZE_GB),
-                        filesystem_type: MountPoint::Root.filesystem_type(),
                     }),
                     PartitionState::Planned(Partition {
                         device: DevicePath::new(format!("{}p2", primary_device))?,
                         mount_point: MountPoint::Var,
                         label: PartitionLabel::new("var"),
                         size: PartitionSize::from_gb(VAR_SIZE_GB),
-                        filesystem_type: MountPoint::Var.filesystem_type(),
                     }),
                     PartitionState::Planned(Partition {
                         device: DevicePath::new(format!("{}p3", primary_device))?,
                         mount_point: MountPoint::Cache,
                         label: PartitionLabel::new("cache"),
                         size: cache_size,
-                        filesystem_type: MountPoint::Cache.filesystem_type(),
                     }),
                 ]
             }
@@ -350,7 +334,6 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                     mount_point: MountPoint::CdjExport,
                     label: PartitionLabel::new("cdj-export"),
                     size: secondary.size_bytes,
-                    filesystem_type: MountPoint::CdjExport.filesystem_type(),
                 })]
             } else {
                 // Music on secondary → secondary gets music (full drive, dedicated)
@@ -359,7 +342,6 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                     mount_point: MountPoint::Music,
                     label: PartitionLabel::new("music"),
                     size: secondary.size_bytes,
-                    filesystem_type: MountPoint::Music.filesystem_type(),
                 })]
             };
 
