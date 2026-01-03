@@ -18,7 +18,7 @@ use thiserror::Error;
 // Re-exports from shared components
 // ============================================================================
 
-pub use storage_primitives::{ByteSize, PartitionSize, StorageCapacity};
+pub use storage_primitives::{ByteSize, PartitionSize};
 
 // ============================================================================
 // Validation Errors
@@ -222,30 +222,76 @@ impl From<&str> for DevicePath {
 }
 
 // ============================================================================
-// Mount Point (static validated paths)
+// Mount Point (validated enum)
 // ============================================================================
 
 /// Mount point path
 ///
-/// A static mount point path.
+/// All known mount points as enum variants for compile-time safety.
+/// Adding a new mount point requires explicitly deciding its filesystem type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MountPoint(&'static str);
+pub enum MountPoint {
+    /// Boot partition (/boot) - FAT32 for Pi firmware compatibility
+    Boot,
+    /// Root filesystem (/)
+    Root,
+    /// Variable data (/var) - logs, journals
+    Var,
+    /// Music library (/music)
+    Music,
+    /// ACID metadata (/metadata)
+    Metadata,
+    /// CDJ export cache (/cdj-export) - NFS exported to CDJ equipment
+    CdjExport,
+    /// General cache (/cache)
+    Cache,
+}
 
 impl MountPoint {
-    /// Create a new mount point
-    pub const fn new(path: &'static str) -> Self {
-        MountPoint(path)
+    /// Get the mount point as a string slice
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            MountPoint::Boot => "/boot",
+            MountPoint::Root => "/",
+            MountPoint::Var => "/var",
+            MountPoint::Music => "/music",
+            MountPoint::Metadata => "/metadata",
+            MountPoint::CdjExport => "/cdj-export",
+            MountPoint::Cache => "/cache",
+        }
     }
 
-    /// Get the mount point as a string slice
-    pub const fn as_str(&self) -> &str {
-        self.0
+    /// Get the mount point as a Path reference
+    pub fn as_path(&self) -> &std::path::Path {
+        std::path::Path::new(self.as_str())
+    }
+
+    /// Get the filesystem type for this mount point
+    ///
+    /// This method is exhaustive - adding a new MountPoint variant
+    /// will cause a compile error until filesystem_type is updated.
+    pub const fn filesystem_type(&self) -> FilesystemType {
+        match self {
+            MountPoint::Boot => FilesystemType::Fat32,
+            MountPoint::Root
+            | MountPoint::Var
+            | MountPoint::Music
+            | MountPoint::Metadata
+            | MountPoint::CdjExport
+            | MountPoint::Cache => FilesystemType::Ext4,
+        }
     }
 }
 
 impl fmt::Display for MountPoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl AsRef<std::path::Path> for MountPoint {
+    fn as_ref(&self) -> &std::path::Path {
+        self.as_path()
     }
 }
 
@@ -274,6 +320,36 @@ impl PartitionLabel {
 impl fmt::Display for PartitionLabel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+// ============================================================================
+// Filesystem Type
+// ============================================================================
+
+/// Filesystem type for partitions
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FilesystemType {
+    /// FAT32 filesystem (boot partition)
+    Fat32,
+    /// ext4 filesystem (all other partitions)
+    Ext4,
+}
+
+impl FilesystemType {
+    /// Get the filesystem type string used by mkfs commands
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            FilesystemType::Fat32 => "vfat",
+            FilesystemType::Ext4 => "ext4",
+        }
+    }
+}
+
+impl fmt::Display for FilesystemType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
     }
 }
 
@@ -377,9 +453,13 @@ mod tests {
 
     #[test]
     fn test_mount_point() {
-        let mp = MountPoint::new("/music");
+        let mp = MountPoint::Music;
         assert_eq!(mp.as_str(), "/music");
         assert_eq!(mp.to_string(), "/music");
+        assert_eq!(mp.filesystem_type(), FilesystemType::Ext4);
+        
+        // Boot partition should use FAT32
+        assert_eq!(MountPoint::Boot.filesystem_type(), FilesystemType::Fat32);
     }
 
     #[test]

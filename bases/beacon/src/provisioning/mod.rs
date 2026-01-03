@@ -4,7 +4,7 @@
 use crate::actions::{Action, ProvisioningPlan};
 use crate::error::Result;
 use crate::hardware::HardwareInfo;
-use crate::provisioning::types::{CompletedPartitionPlan, PartitionPlan};
+use crate::provisioning::types::CompletedPartitionPlan;
 use tokio::sync::mpsc;
 
 pub mod types;

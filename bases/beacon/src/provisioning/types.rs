@@ -17,8 +17,8 @@ use crate::hardware::HardwareInfo;
 // ============================================================================
 
 pub use crate::types::{
-    ByteSize, DevicePath, MountPoint, PartitionLabel, PartitionSize, ProvisionConfig, UnitType,
-    ValidationError,
+    ByteSize, DevicePath, FilesystemType, MountPoint, PartitionLabel, PartitionSize,
+    ProvisionConfig, UnitType, ValidationError,
 };
 
 // ============================================================================
@@ -397,14 +397,15 @@ pub struct Partition {
     pub mount_point: MountPoint,
     pub label: PartitionLabel,
     pub size: PartitionSize,
+    pub filesystem_type: FilesystemType,
 }
 
 impl std::fmt::Display for Partition {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} → {} ({}, label: {})",
-            self.device, self.mount_point, self.size, self.label
+            "{} → {} ({}, label: {}, fs: {})",
+            self.device, self.mount_point, self.size, self.label, self.filesystem_type
         )
     }
 }
