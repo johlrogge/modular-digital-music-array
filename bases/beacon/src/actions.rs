@@ -101,7 +101,7 @@ pub enum PlanExecutionError {
 // ============================================================================
 
 /// A planned action ready for execution
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct PlannedAction<Input: Debug, PlannedWork: Debug, Output: Debug, A: Debug>
 where
     A: Action<Input, PlannedWork, Output>,

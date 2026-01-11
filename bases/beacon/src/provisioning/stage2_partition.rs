@@ -100,7 +100,7 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
     ) -> Result<PlannedAction<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives, Self>>
     {
         use crate::provisioning::types::{
-            DevicePath, MountPoint, PartitionLabel, PartitionSize, UnitType,
+            DevicePath, MountPoint, PartitionSize, UnitType,
         };
 
         let primary_device = input.drives.primary().device.clone();

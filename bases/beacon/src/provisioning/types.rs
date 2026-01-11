@@ -450,23 +450,260 @@ impl std::fmt::Display for FormattedSystem {
 }
 
 // ============================================================================
-// Stage 4: Base Installation
+// Stage 4: Base Installation (Sub-stages)
 // ============================================================================
+
+// ----------------------------------------------------------------------------
+// Stage 4.1: Mount Partitions
+// ----------------------------------------------------------------------------
+
+/// Workflow state for a partition during mounting
+#[derive(Debug, Clone, PartialEq)]
+pub enum MountState {
+    /// Partition needs to be mounted
+    NeedsMount(Partition),
+    /// Partition is already mounted
+    AlreadyMounted(Partition),
+}
+
+impl MountState {
+    pub fn partition(&self) -> &Partition {
+        match self {
+            MountState::NeedsMount(p) => p,
+            MountState::AlreadyMounted(p) => p,
+        }
+    }
+}
+
+impl std::fmt::Display for MountState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MountState::NeedsMount(p) => write!(f, "✨ Mount {} to /mnt/mdma-install{}", 
+                p.device, p.mount_point.as_path().display()),
+            MountState::AlreadyMounted(p) => write!(f, "⏭️  {} already mounted", p.device),
+        }
+    }
+}
+
+/// Planned work for mounting partitions (WITH workflow state)
+#[derive(Debug, Clone, PartialEq)]
+pub struct MountPlan {
+    pub formatted: FormattedSystem,  // Thread the input through
+    pub mount_root: PathBuf,
+    pub partitions: Vec<MountState>,
+}
+
+impl std::fmt::Display for MountPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let needs_mount = self.partitions.iter()
+            .filter(|p| matches!(p, MountState::NeedsMount(_)))
+            .count();
+        let already_mounted = self.partitions.iter()
+            .filter(|p| matches!(p, MountState::AlreadyMounted(_)))
+            .count();
+        
+        if needs_mount > 0 && already_mounted > 0 {
+            writeln!(f, "📝 Mount {} partition(s), skip {} (already mounted)", 
+                needs_mount, already_mounted)?;
+        } else if needs_mount > 0 {
+            writeln!(f, "📝 Mount {} partition(s)", needs_mount)?;
+        } else {
+            writeln!(f, "📝 All {} partition(s) already mounted", already_mounted)?;
+        }
+        
+        writeln!(f, "\nMount root: {}", self.mount_root.display())?;
+        for partition_state in &self.partitions {
+            writeln!(f, "  {}", partition_state)?;
+        }
+        Ok(())
+    }
+}
+
+/// Partitions that have been mounted (WITHOUT workflow state)
+#[derive(Debug, Clone, PartialEq)]
+pub struct MountedPartitions {
+    pub formatted: FormattedSystem,
+    pub mount_root: PathBuf,
+    pub partitions: Vec<Partition>,
+}
+
+impl std::fmt::Display for MountedPartitions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "✅ {} partition(s) mounted at {}", 
+            self.partitions.len(), 
+            self.mount_root.display())
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Stage 4.2: Install Packages
+// ----------------------------------------------------------------------------
+
+/// Workflow state for package installation
+#[derive(Debug, Clone, PartialEq)]
+pub enum InstallState {
+    NeedsInstall,
+    AlreadyInstalled,
+}
+
+impl std::fmt::Display for InstallState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InstallState::NeedsInstall => write!(f, "✨ Install base-system package"),
+            InstallState::AlreadyInstalled => write!(f, "⏭️  base-system already installed"),
+        }
+    }
+}
+
+/// Planned work for installing packages (WITH workflow state)
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstallPlan {
+    pub mount_root: PathBuf,
+    pub packages: Vec<String>,
+    pub install_state: InstallState,
+}
+
+impl std::fmt::Display for InstallPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}", self.install_state)?;
+        writeln!(f, "Target: {}", self.mount_root.display())?;
+        writeln!(f, "Packages: {}", self.packages.join(", "))
+    }
+}
+
+/// System with packages installed (WITHOUT workflow state)
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstalledPackages {
+    pub mounted: MountedPartitions,
+    pub packages: Vec<String>,
+}
+
+impl std::fmt::Display for InstalledPackages {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "✅ {} package(s) installed", self.packages.len())
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Stage 4.3: Configure fstab
+// ----------------------------------------------------------------------------
+
+/// Workflow state for fstab configuration
+#[derive(Debug, Clone, PartialEq)]
+pub enum FstabState {
+    NeedsConfig,
+    AlreadyConfigured,
+}
+
+impl std::fmt::Display for FstabState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FstabState::NeedsConfig => write!(f, "✨ Configure /etc/fstab"),
+            FstabState::AlreadyConfigured => write!(f, "⏭️  /etc/fstab already configured"),
+        }
+    }
+}
+
+/// Planned work for configuring fstab (WITH workflow state)
+#[derive(Debug, Clone, PartialEq)]
+pub struct FstabPlan {
+    pub mount_root: PathBuf,
+    pub partitions: Vec<Partition>,
+    pub config_state: FstabState,
+}
+
+impl std::fmt::Display for FstabPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}", self.config_state)?;
+        writeln!(f, "Target: {}/etc/fstab", self.mount_root.display())?;
+        writeln!(f, "Partitions: {}", self.partitions.len())
+    }
+}
+
+/// System with fstab configured (WITHOUT workflow state)
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfiguredFstab {
+    pub installed: InstalledPackages,
+}
+
+impl std::fmt::Display for ConfiguredFstab {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "✅ fstab configured")
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Stage 4.4: Unmount Partitions
+// ----------------------------------------------------------------------------
+
+/// Workflow state for unmounting
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnmountState {
+    NeedsUnmount(PathBuf),
+    AlreadyUnmounted,
+}
+
+impl std::fmt::Display for UnmountState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UnmountState::NeedsUnmount(path) => write!(f, "✨ Unmount {}", path.display()),
+            UnmountState::AlreadyUnmounted => write!(f, "⏭️  Already unmounted"),
+        }
+    }
+}
+
+/// Planned work for unmounting (WITH workflow state)
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnmountPlan {
+    pub mount_points: Vec<(PathBuf, UnmountState)>,
+}
+
+impl std::fmt::Display for UnmountPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let needs_unmount = self.mount_points.iter()
+            .filter(|(_, state)| matches!(state, UnmountState::NeedsUnmount(_)))
+            .count();
+        
+        if needs_unmount > 0 {
+            writeln!(f, "📝 Unmount {} mount point(s)", needs_unmount)?;
+            for (_path, state) in &self.mount_points {
+                if matches!(state, UnmountState::NeedsUnmount(_)) {
+                    writeln!(f, "  {}", state)?;
+                }
+            }
+        } else {
+            writeln!(f, "📝 All mount points already unmounted")?;
+        }
+        Ok(())
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Stage 4: Final Output (Composite)
+// ----------------------------------------------------------------------------
 
 /// System with base Void Linux installed
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstalledSystem {
     pub formatted: FormattedSystem,
 }
-impl InstalledSystem {
-    pub(crate) fn mount_point(&self) -> PathBuf {
-        todo!()
-    }
-}
 
 impl std::fmt::Display for InstalledSystem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "✅ Base system installed")
+    }
+}
+
+impl InstalledSystem {
+    /// Get the mount point where the system was installed
+    /// 
+    /// NOTE: This is a temporary stub for backwards compatibility with stages 5 and 6.
+    /// These stages should be updated to use a better approach once we finalize
+    /// the installation architecture.
+    pub fn mount_point(&self) -> PathBuf {
+        // For now, return the standard mount point
+        // In the future, this should come from the installation plan
+        PathBuf::from("/mnt/mdma-install")
     }
 }
 
