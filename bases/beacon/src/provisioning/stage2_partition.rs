@@ -99,9 +99,7 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
         input: &ValidatedHardware,
     ) -> Result<PlannedAction<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives, Self>>
     {
-        use crate::provisioning::types::{
-            DevicePath, MountPoint, PartitionSize, UnitType,
-        };
+        use crate::provisioning::types::{DevicePath, MountPoint, PartitionSize, UnitType};
 
         let primary_device = input.drives.primary().device.clone();
         let primary_size_bytes = input.drives.primary().size_bytes;
@@ -109,7 +107,7 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
         // Constants (in GB)
         const ROOT_SIZE_GB: u64 = 16;
         const VAR_SIZE_GB: u64 = 8;
-        const METADATA_SIZE_GB: u64 = 88; // Increased for extensive collections + playback history
+        const METADATA_SIZE_GB: u64 = 12; // ACID fact streams for music library metadata
         const MIN_MUSIC_SIZE_GB: u64 = 200; // Minimum viable music library size
 
         // Music assignment threshold: Primary must be 50% larger than secondary to justify shared drive
@@ -161,7 +159,7 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                             PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p4", primary_device))?,
                                 mount_point: MountPoint::Music,
-                                size: remaining_bytes,  // ALL remaining on primary
+                                size: remaining_bytes, // ALL remaining on primary
                             }),
                         ]
                     } else {
@@ -235,7 +233,7 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                         PartitionState::Planned(Partition {
                             device: DevicePath::new(format!("{}p4", primary_device))?,
                             mount_point: MountPoint::Music,
-                            size: remaining_bytes,  // ALL remaining space!
+                            size: remaining_bytes, // ALL remaining space!
                         }),
                     ]
                 }
@@ -326,7 +324,9 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
             for partition_state in partitions.iter_mut() {
                 // First check if we should convert (immutable borrow via &*)
                 let should_mark = if let PartitionState::Planned(p) = &*partition_state {
-                    existing.iter().any(|(label, _)| label == p.label().as_str())
+                    existing
+                        .iter()
+                        .any(|(label, _)| label == p.label().as_str())
                 } else {
                     false
                 };
@@ -344,7 +344,8 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                         } else {
                             format!(
                                 "{} partition {} already exists, will skip creation",
-                                context, p_clone.label()
+                                context,
+                                p_clone.label()
                             )
                         };
                         tracing::info!("{}", msg);
@@ -432,12 +433,17 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                         let log_msg = if context.is_empty() {
                             format!(
                                 "Partition {} already exists: {} (label: {})",
-                                partition_num, partition.mount_point, partition.label()
+                                partition_num,
+                                partition.mount_point,
+                                partition.label()
                             )
                         } else {
                             format!(
                                 "{} partition {} already exists: {} (label: {})",
-                                context, partition_num, partition.mount_point, partition.label()
+                                context,
+                                partition_num,
+                                partition.mount_point,
+                                partition.label()
                             )
                         };
                         tracing::info!("{}", log_msg);
@@ -465,7 +471,9 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                 // sfdisk format: start=X, size=Y, type=linux, name=label
                 sfdisk_input.push_str(&format!(
                     "start={}M, size={}M, type=linux, name={}\n",
-                    start_mb, size_mb, partition.label()
+                    start_mb,
+                    size_mb,
+                    partition.label()
                 ));
 
                 start_mb += size_mb;
@@ -680,43 +688,43 @@ mod tests {
     #[case::equal_drives_512gb(
         512, 512,
         "Equal drives → dedicated music on secondary (full drive)",
-        vec![("/", 16), ("/var", 8), ("/metadata", 88)],
+        vec![("/", 16), ("/var", 8), ("/metadata", 12)],
         Some(vec![("/music", 512)])
     )]
     #[case::slightly_larger_primary_640gb(
         640, 512,
         "Primary 1.25× (640/512) → dedicated music on secondary (below 1.5× threshold)",
-        vec![("/", 16), ("/var", 8), ("/metadata", 88)],
+        vec![("/", 16), ("/var", 8), ("/metadata", 12)],
         Some(vec![("/music", 512)])
     )]
     #[case::threshold_case_768gb(
         768, 512,
         "Primary 1.5× (768/512) → music on primary (exactly at threshold), secondary unpartitioned",
-        vec![("/", 16), ("/var", 8), ("/metadata", 88), ("/music", 656)],
+        vec![("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 732)],
         Some(Vec::new())  // Secondary left unpartitioned
     )]
     #[case::large_primary_1tb(
         1024, 512,
         "Primary 2.0× (1024/512) → music on primary (well above threshold), secondary unpartitioned",
-        vec![("/", 16), ("/var", 8), ("/metadata", 88), ("/music", 912)],
+        vec![("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 988)],
         Some(Vec::new())  // Secondary left unpartitioned
     )]
     #[case::huge_primary_2tb(
         2048, 512,
         "Primary 4.0× (2048/512) → music on primary (massive difference), secondary unpartitioned",
-        vec![("/", 16), ("/var", 8), ("/metadata", 88), ("/music", 1936)],
+        vec![("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 2012)],
         Some(Vec::new())  // Secondary left unpartitioned
     )]
     #[case::just_below_threshold(
         730, 512,
         "Primary 1.43× (730/512) → dedicated music on secondary (just below 1.5×)",
-        vec![("/", 16), ("/var", 8), ("/metadata", 88)],
+        vec![("/", 16), ("/var", 8), ("/metadata", 12)],
         Some(vec![("/music", 512)])
     )]
     #[case::just_above_threshold(
         800, 512,
         "Primary 1.56× (800/512) → music on primary (just above 1.5×), secondary unpartitioned",
-        vec![("/", 16), ("/var", 8), ("/metadata", 88), ("/music", 688)],
+        vec![("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 764)],
         Some(Vec::new())  // Secondary left unpartitioned
     )]
     #[tokio::test]
@@ -788,12 +796,12 @@ mod tests {
     #[case::standard_512gb(
         512,
         "Single 512GB drive - Music gets all remaining space",
-        vec![("/", 16), ("/var", 8), ("/metadata", 88), ("/music", 400)]
+        vec![("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 476)]
     )]
     #[case::large_1tb(
         1024,
         "Single 1TB drive - Music gets all remaining space",
-        vec![("/", 16), ("/var", 8), ("/metadata", 88), ("/music", 912)]
+        vec![("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 988)]
     )]
     #[tokio::test]
     async fn test_single_drive_partitioning(
@@ -851,8 +859,8 @@ mod tests {
         );
         assert_eq!(
             music_partition.unwrap().1,
-            656,
-            "Music partition should be 656GB (768 - 16 - 8 - 88)"
+            768 - 16 - 8 - 12,
+            "Music partition should be 656GB (768 - 16 - 8 - 12)"
         );
 
         // Secondary should be unpartitioned (left for future expansion)
@@ -915,6 +923,10 @@ mod tests {
         assert_eq!(music.1, 512, "Music should get full 512GB dedicated");
 
         // Primary should have OS partitions only
-        assert_eq!(primary_info.len(), 3, "Primary should have 3 partitions (root, var, metadata)");
+        assert_eq!(
+            primary_info.len(),
+            3,
+            "Primary should have 3 partitions (root, var, metadata)"
+        );
     }
 }
