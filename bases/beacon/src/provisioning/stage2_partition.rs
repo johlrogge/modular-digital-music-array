@@ -109,9 +109,8 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
         // Constants (in GB)
         const ROOT_SIZE_GB: u64 = 16;
         const VAR_SIZE_GB: u64 = 8;
-        const METADATA_SIZE_GB: u64 = 12; // Sufficient for extensive collections + playback history
-        const MIN_MUSIC_SIZE_GB: u64 = 300;
-        const MIN_CDJ_SIZE_GB: u64 = 64;
+        const METADATA_SIZE_GB: u64 = 88; // Increased for extensive collections + playback history
+        const MIN_MUSIC_SIZE_GB: u64 = 200; // Minimum viable music library size
 
         // Music assignment threshold: Primary must be 50% larger than secondary to justify shared drive
         const MUSIC_SIZE_THRESHOLD_RATIO: f64 = 1.5;
@@ -119,7 +118,7 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
         let partitions = match input.config.unit_type {
             UnitType::Mdma909 | UnitType::Mdma101 => {
                 if let Some(secondary) = input.drives.secondary() {
-                    // Two-drive config: Decide music placement based on size
+                    // Two-drive config: Music goes on the larger drive (full remaining space)
                     let os_overhead_gb = ROOT_SIZE_GB + VAR_SIZE_GB + METADATA_SIZE_GB;
                     let primary_available_gb = primary_size_bytes
                         .gigabytes()
@@ -133,19 +132,15 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                         >= (secondary_size_gb as f64 * MUSIC_SIZE_THRESHOLD_RATIO);
 
                     if primary_much_larger {
-                        // Primary is 50%+ larger: Music on primary (worth sharing drive)
-                        // Primary: OS + metadata + music (most of drive)
-                        // Secondary: CDJ export (full drive, dedicated)
+                        // Primary is 50%+ larger: Music on primary (all remaining space)
+                        // Secondary left unpartitioned for future expansion
                         tracing::info!(
-                            "Two-drive (primary larger): Music on primary ({}GB available > {}GB secondary × {:.1})",
-                            primary_available_gb,
-                            secondary_size_gb,
-                            MUSIC_SIZE_THRESHOLD_RATIO
+                            "Two-drive (primary larger): Music on primary ({}GB available after OS)",
+                            primary_available_gb
                         );
 
                         let os_overhead = PartitionSize::from_gb(os_overhead_gb);
                         let remaining_bytes = primary_size_bytes.saturating_sub(os_overhead);
-                        let music_size = remaining_bytes;
 
                         vec![
                             PartitionState::Planned(Partition {
@@ -166,23 +161,16 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                             PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p4", primary_device))?,
                                 mount_point: MountPoint::Music,
-                                size: music_size,
+                                size: remaining_bytes,  // ALL remaining on primary
                             }),
                         ]
                     } else {
-                        // Secondary dedicated to music (clean separation worth preserving)
-                        // Primary: OS + metadata + CDJ export
-                        // Secondary: Music (full drive, dedicated)
+                        // Secondary is larger or equal: Music on secondary (full drive)
+                        // Primary has OS + metadata only
                         tracing::info!(
-                            "Two-drive (dedicated music): Music on secondary ({}GB available < {}GB secondary × {:.1})",
-                            primary_available_gb,
-                            secondary_size_gb,
-                            MUSIC_SIZE_THRESHOLD_RATIO
+                            "Two-drive (secondary larger/equal): Music on secondary ({}GB full drive)",
+                            secondary_size_gb
                         );
-
-                        let os_overhead = PartitionSize::from_gb(os_overhead_gb);
-                        let remaining_bytes = primary_size_bytes.saturating_sub(os_overhead);
-                        let cdj_size = remaining_bytes;
 
                         vec![
                             PartitionState::Planned(Partition {
@@ -200,51 +188,32 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                                 mount_point: MountPoint::Metadata,
                                 size: PartitionSize::from_gb(METADATA_SIZE_GB),
                             }),
-                            PartitionState::Planned(Partition {
-                                device: DevicePath::new(format!("{}p4", primary_device))?,
-                                mount_point: MountPoint::CdjExport,
-                                size: cdj_size,
-                            }),
                         ]
                     }
                 } else {
-                    // Single-drive config: Split between music and CDJ
+                    // Single-drive config: Music gets ALL remaining space
                     let os_overhead =
                         PartitionSize::from_gb(ROOT_SIZE_GB + VAR_SIZE_GB + METADATA_SIZE_GB);
                     let remaining_bytes = primary_size_bytes.saturating_sub(os_overhead);
                     let remaining_gb = remaining_bytes.gigabytes();
 
-                    // Check minimums
-                    let min_required_gb = MIN_MUSIC_SIZE_GB + MIN_CDJ_SIZE_GB;
-                    if remaining_gb < min_required_gb {
+                    // Check minimum
+                    if remaining_gb < MIN_MUSIC_SIZE_GB {
                         return Err(crate::error::BeaconError::Validation(
                             ValidationError::DriveToSmall(
                             format!(
-                            "{} has only {}GB after OS partitions, need at least {}GB for music ({}GB) + CDJ export ({}GB)",
+                            "{} has only {}GB after OS partitions, need at least {}GB for music library",
                             primary_device,
                             remaining_gb,
-                            min_required_gb,
-                            MIN_MUSIC_SIZE_GB,
-                            MIN_CDJ_SIZE_GB
+                            MIN_MUSIC_SIZE_GB
                         ))));
                     }
 
-                    // Calculate proportional sizes
-                    let extra_gb = remaining_gb - min_required_gb;
-                    let music_weight =
-                        MIN_MUSIC_SIZE_GB as f64 / (MIN_MUSIC_SIZE_GB + MIN_CDJ_SIZE_GB) as f64;
-                    let cdj_weight =
-                        MIN_CDJ_SIZE_GB as f64 / (MIN_MUSIC_SIZE_GB + MIN_CDJ_SIZE_GB) as f64;
-
-                    let music_size_gb =
-                        MIN_MUSIC_SIZE_GB + ((extra_gb as f64 * music_weight) as u64);
-                    let cdj_size_gb = MIN_CDJ_SIZE_GB + ((extra_gb as f64 * cdj_weight) as u64);
-
                     tracing::info!(
-                        "Single-drive partition sizing: {} total, {} music, {} CDJ export",
+                        "Single-drive partition sizing: {} total, {} OS overhead, {} music (remaining)",
                         primary_size_bytes,
-                        PartitionSize::from_gb(music_size_gb),
-                        PartitionSize::from_gb(cdj_size_gb)
+                        os_overhead,
+                        remaining_bytes
                     );
 
                     vec![
@@ -260,18 +229,13 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                         }),
                         PartitionState::Planned(Partition {
                             device: DevicePath::new(format!("{}p3", primary_device))?,
-                            mount_point: MountPoint::Music,
-                            size: PartitionSize::from_gb(music_size_gb),
-                        }),
-                        PartitionState::Planned(Partition {
-                            device: DevicePath::new(format!("{}p4", primary_device))?,
                             mount_point: MountPoint::Metadata,
                             size: PartitionSize::from_gb(METADATA_SIZE_GB),
                         }),
                         PartitionState::Planned(Partition {
-                            device: DevicePath::new(format!("{}p5", primary_device))?,
-                            mount_point: MountPoint::CdjExport,
-                            size: PartitionSize::from_gb(cdj_size_gb),
+                            device: DevicePath::new(format!("{}p4", primary_device))?,
+                            mount_point: MountPoint::Music,
+                            size: remaining_bytes,  // ALL remaining space!
                         }),
                     ]
                 }
@@ -312,12 +276,8 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                 >= (secondary_size_gb as f64 * MUSIC_SIZE_THRESHOLD_RATIO);
 
             let secondary_partitions = if primary_much_larger {
-                // Music on primary → secondary gets CDJ export (full drive)
-                vec![PartitionState::Planned(Partition {
-                    device: DevicePath::new(format!("{}p1", secondary.device))?,
-                    mount_point: MountPoint::CdjExport,
-                    size: secondary.size_bytes,
-                })]
+                // Music on primary → secondary left unpartitioned for future expansion
+                Vec::new()
             } else {
                 // Music on secondary → secondary gets music (full drive, dedicated)
                 vec![PartitionState::Planned(Partition {
@@ -719,45 +679,45 @@ mod tests {
     #[rstest]
     #[case::equal_drives_512gb(
         512, 512,
-        "Equal drives → dedicated music on secondary",
-        vec![("/", 16), ("/var", 8), ("/metadata", 12), ("/cdj-export", 476)],
+        "Equal drives → dedicated music on secondary (full drive)",
+        vec![("/", 16), ("/var", 8), ("/metadata", 88)],
         Some(vec![("/music", 512)])
     )]
     #[case::slightly_larger_primary_640gb(
         640, 512,
         "Primary 1.25× (640/512) → dedicated music on secondary (below 1.5× threshold)",
-        vec![("/", 16), ("/var", 8), ("/metadata", 12), ("/cdj-export", 604)],
+        vec![("/", 16), ("/var", 8), ("/metadata", 88)],
         Some(vec![("/music", 512)])
     )]
     #[case::threshold_case_768gb(
         768, 512,
-        "Primary 1.5× (768/512) → music on primary (exactly at threshold)",
-        vec![("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 732)],
-        Some(vec![("/cdj-export", 512)])
+        "Primary 1.5× (768/512) → music on primary (exactly at threshold), secondary unpartitioned",
+        vec![("/", 16), ("/var", 8), ("/metadata", 88), ("/music", 656)],
+        Some(Vec::new())  // Secondary left unpartitioned
     )]
     #[case::large_primary_1tb(
         1024, 512,
-        "Primary 2.0× (1024/512) → music on primary (well above threshold)",
-        vec![("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 988)],
-        Some(vec![("/cdj-export", 512)])
+        "Primary 2.0× (1024/512) → music on primary (well above threshold), secondary unpartitioned",
+        vec![("/", 16), ("/var", 8), ("/metadata", 88), ("/music", 912)],
+        Some(Vec::new())  // Secondary left unpartitioned
     )]
     #[case::huge_primary_2tb(
         2048, 512,
-        "Primary 4.0× (2048/512) → music on primary (massive difference)",
-        vec![("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 2012)],
-        Some(vec![("/cdj-export", 512)])
+        "Primary 4.0× (2048/512) → music on primary (massive difference), secondary unpartitioned",
+        vec![("/", 16), ("/var", 8), ("/metadata", 88), ("/music", 1936)],
+        Some(Vec::new())  // Secondary left unpartitioned
     )]
     #[case::just_below_threshold(
         730, 512,
         "Primary 1.43× (730/512) → dedicated music on secondary (just below 1.5×)",
-        vec![("/", 16), ("/var", 8), ("/metadata", 12), ("/cdj-export", 694)],
+        vec![("/", 16), ("/var", 8), ("/metadata", 88)],
         Some(vec![("/music", 512)])
     )]
     #[case::just_above_threshold(
         800, 512,
-        "Primary 1.56× (800/512) → music on primary (just above 1.5×)",
-        vec![("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 764)],
-        Some(vec![("/cdj-export", 512)])
+        "Primary 1.56× (800/512) → music on primary (just above 1.5×), secondary unpartitioned",
+        vec![("/", 16), ("/var", 8), ("/metadata", 88), ("/music", 688)],
+        Some(Vec::new())  // Secondary left unpartitioned
     )]
     #[tokio::test]
     async fn test_two_drive_size_based_assignment(
@@ -827,13 +787,13 @@ mod tests {
     #[rstest]
     #[case::standard_512gb(
         512,
-        "Single 512GB drive",
-        vec![("/", 16), ("/var", 8), ("/music", 392), ("/metadata", 12), ("/cdj-export", 83)]
+        "Single 512GB drive - Music gets all remaining space",
+        vec![("/", 16), ("/var", 8), ("/metadata", 88), ("/music", 400)]
     )]
     #[case::large_1tb(
         1024,
-        "Single 1TB drive",
-        vec![("/", 16), ("/var", 8), ("/music", 814), ("/metadata", 12), ("/cdj-export", 173)]
+        "Single 1TB drive - Music gets all remaining space",
+        vec![("/", 16), ("/var", 8), ("/metadata", 88), ("/music", 912)]
     )]
     #[tokio::test]
     async fn test_single_drive_partitioning(
@@ -876,14 +836,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_music_capacity_at_threshold() {
-        // 768GB primary (exactly 1.5× after OS overhead)
+        // 768GB primary (exactly 1.5× after OS overhead threshold)
         let input = create_validated_drives(768, Some(512));
         let action = PartitionDrivesAction;
 
         let planned = action.plan(&input).await.unwrap();
         let (primary_info, secondary_info) = get_partition_info(&planned.planned_work.plan);
 
-        // Music should be on primary with 732 GB
+        // Music should be on primary with all remaining space (656GB)
         let music_partition = primary_info.iter().find(|(mount, _)| mount == "/music");
         assert!(
             music_partition.is_some(),
@@ -891,23 +851,13 @@ mod tests {
         );
         assert_eq!(
             music_partition.unwrap().1,
-            732,
-            "Music partition should be 732GB"
+            656,
+            "Music partition should be 656GB (768 - 16 - 8 - 88)"
         );
 
-        // Secondary should have CDJ export with full 512 GB
+        // Secondary should be unpartitioned (left for future expansion)
         let secondary = secondary_info.unwrap();
-        assert_eq!(secondary.len(), 1, "Secondary should have one partition");
-        assert_eq!(
-            secondary[0].0, "/cdj-export",
-            "Secondary should be CDJ export"
-        );
-        assert_eq!(secondary[0].1, 512, "CDJ export should be 512GB");
-
-        // Verify capacity gain: 732GB vs 512GB = +220GB (+43%)
-        let gain_gb = 732 - 512;
-        let gain_percent = (gain_gb as f64 / 512.0) * 100.0;
-        assert!(gain_percent >= 40.0, "Capacity gain should be at least 40%");
+        assert_eq!(secondary.len(), 0, "Secondary should have no partitions");
     }
 
     #[tokio::test]
@@ -940,23 +890,31 @@ mod tests {
         let planned = action.plan(&input).await.unwrap();
         let (primary_info, secondary_info) = get_partition_info(&planned.planned_work.plan);
 
-        // Should use clean separation pattern
-        let cdj_on_primary = primary_info.iter().any(|(mount, _)| mount == "/cdj-export");
+        // Should use clean separation pattern:
+        // Primary: OS + metadata only (no music)
+        // Secondary: Music (full drive)
+        let music_on_primary = primary_info.iter().any(|(mount, _)| mount == "/music");
+        assert!(
+            !music_on_primary,
+            "Music should NOT be on primary (equal drives → dedicated music on secondary)"
+        );
+
         let music_on_secondary = secondary_info
             .as_ref()
             .unwrap()
             .iter()
             .any(|(mount, _)| mount == "/music");
-
-        assert!(cdj_on_primary, "CDJ export should be on primary");
         assert!(
             music_on_secondary,
-            "Music should be on secondary (dedicated)"
+            "Music should be on secondary (dedicated full drive)"
         );
 
         // Verify capacities
         let binding = secondary_info.unwrap();
         let music = binding.iter().find(|(m, _)| m == "/music").unwrap();
         assert_eq!(music.1, 512, "Music should get full 512GB dedicated");
+
+        // Primary should have OS partitions only
+        assert_eq!(primary_info.len(), 3, "Primary should have 3 partitions (root, var, metadata)");
     }
 }

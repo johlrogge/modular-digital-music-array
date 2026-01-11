@@ -409,37 +409,4 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
-
-    #[test]
-    fn test_verify_boot_partition_vfat() {
-        let lsblk_json = r#"{
-            "blockdevices": [
-                {
-                    "name": "nvme0n1",
-                    "children": [
-                        {
-                            "name": "nvme0n1p1",
-                            "fstype": "vfat",
-                            "label": "boot",
-                            "size": "512M"
-                        }
-                    ]
-                }
-            ]
-        }"#;
-
-        let lsblk_data: serde_json::Value = serde_json::from_str(lsblk_json).unwrap();
-
-        let partition = Partition {
-            device: DevicePath::new("/dev/nvme0n1p1").unwrap(),
-            mount_point: MountPoint::Boot, // Expects vfat
-            size: PartitionSize::from_mb(512),
-        };
-
-        let result = verify_partition(&lsblk_data, &partition);
-        assert!(
-            result.is_ok(),
-            "Expected boot partition verification to succeed"
-        );
-    }
 }

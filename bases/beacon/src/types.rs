@@ -231,19 +231,15 @@ impl From<&str> for DevicePath {
 /// Adding a new mount point requires explicitly deciding its filesystem type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MountPoint {
-    /// Boot partition (/boot) - FAT32 for Pi firmware compatibility
-    Boot,
     /// Root filesystem (/)
     Root,
     /// Variable data (/var) - logs, journals
     Var,
-    /// Music library (/music)
+    /// Music library (/music) - Contains both FLAC library and CDJ export cache
     Music,
     /// ACID metadata (/metadata)
     Metadata,
-    /// CDJ export cache (/cdj-export) - NFS exported to CDJ equipment
-    CdjExport,
-    /// General cache (/cache)
+    /// General cache (/cache) - Used by MDMA-303 satellite nodes
     Cache,
 }
 
@@ -251,12 +247,10 @@ impl MountPoint {
     /// Get the mount point as a string slice
     pub const fn as_str(&self) -> &'static str {
         match self {
-            MountPoint::Boot => "/boot",
             MountPoint::Root => "/",
             MountPoint::Var => "/var",
             MountPoint::Music => "/music",
             MountPoint::Metadata => "/metadata",
-            MountPoint::CdjExport => "/cdj-export",
             MountPoint::Cache => "/cache",
         }
     }
@@ -268,37 +262,32 @@ impl MountPoint {
 
     /// Get the filesystem type for this mount point
     ///
+    /// All MDMA partitions use ext4.
+    ///
     /// This method is exhaustive - adding a new MountPoint variant
     /// will cause a compile error until filesystem_type is updated.
     pub const fn filesystem_type(&self) -> FilesystemType {
         match self {
-            MountPoint::Boot => FilesystemType::Fat32,
             MountPoint::Root
             | MountPoint::Var
             | MountPoint::Music
             | MountPoint::Metadata
-            | MountPoint::CdjExport
             | MountPoint::Cache => FilesystemType::Ext4,
         }
     }
 
-    /// Get the default partition label for this mount point
     /// Get the partition label for this mount point
     ///
-    /// Labels use kebab-case naming convention:
-    /// - Boot → "boot"
-    /// - CdjExport → "cdj-export"
+    /// Labels use kebab-case naming convention matching mount points.
     ///
     /// Labels are consistent across all MDMA hosts, making
     /// lsblk output instantly recognizable.
     pub fn label(&self) -> PartitionLabel {
         let label = match self {
-            MountPoint::Boot => "boot",
             MountPoint::Root => "root",
             MountPoint::Var => "var",
             MountPoint::Music => "music",
             MountPoint::Metadata => "metadata",
-            MountPoint::CdjExport => "cdj-export",
             MountPoint::Cache => "cache",
         };
         PartitionLabel::new(label)
@@ -481,13 +470,16 @@ mod tests {
         assert_eq!(mp.filesystem_type(), FilesystemType::Ext4);
         assert_eq!(mp.label().as_str(), "music");
         
-        // Boot partition should use FAT32
-        assert_eq!(MountPoint::Boot.filesystem_type(), FilesystemType::Fat32);
-        assert_eq!(MountPoint::Boot.label().as_str(), "boot");
+        // All partitions now use ext4
+        assert_eq!(MountPoint::Root.filesystem_type(), FilesystemType::Ext4);
+        assert_eq!(MountPoint::Var.filesystem_type(), FilesystemType::Ext4);
+        assert_eq!(MountPoint::Music.filesystem_type(), FilesystemType::Ext4);
+        assert_eq!(MountPoint::Metadata.filesystem_type(), FilesystemType::Ext4);
+        assert_eq!(MountPoint::Cache.filesystem_type(), FilesystemType::Ext4);
         
-        // Test PascalCase to kebab-case conversion
-        assert_eq!(MountPoint::CdjExport.label().as_str(), "cdj-export");
+        // Test label generation
         assert_eq!(MountPoint::Metadata.label().as_str(), "metadata");
+        assert_eq!(MountPoint::Cache.label().as_str(), "cache");
     }
 
     #[test]
