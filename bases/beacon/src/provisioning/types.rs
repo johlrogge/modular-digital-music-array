@@ -445,7 +445,27 @@ pub struct FormattedSystem {
 
 impl std::fmt::Display for FormattedSystem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "✅ Formatted filesystems on all partitions")
+        // Neutral description - doesn't imply formatting already happened
+        match &self.partitioned.plan {
+            CompletedPartitionPlan::SingleDrive { partitions, .. } => {
+                write!(
+                    f,
+                    "Filesystems verified on {} partition(s)",
+                    partitions.len()
+                )
+            }
+            CompletedPartitionPlan::DualDrive {
+                primary_partitions,
+                secondary_partitions,
+                ..
+            } => {
+                write!(
+                    f,
+                    "Filesystems verified on {} partition(s)",
+                    primary_partitions.len() + secondary_partitions.len()
+                )
+            }
+        }
     }
 }
 
