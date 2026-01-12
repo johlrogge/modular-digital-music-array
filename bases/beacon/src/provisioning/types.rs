@@ -441,31 +441,88 @@ impl std::fmt::Display for Partition {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FormattedSystem {
     pub partitioned: CompletedPartitionedDrives,
+    pub format_actions: Vec<PartitionFormatAction>,
+}
+
+/// Describes what will happen (or happened) during formatting for a partition
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartitionFormatAction {
+    /// Partition will be formatted (or was formatted)
+    WillFormat {
+        device: DevicePath,
+        label: PartitionLabel,
+        fs_type: FilesystemType,
+    },
+    /// Partition is already correctly formatted - will skip
+    AlreadyFormatted {
+        device: DevicePath,
+        label: PartitionLabel,
+        fs_type: FilesystemType,
+    },
 }
 
 impl std::fmt::Display for FormattedSystem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Neutral description - doesn't imply formatting already happened
-        match &self.partitioned.plan {
-            CompletedPartitionPlan::SingleDrive { partitions, .. } => {
-                write!(
-                    f,
-                    "Filesystems verified on {} partition(s)",
-                    partitions.len()
-                )
-            }
-            CompletedPartitionPlan::DualDrive {
-                primary_partitions,
-                secondary_partitions,
-                ..
-            } => {
-                write!(
-                    f,
-                    "Filesystems verified on {} partition(s)",
-                    primary_partitions.len() + secondary_partitions.len()
-                )
+        let will_format = self
+            .format_actions
+            .iter()
+            .filter(|a| matches!(a, PartitionFormatAction::WillFormat { .. }))
+            .count();
+        let will_skip = self.format_actions.len() - will_format;
+
+        if will_format == 0 {
+            writeln!(
+                f,
+                "📝 All {} partition(s) already formatted correctly\n",
+                self.format_actions.len()
+            )?;
+        } else if will_skip == 0 {
+            writeln!(
+                f,
+                "📝 Format {} partition(s)\n",
+                self.format_actions.len()
+            )?;
+        } else {
+            writeln!(
+                f,
+                "📝 Format {} partition(s), skip {} (already formatted)\n",
+                will_format, will_skip
+            )?;
+        }
+
+        // Show per-partition status
+        for action in &self.format_actions {
+            match action {
+                PartitionFormatAction::WillFormat {
+                    device,
+                    label,
+                    fs_type,
+                } => {
+                    writeln!(
+                        f,
+                        "  ✨ {} ({}) - will format as {}",
+                        device.as_path().display(),
+                        label.as_str(),
+                        fs_type
+                    )?;
+                }
+                PartitionFormatAction::AlreadyFormatted {
+                    device,
+                    label,
+                    fs_type,
+                } => {
+                    writeln!(
+                        f,
+                        "  ⏭️  {} ({}) - already formatted as {}",
+                        device.as_path().display(),
+                        label.as_str(),
+                        fs_type
+                    )?;
+                }
             }
         }
+
+        Ok(())
     }
 }
 

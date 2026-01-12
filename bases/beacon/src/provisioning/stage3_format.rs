@@ -24,8 +24,29 @@ impl Action<CompletedPartitionedDrives, FormattedSystem, FormattedSystem>
         input: &CompletedPartitionedDrives,
     ) -> Result<PlannedAction<CompletedPartitionedDrives, FormattedSystem, FormattedSystem, Self>>
     {
+        use crate::provisioning::types::CompletedPartitionPlan;
+        
+        tracing::info!("Planning format stage - checking current partition state");
+
+        // Check each partition to see if it needs formatting
+        let format_actions = match &input.plan {
+            CompletedPartitionPlan::SingleDrive { partitions, .. } => {
+                check_partitions_formatting_status(partitions).await?
+            }
+            CompletedPartitionPlan::DualDrive {
+                primary_partitions,
+                secondary_partitions,
+                ..
+            } => {
+                let mut actions = check_partitions_formatting_status(primary_partitions).await?;
+                actions.extend(check_partitions_formatting_status(secondary_partitions).await?);
+                actions
+            }
+        };
+
         let assumed_output = FormattedSystem {
             partitioned: input.clone(),
+            format_actions,
         };
 
         Ok(PlannedAction {
@@ -38,22 +59,99 @@ impl Action<CompletedPartitionedDrives, FormattedSystem, FormattedSystem>
     }
 
     async fn apply(&self, planned_output: &FormattedSystem) -> Result<FormattedSystem> {
-        tracing::info!("Stage 3: Format partitions - checking current state");
+        use crate::provisioning::types::PartitionFormatAction;
+        
+        tracing::info!("Stage 3: Format partitions - executing plan");
 
-        // Check and format partitions from the plan
-        match &planned_output.partitioned.plan {
+        // Collect partitions that need formatting
+        let partitions_to_format: Vec<&super::types::Partition> = match &planned_output
+            .partitioned
+            .plan
+        {
             crate::provisioning::types::CompletedPartitionPlan::SingleDrive {
                 partitions, ..
-            } => {
-                check_and_format_partitions(partitions).await?;
-            }
+            } => partitions
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, p)| {
+                    if matches!(
+                        planned_output.format_actions.get(idx),
+                        Some(PartitionFormatAction::WillFormat { .. })
+                    ) {
+                        Some(p)
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
             crate::provisioning::types::CompletedPartitionPlan::DualDrive {
                 primary_partitions,
                 secondary_partitions,
                 ..
             } => {
-                check_and_format_partitions(primary_partitions).await?;
-                check_and_format_partitions(secondary_partitions).await?;
+                let primary_count = primary_partitions.len();
+                primary_partitions
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, p)| {
+                        if matches!(
+                            planned_output.format_actions.get(idx),
+                            Some(PartitionFormatAction::WillFormat { .. })
+                        ) {
+                            Some(p)
+                        } else {
+                            None
+                        }
+                    })
+                    .chain(secondary_partitions.iter().enumerate().filter_map(
+                        |(idx, p)| {
+                            if matches!(
+                                planned_output.format_actions.get(primary_count + idx),
+                                Some(PartitionFormatAction::WillFormat { .. })
+                            ) {
+                                Some(p)
+                            } else {
+                                None
+                            }
+                        },
+                    ))
+                    .collect()
+            }
+        };
+
+        if partitions_to_format.is_empty() {
+            tracing::info!("✅ All partitions already formatted correctly - skipping format step");
+        } else {
+            tracing::info!(
+                "Formatting {} partition(s)...",
+                partitions_to_format.len()
+            );
+
+            // Unmount any that are mounted before formatting
+            for partition in &partitions_to_format {
+                unmount_if_mounted(partition).await?;
+            }
+
+            // Format the partitions
+            for partition in &partitions_to_format {
+                format_partition(partition).await?;
+            }
+
+            // Verify all partitions (including ones we skipped)
+            match &planned_output.partitioned.plan {
+                crate::provisioning::types::CompletedPartitionPlan::SingleDrive {
+                    partitions, ..
+                } => {
+                    verify_formatting(partitions).await?;
+                }
+                crate::provisioning::types::CompletedPartitionPlan::DualDrive {
+                    primary_partitions,
+                    secondary_partitions,
+                    ..
+                } => {
+                    verify_formatting(primary_partitions).await?;
+                    verify_formatting(secondary_partitions).await?;
+                }
             }
         }
 
@@ -62,92 +160,112 @@ impl Action<CompletedPartitionedDrives, FormattedSystem, FormattedSystem>
     }
 }
 
-async fn check_and_format_partitions(partitions: &[super::types::Partition]) -> Result<()> {
-    // First, try to verify current state
-    match verify_formatting(partitions).await {
-        Ok(()) => {
-            // All partitions already formatted correctly!
-            tracing::info!(
-                "✅ All {} partition(s) already formatted correctly - skipping format step",
-                partitions.len()
-            );
-            Ok(())
+async fn check_partitions_formatting_status(
+    partitions: &[super::types::Partition],
+) -> Result<Vec<super::types::PartitionFormatAction>> {
+    use super::types::PartitionFormatAction;
+    use tokio::process::Command;
+
+    let mut actions = Vec::new();
+
+    // Get current lsblk data once
+    let output = Command::new("lsblk")
+        .arg("-o")
+        .arg("NAME,FSTYPE,LABEL,SIZE")
+        .arg("--json")
+        .output()
+        .await
+        .map_err(|e| crate::error::BeaconError::command_failed("lsblk", e))?;
+
+    if !output.status.success() {
+        // Can't read lsblk - assume all need formatting
+        for partition in partitions {
+            actions.push(PartitionFormatAction::WillFormat {
+                device: partition.device.clone(),
+                label: partition.label(),
+                fs_type: partition.filesystem_type(),
+            });
         }
-        Err(e) => {
-            // Not formatted correctly - need to format
-            tracing::info!(
-                "Partitions not formatted correctly ({}), will format now...",
-                e
-            );
-            
-            // IMPORTANT: Unmount partitions before formatting
-            // They might be mounted from a previous failed provisioning run
-            unmount_if_needed(partitions).await?;
-            
-            // Now format
-            format_partitions(partitions).await?;
-            
-            // Verify after formatting
-            verify_formatting(partitions).await?;
-            Ok(())
+        return Ok(actions);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lsblk_data: serde_json::Value =
+        serde_json::from_str(&stdout).map_err(|e| crate::error::BeaconError::Formatting {
+            partition: "planning".to_string(),
+            reason: format!("Failed to parse lsblk JSON: {}", e),
+        })?;
+
+    // Check each partition - use existing verify_partition function
+    for partition in partitions {
+        let device = partition.device.clone();
+        let label = partition.label();
+        let fs_type = partition.filesystem_type();
+
+        // Try to verify this specific partition
+        let is_formatted_correctly = verify_partition(&lsblk_data, partition).is_ok();
+
+        if is_formatted_correctly {
+            actions.push(PartitionFormatAction::AlreadyFormatted {
+                device,
+                label,
+                fs_type,
+            });
+        } else {
+            actions.push(PartitionFormatAction::WillFormat {
+                device,
+                label,
+                fs_type,
+            });
         }
     }
+
+    Ok(actions)
 }
 
-async fn unmount_if_needed(partitions: &[super::types::Partition]) -> Result<()> {
+async fn unmount_if_mounted(partition: &super::types::Partition) -> Result<()> {
     use tokio::process::Command;
-    
-    tracing::debug!("Checking if any partitions are mounted...");
-    
-    for partition in partitions {
-        let device = partition.device.as_str();
-        
-        // Check if mounted using findmnt
-        let output = Command::new("findmnt")
-            .arg("-n")  // No header
-            .arg("-o")
-            .arg("TARGET")  // Just show mount point
+
+    let device = partition.device.as_str();
+
+    // Check if mounted using findmnt
+    let output = Command::new("findmnt")
+        .arg("-n") // No header
+        .arg("-o")
+        .arg("TARGET") // Just show mount point
+        .arg(device)
+        .output()
+        .await
+        .map_err(|e| crate::error::BeaconError::command_failed("findmnt", e))?;
+
+    if output.status.success() && !output.stdout.is_empty() {
+        // Partition is mounted - unmount it
+        let mount_point = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        tracing::warn!(
+            "Partition {} is mounted at '{}', unmounting before formatting",
+            device,
+            mount_point
+        );
+
+        let unmount = Command::new("umount")
             .arg(device)
             .output()
             .await
-            .map_err(|e| crate::error::BeaconError::command_failed("findmnt", e))?;
-        
-        if output.status.success() && !output.stdout.is_empty() {
-            // Partition is mounted - unmount it
-            let mount_point = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            tracing::warn!(
-                "Partition {} is mounted at '{}', unmounting before formatting",
-                device,
-                mount_point
-            );
-            
-            let unmount = Command::new("umount")
-                .arg(device)
-                .output()
-                .await
-                .map_err(|e| crate::error::BeaconError::command_failed("umount", e))?;
-            
-            if !unmount.status.success() {
-                let stderr = String::from_utf8_lossy(&unmount.stderr);
-                return Err(crate::error::BeaconError::Formatting {
-                    partition: device.to_string(),
-                    reason: format!("Failed to unmount before formatting: {}", stderr),
-                });
-            }
-            
-            tracing::info!("Successfully unmounted {} from {}", device, mount_point);
-        } else {
-            tracing::debug!("Partition {} is not mounted", device);
-        }
-    }
-    
-    Ok(())
-}
+            .map_err(|e| crate::error::BeaconError::command_failed("umount", e))?;
 
-async fn format_partitions(partitions: &[super::types::Partition]) -> Result<()> {
-    for partition in partitions {
-        format_partition(partition).await?;
+        if !unmount.status.success() {
+            let stderr = String::from_utf8_lossy(&unmount.stderr);
+            return Err(crate::error::BeaconError::Formatting {
+                partition: device.to_string(),
+                reason: format!("Failed to unmount before formatting: {}", stderr),
+            });
+        }
+
+        tracing::info!("Successfully unmounted {} from {}", device, mount_point);
+    } else {
+        tracing::debug!("Partition {} is not mounted", device);
     }
+
     Ok(())
 }
 

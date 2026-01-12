@@ -186,6 +186,7 @@ pub async fn provision_system(
                                 }
                             },
                         },
+                        format_actions: vec![], // No partitions in test = no format actions
                     },
                 },
             },
@@ -312,6 +313,7 @@ pub async fn provision_system(
                             }
                         },
                     },
+                    format_actions: vec![], // No partitions in test = no format actions
                 },
             },
         },
