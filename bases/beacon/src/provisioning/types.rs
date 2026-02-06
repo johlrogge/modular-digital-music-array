@@ -694,16 +694,19 @@ impl std::fmt::Display for FstabState {
 /// Planned work for configuring fstab (WITH workflow state)
 #[derive(Debug, Clone, PartialEq)]
 pub struct FstabPlan {
-    pub mount_root: PathBuf,
-    pub partitions: Vec<Partition>,
+    pub installed: InstalledPackages, // Thread input through for apply()
     pub config_state: FstabState,
 }
 
 impl std::fmt::Display for FstabPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "{}", self.config_state)?;
-        writeln!(f, "Target: {}/etc/fstab", self.mount_root.display())?;
-        writeln!(f, "Partitions: {}", self.partitions.len())
+        writeln!(
+            f,
+            "Target: {}/etc/fstab",
+            self.installed.mounted.mount_root.display()
+        )?;
+        writeln!(f, "Partitions: {}", self.installed.mounted.partitions.len())
     }
 }
 
