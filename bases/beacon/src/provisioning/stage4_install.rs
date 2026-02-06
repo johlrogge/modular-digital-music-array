@@ -12,7 +12,7 @@
 use crate::actions::{Action, ActionId, PlannedAction};
 use crate::error::Result;
 use crate::provisioning::types::{
-    ConfiguredFstab, FstabPlan, FstabState, FormattedSystem, InstallPlan, InstallState,
+    ConfiguredFstab, FormattedSystem, FstabPlan, FstabState, InstallPlan, InstallState,
     InstalledPackages, InstalledSystem, MountPlan, MountState, MountedPartitions, Partition,
     UnmountPlan,
 };
@@ -43,9 +43,9 @@ impl Action<FormattedSystem, MountPlan, MountedPartitions> for MountPartitionsAc
 
         // Collect all partitions from the partition plan
         let partitions: Vec<Partition> = match &input.partitioned.plan {
-            crate::provisioning::types::CompletedPartitionPlan::SingleDrive { partitions, .. } => {
-                partitions.clone()
-            }
+            crate::provisioning::types::CompletedPartitionPlan::SingleDrive {
+                partitions, ..
+            } => partitions.clone(),
             crate::provisioning::types::CompletedPartitionPlan::DualDrive {
                 primary_partitions,
                 secondary_partitions,
@@ -63,10 +63,7 @@ impl Action<FormattedSystem, MountPlan, MountedPartitions> for MountPartitionsAc
             let is_mounted = check_if_mounted(&partition.device.as_str()).await?;
 
             if is_mounted {
-                tracing::info!(
-                    "{} is already mounted, will skip",
-                    partition.device
-                );
+                tracing::info!("{} is already mounted, will skip", partition.device);
                 mount_states.push(MountState::AlreadyMounted(partition.clone()));
             } else {
                 mount_states.push(MountState::NeedsMount(partition.clone()));
@@ -74,7 +71,7 @@ impl Action<FormattedSystem, MountPlan, MountedPartitions> for MountPartitionsAc
         }
 
         let planned_work = MountPlan {
-            formatted: input.clone(),  // Store input in plan
+            formatted: input.clone(), // Store input in plan
             mount_root: mount_root.clone(),
             partitions: mount_states,
         };
@@ -154,18 +151,16 @@ async fn mount_partition(mount_root: &PathBuf, partition: &Partition) -> Result<
 
     // Create mount point directory
     tracing::info!("Creating mount point: {}", target_path.display());
-    tokio::fs::create_dir_all(&target_path)
-        .await
-        .map_err(|e| crate::error::BeaconError::Provisioning(
-            format!("Failed to create mount point {}: {}", target_path.display(), e)
-        ))?;
+    tokio::fs::create_dir_all(&target_path).await.map_err(|e| {
+        crate::error::BeaconError::Provisioning(format!(
+            "Failed to create mount point {}: {}",
+            target_path.display(),
+            e
+        ))
+    })?;
 
     // Mount the partition
-    tracing::info!(
-        "Mounting {} to {}",
-        partition.device,
-        target_path.display()
-    );
+    tracing::info!("Mounting {} to {}", partition.device, target_path.display());
 
     let output = Command::new("mount")
         .arg(partition.device.as_str())
@@ -206,12 +201,15 @@ async fn verify_all_mounted(_mount_root: &PathBuf, mount_states: &[MountState]) 
         tracing::debug!("✅ {} verified mounted", partition.device);
     }
 
-    tracing::info!("✅ All {} partition(s) verified mounted", mount_states.len());
+    tracing::info!(
+        "✅ All {} partition(s) verified mounted",
+        mount_states.len()
+    );
     Ok(())
 }
 
 // ============================================================================
-// Sub-Action 2: Install Packages (STUBBED)
+// Sub-Action 2: Install Packages
 // ============================================================================
 
 #[derive(Clone, Debug)]
@@ -230,13 +228,13 @@ impl Action<MountedPartitions, InstallPlan, InstalledPackages> for InstallPackag
         &self,
         input: &MountedPartitions,
     ) -> Result<PlannedAction<MountedPartitions, InstallPlan, InstalledPackages, Self>> {
-        // TODO: Check if base-system is already installed
-        let install_state = InstallState::NeedsInstall;
-
         let packages = vec!["base-system".to_string()];
 
+        // Check if base-system is already installed by looking for a key binary
+        let install_state = check_if_base_system_installed(&input.mount_root).await;
+
         let planned_work = InstallPlan {
-            mount_root: input.mount_root.clone(),
+            mounted: input.clone(),
             packages: packages.clone(),
             install_state,
         };
@@ -256,24 +254,125 @@ impl Action<MountedPartitions, InstallPlan, InstalledPackages> for InstallPackag
     }
 
     async fn apply(&self, plan: &InstallPlan) -> Result<InstalledPackages> {
-        tracing::info!("TODO: Install packages to {}", plan.mount_root.display());
-        tracing::info!("  Packages: {}", plan.packages.join(", "));
-        tracing::info!("  Would execute: xbps-install -Sy -R https://repo-default.voidlinux.org/current -r {} {}",
-            plan.mount_root.display(),
-            plan.packages.join(" ")
-        );
+        match plan.install_state {
+            InstallState::NeedsInstall => {
+                install_base_system(&plan.mounted.mount_root, &plan.packages).await?;
+            }
+            InstallState::AlreadyInstalled => {
+                tracing::info!("Base system already installed, skipping");
+            }
+        }
 
-        // Stub: This will be implemented in a future session
-        // For now, we just return what we planned - the input MountedPartitions is in the PlannedAction
-        // We can't access it from here, so we'll need to construct it
-        // Actually, we should store the input in the plan!
-        
-        // FIXME: Need to add `mounted: MountedPartitions` to InstallPlan
-        // For now, create a minimal stub that won't panic
-        Err(crate::error::BeaconError::Provisioning(
-            "InstallPackagesAction not yet implemented - coming in next session!".to_string()
-        ))
+        Ok(InstalledPackages {
+            mounted: plan.mounted.clone(),
+            packages: plan.packages.clone(),
+        })
     }
+}
+
+/// Check if base-system is already installed
+async fn check_if_base_system_installed(mount_root: &PathBuf) -> InstallState {
+    // Check for /usr/bin/xbps-query which is part of base-system
+    let xbps_query_path = mount_root.join("usr/bin/xbps-query");
+
+    match tokio::fs::try_exists(&xbps_query_path).await {
+        Ok(true) => {
+            tracing::info!(
+                "Found {} - base-system appears installed",
+                xbps_query_path.display()
+            );
+            InstallState::AlreadyInstalled
+        }
+        Ok(false) => {
+            tracing::info!(
+                "{} not found - base-system needs to be installed",
+                xbps_query_path.display()
+            );
+            InstallState::NeedsInstall
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Could not check for {}: {} - assuming install needed",
+                xbps_query_path.display(),
+                e
+            );
+            InstallState::NeedsInstall
+        }
+    }
+}
+
+/// Install base system packages using xbps-install
+async fn install_base_system(mount_root: &PathBuf, packages: &[String]) -> Result<()> {
+    // Void Linux repo URL for aarch64 (Raspberry Pi 5)
+    let repo_url = "https://repo-default.voidlinux.org/current/aarch64";
+
+    tracing::info!(
+        "Installing packages to {}: {}",
+        mount_root.display(),
+        packages.join(", ")
+    );
+    tracing::info!("Using repository: {}", repo_url);
+
+    // Build the command
+    // xbps-install -Sy -R <repo> -r <root> <packages>
+    // -S: sync repository index
+    // -y: assume yes to all questions
+    // -R: repository URL
+    // -r: target root directory
+    let mut cmd = Command::new("xbps-install");
+    cmd.arg("-Sy")
+        .arg("-R")
+        .arg(repo_url)
+        .arg("-r")
+        .arg(mount_root)
+        .args(packages);
+
+    tracing::info!(
+        "Executing: xbps-install -Sy -R {} -r {} {}",
+        repo_url,
+        mount_root.display(),
+        packages.join(" ")
+    );
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| crate::error::BeaconError::command_failed("xbps-install", e))?;
+
+    // Log stdout for visibility
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.is_empty() {
+        for line in stdout.lines() {
+            tracing::info!("[xbps-install] {}", line);
+        }
+    }
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!("xbps-install failed with status: {}", output.status);
+        for line in stderr.lines() {
+            tracing::error!("[xbps-install stderr] {}", line);
+        }
+        return Err(crate::error::BeaconError::Provisioning(format!(
+            "xbps-install failed: {}",
+            stderr.trim()
+        )));
+    }
+
+    // Verify installation succeeded
+    let xbps_query_path = mount_root.join("usr/bin/xbps-query");
+    if !tokio::fs::try_exists(&xbps_query_path)
+        .await
+        .unwrap_or(false)
+    {
+        return Err(crate::error::BeaconError::Provisioning(format!(
+            "xbps-install reported success but {} not found - installation may have failed",
+            xbps_query_path.display()
+        )));
+    }
+
+    tracing::info!("✅ Base system installed successfully");
+    Ok(())
 }
 
 // ============================================================================
@@ -319,12 +418,15 @@ impl Action<InstalledPackages, FstabPlan, ConfiguredFstab> for ConfigureFstabAct
     }
 
     async fn apply(&self, plan: &FstabPlan) -> Result<ConfiguredFstab> {
-        tracing::info!("TODO: Configure fstab at {}/etc/fstab", plan.mount_root.display());
+        tracing::info!(
+            "TODO: Configure fstab at {}/etc/fstab",
+            plan.mount_root.display()
+        );
         tracing::info!("  Partitions: {}", plan.partitions.len());
 
         // Stub: This will be implemented in a future session
         Err(crate::error::BeaconError::Provisioning(
-            "ConfigureFstabAction not yet implemented - coming in a future session!".to_string()
+            "ConfigureFstabAction not yet implemented - coming in a future session!".to_string(),
         ))
     }
 }
@@ -369,7 +471,7 @@ impl Action<ConfiguredFstab, UnmountPlan, InstalledSystem> for UnmountPartitions
 
     async fn apply(&self, _plan: &UnmountPlan) -> Result<InstalledSystem> {
         tracing::info!("TODO: Unmount partitions");
-        
+
         // Stub: Keep this stubbed intentionally so we can inspect mounted filesystems
         // This will be the LAST thing we implement
         Err(crate::error::BeaconError::Provisioning(
@@ -383,7 +485,7 @@ impl Action<ConfiguredFstab, UnmountPlan, InstalledSystem> for UnmountPartitions
 // ============================================================================
 
 /// Planned work for the composite installation
-/// 
+///
 /// Stores just the planned work from each sub-action (not the PlannedActions themselves)
 /// since PlannedAction doesn't implement Clone.
 #[derive(Debug, Clone, PartialEq)]
@@ -425,9 +527,15 @@ impl Action<FormattedSystem, InstallationPlan, InstalledSystem> for InstallSyste
 
         // Plan each sub-action, chaining outputs to inputs
         let mount_planned = MountPartitionsAction.plan(input).await?;
-        let install_planned = InstallPackagesAction.plan(&mount_planned.assumed_output).await?;
-        let configure_planned = ConfigureFstabAction.plan(&install_planned.assumed_output).await?;
-        let unmount_planned = UnmountPartitionsAction.plan(&configure_planned.assumed_output).await?;
+        let install_planned = InstallPackagesAction
+            .plan(&mount_planned.assumed_output)
+            .await?;
+        let configure_planned = ConfigureFstabAction
+            .plan(&install_planned.assumed_output)
+            .await?;
+        let unmount_planned = UnmountPartitionsAction
+            .plan(&configure_planned.assumed_output)
+            .await?;
 
         // Extract just the planned work (the PlannedActions aren't Clone)
         let installation_plan = InstallationPlan {
@@ -455,13 +563,13 @@ impl Action<FormattedSystem, InstallationPlan, InstalledSystem> for InstallSyste
         // Execute each sub-action in sequence (recreate actions - they're zero-sized)
         tracing::info!("Stage 1/4: Mount partitions");
         let _mounted = MountPartitionsAction.apply(&plan.mount_plan).await?;
-        
+
         tracing::info!("Stage 2/4: Install packages");
         let _installed = InstallPackagesAction.apply(&plan.install_plan).await?;
-        
+
         tracing::info!("Stage 3/4: Configure fstab");
         let _configured = ConfigureFstabAction.apply(&plan.configure_plan).await?;
-        
+
         tracing::info!("Stage 4/4: Unmount partitions");
         let final_output = UnmountPartitionsAction.apply(&plan.unmount_plan).await?;
 

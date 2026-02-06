@@ -477,11 +477,7 @@ impl std::fmt::Display for FormattedSystem {
                 self.format_actions.len()
             )?;
         } else if will_skip == 0 {
-            writeln!(
-                f,
-                "📝 Format {} partition(s)\n",
-                self.format_actions.len()
-            )?;
+            writeln!(f, "📝 Format {} partition(s)\n", self.format_actions.len())?;
         } else {
             writeln!(
                 f,
@@ -555,8 +551,12 @@ impl MountState {
 impl std::fmt::Display for MountState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MountState::NeedsMount(p) => write!(f, "✨ Mount {} to /mnt/mdma-install{}", 
-                p.device, p.mount_point.as_path().display()),
+            MountState::NeedsMount(p) => write!(
+                f,
+                "✨ Mount {} to /mnt/mdma-install{}",
+                p.device,
+                p.mount_point.as_path().display()
+            ),
             MountState::AlreadyMounted(p) => write!(f, "⏭️  {} already mounted", p.device),
         }
     }
@@ -565,29 +565,36 @@ impl std::fmt::Display for MountState {
 /// Planned work for mounting partitions (WITH workflow state)
 #[derive(Debug, Clone, PartialEq)]
 pub struct MountPlan {
-    pub formatted: FormattedSystem,  // Thread the input through
+    pub formatted: FormattedSystem, // Thread the input through
     pub mount_root: PathBuf,
     pub partitions: Vec<MountState>,
 }
 
 impl std::fmt::Display for MountPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let needs_mount = self.partitions.iter()
+        let needs_mount = self
+            .partitions
+            .iter()
             .filter(|p| matches!(p, MountState::NeedsMount(_)))
             .count();
-        let already_mounted = self.partitions.iter()
+        let already_mounted = self
+            .partitions
+            .iter()
             .filter(|p| matches!(p, MountState::AlreadyMounted(_)))
             .count();
-        
+
         if needs_mount > 0 && already_mounted > 0 {
-            writeln!(f, "📝 Mount {} partition(s), skip {} (already mounted)", 
-                needs_mount, already_mounted)?;
+            writeln!(
+                f,
+                "📝 Mount {} partition(s), skip {} (already mounted)",
+                needs_mount, already_mounted
+            )?;
         } else if needs_mount > 0 {
             writeln!(f, "📝 Mount {} partition(s)", needs_mount)?;
         } else {
             writeln!(f, "📝 All {} partition(s) already mounted", already_mounted)?;
         }
-        
+
         writeln!(f, "\nMount root: {}", self.mount_root.display())?;
         for partition_state in &self.partitions {
             writeln!(f, "  {}", partition_state)?;
@@ -606,9 +613,12 @@ pub struct MountedPartitions {
 
 impl std::fmt::Display for MountedPartitions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "✅ {} partition(s) mounted at {}", 
-            self.partitions.len(), 
-            self.mount_root.display())
+        write!(
+            f,
+            "✅ {} partition(s) mounted at {}",
+            self.partitions.len(),
+            self.mount_root.display()
+        )
     }
 }
 
@@ -635,7 +645,7 @@ impl std::fmt::Display for InstallState {
 /// Planned work for installing packages (WITH workflow state)
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstallPlan {
-    pub mount_root: PathBuf,
+    pub mounted: MountedPartitions, // Thread input through for apply()
     pub packages: Vec<String>,
     pub install_state: InstallState,
 }
@@ -643,7 +653,7 @@ pub struct InstallPlan {
 impl std::fmt::Display for InstallPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "{}", self.install_state)?;
-        writeln!(f, "Target: {}", self.mount_root.display())?;
+        writeln!(f, "Target: {}", self.mounted.mount_root.display())?;
         writeln!(f, "Packages: {}", self.packages.join(", "))
     }
 }
@@ -737,10 +747,12 @@ pub struct UnmountPlan {
 
 impl std::fmt::Display for UnmountPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let needs_unmount = self.mount_points.iter()
+        let needs_unmount = self
+            .mount_points
+            .iter()
             .filter(|(_, state)| matches!(state, UnmountState::NeedsUnmount(_)))
             .count();
-        
+
         if needs_unmount > 0 {
             writeln!(f, "📝 Unmount {} mount point(s)", needs_unmount)?;
             for (_path, state) in &self.mount_points {
@@ -773,7 +785,7 @@ impl std::fmt::Display for InstalledSystem {
 
 impl InstalledSystem {
     /// Get the mount point where the system was installed
-    /// 
+    ///
     /// NOTE: This is a temporary stub for backwards compatibility with stages 5 and 6.
     /// These stages should be updated to use a better approach once we finalize
     /// the installation architecture.
