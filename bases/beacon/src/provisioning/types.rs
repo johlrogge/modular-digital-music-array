@@ -745,6 +745,7 @@ impl std::fmt::Display for UnmountState {
 /// Planned work for unmounting (WITH workflow state)
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnmountPlan {
+    pub configured: ConfiguredFstab, // Thread input through for apply()
     pub mount_points: Vec<(PathBuf, UnmountState)>,
 }
 

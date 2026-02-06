@@ -14,7 +14,7 @@ use crate::error::Result;
 use crate::provisioning::types::{
     ConfiguredFstab, FormattedSystem, FstabPlan, FstabState, InstallPlan, InstallState,
     InstalledPackages, InstalledSystem, MountPlan, MountState, MountedPartitions, Partition,
-    UnmountPlan,
+    UnmountPlan, UnmountState,
 };
 use std::path::PathBuf;
 use tokio::process::Command;
@@ -60,7 +60,7 @@ impl Action<FormattedSystem, MountPlan, MountedPartitions> for MountPartitionsAc
         // Check which partitions are already mounted
         let mut mount_states = Vec::new();
         for partition in &partitions {
-            let is_mounted = check_if_mounted(&partition.device.as_str()).await?;
+            let is_mounted = check_if_mounted(partition.device.as_str()).await?;
 
             if is_mounted {
                 tracing::info!("{} is already mounted, will skip", partition.device);
@@ -140,12 +140,12 @@ async fn check_if_mounted(device: &str) -> Result<bool> {
 }
 
 /// Mount a single partition
-async fn mount_partition(mount_root: &PathBuf, partition: &Partition) -> Result<()> {
+async fn mount_partition(mount_root: &std::path::Path, partition: &Partition) -> Result<()> {
     use crate::provisioning::types::MountPoint;
 
     // Determine target mount path
     let target_path = match partition.mount_point {
-        MountPoint::Root => mount_root.clone(),
+        MountPoint::Root => mount_root.to_path_buf(),
         _ => mount_root.join(partition.mount_point.as_path().strip_prefix("/").unwrap()),
     };
 
@@ -189,7 +189,7 @@ async fn verify_all_mounted(_mount_root: &PathBuf, mount_states: &[MountState]) 
 
     for mount_state in mount_states {
         let partition = mount_state.partition();
-        let is_mounted = check_if_mounted(&partition.device.as_str()).await?;
+        let is_mounted = check_if_mounted(partition.device.as_str()).await?;
 
         if !is_mounted {
             return Err(crate::error::BeaconError::Provisioning(format!(
@@ -271,7 +271,7 @@ impl Action<MountedPartitions, InstallPlan, InstalledPackages> for InstallPackag
 }
 
 /// Check if base-system is already installed
-async fn check_if_base_system_installed(mount_root: &PathBuf) -> InstallState {
+async fn check_if_base_system_installed(mount_root: &std::path::Path) -> InstallState {
     // Check for /usr/bin/xbps-query which is part of base-system
     let xbps_query_path = mount_root.join("usr/bin/xbps-query");
 
@@ -438,7 +438,10 @@ impl Action<InstalledPackages, FstabPlan, ConfiguredFstab> for ConfigureFstabAct
 }
 
 /// Check if fstab is already configured with expected partition entries
-async fn check_if_fstab_configured(mount_root: &PathBuf, partitions: &[Partition]) -> FstabState {
+async fn check_if_fstab_configured(
+    mount_root: &std::path::Path,
+    partitions: &[Partition],
+) -> FstabState {
     let fstab_path = mount_root.join("etc/fstab");
 
     // Try to read existing fstab
@@ -478,7 +481,7 @@ async fn check_if_fstab_configured(mount_root: &PathBuf, partitions: &[Partition
 }
 
 /// Generate and write /etc/fstab
-async fn write_fstab(mount_root: &PathBuf, partitions: &[Partition]) -> Result<()> {
+async fn write_fstab(mount_root: &std::path::Path, partitions: &[Partition]) -> Result<()> {
     use crate::provisioning::types::MountPoint;
 
     let fstab_path = mount_root.join("etc/fstab");
@@ -545,9 +548,9 @@ async fn write_fstab(mount_root: &PathBuf, partitions: &[Partition]) -> Result<(
     })?;
 
     if verify_content != content {
-        return Err(crate::error::BeaconError::Provisioning(format!(
-            "fstab verification failed - content mismatch after write"
-        )));
+        return Err(crate::error::BeaconError::Provisioning(
+            "fstab verification failed - content mismatch after write".to_string(),
+        ));
     }
 
     tracing::info!("✅ fstab configured with {} entries", partitions.len());
@@ -555,7 +558,7 @@ async fn write_fstab(mount_root: &PathBuf, partitions: &[Partition]) -> Result<(
 }
 
 // ============================================================================
-// Sub-Action 4: Unmount Partitions (STUBBED - Keep last for inspection)
+// Sub-Action 4: Unmount Partitions
 // ============================================================================
 
 #[derive(Clone, Debug)]
@@ -574,10 +577,16 @@ impl Action<ConfiguredFstab, UnmountPlan, InstalledSystem> for UnmountPartitions
         &self,
         input: &ConfiguredFstab,
     ) -> Result<PlannedAction<ConfiguredFstab, UnmountPlan, InstalledSystem, Self>> {
-        // TODO: Check which mount points need unmounting
-        let mount_points = vec![]; // Stub
+        let mount_root = &input.installed.mounted.mount_root;
+        let partitions = &input.installed.mounted.partitions;
 
-        let planned_work = UnmountPlan { mount_points };
+        // Build list of mount points and check which are currently mounted
+        let mount_points = build_unmount_plan(mount_root, partitions).await?;
+
+        let planned_work = UnmountPlan {
+            configured: input.clone(),
+            mount_points,
+        };
 
         let assumed_output = InstalledSystem {
             formatted: input.installed.mounted.formatted.clone(),
@@ -592,15 +601,137 @@ impl Action<ConfiguredFstab, UnmountPlan, InstalledSystem> for UnmountPartitions
         })
     }
 
-    async fn apply(&self, _plan: &UnmountPlan) -> Result<InstalledSystem> {
-        tracing::info!("TODO: Unmount partitions");
+    async fn apply(&self, plan: &UnmountPlan) -> Result<InstalledSystem> {
+        unmount_all(&plan.mount_points).await?;
 
-        // Stub: Keep this stubbed intentionally so we can inspect mounted filesystems
-        // This will be the LAST thing we implement
-        Err(crate::error::BeaconError::Provisioning(
-            "UnmountPartitionsAction not yet implemented - keeping partitions mounted for inspection!".to_string()
-        ))
+        Ok(InstalledSystem {
+            formatted: plan.configured.installed.mounted.formatted.clone(),
+        })
     }
+}
+
+/// Build list of mount points with their unmount state
+async fn build_unmount_plan(
+    mount_root: &std::path::Path,
+    partitions: &[Partition],
+) -> Result<Vec<(PathBuf, UnmountState)>> {
+    use crate::provisioning::types::MountPoint;
+
+    let mut mount_points = Vec::new();
+
+    for partition in partitions {
+        // Calculate the actual mount path (during installation)
+        let mount_path = match partition.mount_point {
+            MountPoint::Root => mount_root.to_path_buf(),
+            _ => mount_root.join(
+                partition
+                    .mount_point
+                    .as_path()
+                    .strip_prefix("/")
+                    .unwrap_or(partition.mount_point.as_path()),
+            ),
+        };
+
+        // Check if this path is currently mounted
+        let is_mounted = check_if_path_mounted(&mount_path).await?;
+
+        let state = if is_mounted {
+            tracing::info!("{} is mounted, will unmount", mount_path.display());
+            UnmountState::NeedsUnmount(mount_path.clone())
+        } else {
+            tracing::info!("{} is not mounted, will skip", mount_path.display());
+            UnmountState::AlreadyUnmounted
+        };
+
+        mount_points.push((mount_path, state));
+    }
+
+    Ok(mount_points)
+}
+
+/// Check if a path is currently a mount point
+async fn check_if_path_mounted(path: &std::path::Path) -> Result<bool> {
+    // Use findmnt to check if path is a mount point
+    let output = Command::new("findmnt")
+        .arg("-n") // No header
+        .arg("-M") // Match mount point exactly
+        .arg(path)
+        .output()
+        .await
+        .map_err(|e| crate::error::BeaconError::command_failed("findmnt", e))?;
+
+    // findmnt returns success (0) if the path is a mount point
+    Ok(output.status.success())
+}
+
+/// Unmount all mount points in reverse depth order (deepest first)
+async fn unmount_all(mount_points: &[(PathBuf, UnmountState)]) -> Result<()> {
+    // Collect paths that need unmounting
+    let mut paths_to_unmount: Vec<&PathBuf> = mount_points
+        .iter()
+        .filter_map(|(path, state)| {
+            if matches!(state, UnmountState::NeedsUnmount(_)) {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if paths_to_unmount.is_empty() {
+        tracing::info!("No mount points to unmount");
+        return Ok(());
+    }
+
+    // Sort by path length descending (deepest paths first)
+    // This ensures we unmount /mnt/mdma-install/var before /mnt/mdma-install
+    paths_to_unmount.sort_by(|a: &&PathBuf, b: &&PathBuf| {
+        let a_depth = a.components().count();
+        let b_depth = b.components().count();
+        b_depth.cmp(&a_depth)
+    });
+
+    tracing::info!(
+        "Unmounting {} mount point(s) in reverse depth order",
+        paths_to_unmount.len()
+    );
+
+    for path in &paths_to_unmount {
+        tracing::info!("Unmounting {}", path.display());
+
+        let output = Command::new("umount")
+            .arg(path)
+            .output()
+            .await
+            .map_err(|e| crate::error::BeaconError::command_failed("umount", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(crate::error::BeaconError::Provisioning(format!(
+                "Failed to unmount {}: {}",
+                path.display(),
+                stderr.trim()
+            )));
+        }
+
+        tracing::info!("✅ Unmounted {}", path.display());
+    }
+
+    // Verify all are unmounted
+    for path in &paths_to_unmount {
+        if check_if_path_mounted(path).await? {
+            return Err(crate::error::BeaconError::Provisioning(format!(
+                "Verification failed: {} is still mounted after unmount",
+                path.display()
+            )));
+        }
+    }
+
+    tracing::info!(
+        "✅ All {} mount point(s) unmounted successfully",
+        paths_to_unmount.len()
+    );
+    Ok(())
 }
 
 // ============================================================================
