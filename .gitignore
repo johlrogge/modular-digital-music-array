@@ -39,6 +39,7 @@ Cargo.lock
 node_modules/
 .cargo/registry/
 .cargo/git/
+.cargo/
 
 # Editor and IDE
 .vscode/
@@ -50,3 +51,14 @@ node_modules/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml
