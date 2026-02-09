@@ -3,10 +3,16 @@
 
 set -euo pipefail
 
-echo "🔨 Building beacon for aarch64..."
-cargo build --release --target aarch64-unknown-linux-gnu --bin beacon
+echo "Building beacon for aarch64..."
+
+# Use cargo-zigbuild if available (devenv), otherwise fall back to plain cargo
+if command -v cargo-zigbuild &> /dev/null; then
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin beacon
+else
+    cargo build --release --target aarch64-unknown-linux-gnu --bin beacon
+fi
 
 echo ""
-echo "✅ Build complete"
+echo "Build complete"
 file target/aarch64-unknown-linux-gnu/release/beacon
 ls -lh target/aarch64-unknown-linux-gnu/release/beacon

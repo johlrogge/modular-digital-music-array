@@ -23,12 +23,12 @@ fn main() {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Check if working directory is dirty
+    // Check if working directory is dirty (only tracked files, ignore untracked)
     let git_dirty = Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
+        .args(["diff", "--quiet", "HEAD"])
+        .status()
         .ok()
-        .map(|o| !o.stdout.is_empty())
+        .map(|s| !s.success()) // exit code 1 means there are differences
         .unwrap_or(false);
 
     let dirty_suffix = if git_dirty { "-dirty" } else { "" };
