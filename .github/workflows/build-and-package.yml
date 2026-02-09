@@ -28,6 +28,8 @@ jobs:
     
     - name: Install system dependencies
       run: |
+        # Remove broken Microsoft repos from GitHub runner
+        sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/azure-cli.list || true
         sudo apt-get update
         sudo apt-get install -y gcc-aarch64-linux-gnu wget
     
