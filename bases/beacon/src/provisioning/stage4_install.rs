@@ -301,6 +301,73 @@ async fn check_if_base_system_installed(mount_root: &std::path::Path) -> Install
     }
 }
 
+/// Copy xbps repository keys to the target root
+///
+/// This is required before running xbps-install to a fresh root directory,
+/// otherwise xbps will prompt interactively for key import which fails
+/// without a TTY.
+async fn copy_xbps_keys(mount_root: &PathBuf) -> Result<()> {
+    let source_keys = std::path::Path::new("/var/db/xbps/keys");
+    let target_keys = mount_root.join("var/db/xbps/keys");
+
+    tracing::info!(
+        "Copying xbps repository keys from {} to {}",
+        source_keys.display(),
+        target_keys.display()
+    );
+
+    // Create target directory
+    tokio::fs::create_dir_all(&target_keys).await.map_err(|e| {
+        crate::error::BeaconError::Provisioning(format!(
+            "Failed to create {}: {}",
+            target_keys.display(),
+            e
+        ))
+    })?;
+
+    // Copy all key files
+    let mut entries = tokio::fs::read_dir(source_keys).await.map_err(|e| {
+        crate::error::BeaconError::Provisioning(format!(
+            "Failed to read {}: {}",
+            source_keys.display(),
+            e
+        ))
+    })?;
+
+    let mut copied_count = 0;
+    while let Some(entry) = entries.next_entry().await.map_err(|e| {
+        crate::error::BeaconError::Provisioning(format!("Failed to read directory entry: {}", e))
+    })? {
+        let path = entry.path();
+        if path.is_file() {
+            let filename = path.file_name().unwrap();
+            let target_path = target_keys.join(filename);
+
+            tokio::fs::copy(&path, &target_path).await.map_err(|e| {
+                crate::error::BeaconError::Provisioning(format!(
+                    "Failed to copy {} to {}: {}",
+                    path.display(),
+                    target_path.display(),
+                    e
+                ))
+            })?;
+
+            tracing::info!("  Copied key: {:?}", filename);
+            copied_count += 1;
+        }
+    }
+
+    if copied_count == 0 {
+        return Err(crate::error::BeaconError::Provisioning(format!(
+            "No xbps keys found in {}",
+            source_keys.display()
+        )));
+    }
+
+    tracing::info!("✅ Copied {} xbps repository key(s)", copied_count);
+    Ok(())
+}
+
 /// Install base system packages using xbps-install
 async fn install_base_system(mount_root: &PathBuf, packages: &[String]) -> Result<()> {
     // Void Linux repo URL for aarch64 (Raspberry Pi 5)
@@ -312,6 +379,10 @@ async fn install_base_system(mount_root: &PathBuf, packages: &[String]) -> Resul
         packages.join(", ")
     );
     tracing::info!("Using repository: {}", repo_url);
+
+    // Copy xbps repository keys to target root first
+    // This prevents the interactive key import prompt
+    copy_xbps_keys(mount_root).await?;
 
     // Build the command
     // xbps-install -Sy -R <repo> -r <root> <packages>
