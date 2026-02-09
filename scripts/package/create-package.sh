@@ -19,7 +19,7 @@ fi
 # Clean and create package structure
 rm -rf "$PACKAGE_DIR"
 mkdir -p "$PACKAGE_DIR/usr/bin"
-mkdir -p "$PACKAGE_DIR/etc/sv/beacon"
+mkdir -p "$PACKAGE_DIR/etc/sv/beacon/log"
 
 echo "  → Cleaning any leftover metadata files..."
 # Remove any leftover plist files from old manual packaging approach
@@ -44,6 +44,14 @@ RUNSCRIPT
 fi
 chmod +x "$PACKAGE_DIR/etc/sv/beacon/run"
 
+# Create runit log service for proper logging
+echo "  → Creating log service script..."
+cat > "$PACKAGE_DIR/etc/sv/beacon/log/run" <<'LOGSCRIPT'
+#!/bin/sh
+exec svlogd -tt /var/log/beacon
+LOGSCRIPT
+chmod +x "$PACKAGE_DIR/etc/sv/beacon/log/run"
+
 # NOTE: We don't create the supervise symlink in the package!
 # Runit creates /etc/sv/beacon/supervise automatically when the service starts.
 # Packaging it causes "Directory not empty" errors on upgrades.
@@ -57,16 +65,28 @@ cat > "$PACKAGE_DIR/INSTALL" <<'INSTALLSCRIPT'
 
 case "${ACTION}" in
 post)
+    # Create log directory for svlogd
+    if [ ! -d /var/log/beacon ]; then
+        mkdir -p /var/log/beacon
+        echo "Created /var/log/beacon for beacon logs"
+    fi
+
     # Enable beacon service by creating symlink to /var/service
     # This is the standard Void Linux method for enabling runit services
     if [ ! -d /var/service ]; then
         mkdir -p /var/service
     fi
-    
+
     # Enable beacon service
     if [ ! -e /var/service/beacon ]; then
         ln -sf /etc/sv/beacon /var/service/beacon
         echo "beacon service enabled (will start on next boot)"
+    fi
+
+    # Restart beacon if already running to pick up log service
+    if sv status beacon >/dev/null 2>&1; then
+        sv restart beacon
+        echo "beacon service restarted"
     fi
     ;;
 esac

@@ -145,6 +145,22 @@ pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Get git commit hash (with -dirty suffix if uncommitted changes)
+pub fn git_hash() -> &'static str {
+    env!("BUILD_GIT_HASH")
+}
+
+/// Get build timestamp
+pub fn build_timestamp() -> &'static str {
+    env!("BUILD_TIMESTAMP")
+}
+
+/// Get full version string including git hash
+/// Format: "0.3.1 (abc1234)" or "0.3.1 (abc1234-dirty)"
+pub fn full_version() -> String {
+    format!("{} ({})", current_version(), git_hash())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

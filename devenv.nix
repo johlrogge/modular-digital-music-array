@@ -9,24 +9,30 @@
     bacon
     socat              # For Claude Code sandboxing
     claude-code        # The actual package!
-    
+
     # Rust build dependencies
     clang
     llvmPackages.libclang
-    
+
+    # Cross-compilation (zig-based, simpler than gcc cross toolchain)
+    zig
+    cargo-zigbuild
+
     # Audio development
     pkg-config
     alsa-lib
     pipewire
-    
+
     # Network tools
     nmap
+    sshpass
   ];
 
   # Rust language support
   languages.rust = {
     enable = true;
     channel = "stable";
+    targets = [ "aarch64-unknown-linux-gnu" ];
   };
 
   # Environment variables for bindgen
@@ -39,17 +45,14 @@
 
   # Shell hook
   enterShell = ''
-    echo "🎵 MDMA Development Environment"
+    echo "MDMA Development Environment"
     echo "Rust: $(rustc --version)"
-    echo "Helix: $(hx --version | head -1)"
-    echo "Clang: $(clang --version | head -1)"
-    echo "Claude: $(claude --version)"
+    echo "Zig:  $(zig version)"
     echo ""
-    echo "📦 Available commands:"
-    echo "  claude               - Start Claude Code"
-    echo "  just --list          - Show available tasks"
-    echo "  bacon                - Watch mode for Rust"
-    echo "  hx                   - Helix editor"
+    echo "Available commands:"
+    echo "  just deploy-dev      - Build and deploy beacon to Pi"
+    echo "  just beacon-cross    - Cross-compile beacon for aarch64"
+    echo "  just --list          - Show all tasks"
   '';
 
   # Tests

@@ -22,6 +22,13 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Log version info
+    tracing::info!(
+        "Beacon {} (built: {})",
+        update::full_version(),
+        update::build_timestamp()
+    );
+
     // Parse CLI arguments
     let args = config::CliArgs::parse();
     let config = config::Config::from_args(args);

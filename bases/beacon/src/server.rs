@@ -41,7 +41,8 @@ struct AppState {
 #[template(path = "index.html")]
 struct IndexTemplate {
     hardware: HardwareInfo,
-    version: &'static str,
+    version: String,
+    build_time: &'static str,
 }
 
 /// Provisioning form submission
@@ -101,7 +102,8 @@ async fn index(State(state): State<AppState>) -> Result<Html<String>, AppError> 
     let hardware = state.hardware.lock().await;
     let template = IndexTemplate {
         hardware: hardware.clone(),
-        version: crate::update::current_version(),
+        version: crate::update::full_version(),
+        build_time: crate::update::build_timestamp(),
     };
 
     let html = template

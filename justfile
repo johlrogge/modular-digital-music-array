@@ -16,19 +16,15 @@ watch:
 build:
     cargo build
 
-# Quick cross-compile beacon using cross-rs (recommended for Arch)
+# Quick cross-compile beacon using cargo-zigbuild (devenv provides zig + target)
 [group('build')]
 beacon-cross:
     #!/usr/bin/env bash
     set -euo pipefail
-    if ! command -v cross &> /dev/null; then
-        echo "Installing cross (Docker-based cross-compiler)..."
-        cargo install cross --git https://github.com/cross-rs/cross
-    fi
     echo "Building beacon for aarch64..."
-    cross build --release --target aarch64-unknown-linux-gnu --bin beacon
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin beacon
     echo ""
-    echo "✅ Beacon built!"
+    echo "Beacon built!"
     file target/aarch64-unknown-linux-gnu/release/beacon
     ls -lh target/aarch64-unknown-linux-gnu/release/beacon
 
@@ -89,28 +85,35 @@ check-toolchain:
     #!/usr/bin/env bash
     echo "Checking cross-compilation options..."
     echo ""
-    if command -v cross &> /dev/null; then
-        echo "✅ cross-rs available (recommended)"
+    if command -v cargo-zigbuild &> /dev/null; then
+        echo "cargo-zigbuild available (recommended)"
         echo "   Use: just beacon-cross"
     else
-        echo "❌ cross-rs not found"
-        echo "   Install: cargo install cross --git https://github.com/cross-rs/cross"
+        echo "cargo-zigbuild not found"
+        echo "   Restart devenv shell or add cargo-zigbuild to devenv.nix"
+    fi
+    echo ""
+    if command -v zig &> /dev/null; then
+        echo "zig available: $(zig version)"
+    else
+        echo "zig not found"
+        echo "   Restart devenv shell or add zig to devenv.nix"
     fi
     echo ""
     if command -v aarch64-linux-gnu-gcc &> /dev/null; then
-        echo "✅ aarch64-linux-gnu-gcc available"
+        echo "aarch64-linux-gnu-gcc available (alternative)"
         echo "   Use: just beacon-native"
     else
-        echo "❌ aarch64-linux-gnu-gcc not found"
-        echo "   Install (AUR): yay -S aarch64-linux-gnu-gcc"
+        echo "aarch64-linux-gnu-gcc not found (optional)"
     fi
     echo ""
     echo "Rust target:"
-    if rustup target list | grep -q "aarch64-unknown-linux-gnu (installed)"; then
-        echo "✅ aarch64-unknown-linux-gnu target installed"
+    if rustup target list 2>/dev/null | grep -q "aarch64-unknown-linux-gnu"; then
+        echo "aarch64-unknown-linux-gnu target installed"
+    elif rustc --print target-list | grep -q "aarch64-unknown-linux-gnu"; then
+        echo "aarch64-unknown-linux-gnu target available"
     else
-        echo "❌ aarch64-unknown-linux-gnu target not installed"
-        echo "   Install: rustup target add aarch64-unknown-linux-gnu"
+        echo "aarch64-unknown-linux-gnu target not available"
     fi
 
 # Watch beacon and rebuild on changes (for development)
@@ -128,6 +131,48 @@ beacon-run:
 beacon-dev:
     cargo build --bin beacon
     @ls -lh target/debug/beacon
+
+# Rapid deploy beacon to Pi for development iteration
+# Set PI_PASSWORD env var or it defaults to 'voidlinux'
+[group('dev')]
+deploy-dev: beacon-cross
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    HOST="welcome-to-mdma.local"
+    BEACON="target/aarch64-unknown-linux-gnu/release/beacon"
+    PASS="${PI_PASSWORD:-voidlinux}"
+
+    # Helper function for SSH commands
+    run_ssh() {
+        if ssh -4 -o BatchMode=yes -o ConnectTimeout=5 "root@${HOST}" true 2>/dev/null; then
+            ssh -4 "root@${HOST}" "$@"
+        else
+            sshpass -p "$PASS" ssh -4 -o StrictHostKeyChecking=no "root@${HOST}" "$@"
+        fi
+    }
+
+    # Helper function for SCP
+    run_scp() {
+        if ssh -4 -o BatchMode=yes -o ConnectTimeout=5 "root@${HOST}" true 2>/dev/null; then
+            scp -4 "$@"
+        else
+            sshpass -p "$PASS" scp -4 -o StrictHostKeyChecking=no "$@"
+        fi
+    }
+
+    echo "Deploying beacon to $HOST..."
+
+    # Copy binary to Pi
+    run_scp "$BEACON" "root@${HOST}:/tmp/"
+
+    # Stop service, move binary, ensure logging is set up, restart
+    run_ssh 'sv stop beacon 2>/dev/null || true; mv /tmp/beacon /usr/bin/; mkdir -p /var/log/beacon /etc/sv/beacon/log; if [ ! -f /etc/sv/beacon/log/run ]; then echo "#!/bin/sh" > /etc/sv/beacon/log/run; echo "exec svlogd -tt /var/log/beacon" >> /etc/sv/beacon/log/run; chmod +x /etc/sv/beacon/log/run; rm -f /var/service/beacon; sleep 1; ln -sf /etc/sv/beacon /var/service/beacon; sleep 2; else sv start beacon 2>/dev/null || true; fi'
+
+    echo "Beacon deployed and restarted!"
+    echo ""
+    echo "Tailing logs (Ctrl+C to stop)..."
+    run_ssh 'tail -n 30 -f /var/log/beacon/current'
 
 # ============================================================================
 # CI/CD Build Recipes (Work Locally and in GitHub Actions)
