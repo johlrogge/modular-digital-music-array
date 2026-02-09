@@ -33,13 +33,16 @@ impl TrackLocation {
     pub fn to_path(&self, library_root: impl AsRef<Path>) -> PathBuf {
         let artist_dir = sanitize_filename::sanitize(&self.artist);
         let title_file = format!("{}.flac", sanitize_filename::sanitize(&self.title));
-        
-        let mut components = vec![library_root.as_ref().to_path_buf(), PathBuf::from(artist_dir)];
-        
+
+        let mut components = vec![
+            library_root.as_ref().to_path_buf(),
+            PathBuf::from(artist_dir),
+        ];
+
         if let Some(album) = &self.album {
             components.push(PathBuf::from(sanitize_filename::sanitize(album)));
         }
-        
+
         components.push(PathBuf::from(title_file));
         components.iter().collect()
     }
@@ -52,12 +55,8 @@ mod tests {
 
     #[test]
     fn test_path_generation_with_album() {
-        let location = TrackLocation::with_album(
-            "Test Artist",
-            "Test Album",
-            "Test Song",
-        );
-        
+        let location = TrackLocation::with_album("Test Artist", "Test Album", "Test Song");
+
         let path = location.to_path(Path::new("/music"));
         assert_eq!(
             path,
@@ -69,10 +68,7 @@ mod tests {
     fn test_path_generation_without_album() {
         let location = TrackLocation::new("Test Artist", "Test Song");
         let path = location.to_path(Path::new("/music"));
-        assert_eq!(
-            path,
-            Path::new("/music/Test Artist/Test Song.flac")
-        );
+        assert_eq!(path, Path::new("/music/Test Artist/Test Song.flac"));
     }
 
     #[test]
@@ -82,7 +78,7 @@ mod tests {
             "Album : with : colons",
             "Song * with * stars",
         );
-        
+
         let path = location.to_path(Path::new("/music"));
         assert_eq!(
             path,
@@ -92,26 +88,28 @@ mod tests {
 
     #[test]
     fn test_sanitization_edge_cases() {
-        let location = TrackLocation::new(
-            "Artist?<>\\/*", 
-            "Song|\":\n\t"
-        );
-        
+        let location = TrackLocation::new("Artist?<>\\/*", "Song|\":\n\t");
+
         let path = location.to_path(Path::new("/music"));
-        
+
         // Get just the filename parts (artist and song)
-        let components: Vec<_> = path.components()
+        let components: Vec<_> = path
+            .components()
             .skip(2) // Skip "/music"
             .map(|c| c.as_os_str().to_string_lossy())
             .collect();
-            
+
         // Should not contain any of these characters
         let forbidden_chars = ['<', '>', '\\', '/', '*', '|', '"', ':', '\n', '\t'];
-        
+
         for component in components {
             for forbidden in forbidden_chars {
-                assert!(!component.contains(forbidden), 
-                    "Sanitized component '{}' should not contain '{}'", component, forbidden);
+                assert!(
+                    !component.contains(forbidden),
+                    "Sanitized component '{}' should not contain '{}'",
+                    component,
+                    forbidden
+                );
             }
         }
     }

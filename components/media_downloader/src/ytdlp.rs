@@ -141,13 +141,14 @@ impl Downloader for YtDlp {
 
         Ok(())
     }
-    
+
     async fn fetch_playlist_urls(&self, url: &Url) -> Result<Vec<String>, DownloadError> {
         // Check if this is a SoundCloud URL
-        let is_soundcloud = url.host_str()
+        let is_soundcloud = url
+            .host_str()
             .map(|host| host.contains("soundcloud.com"))
             .unwrap_or(false);
-            
+
         // For SoundCloud, we need to get the track URLs differently
         let output = if is_soundcloud {
             Command::new("yt-dlp")
@@ -176,7 +177,7 @@ impl Downloader for YtDlp {
             // Each line is a JSON entry, we need to extract webpage_url
             let json_lines = String::from_utf8_lossy(&output.stdout);
             let mut track_urls = Vec::new();
-            
+
             for line in json_lines.lines() {
                 if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
                     if let Some(track_url) = entry.get("webpage_url").and_then(|u| u.as_str()) {
@@ -184,7 +185,7 @@ impl Downloader for YtDlp {
                     }
                 }
             }
-            
+
             track_urls
         } else {
             // Each line is a direct URL
@@ -194,13 +195,13 @@ impl Downloader for YtDlp {
                 .filter(|s| !s.is_empty())
                 .collect()
         };
-        
+
         if urls.is_empty() {
             return Err(DownloadError::PlaylistError(
                 "No tracks found in playlist".to_string(),
             ));
         }
-        
+
         Ok(urls)
     }
 }

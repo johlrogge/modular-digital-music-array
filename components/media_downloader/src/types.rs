@@ -20,7 +20,7 @@ pub enum DownloadError {
 
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
-    
+
     #[error("Playlist error: {0}")]
     PlaylistError(String),
 }
@@ -59,7 +59,7 @@ pub trait Downloader {
         output: &std::path::Path,
         temp_dir: &std::path::Path,
     ) -> Result<(), DownloadError>;
-    
+
     /// Fetch all track URLs from a playlist
     async fn fetch_playlist_urls(&self, url: &url::Url) -> Result<Vec<String>, DownloadError>;
 }

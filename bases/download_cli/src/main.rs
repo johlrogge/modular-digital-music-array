@@ -1,12 +1,12 @@
 // bases/download_cli/src/main.rs
+mod app;
 mod args;
 mod output;
-mod app;
 
+use app::App;
+use args::Args;
 use clap::Parser;
 use color_eyre::Result;
-use args::Args;
-use app::App;
 
 #[tokio::main]
 async fn main() -> Result<()> {

@@ -25,7 +25,7 @@ impl Action<CompletedPartitionedDrives, FormattedSystem, FormattedSystem>
     ) -> Result<PlannedAction<CompletedPartitionedDrives, FormattedSystem, FormattedSystem, Self>>
     {
         use crate::provisioning::types::CompletedPartitionPlan;
-        
+
         tracing::info!("Planning format stage - checking current partition state");
 
         // Check each partition to see if it needs formatting
@@ -60,37 +60,16 @@ impl Action<CompletedPartitionedDrives, FormattedSystem, FormattedSystem>
 
     async fn apply(&self, planned_output: &FormattedSystem) -> Result<FormattedSystem> {
         use crate::provisioning::types::PartitionFormatAction;
-        
+
         tracing::info!("Stage 3: Format partitions - executing plan");
 
         // Collect partitions that need formatting
-        let partitions_to_format: Vec<&super::types::Partition> = match &planned_output
-            .partitioned
-            .plan
-        {
-            crate::provisioning::types::CompletedPartitionPlan::SingleDrive {
-                partitions, ..
-            } => partitions
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, p)| {
-                    if matches!(
-                        planned_output.format_actions.get(idx),
-                        Some(PartitionFormatAction::WillFormat { .. })
-                    ) {
-                        Some(p)
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-            crate::provisioning::types::CompletedPartitionPlan::DualDrive {
-                primary_partitions,
-                secondary_partitions,
-                ..
-            } => {
-                let primary_count = primary_partitions.len();
-                primary_partitions
+        let partitions_to_format: Vec<&super::types::Partition> =
+            match &planned_output.partitioned.plan {
+                crate::provisioning::types::CompletedPartitionPlan::SingleDrive {
+                    partitions,
+                    ..
+                } => partitions
                     .iter()
                     .enumerate()
                     .filter_map(|(idx, p)| {
@@ -103,29 +82,49 @@ impl Action<CompletedPartitionedDrives, FormattedSystem, FormattedSystem>
                             None
                         }
                     })
-                    .chain(secondary_partitions.iter().enumerate().filter_map(
-                        |(idx, p)| {
+                    .collect(),
+                crate::provisioning::types::CompletedPartitionPlan::DualDrive {
+                    primary_partitions,
+                    secondary_partitions,
+                    ..
+                } => {
+                    let primary_count = primary_partitions.len();
+                    primary_partitions
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, p)| {
                             if matches!(
-                                planned_output.format_actions.get(primary_count + idx),
+                                planned_output.format_actions.get(idx),
                                 Some(PartitionFormatAction::WillFormat { .. })
                             ) {
                                 Some(p)
                             } else {
                                 None
                             }
-                        },
-                    ))
-                    .collect()
-            }
-        };
+                        })
+                        .chain(
+                            secondary_partitions
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(idx, p)| {
+                                    if matches!(
+                                        planned_output.format_actions.get(primary_count + idx),
+                                        Some(PartitionFormatAction::WillFormat { .. })
+                                    ) {
+                                        Some(p)
+                                    } else {
+                                        None
+                                    }
+                                }),
+                        )
+                        .collect()
+                }
+            };
 
         if partitions_to_format.is_empty() {
             tracing::info!("✅ All partitions already formatted correctly - skipping format step");
         } else {
-            tracing::info!(
-                "Formatting {} partition(s)...",
-                partitions_to_format.len()
-            );
+            tracing::info!("Formatting {} partition(s)...", partitions_to_format.len());
 
             // Unmount any that are mounted before formatting
             for partition in &partitions_to_format {
@@ -140,7 +139,8 @@ impl Action<CompletedPartitionedDrives, FormattedSystem, FormattedSystem>
             // Verify all partitions (including ones we skipped)
             match &planned_output.partitioned.plan {
                 crate::provisioning::types::CompletedPartitionPlan::SingleDrive {
-                    partitions, ..
+                    partitions,
+                    ..
                 } => {
                     verify_formatting(partitions).await?;
                 }

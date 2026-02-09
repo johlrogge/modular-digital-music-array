@@ -1,6 +1,6 @@
+use serde::{Deserialize, Serialize};
 use std::ops::{Add, Sub};
 use thiserror::Error;
-use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Error)]
 pub enum TimeError {
@@ -72,7 +72,7 @@ impl Tempo {
 
     pub fn new(bpm: f64) -> Result<Self, TimeError> {
         if !(Self::MIN..=Self::MAX).contains(&bpm) {
-            return Err(TimeError::TempoOutOfRange { 
+            return Err(TimeError::TempoOutOfRange {
                 min: Self::MIN,
                 max: Self::MAX,
                 value: bpm,
@@ -102,10 +102,7 @@ mod tests {
 
     #[test]
     fn test_ppqn_validation() {
-        assert!(matches!(
-            Ppqn::new(0).unwrap_err(),
-            TimeError::ZeroPpqn
-        ));
+        assert!(matches!(Ppqn::new(0).unwrap_err(), TimeError::ZeroPpqn));
         assert!(Ppqn::new(960).is_ok());
         assert_eq!(Ppqn::DEFAULT.raw(), 960);
     }
@@ -114,11 +111,19 @@ mod tests {
     fn test_tempo_validation() {
         assert!(matches!(
             Tempo::new(0.0).unwrap_err(),
-            TimeError::TempoOutOfRange { min: 20.0, max: 400.0, value: 0.0 }
+            TimeError::TempoOutOfRange {
+                min: 20.0,
+                max: 400.0,
+                value: 0.0
+            }
         ));
         assert!(matches!(
             Tempo::new(500.0).unwrap_err(),
-            TimeError::TempoOutOfRange { min: 20.0, max: 400.0, value: 500.0 }
+            TimeError::TempoOutOfRange {
+                min: 20.0,
+                max: 400.0,
+                value: 500.0
+            }
         ));
         assert!(Tempo::new(120.0).is_ok());
         assert_eq!(Tempo::DEFAULT.raw(), 120.0);

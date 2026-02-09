@@ -469,14 +469,14 @@ mod tests {
         assert_eq!(mp.to_string(), "/music");
         assert_eq!(mp.filesystem_type(), FilesystemType::Ext4);
         assert_eq!(mp.label().as_str(), "music");
-        
+
         // All partitions now use ext4
         assert_eq!(MountPoint::Root.filesystem_type(), FilesystemType::Ext4);
         assert_eq!(MountPoint::Var.filesystem_type(), FilesystemType::Ext4);
         assert_eq!(MountPoint::Music.filesystem_type(), FilesystemType::Ext4);
         assert_eq!(MountPoint::Metadata.filesystem_type(), FilesystemType::Ext4);
         assert_eq!(MountPoint::Cache.filesystem_type(), FilesystemType::Ext4);
-        
+
         // Test label generation
         assert_eq!(MountPoint::Metadata.label().as_str(), "metadata");
         assert_eq!(MountPoint::Cache.label().as_str(), "cache");
