@@ -160,37 +160,47 @@ pub async fn provision_system(
             }
         };
 
-        return Ok(types::ProvisionedSystem {
-            configured: types::ConfiguredSystem {
-                installed: types::InstalledSystem {
-                    formatted: types::FormattedSystem {
-                        partitioned: types::CompletedPartitionedDrives {
-                            validated: types::ValidatedHardware {
-                                config,
-                                drives: drives.clone(),
-                            },
-                            plan: match drives {
-                                ValidatedDrives::OneDrive(drive_info) => {
-                                    CompletedPartitionPlan::SingleDrive {
-                                        device: drive_info,
-                                        partitions: vec![],
-                                    }
-                                }
-                                ValidatedDrives::TwoDrives(primary_device, secondary_device) => {
-                                    CompletedPartitionPlan::DualDrive {
-                                        primary_device,
-                                        primary_partitions: vec![],
-                                        secondary_device,
-                                        secondary_partitions: vec![],
-                                    }
-                                }
-                            },
-                        },
-                        format_actions: vec![], // No partitions in test = no format actions
+        // Build the nested type structure
+        let formatted = types::FormattedSystem {
+            partitioned: types::CompletedPartitionedDrives {
+                validated: types::ValidatedHardware {
+                    config,
+                    drives: drives.clone(),
+                },
+                plan: match drives {
+                    ValidatedDrives::OneDrive(drive_info) => CompletedPartitionPlan::SingleDrive {
+                        device: drive_info,
+                        partitions: vec![],
                     },
+                    ValidatedDrives::TwoDrives(primary_device, secondary_device) => {
+                        CompletedPartitionPlan::DualDrive {
+                            primary_device,
+                            primary_partitions: vec![],
+                            secondary_device,
+                            secondary_partitions: vec![],
+                        }
+                    }
                 },
             },
-        });
+            format_actions: vec![],
+        };
+
+        let mounted = types::MountedPartitions {
+            formatted,
+            mount_root: std::path::PathBuf::from("/mnt/mdma-install"),
+            partitions: vec![],
+        };
+
+        let installed = types::InstalledPackages {
+            mounted,
+            packages: vec!["base-system".to_string()],
+        };
+
+        let fstab_configured = types::ConfiguredFstab { installed };
+
+        let configured = types::ConfiguredSystem { fstab_configured };
+
+        return Ok(types::ProvisionedSystem { configured });
     }
 
     // Execute with progress feedback
@@ -286,38 +296,47 @@ pub async fn provision_system(
         }
     };
 
-    Ok(types::ProvisionedSystem {
-        configured: types::ConfiguredSystem {
-            installed: types::InstalledSystem {
-                formatted: types::FormattedSystem {
-                    partitioned: types::CompletedPartitionedDrives {
-                        validated: types::ValidatedHardware {
-                            config,
-                            drives: drives.clone(),
-                        },
-                        plan: match drives {
-                            ValidatedDrives::OneDrive(device) => {
-                                CompletedPartitionPlan::SingleDrive {
-                                    device,
-                                    partitions: vec![],
-                                }
-                            }
-
-                            ValidatedDrives::TwoDrives(primary_device, secondary_device) => {
-                                CompletedPartitionPlan::DualDrive {
-                                    primary_device,
-                                    primary_partitions: vec![],
-                                    secondary_device,
-                                    secondary_partitions: vec![],
-                                }
-                            }
-                        },
-                    },
-                    format_actions: vec![], // No partitions in test = no format actions
+    // Build the nested type structure
+    let formatted = types::FormattedSystem {
+        partitioned: types::CompletedPartitionedDrives {
+            validated: types::ValidatedHardware {
+                config,
+                drives: drives.clone(),
+            },
+            plan: match drives {
+                ValidatedDrives::OneDrive(device) => CompletedPartitionPlan::SingleDrive {
+                    device,
+                    partitions: vec![],
                 },
+                ValidatedDrives::TwoDrives(primary_device, secondary_device) => {
+                    CompletedPartitionPlan::DualDrive {
+                        primary_device,
+                        primary_partitions: vec![],
+                        secondary_device,
+                        secondary_partitions: vec![],
+                    }
+                }
             },
         },
-    })
+        format_actions: vec![],
+    };
+
+    let mounted = types::MountedPartitions {
+        formatted,
+        mount_root: std::path::PathBuf::from("/mnt/mdma-install"),
+        partitions: vec![],
+    };
+
+    let installed = types::InstalledPackages {
+        mounted,
+        packages: vec!["base-system".to_string()],
+    };
+
+    let fstab_configured = types::ConfiguredFstab { installed };
+
+    let configured = types::ConfiguredSystem { fstab_configured };
+
+    Ok(types::ProvisionedSystem { configured })
 }
 
 #[cfg(test)]

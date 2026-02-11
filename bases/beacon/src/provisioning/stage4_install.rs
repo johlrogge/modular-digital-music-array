@@ -5,7 +5,9 @@
 //! 1. Mount partitions
 //! 2. Install packages (xbps-install base-system)
 //! 3. Configure fstab
-//! 4. Unmount partitions
+//!
+//! Note: Unmount is handled by stage 6 (finalize) so that stage 5 (configure)
+//! can work with the mounted filesystem.
 //!
 //! Each sub-action checks current state in plan() and only acts if needed.
 
@@ -13,8 +15,7 @@ use crate::actions::{Action, ActionId, PlannedAction};
 use crate::error::Result;
 use crate::provisioning::types::{
     ConfiguredFstab, FormattedSystem, FstabPlan, FstabState, InstallPlan, InstallState,
-    InstalledPackages, InstalledSystem, MountPlan, MountState, MountedPartitions, Partition,
-    UnmountPlan, UnmountState,
+    InstalledPackages, MountPlan, MountState, MountedPartitions, Partition,
 };
 use std::path::PathBuf;
 use tokio::process::Command;
@@ -221,14 +222,15 @@ impl Action<MountedPartitions, InstallPlan, InstalledPackages> for InstallPackag
     }
 
     fn description(&self) -> String {
-        "Install base system packages".to_string()
+        "Install base system and RPi kernel packages".to_string()
     }
 
     async fn plan(
         &self,
         input: &MountedPartitions,
     ) -> Result<PlannedAction<MountedPartitions, InstallPlan, InstalledPackages, Self>> {
-        let packages = vec!["base-system".to_string()];
+        // Install both base-system (userland) and rpi-base (RPi kernel + firmware)
+        let packages = vec!["base-system".to_string(), "rpi-base".to_string()];
 
         // Check if base-system is already installed by looking for a key binary
         let install_state = check_if_base_system_installed(&input.mount_root).await;
@@ -270,34 +272,39 @@ impl Action<MountedPartitions, InstallPlan, InstalledPackages> for InstallPackag
     }
 }
 
-/// Check if base-system is already installed
+/// Check if base-system and rpi-base are already installed
 async fn check_if_base_system_installed(mount_root: &std::path::Path) -> InstallState {
-    // Check for /usr/bin/xbps-query which is part of base-system
+    // Check for /usr/bin/xbps-query (from base-system)
     let xbps_query_path = mount_root.join("usr/bin/xbps-query");
+    // Check for /boot/kernel8.img (from rpi-base/rpi-kernel)
+    let kernel_path = mount_root.join("boot/kernel8.img");
 
-    match tokio::fs::try_exists(&xbps_query_path).await {
-        Ok(true) => {
-            tracing::info!(
-                "Found {} - base-system appears installed",
-                xbps_query_path.display()
-            );
-            InstallState::AlreadyInstalled
-        }
-        Ok(false) => {
+    let base_system_exists = tokio::fs::try_exists(&xbps_query_path)
+        .await
+        .unwrap_or(false);
+    let rpi_kernel_exists = tokio::fs::try_exists(&kernel_path).await.unwrap_or(false);
+
+    if base_system_exists && rpi_kernel_exists {
+        tracing::info!(
+            "Found {} and {} - system appears fully installed",
+            xbps_query_path.display(),
+            kernel_path.display()
+        );
+        InstallState::AlreadyInstalled
+    } else {
+        if !base_system_exists {
             tracing::info!(
                 "{} not found - base-system needs to be installed",
                 xbps_query_path.display()
             );
-            InstallState::NeedsInstall
         }
-        Err(e) => {
-            tracing::warn!(
-                "Could not check for {}: {} - assuming install needed",
-                xbps_query_path.display(),
-                e
+        if !rpi_kernel_exists {
+            tracing::info!(
+                "{} not found - rpi-base needs to be installed",
+                kernel_path.display()
             );
-            InstallState::NeedsInstall
         }
+        InstallState::NeedsInstall
     }
 }
 
@@ -430,19 +437,28 @@ async fn install_base_system(mount_root: &PathBuf, packages: &[String]) -> Resul
         )));
     }
 
-    // Verify installation succeeded
+    // Verify installation succeeded - check for key files from both packages
     let xbps_query_path = mount_root.join("usr/bin/xbps-query");
     if !tokio::fs::try_exists(&xbps_query_path)
         .await
         .unwrap_or(false)
     {
         return Err(crate::error::BeaconError::Provisioning(format!(
-            "xbps-install reported success but {} not found - installation may have failed",
+            "xbps-install reported success but {} not found - base-system installation may have failed",
             xbps_query_path.display()
         )));
     }
 
-    tracing::info!("✅ Base system installed successfully");
+    // Verify rpi-base installed (check for kernel image)
+    let kernel_path = mount_root.join("boot/kernel8.img");
+    if !tokio::fs::try_exists(&kernel_path).await.unwrap_or(false) {
+        return Err(crate::error::BeaconError::Provisioning(format!(
+            "xbps-install reported success but {} not found - rpi-base installation may have failed",
+            kernel_path.display()
+        )));
+    }
+
+    tracing::info!("✅ Base system and RPi kernel installed successfully");
     Ok(())
 }
 
@@ -629,183 +645,6 @@ async fn write_fstab(mount_root: &std::path::Path, partitions: &[Partition]) -> 
 }
 
 // ============================================================================
-// Sub-Action 4: Unmount Partitions
-// ============================================================================
-
-#[derive(Clone, Debug)]
-pub struct UnmountPartitionsAction;
-
-impl Action<ConfiguredFstab, UnmountPlan, InstalledSystem> for UnmountPartitionsAction {
-    fn id(&self) -> ActionId {
-        ActionId::new("unmount-partitions")
-    }
-
-    fn description(&self) -> String {
-        "Unmount all partitions".to_string()
-    }
-
-    async fn plan(
-        &self,
-        input: &ConfiguredFstab,
-    ) -> Result<PlannedAction<ConfiguredFstab, UnmountPlan, InstalledSystem, Self>> {
-        let mount_root = &input.installed.mounted.mount_root;
-        let partitions = &input.installed.mounted.partitions;
-
-        // Build list of mount points and check which are currently mounted
-        let mount_points = build_unmount_plan(mount_root, partitions).await?;
-
-        let planned_work = UnmountPlan {
-            configured: input.clone(),
-            mount_points,
-        };
-
-        let assumed_output = InstalledSystem {
-            formatted: input.installed.mounted.formatted.clone(),
-        };
-
-        Ok(PlannedAction {
-            description: self.description(),
-            action: self.clone(),
-            input: input.clone(),
-            planned_work,
-            assumed_output,
-        })
-    }
-
-    async fn apply(&self, plan: &UnmountPlan) -> Result<InstalledSystem> {
-        unmount_all(&plan.mount_points).await?;
-
-        Ok(InstalledSystem {
-            formatted: plan.configured.installed.mounted.formatted.clone(),
-        })
-    }
-}
-
-/// Build list of mount points with their unmount state
-async fn build_unmount_plan(
-    mount_root: &std::path::Path,
-    partitions: &[Partition],
-) -> Result<Vec<(PathBuf, UnmountState)>> {
-    use crate::provisioning::types::MountPoint;
-
-    let mut mount_points = Vec::new();
-
-    for partition in partitions {
-        // Calculate the actual mount path (during installation)
-        let mount_path = match partition.mount_point {
-            MountPoint::Root => mount_root.to_path_buf(),
-            _ => mount_root.join(
-                partition
-                    .mount_point
-                    .as_path()
-                    .strip_prefix("/")
-                    .unwrap_or(partition.mount_point.as_path()),
-            ),
-        };
-
-        // Check if this path is currently mounted
-        let is_mounted = check_if_path_mounted(&mount_path).await?;
-
-        let state = if is_mounted {
-            tracing::info!("{} is mounted, will unmount", mount_path.display());
-            UnmountState::NeedsUnmount(mount_path.clone())
-        } else {
-            tracing::info!("{} is not mounted, will skip", mount_path.display());
-            UnmountState::AlreadyUnmounted
-        };
-
-        mount_points.push((mount_path, state));
-    }
-
-    Ok(mount_points)
-}
-
-/// Check if a path is currently a mount point
-async fn check_if_path_mounted(path: &std::path::Path) -> Result<bool> {
-    // Use findmnt to check if path is a mount point
-    let output = Command::new("findmnt")
-        .arg("-n") // No header
-        .arg("-M") // Match mount point exactly
-        .arg(path)
-        .output()
-        .await
-        .map_err(|e| crate::error::BeaconError::command_failed("findmnt", e))?;
-
-    // findmnt returns success (0) if the path is a mount point
-    Ok(output.status.success())
-}
-
-/// Unmount all mount points in reverse depth order (deepest first)
-async fn unmount_all(mount_points: &[(PathBuf, UnmountState)]) -> Result<()> {
-    // Collect paths that need unmounting
-    let mut paths_to_unmount: Vec<&PathBuf> = mount_points
-        .iter()
-        .filter_map(|(path, state)| {
-            if matches!(state, UnmountState::NeedsUnmount(_)) {
-                Some(path)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if paths_to_unmount.is_empty() {
-        tracing::info!("No mount points to unmount");
-        return Ok(());
-    }
-
-    // Sort by path length descending (deepest paths first)
-    // This ensures we unmount /mnt/mdma-install/var before /mnt/mdma-install
-    paths_to_unmount.sort_by(|a: &&PathBuf, b: &&PathBuf| {
-        let a_depth = a.components().count();
-        let b_depth = b.components().count();
-        b_depth.cmp(&a_depth)
-    });
-
-    tracing::info!(
-        "Unmounting {} mount point(s) in reverse depth order",
-        paths_to_unmount.len()
-    );
-
-    for path in &paths_to_unmount {
-        tracing::info!("Unmounting {}", path.display());
-
-        let output = Command::new("umount")
-            .arg(path)
-            .output()
-            .await
-            .map_err(|e| crate::error::BeaconError::command_failed("umount", e))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(crate::error::BeaconError::Provisioning(format!(
-                "Failed to unmount {}: {}",
-                path.display(),
-                stderr.trim()
-            )));
-        }
-
-        tracing::info!("✅ Unmounted {}", path.display());
-    }
-
-    // Verify all are unmounted
-    for path in &paths_to_unmount {
-        if check_if_path_mounted(path).await? {
-            return Err(crate::error::BeaconError::Provisioning(format!(
-                "Verification failed: {} is still mounted after unmount",
-                path.display()
-            )));
-        }
-    }
-
-    tracing::info!(
-        "✅ All {} mount point(s) unmounted successfully",
-        paths_to_unmount.len()
-    );
-    Ok(())
-}
-
-// ============================================================================
 // Composite Action: Install System
 // ============================================================================
 
@@ -813,21 +652,21 @@ async fn unmount_all(mount_points: &[(PathBuf, UnmountState)]) -> Result<()> {
 ///
 /// Stores just the planned work from each sub-action (not the PlannedActions themselves)
 /// since PlannedAction doesn't implement Clone.
+///
+/// Note: Unmount is handled by stage 6, not here.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstallationPlan {
     pub mount_plan: MountPlan,
     pub install_plan: InstallPlan,
     pub configure_plan: FstabPlan,
-    pub unmount_plan: UnmountPlan,
 }
 
 impl std::fmt::Display for InstallationPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "📝 Installation plan with 4 sub-stages:")?;
+        writeln!(f, "📝 Installation plan with 3 sub-stages:")?;
         writeln!(f, "  1. {}", self.mount_plan)?;
         writeln!(f, "  2. {}", self.install_plan)?;
         writeln!(f, "  3. {}", self.configure_plan)?;
-        writeln!(f, "  4. {}", self.unmount_plan)?;
         Ok(())
     }
 }
@@ -835,7 +674,7 @@ impl std::fmt::Display for InstallationPlan {
 #[derive(Clone, Debug)]
 pub struct InstallSystemAction;
 
-impl Action<FormattedSystem, InstallationPlan, InstalledSystem> for InstallSystemAction {
+impl Action<FormattedSystem, InstallationPlan, ConfiguredFstab> for InstallSystemAction {
     fn id(&self) -> ActionId {
         ActionId::new("install-system")
     }
@@ -847,7 +686,7 @@ impl Action<FormattedSystem, InstallationPlan, InstalledSystem> for InstallSyste
     async fn plan(
         &self,
         input: &FormattedSystem,
-    ) -> Result<PlannedAction<FormattedSystem, InstallationPlan, InstalledSystem, Self>> {
+    ) -> Result<PlannedAction<FormattedSystem, InstallationPlan, ConfiguredFstab, Self>> {
         tracing::info!("Planning installation with sub-actions...");
 
         // Plan each sub-action, chaining outputs to inputs
@@ -858,20 +697,16 @@ impl Action<FormattedSystem, InstallationPlan, InstalledSystem> for InstallSyste
         let configure_planned = ConfigureFstabAction
             .plan(&install_planned.assumed_output)
             .await?;
-        let unmount_planned = UnmountPartitionsAction
-            .plan(&configure_planned.assumed_output)
-            .await?;
 
         // Extract just the planned work (the PlannedActions aren't Clone)
         let installation_plan = InstallationPlan {
             mount_plan: mount_planned.planned_work,
             install_plan: install_planned.planned_work,
             configure_plan: configure_planned.planned_work,
-            unmount_plan: unmount_planned.planned_work,
         };
 
-        // Final output after all sub-actions complete
-        let final_output = unmount_planned.assumed_output;
+        // Final output - filesystem remains mounted for stage 5
+        let final_output = configure_planned.assumed_output;
 
         Ok(PlannedAction {
             description: self.description(),
@@ -882,23 +717,20 @@ impl Action<FormattedSystem, InstallationPlan, InstalledSystem> for InstallSyste
         })
     }
 
-    async fn apply(&self, plan: &InstallationPlan) -> Result<InstalledSystem> {
-        tracing::info!("Executing installation with 4 sub-stages");
+    async fn apply(&self, plan: &InstallationPlan) -> Result<ConfiguredFstab> {
+        tracing::info!("Executing installation with 3 sub-stages");
 
         // Execute each sub-action in sequence (recreate actions - they're zero-sized)
-        tracing::info!("Stage 1/4: Mount partitions");
+        tracing::info!("Stage 1/3: Mount partitions");
         let _mounted = MountPartitionsAction.apply(&plan.mount_plan).await?;
 
-        tracing::info!("Stage 2/4: Install packages");
+        tracing::info!("Stage 2/3: Install packages");
         let _installed = InstallPackagesAction.apply(&plan.install_plan).await?;
 
-        tracing::info!("Stage 3/4: Configure fstab");
-        let _configured = ConfigureFstabAction.apply(&plan.configure_plan).await?;
+        tracing::info!("Stage 3/3: Configure fstab");
+        let final_output = ConfigureFstabAction.apply(&plan.configure_plan).await?;
 
-        tracing::info!("Stage 4/4: Unmount partitions");
-        let final_output = UnmountPartitionsAction.apply(&plan.unmount_plan).await?;
-
-        tracing::info!("✅ Installation complete");
+        tracing::info!("✅ Installation complete (partitions remain mounted for stage 5)");
         Ok(final_output)
     }
 }

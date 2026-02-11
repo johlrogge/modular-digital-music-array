@@ -636,8 +636,10 @@ pub enum InstallState {
 impl std::fmt::Display for InstallState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            InstallState::NeedsInstall => write!(f, "✨ Install base-system package"),
-            InstallState::AlreadyInstalled => write!(f, "⏭️  base-system already installed"),
+            InstallState::NeedsInstall => write!(f, "✨ Install base-system + rpi-base packages"),
+            InstallState::AlreadyInstalled => {
+                write!(f, "⏭️  base-system + rpi-base already installed")
+            }
         }
     }
 }
@@ -804,15 +806,40 @@ impl InstalledSystem {
 // Stage 5: Configuration
 // ============================================================================
 
-/// System with configuration applied
+/// System with configuration applied (partitions still mounted)
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfiguredSystem {
-    pub installed: InstalledSystem,
+    /// The system with fstab configured - partitions remain mounted for stage 5
+    pub fstab_configured: ConfiguredFstab,
 }
 
 impl std::fmt::Display for ConfiguredSystem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "✅ System configured")
+    }
+}
+
+impl ConfiguredSystem {
+    /// Get the mount point where the system is installed
+    pub fn mount_root(&self) -> &std::path::Path {
+        &self.fstab_configured.installed.mounted.mount_root
+    }
+
+    /// Get the provision config
+    pub fn config(&self) -> &crate::types::ProvisionConfig {
+        &self
+            .fstab_configured
+            .installed
+            .mounted
+            .formatted
+            .partitioned
+            .validated
+            .config
+    }
+
+    /// Get the partitions
+    pub fn partitions(&self) -> &[Partition] {
+        &self.fstab_configured.installed.mounted.partitions
     }
 }
 

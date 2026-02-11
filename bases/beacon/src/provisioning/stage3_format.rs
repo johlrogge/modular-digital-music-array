@@ -136,6 +136,17 @@ impl Action<CompletedPartitionedDrives, FormattedSystem, FormattedSystem>
                 format_partition(partition).await?;
             }
 
+            // Sync and wait for udev to update device info
+            // This ensures lsblk sees the new filesystems, especially for large partitions
+            tracing::info!("Syncing filesystems and waiting for udev...");
+            let _ = tokio::process::Command::new("sync").output().await;
+            let _ = tokio::process::Command::new("udevadm")
+                .args(["settle", "--timeout=10"])
+                .output()
+                .await;
+            // Small additional delay for safety
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
             // Verify all partitions (including ones we skipped)
             match &planned_output.partitioned.plan {
                 crate::provisioning::types::CompletedPartitionPlan::SingleDrive {
