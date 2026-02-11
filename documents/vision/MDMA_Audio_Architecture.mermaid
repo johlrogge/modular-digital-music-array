@@ -1,0 +1,53 @@
+flowchart LR
+    subgraph "Tokio World (Async)"
+        Audio[Audio Files]
+        SeekCmd[Seek Commands]
+        
+        subgraph Track["Track"]
+            Source["Source\n(FlacSource)"]
+            SegBuf["SegmentedBuffer"]
+            TrackState["Track State\n(position, volume)"]
+            LoadTask["Buffer Management Task"]
+        end
+        
+        Audio --> Source
+        Source --> LoadTask
+        LoadTask --> SegBuf
+        SeekCmd --> TrackState
+    end
+    
+    subgraph "Real-time Audio World"
+        subgraph PerTrackEffects["Per-Track Effects"]
+            EQ["EQ"]
+            Echo["Echo/Delay"]
+            Pitch["Pitch/Tempo"]
+        end
+        
+        subgraph Mixer["Mixer"]
+            MixProc["Mix Processing\n(possibly Rayon)"]
+            Faders["Channel Faders\n+ CrossFader"]
+        end
+        
+        subgraph MasterEffects["Master Effects"]
+            MasterEQ["Master EQ"]
+            MasterVol["Master Volume"]
+            Limiter["Limiter"]
+        end
+        
+        AudioOut["Audio Output\n(PipeWire/PulseAudio)"]
+    end
+    
+    %% Connect components with ringbuffers
+    SegBuf -- "RingBuffer\n(Key Boundary)" --> PerTrackEffects
+    TrackState -- "Controls" --> PerTrackEffects
+    PerTrackEffects --> Mixer
+    Mixer --> MasterEffects
+    MasterEffects --> AudioOut
+    
+    classDef tokioNode fill:#f9d5e5,stroke:#333,stroke-width:1px
+    classDef rtNode fill:#eeeeee,stroke:#333,stroke-width:1px
+    classDef bufferNode fill:#b5ead7,stroke:#333,stroke-width:1px,stroke-dasharray: 5 5
+    
+    class Track,Source,SegBuf,TrackState,LoadTask,Audio,SeekCmd tokioNode
+    class PerTrackEffects,EQ,Echo,Pitch,Mixer,MixProc,Faders,MasterEffects,MasterEQ,MasterVol,Limiter,AudioOut rtNode
+    class SegBuf bufferNode
