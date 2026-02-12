@@ -31,8 +31,12 @@ echo "  → Creating service script..."
 cat > "$PACKAGE_DIR/etc/sv/mdma-console/run" <<'RUNSCRIPT'
 #!/bin/sh
 exec 2>&1
-# Port 80 requires root privileges
-exec /usr/bin/mdma-console --port 80
+# Run as mdma user (binary has CAP_NET_BIND_SERVICE for port 80)
+if id mdma >/dev/null 2>&1; then
+    exec chpst -u mdma /usr/bin/mdma-console --port 80
+else
+    exec /usr/bin/mdma-console --port 80
+fi
 RUNSCRIPT
 chmod +x "$PACKAGE_DIR/etc/sv/mdma-console/run"
 
@@ -52,6 +56,14 @@ case "${ACTION}" in
 post)
     # Create log directory
     mkdir -p /var/log/mdma-console
+
+    # Allow binding to privileged ports without root
+    if command -v setcap >/dev/null 2>&1; then
+        setcap 'cap_net_bind_service=+ep' /usr/bin/mdma-console
+        echo "mdma-console: granted CAP_NET_BIND_SERVICE capability"
+    else
+        echo "WARNING: setcap not found, mdma-console may not bind to port 80"
+    fi
 
     # Enable service
     if [ ! -d /var/service ]; then
