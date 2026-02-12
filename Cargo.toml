@@ -21,6 +21,7 @@ members = [
     "bases/library_crawler",
     "bases/beacon",
     "bases/mdma_console",
+    "bases/mdma_library",
 ]
 resolver = "2"
 
