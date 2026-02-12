@@ -235,7 +235,8 @@ async fn create_users(mount_root: &Path) -> Result<()> {
         tracing::info!("  ✅ mdma user created");
     }
 
-    // Enable sudo for wheel group (uncomment the wheel line in sudoers)
+    // Enable passwordless sudo for wheel group
+    // Admin user has no password (SSH key only), so NOPASSWD is required
     let sudoers_path = mount_root.join("etc/sudoers");
     if sudoers_path.exists() {
         let content = tokio::fs::read_to_string(&sudoers_path)
@@ -248,8 +249,17 @@ async fn create_users(mount_root: &Path) -> Result<()> {
                 ))
             })?;
 
-        // Enable wheel group for sudo (uncomment the line)
-        let new_content = content.replace("# %wheel ALL=(ALL:ALL) ALL", "%wheel ALL=(ALL:ALL) ALL");
+        // Enable wheel group for passwordless sudo
+        // Replace the commented NOPASSWD line, or the regular wheel line
+        let new_content = content
+            .replace(
+                "# %wheel ALL=(ALL:ALL) NOPASSWD: ALL",
+                "%wheel ALL=(ALL:ALL) NOPASSWD: ALL",
+            )
+            .replace(
+                "# %wheel ALL=(ALL:ALL) ALL",
+                "%wheel ALL=(ALL:ALL) NOPASSWD: ALL",
+            );
         if new_content != content {
             tokio::fs::write(&sudoers_path, new_content)
                 .await
@@ -260,7 +270,7 @@ async fn create_users(mount_root: &Path) -> Result<()> {
                         e
                     ))
                 })?;
-            tracing::info!("  ✅ sudo enabled for wheel group");
+            tracing::info!("  ✅ passwordless sudo enabled for wheel group");
         }
     }
 
