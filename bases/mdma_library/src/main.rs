@@ -63,10 +63,15 @@ async fn main() -> Result<()> {
     }
 
     // Initialize service
-    let library = std::sync::Arc::new(service::LibraryService::new(
-        args.music_dir,
-        args.metadata_dir,
-    ));
+    let library = service::LibraryService::new(args.music_dir, args.metadata_dir)?;
+
+    tracing::info!(
+        tracks = library.tracks_count(),
+        facts = library.facts_count(),
+        "Loaded library from facts"
+    );
+
+    let library = std::sync::Arc::new(library);
 
     // Run IPC server (blocking)
     service::run_ipc_server(library, &args.socket)?;

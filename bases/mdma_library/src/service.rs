@@ -2,10 +2,13 @@
 //!
 //! Handles IPC requests and manages library state
 
+use crate::fact_writer::FactWriter;
 use crate::ipc::{IpcServer, LibraryRequest, LibraryResponse, ServiceStatus, TrackInfo};
+use crate::pipeline::{InboxFile, UploadSource};
+use music_facts::{ContentHash, MusicValue};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use thiserror::Error;
 
@@ -16,6 +19,12 @@ pub enum ServiceError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Ingest error: {0}")]
+    Ingest(#[from] crate::pipeline::IngestError),
+
+    #[error("Fact write error: {0}")]
+    FactWrite(#[from] crate::fact_writer::FactWriteError),
 }
 
 /// Library service state
@@ -25,18 +34,134 @@ pub struct LibraryService {
     start_time: Instant,
     tracks_indexed: AtomicUsize,
     facts_count: AtomicUsize,
+    /// In-memory index of tracks for fast search (rebuilt from facts on startup)
+    tracks: Mutex<Vec<IndexedTrackInfo>>,
+    /// Fact writer for persisting to disk
+    fact_writer: Mutex<FactWriter>,
+}
+
+/// Track info stored in memory for search
+#[derive(Clone)]
+struct IndexedTrackInfo {
+    content_hash: ContentHash,
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    duration_seconds: Option<u32>,
+    bpm: Option<f32>,
+    key: Option<String>,
+    blob_path: PathBuf,
 }
 
 impl LibraryService {
     /// Create a new library service
-    pub fn new(music_dir: PathBuf, metadata_dir: PathBuf) -> Self {
-        Self {
+    pub fn new(music_dir: PathBuf, metadata_dir: PathBuf) -> Result<Self, ServiceError> {
+        let facts_path = metadata_dir.join("facts.jsonl");
+        let fact_writer = FactWriter::open(&facts_path)?;
+
+        // Load existing tracks from facts file
+        let tracks = Self::load_tracks_from_facts(&facts_path);
+        let tracks_count = tracks.len();
+        let facts_count = Self::count_facts(&facts_path);
+
+        Ok(Self {
             music_dir,
             metadata_dir,
             start_time: Instant::now(),
-            tracks_indexed: AtomicUsize::new(0),
-            facts_count: AtomicUsize::new(0),
+            tracks_indexed: AtomicUsize::new(tracks_count),
+            facts_count: AtomicUsize::new(facts_count),
+            tracks: Mutex::new(tracks),
+            fact_writer: Mutex::new(fact_writer),
+        })
+    }
+
+    /// Load tracks from facts file into memory for search
+    fn load_tracks_from_facts(facts_path: &PathBuf) -> Vec<IndexedTrackInfo> {
+        use std::collections::HashMap;
+        use std::io::{BufRead, BufReader};
+
+        let file = match std::fs::File::open(facts_path) {
+            Ok(f) => f,
+            Err(_) => return vec![],
+        };
+
+        // Aggregate facts by content hash
+        let mut tracks_map: HashMap<String, IndexedTrackInfo> = HashMap::new();
+
+        for line in BufReader::new(file).lines().filter_map(|l| l.ok()) {
+            // Parse JSON line as Fact
+            if let Ok(fact) = serde_json::from_str::<serde_json::Value>(&line) {
+                let entity = fact.get("entity").and_then(|e| e.as_str()).unwrap_or("");
+                let value = fact.get("value");
+
+                let entry =
+                    tracks_map
+                        .entry(entity.to_string())
+                        .or_insert_with(|| IndexedTrackInfo {
+                            content_hash: ContentHash(entity.to_string()),
+                            title: None,
+                            artist: None,
+                            album: None,
+                            duration_seconds: None,
+                            bpm: None,
+                            key: None,
+                            blob_path: PathBuf::new(),
+                        });
+
+                // Extract fields from value
+                if let Some(val) = value {
+                    if let Some(title) = val.get("Title").and_then(|v| v.as_str()) {
+                        entry.title = Some(title.to_string());
+                    }
+                    if let Some(artist) = val.get("Artist").and_then(|v| v.as_str()) {
+                        entry.artist = Some(artist.to_string());
+                    }
+                    if let Some(album) = val.get("Album").and_then(|v| v.as_str()) {
+                        entry.album = Some(album.to_string());
+                    }
+                    if let Some(duration) = val.get("DurationSeconds").and_then(|v| v.as_u64()) {
+                        entry.duration_seconds = Some(duration as u32);
+                    }
+                    if let Some(bpm) = val.get("Bpm").and_then(|v| v.as_f64()) {
+                        entry.bpm = Some(bpm as f32);
+                    }
+                    if let Some(key) = val.get("Key").and_then(|v| v.as_str()) {
+                        entry.key = Some(key.to_string());
+                    }
+                }
+            }
         }
+
+        // Set blob paths based on hash
+        for (hash, track) in tracks_map.iter_mut() {
+            let hash_clean = hash.strip_prefix("sha256:").unwrap_or(hash);
+            if hash_clean.len() >= 2 {
+                track.blob_path =
+                    PathBuf::from(format!("blobs/{}/{}.flac", &hash_clean[..2], hash_clean));
+            }
+        }
+
+        tracks_map.into_values().collect()
+    }
+
+    /// Count total facts in file
+    fn count_facts(facts_path: &PathBuf) -> usize {
+        use std::io::{BufRead, BufReader};
+
+        std::fs::File::open(facts_path)
+            .ok()
+            .map(|f| BufReader::new(f).lines().count())
+            .unwrap_or(0)
+    }
+
+    /// Get number of indexed tracks
+    pub fn tracks_count(&self) -> usize {
+        self.tracks_indexed.load(Ordering::Relaxed)
+    }
+
+    /// Get number of facts
+    pub fn facts_count(&self) -> usize {
+        self.facts_count.load(Ordering::Relaxed)
     }
 
     /// Handle a single request
@@ -117,83 +242,87 @@ impl LibraryService {
             .unwrap_or_default()
     }
 
-    /// List tracks (stub - TODO: read from facts)
+    /// List tracks from in-memory index
     fn list_tracks(&self, limit: Option<usize>) -> Vec<TrackInfo> {
-        // For now, scan blob directory
-        let blobs_dir = self.music_dir.join("blobs");
-        if !blobs_dir.exists() {
-            return vec![];
+        let tracks = self.tracks.lock().unwrap();
+
+        let iter = tracks.iter().map(|t| TrackInfo {
+            content_hash: t.content_hash.0.clone(),
+            title: t.title.clone(),
+            artist: t.artist.clone(),
+            album: t.album.clone(),
+            duration_seconds: t.duration_seconds,
+            bpm: t.bpm,
+            key: t.key.clone(),
+            blob_path: Some(self.music_dir.join(&t.blob_path)),
+        });
+
+        match limit {
+            Some(n) => iter.take(n).collect(),
+            None => iter.collect(),
         }
+    }
 
-        let mut tracks = Vec::new();
+    /// Get track by hash from in-memory index
+    fn get_track(&self, hash: &str) -> Option<TrackInfo> {
+        let hash_normalized = if hash.starts_with("sha256:") {
+            hash.to_string()
+        } else {
+            format!("sha256:{}", hash)
+        };
 
-        if let Ok(entries) = std::fs::read_dir(&blobs_dir) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                if entry.path().is_dir() {
-                    if let Ok(subentries) = std::fs::read_dir(entry.path()) {
-                        for subentry in subentries.filter_map(|e| e.ok()) {
-                            let path = subentry.path();
-                            if path.is_file() {
-                                if let Some(hash) = path.file_stem().and_then(|s| s.to_str()) {
-                                    tracks.push(TrackInfo {
-                                        content_hash: format!("sha256:{}", hash),
-                                        title: None, // TODO: Read from facts
-                                        artist: None,
-                                        album: None,
-                                        duration_seconds: None,
-                                        bpm: None,
-                                        key: None,
-                                        blob_path: Some(path),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
+        let tracks = self.tracks.lock().unwrap();
+        tracks
+            .iter()
+            .find(|t| t.content_hash.0 == hash_normalized)
+            .map(|t| TrackInfo {
+                content_hash: t.content_hash.0.clone(),
+                title: t.title.clone(),
+                artist: t.artist.clone(),
+                album: t.album.clone(),
+                duration_seconds: t.duration_seconds,
+                bpm: t.bpm,
+                key: t.key.clone(),
+                blob_path: Some(self.music_dir.join(&t.blob_path)),
+            })
+    }
 
-                if let Some(limit) = limit {
-                    if tracks.len() >= limit {
-                        break;
-                    }
-                }
-            }
-        }
+    /// Search tracks by query (case-insensitive, searches title/artist/album)
+    fn search_tracks(&self, query: &str) -> Vec<TrackInfo> {
+        let query_lower = query.to_lowercase();
+        let tracks = self.tracks.lock().unwrap();
 
         tracks
+            .iter()
+            .filter(|t| {
+                let title_match = t
+                    .title
+                    .as_ref()
+                    .map_or(false, |s| s.to_lowercase().contains(&query_lower));
+                let artist_match = t
+                    .artist
+                    .as_ref()
+                    .map_or(false, |s| s.to_lowercase().contains(&query_lower));
+                let album_match = t
+                    .album
+                    .as_ref()
+                    .map_or(false, |s| s.to_lowercase().contains(&query_lower));
+                title_match || artist_match || album_match
+            })
+            .map(|t| TrackInfo {
+                content_hash: t.content_hash.0.clone(),
+                title: t.title.clone(),
+                artist: t.artist.clone(),
+                album: t.album.clone(),
+                duration_seconds: t.duration_seconds,
+                bpm: t.bpm,
+                key: t.key.clone(),
+                blob_path: Some(self.music_dir.join(&t.blob_path)),
+            })
+            .collect()
     }
 
-    /// Get track by hash (stub)
-    fn get_track(&self, hash: &str) -> Option<TrackInfo> {
-        let hash_clean = hash.strip_prefix("sha256:").unwrap_or(hash);
-        let blob_dir = self.music_dir.join("blobs").join(&hash_clean[..2]);
-
-        // Try common extensions
-        for ext in &["flac", "mp3", "aiff", "wav"] {
-            let blob_path = blob_dir.join(format!("{}.{}", hash_clean, ext));
-            if blob_path.exists() {
-                return Some(TrackInfo {
-                    content_hash: format!("sha256:{}", hash_clean),
-                    title: None,
-                    artist: None,
-                    album: None,
-                    duration_seconds: None,
-                    bpm: None,
-                    key: None,
-                    blob_path: Some(blob_path),
-                });
-            }
-        }
-
-        None
-    }
-
-    /// Search tracks (stub)
-    fn search_tracks(&self, _query: &str) -> Vec<TrackInfo> {
-        // TODO: Implement actual search over facts
-        vec![]
-    }
-
-    /// Ingest a file (stub)
+    /// Ingest a file through the pipeline
     fn ingest_file(&self, path: &PathBuf) -> Result<String, ServiceError> {
         if !path.exists() {
             return Err(ServiceError::Io(std::io::Error::new(
@@ -202,9 +331,71 @@ impl LibraryService {
             )));
         }
 
-        // TODO: Run through pipeline
-        // For now, just return a placeholder hash
-        Ok("sha256:not_implemented".to_string())
+        // Stage 1: Create inbox file
+        let inbox = InboxFile::new(path.clone(), UploadSource::HttpUpload);
+
+        // Stage 2: Validate and compute hash
+        let validated = inbox.validate()?;
+        let content_hash = validated.content_hash.clone();
+
+        // Stage 3: Extract metadata
+        let extracted = validated.extract_metadata()?;
+        let facts = extracted.facts.clone();
+
+        // Stage 4: Import to blob storage
+        let indexed = extracted.import(&self.music_dir)?;
+
+        let result = (content_hash, facts, indexed);
+
+        let (content_hash, facts, indexed) = result;
+
+        // Write facts to disk
+        {
+            let mut writer = self.fact_writer.lock().unwrap();
+            writer.write_track_facts(&content_hash, &facts)?;
+        }
+
+        // Update in-memory index
+        {
+            let mut tracks = self.tracks.lock().unwrap();
+
+            // Extract metadata from facts for the index
+            let mut title = None;
+            let mut artist = None;
+            let mut album = None;
+            let mut duration_seconds = None;
+            let mut bpm = None;
+            let mut key = None;
+
+            for (value, _source) in &facts {
+                match value {
+                    MusicValue::Title(t) => title = Some(t.clone()),
+                    MusicValue::Artist(a) => artist = Some(a.clone()),
+                    MusicValue::Album(a) => album = Some(a.clone()),
+                    MusicValue::DurationSeconds(d) => duration_seconds = Some(d.0),
+                    MusicValue::Bpm(b) => bpm = Some(b.as_f32()),
+                    MusicValue::Key(k) => key = Some(k.to_string()),
+                    _ => {}
+                }
+            }
+
+            tracks.push(IndexedTrackInfo {
+                content_hash: content_hash.clone(),
+                title,
+                artist,
+                album,
+                duration_seconds,
+                bpm,
+                key,
+                blob_path: indexed.blob_path,
+            });
+        }
+
+        // Update counters
+        self.tracks_indexed.fetch_add(1, Ordering::Relaxed);
+        self.facts_count.fetch_add(facts.len(), Ordering::Relaxed);
+
+        Ok(content_hash.0)
     }
 }
 

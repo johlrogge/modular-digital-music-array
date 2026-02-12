@@ -96,7 +96,7 @@ impl InboxFile {
 
     /// Validate the file and compute its hash
     /// Consumes self, transferring ownership to ValidatedAudio
-    pub async fn validate(self) -> Result<ValidatedAudio, IngestError> {
+    pub fn validate(self) -> Result<ValidatedAudio, IngestError> {
         // Check file exists
         if !self.path.exists() {
             return Err(IngestError::FileNotFound(self.path));
@@ -108,7 +108,7 @@ impl InboxFile {
             .ok_or_else(|| IngestError::UnsupportedFormat(ext.to_string()))?;
 
         // Compute content hash (streams file, doesn't load into memory)
-        let content_hash = compute_hash(&self.path).await?;
+        let content_hash = compute_hash(&self.path)?;
 
         Ok(ValidatedAudio {
             path: self.path,
@@ -134,9 +134,9 @@ pub struct ValidatedAudio {
 impl ValidatedAudio {
     /// Extract metadata from the audio file
     /// Consumes self, transferring ownership to ExtractedTrack
-    pub async fn extract_metadata(self) -> Result<ExtractedTrack, IngestError> {
+    pub fn extract_metadata(self) -> Result<ExtractedTrack, IngestError> {
         // Only read metadata, not audio data
-        let facts = extract_facts(&self.path, &self.content_hash, self.format).await?;
+        let facts = extract_facts(&self.path, &self.content_hash, self.format)?;
 
         Ok(ExtractedTrack {
             path: self.path,
@@ -165,7 +165,7 @@ impl ExtractedTrack {
     /// Import the track into the library
     /// Moves file to blob storage and creates symlinks
     /// Consumes self, transferring ownership to IndexedTrack
-    pub async fn import(self, music_dir: &std::path::Path) -> Result<IndexedTrack, IngestError> {
+    pub fn import(self, music_dir: &std::path::Path) -> Result<IndexedTrack, IngestError> {
         let hash_str = self
             .content_hash
             .0
@@ -177,13 +177,13 @@ impl ExtractedTrack {
         let blob_path = blob_dir.join(format!("{}.{}", hash_str, self.format.extension()));
 
         // Create blob directory
-        tokio::fs::create_dir_all(&blob_dir).await?;
+        std::fs::create_dir_all(&blob_dir)?;
 
         // Move file to blob storage (atomic rename, no data copy)
-        tokio::fs::rename(&self.path, &blob_path).await?;
+        std::fs::rename(&self.path, &blob_path)?;
 
         // Create human-readable symlink for debugging
-        let symlink_path = create_symlink(&self.facts, &blob_path, music_dir).await?;
+        let symlink_path = create_symlink(&self.facts, &blob_path, music_dir)?;
 
         Ok(IndexedTrack {
             blob_path,
@@ -209,16 +209,16 @@ pub struct IndexedTrack {
 // =============================================================================
 
 /// Compute SHA256 hash of file contents (streaming, not loading into memory)
-async fn compute_hash(path: &std::path::Path) -> Result<ContentHash, IngestError> {
+fn compute_hash(path: &std::path::Path) -> Result<ContentHash, IngestError> {
     use sha2::{Digest, Sha256};
-    use tokio::io::AsyncReadExt;
+    use std::io::Read;
 
-    let mut file = tokio::fs::File::open(path).await?;
+    let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 8192];
 
     loop {
-        let bytes_read = file.read(&mut buffer).await?;
+        let bytes_read = file.read(&mut buffer)?;
         if bytes_read == 0 {
             break;
         }
@@ -231,22 +231,16 @@ async fn compute_hash(path: &std::path::Path) -> Result<ContentHash, IngestError
 }
 
 /// Extract metadata facts from audio file
-async fn extract_facts(
+fn extract_facts(
     path: &std::path::Path,
     content_hash: &ContentHash,
     format: AudioFormat,
 ) -> Result<Vec<(MusicValue, FactSource)>, IngestError> {
-    // Run blocking metadata extraction in spawn_blocking
-    let path = path.to_path_buf();
-    let hash = content_hash.clone();
-
-    tokio::task::spawn_blocking(move || crate::fact_generator::generate_facts(&path, &hash, format))
-        .await
-        .map_err(|e| IngestError::MetadataError(format!("Task join error: {}", e)))?
+    crate::fact_generator::generate_facts(path, content_hash, format)
 }
 
 /// Create human-readable symlink in by-artist directory
-async fn create_symlink(
+fn create_symlink(
     facts: &[(MusicValue, FactSource)],
     blob_path: &std::path::Path,
     music_dir: &std::path::Path,
@@ -295,7 +289,7 @@ async fn create_symlink(
     let symlink_path = symlink_dir.join(&filename);
 
     // Create directory
-    tokio::fs::create_dir_all(&symlink_dir).await?;
+    std::fs::create_dir_all(&symlink_dir)?;
 
     // Compute relative path from symlink to blob
     // e.g., from /music/by-artist/Artist/Album/ to /music/blobs/a1/hash.flac
@@ -304,7 +298,7 @@ async fn create_symlink(
         pathdiff::diff_paths(blob_path, &symlink_dir).unwrap_or_else(|| blob_path.to_path_buf());
 
     // Create symlink (ignore if exists - could be re-import)
-    match tokio::fs::symlink(&relative_blob, &symlink_path).await {
+    match std::os::unix::fs::symlink(&relative_blob, &symlink_path) {
         Ok(()) => Ok(Some(symlink_path)),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Some(symlink_path)),
         Err(e) => Err(e.into()),
