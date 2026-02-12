@@ -57,7 +57,7 @@ pub struct ServiceStatus {
 
 /// Responses from the library service
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", content = "data")]
 pub enum LibraryResponse {
     /// Service status
     Status(ServiceStatus),

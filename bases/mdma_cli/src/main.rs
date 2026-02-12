@@ -45,7 +45,7 @@ pub struct ServiceStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", content = "data")]
 pub enum LibraryResponse {
     Status(ServiceStatus),
     Tracks(Vec<TrackInfo>),
