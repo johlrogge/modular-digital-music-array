@@ -236,10 +236,13 @@ async fn extract_facts(
     content_hash: &ContentHash,
     format: AudioFormat,
 ) -> Result<Vec<(MusicValue, FactSource)>, IngestError> {
-    // TODO: Implement metadata extraction
-    // For now, return empty facts
-    let _ = (path, content_hash, format);
-    Ok(vec![])
+    // Run blocking metadata extraction in spawn_blocking
+    let path = path.to_path_buf();
+    let hash = content_hash.clone();
+
+    tokio::task::spawn_blocking(move || crate::fact_generator::generate_facts(&path, &hash, format))
+        .await
+        .map_err(|e| IngestError::MetadataError(format!("Task join error: {}", e)))?
 }
 
 /// Create human-readable symlink in by-artist directory
