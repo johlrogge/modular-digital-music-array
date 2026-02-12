@@ -733,3 +733,60 @@ golden-help:
 [group("run")]
 run-beacon:
     cargo run --bin beacon
+
+# run console locally
+[group("run")]
+run-console:
+    cargo run --bin mdma-console
+
+# Cross-compile console for aarch64
+[group('build')]
+console-cross:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Building console for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin mdma-console
+    echo ""
+    echo "Console built!"
+    file target/aarch64-unknown-linux-gnu/release/mdma-console
+    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-console
+
+# Deploy console to Pi
+[group('dev')]
+deploy-console: console-cross
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    HOST="mdma-909.local"
+    CONSOLE="target/aarch64-unknown-linux-gnu/release/mdma-console"
+    PASS="${PI_PASSWORD:-voidlinux}"
+
+    # Helper function for SSH commands
+    run_ssh() {
+        if ssh -4 -o BatchMode=yes -o ConnectTimeout=5 "root@${HOST}" true 2>/dev/null; then
+            ssh -4 "root@${HOST}" "$@"
+        else
+            sshpass -p "$PASS" ssh -4 -o StrictHostKeyChecking=no "root@${HOST}" "$@"
+        fi
+    }
+
+    # Helper function for SCP
+    run_scp() {
+        if ssh -4 -o BatchMode=yes -o ConnectTimeout=5 "root@${HOST}" true 2>/dev/null; then
+            scp -4 "$@"
+        else
+            sshpass -p "$PASS" scp -4 -o StrictHostKeyChecking=no "$@"
+        fi
+    }
+
+    echo "Deploying console to $HOST..."
+
+    # Copy binary to Pi
+    run_scp "$CONSOLE" "root@${HOST}:/tmp/"
+
+    # Stop service if running, move binary, start
+    run_ssh 'sv stop mdma-console 2>/dev/null || true; mv /tmp/mdma-console /usr/bin/; chmod +x /usr/bin/mdma-console; mkdir -p /etc/sv/mdma-console/log /var/log/mdma-console; if [ ! -f /etc/sv/mdma-console/run ]; then echo "#!/bin/sh" > /etc/sv/mdma-console/run; echo "exec /usr/bin/mdma-console --port 3000 2>&1" >> /etc/sv/mdma-console/run; chmod +x /etc/sv/mdma-console/run; echo "#!/bin/sh" > /etc/sv/mdma-console/log/run; echo "exec svlogd -tt /var/log/mdma-console" >> /etc/sv/mdma-console/log/run; chmod +x /etc/sv/mdma-console/log/run; ln -sf /etc/sv/mdma-console /var/service/mdma-console; sleep 2; fi; sv start mdma-console 2>/dev/null || true'
+
+    echo "Console deployed!"
+    echo ""
+    echo "Access at: http://$HOST:3000"

@@ -310,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "beacon"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "askama",
  "async-stream",
@@ -1511,6 +1511,22 @@ name = "matchit"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
+
+[[package]]
+name = "mdma-console"
+version = "0.1.0"
+dependencies = [
+ "askama",
+ "axum",
+ "clap",
+ "color-eyre",
+ "rstest",
+ "serde",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "media-client"
