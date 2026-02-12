@@ -872,13 +872,7 @@ deploy-library: library-cross
     run_scp "$LIBRARY" "root@${HOST}:/tmp/"
 
     # Stop service if running, move binary, create directories, start
-    run_ssh 'sv stop mdma-library 2>/dev/null || true; mv /tmp/mdma-library /usr/bin/; chmod +x /usr/bin/mdma-library; mkdir -p /etc/sv/mdma-library/log /var/log/mdma-library /music/inbox /music/blobs /metadata /run/mdma; if [ ! -f /etc/sv/mdma-library/run ]; then cat > /etc/sv/mdma-library/run << "EOF"
-#!/bin/sh
-exec 2>&1
-mkdir -p /music/inbox /music/blobs /metadata /run/mdma
-exec /usr/bin/mdma-library --music-dir /music --metadata-dir /metadata --socket ipc:///run/mdma/library.sock
-EOF
-chmod +x /etc/sv/mdma-library/run; echo "#!/bin/sh" > /etc/sv/mdma-library/log/run; echo "exec svlogd -tt /var/log/mdma-library" >> /etc/sv/mdma-library/log/run; chmod +x /etc/sv/mdma-library/log/run; ln -sf /etc/sv/mdma-library /var/service/mdma-library; sleep 2; fi; sv start mdma-library 2>/dev/null || true'
+    run_ssh 'sv stop mdma-library 2>/dev/null || true; mv /tmp/mdma-library /usr/bin/; chmod +x /usr/bin/mdma-library; mkdir -p /etc/sv/mdma-library/log /var/log/mdma-library /music/inbox /music/blobs /metadata /run/mdma; if [ ! -f /etc/sv/mdma-library/run ]; then echo "#!/bin/sh" > /etc/sv/mdma-library/run; echo "exec 2>&1" >> /etc/sv/mdma-library/run; echo "mkdir -p /music/inbox /music/blobs /metadata /run/mdma" >> /etc/sv/mdma-library/run; echo "exec /usr/bin/mdma-library --music-dir /music --metadata-dir /metadata --socket ipc:///run/mdma/library.sock" >> /etc/sv/mdma-library/run; chmod +x /etc/sv/mdma-library/run; echo "#!/bin/sh" > /etc/sv/mdma-library/log/run; echo "exec svlogd -tt /var/log/mdma-library" >> /etc/sv/mdma-library/log/run; chmod +x /etc/sv/mdma-library/log/run; ln -sf /etc/sv/mdma-library /var/service/mdma-library; sleep 2; fi; sv start mdma-library 2>/dev/null || true'
 
     echo "Library deployed!"
     echo ""
