@@ -1,7 +1,7 @@
 # bases/beacon/Cargo.toml
 [package]
 name = "beacon"
-version = "0.5.0"
+version = "0.5.1"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
