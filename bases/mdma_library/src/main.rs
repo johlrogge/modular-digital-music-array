@@ -2,6 +2,7 @@ use clap::Parser;
 use color_eyre::Result;
 
 mod fact_generator;
+mod fact_writer;
 mod pipeline;
 
 #[derive(Parser, Debug)]
