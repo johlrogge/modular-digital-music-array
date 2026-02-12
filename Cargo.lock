@@ -1464,7 +1464,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc2f4eb4bc735547cfed7c0a4922cbd04a4655978c09b54f1f7b228750664c34"
 dependencies = [
  "cfg-if",
- "windows-targets 0.52.6",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -2518,7 +2518,7 @@ checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
 [[package]]
 name = "stainless-facts"
 version = "0.2.0"
-source = "git+https://github.com/johlrogge/stainless_facts#8d88e445b70046d46b07702d29786373092bcdf1"
+source = "git+https://github.com/johlrogge/stainless_facts#2aa820a808fd5345a1bd59c11d90969bfa84b285"
 dependencies = [
  "chrono",
  "fs2",

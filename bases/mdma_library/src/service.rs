@@ -6,7 +6,6 @@ use crate::fact_writer::FactWriter;
 use crate::ipc::{IpcServer, LibraryRequest, LibraryResponse, ServiceStatus, TrackInfo};
 use crate::pipeline::{InboxFile, UploadSource};
 use music_facts::{ContentHash, MusicValue};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,8 +36,6 @@ pub struct LibraryService {
     facts_count: AtomicUsize,
     /// In-memory index of tracks for fast search (rebuilt from facts on startup)
     tracks: Mutex<Vec<IndexedTrackInfo>>,
-    /// In-memory cache of all facts by content hash (for get_facts queries)
-    facts_cache: Mutex<HashMap<String, Vec<MusicValue>>>,
     /// Fact writer for persisting to disk
     fact_writer: Mutex<FactWriter>,
 }
@@ -66,13 +63,11 @@ impl LibraryService {
     pub fn new(music_dir: PathBuf, metadata_dir: PathBuf) -> Result<Self, ServiceError> {
         let facts_path = metadata_dir.join("facts.jsonl");
 
-        // Load existing tracks and facts from file BEFORE opening writer
-        // (FactWriter holds exclusive lock, FactStreamReader also needs lock)
-        let (tracks, facts_cache) = Self::load_tracks_and_facts(&facts_path);
+        // Load existing tracks from facts file
+        let (tracks, facts_count) = Self::load_tracks_from_facts(&facts_path);
         let tracks_count = tracks.len();
-        let facts_count = facts_cache.values().map(|v| v.len()).sum();
 
-        // Now open writer for future writes
+        // Open writer for future writes
         let fact_writer = FactWriter::open(&facts_path)?;
 
         Ok(Self {
@@ -82,30 +77,28 @@ impl LibraryService {
             tracks_indexed: AtomicUsize::new(tracks_count),
             facts_count: AtomicUsize::new(facts_count),
             tracks: Mutex::new(tracks),
-            facts_cache: Mutex::new(facts_cache),
             fact_writer: Mutex::new(fact_writer),
         })
     }
 
     /// Load tracks and all facts from facts file into memory
-    fn load_tracks_and_facts(
-        facts_path: &PathBuf,
-    ) -> (Vec<IndexedTrackInfo>, HashMap<String, Vec<MusicValue>>) {
+    /// Load tracks from facts file into memory for search
+    fn load_tracks_from_facts(facts_path: &PathBuf) -> (Vec<IndexedTrackInfo>, usize) {
         use music_facts::FactSource;
         use stainless_facts::FactStreamReader;
+        use std::collections::HashMap;
 
         let reader: FactStreamReader<ContentHash, MusicValue, FactSource> =
             match FactStreamReader::open(facts_path) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!("Failed to open fact stream: {:?}", e);
-                    return (vec![], HashMap::new());
+                    return (vec![], 0);
                 }
             };
 
         // Aggregate facts by content hash
         let mut tracks_map: HashMap<String, IndexedTrackInfo> = HashMap::new();
-        let mut facts_cache: HashMap<String, Vec<MusicValue>> = HashMap::new();
         let mut errors = 0;
         let mut total = 0;
 
@@ -123,12 +116,6 @@ impl LibraryService {
             };
 
             let entity = fact.entity().0.clone();
-
-            // Store all facts in cache
-            facts_cache
-                .entry(entity.clone())
-                .or_default()
-                .push(fact.value().clone());
 
             // Build track summary
             let entry = tracks_map
@@ -167,7 +154,7 @@ impl LibraryService {
             }
         }
 
-        (tracks_map.into_values().collect(), facts_cache)
+        (tracks_map.into_values().collect(), total)
     }
 
     /// Get number of indexed tracks
@@ -355,14 +342,27 @@ impl LibraryService {
 
     /// Get all facts for a track by hash (supports partial hashes)
     fn get_facts(&self, hash: &str) -> Result<Vec<(String, String)>, String> {
+        use music_facts::FactSource;
+        use stainless_facts::FactStreamReader;
+
         let full_hash = self.resolve_hash(hash)?;
+        let facts_path = self.metadata_dir.join("facts.jsonl");
 
-        let facts_cache = self.facts_cache.lock().unwrap();
+        let reader: FactStreamReader<ContentHash, MusicValue, FactSource> =
+            FactStreamReader::open(&facts_path)
+                .map_err(|e| format!("Failed to open facts file: {}", e))?;
 
-        facts_cache
-            .get(&full_hash)
-            .map(|values| values.iter().map(|v| format_fact_for_display(v)).collect())
-            .ok_or_else(|| format!("No facts found for {}", full_hash))
+        let facts: Vec<_> = reader
+            .filter_map(|r| r.ok())
+            .filter(|f| f.entity().0 == full_hash)
+            .map(|f| format_fact_for_display(f.value()))
+            .collect();
+
+        if facts.is_empty() {
+            Err(format!("No facts found for {}", full_hash))
+        } else {
+            Ok(facts)
+        }
     }
 
     /// Search tracks by query (case-insensitive, searches title/artist/album)
