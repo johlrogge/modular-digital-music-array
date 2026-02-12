@@ -1790,6 +1790,7 @@ dependencies = [
  "music-primitives",
  "serde",
  "serde_json",
+ "stainless-facts",
  "thiserror",
 ]
 

@@ -14,3 +14,4 @@ chrono = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+stainless-facts = { git = "https://github.com/johlrogge/stainless_facts" }

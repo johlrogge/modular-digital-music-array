@@ -17,6 +17,7 @@ pub enum LibraryRequest {
     GetStatus,
     ListTracks { limit: Option<usize> },
     GetTrack { hash: String },
+    GetFacts { hash: String },
     Search { query: String },
     GetInboxQueue,
     IngestFile { path: PathBuf },
@@ -49,7 +50,11 @@ pub struct ServiceStatus {
 pub enum LibraryResponse {
     Status(ServiceStatus),
     Tracks(Vec<TrackInfo>),
-    Track(Option<TrackInfo>),
+    Track(TrackInfo),
+    Facts {
+        hash: String,
+        facts: Vec<(String, String)>,
+    },
     SearchResults(Vec<TrackInfo>),
     InboxQueue(Vec<PathBuf>),
     IngestResult {
@@ -94,9 +99,15 @@ enum Commands {
         limit: Option<usize>,
     },
 
-    /// Get a specific track by hash
+    /// Get a specific track by hash (supports partial hashes like git)
     Get {
-        /// Content hash (with or without sha256: prefix)
+        /// Content hash (full or partial, with or without sha256: prefix)
+        hash: String,
+    },
+
+    /// Show all facts for a track
+    Facts {
+        /// Content hash (full or partial, with or without sha256: prefix)
         hash: String,
     },
 
@@ -185,6 +196,16 @@ fn handle_status(client: &Client) -> Result<()> {
     }
 }
 
+/// Get a short hash for display (8 chars after sha256: prefix)
+fn short_hash(hash: &str) -> &str {
+    let clean = hash.strip_prefix("sha256:").unwrap_or(hash);
+    if clean.len() >= 8 {
+        &clean[..8]
+    } else {
+        clean
+    }
+}
+
 fn handle_list(client: &Client, limit: Option<usize>) -> Result<()> {
     match client.request(&LibraryRequest::ListTracks { limit })? {
         LibraryResponse::Tracks(tracks) => {
@@ -199,9 +220,12 @@ fn handle_list(client: &Client, limit: Option<usize>) -> Result<()> {
             for track in tracks {
                 let title = track.title.as_deref().unwrap_or("Unknown");
                 let artist = track.artist.as_deref().unwrap_or("Unknown");
-                let hash_short = &track.content_hash[7..15]; // Skip "sha256:" and take 8 chars
-
-                println!("{} │ {} - {}", hash_short, artist, title);
+                println!(
+                    "{} │ {} - {}",
+                    short_hash(&track.content_hash),
+                    artist,
+                    title
+                );
             }
             Ok(())
         }
@@ -217,15 +241,9 @@ fn handle_list(client: &Client, limit: Option<usize>) -> Result<()> {
 }
 
 fn handle_get(client: &Client, hash: String) -> Result<()> {
-    // Normalize hash (add prefix if missing)
-    let hash = if hash.starts_with("sha256:") {
-        hash
-    } else {
-        format!("sha256:{}", hash)
-    };
-
+    // Send hash as-is - server handles partial matching and normalization
     match client.request(&LibraryRequest::GetTrack { hash })? {
-        LibraryResponse::Track(Some(track)) => {
+        LibraryResponse::Track(track) => {
             println!("Track: {}", track.content_hash);
             println!("─────────────────────────────────────────────────────────────────");
             if let Some(title) = track.title {
@@ -251,9 +269,27 @@ fn handle_get(client: &Client, hash: String) -> Result<()> {
             }
             Ok(())
         }
-        LibraryResponse::Track(None) => {
-            println!("Track not found");
+        LibraryResponse::Error { message } => {
+            eprintln!("Error: {}", message);
             std::process::exit(1);
+        }
+        other => {
+            eprintln!("Unexpected response: {:?}", other);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_facts(client: &Client, hash: String) -> Result<()> {
+    // Send hash as-is - server handles partial matching and normalization
+    match client.request(&LibraryRequest::GetFacts { hash })? {
+        LibraryResponse::Facts { hash, facts } => {
+            println!("Facts for: {}", hash);
+            println!("─────────────────────────────────────────────────────────────────");
+            for (fact_type, fact_value) in facts {
+                println!("{:20} │ {}", fact_type, fact_value);
+            }
+            Ok(())
         }
         LibraryResponse::Error { message } => {
             eprintln!("Error: {}", message);
@@ -282,9 +318,12 @@ fn handle_search(client: &Client, query: String) -> Result<()> {
             for track in tracks {
                 let title = track.title.as_deref().unwrap_or("Unknown");
                 let artist = track.artist.as_deref().unwrap_or("Unknown");
-                let hash_short = &track.content_hash[7..15];
-
-                println!("{} │ {} - {}", hash_short, artist, title);
+                println!(
+                    "{} │ {} - {}",
+                    short_hash(&track.content_hash),
+                    artist,
+                    title
+                );
             }
             Ok(())
         }
@@ -390,6 +429,7 @@ fn main() -> Result<()> {
         Commands::Status => handle_status(&client),
         Commands::List { limit } => handle_list(&client, limit),
         Commands::Get { hash } => handle_get(&client, hash),
+        Commands::Facts { hash } => handle_facts(&client, hash),
         Commands::Search { query } => handle_search(&client, query),
         Commands::Inbox => handle_inbox(&client),
         Commands::Ingest { path } => handle_ingest(&client, path),

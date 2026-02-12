@@ -16,8 +16,11 @@ pub enum LibraryRequest {
     /// List all tracks (optionally filtered)
     ListTracks { limit: Option<usize> },
 
-    /// Get a specific track by content hash
+    /// Get a specific track by content hash (supports partial hashes)
     GetTrack { hash: String },
+
+    /// Get all facts for a track (supports partial hashes)
+    GetFacts { hash: String },
 
     /// Search tracks by query string
     Search { query: String },
@@ -65,8 +68,14 @@ pub enum LibraryResponse {
     /// List of tracks
     Tracks(Vec<TrackInfo>),
 
-    /// Single track (or None if not found)
-    Track(Option<TrackInfo>),
+    /// Single track
+    Track(TrackInfo),
+
+    /// All facts for a track (type, value pairs)
+    Facts {
+        hash: String,
+        facts: Vec<(String, String)>,
+    },
 
     /// Search results
     SearchResults(Vec<TrackInfo>),

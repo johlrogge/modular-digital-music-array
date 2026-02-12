@@ -6,6 +6,7 @@ use crate::fact_writer::FactWriter;
 use crate::ipc::{IpcServer, LibraryRequest, LibraryResponse, ServiceStatus, TrackInfo};
 use crate::pipeline::{InboxFile, UploadSource};
 use music_facts::{ContentHash, MusicValue};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,6 +37,8 @@ pub struct LibraryService {
     facts_count: AtomicUsize,
     /// In-memory index of tracks for fast search (rebuilt from facts on startup)
     tracks: Mutex<Vec<IndexedTrackInfo>>,
+    /// In-memory cache of all facts by content hash (for get_facts queries)
+    facts_cache: Mutex<HashMap<String, Vec<MusicValue>>>,
     /// Fact writer for persisting to disk
     fact_writer: Mutex<FactWriter>,
 }
@@ -53,16 +56,24 @@ struct IndexedTrackInfo {
     blob_path: PathBuf,
 }
 
+/// Format a MusicValue for display (returns type name and string value)
+fn format_fact_for_display(value: &MusicValue) -> (String, String) {
+    (value.variant_name().to_string(), value.to_string())
+}
+
 impl LibraryService {
     /// Create a new library service
     pub fn new(music_dir: PathBuf, metadata_dir: PathBuf) -> Result<Self, ServiceError> {
         let facts_path = metadata_dir.join("facts.jsonl");
-        let fact_writer = FactWriter::open(&facts_path)?;
 
-        // Load existing tracks from facts file
-        let tracks = Self::load_tracks_from_facts(&facts_path);
+        // Load existing tracks and facts from file BEFORE opening writer
+        // (FactWriter holds exclusive lock, FactStreamReader also needs lock)
+        let (tracks, facts_cache) = Self::load_tracks_and_facts(&facts_path);
         let tracks_count = tracks.len();
-        let facts_count = Self::count_facts(&facts_path);
+        let facts_count = facts_cache.values().map(|v| v.len()).sum();
+
+        // Now open writer for future writes
+        let fact_writer = FactWriter::open(&facts_path)?;
 
         Ok(Self {
             music_dir,
@@ -71,66 +82,81 @@ impl LibraryService {
             tracks_indexed: AtomicUsize::new(tracks_count),
             facts_count: AtomicUsize::new(facts_count),
             tracks: Mutex::new(tracks),
+            facts_cache: Mutex::new(facts_cache),
             fact_writer: Mutex::new(fact_writer),
         })
     }
 
-    /// Load tracks from facts file into memory for search
-    fn load_tracks_from_facts(facts_path: &PathBuf) -> Vec<IndexedTrackInfo> {
-        use std::collections::HashMap;
-        use std::io::{BufRead, BufReader};
+    /// Load tracks and all facts from facts file into memory
+    fn load_tracks_and_facts(
+        facts_path: &PathBuf,
+    ) -> (Vec<IndexedTrackInfo>, HashMap<String, Vec<MusicValue>>) {
+        use music_facts::FactSource;
+        use stainless_facts::FactStreamReader;
 
-        let file = match std::fs::File::open(facts_path) {
-            Ok(f) => f,
-            Err(_) => return vec![],
-        };
+        let reader: FactStreamReader<ContentHash, MusicValue, FactSource> =
+            match FactStreamReader::open(facts_path) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("Failed to open fact stream: {:?}", e);
+                    return (vec![], HashMap::new());
+                }
+            };
 
         // Aggregate facts by content hash
         let mut tracks_map: HashMap<String, IndexedTrackInfo> = HashMap::new();
+        let mut facts_cache: HashMap<String, Vec<MusicValue>> = HashMap::new();
+        let mut errors = 0;
+        let mut total = 0;
 
-        for line in BufReader::new(file).lines().filter_map(|l| l.ok()) {
-            // Parse JSON line as Fact
-            if let Ok(fact) = serde_json::from_str::<serde_json::Value>(&line) {
-                let entity = fact.get("entity").and_then(|e| e.as_str()).unwrap_or("");
-                let value = fact.get("value");
-
-                let entry =
-                    tracks_map
-                        .entry(entity.to_string())
-                        .or_insert_with(|| IndexedTrackInfo {
-                            content_hash: ContentHash(entity.to_string()),
-                            title: None,
-                            artist: None,
-                            album: None,
-                            duration_seconds: None,
-                            bpm: None,
-                            key: None,
-                            blob_path: PathBuf::new(),
-                        });
-
-                // Extract fields from value
-                if let Some(val) = value {
-                    if let Some(title) = val.get("Title").and_then(|v| v.as_str()) {
-                        entry.title = Some(title.to_string());
+        for fact_result in reader {
+            total += 1;
+            let fact = match fact_result {
+                Ok(f) => f,
+                Err(e) => {
+                    errors += 1;
+                    if errors <= 3 {
+                        tracing::warn!("Failed to parse fact: {:?}", e);
                     }
-                    if let Some(artist) = val.get("Artist").and_then(|v| v.as_str()) {
-                        entry.artist = Some(artist.to_string());
-                    }
-                    if let Some(album) = val.get("Album").and_then(|v| v.as_str()) {
-                        entry.album = Some(album.to_string());
-                    }
-                    if let Some(duration) = val.get("DurationSeconds").and_then(|v| v.as_u64()) {
-                        entry.duration_seconds = Some(duration as u32);
-                    }
-                    if let Some(bpm) = val.get("Bpm").and_then(|v| v.as_f64()) {
-                        entry.bpm = Some(bpm as f32);
-                    }
-                    if let Some(key) = val.get("Key").and_then(|v| v.as_str()) {
-                        entry.key = Some(key.to_string());
-                    }
+                    continue;
                 }
+            };
+
+            let entity = fact.entity().0.clone();
+
+            // Store all facts in cache
+            facts_cache
+                .entry(entity.clone())
+                .or_default()
+                .push(fact.value().clone());
+
+            // Build track summary
+            let entry = tracks_map
+                .entry(entity.clone())
+                .or_insert_with(|| IndexedTrackInfo {
+                    content_hash: ContentHash(entity),
+                    title: None,
+                    artist: None,
+                    album: None,
+                    duration_seconds: None,
+                    bpm: None,
+                    key: None,
+                    blob_path: PathBuf::new(),
+                });
+
+            // Extract key fields for search
+            match fact.value() {
+                MusicValue::Title(v) => entry.title = Some(v.clone()),
+                MusicValue::Artist(v) => entry.artist = Some(v.clone()),
+                MusicValue::Album(v) => entry.album = Some(v.clone()),
+                MusicValue::DurationSeconds(v) => entry.duration_seconds = Some(v.0),
+                MusicValue::Bpm(v) => entry.bpm = Some(v.as_f32()),
+                MusicValue::Key(v) => entry.key = Some(v.to_string()),
+                _ => {}
             }
         }
+
+        tracing::info!("Processed {} facts from file, {} errors", total, errors);
 
         // Set blob paths based on hash
         for (hash, track) in tracks_map.iter_mut() {
@@ -141,17 +167,7 @@ impl LibraryService {
             }
         }
 
-        tracks_map.into_values().collect()
-    }
-
-    /// Count total facts in file
-    fn count_facts(facts_path: &PathBuf) -> usize {
-        use std::io::{BufRead, BufReader};
-
-        std::fs::File::open(facts_path)
-            .ok()
-            .map(|f| BufReader::new(f).lines().count())
-            .unwrap_or(0)
+        (tracks_map.into_values().collect(), facts_cache)
     }
 
     /// Get number of indexed tracks
@@ -188,14 +204,23 @@ impl LibraryService {
                 LibraryResponse::Tracks(tracks)
             }
 
-            LibraryRequest::GetTrack { hash } => {
-                // TODO: Look up track by hash
-                let track = self.get_track(&hash);
-                LibraryResponse::Track(track)
-            }
+            LibraryRequest::GetTrack { hash } => match self.get_track(&hash) {
+                Ok(track) => LibraryResponse::Track(track),
+                Err(msg) => LibraryResponse::Error { message: msg },
+            },
+
+            LibraryRequest::GetFacts { hash } => match self.get_facts(&hash) {
+                Ok(facts) => {
+                    let full_hash = self.resolve_hash(&hash).unwrap_or_default();
+                    LibraryResponse::Facts {
+                        hash: full_hash,
+                        facts,
+                    }
+                }
+                Err(msg) => LibraryResponse::Error { message: msg },
+            },
 
             LibraryRequest::Search { query } => {
-                // TODO: Implement search
                 let results = self.search_tracks(&query);
                 LibraryResponse::SearchResults(results)
             }
@@ -263,18 +288,58 @@ impl LibraryService {
         }
     }
 
-    /// Get track by hash from in-memory index
-    fn get_track(&self, hash: &str) -> Option<TrackInfo> {
-        let hash_normalized = if hash.starts_with("sha256:") {
-            hash.to_string()
-        } else {
-            format!("sha256:{}", hash)
-        };
+    /// Resolve a partial hash to a full hash (like git short refs)
+    /// Returns None if no match, Some(hash) if exactly one match, or error message if ambiguous
+    fn resolve_hash(&self, partial: &str) -> Result<String, String> {
+        let partial_clean = partial
+            .strip_prefix("sha256:")
+            .unwrap_or(partial)
+            .to_lowercase();
+
+        let tracks = self.tracks.lock().unwrap();
+        let matches: Vec<_> = tracks
+            .iter()
+            .filter(|t| {
+                let hash = t
+                    .content_hash
+                    .0
+                    .strip_prefix("sha256:")
+                    .unwrap_or(&t.content_hash.0);
+                hash.to_lowercase().starts_with(&partial_clean)
+            })
+            .collect();
+
+        match matches.len() {
+            0 => Err(format!("No track found matching '{}'", partial)),
+            1 => Ok(matches[0].content_hash.0.clone()),
+            n => {
+                let examples: Vec<_> = matches
+                    .iter()
+                    .take(3)
+                    .map(|t| {
+                        let short = &t.content_hash.0[7..15]; // sha256: prefix + 8 chars
+                        let name = t.title.as_deref().unwrap_or("Unknown");
+                        format!("  {} ({})", short, name)
+                    })
+                    .collect();
+                Err(format!(
+                    "Ambiguous hash '{}' matches {} tracks:\n{}",
+                    partial,
+                    n,
+                    examples.join("\n")
+                ))
+            }
+        }
+    }
+
+    /// Get track by hash from in-memory index (supports partial hashes)
+    fn get_track(&self, hash: &str) -> Result<TrackInfo, String> {
+        let full_hash = self.resolve_hash(hash)?;
 
         let tracks = self.tracks.lock().unwrap();
         tracks
             .iter()
-            .find(|t| t.content_hash.0 == hash_normalized)
+            .find(|t| t.content_hash.0 == full_hash)
             .map(|t| TrackInfo {
                 content_hash: t.content_hash.0.clone(),
                 title: t.title.clone(),
@@ -285,6 +350,19 @@ impl LibraryService {
                 key: t.key.clone(),
                 blob_path: Some(self.music_dir.join(&t.blob_path)),
             })
+            .ok_or_else(|| "Track not found".to_string())
+    }
+
+    /// Get all facts for a track by hash (supports partial hashes)
+    fn get_facts(&self, hash: &str) -> Result<Vec<(String, String)>, String> {
+        let full_hash = self.resolve_hash(hash)?;
+
+        let facts_cache = self.facts_cache.lock().unwrap();
+
+        facts_cache
+            .get(&full_hash)
+            .map(|values| values.iter().map(|v| format_fact_for_display(v)).collect())
+            .ok_or_else(|| format!("No facts found for {}", full_hash))
     }
 
     /// Search tracks by query (case-insensitive, searches title/artist/album)

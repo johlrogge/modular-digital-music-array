@@ -1,6 +1,7 @@
 use crate::primitives::*;
 use music_primitives::{Bpm, Key};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::PathBuf;
 
 /// All possible metadata values for a music track
@@ -127,4 +128,94 @@ pub enum MusicValue {
 
     /// Who encoded the file (e.g., "Beatport")
     EncodedBy(String),
+}
+
+impl MusicValue {
+    /// Returns the variant name for display (e.g., "Title", "Artist", "BPM")
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            MusicValue::FilePath(_) => "FilePath",
+            MusicValue::Title(_) => "Title",
+            MusicValue::Artist(_) => "Artist",
+            MusicValue::Album(_) => "Album",
+            MusicValue::AlbumArtist(_) => "AlbumArtist",
+            MusicValue::TrackNumber(_) => "TrackNumber",
+            MusicValue::Year(_) => "Year",
+            MusicValue::Bpm(_) => "BPM",
+            MusicValue::Key(_) => "Key",
+            MusicValue::MainGenre(_) => "MainGenre",
+            MusicValue::StyleDescriptor(_) => "StyleDescriptor",
+            MusicValue::FullGenre(_) => "FullGenre",
+            MusicValue::Isrc(_) => "ISRC",
+            MusicValue::Label(_) => "Label",
+            MusicValue::RecordingYear(_) => "RecordingYear",
+            MusicValue::RecordingDate(_) => "RecordingDate",
+            MusicValue::BeatportTrackUrl(_) => "BeatportTrackUrl",
+            MusicValue::BeatportLabelUrl(_) => "BeatportLabelUrl",
+            MusicValue::BandcampUrl(_) => "BandcampUrl",
+            MusicValue::Comment(_) => "Comment",
+            MusicValue::BeatportTrackId(_) => "BeatportTrackId",
+            MusicValue::BitDepth(_) => "BitDepth",
+            MusicValue::Channels(_) => "Channels",
+            MusicValue::SampleRate(_) => "SampleRate",
+            MusicValue::DurationSeconds(_) => "Duration",
+            MusicValue::Bitrate(_) => "Bitrate",
+            MusicValue::FileSizeBytes(_) => "FileSize",
+            MusicValue::HasAlbumArt(_) => "HasAlbumArt",
+            MusicValue::EncoderSoftware(_) => "EncoderSoftware",
+            MusicValue::EncodedBy(_) => "EncodedBy",
+        }
+    }
+}
+
+impl fmt::Display for MusicValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MusicValue::FilePath(p) => write!(f, "{}", p.display()),
+            MusicValue::Title(s) => write!(f, "{}", s),
+            MusicValue::Artist(s) => write!(f, "{}", s),
+            MusicValue::Album(s) => write!(f, "{}", s),
+            MusicValue::AlbumArtist(s) => write!(f, "{}", s),
+            MusicValue::TrackNumber(n) => write!(f, "{}", n),
+            MusicValue::Year(y) => write!(f, "{}", y),
+            MusicValue::Bpm(b) => write!(f, "{}", b),
+            MusicValue::Key(k) => write!(f, "{}", k),
+            MusicValue::MainGenre(s) => write!(f, "{}", s),
+            MusicValue::StyleDescriptor(s) => write!(f, "{}", s),
+            MusicValue::FullGenre(s) => write!(f, "{}", s),
+            MusicValue::Isrc(i) => write!(f, "{}", i),
+            MusicValue::Label(s) => write!(f, "{}", s),
+            MusicValue::RecordingYear(y) => write!(f, "{}", y),
+            MusicValue::RecordingDate(s) => write!(f, "{}", s),
+            MusicValue::BeatportTrackUrl(s) => write!(f, "{}", s),
+            MusicValue::BeatportLabelUrl(s) => write!(f, "{}", s),
+            MusicValue::BandcampUrl(s) => write!(f, "{}", s),
+            MusicValue::Comment(s) => write!(f, "{}", s),
+            MusicValue::BeatportTrackId(s) => write!(f, "{}", s),
+            MusicValue::BitDepth(b) => write!(f, "{}", b),
+            MusicValue::Channels(c) => write!(f, "{}", c),
+            MusicValue::SampleRate(s) => write!(f, "{}", s),
+            MusicValue::DurationSeconds(d) => write!(f, "{}", d),
+            MusicValue::Bitrate(b) => write!(f, "{}", b),
+            MusicValue::FileSizeBytes(s) => write!(f, "{}", s),
+            MusicValue::HasAlbumArt(b) => write!(f, "{}", if *b { "yes" } else { "no" }),
+            MusicValue::EncoderSoftware(s) => write!(f, "{}", s),
+            MusicValue::EncodedBy(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stainless_facts::assert_fact_value_format;
+
+    #[test]
+    fn music_value_has_correct_serde_format() {
+        // Verify that MusicValue uses the correct stainless-facts format
+        // This will fail at compile time if the serde attributes are wrong
+        assert_fact_value_format!(MusicValue::Title("Test".to_string()));
+        assert_fact_value_format!(MusicValue::Artist("Test Artist".to_string()));
+        assert_fact_value_format!(MusicValue::HasAlbumArt(true));
+    }
 }
