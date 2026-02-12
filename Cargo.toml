@@ -22,6 +22,7 @@ members = [
     "bases/beacon",
     "bases/mdma_console",
     "bases/mdma_library",
+    "bases/mdma_cli",
 ]
 resolver = "2"
 

@@ -3,7 +3,9 @@ use color_eyre::Result;
 
 mod fact_generator;
 mod fact_writer;
+pub mod ipc;
 mod pipeline;
+mod service;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -45,13 +47,29 @@ async fn main() -> Result<()> {
         "Starting MDMA Library service"
     );
 
-    // TODO: Initialize service
-    // 1. Create inbox watcher
-    // 2. Start nng IPC server
-    // 3. Process existing inbox files
-    // 4. Enter main loop
+    // Create directories if they don't exist
+    std::fs::create_dir_all(&args.music_dir.join("inbox"))?;
+    std::fs::create_dir_all(&args.music_dir.join("blobs"))?;
+    std::fs::create_dir_all(&args.music_dir.join("by-artist"))?;
+    std::fs::create_dir_all(&args.metadata_dir)?;
 
-    tracing::info!("MDMA Library service stub - implementation pending");
+    // Create socket directory if needed
+    if args.socket.starts_with("ipc://") {
+        if let Some(path) = args.socket.strip_prefix("ipc://") {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+    }
+
+    // Initialize service
+    let library = std::sync::Arc::new(service::LibraryService::new(
+        args.music_dir,
+        args.metadata_dir,
+    ));
+
+    // Run IPC server (blocking)
+    service::run_ipc_server(library, &args.socket)?;
 
     Ok(())
 }
