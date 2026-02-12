@@ -31,12 +31,8 @@ echo "  → Creating service script..."
 cat > "$PACKAGE_DIR/etc/sv/mdma-console/run" <<'RUNSCRIPT'
 #!/bin/sh
 exec 2>&1
-# Run as mdma user if exists, otherwise root
-if id mdma >/dev/null 2>&1; then
-    exec chpst -u mdma /usr/bin/mdma-console --port 80
-else
-    exec /usr/bin/mdma-console --port 80
-fi
+# Port 80 requires root privileges
+exec /usr/bin/mdma-console --port 80
 RUNSCRIPT
 chmod +x "$PACKAGE_DIR/etc/sv/mdma-console/run"
 

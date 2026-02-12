@@ -533,6 +533,15 @@ async fn enable_services(mount_root: &Path) -> Result<()> {
         "mdma-library",
     ];
 
+    // Create log directories for MDMA services
+    for log_dir in ["mdma-console", "mdma-library"] {
+        let log_path = mount_root.join(format!("var/log/{}", log_dir));
+        tokio::fs::create_dir_all(&log_path).await.map_err(|e| {
+            BeaconError::Provisioning(format!("Failed to create {}: {}", log_path.display(), e))
+        })?;
+        tracing::info!("  Created log directory: /var/log/{}", log_dir);
+    }
+
     for service in &services {
         tracing::info!("  Enabling {}...", service);
 
