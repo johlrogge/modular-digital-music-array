@@ -48,9 +48,9 @@ async fn main() -> Result<()> {
     );
 
     // Create directories if they don't exist
-    std::fs::create_dir_all(&args.music_dir.join("inbox"))?;
-    std::fs::create_dir_all(&args.music_dir.join("blobs"))?;
-    std::fs::create_dir_all(&args.music_dir.join("by-artist"))?;
+    std::fs::create_dir_all(args.music_dir.join("inbox"))?;
+    std::fs::create_dir_all(args.music_dir.join("blobs"))?;
+    std::fs::create_dir_all(args.music_dir.join("by-artist"))?;
     std::fs::create_dir_all(&args.metadata_dir)?;
 
     // Create socket directory if needed

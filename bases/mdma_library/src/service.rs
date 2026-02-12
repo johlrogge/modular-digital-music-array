@@ -219,7 +219,13 @@ pub fn run_ipc_server(service: Arc<LibraryService>, address: &str) -> Result<(),
             Ok(request) => {
                 let response = service.handle_request(request);
                 if let Err(e) = server.send(&response) {
-                    tracing::error!(error = %e, "Failed to send response");
+                    tracing::error!(error = %e, "Failed to send response, sending error fallback");
+                    let fallback = LibraryResponse::Error {
+                        message: format!("Internal error: {}", e),
+                    };
+                    if let Err(e2) = server.send(&fallback) {
+                        tracing::error!(error = %e2, "Failed to send fallback error response");
+                    }
                 }
             }
             Err(e) => {
