@@ -294,9 +294,43 @@ ci-check-deps:
 pkg-beacon: ci-build-beacon ci-strip-beacon
     ./scripts/package/create-package.sh
 
-# Create repository structure and index
+# Build mdma-library for CI
+[group('ci')]
+ci-build-library:
+    ./scripts/ci/build-library.sh
+
+# Build mdma-console for CI
+[group('ci')]
+ci-build-console:
+    ./scripts/ci/build-console.sh
+
+# Build mdma-library Void package
 [group('package')]
-pkg-repository: pkg-beacon
+pkg-library: ci-build-library
+    #!/usr/bin/env bash
+    set -euo pipefail
+    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-library"
+    if [ -f "$BINARY" ]; then
+        echo "Stripping mdma-library..."
+        aarch64-linux-gnu-strip "$BINARY" 2>/dev/null || strip "$BINARY" 2>/dev/null || true
+    fi
+    ./scripts/package/create-library-package.sh
+
+# Build mdma-console Void package
+[group('package')]
+pkg-console: ci-build-console
+    #!/usr/bin/env bash
+    set -euo pipefail
+    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-console"
+    if [ -f "$BINARY" ]; then
+        echo "Stripping mdma-console..."
+        aarch64-linux-gnu-strip "$BINARY" 2>/dev/null || strip "$BINARY" 2>/dev/null || true
+    fi
+    ./scripts/package/create-console-package.sh
+
+# Create repository structure and index (all packages)
+[group('package')]
+pkg-repository: pkg-beacon pkg-library pkg-console
     ./scripts/package/create-repository.sh
 
 # Full package build pipeline (what CI runs!)
@@ -306,6 +340,7 @@ pkg-build-all: check-prereqs pkg-repository
     @echo "🎉 Package build complete!"
     @echo ""
     @echo "Repository ready at: build/repository/"
+    @echo "Packages: beacon, mdma-library, mdma-console"
     @echo ""
     @echo "To test locally:"
     @echo "  1. Serve repository: just pkg-serve"
@@ -751,6 +786,18 @@ console-cross:
     file target/aarch64-unknown-linux-gnu/release/mdma-console
     ls -lh target/aarch64-unknown-linux-gnu/release/mdma-console
 
+# Cross-compile library service for aarch64
+[group('build')]
+library-cross:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Building mdma-library for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin mdma-library
+    echo ""
+    echo "Library built!"
+    file target/aarch64-unknown-linux-gnu/release/mdma-library
+    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-library
+
 # Deploy console to Pi
 [group('dev')]
 deploy-console: console-cross
@@ -790,3 +837,50 @@ deploy-console: console-cross
     echo "Console deployed!"
     echo ""
     echo "Access at: http://$HOST:3000"
+
+# Deploy library service to Pi
+[group('dev')]
+deploy-library: library-cross
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    HOST="mdma-909.local"
+    LIBRARY="target/aarch64-unknown-linux-gnu/release/mdma-library"
+    PASS="${PI_PASSWORD:-voidlinux}"
+
+    # Helper function for SSH commands
+    run_ssh() {
+        if ssh -4 -o BatchMode=yes -o ConnectTimeout=5 "root@${HOST}" true 2>/dev/null; then
+            ssh -4 "root@${HOST}" "$@"
+        else
+            sshpass -p "$PASS" ssh -4 -o StrictHostKeyChecking=no "root@${HOST}" "$@"
+        fi
+    }
+
+    # Helper function for SCP
+    run_scp() {
+        if ssh -4 -o BatchMode=yes -o ConnectTimeout=5 "root@${HOST}" true 2>/dev/null; then
+            scp -4 "$@"
+        else
+            sshpass -p "$PASS" scp -4 -o StrictHostKeyChecking=no "$@"
+        fi
+    }
+
+    echo "Deploying mdma-library to $HOST..."
+
+    # Copy binary to Pi
+    run_scp "$LIBRARY" "root@${HOST}:/tmp/"
+
+    # Stop service if running, move binary, create directories, start
+    run_ssh 'sv stop mdma-library 2>/dev/null || true; mv /tmp/mdma-library /usr/bin/; chmod +x /usr/bin/mdma-library; mkdir -p /etc/sv/mdma-library/log /var/log/mdma-library /music/inbox /music/blobs /metadata /run/mdma; if [ ! -f /etc/sv/mdma-library/run ]; then cat > /etc/sv/mdma-library/run << "EOF"
+#!/bin/sh
+exec 2>&1
+mkdir -p /music/inbox /music/blobs /metadata /run/mdma
+exec /usr/bin/mdma-library --music-dir /music --metadata-dir /metadata --socket ipc:///run/mdma/library.sock
+EOF
+chmod +x /etc/sv/mdma-library/run; echo "#!/bin/sh" > /etc/sv/mdma-library/log/run; echo "exec svlogd -tt /var/log/mdma-library" >> /etc/sv/mdma-library/log/run; chmod +x /etc/sv/mdma-library/log/run; ln -sf /etc/sv/mdma-library /var/service/mdma-library; sleep 2; fi; sv start mdma-library 2>/dev/null || true'
+
+    echo "Library deployed!"
+    echo ""
+    echo "Tailing logs (Ctrl+C to stop)..."
+    run_ssh 'tail -n 30 -f /var/log/mdma-library/current'

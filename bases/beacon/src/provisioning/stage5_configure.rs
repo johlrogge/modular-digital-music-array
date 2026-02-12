@@ -53,6 +53,9 @@ impl Action<ConfiguredFstab, ConfiguredSystem, ConfiguredSystem> for ConfigureSy
         let mount_root = planned_output.mount_root();
         let config = planned_output.config();
 
+        // 0. Update SD card system FIRST (ensures matching kernel versions)
+        update_sd_card_system().await?;
+
         // 1. Set hostname
         configure_hostname(mount_root, config.hostname.as_str()).await?;
 
@@ -68,21 +71,61 @@ impl Action<ConfiguredFstab, ConfiguredSystem, ConfiguredSystem> for ConfigureSy
         // 5. Configure sshd (disable root login)
         configure_sshd(mount_root).await?;
 
-        // 6. Install additional packages
+        // 6. Configure MDMA package repository
+        configure_mdma_repository(mount_root).await?;
+
+        // 7. Install Void Linux packages
         install_packages(mount_root).await?;
 
-        // 7. Enable services
+        // 8. Install MDMA packages (beacon, mdma-console, mdma-library)
+        install_mdma_packages(mount_root).await?;
+
+        // 9. Enable services
         enable_services(mount_root).await?;
 
-        // 8. Sync kernel from NVMe to SD card boot partition
+        // 10. Sync kernel from NVMe to SD card boot partition
+        // (kept as safety measure even though both should have matching versions)
         sync_kernel_to_sd_boot(mount_root).await?;
 
-        // 9. Configure boot to use NVMe root
+        // 11. Configure boot to use NVMe root
         configure_boot().await?;
 
         tracing::info!("✅ Stage 5: System configuration complete");
         Ok(planned_output.clone())
     }
+}
+
+/// Update the SD card (running system) before configuring NVMe
+///
+/// This ensures both SD and NVMe have matching kernel versions,
+/// allowing easy switching between boot sources via cmdline.txt.
+async fn update_sd_card_system() -> Result<()> {
+    tracing::info!("Updating SD card system packages (for kernel matching)");
+
+    // Sync and update all packages on the running system
+    let output = Command::new("xbps-install")
+        .args(["-Syu"])
+        .output()
+        .await
+        .map_err(|e| BeaconError::command_failed("xbps-install -Syu", e))?;
+
+    // Log output
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        tracing::info!("  [xbps] {}", line);
+    }
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Don't fail if already up to date
+        if !stderr.contains("up to date") {
+            tracing::warn!("xbps-install -Syu returned non-zero: {}", stderr);
+            // Continue anyway - kernel sync will handle mismatches
+        }
+    }
+
+    tracing::info!("✅ SD card system updated");
+    Ok(())
 }
 
 /// Set hostname from ProvisionConfig
@@ -355,9 +398,37 @@ async fn configure_sshd(mount_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Install additional packages
+/// Configure MDMA package repository
+///
+/// Adds the MDMA GitHub Pages repository to xbps.d so we can install
+/// beacon, mdma-console, mdma-library packages.
+async fn configure_mdma_repository(mount_root: &Path) -> Result<()> {
+    tracing::info!("Configuring MDMA package repository");
+
+    // Create xbps.d directory if needed
+    let xbps_d = mount_root.join("etc/xbps.d");
+    tokio::fs::create_dir_all(&xbps_d).await.map_err(|e| {
+        BeaconError::Provisioning(format!("Failed to create {}: {}", xbps_d.display(), e))
+    })?;
+
+    // Write repository configuration
+    let repo_conf = xbps_d.join("10-mdma.conf");
+    let repo_url = "repository=https://johlrogge.github.io/modular-digital-music-array/aarch64";
+
+    tokio::fs::write(&repo_conf, format!("{}\n", repo_url))
+        .await
+        .map_err(|e| {
+            BeaconError::Provisioning(format!("Failed to write {}: {}", repo_conf.display(), e))
+        })?;
+
+    tracing::info!("  Added MDMA repository: {}", repo_url);
+    tracing::info!("✅ MDMA repository configured");
+    Ok(())
+}
+
+/// Install additional packages (Void Linux base packages)
 async fn install_packages(mount_root: &Path) -> Result<()> {
-    tracing::info!("Installing additional packages");
+    tracing::info!("Installing additional Void Linux packages");
 
     let packages = [
         "openssh",
@@ -394,7 +465,48 @@ async fn install_packages(mount_root: &Path) -> Result<()> {
         )));
     }
 
-    tracing::info!("✅ Additional packages installed");
+    tracing::info!("✅ Void Linux packages installed");
+    Ok(())
+}
+
+/// Install MDMA packages from MDMA repository
+///
+/// Installs beacon, mdma-console, and mdma-library services.
+async fn install_mdma_packages(mount_root: &Path) -> Result<()> {
+    tracing::info!("Installing MDMA packages from MDMA repository");
+
+    let packages = ["beacon", "mdma-console", "mdma-library"];
+
+    tracing::info!("  Packages: {}", packages.join(", "));
+
+    // First sync the repository index to pick up the new MDMA repo
+    let output = Command::new("xbps-install")
+        .args(["-Sy", "-r"])
+        .arg(mount_root)
+        .args(&packages)
+        .output()
+        .await
+        .map_err(|e| BeaconError::command_failed("xbps-install mdma packages", e))?;
+
+    // Log output
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        tracing::info!("  [xbps] {}", line);
+    }
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Don't fail provisioning if MDMA packages aren't available yet
+        // This allows provisioning to work before packages are published
+        tracing::warn!(
+            "MDMA packages not installed (may not be published yet): {}",
+            stderr
+        );
+        tracing::warn!("You can install them manually later with: xbps-install beacon mdma-console mdma-library");
+        return Ok(());
+    }
+
+    tracing::info!("✅ MDMA packages installed");
     Ok(())
 }
 
