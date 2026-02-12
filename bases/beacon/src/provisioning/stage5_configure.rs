@@ -524,7 +524,14 @@ async fn install_mdma_packages(mount_root: &Path) -> Result<()> {
 async fn enable_services(mount_root: &Path) -> Result<()> {
     tracing::info!("Enabling services (runit)");
 
-    let services = ["sshd", "dhcpcd", "dbus", "avahi-daemon"];
+    let services = [
+        "sshd",
+        "dhcpcd",
+        "dbus",
+        "avahi-daemon",
+        "mdma-console",
+        "mdma-library",
+    ];
 
     for service in &services {
         tracing::info!("  Enabling {}...", service);

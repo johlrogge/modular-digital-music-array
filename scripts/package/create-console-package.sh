@@ -33,9 +33,9 @@ cat > "$PACKAGE_DIR/etc/sv/mdma-console/run" <<'RUNSCRIPT'
 exec 2>&1
 # Run as mdma user if exists, otherwise root
 if id mdma >/dev/null 2>&1; then
-    exec chpst -u mdma /usr/bin/mdma-console --port 3000
+    exec chpst -u mdma /usr/bin/mdma-console --port 80
 else
-    exec /usr/bin/mdma-console --port 3000
+    exec /usr/bin/mdma-console --port 80
 fi
 RUNSCRIPT
 chmod +x "$PACKAGE_DIR/etc/sv/mdma-console/run"
