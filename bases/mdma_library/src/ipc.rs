@@ -123,6 +123,13 @@ impl IpcServer {
         Ok(Self { socket })
     }
 
+    /// Add another listener address (nng supports multiple listeners on one socket)
+    pub fn listen_also(&self, address: &str) -> Result<(), IpcError> {
+        self.socket.listen(address)?;
+        tracing::info!(address = %address, "IPC server also listening");
+        Ok(())
+    }
+
     /// Receive a request (blocking)
     pub fn recv(&self) -> Result<LibraryRequest, IpcError> {
         let msg = self.socket.recv()?;

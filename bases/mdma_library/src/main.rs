@@ -25,6 +25,10 @@ struct Args {
     /// nng IPC socket path
     #[arg(long, default_value = "ipc:///run/mdma/library.sock")]
     socket: String,
+
+    /// Also listen on TCP for remote connections (e.g., "tcp://0.0.0.0:5555")
+    #[arg(long)]
+    tcp: Option<String>,
 }
 
 #[tokio::main]
@@ -74,7 +78,7 @@ async fn main() -> Result<()> {
     let library = std::sync::Arc::new(library);
 
     // Run IPC server (blocking)
-    service::run_ipc_server(library, &args.socket)?;
+    service::run_ipc_server(library, &args.socket, args.tcp.as_deref())?;
 
     Ok(())
 }

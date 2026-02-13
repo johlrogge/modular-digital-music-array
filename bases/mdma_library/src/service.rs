@@ -478,8 +478,17 @@ impl LibraryService {
 }
 
 /// Run the IPC server loop
-pub fn run_ipc_server(service: Arc<LibraryService>, address: &str) -> Result<(), ServiceError> {
+pub fn run_ipc_server(
+    service: Arc<LibraryService>,
+    address: &str,
+    tcp_address: Option<&str>,
+) -> Result<(), ServiceError> {
     let server = IpcServer::bind(address)?;
+
+    // Also listen on TCP if specified (for remote connections)
+    if let Some(tcp) = tcp_address {
+        server.listen_also(tcp)?;
+    }
 
     tracing::info!("IPC server running, waiting for requests...");
 
