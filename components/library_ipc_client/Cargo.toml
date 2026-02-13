@@ -1,0 +1,16 @@
+[package]
+name = "library-ipc-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+library-ipc-protocol = { path = "../library_ipc_protocol" }
+nng = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }

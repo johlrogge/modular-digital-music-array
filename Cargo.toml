@@ -3,7 +3,9 @@
 members = [
     # Components (bricks)
     "components/clock",
-    "components/flac_metadata",  
+    "components/flac_metadata",
+    "components/library_ipc_client",
+    "components/library_ipc_protocol",
     "components/media_client",
     "components/media_downloader",
     "components/media_protocol",

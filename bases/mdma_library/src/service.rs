@@ -3,9 +3,12 @@
 //! Handles IPC requests and manages library state
 
 use crate::fact_writer::FactWriter;
-use crate::ipc::{IpcServer, LibraryRequest, LibraryResponse, ServiceStatus, TrackInfo};
+use crate::ipc::{
+    Bpm, ContentHash, DurationSeconds, InboxPath, IngestAllItem, IngestResult, IpcServer, Key,
+    LibraryRequest, LibraryResponse, ProtocolError, ServiceStatus, TrackInfo,
+};
 use crate::pipeline::{InboxFile, UploadSource};
-use music_facts::{ContentHash, MusicValue};
+use music_facts::MusicValue;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -167,6 +170,11 @@ impl LibraryService {
         self.facts_count.load(Ordering::Relaxed)
     }
 
+    /// Resolve an InboxPath to an absolute filesystem path
+    fn resolve_inbox_path(&self, inbox_path: &InboxPath) -> PathBuf {
+        self.music_dir.join("inbox").join(inbox_path.as_str())
+    }
+
     /// Handle a single request
     pub fn handle_request(&self, request: LibraryRequest) -> LibraryResponse {
         tracing::debug!(?request, "Handling request");
@@ -179,32 +187,28 @@ impl LibraryService {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     tracks_indexed: self.tracks_indexed.load(Ordering::Relaxed),
                     facts_count: self.facts_count.load(Ordering::Relaxed),
-                    inbox_queue_size: self.get_inbox_queue().len(),
+                    inbox_queue_size: self.get_inbox_queue_internal().len(),
                     uptime_seconds: self.start_time.elapsed().as_secs(),
                 };
                 LibraryResponse::Status(status)
             }
 
             LibraryRequest::ListTracks { limit } => {
-                // TODO: Read from fact stream and aggregate
                 let tracks = self.list_tracks(limit);
                 LibraryResponse::Tracks(tracks)
             }
 
             LibraryRequest::GetTrack { hash } => match self.get_track(&hash) {
                 Ok(track) => LibraryResponse::Track(track),
-                Err(msg) => LibraryResponse::Error { message: msg },
+                Err(e) => LibraryResponse::Error(e),
             },
 
             LibraryRequest::GetFacts { hash } => match self.get_facts(&hash) {
-                Ok(facts) => {
-                    let full_hash = self.resolve_hash(&hash).unwrap_or_default();
-                    LibraryResponse::Facts {
-                        hash: full_hash,
-                        facts,
-                    }
-                }
-                Err(msg) => LibraryResponse::Error { message: msg },
+                Ok((full_hash, facts)) => LibraryResponse::Facts {
+                    hash: full_hash,
+                    facts,
+                },
+                Err(e) => LibraryResponse::Error(e),
             },
 
             LibraryRequest::Search { query } => {
@@ -218,25 +222,24 @@ impl LibraryService {
             }
 
             LibraryRequest::IngestFile { path } => {
-                // TODO: Trigger ingestion pipeline
-                match self.ingest_file(&path) {
-                    Ok(hash) => LibraryResponse::IngestResult {
-                        hash: Some(hash),
-                        success: true,
-                        message: "File ingested successfully".to_string(),
-                    },
-                    Err(e) => LibraryResponse::IngestResult {
-                        hash: None,
-                        success: false,
-                        message: e.to_string(),
-                    },
-                }
+                let result = self.ingest_inbox_file(&path);
+                LibraryResponse::IngestResult(result)
+            }
+
+            LibraryRequest::DeleteInboxFile { path } => {
+                let result = self.delete_inbox_file(&path);
+                LibraryResponse::IngestResult(result)
+            }
+
+            LibraryRequest::IngestAll => {
+                let results = self.ingest_all();
+                LibraryResponse::IngestAllResult(results)
             }
         }
     }
 
-    /// Get files in inbox directory
-    fn get_inbox_queue(&self) -> Vec<PathBuf> {
+    /// Get files in inbox directory (internal, returns PathBuf)
+    fn get_inbox_queue_internal(&self) -> Vec<PathBuf> {
         let inbox_dir = self.music_dir.join("inbox");
         if !inbox_dir.exists() {
             return vec![];
@@ -254,20 +257,37 @@ impl LibraryService {
             .unwrap_or_default()
     }
 
+    /// Get files in inbox directory as InboxPath values
+    fn get_inbox_queue(&self) -> Vec<InboxPath> {
+        self.get_inbox_queue_internal()
+            .into_iter()
+            .filter_map(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|s| InboxPath::new(s).ok())
+            })
+            .collect()
+    }
+
+    /// Convert internal track to protocol TrackInfo
+    fn to_track_info(&self, t: &IndexedTrackInfo) -> TrackInfo {
+        TrackInfo {
+            content_hash: t.content_hash.clone(),
+            title: t.title.clone(),
+            artist: t.artist.clone(),
+            album: t.album.clone(),
+            duration: t.duration_seconds.map(DurationSeconds),
+            bpm: t.bpm.and_then(|b| Bpm::from_f32(b).ok()),
+            key: t.key.as_ref().and_then(|k| Key::from_traditional(k).ok()),
+            blob_path: Some(t.blob_path.to_string_lossy().to_string()),
+        }
+    }
+
     /// List tracks from in-memory index
     fn list_tracks(&self, limit: Option<usize>) -> Vec<TrackInfo> {
         let tracks = self.tracks.lock().unwrap();
 
-        let iter = tracks.iter().map(|t| TrackInfo {
-            content_hash: t.content_hash.0.clone(),
-            title: t.title.clone(),
-            artist: t.artist.clone(),
-            album: t.album.clone(),
-            duration_seconds: t.duration_seconds,
-            bpm: t.bpm,
-            key: t.key.clone(),
-            blob_path: Some(self.music_dir.join(&t.blob_path)),
-        });
+        let iter = tracks.iter().map(|t| self.to_track_info(t));
 
         match limit {
             Some(n) => iter.take(n).collect(),
@@ -276,11 +296,11 @@ impl LibraryService {
     }
 
     /// Resolve a partial hash to a full hash (like git short refs)
-    /// Returns None if no match, Some(hash) if exactly one match, or error message if ambiguous
-    fn resolve_hash(&self, partial: &str) -> Result<String, String> {
+    fn resolve_hash(&self, partial: &ContentHash) -> Result<ContentHash, ProtocolError> {
         let partial_clean = partial
+            .0
             .strip_prefix("sha256:")
-            .unwrap_or(partial)
+            .unwrap_or(&partial.0)
             .to_lowercase();
 
         let tracks = self.tracks.lock().unwrap();
@@ -297,8 +317,10 @@ impl LibraryService {
             .collect();
 
         match matches.len() {
-            0 => Err(format!("No track found matching '{}'", partial)),
-            1 => Ok(matches[0].content_hash.0.clone()),
+            0 => Err(ProtocolError::TrackNotFound {
+                hash: partial.0.clone(),
+            }),
+            1 => Ok(matches[0].content_hash.clone()),
             n => {
                 let examples: Vec<_> = matches
                     .iter()
@@ -309,39 +331,37 @@ impl LibraryService {
                         format!("  {} ({})", short, name)
                     })
                     .collect();
-                Err(format!(
-                    "Ambiguous hash '{}' matches {} tracks:\n{}",
-                    partial,
-                    n,
-                    examples.join("\n")
-                ))
+                Err(ProtocolError::Internal {
+                    message: format!(
+                        "Ambiguous hash '{}' matches {} tracks:\n{}",
+                        partial.0,
+                        n,
+                        examples.join("\n")
+                    ),
+                })
             }
         }
     }
 
     /// Get track by hash from in-memory index (supports partial hashes)
-    fn get_track(&self, hash: &str) -> Result<TrackInfo, String> {
+    fn get_track(&self, hash: &ContentHash) -> Result<TrackInfo, ProtocolError> {
         let full_hash = self.resolve_hash(hash)?;
 
         let tracks = self.tracks.lock().unwrap();
         tracks
             .iter()
-            .find(|t| t.content_hash.0 == full_hash)
-            .map(|t| TrackInfo {
-                content_hash: t.content_hash.0.clone(),
-                title: t.title.clone(),
-                artist: t.artist.clone(),
-                album: t.album.clone(),
-                duration_seconds: t.duration_seconds,
-                bpm: t.bpm,
-                key: t.key.clone(),
-                blob_path: Some(self.music_dir.join(&t.blob_path)),
+            .find(|t| t.content_hash.0 == full_hash.0)
+            .map(|t| self.to_track_info(t))
+            .ok_or_else(|| ProtocolError::TrackNotFound {
+                hash: hash.0.clone(),
             })
-            .ok_or_else(|| "Track not found".to_string())
     }
 
     /// Get all facts for a track by hash (supports partial hashes)
-    fn get_facts(&self, hash: &str) -> Result<Vec<(String, String)>, String> {
+    fn get_facts(
+        &self,
+        hash: &ContentHash,
+    ) -> Result<(ContentHash, Vec<(String, String)>), ProtocolError> {
         use music_facts::FactSource;
         use stainless_facts::FactStreamReader;
 
@@ -349,19 +369,22 @@ impl LibraryService {
         let facts_path = self.metadata_dir.join("facts.jsonl");
 
         let reader: FactStreamReader<ContentHash, MusicValue, FactSource> =
-            FactStreamReader::open(&facts_path)
-                .map_err(|e| format!("Failed to open facts file: {}", e))?;
+            FactStreamReader::open(&facts_path).map_err(|e| ProtocolError::Internal {
+                message: format!("Failed to open facts file: {}", e),
+            })?;
 
         let facts: Vec<_> = reader
             .filter_map(|r| r.ok())
-            .filter(|f| f.entity().0 == full_hash)
+            .filter(|f| f.entity().0 == full_hash.0)
             .map(|f| format_fact_for_display(f.value()))
             .collect();
 
         if facts.is_empty() {
-            Err(format!("No facts found for {}", full_hash))
+            Err(ProtocolError::TrackNotFound {
+                hash: full_hash.0.clone(),
+            })
         } else {
-            Ok(facts)
+            Ok((full_hash, facts))
         }
     }
 
@@ -387,21 +410,69 @@ impl LibraryService {
                     .map_or(false, |s| s.to_lowercase().contains(&query_lower));
                 title_match || artist_match || album_match
             })
-            .map(|t| TrackInfo {
-                content_hash: t.content_hash.0.clone(),
-                title: t.title.clone(),
-                artist: t.artist.clone(),
-                album: t.album.clone(),
-                duration_seconds: t.duration_seconds,
-                bpm: t.bpm,
-                key: t.key.clone(),
-                blob_path: Some(self.music_dir.join(&t.blob_path)),
+            .map(|t| self.to_track_info(t))
+            .collect()
+    }
+
+    /// Ingest a file from the inbox
+    fn ingest_inbox_file(&self, inbox_path: &InboxPath) -> IngestResult {
+        let path = self.resolve_inbox_path(inbox_path);
+
+        match self.ingest_file_internal(&path) {
+            Ok(hash) => IngestResult {
+                hash: Some(hash),
+                success: true,
+                message: "File ingested successfully".to_string(),
+            },
+            Err(e) => IngestResult {
+                hash: None,
+                success: false,
+                message: e.to_string(),
+            },
+        }
+    }
+
+    /// Delete a file from the inbox without ingesting
+    fn delete_inbox_file(&self, inbox_path: &InboxPath) -> IngestResult {
+        let path = self.resolve_inbox_path(inbox_path);
+
+        if !path.exists() {
+            return IngestResult {
+                hash: None,
+                success: false,
+                message: format!("File not found: {}", inbox_path.as_str()),
+            };
+        }
+
+        match std::fs::remove_file(&path) {
+            Ok(()) => IngestResult {
+                hash: None,
+                success: true,
+                message: format!("Deleted: {}", inbox_path.as_str()),
+            },
+            Err(e) => IngestResult {
+                hash: None,
+                success: false,
+                message: format!("Failed to delete: {}", e),
+            },
+        }
+    }
+
+    /// Ingest all files in the inbox
+    fn ingest_all(&self) -> Vec<IngestAllItem> {
+        let inbox_paths = self.get_inbox_queue();
+
+        inbox_paths
+            .into_iter()
+            .map(|path| {
+                let result = self.ingest_inbox_file(&path);
+                IngestAllItem { path, result }
             })
             .collect()
     }
 
-    /// Ingest a file through the pipeline
-    fn ingest_file(&self, path: &PathBuf) -> Result<String, ServiceError> {
+    /// Ingest a file through the pipeline (internal, takes absolute path)
+    fn ingest_file_internal(&self, path: &PathBuf) -> Result<ContentHash, ServiceError> {
         if !path.exists() {
             return Err(ServiceError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -473,7 +544,7 @@ impl LibraryService {
         self.tracks_indexed.fetch_add(1, Ordering::Relaxed);
         self.facts_count.fetch_add(facts.len(), Ordering::Relaxed);
 
-        Ok(content_hash.0)
+        Ok(content_hash)
     }
 }
 
@@ -498,9 +569,9 @@ pub fn run_ipc_server(
                 let response = service.handle_request(request);
                 if let Err(e) = server.send(&response) {
                     tracing::error!(error = %e, "Failed to send response, sending error fallback");
-                    let fallback = LibraryResponse::Error {
+                    let fallback = LibraryResponse::Error(ProtocolError::Internal {
                         message: format!("Internal error: {}", e),
-                    };
+                    });
                     if let Err(e2) = server.send(&fallback) {
                         tracing::error!(error = %e2, "Failed to send fallback error response");
                     }

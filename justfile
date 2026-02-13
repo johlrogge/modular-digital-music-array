@@ -804,39 +804,32 @@ deploy-console: console-cross
     #!/usr/bin/env bash
     set -euo pipefail
 
-    HOST="mdma-909.local"
+    HOST="${PI_HOST:-mdma-909.local}"
     CONSOLE="target/aarch64-unknown-linux-gnu/release/mdma-console"
-    PASS="${PI_PASSWORD:-voidlinux}"
-
-    # Helper function for SSH commands
-    run_ssh() {
-        if ssh -4 -o BatchMode=yes -o ConnectTimeout=5 "root@${HOST}" true 2>/dev/null; then
-            ssh -4 "root@${HOST}" "$@"
-        else
-            sshpass -p "$PASS" ssh -4 -o StrictHostKeyChecking=no "root@${HOST}" "$@"
-        fi
-    }
-
-    # Helper function for SCP
-    run_scp() {
-        if ssh -4 -o BatchMode=yes -o ConnectTimeout=5 "root@${HOST}" true 2>/dev/null; then
-            scp -4 "$@"
-        else
-            sshpass -p "$PASS" scp -4 -o StrictHostKeyChecking=no "$@"
-        fi
-    }
+    SSH_KEY="$HOME/.ssh/mdma_pi"
 
     echo "Deploying console to $HOST..."
 
-    # Copy binary to Pi
-    run_scp "$CONSOLE" "root@${HOST}:/tmp/"
+    # Copy binary to Pi (use -4 to force IPv4, avoids IPv6 link-local issues)
+    scp -4 -i "$SSH_KEY" "$CONSOLE" "admin@${HOST}:/tmp/"
 
-    # Stop service if running, move binary, start
-    run_ssh 'sv stop mdma-console 2>/dev/null || true; mv /tmp/mdma-console /usr/bin/; chmod +x /usr/bin/mdma-console; mkdir -p /etc/sv/mdma-console/log /var/log/mdma-console; if [ ! -f /etc/sv/mdma-console/run ]; then echo "#!/bin/sh" > /etc/sv/mdma-console/run; echo "exec /usr/bin/mdma-console --port 3000 2>&1" >> /etc/sv/mdma-console/run; chmod +x /etc/sv/mdma-console/run; echo "#!/bin/sh" > /etc/sv/mdma-console/log/run; echo "exec svlogd -tt /var/log/mdma-console" >> /etc/sv/mdma-console/log/run; chmod +x /etc/sv/mdma-console/log/run; ln -sf /etc/sv/mdma-console /var/service/mdma-console; sleep 2; fi; sv start mdma-console 2>/dev/null || true'
+    # Stop service, move binary, set capability, update run script, start
+    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-console 2>/dev/null || true
+        sudo mv /tmp/mdma-console /usr/bin/
+        sudo chmod +x /usr/bin/mdma-console
+        sudo setcap "cap_net_bind_service=+ep" /usr/bin/mdma-console
+        sudo mkdir -p /etc/sv/mdma-console/log /var/log/mdma-console
+        printf "#!/bin/sh\nexec 2>&1\nexec chpst -u mdma /usr/bin/mdma-console --port 80\n" | sudo tee /etc/sv/mdma-console/run > /dev/null
+        sudo chmod +x /etc/sv/mdma-console/run
+        printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-console\n" | sudo tee /etc/sv/mdma-console/log/run > /dev/null
+        sudo chmod +x /etc/sv/mdma-console/log/run
+        sudo ln -sf /etc/sv/mdma-console /var/service/mdma-console 2>/dev/null || true
+        sleep 2
+        sudo sv start mdma-console 2>/dev/null || true
+        sudo sv status mdma-console'
 
-    echo "Console deployed!"
     echo ""
-    echo "Access at: http://$HOST:3000"
+    echo "Console deployed! Access at: http://$HOST/"
 
 # Deploy library service to Pi
 [group('dev')]
@@ -844,37 +837,29 @@ deploy-library: library-cross
     #!/usr/bin/env bash
     set -euo pipefail
 
-    HOST="mdma-909.local"
+    HOST="${PI_HOST:-mdma-909.local}"
     LIBRARY="target/aarch64-unknown-linux-gnu/release/mdma-library"
-    PASS="${PI_PASSWORD:-voidlinux}"
-
-    # Helper function for SSH commands
-    run_ssh() {
-        if ssh -4 -o BatchMode=yes -o ConnectTimeout=5 "root@${HOST}" true 2>/dev/null; then
-            ssh -4 "root@${HOST}" "$@"
-        else
-            sshpass -p "$PASS" ssh -4 -o StrictHostKeyChecking=no "root@${HOST}" "$@"
-        fi
-    }
-
-    # Helper function for SCP
-    run_scp() {
-        if ssh -4 -o BatchMode=yes -o ConnectTimeout=5 "root@${HOST}" true 2>/dev/null; then
-            scp -4 "$@"
-        else
-            sshpass -p "$PASS" scp -4 -o StrictHostKeyChecking=no "$@"
-        fi
-    }
+    SSH_KEY="$HOME/.ssh/mdma_pi"
 
     echo "Deploying mdma-library to $HOST..."
 
-    # Copy binary to Pi
-    run_scp "$LIBRARY" "root@${HOST}:/tmp/"
+    # Copy binary to Pi (use -4 to force IPv4, avoids IPv6 link-local issues)
+    scp -4 -i "$SSH_KEY" "$LIBRARY" "admin@${HOST}:/tmp/"
 
-    # Stop service if running, move binary, create directories, start
-    run_ssh 'sv stop mdma-library 2>/dev/null || true; mv /tmp/mdma-library /usr/bin/; chmod +x /usr/bin/mdma-library; mkdir -p /etc/sv/mdma-library/log /var/log/mdma-library /music/inbox /music/blobs /metadata /run/mdma; if [ ! -f /etc/sv/mdma-library/run ]; then echo "#!/bin/sh" > /etc/sv/mdma-library/run; echo "exec 2>&1" >> /etc/sv/mdma-library/run; echo "mkdir -p /music/inbox /music/blobs /metadata /run/mdma" >> /etc/sv/mdma-library/run; echo "exec /usr/bin/mdma-library --music-dir /music --metadata-dir /metadata --socket ipc:///run/mdma/library.sock" >> /etc/sv/mdma-library/run; chmod +x /etc/sv/mdma-library/run; echo "#!/bin/sh" > /etc/sv/mdma-library/log/run; echo "exec svlogd -tt /var/log/mdma-library" >> /etc/sv/mdma-library/log/run; chmod +x /etc/sv/mdma-library/log/run; ln -sf /etc/sv/mdma-library /var/service/mdma-library; sleep 2; fi; sv start mdma-library 2>/dev/null || true'
+    # Stop service, move binary, create directories, update run script, start
+    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-library 2>/dev/null || true
+        sudo mv /tmp/mdma-library /usr/bin/
+        sudo chmod +x /usr/bin/mdma-library
+        sudo mkdir -p /etc/sv/mdma-library/log /var/log/mdma-library /music/inbox /music/blobs /metadata /run/mdma
+        sudo chown -R mdma:mdma /music /metadata /run/mdma
+        printf "#!/bin/sh\nexec 2>&1\nexec chpst -u mdma /usr/bin/mdma-library --music-dir /music --metadata-dir /metadata --socket ipc:///run/mdma/library.sock\n" | sudo tee /etc/sv/mdma-library/run > /dev/null
+        sudo chmod +x /etc/sv/mdma-library/run
+        printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-library\n" | sudo tee /etc/sv/mdma-library/log/run > /dev/null
+        sudo chmod +x /etc/sv/mdma-library/log/run
+        sudo ln -sf /etc/sv/mdma-library /var/service/mdma-library 2>/dev/null || true
+        sleep 2
+        sudo sv start mdma-library 2>/dev/null || true
+        sudo sv status mdma-library'
 
-    echo "Library deployed!"
     echo ""
-    echo "Tailing logs (Ctrl+C to stop)..."
-    run_ssh 'tail -n 30 -f /var/log/mdma-library/current'
+    echo "Library deployed!"

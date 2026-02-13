@@ -82,9 +82,19 @@ Provides: Rust, Zig, cargo-zigbuild, PipeWire libs, nmap, sshpass, just
 
 ## Deployment
 
-**SSH to Pi:** `ssh root@welcome-to-mdma.local` (password: `voidlinux`)
+### SSH Access
 
-**Web UI:** `http://welcome-to-mdma.local`
+**Unprovisioned Pi (beacon mode):**
+```bash
+ssh root@welcome-to-mdma.local  # password: voidlinux
+```
+
+**Provisioned Pi:**
+```bash
+ssh -4 -i ~/.ssh/mdma_pi admin@mdma-909.local  # key-based auth, -4 forces IPv4
+```
+
+**Web UI:** `http://welcome-to-mdma.local` (beacon) or `http://mdma-909.local` (provisioned)
 
 **Package repo:** GitHub Pages at `https://johlrogge.github.io/modular-digital-music-array/`
 

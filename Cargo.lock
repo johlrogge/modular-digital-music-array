@@ -237,6 +237,7 @@ checksum = "edca88bc138befd0323b20752846e6587272d3b03b0343c8ea28a6f819e6e71f"
 dependencies = [
  "async-trait",
  "axum-core",
+ "axum-macros",
  "bytes",
  "futures-util",
  "http",
@@ -282,6 +283,17 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+]
+
+[[package]]
+name = "axum-macros"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57d123550fa8d071b7255cb0cc04dc302baa6c8c4a79f55701552684d8399bce"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.96",
 ]
 
 [[package]]
@@ -1494,6 +1506,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "library-ipc-client"
+version = "0.1.0"
+dependencies = [
+ "library-ipc-protocol",
+ "nng",
+ "rstest",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "library-ipc-protocol"
+version = "0.1.0"
+dependencies = [
+ "music-facts",
+ "rstest",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "libredox"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1607,9 +1641,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "color-eyre",
- "nng",
- "serde",
- "serde_json",
+ "library-ipc-client",
  "tabled",
 ]
 
@@ -1621,8 +1653,12 @@ dependencies = [
  "axum",
  "clap",
  "color-eyre",
+ "futures",
+ "library-ipc-client",
  "rstest",
  "serde",
+ "serde_json",
+ "thiserror",
  "tokio",
  "tower-http",
  "tracing",
@@ -1638,6 +1674,7 @@ dependencies = [
  "color-eyre",
  "flac-metadata",
  "hex",
+ "library-ipc-protocol",
  "music-facts",
  "music-primitives",
  "nng",

@@ -4,69 +4,9 @@
 
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-
-// =============================================================================
-// IPC Message Types (mirror of mdma-library/src/ipc.rs)
-// =============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum LibraryRequest {
-    GetStatus,
-    ListTracks { limit: Option<usize> },
-    GetTrack { hash: String },
-    GetFacts { hash: String },
-    Search { query: String },
-    GetInboxQueue,
-    IngestFile { path: PathBuf },
-    Ping,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrackInfo {
-    pub content_hash: String,
-    pub title: Option<String>,
-    pub artist: Option<String>,
-    pub album: Option<String>,
-    pub duration_seconds: Option<u32>,
-    pub bpm: Option<f32>,
-    pub key: Option<String>,
-    pub blob_path: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServiceStatus {
-    pub version: String,
-    pub tracks_indexed: usize,
-    pub facts_count: usize,
-    pub inbox_queue_size: usize,
-    pub uptime_seconds: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data")]
-pub enum LibraryResponse {
-    Status(ServiceStatus),
-    Tracks(Vec<TrackInfo>),
-    Track(TrackInfo),
-    Facts {
-        hash: String,
-        facts: Vec<(String, String)>,
-    },
-    SearchResults(Vec<TrackInfo>),
-    InboxQueue(Vec<PathBuf>),
-    IngestResult {
-        hash: Option<String>,
-        success: bool,
-        message: String,
-    },
-    Pong,
-    Error {
-        message: String,
-    },
-}
+use library_ipc_client::{
+    ClientError, ContentHash, InboxPath, LibraryClient, ProtocolError, TrackInfo,
+};
 
 // =============================================================================
 // CLI Definition
@@ -117,88 +57,41 @@ enum Commands {
         query: String,
     },
 
-    /// Show inbox queue
-    Inbox,
-
-    /// Ingest a file
-    Ingest {
-        /// Path to file to ingest
-        path: PathBuf,
+    /// Inbox management commands
+    Inbox {
+        #[command(subcommand)]
+        command: InboxCommands,
     },
 }
 
-// =============================================================================
-// IPC Client
-// =============================================================================
+#[derive(Subcommand, Debug)]
+enum InboxCommands {
+    /// List files in inbox
+    List,
 
-struct Client {
-    socket: nng::Socket,
-}
+    /// Delete a file from inbox without ingesting
+    Delete {
+        /// File name in inbox
+        filename: String,
+    },
 
-impl Client {
-    fn connect(address: &str) -> Result<Self> {
-        let socket = nng::Socket::new(nng::Protocol::Req0)?;
-        socket.dial(address)?;
-        Ok(Self { socket })
-    }
+    /// Ingest a specific file from inbox
+    Ingest {
+        /// File name in inbox
+        filename: String,
+    },
 
-    fn request(&self, request: &LibraryRequest) -> Result<LibraryResponse> {
-        let data = serde_json::to_vec(request)?;
-        let msg = nng::Message::from(&data[..]);
-        self.socket.send(msg).map_err(|(_, e)| e)?;
-
-        let response_msg = self.socket.recv()?;
-        let response: LibraryResponse = serde_json::from_slice(&response_msg)?;
-        Ok(response)
-    }
+    /// Ingest all files in inbox
+    IngestAll,
 }
 
 // =============================================================================
-// Command Handlers
+// Display Helpers
 // =============================================================================
-
-fn handle_ping(client: &Client) -> Result<()> {
-    match client.request(&LibraryRequest::Ping)? {
-        LibraryResponse::Pong => {
-            println!("pong - service is alive");
-            Ok(())
-        }
-        LibraryResponse::Error { message } => {
-            eprintln!("Error: {}", message);
-            std::process::exit(1);
-        }
-        other => {
-            eprintln!("Unexpected response: {:?}", other);
-            std::process::exit(1);
-        }
-    }
-}
-
-fn handle_status(client: &Client) -> Result<()> {
-    match client.request(&LibraryRequest::GetStatus)? {
-        LibraryResponse::Status(status) => {
-            println!("MDMA Library Service v{}", status.version);
-            println!("─────────────────────────────");
-            println!("Tracks indexed:  {}", status.tracks_indexed);
-            println!("Facts count:     {}", status.facts_count);
-            println!("Inbox queue:     {} files", status.inbox_queue_size);
-            println!("Uptime:          {} seconds", status.uptime_seconds);
-            Ok(())
-        }
-        LibraryResponse::Error { message } => {
-            eprintln!("Error: {}", message);
-            std::process::exit(1);
-        }
-        other => {
-            eprintln!("Unexpected response: {:?}", other);
-            std::process::exit(1);
-        }
-    }
-}
 
 /// Get a short hash for display (8 chars after sha256: prefix)
-fn short_hash(hash: &str) -> &str {
-    let clean = hash.strip_prefix("sha256:").unwrap_or(hash);
+fn short_hash(hash: &ContentHash) -> &str {
+    let clean = hash.0.strip_prefix("sha256:").unwrap_or(&hash.0);
     if clean.len() >= 8 {
         &clean[..8]
     } else {
@@ -206,46 +99,95 @@ fn short_hash(hash: &str) -> &str {
     }
 }
 
-fn handle_list(client: &Client, limit: Option<usize>) -> Result<()> {
-    match client.request(&LibraryRequest::ListTracks { limit })? {
-        LibraryResponse::Tracks(tracks) => {
+/// Format track for single-line display
+fn format_track_line(track: &TrackInfo) -> String {
+    let title = track.title.as_deref().unwrap_or("Unknown");
+    let artist = track.artist.as_deref().unwrap_or("Unknown");
+    format!("{} - {}", artist, title)
+}
+
+/// Handle client errors uniformly
+fn handle_error(err: ClientError) -> ! {
+    match err {
+        ClientError::Protocol(ProtocolError::TrackNotFound { hash }) => {
+            eprintln!("Track not found: {}", hash);
+        }
+        ClientError::Protocol(ProtocolError::InboxFileNotFound { path }) => {
+            eprintln!("Inbox file not found: {}", path);
+        }
+        ClientError::Protocol(e) => {
+            eprintln!("Error: {}", e);
+        }
+        ClientError::ConnectionFailed(msg) => {
+            eprintln!("Connection failed: {}", msg);
+            eprintln!("Is mdma-library running?");
+        }
+        e => {
+            eprintln!("Error: {}", e);
+        }
+    }
+    std::process::exit(1);
+}
+
+// =============================================================================
+// Command Handlers
+// =============================================================================
+
+fn handle_ping(client: &LibraryClient) -> Result<()> {
+    match client.ping() {
+        Ok(()) => {
+            println!("pong - service is alive");
+            Ok(())
+        }
+        Err(e) => handle_error(e),
+    }
+}
+
+fn handle_status(client: &LibraryClient) -> Result<()> {
+    match client.status() {
+        Ok(status) => {
+            println!("MDMA Library Service v{}", status.version);
+            println!("{}", "=".repeat(35));
+            println!("Tracks indexed:  {}", status.tracks_indexed);
+            println!("Facts count:     {}", status.facts_count);
+            println!("Inbox queue:     {} files", status.inbox_queue_size);
+            println!("Uptime:          {} seconds", status.uptime_seconds);
+            Ok(())
+        }
+        Err(e) => handle_error(e),
+    }
+}
+
+fn handle_list(client: &LibraryClient, limit: Option<usize>) -> Result<()> {
+    match client.list_tracks(limit) {
+        Ok(tracks) => {
             if tracks.is_empty() {
                 println!("No tracks in library");
                 return Ok(());
             }
 
             println!("Tracks in library ({}):", tracks.len());
-            println!("─────────────────────────────────────────────────────────────────");
+            println!("{}", "=".repeat(65));
 
             for track in tracks {
-                let title = track.title.as_deref().unwrap_or("Unknown");
-                let artist = track.artist.as_deref().unwrap_or("Unknown");
                 println!(
-                    "{} │ {} - {}",
+                    "{} | {}",
                     short_hash(&track.content_hash),
-                    artist,
-                    title
+                    format_track_line(&track)
                 );
             }
             Ok(())
         }
-        LibraryResponse::Error { message } => {
-            eprintln!("Error: {}", message);
-            std::process::exit(1);
-        }
-        other => {
-            eprintln!("Unexpected response: {:?}", other);
-            std::process::exit(1);
-        }
+        Err(e) => handle_error(e),
     }
 }
 
-fn handle_get(client: &Client, hash: String) -> Result<()> {
-    // Send hash as-is - server handles partial matching and normalization
-    match client.request(&LibraryRequest::GetTrack { hash })? {
-        LibraryResponse::Track(track) => {
-            println!("Track: {}", track.content_hash);
-            println!("─────────────────────────────────────────────────────────────────");
+fn handle_get(client: &LibraryClient, hash: String) -> Result<()> {
+    let content_hash = ContentHash(hash);
+    match client.get_track(&content_hash) {
+        Ok(track) => {
+            println!("Track: {}", track.content_hash.0);
+            println!("{}", "=".repeat(65));
             if let Some(title) = track.title {
                 println!("Title:    {}", title);
             }
@@ -255,152 +197,171 @@ fn handle_get(client: &Client, hash: String) -> Result<()> {
             if let Some(album) = track.album {
                 println!("Album:    {}", album);
             }
-            if let Some(duration) = track.duration_seconds {
-                println!("Duration: {}:{:02}", duration / 60, duration % 60);
+            if let Some(duration) = track.duration {
+                println!("Duration: {}", duration);
             }
             if let Some(bpm) = track.bpm {
-                println!("BPM:      {:.1}", bpm);
+                println!("BPM:      {}", bpm);
             }
             if let Some(key) = track.key {
                 println!("Key:      {}", key);
             }
             if let Some(path) = track.blob_path {
-                println!("Path:     {}", path.display());
+                println!("Path:     {}", path);
             }
             Ok(())
         }
-        LibraryResponse::Error { message } => {
-            eprintln!("Error: {}", message);
-            std::process::exit(1);
-        }
-        other => {
-            eprintln!("Unexpected response: {:?}", other);
-            std::process::exit(1);
-        }
+        Err(e) => handle_error(e),
     }
 }
 
-fn handle_facts(client: &Client, hash: String) -> Result<()> {
-    // Send hash as-is - server handles partial matching and normalization
-    match client.request(&LibraryRequest::GetFacts { hash })? {
-        LibraryResponse::Facts { hash, facts } => {
-            println!("Facts for: {}", hash);
-            println!("─────────────────────────────────────────────────────────────────");
+fn handle_facts(client: &LibraryClient, hash: String) -> Result<()> {
+    let content_hash = ContentHash(hash);
+    match client.get_facts(&content_hash) {
+        Ok((full_hash, facts)) => {
+            println!("Facts for: {}", full_hash.0);
+            println!("{}", "=".repeat(65));
             for (fact_type, fact_value) in facts {
-                println!("{:20} │ {}", fact_type, fact_value);
+                println!("{:20} | {}", fact_type, fact_value);
             }
             Ok(())
         }
-        LibraryResponse::Error { message } => {
-            eprintln!("Error: {}", message);
-            std::process::exit(1);
-        }
-        other => {
-            eprintln!("Unexpected response: {:?}", other);
-            std::process::exit(1);
-        }
+        Err(e) => handle_error(e),
     }
 }
 
-fn handle_search(client: &Client, query: String) -> Result<()> {
-    match client.request(&LibraryRequest::Search {
-        query: query.clone(),
-    })? {
-        LibraryResponse::SearchResults(tracks) => {
+fn handle_search(client: &LibraryClient, query: String) -> Result<()> {
+    match client.search(&query) {
+        Ok(tracks) => {
             if tracks.is_empty() {
                 println!("No tracks found matching '{}'", query);
                 return Ok(());
             }
 
             println!("Search results for '{}' ({} matches):", query, tracks.len());
-            println!("─────────────────────────────────────────────────────────────────");
+            println!("{}", "=".repeat(65));
 
             for track in tracks {
-                let title = track.title.as_deref().unwrap_or("Unknown");
-                let artist = track.artist.as_deref().unwrap_or("Unknown");
                 println!(
-                    "{} │ {} - {}",
+                    "{} | {}",
                     short_hash(&track.content_hash),
-                    artist,
-                    title
+                    format_track_line(&track)
                 );
             }
             Ok(())
         }
-        LibraryResponse::Error { message } => {
-            eprintln!("Error: {}", message);
-            std::process::exit(1);
-        }
-        other => {
-            eprintln!("Unexpected response: {:?}", other);
-            std::process::exit(1);
-        }
+        Err(e) => handle_error(e),
     }
 }
 
-fn handle_inbox(client: &Client) -> Result<()> {
-    match client.request(&LibraryRequest::GetInboxQueue)? {
-        LibraryResponse::InboxQueue(files) => {
+fn handle_inbox_list(client: &LibraryClient) -> Result<()> {
+    match client.inbox_queue() {
+        Ok(files) => {
             if files.is_empty() {
                 println!("Inbox is empty");
                 return Ok(());
             }
 
             println!("Inbox queue ({} files):", files.len());
-            println!("─────────────────────────────────────────────────────────────────");
+            println!("{}", "=".repeat(65));
 
             for file in files {
-                println!("  {}", file.display());
+                println!("  {}", file.as_str());
             }
             Ok(())
         }
-        LibraryResponse::Error { message } => {
-            eprintln!("Error: {}", message);
-            std::process::exit(1);
-        }
-        other => {
-            eprintln!("Unexpected response: {:?}", other);
-            std::process::exit(1);
-        }
+        Err(e) => handle_error(e),
     }
 }
 
-fn handle_ingest(client: &Client, path: PathBuf) -> Result<()> {
-    // Convert to absolute path
-    let path = if path.is_absolute() {
-        path
-    } else {
-        std::env::current_dir()?.join(path)
+fn handle_inbox_delete(client: &LibraryClient, filename: String) -> Result<()> {
+    let path = match InboxPath::new(&filename) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Invalid filename: {}", e);
+            std::process::exit(1);
+        }
     };
 
-    println!("Ingesting: {}", path.display());
-
-    match client.request(&LibraryRequest::IngestFile { path })? {
-        LibraryResponse::IngestResult {
-            hash,
-            success,
-            message,
-        } => {
-            if success {
-                if let Some(hash) = hash {
-                    println!("Success: {}", hash);
-                } else {
-                    println!("Success: {}", message);
-                }
+    match client.delete_inbox_file(&path) {
+        Ok(result) => {
+            if result.success {
+                println!("{}", result.message);
             } else {
-                eprintln!("Failed: {}", message);
+                eprintln!("Failed: {}", result.message);
                 std::process::exit(1);
             }
             Ok(())
         }
-        LibraryResponse::Error { message } => {
-            eprintln!("Error: {}", message);
+        Err(e) => handle_error(e),
+    }
+}
+
+fn handle_inbox_ingest(client: &LibraryClient, filename: String) -> Result<()> {
+    let path = match InboxPath::new(&filename) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Invalid filename: {}", e);
             std::process::exit(1);
         }
-        other => {
-            eprintln!("Unexpected response: {:?}", other);
-            std::process::exit(1);
+    };
+
+    println!("Ingesting: {}", filename);
+
+    match client.ingest_file(&path) {
+        Ok(result) => {
+            if result.success {
+                if let Some(hash) = result.hash {
+                    println!("Success: {}", hash.0);
+                } else {
+                    println!("Success: {}", result.message);
+                }
+            } else {
+                eprintln!("Failed: {}", result.message);
+                std::process::exit(1);
+            }
+            Ok(())
         }
+        Err(e) => handle_error(e),
+    }
+}
+
+fn handle_inbox_ingest_all(client: &LibraryClient) -> Result<()> {
+    println!("Ingesting all files in inbox...");
+
+    match client.ingest_all() {
+        Ok(results) => {
+            if results.is_empty() {
+                println!("Inbox is empty - nothing to ingest");
+                return Ok(());
+            }
+
+            let mut success_count = 0;
+            let mut fail_count = 0;
+
+            for item in results {
+                if item.result.success {
+                    success_count += 1;
+                    if let Some(hash) = item.result.hash {
+                        println!("  OK: {} -> {}", item.path.as_str(), short_hash(&hash));
+                    } else {
+                        println!("  OK: {}", item.path.as_str());
+                    }
+                } else {
+                    fail_count += 1;
+                    println!("  FAIL: {} - {}", item.path.as_str(), item.result.message);
+                }
+            }
+
+            println!();
+            println!("Done: {} succeeded, {} failed", success_count, fail_count);
+
+            if fail_count > 0 {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Err(e) => handle_error(e),
     }
 }
 
@@ -414,7 +375,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Connect to service
-    let client = match Client::connect(&cli.socket) {
+    let client = match LibraryClient::connect(&cli.socket) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to connect to service at {}: {}", cli.socket, e);
@@ -431,7 +392,11 @@ fn main() -> Result<()> {
         Commands::Get { hash } => handle_get(&client, hash),
         Commands::Facts { hash } => handle_facts(&client, hash),
         Commands::Search { query } => handle_search(&client, query),
-        Commands::Inbox => handle_inbox(&client),
-        Commands::Ingest { path } => handle_ingest(&client, path),
+        Commands::Inbox { command } => match command {
+            InboxCommands::List => handle_inbox_list(&client),
+            InboxCommands::Delete { filename } => handle_inbox_delete(&client, filename),
+            InboxCommands::Ingest { filename } => handle_inbox_ingest(&client, filename),
+            InboxCommands::IngestAll => handle_inbox_ingest_all(&client),
+        },
     }
 }

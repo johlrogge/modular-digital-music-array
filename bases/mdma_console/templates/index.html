@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MDMA Console</title>
+    <style>
+        :root {
+            --bg-dark: #1a1a2e;
+            --bg-card: #16213e;
+            --text: #eee;
+            --text-muted: #888;
+            --accent: #00d9ff;
+            --success: #00ff88;
+            --error: #ff4757;
+            --border: #2a2a4e;
+        }
+        * { box-sizing: border-box; }
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 20px;
+            background: var(--bg-dark);
+            color: var(--text);
+        }
+        h1 { color: var(--accent); margin-bottom: 5px; }
+        .version { color: var(--text-muted); margin-bottom: 30px; }
+        .card {
+            background: var(--bg-card);
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        .card h2 {
+            margin-top: 0;
+            color: var(--text);
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 10px;
+        }
+        table { width: 100%; border-collapse: collapse; }
+        th, td {
+            text-align: left;
+            padding: 10px 8px;
+            border-bottom: 1px solid var(--border);
+        }
+        th { color: var(--text-muted); font-weight: normal; font-size: 0.9em; }
+        .btn {
+            background: var(--accent);
+            color: var(--bg-dark);
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.9em;
+            font-weight: 500;
+        }
+        .btn:hover { opacity: 0.9; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-secondary { background: var(--border); color: var(--text); }
+        .btn-small { padding: 4px 12px; font-size: 0.85em; }
+        .update-available { color: var(--success); }
+        .no-update { color: var(--text-muted); }
+        .status-msg { padding: 10px; border-radius: 4px; margin: 10px 0; }
+        .status-success {
+            background: rgba(0, 255, 136, 0.1);
+            border: 1px solid var(--success);
+            color: var(--success);
+        }
+        .status-error {
+            background: rgba(255, 71, 87, 0.1);
+            border: 1px solid var(--error);
+            color: var(--error);
+        }
+        .inbox-list { list-style: none; padding: 0; margin: 0; }
+        .inbox-list li { padding: 8px 0; border-bottom: 1px solid var(--border); }
+        .inbox-list li:last-child { border-bottom: none; }
+        .empty-msg { color: var(--text-muted); font-style: italic; }
+        .actions { margin-top: 15px; display: flex; gap: 10px; }
+        #status-area { display: none; }
+        .loading {
+            display: inline-block;
+            width: 16px; height: 16px;
+            border: 2px solid var(--text-muted);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <h1>MDMA Console</h1>
+    <p class="version">v{{ version }}</p>
+
+    <div id="status-area"></div>
+
+    <div class="card">
+        <h2>Package Management</h2>
+        {% if packages.is_empty() %}
+        <p class="empty-msg">No MDMA packages installed</p>
+        {% else %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Package</th>
+                    <th>Version</th>
+                    <th>Update</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for pkg in packages %}
+                <tr>
+                    <td>{{ pkg.name }}</td>
+                    <td>{{ pkg.version }}</td>
+                    <td>
+                        {% match pkg.update_version %}
+                            {% when Some with (ver) %}
+                                <span class="update-available">{{ ver }}</span>
+                            {% when None %}
+                                <span class="no-update">-</span>
+                        {% endmatch %}
+                    </td>
+                    <td>
+                        {% if pkg.has_update %}
+                        <button class="btn btn-small" onclick="updatePackage('{{ pkg.name }}')">Update</button>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+        <div class="actions">
+            <button class="btn btn-secondary" onclick="checkUpdates()">Check for Updates</button>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Music Inbox</h2>
+        {% if inbox.is_empty() %}
+        <p class="empty-msg">Inbox is empty</p>
+        {% else %}
+        <p>{{ inbox.len() }} file(s) waiting</p>
+        <ul class="inbox-list">
+            {% for file in inbox %}
+            <li>{{ file }}</li>
+            {% endfor %}
+        </ul>
+        {% endif %}
+        <div class="actions">
+            <button class="btn" onclick="ingestAll()" {% if inbox.is_empty() %}disabled{% endif %}>Ingest All</button>
+        </div>
+    </div>
+
+    <script>
+        function showStatus(message, isError) {
+            const area = document.getElementById('status-area');
+            area.style.display = 'block';
+            area.className = 'status-msg ' + (isError ? 'status-error' : 'status-success');
+            area.textContent = message;
+            setTimeout(() => { area.style.display = 'none'; }, 5000);
+        }
+
+        function showLoading(btn) {
+            btn.disabled = true;
+            btn.innerHTML = '<span class="loading"></span>Working...';
+        }
+
+        async function checkUpdates() {
+            const btn = event.target;
+            showLoading(btn);
+            try {
+                const response = await fetch('/check-updates', { method: 'POST' });
+                if (response.ok) {
+                    location.reload();
+                } else {
+                    const text = await response.text();
+                    showStatus('Failed: ' + text, true);
+                    btn.disabled = false;
+                    btn.textContent = 'Check for Updates';
+                }
+            } catch (e) {
+                showStatus('Error: ' + e.message, true);
+                btn.disabled = false;
+                btn.textContent = 'Check for Updates';
+            }
+        }
+
+        async function updatePackage(name) {
+            const btn = event.target;
+            showLoading(btn);
+            try {
+                const response = await fetch('/update/' + encodeURIComponent(name), { method: 'POST' });
+                if (response.ok) {
+                    showStatus('Package ' + name + ' updated successfully', false);
+                    setTimeout(() => location.reload(), 1000);
+                } else {
+                    const text = await response.text();
+                    showStatus('Failed to update ' + name + ': ' + text, true);
+                    btn.disabled = false;
+                    btn.textContent = 'Update';
+                }
+            } catch (e) {
+                showStatus('Error: ' + e.message, true);
+                btn.disabled = false;
+                btn.textContent = 'Update';
+            }
+        }
+
+        async function ingestAll() {
+            const btn = event.target;
+            showLoading(btn);
+            try {
+                const response = await fetch('/ingest-all', { method: 'POST' });
+                const data = await response.json();
+                if (response.ok) {
+                    const success = data.filter(r => r.success).length;
+                    const fail = data.filter(r => !r.success).length;
+                    showStatus('Ingested ' + success + ' file(s), ' + fail + ' failed', fail > 0);
+                    setTimeout(() => location.reload(), 1000);
+                } else {
+                    showStatus('Failed: ' + (data.error || 'Unknown error'), true);
+                    btn.disabled = false;
+                    btn.textContent = 'Ingest All';
+                }
+            } catch (e) {
+                showStatus('Error: ' + e.message, true);
+                btn.disabled = false;
+                btn.textContent = 'Ingest All';
+            }
+        }
+    </script>
+</body>
+</html>

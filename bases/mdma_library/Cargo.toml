@@ -21,6 +21,7 @@ thiserror = { workspace = true }
 music-facts = { path = "../../components/music_facts" }
 music-primitives = { path = "../../components/music_primitives" }
 flac-metadata = { path = "../../components/flac_metadata" }
+library-ipc-protocol = { path = "../../components/library_ipc_protocol" }
 
 # Fact stream
 stainless-facts = { git = "https://github.com/johlrogge/stainless_facts" }
