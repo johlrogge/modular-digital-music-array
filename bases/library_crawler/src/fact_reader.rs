@@ -51,10 +51,10 @@ impl FactAggregator<ContentHash, MusicValue, FactSource> for AggregatedTrack {
 
         match value {
             FilePath(path) => self.file_path = Some(path.clone()),
-            Title(s) => self.title = Some(s.clone()),
-            Artist(s) => self.artist = Some(s.clone()),
-            Album(s) => self.album = Some(s.clone()),
-            AlbumArtist(s) => self.album_artist = Some(s.clone()),
+            Title(s) => self.title = Some(s.0.clone()),
+            Artist(s) => self.artist = Some(s.0.clone()),
+            Album(s) => self.album = Some(s.0.clone()),
+            AlbumArtist(s) => self.album_artist = Some(s.0.clone()),
             TrackNumber(n) => self.track_number = Some(n.0),
             Year(y) => self.year = Some(y.0),
             Bpm(bpm) => self.bpm = Some(format!("{:.2}", bpm.as_f32())),
@@ -209,7 +209,7 @@ impl AggregatedTrack {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use music_facts::FactOrigin;
+    use music_facts::{Artist, FactOrigin, Title};
     use music_primitives::Bpm;
     use stainless_facts::{Fact, FactStreamWriter, Operation};
     use tempfile::NamedTempFile;
@@ -225,14 +225,14 @@ mod tests {
         let facts = vec![
             Fact::new(
                 content_hash.clone(),
-                MusicValue::Title("Test Track".to_string()),
+                MusicValue::Title(Title::new("Test Track")),
                 now,
                 source.clone(),
                 Operation::Assert,
             ),
             Fact::new(
                 content_hash.clone(),
-                MusicValue::Artist("Test Artist".to_string()),
+                MusicValue::Artist(Artist::new("Test Artist")),
                 now,
                 source.clone(),
                 Operation::Assert,
@@ -273,21 +273,21 @@ mod tests {
         let facts = vec![
             Fact::new(
                 content_hash.clone(),
-                MusicValue::Title("First Title".to_string()),
+                MusicValue::Title(Title::new("First Title")),
                 now,
                 source.clone(),
                 Operation::Assert,
             ),
             Fact::new(
                 content_hash.clone(),
-                MusicValue::Title("First Title".to_string()),
+                MusicValue::Title(Title::new("First Title")),
                 now,
                 source.clone(),
                 Operation::Retract,
             ),
             Fact::new(
                 content_hash.clone(),
-                MusicValue::Title("Second Title".to_string()),
+                MusicValue::Title(Title::new("Second Title")),
                 now,
                 source.clone(),
                 Operation::Assert,

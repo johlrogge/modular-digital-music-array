@@ -2,8 +2,8 @@
 
 use flac_metadata::{discover_all_fields, extract_metadata, TrackMetadata};
 use music_facts::{
-    BitDepth, Bitrate, Channels, ContentHash, DurationSeconds, FactOrigin, FactSource,
-    FileSizeBytes, Isrc, MusicValue, SampleRate, TrackNumber, Year,
+    Album, Artist, BitDepth, Bitrate, Channels, ContentHash, DurationSeconds, FactOrigin,
+    FactSource, FileSizeBytes, Isrc, MusicValue, SampleRate, Title, TrackNumber, Year,
 };
 use music_primitives::{Bpm, Key};
 use std::collections::HashMap;
@@ -51,20 +51,20 @@ fn generate_facts_from_metadata(
 
     // Basic metadata
     if let Some(ref title) = metadata.title {
-        facts.push((MusicValue::Title(title.clone()), source.clone()));
+        facts.push((MusicValue::Title(Title::new(title)), source.clone()));
     }
 
     if let Some(ref artist) = metadata.artist {
-        facts.push((MusicValue::Artist(artist.clone()), source.clone()));
+        facts.push((MusicValue::Artist(Artist::new(artist)), source.clone()));
     }
 
     if let Some(ref album) = metadata.album {
-        facts.push((MusicValue::Album(album.clone()), source.clone()));
+        facts.push((MusicValue::Album(Album::new(album)), source.clone()));
     }
 
     if let Some(ref album_artist) = metadata.album_artist {
         facts.push((
-            MusicValue::AlbumArtist(album_artist.clone()),
+            MusicValue::AlbumArtist(Artist::new(album_artist)),
             source.clone(),
         ));
     }

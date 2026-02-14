@@ -60,7 +60,7 @@ impl FactWriter {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use music_facts::FactOrigin;
+    use music_facts::{FactOrigin, Title};
     use tempfile::NamedTempFile;
 
     #[test]
@@ -72,7 +72,7 @@ mod tests {
 
         let fact = Fact::new(
             content_hash,
-            MusicValue::Title("Test Track".to_string()),
+            MusicValue::Title(Title::new("Test Track")),
             now,
             source,
             Operation::Assert,

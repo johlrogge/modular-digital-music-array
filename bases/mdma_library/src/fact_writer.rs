@@ -79,7 +79,7 @@ impl FactWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use music_facts::FactOrigin;
+    use music_facts::{Artist, FactOrigin, Title};
     use tempfile::NamedTempFile;
 
     #[test]
@@ -89,9 +89,9 @@ mod tests {
         let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
 
         let facts = vec![
-            (MusicValue::Title("Test Track".to_string()), source.clone()),
+            (MusicValue::Title(Title::new("Test Track")), source.clone()),
             (
-                MusicValue::Artist("Test Artist".to_string()),
+                MusicValue::Artist(Artist::new("Test Artist")),
                 source.clone(),
             ),
         ];

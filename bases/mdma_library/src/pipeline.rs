@@ -253,9 +253,9 @@ fn create_symlink(
 
     for (value, _source) in facts {
         match value {
-            MusicValue::Artist(a) => artist = Some(a.clone()),
-            MusicValue::Album(a) => album = Some(a.clone()),
-            MusicValue::Title(t) => title = Some(t.clone()),
+            MusicValue::Artist(a) => artist = Some(a.0.clone()),
+            MusicValue::Album(a) => album = Some(a.0.clone()),
+            MusicValue::Title(t) => title = Some(t.0.clone()),
             MusicValue::TrackNumber(n) => track_num = Some(n.0),
             _ => {}
         }

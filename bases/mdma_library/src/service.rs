@@ -136,9 +136,9 @@ impl LibraryService {
 
             // Extract key fields for search
             match fact.value() {
-                MusicValue::Title(v) => entry.title = Some(v.clone()),
-                MusicValue::Artist(v) => entry.artist = Some(v.clone()),
-                MusicValue::Album(v) => entry.album = Some(v.clone()),
+                MusicValue::Title(v) => entry.title = Some(v.0.clone()),
+                MusicValue::Artist(v) => entry.artist = Some(v.0.clone()),
+                MusicValue::Album(v) => entry.album = Some(v.0.clone()),
                 MusicValue::DurationSeconds(v) => entry.duration_seconds = Some(v.0),
                 MusicValue::Bpm(v) => entry.bpm = Some(v.as_f32()),
                 MusicValue::Key(v) => entry.key = Some(v.to_string()),
@@ -518,9 +518,9 @@ impl LibraryService {
 
             for (value, _source) in &facts {
                 match value {
-                    MusicValue::Title(t) => title = Some(t.clone()),
-                    MusicValue::Artist(a) => artist = Some(a.clone()),
-                    MusicValue::Album(a) => album = Some(a.clone()),
+                    MusicValue::Title(t) => title = Some(t.0.clone()),
+                    MusicValue::Artist(a) => artist = Some(a.0.clone()),
+                    MusicValue::Album(a) => album = Some(a.0.clone()),
                     MusicValue::DurationSeconds(d) => duration_seconds = Some(d.0),
                     MusicValue::Bpm(b) => bpm = Some(b.as_f32()),
                     MusicValue::Key(k) => key = Some(k.to_string()),

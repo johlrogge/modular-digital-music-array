@@ -21,16 +21,16 @@ pub enum MusicValue {
     // Basic Metadata (from tags)
     // ========================================================================
     /// Track title
-    Title(String),
+    Title(Title),
 
     /// Artist name
-    Artist(String),
+    Artist(Artist),
 
     /// Album name
-    Album(String),
+    Album(Album),
 
     /// Album artist (for compilations)
-    AlbumArtist(String),
+    AlbumArtist(Artist),
 
     /// Track number on album
     TrackNumber(TrackNumber),
@@ -214,8 +214,8 @@ mod tests {
     fn music_value_has_correct_serde_format() {
         // Verify that MusicValue uses the correct stainless-facts format
         // This will fail at compile time if the serde attributes are wrong
-        assert_fact_value_format!(MusicValue::Title("Test".to_string()));
-        assert_fact_value_format!(MusicValue::Artist("Test Artist".to_string()));
+        assert_fact_value_format!(MusicValue::Title(Title::new("Test")));
+        assert_fact_value_format!(MusicValue::Artist(Artist::new("Test Artist")));
         assert_fact_value_format!(MusicValue::HasAlbumArt(true));
     }
 }
