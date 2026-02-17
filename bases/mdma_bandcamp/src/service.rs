@@ -11,7 +11,7 @@ use crate::ipc::{
 use bandcamp_api::{AudioFormat, BandcampClient, CollectionItem};
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -312,6 +312,156 @@ fn api_item_id_to_protocol(id: &bandcamp_api::ItemId) -> ItemId {
     ItemId::new(id.as_str())
 }
 
+/// Supported audio file extensions
+const AUDIO_EXTENSIONS: &[&str] = &["flac", "mp3", "wav", "aif", "aiff"];
+
+/// Check if a file has an audio extension
+fn is_audio_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| AUDIO_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Detect file type by magic bytes
+fn detect_file_type(path: &Path) -> Option<&'static str> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic).ok()?;
+
+    match &magic {
+        // ZIP: PK\x03\x04
+        [0x50, 0x4B, 0x03, 0x04] => Some("zip"),
+        // FLAC: fLaC
+        [0x66, 0x4C, 0x61, 0x43] => Some("flac"),
+        // MP3: ID3 or \xFF\xFB
+        [0x49, 0x44, 0x33, _] => Some("mp3"),
+        [0xFF, 0xFB, _, _] => Some("mp3"),
+        // WAV: RIFF
+        [0x52, 0x49, 0x46, 0x46] => Some("wav"),
+        // AIFF: FORM
+        [0x46, 0x4F, 0x52, 0x4D] => Some("aiff"),
+        _ => None,
+    }
+}
+
+/// Process a downloaded file - extract if ZIP, move if audio file.
+/// Returns the list of files moved to inbox.
+fn process_download_to_inbox(
+    download_path: &Path,
+    inbox_dir: &Path,
+    artist: &str,
+    title: &str,
+) -> Result<Vec<PathBuf>, std::io::Error> {
+    let file_type = detect_file_type(download_path);
+    tracing::debug!(path = %download_path.display(), file_type = ?file_type, "Detected file type");
+
+    match file_type {
+        Some("zip") => extract_zip_to_inbox(download_path, inbox_dir),
+        Some(ext @ ("flac" | "mp3" | "wav" | "aiff")) => {
+            // Single track - move directly to inbox with proper name
+            let safe_artist = sanitize_filename(artist);
+            let safe_title = sanitize_filename(title);
+            let filename = format!("{} - {}.{}", safe_artist, safe_title, ext);
+            let dest_path = unique_path(inbox_dir, &filename);
+
+            std::fs::rename(download_path, &dest_path)?;
+            tracing::info!(dest = %dest_path.display(), "Moved audio file to inbox");
+            Ok(vec![dest_path])
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Unknown file type for {:?}", download_path),
+        )),
+    }
+}
+
+/// Sanitize a string for use in filenames
+fn sanitize_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c => c,
+        })
+        .collect()
+}
+
+/// Generate a unique path, adding suffix if file exists
+fn unique_path(dir: &Path, filename: &str) -> PathBuf {
+    let dest_path = dir.join(filename);
+    if !dest_path.exists() {
+        return dest_path;
+    }
+
+    let path = Path::new(filename);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("flac");
+
+    let mut counter = 1;
+    loop {
+        let new_name = format!("{}_{}.{}", stem, counter, ext);
+        let new_path = dir.join(&new_name);
+        if !new_path.exists() {
+            return new_path;
+        }
+        counter += 1;
+    }
+}
+
+/// Extract audio files from a ZIP archive to the inbox directory.
+/// Returns the list of extracted file paths.
+fn extract_zip_to_inbox(zip_path: &Path, inbox_dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let file = std::fs::File::open(zip_path)?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    let mut extracted = Vec::new();
+
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        // Skip directories
+        if entry.is_dir() {
+            continue;
+        }
+
+        let entry_path = match entry.enclosed_name() {
+            Some(p) => p.to_path_buf(),
+            None => continue, // Skip entries with invalid paths
+        };
+
+        // Only extract audio files
+        if !is_audio_file(&entry_path) {
+            tracing::debug!(path = %entry_path.display(), "Skipping non-audio file");
+            continue;
+        }
+
+        // Use just the filename, not the full path from the ZIP
+        let filename = match entry_path.file_name().and_then(|f| f.to_str()) {
+            Some(f) => f.to_string(),
+            None => continue,
+        };
+
+        let final_path = unique_path(inbox_dir, &filename);
+
+        // Extract the file
+        let mut outfile = std::fs::File::create(&final_path)?;
+        std::io::copy(&mut entry, &mut outfile)?;
+
+        tracing::info!(
+            source = %entry_path.display(),
+            dest = %final_path.display(),
+            "Extracted audio file"
+        );
+        extracted.push(final_path);
+    }
+
+    Ok(extracted)
+}
+
 /// Run the async IPC server
 ///
 /// This spawns a blocking task for NNG recv/send and bridges to async via channels.
@@ -473,8 +623,8 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
             }
         };
 
-        // Download to staging directory
-        let staging_path = service.downloads_dir.join(format!("{}.zip", item_id));
+        // Download to staging directory (use .download extension, actual type detected later)
+        let staging_path = service.downloads_dir.join(format!("{}.download", item_id));
 
         use tokio_stream::StreamExt;
         let mut stream =
@@ -508,34 +658,85 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
                         }
                     }
 
-                    // TODO: Extract ZIP and move to inbox
-                    // For now, just move the ZIP to inbox
-                    let inbox_path = service.inbox_dir.join(format!("{}.zip", item_id));
-                    if let Err(e) = tokio::fs::rename(&path, &inbox_path).await {
-                        tracing::error!(error = %e, "Failed to move to inbox");
-                        let mut active = service.active_downloads.lock();
-                        if let Some(dl) = active.get_mut(&item_id) {
-                            dl.state = DownloadState::Failed;
-                            dl.error = Some(format!("Failed to move: {}", e));
-                        }
-                        service.downloads_failed.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        // Mark as completed
-                        let mut active = service.active_downloads.lock();
-                        if let Some(dl) = active.get_mut(&item_id) {
-                            dl.state = DownloadState::Completed;
-                        }
-                        service.downloads_completed.fetch_add(1, Ordering::Relaxed);
+                    // Process download - extract ZIP or move single track
+                    let inbox_dir = service.inbox_dir.clone();
+                    let download_path = path.clone();
+                    let artist = queued.item.artist.to_string();
+                    let title = queued.item.title.to_string();
 
-                        // Update cache
-                        let cache_key = format!(
-                            "{}|{}|{}|0",
-                            queued.item.artist,
-                            queued.item.title,
-                            queued.item.id.as_str()
-                        );
-                        if let Err(e) = service.cache.lock().mark_downloaded(&cache_key, &item_id) {
-                            tracing::warn!(error = %e, "Failed to update cache");
+                    // Run in blocking task since file I/O is sync
+                    let extract_result = tokio::task::spawn_blocking(move || {
+                        process_download_to_inbox(&download_path, &inbox_dir, &artist, &title)
+                    })
+                    .await;
+
+                    match extract_result {
+                        Ok(Ok(extracted_files)) => {
+                            tracing::info!(
+                                item_id = %item_id,
+                                files = extracted_files.len(),
+                                "Extracted audio files to inbox"
+                            );
+
+                            // Update state to moving (already done, just update status)
+                            {
+                                let mut active = service.active_downloads.lock();
+                                if let Some(dl) = active.get_mut(&item_id) {
+                                    dl.state = DownloadState::Moving;
+                                }
+                            }
+
+                            // Delete the source file (ZIP after extraction)
+                            // For single tracks, the file was moved so this will fail - that's OK
+                            if path.exists() {
+                                if let Err(e) = tokio::fs::remove_file(&path).await {
+                                    tracing::warn!(error = %e, "Failed to delete source file");
+                                }
+                            }
+
+                            // Mark as completed
+                            {
+                                let mut active = service.active_downloads.lock();
+                                if let Some(dl) = active.get_mut(&item_id) {
+                                    dl.state = DownloadState::Completed;
+                                }
+                            }
+                            service.downloads_completed.fetch_add(1, Ordering::Relaxed);
+
+                            // Update cache for each extracted file
+                            for file_path in &extracted_files {
+                                let filename = file_path
+                                    .file_name()
+                                    .and_then(|f| f.to_str())
+                                    .unwrap_or("unknown");
+                                let cache_key = format!(
+                                    "{}|{}|{}|0",
+                                    queued.item.artist, queued.item.title, filename
+                                );
+                                if let Err(e) =
+                                    service.cache.lock().mark_downloaded(&cache_key, &item_id)
+                                {
+                                    tracing::warn!(error = %e, "Failed to update cache");
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!(error = %e, item_id = %item_id, "Failed to process download");
+                            let mut active = service.active_downloads.lock();
+                            if let Some(dl) = active.get_mut(&item_id) {
+                                dl.state = DownloadState::Failed;
+                                dl.error = Some(format!("Processing failed: {}", e));
+                            }
+                            service.downloads_failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, item_id = %item_id, "Extraction task panicked");
+                            let mut active = service.active_downloads.lock();
+                            if let Some(dl) = active.get_mut(&item_id) {
+                                dl.state = DownloadState::Failed;
+                                dl.error = Some("Extraction task panicked".to_string());
+                            }
+                            service.downloads_failed.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
