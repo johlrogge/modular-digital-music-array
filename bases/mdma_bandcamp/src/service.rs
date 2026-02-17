@@ -1,6 +1,7 @@
 //! Bandcamp download service
 //!
 //! Handles collection syncing and download management.
+//! Uses async throughout with NNG IPC bridged via channels.
 
 use crate::cache::DownloadCache;
 use crate::ipc::{
@@ -15,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -30,6 +31,9 @@ pub enum ServiceError {
 
     #[error("Cache error: {0}")]
     Cache(#[from] crate::cache::CacheError),
+
+    #[error("Channel error")]
+    Channel,
 }
 
 /// Download queue entry
@@ -42,10 +46,14 @@ struct QueuedDownload {
     error: Option<String>,
 }
 
+/// Request with response channel for async processing
+struct IpcMessage {
+    request: BandcampRequest,
+    response_tx: oneshot::Sender<BandcampResponse>,
+}
+
 /// Bandcamp download service
 pub struct BandcampService {
-    /// HTTP client (None if cookies not loaded)
-    client: Mutex<Option<BandcampClient>>,
     /// Cookie file path
     cookie_path: PathBuf,
     /// Downloads staging directory
@@ -70,8 +78,8 @@ pub struct BandcampService {
     paused: AtomicBool,
     /// Audio format to download
     format: AudioFormat,
-    /// Shutdown signal sender
-    shutdown_tx: Option<mpsc::Sender<()>>,
+    /// Whether cookies are currently loaded
+    cookies_loaded: AtomicBool,
 }
 
 impl BandcampService {
@@ -86,11 +94,10 @@ impl BandcampService {
         // Load cache
         let cache = DownloadCache::open(&cache_path)?;
 
-        // Try to load cookies
-        let client = Self::try_load_client(&cookie_path);
+        // Check if cookies exist
+        let cookies_exist = cookie_path.exists();
 
         Ok(Self {
-            client: Mutex::new(client),
             cookie_path,
             downloads_dir,
             inbox_dir,
@@ -103,31 +110,28 @@ impl BandcampService {
             start_time: Instant::now(),
             paused: AtomicBool::new(false),
             format,
-            shutdown_tx: None,
+            cookies_loaded: AtomicBool::new(cookies_exist),
         })
     }
 
     /// Try to load the Bandcamp client from cookies
-    fn try_load_client(cookie_path: &PathBuf) -> Option<BandcampClient> {
-        match bandcamp_api::load_cookies(cookie_path) {
+    fn try_load_client(&self) -> Option<BandcampClient> {
+        match bandcamp_api::load_cookies(&self.cookie_path) {
             Ok(jar) => {
-                tracing::info!(path = %cookie_path.display(), "Loaded cookies");
+                tracing::info!(path = %self.cookie_path.display(), "Loaded cookies");
+                self.cookies_loaded.store(true, Ordering::Relaxed);
                 Some(BandcampClient::new(jar))
             }
             Err(e) => {
-                tracing::warn!(error = %e, path = %cookie_path.display(), "Failed to load cookies");
+                tracing::warn!(error = %e, path = %self.cookie_path.display(), "Failed to load cookies");
+                self.cookies_loaded.store(false, Ordering::Relaxed);
                 None
             }
         }
     }
 
-    /// Check if cookies are loaded
-    fn cookies_loaded(&self) -> bool {
-        self.client.lock().is_some()
-    }
-
-    /// Handle a request
-    pub fn handle_request(&self, request: BandcampRequest) -> BandcampResponse {
+    /// Handle a request asynchronously
+    pub async fn handle_request(&self, request: BandcampRequest) -> BandcampResponse {
         tracing::debug!(?request, "Handling request");
 
         match request {
@@ -136,7 +140,7 @@ impl BandcampService {
             BandcampRequest::GetStatus => {
                 let status = ServiceStatus {
                     version: env!("CARGO_PKG_VERSION").to_string(),
-                    cookies_loaded: self.cookies_loaded(),
+                    cookies_loaded: self.cookies_loaded.load(Ordering::Relaxed),
                     current_username: self.current_username.lock().clone(),
                     downloads_active: self.active_downloads.lock().len(),
                     downloads_queued: self.download_queue.lock().len(),
@@ -149,9 +153,8 @@ impl BandcampService {
             }
 
             BandcampRequest::ReloadCookies => {
-                let client = Self::try_load_client(&self.cookie_path);
+                let client = self.try_load_client();
                 let valid = client.is_some();
-                *self.client.lock() = client;
 
                 BandcampResponse::CookiesReloaded {
                     valid,
@@ -163,18 +166,7 @@ impl BandcampService {
                 }
             }
 
-            BandcampRequest::Sync { username } => {
-                // This is a blocking request, but sync is async
-                // We'll return immediately and the actual sync happens in the background
-                match self.start_sync(&username) {
-                    Ok((total, new)) => BandcampResponse::SyncStarted {
-                        username: username.to_string(),
-                        total_items: total,
-                        new_items: new,
-                    },
-                    Err(e) => BandcampResponse::Error(e),
-                }
-            }
+            BandcampRequest::Sync { username } => self.handle_sync(username).await,
 
             BandcampRequest::ListDownloads => {
                 let downloads = self.list_downloads();
@@ -200,27 +192,72 @@ impl BandcampService {
         }
     }
 
-    /// Start a collection sync (blocking for now, returns immediately with queue info)
-    fn start_sync(&self, username: &BandcampUsername) -> Result<(usize, usize), ProtocolError> {
-        let client = self.client.lock();
-        let _client = client.as_ref().ok_or(ProtocolError::NotAuthenticated {
-            message: "Cookies not loaded. Upload cookies first.".to_string(),
-        })?;
-
-        // For now, we can't easily do async from a sync context
-        // The actual sync will be done via a separate mechanism
-        // This is a limitation we need to address later
+    /// Handle sync request - fetches collection and queues new downloads
+    async fn handle_sync(&self, username: BandcampUsername) -> BandcampResponse {
+        // Try to load client
+        let client = match self.try_load_client() {
+            Some(c) => c,
+            None => {
+                return BandcampResponse::Error(ProtocolError::NotAuthenticated {
+                    message: "Cookies not loaded. Upload cookies first.".to_string(),
+                });
+            }
+        };
 
         // Store the username
         *self.current_username.lock() = Some(username.to_string());
 
-        // Return placeholder - the actual sync needs async runtime
-        // TODO: Implement proper async sync with a background task
-        tracing::info!(username = %username, "Sync requested (not yet implemented in blocking context)");
+        tracing::info!(username = %username, "Starting collection sync");
 
-        Err(ProtocolError::Internal {
-            message: "Sync requires async runtime - use the async API".to_string(),
-        })
+        // Fetch the collection
+        let collection = match client.get_collection(username.as_str()).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to fetch collection");
+                return BandcampResponse::Error(ProtocolError::CollectionFetchFailed {
+                    message: e.to_string(),
+                });
+            }
+        };
+
+        let total_items = collection.len();
+        tracing::info!(total = total_items, "Fetched collection");
+
+        // Filter out already downloaded items using the cache
+        let cache = self.cache.lock();
+        let mut new_items = 0;
+
+        for item in collection {
+            // For now, use item ID as cache key (we'll improve this when we have track info)
+            let cache_key = format!("{}|{}|{}|0", item.artist, item.title, item.id.as_str());
+
+            if !cache.is_downloaded(&cache_key) {
+                new_items += 1;
+
+                // Add to download queue
+                let queued = QueuedDownload {
+                    item,
+                    state: DownloadState::Queued,
+                    downloaded_bytes: 0,
+                    total_bytes: None,
+                    error: None,
+                };
+
+                self.download_queue.lock().push_back(queued);
+            }
+        }
+
+        tracing::info!(
+            total = total_items,
+            new = new_items,
+            "Sync complete, items queued"
+        );
+
+        BandcampResponse::SyncStarted {
+            username: username.to_string(),
+            total_items,
+            new_items,
+        }
     }
 
     /// List current downloads
@@ -275,40 +312,97 @@ fn api_item_id_to_protocol(id: &bandcamp_api::ItemId) -> ItemId {
     ItemId::new(id.as_str())
 }
 
-/// Run the IPC server loop
-pub fn run_ipc_server(
+/// Run the async IPC server
+///
+/// This spawns a blocking task for NNG recv/send and bridges to async via channels.
+pub async fn run_async_ipc_server(
     service: Arc<BandcampService>,
-    address: &str,
-    tcp_address: Option<&str>,
+    address: String,
+    tcp_address: Option<String>,
 ) -> Result<(), ServiceError> {
-    let server = IpcServer::bind(address)?;
+    // Create channel for requests from NNG thread to async runtime
+    let (request_tx, mut request_rx) = mpsc::channel::<IpcMessage>(32);
 
-    // Also listen on TCP if specified
-    if let Some(tcp) = tcp_address {
-        server.listen_also(tcp)?;
+    // Spawn the NNG server in a blocking task
+    let nng_handle = {
+        let address = address.clone();
+        let tcp_address = tcp_address.clone();
+        tokio::task::spawn_blocking(move || run_nng_bridge(address, tcp_address, request_tx))
+    };
+
+    tracing::info!("Async IPC server running");
+
+    // Process requests from the NNG bridge
+    while let Some(msg) = request_rx.recv().await {
+        let response = service.handle_request(msg.request).await;
+
+        // Send response back (ignore error if receiver dropped)
+        let _ = msg.response_tx.send(response);
     }
 
-    tracing::info!("IPC server running, waiting for requests...");
+    // Wait for NNG thread to finish (it won't normally)
+    nng_handle.await.map_err(|_| ServiceError::Channel)??;
+
+    Ok(())
+}
+
+/// NNG bridge - runs in a blocking thread, communicates via channels
+fn run_nng_bridge(
+    address: String,
+    tcp_address: Option<String>,
+    request_tx: mpsc::Sender<IpcMessage>,
+) -> Result<(), ServiceError> {
+    let server = IpcServer::bind(&address)?;
+
+    if let Some(tcp) = tcp_address {
+        server.listen_also(&tcp)?;
+    }
+
+    tracing::info!(address = %address, "NNG server listening");
 
     loop {
-        match server.recv() {
-            Ok(request) => {
-                let response = service.handle_request(request);
-                if let Err(e) = server.send(&response) {
-                    tracing::error!(error = %e, "Failed to send response");
-                    let fallback = BandcampResponse::Error(ProtocolError::Internal {
-                        message: format!("Internal error: {}", e),
-                    });
-                    if let Err(e2) = server.send(&fallback) {
-                        tracing::error!(error = %e2, "Failed to send fallback error response");
-                    }
-                }
-            }
+        // Blocking recv
+        let request = match server.recv() {
+            Ok(r) => r,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to receive request");
+                continue;
             }
+        };
+
+        // Create oneshot channel for response
+        let (response_tx, response_rx) = oneshot::channel();
+
+        // Send to async runtime
+        if request_tx
+            .blocking_send(IpcMessage {
+                request,
+                response_tx,
+            })
+            .is_err()
+        {
+            tracing::error!("Failed to send request to async runtime - shutting down");
+            break;
+        }
+
+        // Wait for response
+        let response = match response_rx.blocking_recv() {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::error!("Response channel closed");
+                BandcampResponse::Error(ProtocolError::Internal {
+                    message: "Internal error: response channel closed".to_string(),
+                })
+            }
+        };
+
+        // Send response
+        if let Err(e) = server.send(&response) {
+            tracing::error!(error = %e, "Failed to send response");
         }
     }
+
+    Ok(())
 }
 
 /// Async download worker - processes the download queue
@@ -343,49 +437,133 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
             active.insert(item_id.clone(), queued.clone());
         }
 
-        // Get the client
-        let has_client: bool = {
-            let client_lock = service.client.lock();
-            match client_lock.as_ref() {
-                Some(_c) => {
-                    // We need to clone or recreate the client for async use
-                    // For now, skip if no client
-                    drop(client_lock);
-                    false // TODO: Fix this - need to share client properly
+        // Load client for this download
+        let client = match service.try_load_client() {
+            Some(c) => c,
+            None => {
+                let mut active = service.active_downloads.lock();
+                if let Some(dl) = active.get_mut(&item_id) {
+                    dl.state = DownloadState::Failed;
+                    dl.error = Some("No authenticated client available".to_string());
                 }
-                None => {
-                    tracing::error!("No client available for download");
-                    false
-                }
+                service.downloads_failed.fetch_add(1, Ordering::Relaxed);
+                continue;
             }
         };
 
-        if !has_client {
-            // Mark as failed
-            let mut active = service.active_downloads.lock();
-            if let Some(dl) = active.get_mut(&item_id) {
-                dl.state = DownloadState::Failed;
-                dl.error = Some("No authenticated client available".to_string());
+        tracing::info!(
+            item_id = %item_id,
+            artist = %queued.item.artist,
+            title = %queued.item.title,
+            "Starting download"
+        );
+
+        // Get download details
+        let details = match client.get_item_details(&queued.item.download_url).await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!(error = %e, item_id = %item_id, "Failed to get item details");
+                let mut active = service.active_downloads.lock();
+                if let Some(dl) = active.get_mut(&item_id) {
+                    dl.state = DownloadState::Failed;
+                    dl.error = Some(format!("Failed to get details: {}", e));
+                }
+                service.downloads_failed.fetch_add(1, Ordering::Relaxed);
+                continue;
             }
-            service.downloads_failed.fetch_add(1, Ordering::Relaxed);
-            continue;
+        };
+
+        // Download to staging directory
+        let staging_path = service.downloads_dir.join(format!("{}.zip", item_id));
+
+        use tokio_stream::StreamExt;
+        let mut stream =
+            std::pin::pin!(client.download_item(&details, service.format, &staging_path));
+
+        let mut download_success = false;
+        while let Some(event) = stream.next().await {
+            match event {
+                bandcamp_api::DownloadEvent::Started { total } => {
+                    let mut active = service.active_downloads.lock();
+                    if let Some(dl) = active.get_mut(&item_id) {
+                        dl.total_bytes = total;
+                    }
+                }
+                bandcamp_api::DownloadEvent::Progress(progress) => {
+                    let mut active = service.active_downloads.lock();
+                    if let Some(dl) = active.get_mut(&item_id) {
+                        dl.downloaded_bytes = progress.downloaded;
+                        dl.total_bytes = progress.total;
+                    }
+                }
+                bandcamp_api::DownloadEvent::Completed { path } => {
+                    tracing::info!(item_id = %item_id, path = %path.display(), "Download completed");
+                    download_success = true;
+
+                    // Update state to extracting
+                    {
+                        let mut active = service.active_downloads.lock();
+                        if let Some(dl) = active.get_mut(&item_id) {
+                            dl.state = DownloadState::Extracting;
+                        }
+                    }
+
+                    // TODO: Extract ZIP and move to inbox
+                    // For now, just move the ZIP to inbox
+                    let inbox_path = service.inbox_dir.join(format!("{}.zip", item_id));
+                    if let Err(e) = tokio::fs::rename(&path, &inbox_path).await {
+                        tracing::error!(error = %e, "Failed to move to inbox");
+                        let mut active = service.active_downloads.lock();
+                        if let Some(dl) = active.get_mut(&item_id) {
+                            dl.state = DownloadState::Failed;
+                            dl.error = Some(format!("Failed to move: {}", e));
+                        }
+                        service.downloads_failed.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        // Mark as completed
+                        let mut active = service.active_downloads.lock();
+                        if let Some(dl) = active.get_mut(&item_id) {
+                            dl.state = DownloadState::Completed;
+                        }
+                        service.downloads_completed.fetch_add(1, Ordering::Relaxed);
+
+                        // Update cache
+                        let cache_key = format!(
+                            "{}|{}|{}|0",
+                            queued.item.artist,
+                            queued.item.title,
+                            queued.item.id.as_str()
+                        );
+                        if let Err(e) = service.cache.lock().mark_downloaded(&cache_key, &item_id) {
+                            tracing::warn!(error = %e, "Failed to update cache");
+                        }
+                    }
+                }
+                bandcamp_api::DownloadEvent::Failed { error } => {
+                    tracing::error!(item_id = %item_id, error = %error, "Download failed");
+                    let mut active = service.active_downloads.lock();
+                    if let Some(dl) = active.get_mut(&item_id) {
+                        dl.state = DownloadState::Failed;
+                        dl.error = Some(error);
+                    }
+                    service.downloads_failed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
 
-        // TODO: Implement actual download logic
-        // This requires proper async client sharing
-        tracing::warn!(item_id = %item_id, "Download worker not fully implemented yet");
-
-        // For now, just mark as failed with a message
-        {
+        if !download_success {
+            // Stream ended without success event
             let mut active = service.active_downloads.lock();
             if let Some(dl) = active.get_mut(&item_id) {
-                dl.state = DownloadState::Failed;
-                dl.error = Some("Download worker not fully implemented".to_string());
+                if dl.state == DownloadState::Downloading {
+                    dl.state = DownloadState::Failed;
+                    dl.error = Some("Download stream ended unexpectedly".to_string());
+                    service.downloads_failed.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
-        service.downloads_failed.fetch_add(1, Ordering::Relaxed);
 
-        // Small delay between downloads
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // Small delay between downloads for rate limiting
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
 }

@@ -118,9 +118,9 @@ async fn main() -> Result<()> {
         service::run_download_worker(worker_service).await;
     });
 
-    // Run IPC server (blocking)
-    // Note: This runs in the main thread but the download worker runs in a tokio task
-    service::run_ipc_server(service, &args.socket, args.tcp.as_deref())?;
+    // Run async IPC server
+    // NNG blocking I/O runs in a spawn_blocking task, bridged to async via channels
+    service::run_async_ipc_server(service, args.socket, args.tcp).await?;
 
     Ok(())
 }
