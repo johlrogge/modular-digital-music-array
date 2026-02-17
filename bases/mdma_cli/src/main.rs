@@ -1,7 +1,11 @@
-//! MDMA CLI - Command line interface for mdma-library
+//! MDMA CLI - Command line interface for mdma services
 //!
-//! Connects to the library service via nng IPC
+//! Connects to the library and bandcamp services via nng IPC
 
+use bandcamp_ipc_client::{
+    BandcampClient, BandcampUsername, ClientError as BandcampClientError,
+    ProtocolError as BandcampProtocolError,
+};
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use library_ipc_client::{
@@ -14,11 +18,15 @@ use library_ipc_client::{
 
 #[derive(Parser, Debug)]
 #[command(name = "mdma")]
-#[command(author, version, about = "MDMA CLI - Control the music library")]
+#[command(author, version, about = "MDMA CLI - Control the music services")]
 struct Cli {
-    /// IPC socket address
+    /// Library IPC socket address
     #[arg(long, default_value = "ipc:///run/mdma/library.sock", global = true)]
     socket: String,
+
+    /// Bandcamp IPC socket address
+    #[arg(long, default_value = "ipc:///run/mdma/bandcamp.sock", global = true)]
+    bandcamp_socket: String,
 
     #[command(subcommand)]
     command: Commands,
@@ -62,6 +70,12 @@ enum Commands {
         #[command(subcommand)]
         command: InboxCommands,
     },
+
+    /// Bandcamp download commands
+    Bandcamp {
+        #[command(subcommand)]
+        command: BandcampCommands,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -85,6 +99,39 @@ enum InboxCommands {
     IngestAll,
 }
 
+#[derive(Subcommand, Debug)]
+enum BandcampCommands {
+    /// Check if the bandcamp service is running
+    Ping,
+
+    /// Get bandcamp service status
+    Status,
+
+    /// Reload cookies from disk
+    ReloadCookies,
+
+    /// Sync a user's Bandcamp collection
+    Sync {
+        /// Bandcamp username
+        username: String,
+    },
+
+    /// List current downloads
+    Downloads,
+
+    /// Cancel a download
+    Cancel {
+        /// Item ID to cancel
+        id: String,
+    },
+
+    /// Pause all downloads
+    Pause,
+
+    /// Resume downloads
+    Resume,
+}
+
 // =============================================================================
 // Display Helpers
 // =============================================================================
@@ -106,7 +153,7 @@ fn format_track_line(track: &TrackInfo) -> String {
     format!("{} - {}", artist, title)
 }
 
-/// Handle client errors uniformly
+/// Handle library client errors uniformly
 fn handle_error(err: ClientError) -> ! {
     match err {
         ClientError::Protocol(ProtocolError::TrackNotFound { hash }) => {
@@ -121,6 +168,27 @@ fn handle_error(err: ClientError) -> ! {
         ClientError::ConnectionFailed(msg) => {
             eprintln!("Connection failed: {}", msg);
             eprintln!("Is mdma-library running?");
+        }
+        e => {
+            eprintln!("Error: {}", e);
+        }
+    }
+    std::process::exit(1);
+}
+
+/// Handle bandcamp client errors uniformly
+fn handle_bandcamp_error(err: BandcampClientError) -> ! {
+    match err {
+        BandcampClientError::Protocol(BandcampProtocolError::NotAuthenticated { message }) => {
+            eprintln!("Not authenticated: {}", message);
+            eprintln!("Upload cookies to /etc/mdma/bandcamp-cookies.json");
+        }
+        BandcampClientError::Protocol(e) => {
+            eprintln!("Error: {}", e);
+        }
+        BandcampClientError::ConnectionFailed(msg) => {
+            eprintln!("Connection failed: {}", msg);
+            eprintln!("Is mdma-bandcamp running?");
         }
         e => {
             eprintln!("Error: {}", e);
@@ -366,6 +434,155 @@ fn handle_inbox_ingest_all(client: &LibraryClient) -> Result<()> {
 }
 
 // =============================================================================
+// Bandcamp Command Handlers
+// =============================================================================
+
+fn handle_bandcamp_ping(client: &BandcampClient) -> Result<()> {
+    match client.ping() {
+        Ok(()) => {
+            println!("pong - bandcamp service is alive");
+            Ok(())
+        }
+        Err(e) => handle_bandcamp_error(e),
+    }
+}
+
+fn handle_bandcamp_status(client: &BandcampClient) -> Result<()> {
+    match client.status() {
+        Ok(status) => {
+            println!("MDMA Bandcamp Service v{}", status.version);
+            println!("{}", "=".repeat(40));
+            println!(
+                "Cookies loaded:    {}",
+                if status.cookies_loaded { "yes" } else { "no" }
+            );
+            if let Some(user) = status.current_username {
+                println!("Current user:      {}", user);
+            }
+            println!("Downloads active:  {}", status.downloads_active);
+            println!("Downloads queued:  {}", status.downloads_queued);
+            println!("Downloads done:    {}", status.downloads_completed);
+            println!("Downloads failed:  {}", status.downloads_failed);
+            println!("Uptime:            {} seconds", status.uptime_seconds);
+            println!(
+                "Paused:            {}",
+                if status.paused { "yes" } else { "no" }
+            );
+            Ok(())
+        }
+        Err(e) => handle_bandcamp_error(e),
+    }
+}
+
+fn handle_bandcamp_reload_cookies(client: &BandcampClient) -> Result<()> {
+    match client.reload_cookies() {
+        Ok((valid, message)) => {
+            if valid {
+                println!("Cookies reloaded successfully");
+            } else {
+                eprintln!("Failed to reload cookies: {}", message);
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Err(e) => handle_bandcamp_error(e),
+    }
+}
+
+fn handle_bandcamp_sync(client: &BandcampClient, username: String) -> Result<()> {
+    let username = match BandcampUsername::new(&username) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("Invalid username: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    println!("Syncing collection for {}...", username);
+
+    match client.sync(&username) {
+        Ok((user, total, new)) => {
+            println!("Sync started for {}", user);
+            println!("Total items: {}, New items: {}", total, new);
+            Ok(())
+        }
+        Err(e) => handle_bandcamp_error(e),
+    }
+}
+
+fn handle_bandcamp_downloads(client: &BandcampClient) -> Result<()> {
+    match client.list_downloads() {
+        Ok(downloads) => {
+            if downloads.is_empty() {
+                println!("No downloads in progress");
+                return Ok(());
+            }
+
+            println!("Downloads ({}):", downloads.len());
+            println!("{}", "=".repeat(65));
+
+            for dl in downloads {
+                let progress = if let Some(total) = dl.total_bytes {
+                    let pct = (dl.downloaded_bytes as f64 / total as f64) * 100.0;
+                    format!("{:.1}%", pct)
+                } else {
+                    format!("{} bytes", dl.downloaded_bytes)
+                };
+
+                let status = match dl.state {
+                    bandcamp_ipc_client::DownloadState::Queued => "queued".to_string(),
+                    bandcamp_ipc_client::DownloadState::Downloading => {
+                        format!("downloading {}", progress)
+                    }
+                    bandcamp_ipc_client::DownloadState::Extracting => "extracting".to_string(),
+                    bandcamp_ipc_client::DownloadState::Moving => "moving".to_string(),
+                    bandcamp_ipc_client::DownloadState::Completed => "completed".to_string(),
+                    bandcamp_ipc_client::DownloadState::Failed => {
+                        format!("failed: {}", dl.error.unwrap_or_default())
+                    }
+                    bandcamp_ipc_client::DownloadState::Cancelled => "cancelled".to_string(),
+                };
+
+                println!("{} | {} - {} | {}", dl.id, dl.artist, dl.title, status);
+            }
+            Ok(())
+        }
+        Err(e) => handle_bandcamp_error(e),
+    }
+}
+
+fn handle_bandcamp_cancel(client: &BandcampClient, id: String) -> Result<()> {
+    let item_id = bandcamp_ipc_client::ItemId::new(&id);
+    match client.cancel_download(&item_id) {
+        Ok(()) => {
+            println!("Cancelled download: {}", id);
+            Ok(())
+        }
+        Err(e) => handle_bandcamp_error(e),
+    }
+}
+
+fn handle_bandcamp_pause(client: &BandcampClient) -> Result<()> {
+    match client.pause() {
+        Ok(()) => {
+            println!("Downloads paused");
+            Ok(())
+        }
+        Err(e) => handle_bandcamp_error(e),
+    }
+}
+
+fn handle_bandcamp_resume(client: &BandcampClient) -> Result<()> {
+    match client.resume() {
+        Ok(()) => {
+            println!("Downloads resumed");
+            Ok(())
+        }
+        Err(e) => handle_bandcamp_error(e),
+    }
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -374,29 +591,60 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Connect to service
-    let client = match LibraryClient::connect(&cli.socket) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to connect to service at {}: {}", cli.socket, e);
-            eprintln!("Is mdma-library running?");
-            std::process::exit(1);
-        }
-    };
-
-    // Dispatch command
+    // Dispatch command - connect to appropriate service based on command
     match cli.command {
-        Commands::Ping => handle_ping(&client),
-        Commands::Status => handle_status(&client),
-        Commands::List { limit } => handle_list(&client, limit),
-        Commands::Get { hash } => handle_get(&client, hash),
-        Commands::Facts { hash } => handle_facts(&client, hash),
-        Commands::Search { query } => handle_search(&client, query),
-        Commands::Inbox { command } => match command {
-            InboxCommands::List => handle_inbox_list(&client),
-            InboxCommands::Delete { filename } => handle_inbox_delete(&client, filename),
-            InboxCommands::Ingest { filename } => handle_inbox_ingest(&client, filename),
-            InboxCommands::IngestAll => handle_inbox_ingest_all(&client),
-        },
+        Commands::Bandcamp { command } => {
+            // Connect to bandcamp service
+            let client = match BandcampClient::connect(&cli.bandcamp_socket) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "Failed to connect to bandcamp service at {}: {}",
+                        cli.bandcamp_socket, e
+                    );
+                    eprintln!("Is mdma-bandcamp running?");
+                    std::process::exit(1);
+                }
+            };
+
+            match command {
+                BandcampCommands::Ping => handle_bandcamp_ping(&client),
+                BandcampCommands::Status => handle_bandcamp_status(&client),
+                BandcampCommands::ReloadCookies => handle_bandcamp_reload_cookies(&client),
+                BandcampCommands::Sync { username } => handle_bandcamp_sync(&client, username),
+                BandcampCommands::Downloads => handle_bandcamp_downloads(&client),
+                BandcampCommands::Cancel { id } => handle_bandcamp_cancel(&client, id),
+                BandcampCommands::Pause => handle_bandcamp_pause(&client),
+                BandcampCommands::Resume => handle_bandcamp_resume(&client),
+            }
+        }
+
+        // Library commands - connect to library service
+        cmd => {
+            let client = match LibraryClient::connect(&cli.socket) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Failed to connect to service at {}: {}", cli.socket, e);
+                    eprintln!("Is mdma-library running?");
+                    std::process::exit(1);
+                }
+            };
+
+            match cmd {
+                Commands::Ping => handle_ping(&client),
+                Commands::Status => handle_status(&client),
+                Commands::List { limit } => handle_list(&client, limit),
+                Commands::Get { hash } => handle_get(&client, hash),
+                Commands::Facts { hash } => handle_facts(&client, hash),
+                Commands::Search { query } => handle_search(&client, query),
+                Commands::Inbox { command } => match command {
+                    InboxCommands::List => handle_inbox_list(&client),
+                    InboxCommands::Delete { filename } => handle_inbox_delete(&client, filename),
+                    InboxCommands::Ingest { filename } => handle_inbox_ingest(&client, filename),
+                    InboxCommands::IngestAll => handle_inbox_ingest_all(&client),
+                },
+                Commands::Bandcamp { .. } => unreachable!(), // Already handled above
+            }
+        }
     }
 }

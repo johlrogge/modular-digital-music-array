@@ -1,0 +1,42 @@
+[package]
+name = "mdma-bandcamp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mdma-bandcamp"
+path = "src/main.rs"
+
+[dependencies]
+# IPC and protocol
+bandcamp-api = { path = "../../components/bandcamp_api" }
+bandcamp-ipc-protocol = { path = "../../components/bandcamp_ipc_protocol" }
+nng = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+tokio-stream = "0.1"
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+color-eyre = { workspace = true }
+thiserror = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Tracing
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Utilities
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

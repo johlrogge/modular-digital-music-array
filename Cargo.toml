@@ -3,6 +3,8 @@
 members = [
     # Components (bricks)
     "components/bandcamp_api",
+    "components/bandcamp_ipc_protocol",
+    "components/bandcamp_ipc_client",
     "components/clock",
     "components/flac_metadata",
     "components/library_ipc_client",
@@ -26,6 +28,7 @@ members = [
     "bases/mdma_console",
     "bases/mdma_library",
     "bases/mdma_cli",
+    "bases/mdma_bandcamp",
 ]
 resolver = "2"
 

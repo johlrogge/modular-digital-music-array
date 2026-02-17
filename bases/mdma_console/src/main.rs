@@ -1,4 +1,4 @@
-//! MDMA Console - Web interface for package and inbox management
+//! MDMA Console - Web interface for package, inbox, and bandcamp management
 
 use askama::Template;
 use axum::{
@@ -8,6 +8,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use bandcamp_ipc_client::{BandcampClient, BandcampUsername, ServiceStatus as BandcampStatus};
 use clap::Parser;
 use color_eyre::Result;
 use library_ipc_client::LibraryClient;
@@ -38,6 +39,10 @@ struct Args {
     /// Library IPC socket address
     #[arg(long, default_value = "ipc:///run/mdma/library.sock")]
     library_socket: String,
+
+    /// Bandcamp IPC socket address
+    #[arg(long, default_value = "ipc:///run/mdma/bandcamp.sock")]
+    bandcamp_socket: String,
 }
 
 // =============================================================================
@@ -49,22 +54,30 @@ struct AppState {
     packages: Mutex<Vec<InstalledPackage>>,
     /// Cached list of available updates
     updates: Mutex<Vec<AvailableUpdate>>,
-    /// Library client (lazily connected)
+    /// Library socket address
     library_socket: String,
+    /// Bandcamp socket address
+    bandcamp_socket: String,
 }
 
 impl AppState {
-    fn new(library_socket: String) -> Self {
+    fn new(library_socket: String, bandcamp_socket: String) -> Self {
         Self {
             packages: Mutex::new(Vec::new()),
             updates: Mutex::new(Vec::new()),
             library_socket,
+            bandcamp_socket,
         }
     }
 
     /// Get library client (creates new connection each time)
     fn library_client(&self) -> Option<LibraryClient> {
         LibraryClient::connect(&self.library_socket).ok()
+    }
+
+    /// Get bandcamp client (creates new connection each time)
+    fn bandcamp_client(&self) -> Option<BandcampClient> {
+        BandcampClient::connect(&self.bandcamp_socket).ok()
     }
 }
 
@@ -92,12 +105,52 @@ impl PackageView {
     }
 }
 
+/// Bandcamp status view for template
+struct BandcampView {
+    connected: bool,
+    cookies_loaded: bool,
+    current_username: Option<String>,
+    downloads_active: usize,
+    downloads_queued: usize,
+    downloads_completed: usize,
+    downloads_failed: usize,
+    paused: bool,
+}
+
+impl BandcampView {
+    fn from_status(status: Option<BandcampStatus>) -> Self {
+        match status {
+            Some(s) => Self {
+                connected: true,
+                cookies_loaded: s.cookies_loaded,
+                current_username: s.current_username,
+                downloads_active: s.downloads_active,
+                downloads_queued: s.downloads_queued,
+                downloads_completed: s.downloads_completed,
+                downloads_failed: s.downloads_failed,
+                paused: s.paused,
+            },
+            None => Self {
+                connected: false,
+                cookies_loaded: false,
+                current_username: None,
+                downloads_active: 0,
+                downloads_queued: 0,
+                downloads_completed: 0,
+                downloads_failed: 0,
+                paused: false,
+            },
+        }
+    }
+}
+
 #[derive(Template)]
 #[template(path = "index.html")]
 struct IndexTemplate {
     version: String,
     packages: Vec<PackageView>,
     inbox: Vec<String>,
+    bandcamp: BandcampView,
 }
 
 // =============================================================================
@@ -135,10 +188,17 @@ async fn index(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .map(|pkg| PackageView::from_installed(pkg, &updates))
         .collect();
 
+    // Get bandcamp status
+    let bandcamp_status = state
+        .bandcamp_client()
+        .and_then(|client| client.status().ok());
+    let bandcamp = BandcampView::from_status(bandcamp_status);
+
     let template = IndexTemplate {
         version: env!("CARGO_PKG_VERSION").to_string(),
         packages,
         inbox,
+        bandcamp,
     };
 
     match template.render() {
@@ -249,6 +309,206 @@ async fn ingest_all(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 // =============================================================================
+// Bandcamp Handlers
+// =============================================================================
+
+#[derive(serde::Serialize)]
+struct BandcampStatusJson {
+    connected: bool,
+    cookies_loaded: bool,
+    current_username: Option<String>,
+    downloads_active: usize,
+    downloads_queued: usize,
+    downloads_completed: usize,
+    downloads_failed: usize,
+    paused: bool,
+}
+
+async fn bandcamp_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.bandcamp_client() {
+        Some(client) => match client.status() {
+            Ok(status) => Json(BandcampStatusJson {
+                connected: true,
+                cookies_loaded: status.cookies_loaded,
+                current_username: status.current_username,
+                downloads_active: status.downloads_active,
+                downloads_queued: status.downloads_queued,
+                downloads_completed: status.downloads_completed,
+                downloads_failed: status.downloads_failed,
+                paused: status.paused,
+            })
+            .into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        },
+        None => Json(BandcampStatusJson {
+            connected: false,
+            cookies_loaded: false,
+            current_username: None,
+            downloads_active: 0,
+            downloads_queued: 0,
+            downloads_completed: 0,
+            downloads_failed: 0,
+            paused: false,
+        })
+        .into_response(),
+    }
+}
+
+async fn bandcamp_reload_cookies(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.bandcamp_client() {
+        Some(client) => match client.reload_cookies() {
+            Ok((valid, message)) => {
+                if valid {
+                    Json(serde_json::json!({"success": true, "message": message})).into_response()
+                } else {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"success": false, "message": message})),
+                    )
+                        .into_response()
+                }
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        },
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Bandcamp service not available"})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SyncRequest {
+    username: String,
+}
+
+async fn bandcamp_sync(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SyncRequest>,
+) -> impl IntoResponse {
+    let username = match BandcampUsername::new(&req.username) {
+        Ok(u) => u,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid username: {}", e)})),
+            )
+                .into_response()
+        }
+    };
+
+    match state.bandcamp_client() {
+        Some(client) => match client.sync(&username) {
+            Ok((user, total, new)) => Json(serde_json::json!({
+                "success": true,
+                "username": user,
+                "total_items": total,
+                "new_items": new
+            }))
+            .into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        },
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Bandcamp service not available"})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct DownloadJson {
+    id: String,
+    artist: String,
+    title: String,
+    state: String,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    error: Option<String>,
+}
+
+async fn bandcamp_downloads(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.bandcamp_client() {
+        Some(client) => match client.list_downloads() {
+            Ok(downloads) => {
+                let json_downloads: Vec<DownloadJson> = downloads
+                    .into_iter()
+                    .map(|d| DownloadJson {
+                        id: d.id.to_string(),
+                        artist: d.artist,
+                        title: d.title,
+                        state: d.state.to_string(),
+                        downloaded_bytes: d.downloaded_bytes,
+                        total_bytes: d.total_bytes,
+                        error: d.error,
+                    })
+                    .collect();
+                Json(json_downloads).into_response()
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        },
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Bandcamp service not available"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn bandcamp_pause(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.bandcamp_client() {
+        Some(client) => match client.pause() {
+            Ok(()) => Json(serde_json::json!({"success": true})).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        },
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Bandcamp service not available"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn bandcamp_resume(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.bandcamp_client() {
+        Some(client) => match client.resume() {
+            Ok(()) => Json(serde_json::json!({"success": true})).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        },
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Bandcamp service not available"})),
+        )
+            .into_response(),
+    }
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -265,7 +525,7 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let state = Arc::new(AppState::new(args.library_socket));
+    let state = Arc::new(AppState::new(args.library_socket, args.bandcamp_socket));
 
     // Initial package list load
     if let Ok(pkgs) = packages::list_installed().await {
@@ -278,6 +538,13 @@ async fn main() -> Result<()> {
         .route("/check-updates", post(check_updates))
         .route("/update/{name}", post(update_package))
         .route("/ingest-all", post(ingest_all))
+        // Bandcamp routes
+        .route("/bandcamp/status", get(bandcamp_status))
+        .route("/bandcamp/reload-cookies", post(bandcamp_reload_cookies))
+        .route("/bandcamp/sync", post(bandcamp_sync))
+        .route("/bandcamp/downloads", get(bandcamp_downloads))
+        .route("/bandcamp/pause", post(bandcamp_pause))
+        .route("/bandcamp/resume", post(bandcamp_resume))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", args.port);

@@ -40,6 +40,8 @@ tracing = "0.1"
 
 # Stream utilities
 futures-util = "0.3"
+tokio-stream = "0.1"
+async-stream = "0.3"
 
 # URL parsing
 url = "2"

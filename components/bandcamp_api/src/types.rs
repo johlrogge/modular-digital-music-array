@@ -179,6 +179,19 @@ impl DownloadProgress {
     }
 }
 
+/// Events emitted during download
+#[derive(Debug, Clone)]
+pub enum DownloadEvent {
+    /// Download started with optional total size
+    Started { total: Option<u64> },
+    /// Progress update
+    Progress(DownloadProgress),
+    /// Download completed successfully
+    Completed { path: std::path::PathBuf },
+    /// Download failed
+    Failed { error: String },
+}
+
 // Internal types for parsing Bandcamp's JSON responses
 
 /// Parsed data from user's Bandcamp collection page

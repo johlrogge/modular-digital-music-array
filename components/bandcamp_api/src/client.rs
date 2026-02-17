@@ -322,62 +322,113 @@ impl BandcampClient {
         })
     }
 
-    /// Download an item to the specified path
-    pub async fn download_item<F>(
+    /// Download an item to the specified path, returning a stream of progress events
+    pub fn download_item(
         &self,
         item: &DigitalItem,
         format: AudioFormat,
         dest: &Path,
-        progress: F,
-    ) -> Result<std::path::PathBuf, BandcampError>
-    where
-        F: Fn(DownloadProgress),
-    {
-        let url = item
-            .formats
-            .get(&format)
-            .ok_or_else(|| BandcampError::Download(format!("Format {} not available", format)))?;
+    ) -> impl tokio_stream::Stream<Item = DownloadEvent> + '_ {
+        let url = item.formats.get(&format).cloned();
+        let dest = dest.to_path_buf();
+        let artist = item.artist.clone();
+        let title = item.title.clone();
 
-        tracing::info!("Downloading {} - {} as {}", item.artist, item.title, format);
+        async_stream::stream! {
+            let url = match url {
+                Some(u) => u,
+                None => {
+                    yield DownloadEvent::Failed {
+                        error: format!("Format {} not available", format),
+                    };
+                    return;
+                }
+            };
 
-        // Create parent directory
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            tracing::info!("Downloading {} - {} as {}", artist, title, format);
+
+            // Create parent directory
+            if let Some(parent) = dest.parent() {
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                    yield DownloadEvent::Failed {
+                        error: format!("Failed to create directory: {}", e),
+                    };
+                    return;
+                }
+            }
+
+            // Start download
+            self.wait_for_rate_limit().await;
+            let response = match self.http.get(&url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    yield DownloadEvent::Failed {
+                        error: format!("HTTP request failed: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                yield DownloadEvent::Failed {
+                    error: format!("Download failed with status {}", response.status()),
+                };
+                return;
+            }
+
+            let total_size = response.content_length();
+            yield DownloadEvent::Started { total: total_size };
+
+            let mut downloaded: u64 = 0;
+
+            // Stream to file
+            let mut file = match tokio::fs::File::create(&dest).await {
+                Ok(f) => f,
+                Err(e) => {
+                    yield DownloadEvent::Failed {
+                        error: format!("Failed to create file: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            let mut stream = response.bytes_stream();
+
+            use futures_util::StreamExt;
+            while let Some(chunk_result) = stream.next().await {
+                let chunk = match chunk_result {
+                    Ok(c) => c,
+                    Err(e) => {
+                        yield DownloadEvent::Failed {
+                            error: format!("Download error: {}", e),
+                        };
+                        return;
+                    }
+                };
+
+                if let Err(e) = file.write_all(&chunk).await {
+                    yield DownloadEvent::Failed {
+                        error: format!("Write error: {}", e),
+                    };
+                    return;
+                }
+
+                downloaded += chunk.len() as u64;
+                yield DownloadEvent::Progress(DownloadProgress {
+                    downloaded,
+                    total: total_size,
+                });
+            }
+
+            if let Err(e) = file.flush().await {
+                yield DownloadEvent::Failed {
+                    error: format!("Flush error: {}", e),
+                };
+                return;
+            }
+
+            tracing::info!("Download complete: {:?}", dest);
+            yield DownloadEvent::Completed { path: dest };
         }
-
-        // Start download
-        self.wait_for_rate_limit().await;
-        let response = self.http.get(url).send().await?;
-
-        if !response.status().is_success() {
-            return Err(BandcampError::Download(format!(
-                "Download failed with status {}",
-                response.status()
-            )));
-        }
-
-        let total_size = response.content_length();
-        let mut downloaded: u64 = 0;
-
-        // Stream to file
-        let mut file = tokio::fs::File::create(dest).await?;
-        let mut stream = response.bytes_stream();
-
-        use futures_util::StreamExt;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            file.write_all(&chunk).await?;
-
-            downloaded += chunk.len() as u64;
-            progress(DownloadProgress {
-                downloaded,
-                total: total_size,
-            });
-        }
-
-        file.flush().await?;
-
-        tracing::info!("Download complete: {:?}", dest);
-        Ok(dest.to_path_buf())
     }
 }

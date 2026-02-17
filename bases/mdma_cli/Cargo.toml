@@ -15,8 +15,9 @@ path = "src/main.rs"
 clap = { workspace = true, features = ["derive"] }
 color-eyre = { workspace = true }
 
-# IPC (via shared client)
+# IPC (via shared clients)
 library-ipc-client = { path = "../../components/library_ipc_client" }
+bandcamp-ipc-client = { path = "../../components/bandcamp_ipc_client" }
 
 # Output formatting
 tabled = "0.15"

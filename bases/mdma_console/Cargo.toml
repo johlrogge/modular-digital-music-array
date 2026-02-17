@@ -21,8 +21,9 @@ axum = { workspace = true, features = ["macros"] }
 askama = { workspace = true }
 tower-http = { workspace = true }
 
-# Library IPC client
+# IPC clients
 library-ipc-client = { path = "../../components/library_ipc_client" }
+bandcamp-ipc-client = { path = "../../components/bandcamp_ipc_client" }
 
 # CLI and logging
 clap = { workspace = true, features = ["derive"] }

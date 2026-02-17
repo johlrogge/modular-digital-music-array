@@ -156,6 +156,70 @@
         </div>
     </div>
 
+    <div class="card">
+        <h2>Bandcamp Downloads</h2>
+        {% if !bandcamp.connected %}
+        <p class="empty-msg">Bandcamp service not connected</p>
+        {% else %}
+        <table>
+            <tbody>
+                <tr>
+                    <td>Cookies</td>
+                    <td>{% if bandcamp.cookies_loaded %}<span class="update-available">loaded</span>{% else %}<span class="no-update">not loaded</span>{% endif %}</td>
+                </tr>
+                {% match bandcamp.current_username %}
+                    {% when Some with (user) %}
+                <tr>
+                    <td>User</td>
+                    <td>{{ user }}</td>
+                </tr>
+                    {% when None %}
+                {% endmatch %}
+                <tr>
+                    <td>Downloads Active</td>
+                    <td>{{ bandcamp.downloads_active }}</td>
+                </tr>
+                <tr>
+                    <td>Downloads Queued</td>
+                    <td>{{ bandcamp.downloads_queued }}</td>
+                </tr>
+                <tr>
+                    <td>Downloads Completed</td>
+                    <td>{{ bandcamp.downloads_completed }}</td>
+                </tr>
+                <tr>
+                    <td>Downloads Failed</td>
+                    <td>{% if bandcamp.downloads_failed > 0 %}<span class="status-error">{{ bandcamp.downloads_failed }}</span>{% else %}0{% endif %}</td>
+                </tr>
+                <tr>
+                    <td>Status</td>
+                    <td>{% if bandcamp.paused %}<span class="no-update">Paused</span>{% else %}<span class="update-available">Running</span>{% endif %}</td>
+                </tr>
+            </tbody>
+        </table>
+        <div class="actions">
+            <button class="btn btn-secondary" onclick="reloadCookies()">Reload Cookies</button>
+            {% if bandcamp.paused %}
+            <button class="btn" onclick="resumeDownloads()">Resume</button>
+            {% else %}
+            <button class="btn btn-secondary" onclick="pauseDownloads()">Pause</button>
+            {% endif %}
+            <button class="btn" onclick="showSyncDialog()">Sync Collection</button>
+        </div>
+        {% endif %}
+    </div>
+
+    <div id="sync-dialog" style="display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.7); z-index:1000;">
+        <div style="position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:var(--bg-card); padding:20px; border-radius:8px; min-width:300px;">
+            <h3 style="margin-top:0;">Sync Bandcamp Collection</h3>
+            <input type="text" id="bandcamp-username" placeholder="Bandcamp username" style="width:100%; padding:8px; border:1px solid var(--border); background:var(--bg-dark); color:var(--text); border-radius:4px; margin-bottom:10px;">
+            <div style="display:flex; gap:10px; justify-content:flex-end;">
+                <button class="btn btn-secondary" onclick="hideSyncDialog()">Cancel</button>
+                <button class="btn" onclick="syncCollection()">Sync</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         function showStatus(message, isError) {
             const area = document.getElementById('status-area');
@@ -231,6 +295,103 @@
                 showStatus('Error: ' + e.message, true);
                 btn.disabled = false;
                 btn.textContent = 'Ingest All';
+            }
+        }
+
+        async function reloadCookies() {
+            const btn = event.target;
+            showLoading(btn);
+            try {
+                const response = await fetch('/bandcamp/reload-cookies', { method: 'POST' });
+                const data = await response.json();
+                if (response.ok && data.success) {
+                    showStatus('Cookies reloaded', false);
+                    setTimeout(() => location.reload(), 1000);
+                } else {
+                    showStatus('Failed: ' + (data.error || data.message || 'Unknown error'), true);
+                    btn.disabled = false;
+                    btn.textContent = 'Reload Cookies';
+                }
+            } catch (e) {
+                showStatus('Error: ' + e.message, true);
+                btn.disabled = false;
+                btn.textContent = 'Reload Cookies';
+            }
+        }
+
+        async function pauseDownloads() {
+            const btn = event.target;
+            showLoading(btn);
+            try {
+                const response = await fetch('/bandcamp/pause', { method: 'POST' });
+                if (response.ok) {
+                    showStatus('Downloads paused', false);
+                    setTimeout(() => location.reload(), 1000);
+                } else {
+                    const data = await response.json();
+                    showStatus('Failed: ' + (data.error || 'Unknown error'), true);
+                    btn.disabled = false;
+                    btn.textContent = 'Pause';
+                }
+            } catch (e) {
+                showStatus('Error: ' + e.message, true);
+                btn.disabled = false;
+                btn.textContent = 'Pause';
+            }
+        }
+
+        async function resumeDownloads() {
+            const btn = event.target;
+            showLoading(btn);
+            try {
+                const response = await fetch('/bandcamp/resume', { method: 'POST' });
+                if (response.ok) {
+                    showStatus('Downloads resumed', false);
+                    setTimeout(() => location.reload(), 1000);
+                } else {
+                    const data = await response.json();
+                    showStatus('Failed: ' + (data.error || 'Unknown error'), true);
+                    btn.disabled = false;
+                    btn.textContent = 'Resume';
+                }
+            } catch (e) {
+                showStatus('Error: ' + e.message, true);
+                btn.disabled = false;
+                btn.textContent = 'Resume';
+            }
+        }
+
+        function showSyncDialog() {
+            document.getElementById('sync-dialog').style.display = 'block';
+            document.getElementById('bandcamp-username').focus();
+        }
+
+        function hideSyncDialog() {
+            document.getElementById('sync-dialog').style.display = 'none';
+        }
+
+        async function syncCollection() {
+            const username = document.getElementById('bandcamp-username').value.trim();
+            if (!username) {
+                showStatus('Please enter a username', true);
+                return;
+            }
+            hideSyncDialog();
+            try {
+                const response = await fetch('/bandcamp/sync', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username: username })
+                });
+                const data = await response.json();
+                if (response.ok && data.success) {
+                    showStatus('Sync started for ' + data.username + ': ' + data.new_items + ' new items', false);
+                    setTimeout(() => location.reload(), 2000);
+                } else {
+                    showStatus('Sync failed: ' + (data.error || 'Unknown error'), true);
+                }
+            } catch (e) {
+                showStatus('Error: ' + e.message, true);
             }
         }
     </script>

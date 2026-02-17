@@ -14,8 +14,9 @@
 //! # Example
 //!
 //! ```ignore
-//! use bandcamp_api::{BandcampClient, load_cookies, AudioFormat};
+//! use bandcamp_api::{BandcampClient, load_cookies, AudioFormat, DownloadEvent};
 //! use std::path::Path;
+//! use tokio_stream::StreamExt;
 //!
 //! let cookies = load_cookies(Path::new("/etc/mdma/bandcamp-cookies.json"))?;
 //! let client = BandcampClient::new(cookies);
@@ -26,9 +27,15 @@
 //! // Download an item
 //! for item in &collection {
 //!     let details = client.get_item_details(&item.download_url).await?;
-//!     client.download_item(&details, AudioFormat::Flac, Path::new("./music"), |p| {
-//!         println!("Progress: {:?}", p.percentage());
-//!     }).await?;
+//!     let mut stream = std::pin::pin!(client.download_item(&details, AudioFormat::Flac, Path::new("./music/file.flac")));
+//!     while let Some(event) = stream.next().await {
+//!         match event {
+//!             DownloadEvent::Progress(p) => println!("Progress: {:?}%", p.percentage()),
+//!             DownloadEvent::Completed { path } => println!("Downloaded to {:?}", path),
+//!             DownloadEvent::Failed { error } => eprintln!("Failed: {}", error),
+//!             _ => {}
+//!         }
+//!     }
 //! }
 //! ```
 
@@ -41,7 +48,8 @@ pub use client::BandcampClient;
 pub use cookies::load_cookies;
 pub use error::BandcampError;
 pub use types::{
-    AudioFormat, CollectionItem, DigitalItem, DownloadProgress, FanId, ItemId, ItemType, TrackInfo,
+    AudioFormat, CollectionItem, DigitalItem, DownloadEvent, DownloadProgress, FanId, ItemId,
+    ItemType, TrackInfo,
 };
 
 // Re-export commonly used types from music_facts
