@@ -1,6 +1,6 @@
 # MDMA Roadmap
 
-**Last updated:** February 12, 2026
+**Last updated:** February 18, 2026
 
 ## Current Status Summary
 
@@ -8,9 +8,13 @@
 
 NVMe boot working with kernel sync. mdma-console stub deployed (port 3000). `just deploy-dev` and `just deploy-console` working.
 
-**Milestone 1 Part 2 (Music Library): ~40% Complete**
+**Milestone 1 Part 2 (Music Library): ~60% Complete**
 
 mdma-library service operational with nng IPC. mdma-cli tool for testing. Partial hash matching, facts display, stainless-facts locking fixed.
+
+**Bandcamp integration: OPERATIONAL on Pi**
+
+mdma-bandcamp service running on Pi. Syncing 114+ item collection. ZIP extraction working. Files landing in `/music/inbox`. Library ingestion pending trigger.
 
 ---
 
@@ -111,12 +115,34 @@ mdma-cli (client) <-- nng IPC --> mdma-library
 mdma-console (future) <-- nng IPC --> mdma-library
 ```
 
+**What works (Bandcamp integration):**
+
+- **mdma-bandcamp service:**
+  - Async NNG IPC server (nng blocking I/O bridged to tokio via channels)
+  - Listens on `ipc:///run/mdma/bandcamp.sock` or TCP
+  - Handles: Ping, GetStatus, ReloadCookies, Sync, ListDownloads, CancelDownload, PauseAll, ResumeAll
+  - Cookie file from `/var/lib/mdma-bandcamp/cookies.txt` (Netscape/browser export format)
+
+- **Download pipeline:**
+  - Syncs Bandcamp collection (tested with 114 items)
+  - Magic-byte detection: ZIPs extracted to inbox, single FLACs renamed to `Artist - Title.flac`
+  - Staging at `/music/downloads/` (not inbox), atomic move on completion
+  - Track-oriented cache at `/var/lib/mdma-bandcamp/bandcamp.cache`
+
+- **nng_transport component:**
+  - Shared `connect(address)` used by both library-ipc-client and bandcamp-ipc-client
+  - mDNS resolution via `avahi-resolve -4 -n` for `.local` hostnames (NNG can't resolve DNS)
+
+- **CLI env vars:**
+  - `MDMA_LIBRARY_SOCKET` and `MDMA_BANDCAMP_SOCKET` for easy Pi connection
+
 **What's next:**
 
-1. **HTTP upload in mdma-console** - POST endpoint writes to inbox
-2. **Library browsing in mdma-console** - Read from mdma-library via nng
-3. **Inbox watcher** - inotify-based auto-ingest
-4. **Bandcamp integration** - Study bandsnatch, then native library
+1. **Trigger library ingestion** - Run `mdma ingest-all` after Bandcamp sync fills inbox
+2. **Atomic ZIP extraction** - Currently ZIP entries are written directly to inbox; should stage each file to `/music/downloads/{filename}.extract` first, then `rename()` into inbox (same pattern as single tracks). Confirmed needed: ZIPs are used for all multi-track albums.
+3. **Inbox watcher** - inotify-based auto-ingest (so library stays up-to-date automatically)
+4. **HTTP upload in mdma-console** - POST endpoint writes to inbox
+5. **Library browsing in mdma-console** - Read from mdma-library via nng
 
 **Success criteria:**
 - Can drop files in inbox -> they appear in library
@@ -231,13 +257,21 @@ beacon             = Provisioning and service discovery
 **Storage layout:**
 ```
 /music/
-    inbox/              # Drop files here
+    inbox/              # Drop files here (watched by mdma-library)
+    downloads/          # Staging area for in-progress downloads (NOT inbox)
     blobs/              # Content-addressed storage
         a1/
             b2c3d4...sha256.flac
 
 /metadata/
     facts.jsonl         # Main fact stream (source of truth)
+
+/var/lib/mdma-bandcamp/
+    cookies.txt         # Bandcamp session cookies (Netscape format)
+    bandcamp.cache      # Track-oriented download cache
+
+/etc/mdma/
+    bandcamp-cookies.json  # Alternative location (Cookie Quick Manager format)
 ```
 
 ---
@@ -261,6 +295,40 @@ beacon             = Provisioning and service discovery
 ## Beyond Milestone 2: Future Vision
 
 **Not prioritized yet - noted for context:**
+
+### Architecture: Unified IPC Gateway (Future)
+
+**Problem:** As more microservices are added (mdma-library, mdma-bandcamp, future playback, CDJ, etc.), each service exposes its own port/socket. External clients (CLI, console, remote) must know each service's address individually. This doesn't scale and complicates firewall/network setup.
+
+**Solution:** A single MDMA gateway service that:
+- Exposes **one public port** (e.g., `tcp://mdma-909.local:5555`)
+- Microservices **register** on a local bus (IPC socket only, not exposed externally)
+- Gateway routes requests to the appropriate service by type/namespace
+- Clients are discoverable and addressable via the public interface
+
+```
+External clients
+       |
+       ▼
+┌─────────────────┐
+│  mdma-gateway   │  (single public port: 5555)
+│  (router/proxy) │
+└────────┬────────┘
+         │ local IPC bus
+    ┌────┴─────────────────────────┐
+    │         │                   │
+    ▼         ▼                   ▼
+mdma-library  mdma-bandcamp  mdma-playback
+(registered)  (registered)   (registered)
+```
+
+**Benefits:**
+- One port to forward/expose
+- Services can come and go without client reconfiguration
+- Natural place for auth, rate limiting, observability
+- Enables future service mesh for multi-room setups
+
+**When to implement:** After Milestone 1 complete and multiple services are running on the Pi simultaneously.
 
 ### Milestone 3: Basic Mixing (Automated)
 - Intelligent beatmatching
@@ -303,23 +371,31 @@ Rust's type system prevents illegal states.
 
 ## Current Focus
 
-**Immediate priority:** Connect mdma-console to mdma-library
+**Immediate priority:** Close the library ingestion loop (Bandcamp → inbox → indexed)
 
 **What's critical right now:**
-1. Add HTTP upload endpoint to mdma-console
-2. Add library browsing page to mdma-console
-3. Test end-to-end: upload -> ingest -> browse
+1. Trigger `mdma ingest-all` to index the 200+ tracks already in `/music/inbox`
+2. Verify end-to-end: Bandcamp download → inbox → library indexed
+3. Add inbox watcher so future downloads auto-ingest
 
-**What comes after console integration:**
-1. Inbox watcher (inotify-based)
-2. Bandcamp integration
-3. Audio playback service
+**What comes after:**
+1. Connect mdma-console to mdma-library (browse library in web UI)
+2. Audio playback service
+3. Unified IPC gateway (future architecture, see Future Vision section)
 
-**Philosophy:** Get the library visible in the UI, then add more sources and playback.
+**Philosophy:** Music is in the inbox. Close the loop before adding more features.
 
 ---
 
 ## Update History
+
+- **2026-02-18:** Bandcamp integration operational
+  - mdma-bandcamp service running on Pi (async NNG + tokio)
+  - 114-item Bandcamp collection syncing successfully
+  - ZIP extraction for albums, single FLAC rename for tracks
+  - nng_transport component extracted (shared mDNS resolution via avahi)
+  - MDMA_LIBRARY_SOCKET / MDMA_BANDCAMP_SOCKET env vars for CLI
+  - Future architecture: unified IPC gateway (one public port, services register locally)
 
 - **2026-02-12:** Part 2 progress update
   - mdma-library service fully operational
@@ -347,24 +423,23 @@ Rust's type system prevents illegal states.
 
 **Immediate actions:**
 
-1. **Add HTTP upload to mdma-console** (1-2 hours)
-   - POST /upload endpoint
-   - Writes to /music/inbox/
-   - Response with ingest status
+1. **Trigger library ingestion** (5 min)
+   ```bash
+   export MDMA_LIBRARY_SOCKET="tcp://mdma-909.local:5555"
+   mdma ingest-all
+   # Verify: mdma tracks
+   ```
 
-2. **Add library browsing to mdma-console** (2-3 hours)
+2. **Inbox watcher** - inotify-based auto-ingest
+   - Auto-trigger ingest pipeline when files land in inbox
+   - Eliminates manual `ingest-all` trigger after each sync
+
+3. **Add HTTP upload to mdma-console**
+   - POST /upload endpoint writes to /music/inbox/
+   - Triggers ingest after upload
+
+4. **Add library browsing to mdma-console**
    - Connect to mdma-library via nng
-   - Display track list
-   - Track detail page with facts
+   - Display track list, track detail page with facts
 
-3. **Test end-to-end workflow** (30 min)
-   - Upload file via web UI
-   - Verify appears in library
-   - Browse and view facts
-
-4. **Inbox watcher** (2-3 hours)
-   - inotify-based file watching
-   - Auto-trigger ingest pipeline
-   - Handle rate limiting for bulk drops
-
-**Current recommendation:** Focus on mdma-console integration to make the library visible and usable through a web browser.
+**Current recommendation:** Trigger `ingest-all` first to prove the full pipeline end-to-end, then add the inbox watcher to automate it.

@@ -82,7 +82,15 @@ Provides: Rust, Zig, cargo-zigbuild, PipeWire libs, nmap, sshpass, just
 
 ## Deployment
 
+### Raspberry Pi
+
+The provisioned Pi is at **mdma-909.local**.
+
+**IMPORTANT: Never wipe or delete `/music` on the Pi unless explicitly instructed. It contains the music library and downloaded tracks.**
+
 ### SSH Access
+
+Always use `/home/johlrogge/.ssh/mdma_pi` as the SSH key when connecting to the Pi.
 
 **Unprovisioned Pi (beacon mode):**
 ```bash
@@ -92,6 +100,18 @@ ssh root@welcome-to-mdma.local  # password: voidlinux
 **Provisioned Pi:**
 ```bash
 ssh -4 -i ~/.ssh/mdma_pi admin@mdma-909.local  # key-based auth, -4 forces IPv4
+```
+
+### Service Access
+
+- **Library IPC (local):** `ipc:///run/mdma/library.sock`
+- **Library TCP (remote):** `tcp://mdma-909.local:5555`
+- **Bandcamp TCP (remote):** `tcp://mdma-909.local:5556`
+
+Use env vars for the CLI from your laptop:
+```bash
+export MDMA_LIBRARY_SOCKET="tcp://mdma-909.local:5555"
+export MDMA_BANDCAMP_SOCKET="tcp://mdma-909.local:5556"
 ```
 
 **Web UI:** `http://welcome-to-mdma.local` (beacon) or `http://mdma-909.local` (provisioned)
