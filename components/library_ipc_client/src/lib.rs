@@ -10,14 +10,14 @@ use thiserror::Error;
 /// Errors that can occur when communicating with the library.
 #[derive(Debug, Error)]
 pub enum ClientError {
+    #[error("Connection error: {0}")]
+    Connection(#[from] nng_transport::ConnectionError),
+
     #[error("NNG error: {0}")]
     Nng(#[from] nng::Error),
 
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
-
-    #[error("Connection failed: {0}")]
-    ConnectionFailed(String),
 
     #[error("Protocol error: {0}")]
     Protocol(ProtocolError),
@@ -31,19 +31,20 @@ pub struct LibraryClient {
 impl LibraryClient {
     /// Connect to the library service at the given address.
     ///
+    /// Supports both IPC (`ipc:///path/to/socket`) and TCP (`tcp://host:port`).
+    /// For TCP addresses, hostnames are resolved to IPv4 addresses.
+    ///
     /// # Examples
     ///
     /// ```no_run
     /// use library_ipc_client::LibraryClient;
     ///
     /// let client = LibraryClient::connect("ipc:///run/mdma/library.sock")?;
+    /// let client = LibraryClient::connect("tcp://mdma-909.local:5555")?;
     /// # Ok::<(), library_ipc_client::ClientError>(())
     /// ```
     pub fn connect(address: &str) -> Result<Self, ClientError> {
-        let socket = nng::Socket::new(nng::Protocol::Req0)?;
-        socket.dial(address).map_err(|e| {
-            ClientError::ConnectionFailed(format!("Failed to connect to {}: {}", address, e))
-        })?;
+        let socket = nng_transport::connect(address)?;
         Ok(Self { socket })
     }
 
@@ -189,7 +190,9 @@ mod tests {
 
     #[test]
     fn client_error_display() {
-        let err = ClientError::ConnectionFailed("test".to_string());
+        let err = ClientError::Protocol(ProtocolError::Internal {
+            message: "test".to_string(),
+        });
         assert!(err.to_string().contains("test"));
     }
 }

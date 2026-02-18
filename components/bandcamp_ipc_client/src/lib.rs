@@ -10,14 +10,14 @@ use thiserror::Error;
 /// Errors that can occur when communicating with the bandcamp service.
 #[derive(Debug, Error)]
 pub enum ClientError {
+    #[error("Connection error: {0}")]
+    Connection(#[from] nng_transport::ConnectionError),
+
     #[error("NNG error: {0}")]
     Nng(#[from] nng::Error),
 
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
-
-    #[error("Connection failed: {0}")]
-    ConnectionFailed(String),
 
     #[error("Protocol error: {0}")]
     Protocol(ProtocolError),
@@ -31,19 +31,24 @@ pub struct BandcampClient {
 impl BandcampClient {
     /// Connect to the bandcamp service at the given address.
     ///
+    /// Supports both IPC (`ipc:///path/to/socket`) and TCP (`tcp://host:port`).
+    /// For TCP addresses, hostnames are resolved to IPv4 addresses since NNG
+    /// doesn't handle DNS resolution.
+    ///
     /// # Examples
     ///
     /// ```no_run
     /// use bandcamp_ipc_client::BandcampClient;
     ///
+    /// // IPC connection
     /// let client = BandcampClient::connect("ipc:///run/mdma/bandcamp.sock")?;
+    ///
+    /// // TCP with hostname (resolved to IPv4)
+    /// let client = BandcampClient::connect("tcp://mdma-909.local:5556")?;
     /// # Ok::<(), bandcamp_ipc_client::ClientError>(())
     /// ```
     pub fn connect(address: &str) -> Result<Self, ClientError> {
-        let socket = nng::Socket::new(nng::Protocol::Req0)?;
-        socket.dial(address).map_err(|e| {
-            ClientError::ConnectionFailed(format!("Failed to connect to {}: {}", address, e))
-        })?;
+        let socket = nng_transport::connect(address)?;
         Ok(Self { socket })
     }
 
@@ -165,7 +170,9 @@ mod tests {
 
     #[test]
     fn client_error_display() {
-        let err = ClientError::ConnectionFailed("test".to_string());
+        let err = ClientError::Protocol(ProtocolError::Internal {
+            message: "test".to_string(),
+        });
         assert!(err.to_string().contains("test"));
     }
 }

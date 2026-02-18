@@ -21,11 +21,21 @@ use library_ipc_client::{
 #[command(author, version, about = "MDMA CLI - Control the music services")]
 struct Cli {
     /// Library IPC socket address
-    #[arg(long, default_value = "ipc:///run/mdma/library.sock", global = true)]
+    #[arg(
+        long,
+        default_value = "ipc:///run/mdma/library.sock",
+        global = true,
+        env = "MDMA_LIBRARY_SOCKET"
+    )]
     socket: String,
 
     /// Bandcamp IPC socket address
-    #[arg(long, default_value = "ipc:///run/mdma/bandcamp.sock", global = true)]
+    #[arg(
+        long,
+        default_value = "ipc:///run/mdma/bandcamp.sock",
+        global = true,
+        env = "MDMA_BANDCAMP_SOCKET"
+    )]
     bandcamp_socket: String,
 
     #[command(subcommand)]
@@ -165,8 +175,8 @@ fn handle_error(err: ClientError) -> ! {
         ClientError::Protocol(e) => {
             eprintln!("Error: {}", e);
         }
-        ClientError::ConnectionFailed(msg) => {
-            eprintln!("Connection failed: {}", msg);
+        ClientError::Connection(e) => {
+            eprintln!("Connection failed: {}", e);
             eprintln!("Is mdma-library running?");
         }
         e => {
@@ -186,8 +196,8 @@ fn handle_bandcamp_error(err: BandcampClientError) -> ! {
         BandcampClientError::Protocol(e) => {
             eprintln!("Error: {}", e);
         }
-        BandcampClientError::ConnectionFailed(msg) => {
-            eprintln!("Connection failed: {}", msg);
+        BandcampClientError::Connection(e) => {
+            eprintln!("Connection failed: {}", e);
             eprintln!("Is mdma-bandcamp running?");
         }
         e => {
