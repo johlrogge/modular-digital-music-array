@@ -228,10 +228,10 @@ impl BandcampService {
         let mut new_items = 0;
 
         for item in collection {
-            // For now, use item ID as cache key (we'll improve this when we have track info)
+            // Check both by track key and by item ID (old cache entries use filename as 3rd field)
             let cache_key = format!("{}|{}|{}|0", item.artist, item.title, item.id.as_str());
 
-            if !cache.is_downloaded(&cache_key) {
+            if !cache.is_downloaded(&cache_key) && !cache.is_item_downloaded(item.id.as_str()) {
                 new_items += 1;
 
                 // Add to download queue
@@ -627,8 +627,12 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
         let staging_path = service.downloads_dir.join(format!("{}.download", item_id));
 
         use tokio_stream::StreamExt;
-        let mut stream =
-            std::pin::pin!(client.download_item(&details, service.format, &staging_path));
+        let mut stream = std::pin::pin!(client.download_item(
+            &details,
+            service.format,
+            &staging_path,
+            &queued.item.download_url
+        ));
 
         let mut download_success = false;
         while let Some(event) = stream.next().await {
@@ -741,7 +745,16 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
                     }
                 }
                 bandcamp_api::DownloadEvent::Failed { error } => {
-                    tracing::error!(item_id = %item_id, error = %error, "Download failed");
+                    if error.contains("permanently expired") {
+                        tracing::warn!(
+                            item_id = %item_id,
+                            artist = %queued.item.artist,
+                            title = %queued.item.title,
+                            "Download links expired — revalidate at bandcamp.com"
+                        );
+                    } else {
+                        tracing::error!(item_id = %item_id, error = %error, "Download failed");
+                    }
                     let mut active = service.active_downloads.lock();
                     if let Some(dl) = active.get_mut(&item_id) {
                         dl.state = DownloadState::Failed;

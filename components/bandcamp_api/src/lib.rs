@@ -27,7 +27,7 @@
 //! // Download an item
 //! for item in &collection {
 //!     let details = client.get_item_details(&item.download_url).await?;
-//!     let mut stream = std::pin::pin!(client.download_item(&details, AudioFormat::Flac, Path::new("./music/file.flac")));
+//!     let mut stream = std::pin::pin!(client.download_item(&details, AudioFormat::Flac, Path::new("./music/file.flac"), &item.download_url));
 //!     while let Some(event) = stream.next().await {
 //!         match event {
 //!             DownloadEvent::Progress(p) => println!("Progress: {:?}%", p.percentage()),

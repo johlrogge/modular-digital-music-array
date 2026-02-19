@@ -43,4 +43,13 @@ pub enum BandcampError {
 
     #[error("Not logged in - cookies may have expired")]
     NotLoggedIn,
+
+    #[error("Bandcamp cookie '{cookie}' expired {expired_ago_secs}s ago — re-export cookies from your browser")]
+    CookiesExpired {
+        cookie: String,
+        expired_ago_secs: u64,
+    },
+
+    #[error("Download signature expired — needs page refresh")]
+    DownloadExpired,
 }

@@ -27,15 +27,17 @@ pub struct DownloadCache {
     path: PathBuf,
     /// Set of track keys that have been downloaded
     downloaded: HashSet<String>,
+    /// Set of source item IDs that have been downloaded
+    downloaded_item_ids: HashSet<String>,
 }
 
 impl DownloadCache {
     /// Open or create a cache file
     pub fn open(path: &Path) -> Result<Self, CacheError> {
-        let downloaded = if path.exists() {
+        let (downloaded, downloaded_item_ids) = if path.exists() {
             Self::load_entries(path)?
         } else {
-            HashSet::new()
+            (HashSet::new(), HashSet::new())
         };
 
         tracing::info!(path = %path.display(), entries = downloaded.len(), "Loaded download cache");
@@ -43,14 +45,16 @@ impl DownloadCache {
         Ok(Self {
             path: path.to_path_buf(),
             downloaded,
+            downloaded_item_ids,
         })
     }
 
     /// Load entries from cache file
-    fn load_entries(path: &Path) -> Result<HashSet<String>, CacheError> {
+    fn load_entries(path: &Path) -> Result<(HashSet<String>, HashSet<String>), CacheError> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
         let mut entries = HashSet::new();
+        let mut item_ids = HashSet::new();
 
         for line in reader.lines() {
             let line = line?;
@@ -61,19 +65,21 @@ impl DownloadCache {
                 continue;
             }
 
-            // Format: track_key|source_item_id
-            // We only need the track_key part for lookup
-            // Reconstruct the key from the first 4 parts (artist|album|track|duration)
+            // Format: artist|album|track|duration|source_item_id
             let parts: Vec<&str> = line.splitn(5, '|').collect();
             if parts.len() >= 4 {
                 let track_key = format!("{}|{}|{}|{}", parts[0], parts[1], parts[2], parts[3]);
                 entries.insert(track_key);
+                // Also index by source item ID (5th field)
+                if parts.len() >= 5 && !parts[4].is_empty() {
+                    item_ids.insert(parts[4].to_string());
+                }
             } else {
                 tracing::warn!(line = %line, "Invalid cache entry, skipping");
             }
         }
 
-        Ok(entries)
+        Ok((entries, item_ids))
     }
 
     /// Build a track key for cache lookup
@@ -86,9 +92,14 @@ impl DownloadCache {
         format!("{}|{}|{}|{}", artist, album, track_name, duration_secs)
     }
 
-    /// Check if a track has been downloaded
+    /// Check if a track has been downloaded (by track key)
     pub fn is_downloaded(&self, key: &str) -> bool {
         self.downloaded.contains(key)
+    }
+
+    /// Check if an item ID has been downloaded
+    pub fn is_item_downloaded(&self, item_id: &str) -> bool {
+        self.downloaded_item_ids.contains(item_id)
     }
 
     /// Mark a track as downloaded
@@ -105,8 +116,11 @@ impl DownloadCache {
 
         writeln!(file, "{}|{}", key, source_item_id)?;
 
-        // Add to in-memory set
+        // Add to in-memory sets
         self.downloaded.insert(key.to_string());
+        if !source_item_id.is_empty() {
+            self.downloaded_item_ids.insert(source_item_id.to_string());
+        }
 
         Ok(())
     }

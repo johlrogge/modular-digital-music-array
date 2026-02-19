@@ -68,7 +68,7 @@ pub struct CollectionItem {
     pub item_type: ItemType,
     /// When the item was purchased
     pub purchased: Option<DateTime<Utc>>,
-    /// URL to download the item
+    /// URL to download the item (from redownload_urls)
     pub download_url: String,
 }
 

@@ -117,6 +117,8 @@ export MDMA_BANDCAMP_SOCKET="tcp://mdma-909.local:5556"
 export MDMA_PLAYBACK_SOCKET="tcp://mdma-909.local:5557"
 ```
 
+**Bandcamp username:** `johlyroger`
+
 **Web UI:** `http://welcome-to-mdma.local` (beacon) or `http://mdma-909.local` (provisioned)
 
 **Package repo:** GitHub Pages at `https://johlrogge.github.io/modular-digital-music-array/`

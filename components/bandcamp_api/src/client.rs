@@ -138,7 +138,7 @@ impl BandcampClient {
     ) -> Result<Vec<CollectionItem>, BandcampError> {
         let mut items = Vec::new();
 
-        // Get download URLs
+        // Get download URLs — iterate redownload_urls as primary source, enrich with metadata
         let download_urls = data
             .collection_data
             .redownload_urls
@@ -146,17 +146,18 @@ impl BandcampClient {
             .cloned()
             .unwrap_or_default();
 
-        // Match items to download URLs
-        for (id, url) in download_urls {
-            // Find the item in the cache
-            if let Some(item) = data
-                .item_cache
-                .collection
-                .values()
-                .find(|i| format!("{}{}", i.sale_item_type, i.sale_item_id) == id)
-            {
+        for (id, url) in &download_urls {
+            // Find the item in the cache — try both direct key and constructed key lookup
+            let cached = data.item_cache.collection.get(id).or_else(|| {
+                data.item_cache
+                    .collection
+                    .values()
+                    .find(|i| format!("{}{}", i.sale_item_type, i.sale_item_id) == *id)
+            });
+
+            if let Some(item) = cached {
                 items.push(CollectionItem {
-                    id: ItemId::new(&id),
+                    id: ItemId::new(id),
                     artist: Artist::new(&item.band_name),
                     title: Title::new(&item.item_title),
                     item_type: if item.sale_item_type == "t" {
@@ -165,8 +166,30 @@ impl BandcampClient {
                         ItemType::Album
                     },
                     purchased: self.parse_purchase_date(&item.purchased),
-                    download_url: url,
+                    download_url: url.clone(),
                 });
+            } else {
+                tracing::warn!("Item {} has download URL but no cache entry", id);
+                items.push(CollectionItem {
+                    id: ItemId::new(id),
+                    artist: Artist::new("Unknown"),
+                    title: Title::new("Unknown"),
+                    item_type: ItemType::Album,
+                    purchased: None,
+                    download_url: url.clone(),
+                });
+            }
+        }
+
+        // Log gap detection
+        if let Some(expected) = data.collection_data.item_count {
+            let actual = items.len();
+            if actual < expected as usize {
+                tracing::info!(
+                    "Initial page has {}/{} items, remaining will be fetched via pagination",
+                    actual,
+                    expected
+                );
             }
         }
 
@@ -216,15 +239,12 @@ impl BandcampClient {
 
             let data: ParsedCollectionItems = response.json().await?;
 
-            // Add items
-            for (id, url) in data.redownload_urls {
-                if let Some(item) = data
-                    .items
-                    .iter()
-                    .find(|i| format!("{}{}", i.sale_item_type, i.sale_item_id) == id)
-                {
+            // Match items to download URLs (pagination API items have consistent key format)
+            for item in &data.items {
+                let constructed_key = format!("{}{}", item.sale_item_type, item.sale_item_id);
+                if let Some(url) = data.redownload_urls.get(&constructed_key) {
                     all_items.push(CollectionItem {
-                        id: ItemId::new(&id),
+                        id: ItemId::new(&constructed_key),
                         artist: Artist::new(&item.band_name),
                         title: Title::new(&item.item_title),
                         item_type: if item.sale_item_type == "t" {
@@ -233,8 +253,15 @@ impl BandcampClient {
                             ItemType::Album
                         },
                         purchased: self.parse_purchase_date(&item.purchased),
-                        download_url: url,
+                        download_url: url.clone(),
                     });
+                } else {
+                    tracing::warn!(
+                        "Paginated item without download URL: {} - {} ({})",
+                        item.band_name,
+                        item.item_title,
+                        constructed_key
+                    );
                 }
             }
 
@@ -322,20 +349,25 @@ impl BandcampClient {
         })
     }
 
-    /// Download an item to the specified path, returning a stream of progress events
+    /// Download an item to the specified path, returning a stream of progress events.
+    ///
+    /// `download_page_url` is the Bandcamp download page URL (from redownload_urls),
+    /// used to refresh expired download signatures if needed.
     pub fn download_item(
         &self,
         item: &DigitalItem,
         format: AudioFormat,
         dest: &Path,
+        download_page_url: &str,
     ) -> impl tokio_stream::Stream<Item = DownloadEvent> + '_ {
         let url = item.formats.get(&format).cloned();
         let dest = dest.to_path_buf();
         let artist = item.artist.clone();
         let title = item.title.clone();
+        let page_url = download_page_url.to_string();
 
         async_stream::stream! {
-            let url = match url {
+            let mut url = match url {
                 Some(u) => u,
                 None => {
                     yield DownloadEvent::Failed {
@@ -357,9 +389,71 @@ impl BandcampClient {
                 }
             }
 
-            // Start download
+            // Resolve the actual download URL via Bandcamp's statdownload endpoint.
+            // The format URL from digital_items is not a direct download — it needs
+            // to go through /statdownload/ to get the real CDN URL with a valid token.
+            let download_url = match Self::resolve_download_url(&self.http, &url).await {
+                Ok(u) => u,
+                Err(BandcampError::DownloadExpired) => {
+                    // Sig expired — re-fetch the download page for a fresh sig
+                    tracing::info!("Download sig expired, re-fetching download page for {} - {}", artist, title);
+                    self.wait_for_rate_limit().await;
+                    match self.get_item_details(&page_url).await {
+                        Ok(fresh_item) => {
+                            match fresh_item.formats.get(&format) {
+                                Some(fresh_url) => {
+                                    url = fresh_url.clone();
+                                    match Self::resolve_download_url(&self.http, &url).await {
+                                        Ok(u) => u,
+                                        Err(BandcampError::DownloadExpired) => {
+                                            yield DownloadEvent::Failed {
+                                                error: format!(
+                                                    "Download links for '{} - {}' have permanently expired. \
+                                                     Visit bandcamp.com, go to your collection, click this item, \
+                                                     and re-request the download link (you may need to enter your \
+                                                     purchase email). Then re-sync.",
+                                                    artist, title
+                                                ),
+                                            };
+                                            return;
+                                        }
+                                        Err(e) => {
+                                            yield DownloadEvent::Failed {
+                                                error: format!("Failed to resolve after refresh: {}", e),
+                                            };
+                                            return;
+                                        }
+                                    }
+                                }
+                                None => {
+                                    yield DownloadEvent::Failed {
+                                        error: format!("Format {} not available after refresh", format),
+                                    };
+                                    return;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            yield DownloadEvent::Failed {
+                                error: format!("Failed to refresh download page: {}", e),
+                            };
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    yield DownloadEvent::Failed {
+                        error: format!("Failed to resolve download URL: {}", e),
+                    };
+                    return;
+                }
+            };
+
+            tracing::debug!("Resolved download URL: {}", download_url);
+
+            // Download the actual file
             self.wait_for_rate_limit().await;
-            let response = match self.http.get(&url).send().await {
+            let response = match self.http.get(&download_url).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     yield DownloadEvent::Failed {
@@ -372,6 +466,17 @@ impl BandcampClient {
             if !response.status().is_success() {
                 yield DownloadEvent::Failed {
                     error: format!("Download failed with status {}", response.status()),
+                };
+                return;
+            }
+
+            // Verify we got audio, not HTML
+            let content_type = response.headers().get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("unknown");
+            if content_type.contains("text/html") {
+                yield DownloadEvent::Failed {
+                    error: format!("Got HTML instead of audio from resolved URL (content-type: {})", content_type),
                 };
                 return;
             }
@@ -430,5 +535,143 @@ impl BandcampClient {
             tracing::info!("Download complete: {:?}", dest);
             yield DownloadEvent::Completed { path: dest };
         }
+    }
+
+    /// Resolve a Bandcamp format URL to the actual CDN download URL via the statdownload endpoint.
+    ///
+    /// Bandcamp's download URLs from digital_items are not direct links to audio files.
+    /// They must go through a /statdownload/ endpoint which returns JSON with the real URL.
+    async fn resolve_download_url(
+        http: &Client,
+        format_url: &str,
+    ) -> Result<String, BandcampError> {
+        // Transform /download/ to /statdownload/ and add required params
+        let stat_url = format_url.replace("/download/", "/statdownload/");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let stat_url = format!("{}&.rand={}&.vrs=1", stat_url, now_ms);
+
+        tracing::debug!("Calling statdownload: {}", stat_url);
+
+        let response = http.get(&stat_url).send().await?;
+
+        if !response.status().is_success() {
+            return Err(BandcampError::Download(format!(
+                "statdownload returned status {}",
+                response.status()
+            )));
+        }
+
+        let body = response.text().await?;
+        tracing::debug!(
+            "statdownload response body (first 500 chars): {}",
+            &body[..body.len().min(500)]
+        );
+
+        // The response is JavaScript: `if ( window.Downloads ) { Downloads.statResult( {...} ) };`
+        // Extract the JSON object from inside statResult( ... )
+        let json_str = if body.trim_start().starts_with('{') {
+            body.clone()
+        } else if let Some(start) = body.find("statResult") {
+            // Find the JSON object after "statResult(" or "statResult ("
+            let after_stat = &body[start..];
+            let paren_start = after_stat.find('(').ok_or_else(|| {
+                BandcampError::Download("statResult without opening paren".to_string())
+            })?;
+            let json_start = after_stat[paren_start..].find('{').ok_or_else(|| {
+                BandcampError::Download("No JSON object after statResult(".to_string())
+            })?;
+            let json_begin = start + paren_start + json_start;
+            // Find the matching closing brace
+            let remaining = &body[json_begin..];
+            let mut depth = 0;
+            let mut end = 0;
+            for (i, c) in remaining.char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if end == 0 {
+                return Err(BandcampError::Download(
+                    "Unmatched braces in statResult".to_string(),
+                ));
+            }
+            remaining[..=end].to_string()
+        } else {
+            return Err(BandcampError::Download(format!(
+                "statdownload returned unexpected response: {}",
+                &body[..body.len().min(200)]
+            )));
+        };
+
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
+            BandcampError::Download(format!(
+                "Failed to parse statdownload JSON: {} — body: {}",
+                e,
+                &json_str[..json_str.len().min(300)]
+            ))
+        })?;
+
+        // Check for error result with retry_url
+        if let Some(result) = parsed.get("result").and_then(|v| v.as_str()) {
+            if result == "ok" {
+                if let Some(url) = parsed.get("download_url").and_then(|v| v.as_str()) {
+                    return Ok(url.to_string());
+                }
+            } else if result == "err" {
+                if let Some(retry_url) = parsed
+                    .get("retry_url")
+                    .and_then(|v| v.as_str())
+                    .filter(|u| !u.is_empty())
+                {
+                    tracing::debug!("statdownload returned retry_url, retrying: {}", retry_url);
+                    // Retry with the provided URL
+                    let retry_response = http.get(retry_url).send().await?;
+                    let retry_body = retry_response.text().await?;
+                    let retry_json: serde_json::Value =
+                        serde_json::from_str(&if retry_body.trim_start().starts_with('{') {
+                            retry_body
+                        } else {
+                            retry_body
+                                .find('{')
+                                .and_then(|s| {
+                                    retry_body.rfind('}').map(|e| retry_body[s..=e].to_string())
+                                })
+                                .unwrap_or(retry_body)
+                        })?;
+
+                    if let Some(url) = retry_json.get("download_url").and_then(|v| v.as_str()) {
+                        return Ok(url.to_string());
+                    }
+                }
+                let error_type = parsed
+                    .get("errortype")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                if error_type == "ExpirationError" {
+                    tracing::info!("statdownload returned ExpirationError — sig expired");
+                    return Err(BandcampError::DownloadExpired);
+                }
+                return Err(BandcampError::Download(format!(
+                    "statdownload returned error: {}",
+                    error_type
+                )));
+            }
+        }
+
+        Err(BandcampError::Download(format!(
+            "Unexpected statdownload response: {}",
+            &json_str[..json_str.len().min(300)]
+        )))
     }
 }
