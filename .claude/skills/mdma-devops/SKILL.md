@@ -18,6 +18,10 @@ Production deployment infrastructure for MDMA music system on Raspberry Pi 5 har
 - **NVMe:** All runtime operations, OS, data, high-write activities  
 - **Music/Metadata:** Separate partitions, survive OS reinstalls
 
+**Void-First Approach:** Always use what Void Linux provides before creating custom solutions. Use stock Void packages, runit services, users, and conventions. Only create custom services/users when Void has no equivalent. When creating our own packages, follow Void packaging conventions. Example: use Void's stock `pipewire` runit service and `_pipewire` user. WirePlumber is launched by PipeWire via `context.exec` drop-in (`ln -s /usr/share/examples/wireplumber/10-wireplumber.conf /etc/pipewire/pipewire.conf.d/`), not as a separate service — this is the Void handbook way.
+
+**Never Build on the Pi:** All compilation happens on the dev machine via cross-compilation. Never install Rust, cargo, gcc, cmake, or other build tools on the Pi. The Pi is a deployment target only.
+
 **Ansible vs Packages:**
 - **Void Packages:** Application code, binaries, services (changes with git commits)
 - **Ansible:** System topology, configuration, provisioning (defines system shape)

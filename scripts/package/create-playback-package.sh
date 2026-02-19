@@ -31,24 +31,15 @@ echo "  → Creating service script..."
 cat > "$PACKAGE_DIR/etc/sv/mdma-playback/run" <<'RUNSCRIPT'
 #!/bin/sh
 exec 2>&1
-# Create runtime directory if needed
+sv check pipewire || exit 1
+sleep 1
 mkdir -p /run/mdma
-
-# PipeWire must be running for audio output.
-# The mdma user needs access to the PipeWire socket.
-# Set XDG_RUNTIME_DIR so PipeWire client can find the socket.
-export XDG_RUNTIME_DIR="/run/user/$(id -u mdma)"
-
-# Run as mdma user (must be in audio group)
-if id mdma >/dev/null 2>&1; then
-    exec chpst -u mdma /usr/bin/mdma-playback \
-        --socket ipc:///run/mdma/playback.sock \
-        --tcp tcp://0.0.0.0:5557
-else
-    exec /usr/bin/mdma-playback \
-        --socket ipc:///run/mdma/playback.sock \
-        --tcp tcp://0.0.0.0:5557
-fi
+chown mdma:mdma /run/mdma
+rm -f /run/mdma/playback.sock
+export PIPEWIRE_RUNTIME_DIR=/run/pipewire
+exec chpst -u mdma:mdma:audio:video:_pipewire /usr/bin/mdma-playback \
+    --socket ipc:///run/mdma/playback.sock \
+    --tcp tcp://0.0.0.0:5557
 RUNSCRIPT
 chmod +x "$PACKAGE_DIR/etc/sv/mdma-playback/run"
 
@@ -75,8 +66,22 @@ post)
         useradd -r -s /sbin/nologin -d /music -c "MDMA Service User" mdma || true
     fi
 
-    # Add mdma user to audio group for PipeWire access
-    usermod -a -G audio mdma 2>/dev/null || true
+    # Add mdma user to audio, video, _pipewire groups for PipeWire access
+    usermod -a -G audio,video,_pipewire mdma 2>/dev/null || true
+
+    # Ensure PipeWire is set up for headless operation:
+    # - Stock pipewire runit service must be enabled
+    # - WirePlumber launched via PipeWire context.exec drop-in
+    if [ -f /usr/share/examples/wireplumber/10-wireplumber.conf ]; then
+        mkdir -p /etc/pipewire/pipewire.conf.d
+        ln -sf /usr/share/examples/wireplumber/10-wireplumber.conf \
+            /etc/pipewire/pipewire.conf.d/ 2>/dev/null || true
+    fi
+    # Enable stock pipewire service if not already enabled
+    if [ -d /etc/sv/pipewire ] && [ ! -e /var/service/pipewire ]; then
+        ln -sf /etc/sv/pipewire /var/service/pipewire
+        echo "pipewire service enabled"
+    fi
 
     # Set ownership
     chown -R mdma:mdma /run/mdma 2>/dev/null || true
@@ -127,7 +132,7 @@ if XBPS_TARGET_ARCH=aarch64 xbps-create \
     -A aarch64 \
     -n "mdma-playback-${FULLVERSION}" \
     -s "MDMA audio playback server" \
-    -D "pipewire>=0 wireplumber>=0" \
+    -D "pipewire>=0 wireplumber>=0 libspa-alsa>=0 alsa-pipewire>=0" \
     -H "https://github.com/johlrogge/modular-digital-music-array" \
     -l MIT \
     -m "Joakim Rohlén <joakim@roehlen.com>" \

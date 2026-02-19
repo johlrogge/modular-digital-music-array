@@ -803,17 +803,22 @@ console-cross:
     file target/aarch64-unknown-linux-gnu/release/mdma-console
     ls -lh target/aarch64-unknown-linux-gnu/release/mdma-console
 
-# Cross-compile playback server for aarch64
+# Set up aarch64 PipeWire sysroot for cross-compiling playback
 [group('build')]
-playback-cross:
+setup-playback-sysroot:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "Building mdma-playback for aarch64..."
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin mdma-playback
-    echo ""
-    echo "Playback built!"
-    file target/aarch64-unknown-linux-gnu/release/mdma-playback
-    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-playback
+    if [ -d ".cross/aarch64-sysroot/usr/lib" ]; then
+        echo "Sysroot already exists at .cross/aarch64-sysroot/"
+        echo "  To recreate, run: rm -rf .cross/aarch64-sysroot && just setup-playback-sysroot"
+    else
+        ./scripts/ci/setup-cross-sysroot.sh
+    fi
+
+# Cross-compile playback server for aarch64
+[group('build')]
+playback-cross: setup-playback-sysroot
+    ./scripts/ci/build-playback.sh
 
 # Cross-compile library service for aarch64
 [group('build')]
@@ -902,27 +907,57 @@ deploy-playback: playback-cross
     HOST="${PI_HOST:-mdma-909.local}"
     PLAYBACK="target/aarch64-unknown-linux-gnu/release/mdma-playback"
     SSH_KEY="$HOME/.ssh/mdma_pi"
+    TMPDIR=$(mktemp -d)
+    trap 'rm -rf "$TMPDIR"' EXIT
 
     echo "Deploying mdma-playback to $HOST..."
 
-    # Copy binary to Pi (use -4 to force IPv4, avoids IPv6 link-local issues)
-    scp -4 -i "$SSH_KEY" "$PLAYBACK" "admin@${HOST}:/tmp/"
+    # Write service scripts locally (avoids SSH heredoc escaping issues)
+    cat > "$TMPDIR/run" <<'EOF'
+    #!/bin/sh
+    exec 2>&1
+    sv check pipewire || exit 1
+    sleep 1
+    mkdir -p /run/mdma
+    chown mdma:mdma /run/mdma
+    rm -f /run/mdma/playback.sock
+    export PIPEWIRE_RUNTIME_DIR=/run/pipewire
+    exec chpst -u mdma:mdma:audio:video:_pipewire /usr/bin/mdma-playback \
+        --socket ipc:///run/mdma/playback.sock \
+        --tcp tcp://0.0.0.0:5557
+    EOF
 
-    # Stop service, move binary, create directories, update run script, start
+    cat > "$TMPDIR/log-run" <<'EOF'
+    #!/bin/sh
+    exec svlogd -tt /var/log/mdma-playback
+    EOF
+
+    # Copy binary and service scripts to Pi
+    scp -4 -i "$SSH_KEY" "$PLAYBACK" "$TMPDIR/run" "$TMPDIR/log-run" "admin@${HOST}:/tmp/"
+
+    # Stop service, install files, ensure PipeWire setup, start
     ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-playback 2>/dev/null || true
         sudo mv /tmp/mdma-playback /usr/bin/
         sudo chmod +x /usr/bin/mdma-playback
         sudo mkdir -p /etc/sv/mdma-playback/log /var/log/mdma-playback /run/mdma
         sudo chown -R mdma:mdma /run/mdma
-        sudo usermod -a -G audio mdma 2>/dev/null || true
-        printf "#!/bin/sh\nexec 2>&1\nexport XDG_RUNTIME_DIR=/run/user/\$(id -u mdma)\nexec chpst -u mdma /usr/bin/mdma-playback --socket ipc:///run/mdma/playback.sock --tcp tcp://0.0.0.0:5557\n" | sudo tee /etc/sv/mdma-playback/run > /dev/null
-        sudo chmod +x /etc/sv/mdma-playback/run
-        printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-playback\n" | sudo tee /etc/sv/mdma-playback/log/run > /dev/null
-        sudo chmod +x /etc/sv/mdma-playback/log/run
+        sudo usermod -a -G audio,video,_pipewire mdma 2>/dev/null || true
+        sudo cp /tmp/run /etc/sv/mdma-playback/run
+        sudo cp /tmp/log-run /etc/sv/mdma-playback/log/run
+        sudo chmod +x /etc/sv/mdma-playback/run /etc/sv/mdma-playback/log/run
+        # Ensure PipeWire WirePlumber drop-in is configured
+        sudo mkdir -p /etc/pipewire/pipewire.conf.d
+        sudo ln -sf /usr/share/examples/wireplumber/10-wireplumber.conf /etc/pipewire/pipewire.conf.d/ 2>/dev/null || true
+        # Ensure stock pipewire service is enabled
+        if [ -d /etc/sv/pipewire ] && [ ! -e /var/service/pipewire ]; then
+            sudo cp -a /usr/share/examples/sv/pipewire /etc/sv/pipewire
+            sudo ln -sf /etc/sv/pipewire /var/service/pipewire
+            sleep 3
+        fi
         sudo ln -sf /etc/sv/mdma-playback /var/service/mdma-playback 2>/dev/null || true
         sleep 2
         sudo sv start mdma-playback 2>/dev/null || true
-        sudo sv status mdma-playback'
+        sudo sv status pipewire mdma-playback'
 
     echo ""
     echo "Playback deployed! TCP on port 5557"

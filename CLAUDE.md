@@ -39,7 +39,7 @@ just pi-connect         # Find and auto-SSH to Pi
 
 - **bases/** - Binary entry points
   - `beacon` - Provisioning server with web UI (main focus)
-  - `playback_server` - Audio playback server
+  - `mdma_playback` - Audio playback server
   - `library_crawler` - Music library indexing
   - `media_ctl`, `download_cli` - CLI tools
 
@@ -107,11 +107,14 @@ ssh -4 -i ~/.ssh/mdma_pi admin@mdma-909.local  # key-based auth, -4 forces IPv4
 - **Library IPC (local):** `ipc:///run/mdma/library.sock`
 - **Library TCP (remote):** `tcp://mdma-909.local:5555`
 - **Bandcamp TCP (remote):** `tcp://mdma-909.local:5556`
+- **Playback IPC (local):** `ipc:///run/mdma/playback.sock`
+- **Playback TCP (remote):** `tcp://mdma-909.local:5557`
 
 Use env vars for the CLI from your laptop:
 ```bash
 export MDMA_LIBRARY_SOCKET="tcp://mdma-909.local:5555"
 export MDMA_BANDCAMP_SOCKET="tcp://mdma-909.local:5556"
+export MDMA_PLAYBACK_SOCKET="tcp://mdma-909.local:5557"
 ```
 
 **Web UI:** `http://welcome-to-mdma.local` (beacon) or `http://mdma-909.local` (provisioned)
