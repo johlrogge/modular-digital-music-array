@@ -36,6 +36,10 @@ struct Args {
     #[arg(long)]
     tcp: Option<String>,
 
+    /// Library service socket address for auto-ingest
+    #[arg(long, default_value = "ipc:///run/mdma/library.sock")]
+    library_socket: String,
+
     /// Audio format to download
     #[arg(long, default_value = "flac")]
     format: String,
@@ -77,6 +81,7 @@ async fn main() -> Result<()> {
         inbox_dir = %args.inbox_dir.display(),
         cache = %args.cache.display(),
         socket = %args.socket,
+        library_socket = %args.library_socket,
         format = %args.format,
         "Starting MDMA Bandcamp service"
     );
@@ -108,6 +113,7 @@ async fn main() -> Result<()> {
         args.inbox_dir,
         args.cache,
         format,
+        args.library_socket,
     )?;
 
     let service = std::sync::Arc::new(bandcamp_service);

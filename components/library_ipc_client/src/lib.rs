@@ -152,7 +152,19 @@ impl LibraryClient {
 
     /// Ingest a file from the inbox.
     pub fn ingest_file(&self, path: &InboxPath) -> Result<IngestResult, ClientError> {
-        match self.request(&LibraryRequest::IngestFile { path: path.clone() })? {
+        self.ingest_file_with_source(path, None)
+    }
+
+    /// Ingest a file from the inbox with source metadata.
+    pub fn ingest_file_with_source(
+        &self,
+        path: &InboxPath,
+        source: Option<IngestSource>,
+    ) -> Result<IngestResult, ClientError> {
+        match self.request(&LibraryRequest::IngestFile {
+            path: path.clone(),
+            source,
+        })? {
             LibraryResponse::IngestResult(result) => Ok(result),
             LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
             _ => Err(ClientError::Protocol(ProtocolError::Internal {
@@ -168,6 +180,39 @@ impl LibraryClient {
             LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
             _ => Err(ClientError::Protocol(ProtocolError::Internal {
                 message: "Unexpected response to DeleteInboxFile".to_string(),
+            })),
+        }
+    }
+
+    /// Check if a fact with the given type and value exists.
+    pub fn has_fact(&self, fact_type: &str, value: &str) -> Result<bool, ClientError> {
+        match self.request(&LibraryRequest::HasFact {
+            fact_type: fact_type.to_string(),
+            value: value.to_string(),
+        })? {
+            LibraryResponse::FactExists { exists, .. } => Ok(exists),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to HasFact".to_string(),
+            })),
+        }
+    }
+
+    /// Batch check: which of these values exist for a given fact type?
+    /// Returns only the values that exist.
+    pub fn has_facts(
+        &self,
+        fact_type: &str,
+        values: Vec<String>,
+    ) -> Result<Vec<String>, ClientError> {
+        match self.request(&LibraryRequest::HasFacts {
+            fact_type: fact_type.to_string(),
+            values,
+        })? {
+            LibraryResponse::FactsExist { existing, .. } => Ok(existing),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to HasFacts".to_string(),
             })),
         }
     }

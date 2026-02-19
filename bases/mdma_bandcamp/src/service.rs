@@ -9,8 +9,9 @@ use crate::ipc::{
     ItemId, ProtocolError, ServiceStatus,
 };
 use bandcamp_api::{AudioFormat, BandcampClient, CollectionItem};
+use library_ipc_client::{InboxPath, IngestSource, LibraryClient};
 use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -80,6 +81,8 @@ pub struct BandcampService {
     format: AudioFormat,
     /// Whether cookies are currently loaded
     cookies_loaded: AtomicBool,
+    /// Library service socket address for auto-ingest
+    library_socket: String,
 }
 
 impl BandcampService {
@@ -90,6 +93,7 @@ impl BandcampService {
         inbox_dir: PathBuf,
         cache_path: PathBuf,
         format: AudioFormat,
+        library_socket: String,
     ) -> Result<Self, ServiceError> {
         // Load cache
         let cache = DownloadCache::open(&cache_path)?;
@@ -111,7 +115,19 @@ impl BandcampService {
             paused: AtomicBool::new(false),
             format,
             cookies_loaded: AtomicBool::new(cookies_exist),
+            library_socket,
         })
+    }
+
+    /// Try to connect to the library service
+    fn try_library_client(&self) -> Option<LibraryClient> {
+        match LibraryClient::connect(&self.library_socket) {
+            Ok(client) => Some(client),
+            Err(e) => {
+                tracing::warn!(error = %e, socket = %self.library_socket, "Failed to connect to library");
+                None
+            }
+        }
     }
 
     /// Try to load the Bandcamp client from cookies
@@ -223,28 +239,63 @@ impl BandcampService {
         let total_items = collection.len();
         tracing::info!(total = total_items, "Fetched collection");
 
-        // Filter out already downloaded items using the cache
+        // Check library for already-ingested items (primary dedup)
+        let library_known: HashSet<String> = match self.try_library_client() {
+            Some(lib_client) => {
+                let all_item_ids: Vec<String> = collection
+                    .iter()
+                    .map(|i| i.id.as_str().to_string())
+                    .collect();
+                match lib_client.has_facts("ItemId", all_item_ids) {
+                    Ok(existing) => {
+                        tracing::info!(
+                            count = existing.len(),
+                            "Library reports items already ingested"
+                        );
+                        existing.into_iter().collect()
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to query library, falling back to cache only");
+                        HashSet::new()
+                    }
+                }
+            }
+            None => {
+                tracing::warn!("Library not available, falling back to cache-only dedup");
+                HashSet::new()
+            }
+        };
+
+        // Filter out already downloaded items using library + cache
         let cache = self.cache.lock();
         let mut new_items = 0;
 
         for item in collection {
-            // Check both by track key and by item ID (old cache entries use filename as 3rd field)
-            let cache_key = format!("{}|{}|{}|0", item.artist, item.title, item.id.as_str());
+            let item_id_str = item.id.as_str().to_string();
 
-            if !cache.is_downloaded(&cache_key) && !cache.is_item_downloaded(item.id.as_str()) {
-                new_items += 1;
-
-                // Add to download queue
-                let queued = QueuedDownload {
-                    item,
-                    state: DownloadState::Queued,
-                    downloaded_bytes: 0,
-                    total_bytes: None,
-                    error: None,
-                };
-
-                self.download_queue.lock().push_back(queued);
+            // Primary dedup: library knows this item ID
+            if library_known.contains(&item_id_str) {
+                continue;
             }
+
+            // Fallback dedup: local cache
+            let cache_key = format!("{}|{}|{}|0", item.artist, item.title, item.id.as_str());
+            if cache.is_downloaded(&cache_key) || cache.is_item_downloaded(item.id.as_str()) {
+                continue;
+            }
+
+            new_items += 1;
+
+            // Add to download queue
+            let queued = QueuedDownload {
+                item,
+                state: DownloadState::Queued,
+                downloaded_bytes: 0,
+                total_bytes: None,
+                error: None,
+            };
+
+            self.download_queue.lock().push_back(queued);
         }
 
         tracing::info!(
@@ -698,6 +749,50 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
                                 }
                             }
 
+                            // Auto-ingest via library service
+                            if let Some(lib_client) = service.try_library_client() {
+                                for file_path in &extracted_files {
+                                    let filename = file_path
+                                        .file_name()
+                                        .and_then(|f| f.to_str())
+                                        .unwrap_or("unknown");
+
+                                    if let Ok(inbox_path) = InboxPath::new(filename) {
+                                        let source = IngestSource::Bandcamp {
+                                            item_id: item_id.clone(),
+                                            artist_url: None,
+                                        };
+                                        match lib_client
+                                            .ingest_file_with_source(&inbox_path, Some(source))
+                                        {
+                                            Ok(result) if result.success => {
+                                                tracing::info!(
+                                                    file = %filename,
+                                                    hash = ?result.hash,
+                                                    "Auto-ingested into library"
+                                                );
+                                            }
+                                            Ok(result) => {
+                                                tracing::warn!(
+                                                    file = %filename,
+                                                    msg = %result.message,
+                                                    "Library ingest returned failure"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    file = %filename,
+                                                    "Failed to auto-ingest into library"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                tracing::debug!("Library not available, skipping auto-ingest");
+                            }
+
                             // Mark as completed
                             {
                                 let mut active = service.active_downloads.lock();
@@ -707,7 +802,7 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
                             }
                             service.downloads_completed.fetch_add(1, Ordering::Relaxed);
 
-                            // Update cache for each extracted file
+                            // Update cache for each extracted file (fallback dedup)
                             for file_path in &extracted_files {
                                 let filename = file_path
                                     .file_name()

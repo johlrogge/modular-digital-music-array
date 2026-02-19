@@ -2125,6 +2125,7 @@ dependencies = [
  "bandcamp-ipc-protocol",
  "clap",
  "color-eyre",
+ "library-ipc-client",
  "nng",
  "parking_lot",
  "serde",

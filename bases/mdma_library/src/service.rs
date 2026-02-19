@@ -4,11 +4,12 @@
 
 use crate::fact_writer::FactWriter;
 use crate::ipc::{
-    Bpm, ContentHash, DurationSeconds, InboxPath, IngestAllItem, IngestResult, IpcServer, Key,
-    LibraryRequest, LibraryResponse, ProtocolError, ServiceStatus, TrackInfo,
+    Bpm, ContentHash, DurationSeconds, InboxPath, IngestAllItem, IngestResult, IngestSource,
+    IpcServer, Key, LibraryRequest, LibraryResponse, ProtocolError, ServiceStatus, TrackInfo,
 };
 use crate::pipeline::{InboxFile, UploadSource};
 use music_facts::MusicValue;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,6 +42,11 @@ pub struct LibraryService {
     tracks: Mutex<Vec<IndexedTrackInfo>>,
     /// Fact writer for persisting to disk
     fact_writer: Mutex<FactWriter>,
+    /// Generic fact value index: fact_type -> set of values
+    /// Used for fast HasFact/HasFacts lookups (e.g., ItemId -> {"p123", "p456"})
+    fact_index: Mutex<HashMap<String, HashSet<String>>>,
+    /// Set of known content hashes for dedup on ingest
+    content_hashes: Mutex<HashSet<String>>,
 }
 
 /// Track info stored in memory for search
@@ -56,6 +62,14 @@ struct IndexedTrackInfo {
     blob_path: PathBuf,
 }
 
+/// Result of loading tracks from the fact stream
+struct LoadResult {
+    tracks: Vec<IndexedTrackInfo>,
+    facts_count: usize,
+    fact_index: HashMap<String, HashSet<String>>,
+    content_hashes: HashSet<String>,
+}
+
 /// Format a MusicValue for display (returns type name and string value)
 fn format_fact_for_display(value: &MusicValue) -> (String, String) {
     (value.variant_name().to_string(), value.to_string())
@@ -67,8 +81,8 @@ impl LibraryService {
         let facts_path = metadata_dir.join("facts.jsonl");
 
         // Load existing tracks from facts file
-        let (tracks, facts_count) = Self::load_tracks_from_facts(&facts_path);
-        let tracks_count = tracks.len();
+        let loaded = Self::load_tracks_from_facts(&facts_path);
+        let tracks_count = loaded.tracks.len();
 
         // Open writer for future writes
         let fact_writer = FactWriter::open(&facts_path)?;
@@ -78,30 +92,36 @@ impl LibraryService {
             metadata_dir,
             start_time: Instant::now(),
             tracks_indexed: AtomicUsize::new(tracks_count),
-            facts_count: AtomicUsize::new(facts_count),
-            tracks: Mutex::new(tracks),
+            facts_count: AtomicUsize::new(loaded.facts_count),
+            tracks: Mutex::new(loaded.tracks),
             fact_writer: Mutex::new(fact_writer),
+            fact_index: Mutex::new(loaded.fact_index),
+            content_hashes: Mutex::new(loaded.content_hashes),
         })
     }
 
-    /// Load tracks and all facts from facts file into memory
     /// Load tracks from facts file into memory for search
-    fn load_tracks_from_facts(facts_path: &PathBuf) -> (Vec<IndexedTrackInfo>, usize) {
+    fn load_tracks_from_facts(facts_path: &PathBuf) -> LoadResult {
         use music_facts::FactSource;
         use stainless_facts::FactStreamReader;
-        use std::collections::HashMap;
 
         let reader: FactStreamReader<ContentHash, MusicValue, FactSource> =
             match FactStreamReader::open(facts_path) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!("Failed to open fact stream: {:?}", e);
-                    return (vec![], 0);
+                    return LoadResult {
+                        tracks: vec![],
+                        facts_count: 0,
+                        fact_index: HashMap::new(),
+                        content_hashes: HashSet::new(),
+                    };
                 }
             };
 
         // Aggregate facts by content hash
         let mut tracks_map: HashMap<String, IndexedTrackInfo> = HashMap::new();
+        let mut fact_index: HashMap<String, HashSet<String>> = HashMap::new();
         let mut errors = 0;
         let mut total = 0;
 
@@ -134,6 +154,14 @@ impl LibraryService {
                     blob_path: PathBuf::new(),
                 });
 
+            // Index fact values for HasFact/HasFacts lookups
+            let variant_name = fact.value().variant_name();
+            let value_str = fact.value().to_string();
+            fact_index
+                .entry(variant_name.to_string())
+                .or_default()
+                .insert(value_str);
+
             // Extract key fields for search
             match fact.value() {
                 MusicValue::Title(v) => entry.title = Some(v.0.clone()),
@@ -148,6 +176,9 @@ impl LibraryService {
 
         tracing::info!("Processed {} facts from file, {} errors", total, errors);
 
+        // Collect content hashes for dedup
+        let content_hashes: HashSet<String> = tracks_map.keys().cloned().collect();
+
         // Set blob paths based on hash
         for (hash, track) in tracks_map.iter_mut() {
             let hash_clean = hash.strip_prefix("sha256:").unwrap_or(hash);
@@ -157,7 +188,12 @@ impl LibraryService {
             }
         }
 
-        (tracks_map.into_values().collect(), total)
+        LoadResult {
+            tracks: tracks_map.into_values().collect(),
+            facts_count: total,
+            fact_index,
+            content_hashes,
+        }
     }
 
     /// Get number of indexed tracks
@@ -221,8 +257,8 @@ impl LibraryService {
                 LibraryResponse::InboxQueue(queue)
             }
 
-            LibraryRequest::IngestFile { path } => {
-                let result = self.ingest_inbox_file(&path);
+            LibraryRequest::IngestFile { path, source } => {
+                let result = self.ingest_inbox_file(&path, source.as_ref());
                 LibraryResponse::IngestResult(result)
             }
 
@@ -234,6 +270,30 @@ impl LibraryService {
             LibraryRequest::IngestAll => {
                 let results = self.ingest_all();
                 LibraryResponse::IngestAllResult(results)
+            }
+
+            LibraryRequest::HasFact { fact_type, value } => {
+                let fact_index = self.fact_index.lock().unwrap();
+                let exists = fact_index
+                    .get(&fact_type)
+                    .map_or(false, |values| values.contains(&value));
+                LibraryResponse::FactExists {
+                    fact_type,
+                    value,
+                    exists,
+                }
+            }
+
+            LibraryRequest::HasFacts { fact_type, values } => {
+                let fact_index = self.fact_index.lock().unwrap();
+                let existing = match fact_index.get(&fact_type) {
+                    Some(indexed) => values.into_iter().filter(|v| indexed.contains(v)).collect(),
+                    None => vec![],
+                };
+                LibraryResponse::FactsExist {
+                    fact_type,
+                    existing,
+                }
             }
         }
     }
@@ -415,10 +475,14 @@ impl LibraryService {
     }
 
     /// Ingest a file from the inbox
-    fn ingest_inbox_file(&self, inbox_path: &InboxPath) -> IngestResult {
+    fn ingest_inbox_file(
+        &self,
+        inbox_path: &InboxPath,
+        source: Option<&IngestSource>,
+    ) -> IngestResult {
         let path = self.resolve_inbox_path(inbox_path);
 
-        match self.ingest_file_internal(&path) {
+        match self.ingest_file_internal(&path, source) {
             Ok(hash) => IngestResult {
                 hash: Some(hash),
                 success: true,
@@ -465,14 +529,52 @@ impl LibraryService {
         inbox_paths
             .into_iter()
             .map(|path| {
-                let result = self.ingest_inbox_file(&path);
+                let result = self.ingest_inbox_file(&path, None);
                 IngestAllItem { path, result }
             })
             .collect()
     }
 
+    /// Map protocol IngestSource to pipeline UploadSource
+    fn map_upload_source(source: Option<&IngestSource>) -> UploadSource {
+        match source {
+            Some(IngestSource::Bandcamp { artist_url, .. }) => UploadSource::BandcampDownload {
+                artist_url: artist_url.clone(),
+            },
+            Some(IngestSource::Beatport { order_id }) => UploadSource::BeatportZip {
+                order_id: order_id.clone(),
+            },
+            Some(IngestSource::Upload) | None => UploadSource::HttpUpload,
+        }
+    }
+
+    /// Generate provenance facts from IngestSource
+    fn source_facts(
+        source: Option<&IngestSource>,
+        fact_source: &music_facts::FactSource,
+    ) -> Vec<(MusicValue, music_facts::FactSource)> {
+        match source {
+            Some(IngestSource::Bandcamp { item_id, .. }) => vec![
+                (
+                    MusicValue::Source("bandcamp".to_string()),
+                    fact_source.clone(),
+                ),
+                (MusicValue::ItemId(item_id.clone()), fact_source.clone()),
+            ],
+            Some(IngestSource::Beatport { .. }) => vec![(
+                MusicValue::Source("beatport".to_string()),
+                fact_source.clone(),
+            )],
+            _ => vec![],
+        }
+    }
+
     /// Ingest a file through the pipeline (internal, takes absolute path)
-    fn ingest_file_internal(&self, path: &PathBuf) -> Result<ContentHash, ServiceError> {
+    fn ingest_file_internal(
+        &self,
+        path: &PathBuf,
+        source: Option<&IngestSource>,
+    ) -> Result<ContentHash, ServiceError> {
         if !path.exists() {
             return Err(ServiceError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -481,22 +583,42 @@ impl LibraryService {
         }
 
         // Stage 1: Create inbox file
-        let inbox = InboxFile::new(path.clone(), UploadSource::HttpUpload);
+        let upload_source = Self::map_upload_source(source);
+        let inbox = InboxFile::new(path.clone(), upload_source);
 
         // Stage 2: Validate and compute hash
         let validated = inbox.validate()?;
         let content_hash = validated.content_hash.clone();
 
+        // Dedup: if content hash already exists, delete inbox file and return success
+        {
+            let hashes = self.content_hashes.lock().unwrap();
+            if hashes.contains(&content_hash.0) {
+                tracing::info!(
+                    hash = %content_hash.0,
+                    path = %path.display(),
+                    "Duplicate content hash, removing inbox file"
+                );
+                let _ = std::fs::remove_file(path);
+                return Ok(content_hash);
+            }
+        }
+
         // Stage 3: Extract metadata
         let extracted = validated.extract_metadata()?;
-        let facts = extracted.facts.clone();
+        let mut facts = extracted.facts.clone();
 
         // Stage 4: Import to blob storage
         let indexed = extracted.import(&self.music_dir)?;
 
-        let result = (content_hash, facts, indexed);
-
-        let (content_hash, facts, indexed) = result;
+        // Add provenance facts from source metadata
+        let fact_source = music_facts::FactSource::new(
+            "mdma-library",
+            env!("CARGO_PKG_VERSION"),
+            music_facts::FactOrigin::Unknown,
+        );
+        let source_facts = Self::source_facts(source, &fact_source);
+        facts.extend(source_facts);
 
         // Write facts to disk
         {
@@ -538,6 +660,23 @@ impl LibraryService {
                 key,
                 blob_path: indexed.blob_path,
             });
+        }
+
+        // Update fact index
+        {
+            let mut fact_index = self.fact_index.lock().unwrap();
+            for (value, _) in &facts {
+                fact_index
+                    .entry(value.variant_name().to_string())
+                    .or_default()
+                    .insert(value.to_string());
+            }
+        }
+
+        // Update content hash set
+        {
+            let mut hashes = self.content_hashes.lock().unwrap();
+            hashes.insert(content_hash.0.clone());
         }
 
         // Update counters

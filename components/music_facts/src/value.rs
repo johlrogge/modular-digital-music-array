@@ -87,6 +87,13 @@ pub enum MusicValue {
     // ========================================================================
     // Provenance & Source Info
     // ========================================================================
+    /// Source of the track (e.g., "bandcamp", "beatport")
+    Source(String),
+
+    /// Source-specific item ID (e.g., "p367090081" for bandcamp).
+    /// Unique within a given source.
+    ItemId(String),
+
     /// Comment field from metadata
     Comment(String),
 
@@ -153,6 +160,8 @@ impl MusicValue {
             MusicValue::BeatportTrackUrl(_) => "BeatportTrackUrl",
             MusicValue::BeatportLabelUrl(_) => "BeatportLabelUrl",
             MusicValue::BandcampUrl(_) => "BandcampUrl",
+            MusicValue::Source(_) => "Source",
+            MusicValue::ItemId(_) => "ItemId",
             MusicValue::Comment(_) => "Comment",
             MusicValue::BeatportTrackId(_) => "BeatportTrackId",
             MusicValue::BitDepth(_) => "BitDepth",
@@ -190,6 +199,8 @@ impl fmt::Display for MusicValue {
             MusicValue::BeatportTrackUrl(s) => write!(f, "{}", s),
             MusicValue::BeatportLabelUrl(s) => write!(f, "{}", s),
             MusicValue::BandcampUrl(s) => write!(f, "{}", s),
+            MusicValue::Source(s) => write!(f, "{}", s),
+            MusicValue::ItemId(s) => write!(f, "{}", s),
             MusicValue::Comment(s) => write!(f, "{}", s),
             MusicValue::BeatportTrackId(s) => write!(f, "{}", s),
             MusicValue::BitDepth(b) => write!(f, "{}", b),

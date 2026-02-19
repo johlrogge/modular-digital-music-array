@@ -99,6 +99,25 @@ pub enum ProtocolError {
 }
 
 // ============================================================================
+// Ingest Source Metadata
+// ============================================================================
+
+/// Source metadata for provenance tracking during ingestion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "source_type")]
+pub enum IngestSource {
+    /// Downloaded from Bandcamp
+    Bandcamp {
+        item_id: String,
+        artist_url: Option<String>,
+    },
+    /// Extracted from Beatport
+    Beatport { order_id: Option<String> },
+    /// Uploaded via HTTP or dropped into inbox
+    Upload,
+}
+
+// ============================================================================
 // Request Types
 // ============================================================================
 
@@ -128,13 +147,26 @@ pub enum LibraryRequest {
     GetInboxQueue,
 
     /// Ingest a specific file from inbox.
-    IngestFile { path: InboxPath },
+    IngestFile {
+        path: InboxPath,
+        /// Optional source metadata for provenance tracking.
+        source: Option<IngestSource>,
+    },
 
     /// Delete a file from inbox without ingesting.
     DeleteInboxFile { path: InboxPath },
 
     /// Ingest all files in inbox.
     IngestAll,
+
+    /// Check if any track has a fact matching the given type and value.
+    HasFact { fact_type: String, value: String },
+
+    /// Batch check: which of these values exist for a given fact type?
+    HasFacts {
+        fact_type: String,
+        values: Vec<String>,
+    },
 }
 
 // ============================================================================
@@ -174,6 +206,19 @@ pub enum LibraryResponse {
 
     /// Results of ingest-all operation.
     IngestAllResult(Vec<IngestAllItem>),
+
+    /// Whether a single fact exists.
+    FactExists {
+        fact_type: String,
+        value: String,
+        exists: bool,
+    },
+
+    /// Batch result: which values exist for a given fact type.
+    FactsExist {
+        fact_type: String,
+        existing: Vec<String>,
+    },
 
     /// Error response.
     Error(ProtocolError),
