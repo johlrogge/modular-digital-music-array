@@ -1,6 +1,6 @@
 # MDMA Roadmap
 
-**Last updated:** February 18, 2026
+**Last updated:** February 19, 2026
 
 ## Current Status Summary
 
@@ -10,7 +10,11 @@ NVMe boot working with kernel sync. mdma-console stub deployed (port 3000). `jus
 
 **Milestone 1 Part 2 (Music Library): ~60% Complete**
 
-mdma-library service operational with nng IPC. mdma-cli tool for testing. Partial hash matching, facts display, stainless-facts locking fixed.
+mdma-library service operational with nng IPC. 329 tracks indexed. Bandcamp sync operational. `by-artist` symlink tree for browsing. mdma-cli for search/list/facts from laptop.
+
+**Milestone 1 Part 3 (Audio Playback): FIRST PLAYBACK ACHIEVED**
+
+End-to-end playback proven on Feb 19, 2026: laptop CLI -> TCP -> Pi library -> playback engine -> PipeWire -> iFi USB DAC. Audio plays but has known bugs (speed, stop command). Cross-compilation pipeline working with aarch64 PipeWire sysroot.
 
 **Bandcamp integration: OPERATIONAL on Pi**
 
@@ -154,28 +158,62 @@ mdma-console (future) <-- nng IPC --> mdma-library
 
 ---
 
-#### 3. Audio Playback - **PLANNED**
+#### 3. Audio Playback - **IN PROGRESS** (First playback achieved)
 
-**Status:** Not started, blocked by music library completion
+**Status:** End-to-end playback proven on real hardware. Known bugs to fix.
 
-**Output stack progression:**
-- Phase 1: 3.5mm -> RCA (basic validation)
-- Phase 2: USB DAC support (iFi zen BLUE v3 Bluetooth - your reference)
-- Phase 3: High-end DACs (iFi, Fosi Audio, etc.)
+**First playback: February 19, 2026**
+- Track: Applescal - Cymbals Rush
+- Chain: laptop `mdma` CLI -> TCP:5557 -> mdma-playback -> PipeWire -> iFi USB DAC
+- Result: Audio plays! But too fast (sample rate mismatch) and stop command doesn't work.
 
-**Technical approach:**
-- `mdma-playback` user/service
-- ALSA/PipeWire for audio routing
-- Gapless playback support
-- Volume control
+**What works:**
+- mdma-playback service running on Pi as runit service
+- Stock Void Linux PipeWire service (headless, with WirePlumber via context.exec drop-in)
+- iFi (by AMR) HD USB Audio detected as PipeWire Audio/Sink
+- CLI `playback play <hash>` resolves track from library and sends to playback
+- CLI `playback stop` sends command (server acknowledges but doesn't actually stop)
+- Cross-compilation from x86_64 dev machine using aarch64 PipeWire sysroot
+- `just playback-cross` handles sysroot setup + build in one command
+- `just deploy-playback` cross-compiles and deploys to Pi
+
+**Hi-Fi audio requirements:**
+- Minimum 96 kHz sample rate (CD is 44.1 kHz, hi-res is 96/192 kHz)
+- 24-bit depth minimum (CD is 16-bit)
+- Bit-perfect passthrough to USB DAC when possible
+- No unnecessary resampling — match source format to DAC capabilities
+- The iFi HD USB Audio supports up to 384 kHz / 32-bit — use what the DAC offers
+
+**Known bugs:**
+1. **Playback too fast** — sample rate mismatch between decoded audio and PipeWire stream
+2. **Stop doesn't stop** — stop command returns success but audio continues playing
+3. **No sample rate negotiation** — playback engine should match source file sample rate
+
+**Output stack:**
+- iFi (by AMR) HD USB Audio (current, connected)
+- HDMI audio (available as fallback)
+- 3.5mm headphone jack (Pi built-in, low quality)
+
+**Technical stack:**
+- `mdma-playback` service (runit, runs as `mdma` user)
+- PipeWire (stock Void service, `_pipewire` user)
+- WirePlumber (launched by PipeWire via context.exec)
+- Symphonia for audio decoding
+- `PIPEWIRE_RUNTIME_DIR=/run/pipewire` for socket access
+
+**What's next:**
+1. Fix sample rate handling — read source file rate, configure PipeWire stream to match
+2. Fix stop command — actually stop the decode/playback thread
+3. Verify 24-bit/96 kHz passthrough to iFi DAC
+4. Gapless playback between tracks
+5. Volume control
 
 **Success criteria:**
-- Music plays from Raspberry Pi
+- Music plays at correct speed with correct pitch
+- Stop/pause commands work
+- 24-bit/96 kHz minimum output quality
 - Audio quality matches or exceeds phone playback
-- Volume control works
 - Gapless playback between tracks
-
-**Not started yet - blocked by:** Music library UI (Part 2)
 
 ---
 
@@ -201,15 +239,16 @@ mdma-console (future) <-- nng IPC --> mdma-library
 
 - [x] Can provision a Pi from scratch
 - [x] Pi boots from NVMe with user-specified hostname
-- [ ] Music syncs from at least one source (inbox working, bandcamp pending)
+- [x] Music syncs from at least one source (Bandcamp operational, 329 tracks indexed)
 - [ ] Can browse library in web UI
-- [ ] Audio plays through at least 3.5mm output
-- [ ] Can control playback through some interface
+- [x] Audio plays through USB DAC (first playback achieved, bugs to fix)
+- [x] Can control playback through CLI (play/stop from laptop)
+- [ ] Audio plays at correct speed with hi-fi quality (96 kHz / 24-bit)
 - [ ] System is stable enough to use at a party
 
-**User value unlocked:** No more jarring Spotify cuts during gatherings. Professional playback from dedicated hardware.
+**User value unlocked:** No more jarring Spotify cuts during gatherings. Professional hi-fi playback from dedicated hardware.
 
-**Current completion:** ~35% overall (provisioning complete, library core working, UI and playback pending)
+**Current completion:** ~60% overall (provisioning complete, library operational, playback proven but buggy, UI pending)
 
 ---
 
@@ -371,23 +410,35 @@ Rust's type system prevents illegal states.
 
 ## Current Focus
 
-**Immediate priority:** Close the library ingestion loop (Bandcamp → inbox → indexed)
+**Immediate priority:** Fix playback bugs and achieve hi-fi quality audio
 
 **What's critical right now:**
-1. Trigger `mdma ingest-all` to index the 200+ tracks already in `/music/inbox`
-2. Verify end-to-end: Bandcamp download → inbox → library indexed
-3. Add inbox watcher so future downloads auto-ingest
+1. Fix playback speed — sample rate mismatch in playback engine
+2. Fix stop command — playback continues after stop acknowledged
+3. Investigate missing Bandcamp downloads (e.g. Carbon Based Lifeforms not downloaded despite being in collection)
+4. Verify 24-bit / 96 kHz passthrough to iFi DAC
 
 **What comes after:**
-1. Connect mdma-console to mdma-library (browse library in web UI)
-2. Audio playback service
-3. Unified IPC gateway (future architecture, see Future Vision section)
+1. Gapless playback
+2. Connect mdma-console to mdma-library (browse library in web UI)
+3. Playback controls in web UI
+4. Unified IPC gateway (future architecture, see Future Vision section)
 
-**Philosophy:** Music is in the inbox. Close the loop before adding more features.
+**Philosophy:** Audio is playing. Fix the quality, then build the UI around it.
 
 ---
 
 ## Update History
+
+- **2026-02-19:** First end-to-end playback achieved
+  - Applescal - Cymbals Rush played from laptop CLI through Pi to iFi USB DAC
+  - Full chain: mdma CLI -> TCP -> mdma-library (track lookup) -> mdma-playback -> PipeWire -> iFi
+  - Stock Void PipeWire service works headless (WirePlumber via context.exec drop-in)
+  - Cross-compilation pipeline: aarch64 PipeWire sysroot from Void packages, cargo-zigbuild with glibc 2.38
+  - `just playback-cross` and `just deploy-playback` working
+  - Known bugs: playback too fast (sample rate), stop doesn't stop
+  - Hi-fi requirement established: 96 kHz / 24-bit minimum, bit-perfect passthrough
+  - DevOps principle added: Void-first approach, never build on Pi
 
 - **2026-02-18:** Bandcamp integration operational
   - mdma-bandcamp service running on Pi (async NNG + tokio)
@@ -423,23 +474,12 @@ Rust's type system prevents illegal states.
 
 **Immediate actions:**
 
-1. **Trigger library ingestion** (5 min)
-   ```bash
-   export MDMA_LIBRARY_SOCKET="tcp://mdma-909.local:5555"
-   mdma ingest-all
-   # Verify: mdma tracks
-   ```
+1. **Fix playback speed** — Read source file sample rate, configure PipeWire stream to match instead of assuming a fixed rate. This is the #1 blocker for usable playback.
 
-2. **Inbox watcher** - inotify-based auto-ingest
-   - Auto-trigger ingest pipeline when files land in inbox
-   - Eliminates manual `ingest-all` trigger after each sync
+2. **Fix stop command** — The playback engine acknowledges the stop but doesn't actually stop the decode/output thread. Debug the command dispatch in the server.
 
-3. **Add HTTP upload to mdma-console**
-   - POST /upload endpoint writes to /music/inbox/
-   - Triggers ingest after upload
+3. **Investigate missing Bandcamp downloads** — Carbon Based Lifeforms (Interloper album + Rymden3000 single) in user's collection but not downloaded. Check bandcamp sync logs, cache state, and whether certain items are skipped.
 
-4. **Add library browsing to mdma-console**
-   - Connect to mdma-library via nng
-   - Display track list, track detail page with facts
+4. **Verify hi-fi passthrough** — After fixing sample rate, test with a known 24-bit/96 kHz FLAC to confirm bit-perfect output through the iFi DAC.
 
-**Current recommendation:** Trigger `ingest-all` first to prove the full pipeline end-to-end, then add the inbox watcher to automate it.
+**Current recommendation:** Fix the two playback bugs first (speed + stop). These are small engine fixes that unlock real-world testing with the full music library.
