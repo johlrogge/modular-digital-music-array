@@ -1,19 +1,23 @@
-# bases/playback_server/Cargo.toml
 [package]
-name = "playback-server"
-version.workspace = true
+name = "mdma-playback"
+version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
+
+[[bin]]
+name = "mdma-playback"
+path = "src/main.rs"
 
 [dependencies]
 playback-engine = { path = "../../components/playback_engine" }
 media-protocol = { path = "../../components/media_protocol" }
 tokio = { workspace = true, features = ["full"] }
 color-eyre = { workspace = true }
-parking_lot = { workspace = true}
-nng = {workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
+parking_lot = { workspace = true }
+nng = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = "0.3"
 serde_json = { workspace = true }

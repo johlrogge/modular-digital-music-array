@@ -11,6 +11,7 @@ use color_eyre::Result;
 use library_ipc_client::{
     ClientError, ContentHash, InboxPath, LibraryClient, ProtocolError, TrackInfo,
 };
+use media_client::{Deck, MediaClient};
 
 // =============================================================================
 // CLI Definition
@@ -37,6 +38,15 @@ struct Cli {
         env = "MDMA_BANDCAMP_SOCKET"
     )]
     bandcamp_socket: String,
+
+    /// Playback server socket address
+    #[arg(
+        long,
+        default_value = "ipc:///run/mdma/playback.sock",
+        global = true,
+        env = "MDMA_PLAYBACK_SOCKET"
+    )]
+    playback_socket: String,
 
     #[command(subcommand)]
     command: Commands,
@@ -85,6 +95,12 @@ enum Commands {
     Bandcamp {
         #[command(subcommand)]
         command: BandcampCommands,
+    },
+
+    /// Playback control commands
+    Playback {
+        #[command(subcommand)]
+        command: PlaybackCommands,
     },
 }
 
@@ -140,6 +156,18 @@ enum BandcampCommands {
 
     /// Resume downloads
     Resume,
+}
+
+#[derive(Subcommand, Debug)]
+enum PlaybackCommands {
+    /// Play a track by hash (looks up blob path in library)
+    Play {
+        /// Content hash (full or partial, with or without sha256: prefix)
+        hash: String,
+    },
+
+    /// Stop playback on deck A
+    Stop,
 }
 
 // =============================================================================
@@ -593,6 +621,70 @@ fn handle_bandcamp_resume(client: &BandcampClient) -> Result<()> {
 }
 
 // =============================================================================
+// Playback Command Handlers
+// =============================================================================
+
+fn handle_playback_error(err: media_client::ClientError) -> ! {
+    match err {
+        media_client::ClientError::Connection(e) => {
+            eprintln!("Connection failed: {}", e);
+            eprintln!("Is mdma-playback running?");
+        }
+        e => {
+            eprintln!("Error: {}", e);
+        }
+    }
+    std::process::exit(1);
+}
+
+fn handle_playback_play(
+    library_client: &LibraryClient,
+    media_client: &MediaClient,
+    hash: String,
+) -> Result<()> {
+    // Step 1: Look up the track in the library to get blob_path
+    let content_hash = ContentHash(hash);
+    let track = match library_client.get_track(&content_hash) {
+        Ok(t) => t,
+        Err(e) => handle_error(e),
+    };
+
+    let blob_path = match track.blob_path {
+        Some(ref p) => p,
+        None => {
+            eprintln!("Track {} has no blob path", short_hash(&track.content_hash));
+            std::process::exit(1);
+        }
+    };
+
+    let title = track.title.as_deref().unwrap_or("Unknown");
+    let artist = track.artist.as_deref().unwrap_or("Unknown");
+
+    // Step 2: Load the track on deck A and play
+    let path = std::path::PathBuf::from(blob_path);
+    if let Err(e) = media_client.load_track(path, Deck::A) {
+        handle_playback_error(e);
+    }
+
+    if let Err(e) = media_client.play(Deck::A) {
+        handle_playback_error(e);
+    }
+
+    println!("Playing: {} - {}", artist, title);
+    println!("Hash:    {}", track.content_hash.0);
+    Ok(())
+}
+
+fn handle_playback_stop(media_client: &MediaClient) -> Result<()> {
+    if let Err(e) = media_client.stop(Deck::A) {
+        handle_playback_error(e);
+    }
+
+    println!("Stopped");
+    Ok(())
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -603,6 +695,39 @@ fn main() -> Result<()> {
 
     // Dispatch command - connect to appropriate service based on command
     match cli.command {
+        Commands::Playback { command } => {
+            let connect_media = || match MediaClient::connect(&cli.playback_socket) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "Failed to connect to playback server at {}: {}",
+                        cli.playback_socket, e
+                    );
+                    eprintln!("Is mdma-playback running?");
+                    std::process::exit(1);
+                }
+            };
+
+            match command {
+                PlaybackCommands::Play { hash } => {
+                    let library_client = match LibraryClient::connect(&cli.socket) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("Failed to connect to library at {}: {}", cli.socket, e);
+                            eprintln!("Is mdma-library running?");
+                            std::process::exit(1);
+                        }
+                    };
+                    let media_client = connect_media();
+                    handle_playback_play(&library_client, &media_client, hash)
+                }
+                PlaybackCommands::Stop => {
+                    let media_client = connect_media();
+                    handle_playback_stop(&media_client)
+                }
+            }
+        }
+
         Commands::Bandcamp { command } => {
             // Connect to bandcamp service
             let client = match BandcampClient::connect(&cli.bandcamp_socket) {
@@ -653,7 +778,7 @@ fn main() -> Result<()> {
                     InboxCommands::Ingest { filename } => handle_inbox_ingest(&client, filename),
                     InboxCommands::IngestAll => handle_inbox_ingest_all(&client),
                 },
-                Commands::Bandcamp { .. } => unreachable!(), // Already handled above
+                Commands::Bandcamp { .. } | Commands::Playback { .. } => unreachable!(),
             }
         }
     }

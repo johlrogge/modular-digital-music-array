@@ -1,8 +1,8 @@
 use crate::error::ServerError;
 use color_eyre::Result;
-use media_protocol::{Command, Deck as ProtocolChannel, Response, ResponseData};
+use media_protocol::{Command, Response, ResponseData};
 use nng::Socket;
-use playback_engine::{self, PlaybackEngine, PlaybackError};
+use playback_engine::{PlaybackEngine, PlaybackError};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -13,14 +13,6 @@ pub struct Server {
 }
 
 impl Server {
-    // Convert protocol channel to playback channel
-    fn convert_deck(protocol_channel: ProtocolChannel) -> playback_engine::Deck {
-        match protocol_channel {
-            ProtocolChannel::A => playback_engine::Deck::A,
-            ProtocolChannel::B => playback_engine::Deck::B,
-        }
-    }
-
     pub fn new(engine: Arc<Mutex<PlaybackEngine>>, socket: Socket) -> Self {
         Self { engine, socket }
     }
@@ -53,52 +45,34 @@ impl Server {
             Command::LoadTrack { path, deck } => {
                 info!("Loading track {:?} on deck {:?}", path, deck);
                 // Use .await to acquire the lock asynchronously
-                let result = self
-                    .engine
-                    .lock()
-                    .await
-                    .load_track(Self::convert_deck(deck), &path)
-                    .await;
+                let result = self.engine.lock().await.load_track(deck, &path).await;
                 info!("Track loaded");
                 self.create_response(result, None)
             } // For non-async operations, keep the original pattern
             Command::Play { deck } => {
                 info!("About to play deck {:?}", deck);
-                let result = self.engine.lock().await.play(Self::convert_deck(deck));
+                let result = self.engine.lock().await.play(deck);
                 info!("Play command completed for deck {:?}: {:?}", deck, result);
                 self.create_response(result, None)
             }
             Command::Stop { deck } => {
                 info!("Stopping deck {:?}", deck);
-                let result = self.engine.lock().await.stop(Self::convert_deck(deck));
+                let result = self.engine.lock().await.stop(deck);
                 self.create_response(result, None)
             }
             Command::SetVolume { deck, db } => {
                 info!("Setting volume on deck {:?} to {}dB", deck, db);
-                let result = self
-                    .engine
-                    .lock()
-                    .await
-                    .set_volume(Self::convert_deck(deck), db);
+                let result = self.engine.lock().await.set_volume(deck, db);
                 self.create_response(result, None)
             }
             Command::Unload { deck } => {
                 info!("Unloading deck {:?}", deck);
-                let result = self
-                    .engine
-                    .lock()
-                    .await
-                    .unload_track(Self::convert_deck(deck));
+                let result = self.engine.lock().await.unload_track(deck);
                 self.create_response(result, None)
             }
             Command::Seek { deck, position } => {
                 info!("Seeking deck {:?} to position {}", deck, position);
-                let result = self
-                    .engine
-                    .lock()
-                    .await
-                    .seek(Self::convert_deck(deck), position)
-                    .await; // Now awaiting the seek operation
+                let result = self.engine.lock().await.seek(deck, position).await; // Now awaiting the seek operation
                 self.create_response(result, None)
             }
             Command::GetLength { deck } => {
@@ -140,21 +114,6 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    #[test]
-    fn test_channel_conversion() {
-        use playback_engine::Deck as PlaybackChannel;
-
-        assert!(matches!(
-            Server::convert_deck(ProtocolChannel::A),
-            PlaybackChannel::A
-        ));
-
-        assert!(matches!(
-            Server::convert_deck(ProtocolChannel::B),
-            PlaybackChannel::B
-        ));
-    }
-
     #[tokio::test]
     #[ignore]
     async fn test_handle_nonexistent_track() {
@@ -167,7 +126,7 @@ mod tests {
         let nonexistent_path = PathBuf::from("/this/file/does/not/exist.flac");
         let command = Command::LoadTrack {
             path: nonexistent_path.clone(),
-            deck: ProtocolChannel::A,
+            deck: playback_engine::Deck::A,
         };
 
         let response = server.handle_command(command).await;

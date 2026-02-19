@@ -23,7 +23,7 @@ members = [
     # Bases (entry points)
     "bases/download_cli",
     "bases/media_ctl",
-    "bases/playback_server",
+    "bases/mdma_playback",
     "bases/library_crawler",
     "bases/beacon",
     "bases/mdma_console",

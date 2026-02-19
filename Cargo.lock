@@ -2146,6 +2146,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "library-ipc-client",
+ "media-client",
  "tabled",
 ]
 
@@ -2198,16 +2199,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "mdma-playback"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "color-eyre",
+ "media-protocol",
+ "nng",
+ "parking_lot",
+ "playback-engine",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "media-client"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "bytes",
  "media-protocol",
  "nng",
- "playback-engine",
+ "nng-transport",
  "serde_json",
- "tokio",
+ "thiserror 1.0.69",
  "tracing",
 ]
 
@@ -2716,22 +2732,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
-]
-
-[[package]]
-name = "playback-server"
-version = "0.1.0"
-dependencies = [
- "color-eyre",
- "media-protocol",
- "nng",
- "parking_lot",
- "playback-engine",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

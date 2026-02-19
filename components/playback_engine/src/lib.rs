@@ -101,6 +101,15 @@ impl PlaybackEngine {
     pub async fn load_track(&mut self, deck: Deck, path: &Path) -> Result<(), PlaybackError> {
         tracing::info!("Starting track load for deck {:?}", deck);
 
+        // Stop and remove any existing track on this deck
+        {
+            let mut decks = self.decks.write();
+            if let Some(existing) = decks.remove(&deck) {
+                tracing::info!("Unloading existing track from deck {:?}", deck);
+                existing.write().stop();
+            }
+        }
+
         // Create ringbuffer for this deck
         const BUFFER_SIZE: usize = 16384;
         let rb = HeapRb::<f32>::new(BUFFER_SIZE);
