@@ -1,6 +1,6 @@
 # MDMA Roadmap
 
-**Last updated:** February 20, 2026 (evening)
+**Last updated:** February 20, 2026 (night)
 
 ## Where We Are
 
@@ -51,7 +51,7 @@ Always output at the iFi DAC's maximum supported rate (probe at startup — like
 
 ---
 
-### 2. Queue + stainless_facts Search (Together)
+### ~~2. Queue + stainless_facts Search (Together)~~ — COMPLETE
 
 **Queue: COMPLETE**
 
@@ -63,11 +63,17 @@ Always output at the iFi DAC's maximum supported rate (probe at startup — like
 - `playback now`: shows currently playing track in same format as queue list
 - `ContentHash` moved to `playback_primitives` — available across all services without circular deps
 
-**Remaining: stainless_facts search**
-- Add query/filter capabilities to the crate (search by title, artist, etc.)
-- All library consumers use this API — zero raw JSONL parsing anywhere
-- This is a crate-level feature, not a workaround
-- **dmenu integration falls out here:** `mdma search "query" | dmenu | mdma queue append`
+**Search: COMPLETE**
+
+- New `library_search` crate: composable `TrackQuery` with implicit AND semantics
+- `StringQuery`: Contains (all-words), Initialism (CamelCase + all-caps like `CBL`), Regex
+- `NumericQuery`: Exact, Range (`124..132`), Tolerance (`128+-4`)
+- `DurationQuery`: Exact, AtLeast, AtMost, Range, WithPrecision (named-unit bucket)
+- `KeyQuery`: Camelot-based exact and tolerance (traditional notation → Camelot at parse time)
+- CLI: `mdma search [QUERY] [--artist] [--title] [--album] [--label] [--genre] [--bpm] [--key] [--duration] [--year] [--source]`
+- CLI: `mdma search fact-values-for <FACT_TYPE>` — discover all values for any fact type
+- **dmenu workflow operational:** `mdma search --artist "CBL" | dmenu | mdma queue append`
+- Deployed and verified on real hardware against 339-track library
 
 ---
 
@@ -205,6 +211,15 @@ export MDMA_PLAYBACK_SOCKET="tcp://mdma-909.local:5557"
 
 ## Update History
 
+- **2026-02-20 (night):** Priority 2 complete. Rich search operational.
+  - `library_search` crate: TrackQuery with Initialism/Contains/Regex/Numeric/Duration/Key
+  - All-caps treated as initialism (`CBL` → Carbon Based Lifeforms)
+  - `mdma search fact-values-for <FACT_TYPE>` for value discovery
+  - `deploy-library` justfile bug fixed (TCP flag was dropped on each deploy)
+  - Stray test playback process killed (was burning a full CPU core for 39 hours)
+  - Observed: 44.1→192 kHz upsampling uses ~2.5/4 cores; configurable rate deferred
+  - **Next:** Priority 3 — Single API Gateway + Pub/Sub Events
+
 - **2026-02-20 (evening):** Resampler complete. Queue and now-playing operational.
   - `rubato` resampler done: 192 kHz output confirmed on iFi DAC
   - Queue overhaul: stores `ContentHash` + path pairs, exposes hashes (not paths)
@@ -212,7 +227,6 @@ export MDMA_PLAYBACK_SOCKET="tcp://mdma-909.local:5557"
   - `queue remove`: by arg or stdin, composes with `queue list | dmenu | queue remove`
   - `playback now`: shows currently playing track, same tty-aware format as queue list
   - `ContentHash` moved to `playback_primitives` — cross-service identifier without new deps
-  - **Next:** stainless_facts search → closes Priority 2, unlocks full dmenu workflow
 
 - **2026-02-20:** Playback bugs fixed and verified. First real playback milestone complete.
   - Rymden3000 (24-bit / 44.1 kHz) plays at correct speed and full fidelity

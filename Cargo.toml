@@ -20,6 +20,7 @@ members = [
     "components/storage_primitives",
     "components/audio_fingerprint",
     "components/nng_transport",
+    "components/library_search",
     # Bases (entry points)
     "bases/download_cli",
     "bases/media_ctl",

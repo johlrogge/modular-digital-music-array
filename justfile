@@ -21,6 +21,8 @@ build:
 beacon-cross:
     #!/usr/bin/env bash
     set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     echo "Building beacon for aarch64..."
     cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin beacon
     echo ""
@@ -521,6 +523,14 @@ pi-scan-quick:
         just pi-scan
     fi
 
+# SSH into the provisioned Pi (mdma-909.local)
+pi-ssh:
+    ssh -4 -i ~/.ssh/mdma_pi admin@mdma-909.local
+
+# SSH into the unprovisioned beacon Pi (welcome-to-mdma.local)
+pi-ssh-beacon:
+    ssh -4 root@welcome-to-mdma.local
+
 # Scan and auto-connect to first found Pi
 pi-connect:
     #!/usr/bin/env bash
@@ -796,6 +806,8 @@ run-console:
 console-cross:
     #!/usr/bin/env bash
     set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     echo "Building console for aarch64..."
     cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin mdma-console
     echo ""
@@ -825,6 +837,8 @@ playback-cross: setup-playback-sysroot
 library-cross:
     #!/usr/bin/env bash
     set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     echo "Building mdma-library for aarch64..."
     cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin mdma-library
     echo ""
@@ -886,7 +900,7 @@ deploy-library: library-cross
         sudo chmod +x /usr/bin/mdma-library
         sudo mkdir -p /etc/sv/mdma-library/log /var/log/mdma-library /music/inbox /music/blobs /metadata /run/mdma
         sudo chown -R mdma:mdma /music /metadata /run/mdma
-        printf "#!/bin/sh\nexec 2>&1\nexec chpst -u mdma /usr/bin/mdma-library --music-dir /music --metadata-dir /metadata --socket ipc:///run/mdma/library.sock\n" | sudo tee /etc/sv/mdma-library/run > /dev/null
+        printf "#!/bin/sh\nexec 2>&1\nexec chpst -u mdma /usr/bin/mdma-library --music-dir /music --metadata-dir /metadata --socket ipc:///run/mdma/library.sock --tcp tcp://0.0.0.0:5555\n" | sudo tee /etc/sv/mdma-library/run > /dev/null
         sudo chmod +x /etc/sv/mdma-library/run
         printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-library\n" | sudo tee /etc/sv/mdma-library/log/run > /dev/null
         sudo chmod +x /etc/sv/mdma-library/log/run

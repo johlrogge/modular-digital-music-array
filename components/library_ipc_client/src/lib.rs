@@ -126,15 +126,34 @@ impl LibraryClient {
         }
     }
 
-    /// Search for tracks.
-    pub fn search(&self, query: &str) -> Result<Vec<TrackInfo>, ClientError> {
+    /// Search for tracks using a structured query.
+    pub fn search(&self, query: &TrackQuery) -> Result<Vec<TrackInfo>, ClientError> {
         match self.request(&LibraryRequest::Search {
-            query: query.to_string(),
+            query: query.clone(),
         })? {
             LibraryResponse::SearchResults(tracks) => Ok(tracks),
             LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
             _ => Err(ClientError::Protocol(ProtocolError::Internal {
                 message: "Unexpected response to Search".to_string(),
+            })),
+        }
+    }
+
+    /// Get all distinct values stored for a given fact type (sorted).
+    ///
+    /// Useful for discovery — e.g. list all genres, labels, or keys in the library.
+    ///
+    /// ```bash
+    /// mdma search fact-values-for genre | dmenu | xargs -I{} mdma search --genre {}
+    /// ```
+    pub fn get_fact_values(&self, fact_type: &str) -> Result<Vec<String>, ClientError> {
+        match self.request(&LibraryRequest::GetFactValues {
+            fact_type: fact_type.to_string(),
+        })? {
+            LibraryResponse::FactValues(values) => Ok(values),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to GetFactValues".to_string(),
             })),
         }
     }

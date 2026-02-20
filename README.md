@@ -1,90 +1,131 @@
 # Modular Distributed Music Architecture (MDMA)
 
-A distributed DJ system for Raspberry Pi 5, enabling professional music playback and mixing without being tied to equipment.
+A hi-fi music player for Raspberry Pi 5. Indexes your FLAC library, streams to a USB DAC at 192 kHz, and is fully controlled from the command line — composable with dmenu for keyboard-driven browsing and queuing.
 
-## 🎯 Project Vision
+## What it does today
 
-Move the music experience from phone to a dedicated "music thing" in the living room. Professional playback without being tied to equipment, enabling socializing during parties while maintaining quality.
-
-## 🚧 Status: Milestone 1 - The Installable Player
-
-**Current Progress:** ~15% complete
-
-- ✅ Beacon binary cross-compiled for ARM64
-- ✅ CI/CD pipeline operational
-- 🔄 SD card creation (next step)
-- ⏸️ Music sync (after SD works)
-- ⏸️ Audio playback (after sync works)
-
-## 🚀 Quick Start
-
-### Building Beacon Locally
+MDMA runs headlessly on a Pi 5 with an NVMe drive. You control it from your laptop over the network with the `mdma` CLI.
 
 ```bash
-# Cross-compile for Raspberry Pi 5
-just beacon-native
+# Search your library
+mdma search "rymden"
+mdma search --artist "Carbon Based Lifeforms"
+mdma search --artist CBL          # initialism — same result
+mdma search --bpm "128+-4"        # 124–132 BPM
+mdma search --artist CBL --bpm "128+-4"   # implicit AND
 
-# Test the full CI pipeline locally
-just ci-simulate
+# Discover what's in your library
+mdma search fact-values-for Artist
+mdma search fact-values-for Label
+mdma search fact-values-for Source   # bandcamp, upload, ...
+
+# Queue tracks
+mdma queue append <hash>
+mdma queue list
+mdma queue next           # skip to next
+mdma queue remove <hash>
+mdma queue clear
+
+# Playback
+mdma playback play <hash>
+mdma playback stop
+mdma playback now         # show currently playing track
+
+# Compose with dmenu
+mdma search --artist CBL | dmenu | mdma queue append
+mdma search fact-values-for Artist | dmenu | xargs -I{} mdma search --artist {}
+mdma queue list | dmenu | mdma queue remove
 ```
 
-### CI/CD
+## Search syntax
 
-GitHub Actions automatically builds ARM64 binaries on every push to `master`.
+String fields (`--artist`, `--title`, `--album`, `--label`, `--genre`, `--style`):
 
-- [View workflow runs](https://github.com/johlrogge/modular-digital-music-array/actions)
-- [Download latest beacon binary](https://github.com/johlrogge/modular-digital-music-array/actions)
+| Input | Mode | Example match |
+|-------|------|--------------|
+| `carbon based` | Contains (all words, any order) | "Carbon Based Lifeforms" |
+| `CarbBased` | Initialism (CamelCase prefix match) | "Carbon Based Lifeforms" |
+| `CBL` | Initialism (all-caps = each letter) | "Carbon Based Lifeforms" |
+| `/^Carbon.*/` | Regex | "Carbon Based Lifeforms" |
 
-## 📦 System Components
+Numeric fields (`--bpm`, `--year`):
 
-### Current
+| Input | Meaning |
+|-------|---------|
+| `128` | Exact (±0.5) |
+| `124..132` | Range |
+| `128+-4` | 124–132 (symmetric tolerance) |
+| `128+4` | 128–132 (only higher) |
+| `128-4` | 124–128 (only lower) |
 
-- **Beacon** - Provisioning and configuration server with web interface
-  - Built in Rust
-  - 4.6MB stripped binary
-  - Handles SD card setup and system configuration
+Duration (`--duration`): `7m15s`, `7m`, `>5m`, `<8m`, `6m..8m`
 
-### Planned (Future Milestones)
+Key (`--key`): `Am`, `A minor`, `8B`, `8B+-1`, `8B+-1~` (include relative key)
 
-- **MDMA-909** - Main processing unit with full DJ capabilities
-- **MDMA-303** - Satellite playback nodes for multi-room audio
-- **MDMA-101** - Browser/controller with jog wheel interface
+## Architecture
 
-## 🎵 Why MDMA?
+```
+Your laptop
+    |  TCP (mdma CLI)
+    v
+Raspberry Pi 5
+    |
+    +-- mdma-library   (indexes FLAC library, serves search/facts)
+    +-- mdma-playback  (Symphonia decoder → rubato resampler → PipeWire → USB DAC)
+    +-- mdma-bandcamp  (syncs Bandcamp collection to library)
+    +-- mdma-console   (HTTP frontend, stub)
+    +-- beacon         (provisioning — how the Pi gets set up in the first place)
+```
 
-The acronym is a playful nod to electronic music culture - techno and house DJs will appreciate the humor. The system helps you maintain that party vibe without being tied to the decks!
+Audio path: FLAC → Symphonia → rubato resampler (192 kHz) → PipeWire → iFi USB DAC
 
-**Full name:** Modular Distributed Music Architecture
+Library: immutable fact stream (`stainless_facts`) — every track attribute is a typed fact, appended never overwritten. The entire library state can be rebuilt from `facts.jsonl`.
 
-## 🛠️ Technology Stack
+## Setup
 
-- **Language:** Rust (type-safe, cross-platform)
-- **OS:** Void Linux on Raspberry Pi 5
-- **Storage:** NVMe drives via M.2 HAT
-- **Network:** mDNS for service discovery
-- **Build:** Justfile-based CI/CD (test locally, run in GitHub Actions)
+**Target:** Raspberry Pi 5, Void Linux, NVMe via M.2 HAT, iFi USB DAC
 
-## 📚 Documentation
+**Network:** Pi is at `mdma-909.local`. Services accessible over TCP from the local network.
 
-- [Build Pipeline Docs](docs/build-pipeline.md)
-- [Local CI Testing](docs/LOCAL_CI_TESTING.md)
-- [Scope & Milestones](docs/milestone_1_2_scope_reduction.md)
+```bash
+# Environment (add to shell profile)
+export MDMA_LIBRARY_SOCKET="tcp://mdma-909.local:5555"
+export MDMA_BANDCAMP_SOCKET="tcp://mdma-909.local:5556"
+export MDMA_PLAYBACK_SOCKET="tcp://mdma-909.local:5557"
+```
 
-## 🤝 Contributing
+**SSH to Pi:**
+```bash
+just pi-ssh          # provisioned Pi (mdma-909.local)
+just pi-ssh-beacon   # unprovisioned Pi (welcome-to-mdma.local)
+```
 
-This is currently a personal project in active development. Contributions, ideas, and feedback are welcome once Milestone 1 is complete!
+## Development
 
-## 📄 License
+Requires: Rust, Zig, cargo-zigbuild, PipeWire libs (enter `devenv shell`)
 
-MIT License - See [LICENSE](LICENSE) for details
+```bash
+# Build and deploy to Pi
+just deploy-library    # cross-compile + scp + restart mdma-library
+just deploy-playback   # cross-compile + scp + restart mdma-playback
 
-## 🙏 Acknowledgments
+# Local development
+just watch             # check → test → build → clippy on file changes
+cargo test             # run all tests
+```
 
-Built with inspiration from:
-- Pioneer CDJ series (hardware interface evolution)
-- Traktor/Serato (software DJ platforms)
-- The global techno and house music community
+## What's next
 
----
+- **API gateway** (`mdma-api`) — single TCP entry point replacing the current per-service ports
+- **Pub/sub events** — push notifications for track changes, position, queue updates
+- After that: gapless playback, mixlists, MIDI controller (A&H K3)
 
-**Next milestone:** Boot a Raspberry Pi from SD card and see the beacon interface at `http://welcome-to-mdma.local` 🚀
+See [ROADMAP.md](ROADMAP.md) for the full picture.
+
+## Why MDMA?
+
+Modular Distributed Music Architecture. The acronym is a nod to electronic music culture. The system exists to keep the music going at parties without being physically tied to equipment.
+
+## License
+
+MIT — see [LICENSE](LICENSE)

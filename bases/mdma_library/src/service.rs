@@ -6,8 +6,10 @@ use crate::fact_writer::FactWriter;
 use crate::ipc::{
     Bpm, ContentHash, DurationSeconds, InboxPath, IngestAllItem, IngestResult, IngestSource,
     IpcServer, Key, LibraryRequest, LibraryResponse, ProtocolError, ServiceStatus, TrackInfo,
+    TrackQuery,
 };
 use crate::pipeline::{InboxFile, UploadSource};
+use library_search::{matches_query, TrackFields};
 use music_facts::MusicValue;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -56,9 +58,14 @@ struct IndexedTrackInfo {
     title: Option<String>,
     artist: Option<String>,
     album: Option<String>,
+    label: Option<String>,
+    genre: Option<String>,
+    styles: Vec<String>,
     duration_seconds: Option<u32>,
     bpm: Option<f32>,
     key: Option<String>,
+    year: Option<u32>,
+    source: Option<String>,
     blob_path: PathBuf,
 }
 
@@ -148,9 +155,14 @@ impl LibraryService {
                     title: None,
                     artist: None,
                     album: None,
+                    label: None,
+                    genre: None,
+                    styles: vec![],
                     duration_seconds: None,
                     bpm: None,
                     key: None,
+                    year: None,
+                    source: None,
                     blob_path: PathBuf::new(),
                 });
 
@@ -167,9 +179,14 @@ impl LibraryService {
                 MusicValue::Title(v) => entry.title = Some(v.0.clone()),
                 MusicValue::Artist(v) => entry.artist = Some(v.0.clone()),
                 MusicValue::Album(v) => entry.album = Some(v.0.clone()),
+                MusicValue::Label(v) => entry.label = Some(v.clone()),
+                MusicValue::MainGenre(v) => entry.genre = Some(v.clone()),
+                MusicValue::StyleDescriptor(v) => entry.styles.push(v.clone()),
                 MusicValue::DurationSeconds(v) => entry.duration_seconds = Some(v.0),
                 MusicValue::Bpm(v) => entry.bpm = Some(v.as_f32()),
                 MusicValue::Key(v) => entry.key = Some(v.to_string()),
+                MusicValue::Year(v) => entry.year = Some(v.0),
+                MusicValue::Source(v) => entry.source = Some(v.clone()),
                 _ => {}
             }
         }
@@ -250,6 +267,18 @@ impl LibraryService {
             LibraryRequest::Search { query } => {
                 let results = self.search_tracks(&query);
                 LibraryResponse::SearchResults(results)
+            }
+
+            LibraryRequest::GetFactValues { fact_type } => {
+                let mut values: Vec<String> = self
+                    .fact_index
+                    .lock()
+                    .unwrap()
+                    .get(&fact_type)
+                    .map(|s| s.iter().cloned().collect())
+                    .unwrap_or_default();
+                values.sort();
+                LibraryResponse::FactValues(values)
             }
 
             LibraryRequest::GetInboxQueue => {
@@ -448,27 +477,27 @@ impl LibraryService {
         }
     }
 
-    /// Search tracks by query (case-insensitive, searches title/artist/album)
-    fn search_tracks(&self, query: &str) -> Vec<TrackInfo> {
-        let query_lower = query.to_lowercase();
+    /// Search tracks by structured query (uses library-search for evaluation)
+    fn search_tracks(&self, query: &TrackQuery) -> Vec<TrackInfo> {
         let tracks = self.tracks.lock().unwrap();
 
         tracks
             .iter()
             .filter(|t| {
-                let title_match = t
-                    .title
-                    .as_ref()
-                    .map_or(false, |s| s.to_lowercase().contains(&query_lower));
-                let artist_match = t
-                    .artist
-                    .as_ref()
-                    .map_or(false, |s| s.to_lowercase().contains(&query_lower));
-                let album_match = t
-                    .album
-                    .as_ref()
-                    .map_or(false, |s| s.to_lowercase().contains(&query_lower));
-                title_match || artist_match || album_match
+                let fields = TrackFields {
+                    title: t.title.as_deref(),
+                    artist: t.artist.as_deref(),
+                    album: t.album.as_deref(),
+                    label: t.label.as_deref(),
+                    genre: t.genre.as_deref(),
+                    styles: &t.styles,
+                    bpm: t.bpm,
+                    key: t.key.as_deref(),
+                    duration: t.duration_seconds,
+                    year: t.year,
+                    source: t.source.as_deref(),
+                };
+                matches_query(query, &fields)
             })
             .map(|t| self.to_track_info(t))
             .collect()
@@ -634,18 +663,28 @@ impl LibraryService {
             let mut title = None;
             let mut artist = None;
             let mut album = None;
+            let mut label = None;
+            let mut genre = None;
+            let mut styles: Vec<String> = vec![];
             let mut duration_seconds = None;
             let mut bpm = None;
             let mut key = None;
+            let mut year = None;
+            let mut source_str = None;
 
             for (value, _source) in &facts {
                 match value {
                     MusicValue::Title(t) => title = Some(t.0.clone()),
                     MusicValue::Artist(a) => artist = Some(a.0.clone()),
                     MusicValue::Album(a) => album = Some(a.0.clone()),
+                    MusicValue::Label(l) => label = Some(l.clone()),
+                    MusicValue::MainGenre(g) => genre = Some(g.clone()),
+                    MusicValue::StyleDescriptor(s) => styles.push(s.clone()),
                     MusicValue::DurationSeconds(d) => duration_seconds = Some(d.0),
                     MusicValue::Bpm(b) => bpm = Some(b.as_f32()),
                     MusicValue::Key(k) => key = Some(k.to_string()),
+                    MusicValue::Year(y) => year = Some(y.0),
+                    MusicValue::Source(s) => source_str = Some(s.clone()),
                     _ => {}
                 }
             }
@@ -655,9 +694,14 @@ impl LibraryService {
                 title,
                 artist,
                 album,
+                label,
+                genre,
+                styles,
                 duration_seconds,
                 bpm,
                 key,
+                year,
+                source: source_str,
                 blob_path: indexed.blob_path,
             });
         }

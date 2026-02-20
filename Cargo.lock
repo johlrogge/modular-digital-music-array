@@ -1949,8 +1949,19 @@ dependencies = [
 name = "library-ipc-protocol"
 version = "0.1.0"
 dependencies = [
+ "library-search",
  "music-facts",
  "rstest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "library-search"
+version = "0.1.0"
+dependencies = [
+ "regex",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -2147,6 +2158,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "library-ipc-client",
+ "library-search",
  "media-client",
  "tabled",
 ]
@@ -2182,6 +2194,7 @@ dependencies = [
  "flac-metadata",
  "hex",
  "library-ipc-protocol",
+ "library-search",
  "music-facts",
  "music-primitives",
  "nng",

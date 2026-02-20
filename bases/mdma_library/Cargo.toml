@@ -18,6 +18,7 @@ chrono = { workspace = true, features = ["serde"] }
 thiserror = { workspace = true }
 
 # Internal components
+library-search = { path = "../../components/library_search" }
 music-facts = { path = "../../components/music_facts" }
 music-primitives = { path = "../../components/music_primitives" }
 flac-metadata = { path = "../../components/flac_metadata" }

@@ -11,6 +11,7 @@ use color_eyre::Result;
 use library_ipc_client::{
     ClientError, ContentHash, InboxPath, LibraryClient, ProtocolError, TrackInfo,
 };
+use library_search::{parse_numeric_query, parse_string_query, TrackQuery};
 use media_client::{Deck, MediaClient};
 
 // =============================================================================
@@ -81,8 +82,56 @@ enum Commands {
 
     /// Search for tracks
     Search {
-        /// Search query
-        query: String,
+        /// Free-text query applied to all text fields (title, artist, album, label, genre).
+        /// Supports CamelCase initialism (CarbBased) and /regex/ syntax.
+        query: Option<String>,
+
+        /// Filter by artist name
+        #[arg(long)]
+        artist: Option<String>,
+
+        /// Filter by track title
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Filter by album name
+        #[arg(long)]
+        album: Option<String>,
+
+        /// Filter by label name
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Filter by main genre (e.g. "Electronic", "Techno")
+        #[arg(long)]
+        genre: Option<String>,
+
+        /// Filter by style descriptor — matches if any descriptor matches
+        #[arg(long)]
+        style: Option<String>,
+
+        /// Filter by BPM. Formats: 128  128+-4  124..132  128+2  128-2
+        #[arg(long)]
+        bpm: Option<String>,
+
+        /// Filter by musical key. Formats: Am  "A minor"  8B  8B+-1  8B+-1~
+        #[arg(long)]
+        key: Option<String>,
+
+        /// Filter by duration. Formats: 7m  7m15s  >5m  <8m  6m..8m
+        #[arg(long)]
+        duration: Option<String>,
+
+        /// Filter by release year. Formats: 2022  2019..2022
+        #[arg(long)]
+        year: Option<String>,
+
+        /// Filter by source (bandcamp, beatport, upload)
+        #[arg(long)]
+        source: Option<String>,
+
+        #[command(subcommand)]
+        subcommand: Option<SearchSubcommands>,
     },
 
     /// Inbox management commands
@@ -174,6 +223,20 @@ enum PlaybackCommands {
 
     /// Show what is currently playing
     Now,
+}
+
+#[derive(Subcommand, Debug)]
+enum SearchSubcommands {
+    /// List all distinct values stored for a fact type.
+    ///
+    /// Examples:
+    ///   mdma search fact-values-for genre
+    ///   mdma search fact-values-for label | grep -i "ost"
+    ///   mdma search fact-values-for genre | dmenu | xargs -I{} mdma search --genre {}
+    FactValuesFor {
+        /// Fact type to inspect (e.g. MainGenre, Label, Key, Source, BPM, StyleDescriptor)
+        fact_type: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -372,16 +435,57 @@ fn handle_facts(client: &LibraryClient, hash: String) -> Result<()> {
     }
 }
 
-fn handle_search(client: &LibraryClient, query: String) -> Result<()> {
+/// Build a TrackQuery from individual CLI arguments.
+fn build_track_query(
+    any_text: Option<String>,
+    artist: Option<String>,
+    title: Option<String>,
+    album: Option<String>,
+    label: Option<String>,
+    genre: Option<String>,
+    style: Option<String>,
+    bpm_str: Option<String>,
+    _key_str: Option<String>,
+    _duration_str: Option<String>,
+    year_str: Option<String>,
+    source: Option<String>,
+) -> TrackQuery {
+    TrackQuery {
+        any_text: any_text.map(|s| parse_string_query(&s)),
+        artist: artist.map(|s| parse_string_query(&s)),
+        title: title.map(|s| parse_string_query(&s)),
+        album: album.map(|s| parse_string_query(&s)),
+        label: label.map(|s| parse_string_query(&s)),
+        genre: genre.map(|s| parse_string_query(&s)),
+        style: style.map(|s| parse_string_query(&s)),
+        bpm: bpm_str.and_then(|s| parse_numeric_query(&s).ok()),
+        key: None,      // key parsing deferred — key filter not yet wired up
+        duration: None, // duration parsing deferred
+        year: year_str.and_then(|s| parse_numeric_query(&s).ok()),
+        source,
+    }
+}
+
+fn handle_search(client: &LibraryClient, query: &TrackQuery) -> Result<()> {
     use std::io::IsTerminal;
-    match client.search(&query) {
+    // Refuse to run a completely empty query on a terminal — it would dump the
+    // entire library with no feedback, which is almost never what the user wants.
+    // In pipe mode (e.g. scripts) an empty query is intentional and allowed.
+    if query.is_empty() && std::io::stdout().is_terminal() {
+        eprintln!("No search filters specified. Try:");
+        eprintln!("  mdma search \"rymden\"");
+        eprintln!("  mdma search --artist \"carbon based\" --bpm \"128+-4\"");
+        eprintln!("  mdma search fact-values-for genre");
+        std::process::exit(1);
+    }
+    match client.search(query) {
         Ok(tracks) => {
             if std::io::stdout().is_terminal() {
                 if tracks.is_empty() {
-                    println!("No tracks found matching '{}'", query);
+                    println!("No tracks found");
                     return Ok(());
                 }
-                println!("Search results for '{}' ({} matches):", query, tracks.len());
+                println!("Search results ({} matches):", tracks.len());
                 println!("{}", "=".repeat(65));
                 for track in tracks {
                     println!(
@@ -392,13 +496,38 @@ fn handle_search(client: &LibraryClient, query: String) -> Result<()> {
                 }
             } else {
                 // Pipe / dmenu mode: "{short_hash}  {display}" — one per line, no header.
-                // The receiving command reads the first whitespace-delimited token as the hash.
                 for track in tracks {
                     println!(
                         "{}  {}",
                         short_hash(&track.content_hash),
                         format_track_line(&track)
                     );
+                }
+            }
+            Ok(())
+        }
+        Err(e) => handle_error(e),
+    }
+}
+
+fn handle_fact_values_for(client: &LibraryClient, fact_type: String) -> Result<()> {
+    use std::io::IsTerminal;
+    match client.get_fact_values(&fact_type) {
+        Ok(values) => {
+            if std::io::stdout().is_terminal() {
+                if values.is_empty() {
+                    println!("No values found for fact type '{}'", fact_type);
+                    return Ok(());
+                }
+                println!("Values for '{}' ({} distinct):", fact_type, values.len());
+                println!("{}", "=".repeat(65));
+                for v in values {
+                    println!("  {}", v);
+                }
+            } else {
+                // Pipe mode: one value per line — composable with dmenu, grep, etc.
+                for v in values {
+                    println!("{}", v);
                 }
             }
             Ok(())
@@ -1025,7 +1154,35 @@ fn main() -> Result<()> {
                 Commands::List { limit } => handle_list(&client, limit),
                 Commands::Get { hash } => handle_get(&client, hash),
                 Commands::Facts { hash } => handle_facts(&client, hash),
-                Commands::Search { query } => handle_search(&client, query),
+                Commands::Search {
+                    query,
+                    artist,
+                    title,
+                    album,
+                    label,
+                    genre,
+                    style,
+                    bpm,
+                    key,
+                    duration,
+                    year,
+                    source,
+                    subcommand,
+                } => {
+                    if let Some(sub) = subcommand {
+                        match sub {
+                            SearchSubcommands::FactValuesFor { fact_type } => {
+                                handle_fact_values_for(&client, fact_type)
+                            }
+                        }
+                    } else {
+                        let track_query = build_track_query(
+                            query, artist, title, album, label, genre, style, bpm, key, duration,
+                            year, source,
+                        );
+                        handle_search(&client, &track_query)
+                    }
+                }
                 Commands::Inbox { command } => match command {
                     InboxCommands::List => handle_inbox_list(&client),
                     InboxCommands::Delete { filename } => handle_inbox_delete(&client, filename),

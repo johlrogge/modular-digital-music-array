@@ -6,6 +6,10 @@
 
 // Re-export types used in the protocol so clients don't need to depend on music-facts
 pub use music_facts::{Bpm, ContentHash, DurationSeconds, Key};
+// Re-export query types so clients can use them without depending on library-search directly
+pub use library_search::{
+    CamelotLetter, DurationQuery, DurationUnit, KeyQuery, NumericQuery, StringQuery, TrackQuery,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -140,8 +144,12 @@ pub enum LibraryRequest {
     /// Get all facts for a track (supports partial hashes).
     GetFacts { hash: ContentHash },
 
-    /// Search tracks by query string.
-    Search { query: String },
+    /// Search tracks by structured query.
+    Search { query: TrackQuery },
+
+    /// Get all distinct values stored for a given fact type.
+    /// Returns a sorted list usable for discovery (e.g. all genres, all labels).
+    GetFactValues { fact_type: String },
 
     /// Get files currently in inbox queue.
     GetInboxQueue,
@@ -206,6 +214,9 @@ pub enum LibraryResponse {
 
     /// Results of ingest-all operation.
     IngestAllResult(Vec<IngestAllItem>),
+
+    /// Sorted distinct values for a requested fact type.
+    FactValues(Vec<String>),
 
     /// Whether a single fact exists.
     FactExists {
