@@ -38,6 +38,9 @@
   # Environment variables for bindgen
   env.LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
+  # Project root — evaluated at devenv build time, always the correct absolute path
+  env.MDMA_PROJECT_ROOT = toString ./.;
+
   # Pi service sockets — available in every devenv shell automatically
   env.MDMA_LIBRARY_SOCKET  = "tcp://mdma-909.local:5555";
   env.MDMA_BANDCAMP_SOCKET = "tcp://mdma-909.local:5556";
@@ -50,7 +53,10 @@
     rustfmt.enable = true;
   };
 
-  # Shell scripts — available as commands in the devenv shell
+  # Shell scripts — available as commands in the devenv shell.
+  # All scripts use the pre-built mdma binary from target/debug, falling back
+  # to building it if it doesn't exist yet. They talk to the Pi via the
+  # MDMA_* socket env vars above — no local PipeWire or playback server starts.
   scripts = {
     # Search the library and play the first matching track on deck A
     mdma-play.exec = ''
@@ -60,18 +66,26 @@
         echo "Usage: mdma-play <search term>"
         exit 1
       fi
-      result=$(cargo run --quiet --package mdma-cli -- search "$query" 2>/dev/null \
-        | grep -m1 '[0-9a-f]\{8\}' | awk '{print $1}')
+      bin="$MDMA_PROJECT_ROOT/target/debug/mdma"
+      if [ ! -x "$bin" ]; then
+        echo "Building mdma-cli..." >&2
+        cargo --manifest-path "$MDMA_PROJECT_ROOT/Cargo.toml" build -q --package mdma-cli
+      fi
+      result=$("$bin" search "$query" | grep -m1 '[0-9a-f]\{8\}' | awk '{print $1}')
       if [ -z "$result" ]; then
         echo "No tracks found for: $query"
         exit 1
       fi
-      cargo run --quiet --package mdma-cli -- playback play "$result"
+      "$bin" playback play "$result"
     '';
 
     # Stop deck A
     mdma-stop.exec = ''
-      cargo run --quiet --package mdma-cli -- playback stop
+      bin="$MDMA_PROJECT_ROOT/target/debug/mdma"
+      if [ ! -x "$bin" ]; then
+        cargo --manifest-path "$MDMA_PROJECT_ROOT/Cargo.toml" build -q --package mdma-cli
+      fi
+      "$bin" playback stop
     '';
 
     # Set the iFi DAC (or default sink) volume via wpctl on the Pi
@@ -83,7 +97,7 @@
         "sudo -u _pipewire PIPEWIRE_RUNTIME_DIR=/run/pipewire wpctl set-volume @DEFAULT_AUDIO_SINK@ $vol"
     '';
 
-    # Show service reachability and current PipeWire stream
+    # Show service reachability and current PipeWire stream on the Pi
     mdma-status.exec = ''
       echo "Pi: $MDMA_PI_HOST"
       echo ""
@@ -103,7 +117,8 @@
     '';
   };
 
-  # Shell hook
+  # Shell hook — also builds mdma-cli and adds target/debug to PATH so
+  # you can call `mdma` directly without going through the scripts.
   enterShell = ''
     echo "MDMA Development Environment"
     echo "Rust: $(rustc --version)"
@@ -114,7 +129,16 @@
     echo "  bandcamp $MDMA_BANDCAMP_SOCKET"
     echo "  playback $MDMA_PLAYBACK_SOCKET"
     echo ""
-    echo "Commands:  mdma-play <term>  mdma-stop  mdma-volume <0-1>  mdma-status"
+
+    # Build mdma-cli and expose it directly as `mdma` on PATH
+    cargo build -q --package mdma-cli 2>/dev/null \
+      && export PATH="$MDMA_PROJECT_ROOT/target/debug:$PATH" \
+      && echo "mdma CLI ready (talks to Pi via TCP)" \
+      || echo "mdma CLI not built — run: cargo build --package mdma-cli"
+
+    echo ""
+    echo "Commands:  mdma search <term>   mdma playback play <hash>   mdma playback stop"
+    echo "           mdma-play <term>  mdma-stop  mdma-volume <0-1>  mdma-status"
     echo "           just --list"
   '';
 
