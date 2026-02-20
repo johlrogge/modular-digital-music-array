@@ -1,6 +1,6 @@
 # MDMA Roadmap
 
-**Last updated:** February 20, 2026
+**Last updated:** February 20, 2026 (evening)
 
 ## Where We Are
 
@@ -45,38 +45,29 @@ Always output at the iFi DAC's maximum supported rate (probe at startup — like
 
 ## Priorities
 
-### 1. Hi-Res Resampler — Foundation of Everything
+### ~~1. Hi-Res Resampler~~ — COMPLETE
 
-**Why first:** Audio quality is the point. Building a queue on a wrong-rate pipeline is building on sand.
-
-**What it means:**
-- Probe iFi DAC for actual max rate at startup (via PipeWire negotiation or device info), default to 192 kHz
-- Add `rubato` crate as resampler: FlacSource → Resampler → 192 kHz F32LE → Mixer → PipeWire
-- PipeWire stream fixed at 192 kHz from creation — source rate no longer matters, everything gets upsampled
-- Resolves the sample-rate-lock limitation from the MVP
-
-**Verify:** Load Rymden3000 (44.1 kHz source). iFi DAC indicator shows 192 kHz.
+`rubato` resampler integrated. PipeWire stream fixed at 192 kHz. All sources upsampled at load time. iFi DAC indicator confirms 192 kHz output.
 
 ---
 
 ### 2. Queue + stainless_facts Search (Together)
 
-**Why together:** Search without queue is incomplete; queue without search means you can't find tracks to add. dmenu falls out naturally once both exist.
+**Queue: COMPLETE**
 
-**stainless_facts search:**
+- In-memory queue with `ContentHash` as the track identifier (not paths)
+- Commands: `queue append`, `queue next`, `queue list`, `queue clear`, `queue remove`
+- Auto-advances when a track finishes
+- `queue list`: tty-aware — human display in terminal, hashes when piped (dmenu-composable)
+- `queue remove`: accepts hash arg or stdin, composes with `queue list | dmenu | queue remove`
+- `playback now`: shows currently playing track in same format as queue list
+- `ContentHash` moved to `playback_primitives` — available across all services without circular deps
+
+**Remaining: stainless_facts search**
 - Add query/filter capabilities to the crate (search by title, artist, etc.)
 - All library consumers use this API — zero raw JSONL parsing anywhere
 - This is a crate-level feature, not a workaround
-
-**Queue:**
-- Persistent ordered list of track IDs
-- Commands: enqueue, play-next, skip, reorder, clear
-- Auto-advances when a track finishes (EOF → pop next from queue, load, play)
-- **Storage: in-memory only** — no fact stream, no persistence across restarts. When the design stabilises (play statistics, history, set logging), write into a separate fact stream and eventually join with the library fact stream
-- Feeds deck A only; deck abstraction stays for future expansion
-- Silence when queue is empty is acceptable for now
-
-**dmenu integration:** No special work needed. Once you can search, pipe results into dmenu and pipe selection into enqueue. Unix pipelines compose naturally.
+- **dmenu integration falls out here:** `mdma search "query" | dmenu | mdma queue append`
 
 ---
 
@@ -213,6 +204,15 @@ export MDMA_PLAYBACK_SOCKET="tcp://mdma-909.local:5557"
 ---
 
 ## Update History
+
+- **2026-02-20 (evening):** Resampler complete. Queue and now-playing operational.
+  - `rubato` resampler done: 192 kHz output confirmed on iFi DAC
+  - Queue overhaul: stores `ContentHash` + path pairs, exposes hashes (not paths)
+  - `queue list`: tty-aware human display (artist/title/duration) or raw hashes when piped
+  - `queue remove`: by arg or stdin, composes with `queue list | dmenu | queue remove`
+  - `playback now`: shows currently playing track, same tty-aware format as queue list
+  - `ContentHash` moved to `playback_primitives` — cross-service identifier without new deps
+  - **Next:** stainless_facts search → closes Priority 2, unlocks full dmenu workflow
 
 - **2026-02-20:** Playback bugs fixed and verified. First real playback milestone complete.
   - Rymden3000 (24-bit / 44.1 kHz) plays at correct speed and full fidelity
