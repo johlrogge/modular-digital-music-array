@@ -56,7 +56,7 @@ pub struct DecodedSegment {
 
 impl DecodedSegment {
     pub fn is_empty(&self) -> bool {
-        self.segment.samples.iter().filter(|s| **s != 0.0).count() > 0
+        self.segment.samples.iter().all(|s| *s == 0.0)
     }
 }
 

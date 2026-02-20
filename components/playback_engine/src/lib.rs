@@ -24,7 +24,9 @@ type Decks = Arc<RwLock<HashMap<Deck, Arc<RwLock<Track>>>>>;
 
 pub struct PlaybackEngine {
     decks: Decks,
-    _audio_output: PipewireOutput,
+    _audio_output: Option<PipewireOutput>,
+    mixer_consumer: Option<HeapConsumer<f32>>,
+    current_sample_rate: Option<u32>,
     command_sender: mpsc::Sender<MixerCommand>,
     _mix_task: Option<std::thread::JoinHandle<()>>,
 }
@@ -47,14 +49,6 @@ impl PlaybackEngine {
         const MIXER_BUFFER_SIZE: usize = 32768;
         let mixer_rb = HeapRb::<f32>::new(MIXER_BUFFER_SIZE);
         let (mixer_producer, mixer_consumer) = mixer_rb.split();
-
-        // Create PipeWire audio output with consumer
-        // Need to add conversion from pipewire::Error to PlaybackError
-        info!("spawn pipewire output");
-        let audio_output = match PipewireOutput::new(mixer_consumer) {
-            Ok(output) => output,
-            Err(e) => return Err(PlaybackError::AudioDevice(format!("PipeWire error: {}", e))),
-        };
 
         // Start the mix thread with command receiver
         let mix_task = std::thread::spawn(move || {
@@ -89,10 +83,12 @@ impl PlaybackEngine {
             }
         });
 
-        // Return the engine
+        // Return the engine — PipeWire output deferred until first track load
         Ok(Self {
             decks: Arc::new(RwLock::new(HashMap::new())),
-            _audio_output: audio_output,
+            _audio_output: None,
+            mixer_consumer: Some(mixer_consumer),
+            current_sample_rate: None,
             command_sender,
             _mix_task: Some(mix_task),
         })
@@ -110,13 +106,34 @@ impl PlaybackEngine {
             }
         }
 
+        // Create source first to get sample rate
+        let source = FlacSource::new(path)?;
+        let track_rate = source.sample_rate();
+
+        // Create PipeWire output on first track load
+        if self._audio_output.is_none() {
+            if let Some(consumer) = self.mixer_consumer.take() {
+                info!("Creating PipeWire output at {}Hz", track_rate);
+                let audio_output = PipewireOutput::new(consumer, track_rate)
+                    .map_err(|e| PlaybackError::AudioDevice(format!("PipeWire error: {}", e)))?;
+                self._audio_output = Some(audio_output);
+                self.current_sample_rate = Some(track_rate);
+            }
+        } else if self.current_sample_rate != Some(track_rate) {
+            tracing::warn!(
+                "Track sample rate {}Hz differs from PipeWire stream rate {}Hz — resampling not yet supported",
+                track_rate,
+                self.current_sample_rate.unwrap_or(0)
+            );
+        }
+
         // Create ringbuffer for this deck
         const BUFFER_SIZE: usize = 16384;
         let rb = HeapRb::<f32>::new(BUFFER_SIZE);
         let (producer, consumer) = rb.split();
 
         // Create new track with producer
-        let track = Track::new(FlacSource::new(path)?, producer).await?;
+        let track = Track::new(source, producer).await?;
         tracing::info!("Track is ready for playback");
 
         // Store the track - no lock conflicts possible with mix thread now

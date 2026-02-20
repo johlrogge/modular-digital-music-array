@@ -1,6 +1,6 @@
 // in mixer.rs
 use crate::error::PlaybackError;
-use playback_primitives::Deck;
+use playback_primitives::{Db, Deck, Volume};
 use ringbuf::{HeapConsumer, HeapProducer};
 use std::collections::HashMap;
 
@@ -81,6 +81,7 @@ impl Mixer {
         Ok(())
     }
     pub(crate) fn set_volume(&mut self, deck: Deck, db: f32) {
-        self.volumes.insert(deck, db);
+        let linear = Volume::new(db).map(|v| v.to_linear()).unwrap_or(1.0);
+        self.volumes.insert(deck, linear);
     }
 }

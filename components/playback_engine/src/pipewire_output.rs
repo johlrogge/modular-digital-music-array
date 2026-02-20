@@ -6,9 +6,8 @@ use ringbuf::HeapConsumer;
 use spa::pod::Pod;
 use tracing::{debug, info};
 
-pub const DEFAULT_RATE: u32 = 48000;
 pub const DEFAULT_CHANNELS: u32 = 2;
-pub const CHAN_SIZE: usize = std::mem::size_of::<i16>();
+pub const CHAN_SIZE: usize = std::mem::size_of::<f32>();
 
 pub struct PipewireOutput {
     // Thread handle to keep the PipeWire thread alive
@@ -16,7 +15,7 @@ pub struct PipewireOutput {
 }
 
 impl PipewireOutput {
-    pub fn new(sample_consumer: HeapConsumer<f32>) -> Result<Self, pw::Error> {
+    pub fn new(sample_consumer: HeapConsumer<f32>, sample_rate: u32) -> Result<Self, pw::Error> {
         // Create a ring buffer for audio samples
         info!("create pipe wire thread");
         // Spawn PipeWire thread
@@ -51,7 +50,7 @@ impl PipewireOutput {
             let _listener = stream
                 .add_local_listener_with_user_data(user_data)
                 .process(|stream, user_data| match stream.dequeue_buffer() {
-                    None => println!("No buffer received"),
+                    None => tracing::warn!("No buffer received"),
                     Some(mut buffer) => {
                         let datas = buffer.datas_mut();
                         let stride = CHAN_SIZE * DEFAULT_CHANNELS as usize;
@@ -80,28 +79,21 @@ impl PipewireOutput {
                                 debug!("Read {} samples from consumer", samples_read);
                             }
 
-                            // Convert f32 samples to i16 and copy to output buffer
+                            // Write f32 samples directly to output buffer
                             for i in 0..n_frames {
                                 for c in 0..DEFAULT_CHANNELS {
-                                    // Calculate index in f32 buffer
                                     let f32_idx = i * DEFAULT_CHANNELS as usize + c as usize;
 
-                                    // Get sample (or 0 if we've read all samples)
                                     let f32_sample = if f32_idx < samples_read {
                                         f32_buffer[f32_idx]
                                     } else {
                                         0.0
                                     };
 
-                                    // Convert to i16 (-1.0..1.0 -> -32767..32767)
-                                    let val =
-                                        (f32_sample * 32767.0).clamp(-32767.0, 32767.0) as i16;
-
-                                    // Copy to output buffer
                                     let start = i * stride + (c as usize * CHAN_SIZE);
                                     let end = start + CHAN_SIZE;
                                     let chan = &mut slice[start..end];
-                                    chan.copy_from_slice(&i16::to_le_bytes(val));
+                                    chan.copy_from_slice(&f32_sample.to_le_bytes());
                                 }
                             }
 
@@ -119,8 +111,8 @@ impl PipewireOutput {
                 .register()?;
 
             let mut audio_info = spa::param::audio::AudioInfoRaw::new();
-            audio_info.set_format(spa::param::audio::AudioFormat::S16LE);
-            audio_info.set_rate(DEFAULT_RATE);
+            audio_info.set_format(spa::param::audio::AudioFormat::F32LE);
+            audio_info.set_rate(sample_rate);
             audio_info.set_channels(DEFAULT_CHANNELS);
             let mut position = [0; spa::param::audio::MAX_CHANNELS];
             position[0] = spa_sys::SPA_AUDIO_CHANNEL_FL;

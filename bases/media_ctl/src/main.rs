@@ -16,7 +16,9 @@ async fn main() -> Result<()> {
     color_eyre::install()?;
     let cli = Cli::parse();
 
-    let client = media_client::MediaClient::connect("ipc:///tmp/mdma-commands")?;
+    let socket = std::env::var("MDMA_PLAYBACK_SOCKET")
+        .unwrap_or_else(|_| "ipc:///run/mdma/playback.sock".to_string());
+    let client = media_client::MediaClient::connect(&socket)?;
 
     match cli.command {
         Commands::Load {

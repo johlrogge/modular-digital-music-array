@@ -32,6 +32,7 @@ async fn decoder_task<S: Source + Send + Sync + 'static>(
     source: S,
     mut output: HeapProducer<f32>,
     mut command_rx: mpsc::Receiver<TrackCommand>,
+    playing: Arc<AtomicBool>,
 ) {
     let mut decoded_segments = VecDeque::new();
     let mut next_segment: Option<DecodedSegment> = None;
@@ -50,6 +51,12 @@ async fn decoder_task<S: Source + Send + Sync + 'static>(
                     tracing::error!("failed to decode segment: {error}");
                 }
             }
+        }
+
+        if !playing.load(Ordering::Relaxed) {
+            // Paused: sleep briefly, keep decoding ahead for instant resume
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            continue;
         }
 
         if let Some(ref segment) = next_segment {
@@ -101,8 +108,9 @@ impl Track {
         let (command_tx, command_rx) = mpsc::channel(32);
 
         // Create decoder task
+        let playing_clone = playing.clone();
         let decoder_task = tokio::spawn(async move {
-            decoder_task(source, output_producer, command_rx).await;
+            decoder_task(source, output_producer, command_rx, playing_clone).await;
         });
 
         let track = Self {
