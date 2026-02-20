@@ -38,9 +38,6 @@
   # Environment variables for bindgen
   env.LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
-  # Project root — evaluated at devenv build time, always the correct absolute path
-  env.MDMA_PROJECT_ROOT = toString ./.;
-
   # Pi service sockets — available in every devenv shell automatically
   env.MDMA_LIBRARY_SOCKET  = "tcp://mdma-909.local:5555";
   env.MDMA_BANDCAMP_SOCKET = "tcp://mdma-909.local:5556";
@@ -117,9 +114,13 @@
     '';
   };
 
-  # Shell hook — also builds mdma-cli and adds target/debug to PATH so
-  # you can call `mdma` directly without going through the scripts.
+  # Shell hook — sets MDMA_PROJECT_ROOT to the live checkout, builds mdma-cli,
+  # and adds target/debug to PATH so `mdma` works directly in the shell.
   enterShell = ''
+    # Must be set here (not via env.*) so it points to the live checkout,
+    # not the read-only Nix store copy that toString ./. would produce.
+    export MDMA_PROJECT_ROOT="$PWD"
+
     echo "MDMA Development Environment"
     echo "Rust: $(rustc --version)"
     echo "Zig:  $(zig version)"
