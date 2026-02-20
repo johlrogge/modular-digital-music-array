@@ -171,6 +171,9 @@ enum PlaybackCommands {
 
     /// Stop playback on deck A
     Stop,
+
+    /// Show what is currently playing
+    Now,
 }
 
 #[derive(Subcommand, Debug)]
@@ -689,6 +692,38 @@ fn handle_playback_play(media_client: &MediaClient) -> Result<()> {
     Ok(())
 }
 
+fn handle_playback_now(
+    media_client: &MediaClient,
+    library_client: Option<&LibraryClient>,
+) -> Result<()> {
+    let hash = match media_client.now_playing() {
+        Ok(h) => h,
+        Err(e) => handle_playback_error(e),
+    };
+    match hash {
+        None => {
+            eprintln!("Nothing playing");
+            std::process::exit(1);
+        }
+        Some(h) => match library_client {
+            None => println!("{}", h.0),
+            Some(lib) => {
+                let track = lib
+                    .get_track(&h)
+                    .expect("playing hash not found in library — invariant violated");
+                let artist = track.artist.as_deref().unwrap_or("-");
+                let title = track.title.as_deref().unwrap_or("-");
+                let duration = track
+                    .duration
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                println!("{}  {} - {}  [{}]", short_hash(&h), artist, title, duration);
+            }
+        },
+    }
+    Ok(())
+}
+
 fn handle_queue_next(
     library_client: &LibraryClient,
     media_client: &MediaClient,
@@ -867,6 +902,15 @@ fn main() -> Result<()> {
                 }
             };
 
+            let connect_library = || match LibraryClient::connect(&cli.socket) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Failed to connect to library at {}: {}", cli.socket, e);
+                    eprintln!("Is mdma-library running?");
+                    std::process::exit(1);
+                }
+            };
+
             match command {
                 PlaybackCommands::Play => {
                     let media_client = connect_media();
@@ -875,6 +919,16 @@ fn main() -> Result<()> {
                 PlaybackCommands::Stop => {
                     let media_client = connect_media();
                     handle_playback_stop(&media_client)
+                }
+                PlaybackCommands::Now => {
+                    use std::io::IsTerminal;
+                    let media_client = connect_media();
+                    if std::io::stdout().is_terminal() {
+                        let lib = connect_library();
+                        handle_playback_now(&media_client, Some(&lib))
+                    } else {
+                        handle_playback_now(&media_client, None)
+                    }
                 }
             }
         }

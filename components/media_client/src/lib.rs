@@ -118,6 +118,16 @@ impl MediaClient {
         self.send_command(Command::QueueRemove { hashes })
     }
 
+    pub fn now_playing(&self) -> Result<Option<ContentHash>, ClientError> {
+        self.send_command_with_response(Command::NowPlaying, |data| {
+            if let ResponseData::NowPlaying(hash) = data {
+                Some(hash)
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn play_queue(&self) -> Result<(), ClientError> {
         self.send_command(Command::PlayQueue)
     }

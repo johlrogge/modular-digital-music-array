@@ -19,6 +19,7 @@ pub struct Server {
     engine: Arc<Mutex<PlaybackEngine>>,
     socket: Socket,
     queue: Arc<Mutex<VecDeque<QueueEntry>>>,
+    current_hash: Arc<Mutex<Option<ContentHash>>>,
 }
 
 impl Server {
@@ -27,6 +28,7 @@ impl Server {
             engine,
             socket,
             queue: Arc::new(Mutex::new(VecDeque::new())),
+            current_hash: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -34,7 +36,11 @@ impl Server {
         info!("Playback server starting...");
 
         // Background task: auto-advance to next queued track when current track finishes.
-        tokio::spawn(auto_advance_task(self.engine.clone(), self.queue.clone()));
+        tokio::spawn(auto_advance_task(
+            self.engine.clone(),
+            self.queue.clone(),
+            self.current_hash.clone(),
+        ));
 
         loop {
             // Receive command
@@ -145,9 +151,19 @@ impl Server {
                         data: None,
                     },
                     Some(e) => {
+                        *self.current_hash.lock().await = Some(e.hash.clone());
                         let result = load_and_play(&self.engine, &e.path).await;
                         self.create_response(result, None)
                     }
+                }
+            }
+            Command::NowPlaying => {
+                let hash = self.current_hash.lock().await.clone();
+                info!("Now playing: {:?}", hash);
+                Response {
+                    success: true,
+                    error_message: String::new(),
+                    data: Some(ResponseData::NowPlaying(hash)),
                 }
             }
         }
@@ -201,6 +217,7 @@ async fn load_and_play(
 async fn auto_advance_task(
     engine: Arc<Mutex<PlaybackEngine>>,
     queue: Arc<Mutex<VecDeque<QueueEntry>>>,
+    current_hash: Arc<Mutex<Option<ContentHash>>>,
 ) {
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -216,6 +233,7 @@ async fn auto_advance_task(
         };
 
         info!("Auto-advance: loading {:?}", entry.path);
+        *current_hash.lock().await = Some(entry.hash.clone());
         if let Err(e) = load_and_play(&engine, &entry.path).await {
             warn!("Auto-advance failed to load {:?}: {}", entry.path, e);
         }

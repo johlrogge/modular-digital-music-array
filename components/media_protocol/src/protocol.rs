@@ -45,6 +45,8 @@ pub enum Command {
     },
     /// Pop from queue head, load on deck A, and start playing.
     PlayQueue,
+    /// Return the hash of the track currently loaded on deck A (None if nothing playing).
+    NowPlaying,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +62,7 @@ pub enum ResponseData {
     Position(usize),
     Length(usize),
     Queue(Vec<ContentHash>),
+    NowPlaying(Option<ContentHash>),
 }
 
 #[cfg(test)]
