@@ -130,6 +130,26 @@ After queue management is working:
 
 ---
 
+## Validation: Full Reinstall from SD Card
+
+Once the roadmap priorities are through, do a full reinstall from SD card to validate
+the provisioning pipeline end-to-end — as a new unit would experience it.
+
+**Constraint:** `/music` must survive. The NVMe partition layout keeps `/music` on its
+own partition (`/dev/nvme0n1p4`), so reinstalling root does not touch it. Verify this
+holds before wiping anything.
+
+**What to test:**
+- Fresh SD card boot → beacon → provision NVMe → all services start automatically
+- `/music` and `/metadata` intact after reinstall
+- `mdma search` works immediately against the existing library
+- Bandcamp sync resumes without re-downloading
+
+This is not a blocker for any current milestone but should happen before inviting
+other users onto the system.
+
+---
+
 ## What to Defer
 
 - Manual DJ mixing (MIDI, crossfader) — after queue + virtual decks proven
