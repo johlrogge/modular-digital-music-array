@@ -685,26 +685,33 @@ fn handle_playback_play(media_client: &MediaClient) -> Result<()> {
 fn handle_queue_next(
     library_client: &LibraryClient,
     media_client: &MediaClient,
-    hash: String,
+    hashes: Vec<String>,
 ) -> Result<()> {
-    let path = resolve_blob_path(library_client, hash);
-    if let Err(e) = media_client.queue_next(path) {
-        handle_playback_error(e);
+    let count = hashes.len();
+    // Prepend in reverse so the first hash ends up at the front of the queue.
+    for hash in hashes.into_iter().rev() {
+        let path = resolve_blob_path(library_client, hash);
+        if let Err(e) = media_client.queue_next(path) {
+            handle_playback_error(e);
+        }
     }
-    println!("Queued next");
+    println!("Queued {} track(s) next", count);
     Ok(())
 }
 
 fn handle_queue_append(
     library_client: &LibraryClient,
     media_client: &MediaClient,
-    hash: String,
+    hashes: Vec<String>,
 ) -> Result<()> {
-    let path = resolve_blob_path(library_client, hash);
-    if let Err(e) = media_client.queue_append(path) {
-        handle_playback_error(e);
+    let count = hashes.len();
+    for hash in hashes {
+        let path = resolve_blob_path(library_client, hash);
+        if let Err(e) = media_client.queue_append(path) {
+            handle_playback_error(e);
+        }
     }
-    println!("Appended to queue");
+    println!("Appended {} track(s) to queue", count);
     Ok(())
 }
 
@@ -733,24 +740,33 @@ fn handle_queue_clear(media_client: &MediaClient) -> Result<()> {
     Ok(())
 }
 
-/// Return the provided hash, or read the first whitespace-delimited token from stdin.
-/// Supports `mdma search ... | dmenu | mdma queue append` where dmenu outputs
-/// "{short_hash}  {display}".
-fn hash_or_stdin(hash: Option<String>) -> String {
+/// Return the provided hash as a single-element vec, or read ALL lines from stdin and
+/// return the first whitespace-delimited token from each non-empty line.
+///
+/// Supports both:
+///   Single:  mdma queue append ec9ce8d0
+///   Multi:   mdma search "van morph" | mdma queue append
+///   Dmenu:   mdma search "van morph" | dmenu | mdma queue append  (dmenu outputs one line)
+fn hashes_arg_or_stdin(hash: Option<String>) -> Vec<String> {
     match hash {
-        Some(h) => h,
+        Some(h) => vec![h],
         None => {
-            let mut line = String::new();
-            std::io::stdin()
-                .read_line(&mut line)
-                .expect("failed to read from stdin");
-            match line.split_whitespace().next() {
-                Some(token) => token.to_string(),
-                None => {
-                    eprintln!("No hash provided and stdin was empty");
-                    std::process::exit(1);
-                }
+            use std::io::BufRead;
+            let hashes: Vec<String> = std::io::stdin()
+                .lock()
+                .lines()
+                .map_while(Result::ok)
+                .filter_map(|line| {
+                    line.split_whitespace()
+                        .next()
+                        .map(|token| token.to_string())
+                })
+                .collect();
+            if hashes.is_empty() {
+                eprintln!("No hash provided and stdin was empty");
+                std::process::exit(1);
             }
+            hashes
         }
     }
 }
@@ -838,12 +854,16 @@ fn main() -> Result<()> {
             };
 
             match command {
-                QueueCommands::Next { hash } => {
-                    handle_queue_next(&connect_library(), &connect_media(), hash_or_stdin(hash))
-                }
-                QueueCommands::Append { hash } => {
-                    handle_queue_append(&connect_library(), &connect_media(), hash_or_stdin(hash))
-                }
+                QueueCommands::Next { hash } => handle_queue_next(
+                    &connect_library(),
+                    &connect_media(),
+                    hashes_arg_or_stdin(hash),
+                ),
+                QueueCommands::Append { hash } => handle_queue_append(
+                    &connect_library(),
+                    &connect_media(),
+                    hashes_arg_or_stdin(hash),
+                ),
                 QueueCommands::List => handle_queue_list(&connect_media()),
                 QueueCommands::Clear => handle_queue_clear(&connect_media()),
             }
