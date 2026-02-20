@@ -1,5 +1,5 @@
 // Enhanced examples/file_leak_test.rs
-use playback_engine::{FlacSource, Track};
+use playback_engine::{FlacSource, Source, Track};
 use ringbuf::HeapRb;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -31,7 +31,8 @@ async fn main() {
         let buffer = HeapRb::new(8 * 1024);
         let (prod, mut cons) = buffer.split();
         let source = FlacSource::new(&path).expect("Failed to create source");
-        let mut track = Track::new(source, prod)
+        let source_rate = source.sample_rate();
+        let mut track = Track::new(source, prod, source_rate, source_rate)
             .await
             .expect("Failed to create track");
 

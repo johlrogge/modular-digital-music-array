@@ -1,6 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use parking_lot::Mutex;
 use playback_engine::FlacSource;
+use playback_engine::Source;
 use playback_engine::Track;
 use ringbuf::HeapRb;
 use std::path::PathBuf;
@@ -31,9 +32,10 @@ fn bench_track_loading(c: &mut Criterion) {
                 let track = rt.block_on(async {
                     // Create a FlacSource
                     let source = FlacSource::new(&path).expect("Could not create source");
+                    let source_rate = source.sample_rate();
 
-                    // Create a Track with the source
-                    Track::new(source, prod)
+                    // Create a Track with the source (no resampling in benchmarks)
+                    Track::new(source, prod, source_rate, source_rate)
                         .await
                         .expect("Could not create track")
                 });
@@ -69,7 +71,8 @@ fn bench_time_to_playable(c: &mut Criterion) {
         let start = Instant::now();
         let mut track = rt.block_on(async {
             let source = FlacSource::new(&path).unwrap();
-            Track::new(source, prod)
+            let rate = source.sample_rate();
+            Track::new(source, prod, rate, rate)
                 .await
                 .expect("Failed to create track")
         });
@@ -103,7 +106,8 @@ fn bench_time_to_playable(c: &mut Criterion) {
                 // Load track
                 let mut track = rt.block_on(async {
                     let source = FlacSource::new(&path).unwrap();
-                    Track::new(source, prod)
+                    let rate = source.sample_rate();
+                    Track::new(source, prod, rate, rate)
                         .await
                         .expect("Failed to create track")
                 });
@@ -135,7 +139,8 @@ fn bench_seeking(c: &mut Criterion) {
         // Create a track for testing
         let track = rt.block_on(async {
             let source = FlacSource::new(&path).unwrap();
-            Track::new(source, prod)
+            let rate = source.sample_rate();
+            Track::new(source, prod, rate, rate)
                 .await
                 .expect("Failed to create track")
         });

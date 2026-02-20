@@ -1,7 +1,8 @@
 use crate::error::PlaybackError;
+use crate::resampler::Resampler;
+use crate::source::Source;
 #[cfg(test)]
-use crate::source::{AudioSegment, SegmentIndex, SEGMENT_SIZE};
-use crate::source::{DecodedSegment, Source};
+use crate::source::{AudioSegment, DecodedSegment, SegmentIndex, SEGMENT_SIZE};
 
 use tokio::sync::mpsc;
 
@@ -22,104 +23,156 @@ pub struct Track {
     decoder_task: Option<tokio::task::JoinHandle<()>>,
 }
 
-// Update TrackCommand to include potential new commands
 pub enum TrackCommand {
     FillFrom(usize),
     Shutdown,
 }
+
+/// Threshold: decode ahead until we have this many resampled samples pending.
+/// At 192 kHz stereo this is ~170 ms of audio.
+const DECODE_AHEAD: usize = 65_536;
 
 async fn decoder_task<S: Source + Send + Sync + 'static>(
     source: S,
     mut output: HeapProducer<f32>,
     mut command_rx: mpsc::Receiver<TrackCommand>,
     playing: Arc<AtomicBool>,
+    source_rate: u32,
+    target_rate: u32,
 ) {
-    let mut decoded_segments = VecDeque::new();
-    let mut next_segment: Option<DecodedSegment> = None;
-    let mut written: usize = 0;
+    let channels = source.audio_channels() as usize;
+
+    let mut resampler: Option<Resampler> = if source_rate != target_rate {
+        match Resampler::new(source_rate, target_rate, channels) {
+            Ok(r) => {
+                tracing::info!(
+                    "Resampling {}Hz → {}Hz ({}ch)",
+                    source_rate,
+                    target_rate,
+                    channels
+                );
+                Some(r)
+            }
+            Err(e) => {
+                tracing::error!("Failed to create resampler, playing at source rate: {e}");
+                None
+            }
+        }
+    } else {
+        tracing::info!(
+            "Source rate matches target ({}Hz), no resampling needed",
+            source_rate
+        );
+        None
+    };
+
+    // Resampled samples waiting to be written to the ring buffer
+    let mut pending: VecDeque<f32> = VecDeque::new();
+    let mut eof = false;
 
     loop {
-        if decoded_segments.is_empty() {
-            tracing::debug!("no more segments, decode");
+        // Decode more audio when the pending buffer runs low
+        if !eof && pending.len() < DECODE_AHEAD {
             match source.decode_next_frame() {
-                Ok(next_frame) => {
-                    for segment in next_frame {
-                        decoded_segments.push_back(segment);
+                Ok(segments) if segments.is_empty() => {
+                    tracing::debug!("Decoder reached EOF");
+                    eof = true;
+                }
+                Ok(segments) => {
+                    for seg in segments {
+                        let samples = if let Some(ref mut r) = resampler {
+                            match r.process_segment(&seg.segment.samples) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    tracing::error!("Resampler error: {e}");
+                                    continue;
+                                }
+                            }
+                        } else {
+                            seg.segment.samples.to_vec()
+                        };
+                        pending.extend(samples);
                     }
                 }
-                Err(error) => {
-                    tracing::error!("failed to decode segment: {error}");
+                Err(e) => {
+                    tracing::error!("Decode error: {e}");
                 }
             }
         }
 
         if !playing.load(Ordering::Relaxed) {
-            // Paused: sleep briefly, keep decoding ahead for instant resume
+            // Paused: keep decoding ahead for instant resume, but don't write
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            continue;
-        }
+        } else if !pending.is_empty() {
+            // Write as much as the ring buffer will accept
+            let (front, _) = pending.as_slices();
+            let written = output.push_slice(front);
+            pending.drain(..written);
 
-        if let Some(ref segment) = next_segment {
-            let to_write = segment.segment.samples.len() - written;
-            let actually_written = output.push_slice(&segment.segment.samples[written..]);
-            written += actually_written;
-
-            // Check if we've written the entire segment
-            if written == segment.segment.samples.len() {
-                next_segment = None;
-                written = 0;
-            }
-
-            // If we couldn't write everything, yield to let the mixer consume some data
-            if actually_written < to_write {
+            if written == 0 {
+                // Ring buffer full — yield so the mixer can consume
                 tokio::task::yield_now().await;
             }
+        } else if eof {
+            // Track finished, nothing left to do — wait for commands
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         } else {
-            next_segment = decoded_segments.pop_front();
+            tokio::task::yield_now().await;
         }
 
+        // Handle commands (seek, shutdown)
         while let Ok(command) = command_rx.try_recv() {
             match command {
                 TrackCommand::FillFrom(position) => {
-                    tracing::debug!("seek to {position}");
-                    if let Err(res) = source.seek(position) {
-                        tracing::error!("failed to seek {res}");
-                    } else {
-                        //current_position = position;
-                        tracing::debug!("seeked to position {position}");
+                    tracing::debug!("Seek to sample {position}");
+                    if let Err(e) = source.seek(position) {
+                        tracing::error!("Seek error: {e}");
+                    }
+                    pending.clear();
+                    eof = false;
+                    // Reset resampler state by recreating it
+                    if source_rate != target_rate {
+                        resampler = Resampler::new(source_rate, target_rate, channels).ok();
                     }
                 }
                 TrackCommand::Shutdown => {
-                    tracing::info!("Decoder task received shutdown command");
+                    tracing::info!("Decoder task shutting down");
                     return;
                 }
             }
         }
     }
 }
+
 impl Track {
     pub async fn new<S: Source + Send + Sync + 'static>(
         source: S,
         output_producer: HeapProducer<f32>,
+        source_rate: u32,
+        target_rate: u32,
     ) -> Result<Self, PlaybackError> {
         let playing = Arc::new(AtomicBool::new(false));
 
-        // Command channels
         let (command_tx, command_rx) = mpsc::channel(32);
 
-        // Create decoder task
         let playing_clone = playing.clone();
         let decoder_task = tokio::spawn(async move {
-            decoder_task(source, output_producer, command_rx, playing_clone).await;
+            decoder_task(
+                source,
+                output_producer,
+                command_rx,
+                playing_clone,
+                source_rate,
+                target_rate,
+            )
+            .await;
         });
 
-        let track = Self {
+        Ok(Self {
             playing,
             command_tx,
             decoder_task: Some(decoder_task),
-        };
-
-        Ok(track)
+        })
     }
 
     // Update seek to use the tracker
@@ -390,8 +443,9 @@ impl Track {
             samples.push(sample);
         }
         let buffer = HeapRb::new(1024 * 8);
-        let (prod, cons) = buffer.split();
-        Self::new(TestSource::new_from_samples(samples), prod).await
+        let (prod, _cons) = buffer.split();
+        // Tests use same source and target rate to skip resampling
+        Self::new(TestSource::new_from_samples(samples), prod, 48_000, 48_000).await
     }
 
     // Add this method for tests

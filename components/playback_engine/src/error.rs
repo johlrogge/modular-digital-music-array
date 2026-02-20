@@ -27,4 +27,7 @@ pub enum PlaybackError {
 
     #[error("Track is not ready for playback")]
     TrackNotReady,
+
+    #[error("Resampler error: {0}")]
+    Resampler(String),
 }

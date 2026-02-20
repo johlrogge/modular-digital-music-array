@@ -1,6 +1,7 @@
 mod error;
 mod mixer;
 mod pipewire_output;
+mod resampler;
 mod source;
 mod track;
 
@@ -19,6 +20,10 @@ use ringbuf::{HeapConsumer, HeapRb};
 pub use source::{FlacSource, Source};
 use tracing::info;
 pub use track::Track;
+
+/// Fixed output sample rate. All sources are upsampled to this rate.
+/// Matches the iFi HD USB Audio maximum capability.
+const TARGET_RATE: u32 = 192_000;
 
 type Decks = Arc<RwLock<HashMap<Deck, Arc<RwLock<Track>>>>>;
 
@@ -45,8 +50,9 @@ impl PlaybackEngine {
         // Create a channel for mixer commands - std::sync::mpsc doesn't take a capacity
         let (command_sender, command_receiver) = std::sync::mpsc::channel();
 
-        // Create ringbuffer for mixer output
-        const MIXER_BUFFER_SIZE: usize = 32768;
+        // Create ringbuffer for mixer output.
+        // Sized for ~0.7 s at 192 kHz stereo.
+        const MIXER_BUFFER_SIZE: usize = 262_144;
         let mixer_rb = HeapRb::<f32>::new(MIXER_BUFFER_SIZE);
         let (mixer_producer, mixer_consumer) = mixer_rb.split();
 
@@ -106,34 +112,33 @@ impl PlaybackEngine {
             }
         }
 
-        // Create source first to get sample rate
+        // Create source and read its native sample rate
         let source = FlacSource::new(path)?;
-        let track_rate = source.sample_rate();
+        let source_rate = source.sample_rate();
 
-        // Create PipeWire output on first track load
+        // Create PipeWire output on first track load, always at TARGET_RATE.
+        // All sources are upsampled by the decoder task regardless of their native rate.
         if self._audio_output.is_none() {
             if let Some(consumer) = self.mixer_consumer.take() {
-                info!("Creating PipeWire output at {}Hz", track_rate);
-                let audio_output = PipewireOutput::new(consumer, track_rate)
+                info!(
+                    "Creating PipeWire output at {}Hz (source: {}Hz)",
+                    TARGET_RATE, source_rate
+                );
+                let audio_output = PipewireOutput::new(consumer, TARGET_RATE)
                     .map_err(|e| PlaybackError::AudioDevice(format!("PipeWire error: {}", e)))?;
                 self._audio_output = Some(audio_output);
-                self.current_sample_rate = Some(track_rate);
+                self.current_sample_rate = Some(TARGET_RATE);
             }
-        } else if self.current_sample_rate != Some(track_rate) {
-            tracing::warn!(
-                "Track sample rate {}Hz differs from PipeWire stream rate {}Hz — resampling not yet supported",
-                track_rate,
-                self.current_sample_rate.unwrap_or(0)
-            );
         }
 
-        // Create ringbuffer for this deck
-        const BUFFER_SIZE: usize = 16384;
+        // Create ringbuffer for this deck.
+        // Sized for ~0.34 s at 192 kHz stereo.
+        const BUFFER_SIZE: usize = 131_072;
         let rb = HeapRb::<f32>::new(BUFFER_SIZE);
         let (producer, consumer) = rb.split();
 
-        // Create new track with producer
-        let track = Track::new(source, producer).await?;
+        // Create new track — decoder task will resample source_rate → TARGET_RATE
+        let track = Track::new(source, producer, source_rate, TARGET_RATE).await?;
         tracing::info!("Track is ready for playback");
 
         // Store the track - no lock conflicts possible with mix thread now

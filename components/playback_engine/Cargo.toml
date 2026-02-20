@@ -16,6 +16,7 @@ time-primitives = { path = "../time_primitives" }
 playback-primitives = { path = "../playback_primitives" }
 tracing.workspace=true
 ringbuf = "0.3"
+rubato = "0.15"
 pipewire = "0.8"
 spa_sys = { package = "libspa-sys", version = "0.8" }
 
