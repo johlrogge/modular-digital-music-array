@@ -175,16 +175,18 @@ enum PlaybackCommands {
 
 #[derive(Subcommand, Debug)]
 enum QueueCommands {
-    /// Prepend a track to the front of the queue (plays next)
+    /// Prepend a track to the front of the queue (plays next).
+    /// Hash may be omitted; if so, reads "{hash}  {display}" from stdin (dmenu output).
     Next {
-        /// Content hash (full or partial, with or without sha256: prefix)
-        hash: String,
+        /// Content hash (full or partial). Omit to read from stdin.
+        hash: Option<String>,
     },
 
-    /// Append a track to the end of the queue
+    /// Append a track to the end of the queue.
+    /// Hash may be omitted; if so, reads "{hash}  {display}" from stdin (dmenu output).
     Append {
-        /// Content hash (full or partial, with or without sha256: prefix)
-        hash: String,
+        /// Content hash (full or partial). Omit to read from stdin.
+        hash: Option<String>,
     },
 
     /// Show the current queue
@@ -361,22 +363,33 @@ fn handle_facts(client: &LibraryClient, hash: String) -> Result<()> {
 }
 
 fn handle_search(client: &LibraryClient, query: String) -> Result<()> {
+    use std::io::IsTerminal;
     match client.search(&query) {
         Ok(tracks) => {
-            if tracks.is_empty() {
-                println!("No tracks found matching '{}'", query);
-                return Ok(());
-            }
-
-            println!("Search results for '{}' ({} matches):", query, tracks.len());
-            println!("{}", "=".repeat(65));
-
-            for track in tracks {
-                println!(
-                    "{} | {}",
-                    short_hash(&track.content_hash),
-                    format_track_line(&track)
-                );
+            if std::io::stdout().is_terminal() {
+                if tracks.is_empty() {
+                    println!("No tracks found matching '{}'", query);
+                    return Ok(());
+                }
+                println!("Search results for '{}' ({} matches):", query, tracks.len());
+                println!("{}", "=".repeat(65));
+                for track in tracks {
+                    println!(
+                        "{} | {}",
+                        short_hash(&track.content_hash),
+                        format_track_line(&track)
+                    );
+                }
+            } else {
+                // Pipe / dmenu mode: "{short_hash}  {display}" — one per line, no header.
+                // The receiving command reads the first whitespace-delimited token as the hash.
+                for track in tracks {
+                    println!(
+                        "{}  {}",
+                        short_hash(&track.content_hash),
+                        format_track_line(&track)
+                    );
+                }
             }
             Ok(())
         }
@@ -720,6 +733,28 @@ fn handle_queue_clear(media_client: &MediaClient) -> Result<()> {
     Ok(())
 }
 
+/// Return the provided hash, or read the first whitespace-delimited token from stdin.
+/// Supports `mdma search ... | dmenu | mdma queue append` where dmenu outputs
+/// "{short_hash}  {display}".
+fn hash_or_stdin(hash: Option<String>) -> String {
+    match hash {
+        Some(h) => h,
+        None => {
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .expect("failed to read from stdin");
+            match line.split_whitespace().next() {
+                Some(token) => token.to_string(),
+                None => {
+                    eprintln!("No hash provided and stdin was empty");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
 /// Resolve a hash to a blob path via the library service.
 fn resolve_blob_path(library_client: &LibraryClient, hash: String) -> std::path::PathBuf {
     let content_hash = ContentHash(hash);
@@ -804,10 +839,10 @@ fn main() -> Result<()> {
 
             match command {
                 QueueCommands::Next { hash } => {
-                    handle_queue_next(&connect_library(), &connect_media(), hash)
+                    handle_queue_next(&connect_library(), &connect_media(), hash_or_stdin(hash))
                 }
                 QueueCommands::Append { hash } => {
-                    handle_queue_append(&connect_library(), &connect_media(), hash)
+                    handle_queue_append(&connect_library(), &connect_media(), hash_or_stdin(hash))
                 }
                 QueueCommands::List => handle_queue_list(&connect_media()),
                 QueueCommands::Clear => handle_queue_clear(&connect_media()),
