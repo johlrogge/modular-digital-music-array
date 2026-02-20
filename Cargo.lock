@@ -2347,6 +2347,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "music-primitives",
+ "playback-primitives",
  "serde",
  "serde_json",
  "stainless-facts",

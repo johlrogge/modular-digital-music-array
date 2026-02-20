@@ -194,6 +194,13 @@ enum QueueCommands {
 
     /// Clear the queue
     Clear,
+
+    /// Remove track(s) from the queue by hash.
+    /// Hash may be omitted; if so, reads one hash per line from stdin.
+    Remove {
+        /// Content hash (full or partial). Omit to read from stdin.
+        hash: Option<String>,
+    },
 }
 
 // =============================================================================
@@ -690,8 +697,8 @@ fn handle_queue_next(
     let count = hashes.len();
     // Prepend in reverse so the first hash ends up at the front of the queue.
     for hash in hashes.into_iter().rev() {
-        let path = resolve_blob_path(library_client, hash);
-        if let Err(e) = media_client.queue_next(path) {
+        let (content_hash, path) = resolve_track(library_client, hash);
+        if let Err(e) = media_client.queue_next(content_hash, path) {
             handle_playback_error(e);
         }
     }
@@ -706,8 +713,8 @@ fn handle_queue_append(
 ) -> Result<()> {
     let count = hashes.len();
     for hash in hashes {
-        let path = resolve_blob_path(library_client, hash);
-        if let Err(e) = media_client.queue_append(path) {
+        let (content_hash, path) = resolve_track(library_client, hash);
+        if let Err(e) = media_client.queue_append(content_hash, path) {
             handle_playback_error(e);
         }
     }
@@ -715,21 +722,58 @@ fn handle_queue_append(
     Ok(())
 }
 
-fn handle_queue_list(media_client: &MediaClient) -> Result<()> {
-    match media_client.queue_list() {
-        Ok(paths) => {
-            if paths.is_empty() {
+fn handle_queue_list(
+    media_client: &MediaClient,
+    library_client: Option<&LibraryClient>,
+) -> Result<()> {
+    let hashes = match media_client.queue_list() {
+        Ok(h) => h,
+        Err(e) => handle_playback_error(e),
+    };
+    match library_client {
+        None => {
+            // Piped: one full hash per line — suitable for piping into queue remove.
+            for hash in &hashes {
+                println!("{}", hash.0);
+            }
+        }
+        Some(lib) => {
+            if hashes.is_empty() {
                 println!("Queue is empty");
             } else {
-                println!("Queue ({} tracks):", paths.len());
-                for (i, p) in paths.iter().enumerate() {
-                    println!("  {}  {}", i + 1, p.display());
+                for (i, hash) in hashes.iter().enumerate() {
+                    let track = lib
+                        .get_track(hash)
+                        .expect("queued hash not found in library — invariant violated");
+                    let artist = track.artist.as_deref().unwrap_or("-");
+                    let title = track.title.as_deref().unwrap_or("-");
+                    let duration = track
+                        .duration
+                        .map(|d| d.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    println!(
+                        "{}  {}  {} - {}  [{}]",
+                        i + 1,
+                        short_hash(hash),
+                        artist,
+                        title,
+                        duration
+                    );
                 }
             }
-            Ok(())
         }
-        Err(e) => handle_playback_error(e),
     }
+    Ok(())
+}
+
+fn handle_queue_remove(media_client: &MediaClient, hashes: Vec<String>) -> Result<()> {
+    let content_hashes: Vec<ContentHash> = hashes.into_iter().map(ContentHash).collect();
+    let count = content_hashes.len();
+    if let Err(e) = media_client.queue_remove(content_hashes) {
+        handle_playback_error(e);
+    }
+    println!("Removed {} track(s) from queue", count);
+    Ok(())
 }
 
 fn handle_queue_clear(media_client: &MediaClient) -> Result<()> {
@@ -771,15 +815,18 @@ fn hashes_arg_or_stdin(hash: Option<String>) -> Vec<String> {
     }
 }
 
-/// Resolve a hash to a blob path via the library service.
-fn resolve_blob_path(library_client: &LibraryClient, hash: String) -> std::path::PathBuf {
+/// Resolve a hash to a (ContentHash, PathBuf) pair via the library service.
+fn resolve_track(
+    library_client: &LibraryClient,
+    hash: String,
+) -> (ContentHash, std::path::PathBuf) {
     let content_hash = ContentHash(hash);
     let track = match library_client.get_track(&content_hash) {
         Ok(t) => t,
         Err(e) => handle_error(e),
     };
     match track.blob_path {
-        Some(p) => std::path::PathBuf::from(p),
+        Some(p) => (track.content_hash, std::path::PathBuf::from(p)),
         None => {
             eprintln!("Track {} has no blob path", short_hash(&track.content_hash));
             std::process::exit(1);
@@ -864,8 +911,20 @@ fn main() -> Result<()> {
                     &connect_media(),
                     hashes_arg_or_stdin(hash),
                 ),
-                QueueCommands::List => handle_queue_list(&connect_media()),
+                QueueCommands::List => {
+                    use std::io::IsTerminal;
+                    let media = connect_media();
+                    if std::io::stdout().is_terminal() {
+                        let lib = connect_library();
+                        handle_queue_list(&media, Some(&lib))
+                    } else {
+                        handle_queue_list(&media, None)
+                    }
+                }
                 QueueCommands::Clear => handle_queue_clear(&connect_media()),
+                QueueCommands::Remove { hash } => {
+                    handle_queue_remove(&connect_media(), hashes_arg_or_stdin(hash))
+                }
             }
         }
 

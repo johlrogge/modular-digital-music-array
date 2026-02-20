@@ -1,16 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// Content hash of audio file (SHA256)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
-#[serde(transparent)]
-pub struct ContentHash(pub String);
-
-impl fmt::Display for ContentHash {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+pub use playback_primitives::ContentHash;
 
 /// International Standard Recording Code
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

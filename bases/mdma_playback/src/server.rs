@@ -1,6 +1,6 @@
 use crate::error::ServerError;
 use color_eyre::Result;
-use media_protocol::{Command, Response, ResponseData};
+use media_protocol::{Command, ContentHash, Response, ResponseData};
 use nng::Socket;
 use playback_engine::{Deck, PlaybackEngine, PlaybackError};
 use std::collections::VecDeque;
@@ -10,10 +10,15 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+struct QueueEntry {
+    hash: ContentHash,
+    path: PathBuf,
+}
+
 pub struct Server {
     engine: Arc<Mutex<PlaybackEngine>>,
     socket: Socket,
-    queue: Arc<Mutex<VecDeque<PathBuf>>>,
+    queue: Arc<Mutex<VecDeque<QueueEntry>>>,
 }
 
 impl Server {
@@ -89,23 +94,32 @@ impl Server {
                 info!("Getting length for deck {:?}", deck);
                 todo!("get length of track, or remove opportunity")
             }
-            Command::QueueNext { path } => {
+            Command::QueueNext { hash, path } => {
                 info!("Queue next: {:?}", path);
-                self.queue.lock().await.push_front(path);
+                self.queue
+                    .lock()
+                    .await
+                    .push_front(QueueEntry { hash, path });
                 self.ok_response()
             }
-            Command::QueueAppend { path } => {
+            Command::QueueAppend { hash, path } => {
                 info!("Queue append: {:?}", path);
-                self.queue.lock().await.push_back(path);
+                self.queue.lock().await.push_back(QueueEntry { hash, path });
                 self.ok_response()
             }
             Command::QueueList => {
-                let paths: Vec<PathBuf> = self.queue.lock().await.iter().cloned().collect();
-                info!("Queue list: {} items", paths.len());
+                let hashes: Vec<ContentHash> = self
+                    .queue
+                    .lock()
+                    .await
+                    .iter()
+                    .map(|e| e.hash.clone())
+                    .collect();
+                info!("Queue list: {} items", hashes.len());
                 Response {
                     success: true,
                     error_message: String::new(),
-                    data: Some(ResponseData::Queue(paths)),
+                    data: Some(ResponseData::Queue(hashes)),
                 }
             }
             Command::QueueClear => {
@@ -113,17 +127,25 @@ impl Server {
                 info!("Queue cleared");
                 self.ok_response()
             }
+            Command::QueueRemove { hashes } => {
+                self.queue
+                    .lock()
+                    .await
+                    .retain(|e| !hashes.contains(&e.hash));
+                info!("Removed {} hash(es) from queue", hashes.len());
+                self.ok_response()
+            }
             Command::PlayQueue => {
                 info!("Play from queue");
-                let path = self.queue.lock().await.pop_front();
-                match path {
+                let entry = self.queue.lock().await.pop_front();
+                match entry {
                     None => Response {
                         success: false,
                         error_message: "Queue is empty".to_string(),
                         data: None,
                     },
-                    Some(p) => {
-                        let result = load_and_play(&self.engine, &p).await;
+                    Some(e) => {
+                        let result = load_and_play(&self.engine, &e.path).await;
                         self.create_response(result, None)
                     }
                 }
@@ -175,10 +197,10 @@ async fn load_and_play(
 }
 
 /// Polls deck A every 200 ms. When the track reaches `Finished`, pops the next
-/// path from the queue and starts playing it automatically.
+/// entry from the queue and starts playing it automatically.
 async fn auto_advance_task(
     engine: Arc<Mutex<PlaybackEngine>>,
-    queue: Arc<Mutex<VecDeque<PathBuf>>>,
+    queue: Arc<Mutex<VecDeque<QueueEntry>>>,
 ) {
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -189,13 +211,13 @@ async fn auto_advance_task(
         }
 
         let next = queue.lock().await.pop_front();
-        let Some(path) = next else {
+        let Some(entry) = next else {
             continue;
         };
 
-        info!("Auto-advance: loading {:?}", path);
-        if let Err(e) = load_and_play(&engine, &path).await {
-            warn!("Auto-advance failed to load {:?}: {}", path, e);
+        info!("Auto-advance: loading {:?}", entry.path);
+        if let Err(e) = load_and_play(&engine, &entry.path).await {
+            warn!("Auto-advance failed to load {:?}: {}", entry.path, e);
         }
     }
 }

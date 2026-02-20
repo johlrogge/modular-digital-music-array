@@ -1,4 +1,4 @@
-use playback_primitives::Deck;
+use playback_primitives::{ContentHash, Deck};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -31,13 +31,18 @@ pub enum Command {
     },
     // Queue management — queue feeds deck A only
     QueueNext {
+        hash: ContentHash,
         path: PathBuf,
     },
     QueueAppend {
+        hash: ContentHash,
         path: PathBuf,
     },
     QueueList,
     QueueClear,
+    QueueRemove {
+        hashes: Vec<ContentHash>,
+    },
     /// Pop from queue head, load on deck A, and start playing.
     PlayQueue,
 }
@@ -54,7 +59,7 @@ pub struct Response {
 pub enum ResponseData {
     Position(usize),
     Length(usize),
-    Queue(Vec<PathBuf>),
+    Queue(Vec<ContentHash>),
 }
 
 #[cfg(test)]

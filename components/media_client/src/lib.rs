@@ -3,7 +3,7 @@
 //! NNG client wrapper for connecting to the playback service.
 //! Used by mdma-cli.
 
-pub use media_protocol::{Command, Deck, Response, ResponseData};
+pub use media_protocol::{Command, ContentHash, Deck, Response, ResponseData};
 
 use std::path::PathBuf;
 use thiserror::Error;
@@ -92,18 +92,18 @@ impl MediaClient {
         })
     }
 
-    pub fn queue_next(&self, path: std::path::PathBuf) -> Result<(), ClientError> {
-        self.send_command(Command::QueueNext { path })
+    pub fn queue_next(&self, hash: ContentHash, path: PathBuf) -> Result<(), ClientError> {
+        self.send_command(Command::QueueNext { hash, path })
     }
 
-    pub fn queue_append(&self, path: std::path::PathBuf) -> Result<(), ClientError> {
-        self.send_command(Command::QueueAppend { path })
+    pub fn queue_append(&self, hash: ContentHash, path: PathBuf) -> Result<(), ClientError> {
+        self.send_command(Command::QueueAppend { hash, path })
     }
 
-    pub fn queue_list(&self) -> Result<Vec<std::path::PathBuf>, ClientError> {
+    pub fn queue_list(&self) -> Result<Vec<ContentHash>, ClientError> {
         self.send_command_with_response(Command::QueueList, |data| {
-            if let ResponseData::Queue(paths) = data {
-                Some(paths)
+            if let ResponseData::Queue(hashes) = data {
+                Some(hashes)
             } else {
                 None
             }
@@ -112,6 +112,10 @@ impl MediaClient {
 
     pub fn queue_clear(&self) -> Result<(), ClientError> {
         self.send_command(Command::QueueClear)
+    }
+
+    pub fn queue_remove(&self, hashes: Vec<ContentHash>) -> Result<(), ClientError> {
+        self.send_command(Command::QueueRemove { hashes })
     }
 
     pub fn play_queue(&self) -> Result<(), ClientError> {
