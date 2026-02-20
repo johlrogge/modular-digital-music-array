@@ -50,41 +50,9 @@
     rustfmt.enable = true;
   };
 
-  # Shell scripts — available as commands in the devenv shell.
-  # All scripts use the pre-built mdma binary from target/debug, falling back
-  # to building it if it doesn't exist yet. They talk to the Pi via the
-  # MDMA_* socket env vars above — no local PipeWire or playback server starts.
+  # Shell scripts for things that aren't in mdma-cli (Pi administration via SSH).
+  # mdma itself is on PATH via enterShell — use it directly for all library/playback commands.
   scripts = {
-    # Search the library and play the first matching track on deck A
-    mdma-play.exec = ''
-      set -euo pipefail
-      query="''${1:-}"
-      if [ -z "$query" ]; then
-        echo "Usage: mdma-play <search term>"
-        exit 1
-      fi
-      bin="$MDMA_PROJECT_ROOT/target/debug/mdma"
-      if [ ! -x "$bin" ]; then
-        echo "Building mdma-cli..." >&2
-        cargo --manifest-path "$MDMA_PROJECT_ROOT/Cargo.toml" build -q --package mdma-cli
-      fi
-      result=$("$bin" search "$query" | grep -m1 '[0-9a-f]\{8\}' | awk '{print $1}')
-      if [ -z "$result" ]; then
-        echo "No tracks found for: $query"
-        exit 1
-      fi
-      "$bin" playback play "$result"
-    '';
-
-    # Stop deck A
-    mdma-stop.exec = ''
-      bin="$MDMA_PROJECT_ROOT/target/debug/mdma"
-      if [ ! -x "$bin" ]; then
-        cargo --manifest-path "$MDMA_PROJECT_ROOT/Cargo.toml" build -q --package mdma-cli
-      fi
-      "$bin" playback stop
-    '';
-
     # Set the iFi DAC (or default sink) volume via wpctl on the Pi
     mdma-volume.exec = ''
       set -euo pipefail
@@ -138,8 +106,8 @@
       || echo "mdma CLI not built — run: cargo build --package mdma-cli"
 
     echo ""
-    echo "Commands:  mdma search <term>   mdma playback play <hash>   mdma playback stop"
-    echo "           mdma-play <term>  mdma-stop  mdma-volume <0-1>  mdma-status"
+    echo "Commands:  mdma --help"
+    echo "           mdma-volume <0-1>  mdma-status"
     echo "           just --list"
   '';
 
