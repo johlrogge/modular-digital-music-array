@@ -222,6 +222,14 @@ impl PlaybackEngine {
         }
     }
 
+    pub fn is_track_finished(&self, deck: Deck) -> bool {
+        if let Some(track) = self.find_track(deck) {
+            track.read().is_finished()
+        } else {
+            false
+        }
+    }
+
     pub async fn seek(&mut self, deck: Deck, position: usize) -> Result<(), PlaybackError> {
         if let Some(track) = self.find_track(deck) {
             tracing::info!("Seeking deck {:?} to position {}", deck, position);

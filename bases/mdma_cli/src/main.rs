@@ -102,6 +102,12 @@ enum Commands {
         #[command(subcommand)]
         command: PlaybackCommands,
     },
+
+    /// Queue management (feeds deck A)
+    Queue {
+        #[command(subcommand)]
+        command: QueueCommands,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -160,14 +166,32 @@ enum BandcampCommands {
 
 #[derive(Subcommand, Debug)]
 enum PlaybackCommands {
-    /// Play a track by hash (looks up blob path in library)
-    Play {
+    /// Play from the queue (use `mdma queue append <hash>` to enqueue tracks)
+    Play,
+
+    /// Stop playback on deck A
+    Stop,
+}
+
+#[derive(Subcommand, Debug)]
+enum QueueCommands {
+    /// Prepend a track to the front of the queue (plays next)
+    Next {
         /// Content hash (full or partial, with or without sha256: prefix)
         hash: String,
     },
 
-    /// Stop playback on deck A
-    Stop,
+    /// Append a track to the end of the queue
+    Append {
+        /// Content hash (full or partial, with or without sha256: prefix)
+        hash: String,
+    },
+
+    /// Show the current queue
+    List,
+
+    /// Clear the queue
+    Clear,
 }
 
 // =============================================================================
@@ -637,42 +661,79 @@ fn handle_playback_error(err: media_client::ClientError) -> ! {
     std::process::exit(1);
 }
 
-fn handle_playback_play(
+fn handle_playback_play(media_client: &MediaClient) -> Result<()> {
+    if let Err(e) = media_client.play_queue() {
+        handle_playback_error(e);
+    }
+    println!("Playing from queue");
+    Ok(())
+}
+
+fn handle_queue_next(
     library_client: &LibraryClient,
     media_client: &MediaClient,
     hash: String,
 ) -> Result<()> {
-    // Step 1: Look up the track in the library to get blob_path
+    let path = resolve_blob_path(library_client, hash);
+    if let Err(e) = media_client.queue_next(path) {
+        handle_playback_error(e);
+    }
+    println!("Queued next");
+    Ok(())
+}
+
+fn handle_queue_append(
+    library_client: &LibraryClient,
+    media_client: &MediaClient,
+    hash: String,
+) -> Result<()> {
+    let path = resolve_blob_path(library_client, hash);
+    if let Err(e) = media_client.queue_append(path) {
+        handle_playback_error(e);
+    }
+    println!("Appended to queue");
+    Ok(())
+}
+
+fn handle_queue_list(media_client: &MediaClient) -> Result<()> {
+    match media_client.queue_list() {
+        Ok(paths) => {
+            if paths.is_empty() {
+                println!("Queue is empty");
+            } else {
+                println!("Queue ({} tracks):", paths.len());
+                for (i, p) in paths.iter().enumerate() {
+                    println!("  {}  {}", i + 1, p.display());
+                }
+            }
+            Ok(())
+        }
+        Err(e) => handle_playback_error(e),
+    }
+}
+
+fn handle_queue_clear(media_client: &MediaClient) -> Result<()> {
+    if let Err(e) = media_client.queue_clear() {
+        handle_playback_error(e);
+    }
+    println!("Queue cleared");
+    Ok(())
+}
+
+/// Resolve a hash to a blob path via the library service.
+fn resolve_blob_path(library_client: &LibraryClient, hash: String) -> std::path::PathBuf {
     let content_hash = ContentHash(hash);
     let track = match library_client.get_track(&content_hash) {
         Ok(t) => t,
         Err(e) => handle_error(e),
     };
-
-    let blob_path = match track.blob_path {
-        Some(ref p) => p,
+    match track.blob_path {
+        Some(p) => std::path::PathBuf::from(p),
         None => {
             eprintln!("Track {} has no blob path", short_hash(&track.content_hash));
             std::process::exit(1);
         }
-    };
-
-    let title = track.title.as_deref().unwrap_or("Unknown");
-    let artist = track.artist.as_deref().unwrap_or("Unknown");
-
-    // Step 2: Load the track on deck A and play
-    let path = std::path::PathBuf::from(blob_path);
-    if let Err(e) = media_client.load_track(path, Deck::A) {
-        handle_playback_error(e);
     }
-
-    if let Err(e) = media_client.play(Deck::A) {
-        handle_playback_error(e);
-    }
-
-    println!("Playing: {} - {}", artist, title);
-    println!("Hash:    {}", track.content_hash.0);
-    Ok(())
 }
 
 fn handle_playback_stop(media_client: &MediaClient) -> Result<()> {
@@ -709,22 +770,47 @@ fn main() -> Result<()> {
             };
 
             match command {
-                PlaybackCommands::Play { hash } => {
-                    let library_client = match LibraryClient::connect(&cli.socket) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            eprintln!("Failed to connect to library at {}: {}", cli.socket, e);
-                            eprintln!("Is mdma-library running?");
-                            std::process::exit(1);
-                        }
-                    };
+                PlaybackCommands::Play => {
                     let media_client = connect_media();
-                    handle_playback_play(&library_client, &media_client, hash)
+                    handle_playback_play(&media_client)
                 }
                 PlaybackCommands::Stop => {
                     let media_client = connect_media();
                     handle_playback_stop(&media_client)
                 }
+            }
+        }
+
+        Commands::Queue { command } => {
+            let connect_media = || match MediaClient::connect(&cli.playback_socket) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "Failed to connect to playback server at {}: {}",
+                        cli.playback_socket, e
+                    );
+                    eprintln!("Is mdma-playback running?");
+                    std::process::exit(1);
+                }
+            };
+            let connect_library = || match LibraryClient::connect(&cli.socket) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Failed to connect to library at {}: {}", cli.socket, e);
+                    eprintln!("Is mdma-library running?");
+                    std::process::exit(1);
+                }
+            };
+
+            match command {
+                QueueCommands::Next { hash } => {
+                    handle_queue_next(&connect_library(), &connect_media(), hash)
+                }
+                QueueCommands::Append { hash } => {
+                    handle_queue_append(&connect_library(), &connect_media(), hash)
+                }
+                QueueCommands::List => handle_queue_list(&connect_media()),
+                QueueCommands::Clear => handle_queue_clear(&connect_media()),
             }
         }
 
@@ -778,7 +864,9 @@ fn main() -> Result<()> {
                     InboxCommands::Ingest { filename } => handle_inbox_ingest(&client, filename),
                     InboxCommands::IngestAll => handle_inbox_ingest_all(&client),
                 },
-                Commands::Bandcamp { .. } | Commands::Playback { .. } => unreachable!(),
+                Commands::Bandcamp { .. } | Commands::Playback { .. } | Commands::Queue { .. } => {
+                    unreachable!()
+                }
             }
         }
     }

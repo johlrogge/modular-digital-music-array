@@ -113,12 +113,13 @@ Load reference files on-demand based on the query topic:
 
 Always consider:
 1. Can illegal states be made impossible with types?
-2. Should this use the newtype pattern?
-3. Is error handling appropriate (thiserror vs eyre)?
-4. Are lifetimes correctly specified?
-5. Is async/await used properly?
-6. Are resources managed with RAII?
-7. Is the abstraction zero-cost?
+2. **Prefer enums over booleans.** Two booleans = 4 states, often only 3 are valid. An enum encodes exactly the valid states and makes transitions explicit. See `references/type-driven-design.md` → "Eliminate Invalid Combinations".
+3. Should this use the newtype pattern?
+4. Is error handling appropriate (thiserror vs eyre)?
+5. Are lifetimes correctly specified?
+6. Is async/await used properly?
+7. Are resources managed with RAII?
+8. Is the abstraction zero-cost?
 
 ## Approach to Tasks
 

@@ -2,23 +2,34 @@ use crate::error::ServerError;
 use color_eyre::Result;
 use media_protocol::{Command, Response, ResponseData};
 use nng::Socket;
-use playback_engine::{PlaybackEngine, PlaybackError};
+use playback_engine::{Deck, PlaybackEngine, PlaybackError};
+use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 pub struct Server {
     engine: Arc<Mutex<PlaybackEngine>>,
     socket: Socket,
+    queue: Arc<Mutex<VecDeque<PathBuf>>>,
 }
 
 impl Server {
     pub fn new(engine: Arc<Mutex<PlaybackEngine>>, socket: Socket) -> Self {
-        Self { engine, socket }
+        Self {
+            engine,
+            socket,
+            queue: Arc::new(Mutex::new(VecDeque::new())),
+        }
     }
 
     pub async fn run(&self) -> Result<(), ServerError> {
         info!("Playback server starting...");
+
+        // Background task: auto-advance to next queued track when current track finishes.
+        tokio::spawn(auto_advance_task(self.engine.clone(), self.queue.clone()));
 
         loop {
             // Receive command
@@ -44,11 +55,10 @@ impl Server {
         match command {
             Command::LoadTrack { path, deck } => {
                 info!("Loading track {:?} on deck {:?}", path, deck);
-                // Use .await to acquire the lock asynchronously
                 let result = self.engine.lock().await.load_track(deck, &path).await;
                 info!("Track loaded");
                 self.create_response(result, None)
-            } // For non-async operations, keep the original pattern
+            }
             Command::Play { deck } => {
                 info!("About to play deck {:?}", deck);
                 let result = self.engine.lock().await.play(deck);
@@ -72,17 +82,63 @@ impl Server {
             }
             Command::Seek { deck, position } => {
                 info!("Seeking deck {:?} to position {}", deck, position);
-                let result = self.engine.lock().await.seek(deck, position).await; // Now awaiting the seek operation
+                let result = self.engine.lock().await.seek(deck, position).await;
                 self.create_response(result, None)
             }
             Command::GetLength { deck } => {
                 info!("Getting length for deck {:?}", deck);
                 todo!("get length of track, or remove opportunity")
             }
+            Command::QueueNext { path } => {
+                info!("Queue next: {:?}", path);
+                self.queue.lock().await.push_front(path);
+                self.ok_response()
+            }
+            Command::QueueAppend { path } => {
+                info!("Queue append: {:?}", path);
+                self.queue.lock().await.push_back(path);
+                self.ok_response()
+            }
+            Command::QueueList => {
+                let paths: Vec<PathBuf> = self.queue.lock().await.iter().cloned().collect();
+                info!("Queue list: {} items", paths.len());
+                Response {
+                    success: true,
+                    error_message: String::new(),
+                    data: Some(ResponseData::Queue(paths)),
+                }
+            }
+            Command::QueueClear => {
+                self.queue.lock().await.clear();
+                info!("Queue cleared");
+                self.ok_response()
+            }
+            Command::PlayQueue => {
+                info!("Play from queue");
+                let path = self.queue.lock().await.pop_front();
+                match path {
+                    None => Response {
+                        success: false,
+                        error_message: "Queue is empty".to_string(),
+                        data: None,
+                    },
+                    Some(p) => {
+                        let result = load_and_play(&self.engine, &p).await;
+                        self.create_response(result, None)
+                    }
+                }
+            }
         }
     }
 
-    // Add a helper method to create responses
+    fn ok_response(&self) -> Response {
+        Response {
+            success: true,
+            error_message: String::new(),
+            data: None,
+        }
+    }
+
     fn create_response(
         &self,
         result: Result<(), PlaybackError>,
@@ -105,6 +161,41 @@ impl Server {
                     data: None,
                 }
             }
+        }
+    }
+}
+
+async fn load_and_play(
+    engine: &Arc<Mutex<PlaybackEngine>>,
+    path: &PathBuf,
+) -> Result<(), PlaybackError> {
+    let mut eng = engine.lock().await;
+    eng.load_track(Deck::A, path).await?;
+    eng.play(Deck::A)
+}
+
+/// Polls deck A every 200 ms. When the track reaches `Finished`, pops the next
+/// path from the queue and starts playing it automatically.
+async fn auto_advance_task(
+    engine: Arc<Mutex<PlaybackEngine>>,
+    queue: Arc<Mutex<VecDeque<PathBuf>>>,
+) {
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let finished = engine.lock().await.is_track_finished(Deck::A);
+        if !finished {
+            continue;
+        }
+
+        let next = queue.lock().await.pop_front();
+        let Some(path) = next else {
+            continue;
+        };
+
+        info!("Auto-advance: loading {:?}", path);
+        if let Err(e) = load_and_play(&engine, &path).await {
+            warn!("Auto-advance failed to load {:?}: {}", path, e);
         }
     }
 }

@@ -5,13 +5,41 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Command {
-    LoadTrack { path: PathBuf, deck: Deck },
-    Play { deck: Deck },
-    Stop { deck: Deck },
-    SetVolume { deck: Deck, db: f32 },
-    Unload { deck: Deck },
-    Seek { deck: Deck, position: usize },
-    GetLength { deck: Deck },
+    LoadTrack {
+        path: PathBuf,
+        deck: Deck,
+    },
+    Play {
+        deck: Deck,
+    },
+    Stop {
+        deck: Deck,
+    },
+    SetVolume {
+        deck: Deck,
+        db: f32,
+    },
+    Unload {
+        deck: Deck,
+    },
+    Seek {
+        deck: Deck,
+        position: usize,
+    },
+    GetLength {
+        deck: Deck,
+    },
+    // Queue management — queue feeds deck A only
+    QueueNext {
+        path: PathBuf,
+    },
+    QueueAppend {
+        path: PathBuf,
+    },
+    QueueList,
+    QueueClear,
+    /// Pop from queue head, load on deck A, and start playing.
+    PlayQueue,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +54,7 @@ pub struct Response {
 pub enum ResponseData {
     Position(usize),
     Length(usize),
+    Queue(Vec<PathBuf>),
 }
 
 #[cfg(test)]

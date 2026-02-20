@@ -92,6 +92,32 @@ impl MediaClient {
         })
     }
 
+    pub fn queue_next(&self, path: std::path::PathBuf) -> Result<(), ClientError> {
+        self.send_command(Command::QueueNext { path })
+    }
+
+    pub fn queue_append(&self, path: std::path::PathBuf) -> Result<(), ClientError> {
+        self.send_command(Command::QueueAppend { path })
+    }
+
+    pub fn queue_list(&self) -> Result<Vec<std::path::PathBuf>, ClientError> {
+        self.send_command_with_response(Command::QueueList, |data| {
+            if let ResponseData::Queue(paths) = data {
+                Some(paths)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn queue_clear(&self) -> Result<(), ClientError> {
+        self.send_command(Command::QueueClear)
+    }
+
+    pub fn play_queue(&self) -> Result<(), ClientError> {
+        self.send_command(Command::PlayQueue)
+    }
+
     fn send_command(&self, cmd: Command) -> Result<(), ClientError> {
         tracing::debug!("Serializing command: {:?}", cmd);
         let data = serde_json::to_vec(&cmd)?;

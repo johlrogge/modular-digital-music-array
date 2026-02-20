@@ -9,16 +9,39 @@ use tokio::sync::mpsc;
 use std::collections::VecDeque;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU8, Ordering};
 
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::Arc;
 
 use ringbuf::HeapProducer;
 #[cfg(test)]
 use ringbuf::HeapRb;
 
+/// Playback state for a track.
+///
+/// Represented as `AtomicU8` so it can be shared safely across threads without a mutex.
+/// Two booleans (`playing`, `finished`) would create 4 combinations of which only 3 are
+/// valid — the enum makes illegal states unrepresentable.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackState {
+    Stopped = 0,
+    Playing = 1,
+    Finished = 2,
+}
+
+impl TrackState {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Playing,
+            2 => Self::Finished,
+            _ => Self::Stopped,
+        }
+    }
+}
+
 pub struct Track {
-    playing: Arc<AtomicBool>,
+    state: Arc<AtomicU8>,
     command_tx: mpsc::Sender<TrackCommand>,
     decoder_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -36,7 +59,7 @@ async fn decoder_task<S: Source + Send + Sync + 'static>(
     source: S,
     mut output: HeapProducer<f32>,
     mut command_rx: mpsc::Receiver<TrackCommand>,
-    playing: Arc<AtomicBool>,
+    state: Arc<AtomicU8>,
     source_rate: u32,
     target_rate: u32,
 ) {
@@ -100,24 +123,35 @@ async fn decoder_task<S: Source + Send + Sync + 'static>(
             }
         }
 
-        if !playing.load(Ordering::Relaxed) {
-            // Paused: keep decoding ahead for instant resume, but don't write
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        } else if !pending.is_empty() {
-            // Write as much as the ring buffer will accept
-            let (front, _) = pending.as_slices();
-            let written = output.push_slice(front);
-            pending.drain(..written);
+        match TrackState::from_u8(state.load(Ordering::Relaxed)) {
+            TrackState::Stopped => {
+                // Paused: keep decoding ahead for instant resume, but don't write
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            TrackState::Playing if !pending.is_empty() => {
+                // Write as much as the ring buffer will accept
+                let (front, _) = pending.as_slices();
+                let written = output.push_slice(front);
+                pending.drain(..written);
 
-            if written == 0 {
-                // Ring buffer full — yield so the mixer can consume
+                if written == 0 {
+                    // Ring buffer full — yield so the mixer can consume
+                    tokio::task::yield_now().await;
+                }
+            }
+            TrackState::Playing if eof => {
+                // All decoded samples written — track is done
+                state.store(TrackState::Finished as u8, Ordering::Relaxed);
+                tracing::info!("Track finished (EOF + pending drained)");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            TrackState::Playing => {
                 tokio::task::yield_now().await;
             }
-        } else if eof {
-            // Track finished, nothing left to do — wait for commands
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        } else {
-            tokio::task::yield_now().await;
+            TrackState::Finished => {
+                // Nothing to do — wait for a seek command to reset or shutdown
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
         }
 
         // Handle commands (seek, shutdown)
@@ -130,6 +164,8 @@ async fn decoder_task<S: Source + Send + Sync + 'static>(
                     }
                     pending.clear();
                     eof = false;
+                    // Seek resets to Stopped — caller must call play() again if desired
+                    state.store(TrackState::Stopped as u8, Ordering::Relaxed);
                     // Reset resampler state by recreating it
                     if source_rate != target_rate {
                         resampler = Resampler::new(source_rate, target_rate, channels).ok();
@@ -151,17 +187,17 @@ impl Track {
         source_rate: u32,
         target_rate: u32,
     ) -> Result<Self, PlaybackError> {
-        let playing = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(AtomicU8::new(TrackState::Stopped as u8));
 
         let (command_tx, command_rx) = mpsc::channel(32);
 
-        let playing_clone = playing.clone();
+        let state_clone = state.clone();
         let decoder_task = tokio::spawn(async move {
             decoder_task(
                 source,
                 output_producer,
                 command_rx,
-                playing_clone,
+                state_clone,
                 source_rate,
                 target_rate,
             )
@@ -169,33 +205,36 @@ impl Track {
         });
 
         Ok(Self {
-            playing,
+            state,
             command_tx,
             decoder_task: Some(decoder_task),
         })
     }
 
-    // Update seek to use the tracker
     pub fn seek(&mut self, position: usize) -> Result<(), PlaybackError> {
-        // Request buffer filling from new position (unchanged)
         if let Err(e) = self.command_tx.try_send(TrackCommand::FillFrom(position)) {
             tracing::error!("Failed to send fill command after seek: {}", e);
         }
-
         Ok(())
     }
 
     pub fn play(&mut self) {
-        self.playing.store(true, Ordering::Relaxed);
+        self.state
+            .store(TrackState::Playing as u8, Ordering::Relaxed);
         tracing::info!("Track set to playing state");
     }
 
     pub fn stop(&mut self) {
-        self.playing.store(false, Ordering::Relaxed);
+        self.state
+            .store(TrackState::Stopped as u8, Ordering::Relaxed);
     }
 
     pub fn is_playing(&self) -> bool {
-        self.playing.load(Ordering::Relaxed)
+        TrackState::from_u8(self.state.load(Ordering::Relaxed)) == TrackState::Playing
+    }
+
+    pub fn is_finished(&self) -> bool {
+        TrackState::from_u8(self.state.load(Ordering::Relaxed)) == TrackState::Finished
     }
 }
 
