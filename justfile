@@ -936,6 +936,7 @@ deploy-playback: playback-cross
     chown mdma:mdma /run/mdma
     rm -f /run/mdma/playback.sock
     export PIPEWIRE_RUNTIME_DIR=/run/pipewire
+    cd /music
     exec chpst -u mdma:mdma:audio:video:_pipewire /usr/bin/mdma-playback \
         --socket ipc:///run/mdma/playback.sock \
         --tcp tcp://0.0.0.0:5557
