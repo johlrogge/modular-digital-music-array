@@ -8,6 +8,11 @@ use bandcamp_ipc_client::{
 };
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
+use colored::Colorize;
+use corsett::{
+    shortener::{FreeText, RightEllipsis},
+    ColumnSizingConfigBuilder, RemovalPolicy, Row, Score, Shorten, ShortenAny,
+};
 use library_ipc_client::{
     ClientError, ContentHash, InboxPath, LibraryClient, ProtocolError, TrackInfo,
 };
@@ -327,7 +332,8 @@ fn short_hash(hash: &ContentHash) -> &str {
     }
 }
 
-/// Format a track as the canonical playlist line: `{short_hash}  {Artist} - {Title}  [{duration}]`
+/// Canonical playlist line format: `{short_hash}  {Artist} - {Title}  [{duration}]`
+/// Used for pipe mode output and temp files (no colors, no alignment).
 fn format_track_line(track: &TrackInfo) -> String {
     let title = track.title.as_deref().unwrap_or("Unknown");
     let artist = track.artist.as_deref().unwrap_or("Unknown");
@@ -343,26 +349,178 @@ fn format_track_line(track: &TrackInfo) -> String {
     }
 }
 
-/// Print tracks with a terminal header. Pipe mode: track lines only.
-fn print_tracks(tracks: &[TrackInfo], header: &str) {
-    use std::io::IsTerminal;
-    if std::io::stdout().is_terminal() {
-        println!("{}:", header);
-        println!("{}", "=".repeat(65));
+// =============================================================================
+// Track Table Rendering (corsett + colored)
+// =============================================================================
+
+// Column types — each maps to a corsett shortening algorithm.
+struct ColHash(String);
+struct ColArtist(String);
+struct ColTitle(String);
+struct ColDuration(String);
+
+impl AsRef<str> for ColHash {
+    fn as_ref(&self) -> &str {
+        &self.0
     }
-    for track in tracks {
-        println!("{}", format_track_line(track));
+}
+impl AsRef<str> for ColArtist {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+impl AsRef<str> for ColTitle {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+impl AsRef<str> for ColDuration {
+    fn as_ref(&self) -> &str {
+        &self.0
     }
 }
 
-/// Print queue tracks (terminal adds position prefix, pipe mode: track lines only).
+impl Shorten for ColHash {
+    type Algorithm = FreeText; // always 8 chars, never needs shortening
+}
+impl Shorten for ColArtist {
+    type Algorithm = RightEllipsis<'…', FreeText>;
+}
+impl Shorten for ColTitle {
+    type Algorithm = RightEllipsis<'…', FreeText>;
+}
+impl Shorten for ColDuration {
+    type Algorithm = FreeText; // naturally short, never needs shortening
+}
+
+struct TrackRow {
+    hash: ColHash,
+    artist: ColArtist,
+    title: ColTitle,
+    duration: ColDuration,
+}
+
+impl Row<4> for TrackRow {
+    fn get_cell(&self, index: usize) -> &dyn ShortenAny {
+        match index {
+            0 => &self.hash,
+            1 => &self.artist,
+            2 => &self.title,
+            3 => &self.duration,
+            _ => panic!("TrackRow only has 4 columns"),
+        }
+    }
+}
+
+impl TrackRow {
+    fn from_track(track: &TrackInfo) -> Self {
+        Self {
+            hash: ColHash(short_hash(&track.content_hash).to_string()),
+            artist: ColArtist(track.artist.as_deref().unwrap_or("Unknown").to_string()),
+            title: ColTitle(track.title.as_deref().unwrap_or("Unknown").to_string()),
+            duration: ColDuration(track.duration.map(|d| d.to_string()).unwrap_or_default()),
+        }
+    }
+}
+
+/// Detect terminal width from $COLUMNS env var, fallback to 100.
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100)
+}
+
+/// Pad a string to `width` chars (visual, not bytes).
+fn pad(s: &str, width: usize) -> String {
+    let len = s.chars().count();
+    if len < width {
+        format!("{}{}", s, " ".repeat(width - len))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Render tracks as a colored, aligned table for terminal display.
+/// Returns one formatted string per track row.
+fn render_track_table(tracks: &[TrackInfo]) -> Vec<String> {
+    if tracks.is_empty() {
+        return vec![];
+    }
+
+    let rows: Vec<TrackRow> = tracks.iter().map(TrackRow::from_track).collect();
+    let config = ColumnSizingConfigBuilder::<4>::new()
+        .terminal_width(terminal_width())
+        .gap_size(2)
+        .removal_policies([
+            RemovalPolicy::Never,                      // hash — always visible
+            RemovalPolicy::BelowScore(Score::MINIMAL), // artist — removed only when very cramped
+            RemovalPolicy::Never,                      // title — always visible
+            RemovalPolicy::BelowScore(Score::BASIC), // duration — removed first on narrow terminals
+        ])
+        .build();
+
+    let resized = corsett::resize_columns(config, &rows);
+
+    // Max visual width per column across all rows — for alignment.
+    let mut col_widths = [0usize; 4];
+    for row in &resized {
+        for (i, cell) in row.iter().enumerate() {
+            col_widths[i] = col_widths[i].max(cell.chars().count());
+        }
+    }
+
+    resized
+        .into_iter()
+        .map(|[hash, artist, title, duration]| {
+            let h = pad(&hash, col_widths[0]).bright_black().to_string();
+            let a = pad(&artist, col_widths[1]).green().to_string();
+            let t = pad(&title, col_widths[2]).bold().to_string();
+            if duration.is_empty() {
+                format!("{}  {}  {}", h, a, t)
+            } else {
+                let d = duration.bright_black().to_string();
+                format!("{}  {}  {}  {}", h, a, t, d)
+            }
+        })
+        .collect()
+}
+
+/// Print tracks with a bold header in terminal mode; canonical lines in pipe mode.
+fn print_tracks(tracks: &[TrackInfo], header: &str) {
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() {
+        println!("{}", header.bold());
+        println!();
+        for line in render_track_table(tracks) {
+            println!("{}", line);
+        }
+    } else {
+        for track in tracks {
+            println!("{}", format_track_line(track));
+        }
+    }
+}
+
+/// Print queue tracks. Terminal: numbered, colored table. Pipe: canonical lines.
 fn print_queue_tracks(indexed: &[(usize, &TrackInfo)]) {
     use std::io::IsTerminal;
     let is_tty = std::io::stdout().is_terminal();
-    for (pos, track) in indexed {
-        if is_tty {
-            println!("{}. {}", pos, format_track_line(track));
-        } else {
+    if is_tty {
+        let tracks: Vec<TrackInfo> = indexed.iter().map(|(_, t)| (*t).clone()).collect();
+        let lines = render_track_table(&tracks);
+        let pos_width = indexed
+            .last()
+            .map(|(p, _)| p.to_string().len())
+            .unwrap_or(1);
+        for ((pos, _), line) in indexed.iter().zip(lines.iter()) {
+            let pos_str = format!("{:>width$}.", pos, width = pos_width)
+                .bright_black()
+                .to_string();
+            println!("{}  {}", pos_str, line);
+        }
+    } else {
+        for (_, track) in indexed {
             println!("{}", format_track_line(track));
         }
     }
@@ -1004,8 +1162,8 @@ fn handle_queue_list(media_client: &MediaClient, library_client: &LibraryClient)
 
     use std::io::IsTerminal;
     if std::io::stdout().is_terminal() {
-        println!("Queue ({} tracks):", tracks.len());
-        println!("{}", "=".repeat(65));
+        println!("{}", format!("Queue ({} tracks)", tracks.len()).bold());
+        println!();
     }
     print_queue_tracks(&indexed);
     Ok(())

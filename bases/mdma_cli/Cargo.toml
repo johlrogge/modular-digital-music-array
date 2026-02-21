@@ -22,4 +22,5 @@ bandcamp-ipc-client = { path = "../../components/bandcamp_ipc_client" }
 media-client = { path = "../../components/media_client" }
 
 # Output formatting
-tabled = "0.15"
+colored = "2.0"
+corsett = { path = "../../../corsett" }
