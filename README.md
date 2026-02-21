@@ -62,6 +62,44 @@ Duration (`--duration`): `7m15s`, `7m`, `>5m`, `<8m`, `6m..8m`
 
 Key (`--key`): `Am`, `A minor`, `8B`, `8B+-1`, `8B+-1~` (include relative key)
 
+## Playlist management
+
+Playlists are plain text files — one hash per line. The Unix pipeline composes them.
+
+```bash
+# Save current queue as a playlist
+mdma queue list > friday_night.plist
+
+# View a playlist (tty-aware: shows artist/title on terminal, hashes when piped)
+cat friday_night.plist | mdma search
+
+# Filter a playlist to tracks by a specific artist
+cat friday_night.plist | mdma search --artist=CBL > cbl_set.plist
+
+# Sort playlist alphabetically (stable — chain for multi-key sort)
+cat friday_night.plist | mdma sort title -a | mdma sort artist -a > sorted.plist
+
+# Multi-key sort: primary=artist asc, tiebreak=title asc (read right-to-left)
+cat friday_night.plist | mdma sort title -a | mdma sort artist -a
+
+# Merge two playlists, deduplicated
+sort -u friday_night.plist saturday_night.plist > weekend.plist
+
+# Shuffle and load into queue
+cat weekend.plist | shuf | mdma queue append
+
+# Search → sort → queue
+mdma search --artist=CBL | mdma sort title -a | mdma queue append
+
+# Filter high-BPM tracks out of the queue
+mdma queue list | mdma search --bpm=>128 | mdma queue remove
+```
+
+`mdma sort` reads hashes from stdin, fetches metadata, and outputs sorted hashes.
+Null values sort last regardless of direction. Stable sort makes chaining correct.
+
+Sort fields: `bpm`, `title`, `artist`, `album`, `duration`
+
 ## Architecture
 
 ```

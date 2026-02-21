@@ -114,8 +114,14 @@ impl MediaClient {
         self.send_command(Command::QueueClear)
     }
 
-    pub fn queue_remove(&self, hashes: Vec<ContentHash>) -> Result<(), ClientError> {
-        self.send_command(Command::QueueRemove { hashes })
+    pub fn queue_remove(&self, hashes: Vec<ContentHash>) -> Result<usize, ClientError> {
+        self.send_command_with_response(Command::QueueRemove { hashes }, |data| {
+            if let ResponseData::Count(n) = data {
+                Some(n)
+            } else {
+                None
+            }
+        })
     }
 
     pub fn now_playing(&self) -> Result<Option<ContentHash>, ClientError> {

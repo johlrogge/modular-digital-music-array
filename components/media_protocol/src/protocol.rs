@@ -63,6 +63,7 @@ pub enum ResponseData {
     Length(usize),
     Queue(Vec<ContentHash>),
     NowPlaying(Option<ContentHash>),
+    Count(usize),
 }
 
 #[cfg(test)]

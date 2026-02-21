@@ -134,12 +134,16 @@ impl Server {
                 self.ok_response()
             }
             Command::QueueRemove { hashes } => {
-                self.queue
-                    .lock()
-                    .await
-                    .retain(|e| !hashes.contains(&e.hash));
-                info!("Removed {} hash(es) from queue", hashes.len());
-                self.ok_response()
+                let mut queue = self.queue.lock().await;
+                let before = queue.len();
+                queue.retain(|e| !hashes.contains(&e.hash));
+                let removed = before - queue.len();
+                info!("Removed {}/{} hash(es) from queue", removed, hashes.len());
+                Response {
+                    success: true,
+                    error_message: String::new(),
+                    data: Some(ResponseData::Count(removed)),
+                }
             }
             Command::PlayQueue => {
                 info!("Play from queue");

@@ -157,6 +157,28 @@ enum Commands {
         #[command(subcommand)]
         command: QueueCommands,
     },
+
+    /// Sort hashes from stdin by a track metadata field.
+    /// Reads one hash per line from stdin, outputs sorted hashes.
+    /// Stable sort: chain multiple invocations for multi-key sort (right-to-left priority).
+    ///
+    /// Examples:
+    ///   mdma search --artist=CBL | mdma sort title -a
+    ///   mdma queue list | mdma sort bpm -d | mdma queue append
+    ///   cat friday.plist | mdma sort title -a | mdma sort artist -a > sorted.plist
+    Sort {
+        /// Field to sort by
+        #[arg(value_enum)]
+        field: SortField,
+
+        /// Sort ascending (A→Z, low→high)
+        #[arg(short = 'a')]
+        ascending: bool,
+
+        /// Sort descending (Z→A, high→low)
+        #[arg(short = 'd')]
+        descending: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -237,6 +259,15 @@ enum SearchSubcommands {
         /// Fact type to inspect (e.g. MainGenre, Label, Key, Source, BPM, StyleDescriptor)
         fact_type: String,
     },
+}
+
+#[derive(clap::ValueEnum, Debug, Clone)]
+enum SortField {
+    Bpm,
+    Title,
+    Artist,
+    Album,
+    Duration,
 }
 
 #[derive(Subcommand, Debug)]
@@ -467,19 +498,47 @@ fn build_track_query(
 }
 
 fn handle_search(client: &LibraryClient, query: &TrackQuery) -> Result<()> {
-    use std::io::IsTerminal;
-    // Refuse to run a completely empty query on a terminal — it would dump the
-    // entire library with no feedback, which is almost never what the user wants.
-    // In pipe mode (e.g. scripts) an empty query is intentional and allowed.
-    if query.is_empty() && std::io::stdout().is_terminal() {
-        eprintln!("No search filters specified. Try:");
-        eprintln!("  mdma search \"rymden\"");
-        eprintln!("  mdma search --artist \"carbon based\" --bpm \"128+-4\"");
-        eprintln!("  mdma search fact-values-for genre");
-        std::process::exit(1);
-    }
+    use std::collections::HashSet;
+    use std::io::{BufRead, IsTerminal};
+
+    // When stdin is piped, read all hashes as an intersection filter.
+    // Each line may be a full hash (sha256:abc...) or the short-hash+display format
+    // emitted by `mdma search` in pipe mode — we take the first whitespace token.
+    let stdin_filter: Option<HashSet<String>> = if !std::io::stdin().is_terminal() {
+        let tokens = std::io::stdin()
+            .lock()
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|line| line.split_whitespace().next().map(|t| t.to_string()))
+            .collect();
+        Some(tokens)
+    } else {
+        None
+    };
+
     match client.search(query) {
         Ok(tracks) => {
+            // Apply stdin intersection filter if hashes were piped in.
+            let tracks: Vec<_> = if let Some(ref filter) = stdin_filter {
+                tracks
+                    .into_iter()
+                    .filter(|t| {
+                        let clean = t
+                            .content_hash
+                            .0
+                            .strip_prefix("sha256:")
+                            .unwrap_or(&t.content_hash.0);
+                        filter.iter().any(|token| {
+                            let token_clean =
+                                token.strip_prefix("sha256:").unwrap_or(token.as_str());
+                            clean.starts_with(token_clean)
+                        })
+                    })
+                    .collect()
+            } else {
+                tracks
+            };
+
             if std::io::stdout().is_terminal() {
                 if tracks.is_empty() {
                     println!("No tracks found");
@@ -930,13 +989,39 @@ fn handle_queue_list(
     Ok(())
 }
 
-fn handle_queue_remove(media_client: &MediaClient, hashes: Vec<String>) -> Result<()> {
-    let content_hashes: Vec<ContentHash> = hashes.into_iter().map(ContentHash).collect();
-    let count = content_hashes.len();
-    if let Err(e) = media_client.queue_remove(content_hashes) {
-        handle_playback_error(e);
+fn handle_queue_remove(
+    library_client: &LibraryClient,
+    media_client: &MediaClient,
+    hashes: Vec<String>,
+) -> Result<()> {
+    // Resolve each hash through the library to get the canonical full sha256: hash.
+    // This handles short hashes (8-char prefixes) and full hashes equally.
+    // Hashes that don't resolve are skipped with a warning — they can't be in the queue.
+    let content_hashes: Vec<ContentHash> = hashes
+        .into_iter()
+        .filter_map(|hash| {
+            let content_hash = ContentHash(hash);
+            match library_client.get_track(&content_hash) {
+                Ok(t) => Some(t.content_hash),
+                Err(e) => {
+                    eprintln!("Warning: could not resolve hash: {}", e);
+                    None
+                }
+            }
+        })
+        .collect();
+
+    if content_hashes.is_empty() {
+        return Ok(());
     }
-    println!("Removed {} track(s) from queue", count);
+
+    match media_client.queue_remove(content_hashes) {
+        Ok(removed) if removed > 0 => {
+            println!("Removed {} track(s) from queue", removed);
+        }
+        Ok(_) => {}
+        Err(e) => handle_playback_error(e),
+    }
     Ok(())
 }
 
@@ -996,6 +1081,123 @@ fn resolve_track(
             std::process::exit(1);
         }
     }
+}
+
+fn handle_sort(
+    client: &LibraryClient,
+    field: SortField,
+    ascending: bool,
+    descending: bool,
+) -> Result<()> {
+    use std::cmp::Ordering;
+    use std::io::IsTerminal;
+
+    let direction_asc = match (ascending, descending) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => {
+            eprintln!("Specify exactly one of -a (ascending) or -d (descending)");
+            std::process::exit(1);
+        }
+    };
+
+    let hashes = hashes_arg_or_stdin(None);
+
+    let mut tracks: Vec<TrackInfo> = hashes
+        .into_iter()
+        .filter_map(|hash| {
+            let content_hash = ContentHash(hash);
+            match client.get_track(&content_hash) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    eprintln!("Warning: could not resolve hash: {}", e);
+                    None
+                }
+            }
+        })
+        .collect();
+
+    tracks.sort_by(|a, b| match &field {
+        SortField::Bpm => match (&a.bpm, &b.bpm) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(av), Some(bv)) => {
+                if direction_asc {
+                    av.cmp(bv)
+                } else {
+                    bv.cmp(av)
+                }
+            }
+        },
+        SortField::Title => match (&a.title, &b.title) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(av), Some(bv)) => {
+                let cmp = av.to_lowercase().cmp(&bv.to_lowercase());
+                if direction_asc {
+                    cmp
+                } else {
+                    cmp.reverse()
+                }
+            }
+        },
+        SortField::Artist => match (&a.artist, &b.artist) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(av), Some(bv)) => {
+                let cmp = av.to_lowercase().cmp(&bv.to_lowercase());
+                if direction_asc {
+                    cmp
+                } else {
+                    cmp.reverse()
+                }
+            }
+        },
+        SortField::Album => match (&a.album, &b.album) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(av), Some(bv)) => {
+                let cmp = av.to_lowercase().cmp(&bv.to_lowercase());
+                if direction_asc {
+                    cmp
+                } else {
+                    cmp.reverse()
+                }
+            }
+        },
+        SortField::Duration => match (&a.duration, &b.duration) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(av), Some(bv)) => {
+                if direction_asc {
+                    av.0.cmp(&bv.0)
+                } else {
+                    bv.0.cmp(&av.0)
+                }
+            }
+        },
+    });
+
+    if std::io::stdout().is_terminal() {
+        for track in &tracks {
+            println!(
+                "{}  {}",
+                short_hash(&track.content_hash),
+                format_track_line(track)
+            );
+        }
+    } else {
+        for track in &tracks {
+            println!("{}", track.content_hash.0);
+        }
+    }
+
+    Ok(())
 }
 
 fn handle_playback_stop(media_client: &MediaClient) -> Result<()> {
@@ -1105,9 +1307,11 @@ fn main() -> Result<()> {
                     }
                 }
                 QueueCommands::Clear => handle_queue_clear(&connect_media()),
-                QueueCommands::Remove { hash } => {
-                    handle_queue_remove(&connect_media(), hashes_arg_or_stdin(hash))
-                }
+                QueueCommands::Remove { hash } => handle_queue_remove(
+                    &connect_library(),
+                    &connect_media(),
+                    hashes_arg_or_stdin(hash),
+                ),
             }
         }
 
@@ -1189,6 +1393,11 @@ fn main() -> Result<()> {
                     InboxCommands::Ingest { filename } => handle_inbox_ingest(&client, filename),
                     InboxCommands::IngestAll => handle_inbox_ingest_all(&client),
                 },
+                Commands::Sort {
+                    field,
+                    ascending,
+                    descending,
+                } => handle_sort(&client, field, ascending, descending),
                 Commands::Bandcamp { .. } | Commands::Playback { .. } | Commands::Queue { .. } => {
                     unreachable!()
                 }
