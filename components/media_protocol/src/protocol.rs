@@ -43,6 +43,10 @@ pub enum Command {
     QueueRemove {
         hashes: Vec<ContentHash>,
     },
+    /// Atomically replace the entire queue with a new ordered list.
+    QueueReplace {
+        entries: Vec<(ContentHash, PathBuf)>,
+    },
     /// Pop from queue head, load on deck A, and start playing.
     PlayQueue,
     /// Return the hash of the track currently loaded on deck A (None if nothing playing).

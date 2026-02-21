@@ -114,6 +114,10 @@ impl MediaClient {
         self.send_command(Command::QueueClear)
     }
 
+    pub fn queue_replace(&self, entries: Vec<(ContentHash, PathBuf)>) -> Result<(), ClientError> {
+        self.send_command(Command::QueueReplace { entries })
+    }
+
     pub fn queue_remove(&self, hashes: Vec<ContentHash>) -> Result<usize, ClientError> {
         self.send_command_with_response(Command::QueueRemove { hashes }, |data| {
             if let ResponseData::Count(n) = data {

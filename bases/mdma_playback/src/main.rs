@@ -1,6 +1,7 @@
 mod error;
 mod server;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -25,6 +26,10 @@ struct Args {
     /// Also listen on TCP for remote connections (e.g., "tcp://0.0.0.0:5557")
     #[arg(long)]
     tcp: Option<String>,
+
+    /// Path to queue persistence file (relative to cwd, which should be /music)
+    #[arg(long, default_value = "queue.json")]
+    queue_file: PathBuf,
 }
 
 fn main() -> Result<()> {
@@ -46,7 +51,7 @@ fn main() -> Result<()> {
         socket.listen(tcp)?;
     }
 
-    let server = Server::new(engine, socket);
+    let server = Server::new(engine, socket, args.queue_file);
     runtime.block_on(server.run())?;
 
     Ok(())

@@ -298,6 +298,19 @@ enum QueueCommands {
         /// Content hash (full or partial). Omit to read from stdin.
         hash: Option<String>,
     },
+
+    /// Atomically replace the entire queue from stdin.
+    /// Reads playlist-format lines (8–12 char hex hash as first token).
+    ///
+    /// Examples:
+    ///   mdma search --genre=Techno | shuf | mdma queue replace
+    ///   cat friday.plist | mdma queue replace
+    ///   mdma queue list | mdma sort bpm -a | mdma queue replace
+    Replace,
+
+    /// Edit the queue in $EDITOR (falls back to vi).
+    /// Opens the current queue as a playlist file; save to apply changes.
+    Edit,
 }
 
 // =============================================================================
@@ -314,11 +327,45 @@ fn short_hash(hash: &ContentHash) -> &str {
     }
 }
 
-/// Format track for single-line display
+/// Format a track as the canonical playlist line: `{short_hash}  {Artist} - {Title}  [{duration}]`
 fn format_track_line(track: &TrackInfo) -> String {
     let title = track.title.as_deref().unwrap_or("Unknown");
     let artist = track.artist.as_deref().unwrap_or("Unknown");
-    format!("{} - {}", artist, title)
+    let duration = track
+        .duration
+        .map(|d| format!("[{}]", d))
+        .unwrap_or_default();
+    let hash = short_hash(&track.content_hash);
+    if duration.is_empty() {
+        format!("{}  {} - {}", hash, artist, title)
+    } else {
+        format!("{}  {} - {}  {}", hash, artist, title, duration)
+    }
+}
+
+/// Print tracks with a terminal header. Pipe mode: track lines only.
+fn print_tracks(tracks: &[TrackInfo], header: &str) {
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() {
+        println!("{}:", header);
+        println!("{}", "=".repeat(65));
+    }
+    for track in tracks {
+        println!("{}", format_track_line(track));
+    }
+}
+
+/// Print queue tracks (terminal adds position prefix, pipe mode: track lines only).
+fn print_queue_tracks(indexed: &[(usize, &TrackInfo)]) {
+    use std::io::IsTerminal;
+    let is_tty = std::io::stdout().is_terminal();
+    for (pos, track) in indexed {
+        if is_tty {
+            println!("{}. {}", pos, format_track_line(track));
+        } else {
+            println!("{}", format_track_line(track));
+        }
+    }
 }
 
 /// Handle library client errors uniformly
@@ -539,30 +586,14 @@ fn handle_search(client: &LibraryClient, query: &TrackQuery) -> Result<()> {
                 tracks
             };
 
-            if std::io::stdout().is_terminal() {
-                if tracks.is_empty() {
-                    println!("No tracks found");
-                    return Ok(());
-                }
-                println!("Search results ({} matches):", tracks.len());
-                println!("{}", "=".repeat(65));
-                for track in tracks {
-                    println!(
-                        "{} | {}",
-                        short_hash(&track.content_hash),
-                        format_track_line(&track)
-                    );
-                }
-            } else {
-                // Pipe / dmenu mode: "{short_hash}  {display}" — one per line, no header.
-                for track in tracks {
-                    println!(
-                        "{}  {}",
-                        short_hash(&track.content_hash),
-                        format_track_line(&track)
-                    );
-                }
+            if tracks.is_empty() && std::io::stdout().is_terminal() {
+                println!("No tracks found");
+                return Ok(());
             }
+            print_tracks(
+                &tracks,
+                &format!("Search results ({} matches)", tracks.len()),
+            );
             Ok(())
         }
         Err(e) => handle_error(e),
@@ -945,47 +976,38 @@ fn handle_queue_append(
     Ok(())
 }
 
-fn handle_queue_list(
-    media_client: &MediaClient,
-    library_client: Option<&LibraryClient>,
-) -> Result<()> {
+fn handle_queue_list(media_client: &MediaClient, library_client: &LibraryClient) -> Result<()> {
     let hashes = match media_client.queue_list() {
         Ok(h) => h,
         Err(e) => handle_playback_error(e),
     };
-    match library_client {
-        None => {
-            // Piped: one full hash per line — suitable for piping into queue remove.
-            for hash in &hashes {
-                println!("{}", hash.0);
-            }
+
+    if hashes.is_empty() {
+        use std::io::IsTerminal;
+        if std::io::stdout().is_terminal() {
+            println!("Queue is empty");
         }
-        Some(lib) => {
-            if hashes.is_empty() {
-                println!("Queue is empty");
-            } else {
-                for (i, hash) in hashes.iter().enumerate() {
-                    let track = lib
-                        .get_track(hash)
-                        .expect("queued hash not found in library — invariant violated");
-                    let artist = track.artist.as_deref().unwrap_or("-");
-                    let title = track.title.as_deref().unwrap_or("-");
-                    let duration = track
-                        .duration
-                        .map(|d| d.to_string())
-                        .unwrap_or_else(|| "-".to_string());
-                    println!(
-                        "{}  {}  {} - {}  [{}]",
-                        i + 1,
-                        short_hash(hash),
-                        artist,
-                        title,
-                        duration
-                    );
-                }
-            }
-        }
+        return Ok(());
     }
+
+    let tracks: Vec<TrackInfo> = hashes
+        .iter()
+        .map(|hash| {
+            library_client
+                .get_track(hash)
+                .expect("queued hash not found in library — invariant violated")
+        })
+        .collect();
+
+    let indexed: Vec<(usize, &TrackInfo)> =
+        tracks.iter().enumerate().map(|(i, t)| (i + 1, t)).collect();
+
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() {
+        println!("Queue ({} tracks):", tracks.len());
+        println!("{}", "=".repeat(65));
+    }
+    print_queue_tracks(&indexed);
     Ok(())
 }
 
@@ -1033,13 +1055,124 @@ fn handle_queue_clear(media_client: &MediaClient) -> Result<()> {
     Ok(())
 }
 
+fn handle_queue_replace(
+    library_client: &LibraryClient,
+    media_client: &MediaClient,
+    hashes: Vec<String>,
+) -> Result<()> {
+    let entries: Vec<(ContentHash, std::path::PathBuf)> = hashes
+        .into_iter()
+        .map(|hash| resolve_track(library_client, hash))
+        .collect();
+    let count = entries.len();
+    if let Err(e) = media_client.queue_replace(entries) {
+        handle_playback_error(e);
+    }
+    println!("Queue replaced: {} tracks", count);
+    Ok(())
+}
+
+fn handle_queue_edit(library_client: &LibraryClient, media_client: &MediaClient) -> Result<()> {
+    // 1. Get current queue hashes.
+    let hashes = match media_client.queue_list() {
+        Ok(h) => h,
+        Err(e) => handle_playback_error(e),
+    };
+
+    // 2. Look up each track for display info.
+    let tracks: Vec<TrackInfo> = hashes
+        .iter()
+        .map(|hash| {
+            library_client
+                .get_track(hash)
+                .expect("queued hash not found in library — invariant violated")
+        })
+        .collect();
+
+    // 3. Write to temp file in playlist format.
+    let tmp_path = std::env::temp_dir().join("mdma_queue_edit.plist");
+    let mut content = String::from(
+        "# MDMA queue — reorder, delete, or add lines. Save to apply.\n\
+         # Lines not starting with an 8-12 character lowercase hash followed by a space are ignored.\n\
+         \n",
+    );
+    for track in &tracks {
+        content.push_str(&format_track_line(track));
+        content.push('\n');
+    }
+    std::fs::write(&tmp_path, &content)
+        .map_err(|e| {
+            eprintln!("Failed to write temp file: {}", e);
+            std::process::exit(1);
+        })
+        .unwrap();
+
+    // 4. Launch $EDITOR (fallback to vi).
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let status = std::process::Command::new(&editor)
+        .arg(&tmp_path)
+        .status()
+        .map_err(|e| {
+            eprintln!("Failed to launch editor '{}': {}", editor, e);
+            std::process::exit(1);
+        })
+        .unwrap();
+
+    if !status.success() {
+        eprintln!("Editor exited with non-zero status");
+        std::process::exit(1);
+    }
+
+    // 5. Read back, parse hashes using the standard filter.
+    use std::io::BufRead;
+    let file = std::fs::File::open(&tmp_path)
+        .map_err(|e| {
+            eprintln!("Failed to read temp file: {}", e);
+            std::process::exit(1);
+        })
+        .unwrap();
+    let edited_hashes: Vec<String> = std::io::BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| {
+            let first = line.split_whitespace().next()?;
+            let len = first.len();
+            if len >= 8
+                && len <= 12
+                && first
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+            {
+                Some(first.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let _ = std::fs::remove_file(&tmp_path);
+
+    // 6. Resolve and replace.
+    let entries: Vec<(ContentHash, std::path::PathBuf)> = edited_hashes
+        .into_iter()
+        .map(|hash| resolve_track(library_client, hash))
+        .collect();
+    let count = entries.len();
+    if let Err(e) = media_client.queue_replace(entries) {
+        handle_playback_error(e);
+    }
+    println!("Queue updated: {} tracks", count);
+    Ok(())
+}
+
 /// Return the provided hash as a single-element vec, or read ALL lines from stdin and
-/// return the first whitespace-delimited token from each non-empty line.
+/// extract valid short hashes (8–12 lowercase hex chars as first token).
 ///
 /// Supports both:
 ///   Single:  mdma queue append ec9ce8d0
 ///   Multi:   mdma search "van morph" | mdma queue append
 ///   Dmenu:   mdma search "van morph" | dmenu | mdma queue append  (dmenu outputs one line)
+///   Playlist: cat set.plist | mdma queue replace   (comments/blank lines silently ignored)
 fn hashes_arg_or_stdin(hash: Option<String>) -> Vec<String> {
     match hash {
         Some(h) => vec![h],
@@ -1050,9 +1183,18 @@ fn hashes_arg_or_stdin(hash: Option<String>) -> Vec<String> {
                 .lines()
                 .map_while(Result::ok)
                 .filter_map(|line| {
-                    line.split_whitespace()
-                        .next()
-                        .map(|token| token.to_string())
+                    let first = line.split_whitespace().next()?;
+                    let len = first.len();
+                    if len >= 8
+                        && len <= 12
+                        && first
+                            .chars()
+                            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+                    {
+                        Some(first.to_string())
+                    } else {
+                        None
+                    }
                 })
                 .collect();
             if hashes.is_empty() {
@@ -1090,7 +1232,6 @@ fn handle_sort(
     descending: bool,
 ) -> Result<()> {
     use std::cmp::Ordering;
-    use std::io::IsTerminal;
 
     let direction_asc = match (ascending, descending) {
         (true, false) => true,
@@ -1183,20 +1324,7 @@ fn handle_sort(
         },
     });
 
-    if std::io::stdout().is_terminal() {
-        for track in &tracks {
-            println!(
-                "{}  {}",
-                short_hash(&track.content_hash),
-                format_track_line(track)
-            );
-        }
-    } else {
-        for track in &tracks {
-            println!("{}", track.content_hash.0);
-        }
-    }
-
+    print_tracks(&tracks, &format!("Sorted ({} tracks)", tracks.len()));
     Ok(())
 }
 
@@ -1296,22 +1424,19 @@ fn main() -> Result<()> {
                     &connect_media(),
                     hashes_arg_or_stdin(hash),
                 ),
-                QueueCommands::List => {
-                    use std::io::IsTerminal;
-                    let media = connect_media();
-                    if std::io::stdout().is_terminal() {
-                        let lib = connect_library();
-                        handle_queue_list(&media, Some(&lib))
-                    } else {
-                        handle_queue_list(&media, None)
-                    }
-                }
+                QueueCommands::List => handle_queue_list(&connect_media(), &connect_library()),
                 QueueCommands::Clear => handle_queue_clear(&connect_media()),
                 QueueCommands::Remove { hash } => handle_queue_remove(
                     &connect_library(),
                     &connect_media(),
                     hashes_arg_or_stdin(hash),
                 ),
+                QueueCommands::Replace => handle_queue_replace(
+                    &connect_library(),
+                    &connect_media(),
+                    hashes_arg_or_stdin(None),
+                ),
+                QueueCommands::Edit => handle_queue_edit(&connect_library(), &connect_media()),
             }
         }
 

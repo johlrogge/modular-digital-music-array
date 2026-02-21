@@ -3,6 +3,7 @@ use color_eyre::Result;
 use media_protocol::{Command, ContentHash, Response, ResponseData};
 use nng::Socket;
 use playback_engine::{Deck, PlaybackEngine, PlaybackError};
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,25 +16,105 @@ struct QueueEntry {
     path: PathBuf,
 }
 
+/// Serializable form of a queue entry for persistence.
+#[derive(Serialize, Deserialize)]
+struct PersistEntry {
+    hash: String,
+    path: String,
+}
+
 pub struct Server {
     engine: Arc<Mutex<PlaybackEngine>>,
     socket: Socket,
     queue: Arc<Mutex<VecDeque<QueueEntry>>>,
     current_hash: Arc<Mutex<Option<ContentHash>>>,
+    queue_file: PathBuf,
 }
 
 impl Server {
-    pub fn new(engine: Arc<Mutex<PlaybackEngine>>, socket: Socket) -> Self {
+    pub fn new(engine: Arc<Mutex<PlaybackEngine>>, socket: Socket, queue_file: PathBuf) -> Self {
         Self {
             engine,
             socket,
             queue: Arc::new(Mutex::new(VecDeque::new())),
             current_hash: Arc::new(Mutex::new(None)),
+            queue_file,
         }
+    }
+
+    /// Serialize and write the queue to disk atomically. Logs a warning on error.
+    fn persist_queue(&self, queue: &VecDeque<QueueEntry>) {
+        let entries: Vec<PersistEntry> = queue
+            .iter()
+            .map(|e| PersistEntry {
+                hash: e.hash.0.clone(),
+                path: e.path.to_string_lossy().into_owned(),
+            })
+            .collect();
+
+        let json = match serde_json::to_string_pretty(&entries) {
+            Ok(j) => j,
+            Err(e) => {
+                warn!("Failed to serialize queue: {}", e);
+                return;
+            }
+        };
+
+        // Write atomically: temp file then rename.
+        let tmp = self.queue_file.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, &json) {
+            warn!("Failed to write queue temp file {:?}: {}", tmp, e);
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &self.queue_file) {
+            warn!("Failed to rename queue file: {}", e);
+        }
+    }
+
+    /// Load the queue from disk. Returns an empty queue on first start or corruption.
+    async fn load_queue(&self) -> VecDeque<QueueEntry> {
+        let data = match std::fs::read(&self.queue_file) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return VecDeque::new();
+            }
+            Err(e) => {
+                warn!("Failed to read queue file {:?}: {}", self.queue_file, e);
+                return VecDeque::new();
+            }
+        };
+
+        let entries: Vec<PersistEntry> = match serde_json::from_slice(&data) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("Queue file corrupt ({}), discarding", e);
+                let _ = std::fs::remove_file(&self.queue_file);
+                return VecDeque::new();
+            }
+        };
+
+        let mut queue = VecDeque::new();
+        for e in entries {
+            let path = PathBuf::from(&e.path);
+            if path.exists() {
+                queue.push_back(QueueEntry {
+                    hash: ContentHash(e.hash),
+                    path,
+                });
+            } else {
+                warn!("Skipping missing queue entry: {}", e.path);
+            }
+        }
+        info!("Restored {} track(s) from queue file", queue.len());
+        queue
     }
 
     pub async fn run(&self) -> Result<(), ServerError> {
         info!("Playback server starting...");
+
+        // Restore queue from disk.
+        let restored = self.load_queue().await;
+        *self.queue.lock().await = restored;
 
         // Background task: auto-advance to next queued track when current track finishes.
         tokio::spawn(auto_advance_task(
@@ -102,15 +183,16 @@ impl Server {
             }
             Command::QueueNext { hash, path } => {
                 info!("Queue next: {:?}", path);
-                self.queue
-                    .lock()
-                    .await
-                    .push_front(QueueEntry { hash, path });
+                let mut queue = self.queue.lock().await;
+                queue.push_front(QueueEntry { hash, path });
+                self.persist_queue(&queue);
                 self.ok_response()
             }
             Command::QueueAppend { hash, path } => {
                 info!("Queue append: {:?}", path);
-                self.queue.lock().await.push_back(QueueEntry { hash, path });
+                let mut queue = self.queue.lock().await;
+                queue.push_back(QueueEntry { hash, path });
+                self.persist_queue(&queue);
                 self.ok_response()
             }
             Command::QueueList => {
@@ -129,7 +211,9 @@ impl Server {
                 }
             }
             Command::QueueClear => {
-                self.queue.lock().await.clear();
+                let mut queue = self.queue.lock().await;
+                queue.clear();
+                self.persist_queue(&queue);
                 info!("Queue cleared");
                 self.ok_response()
             }
@@ -138,6 +222,7 @@ impl Server {
                 let before = queue.len();
                 queue.retain(|e| !hashes.contains(&e.hash));
                 let removed = before - queue.len();
+                self.persist_queue(&queue);
                 info!("Removed {}/{} hash(es) from queue", removed, hashes.len());
                 Response {
                     success: true,
@@ -145,9 +230,27 @@ impl Server {
                     data: Some(ResponseData::Count(removed)),
                 }
             }
+            Command::QueueReplace { entries } => {
+                let mut queue = self.queue.lock().await;
+                queue.clear();
+                for (hash, path) in entries {
+                    queue.push_back(QueueEntry { hash, path });
+                }
+                let n = queue.len();
+                self.persist_queue(&queue);
+                info!("Queue replaced with {} entries", n);
+                self.ok_response()
+            }
             Command::PlayQueue => {
                 info!("Play from queue");
-                let entry = self.queue.lock().await.pop_front();
+                let entry = {
+                    let mut queue = self.queue.lock().await;
+                    let e = queue.pop_front();
+                    if e.is_some() {
+                        self.persist_queue(&queue);
+                    }
+                    e
+                };
                 match entry {
                     None => Response {
                         success: false,
@@ -256,7 +359,7 @@ mod tests {
         let engine = Arc::new(Mutex::new(engine));
 
         let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
-        let server = Server::new(engine, socket);
+        let server = Server::new(engine, socket, PathBuf::from("/tmp/test_queue.json"));
 
         let nonexistent_path = PathBuf::from("/this/file/does/not/exist.flac");
         let command = Command::LoadTrack {
