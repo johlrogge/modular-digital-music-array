@@ -232,8 +232,10 @@ First external pub/sub consumer. Proves the event model works from a separate pr
 
 **Interface:** Rekordbox XML format (official, stable). Not the encrypted SQLite DB.
 
-**Identity mapping:** `RekordboxMapping` fact (ContentHash ↔ TrackID + file path).
+**Identity mapping:** `PioneerMapping` fact (ContentHash ↔ TrackID + file path).
 Persisted via stainless_facts. Created on first export, maintained across syncs.
+Named `PioneerMapping` (not Rekordbox-specific) because it maps to the Pioneer
+ecosystem broadly — shared with Priority 12 (Virtual CDJ).
 
 **Phase A — MDMA to Rekordbox (export):**
 - `mdma rekordbox export --playlist <name> --output <path>` on laptop
@@ -251,6 +253,56 @@ Persisted via stainless_facts. Created on first export, maintained across syncs.
 **Prerequisites:** First-class playlists, tags/rating facts.
 
 **Conversion runs on the laptop, not the Pi.**
+
+**Shared infrastructure:** The FLAC-to-AIFF transcoding pipeline and ContentHash-to-TrackID
+identity mapping are also used by Priority 12 (Virtual CDJ). Factor these into reusable
+components when implementing.
+
+---
+
+### 12. Virtual CDJ (Network Media Server for Physical CDJs)
+
+**Why:** Eliminate USB sticks entirely. MDMA serves its library directly to physical CDJs
+on the local network. The CDJ browses and plays tracks as if a USB stick were inserted.
+
+**Target hardware:** CDJ-900 (confirmed on local network). CDJ-2000/3000 also supported.
+
+**How it works:** CDJs can mount NFS shares and treat them as media sources. MDMA generates
+the Pioneer directory structure (PDB database + ANLZ analysis files) on `/cdj-export` and
+serves it via NFSv3. The CDJ sees the NFS share as equivalent to a USB stick.
+
+**Phase A — Static NFS Export (MVP):**
+- `pioneer_export` component: generates `PIONEER/` directory structure from MDMA library
+  - PDB database: tracks, artists, albums, playlists (via `rekordcrate` crate)
+  - ANLZ files: beatgrid, basic waveform data (from BPM/key facts)
+  - Audio files: AIFF transcoded from FLAC (reuses Rekordbox Sync transcoding pipeline)
+- Generates to `/cdj-export` on MDMA-909 (secondary NVMe, already provisioned)
+- NFS export already configured in provisioning (NFSv3, read-only, LAN only)
+- CLI: `mdma cdj export` — full library export, `mdma cdj export --playlist <name>`
+- Incremental: only transcode/regenerate changed tracks
+
+**Phase B — Reactive Export:**
+- Subscribe to library change events (new tracks, metadata updates)
+- Automatically regenerate affected PDB entries and ANLZ files
+- Background AIFF transcoding on ingest (Pi has the CPU headroom)
+
+**Phase C — Pro DJ Link Participation (stretch):**
+- MDMA announces itself on the Pro DJ Link network (port 50000)
+- Responds to DeviceSQL queries from CDJs (port 12523/1051)
+- Serves track data and metadata on demand
+- Foundation exists in `prodj` research project (packet parsing, player registry)
+- Reference: https://djl-analysis.deepsymmetry.org/djl-analysis/packets.html
+
+**Shared with Priority 11:**
+- `pioneer_export` component (PDB/ANLZ generation)
+- FLAC-to-AIFF transcoding pipeline
+- ContentHash ↔ Pioneer TrackID identity mapping facts
+
+**Prerequisites:** Priority 11 Phase A (transcoding pipeline, identity mapping).
+
+**Hardware:** MDMA-909 variant with secondary NVMe (`/cdj-export` partition).
+
+**Key crate:** `rekordcrate` (PDB/ANLZ read/write, Rust, available on crates.io).
 
 ---
 
@@ -303,7 +355,7 @@ This should happen before inviting other users onto the system.
 - MDMA-101 hardware — long-term; design data model to accommodate it
 - Gapless playback — desirable but not blocking queue MVP
 - Multi-deck UI — after single queue works
-- CDJ/Pro DJ Link integration — after Milestone 1 complete
+- CDJ/Pro DJ Link integration — documented as Priority 12 (Virtual CDJ); Phase C (full protocol participation) deferred until Phase A (static NFS export) is validated
 - Auto-updates — manual deploys fine during development
 - TUI client — after polybar + web UI prove the interaction model
 - mdmamp — after pub/sub, polybar, and web UI are solid
