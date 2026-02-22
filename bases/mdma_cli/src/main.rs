@@ -525,11 +525,6 @@ fn render_track_table(tracks: &[TrackInfo], reserved_prefix: usize) -> Vec<Strin
 /// Corsett's `terminal_width` is compared to the sum of column widths only (no gaps), so we
 /// subtract the gap overhead — `(N-1) * gap_size = 3 * 2 = 6` — to keep the full rendered
 /// line (columns + gaps + prefix) within the terminal width.
-///
-/// Additionally, Corsett's `RightEllipsis` algorithm can stall on the first shortening attempt
-/// (the ellipsis overhead means the returned length equals the original length), leaving artist
-/// and title columns at their natural widths when the budget is tight. We compensate with a
-/// post-corsett budget enforcement step that clamps the elastic columns.
 fn render_track_table_inner(
     tracks: &[TrackInfo],
     reserved_prefix: usize,
@@ -570,28 +565,7 @@ fn render_track_table_inner(
         }
     }
 
-    // Enforce the width budget: clamp elastic columns (artist=1, title=2) when corsett
-    // doesn't converge tightly enough (e.g. due to RightEllipsis stalling on first step).
-    let mut content_sum: usize = col_widths.iter().sum();
-    if content_sum > available_content {
-        while content_sum > available_content {
-            // Reduce the larger of artist/title first; fall back to hash then duration.
-            if col_widths[1] >= col_widths[2] && col_widths[1] > 0 {
-                col_widths[1] -= 1;
-            } else if col_widths[2] > 0 {
-                col_widths[2] -= 1;
-            } else if col_widths[0] > 0 {
-                col_widths[0] -= 1;
-            } else if col_widths[3] > 0 {
-                col_widths[3] -= 1;
-            } else {
-                break; // nothing left to reduce
-            }
-            content_sum = col_widths.iter().sum();
-        }
-    }
-
-    // Render rows: fit_cell truncates-or-pads each cell to the (possibly clamped) column width.
+    // Render rows: fit_cell truncates-or-pads each cell to the column width.
     resized
         .into_iter()
         .map(|[hash, artist, title, duration]| {
