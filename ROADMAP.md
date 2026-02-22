@@ -127,42 +127,93 @@ mdma-library  mdma-playback  /run/mdma/sources/*.sock
 
 ---
 
-### 3b. Pub/Sub Events
+### 3b. Codebase Cleanup
 
-**Why next:** With gateway routing in place, pub/sub is the natural extension. There is real state to observe (position, current track, queue contents).
+**Why now:** The architecture is stable. Dead code is clear. Warnings accumulate. Clean house before building new features.
+
+- Remove dead crates: `bandcamp_ipc_protocol`, `bandcamp_ipc_client` (replaced by `source_protocol` + `gateway_client`)
+- Fix all compiler warnings across workspace
+- Remove half-finished experiments, consolidate components
+- Run as a dedicated focused pass
+
+---
+
+### 4. Web UI Player Controls
+
+**Why next:** The console (`mdma-console`) is a stub. It needs to be a usable player interface — the first front-end that isn't the CLI. This is what beta testers will interact with.
+
+- Now playing display (track, artist, position)
+- Queue view (current queue, highlight playing track)
+- Basic controls: play, stop, next, queue append/remove
+- Search and browse library
+- Requires pub/sub or polling for live updates (see 5)
+
+---
+
+### 5. Pub/Sub Events
+
+**Why:** Enables live UIs (web, TUI, desktop). There is real state to observe (position, current track, queue contents).
 
 **Events (unsolicited):**
 - `track_started`, `track_ended`, `position_update`, `queue_changed`
 - Subscribers get push notifications without polling
-- Enables: live position display, queue UI that updates automatically, dmenu that refreshes when queue changes
+- Enables: live position display in web UI, auto-updating queue, TUI that refreshes
 
 ---
 
-### 4. Codebase Audit and Cleanup
+### 6. MP3 Support + Manual Upload Source
 
-**Why fourth:** After the above, it is clear what is alive vs. what is dead.
+**Why:** Beta testers have large MP3 libraries. FLAC-only blocks adoption. Not "hifi" but pragmatic.
 
-- Read each component, ask: "does anything in library / console / playback depend on this?"
-- If no → delete
-- Known dead: `bandcamp_ipc_protocol`, `bandcamp_ipc_client` (replaced by `source_protocol` + `gateway_client`)
-- Remove half-finished experiments, consolidate components, align everything with the active bases
-- Run as a dedicated focused pass, not incrementally
+- Add MP3 decoding to playback engine (Symphonia supports it — enable the feature)
+- `mdma-library` must accept `.mp3` files in inbox alongside `.flac`
+- **Manual upload source:** a simple "source" that accepts file uploads (SCP/HTTP) and drops them in inbox
+  - Enables beta testers to get their music onto the Pi without Bandcamp
+  - Could be as simple as an HTTP upload endpoint on the console, or an `mdma upload <file>` CLI command
 
 ---
 
-### 5. Stream Management (Silence → Off)
+### 7. Bandcamp Configuration
 
-After queue management is working:
+**Missing piece:** How does a fresh install configure the bandcamp service?
+
+- Username (`--username`) is a CLI flag / config — needs a config file or provisioning step
+- Cookies (`--cookies /etc/mdma/bandcamp-cookies.json`) must be provided manually
+  - Current approach: SCP cookies file to Pi
+  - Better: `mdma source configure bandcamp` interactive flow, or web UI form
+- Document the manual process now, automate later
+
+---
+
+### 8. Stream Management (Silence → Off)
+
 - Auto-shutdown PipeWire stream after N seconds of silence (queue empty, no track playing)
 - Auto-restart when a track is queued/played
 - Quality-of-life, not a blocker
 
 ---
 
+## Future Clients
+
+### TUI Client
+
+Terminal-based player interface. Real-time display of now playing, queue, search. Runs on the laptop. Talks to the gateway.
+
+Think: `cmus` or `ncmpcpp` but for MDMA. Rust TUI framework (ratatui or similar).
+
+### mdmamp (Desktop Player)
+
+**mdmamp** — MDMA Music Player. Graphical desktop client built with **Bevy**. The name flirts with Winamp.
+
+Full-featured player UI: library browser, queue management, now playing with waveform, search. Connects to the Pi's gateway from any machine on the network.
+
+Long-term vision: the primary way non-technical users interact with the system.
+
+---
+
 ## Validation: Full Reinstall from SD Card
 
-Once the roadmap priorities are through, do a full reinstall from SD card to validate
-the provisioning pipeline end-to-end — as a new unit would experience it.
+Deferred until time permits. Not blocking current work, but must happen before beta.
 
 **Constraint:** `/music` must survive. The NVMe partition layout keeps `/music` on its
 own partition (`/dev/nvme0n1p4`), so reinstalling root does not touch it. Verify this
@@ -173,9 +224,9 @@ holds before wiping anything.
 - `/music` and `/metadata` intact after reinstall
 - `mdma search` works immediately against the existing library
 - Bandcamp sync resumes without re-downloading
+- Bandcamp cookies + username configured correctly
 
-This is not a blocker for any current milestone but should happen before inviting
-other users onto the system.
+This should happen before inviting other users onto the system.
 
 ---
 
@@ -187,6 +238,8 @@ other users onto the system.
 - Multi-deck UI — after single queue works
 - CDJ/Pro DJ Link integration — after Milestone 1 complete
 - Auto-updates — manual deploys fine during development
+- TUI client — after web UI proves the interaction model
+- mdmamp — after pub/sub and web UI are solid
 
 ---
 
@@ -199,8 +252,10 @@ mdma-gateway       = API gateway: single TCP port, routes to all services
 mdma-library       = Library service with nng IPC interface
 mdma-playback      = Audio playback service (Symphonia + PipeWire + rubato)
 mdma-bandcamp      = Bandcamp download service (source_protocol)
-mdma-console       = HTTP frontend
+mdma-console       = HTTP frontend (web UI player)
 mdma-cli           = CLI frontend (gateway-aware, dual-mode dispatch)
+mdma-tui           = TUI client (ratatui, future)
+mdmamp             = Desktop player (Bevy, future)
 beacon             = Provisioning and service discovery
 
 source_protocol    = Unified request/response for music sources
