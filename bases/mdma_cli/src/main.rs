@@ -488,10 +488,22 @@ fn terminal_width() -> usize {
         .unwrap_or(100)
 }
 
-/// Pad a string to `width` chars (visual, not bytes).
-fn pad(s: &str, width: usize) -> String {
+/// Fit a string to exactly `width` visible chars: truncate with trailing `…` if too long, pad with
+/// spaces if too short. Returns an empty string when `width == 0`.
+fn fit_cell(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
     let len = s.chars().count();
-    if len < width {
+    if len > width {
+        // Truncate, appending an ellipsis if there's room.
+        if width > 1 {
+            let truncated: String = s.chars().take(width - 1).collect();
+            format!("{}…", truncated)
+        } else {
+            s.chars().take(width).collect()
+        }
+    } else if len < width {
         format!("{}{}", s, " ".repeat(width - len))
     } else {
         s.to_string()
@@ -500,15 +512,46 @@ fn pad(s: &str, width: usize) -> String {
 
 /// Render tracks as a colored, aligned table for terminal display.
 /// Returns one formatted string per track row.
-fn render_track_table(tracks: &[TrackInfo]) -> Vec<String> {
+///
+/// `reserved_prefix` is subtracted from the terminal width before column sizing.
+/// Pass `0` for plain output; for queue display, pass `pos_width + 3` (digit(s) + "." + 2 spaces).
+fn render_track_table(tracks: &[TrackInfo], reserved_prefix: usize) -> Vec<String> {
+    render_track_table_inner(tracks, reserved_prefix, terminal_width())
+}
+
+/// Inner implementation of `render_track_table` that accepts an explicit `term_width`,
+/// allowing tests to inject a known width without relying on `$COLUMNS`.
+///
+/// Corsett's `terminal_width` is compared to the sum of column widths only (no gaps), so we
+/// subtract the gap overhead — `(N-1) * gap_size = 3 * 2 = 6` — to keep the full rendered
+/// line (columns + gaps + prefix) within the terminal width.
+///
+/// Additionally, Corsett's `RightEllipsis` algorithm can stall on the first shortening attempt
+/// (the ellipsis overhead means the returned length equals the original length), leaving artist
+/// and title columns at their natural widths when the budget is tight. We compensate with a
+/// post-corsett budget enforcement step that clamps the elastic columns.
+fn render_track_table_inner(
+    tracks: &[TrackInfo],
+    reserved_prefix: usize,
+    term_width: usize,
+) -> Vec<String> {
     if tracks.is_empty() {
         return vec![];
     }
 
+    const GAP_SIZE: usize = 2;
+    const NUM_COLUMNS: usize = 4;
+    const GAP_OVERHEAD: usize = (NUM_COLUMNS - 1) * GAP_SIZE; // 6
+
+    let available_content = term_width
+        .saturating_sub(reserved_prefix)
+        .saturating_sub(GAP_OVERHEAD);
+
     let rows: Vec<TrackRow> = tracks.iter().map(TrackRow::from_track).collect();
     let config = ColumnSizingConfigBuilder::<4>::new()
-        .terminal_width(terminal_width())
-        .gap_size(2)
+        .terminal_width(available_content)
+        .gap_size(GAP_SIZE)
+        .max_depth(200)
         .removal_policies([
             RemovalPolicy::Never,                      // hash — always visible
             RemovalPolicy::BelowScore(Score::MINIMAL), // artist — removed only when very cramped
@@ -527,16 +570,40 @@ fn render_track_table(tracks: &[TrackInfo]) -> Vec<String> {
         }
     }
 
+    // Enforce the width budget: clamp elastic columns (artist=1, title=2) when corsett
+    // doesn't converge tightly enough (e.g. due to RightEllipsis stalling on first step).
+    let mut content_sum: usize = col_widths.iter().sum();
+    if content_sum > available_content {
+        while content_sum > available_content {
+            // Reduce the larger of artist/title first; fall back to hash then duration.
+            if col_widths[1] >= col_widths[2] && col_widths[1] > 0 {
+                col_widths[1] -= 1;
+            } else if col_widths[2] > 0 {
+                col_widths[2] -= 1;
+            } else if col_widths[0] > 0 {
+                col_widths[0] -= 1;
+            } else if col_widths[3] > 0 {
+                col_widths[3] -= 1;
+            } else {
+                break; // nothing left to reduce
+            }
+            content_sum = col_widths.iter().sum();
+        }
+    }
+
+    // Render rows: fit_cell truncates-or-pads each cell to the (possibly clamped) column width.
     resized
         .into_iter()
         .map(|[hash, artist, title, duration]| {
-            let h = pad(&hash, col_widths[0]).bright_black().to_string();
-            let a = pad(&artist, col_widths[1]).green().to_string();
-            let t = pad(&title, col_widths[2]).bold().to_string();
-            if duration.is_empty() {
+            let h = fit_cell(&hash, col_widths[0]).bright_black().to_string();
+            let a = fit_cell(&artist, col_widths[1]).green().to_string();
+            let t = fit_cell(&title, col_widths[2]).bold().to_string();
+            if col_widths[3] == 0 || duration.is_empty() {
                 format!("{}  {}  {}", h, a, t)
             } else {
-                let d = duration.bright_black().to_string();
+                let d = fit_cell(&duration, col_widths[3])
+                    .bright_black()
+                    .to_string();
                 format!("{}  {}  {}  {}", h, a, t, d)
             }
         })
@@ -549,7 +616,7 @@ fn print_tracks(tracks: &[TrackInfo], header: &str) {
     if std::io::stdout().is_terminal() {
         println!("{}", header.bold());
         println!();
-        for line in render_track_table(tracks) {
+        for line in render_track_table(tracks, 0) {
             println!("{}", line);
         }
     } else {
@@ -564,12 +631,13 @@ fn print_queue_tracks(indexed: &[(usize, &TrackInfo)]) {
     use std::io::IsTerminal;
     let is_tty = std::io::stdout().is_terminal();
     if is_tty {
-        let tracks: Vec<TrackInfo> = indexed.iter().map(|(_, t)| (*t).clone()).collect();
-        let lines = render_track_table(&tracks);
         let pos_width = indexed
             .last()
             .map(|(p, _)| p.to_string().len())
             .unwrap_or(1);
+        let tracks: Vec<TrackInfo> = indexed.iter().map(|(_, t)| (*t).clone()).collect();
+        // Reserve pos_width + 3 chars for the "N.  " prefix (digit(s) + "." + 2 spaces).
+        let lines = render_track_table(&tracks, pos_width + 3);
         for ((pos, _), line) in indexed.iter().zip(lines.iter()) {
             let pos_str = format!("{:>width$}.", pos, width = pos_width)
                 .bright_black()
@@ -1685,6 +1753,118 @@ fn main() -> Result<()> {
         } => {
             let client = connect_library(&cli);
             handle_sort(&client, field.clone(), *ascending, *descending)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_track(artist: &str, title: &str, duration_secs: u32) -> TrackInfo {
+        use library_ipc_client::{ContentHash, DurationSeconds};
+        TrackInfo {
+            content_hash: ContentHash("sha256:aa000001".to_string()),
+            title: Some(title.to_string()),
+            artist: Some(artist.to_string()),
+            album: None,
+            duration: Some(DurationSeconds(duration_secs)),
+            bpm: None,
+            key: None,
+            blob_path: None,
+        }
+    }
+
+    /// Build the same 8-track set used in queue_display.feature.
+    fn queue_display_tracks() -> Vec<TrackInfo> {
+        vec![
+            make_track("Sunju Hargun", "Silverhaze (DJ MARIA. Remix)", 421),
+            make_track("Carbon Based Lifeforms", "Init", 508),
+            make_track("Sunju Hargun", "Right Where It Ends", 376),
+            make_track("Carbon Based Lifeforms", "Marsa (2026 Remaster)", 612),
+            make_track("Sunju Hargun", "Interloper", 293),
+            make_track("Carbon Based Lifeforms", "Midnight Traffic Remix", 444),
+            make_track("Sunju Hargun", "Polyrytmi", 367),
+            make_track("Carbon Based Lifeforms", "20 Minutes", 1200),
+        ]
+    }
+
+    /// Strip ANSI escape codes from a string.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                if let Some(next) = chars.next() {
+                    if next == '[' {
+                        for seq_char in chars.by_ref() {
+                            if seq_char.is_ascii_alphabetic() || seq_char == '~' {
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn render_track_table_with_no_prefix_fits_in_terminal_width() {
+        let tracks = queue_display_tracks();
+        // Use render_track_table_inner with an explicit width to avoid race conditions
+        // from parallel tests sharing the $COLUMNS env var.
+        let lines = render_track_table_inner(&tracks, 0, 65);
+        for (i, line) in lines.iter().enumerate() {
+            let stripped = strip_ansi(line);
+            let width = stripped.chars().count();
+            assert!(
+                width <= 65,
+                "Line {} is {} chars wide, exceeds 65 columns: '{}'",
+                i + 1,
+                width,
+                stripped
+            );
+        }
+    }
+
+    #[test]
+    fn render_track_table_with_prefix_4_fits_in_terminal_width_65() {
+        let tracks = queue_display_tracks();
+        // prefix=4, term_width=65. Every rendered line must be ≤ 65-4=61 chars.
+        let lines = render_track_table_inner(&tracks, 4, 65);
+        for (i, line) in lines.iter().enumerate() {
+            let stripped = strip_ansi(line);
+            let width = stripped.chars().count();
+            assert!(
+                width + 4 <= 65,
+                "Line {} content is {} chars, total with prefix {} exceeds 65 columns: '{}'",
+                i + 1,
+                width,
+                width + 4,
+                stripped
+            );
+        }
+    }
+
+    #[test]
+    fn render_track_table_with_prefix_4_fits_in_terminal_width_55() {
+        let tracks = queue_display_tracks();
+        // prefix=4, term_width=55. Every rendered line must be ≤ 55-4=51 chars.
+        let lines = render_track_table_inner(&tracks, 4, 55);
+        for (i, line) in lines.iter().enumerate() {
+            let stripped = strip_ansi(line);
+            let width = stripped.chars().count();
+            assert!(
+                width + 4 <= 55,
+                "Line {} content is {} chars, total with prefix {} exceeds 55 columns: '{}'",
+                i + 1,
+                width,
+                width + 4,
+                stripped
+            );
         }
     }
 }

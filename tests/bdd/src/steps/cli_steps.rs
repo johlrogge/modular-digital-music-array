@@ -400,6 +400,27 @@ async fn stripped_output_line_should_be(world: &mut MdmaWorld, line_num: usize, 
     );
 }
 
+/// Assert that every non-empty stripped output line fits within `max_width` columns.
+///
+/// This step is the key assertion for the queue-display width bug: position
+/// numbers must be counted inside the column budget, not prepended after layout.
+#[then(regex = r"^every stripped output line should fit in (\d+) columns$")]
+async fn every_line_should_fit(world: &mut MdmaWorld, max_width: usize) {
+    let stripped = strip_ansi(&world.last_cli_stdout);
+    for (i, line) in stripped.lines().enumerate() {
+        let width = line.chars().count();
+        assert!(
+            width <= max_width,
+            "Line {} is {} chars wide, exceeds {} columns.\nLine: '{}'\nFull output:\n{}",
+            i + 1,
+            width,
+            max_width,
+            line,
+            stripped
+        );
+    }
+}
+
 // =============================================================================
 // Helpers
 // =============================================================================
