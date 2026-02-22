@@ -155,12 +155,12 @@ impl FactAggregator<ContentHash, MusicValue, FactSource> for AggregatedTrack {
 
 /// Read and aggregate facts from a fact stream file
 pub fn read_and_aggregate(path: impl AsRef<Path>) -> Result<HashMap<ContentHash, AggregatedTrack>> {
-    let mut reader = FactStreamReader::open(path)?;
+    let reader = FactStreamReader::open(path)?;
 
     let mut facts = Vec::new();
 
     // Read all facts from the stream
-    while let Some(result) = reader.next() {
+    for result in reader {
         let fact: Fact<ContentHash, MusicValue, FactSource> = result?;
         facts.push(fact);
     }

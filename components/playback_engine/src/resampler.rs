@@ -78,8 +78,8 @@ impl Resampler {
         let n_out_frames = out[0].len();
         let mut result = Vec::with_capacity(n_out_frames * self.channels);
         for i in 0..n_out_frames {
-            for ch in 0..self.channels {
-                result.push(out[ch][i]);
+            for channel in &out {
+                result.push(channel[i]);
             }
         }
 

@@ -37,38 +37,38 @@ pub fn matches_query(query: &TrackQuery, track: &TrackFields) -> bool {
         ];
         if !text_fields
             .iter()
-            .any(|f| f.map_or(false, |s| matches_string(sq, s)))
+            .any(|f| f.is_some_and(|s| matches_string(sq, s)))
         {
             return false;
         }
     }
 
     if let Some(sq) = &query.artist {
-        if !track.artist.map_or(false, |s| matches_string(sq, s)) {
+        if !track.artist.is_some_and(|s| matches_string(sq, s)) {
             return false;
         }
     }
 
     if let Some(sq) = &query.title {
-        if !track.title.map_or(false, |s| matches_string(sq, s)) {
+        if !track.title.is_some_and(|s| matches_string(sq, s)) {
             return false;
         }
     }
 
     if let Some(sq) = &query.album {
-        if !track.album.map_or(false, |s| matches_string(sq, s)) {
+        if !track.album.is_some_and(|s| matches_string(sq, s)) {
             return false;
         }
     }
 
     if let Some(sq) = &query.label {
-        if !track.label.map_or(false, |s| matches_string(sq, s)) {
+        if !track.label.is_some_and(|s| matches_string(sq, s)) {
             return false;
         }
     }
 
     if let Some(sq) = &query.genre {
-        if !track.genre.map_or(false, |s| matches_string(sq, s)) {
+        if !track.genre.is_some_and(|s| matches_string(sq, s)) {
             return false;
         }
     }
@@ -80,31 +80,31 @@ pub fn matches_query(query: &TrackQuery, track: &TrackFields) -> bool {
     }
 
     if let Some(nq) = &query.bpm {
-        if !track.bpm.map_or(false, |b| matches_numeric(nq, b)) {
+        if !track.bpm.is_some_and(|b| matches_numeric(nq, b)) {
             return false;
         }
     }
 
     if let Some(nq) = &query.year {
-        if !track.year.map_or(false, |y| matches_numeric(nq, y as f32)) {
+        if !track.year.is_some_and(|y| matches_numeric(nq, y as f32)) {
             return false;
         }
     }
 
     if let Some(dq) = &query.duration {
-        if !track.duration.map_or(false, |d| matches_duration(dq, d)) {
+        if !track.duration.is_some_and(|d| matches_duration(dq, d)) {
             return false;
         }
     }
 
     if let Some(kq) = &query.key {
-        if !track.key.map_or(false, |k| matches_key(kq, k)) {
+        if !track.key.is_some_and(|k| matches_key(kq, k)) {
             return false;
         }
     }
 
     if let Some(src) = &query.source {
-        if !track.source.map_or(false, |s| s.eq_ignore_ascii_case(src)) {
+        if !track.source.is_some_and(|s| s.eq_ignore_ascii_case(src)) {
             return false;
         }
     }

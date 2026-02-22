@@ -200,8 +200,8 @@ fn parse_duration_parts(s: &str) -> Result<(u32, Option<DurationUnit>), ParseErr
 pub fn parse_key_query(s: &str) -> Result<KeyQuery, ParseError> {
     let s = s.trim();
 
-    let (s_notilde, include_relative) = if s.ends_with('~') {
-        (&s[..s.len() - 1], true)
+    let (s_notilde, include_relative) = if let Some(stripped) = s.strip_suffix('~') {
+        (stripped, true)
     } else {
         (s, false)
     };

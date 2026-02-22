@@ -128,6 +128,7 @@ pub enum IngestSource {
 /// Requests that can be sent to the library service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[allow(clippy::large_enum_variant)]
 pub enum LibraryRequest {
     /// Ping to check if service is alive.
     Ping,

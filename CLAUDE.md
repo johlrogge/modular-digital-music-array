@@ -41,7 +41,8 @@ just pi-connect         # Find and auto-SSH to Pi
   - `beacon` - Provisioning server with web UI (main focus)
   - `mdma_playback` - Audio playback server
   - `library_crawler` - Music library indexing
-  - `media_ctl`, `download_cli` - CLI tools
+  - `mdma_cli` - Command-line interface
+  - `mdma_console` - Web management console
 
 - **components/** - Shared libraries
   - `playback_engine` - Real-time audio (Symphonia + PipeWire)

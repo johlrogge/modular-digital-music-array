@@ -11,8 +11,7 @@ use corsett::{
 };
 use library_ipc_client::{ClientError, ContentHash, InboxPath, ProtocolError, TrackInfo};
 use library_search::{parse_numeric_query, parse_string_query, TrackQuery};
-use mdma_client::{LibraryBackend, PlaybackBackend, SourceClient};
-use media_client::Deck;
+use mdma_client::{Deck, LibraryBackend, PlaybackBackend, PlaybackClientError, SourceClient};
 use source_protocol::{SourceRequest, SourceResponse};
 
 // =============================================================================
@@ -59,6 +58,7 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Check if the service is running
     Ping,
@@ -714,6 +714,7 @@ fn handle_facts(client: &LibraryBackend, hash: String) -> Result<()> {
 }
 
 /// Build a TrackQuery from individual CLI arguments.
+#[allow(clippy::too_many_arguments)]
 fn build_track_query(
     any_text: Option<String>,
     artist: Option<String>,
@@ -1083,9 +1084,9 @@ fn handle_source_resume(client: &SourceClient, name: &str) -> Result<()> {
 // Playback Command Handlers
 // =============================================================================
 
-fn handle_playback_error(err: media_client::ClientError) -> ! {
+fn handle_playback_error(err: PlaybackClientError) -> ! {
     match err {
-        media_client::ClientError::Connection(e) => {
+        PlaybackClientError::Connection(e) => {
             eprintln!("Connection failed: {}", e);
             eprintln!("Is mdma-playback running?");
         }
@@ -1333,8 +1334,7 @@ fn handle_queue_edit(
         .filter_map(|line| {
             let first = line.split_whitespace().next()?;
             let len = first.len();
-            if len >= 8
-                && len <= 12
+            if (8..=12).contains(&len)
                 && first
                     .chars()
                     .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
@@ -1375,8 +1375,7 @@ fn hashes_arg_or_stdin(hash: Option<String>) -> Vec<String> {
                 .filter_map(|line| {
                     let first = line.split_whitespace().next()?;
                     let len = first.len();
-                    if len >= 8
-                        && len <= 12
+                    if (8..=12).contains(&len)
                         && first
                             .chars()
                             .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())

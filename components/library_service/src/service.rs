@@ -305,7 +305,7 @@ impl LibraryService {
                 let fact_index = self.fact_index.lock().unwrap();
                 let exists = fact_index
                     .get(&fact_type)
-                    .map_or(false, |values| values.contains(&value));
+                    .is_some_and(|values| values.contains(&value));
                 LibraryResponse::FactExists {
                     fact_type,
                     value,

@@ -5,7 +5,7 @@ use nng::Socket;
 use playback_engine::{Deck, PlaybackEngine, PlaybackError};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -312,7 +312,7 @@ impl Server {
 
 async fn load_and_play(
     engine: &Arc<Mutex<PlaybackEngine>>,
-    path: &PathBuf,
+    path: &Path,
 ) -> Result<(), PlaybackError> {
     let mut eng = engine.lock().await;
     eng.load_track(Deck::A, path).await?;

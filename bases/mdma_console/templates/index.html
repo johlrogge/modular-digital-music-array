@@ -164,17 +164,9 @@
         <table>
             <tbody>
                 <tr>
-                    <td>Cookies</td>
-                    <td>{% if bandcamp.cookies_loaded %}<span class="update-available">loaded</span>{% else %}<span class="no-update">not loaded</span>{% endif %}</td>
+                    <td>Authenticated</td>
+                    <td>{% if bandcamp.authenticated %}<span class="update-available">yes</span>{% else %}<span class="no-update">no</span>{% endif %}</td>
                 </tr>
-                {% match bandcamp.current_username %}
-                    {% when Some with (user) %}
-                <tr>
-                    <td>User</td>
-                    <td>{{ user }}</td>
-                </tr>
-                    {% when None %}
-                {% endmatch %}
                 <tr>
                     <td>Downloads Active</td>
                     <td>{{ bandcamp.downloads_active }}</td>
@@ -198,7 +190,6 @@
             </tbody>
         </table>
         <div class="actions">
-            <button class="btn btn-secondary" onclick="reloadCookies()">Reload Cookies</button>
             {% if bandcamp.paused %}
             <button class="btn" onclick="resumeDownloads()">Resume</button>
             {% else %}
@@ -298,27 +289,6 @@
             }
         }
 
-        async function reloadCookies() {
-            const btn = event.target;
-            showLoading(btn);
-            try {
-                const response = await fetch('/bandcamp/reload-cookies', { method: 'POST' });
-                const data = await response.json();
-                if (response.ok && data.success) {
-                    showStatus('Cookies reloaded', false);
-                    setTimeout(() => location.reload(), 1000);
-                } else {
-                    showStatus('Failed: ' + (data.error || data.message || 'Unknown error'), true);
-                    btn.disabled = false;
-                    btn.textContent = 'Reload Cookies';
-                }
-            } catch (e) {
-                showStatus('Error: ' + e.message, true);
-                btn.disabled = false;
-                btn.textContent = 'Reload Cookies';
-            }
-        }
-
         async function pauseDownloads() {
             const btn = event.target;
             showLoading(btn);
@@ -385,7 +355,7 @@
                 });
                 const data = await response.json();
                 if (response.ok && data.success) {
-                    showStatus('Sync started for ' + data.username + ': ' + data.new_items + ' new items', false);
+                    showStatus('Sync started: ' + data.new_items + ' new items', false);
                     setTimeout(() => location.reload(), 2000);
                 } else {
                     showStatus('Sync failed: ' + (data.error || 'Unknown error'), true);

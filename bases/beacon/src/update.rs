@@ -84,7 +84,7 @@ pub async fn update_beacon_from_repo(log_tx: broadcast::Sender<String>) -> Resul
     send_log!(log_tx, "🔍 Checking for beacon updates...");
 
     let check = Command::new("xbps-install")
-        .args(&["-n", "beacon"])
+        .args(["-n", "beacon"])
         .output()
         .await
         .map_err(|e| BeaconError::Installation(format!("Failed to check updates: {}", e)))?;
@@ -103,7 +103,7 @@ pub async fn update_beacon_from_repo(log_tx: broadcast::Sender<String>) -> Resul
     send_log!(log_tx, "⬇️  Updating beacon package...");
 
     let update = Command::new("xbps-install")
-        .args(&["-uy", "beacon"])
+        .args(["-uy", "beacon"])
         .output()
         .await
         .map_err(|e| BeaconError::Installation(format!("Failed to update beacon: {}", e)))?;
@@ -134,7 +134,7 @@ pub async fn update_beacon_from_repo(log_tx: broadcast::Sender<String>) -> Resul
 
     // Note: This will kill our own process, so we might not see the response
     let restart = Command::new("sv")
-        .args(&["restart", "beacon"])
+        .args(["restart", "beacon"])
         .output()
         .await
         .map_err(|e| BeaconError::Installation(format!("Failed to restart beacon: {}", e)))?;

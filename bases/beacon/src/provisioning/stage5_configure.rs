@@ -455,7 +455,7 @@ async fn install_packages(mount_root: &Path) -> Result<()> {
     let output = Command::new("xbps-install")
         .args(["-Sy", "-r"])
         .arg(mount_root)
-        .args(&packages)
+        .args(packages)
         .output()
         .await
         .map_err(|e| BeaconError::command_failed("xbps-install", e))?;
@@ -500,7 +500,7 @@ async fn install_mdma_packages(mount_root: &Path) -> Result<()> {
     let output = Command::new("xbps-install")
         .args(["-Sy", "-r"])
         .arg(mount_root)
-        .args(&packages)
+        .args(packages)
         .output()
         .await
         .map_err(|e| BeaconError::command_failed("xbps-install mdma packages", e))?;
@@ -572,7 +572,7 @@ async fn enable_services(mount_root: &Path) -> Result<()> {
             ])
             .output()
             .await
-            .map_err(|e| BeaconError::command_failed(&format!("ln -s {} service", service), e))?;
+            .map_err(|e| BeaconError::command_failed(format!("ln -s {} service", service), e))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

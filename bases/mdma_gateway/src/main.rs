@@ -44,7 +44,7 @@ fn connect_backend(address: &str) -> Result<nng::Socket, nng::Error> {
     socket.set_opt::<nng::options::ReconnectMaxTime>(Some(Duration::from_secs(5)))?;
 
     // Nonblocking dial — will reconnect automatically
-    socket.dial_async(address).map_err(|e| e)?;
+    socket.dial_async(address)?;
 
     Ok(socket)
 }

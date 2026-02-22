@@ -1,6 +1,5 @@
 mod fact_generator;
 mod fact_reader;
-mod fact_writer;
 mod hash;
 
 use chrono::Utc;
@@ -198,7 +197,7 @@ fn read_and_display_facts(facts_path: &PathBuf, show_aggregate: bool) -> Result<
         println!("{}", "=".repeat(60));
 
         let mut sorted_tracks: Vec<_> = tracks.values().collect();
-        sorted_tracks.sort_by(|a, b| a.display_name().cmp(&b.display_name()));
+        sorted_tracks.sort_by_key(|a| a.display_name());
 
         for track in sorted_tracks {
             print_aggregated_track(track);

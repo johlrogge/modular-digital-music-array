@@ -15,6 +15,7 @@ use source_protocol::{SourceRequest, SourceResponse};
 /// A request routed through the gateway.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "service")]
+#[allow(clippy::large_enum_variant)]
 pub enum GatewayRequest {
     /// Route to the library service.
     #[serde(rename = "library")]

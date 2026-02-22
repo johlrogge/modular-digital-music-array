@@ -17,7 +17,7 @@ use crate::provisioning::types::{
     ConfiguredFstab, FormattedSystem, FstabPlan, FstabState, InstallPlan, InstallState,
     InstalledPackages, MountPlan, MountState, MountedPartitions, Partition,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 // ============================================================================
@@ -313,7 +313,7 @@ async fn check_if_base_system_installed(mount_root: &std::path::Path) -> Install
 /// This is required before running xbps-install to a fresh root directory,
 /// otherwise xbps will prompt interactively for key import which fails
 /// without a TTY.
-async fn copy_xbps_keys(mount_root: &PathBuf) -> Result<()> {
+async fn copy_xbps_keys(mount_root: &Path) -> Result<()> {
     let source_keys = std::path::Path::new("/var/db/xbps/keys");
     let target_keys = mount_root.join("var/db/xbps/keys");
 
