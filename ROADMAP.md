@@ -269,6 +269,7 @@ This should happen before inviting other users onto the system.
 - Auto-updates — manual deploys fine during development
 - TUI client — after polybar + web UI prove the interaction model
 - mdmamp — after pub/sub, polybar, and web UI are solid
+- MCP tools for smoke testing — custom MCP server wrapping mdma CLI for structured, approval-free agent testing; Bash allowlisting suffices for now
 
 ---
 
