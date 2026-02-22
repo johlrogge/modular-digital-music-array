@@ -127,14 +127,15 @@ mdma-library  mdma-playback  /run/mdma/sources/*.sock
 
 ---
 
-### 3b. Codebase Cleanup
+### ~~3b. Codebase Cleanup~~ — COMPLETE (Feb 22, 2026)
 
-**Why now:** The architecture is stable. Dead code is clear. Warnings accumulate. Clean house before building new features.
-
-- Remove dead crates: `bandcamp_ipc_protocol`, `bandcamp_ipc_client` (replaced by `source_protocol` + `gateway_client`)
-- Fix all compiler warnings across workspace
-- Remove half-finished experiments, consolidate components
-- Run as a dedicated focused pass
+- All clippy warnings resolved across workspace (was ~33, now 0)
+- 6 dead crates removed: `bandcamp_ipc_protocol`, `bandcamp_ipc_client`,
+  `media_downloader`, `audio_fingerprint`, `download_cli`, `media_ctl`
+- `mdma-console` migrated from `bandcamp_ipc_client` to `gateway_client`
+- Beacon: legacy `ActionLegacy` trait + unused error variants removed
+- `library_crawler`: unused `fact_writer` module removed
+- Agent workflow: code-minion + commit agent + architect review loop
 
 ---
 
@@ -347,6 +348,13 @@ All services are behind the gateway. No per-service TCP ports exposed.
 ---
 
 ## Update History
+
+- **2026-02-22 (late):** Priority 3b (Codebase Cleanup) fully complete.
+  - 6 dead crates removed, console migrated to gateway_client
+  - All clippy warnings resolved, dead code removed
+  - Agent workflow established: code-minion → rust-architect → commit
+  - `cargo build`, `cargo clippy`, `cargo test` all clean (0 warnings)
+  - **Next:** Priority 4 — Pub/Sub Events + Play History Facts
 
 - **2026-02-22 (night):** Roadmap restructured — pub/sub + play history facts moved to priority 4.
   - Pub/sub events (`track_started`, `track_ended`, `position_update`, `queue_changed`) are prerequisite for all live UIs
