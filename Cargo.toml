@@ -15,6 +15,7 @@ members = [
     "components/playback_primitives",
     "components/time_primitives",
     "components/storage_primitives",
+    "components/event_protocol",
     "components/nng_transport",
     "components/library_search",
     "components/source_protocol",

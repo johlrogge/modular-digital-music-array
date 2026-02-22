@@ -29,6 +29,14 @@ struct Args {
     /// Directory containing source service sockets
     #[arg(long, default_value = "/run/mdma/sources")]
     sources_dir: PathBuf,
+
+    /// TCP listen address for event publishing (Pub0)
+    #[arg(long, default_value = "tcp://0.0.0.0:5556")]
+    event_listen: String,
+
+    /// Local event source to subscribe to (Sub0)
+    #[arg(long, default_value = "ipc:///run/mdma/events.sock")]
+    event_source: String,
 }
 
 /// Connect a Req0 socket to a backend with reconnect options.
@@ -144,6 +152,48 @@ fn main() -> Result<()> {
     let playback_backend = connect_backend(&args.playback_socket)
         .map_err(|e| color_eyre::eyre::eyre!("Failed to connect to playback: {}", e))?;
     tracing::info!(address = %args.playback_socket, "Connected to playback backend");
+
+    // Event bridge: Sub0 (local) -> Pub0 (TCP)
+    let event_pub = nng::Socket::new(nng::Protocol::Pub0)?;
+    event_pub.listen(&args.event_listen)?;
+    tracing::info!(address = %args.event_listen, "Event publishing on TCP");
+
+    let event_source_addr = args.event_source.clone();
+    std::thread::spawn(move || {
+        let event_sub = match nng::Socket::new(nng::Protocol::Sub0) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to create Sub0 socket for event bridge");
+                return;
+            }
+        };
+
+        if let Err(e) = event_sub.set_opt::<nng::options::protocol::pubsub::Subscribe>(vec![]) {
+            tracing::error!(error = %e, "Failed to set subscription filter");
+            return;
+        }
+
+        if let Err(e) = event_sub.dial_async(&event_source_addr) {
+            tracing::error!(address = %event_source_addr, error = %e, "Failed to connect to event source");
+            return;
+        }
+
+        tracing::info!(address = %event_source_addr, "Event bridge connected to source");
+
+        loop {
+            match event_sub.recv() {
+                Ok(msg) => {
+                    if let Err((_, e)) = event_pub.send(nng::Message::from(msg.as_slice())) {
+                        tracing::warn!(error = %e, "Failed to re-publish event");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Event bridge recv error, retrying...");
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+    });
 
     // Source backend cache (connected on demand)
     let mut source_cache: HashMap<String, nng::Socket> = HashMap::new();

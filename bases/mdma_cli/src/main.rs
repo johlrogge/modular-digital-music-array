@@ -9,9 +9,11 @@ use corsett::{
     shortener::{FreeText, RightEllipsis},
     ColumnSizingConfigBuilder, RemovalPolicy, Row, Score, Shorten, ShortenAny,
 };
+use event_protocol::{from_topic_message, PlaybackEvent, TOPIC_PLAYBACK};
 use library_ipc_client::{ClientError, ContentHash, InboxPath, ProtocolError, TrackInfo};
 use library_search::{parse_numeric_query, parse_string_query, TrackQuery};
 use mdma_client::{Deck, LibraryBackend, PlaybackBackend, PlaybackClientError, SourceClient};
+use nng::options::Options;
 use source_protocol::{SourceRequest, SourceResponse};
 
 // =============================================================================
@@ -183,6 +185,17 @@ enum Commands {
         /// Sort descending (Z→A, high→low)
         #[arg(short = 'd')]
         descending: bool,
+    },
+
+    /// Subscribe to real-time events from the playback system
+    Subscribe {
+        /// Event gateway address
+        #[arg(long, env = "MDMA_EVENT_GATEWAY")]
+        event_gateway: Option<String>,
+
+        /// Topic filter (e.g. "playback/track_started"). Default: all playback events.
+        #[arg(long)]
+        topic: Option<String>,
     },
 }
 
@@ -1578,6 +1591,82 @@ fn handle_playback_stop(media_client: &PlaybackBackend) -> Result<()> {
 }
 
 // =============================================================================
+// Subscribe Command Handler
+// =============================================================================
+
+fn handle_subscribe(event_gateway: &str, topic: Option<&str>) -> Result<()> {
+    use std::io::IsTerminal;
+
+    let socket = nng::Socket::new(nng::Protocol::Sub0)
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to create Sub0 socket: {}", e))?;
+
+    // Subscribe to the requested topic prefix, or all playback events
+    let sub_topic = topic.unwrap_or(TOPIC_PLAYBACK);
+    socket
+        .set_opt::<nng::options::protocol::pubsub::Subscribe>(sub_topic.as_bytes().to_vec())
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to set subscription: {}", e))?;
+
+    // Resolve hostname for .local mDNS addresses
+    let resolved = nng_transport::resolve_tcp_hostname(event_gateway)
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to resolve address: {}", e))?;
+
+    socket
+        .dial(&resolved)
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to connect to {}: {}", event_gateway, e))?;
+
+    let is_tty = std::io::stdout().is_terminal();
+
+    if is_tty {
+        eprintln!("Subscribed to {} (topic: {})", event_gateway, sub_topic);
+        eprintln!("Waiting for events... (Ctrl-C to stop)");
+    }
+
+    loop {
+        let msg = socket
+            .recv()
+            .map_err(|e| color_eyre::eyre::eyre!("Receive error: {}", e))?;
+
+        match from_topic_message(msg.as_slice()) {
+            Ok((_topic, event)) => {
+                if is_tty {
+                    print_event_human(&event);
+                } else {
+                    // Pipe mode: raw JSON, one line per event
+                    println!(
+                        "{}",
+                        serde_json::to_string(&event).unwrap_or_else(|_| format!("{:?}", event))
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to parse event: {}", e);
+            }
+        }
+    }
+}
+
+fn print_event_human(event: &PlaybackEvent) {
+    match event {
+        PlaybackEvent::TrackStarted { hash } => {
+            println!("{} {}", "▶ started".green().bold(), hash.bright_black());
+        }
+        PlaybackEvent::TrackEnded { hash } => {
+            println!("{} {}", "■ ended".yellow().bold(), hash.bright_black());
+        }
+        PlaybackEvent::TrackStopped { hash } => {
+            println!("{} {}", "⏹ stopped".red().bold(), hash.bright_black());
+        }
+        PlaybackEvent::QueueChanged { length } => {
+            println!(
+                "{} {} track(s)",
+                "♫ queue".blue().bold(),
+                length.to_string().bold()
+            );
+        }
+    }
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -1736,6 +1825,36 @@ fn main() -> Result<()> {
         } => {
             let client = connect_library(&cli);
             handle_sort(&client, field.clone(), *ascending, *descending)
+        }
+        Commands::Subscribe {
+            event_gateway,
+            topic,
+        } => {
+            // Derive event gateway from MDMA_GATEWAY if not explicitly set
+            let addr = match event_gateway {
+                Some(a) => a.clone(),
+                None => {
+                    // Try to derive from MDMA_GATEWAY by changing port to 5556
+                    match &cli.gateway {
+                        Some(gw) => {
+                            // Replace the port in the gateway address
+                            if let Some(base) = gw.rsplit_once(':') {
+                                format!("{}:5556", base.0)
+                            } else {
+                                eprintln!("Cannot derive event gateway from MDMA_GATEWAY={}", gw);
+                                eprintln!("Set --event-gateway or MDMA_EVENT_GATEWAY explicitly");
+                                std::process::exit(1);
+                            }
+                        }
+                        None => {
+                            eprintln!("No event gateway specified.");
+                            eprintln!("Set --event-gateway, MDMA_EVENT_GATEWAY, or MDMA_GATEWAY");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            };
+            handle_subscribe(&addr, topic.as_deref())
         }
     }
 }

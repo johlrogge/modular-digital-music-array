@@ -88,6 +88,7 @@ impl FactAggregator<ContentHash, MusicValue, FactSource> for AggregatedTrack {
             HasAlbumArt(has) => self.has_album_art = *has,
             EncoderSoftware(s) => self.encoder_software = Some(s.clone()),
             EncodedBy(s) => self.encoded_by = Some(s.clone()),
+            Played(_) | Skipped(_) => {} // play history — not aggregated metadata
         }
     }
 
@@ -131,6 +132,7 @@ impl FactAggregator<ContentHash, MusicValue, FactSource> for AggregatedTrack {
             HasAlbumArt(_) => self.has_album_art = false,
             EncoderSoftware(_) => self.encoder_software = None,
             EncodedBy(_) => self.encoded_by = None,
+            Played(_) | Skipped(_) => {} // play history — not retractable metadata
         }
     }
 

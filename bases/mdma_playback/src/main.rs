@@ -30,6 +30,14 @@ struct Args {
     /// Path to queue persistence file (relative to cwd, which should be /music)
     #[arg(long, default_value = "queue.json")]
     queue_file: PathBuf,
+
+    /// Event publishing socket (Pub0) for real-time notifications
+    #[arg(long, default_value = "ipc:///run/mdma/events.sock")]
+    event_socket: String,
+
+    /// Path to the facts stream file for play history
+    #[arg(long, default_value = "/metadata/facts.jsonl")]
+    facts_path: PathBuf,
 }
 
 fn main() -> Result<()> {
@@ -51,7 +59,11 @@ fn main() -> Result<()> {
         socket.listen(tcp)?;
     }
 
-    let server = Server::new(engine, socket, args.queue_file);
+    let event_pub = Socket::new(Protocol::Pub0)?;
+    info!("Event publishing on {}", args.event_socket);
+    event_pub.listen(&args.event_socket)?;
+
+    let server = Server::new(engine, socket, args.queue_file, event_pub, args.facts_path);
     runtime.block_on(server.run())?;
 
     Ok(())

@@ -13,6 +13,9 @@ path = "src/main.rs"
 [dependencies]
 playback-engine = { path = "../../components/playback_engine" }
 media-protocol = { path = "../../components/media_protocol" }
+event-protocol = { path = "../../components/event_protocol" }
+music-facts = { path = "../../components/music_facts" }
+stainless-facts = { git = "https://github.com/johlrogge/stainless_facts" }
 tokio = { workspace = true, features = ["full"] }
 color-eyre = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
@@ -23,3 +26,4 @@ tracing-subscriber = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+chrono = { workspace = true }

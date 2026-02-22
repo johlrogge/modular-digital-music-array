@@ -1,4 +1,5 @@
 use crate::primitives::*;
+use chrono::{DateTime, Utc};
 use music_primitives::{Bpm, Key};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -135,6 +136,15 @@ pub enum MusicValue {
 
     /// Who encoded the file (e.g., "Beatport")
     EncodedBy(String),
+
+    // ========================================================================
+    // Play History
+    // ========================================================================
+    /// Track was played to completion (or near-completion)
+    Played(DateTime<Utc>),
+
+    /// Track was stopped before finishing (skipped)
+    Skipped(DateTime<Utc>),
 }
 
 impl MusicValue {
@@ -173,6 +183,8 @@ impl MusicValue {
             MusicValue::HasAlbumArt(_) => "HasAlbumArt",
             MusicValue::EncoderSoftware(_) => "EncoderSoftware",
             MusicValue::EncodedBy(_) => "EncodedBy",
+            MusicValue::Played(_) => "Played",
+            MusicValue::Skipped(_) => "Skipped",
         }
     }
 }
@@ -212,6 +224,8 @@ impl fmt::Display for MusicValue {
             MusicValue::HasAlbumArt(b) => write!(f, "{}", if *b { "yes" } else { "no" }),
             MusicValue::EncoderSoftware(s) => write!(f, "{}", s),
             MusicValue::EncodedBy(s) => write!(f, "{}", s),
+            MusicValue::Played(dt) => write!(f, "{}", dt.to_rfc3339()),
+            MusicValue::Skipped(dt) => write!(f, "{}", dt.to_rfc3339()),
         }
     }
 }

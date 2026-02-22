@@ -16,7 +16,13 @@ clap = { workspace = true, features = ["derive"] }
 color-eyre = { workspace = true }
 
 # Client abstraction (gateway or direct)
+event-protocol = { path = "../../components/event_protocol" }
 mdma-client = { path = "../../components/mdma_client" }
+
+# Event subscription
+nng = { workspace = true }
+nng-transport = { path = "../../components/nng_transport" }
+serde_json = { workspace = true }
 
 # IPC (still needed for protocol types re-exported by mdma-client)
 library-ipc-client = { path = "../../components/library_ipc_client" }

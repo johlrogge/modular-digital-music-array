@@ -1163,6 +1163,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "event-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "extended"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2398,9 +2406,13 @@ dependencies = [
  "color-eyre",
  "colored",
  "corsett",
+ "event-protocol",
  "library-ipc-client",
  "library-search",
  "mdma-client",
+ "nng",
+ "nng-transport",
+ "serde_json",
  "source-protocol",
  "terminal_size",
 ]
@@ -2450,6 +2462,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "color-eyre",
+ "event-protocol",
  "gateway-protocol",
  "library-ipc-protocol",
  "media-protocol",
@@ -2476,14 +2489,18 @@ dependencies = [
 name = "mdma-playback"
 version = "0.2.0"
 dependencies = [
+ "chrono",
  "clap",
  "color-eyre",
+ "event-protocol",
  "media-protocol",
+ "music-facts",
  "nng",
  "parking_lot",
  "playback-engine",
  "serde",
  "serde_json",
+ "stainless-facts",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

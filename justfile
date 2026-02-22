@@ -1055,6 +1055,41 @@ deploy-gateway: gateway-cross
     echo ""
     echo "Gateway deployed! TCP on port 5555"
 
+# Cross-compile CLI (mdma) for aarch64
+[group('build')]
+cli-cross:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building mdma CLI for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin mdma
+    echo ""
+    echo "CLI built!"
+    file target/aarch64-unknown-linux-gnu/release/mdma
+    ls -lh target/aarch64-unknown-linux-gnu/release/mdma
+
+# Deploy CLI (mdma) to Pi - installs as /usr/bin/mdma, no service required
+[group('dev')]
+deploy-cli: cli-cross
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    HOST="${PI_HOST:-mdma-909.local}"
+    BINARY="target/aarch64-unknown-linux-gnu/release/mdma"
+    SSH_KEY="$HOME/.ssh/mdma_pi"
+
+    echo "Deploying mdma CLI to $HOST..."
+
+    scp -4 -i "$SSH_KEY" "$BINARY" "admin@${HOST}:/tmp/"
+
+    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo mv /tmp/mdma /usr/bin/mdma
+        sudo chmod +x /usr/bin/mdma
+        mdma --version'
+
+    echo ""
+    echo "CLI deployed! Run: mdma --help"
+
 # Deploy bandcamp service to Pi
 [group('dev')]
 deploy-bandcamp: bandcamp-cross
