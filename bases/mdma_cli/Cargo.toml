@@ -26,3 +26,4 @@ source-protocol = { path = "../../components/source_protocol" }
 # Output formatting
 colored = "2.0"
 corsett = { path = "../../../corsett" }
+terminal_size = "0.4"

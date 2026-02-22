@@ -480,12 +480,21 @@ impl TrackRow {
     }
 }
 
-/// Detect terminal width from $COLUMNS env var, fallback to 100.
+/// Detect terminal width.
+///
+/// Priority:
+/// 1. `$COLUMNS` env var — honoured first so BDD tests can override the width.
+/// 2. ioctl via `terminal_size` — reads the actual PTY/terminal dimensions.
+/// 3. Hard-coded fallback of 80 — used in CI / piped contexts.
 fn terminal_width() -> usize {
-    std::env::var("COLUMNS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100)
+    // Prefer $COLUMNS if explicitly set (e.g. in BDD tests)
+    if let Some(w) = std::env::var("COLUMNS").ok().and_then(|s| s.parse().ok()) {
+        return w;
+    }
+    // Query the actual terminal via ioctl
+    terminal_size::terminal_size()
+        .map(|(w, _)| w.0 as usize)
+        .unwrap_or(80)
 }
 
 /// Fit a string to exactly `width` visible chars: truncate with trailing `…` if too long, pad with
@@ -1840,5 +1849,30 @@ mod tests {
                 stripped
             );
         }
+    }
+
+    #[test]
+    fn terminal_width_reads_columns_env_var() {
+        // When $COLUMNS is set to a valid integer, terminal_width() must return it.
+        std::env::set_var("COLUMNS", "75");
+        let w = terminal_width();
+        std::env::remove_var("COLUMNS");
+        assert_eq!(
+            w, 75,
+            "terminal_width() should return the value of $COLUMNS"
+        );
+    }
+
+    #[test]
+    fn terminal_width_fallback_is_80_not_100() {
+        // When $COLUMNS is absent and there is no real TTY (CI / piped),
+        // terminal_width() must fall back to 80, not 100.
+        std::env::remove_var("COLUMNS");
+        let w = terminal_width();
+        // In a CI environment there is no TTY, so terminal_size() returns None
+        // and we must fall back to 80.  If there happens to be a TTY (rare in
+        // tests) the result will be the actual terminal width, which is fine —
+        // we only care that 100 is never returned as the hard-coded default.
+        assert_ne!(w, 100, "terminal_width() must not fall back to 100");
     }
 }

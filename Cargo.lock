@@ -2402,6 +2402,7 @@ dependencies = [
  "library-search",
  "mdma-client",
  "source-protocol",
+ "terminal_size",
 ]
 
 [[package]]
