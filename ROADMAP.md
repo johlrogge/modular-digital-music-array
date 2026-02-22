@@ -1,6 +1,6 @@
 # MDMA Roadmap
 
-**Last updated:** February 21, 2026
+**Last updated:** February 22, 2026
 
 ## Where We Are
 
@@ -10,13 +10,15 @@ NVMe boot working. mdma-console stub deployed. `just deploy-dev` working.
 
 **Milestone 1 Part 2 (Music Library): Operational**
 
-mdma-library running with nng IPC. 329 tracks indexed. Bandcamp sync operational. mdma-cli for search/list/facts from laptop.
+mdma-library running with nng IPC. 339 tracks indexed. Bandcamp sync operational. mdma-cli for search/list/facts from laptop.
 
 **Milestone 1 Part 3 (Audio Playback): COMPLETE — Feb 20, 2026**
 
-Playback bugs fixed and verified on real hardware (commit 01c21db). Rymden3000 (24-bit / 44.1 kHz FLAC) plays at correct speed and full fidelity through iFi USB DAC. Full chain working: laptop CLI → TCP → mdma-library → mdma-playback → PipeWire → iFi DAC.
+Playback bugs fixed and verified on real hardware. 192 kHz upsampled output through iFi USB DAC. Full chain working.
 
-**First real playback milestone: complete.**
+**Gateway + Packaging: COMPLETE — Feb 22, 2026**
+
+All services behind the gateway. Only port 5555 exposed. void-packages as single source of truth for run scripts. Clean deploy from laptop via `just deploy-*`. Verified end-to-end: ping, status, search, queue, playback, source commands all work through gateway.
 
 ---
 
@@ -94,17 +96,12 @@ Always output at the iFi DAC's maximum supported rate (probe at startup — like
 
 ---
 
-### ~~3a. Single API Gateway~~ — COMPLETE (code)
+### ~~3a. Single API Gateway + Packaging~~ — COMPLETE
 
-**Gateway code complete, not yet deployed.**
+**Deployed and verified end-to-end on Pi — Feb 22, 2026.**
 
-New crates:
-- `source_protocol` — unified request/response for all music sources (Bandcamp, future Beatport, etc.)
-- `gateway_protocol` — envelope types wrapping library, playback, and source requests
-- `gateway_client` — NNG client for the gateway
-- `mdma_gateway` — binary: single TCP port routing to library, playback, and auto-discovered sources
+Gateway routes all traffic through `tcp://0.0.0.0:5555`. Library and playback are IPC-only (no `--tcp` flags). Only ports exposed: 5555 (gateway) and 80 (console).
 
-Architecture:
 ```
 External clients (laptop CLI)
        |
@@ -121,13 +118,12 @@ mdma-library  mdma-playback  /run/mdma/sources/*.sock
 (ipc fixed)   (ipc fixed)   (auto-discovered)
 ```
 
-- Source discovery: any service dropping a `.sock` in `/run/mdma/sources/` is automatically available
-- `mdma-bandcamp` adapted to `source_protocol`, socket at `/run/mdma/sources/bandcamp.sock`
-- CLI: `Commands::Bandcamp` replaced with `Commands::Source` (list/sync/status/downloads/cancel/pause/resume)
-- CLI: `--gateway`/`MDMA_GATEWAY` env var for single-address mode; falls back to direct IPC when unset
-- Deprecated: `bandcamp_ipc_protocol`, `bandcamp_ipc_client` (still in workspace, no longer used)
-
-**Remaining:** Deploy to Pi, verify end-to-end, update CLAUDE.md env vars.
+**void-packages as single source of truth:**
+- All 6 services have srcpkg entries: `void-packages/srcpkgs/<name>/template` + `files/<name>/run`
+- Package scripts and deploy recipes copy run scripts from void-packages (no more heredocs)
+- CLI: `LibraryBackend` + `PlaybackBackend` enums dispatch via gateway or direct IPC
+- `MDMA_GATEWAY` is the only env var needed from laptop
+- Provisioning (stage5) installs and enables all 6 services
 
 ---
 
@@ -252,11 +248,7 @@ ssh -4 -i ~/.ssh/mdma_pi admin@mdma-909.local
 export MDMA_GATEWAY="tcp://mdma-909.local:5555"
 ```
 
-**Direct access (library/playback bypass gateway for now):**
-```bash
-export MDMA_LIBRARY_SOCKET="tcp://mdma-909.local:5558"
-export MDMA_PLAYBACK_SOCKET="tcp://mdma-909.local:5557"
-```
+All services are behind the gateway. No per-service TCP ports exposed.
 
 ---
 
@@ -272,6 +264,18 @@ export MDMA_PLAYBACK_SOCKET="tcp://mdma-909.local:5557"
 ---
 
 ## Update History
+
+- **2026-02-22:** Priority 3a fully complete — gateway deployed and verified on Pi.
+  - All services behind gateway: only ports 5555 (gateway) and 80 (console) exposed
+  - Library and playback run IPC-only (no more `--tcp` flags, no ports 5557/5558)
+  - void-packages as single source of truth: 6 srcpkg entries with templates + run scripts
+  - Package scripts and deploy recipes copy run scripts from void-packages (no heredocs)
+  - CLI: `LibraryBackend` + `PlaybackBackend` enums with Direct/Gateway variants
+  - Deploy recipes handle first-time install (wait for runit supervise directory)
+  - devenv.nix: only `MDMA_GATEWAY` env var, `mdma-status` checks gateway + console
+  - Provisioning (stage5): installs and enables all 6 services
+  - Verified: ping, status, search, list, queue, playback play/stop/now, source list/status
+  - **Next:** Pub/sub events, codebase audit, or full reinstall validation
 
 - **2026-02-21 (night):** Priority 3a (Gateway) code complete.
   - `source_protocol`: unified request/response for all music sources (Ping, GetStatus, Sync, ListDownloads, Cancel, Pause, Resume)
