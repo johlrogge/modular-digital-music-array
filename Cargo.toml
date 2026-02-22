@@ -24,6 +24,8 @@ members = [
     "components/source_protocol",
     "components/gateway_protocol",
     "components/gateway_client",
+    "components/mdma_client",
+    "components/library_service",
     # Bases (entry points)
     "bases/download_cli",
     "bases/media_ctl",
@@ -35,6 +37,8 @@ members = [
     "bases/mdma_cli",
     "bases/mdma_bandcamp",
     "bases/mdma_gateway",
+    # Tests
+    "tests/bdd",
 ]
 resolver = "2"
 

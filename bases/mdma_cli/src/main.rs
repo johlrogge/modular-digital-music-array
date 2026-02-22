@@ -9,12 +9,10 @@ use corsett::{
     shortener::{FreeText, RightEllipsis},
     ColumnSizingConfigBuilder, RemovalPolicy, Row, Score, Shorten, ShortenAny,
 };
-use library_ipc_client::{
-    ClientError, ContentHash, InboxPath, IngestAllItem, IngestResult, LibraryClient,
-    LibraryRequest, LibraryResponse, ProtocolError, ServiceStatus, TrackInfo,
-};
+use library_ipc_client::{ClientError, ContentHash, InboxPath, ProtocolError, TrackInfo};
 use library_search::{parse_numeric_query, parse_string_query, TrackQuery};
-use media_client::{Command, Deck, MediaClient, Response, ResponseData};
+use mdma_client::{LibraryBackend, PlaybackBackend, SourceClient};
+use media_client::Deck;
 use source_protocol::{SourceRequest, SourceResponse};
 
 // =============================================================================
@@ -332,443 +330,47 @@ enum QueueCommands {
 }
 
 // =============================================================================
-// Source Client Abstraction
+// Connection Helpers
 // =============================================================================
-
-/// Abstraction for sending source requests, works in both gateway and direct mode.
-enum SourceClient {
-    Gateway(gateway_client::GatewayClient),
-    Direct(nng::Socket),
-}
-
-impl SourceClient {
-    fn request(&self, name: &str, req: &SourceRequest) -> Result<SourceResponse, String> {
-        match self {
-            SourceClient::Gateway(gw) => gw.source_request(name, req).map_err(|e| e.to_string()),
-            SourceClient::Direct(socket) => {
-                let data = serde_json::to_vec(req).map_err(|e| e.to_string())?;
-                let msg = nng::Message::from(&data[..]);
-                socket
-                    .send(msg)
-                    .map_err(|(_, e)| format!("send failed: {}", e))?;
-                let resp_msg = socket.recv().map_err(|e| format!("recv failed: {}", e))?;
-                serde_json::from_slice(&resp_msg).map_err(|e| format!("parse failed: {}", e))
-            }
-        }
-    }
-}
-
-/// Connect to a source, via gateway or direct IPC.
-fn connect_source(cli: &Cli, name: &str) -> SourceClient {
-    if let Some(ref gw_addr) = cli.gateway {
-        match gateway_client::GatewayClient::connect(gw_addr) {
-            Ok(gw) => return SourceClient::Gateway(gw),
-            Err(e) => {
-                eprintln!("Failed to connect to gateway at {}: {}", gw_addr, e);
-                std::process::exit(1);
-            }
-        }
-    }
-
-    // Direct mode: connect to /run/mdma/sources/{name}.sock
-    let socket_path = format!("ipc://{}/{}.sock", cli.sources_dir, name);
-    match nng_transport::connect(&socket_path) {
-        Ok(socket) => SourceClient::Direct(socket),
-        Err(e) => {
-            eprintln!(
-                "Failed to connect to source '{}' at {}: {}",
-                name, socket_path, e
-            );
-            eprintln!("Is mdma-{} running?", name);
-            std::process::exit(1);
-        }
-    }
-}
-
-/// List available sources (gateway or directory scan).
-fn list_available_sources(cli: &Cli) -> Vec<String> {
-    if let Some(ref gw_addr) = cli.gateway {
-        match gateway_client::GatewayClient::connect(gw_addr) {
-            Ok(gw) => match gw.list_sources() {
-                Ok(names) => return names,
-                Err(e) => {
-                    eprintln!("Failed to list sources: {}", e);
-                    std::process::exit(1);
-                }
-            },
-            Err(e) => {
-                eprintln!("Failed to connect to gateway at {}: {}", gw_addr, e);
-                std::process::exit(1);
-            }
-        }
-    }
-
-    // Direct mode: scan sources directory
-    let entries = match std::fs::read_dir(&cli.sources_dir) {
-        Ok(e) => e,
-        Err(_) => return vec![],
-    };
-
-    entries
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            if path.extension()?.to_str()? == "sock" {
-                path.file_stem()?.to_str().map(|s| s.to_string())
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-// =============================================================================
-// Library Backend (gateway or direct)
-// =============================================================================
-
-/// Abstraction for library requests, works in both gateway and direct mode.
-enum LibraryBackend {
-    Direct(LibraryClient),
-    Gateway(gateway_client::GatewayClient),
-}
-
-fn map_gw_to_lib_error(e: gateway_client::ClientError) -> ClientError {
-    match e {
-        gateway_client::ClientError::Connection(e) => ClientError::Connection(e),
-        gateway_client::ClientError::Nng(e) => ClientError::Nng(e),
-        gateway_client::ClientError::Serialization(e) => ClientError::Serialization(e),
-        gateway_client::ClientError::Gateway(msg) => {
-            ClientError::Protocol(ProtocolError::Internal { message: msg })
-        }
-    }
-}
-
-impl LibraryBackend {
-    fn request(&self, req: &LibraryRequest) -> Result<LibraryResponse, ClientError> {
-        match self {
-            LibraryBackend::Direct(c) => c.request(req),
-            LibraryBackend::Gateway(gw) => gw.library_request(req).map_err(map_gw_to_lib_error),
-        }
-    }
-
-    fn ping(&self) -> Result<(), ClientError> {
-        match self.request(&LibraryRequest::Ping)? {
-            LibraryResponse::Pong => Ok(()),
-            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
-            _ => Err(ClientError::Protocol(ProtocolError::Internal {
-                message: "Unexpected response to Ping".to_string(),
-            })),
-        }
-    }
-
-    fn status(&self) -> Result<ServiceStatus, ClientError> {
-        match self.request(&LibraryRequest::GetStatus)? {
-            LibraryResponse::Status(status) => Ok(status),
-            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
-            _ => Err(ClientError::Protocol(ProtocolError::Internal {
-                message: "Unexpected response to GetStatus".to_string(),
-            })),
-        }
-    }
-
-    fn list_tracks(&self, limit: Option<usize>) -> Result<Vec<TrackInfo>, ClientError> {
-        match self.request(&LibraryRequest::ListTracks { limit })? {
-            LibraryResponse::Tracks(tracks) => Ok(tracks),
-            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
-            _ => Err(ClientError::Protocol(ProtocolError::Internal {
-                message: "Unexpected response to ListTracks".to_string(),
-            })),
-        }
-    }
-
-    fn get_track(&self, hash: &ContentHash) -> Result<TrackInfo, ClientError> {
-        match self.request(&LibraryRequest::GetTrack { hash: hash.clone() })? {
-            LibraryResponse::Track(track) => Ok(track),
-            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
-            _ => Err(ClientError::Protocol(ProtocolError::Internal {
-                message: "Unexpected response to GetTrack".to_string(),
-            })),
-        }
-    }
-
-    fn get_facts(
-        &self,
-        hash: &ContentHash,
-    ) -> Result<(ContentHash, Vec<(String, String)>), ClientError> {
-        match self.request(&LibraryRequest::GetFacts { hash: hash.clone() })? {
-            LibraryResponse::Facts { hash, facts } => Ok((hash, facts)),
-            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
-            _ => Err(ClientError::Protocol(ProtocolError::Internal {
-                message: "Unexpected response to GetFacts".to_string(),
-            })),
-        }
-    }
-
-    fn search(&self, query: &TrackQuery) -> Result<Vec<TrackInfo>, ClientError> {
-        match self.request(&LibraryRequest::Search {
-            query: query.clone(),
-        })? {
-            LibraryResponse::SearchResults(tracks) => Ok(tracks),
-            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
-            _ => Err(ClientError::Protocol(ProtocolError::Internal {
-                message: "Unexpected response to Search".to_string(),
-            })),
-        }
-    }
-
-    fn get_fact_values(&self, fact_type: &str) -> Result<Vec<String>, ClientError> {
-        match self.request(&LibraryRequest::GetFactValues {
-            fact_type: fact_type.to_string(),
-        })? {
-            LibraryResponse::FactValues(values) => Ok(values),
-            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
-            _ => Err(ClientError::Protocol(ProtocolError::Internal {
-                message: "Unexpected response to GetFactValues".to_string(),
-            })),
-        }
-    }
-
-    fn inbox_queue(&self) -> Result<Vec<InboxPath>, ClientError> {
-        match self.request(&LibraryRequest::GetInboxQueue)? {
-            LibraryResponse::InboxQueue(paths) => Ok(paths),
-            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
-            _ => Err(ClientError::Protocol(ProtocolError::Internal {
-                message: "Unexpected response to GetInboxQueue".to_string(),
-            })),
-        }
-    }
-
-    fn ingest_file(&self, path: &InboxPath) -> Result<IngestResult, ClientError> {
-        match self.request(&LibraryRequest::IngestFile {
-            path: path.clone(),
-            source: None,
-        })? {
-            LibraryResponse::IngestResult(result) => Ok(result),
-            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
-            _ => Err(ClientError::Protocol(ProtocolError::Internal {
-                message: "Unexpected response to IngestFile".to_string(),
-            })),
-        }
-    }
-
-    fn delete_inbox_file(&self, path: &InboxPath) -> Result<IngestResult, ClientError> {
-        match self.request(&LibraryRequest::DeleteInboxFile { path: path.clone() })? {
-            LibraryResponse::IngestResult(result) => Ok(result),
-            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
-            _ => Err(ClientError::Protocol(ProtocolError::Internal {
-                message: "Unexpected response to DeleteInboxFile".to_string(),
-            })),
-        }
-    }
-
-    fn ingest_all(&self) -> Result<Vec<IngestAllItem>, ClientError> {
-        match self.request(&LibraryRequest::IngestAll)? {
-            LibraryResponse::IngestAllResult(results) => Ok(results),
-            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
-            _ => Err(ClientError::Protocol(ProtocolError::Internal {
-                message: "Unexpected response to IngestAll".to_string(),
-            })),
-        }
-    }
-}
 
 /// Connect to the library backend (gateway or direct).
 fn connect_library(cli: &Cli) -> LibraryBackend {
-    if let Some(ref gw_addr) = cli.gateway {
-        match gateway_client::GatewayClient::connect(gw_addr) {
-            Ok(gw) => LibraryBackend::Gateway(gw),
-            Err(e) => {
-                eprintln!("Failed to connect to gateway at {}: {}", gw_addr, e);
-                std::process::exit(1);
-            }
-        }
-    } else {
-        match LibraryClient::connect(&cli.socket) {
-            Ok(c) => LibraryBackend::Direct(c),
-            Err(e) => {
-                eprintln!("Failed to connect to library at {}: {}", cli.socket, e);
+    match LibraryBackend::connect(cli.gateway.as_deref(), &cli.socket) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to connect to library: {}", e);
+            if cli.gateway.is_none() {
                 eprintln!("Is mdma-library running?");
-                std::process::exit(1);
             }
-        }
-    }
-}
-
-// =============================================================================
-// Playback Backend (gateway or direct)
-// =============================================================================
-
-/// Abstraction for playback commands, works in both gateway and direct mode.
-enum PlaybackBackend {
-    Direct(MediaClient),
-    Gateway(gateway_client::GatewayClient),
-}
-
-fn map_gw_to_media_error(e: gateway_client::ClientError) -> media_client::ClientError {
-    match e {
-        gateway_client::ClientError::Connection(e) => media_client::ClientError::Connection(e),
-        gateway_client::ClientError::Nng(e) => media_client::ClientError::Nng(e),
-        gateway_client::ClientError::Serialization(e) => {
-            media_client::ClientError::Serialization(e)
-        }
-        gateway_client::ClientError::Gateway(msg) => media_client::ClientError::Command(msg),
-    }
-}
-
-impl PlaybackBackend {
-    fn gw_send(&self, cmd: Command) -> Result<Response, media_client::ClientError> {
-        match self {
-            PlaybackBackend::Gateway(gw) => {
-                gw.playback_command(&cmd).map_err(map_gw_to_media_error)
-            }
-            PlaybackBackend::Direct(_) => unreachable!(),
-        }
-    }
-
-    fn gw_command(&self, cmd: Command) -> Result<(), media_client::ClientError> {
-        let response = self.gw_send(cmd)?;
-        if !response.success {
-            return Err(media_client::ClientError::Command(response.error_message));
-        }
-        Ok(())
-    }
-
-    fn gw_command_with_data(
-        &self,
-        cmd: Command,
-    ) -> Result<ResponseData, media_client::ClientError> {
-        let response = self.gw_send(cmd)?;
-        if !response.success {
-            return Err(media_client::ClientError::Command(response.error_message));
-        }
-        response
-            .data
-            .ok_or_else(|| media_client::ClientError::Command("Missing response data".to_string()))
-    }
-
-    fn play_queue(&self) -> Result<(), media_client::ClientError> {
-        match self {
-            PlaybackBackend::Direct(c) => c.play_queue(),
-            PlaybackBackend::Gateway(_) => self.gw_command(Command::PlayQueue),
-        }
-    }
-
-    fn stop(&self, deck: Deck) -> Result<(), media_client::ClientError> {
-        match self {
-            PlaybackBackend::Direct(c) => c.stop(deck),
-            PlaybackBackend::Gateway(_) => self.gw_command(Command::Stop { deck }),
-        }
-    }
-
-    fn now_playing(&self) -> Result<Option<ContentHash>, media_client::ClientError> {
-        match self {
-            PlaybackBackend::Direct(c) => c.now_playing(),
-            PlaybackBackend::Gateway(_) => {
-                let data = self.gw_command_with_data(Command::NowPlaying)?;
-                if let ResponseData::NowPlaying(hash) = data {
-                    Ok(hash)
-                } else {
-                    Err(media_client::ClientError::Command(
-                        "Unexpected response data type".to_string(),
-                    ))
-                }
-            }
-        }
-    }
-
-    fn queue_next(
-        &self,
-        hash: ContentHash,
-        path: std::path::PathBuf,
-    ) -> Result<(), media_client::ClientError> {
-        match self {
-            PlaybackBackend::Direct(c) => c.queue_next(hash, path),
-            PlaybackBackend::Gateway(_) => self.gw_command(Command::QueueNext { hash, path }),
-        }
-    }
-
-    fn queue_append(
-        &self,
-        hash: ContentHash,
-        path: std::path::PathBuf,
-    ) -> Result<(), media_client::ClientError> {
-        match self {
-            PlaybackBackend::Direct(c) => c.queue_append(hash, path),
-            PlaybackBackend::Gateway(_) => self.gw_command(Command::QueueAppend { hash, path }),
-        }
-    }
-
-    fn queue_list(&self) -> Result<Vec<ContentHash>, media_client::ClientError> {
-        match self {
-            PlaybackBackend::Direct(c) => c.queue_list(),
-            PlaybackBackend::Gateway(_) => {
-                let data = self.gw_command_with_data(Command::QueueList)?;
-                if let ResponseData::Queue(hashes) = data {
-                    Ok(hashes)
-                } else {
-                    Err(media_client::ClientError::Command(
-                        "Unexpected response data type".to_string(),
-                    ))
-                }
-            }
-        }
-    }
-
-    fn queue_clear(&self) -> Result<(), media_client::ClientError> {
-        match self {
-            PlaybackBackend::Direct(c) => c.queue_clear(),
-            PlaybackBackend::Gateway(_) => self.gw_command(Command::QueueClear),
-        }
-    }
-
-    fn queue_replace(
-        &self,
-        entries: Vec<(ContentHash, std::path::PathBuf)>,
-    ) -> Result<(), media_client::ClientError> {
-        match self {
-            PlaybackBackend::Direct(c) => c.queue_replace(entries),
-            PlaybackBackend::Gateway(_) => self.gw_command(Command::QueueReplace { entries }),
-        }
-    }
-
-    fn queue_remove(&self, hashes: Vec<ContentHash>) -> Result<usize, media_client::ClientError> {
-        match self {
-            PlaybackBackend::Direct(c) => c.queue_remove(hashes),
-            PlaybackBackend::Gateway(_) => {
-                let data = self.gw_command_with_data(Command::QueueRemove { hashes })?;
-                if let ResponseData::Count(n) = data {
-                    Ok(n)
-                } else {
-                    Err(media_client::ClientError::Command(
-                        "Unexpected response data type".to_string(),
-                    ))
-                }
-            }
+            std::process::exit(1);
         }
     }
 }
 
 /// Connect to the playback backend (gateway or direct).
 fn connect_playback(cli: &Cli) -> PlaybackBackend {
-    if let Some(ref gw_addr) = cli.gateway {
-        match gateway_client::GatewayClient::connect(gw_addr) {
-            Ok(gw) => PlaybackBackend::Gateway(gw),
-            Err(e) => {
-                eprintln!("Failed to connect to gateway at {}: {}", gw_addr, e);
-                std::process::exit(1);
-            }
-        }
-    } else {
-        match MediaClient::connect(&cli.playback_socket) {
-            Ok(c) => PlaybackBackend::Direct(c),
-            Err(e) => {
-                eprintln!(
-                    "Failed to connect to playback at {}: {}",
-                    cli.playback_socket, e
-                );
+    match PlaybackBackend::connect(cli.gateway.as_deref(), &cli.playback_socket) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to connect to playback: {}", e);
+            if cli.gateway.is_none() {
                 eprintln!("Is mdma-playback running?");
-                std::process::exit(1);
             }
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Connect to a source, via gateway or direct IPC.
+fn connect_source(cli: &Cli, name: &str) -> SourceClient {
+    match SourceClient::connect(cli.gateway.as_deref(), &cli.sources_dir, name) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{}", e);
+            if cli.gateway.is_none() {
+                eprintln!("Is mdma-{} running?", name);
+            }
+            std::process::exit(1);
         }
     }
 }
@@ -1338,7 +940,14 @@ fn handle_inbox_ingest_all(client: &LibraryBackend) -> Result<()> {
 // =============================================================================
 
 fn handle_source_list(cli: &Cli) -> Result<()> {
-    let sources = list_available_sources(cli);
+    let sources =
+        match mdma_client::list_available_sources(cli.gateway.as_deref(), &cli.sources_dir) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        };
     if sources.is_empty() {
         println!("No sources available");
     } else {

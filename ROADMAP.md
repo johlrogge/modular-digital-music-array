@@ -138,7 +138,40 @@ mdma-library  mdma-playback  /run/mdma/sources/*.sock
 
 ---
 
-### 4. Web UI Player Controls
+### 4. Pub/Sub Events + Play History Facts
+
+**Why now:** Prerequisite for every live UI — polybar, web, TUI, mdmamp. And play history facts are a cheap addition that unlocks powerful queries later.
+
+**Pub/sub events (unsolicited):**
+- `track_started`, `track_ended`, `position_update`, `queue_changed`
+- Subscribers get push notifications without polling
+- Enables: live position display, auto-updating queue, external widgets
+
+**Play history facts:**
+- When playback starts a track, append a `played` fact:
+  ```json
+  {"content_hash": "sha256:...", "fact_type": "played", "value": "2026-02-22T23:45:00Z", "source": "mdma-playback"}
+  ```
+- When a track is stopped/skipped before finishing, append a `skipped` fact
+- When a track finishes naturally, no extra fact needed — finishing is the default
+- Uses existing `stainless_facts` infrastructure — unknown fact types are safely ignored during aggregation
+- Enables: play count queries, `--never-played` filter, `--sort=play-count`, `--recently-played`, frequency-based recommendations
+
+---
+
+### 5. Polybar Widget
+
+**Why now:** First pub/sub consumer. Proves the event model works from an external client. Immediate developer value — see what's playing in the status bar.
+
+- Subscribes to `track_started`, `track_ended` events
+- Displays: `Artist - Title [duration]` or empty when stopped
+- Click actions: left=play, middle=next, right=stop
+- Requires: `--resolve` flag on `playback now` (force human-readable output in pipe mode)
+- Small scope: one CLI flag + shell scripts + polybar config
+
+---
+
+### 6. Web UI Player Controls
 
 **Why next:** The console (`mdma-console`) is a stub. It needs to be a usable player interface — the first front-end that isn't the CLI. This is what beta testers will interact with.
 
@@ -146,22 +179,11 @@ mdma-library  mdma-playback  /run/mdma/sources/*.sock
 - Queue view (current queue, highlight playing track)
 - Basic controls: play, stop, next, queue append/remove
 - Search and browse library
-- Requires pub/sub or polling for live updates (see 5)
+- Uses pub/sub for live updates (no polling)
 
 ---
 
-### 5. Pub/Sub Events
-
-**Why:** Enables live UIs (web, TUI, desktop). There is real state to observe (position, current track, queue contents).
-
-**Events (unsolicited):**
-- `track_started`, `track_ended`, `position_update`, `queue_changed`
-- Subscribers get push notifications without polling
-- Enables: live position display in web UI, auto-updating queue, TUI that refreshes
-
----
-
-### 6. MP3 Support + Manual Upload Source
+### 7. MP3 Support + Manual Upload Source
 
 **Why:** Beta testers have large MP3 libraries. FLAC-only blocks adoption. Not "hifi" but pragmatic.
 
@@ -173,7 +195,7 @@ mdma-library  mdma-playback  /run/mdma/sources/*.sock
 
 ---
 
-### 7. Bandcamp Configuration
+### 8. Bandcamp Configuration
 
 **Missing piece:** How does a fresh install configure the bandcamp service?
 
@@ -185,7 +207,7 @@ mdma-library  mdma-playback  /run/mdma/sources/*.sock
 
 ---
 
-### 8. Stream Management (Silence → Off)
+### 9. Stream Management (Silence → Off)
 
 - Auto-shutdown PipeWire stream after N seconds of silence (queue empty, no track playing)
 - Auto-restart when a track is queued/played
@@ -194,6 +216,12 @@ mdma-library  mdma-playback  /run/mdma/sources/*.sock
 ---
 
 ## Future Clients
+
+Ordered by complexity — simplest ships first.
+
+### Polybar Widget (priority 5 — next up)
+
+Simplest possible client: a status bar module. Shell scripts + polybar config. First pub/sub consumer — proves the event model works from an external process.
 
 ### TUI Client
 
@@ -238,8 +266,8 @@ This should happen before inviting other users onto the system.
 - Multi-deck UI — after single queue works
 - CDJ/Pro DJ Link integration — after Milestone 1 complete
 - Auto-updates — manual deploys fine during development
-- TUI client — after web UI proves the interaction model
-- mdmamp — after pub/sub and web UI are solid
+- TUI client — after polybar + web UI prove the interaction model
+- mdmamp — after pub/sub, polybar, and web UI are solid
 
 ---
 
@@ -319,6 +347,12 @@ All services are behind the gateway. No per-service TCP ports exposed.
 ---
 
 ## Update History
+
+- **2026-02-22 (night):** Roadmap restructured — pub/sub + play history facts moved to priority 4.
+  - Pub/sub events (`track_started`, `track_ended`, `position_update`, `queue_changed`) are prerequisite for all live UIs
+  - Play history facts: `played` and `skipped` facts via stainless_facts — enables play count, never-played, recently-played queries
+  - Polybar widget added as priority 5 — first pub/sub consumer, immediate dev value
+  - Web UI moved to priority 6, MP3 to 7, Bandcamp config to 8, Stream management to 9
 
 - **2026-02-22:** Priority 3a fully complete — gateway deployed and verified on Pi.
   - All services behind gateway: only ports 5555 (gateway) and 80 (console) exposed

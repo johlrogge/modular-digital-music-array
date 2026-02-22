@@ -205,7 +205,7 @@ pub struct IndexedTrack {
 }
 
 // =============================================================================
-// Helper functions (to be implemented)
+// Helper functions
 // =============================================================================
 
 /// Compute SHA256 hash of file contents (streaming, not loading into memory)
@@ -292,8 +292,6 @@ fn create_symlink(
     std::fs::create_dir_all(&symlink_dir)?;
 
     // Compute relative path from symlink to blob
-    // e.g., from /music/by-artist/Artist/Album/ to /music/blobs/a1/hash.flac
-    // = ../../../blobs/a1/hash.flac
     let relative_blob =
         pathdiff::diff_paths(blob_path, &symlink_dir).unwrap_or_else(|| blob_path.to_path_buf());
 

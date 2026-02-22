@@ -1,0 +1,39 @@
+[package]
+name = "mdma-bdd"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[test]]
+name = "cucumber"
+harness = false
+
+[dependencies]
+cucumber = "0.21"
+tokio = { workspace = true, features = ["full"] }
+tempfile = "3"
+
+# Client layer (what we're testing through)
+mdma-client = { path = "../../components/mdma_client" }
+
+# Service (real library, in-process)
+library-service = { path = "../../components/library_service" }
+
+# Protocol types (for playback simulator)
+media-protocol = { path = "../../components/media_protocol" }
+playback-primitives = { path = "../../components/playback_primitives" }
+library-ipc-protocol = { path = "../../components/library_ipc_protocol" }
+
+# For seeding test fact streams
+stainless-facts = { git = "https://github.com/johlrogge/stainless_facts" }
+music-facts = { path = "../../components/music_facts" }
+
+# Query parsing helpers
+library-search = { path = "../../components/library_search" }
+
+# Timestamps for fact seeding
+chrono = { workspace = true }
+
+# NNG (for playback simulator + client connections)
+nng = { workspace = true }
+serde_json = { workspace = true }

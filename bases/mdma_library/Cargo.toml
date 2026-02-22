@@ -12,37 +12,9 @@ tokio = { workspace = true, features = ["full", "fs"] }
 color-eyre = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
-serde = { workspace = true }
-serde_json = { workspace = true }
-chrono = { workspace = true, features = ["serde"] }
-thiserror = { workspace = true }
 
-# Internal components
-library-search = { path = "../../components/library_search" }
-music-facts = { path = "../../components/music_facts" }
-music-primitives = { path = "../../components/music_primitives" }
-flac-metadata = { path = "../../components/flac_metadata" }
-library-ipc-protocol = { path = "../../components/library_ipc_protocol" }
-
-# Fact stream
-stainless-facts = { git = "https://github.com/johlrogge/stainless_facts" }
-
-# Hashing
-sha2 = "0.10"
-hex = "0.4"
-
-# IPC
-nng = { workspace = true }
-
-# File watching
-notify = "6.1"
-
-# Path utilities
-pathdiff = "0.2"
+# Library service component (extracted)
+library-service = { path = "../../components/library_service" }
 
 # CLI
 clap = { workspace = true, features = ["derive"] }
-
-[dev-dependencies]
-rstest = { workspace = true }
-tempfile = "3"

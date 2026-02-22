@@ -1,11 +1,7 @@
 use clap::Parser;
 use color_eyre::Result;
 
-mod fact_generator;
-mod fact_writer;
-pub mod ipc;
-mod pipeline;
-mod service;
+use library_service::{service, LibraryService};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -67,7 +63,7 @@ async fn main() -> Result<()> {
     }
 
     // Initialize service
-    let library = service::LibraryService::new(args.music_dir, args.metadata_dir)?;
+    let library = LibraryService::new(args.music_dir, args.metadata_dir)?;
 
     tracing::info!(
         tracks = library.tracks_count(),

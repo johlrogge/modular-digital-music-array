@@ -1,0 +1,23 @@
+[package]
+name = "mdma-client"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+# IPC clients
+library-ipc-client = { path = "../library_ipc_client" }
+library-ipc-protocol = { path = "../library_ipc_protocol" }
+library-search = { path = "../library_search" }
+media-client = { path = "../media_client" }
+media-protocol = { path = "../media_protocol" }
+gateway-client = { path = "../gateway_client" }
+source-protocol = { path = "../source_protocol" }
+nng-transport = { path = "../nng_transport" }
+
+# NNG + serialization
+nng = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

@@ -16,6 +16,11 @@ watch:
 build:
     cargo build
 
+# Run BDD tests
+[group('test')]
+bdd:
+    cargo test --package mdma-bdd --test cucumber -- -vv
+
 # Quick cross-compile beacon using cargo-zigbuild (devenv provides zig + target)
 [group('build')]
 beacon-cross:

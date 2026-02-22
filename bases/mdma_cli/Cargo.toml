@@ -15,17 +15,14 @@ path = "src/main.rs"
 clap = { workspace = true, features = ["derive"] }
 color-eyre = { workspace = true }
 
-# IPC (via shared clients)
+# Client abstraction (gateway or direct)
+mdma-client = { path = "../../components/mdma_client" }
+
+# IPC (still needed for protocol types re-exported by mdma-client)
 library-ipc-client = { path = "../../components/library_ipc_client" }
 library-search = { path = "../../components/library_search" }
 media-client = { path = "../../components/media_client" }
-gateway-client = { path = "../../components/gateway_client" }
 source-protocol = { path = "../../components/source_protocol" }
-nng-transport = { path = "../../components/nng_transport" }
-
-# Serialization
-serde_json = { workspace = true }
-nng = { workspace = true }
 
 # Output formatting
 colored = "2.0"
