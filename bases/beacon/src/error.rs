@@ -10,13 +10,6 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum BeaconError {
-    #[error("failed to detect NVMe drives at {path}")]
-    NvmeDetection {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
     #[error("hardware problem: {0}")]
     Hardware(String),
 
@@ -29,9 +22,6 @@ pub enum BeaconError {
 
     #[error("validation failed: {0}")]
     Validation(#[from] crate::types::ValidationError),
-
-    #[error("failed to partition device {device}: {reason}")]
-    Partitioning { device: String, reason: String },
 
     #[error("failed to format partition {partition}: {reason}")]
     Formatting { partition: String, reason: String },
@@ -68,13 +58,6 @@ impl BeaconError {
     pub fn io(operation: impl Into<String>, source: std::io::Error) -> Self {
         BeaconError::Io {
             operation: operation.into(),
-            source,
-        }
-    }
-
-    pub fn nvme_detection(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
-        BeaconError::NvmeDetection {
-            path: path.into(),
             source,
         }
     }

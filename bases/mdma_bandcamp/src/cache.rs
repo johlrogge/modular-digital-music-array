@@ -17,9 +17,6 @@ use thiserror::Error;
 pub enum CacheError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-
-    #[error("Invalid cache entry: {0}")]
-    InvalidEntry(String),
 }
 
 /// Track-oriented download cache
@@ -82,7 +79,9 @@ impl DownloadCache {
         Ok((entries, item_ids))
     }
 
-    /// Build a track key for cache lookup
+    /// Build a track key for cache lookup.
+    /// Currently only used in tests; production code builds keys inline in service.rs.
+    #[allow(dead_code)]
     pub fn make_track_key(
         artist: &str,
         album: &str,
@@ -126,11 +125,13 @@ impl DownloadCache {
     }
 
     /// Get the number of cached entries
+    #[allow(dead_code)] // Used in tests; production code checks keys directly
     pub fn len(&self) -> usize {
         self.downloaded.len()
     }
 
     /// Check if cache is empty
+    #[allow(dead_code)] // Used in tests; production code checks keys directly
     pub fn is_empty(&self) -> bool {
         self.downloaded.is_empty()
     }

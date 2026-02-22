@@ -248,15 +248,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
-name = "audio_fingerprint"
-version = "0.1.0"
-dependencies = [
- "hex",
- "serde",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -364,28 +355,6 @@ dependencies = [
  "tracing",
  "url",
  "zip",
-]
-
-[[package]]
-name = "bandcamp-ipc-client"
-version = "0.1.0"
-dependencies = [
- "bandcamp-ipc-protocol",
- "nng",
- "nng-transport",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "bandcamp-ipc-protocol"
-version = "0.1.0"
-dependencies = [
- "rstest",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1130,16 +1099,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "download-cli"
-version = "0.1.0"
-dependencies = [
- "clap",
- "color-eyre",
- "media-downloader",
- "tokio",
-]
-
-[[package]]
 name = "drain_filter_polyfill"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1159,12 +1118,6 @@ checksum = "cd1511a7b6a56299bd043a9c167a6d2bfb37bf84a6dfceaba651168adfb43c87"
 dependencies = [
  "dtoa",
 ]
-
-[[package]]
-name = "dunce"
-version = "1.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "ego-tree"
@@ -1601,15 +1554,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest",
-]
-
-[[package]]
-name = "home"
-version = "0.5.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "589533453244b0995c858700322199b2becb13b627df2851f64a2775d024abcf"
-dependencies = [
- "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2457,7 +2401,6 @@ dependencies = [
  "library-ipc-client",
  "library-search",
  "mdma-client",
- "media-client",
  "source-protocol",
 ]
 
@@ -2484,14 +2427,15 @@ version = "0.1.3"
 dependencies = [
  "askama",
  "axum",
- "bandcamp-ipc-client",
  "clap",
  "color-eyre",
  "futures",
+ "gateway-client",
  "library-ipc-client",
  "rstest",
  "serde",
  "serde_json",
+ "source-protocol",
  "thiserror 1.0.69",
  "tokio",
  "tower-http 0.5.2",
@@ -2555,40 +2499,6 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tracing",
-]
-
-[[package]]
-name = "media-ctl"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "color-eyre",
- "media-client",
- "nng",
- "playback-primitives",
- "prost",
- "tokio",
-]
-
-[[package]]
-name = "media-downloader"
-version = "0.1.0"
-dependencies = [
- "assert_matches",
- "async-trait",
- "chrono",
- "dunce",
- "hex",
- "sanitize-filename",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "url",
- "which",
 ]
 
 [[package]]
@@ -3214,29 +3124,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "prost"
-version = "0.11.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b82eaa1d779e9a4bc1c3217db8ffbeabaae1dca241bf70183242128d48681cd"
-dependencies = [
- "bytes",
- "prost-derive",
-]
-
-[[package]]
-name = "prost-derive"
-version = "0.11.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5d2d8d10f3c6ded6da8b05b5fb3b8a5082514344d56c9f871412d29b4e075b4"
-dependencies = [
- "anyhow",
- "itertools 0.10.5",
- "proc-macro2",
- "quote",
- "syn 1.0.109",
-]
-
-[[package]]
 name = "psl-types"
 version = "2.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3736,16 +3623,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "sanitize-filename"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ed72fbaf78e6f2d41744923916966c4fbe3d7c74e3037a8ee482f1115572603"
-dependencies = [
- "lazy_static",
- "regex",
 ]
 
 [[package]]
@@ -5046,18 +4923,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "12bed680863276c63889429bfd6cab3b99943659923822de1c8a39c49e4d722c"
 dependencies = [
  "rustls-pki-types",
-]
-
-[[package]]
-name = "which"
-version = "4.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87ba24419a2078cd2b0f2ede2691b6c66d8e47836da3b6db8265ebad47afbfc7"
-dependencies = [
- "either",
- "home",
- "once_cell",
- "rustix 0.38.43",
 ]
 
 [[package]]

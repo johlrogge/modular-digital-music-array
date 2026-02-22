@@ -21,7 +21,6 @@ mdma-client = { path = "../../components/mdma_client" }
 # IPC (still needed for protocol types re-exported by mdma-client)
 library-ipc-client = { path = "../../components/library_ipc_client" }
 library-search = { path = "../../components/library_search" }
-media-client = { path = "../../components/media_client" }
 source-protocol = { path = "../../components/source_protocol" }
 
 # Output formatting

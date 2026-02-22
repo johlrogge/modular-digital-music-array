@@ -33,7 +33,7 @@ pub fn generate_facts(
 
 /// Generate facts from already-extracted metadata
 fn generate_facts_from_metadata(
-    content_hash: &ContentHash,
+    _content_hash: &ContentHash,
     metadata: &TrackMetadata,
     all_fields: &HashMap<String, String>,
 ) -> Result<Vec<(MusicValue, FactSource)>, IngestError> {

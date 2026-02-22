@@ -1,16 +1,12 @@
 // bases/beacon/src/actions.rs
 //! Action framework for plan-then-execute provisioning
-//!
-//! This module provides both:
-//! - NEW: Plan-then-execute architecture with type-safe chaining
-//! - LEGACY: Old check/apply/preview pattern (for backward compatibility)
 
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 // ============================================================================
 // Core Types (NEW Architecture)
 // ============================================================================
@@ -65,6 +61,9 @@ pub enum ExecutionProgress {
         id: ActionId,
         description: String,
     },
+    // Progress and Failed are part of the public API for future stage implementations
+    // that will report intermediate status; currently only Started and Complete are sent.
+    #[allow(dead_code)]
     Progress {
         id: ActionId,
         message: String,
@@ -73,6 +72,7 @@ pub enum ExecutionProgress {
         id: ActionId,
         summary: Option<String>,
     },
+    #[allow(dead_code)]
     Failed {
         id: ActionId,
         error: String,
@@ -277,10 +277,12 @@ impl ProvisioningPlan {
         self
     }
 
+    #[allow(dead_code)] // Used in tests; future plan-inspection consumers may use this
     pub fn len(&self) -> usize {
         self.stages.len()
     }
 
+    #[allow(dead_code)] // Used in tests; future plan-inspection consumers may use this
     pub fn is_empty(&self) -> bool {
         self.stages.is_empty()
     }
@@ -312,66 +314,6 @@ pub struct StageSummary {
     pub id: ActionId,
     pub description: String,
     pub details: String,
-}
-
-// ============================================================================
-// LEGACY Support (OLD Architecture - for backward compatibility)
-// ============================================================================
-
-/// Send a log message to both tracing and broadcast channel
-macro_rules! send_log {
-    ($tx:expr, $($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        tracing::info!("{}", msg);
-        let _ = $tx.send(msg);
-    }};
-}
-
-pub(crate) use send_log;
-
-/// Legacy trait for backward compatibility
-pub trait ActionLegacy<Input, Output> {
-    fn description(&self) -> String;
-    async fn check(&self, input: &Input) -> Result<bool>;
-    async fn apply(&self, input: Input) -> Result<Output>;
-    async fn preview(&self, input: Input) -> Result<Output>;
-}
-
-/// Legacy execute function
-pub async fn execute_action<I, O, A>(
-    action: &A,
-    input: I,
-    mode: ExecutionMode,
-    log_tx: &broadcast::Sender<String>,
-) -> Result<O>
-where
-    A: ActionLegacy<I, O>,
-    I: Clone,
-{
-    send_log!(log_tx, "🔍 {}", action.description());
-
-    match mode {
-        ExecutionMode::DryRun => {
-            send_log!(log_tx, "   [DRY RUN] Previewing...");
-            let output = action.preview(input).await?;
-            send_log!(log_tx, "   ✅ Preview complete");
-            Ok(output)
-        }
-        ExecutionMode::Apply => {
-            let needed = action.check(&input).await?;
-
-            if needed {
-                send_log!(log_tx, "   ⚙️  Executing...");
-                let output = action.apply(input).await?;
-                send_log!(log_tx, "   ✅ Complete");
-                Ok(output)
-            } else {
-                send_log!(log_tx, "   ⏭️  Already done, skipping");
-                let output = action.preview(input).await?;
-                Ok(output)
-            }
-        }
-    }
 }
 
 // ============================================================================

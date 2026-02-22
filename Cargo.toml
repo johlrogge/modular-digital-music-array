@@ -3,14 +3,11 @@
 members = [
     # Components (bricks)
     "components/bandcamp_api",
-    "components/bandcamp_ipc_protocol",
-    "components/bandcamp_ipc_client",
     "components/clock",
     "components/flac_metadata",
     "components/library_ipc_client",
     "components/library_ipc_protocol",
     "components/media_client",
-    "components/media_downloader",
     "components/media_protocol",
     "components/music_facts",
     "components/music_primitives",
@@ -18,7 +15,6 @@ members = [
     "components/playback_primitives",
     "components/time_primitives",
     "components/storage_primitives",
-    "components/audio_fingerprint",
     "components/nng_transport",
     "components/library_search",
     "components/source_protocol",
@@ -27,8 +23,6 @@ members = [
     "components/mdma_client",
     "components/library_service",
     # Bases (entry points)
-    "bases/download_cli",
-    "bases/media_ctl",
     "bases/mdma_playback",
     "bases/library_crawler",
     "bases/beacon",

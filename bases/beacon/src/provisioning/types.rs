@@ -729,6 +729,9 @@ impl std::fmt::Display for ConfiguredFstab {
 // ----------------------------------------------------------------------------
 
 /// Workflow state for unmounting
+// These types are scaffolding for a planned unmount stage that has not yet been
+// wired into the provisioning pipeline.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum UnmountState {
     NeedsUnmount(PathBuf),
@@ -745,6 +748,7 @@ impl std::fmt::Display for UnmountState {
 }
 
 /// Planned work for unmounting (WITH workflow state)
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnmountPlan {
     pub configured: ConfiguredFstab, // Thread input through for apply()
@@ -778,6 +782,8 @@ impl std::fmt::Display for UnmountPlan {
 // ----------------------------------------------------------------------------
 
 /// System with base Void Linux installed
+// Scaffolding type for a future stage that will consume the installation output.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstalledSystem {
     pub formatted: FormattedSystem,
@@ -790,14 +796,10 @@ impl std::fmt::Display for InstalledSystem {
 }
 
 impl InstalledSystem {
-    /// Get the mount point where the system was installed
-    ///
-    /// NOTE: This is a temporary stub for backwards compatibility with stages 5 and 6.
-    /// These stages should be updated to use a better approach once we finalize
-    /// the installation architecture.
+    /// Get the mount point where the system was installed.
+    // Stub for future use when stages 5 and 6 are refactored to use InstalledSystem.
+    #[allow(dead_code)]
     pub fn mount_point(&self) -> PathBuf {
-        // For now, return the standard mount point
-        // In the future, this should come from the installation plan
         PathBuf::from("/mnt/mdma-install")
     }
 }

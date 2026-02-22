@@ -1,4 +1,3 @@
-use chrono::Utc;
 use color_eyre::Result;
 use flac_metadata::TrackMetadata;
 use music_facts::{
@@ -7,15 +6,13 @@ use music_facts::{
 };
 use music_primitives::{Bpm, Key};
 use std::collections::HashMap;
-use std::path::Path;
 
 /// Generate facts from FLAC metadata
 pub fn generate_facts(
-    content_hash: ContentHash,
+    _content_hash: ContentHash,
     metadata: &TrackMetadata,
     all_fields: &HashMap<String, String>,
 ) -> Result<Vec<(MusicValue, FactSource)>> {
-    let now = Utc::now();
     let mut facts = Vec::new();
 
     // Infer origin from path and comment

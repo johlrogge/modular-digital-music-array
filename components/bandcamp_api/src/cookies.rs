@@ -14,6 +14,9 @@ use std::sync::Arc;
 const REQUIRED_COOKIES: &[&str] = &["identity"];
 
 /// Cookie data from JSON format (Cookie Quick Manager)
+// Fields beyond name/value/domain are present in the cookie file format but
+// not needed for building the request jar — allow dead_code to keep serde working.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct JsonCookie {
     name: String,

@@ -12,6 +12,9 @@ use serde::Deserialize;
 use std::process::Command;
 
 /// Represents a partition as reported by lsblk
+// Fields `name` and `fs_type` are present in lsblk JSON output and captured
+// for completeness; only `size`, `label`, and `partlabel` are actively used.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct LsblkPartition {
     name: String,
@@ -22,6 +25,8 @@ struct LsblkPartition {
     partlabel: Option<String>, // GPT partition name (set by sfdisk name=)
 }
 
+// Field `name` is present in lsblk JSON output; only `children` is actively used.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct LsblkDevice {
     name: String,
@@ -463,7 +468,6 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
             let mut start_mb = 1u64; // Start at 1MB for alignment
 
             // Include ALL partitions (existing and planned) in proper order
-            partition_num = 1;
             for partition_state in partitions {
                 let partition = partition_state.partition();
                 let size_mb = partition.size.megabytes();
@@ -477,7 +481,6 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                 ));
 
                 start_mb += size_mb;
-                partition_num += 1;
             }
 
             // Log what we're creating

@@ -195,6 +195,9 @@ pub enum DownloadEvent {
 // Internal types for parsing Bandcamp's JSON responses
 
 /// Parsed data from user's Bandcamp collection page
+// Fields are present in Bandcamp's JSON response and captured for completeness;
+// not all are actively read after parsing — allow dead_code for serde structs.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct ParsedFanpageData {
     pub fan_data: FanData,
@@ -209,6 +212,7 @@ pub(crate) struct FanData {
     pub is_own_page: Option<bool>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct CollectionData {
     pub batch_size: Option<u16>,
