@@ -17,6 +17,9 @@ pub struct SeedTrack {
     pub genre: Option<String>,
     pub duration: Option<u32>,
     pub year: Option<u32>,
+    /// Explicit hex hash (e.g. "a1b2c3d4"). Padded to 64 hex chars with trailing zeros.
+    /// When None, an index-based hash is auto-generated.
+    pub hash: Option<String>,
 }
 
 /// Everything the World needs from the harness.
@@ -24,6 +27,8 @@ pub struct TestEnv {
     pub library: LibraryBackend,
     pub playback: PlaybackBackend,
     pub playback_state: Arc<Mutex<PlaybackState>>,
+    pub library_addr: String,
+    pub playback_addr: String,
     pub _temp_dir: tempfile::TempDir,
     pub _library_thread: std::thread::JoinHandle<()>,
     pub _playback_thread: std::thread::JoinHandle<()>,
@@ -38,8 +43,14 @@ fn seed_facts(metadata_dir: &std::path::Path, tracks: &[SeedTrack]) {
     let now = chrono::Utc::now();
 
     for (i, track) in tracks.iter().enumerate() {
-        // Generate a deterministic content hash from the index
-        let hash = ContentHash(format!("sha256:{:064x}", i + 1));
+        // Use explicit hash if provided (padded to 64 hex chars), else auto-generate from index
+        let hash = match &track.hash {
+            Some(h) => {
+                let padded = format!("{:0<64}", h);
+                ContentHash(format!("sha256:{}", padded))
+            }
+            None => ContentHash(format!("sha256:{:064x}", i + 1)),
+        };
 
         let mut facts: Vec<Fact<ContentHash, MusicValue, FactSource>> = vec![
             Fact::new(
@@ -164,6 +175,8 @@ pub fn boot_test_env(tracks: &[SeedTrack]) -> TestEnv {
         library,
         playback,
         playback_state,
+        library_addr,
+        playback_addr,
         _temp_dir: temp_dir,
         _library_thread: library_thread,
         _playback_thread: playback_thread,

@@ -5,31 +5,39 @@ use crate::world::MdmaWorld;
 use cucumber::{gherkin::Step, given, then, when};
 
 /// Background step: seed the library with tracks from a data table.
+/// Parses the header row dynamically so any column order works, and new columns
+/// (hash, duration, year) are picked up automatically.
 #[given("the library contains:")]
 async fn library_contains(world: &mut MdmaWorld, step: &Step) {
     if let Some(table) = step.table.as_ref() {
+        let header = &table.rows[0];
+        let col = |name: &str| -> Option<usize> {
+            header.iter().position(|h| h.eq_ignore_ascii_case(name))
+        };
+
+        let col_hash = col("hash");
+        let col_artist = col("artist");
+        let col_title = col("title");
+        let col_bpm = col("bpm");
+        let col_genre = col("genre");
+        let col_duration = col("duration");
+        let col_year = col("year");
+
         for row in table.rows.iter().skip(1) {
-            // columns: artist | title | bpm | genre
-            let artist = row
-                .get(0)
-                .map(|s| s.as_str())
-                .unwrap_or("Unknown")
-                .to_string();
-            let title = row
-                .get(1)
-                .map(|s| s.as_str())
-                .unwrap_or("Unknown")
-                .to_string();
-            let bpm = row.get(2).and_then(|s| s.parse::<u16>().ok());
-            let genre = row.get(3).map(|s| s.to_string()).filter(|s| !s.is_empty());
+            let get = |idx: Option<usize>| -> Option<&str> {
+                idx.and_then(|i| row.get(i))
+                    .map(|s| s.as_str())
+                    .filter(|s| !s.is_empty())
+            };
 
             world.pending_tracks.push(SeedTrack {
-                artist,
-                title,
-                bpm,
-                genre,
-                duration: None,
-                year: None,
+                artist: get(col_artist).unwrap_or("Unknown").to_string(),
+                title: get(col_title).unwrap_or("Unknown").to_string(),
+                bpm: get(col_bpm).and_then(|s| s.parse::<u16>().ok()),
+                genre: get(col_genre).map(|s| s.to_string()),
+                duration: get(col_duration).and_then(|s| s.parse::<u32>().ok()),
+                year: get(col_year).and_then(|s| s.parse::<u32>().ok()),
+                hash: get(col_hash).map(|s| s.to_string()),
             });
         }
     }
@@ -58,6 +66,82 @@ async fn should_find_n_tracks(world: &mut MdmaWorld, expected: usize) {
         expected,
         world.last_search_results.len()
     );
+}
+
+/// Assert search results match a table exactly (unordered, matched by title).
+/// Supported columns: artist, title, bpm, genre.
+#[then("the results should be:")]
+async fn results_should_be(world: &mut MdmaWorld, step: &Step) {
+    let table = step.table.as_ref().expect("missing table for results");
+    let header = &table.rows[0];
+    let col =
+        |name: &str| -> Option<usize> { header.iter().position(|h| h.eq_ignore_ascii_case(name)) };
+    let col_artist = col("artist");
+    let col_title = col("title");
+    let col_bpm = col("bpm");
+    let col_genre = col("genre");
+
+    let expected_rows = &table.rows[1..];
+    let results = &world.last_search_results;
+
+    assert_eq!(
+        results.len(),
+        expected_rows.len(),
+        "Expected {} result(s), got {}.\nResults: {:?}",
+        expected_rows.len(),
+        results.len(),
+        results
+            .iter()
+            .map(|t| (&t.artist, &t.title))
+            .collect::<Vec<_>>()
+    );
+
+    for row in expected_rows {
+        let get = |idx: Option<usize>| -> Option<&str> {
+            idx.and_then(|i| row.get(i))
+                .map(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+        };
+        let exp_title = get(col_title).expect("results table must have a title column");
+
+        let track = results
+            .iter()
+            .find(|t| t.title.as_deref() == Some(exp_title))
+            .unwrap_or_else(|| {
+                panic!(
+                    "No result with title '{}'. Have: {:?}",
+                    exp_title,
+                    results.iter().map(|t| &t.title).collect::<Vec<_>>()
+                )
+            });
+
+        if let Some(exp_artist) = get(col_artist) {
+            assert_eq!(
+                track.artist.as_deref(),
+                Some(exp_artist),
+                "Track '{}': expected artist '{}', got {:?}",
+                exp_title,
+                exp_artist,
+                track.artist
+            );
+        }
+        if let Some(exp_bpm) = get(col_bpm) {
+            let exp_bpm: u32 = exp_bpm.parse().expect("bpm must be a number");
+            let actual_bpm = track.bpm.as_ref().map(|b| b.as_u32());
+            assert_eq!(
+                actual_bpm,
+                Some(exp_bpm),
+                "Track '{}': expected bpm {}, got {:?}",
+                exp_title,
+                exp_bpm,
+                actual_bpm
+            );
+        }
+        if let Some(exp_genre) = get(col_genre) {
+            // Genre is not on TrackInfo directly — skip for now
+            let _ = exp_genre;
+        }
+    }
 }
 
 #[then("the operation should succeed")]
