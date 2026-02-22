@@ -311,6 +311,16 @@ ci-build-console:
 ci-build-playback:
     ./scripts/ci/build-playback.sh
 
+# Build mdma-gateway for CI
+[group('ci')]
+ci-build-gateway:
+    ./scripts/ci/build-gateway.sh
+
+# Build mdma-bandcamp for CI
+[group('ci')]
+ci-build-bandcamp:
+    ./scripts/ci/build-bandcamp.sh
+
 # Build mdma-library Void package
 [group('package')]
 pkg-library: ci-build-library
@@ -347,9 +357,33 @@ pkg-playback: ci-build-playback
     fi
     ./scripts/package/create-playback-package.sh
 
+# Build mdma-gateway Void package
+[group('package')]
+pkg-gateway: ci-build-gateway
+    #!/usr/bin/env bash
+    set -euo pipefail
+    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-gateway"
+    if [ -f "$BINARY" ]; then
+        echo "Stripping mdma-gateway..."
+        aarch64-linux-gnu-strip "$BINARY" 2>/dev/null || strip "$BINARY" 2>/dev/null || true
+    fi
+    ./scripts/package/create-gateway-package.sh
+
+# Build mdma-bandcamp Void package
+[group('package')]
+pkg-bandcamp: ci-build-bandcamp
+    #!/usr/bin/env bash
+    set -euo pipefail
+    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-bandcamp"
+    if [ -f "$BINARY" ]; then
+        echo "Stripping mdma-bandcamp..."
+        aarch64-linux-gnu-strip "$BINARY" 2>/dev/null || strip "$BINARY" 2>/dev/null || true
+    fi
+    ./scripts/package/create-bandcamp-package.sh
+
 # Create repository structure and index (all packages)
 [group('package')]
-pkg-repository: pkg-beacon pkg-library pkg-console pkg-playback
+pkg-repository: pkg-beacon pkg-library pkg-console pkg-playback pkg-gateway pkg-bandcamp
     ./scripts/package/create-repository.sh
 
 # Full package build pipeline (what CI runs!)
@@ -359,7 +393,7 @@ pkg-build-all: check-prereqs pkg-repository
     @echo "🎉 Package build complete!"
     @echo ""
     @echo "Repository ready at: build/repository/"
-    @echo "Packages: beacon, mdma-library, mdma-console, mdma-playback"
+    @echo "Packages: beacon, mdma-library, mdma-console, mdma-playback, mdma-gateway, mdma-bandcamp"
     @echo ""
     @echo "To test locally:"
     @echo "  1. Serve repository: just pkg-serve"
@@ -855,26 +889,26 @@ deploy-console: console-cross
     HOST="${PI_HOST:-mdma-909.local}"
     CONSOLE="target/aarch64-unknown-linux-gnu/release/mdma-console"
     SSH_KEY="$HOME/.ssh/mdma_pi"
+    RUN_SCRIPT="void-packages/srcpkgs/mdma-console/files/mdma-console/run"
 
     echo "Deploying console to $HOST..."
 
-    # Copy binary to Pi (use -4 to force IPv4, avoids IPv6 link-local issues)
-    scp -4 -i "$SSH_KEY" "$CONSOLE" "admin@${HOST}:/tmp/"
+    scp -4 -i "$SSH_KEY" "$CONSOLE" "$RUN_SCRIPT" "admin@${HOST}:/tmp/"
 
-    # Stop service, move binary, set capability, update run script, start
     ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-console 2>/dev/null || true
         sudo mv /tmp/mdma-console /usr/bin/
         sudo chmod +x /usr/bin/mdma-console
         sudo setcap "cap_net_bind_service=+ep" /usr/bin/mdma-console
         sudo mkdir -p /etc/sv/mdma-console/log /var/log/mdma-console
-        printf "#!/bin/sh\nexec 2>&1\nexec chpst -u mdma /usr/bin/mdma-console --port 80\n" | sudo tee /etc/sv/mdma-console/run > /dev/null
+        sudo cp /tmp/run /etc/sv/mdma-console/run
         sudo chmod +x /etc/sv/mdma-console/run
         printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-console\n" | sudo tee /etc/sv/mdma-console/log/run > /dev/null
         sudo chmod +x /etc/sv/mdma-console/log/run
         sudo ln -sf /etc/sv/mdma-console /var/service/mdma-console 2>/dev/null || true
-        sleep 2
+        for i in 1 2 3 4 5; do sleep 1; [ -d /var/service/mdma-console/supervise ] && break; done
         sudo sv start mdma-console 2>/dev/null || true
-        sudo sv status mdma-console'
+        sleep 1
+        sudo sv status mdma-console 2>/dev/null || echo "mdma-console: waiting for runit (check manually)"'
 
     echo ""
     echo "Console deployed! Access at: http://$HOST/"
@@ -886,28 +920,28 @@ deploy-library: library-cross
     set -euo pipefail
 
     HOST="${PI_HOST:-mdma-909.local}"
-    LIBRARY="target/aarch64-unknown-linux-gnu/release/mdma-library"
+    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-library"
     SSH_KEY="$HOME/.ssh/mdma_pi"
+    RUN_SCRIPT="void-packages/srcpkgs/mdma-library/files/mdma-library/run"
 
     echo "Deploying mdma-library to $HOST..."
 
-    # Copy binary to Pi (use -4 to force IPv4, avoids IPv6 link-local issues)
-    scp -4 -i "$SSH_KEY" "$LIBRARY" "admin@${HOST}:/tmp/"
+    scp -4 -i "$SSH_KEY" "$BINARY" "$RUN_SCRIPT" "admin@${HOST}:/tmp/"
 
-    # Stop service, move binary, create directories, update run script, start
     ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-library 2>/dev/null || true
         sudo mv /tmp/mdma-library /usr/bin/
         sudo chmod +x /usr/bin/mdma-library
         sudo mkdir -p /etc/sv/mdma-library/log /var/log/mdma-library /music/inbox /music/blobs /metadata /run/mdma
         sudo chown -R mdma:mdma /music /metadata /run/mdma
-        printf "#!/bin/sh\nexec 2>&1\nexec chpst -u mdma /usr/bin/mdma-library --music-dir /music --metadata-dir /metadata --socket ipc:///run/mdma/library.sock --tcp tcp://0.0.0.0:5555\n" | sudo tee /etc/sv/mdma-library/run > /dev/null
+        sudo cp /tmp/run /etc/sv/mdma-library/run
         sudo chmod +x /etc/sv/mdma-library/run
         printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-library\n" | sudo tee /etc/sv/mdma-library/log/run > /dev/null
         sudo chmod +x /etc/sv/mdma-library/log/run
         sudo ln -sf /etc/sv/mdma-library /var/service/mdma-library 2>/dev/null || true
-        sleep 2
+        for i in 1 2 3 4 5; do sleep 1; [ -d /var/service/mdma-library/supervise ] && break; done
         sudo sv start mdma-library 2>/dev/null || true
-        sudo sv status mdma-library'
+        sleep 1
+        sudo sv status mdma-library 2>/dev/null || echo "mdma-library: waiting for runit (check manually)"'
 
     echo ""
     echo "Library deployed!"
@@ -921,36 +955,12 @@ deploy-playback: playback-cross
     HOST="${PI_HOST:-mdma-909.local}"
     PLAYBACK="target/aarch64-unknown-linux-gnu/release/mdma-playback"
     SSH_KEY="$HOME/.ssh/mdma_pi"
-    TMPDIR=$(mktemp -d)
-    trap 'rm -rf "$TMPDIR"' EXIT
+    RUN_SCRIPT="void-packages/srcpkgs/mdma-playback/files/mdma-playback/run"
 
     echo "Deploying mdma-playback to $HOST..."
 
-    # Write service scripts locally (avoids SSH heredoc escaping issues)
-    cat > "$TMPDIR/run" <<'EOF'
-    #!/bin/sh
-    exec 2>&1
-    sv check pipewire || exit 1
-    sleep 1
-    mkdir -p /run/mdma
-    chown mdma:mdma /run/mdma
-    rm -f /run/mdma/playback.sock
-    export PIPEWIRE_RUNTIME_DIR=/run/pipewire
-    cd /music
-    exec chpst -u mdma:mdma:audio:video:_pipewire /usr/bin/mdma-playback \
-        --socket ipc:///run/mdma/playback.sock \
-        --tcp tcp://0.0.0.0:5557
-    EOF
+    scp -4 -i "$SSH_KEY" "$PLAYBACK" "$RUN_SCRIPT" "admin@${HOST}:/tmp/"
 
-    cat > "$TMPDIR/log-run" <<'EOF'
-    #!/bin/sh
-    exec svlogd -tt /var/log/mdma-playback
-    EOF
-
-    # Copy binary and service scripts to Pi
-    scp -4 -i "$SSH_KEY" "$PLAYBACK" "$TMPDIR/run" "$TMPDIR/log-run" "admin@${HOST}:/tmp/"
-
-    # Stop service, install files, ensure PipeWire setup, start
     ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-playback 2>/dev/null || true
         sudo mv /tmp/mdma-playback /usr/bin/
         sudo chmod +x /usr/bin/mdma-playback
@@ -958,8 +968,9 @@ deploy-playback: playback-cross
         sudo chown -R mdma:mdma /run/mdma
         sudo usermod -a -G audio,video,_pipewire mdma 2>/dev/null || true
         sudo cp /tmp/run /etc/sv/mdma-playback/run
-        sudo cp /tmp/log-run /etc/sv/mdma-playback/log/run
-        sudo chmod +x /etc/sv/mdma-playback/run /etc/sv/mdma-playback/log/run
+        sudo chmod +x /etc/sv/mdma-playback/run
+        printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-playback\n" | sudo tee /etc/sv/mdma-playback/log/run > /dev/null
+        sudo chmod +x /etc/sv/mdma-playback/log/run
         # Ensure PipeWire WirePlumber drop-in is configured
         sudo mkdir -p /etc/pipewire/pipewire.conf.d
         sudo ln -sf /usr/share/examples/wireplumber/10-wireplumber.conf /etc/pipewire/pipewire.conf.d/ 2>/dev/null || true
@@ -970,9 +981,104 @@ deploy-playback: playback-cross
             sleep 3
         fi
         sudo ln -sf /etc/sv/mdma-playback /var/service/mdma-playback 2>/dev/null || true
-        sleep 2
+        for i in 1 2 3 4 5; do sleep 1; [ -d /var/service/mdma-playback/supervise ] && break; done
         sudo sv start mdma-playback 2>/dev/null || true
-        sudo sv status pipewire mdma-playback'
+        sleep 1
+        sudo sv status pipewire mdma-playback 2>/dev/null || echo "mdma-playback: waiting for runit (check manually)"'
 
     echo ""
-    echo "Playback deployed! TCP on port 5557"
+    echo "Playback deployed! IPC only (gateway exposes TCP)"
+
+# Cross-compile gateway for aarch64
+[group('build')]
+gateway-cross:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building mdma-gateway for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin mdma-gateway
+    echo ""
+    echo "Gateway built!"
+    file target/aarch64-unknown-linux-gnu/release/mdma-gateway
+    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-gateway
+
+# Cross-compile bandcamp for aarch64
+[group('build')]
+bandcamp-cross:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building mdma-bandcamp for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin mdma-bandcamp
+    echo ""
+    echo "Bandcamp built!"
+    file target/aarch64-unknown-linux-gnu/release/mdma-bandcamp
+    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-bandcamp
+
+# Deploy gateway to Pi (single external TCP port)
+[group('dev')]
+deploy-gateway: gateway-cross
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    HOST="${PI_HOST:-mdma-909.local}"
+    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-gateway"
+    SSH_KEY="$HOME/.ssh/mdma_pi"
+    RUN_SCRIPT="void-packages/srcpkgs/mdma-gateway/files/mdma-gateway/run"
+
+    echo "Deploying mdma-gateway to $HOST..."
+
+    scp -4 -i "$SSH_KEY" "$BINARY" "$RUN_SCRIPT" "admin@${HOST}:/tmp/"
+
+    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-gateway 2>/dev/null || true
+        sudo mv /tmp/mdma-gateway /usr/bin/
+        sudo chmod +x /usr/bin/mdma-gateway
+        sudo mkdir -p /etc/sv/mdma-gateway/log /var/log/mdma-gateway /run/mdma/sources
+        sudo chown -R mdma:mdma /run/mdma
+        sudo cp /tmp/run /etc/sv/mdma-gateway/run
+        sudo chmod +x /etc/sv/mdma-gateway/run
+        printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-gateway\n" | sudo tee /etc/sv/mdma-gateway/log/run > /dev/null
+        sudo chmod +x /etc/sv/mdma-gateway/log/run
+        sudo ln -sf /etc/sv/mdma-gateway /var/service/mdma-gateway 2>/dev/null || true
+        for i in 1 2 3 4 5; do sleep 1; [ -d /var/service/mdma-gateway/supervise ] && break; done
+        sudo sv start mdma-gateway 2>/dev/null || true
+        sleep 1
+        sudo sv status mdma-gateway 2>/dev/null || echo "mdma-gateway: waiting for runit (check manually)"'
+
+    echo ""
+    echo "Gateway deployed! TCP on port 5555"
+
+# Deploy bandcamp service to Pi
+[group('dev')]
+deploy-bandcamp: bandcamp-cross
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    HOST="${PI_HOST:-mdma-909.local}"
+    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-bandcamp"
+    SSH_KEY="$HOME/.ssh/mdma_pi"
+    RUN_SCRIPT="void-packages/srcpkgs/mdma-bandcamp/files/mdma-bandcamp/run"
+
+    echo "Deploying mdma-bandcamp to $HOST..."
+
+    scp -4 -i "$SSH_KEY" "$BINARY" "$RUN_SCRIPT" "admin@${HOST}:/tmp/"
+
+    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-bandcamp 2>/dev/null || true
+        sudo mv /tmp/mdma-bandcamp /usr/bin/
+        sudo chmod +x /usr/bin/mdma-bandcamp
+        sudo mkdir -p /etc/sv/mdma-bandcamp/log /var/log/mdma-bandcamp /music/downloads /music/inbox /run/mdma/sources /var/lib/mdma
+        sudo chown -R mdma:mdma /music /run/mdma /var/lib/mdma
+        sudo cp /tmp/run /etc/sv/mdma-bandcamp/run
+        sudo chmod +x /etc/sv/mdma-bandcamp/run
+        printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-bandcamp\n" | sudo tee /etc/sv/mdma-bandcamp/log/run > /dev/null
+        sudo chmod +x /etc/sv/mdma-bandcamp/log/run
+        sudo ln -sf /etc/sv/mdma-bandcamp /var/service/mdma-bandcamp 2>/dev/null || true
+        for i in 1 2 3 4 5; do sleep 1; [ -d /var/service/mdma-bandcamp/supervise ] && break; done
+        sudo sv start mdma-bandcamp 2>/dev/null || true
+        sleep 1
+        sudo sv status mdma-bandcamp 2>/dev/null || echo "mdma-bandcamp: waiting for runit (check manually)"'
+
+    echo ""
+    echo "Bandcamp deployed!"

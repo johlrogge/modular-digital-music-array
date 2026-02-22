@@ -1,0 +1,17 @@
+[package]
+name = "gateway-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+source-protocol = { path = "../source_protocol" }
+library-ipc-protocol = { path = "../library_ipc_protocol" }
+media-protocol = { path = "../media_protocol" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }

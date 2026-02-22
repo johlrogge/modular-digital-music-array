@@ -29,7 +29,7 @@ struct Args {
     cache: std::path::PathBuf,
 
     /// NNG IPC socket path
-    #[arg(long, default_value = "ipc:///run/mdma/bandcamp.sock")]
+    #[arg(long, default_value = "ipc:///run/mdma/sources/bandcamp.sock")]
     socket: String,
 
     /// Also listen on TCP for remote connections (e.g., "tcp://0.0.0.0:5556")
@@ -43,6 +43,10 @@ struct Args {
     /// Audio format to download
     #[arg(long, default_value = "flac")]
     format: String,
+
+    /// Bandcamp username (used for collection sync)
+    #[arg(long, env = "MDMA_BANDCAMP_USERNAME")]
+    username: Option<String>,
 }
 
 fn parse_format(s: &str) -> bandcamp_api::AudioFormat {
@@ -83,6 +87,7 @@ async fn main() -> Result<()> {
         socket = %args.socket,
         library_socket = %args.library_socket,
         format = %args.format,
+        username = ?args.username,
         "Starting MDMA Bandcamp service"
     );
 
@@ -114,6 +119,7 @@ async fn main() -> Result<()> {
         args.cache,
         format,
         args.library_socket,
+        args.username,
     )?;
 
     let service = std::sync::Arc::new(bandcamp_service);

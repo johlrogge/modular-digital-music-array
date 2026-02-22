@@ -104,17 +104,16 @@ ssh -4 -i ~/.ssh/mdma_pi admin@mdma-909.local  # key-based auth, -4 forces IPv4
 
 ### Service Access
 
-- **Library IPC (local):** `ipc:///run/mdma/library.sock`
-- **Library TCP (remote):** `tcp://mdma-909.local:5555`
-- **Bandcamp TCP (remote):** `tcp://mdma-909.local:5556`
-- **Playback IPC (local):** `ipc:///run/mdma/playback.sock`
-- **Playback TCP (remote):** `tcp://mdma-909.local:5557`
+All services are behind the gateway. Only port 5555 is exposed externally.
 
-Use env vars for the CLI from your laptop:
+- **Gateway TCP (remote):** `tcp://mdma-909.local:5555` — routes to all services
+- **Library IPC (local):** `ipc:///run/mdma/library.sock`
+- **Playback IPC (local):** `ipc:///run/mdma/playback.sock`
+- **Source sockets (local):** `/run/mdma/sources/*.sock` (auto-discovered by gateway)
+
+Use one env var for the CLI from your laptop:
 ```bash
-export MDMA_LIBRARY_SOCKET="tcp://mdma-909.local:5555"
-export MDMA_BANDCAMP_SOCKET="tcp://mdma-909.local:5556"
-export MDMA_PLAYBACK_SOCKET="tcp://mdma-909.local:5557"
+export MDMA_GATEWAY="tcp://mdma-909.local:5555"
 ```
 
 **Bandcamp username:** `johlyroger`

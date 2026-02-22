@@ -8,7 +8,7 @@ hostmakedepends="cargo"
 makedepends="rust-std"
 depends="avahi-daemon dbus"
 short_desc="MDMA provisioning beacon"
-maintainer="Joakim Rohlén <your@email>"
+maintainer="Joakim Ohlrogge <joakim.ohlrogge@agical.se>"
 license="MIT"
 homepage="https://github.com/johlrogge/modular-digital-music-array"
 

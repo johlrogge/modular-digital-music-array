@@ -1,0 +1,18 @@
+[package]
+name = "gateway-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+gateway-protocol = { path = "../gateway_protocol" }
+source-protocol = { path = "../source_protocol" }
+library-ipc-protocol = { path = "../library_ipc_protocol" }
+media-protocol = { path = "../media_protocol" }
+nng-transport = { path = "../nng_transport" }
+nng = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

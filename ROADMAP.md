@@ -1,6 +1,6 @@
 # MDMA Roadmap
 
-**Last updated:** February 20, 2026 (night)
+**Last updated:** February 21, 2026
 
 ## Where We Are
 
@@ -51,16 +51,16 @@ Always output at the iFi DAC's maximum supported rate (probe at startup — like
 
 ---
 
-### ~~2. Queue + stainless_facts Search (Together)~~ — COMPLETE
+### ~~2. Queue + Search + CLI Polish~~ — COMPLETE
 
 **Queue: COMPLETE**
 
 - In-memory queue with `ContentHash` as the track identifier (not paths)
-- Commands: `queue append`, `queue next`, `queue list`, `queue clear`, `queue remove`
+- Commands: `queue append`, `queue next`, `queue list`, `queue clear`, `queue remove`, `queue replace`, `queue edit`
 - Auto-advances when a track finishes
-- `queue list`: tty-aware — human display in terminal, hashes when piped (dmenu-composable)
-- `queue remove`: accepts hash arg or stdin, composes with `queue list | dmenu | queue remove`
-- `playback now`: shows currently playing track in same format as queue list
+- `queue replace`: atomic swap of entire queue from stdin — enables shuffle, re-sort, playlist load
+- `queue edit`: opens queue in `$EDITOR` using shared playlist format, applies changes via `queue replace`
+- **Persistent queue**: saved to `queue.json` on every mutation, restored on service restart
 - `ContentHash` moved to `playback_primitives` — available across all services without circular deps
 
 **Search: COMPLETE**
@@ -72,38 +72,70 @@ Always output at the iFi DAC's maximum supported rate (probe at startup — like
 - `KeyQuery`: Camelot-based exact and tolerance (traditional notation → Camelot at parse time)
 - CLI: `mdma search [QUERY] [--artist] [--title] [--album] [--label] [--genre] [--bpm] [--key] [--duration] [--year] [--source]`
 - CLI: `mdma search fact-values-for <FACT_TYPE>` — discover all values for any fact type
+- **Stdin intersection filter**: piped hashes narrow search results — enables playlist viewing and chain filtering
 - **dmenu workflow operational:** `mdma search --artist "CBL" | dmenu | mdma queue append`
 - Deployed and verified on real hardware against 339-track library
 
+**Pipe Composition: COMPLETE**
+
+- `mdma sort <field> <-a|-d>`: reads hashes from stdin, sorts by bpm/title/artist/album/duration
+- Multi-key sort via chaining: `mdma sort title -a | mdma sort artist -a`
+- Unified playlist format: lines starting with 8-12 hex chars are track entries; comments/blanks ignored
+- All commands output same format — directly saveable as `.plist` and composable with dmenu/grep/shuf
+- `queue remove` resolves short hashes to canonical sha256 before sending to service
+
+**CLI Output: COMPLETE**
+
+- Colored tabular output using `corsett` (column sizing) + `colored` (ANSI colors)
+- Hash: dim gray, Artist: green, Title: bold, Duration: dim gray
+- TTY-aware: colored table in terminal, canonical `hash  Artist - Title  [duration]` when piped
+- Queue list: dim position numbers, same column layout as search
+- Column shortening with right-ellipsis (…) via corsett's `RightEllipsis<FreeText>` algorithm
+
 ---
 
-### 3. Single API Gateway + Pub/Sub Events
+### ~~3a. Single API Gateway~~ — COMPLETE (code)
 
-**Why third:** After queue, there is real state to observe (position, current track, queue contents). Pub/sub becomes genuinely useful.
+**Gateway code complete, not yet deployed.**
 
-**Gateway:**
-- One TCP port replaces the current 5555/5556/5557 split
-- Routes commands to internal services (library, playback, bandcamp)
-- Internal services stay on IPC sockets — only the gateway is TCP-accessible
-- Clients see one address regardless of internal topology
+New crates:
+- `source_protocol` — unified request/response for all music sources (Bandcamp, future Beatport, etc.)
+- `gateway_protocol` — envelope types wrapping library, playback, and source requests
+- `gateway_client` — NNG client for the gateway
+- `mdma_gateway` — binary: single TCP port routing to library, playback, and auto-discovered sources
 
+Architecture:
 ```
-External clients
+External clients (laptop CLI)
        |
        ▼
 ┌─────────────────┐
-│  mdma-gateway   │  (single public port)
+│  mdma-gateway   │  tcp://0.0.0.0:5555
 │  (router/proxy) │
 └────────┬────────┘
-         │ local IPC bus
+         │ local IPC
     ┌────┴──────────────────────────┐
     │         │                    │
     ▼         ▼                    ▼
-mdma-library  mdma-bandcamp  mdma-playback
-(registered)  (registered)   (registered)
+mdma-library  mdma-playback  /run/mdma/sources/*.sock
+(ipc fixed)   (ipc fixed)   (auto-discovered)
 ```
 
-**Pub/sub events (unsolicited):**
+- Source discovery: any service dropping a `.sock` in `/run/mdma/sources/` is automatically available
+- `mdma-bandcamp` adapted to `source_protocol`, socket at `/run/mdma/sources/bandcamp.sock`
+- CLI: `Commands::Bandcamp` replaced with `Commands::Source` (list/sync/status/downloads/cancel/pause/resume)
+- CLI: `--gateway`/`MDMA_GATEWAY` env var for single-address mode; falls back to direct IPC when unset
+- Deprecated: `bandcamp_ipc_protocol`, `bandcamp_ipc_client` (still in workspace, no longer used)
+
+**Remaining:** Deploy to Pi, verify end-to-end, update CLAUDE.md env vars.
+
+---
+
+### 3b. Pub/Sub Events
+
+**Why next:** With gateway routing in place, pub/sub is the natural extension. There is real state to observe (position, current track, queue contents).
+
+**Events (unsolicited):**
 - `track_started`, `track_ended`, `position_update`, `queue_changed`
 - Subscribers get push notifications without polling
 - Enables: live position display, queue UI that updates automatically, dmenu that refreshes when queue changes
@@ -116,7 +148,8 @@ mdma-library  mdma-bandcamp  mdma-playback
 
 - Read each component, ask: "does anything in library / console / playback depend on this?"
 - If no → delete
-- Remove half-finished experiments, consolidate components, align everything with the three active bases
+- Known dead: `bandcamp_ipc_protocol`, `bandcamp_ipc_client` (replaced by `source_protocol` + `gateway_client`)
+- Remove half-finished experiments, consolidate components, align everything with the active bases
 - Run as a dedicated focused pass, not incrementally
 
 ---
@@ -166,12 +199,17 @@ other users onto the system.
 ```
 stainless_facts    = Generic fact stream operations (crate, mandatory access layer)
 music_facts        = Types only (MusicValue, FactSource, ContentHash, newtypes)
+mdma-gateway       = API gateway: single TCP port, routes to all services
 mdma-library       = Library service with nng IPC interface
 mdma-playback      = Audio playback service (Symphonia + PipeWire + rubato)
-mdma-bandcamp      = Bandcamp download service
+mdma-bandcamp      = Bandcamp download service (source_protocol)
 mdma-console       = HTTP frontend
-mdma-cli           = CLI frontend
+mdma-cli           = CLI frontend (gateway-aware, dual-mode dispatch)
 beacon             = Provisioning and service discovery
+
+source_protocol    = Unified request/response for music sources
+gateway_protocol   = Envelope types (library + playback + source)
+gateway_client     = NNG client for the gateway
 ```
 
 **Storage layout:**
@@ -209,10 +247,14 @@ just watch
 ssh -4 -i ~/.ssh/mdma_pi admin@mdma-909.local
 ```
 
-**Environment vars for CLI from laptop:**
+**Environment vars for CLI from laptop (gateway mode — preferred):**
 ```bash
-export MDMA_LIBRARY_SOCKET="tcp://mdma-909.local:5555"
-export MDMA_BANDCAMP_SOCKET="tcp://mdma-909.local:5556"
+export MDMA_GATEWAY="tcp://mdma-909.local:5555"
+```
+
+**Direct access (library/playback bypass gateway for now):**
+```bash
+export MDMA_LIBRARY_SOCKET="tcp://mdma-909.local:5558"
 export MDMA_PLAYBACK_SOCKET="tcp://mdma-909.local:5557"
 ```
 
@@ -230,6 +272,31 @@ export MDMA_PLAYBACK_SOCKET="tcp://mdma-909.local:5557"
 ---
 
 ## Update History
+
+- **2026-02-21 (night):** Priority 3a (Gateway) code complete.
+  - `source_protocol`: unified request/response for all music sources (Ping, GetStatus, Sync, ListDownloads, Cancel, Pause, Resume)
+  - `gateway_protocol`: envelope wrapping library, playback, source, and ListSources
+  - `gateway_client`: typed NNG client with `library_request()`, `playback_command()`, `source_request()`, `list_sources()`
+  - `mdma_gateway`: single TCP entry point, routes to library/playback IPC + auto-discovered sources in `/run/mdma/sources/`
+  - `mdma-bandcamp` adapted: uses `source_protocol` instead of `bandcamp_ipc_protocol`, socket at `/run/mdma/sources/bandcamp.sock`
+  - CLI: `Commands::Bandcamp` → `Commands::Source` (list/sync/status/downloads/cancel/pause/resume)
+  - CLI: `--gateway`/`MDMA_GATEWAY` for single-address mode; direct IPC fallback preserved
+  - Deprecated: `bandcamp_ipc_protocol`, `bandcamp_ipc_client` (still in workspace, unused)
+  - All 22 tests pass, workspace builds clean
+  - **Next:** Deploy gateway + updated bandcamp to Pi, verify end-to-end, then pub/sub events
+
+- **2026-02-21:** Priority 2 fully complete. Queue, search, sort, pipe composition, and CLI polish all done.
+  - `queue replace`: atomic queue swap from stdin (shuffle, playlist load, re-sort)
+  - `queue edit`: opens queue in `$EDITOR`, applies via `queue replace`
+  - Persistent queue: `queue.json` saved on every mutation, restored on service restart
+  - `mdma sort`: stable sort by bpm/title/artist/album/duration, chainable for multi-key
+  - Stdin intersection filter on search: piped hashes narrow results
+  - Unified playlist format: 8-12 hex first token = track entry, everything else ignored
+  - Colored tabular output: `corsett` column sizing + `colored` ANSI — hash/artist/title/duration columns
+  - TTY-aware: colored table in terminal, composable canonical format when piped
+  - Fixed playback service cwd (relative blob paths required `/music` working directory)
+  - Fixed `queue remove` short hash resolution
+  - **Next:** Priority 3 — Single API Gateway + Pub/Sub Events
 
 - **2026-02-20 (night):** Priority 2 complete. Rich search operational.
   - `library_search` crate: TrackQuery with Initialism/Contains/Regex/Numeric/Duration/Key

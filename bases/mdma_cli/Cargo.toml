@@ -18,8 +18,14 @@ color-eyre = { workspace = true }
 # IPC (via shared clients)
 library-ipc-client = { path = "../../components/library_ipc_client" }
 library-search = { path = "../../components/library_search" }
-bandcamp-ipc-client = { path = "../../components/bandcamp_ipc_client" }
 media-client = { path = "../../components/media_client" }
+gateway-client = { path = "../../components/gateway_client" }
+source-protocol = { path = "../../components/source_protocol" }
+nng-transport = { path = "../../components/nng_transport" }
+
+# Serialization
+serde_json = { workspace = true }
+nng = { workspace = true }
 
 # Output formatting
 colored = "2.0"

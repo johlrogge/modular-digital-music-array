@@ -1302,6 +1302,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "gateway-client"
+version = "0.1.0"
+dependencies = [
+ "gateway-protocol",
+ "library-ipc-protocol",
+ "media-protocol",
+ "nng",
+ "nng-transport",
+ "serde",
+ "serde_json",
+ "source-protocol",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "gateway-protocol"
+version = "0.1.0"
+dependencies = [
+ "library-ipc-protocol",
+ "media-protocol",
+ "rstest",
+ "serde",
+ "serde_json",
+ "source-protocol",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2129,7 +2156,6 @@ name = "mdma-bandcamp"
 version = "0.1.0"
 dependencies = [
  "bandcamp-api",
- "bandcamp-ipc-protocol",
  "clap",
  "color-eyre",
  "library-ipc-client",
@@ -2137,6 +2163,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "source-protocol",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -2150,14 +2177,18 @@ dependencies = [
 name = "mdma-cli"
 version = "0.2.0"
 dependencies = [
- "bandcamp-ipc-client",
  "clap",
  "color-eyre",
  "colored",
  "corsett",
+ "gateway-client",
  "library-ipc-client",
  "library-search",
  "media-client",
+ "nng",
+ "nng-transport",
+ "serde_json",
+ "source-protocol",
 ]
 
 [[package]]
@@ -2177,6 +2208,22 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "mdma-gateway"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "color-eyre",
+ "gateway-protocol",
+ "library-ipc-protocol",
+ "media-protocol",
+ "nng",
+ "serde_json",
+ "source-protocol",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3580,6 +3627,16 @@ checksum = "86f4aa3ad99f2088c990dfa82d367e19cb29268ed67c574d10d0a4bfe71f07e0"
 dependencies = [
  "libc",
  "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "source-protocol"
+version = "0.1.0"
+dependencies = [
+ "rstest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

@@ -5,8 +5,8 @@
 
 use crate::cache::DownloadCache;
 use crate::ipc::{
-    BandcampRequest, BandcampResponse, BandcampUsername, DownloadState, DownloadStatus, IpcServer,
-    ItemId, ProtocolError, ServiceStatus,
+    DownloadState, DownloadStatus, IpcServer, SourceError, SourceRequest, SourceResponse,
+    SourceStatus,
 };
 use bandcamp_api::{AudioFormat, BandcampClient, CollectionItem};
 use library_ipc_client::{InboxPath, IngestSource, LibraryClient};
@@ -37,11 +37,40 @@ pub enum ServiceError {
     Channel,
 }
 
+/// Internal download state — maps to source_protocol::DownloadState for wire format.
+#[derive(Clone, PartialEq, Eq)]
+enum InternalDownloadState {
+    Queued,
+    Downloading,
+    Extracting,
+    Moving,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl InternalDownloadState {
+    fn to_protocol(&self, error: &Option<String>) -> DownloadState {
+        match self {
+            InternalDownloadState::Queued => DownloadState::Queued,
+            InternalDownloadState::Downloading => DownloadState::Downloading,
+            InternalDownloadState::Extracting | InternalDownloadState::Moving => {
+                DownloadState::Processing
+            }
+            InternalDownloadState::Completed => DownloadState::Completed,
+            InternalDownloadState::Failed => DownloadState::Failed {
+                message: error.clone().unwrap_or_default(),
+            },
+            InternalDownloadState::Cancelled => DownloadState::Cancelled,
+        }
+    }
+}
+
 /// Download queue entry
 #[derive(Clone)]
 struct QueuedDownload {
     item: CollectionItem,
-    state: DownloadState,
+    state: InternalDownloadState,
     downloaded_bytes: u64,
     total_bytes: Option<u64>,
     error: Option<String>,
@@ -49,8 +78,8 @@ struct QueuedDownload {
 
 /// Request with response channel for async processing
 struct IpcMessage {
-    request: BandcampRequest,
-    response_tx: oneshot::Sender<BandcampResponse>,
+    request: SourceRequest,
+    response_tx: oneshot::Sender<SourceResponse>,
 }
 
 /// Bandcamp download service
@@ -83,6 +112,8 @@ pub struct BandcampService {
     cookies_loaded: AtomicBool,
     /// Library service socket address for auto-ingest
     library_socket: String,
+    /// Bandcamp username (read from cookies/config)
+    username: Option<String>,
 }
 
 impl BandcampService {
@@ -94,6 +125,7 @@ impl BandcampService {
         cache_path: PathBuf,
         format: AudioFormat,
         library_socket: String,
+        username: Option<String>,
     ) -> Result<Self, ServiceError> {
         // Load cache
         let cache = DownloadCache::open(&cache_path)?;
@@ -116,6 +148,7 @@ impl BandcampService {
             format,
             cookies_loaded: AtomicBool::new(cookies_exist),
             library_socket,
+            username,
         })
     }
 
@@ -147,17 +180,17 @@ impl BandcampService {
     }
 
     /// Handle a request asynchronously
-    pub async fn handle_request(&self, request: BandcampRequest) -> BandcampResponse {
+    pub async fn handle_request(&self, request: SourceRequest) -> SourceResponse {
         tracing::debug!(?request, "Handling request");
 
         match request {
-            BandcampRequest::Ping => BandcampResponse::Pong,
+            SourceRequest::Ping => SourceResponse::Pong,
 
-            BandcampRequest::GetStatus => {
-                let status = ServiceStatus {
+            SourceRequest::GetStatus => {
+                let status = SourceStatus {
+                    name: "bandcamp".to_string(),
                     version: env!("CARGO_PKG_VERSION").to_string(),
-                    cookies_loaded: self.cookies_loaded.load(Ordering::Relaxed),
-                    current_username: self.current_username.lock().clone(),
+                    authenticated: self.cookies_loaded.load(Ordering::Relaxed),
                     downloads_active: self.active_downloads.lock().len(),
                     downloads_queued: self.download_queue.lock().len(),
                     downloads_completed: self.downloads_completed.load(Ordering::Relaxed),
@@ -165,72 +198,70 @@ impl BandcampService {
                     uptime_seconds: self.start_time.elapsed().as_secs(),
                     paused: self.paused.load(Ordering::Relaxed),
                 };
-                BandcampResponse::Status(status)
+                SourceResponse::Status(status)
             }
 
-            BandcampRequest::ReloadCookies => {
-                let client = self.try_load_client();
-                let valid = client.is_some();
+            SourceRequest::Sync => self.handle_sync().await,
 
-                BandcampResponse::CookiesReloaded {
-                    valid,
-                    message: if valid {
-                        "Cookies loaded successfully".to_string()
-                    } else {
-                        "Failed to load cookies".to_string()
-                    },
-                }
-            }
-
-            BandcampRequest::Sync { username } => self.handle_sync(username).await,
-
-            BandcampRequest::ListDownloads => {
+            SourceRequest::ListDownloads => {
                 let downloads = self.list_downloads();
-                BandcampResponse::Downloads(downloads)
+                SourceResponse::Downloads(downloads)
             }
 
-            BandcampRequest::CancelDownload { id } => {
+            SourceRequest::CancelDownload { id } => {
                 self.cancel_download(&id);
-                BandcampResponse::Cancelled { id }
+                SourceResponse::Cancelled { id }
             }
 
-            BandcampRequest::PauseAll => {
+            SourceRequest::PauseAll => {
                 self.paused.store(true, Ordering::Relaxed);
                 tracing::info!("Downloads paused");
-                BandcampResponse::Paused
+                SourceResponse::Paused
             }
 
-            BandcampRequest::ResumeAll => {
+            SourceRequest::ResumeAll => {
                 self.paused.store(false, Ordering::Relaxed);
                 tracing::info!("Downloads resumed");
-                BandcampResponse::Resumed
+                SourceResponse::Resumed
             }
         }
     }
 
-    /// Handle sync request - fetches collection and queues new downloads
-    async fn handle_sync(&self, username: BandcampUsername) -> BandcampResponse {
-        // Try to load client
+    /// Handle sync request - fetches collection and queues new downloads.
+    /// Username is read from the service config (no longer passed in the request).
+    async fn handle_sync(&self) -> SourceResponse {
+        // Try to load client (also reloads cookies)
         let client = match self.try_load_client() {
             Some(c) => c,
             None => {
-                return BandcampResponse::Error(ProtocolError::NotAuthenticated {
+                return SourceResponse::Error(SourceError::NotAuthenticated {
                     message: "Cookies not loaded. Upload cookies first.".to_string(),
                 });
             }
         };
 
+        // Get username from config
+        let username = match &self.username {
+            Some(u) => u.clone(),
+            None => {
+                return SourceResponse::Error(SourceError::NotAuthenticated {
+                    message: "No username configured. Set --username or MDMA_BANDCAMP_USERNAME."
+                        .to_string(),
+                });
+            }
+        };
+
         // Store the username
-        *self.current_username.lock() = Some(username.to_string());
+        *self.current_username.lock() = Some(username.clone());
 
         tracing::info!(username = %username, "Starting collection sync");
 
         // Fetch the collection
-        let collection = match client.get_collection(username.as_str()).await {
+        let collection = match client.get_collection(&username).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to fetch collection");
-                return BandcampResponse::Error(ProtocolError::CollectionFetchFailed {
+                return SourceResponse::Error(SourceError::SyncFailed {
                     message: e.to_string(),
                 });
             }
@@ -289,7 +320,7 @@ impl BandcampService {
             // Add to download queue
             let queued = QueuedDownload {
                 item,
-                state: DownloadState::Queued,
+                state: InternalDownloadState::Queued,
                 downloaded_bytes: 0,
                 total_bytes: None,
                 error: None,
@@ -304,8 +335,7 @@ impl BandcampService {
             "Sync complete, items queued"
         );
 
-        BandcampResponse::SyncStarted {
-            username: username.to_string(),
+        SourceResponse::SyncStarted {
             total_items,
             new_items,
         }
@@ -318,26 +348,24 @@ impl BandcampService {
         // Add active downloads
         for (id, dl) in self.active_downloads.lock().iter() {
             downloads.push(DownloadStatus {
-                id: ItemId::new(id),
+                id: id.clone(),
                 artist: dl.item.artist.to_string(),
                 title: dl.item.title.to_string(),
-                state: dl.state.clone(),
+                state: dl.state.to_protocol(&dl.error),
                 downloaded_bytes: dl.downloaded_bytes,
                 total_bytes: dl.total_bytes,
-                error: dl.error.clone(),
             });
         }
 
         // Add queued downloads
         for dl in self.download_queue.lock().iter() {
             downloads.push(DownloadStatus {
-                id: api_item_id_to_protocol(&dl.item.id),
+                id: dl.item.id.as_str().to_string(),
                 artist: dl.item.artist.to_string(),
                 title: dl.item.title.to_string(),
                 state: DownloadState::Queued,
                 downloaded_bytes: 0,
                 total_bytes: None,
-                error: None,
             });
         }
 
@@ -345,22 +373,17 @@ impl BandcampService {
     }
 
     /// Cancel a download
-    fn cancel_download(&self, id: &ItemId) {
+    fn cancel_download(&self, id: &str) {
         // Remove from queue if queued
         let mut queue = self.download_queue.lock();
-        queue.retain(|dl| dl.item.id.as_str() != id.as_str());
+        queue.retain(|dl| dl.item.id.as_str() != id);
 
         // Mark as cancelled if active
         let mut active = self.active_downloads.lock();
-        if let Some(dl) = active.get_mut(id.as_str()) {
-            dl.state = DownloadState::Cancelled;
+        if let Some(dl) = active.get_mut(id) {
+            dl.state = InternalDownloadState::Cancelled;
         }
     }
-}
-
-/// Convert bandcamp_api::ItemId to protocol ItemId
-fn api_item_id_to_protocol(id: &bandcamp_api::ItemId) -> ItemId {
-    ItemId::new(id.as_str())
 }
 
 /// Supported audio file extensions
@@ -591,7 +614,7 @@ fn run_nng_bridge(
             Ok(r) => r,
             Err(_) => {
                 tracing::error!("Response channel closed");
-                BandcampResponse::Error(ProtocolError::Internal {
+                SourceResponse::Error(SourceError::Internal {
                     message: "Internal error: response channel closed".to_string(),
                 })
             }
@@ -630,7 +653,7 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
         };
 
         let item_id = queued.item.id.as_str().to_string();
-        queued.state = DownloadState::Downloading;
+        queued.state = InternalDownloadState::Downloading;
 
         // Add to active downloads
         {
@@ -644,7 +667,7 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
             None => {
                 let mut active = service.active_downloads.lock();
                 if let Some(dl) = active.get_mut(&item_id) {
-                    dl.state = DownloadState::Failed;
+                    dl.state = InternalDownloadState::Failed;
                     dl.error = Some("No authenticated client available".to_string());
                 }
                 service.downloads_failed.fetch_add(1, Ordering::Relaxed);
@@ -666,7 +689,7 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
                 tracing::error!(error = %e, item_id = %item_id, "Failed to get item details");
                 let mut active = service.active_downloads.lock();
                 if let Some(dl) = active.get_mut(&item_id) {
-                    dl.state = DownloadState::Failed;
+                    dl.state = InternalDownloadState::Failed;
                     dl.error = Some(format!("Failed to get details: {}", e));
                 }
                 service.downloads_failed.fetch_add(1, Ordering::Relaxed);
@@ -709,7 +732,7 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
                     {
                         let mut active = service.active_downloads.lock();
                         if let Some(dl) = active.get_mut(&item_id) {
-                            dl.state = DownloadState::Extracting;
+                            dl.state = InternalDownloadState::Extracting;
                         }
                     }
 
@@ -733,11 +756,11 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
                                 "Extracted audio files to inbox"
                             );
 
-                            // Update state to moving (already done, just update status)
+                            // Update state to moving
                             {
                                 let mut active = service.active_downloads.lock();
                                 if let Some(dl) = active.get_mut(&item_id) {
-                                    dl.state = DownloadState::Moving;
+                                    dl.state = InternalDownloadState::Moving;
                                 }
                             }
 
@@ -797,7 +820,7 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
                             {
                                 let mut active = service.active_downloads.lock();
                                 if let Some(dl) = active.get_mut(&item_id) {
-                                    dl.state = DownloadState::Completed;
+                                    dl.state = InternalDownloadState::Completed;
                                 }
                             }
                             service.downloads_completed.fetch_add(1, Ordering::Relaxed);
@@ -823,7 +846,7 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
                             tracing::error!(error = %e, item_id = %item_id, "Failed to process download");
                             let mut active = service.active_downloads.lock();
                             if let Some(dl) = active.get_mut(&item_id) {
-                                dl.state = DownloadState::Failed;
+                                dl.state = InternalDownloadState::Failed;
                                 dl.error = Some(format!("Processing failed: {}", e));
                             }
                             service.downloads_failed.fetch_add(1, Ordering::Relaxed);
@@ -832,7 +855,7 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
                             tracing::error!(error = %e, item_id = %item_id, "Extraction task panicked");
                             let mut active = service.active_downloads.lock();
                             if let Some(dl) = active.get_mut(&item_id) {
-                                dl.state = DownloadState::Failed;
+                                dl.state = InternalDownloadState::Failed;
                                 dl.error = Some("Extraction task panicked".to_string());
                             }
                             service.downloads_failed.fetch_add(1, Ordering::Relaxed);
@@ -852,7 +875,7 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
                     }
                     let mut active = service.active_downloads.lock();
                     if let Some(dl) = active.get_mut(&item_id) {
-                        dl.state = DownloadState::Failed;
+                        dl.state = InternalDownloadState::Failed;
                         dl.error = Some(error);
                     }
                     service.downloads_failed.fetch_add(1, Ordering::Relaxed);
@@ -864,8 +887,8 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
             // Stream ended without success event
             let mut active = service.active_downloads.lock();
             if let Some(dl) = active.get_mut(&item_id) {
-                if dl.state == DownloadState::Downloading {
-                    dl.state = DownloadState::Failed;
+                if dl.state == InternalDownloadState::Downloading {
+                    dl.state = InternalDownloadState::Failed;
                     dl.error = Some("Download stream ended unexpectedly".to_string());
                     service.downloads_failed.fetch_add(1, Ordering::Relaxed);
                 }

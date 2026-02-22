@@ -1,11 +1,7 @@
 //! MDMA CLI - Command line interface for mdma services
 //!
-//! Connects to the library and bandcamp services via nng IPC
+//! Connects to services via gateway (single address) or direct IPC.
 
-use bandcamp_ipc_client::{
-    BandcampClient, BandcampUsername, ClientError as BandcampClientError,
-    ProtocolError as BandcampProtocolError,
-};
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use colored::Colorize;
@@ -14,10 +10,12 @@ use corsett::{
     ColumnSizingConfigBuilder, RemovalPolicy, Row, Score, Shorten, ShortenAny,
 };
 use library_ipc_client::{
-    ClientError, ContentHash, InboxPath, LibraryClient, ProtocolError, TrackInfo,
+    ClientError, ContentHash, InboxPath, IngestAllItem, IngestResult, LibraryClient,
+    LibraryRequest, LibraryResponse, ProtocolError, ServiceStatus, TrackInfo,
 };
 use library_search::{parse_numeric_query, parse_string_query, TrackQuery};
-use media_client::{Deck, MediaClient};
+use media_client::{Command, Deck, MediaClient, Response, ResponseData};
+use source_protocol::{SourceRequest, SourceResponse};
 
 // =============================================================================
 // CLI Definition
@@ -27,7 +25,11 @@ use media_client::{Deck, MediaClient};
 #[command(name = "mdma")]
 #[command(author, version, about = "MDMA CLI - Control the music services")]
 struct Cli {
-    /// Library IPC socket address
+    /// Gateway address (routes all requests through a single endpoint)
+    #[arg(long, global = true, env = "MDMA_GATEWAY")]
+    gateway: Option<String>,
+
+    /// Library IPC socket address (direct mode, ignored when --gateway is set)
     #[arg(
         long,
         default_value = "ipc:///run/mdma/library.sock",
@@ -36,16 +38,7 @@ struct Cli {
     )]
     socket: String,
 
-    /// Bandcamp IPC socket address
-    #[arg(
-        long,
-        default_value = "ipc:///run/mdma/bandcamp.sock",
-        global = true,
-        env = "MDMA_BANDCAMP_SOCKET"
-    )]
-    bandcamp_socket: String,
-
-    /// Playback server socket address
+    /// Playback server socket address (direct mode, ignored when --gateway is set)
     #[arg(
         long,
         default_value = "ipc:///run/mdma/playback.sock",
@@ -53,6 +46,15 @@ struct Cli {
         env = "MDMA_PLAYBACK_SOCKET"
     )]
     playback_socket: String,
+
+    /// Sources directory for direct mode (contains *.sock files)
+    #[arg(
+        long,
+        default_value = "/run/mdma/sources",
+        global = true,
+        env = "MDMA_SOURCES_DIR"
+    )]
+    sources_dir: String,
 
     #[command(subcommand)]
     command: Commands,
@@ -145,10 +147,10 @@ enum Commands {
         command: InboxCommands,
     },
 
-    /// Bandcamp download commands
-    Bandcamp {
+    /// Music source management
+    Source {
         #[command(subcommand)]
-        command: BandcampCommands,
+        command: SourceCommands,
     },
 
     /// Playback control commands
@@ -208,36 +210,47 @@ enum InboxCommands {
 }
 
 #[derive(Subcommand, Debug)]
-enum BandcampCommands {
-    /// Check if the bandcamp service is running
-    Ping,
+enum SourceCommands {
+    /// List available music sources
+    List,
 
-    /// Get bandcamp service status
-    Status,
-
-    /// Reload cookies from disk
-    ReloadCookies,
-
-    /// Sync a user's Bandcamp collection
+    /// Sync a music source (download new items)
     Sync {
-        /// Bandcamp username
-        username: String,
+        /// Source name (e.g. bandcamp)
+        name: String,
     },
 
-    /// List current downloads
-    Downloads,
+    /// Show source status
+    Status {
+        /// Source name (e.g. bandcamp)
+        name: String,
+    },
+
+    /// List downloads for a source
+    Downloads {
+        /// Source name (e.g. bandcamp)
+        name: String,
+    },
 
     /// Cancel a download
     Cancel {
-        /// Item ID to cancel
+        /// Source name
+        name: String,
+        /// Download ID to cancel
         id: String,
     },
 
-    /// Pause all downloads
-    Pause,
+    /// Pause all downloads for a source
+    Pause {
+        /// Source name
+        name: String,
+    },
 
-    /// Resume downloads
-    Resume,
+    /// Resume downloads for a source
+    Resume {
+        /// Source name
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -316,6 +329,448 @@ enum QueueCommands {
     /// Edit the queue in $EDITOR (falls back to vi).
     /// Opens the current queue as a playlist file; save to apply changes.
     Edit,
+}
+
+// =============================================================================
+// Source Client Abstraction
+// =============================================================================
+
+/// Abstraction for sending source requests, works in both gateway and direct mode.
+enum SourceClient {
+    Gateway(gateway_client::GatewayClient),
+    Direct(nng::Socket),
+}
+
+impl SourceClient {
+    fn request(&self, name: &str, req: &SourceRequest) -> Result<SourceResponse, String> {
+        match self {
+            SourceClient::Gateway(gw) => gw.source_request(name, req).map_err(|e| e.to_string()),
+            SourceClient::Direct(socket) => {
+                let data = serde_json::to_vec(req).map_err(|e| e.to_string())?;
+                let msg = nng::Message::from(&data[..]);
+                socket
+                    .send(msg)
+                    .map_err(|(_, e)| format!("send failed: {}", e))?;
+                let resp_msg = socket.recv().map_err(|e| format!("recv failed: {}", e))?;
+                serde_json::from_slice(&resp_msg).map_err(|e| format!("parse failed: {}", e))
+            }
+        }
+    }
+}
+
+/// Connect to a source, via gateway or direct IPC.
+fn connect_source(cli: &Cli, name: &str) -> SourceClient {
+    if let Some(ref gw_addr) = cli.gateway {
+        match gateway_client::GatewayClient::connect(gw_addr) {
+            Ok(gw) => return SourceClient::Gateway(gw),
+            Err(e) => {
+                eprintln!("Failed to connect to gateway at {}: {}", gw_addr, e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Direct mode: connect to /run/mdma/sources/{name}.sock
+    let socket_path = format!("ipc://{}/{}.sock", cli.sources_dir, name);
+    match nng_transport::connect(&socket_path) {
+        Ok(socket) => SourceClient::Direct(socket),
+        Err(e) => {
+            eprintln!(
+                "Failed to connect to source '{}' at {}: {}",
+                name, socket_path, e
+            );
+            eprintln!("Is mdma-{} running?", name);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// List available sources (gateway or directory scan).
+fn list_available_sources(cli: &Cli) -> Vec<String> {
+    if let Some(ref gw_addr) = cli.gateway {
+        match gateway_client::GatewayClient::connect(gw_addr) {
+            Ok(gw) => match gw.list_sources() {
+                Ok(names) => return names,
+                Err(e) => {
+                    eprintln!("Failed to list sources: {}", e);
+                    std::process::exit(1);
+                }
+            },
+            Err(e) => {
+                eprintln!("Failed to connect to gateway at {}: {}", gw_addr, e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Direct mode: scan sources directory
+    let entries = match std::fs::read_dir(&cli.sources_dir) {
+        Ok(e) => e,
+        Err(_) => return vec![],
+    };
+
+    entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.extension()?.to_str()? == "sock" {
+                path.file_stem()?.to_str().map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+// =============================================================================
+// Library Backend (gateway or direct)
+// =============================================================================
+
+/// Abstraction for library requests, works in both gateway and direct mode.
+enum LibraryBackend {
+    Direct(LibraryClient),
+    Gateway(gateway_client::GatewayClient),
+}
+
+fn map_gw_to_lib_error(e: gateway_client::ClientError) -> ClientError {
+    match e {
+        gateway_client::ClientError::Connection(e) => ClientError::Connection(e),
+        gateway_client::ClientError::Nng(e) => ClientError::Nng(e),
+        gateway_client::ClientError::Serialization(e) => ClientError::Serialization(e),
+        gateway_client::ClientError::Gateway(msg) => {
+            ClientError::Protocol(ProtocolError::Internal { message: msg })
+        }
+    }
+}
+
+impl LibraryBackend {
+    fn request(&self, req: &LibraryRequest) -> Result<LibraryResponse, ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.request(req),
+            LibraryBackend::Gateway(gw) => gw.library_request(req).map_err(map_gw_to_lib_error),
+        }
+    }
+
+    fn ping(&self) -> Result<(), ClientError> {
+        match self.request(&LibraryRequest::Ping)? {
+            LibraryResponse::Pong => Ok(()),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to Ping".to_string(),
+            })),
+        }
+    }
+
+    fn status(&self) -> Result<ServiceStatus, ClientError> {
+        match self.request(&LibraryRequest::GetStatus)? {
+            LibraryResponse::Status(status) => Ok(status),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to GetStatus".to_string(),
+            })),
+        }
+    }
+
+    fn list_tracks(&self, limit: Option<usize>) -> Result<Vec<TrackInfo>, ClientError> {
+        match self.request(&LibraryRequest::ListTracks { limit })? {
+            LibraryResponse::Tracks(tracks) => Ok(tracks),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to ListTracks".to_string(),
+            })),
+        }
+    }
+
+    fn get_track(&self, hash: &ContentHash) -> Result<TrackInfo, ClientError> {
+        match self.request(&LibraryRequest::GetTrack { hash: hash.clone() })? {
+            LibraryResponse::Track(track) => Ok(track),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to GetTrack".to_string(),
+            })),
+        }
+    }
+
+    fn get_facts(
+        &self,
+        hash: &ContentHash,
+    ) -> Result<(ContentHash, Vec<(String, String)>), ClientError> {
+        match self.request(&LibraryRequest::GetFacts { hash: hash.clone() })? {
+            LibraryResponse::Facts { hash, facts } => Ok((hash, facts)),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to GetFacts".to_string(),
+            })),
+        }
+    }
+
+    fn search(&self, query: &TrackQuery) -> Result<Vec<TrackInfo>, ClientError> {
+        match self.request(&LibraryRequest::Search {
+            query: query.clone(),
+        })? {
+            LibraryResponse::SearchResults(tracks) => Ok(tracks),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to Search".to_string(),
+            })),
+        }
+    }
+
+    fn get_fact_values(&self, fact_type: &str) -> Result<Vec<String>, ClientError> {
+        match self.request(&LibraryRequest::GetFactValues {
+            fact_type: fact_type.to_string(),
+        })? {
+            LibraryResponse::FactValues(values) => Ok(values),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to GetFactValues".to_string(),
+            })),
+        }
+    }
+
+    fn inbox_queue(&self) -> Result<Vec<InboxPath>, ClientError> {
+        match self.request(&LibraryRequest::GetInboxQueue)? {
+            LibraryResponse::InboxQueue(paths) => Ok(paths),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to GetInboxQueue".to_string(),
+            })),
+        }
+    }
+
+    fn ingest_file(&self, path: &InboxPath) -> Result<IngestResult, ClientError> {
+        match self.request(&LibraryRequest::IngestFile {
+            path: path.clone(),
+            source: None,
+        })? {
+            LibraryResponse::IngestResult(result) => Ok(result),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to IngestFile".to_string(),
+            })),
+        }
+    }
+
+    fn delete_inbox_file(&self, path: &InboxPath) -> Result<IngestResult, ClientError> {
+        match self.request(&LibraryRequest::DeleteInboxFile { path: path.clone() })? {
+            LibraryResponse::IngestResult(result) => Ok(result),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to DeleteInboxFile".to_string(),
+            })),
+        }
+    }
+
+    fn ingest_all(&self) -> Result<Vec<IngestAllItem>, ClientError> {
+        match self.request(&LibraryRequest::IngestAll)? {
+            LibraryResponse::IngestAllResult(results) => Ok(results),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to IngestAll".to_string(),
+            })),
+        }
+    }
+}
+
+/// Connect to the library backend (gateway or direct).
+fn connect_library(cli: &Cli) -> LibraryBackend {
+    if let Some(ref gw_addr) = cli.gateway {
+        match gateway_client::GatewayClient::connect(gw_addr) {
+            Ok(gw) => LibraryBackend::Gateway(gw),
+            Err(e) => {
+                eprintln!("Failed to connect to gateway at {}: {}", gw_addr, e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match LibraryClient::connect(&cli.socket) {
+            Ok(c) => LibraryBackend::Direct(c),
+            Err(e) => {
+                eprintln!("Failed to connect to library at {}: {}", cli.socket, e);
+                eprintln!("Is mdma-library running?");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Playback Backend (gateway or direct)
+// =============================================================================
+
+/// Abstraction for playback commands, works in both gateway and direct mode.
+enum PlaybackBackend {
+    Direct(MediaClient),
+    Gateway(gateway_client::GatewayClient),
+}
+
+fn map_gw_to_media_error(e: gateway_client::ClientError) -> media_client::ClientError {
+    match e {
+        gateway_client::ClientError::Connection(e) => media_client::ClientError::Connection(e),
+        gateway_client::ClientError::Nng(e) => media_client::ClientError::Nng(e),
+        gateway_client::ClientError::Serialization(e) => {
+            media_client::ClientError::Serialization(e)
+        }
+        gateway_client::ClientError::Gateway(msg) => media_client::ClientError::Command(msg),
+    }
+}
+
+impl PlaybackBackend {
+    fn gw_send(&self, cmd: Command) -> Result<Response, media_client::ClientError> {
+        match self {
+            PlaybackBackend::Gateway(gw) => {
+                gw.playback_command(&cmd).map_err(map_gw_to_media_error)
+            }
+            PlaybackBackend::Direct(_) => unreachable!(),
+        }
+    }
+
+    fn gw_command(&self, cmd: Command) -> Result<(), media_client::ClientError> {
+        let response = self.gw_send(cmd)?;
+        if !response.success {
+            return Err(media_client::ClientError::Command(response.error_message));
+        }
+        Ok(())
+    }
+
+    fn gw_command_with_data(
+        &self,
+        cmd: Command,
+    ) -> Result<ResponseData, media_client::ClientError> {
+        let response = self.gw_send(cmd)?;
+        if !response.success {
+            return Err(media_client::ClientError::Command(response.error_message));
+        }
+        response
+            .data
+            .ok_or_else(|| media_client::ClientError::Command("Missing response data".to_string()))
+    }
+
+    fn play_queue(&self) -> Result<(), media_client::ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.play_queue(),
+            PlaybackBackend::Gateway(_) => self.gw_command(Command::PlayQueue),
+        }
+    }
+
+    fn stop(&self, deck: Deck) -> Result<(), media_client::ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.stop(deck),
+            PlaybackBackend::Gateway(_) => self.gw_command(Command::Stop { deck }),
+        }
+    }
+
+    fn now_playing(&self) -> Result<Option<ContentHash>, media_client::ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.now_playing(),
+            PlaybackBackend::Gateway(_) => {
+                let data = self.gw_command_with_data(Command::NowPlaying)?;
+                if let ResponseData::NowPlaying(hash) = data {
+                    Ok(hash)
+                } else {
+                    Err(media_client::ClientError::Command(
+                        "Unexpected response data type".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn queue_next(
+        &self,
+        hash: ContentHash,
+        path: std::path::PathBuf,
+    ) -> Result<(), media_client::ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.queue_next(hash, path),
+            PlaybackBackend::Gateway(_) => self.gw_command(Command::QueueNext { hash, path }),
+        }
+    }
+
+    fn queue_append(
+        &self,
+        hash: ContentHash,
+        path: std::path::PathBuf,
+    ) -> Result<(), media_client::ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.queue_append(hash, path),
+            PlaybackBackend::Gateway(_) => self.gw_command(Command::QueueAppend { hash, path }),
+        }
+    }
+
+    fn queue_list(&self) -> Result<Vec<ContentHash>, media_client::ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.queue_list(),
+            PlaybackBackend::Gateway(_) => {
+                let data = self.gw_command_with_data(Command::QueueList)?;
+                if let ResponseData::Queue(hashes) = data {
+                    Ok(hashes)
+                } else {
+                    Err(media_client::ClientError::Command(
+                        "Unexpected response data type".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn queue_clear(&self) -> Result<(), media_client::ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.queue_clear(),
+            PlaybackBackend::Gateway(_) => self.gw_command(Command::QueueClear),
+        }
+    }
+
+    fn queue_replace(
+        &self,
+        entries: Vec<(ContentHash, std::path::PathBuf)>,
+    ) -> Result<(), media_client::ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.queue_replace(entries),
+            PlaybackBackend::Gateway(_) => self.gw_command(Command::QueueReplace { entries }),
+        }
+    }
+
+    fn queue_remove(&self, hashes: Vec<ContentHash>) -> Result<usize, media_client::ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.queue_remove(hashes),
+            PlaybackBackend::Gateway(_) => {
+                let data = self.gw_command_with_data(Command::QueueRemove { hashes })?;
+                if let ResponseData::Count(n) = data {
+                    Ok(n)
+                } else {
+                    Err(media_client::ClientError::Command(
+                        "Unexpected response data type".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Connect to the playback backend (gateway or direct).
+fn connect_playback(cli: &Cli) -> PlaybackBackend {
+    if let Some(ref gw_addr) = cli.gateway {
+        match gateway_client::GatewayClient::connect(gw_addr) {
+            Ok(gw) => PlaybackBackend::Gateway(gw),
+            Err(e) => {
+                eprintln!("Failed to connect to gateway at {}: {}", gw_addr, e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match MediaClient::connect(&cli.playback_socket) {
+            Ok(c) => PlaybackBackend::Direct(c),
+            Err(e) => {
+                eprintln!(
+                    "Failed to connect to playback at {}: {}",
+                    cli.playback_socket, e
+                );
+                eprintln!("Is mdma-playback running?");
+                std::process::exit(1);
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -549,24 +1004,9 @@ fn handle_error(err: ClientError) -> ! {
     std::process::exit(1);
 }
 
-/// Handle bandcamp client errors uniformly
-fn handle_bandcamp_error(err: BandcampClientError) -> ! {
-    match err {
-        BandcampClientError::Protocol(BandcampProtocolError::NotAuthenticated { message }) => {
-            eprintln!("Not authenticated: {}", message);
-            eprintln!("Upload cookies to /etc/mdma/bandcamp-cookies.json");
-        }
-        BandcampClientError::Protocol(e) => {
-            eprintln!("Error: {}", e);
-        }
-        BandcampClientError::Connection(e) => {
-            eprintln!("Connection failed: {}", e);
-            eprintln!("Is mdma-bandcamp running?");
-        }
-        e => {
-            eprintln!("Error: {}", e);
-        }
-    }
+/// Handle source errors uniformly
+fn handle_source_error(err: &str) -> ! {
+    eprintln!("Error: {}", err);
     std::process::exit(1);
 }
 
@@ -574,7 +1014,7 @@ fn handle_bandcamp_error(err: BandcampClientError) -> ! {
 // Command Handlers
 // =============================================================================
 
-fn handle_ping(client: &LibraryClient) -> Result<()> {
+fn handle_ping(client: &LibraryBackend) -> Result<()> {
     match client.ping() {
         Ok(()) => {
             println!("pong - service is alive");
@@ -584,7 +1024,7 @@ fn handle_ping(client: &LibraryClient) -> Result<()> {
     }
 }
 
-fn handle_status(client: &LibraryClient) -> Result<()> {
+fn handle_status(client: &LibraryBackend) -> Result<()> {
     match client.status() {
         Ok(status) => {
             println!("MDMA Library Service v{}", status.version);
@@ -599,7 +1039,7 @@ fn handle_status(client: &LibraryClient) -> Result<()> {
     }
 }
 
-fn handle_list(client: &LibraryClient, limit: Option<usize>) -> Result<()> {
+fn handle_list(client: &LibraryBackend, limit: Option<usize>) -> Result<()> {
     match client.list_tracks(limit) {
         Ok(tracks) => {
             if tracks.is_empty() {
@@ -623,7 +1063,7 @@ fn handle_list(client: &LibraryClient, limit: Option<usize>) -> Result<()> {
     }
 }
 
-fn handle_get(client: &LibraryClient, hash: String) -> Result<()> {
+fn handle_get(client: &LibraryBackend, hash: String) -> Result<()> {
     let content_hash = ContentHash(hash);
     match client.get_track(&content_hash) {
         Ok(track) => {
@@ -656,7 +1096,7 @@ fn handle_get(client: &LibraryClient, hash: String) -> Result<()> {
     }
 }
 
-fn handle_facts(client: &LibraryClient, hash: String) -> Result<()> {
+fn handle_facts(client: &LibraryBackend, hash: String) -> Result<()> {
     let content_hash = ContentHash(hash);
     match client.get_facts(&content_hash) {
         Ok((full_hash, facts)) => {
@@ -702,13 +1142,11 @@ fn build_track_query(
     }
 }
 
-fn handle_search(client: &LibraryClient, query: &TrackQuery) -> Result<()> {
+fn handle_search(client: &LibraryBackend, query: &TrackQuery) -> Result<()> {
     use std::collections::HashSet;
     use std::io::{BufRead, IsTerminal};
 
     // When stdin is piped, read all hashes as an intersection filter.
-    // Each line may be a full hash (sha256:abc...) or the short-hash+display format
-    // emitted by `mdma search` in pipe mode — we take the first whitespace token.
     let stdin_filter: Option<HashSet<String>> = if !std::io::stdin().is_terminal() {
         let tokens = std::io::stdin()
             .lock()
@@ -758,7 +1196,7 @@ fn handle_search(client: &LibraryClient, query: &TrackQuery) -> Result<()> {
     }
 }
 
-fn handle_fact_values_for(client: &LibraryClient, fact_type: String) -> Result<()> {
+fn handle_fact_values_for(client: &LibraryBackend, fact_type: String) -> Result<()> {
     use std::io::IsTerminal;
     match client.get_fact_values(&fact_type) {
         Ok(values) => {
@@ -784,7 +1222,7 @@ fn handle_fact_values_for(client: &LibraryClient, fact_type: String) -> Result<(
     }
 }
 
-fn handle_inbox_list(client: &LibraryClient) -> Result<()> {
+fn handle_inbox_list(client: &LibraryBackend) -> Result<()> {
     match client.inbox_queue() {
         Ok(files) => {
             if files.is_empty() {
@@ -804,7 +1242,7 @@ fn handle_inbox_list(client: &LibraryClient) -> Result<()> {
     }
 }
 
-fn handle_inbox_delete(client: &LibraryClient, filename: String) -> Result<()> {
+fn handle_inbox_delete(client: &LibraryBackend, filename: String) -> Result<()> {
     let path = match InboxPath::new(&filename) {
         Ok(p) => p,
         Err(e) => {
@@ -827,7 +1265,7 @@ fn handle_inbox_delete(client: &LibraryClient, filename: String) -> Result<()> {
     }
 }
 
-fn handle_inbox_ingest(client: &LibraryClient, filename: String) -> Result<()> {
+fn handle_inbox_ingest(client: &LibraryBackend, filename: String) -> Result<()> {
     let path = match InboxPath::new(&filename) {
         Ok(p) => p,
         Err(e) => {
@@ -856,7 +1294,7 @@ fn handle_inbox_ingest(client: &LibraryClient, filename: String) -> Result<()> {
     }
 }
 
-fn handle_inbox_ingest_all(client: &LibraryClient) -> Result<()> {
+fn handle_inbox_ingest_all(client: &LibraryBackend) -> Result<()> {
     println!("Ingesting all files in inbox...");
 
     match client.ingest_all() {
@@ -896,31 +1334,47 @@ fn handle_inbox_ingest_all(client: &LibraryClient) -> Result<()> {
 }
 
 // =============================================================================
-// Bandcamp Command Handlers
+// Source Command Handlers
 // =============================================================================
 
-fn handle_bandcamp_ping(client: &BandcampClient) -> Result<()> {
-    match client.ping() {
-        Ok(()) => {
-            println!("pong - bandcamp service is alive");
+fn handle_source_list(cli: &Cli) -> Result<()> {
+    let sources = list_available_sources(cli);
+    if sources.is_empty() {
+        println!("No sources available");
+    } else {
+        for name in sources {
+            println!("{}", name);
+        }
+    }
+    Ok(())
+}
+
+fn handle_source_sync(client: &SourceClient, name: &str) -> Result<()> {
+    println!("Syncing {}...", name);
+    match client.request(name, &SourceRequest::Sync) {
+        Ok(SourceResponse::SyncStarted {
+            total_items,
+            new_items,
+        }) => {
+            println!("Sync started for {}", name);
+            println!("Total items: {}, New items: {}", total_items, new_items);
             Ok(())
         }
-        Err(e) => handle_bandcamp_error(e),
+        Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
+        Ok(_) => handle_source_error("Unexpected response"),
+        Err(e) => handle_source_error(&e),
     }
 }
 
-fn handle_bandcamp_status(client: &BandcampClient) -> Result<()> {
-    match client.status() {
-        Ok(status) => {
-            println!("MDMA Bandcamp Service v{}", status.version);
+fn handle_source_status(client: &SourceClient, name: &str) -> Result<()> {
+    match client.request(name, &SourceRequest::GetStatus) {
+        Ok(SourceResponse::Status(status)) => {
+            println!("Source: {} v{}", status.name, status.version);
             println!("{}", "=".repeat(40));
             println!(
-                "Cookies loaded:    {}",
-                if status.cookies_loaded { "yes" } else { "no" }
+                "Authenticated:     {}",
+                if status.authenticated { "yes" } else { "no" }
             );
-            if let Some(user) = status.current_username {
-                println!("Current user:      {}", user);
-            }
             println!("Downloads active:  {}", status.downloads_active);
             println!("Downloads queued:  {}", status.downloads_queued);
             println!("Downloads done:    {}", status.downloads_completed);
@@ -932,49 +1386,15 @@ fn handle_bandcamp_status(client: &BandcampClient) -> Result<()> {
             );
             Ok(())
         }
-        Err(e) => handle_bandcamp_error(e),
+        Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
+        Ok(_) => handle_source_error("Unexpected response"),
+        Err(e) => handle_source_error(&e),
     }
 }
 
-fn handle_bandcamp_reload_cookies(client: &BandcampClient) -> Result<()> {
-    match client.reload_cookies() {
-        Ok((valid, message)) => {
-            if valid {
-                println!("Cookies reloaded successfully");
-            } else {
-                eprintln!("Failed to reload cookies: {}", message);
-                std::process::exit(1);
-            }
-            Ok(())
-        }
-        Err(e) => handle_bandcamp_error(e),
-    }
-}
-
-fn handle_bandcamp_sync(client: &BandcampClient, username: String) -> Result<()> {
-    let username = match BandcampUsername::new(&username) {
-        Ok(u) => u,
-        Err(e) => {
-            eprintln!("Invalid username: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    println!("Syncing collection for {}...", username);
-
-    match client.sync(&username) {
-        Ok((user, total, new)) => {
-            println!("Sync started for {}", user);
-            println!("Total items: {}, New items: {}", total, new);
-            Ok(())
-        }
-        Err(e) => handle_bandcamp_error(e),
-    }
-}
-
-fn handle_bandcamp_downloads(client: &BandcampClient) -> Result<()> {
-    match client.list_downloads() {
-        Ok(downloads) => {
+fn handle_source_downloads(client: &SourceClient, name: &str) -> Result<()> {
+    match client.request(name, &SourceRequest::ListDownloads) {
+        Ok(SourceResponse::Downloads(downloads)) => {
             if downloads.is_empty() {
                 println!("No downloads in progress");
                 return Ok(());
@@ -991,56 +1411,62 @@ fn handle_bandcamp_downloads(client: &BandcampClient) -> Result<()> {
                     format!("{} bytes", dl.downloaded_bytes)
                 };
 
-                let status = match dl.state {
-                    bandcamp_ipc_client::DownloadState::Queued => "queued".to_string(),
-                    bandcamp_ipc_client::DownloadState::Downloading => {
+                let status = match &dl.state {
+                    source_protocol::DownloadState::Queued => "queued".to_string(),
+                    source_protocol::DownloadState::Downloading => {
                         format!("downloading {}", progress)
                     }
-                    bandcamp_ipc_client::DownloadState::Extracting => "extracting".to_string(),
-                    bandcamp_ipc_client::DownloadState::Moving => "moving".to_string(),
-                    bandcamp_ipc_client::DownloadState::Completed => "completed".to_string(),
-                    bandcamp_ipc_client::DownloadState::Failed => {
-                        format!("failed: {}", dl.error.unwrap_or_default())
+                    source_protocol::DownloadState::Processing => "processing".to_string(),
+                    source_protocol::DownloadState::Completed => "completed".to_string(),
+                    source_protocol::DownloadState::Failed { message } => {
+                        format!("failed: {}", message)
                     }
-                    bandcamp_ipc_client::DownloadState::Cancelled => "cancelled".to_string(),
+                    source_protocol::DownloadState::Cancelled => "cancelled".to_string(),
                 };
 
                 println!("{} | {} - {} | {}", dl.id, dl.artist, dl.title, status);
             }
             Ok(())
         }
-        Err(e) => handle_bandcamp_error(e),
+        Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
+        Ok(_) => handle_source_error("Unexpected response"),
+        Err(e) => handle_source_error(&e),
     }
 }
 
-fn handle_bandcamp_cancel(client: &BandcampClient, id: String) -> Result<()> {
-    let item_id = bandcamp_ipc_client::ItemId::new(&id);
-    match client.cancel_download(&item_id) {
-        Ok(()) => {
+fn handle_source_cancel(client: &SourceClient, name: &str, id: String) -> Result<()> {
+    match client.request(name, &SourceRequest::CancelDownload { id: id.clone() }) {
+        Ok(SourceResponse::Cancelled { .. }) => {
             println!("Cancelled download: {}", id);
             Ok(())
         }
-        Err(e) => handle_bandcamp_error(e),
+        Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
+        Ok(_) => handle_source_error("Unexpected response"),
+        Err(e) => handle_source_error(&e),
     }
 }
 
-fn handle_bandcamp_pause(client: &BandcampClient) -> Result<()> {
-    match client.pause() {
-        Ok(()) => {
+fn handle_source_pause(client: &SourceClient, name: &str) -> Result<()> {
+    match client.request(name, &SourceRequest::PauseAll) {
+        Ok(SourceResponse::Paused) => {
             println!("Downloads paused");
             Ok(())
         }
-        Err(e) => handle_bandcamp_error(e),
+        Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
+        Ok(_) => handle_source_error("Unexpected response"),
+        Err(e) => handle_source_error(&e),
     }
 }
 
-fn handle_bandcamp_resume(client: &BandcampClient) -> Result<()> {
-    match client.resume() {
-        Ok(()) => {
+fn handle_source_resume(client: &SourceClient, name: &str) -> Result<()> {
+    match client.request(name, &SourceRequest::ResumeAll) {
+        Ok(SourceResponse::Resumed) => {
             println!("Downloads resumed");
             Ok(())
         }
-        Err(e) => handle_bandcamp_error(e),
+        Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
+        Ok(_) => handle_source_error("Unexpected response"),
+        Err(e) => handle_source_error(&e),
     }
 }
 
@@ -1061,7 +1487,7 @@ fn handle_playback_error(err: media_client::ClientError) -> ! {
     std::process::exit(1);
 }
 
-fn handle_playback_play(media_client: &MediaClient) -> Result<()> {
+fn handle_playback_play(media_client: &PlaybackBackend) -> Result<()> {
     if let Err(e) = media_client.play_queue() {
         handle_playback_error(e);
     }
@@ -1070,8 +1496,8 @@ fn handle_playback_play(media_client: &MediaClient) -> Result<()> {
 }
 
 fn handle_playback_now(
-    media_client: &MediaClient,
-    library_client: Option<&LibraryClient>,
+    media_client: &PlaybackBackend,
+    library_client: Option<&LibraryBackend>,
 ) -> Result<()> {
     let hash = match media_client.now_playing() {
         Ok(h) => h,
@@ -1102,8 +1528,8 @@ fn handle_playback_now(
 }
 
 fn handle_queue_next(
-    library_client: &LibraryClient,
-    media_client: &MediaClient,
+    library_client: &LibraryBackend,
+    media_client: &PlaybackBackend,
     hashes: Vec<String>,
 ) -> Result<()> {
     let count = hashes.len();
@@ -1119,8 +1545,8 @@ fn handle_queue_next(
 }
 
 fn handle_queue_append(
-    library_client: &LibraryClient,
-    media_client: &MediaClient,
+    library_client: &LibraryBackend,
+    media_client: &PlaybackBackend,
     hashes: Vec<String>,
 ) -> Result<()> {
     let count = hashes.len();
@@ -1134,7 +1560,10 @@ fn handle_queue_append(
     Ok(())
 }
 
-fn handle_queue_list(media_client: &MediaClient, library_client: &LibraryClient) -> Result<()> {
+fn handle_queue_list(
+    media_client: &PlaybackBackend,
+    library_client: &LibraryBackend,
+) -> Result<()> {
     let hashes = match media_client.queue_list() {
         Ok(h) => h,
         Err(e) => handle_playback_error(e),
@@ -1170,13 +1599,10 @@ fn handle_queue_list(media_client: &MediaClient, library_client: &LibraryClient)
 }
 
 fn handle_queue_remove(
-    library_client: &LibraryClient,
-    media_client: &MediaClient,
+    library_client: &LibraryBackend,
+    media_client: &PlaybackBackend,
     hashes: Vec<String>,
 ) -> Result<()> {
-    // Resolve each hash through the library to get the canonical full sha256: hash.
-    // This handles short hashes (8-char prefixes) and full hashes equally.
-    // Hashes that don't resolve are skipped with a warning — they can't be in the queue.
     let content_hashes: Vec<ContentHash> = hashes
         .into_iter()
         .filter_map(|hash| {
@@ -1205,7 +1631,7 @@ fn handle_queue_remove(
     Ok(())
 }
 
-fn handle_queue_clear(media_client: &MediaClient) -> Result<()> {
+fn handle_queue_clear(media_client: &PlaybackBackend) -> Result<()> {
     if let Err(e) = media_client.queue_clear() {
         handle_playback_error(e);
     }
@@ -1214,8 +1640,8 @@ fn handle_queue_clear(media_client: &MediaClient) -> Result<()> {
 }
 
 fn handle_queue_replace(
-    library_client: &LibraryClient,
-    media_client: &MediaClient,
+    library_client: &LibraryBackend,
+    media_client: &PlaybackBackend,
     hashes: Vec<String>,
 ) -> Result<()> {
     let entries: Vec<(ContentHash, std::path::PathBuf)> = hashes
@@ -1230,7 +1656,10 @@ fn handle_queue_replace(
     Ok(())
 }
 
-fn handle_queue_edit(library_client: &LibraryClient, media_client: &MediaClient) -> Result<()> {
+fn handle_queue_edit(
+    library_client: &LibraryBackend,
+    media_client: &PlaybackBackend,
+) -> Result<()> {
     // 1. Get current queue hashes.
     let hashes = match media_client.queue_list() {
         Ok(h) => h,
@@ -1325,12 +1754,6 @@ fn handle_queue_edit(library_client: &LibraryClient, media_client: &MediaClient)
 
 /// Return the provided hash as a single-element vec, or read ALL lines from stdin and
 /// extract valid short hashes (8–12 lowercase hex chars as first token).
-///
-/// Supports both:
-///   Single:  mdma queue append ec9ce8d0
-///   Multi:   mdma search "van morph" | mdma queue append
-///   Dmenu:   mdma search "van morph" | dmenu | mdma queue append  (dmenu outputs one line)
-///   Playlist: cat set.plist | mdma queue replace   (comments/blank lines silently ignored)
 fn hashes_arg_or_stdin(hash: Option<String>) -> Vec<String> {
     match hash {
         Some(h) => vec![h],
@@ -1366,7 +1789,7 @@ fn hashes_arg_or_stdin(hash: Option<String>) -> Vec<String> {
 
 /// Resolve a hash to a (ContentHash, PathBuf) pair via the library service.
 fn resolve_track(
-    library_client: &LibraryClient,
+    library_client: &LibraryBackend,
     hash: String,
 ) -> (ContentHash, std::path::PathBuf) {
     let content_hash = ContentHash(hash);
@@ -1384,7 +1807,7 @@ fn resolve_track(
 }
 
 fn handle_sort(
-    client: &LibraryClient,
+    client: &LibraryBackend,
     field: SortField,
     ascending: bool,
     descending: bool,
@@ -1486,7 +1909,7 @@ fn handle_sort(
     Ok(())
 }
 
-fn handle_playback_stop(media_client: &MediaClient) -> Result<()> {
+fn handle_playback_stop(media_client: &PlaybackBackend) -> Result<()> {
     if let Err(e) = media_client.stop(Deck::A) {
         handle_playback_error(e);
     }
@@ -1505,186 +1928,155 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Dispatch command - connect to appropriate service based on command
-    match cli.command {
+    match &cli.command {
         Commands::Playback { command } => {
-            let connect_media = || match MediaClient::connect(&cli.playback_socket) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!(
-                        "Failed to connect to playback server at {}: {}",
-                        cli.playback_socket, e
-                    );
-                    eprintln!("Is mdma-playback running?");
-                    std::process::exit(1);
-                }
-            };
-
-            let connect_library = || match LibraryClient::connect(&cli.socket) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Failed to connect to library at {}: {}", cli.socket, e);
-                    eprintln!("Is mdma-library running?");
-                    std::process::exit(1);
-                }
-            };
-
+            let pb = connect_playback(&cli);
             match command {
-                PlaybackCommands::Play => {
-                    let media_client = connect_media();
-                    handle_playback_play(&media_client)
-                }
-                PlaybackCommands::Stop => {
-                    let media_client = connect_media();
-                    handle_playback_stop(&media_client)
-                }
+                PlaybackCommands::Play => handle_playback_play(&pb),
+                PlaybackCommands::Stop => handle_playback_stop(&pb),
                 PlaybackCommands::Now => {
                     use std::io::IsTerminal;
-                    let media_client = connect_media();
                     if std::io::stdout().is_terminal() {
-                        let lib = connect_library();
-                        handle_playback_now(&media_client, Some(&lib))
+                        let lib = connect_library(&cli);
+                        handle_playback_now(&pb, Some(&lib))
                     } else {
-                        handle_playback_now(&media_client, None)
+                        handle_playback_now(&pb, None)
                     }
                 }
             }
         }
 
         Commands::Queue { command } => {
-            let connect_media = || match MediaClient::connect(&cli.playback_socket) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!(
-                        "Failed to connect to playback server at {}: {}",
-                        cli.playback_socket, e
-                    );
-                    eprintln!("Is mdma-playback running?");
-                    std::process::exit(1);
-                }
-            };
-            let connect_library = || match LibraryClient::connect(&cli.socket) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Failed to connect to library at {}: {}", cli.socket, e);
-                    eprintln!("Is mdma-library running?");
-                    std::process::exit(1);
-                }
-            };
-
+            let lib = connect_library(&cli);
+            let pb = connect_playback(&cli);
             match command {
-                QueueCommands::Next { hash } => handle_queue_next(
-                    &connect_library(),
-                    &connect_media(),
-                    hashes_arg_or_stdin(hash),
-                ),
-                QueueCommands::Append { hash } => handle_queue_append(
-                    &connect_library(),
-                    &connect_media(),
-                    hashes_arg_or_stdin(hash),
-                ),
-                QueueCommands::List => handle_queue_list(&connect_media(), &connect_library()),
-                QueueCommands::Clear => handle_queue_clear(&connect_media()),
-                QueueCommands::Remove { hash } => handle_queue_remove(
-                    &connect_library(),
-                    &connect_media(),
-                    hashes_arg_or_stdin(hash),
-                ),
-                QueueCommands::Replace => handle_queue_replace(
-                    &connect_library(),
-                    &connect_media(),
-                    hashes_arg_or_stdin(None),
-                ),
-                QueueCommands::Edit => handle_queue_edit(&connect_library(), &connect_media()),
+                QueueCommands::Next { hash } => {
+                    handle_queue_next(&lib, &pb, hashes_arg_or_stdin(hash.clone()))
+                }
+                QueueCommands::Append { hash } => {
+                    handle_queue_append(&lib, &pb, hashes_arg_or_stdin(hash.clone()))
+                }
+                QueueCommands::List => handle_queue_list(&pb, &lib),
+                QueueCommands::Clear => handle_queue_clear(&pb),
+                QueueCommands::Remove { hash } => {
+                    handle_queue_remove(&lib, &pb, hashes_arg_or_stdin(hash.clone()))
+                }
+                QueueCommands::Replace => {
+                    handle_queue_replace(&lib, &pb, hashes_arg_or_stdin(None))
+                }
+                QueueCommands::Edit => handle_queue_edit(&lib, &pb),
             }
         }
 
-        Commands::Bandcamp { command } => {
-            // Connect to bandcamp service
-            let client = match BandcampClient::connect(&cli.bandcamp_socket) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!(
-                        "Failed to connect to bandcamp service at {}: {}",
-                        cli.bandcamp_socket, e
-                    );
-                    eprintln!("Is mdma-bandcamp running?");
-                    std::process::exit(1);
-                }
-            };
-
-            match command {
-                BandcampCommands::Ping => handle_bandcamp_ping(&client),
-                BandcampCommands::Status => handle_bandcamp_status(&client),
-                BandcampCommands::ReloadCookies => handle_bandcamp_reload_cookies(&client),
-                BandcampCommands::Sync { username } => handle_bandcamp_sync(&client, username),
-                BandcampCommands::Downloads => handle_bandcamp_downloads(&client),
-                BandcampCommands::Cancel { id } => handle_bandcamp_cancel(&client, id),
-                BandcampCommands::Pause => handle_bandcamp_pause(&client),
-                BandcampCommands::Resume => handle_bandcamp_resume(&client),
+        Commands::Source { command } => match command {
+            SourceCommands::List => handle_source_list(&cli),
+            SourceCommands::Sync { name } => {
+                let client = connect_source(&cli, name);
+                handle_source_sync(&client, name)
             }
-        }
+            SourceCommands::Status { name } => {
+                let client = connect_source(&cli, name);
+                handle_source_status(&client, name)
+            }
+            SourceCommands::Downloads { name } => {
+                let client = connect_source(&cli, name);
+                handle_source_downloads(&client, name)
+            }
+            SourceCommands::Cancel { name, id } => {
+                let client = connect_source(&cli, name);
+                handle_source_cancel(&client, name, id.clone())
+            }
+            SourceCommands::Pause { name } => {
+                let client = connect_source(&cli, name);
+                handle_source_pause(&client, name)
+            }
+            SourceCommands::Resume { name } => {
+                let client = connect_source(&cli, name);
+                handle_source_resume(&client, name)
+            }
+        },
 
         // Library commands - connect to library service
-        cmd => {
-            let client = match LibraryClient::connect(&cli.socket) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Failed to connect to service at {}: {}", cli.socket, e);
-                    eprintln!("Is mdma-library running?");
-                    std::process::exit(1);
-                }
-            };
-
-            match cmd {
-                Commands::Ping => handle_ping(&client),
-                Commands::Status => handle_status(&client),
-                Commands::List { limit } => handle_list(&client, limit),
-                Commands::Get { hash } => handle_get(&client, hash),
-                Commands::Facts { hash } => handle_facts(&client, hash),
-                Commands::Search {
-                    query,
-                    artist,
-                    title,
-                    album,
-                    label,
-                    genre,
-                    style,
-                    bpm,
-                    key,
-                    duration,
-                    year,
-                    source,
-                    subcommand,
-                } => {
-                    if let Some(sub) = subcommand {
-                        match sub {
-                            SearchSubcommands::FactValuesFor { fact_type } => {
-                                handle_fact_values_for(&client, fact_type)
-                            }
-                        }
-                    } else {
-                        let track_query = build_track_query(
-                            query, artist, title, album, label, genre, style, bpm, key, duration,
-                            year, source,
-                        );
-                        handle_search(&client, &track_query)
+        Commands::Ping => {
+            let client = connect_library(&cli);
+            handle_ping(&client)
+        }
+        Commands::Status => {
+            let client = connect_library(&cli);
+            handle_status(&client)
+        }
+        Commands::List { limit } => {
+            let client = connect_library(&cli);
+            handle_list(&client, *limit)
+        }
+        Commands::Get { hash } => {
+            let client = connect_library(&cli);
+            handle_get(&client, hash.clone())
+        }
+        Commands::Facts { hash } => {
+            let client = connect_library(&cli);
+            handle_facts(&client, hash.clone())
+        }
+        Commands::Search {
+            query,
+            artist,
+            title,
+            album,
+            label,
+            genre,
+            style,
+            bpm,
+            key,
+            duration,
+            year,
+            source,
+            subcommand,
+        } => {
+            let client = connect_library(&cli);
+            if let Some(sub) = subcommand {
+                match sub {
+                    SearchSubcommands::FactValuesFor { fact_type } => {
+                        handle_fact_values_for(&client, fact_type.clone())
                     }
                 }
-                Commands::Inbox { command } => match command {
-                    InboxCommands::List => handle_inbox_list(&client),
-                    InboxCommands::Delete { filename } => handle_inbox_delete(&client, filename),
-                    InboxCommands::Ingest { filename } => handle_inbox_ingest(&client, filename),
-                    InboxCommands::IngestAll => handle_inbox_ingest_all(&client),
-                },
-                Commands::Sort {
-                    field,
-                    ascending,
-                    descending,
-                } => handle_sort(&client, field, ascending, descending),
-                Commands::Bandcamp { .. } | Commands::Playback { .. } | Commands::Queue { .. } => {
-                    unreachable!()
-                }
+            } else {
+                let track_query = build_track_query(
+                    query.clone(),
+                    artist.clone(),
+                    title.clone(),
+                    album.clone(),
+                    label.clone(),
+                    genre.clone(),
+                    style.clone(),
+                    bpm.clone(),
+                    key.clone(),
+                    duration.clone(),
+                    year.clone(),
+                    source.clone(),
+                );
+                handle_search(&client, &track_query)
             }
+        }
+        Commands::Inbox { command } => {
+            let client = connect_library(&cli);
+            match command {
+                InboxCommands::List => handle_inbox_list(&client),
+                InboxCommands::Delete { filename } => {
+                    handle_inbox_delete(&client, filename.clone())
+                }
+                InboxCommands::Ingest { filename } => {
+                    handle_inbox_ingest(&client, filename.clone())
+                }
+                InboxCommands::IngestAll => handle_inbox_ingest_all(&client),
+            }
+        }
+        Commands::Sort {
+            field,
+            ascending,
+            descending,
+        } => {
+            let client = connect_library(&cli);
+            handle_sort(&client, field.clone(), *ascending, *descending)
         }
     }
 }

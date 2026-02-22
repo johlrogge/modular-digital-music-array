@@ -26,21 +26,9 @@ echo "  → Copying mdma-playback binary..."
 cp "$BINARY" "$PACKAGE_DIR/usr/bin/"
 chmod +x "$PACKAGE_DIR/usr/bin/mdma-playback"
 
-# Create runit service script
-echo "  → Creating service script..."
-cat > "$PACKAGE_DIR/etc/sv/mdma-playback/run" <<'RUNSCRIPT'
-#!/bin/sh
-exec 2>&1
-sv check pipewire || exit 1
-sleep 1
-mkdir -p /run/mdma
-chown mdma:mdma /run/mdma
-rm -f /run/mdma/playback.sock
-export PIPEWIRE_RUNTIME_DIR=/run/pipewire
-exec chpst -u mdma:mdma:audio:video:_pipewire /usr/bin/mdma-playback \
-    --socket ipc:///run/mdma/playback.sock \
-    --tcp tcp://0.0.0.0:5557
-RUNSCRIPT
+# Copy runit service script from void-packages (single source of truth)
+echo "  → Copying service script from void-packages..."
+cp "void-packages/srcpkgs/mdma-playback/files/mdma-playback/run" "$PACKAGE_DIR/etc/sv/mdma-playback/run"
 chmod +x "$PACKAGE_DIR/etc/sv/mdma-playback/run"
 
 # Create runit log service
@@ -135,7 +123,7 @@ if XBPS_TARGET_ARCH=aarch64 xbps-create \
     -D "pipewire>=0 wireplumber>=0 libspa-alsa>=0 alsa-pipewire>=0" \
     -H "https://github.com/johlrogge/modular-digital-music-array" \
     -l MIT \
-    -m "Joakim Rohlén <joakim@roehlen.com>" \
+    -m "Joakim Ohlrogge <joakim.ohlrogge@agical.se>" \
     "$PACKAGE_DIR_ABS" 2>&1; then
     echo "  → xbps-create succeeded"
 else

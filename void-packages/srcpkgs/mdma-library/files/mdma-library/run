@@ -1,0 +1,7 @@
+#!/bin/sh
+exec 2>&1
+mkdir -p /music/inbox /music/blobs /metadata /run/mdma
+exec chpst -u mdma /usr/bin/mdma-library \
+    --music-dir /music \
+    --metadata-dir /metadata \
+    --socket ipc:///run/mdma/library.sock

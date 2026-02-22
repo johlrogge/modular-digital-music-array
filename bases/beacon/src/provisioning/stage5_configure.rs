@@ -485,7 +485,14 @@ async fn install_packages(mount_root: &Path) -> Result<()> {
 async fn install_mdma_packages(mount_root: &Path) -> Result<()> {
     tracing::info!("Installing MDMA packages from MDMA repository");
 
-    let packages = ["beacon", "mdma-console", "mdma-library"];
+    let packages = [
+        "beacon",
+        "mdma-console",
+        "mdma-library",
+        "mdma-playback",
+        "mdma-gateway",
+        "mdma-bandcamp",
+    ];
 
     tracing::info!("  Packages: {}", packages.join(", "));
 
@@ -512,7 +519,7 @@ async fn install_mdma_packages(mount_root: &Path) -> Result<()> {
             "MDMA packages not installed (may not be published yet): {}",
             stderr
         );
-        tracing::warn!("You can install them manually later with: xbps-install beacon mdma-console mdma-library");
+        tracing::warn!("You can install them manually later with: xbps-install beacon mdma-console mdma-library mdma-playback mdma-gateway mdma-bandcamp");
         return Ok(());
     }
 
@@ -531,10 +538,19 @@ async fn enable_services(mount_root: &Path) -> Result<()> {
         "avahi-daemon",
         "mdma-console",
         "mdma-library",
+        "mdma-playback",
+        "mdma-gateway",
+        "mdma-bandcamp",
     ];
 
     // Create log directories for MDMA services
-    for log_dir in ["mdma-console", "mdma-library"] {
+    for log_dir in [
+        "mdma-console",
+        "mdma-library",
+        "mdma-playback",
+        "mdma-gateway",
+        "mdma-bandcamp",
+    ] {
         let log_path = mount_root.join(format!("var/log/{}", log_dir));
         tokio::fs::create_dir_all(&log_path).await.map_err(|e| {
             BeaconError::Provisioning(format!("Failed to create {}: {}", log_path.display(), e))

@@ -1,9 +1,9 @@
 //! IPC server for mdma-bandcamp using nng
 //!
 //! Uses request/reply pattern over IPC socket.
-//! Protocol types are defined in bandcamp-ipc-protocol.
+//! Protocol types are defined in source-protocol.
 
-pub use bandcamp_ipc_protocol::*;
+pub use source_protocol::*;
 
 use thiserror::Error;
 
@@ -41,14 +41,14 @@ impl IpcServer {
     }
 
     /// Receive a request (blocking)
-    pub fn recv(&self) -> Result<BandcampRequest, IpcError> {
+    pub fn recv(&self) -> Result<SourceRequest, IpcError> {
         let msg = self.socket.recv()?;
-        let request: BandcampRequest = serde_json::from_slice(&msg)?;
+        let request: SourceRequest = serde_json::from_slice(&msg)?;
         Ok(request)
     }
 
     /// Send a response
-    pub fn send(&self, response: &BandcampResponse) -> Result<(), IpcError> {
+    pub fn send(&self, response: &SourceResponse) -> Result<(), IpcError> {
         let data = serde_json::to_vec(response)?;
         let msg = nng::Message::from(&data[..]);
         self.socket.send(msg).map_err(|(_, e)| IpcError::Nng(e))?;
@@ -62,14 +62,14 @@ mod tests {
 
     #[test]
     fn serialize_request() {
-        let req = BandcampRequest::GetStatus;
+        let req = SourceRequest::GetStatus;
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("GetStatus"));
     }
 
     #[test]
     fn serialize_response() {
-        let resp = BandcampResponse::Pong;
+        let resp = SourceResponse::Pong;
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("Pong"));
     }

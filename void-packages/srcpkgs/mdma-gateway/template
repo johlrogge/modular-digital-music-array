@@ -1,0 +1,24 @@
+# Template file for mdma-gateway package
+pkgname=mdma-gateway
+version=0.1.0
+revision=1
+archs="aarch64"
+build_style=cargo
+hostmakedepends="cargo"
+makedepends="rust-std"
+short_desc="MDMA API gateway"
+maintainer="Joakim Ohlrogge <joakim.ohlrogge@agical.se>"
+license="MIT"
+homepage="https://github.com/johlrogge/modular-digital-music-array"
+
+distfiles="https://github.com/johlrogge/modular-digital-music-array/archive/v${version}.tar.gz"
+checksum="SKIP"
+
+do_build() {
+    cargo build --release --bin mdma-gateway --target aarch64-unknown-linux-gnu
+}
+
+do_install() {
+    vbin target/aarch64-unknown-linux-gnu/release/mdma-gateway
+    vsv mdma-gateway
+}

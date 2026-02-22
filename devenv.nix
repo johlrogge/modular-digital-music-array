@@ -39,9 +39,8 @@
   env.LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
   # Pi service sockets — available in every devenv shell automatically
-  env.MDMA_LIBRARY_SOCKET  = "tcp://mdma-909.local:5555";
-  env.MDMA_BANDCAMP_SOCKET = "tcp://mdma-909.local:5556";
-  env.MDMA_PLAYBACK_SOCKET = "tcp://mdma-909.local:5557";
+  # Gateway mode: single address routes to all services
+  env.MDMA_GATEWAY         = "tcp://mdma-909.local:5555";
   env.MDMA_SSH_KEY         = "/home/johlrogge/.ssh/mdma_pi";
   env.MDMA_PI_HOST         = "mdma-909.local";
 
@@ -66,14 +65,23 @@
     mdma-status.exec = ''
       echo "Pi: $MDMA_PI_HOST"
       echo ""
-      for port in 5555 5556 5557; do
-        label="library "
-        [ "$port" = "5556" ] && label="bandcamp"
-        [ "$port" = "5557" ] && label="playback"
-        nc -z -w2 mdma-909.local $port 2>/dev/null \
-          && echo "  ✓ $label :$port" \
-          || echo "  ✗ $label :$port (unreachable)"
-      done
+      # Check gateway (single external port)
+      nc -z -w2 mdma-909.local 5555 2>/dev/null \
+        && echo "  ✓ gateway  :5555" \
+        || echo "  ✗ gateway  :5555 (unreachable)"
+      # Check console
+      nc -z -w2 mdma-909.local 80 2>/dev/null \
+        && echo "  ✓ console  :80" \
+        || echo "  ✗ console  :80   (unreachable)"
+      echo ""
+      # Services via gateway
+      if nc -z -w2 mdma-909.local 5555 2>/dev/null; then
+        echo "Library:"
+        mdma status 2>/dev/null | sed 's/^/  /' || echo "  (unreachable)"
+        echo ""
+        echo "Sources:"
+        mdma source list 2>/dev/null | sed 's/^/  /' || echo "  (none)"
+      fi
       echo ""
       echo "PipeWire stream:"
       ssh -4 -i "$MDMA_SSH_KEY" "admin@$MDMA_PI_HOST" \
@@ -94,19 +102,18 @@
     echo "Zig:  $(zig version)"
     echo ""
     echo "Pi: $MDMA_PI_HOST"
-    echo "  library  $MDMA_LIBRARY_SOCKET"
-    echo "  bandcamp $MDMA_BANDCAMP_SOCKET"
-    echo "  playback $MDMA_PLAYBACK_SOCKET"
+    echo "  gateway  $MDMA_GATEWAY"
     echo ""
 
     # Build mdma-cli and expose it directly as `mdma` on PATH
     cargo build -q --package mdma-cli 2>/dev/null \
       && export PATH="$MDMA_PROJECT_ROOT/target/debug:$PATH" \
-      && echo "mdma CLI ready (talks to Pi via TCP)" \
+      && echo "mdma CLI ready (gateway mode)" \
       || echo "mdma CLI not built — run: cargo build --package mdma-cli"
 
     echo ""
     echo "Commands:  mdma --help"
+    echo "           mdma source list|sync|status|downloads"
     echo "           mdma-volume <0-1>  mdma-status"
     echo "           just --list"
   '';

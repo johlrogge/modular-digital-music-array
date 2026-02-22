@@ -143,7 +143,7 @@ if XBPS_TARGET_ARCH=aarch64 xbps-create \
     -s "MDMA provisioning beacon" \
     -H "https://github.com/johlrogge/modular-digital-music-array" \
     -l MIT \
-    -m "Joakim Rohlén <joakim@roehlen.com>" \
+    -m "Joakim Ohlrogge <joakim.ohlrogge@agical.se>" \
     -D "avahi>=0" \
     -D "dbus>=0" \
     "$PACKAGE_DIR_ABS" 2>&1; then

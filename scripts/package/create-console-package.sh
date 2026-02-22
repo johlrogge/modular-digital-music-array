@@ -26,18 +26,9 @@ echo "  → Copying mdma-console binary..."
 cp "$BINARY" "$PACKAGE_DIR/usr/bin/"
 chmod +x "$PACKAGE_DIR/usr/bin/mdma-console"
 
-# Create runit service script
-echo "  → Creating service script..."
-cat > "$PACKAGE_DIR/etc/sv/mdma-console/run" <<'RUNSCRIPT'
-#!/bin/sh
-exec 2>&1
-# Run as mdma user (binary has CAP_NET_BIND_SERVICE for port 80)
-if id mdma >/dev/null 2>&1; then
-    exec chpst -u mdma /usr/bin/mdma-console --port 80
-else
-    exec /usr/bin/mdma-console --port 80
-fi
-RUNSCRIPT
+# Copy runit service script from void-packages (single source of truth)
+echo "  → Copying service script from void-packages..."
+cp "void-packages/srcpkgs/mdma-console/files/mdma-console/run" "$PACKAGE_DIR/etc/sv/mdma-console/run"
 chmod +x "$PACKAGE_DIR/etc/sv/mdma-console/run"
 
 # Create runit log service
@@ -113,7 +104,7 @@ if XBPS_TARGET_ARCH=aarch64 xbps-create \
     -s "MDMA web console" \
     -H "https://github.com/johlrogge/modular-digital-music-array" \
     -l MIT \
-    -m "Joakim Rohlén <joakim@roehlen.com>" \
+    -m "Joakim Ohlrogge <joakim.ohlrogge@agical.se>" \
     "$PACKAGE_DIR_ABS" 2>&1; then
     echo "  → xbps-create succeeded"
 else

@@ -1,0 +1,11 @@
+#!/bin/sh
+exec 2>&1
+mkdir -p /run/mdma/sources /var/lib/mdma
+exec chpst -u mdma /usr/bin/mdma-bandcamp \
+    --cookies /etc/mdma/bandcamp-cookies.json \
+    --downloads-dir /music/downloads \
+    --inbox-dir /music/inbox \
+    --cache /var/lib/mdma/bandcamp.cache \
+    --socket ipc:///run/mdma/sources/bandcamp.sock \
+    --library-socket ipc:///run/mdma/library.sock \
+    --username johlyroger
