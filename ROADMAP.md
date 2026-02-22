@@ -183,19 +183,30 @@ First external pub/sub consumer. Proves the event model works from a separate pr
 
 ---
 
-### 7. MP3 Support + Manual Upload Source
+### 7. ZIP Upload for Library Ingestion
+
+**Why:** Beatport tracks come as ZIP downloads of FLACs. The inbox mechanism and ZIP extraction logic already exist — this just connects the laptop to the inbox.
+
+- Extract `extract_zip_to_inbox` from `mdma-bandcamp` into a shared component
+- Add `Upload` command to gateway protocol (accepts file bytes + source metadata)
+- CLI: `mdma upload <file>` — sends ZIP or single FLAC through the gateway
+- Gateway: receives file, extracts to inbox, triggers ingest, returns hashes
+- Supports: ZIP archives (extracts audio files), individual FLAC/WAV/AIFF files
+- Uses existing `IngestSource::Upload` provenance tracking
+
+---
+
+### 8. MP3 Support
 
 **Why:** Beta testers have large MP3 libraries. FLAC-only blocks adoption. Not "hifi" but pragmatic.
 
 - Add MP3 decoding to playback engine (Symphonia supports it — enable the feature)
 - `mdma-library` must accept `.mp3` files in inbox alongside `.flac`
-- **Manual upload source:** a simple "source" that accepts file uploads (SCP/HTTP) and drops them in inbox
-  - Enables beta testers to get their music onto the Pi without Bandcamp
-  - Could be as simple as an HTTP upload endpoint on the console, or an `mdma upload <file>` CLI command
+- `mdma upload` (priority 7) already handles getting files onto the Pi
 
 ---
 
-### 8. Bandcamp Configuration
+### 9. Bandcamp Configuration
 
 **Missing piece:** How does a fresh install configure the bandcamp service?
 
@@ -207,11 +218,39 @@ First external pub/sub consumer. Proves the event model works from a separate pr
 
 ---
 
-### 9. Stream Management (Silence → Off)
+### 10. Stream Management (Silence → Off)
 
 - Auto-shutdown PipeWire stream after N seconds of silence (queue empty, no track playing)
 - Auto-restart when a track is queued/played
 - Quality-of-life, not a blocker
+
+---
+
+### 11. Rekordbox Sync
+
+**Why:** Bridge MDMA and Rekordbox for club/CDJ preparation. Two phases.
+
+**Interface:** Rekordbox XML format (official, stable). Not the encrypted SQLite DB.
+
+**Identity mapping:** `RekordboxMapping` fact (ContentHash ↔ TrackID + file path).
+Persisted via stainless_facts. Created on first export, maintained across syncs.
+
+**Phase A — MDMA to Rekordbox (export):**
+- `mdma rekordbox export --playlist <name> --output <path>` on laptop
+- Pulls tracks from Pi, converts FLAC to AIFF locally (metadata + album art support)
+- Generates Rekordbox XML with file paths, BPM, key, artist, title
+- Records identity mapping as facts for future syncs
+- User imports XML in Rekordbox
+
+**Phase B — Rekordbox to MDMA (import):**
+- `mdma rekordbox import <rekordbox.xml>`
+- Matches tracks via identity mapping facts (falls back to metadata matching)
+- Imports playlists into MDMA playlist system
+- Imports/updates metadata: tags, rating, comments
+
+**Prerequisites:** First-class playlists, tags/rating facts.
+
+**Conversion runs on the laptop, not the Pi.**
 
 ---
 
