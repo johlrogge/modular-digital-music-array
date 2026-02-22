@@ -35,7 +35,7 @@ Always output at the iFi DAC's maximum supported rate (probe at startup — like
 4. Eventually: MDMA-101 hardware
 
 **Architecture constraints (locked):**
-- One NNG TCP socket (API gateway) — no more per-service ports (5555/5556/5557)
+- Two external NNG TCP ports: 5555 (API gateway, req/rep) + 5556 (event bus, pub/sub) — no per-service ports
 - Message bus / pub/sub for unsolicited events (position, track change, queue)
 - **stainless_facts is the only way to interact with facts.** Any new fact need = new capability in stainless_facts. Never parse or write JSONL manually.
 - Virtual deck is the internal abstraction — the queue feeds it; users don't address decks directly yet
@@ -139,36 +139,35 @@ mdma-library  mdma-playback  /run/mdma/sources/*.sock
 
 ---
 
-### 4. Pub/Sub Events + Play History Facts
+### ~~4. Pub/Sub Events + Play History Facts~~ — COMPLETE (Feb 22, 2026)
 
-**Why now:** Prerequisite for every live UI — polybar, web, TUI, mdmamp. And play history facts are a cheap addition that unlocks powerful queries later.
-
-**Pub/sub events (unsolicited):**
-- `track_started`, `track_ended`, `position_update`, `queue_changed`
-- Subscribers get push notifications without polling
-- Enables: live position display, auto-updating queue, external widgets
+**Pub/sub events:**
+- `event_protocol` crate: `PlaybackEvent` enum (TrackStarted, TrackEnded, TrackStopped, QueueChanged)
+- Topic-prefixed wire format: `{topic}\0{json}` for nng Pub/Sub filtering
+- Playback server publishes events via Pub0 at all state transitions
+- Gateway bridges IPC events to TCP port 5556 (raw byte passthrough)
+- CLI: `mdma subscribe` with rich formatting (resolves artist/title from library for TrackStarted)
 
 **Play history facts:**
-- When playback starts a track, append a `played` fact:
-  ```json
-  {"content_hash": "sha256:...", "fact_type": "played", "value": "2026-02-22T23:45:00Z", "source": "mdma-playback"}
-  ```
-- When a track is stopped/skipped before finishing, append a `skipped` fact
-- When a track finishes naturally, no extra fact needed — finishing is the default
-- Uses existing `stainless_facts` infrastructure — unknown fact types are safely ignored during aggregation
-- Enables: play count queries, `--never-played` filter, `--sort=play-count`, `--recently-played`, frequency-based recommendations
+- `Played(DateTime)` and `Skipped(DateTime)` variants in `MusicValue`
+- Playback writes `Played` fact on natural track end, `Skipped` on manual stop
+- Uses existing `stainless_facts` infrastructure
+- Enables: play count queries, `--never-played`, `--recently-played`
+
+**Deployed and smoke tested (6/6 pass) on Pi.**
 
 ---
 
-### 5. Polybar Widget
+### ~~5. Polybar Widget~~ — COMPLETE (Feb 23, 2026)
 
-**Why now:** First pub/sub consumer. Proves the event model works from an external client. Immediate developer value — see what's playing in the status bar.
+First external pub/sub consumer. Proves the event model works from a separate process.
 
-- Subscribes to `track_started`, `track_ended` events
-- Displays: `Artist - Title [duration]` or empty when stopped
-- Click actions: left=play, middle=next, right=stop
-- Requires: `--resolve` flag on `playback now` (force human-readable output in pipe mode)
-- Small scope: one CLI flag + shell scripts + polybar config
+- Shell script (`scripts/polybar/mdma-now-playing.sh`) subscribes via `mdma subscribe` pipe mode
+- Parses JSON events with `jq`, resolves hashes to `Artist - Title` via `mdma search`
+- Queries `mdma playback now` on startup for initial state
+- Click actions: left=play, middle=skip (stop+play), right=stop
+- Gateway address passed as CLI argument (no env var dependency from polybar)
+- Polybar `format-prefix` ensures clickable icon even when stopped
 
 ---
 
@@ -220,9 +219,9 @@ mdma-library  mdma-playback  /run/mdma/sources/*.sock
 
 Ordered by complexity — simplest ships first.
 
-### Polybar Widget (priority 5 — next up)
+### ~~Polybar Widget~~ (priority 5 — COMPLETE)
 
-Simplest possible client: a status bar module. Shell scripts + polybar config. First pub/sub consumer — proves the event model works from an external process.
+Status bar module. Shell script + polybar config. First pub/sub consumer — proved the event model works from an external process.
 
 ### TUI Client
 
@@ -291,6 +290,7 @@ beacon             = Provisioning and service discovery
 source_protocol    = Unified request/response for music sources
 gateway_protocol   = Envelope types (library + playback + source)
 gateway_client     = NNG client for the gateway
+event_protocol     = Pub/sub event types + topic-prefixed wire format
 ```
 
 **Storage layout:**
@@ -333,7 +333,7 @@ ssh -4 -i ~/.ssh/mdma_pi admin@mdma-909.local
 export MDMA_GATEWAY="tcp://mdma-909.local:5555"
 ```
 
-All services are behind the gateway. No per-service TCP ports exposed.
+Two external ports: 5555 (gateway) and 5556 (events). No per-service TCP ports exposed.
 
 ---
 
@@ -349,6 +349,22 @@ All services are behind the gateway. No per-service TCP ports exposed.
 ---
 
 ## Update History
+
+- **2026-02-23:** Priority 5 (Polybar Widget) complete.
+  - First external pub/sub consumer — proves event model from a separate process
+  - Shell script: subscribes to events, resolves hashes via `mdma search`, outputs to polybar
+  - Click actions: play/skip/stop with full gateway path
+  - Gateway address as CLI argument (no env var needed from polybar)
+  - **Next:** Priority 6 — Web UI Player Controls
+
+- **2026-02-22 (night, late):** Priority 4 (Pub/Sub Events + Play History Facts) fully complete.
+  - event_protocol crate with topic-prefixed wire format
+  - Playback publishes TrackStarted/Ended/Stopped/QueueChanged via Pub0
+  - Gateway bridges IPC events to TCP 5556 (raw byte passthrough)
+  - CLI: `mdma subscribe` with artist/title lookup for TrackStarted
+  - Played/Skipped facts written to fact stream
+  - All deployed, smoke tested (6/6 pass)
+  - **Next:** Priority 5 — Polybar Widget
 
 - **2026-02-22 (late):** Priority 3b (Codebase Cleanup) fully complete.
   - 6 dead crates removed, console migrated to gateway_client
