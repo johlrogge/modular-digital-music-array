@@ -1594,7 +1594,11 @@ fn handle_playback_stop(media_client: &PlaybackBackend) -> Result<()> {
 // Subscribe Command Handler
 // =============================================================================
 
-fn handle_subscribe(event_gateway: &str, topic: Option<&str>) -> Result<()> {
+fn handle_subscribe(
+    event_gateway: &str,
+    topic: Option<&str>,
+    library: Option<&LibraryBackend>,
+) -> Result<()> {
     use std::io::IsTerminal;
 
     let socket = nng::Socket::new(nng::Protocol::Sub0)
@@ -1629,7 +1633,7 @@ fn handle_subscribe(event_gateway: &str, topic: Option<&str>) -> Result<()> {
         match from_topic_message(msg.as_slice()) {
             Ok((_topic, event)) => {
                 if is_tty {
-                    print_event_human(&event);
+                    print_event_human(&event, library);
                 } else {
                     // Pipe mode: raw JSON, one line per event
                     println!(
@@ -1645,10 +1649,31 @@ fn handle_subscribe(event_gateway: &str, topic: Option<&str>) -> Result<()> {
     }
 }
 
-fn print_event_human(event: &PlaybackEvent) {
+fn print_event_human(event: &PlaybackEvent, library: Option<&LibraryBackend>) {
     match event {
         PlaybackEvent::TrackStarted { hash } => {
-            println!("{} {}", "▶ started".green().bold(), hash.bright_black());
+            let track_info = library.and_then(|lib| lib.get_track(&ContentHash(hash.clone())).ok());
+            match track_info {
+                Some(track) => {
+                    let artist = track.artist.as_deref().unwrap_or("Unknown");
+                    let title = track.title.as_deref().unwrap_or("Unknown");
+                    let duration = track
+                        .duration
+                        .map(|d| format!(" [{}]", d))
+                        .unwrap_or_default();
+                    println!(
+                        "{} {} {} - {}{}",
+                        "▶".green().bold(),
+                        short_hash(&track.content_hash).bright_black(),
+                        artist.green(),
+                        title.bold(),
+                        duration.bright_black()
+                    );
+                }
+                None => {
+                    println!("{} {}", "▶ started".green().bold(), hash.bright_black());
+                }
+            }
         }
         PlaybackEvent::TrackEnded { hash } => {
             println!("{} {}", "■ ended".yellow().bold(), hash.bright_black());
@@ -1854,7 +1879,8 @@ fn main() -> Result<()> {
                     }
                 }
             };
-            handle_subscribe(&addr, topic.as_deref())
+            let lib = connect_library(&cli);
+            handle_subscribe(&addr, topic.as_deref(), Some(&lib))
         }
     }
 }
