@@ -112,10 +112,7 @@ All services are behind the gateway. Only port 5555 is exposed externally.
 - **Playback IPC (local):** `ipc:///run/mdma/playback.sock`
 - **Source sockets (local):** `/run/mdma/sources/*.sock` (auto-discovered by gateway)
 
-Use one env var for the CLI from your laptop:
-```bash
-export MDMA_GATEWAY="tcp://mdma-909.local:5555"
-```
+MDMA_GATEWAY is already set in the devenv shell. Never export or prefix commands with it.
 
 **Bandcamp username:** `johlyroger`
 
@@ -131,6 +128,25 @@ cargo test                    # All tests
 cargo test --package beacon   # Single package
 cargo test provisioning       # Filter by name
 ```
+
+## Coordinator Rules
+
+You are a **coordinator**. You talk to Joakim and dispatch work to agents. You do NOT do work yourself.
+
+- **NEVER** write, edit, or create code files — use code-minion
+- **NEVER** SSH to the Pi or deploy — use devops
+- **NEVER** explore the codebase deeply (more than a quick glance) — use Explore agents
+- **NEVER** commit — use commit agent
+- **NEVER** run cargo build/test/clippy — agents do this
+- **DO** summarize agent output concisely for Joakim
+- **DO** suggest which agent to use next based on context
+- **DO** suggest new agents when no existing agent fits
+
+Workflow:
+1. Joakim states intent → dispatch to glenn-c for planning
+2. Plan approved → dispatch to minion-herder with the approved plan
+3. minion-herder executes via subagents, reports back
+4. You relay results to Joakim
 
 ## Git Commit Guidelines
 
