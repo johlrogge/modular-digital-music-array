@@ -491,8 +491,74 @@ impl LibraryService {
         }
     }
 
+    /// Re-read the facts file and update only `last_played` / `last_skipped` in the
+    /// in-memory index.  Called before any search that filters on played/skipped so
+    /// that facts written by external services (e.g. mdma-playback) after startup
+    /// are picked up without a full reload.
+    fn refresh_play_timestamps(&self) {
+        use music_facts::FactSource;
+        use stainless_facts::FactStreamReader;
+
+        let facts_path = self.metadata_dir.join("facts.jsonl");
+
+        let reader: FactStreamReader<ContentHash, MusicValue, FactSource> =
+            match FactStreamReader::open(&facts_path) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        "refresh_play_timestamps: failed to open facts file: {:?}",
+                        e
+                    );
+                    return;
+                }
+            };
+
+        // Collect the most-recent Played/Skipped timestamp per content hash
+        let mut last_played: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+        let mut last_skipped: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+
+        for fact_result in reader {
+            let fact = match fact_result {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+
+            let entity = fact.entity().0.clone();
+            match fact.value() {
+                MusicValue::Played(ts) => {
+                    let entry = last_played.entry(entity).or_insert(*ts);
+                    if ts > entry {
+                        *entry = *ts;
+                    }
+                }
+                MusicValue::Skipped(ts) => {
+                    let entry = last_skipped.entry(entity).or_insert(*ts);
+                    if ts > entry {
+                        *entry = *ts;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Acquire the lock only after reading the file to avoid deadlock
+        let mut tracks = self.tracks.lock().unwrap();
+        for track in tracks.iter_mut() {
+            let hash = &track.content_hash.0;
+            if let Some(&ts) = last_played.get(hash) {
+                track.last_played = Some(ts);
+            }
+            if let Some(&ts) = last_skipped.get(hash) {
+                track.last_skipped = Some(ts);
+            }
+        }
+    }
+
     /// Search tracks by structured query (uses library-search for evaluation)
     fn search_tracks(&self, query: &TrackQuery) -> Vec<TrackInfo> {
+        if query.played.is_some() || query.skipped.is_some() {
+            self.refresh_play_timestamps();
+        }
         let tracks = self.tracks.lock().unwrap();
 
         tracks
@@ -936,6 +1002,60 @@ mod tests {
         assert!(
             results.is_empty(),
             "PlayedQuery::NA should not match a track with last_played set"
+        );
+    }
+
+    #[test]
+    fn search_played_na_excludes_after_external_append() {
+        use library_search::{query::PlayedQuery, TrackQuery};
+
+        let hash = ContentHash("sha256:778899aabbcc".to_string());
+
+        // Setup: one track with no Played fact
+        let temp = write_facts_file(&[(
+            hash.clone(),
+            MusicValue::Title(Title::new("External Append Track")),
+        )]);
+
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+
+        let facts_dest = metadata_dir.path().join("facts.jsonl");
+        std::fs::copy(temp.path(), &facts_dest).unwrap();
+
+        let service = LibraryService::new(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+        )
+        .unwrap();
+
+        let na_query = TrackQuery {
+            played: Some(PlayedQuery::NA),
+            ..Default::default()
+        };
+
+        // Before: track has no play history → should appear in NA results
+        let before = service.search_tracks(&na_query);
+        assert_eq!(before.len(), 1, "track should appear before play event");
+
+        // Simulate playback service appending a Played fact after startup
+        let ts = Utc.with_ymd_and_hms(2026, 2, 20, 12, 0, 0).unwrap();
+        let source = music_facts::FactSource::new(
+            "test-playback",
+            "1.0.0",
+            music_facts::FactOrigin::Unknown,
+        );
+        let mut writer = FactWriter::open(&facts_dest).unwrap();
+        writer
+            .write_track_facts(&hash, &[(MusicValue::Played(ts), source)])
+            .unwrap();
+        drop(writer);
+
+        // After: track now has play history → NA query should return 0
+        let after = service.search_tracks(&na_query);
+        assert!(
+            after.is_empty(),
+            "PlayedQuery::NA should exclude track after Played fact appended externally"
         );
     }
 }
