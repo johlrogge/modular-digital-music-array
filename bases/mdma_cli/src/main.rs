@@ -11,10 +11,13 @@ use corsett::{
 };
 use event_protocol::{from_topic_message, PlaybackEvent, TOPIC_PLAYBACK};
 use library_ipc_client::{ClientError, ContentHash, InboxPath, ProtocolError, TrackInfo};
-use library_search::{parse_numeric_query, parse_string_query, TrackQuery};
-use mdma_client::{Deck, LibraryBackend, PlaybackBackend, PlaybackClientError, SourceClient};
+use library_search::{parse_numeric_query, parse_played_query, parse_string_query, TrackQuery};
+use mdma_client::{
+    Deck, IngestSource, LibraryBackend, PlaybackBackend, PlaybackClientError, SourceClient,
+};
 use nng::options::Options;
 use source_protocol::{SourceRequest, SourceResponse};
+use std::path::Path;
 
 // =============================================================================
 // CLI Definition
@@ -137,6 +140,18 @@ enum Commands {
         #[arg(long)]
         source: Option<String>,
 
+        /// Ignore stdin (don't read piped hashes as intersection filter)
+        #[arg(long)]
+        no_stdin: bool,
+
+        /// Filter by last played date. Format: N/A, >2026-02, <2026, 2026-01..2026-06
+        #[arg(long)]
+        played: Option<String>,
+
+        /// Filter by last skipped date. Same format as --played.
+        #[arg(long)]
+        skipped: Option<String>,
+
         #[command(subcommand)]
         subcommand: Option<SearchSubcommands>,
     },
@@ -196,6 +211,24 @@ enum Commands {
         /// Topic filter (e.g. "playback/track_started"). Default: all playback events.
         #[arg(long)]
         topic: Option<String>,
+    },
+
+    /// Upload a file (audio or ZIP of audio) to the library
+    Upload {
+        /// Path to file (audio file or ZIP archive)
+        file: std::path::PathBuf,
+
+        /// SSH key for SCP transfer
+        #[arg(long, default_value = "~/.ssh/mdma_pi", env = "MDMA_SSH_KEY")]
+        ssh_key: String,
+
+        /// SSH user on the Pi
+        #[arg(long, default_value = "mdma", env = "MDMA_SSH_USER")]
+        ssh_user: String,
+
+        /// Remote inbox directory
+        #[arg(long, default_value = "/music/inbox/", env = "MDMA_INBOX_DIR")]
+        inbox_dir: String,
     },
 }
 
@@ -792,7 +825,31 @@ fn build_track_query(
     _duration_str: Option<String>,
     year_str: Option<String>,
     source: Option<String>,
+    played_str: Option<String>,
+    skipped_str: Option<String>,
 ) -> TrackQuery {
+    let played = if let Some(s) = played_str {
+        match parse_played_query(&s) {
+            Ok(q) => Some(q),
+            Err(e) => {
+                eprintln!("Invalid --played value: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+    let skipped = if let Some(s) = skipped_str {
+        match parse_played_query(&s) {
+            Ok(q) => Some(q),
+            Err(e) => {
+                eprintln!("Invalid --skipped value: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
     TrackQuery {
         any_text: any_text.map(|s| parse_string_query(&s)),
         artist: artist.map(|s| parse_string_query(&s)),
@@ -806,15 +863,17 @@ fn build_track_query(
         duration: None, // duration parsing deferred
         year: year_str.and_then(|s| parse_numeric_query(&s).ok()),
         source,
+        played,
+        skipped,
     }
 }
 
-fn handle_search(client: &LibraryBackend, query: &TrackQuery) -> Result<()> {
+fn handle_search(client: &LibraryBackend, query: &TrackQuery, no_stdin: bool) -> Result<()> {
     use std::collections::HashSet;
     use std::io::{BufRead, IsTerminal};
 
-    // When stdin is piped, read all hashes as an intersection filter.
-    let stdin_filter: Option<HashSet<String>> = if !std::io::stdin().is_terminal() {
+    // When stdin is piped (and --no-stdin is not set), read all hashes as an intersection filter.
+    let stdin_filter: Option<HashSet<String>> = if !no_stdin && !std::io::stdin().is_terminal() {
         let tokens = std::io::stdin()
             .lock()
             .lines()
@@ -1692,6 +1751,176 @@ fn print_event_human(event: &PlaybackEvent, library: Option<&LibraryBackend>) {
 }
 
 // =============================================================================
+// Upload Command Handler
+// =============================================================================
+
+/// Extract hostname from a gateway address like `tcp://mdma-909.local:5555`.
+fn extract_hostname(gateway: &str) -> Option<&str> {
+    let after_scheme = gateway.strip_prefix("tcp://")?;
+    after_scheme.split(':').next()
+}
+
+/// Expand `~` to the user's home directory.
+fn expand_tilde(path: &str) -> std::path::PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::PathBuf::from(home).join(rest);
+        }
+    }
+    std::path::PathBuf::from(path)
+}
+
+/// SCP a local file to a remote destination.
+fn scp_file(
+    local_path: &Path,
+    remote_user: &str,
+    remote_host: &str,
+    remote_dir: &str,
+    ssh_key: &Path,
+) -> Result<()> {
+    let dest = format!("{}@{}:{}", remote_user, remote_host, remote_dir);
+    let status = std::process::Command::new("scp")
+        .args([
+            "-i",
+            &ssh_key.to_string_lossy(),
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-4",
+            &local_path.to_string_lossy(),
+            &dest,
+        ])
+        .status()?;
+
+    if !status.success() {
+        eprintln!(
+            "SCP failed for {}",
+            local_path.file_name().unwrap_or_default().to_string_lossy()
+        );
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn handle_upload(
+    cli: &Cli,
+    file: &Path,
+    ssh_key: &str,
+    ssh_user: &str,
+    inbox_dir: &str,
+) -> Result<()> {
+    use library_ipc_client::InboxPath;
+
+    // 1. Validate file exists
+    if !file.exists() {
+        eprintln!("File not found: {}", file.display());
+        std::process::exit(1);
+    }
+
+    // 2. Extract hostname from gateway
+    let gateway = match &cli.gateway {
+        Some(gw) => gw.as_str(),
+        None => {
+            eprintln!("Upload requires --gateway or MDMA_GATEWAY to determine the Pi hostname");
+            std::process::exit(1);
+        }
+    };
+
+    let hostname = match extract_hostname(gateway) {
+        Some(h) => h.to_string(),
+        None => {
+            eprintln!("Cannot parse hostname from gateway: {}", gateway);
+            std::process::exit(1);
+        }
+    };
+
+    let key_path = expand_tilde(ssh_key);
+
+    // 3. Detect file type
+    let file_type = inbox_utils::detect_file_type(file);
+
+    // 4. Collect audio files to upload
+    let temp_dir = tempfile::tempdir()?;
+    let audio_files: Vec<std::path::PathBuf> = match file_type {
+        Some("zip") => {
+            println!("Extracting ZIP archive...");
+            let extracted = inbox_utils::extract_zip(file, temp_dir.path())?;
+            if extracted.is_empty() {
+                eprintln!("No audio files found in ZIP archive");
+                std::process::exit(1);
+            }
+            println!("Found {} audio file(s)", extracted.len());
+            extracted
+        }
+        Some("flac" | "mp3" | "wav" | "aiff") => {
+            vec![file.to_path_buf()]
+        }
+        _ => {
+            eprintln!(
+                "Unsupported file type. Expected audio file (FLAC, MP3, WAV, AIFF) or ZIP archive."
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // 5. SCP each file to the Pi's inbox
+    for audio_file in &audio_files {
+        let filename = audio_file.file_name().unwrap_or_default().to_string_lossy();
+        println!("Uploading: {}", filename);
+        scp_file(audio_file, ssh_user, &hostname, inbox_dir, &key_path)?;
+    }
+
+    // 6. Ingest each file via the library service
+    let lib = connect_library(cli);
+    let mut success_count = 0;
+    let mut fail_count = 0;
+
+    for audio_file in &audio_files {
+        let filename = audio_file
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        let inbox_path = match InboxPath::new(&filename) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("  FAIL: {} - invalid inbox path: {}", filename, e);
+                fail_count += 1;
+                continue;
+            }
+        };
+
+        match lib.ingest_file_with_source(&inbox_path, Some(IngestSource::Upload)) {
+            Ok(result) if result.success => {
+                let hash_str = result
+                    .hash
+                    .as_ref()
+                    .map(|h| short_hash(h).to_string())
+                    .unwrap_or_default();
+                println!("  OK: {} -> {}", filename, hash_str);
+                success_count += 1;
+            }
+            Ok(result) => {
+                eprintln!("  FAIL: {} - {}", filename, result.message);
+                fail_count += 1;
+            }
+            Err(e) => {
+                eprintln!("  FAIL: {} - {}", filename, e);
+                fail_count += 1;
+            }
+        }
+    }
+
+    println!();
+    println!("Done: {} succeeded, {} failed", success_count, fail_count);
+
+    if fail_count > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -1803,6 +2032,9 @@ fn main() -> Result<()> {
             duration,
             year,
             source,
+            no_stdin,
+            played,
+            skipped,
             subcommand,
         } => {
             let client = connect_library(&cli);
@@ -1826,8 +2058,10 @@ fn main() -> Result<()> {
                     duration.clone(),
                     year.clone(),
                     source.clone(),
+                    played.clone(),
+                    skipped.clone(),
                 );
-                handle_search(&client, &track_query)
+                handle_search(&client, &track_query, *no_stdin)
             }
         }
         Commands::Inbox { command } => {
@@ -1882,6 +2116,12 @@ fn main() -> Result<()> {
             let lib = connect_library(&cli);
             handle_subscribe(&addr, topic.as_deref(), Some(&lib))
         }
+        Commands::Upload {
+            file,
+            ssh_key,
+            ssh_user,
+            inbox_dir,
+        } => handle_upload(&cli, file, ssh_key, ssh_user, inbox_dir),
     }
 }
 
