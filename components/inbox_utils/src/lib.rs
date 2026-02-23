@@ -2,14 +2,35 @@
 
 use std::path::{Path, PathBuf};
 
-/// Supported audio file extensions.
+/// All recognized audio file extensions (used for ZIP extraction filtering).
 pub const AUDIO_EXTENSIONS: &[&str] = &["flac", "mp3", "wav", "aif", "aiff"];
 
-/// Check if a file has an audio extension.
+/// Ingestible audio file extensions — only FLAC and MP3 are accepted for library ingest.
+///
+/// This is derived from the same policy as `AudioFormat::is_ingestible()` in `library_service`.
+/// When adding a new ingestible format, update both this list and that method.
+pub const INGEST_EXTENSIONS: &[&str] = &["flac", "mp3"];
+
+/// Human-readable error message for non-ingestible audio files (used in HTTP responses).
+///
+/// Centralised here so the console and any other HTTP layer show consistent messaging.
+pub const NON_INGESTIBLE_ERROR: &str = "Unsupported format: only FLAC and MP3 accepted";
+
+/// Check if a file has any recognized audio extension.
 pub fn is_audio_file(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| AUDIO_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Check if a file has an ingestible audio extension (FLAC or MP3 only).
+///
+/// WAV and AIFF are recognized as audio but are export-only formats and must not be ingested.
+pub fn is_ingestible_audio(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| INGEST_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
         .unwrap_or(false)
 }
 
@@ -92,9 +113,9 @@ pub fn extract_zip(zip_path: &Path, output_dir: &Path) -> Result<Vec<PathBuf>, s
             None => continue, // Skip entries with invalid paths
         };
 
-        // Only extract audio files
-        if !is_audio_file(&entry_path) {
-            tracing::debug!(path = %entry_path.display(), "Skipping non-audio file");
+        // Only extract ingestible audio files (FLAC and MP3)
+        if !is_ingestible_audio(&entry_path) {
+            tracing::debug!(path = %entry_path.display(), "Skipping non-ingestible file (only FLAC and MP3 accepted)");
             continue;
         }
 
@@ -137,6 +158,20 @@ mod tests {
         assert!(!is_audio_file(Path::new("cover.jpg")));
         assert!(!is_audio_file(Path::new("notes.txt")));
         assert!(!is_audio_file(Path::new("noext")));
+    }
+
+    #[test]
+    fn ingestible_audio_only_flac_and_mp3() {
+        assert!(is_ingestible_audio(Path::new("track.flac")));
+        assert!(is_ingestible_audio(Path::new("track.FLAC")));
+        assert!(is_ingestible_audio(Path::new("track.mp3")));
+        assert!(is_ingestible_audio(Path::new("track.MP3")));
+        // WAV and AIFF are export-only, not ingestible
+        assert!(!is_ingestible_audio(Path::new("track.wav")));
+        assert!(!is_ingestible_audio(Path::new("track.aif")));
+        assert!(!is_ingestible_audio(Path::new("track.aiff")));
+        assert!(!is_ingestible_audio(Path::new("cover.jpg")));
+        assert!(!is_ingestible_audio(Path::new("noext")));
     }
 
     #[test]
@@ -247,5 +282,38 @@ mod tests {
             .collect();
         assert!(names.contains(&"track.flac".to_string()));
         assert!(names.contains(&"other.mp3".to_string()));
+    }
+
+    #[test]
+    fn extract_zip_skips_wav_and_aiff() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("test.zip");
+        let output_dir = dir.path().join("output");
+        std::fs::create_dir(&output_dir).unwrap();
+
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip_writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        zip_writer.start_file("track.flac", options).unwrap();
+        zip_writer.write_all(b"fLaC fake audio data").unwrap();
+
+        zip_writer.start_file("track.wav", options).unwrap();
+        zip_writer.write_all(b"RIFF fake wav data").unwrap();
+
+        zip_writer.start_file("track.aiff", options).unwrap();
+        zip_writer.write_all(b"FORM fake aiff data").unwrap();
+
+        zip_writer.finish().unwrap();
+
+        let extracted = extract_zip(&zip_path, &output_dir).unwrap();
+        // Only FLAC should be extracted; WAV and AIFF are skipped
+        assert_eq!(extracted.len(), 1);
+        let name = extracted[0]
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("");
+        assert_eq!(name, "track.flac");
     }
 }

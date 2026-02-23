@@ -248,6 +248,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "audio-metadata"
+version = "0.1.0"
+dependencies = [
+ "lofty",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "audio-transcoder"
+version = "0.1.0"
+dependencies = [
+ "extended",
+ "lofty",
+ "symphonia",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1205,14 +1224,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flac-metadata"
-version = "0.1.0"
-dependencies = [
- "lofty",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "flate2"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2154,8 +2165,8 @@ dependencies = [
 name = "library-service"
 version = "0.2.0"
 dependencies = [
+ "audio-metadata",
  "chrono",
- "flac-metadata",
  "hex",
  "library-ipc-protocol",
  "library-search",

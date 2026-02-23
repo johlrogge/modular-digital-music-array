@@ -29,7 +29,7 @@ async fn main() {
     for i in 0..10 {
         println!("Creating track {}...", i);
         let buffer = HeapRb::new(8 * 1024);
-        let (prod, mut cons) = buffer.split();
+        let (prod, _cons) = buffer.split();
         let source = AudioSource::new(&path).expect("Failed to create source");
         let source_rate = source.sample_rate();
         let mut track = Track::new(source, prod, source_rate, source_rate)

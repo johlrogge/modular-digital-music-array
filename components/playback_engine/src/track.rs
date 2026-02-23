@@ -263,6 +263,7 @@ impl Drop for Track {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub struct TestSource {
     position: AtomicUsize, // Track which frame we're on
     samples: Vec<Vec<DecodedSegment>>,
@@ -270,6 +271,7 @@ pub struct TestSource {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 impl TestSource {
     pub fn new_from_samples(samples: Vec<f32>) -> Self {
         let segments = Self::create_segments_from_samples(samples);
@@ -469,6 +471,7 @@ impl Source for TestSource {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 impl Track {
     pub(crate) async fn new_test() -> Result<Self, PlaybackError> {
         // Generate 1 second of 440Hz test tone

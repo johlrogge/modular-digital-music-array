@@ -39,10 +39,9 @@
   env.LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
   # Pi service sockets — available in every devenv shell automatically
-  # Gateway mode: single address routes to all services
-  env.MDMA_GATEWAY         = "tcp://mdma-909.local:5555";
+  # MDMA_NODE identifies the target Pi; gateway and event gateway are derived from it.
+  env.MDMA_NODE            = "mdma-909.local";
   env.MDMA_SSH_KEY         = "/home/johlrogge/.ssh/mdma_pi";
-  env.MDMA_PI_HOST         = "mdma-909.local";
 
   # Git hooks
   git-hooks.hooks = {
@@ -56,26 +55,26 @@
     mdma-volume.exec = ''
       set -euo pipefail
       vol="''${1:-1.0}"
-      echo "Setting sink volume to $vol on $MDMA_PI_HOST"
-      ssh -4 -i "$MDMA_SSH_KEY" "admin@$MDMA_PI_HOST" \
+      echo "Setting sink volume to $vol on $MDMA_NODE"
+      ssh -4 -i "$MDMA_SSH_KEY" "admin@$MDMA_NODE" \
         "sudo -u _pipewire PIPEWIRE_RUNTIME_DIR=/run/pipewire wpctl set-volume @DEFAULT_AUDIO_SINK@ $vol"
     '';
 
     # Show service reachability and current PipeWire stream on the Pi
     mdma-status.exec = ''
-      echo "Pi: $MDMA_PI_HOST"
+      echo "Pi: $MDMA_NODE"
       echo ""
       # Check gateway (single external port)
-      nc -z -w2 mdma-909.local 5555 2>/dev/null \
+      nc -z -w2 "$MDMA_NODE" 5555 2>/dev/null \
         && echo "  ✓ gateway  :5555" \
         || echo "  ✗ gateway  :5555 (unreachable)"
       # Check console
-      nc -z -w2 mdma-909.local 80 2>/dev/null \
+      nc -z -w2 "$MDMA_NODE" 80 2>/dev/null \
         && echo "  ✓ console  :80" \
         || echo "  ✗ console  :80   (unreachable)"
       echo ""
       # Services via gateway
-      if nc -z -w2 mdma-909.local 5555 2>/dev/null; then
+      if nc -z -w2 "$MDMA_NODE" 5555 2>/dev/null; then
         echo "Library:"
         mdma status 2>/dev/null | sed 's/^/  /' || echo "  (unreachable)"
         echo ""
@@ -84,7 +83,7 @@
       fi
       echo ""
       echo "PipeWire stream:"
-      ssh -4 -i "$MDMA_SSH_KEY" "admin@$MDMA_PI_HOST" \
+      ssh -4 -i "$MDMA_SSH_KEY" "admin@$MDMA_NODE" \
         "sudo -u _pipewire PIPEWIRE_RUNTIME_DIR=/run/pipewire wpctl status 2>/dev/null" \
         | grep -E 'Sink|Stream|mdma|vol' | sed 's/^/  /'
     '';
@@ -101,8 +100,8 @@
     echo "Rust: $(rustc --version)"
     echo "Zig:  $(zig version)"
     echo ""
-    echo "Pi: $MDMA_PI_HOST"
-    echo "  gateway  $MDMA_GATEWAY"
+    echo "Pi: $MDMA_NODE"
+    echo "  gateway  tcp://$MDMA_NODE:5555"
     echo ""
 
     # Build mdma-cli and expose it directly as `mdma` on PATH
@@ -319,7 +318,7 @@
 
         Pi: mdma-909.local | SSH key: ~/.ssh/mdma_pi
         SSH: ssh -4 -i ~/.ssh/mdma_pi admin@mdma-909.local
-        MDMA_GATEWAY is already set in the shell — never export or prefix commands with it
+        MDMA_NODE is already set in the shell — the CLI derives the gateway from it automatically.
 
         ALWAYS use just recipes for building and deploying. NEVER run cargo zigbuild,
         cargo build, or scp manually — the just recipes encapsulate the correct
@@ -344,9 +343,9 @@
       prompt = ''
         You verify that MDMA services are running correctly after deployment.
 
-        IMPORTANT: MDMA_GATEWAY is already set in your environment. Do NOT
-        set, export, or prefix it. Run mdma commands directly (e.g. "mdma ping",
-        NOT "MDMA_GATEWAY=... mdma ping" or "export MDMA_GATEWAY=...").
+        IMPORTANT: MDMA_NODE is already set in your environment. The mdma CLI derives
+        the gateway address from it automatically. Do NOT set or export MDMA_GATEWAY.
+        Run mdma commands directly (e.g. "mdma ping", NOT "MDMA_GATEWAY=... mdma ping").
 
         Run these checks IN ORDER and report results as a table:
 

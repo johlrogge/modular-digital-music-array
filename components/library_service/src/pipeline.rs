@@ -20,6 +20,9 @@ pub enum IngestError {
     #[error("Unsupported audio format: {0}")]
     UnsupportedFormat(String),
 
+    #[error("Unsupported format: only FLAC and MP3 accepted")]
+    NonIngestibleFormat,
+
     #[error("Failed to compute hash: {0}")]
     HashError(String),
 
@@ -76,6 +79,15 @@ impl AudioFormat {
             Self::Wav => "wav",
         }
     }
+
+    /// Returns true if this format is accepted for library ingest.
+    ///
+    /// WAV and AIFF are export-only formats and must not be ingested.
+    /// This is the single source of truth for "which formats are ingestible".
+    /// Add new ingestible formats here — all guards derive from this method.
+    pub fn is_ingestible(&self) -> bool {
+        matches!(self, Self::Flac | Self::Mp3)
+    }
 }
 
 // =============================================================================
@@ -106,6 +118,11 @@ impl InboxFile {
         let ext = self.path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let format = AudioFormat::from_extension(ext)
             .ok_or_else(|| IngestError::UnsupportedFormat(ext.to_string()))?;
+
+        // Only FLAC and MP3 are accepted for ingest; WAV/AIFF are export-only formats
+        if !format.is_ingestible() {
+            return Err(IngestError::NonIngestibleFormat);
+        }
 
         // Compute content hash (streams file, doesn't load into memory)
         let content_hash = compute_hash(&self.path)?;
@@ -308,6 +325,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn audio_format_is_ingestible() {
+        assert!(AudioFormat::Flac.is_ingestible());
+        assert!(AudioFormat::Mp3.is_ingestible());
+        assert!(!AudioFormat::Wav.is_ingestible());
+        assert!(!AudioFormat::Aiff.is_ingestible());
+    }
+
+    #[test]
     fn audio_format_from_extension() {
         assert_eq!(AudioFormat::from_extension("flac"), Some(AudioFormat::Flac));
         assert_eq!(AudioFormat::from_extension("FLAC"), Some(AudioFormat::Flac));
@@ -316,5 +341,41 @@ mod tests {
         assert_eq!(AudioFormat::from_extension("aif"), Some(AudioFormat::Aiff));
         assert_eq!(AudioFormat::from_extension("wav"), Some(AudioFormat::Wav));
         assert_eq!(AudioFormat::from_extension("ogg"), None);
+    }
+
+    #[test]
+    fn validate_rejects_wav_with_non_ingestible_format_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav_path = dir.path().join("track.wav");
+        std::fs::write(&wav_path, b"RIFF fake wav data").unwrap();
+
+        let inbox = InboxFile::new(wav_path, UploadSource::HttpUpload);
+        let result = inbox.validate();
+
+        assert!(
+            matches!(result, Err(IngestError::NonIngestibleFormat)),
+            "WAV files should be rejected with NonIngestibleFormat"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_aiff_with_non_ingestible_format_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let aiff_path = dir.path().join("track.aiff");
+        std::fs::write(&aiff_path, b"FORM fake aiff data").unwrap();
+
+        let inbox = InboxFile::new(aiff_path, UploadSource::HttpUpload);
+        let result = inbox.validate();
+
+        match result {
+            Err(IngestError::NonIngestibleFormat) => {
+                let err = IngestError::NonIngestibleFormat;
+                assert_eq!(
+                    err.to_string(),
+                    "Unsupported format: only FLAC and MP3 accepted"
+                );
+            }
+            other => panic!("expected NonIngestibleFormat, got: {:?}", other.is_ok()),
+        }
     }
 }

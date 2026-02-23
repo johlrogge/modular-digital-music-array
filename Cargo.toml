@@ -4,7 +4,7 @@ members = [
     # Components (bricks)
     "components/bandcamp_api",
     "components/clock",
-    "components/flac_metadata",
+    "components/audio_metadata",
     "components/library_ipc_client",
     "components/library_ipc_protocol",
     "components/media_client",
@@ -22,6 +22,7 @@ members = [
     "components/gateway_protocol",
     "components/gateway_client",
     "components/mdma_client",
+    "components/audio_transcoder",
     "components/inbox_utils",
     "components/library_service",
     # Bases (entry points)

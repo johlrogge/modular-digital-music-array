@@ -111,7 +111,7 @@ All services are behind the gateway. Only port 5555 is exposed externally.
 - **Playback IPC (local):** `ipc:///run/mdma/playback.sock`
 - **Source sockets (local):** `/run/mdma/sources/*.sock` (auto-discovered by gateway)
 
-MDMA_GATEWAY is already set in the devenv shell. Never export or prefix commands with it.
+MDMA_NODE is already set in the devenv shell. The CLI derives the gateway address from it automatically. Never export or prefix commands with MDMA_GATEWAY.
 
 **Bandcamp username:** `johlyroger`
 

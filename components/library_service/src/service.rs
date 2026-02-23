@@ -202,6 +202,21 @@ impl LibraryService {
                 MusicValue::Source(v) => entry.source = Some(v.clone()),
                 MusicValue::TrackStarted(ts) => update_if_more_recent(&mut entry.last_started, *ts),
                 MusicValue::TrackStopped(ts) => update_if_more_recent(&mut entry.last_stopped, *ts),
+                MusicValue::FilePath(p) => {
+                    // Reconstruct blob path from the stored file path extension
+                    let hash = entry.content_hash.0.as_str();
+                    let hash_clean = hash.strip_prefix("sha256:").unwrap_or(hash);
+                    if hash_clean.len() >= 2 {
+                        if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                            entry.blob_path = PathBuf::from(format!(
+                                "blobs/{}/{}.{}",
+                                &hash_clean[..2],
+                                hash_clean,
+                                ext
+                            ));
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -210,15 +225,6 @@ impl LibraryService {
 
         // Collect content hashes for dedup
         let content_hashes: HashSet<String> = tracks_map.keys().cloned().collect();
-
-        // Set blob paths based on hash
-        for (hash, track) in tracks_map.iter_mut() {
-            let hash_clean = hash.strip_prefix("sha256:").unwrap_or(hash);
-            if hash_clean.len() >= 2 {
-                track.blob_path =
-                    PathBuf::from(format!("blobs/{}/{}.flac", &hash_clean[..2], hash_clean));
-            }
-        }
 
         LoadResult {
             tracks: tracks_map.into_values().collect(),
@@ -1053,6 +1059,60 @@ mod tests {
         assert!(
             after.is_empty(),
             "DateQuery::NA should exclude track after TrackStarted fact appended externally"
+        );
+    }
+
+    #[test]
+    fn blob_path_uses_extension_from_file_path_fact() {
+        // For MP3 files, blob_path should use .mp3 extension, not hardcoded .flac
+        let hash = ContentHash("sha256:aabbccddeeff".to_string());
+
+        let temp = write_facts_file(&[
+            (hash.clone(), MusicValue::Title(Title::new("MP3 Track"))),
+            (
+                hash.clone(),
+                MusicValue::FilePath(std::path::PathBuf::from("some/track.mp3")),
+            ),
+        ]);
+
+        let result = LibraryService::load_tracks_from_facts(&temp.path().to_path_buf());
+
+        assert_eq!(result.tracks.len(), 1);
+        let track = &result.tracks[0];
+        let path_str = track.blob_path.to_string_lossy();
+        assert!(
+            path_str.ends_with(".mp3"),
+            "blob_path should use .mp3 extension from FilePath fact, got: {}",
+            path_str
+        );
+        assert!(
+            path_str.contains("blobs/"),
+            "blob_path should be under blobs/, got: {}",
+            path_str
+        );
+    }
+
+    #[test]
+    fn blob_path_uses_flac_extension_from_file_path_fact() {
+        let hash = ContentHash("sha256:001122334455".to_string());
+
+        let temp = write_facts_file(&[
+            (hash.clone(), MusicValue::Title(Title::new("FLAC Track"))),
+            (
+                hash.clone(),
+                MusicValue::FilePath(std::path::PathBuf::from("some/track.flac")),
+            ),
+        ]);
+
+        let result = LibraryService::load_tracks_from_facts(&temp.path().to_path_buf());
+
+        assert_eq!(result.tracks.len(), 1);
+        let track = &result.tracks[0];
+        let path_str = track.blob_path.to_string_lossy();
+        assert!(
+            path_str.ends_with(".flac"),
+            "blob_path should use .flac extension from FilePath fact, got: {}",
+            path_str
         );
     }
 }

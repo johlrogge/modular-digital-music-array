@@ -18,7 +18,7 @@ thiserror = { workspace = true }
 library-search = { path = "../library_search" }
 music-facts = { path = "../music_facts" }
 music-primitives = { path = "../music_primitives" }
-flac-metadata = { path = "../flac_metadata" }
+audio-metadata = { path = "../audio_metadata" }
 library-ipc-protocol = { path = "../library_ipc_protocol" }
 
 # Fact stream

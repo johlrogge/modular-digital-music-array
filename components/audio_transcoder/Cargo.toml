@@ -1,0 +1,16 @@
+[package]
+name = "audio-transcoder"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+extended = "0.1"
+lofty = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+symphonia = { version = "0.5", features = ["aiff", "wav", "pcm"] }
+tempfile = "3"

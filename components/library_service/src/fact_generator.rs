@@ -1,6 +1,6 @@
 //! Generate facts from audio file metadata
 
-use flac_metadata::{discover_all_fields, extract_metadata, TrackMetadata};
+use audio_metadata::{discover_all_fields, extract_metadata, TrackMetadata};
 use music_facts::{
     Album, Artist, BitDepth, Bitrate, Channels, ContentHash, DurationSeconds, FactOrigin,
     FactSource, FileSizeBytes, Isrc, MusicValue, SampleRate, Title, TrackNumber, Year,
