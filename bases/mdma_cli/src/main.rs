@@ -152,6 +152,10 @@ enum Commands {
         #[arg(long)]
         stopped: Option<String>,
 
+        /// Invert the search results — return tracks that do NOT match the filters.
+        #[arg(long)]
+        not: bool,
+
         #[command(subcommand)]
         subcommand: Option<SearchSubcommands>,
     },
@@ -865,6 +869,7 @@ fn build_track_query(
         source,
         started,
         stopped,
+        not: false,
     }
 }
 
@@ -2035,6 +2040,7 @@ fn main() -> Result<()> {
             no_stdin,
             started,
             stopped,
+            not,
             subcommand,
         } => {
             let client = connect_library(&cli);
@@ -2045,7 +2051,7 @@ fn main() -> Result<()> {
                     }
                 }
             } else {
-                let track_query = build_track_query(
+                let mut track_query = build_track_query(
                     query.clone(),
                     artist.clone(),
                     title.clone(),
@@ -2061,6 +2067,7 @@ fn main() -> Result<()> {
                     started.clone(),
                     stopped.clone(),
                 );
+                track_query.not = *not;
                 handle_search(&client, &track_query, *no_stdin)
             }
         }

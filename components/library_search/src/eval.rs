@@ -26,11 +26,19 @@ pub struct TrackFields<'a> {
     pub last_stopped: Option<DateTime<Utc>>,
 }
 
-/// Evaluate a `TrackQuery` against a set of track fields.
-///
+/// Evaluate a `TrackQuery` against a set of track fields, respecting `query.not`.
+pub fn matches_query(query: &TrackQuery, track: &TrackFields) -> bool {
+    let matched = matches_query_inner(query, track);
+    if query.not {
+        !matched
+    } else {
+        matched
+    }
+}
+
 /// Returns `true` only if ALL non-None query fields match.
 /// `any_text` uses OR semantics across title/artist/album/label/genre.
-pub fn matches_query(query: &TrackQuery, track: &TrackFields) -> bool {
+fn matches_query_inner(query: &TrackQuery, track: &TrackFields) -> bool {
     if let Some(sq) = &query.any_text {
         let text_fields = [
             track.title,
@@ -504,5 +512,41 @@ mod tests {
                 .into(),
         );
         assert!(matches_query(&q, &f));
+    }
+
+    #[test]
+    fn not_flag_inverts_result() {
+        let query = TrackQuery {
+            artist: Some(StringQuery::Contains("carbon".to_string())),
+            not: true,
+            ..Default::default()
+        };
+        let mut fields = empty_fields();
+        fields.artist = Some("Carbon Based Lifeforms");
+        assert!(!matches_query(&query, &fields));
+        fields.artist = Some("Rymden");
+        assert!(matches_query(&query, &fields));
+    }
+
+    #[test]
+    fn not_false_preserves_normal_match() {
+        let query = TrackQuery {
+            artist: Some(StringQuery::Contains("carbon".to_string())),
+            not: false,
+            ..Default::default()
+        };
+        let mut fields = empty_fields();
+        fields.artist = Some("Carbon Based Lifeforms");
+        assert!(matches_query(&query, &fields));
+    }
+
+    #[test]
+    fn not_with_empty_query_matches_nothing() {
+        let query = TrackQuery {
+            not: true,
+            ..Default::default()
+        };
+        let fields = empty_fields();
+        assert!(!matches_query(&query, &fields));
     }
 }
