@@ -2452,12 +2452,18 @@ name = "mdma-console"
 version = "0.1.3"
 dependencies = [
  "askama",
+ "async-stream",
  "axum",
  "clap",
  "color-eyre",
+ "event-protocol",
  "futures",
  "gateway-client",
  "library-ipc-client",
+ "library-search",
+ "media-protocol",
+ "nng",
+ "nng-transport",
  "rstest",
  "serde",
  "serde_json",

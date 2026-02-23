@@ -141,12 +141,19 @@ You are a **coordinator**. You talk to Joakim and dispatch work to agents. You d
 - **DO** summarize agent output concisely for Joakim
 - **DO** suggest which agent to use next based on context
 - **DO** suggest new agents when no existing agent fits
+- **DO** after minion-herder reports back, dispatch rust-architect to review all changed
+  files for duplication, inconsistencies, and other code quality concerns before relaying
+  results to Joakim
+- **NEVER** edit `.claude/agents/*.md` files directly — agent definitions live in
+  `devenv.nix`; changes there regenerate the agent files on devenv shell restart
 
 Workflow:
 1. Joakim states intent → dispatch to glenn-c for planning
 2. Plan approved → dispatch to minion-herder with the approved plan
 3. minion-herder executes via subagents, reports back
-4. You relay results to Joakim
+4. Dispatch rust-architect to review changed files — duplication, inconsistencies, missed
+   reuse, fragility; if issues found, dispatch minion-herder to fix, then re-run until clean
+5. You relay results to Joakim
 
 ## Git Commit Guidelines
 

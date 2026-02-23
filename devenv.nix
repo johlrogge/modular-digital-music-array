@@ -275,6 +275,8 @@
         6. Polylith fit — logic in the right component?
         7. API design — minimal and hard to misuse?
         8. Prefer enums over booleans
+        9. Duplication — are there near-identical blocks, functions, or match arms that should be extracted?
+        10. Inconsistencies — do similar patterns use different implementations across the codebase?
 
         Reference docs in .claude/skills/rust-architect/references/:
         patterns.md, lifetimes.md, error-handling.md, async-tokio.md,
@@ -284,7 +286,7 @@
         When code passes review, say COMMIT with a suggested commit message.
         The minion-herder will dispatch the commit agent.
 
-        Output format: Summary → Issues (blocking) → Suggestions → Architecture Notes.
+        Output format: Summary → Issues (blocking) → Suggestions (duplication, inconsistencies, smells) → Architecture Notes.
       '';
     };
 
