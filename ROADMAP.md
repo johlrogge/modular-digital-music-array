@@ -1,6 +1,6 @@
 # MDMA Roadmap
 
-**Last updated:** February 22, 2026
+**Last updated:** February 23, 2026
 
 ## Where We Are
 
@@ -171,7 +171,7 @@ First external pub/sub consumer. Proves the event model works from a separate pr
 
 ---
 
-### 6. Web UI Player Controls
+### ~~6. Web UI Player Controls~~ — COMPLETE (Feb 23, 2026)
 
 **Why next:** The console (`mdma-console`) is a stub. It needs to be a usable player interface — the first front-end that isn't the CLI. This is what beta testers will interact with.
 
@@ -183,11 +183,23 @@ First external pub/sub consumer. Proves the event model works from a separate pr
 
 ---
 
+**Future enhancement -- Tabbed UI:**
+The current single-page layout mixes playback (now playing, queue, controls) with library management (search, inbox, bandcamp, packages). As the UI grows, split into two tabs:
+- **Playback tab:** Now playing, queue, player controls -- the DJ-facing view
+- **Library tab:** Search, inbox management, bandcamp sync, package updates -- the librarian view
+
+This keeps each view focused and prevents the page from becoming an endless scroll. Not blocking current work.
+
+**Future enhancement -- Cover Art & Fact Stream Aggregation:**
+The web library should display cover art for tracks. This is a good case for fact stream aggregation and persisting: generate library pages as new tracks are added to the library, and use Stainless facts functionality to only request facts after a certain timestamp to update as needed. This avoids rebuilding the entire library view on every request and enables incremental, event-driven UI updates.
+
+---
+
 ### 7. ZIP Upload for Library Ingestion
 
 **Why:** Beatport tracks come as ZIP downloads of FLACs. The inbox mechanism and ZIP extraction logic already exist — this just connects the laptop to the inbox.
 
-- Extract `extract_zip_to_inbox` from `mdma-bandcamp` into a shared component
+- ~~Extract `extract_zip_to_inbox` from `mdma-bandcamp` into a shared component~~ — DONE (`components/inbox_utils/` exists)
 - Add `Upload` command to gateway protocol (accepts file bytes + source metadata)
 - CLI: `mdma upload <file>` — sends ZIP or single FLAC through the gateway
 - Gateway: receives file, extracts to inbox, triggers ingest, returns hashes
@@ -440,6 +452,15 @@ Two external ports: 5555 (gateway) and 5556 (events). No per-service TCP ports e
 ---
 
 ## Update History
+
+- **2026-02-23:** Priority 6 (Web UI Player Controls) complete.
+  - Now playing display with track title, artist, album, BPM, key, duration
+  - Queue view with remove buttons, clear all
+  - Player controls: play queue, stop, skip
+  - Library search with artist/BPM/key filters, add-to-queue from results
+  - SSE event bridge: live updates from playback pub/sub events
+  - Package management, inbox ingestion, bandcamp sync all in single-page UI
+  - **Next:** Priority 7 -- ZIP Upload for Library Ingestion
 
 - **2026-02-23:** Priority 5 (Polybar Widget) complete.
   - First external pub/sub consumer — proves event model from a separate process
