@@ -17,7 +17,7 @@ use parking_lot::RwLock;
 use pipewire_output::PipewireOutput;
 pub use playback_primitives::Deck;
 use ringbuf::{HeapConsumer, HeapRb};
-pub use source::{FlacSource, Source};
+pub use source::{AudioSource, Source};
 use tracing::info;
 pub use track::Track;
 
@@ -113,7 +113,7 @@ impl PlaybackEngine {
         }
 
         // Create source and read its native sample rate
-        let source = FlacSource::new(path)?;
+        let source = AudioSource::new(path)?;
         let source_rate = source.sample_rate();
 
         // Create PipeWire output on first track load, always at TARGET_RATE.

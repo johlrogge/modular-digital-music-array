@@ -75,7 +75,7 @@ pub trait Source: Send + Sync {
     fn current_position(&self) -> usize;
 }
 
-pub struct FlacSource {
+pub struct AudioSource {
     // Decoder state (format reader + decoder)
     decoder_state: Mutex<DecoderState>,
 
@@ -105,7 +105,7 @@ type DecoderResult = Result<
     PlaybackError,
 >;
 
-impl FlacSource {
+impl AudioSource {
     pub fn new(path: impl AsRef<Path>) -> Result<Self, PlaybackError> {
         tracing::debug!("Opening file: {:?}", path.as_ref());
         // Initialize the decoder and format reader
@@ -132,7 +132,9 @@ impl FlacSource {
 
     fn init_decoder(path: &Path) -> DecoderResult {
         let mut hint = Hint::new();
-        hint.with_extension("flac");
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            hint.with_extension(ext);
+        }
 
         // Open the file
         let file = std::fs::File::open(path)?;
@@ -238,7 +240,7 @@ impl FlacSource {
     }
 }
 
-impl Source for FlacSource {
+impl Source for AudioSource {
     fn decode_next_frame(&self) -> Result<Vec<DecodedSegment>, PlaybackError> {
         tracing::debug!("decode_next_frame");
         if self.is_eof.load(Ordering::Relaxed) {
@@ -305,9 +307,9 @@ impl Source for FlacSource {
     }
 }
 
-impl Drop for FlacSource {
+impl Drop for AudioSource {
     fn drop(&mut self) {
-        tracing::trace!("FlacSource dropped - decoder_state will be dropped automatically");
+        tracing::trace!("AudioSource dropped - decoder_state will be dropped automatically");
     }
 }
 
@@ -328,7 +330,7 @@ mod tests {
     fn first_segment_is_at_position_zero() {
         // Create a source from the alternating pattern file
         let source =
-            FlacSource::new(file_path("alternating.flac")).expect("Failed to create source");
+            AudioSource::new(file_path("alternating.flac")).expect("Failed to create source");
 
         // Decode a single segment
         let segments = source
@@ -353,7 +355,7 @@ mod tests {
     fn second_segment_follows_first() {
         // Create a source from the alternating pattern file
         let source =
-            FlacSource::new(file_path("alternating.flac")).expect("Failed to create source");
+            AudioSource::new(file_path("alternating.flac")).expect("Failed to create source");
 
         // Decode the first segment
         let first_segments = source
@@ -376,7 +378,7 @@ mod tests {
     fn segment_data_matches_expected_pattern() {
         // Create a source from the alternating pattern file
         let source =
-            FlacSource::new(file_path("alternating.flac")).expect("Failed to create source");
+            AudioSource::new(file_path("alternating.flac")).expect("Failed to create source");
 
         // Decode a segment
         let segments = source
@@ -398,7 +400,7 @@ mod tests {
     fn multiple_segments_decode_correctly() {
         // Create a source from the alternating pattern file
         let source =
-            FlacSource::new(file_path("alternating.flac")).expect("Failed to create source");
+            AudioSource::new(file_path("alternating.flac")).expect("Failed to create source");
 
         // Decode three segments at once
         let segments = source
@@ -424,7 +426,8 @@ mod tests {
     #[test]
     fn segment_boundaries_are_seamless() {
         // Create a source from the ascending pattern file (continuous pattern)
-        let source = FlacSource::new(file_path("ascending.flac")).expect("Failed to create source");
+        let source =
+            AudioSource::new(file_path("ascending.flac")).expect("Failed to create source");
 
         // Decode two segments
         let segments = source
@@ -458,7 +461,7 @@ mod tests {
     fn partial_segment_at_eof() {
         // Create a very short custom test file (or use existing one)
         let source =
-            FlacSource::new(file_path("alternating.flac")).expect("Failed to create source");
+            AudioSource::new(file_path("alternating.flac")).expect("Failed to create source");
 
         // Decode all segments
         let mut all_segments = Vec::new();
@@ -484,7 +487,7 @@ mod tests {
     }
 
     // Helper function to decode all segments from a source
-    fn decode_all_segments(source: &mut FlacSource) -> Vec<DecodedSegment> {
+    fn decode_all_segments(source: &mut AudioSource) -> Vec<DecodedSegment> {
         let mut all_segments = Vec::new();
 
         // Decode segments until we reach the end of the file
@@ -509,7 +512,8 @@ mod tests {
     #[test]
     fn decode_reaches_eof() {
         // Test with a short file
-        let mut source = FlacSource::new(file_path("short.flac")).expect("Failed to create source");
+        let mut source =
+            AudioSource::new(file_path("short.flac")).expect("Failed to create source");
 
         // Decode all segments
         let segments = decode_all_segments(&mut source);
@@ -530,7 +534,8 @@ mod tests {
     #[test]
     #[ignore]
     fn segments_are_sequential() {
-        let mut source = FlacSource::new(file_path("short.flac")).expect("Failed to create source");
+        let mut source =
+            AudioSource::new(file_path("short.flac")).expect("Failed to create source");
 
         let segments = decode_all_segments(&mut source);
 
@@ -552,7 +557,7 @@ mod tests {
     #[test]
     fn alternating_pattern_preserved() {
         let mut source =
-            FlacSource::new(file_path("alternating.flac")).expect("Failed to create source");
+            AudioSource::new(file_path("alternating.flac")).expect("Failed to create source");
 
         let segments = decode_all_segments(&mut source);
         assert!(
@@ -605,7 +610,7 @@ mod tests {
     #[test]
     fn ascending_pattern_preserved() {
         let mut source =
-            FlacSource::new(file_path("ascending.flac")).expect("Failed to create source");
+            AudioSource::new(file_path("ascending.flac")).expect("Failed to create source");
 
         let segments = decode_all_segments(&mut source);
         assert!(
@@ -632,7 +637,7 @@ mod tests {
     #[test]
     fn silence_preserved() {
         let mut source =
-            FlacSource::new(file_path("silence.flac")).expect("Failed to create source");
+            AudioSource::new(file_path("silence.flac")).expect("Failed to create source");
 
         let segments = decode_all_segments(&mut source);
         assert!(
@@ -655,7 +660,7 @@ mod tests {
     #[test]
     fn impulses_preserved() {
         let mut source =
-            FlacSource::new(file_path("impulses.flac")).expect("Failed to create source");
+            AudioSource::new(file_path("impulses.flac")).expect("Failed to create source");
 
         let segments = decode_all_segments(&mut source);
         assert!(
@@ -688,7 +693,8 @@ mod tests {
 
     #[test]
     fn segment_size_consistency() {
-        let mut source = FlacSource::new(file_path("short.flac")).expect("Failed to create source");
+        let mut source =
+            AudioSource::new(file_path("short.flac")).expect("Failed to create source");
 
         let segments = decode_all_segments(&mut source);
         assert!(
@@ -712,7 +718,8 @@ mod tests {
     #[test]
     fn seek() {
         // Create a source from the ascending pattern file (continuous pattern)
-        let source = FlacSource::new(file_path("ascending.flac")).expect("Failed to create source");
+        let source =
+            AudioSource::new(file_path("ascending.flac")).expect("Failed to create source");
 
         // Seek to a specific position
         let seek_position = 1000; // 1000 samples into the file
@@ -748,7 +755,7 @@ mod tests {
     }
 
     #[cfg(test)]
-    mod flac_source_position_tests {
+    mod audio_source_position_tests {
         use super::*;
         use std::path::PathBuf;
 
@@ -760,7 +767,7 @@ mod tests {
 
         #[test]
         fn test_initial_position() {
-            let source = FlacSource::new(test_file_path("short.flac")).unwrap();
+            let source = AudioSource::new(test_file_path("short.flac")).unwrap();
             assert_eq!(
                 source.current_position.load(Ordering::Relaxed),
                 0,
@@ -771,7 +778,7 @@ mod tests {
         #[test]
         #[ignore]
         fn test_position_after_decode() {
-            let source = FlacSource::new(test_file_path("short.flac")).unwrap();
+            let source = AudioSource::new(test_file_path("short.flac")).unwrap();
 
             // Decode one frame
             let segments = source.decode_next_frame().unwrap();
@@ -793,7 +800,7 @@ mod tests {
 
         #[test]
         fn test_position_after_seek() {
-            let source = FlacSource::new(test_file_path("short.flac")).unwrap();
+            let source = AudioSource::new(test_file_path("short.flac")).unwrap();
 
             // Seek to a specific position
             let target_position = 1000;
@@ -810,7 +817,7 @@ mod tests {
         #[test]
         #[ignore]
         fn test_decode_after_seek() {
-            let source = FlacSource::new(test_file_path("short.flac")).unwrap();
+            let source = AudioSource::new(test_file_path("short.flac")).unwrap();
 
             // Seek to a specific position
             let target_position = 1000;
@@ -836,7 +843,7 @@ mod tests {
 
         #[test]
         fn test_position_at_eof() {
-            let source = FlacSource::new(test_file_path("short.flac")).unwrap();
+            let source = AudioSource::new(test_file_path("short.flac")).unwrap();
 
             // Read until EOF
             loop {

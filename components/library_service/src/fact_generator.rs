@@ -15,20 +15,22 @@ use crate::pipeline::{AudioFormat, IngestError};
 pub fn generate_facts(
     path: &Path,
     content_hash: &ContentHash,
-    format: AudioFormat,
+    _format: AudioFormat,
 ) -> Result<Vec<(MusicValue, FactSource)>, IngestError> {
-    // Only FLAC is fully supported for metadata extraction currently
-    if format != AudioFormat::Flac {
-        // Return minimal facts for non-FLAC files
-        return Ok(vec![]);
-    }
-
     let metadata = extract_metadata(path).map_err(|e| IngestError::MetadataError(e.to_string()))?;
 
     let all_fields =
         discover_all_fields(path).map_err(|e| IngestError::MetadataError(e.to_string()))?;
 
     generate_facts_from_metadata(content_hash, &metadata, &all_fields)
+}
+
+/// Look up a field name across all known tag type prefixes
+fn find_field<'a>(all_fields: &'a HashMap<String, String>, field_name: &str) -> Option<&'a String> {
+    const PREFIXES: &[&str] = &["VorbisComments", "Id3v2", "Id3v1", "ApeTag"];
+    PREFIXES
+        .iter()
+        .find_map(|prefix| all_fields.get(&format!("{}.{}", prefix, field_name)))
 }
 
 /// Generate facts from already-extracted metadata
@@ -106,11 +108,11 @@ fn generate_facts_from_metadata(
     }
 
     // Catalog info (from all_fields for Beatport)
-    if let Some(isrc) = all_fields.get("VorbisComments.Isrc") {
+    if let Some(isrc) = find_field(all_fields, "Isrc") {
         facts.push((MusicValue::Isrc(Isrc(isrc.clone())), source.clone()));
     }
 
-    if let Some(label) = all_fields.get("VorbisComments.Label") {
+    if let Some(label) = find_field(all_fields, "Label") {
         facts.push((MusicValue::Label(label.clone()), source.clone()));
     }
 
@@ -206,11 +208,11 @@ fn generate_facts_from_metadata(
     ));
 
     // Encoder info
-    if let Some(encoder) = all_fields.get("VorbisComments.EncoderSoftware") {
+    if let Some(encoder) = find_field(all_fields, "EncoderSoftware") {
         facts.push((MusicValue::EncoderSoftware(encoder.clone()), source.clone()));
     }
 
-    if let Some(encoded_by) = all_fields.get("VorbisComments.EncodedBy") {
+    if let Some(encoded_by) = find_field(all_fields, "EncodedBy") {
         facts.push((MusicValue::EncodedBy(encoded_by.clone()), source.clone()));
     }
 

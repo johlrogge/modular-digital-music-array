@@ -7,7 +7,7 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-symphonia = { version = "0.5", features = ["default", "flac"] }
+symphonia = { version = "0.5", features = ["default", "flac", "mp3"] }
 tokio = { workspace = true, features = ["full"] }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
@@ -23,7 +23,7 @@ spa_sys = { package = "libspa-sys", version = "0.8" }
 [build-dependencies]
 hound = "3.5"    # For WAV handling
 anyhow = "1.0"
-symphonia = { version = "0.5", features = ["flac"] }
+symphonia = { version = "0.5", features = ["flac", "mp3"] }
 
 [[bench]]
 name = "track_loading"

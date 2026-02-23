@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use parking_lot::Mutex;
-use playback_engine::FlacSource;
+use playback_engine::AudioSource;
 use playback_engine::Source;
 use playback_engine::Track;
 use ringbuf::HeapRb;
@@ -30,8 +30,8 @@ fn bench_track_loading(c: &mut Criterion) {
                 let (prod, cons) = buffer.split();
                 // Create Track in a block to ensure it's dropped right after use
                 let track = rt.block_on(async {
-                    // Create a FlacSource
-                    let source = FlacSource::new(&path).expect("Could not create source");
+                    // Create a AudioSource
+                    let source = AudioSource::new(&path).expect("Could not create source");
                     let source_rate = source.sample_rate();
 
                     // Create a Track with the source (no resampling in benchmarks)
@@ -70,7 +70,7 @@ fn bench_time_to_playable(c: &mut Criterion) {
         // Print metrics once before benchmarking
         let start = Instant::now();
         let mut track = rt.block_on(async {
-            let source = FlacSource::new(&path).unwrap();
+            let source = AudioSource::new(&path).unwrap();
             let rate = source.sample_rate();
             Track::new(source, prod, rate, rate)
                 .await
@@ -105,7 +105,7 @@ fn bench_time_to_playable(c: &mut Criterion) {
                 let (prod, cons) = buffer.split();
                 // Load track
                 let mut track = rt.block_on(async {
-                    let source = FlacSource::new(&path).unwrap();
+                    let source = AudioSource::new(&path).unwrap();
                     let rate = source.sample_rate();
                     Track::new(source, prod, rate, rate)
                         .await
@@ -138,7 +138,7 @@ fn bench_seeking(c: &mut Criterion) {
         let (prod, mut cons) = buffer.split();
         // Create a track for testing
         let track = rt.block_on(async {
-            let source = FlacSource::new(&path).unwrap();
+            let source = AudioSource::new(&path).unwrap();
             let rate = source.sample_rate();
             Track::new(source, prod, rate, rate)
                 .await
