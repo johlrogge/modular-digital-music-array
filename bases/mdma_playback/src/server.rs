@@ -20,6 +20,25 @@ struct QueueEntry {
     path: PathBuf,
 }
 
+fn write_fact(facts_path: &std::path::Path, hash: &ContentHash, value: MusicValue) {
+    let source = FactSource::new(
+        "mdma-playback",
+        env!("CARGO_PKG_VERSION"),
+        FactOrigin::Unknown,
+    );
+    let fact = Fact::new(hash.clone(), value, Utc::now(), source, Operation::Assert);
+    match FactStreamWriter::open(facts_path) {
+        Ok(mut writer) => {
+            if let Err(e) = writer.write_batch(&[fact]) {
+                warn!("Failed to write fact: {}", e);
+            }
+        }
+        Err(e) => {
+            warn!("Failed to open facts file {:?}: {}", facts_path, e);
+        }
+    }
+}
+
 /// Serializable form of a queue entry for persistence.
 #[derive(Serialize, Deserialize)]
 struct PersistEntry {
@@ -64,22 +83,7 @@ impl Server {
     }
 
     fn append_fact(&self, hash: &ContentHash, value: MusicValue) {
-        let source = FactSource::new(
-            "mdma-playback",
-            env!("CARGO_PKG_VERSION"),
-            FactOrigin::Unknown,
-        );
-        let fact = Fact::new(hash.clone(), value, Utc::now(), source, Operation::Assert);
-        match FactStreamWriter::open(&self.facts_path) {
-            Ok(mut writer) => {
-                if let Err(e) = writer.write_batch(&[fact]) {
-                    warn!("Failed to write fact: {}", e);
-                }
-            }
-            Err(e) => {
-                warn!("Failed to open facts file {:?}: {}", self.facts_path, e);
-            }
-        }
+        write_fact(&self.facts_path, hash, value);
     }
 
     /// Serialize and write the queue to disk atomically. Logs a warning on error.
@@ -400,22 +404,7 @@ fn persist_queue_to_file(queue_file: &Path, queue: &VecDeque<QueueEntry>) {
 }
 
 fn append_play_fact(facts_path: &Path, hash: &ContentHash, value: MusicValue) {
-    let source = FactSource::new(
-        "mdma-playback",
-        env!("CARGO_PKG_VERSION"),
-        FactOrigin::Unknown,
-    );
-    let fact = Fact::new(hash.clone(), value, Utc::now(), source, Operation::Assert);
-    match FactStreamWriter::open(facts_path) {
-        Ok(mut writer) => {
-            if let Err(e) = writer.write_batch(&[fact]) {
-                warn!("Failed to write play fact: {}", e);
-            }
-        }
-        Err(e) => {
-            warn!("Failed to open facts file {:?}: {}", facts_path, e);
-        }
-    }
+    write_fact(facts_path, hash, value);
 }
 
 /// Polls deck A every 200 ms. When the track reaches `Finished`, pops the next

@@ -79,9 +79,18 @@ struct LoadResult {
     content_hashes: HashSet<String>,
 }
 
+fn update_if_more_recent(
+    slot: &mut Option<chrono::DateTime<chrono::Utc>>,
+    ts: chrono::DateTime<chrono::Utc>,
+) {
+    if slot.is_none_or(|existing| ts > existing) {
+        *slot = Some(ts);
+    }
+}
+
 /// Format a MusicValue for display (returns type name and string value)
 fn format_fact_for_display(value: &MusicValue) -> (String, String) {
-    (value.variant_name().to_string(), value.to_string())
+    (value.display_name().to_string(), value.to_string())
 }
 
 impl LibraryService {
@@ -171,7 +180,7 @@ impl LibraryService {
                 });
 
             // Index fact values for HasFact/HasFacts lookups
-            let variant_name = fact.value().variant_name();
+            let variant_name = fact.value().display_name();
             let value_str = fact.value().to_string();
             fact_index
                 .entry(variant_name.to_string())
@@ -191,16 +200,8 @@ impl LibraryService {
                 MusicValue::Key(v) => entry.key = Some(v.to_string()),
                 MusicValue::Year(v) => entry.year = Some(v.0),
                 MusicValue::Source(v) => entry.source = Some(v.clone()),
-                MusicValue::TrackStarted(ts) => {
-                    if entry.last_started.is_none_or(|existing| ts > &existing) {
-                        entry.last_started = Some(*ts);
-                    }
-                }
-                MusicValue::TrackStopped(ts) => {
-                    if entry.last_stopped.is_none_or(|existing| ts > &existing) {
-                        entry.last_stopped = Some(*ts);
-                    }
-                }
+                MusicValue::TrackStarted(ts) => update_if_more_recent(&mut entry.last_started, *ts),
+                MusicValue::TrackStopped(ts) => update_if_more_recent(&mut entry.last_stopped, *ts),
                 _ => {}
             }
         }
@@ -514,8 +515,10 @@ impl LibraryService {
             };
 
         // Collect the most-recent TrackStarted/TrackStopped timestamp per content hash
-        let mut last_started: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
-        let mut last_stopped: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+        let mut last_started: HashMap<String, Option<chrono::DateTime<chrono::Utc>>> =
+            HashMap::new();
+        let mut last_stopped: HashMap<String, Option<chrono::DateTime<chrono::Utc>>> =
+            HashMap::new();
 
         for fact_result in reader {
             let fact = match fact_result {
@@ -526,16 +529,10 @@ impl LibraryService {
             let entity = fact.entity().0.clone();
             match fact.value() {
                 MusicValue::TrackStarted(ts) => {
-                    let entry = last_started.entry(entity).or_insert(*ts);
-                    if ts > entry {
-                        *entry = *ts;
-                    }
+                    update_if_more_recent(last_started.entry(entity).or_insert(None), *ts);
                 }
                 MusicValue::TrackStopped(ts) => {
-                    let entry = last_stopped.entry(entity).or_insert(*ts);
-                    if ts > entry {
-                        *entry = *ts;
-                    }
+                    update_if_more_recent(last_stopped.entry(entity).or_insert(None), *ts);
                 }
                 _ => {}
             }
@@ -545,11 +542,11 @@ impl LibraryService {
         let mut tracks = self.tracks.lock().unwrap();
         for track in tracks.iter_mut() {
             let hash = &track.content_hash.0;
-            if let Some(&ts) = last_started.get(hash) {
-                track.last_started = Some(ts);
+            if let Some(Some(ts)) = last_started.get(hash) {
+                track.last_started = Some(*ts);
             }
-            if let Some(&ts) = last_stopped.get(hash) {
-                track.last_stopped = Some(ts);
+            if let Some(Some(ts)) = last_stopped.get(hash) {
+                track.last_stopped = Some(*ts);
             }
         }
     }
@@ -765,7 +762,7 @@ impl LibraryService {
                             let mut fact_index = self.fact_index.lock().unwrap();
                             for (value, _) in &new_facts {
                                 fact_index
-                                    .entry(value.variant_name().to_string())
+                                    .entry(value.display_name().to_string())
                                     .or_default()
                                     .insert(value.to_string());
                             }
@@ -860,7 +857,7 @@ impl LibraryService {
             let mut fact_index = self.fact_index.lock().unwrap();
             for (value, _) in &facts {
                 fact_index
-                    .entry(value.variant_name().to_string())
+                    .entry(value.display_name().to_string())
                     .or_default()
                     .insert(value.to_string());
             }

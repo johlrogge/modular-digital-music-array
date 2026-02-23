@@ -36,6 +36,14 @@ pub fn matches_query(query: &TrackQuery, track: &TrackFields) -> bool {
     }
 }
 
+/// Returns true if there is no string query constraint, or if the track field matches.
+fn check_text(query_field: Option<&StringQuery>, track_field: Option<&str>) -> bool {
+    match query_field {
+        None => true,
+        Some(sq) => track_field.is_some_and(|s| matches_string(sq, s)),
+    }
+}
+
 /// Returns `true` only if ALL non-None query fields match.
 /// `any_text` uses OR semantics across title/artist/album/label/genre.
 fn matches_query_inner(query: &TrackQuery, track: &TrackFields) -> bool {
@@ -55,34 +63,20 @@ fn matches_query_inner(query: &TrackQuery, track: &TrackFields) -> bool {
         }
     }
 
-    if let Some(sq) = &query.artist {
-        if !track.artist.is_some_and(|s| matches_string(sq, s)) {
-            return false;
-        }
+    if !check_text(query.artist.as_ref(), track.artist) {
+        return false;
     }
-
-    if let Some(sq) = &query.title {
-        if !track.title.is_some_and(|s| matches_string(sq, s)) {
-            return false;
-        }
+    if !check_text(query.title.as_ref(), track.title) {
+        return false;
     }
-
-    if let Some(sq) = &query.album {
-        if !track.album.is_some_and(|s| matches_string(sq, s)) {
-            return false;
-        }
+    if !check_text(query.album.as_ref(), track.album) {
+        return false;
     }
-
-    if let Some(sq) = &query.label {
-        if !track.label.is_some_and(|s| matches_string(sq, s)) {
-            return false;
-        }
+    if !check_text(query.label.as_ref(), track.label) {
+        return false;
     }
-
-    if let Some(sq) = &query.genre {
-        if !track.genre.is_some_and(|s| matches_string(sq, s)) {
-            return false;
-        }
+    if !check_text(query.genre.as_ref(), track.genre) {
+        return false;
     }
 
     if let Some(sq) = &query.style {
@@ -248,8 +242,10 @@ fn matches_date(query: &DateQuery, val: Option<DateTime<Utc>>) -> bool {
 /// Returns the first day of the period described by `date` at `prec`.
 fn period_start(date: NaiveDate, prec: DatePrecision) -> NaiveDate {
     match prec {
-        DatePrecision::Year => NaiveDate::from_ymd_opt(date.year(), 1, 1).unwrap(),
-        DatePrecision::YearMonth => NaiveDate::from_ymd_opt(date.year(), date.month(), 1).unwrap(),
+        DatePrecision::Year => NaiveDate::from_ymd_opt(date.year(), 1, 1)
+            .expect("period_start: invalid date calculation"),
+        DatePrecision::YearMonth => NaiveDate::from_ymd_opt(date.year(), date.month(), 1)
+            .expect("period_start: invalid date calculation"),
         DatePrecision::YearMonthDay => date,
     }
 }
@@ -257,7 +253,8 @@ fn period_start(date: NaiveDate, prec: DatePrecision) -> NaiveDate {
 /// Returns the last day of the period described by `date` at `prec`.
 fn period_end(date: NaiveDate, prec: DatePrecision) -> NaiveDate {
     match prec {
-        DatePrecision::Year => NaiveDate::from_ymd_opt(date.year(), 12, 31).unwrap(),
+        DatePrecision::Year => NaiveDate::from_ymd_opt(date.year(), 12, 31)
+            .expect("period_end: invalid date calculation"),
         DatePrecision::YearMonth => {
             // Last day of the month: go to first day of next month, subtract 1
             let (y, m) = if date.month() == 12 {
@@ -266,9 +263,9 @@ fn period_end(date: NaiveDate, prec: DatePrecision) -> NaiveDate {
                 (date.year(), date.month() + 1)
             };
             NaiveDate::from_ymd_opt(y, m, 1)
-                .unwrap()
+                .expect("period_end: invalid date calculation")
                 .pred_opt()
-                .unwrap()
+                .expect("period_end: invalid date calculation")
         }
         DatePrecision::YearMonthDay => date,
     }
@@ -278,6 +275,7 @@ fn period_end(date: NaiveDate, prec: DatePrecision) -> NaiveDate {
 ///
 /// Full Camelot tolerance math (circular arithmetic on the wheel) is deferred.
 fn matches_key(query: &KeyQuery, key_str: &str) -> bool {
+    // TODO: full Camelot tolerance math (circular arithmetic on the wheel)
     let (number, letter) = match query {
         KeyQuery::Exact { number, letter } => (number, letter),
         KeyQuery::Tolerance { number, letter, .. } => (number, letter),

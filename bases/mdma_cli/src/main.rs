@@ -1542,14 +1542,28 @@ fn resolve_track(
     }
 }
 
+fn compare_optional<T: Ord>(a: Option<T>, b: Option<T>, asc: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(av), Some(bv)) => {
+            if asc {
+                av.cmp(&bv)
+            } else {
+                bv.cmp(&av)
+            }
+        }
+    }
+}
+
 fn handle_sort(
     client: &LibraryBackend,
     field: SortField,
     ascending: bool,
     descending: bool,
 ) -> Result<()> {
-    use std::cmp::Ordering;
-
     let direction_asc = match (ascending, descending) {
         (true, false) => true,
         (false, true) => false,
@@ -1576,69 +1590,27 @@ fn handle_sort(
         .collect();
 
     tracks.sort_by(|a, b| match &field {
-        SortField::Bpm => match (&a.bpm, &b.bpm) {
-            (None, None) => Ordering::Equal,
-            (None, Some(_)) => Ordering::Greater,
-            (Some(_), None) => Ordering::Less,
-            (Some(av), Some(bv)) => {
-                if direction_asc {
-                    av.cmp(bv)
-                } else {
-                    bv.cmp(av)
-                }
-            }
-        },
-        SortField::Title => match (&a.title, &b.title) {
-            (None, None) => Ordering::Equal,
-            (None, Some(_)) => Ordering::Greater,
-            (Some(_), None) => Ordering::Less,
-            (Some(av), Some(bv)) => {
-                let cmp = av.to_lowercase().cmp(&bv.to_lowercase());
-                if direction_asc {
-                    cmp
-                } else {
-                    cmp.reverse()
-                }
-            }
-        },
-        SortField::Artist => match (&a.artist, &b.artist) {
-            (None, None) => Ordering::Equal,
-            (None, Some(_)) => Ordering::Greater,
-            (Some(_), None) => Ordering::Less,
-            (Some(av), Some(bv)) => {
-                let cmp = av.to_lowercase().cmp(&bv.to_lowercase());
-                if direction_asc {
-                    cmp
-                } else {
-                    cmp.reverse()
-                }
-            }
-        },
-        SortField::Album => match (&a.album, &b.album) {
-            (None, None) => Ordering::Equal,
-            (None, Some(_)) => Ordering::Greater,
-            (Some(_), None) => Ordering::Less,
-            (Some(av), Some(bv)) => {
-                let cmp = av.to_lowercase().cmp(&bv.to_lowercase());
-                if direction_asc {
-                    cmp
-                } else {
-                    cmp.reverse()
-                }
-            }
-        },
-        SortField::Duration => match (&a.duration, &b.duration) {
-            (None, None) => Ordering::Equal,
-            (None, Some(_)) => Ordering::Greater,
-            (Some(_), None) => Ordering::Less,
-            (Some(av), Some(bv)) => {
-                if direction_asc {
-                    av.0.cmp(&bv.0)
-                } else {
-                    bv.0.cmp(&av.0)
-                }
-            }
-        },
+        SortField::Bpm => compare_optional(a.bpm, b.bpm, direction_asc),
+        SortField::Title => compare_optional(
+            a.title.as_deref().map(str::to_lowercase),
+            b.title.as_deref().map(str::to_lowercase),
+            direction_asc,
+        ),
+        SortField::Artist => compare_optional(
+            a.artist.as_deref().map(str::to_lowercase),
+            b.artist.as_deref().map(str::to_lowercase),
+            direction_asc,
+        ),
+        SortField::Album => compare_optional(
+            a.album.as_deref().map(str::to_lowercase),
+            b.album.as_deref().map(str::to_lowercase),
+            direction_asc,
+        ),
+        SortField::Duration => compare_optional(
+            a.duration.map(|d| d.0),
+            b.duration.map(|d| d.0),
+            direction_asc,
+        ),
     });
 
     print_tracks(&tracks, &format!("Sorted ({} tracks)", tracks.len()));

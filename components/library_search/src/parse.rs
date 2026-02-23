@@ -17,6 +17,31 @@ pub enum ParseError {
     InvalidDateQuery(String),
 }
 
+/// Splits `s` into `(base, up_str, down_str)` by detecting tolerance suffix patterns.
+/// - `"val+-tol"` → symmetric tolerance
+/// - `"val+tol"` → up-only tolerance
+/// - `"val-tol"` → down-only tolerance
+///
+/// `min_offset`: minimum byte offset at which operators are searched
+/// (use 1 for numeric to skip leading minus, 2 for "8B" Camelot notation).
+fn split_tolerance(s: &str, min_offset: usize) -> Option<(&str, &str, &str)> {
+    // Check symmetric "+-" first (before single "+")
+    if let Some(idx) = s.find("+-") {
+        return Some((&s[..idx], &s[idx + 2..], &s[idx + 2..]));
+    }
+    if s.len() > min_offset {
+        if let Some(rel) = s[min_offset..].find('+') {
+            let idx = rel + min_offset;
+            return Some((&s[..idx], &s[idx + 1..], "0"));
+        }
+        if let Some(rel) = s[min_offset..].find('-') {
+            let idx = rel + min_offset;
+            return Some((&s[..idx], "0", &s[idx + 1..]));
+        }
+    }
+    None
+}
+
 /// Parse a CLI string into a StringQuery.
 ///
 /// Detection rules:
@@ -60,48 +85,17 @@ pub fn parse_numeric_query(s: &str) -> Result<NumericQuery, ParseError> {
         return Ok(NumericQuery::Range(lo, hi));
     }
 
-    // "128+-2" — must check before single '+'
-    if let Some(idx) = s.find("+-") {
-        let value: f32 = s[..idx]
+    if let Some((base, up_s, down_s)) = split_tolerance(s, 1) {
+        let value: f32 = base
             .parse()
             .map_err(|_| ParseError::InvalidNumeric(s.to_string()))?;
-        let tol: f32 = s[idx + 2..]
+        let up: f32 = up_s
             .parse()
             .map_err(|_| ParseError::InvalidNumeric(s.to_string()))?;
-        return Ok(NumericQuery::Tolerance {
-            value,
-            up: tol,
-            down: tol,
-        });
-    }
-
-    // "128+2" → only higher
-    if let Some(idx) = s.find('+') {
-        let value: f32 = s[..idx]
+        let down: f32 = down_s
             .parse()
             .map_err(|_| ParseError::InvalidNumeric(s.to_string()))?;
-        let tol: f32 = s[idx + 1..]
-            .parse()
-            .map_err(|_| ParseError::InvalidNumeric(s.to_string()))?;
-        return Ok(NumericQuery::Tolerance {
-            value,
-            up: tol,
-            down: 0.0,
-        });
-    }
-
-    // "128-2" → only lower (find '-' that is not at position 0)
-    if s.len() > 1 {
-        if let Some(rel_idx) = s[1..].find('-') {
-            let idx = rel_idx + 1;
-            if let (Ok(value), Ok(tol)) = (s[..idx].parse::<f32>(), s[idx + 1..].parse::<f32>()) {
-                return Ok(NumericQuery::Tolerance {
-                    value,
-                    up: 0.0,
-                    down: tol,
-                });
-            }
-        }
+        return Ok(NumericQuery::Tolerance { value, up, down });
     }
 
     let value: f32 = s
@@ -210,53 +204,21 @@ pub fn parse_key_query(s: &str) -> Result<KeyQuery, ParseError> {
         (s, false)
     };
 
-    // "8B+-1" — must check before single +/-
-    if let Some(idx) = s_notilde.find("+-") {
-        let base = &s_notilde[..idx];
-        let tol: u8 = s_notilde[idx + 2..]
+    if let Some((base, up_s, down_s)) = split_tolerance(s_notilde, 2) {
+        let tol_up: u8 = up_s
+            .parse()
+            .map_err(|_| ParseError::InvalidKey(s.to_string()))?;
+        let tol_down: u8 = down_s
             .parse()
             .map_err(|_| ParseError::InvalidKey(s.to_string()))?;
         let (number, letter) = parse_camelot_base(base, s)?;
         return Ok(KeyQuery::Tolerance {
             number,
             letter,
-            tolerance_up: tol,
-            tolerance_down: tol,
+            tolerance_up: tol_up,
+            tolerance_down: tol_down,
             include_relative,
         });
-    }
-
-    // Look for +/- after at least 2 characters (to skip the key notation itself)
-    if s_notilde.len() > 2 {
-        if let Some(rel_idx) = s_notilde[2..].find('+').map(|i| i + 2) {
-            let base = &s_notilde[..rel_idx];
-            let tol: u8 = s_notilde[rel_idx + 1..]
-                .parse()
-                .map_err(|_| ParseError::InvalidKey(s.to_string()))?;
-            let (number, letter) = parse_camelot_base(base, s)?;
-            return Ok(KeyQuery::Tolerance {
-                number,
-                letter,
-                tolerance_up: tol,
-                tolerance_down: 0,
-                include_relative,
-            });
-        }
-
-        if let Some(rel_idx) = s_notilde[2..].find('-').map(|i| i + 2) {
-            let base = &s_notilde[..rel_idx];
-            let tol: u8 = s_notilde[rel_idx + 1..]
-                .parse()
-                .map_err(|_| ParseError::InvalidKey(s.to_string()))?;
-            let (number, letter) = parse_camelot_base(base, s)?;
-            return Ok(KeyQuery::Tolerance {
-                number,
-                letter,
-                tolerance_up: 0,
-                tolerance_down: tol,
-                include_relative,
-            });
-        }
     }
 
     let (number, letter) = parse_camelot_base(s_notilde, s)?;
