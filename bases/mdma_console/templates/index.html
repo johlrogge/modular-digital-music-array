@@ -567,13 +567,17 @@
                         var bpmStr = t.bpm ? Math.round(t.bpm) : '';
                         var keyStr = escapeHtml(t.key || '');
                         var dur = t.duration ? fmtDuration(t.duration) : '';
+                        var exportHref = '/export/' + encodeURIComponent(t.content_hash || '') + '?format=aiff';
                         return '<tr>' +
                             '<td>' + title + '</td>' +
                             '<td>' + artist + '</td>' +
                             '<td>' + bpmStr + '</td>' +
                             '<td>' + keyStr + '</td>' +
                             '<td>' + dur + '</td>' +
-                            '<td><button class="btn btn-small" onclick="addToQueue(\'' + hash + '\')">+Queue</button></td>' +
+                            '<td style="white-space:nowrap">' +
+                            '<button class="btn btn-small" onclick="addToQueue(\'' + hash + '\')" style="margin-right:4px">+Queue</button>' +
+                            '<a class="btn btn-secondary btn-small" href="' + exportHref + '" download>Export</a>' +
+                            '</td>' +
                             '</tr>';
                     }).join('');
                     area.innerHTML =

@@ -1063,6 +1063,8 @@ async fn main() -> Result<()> {
         .route("/player/events", get(player_events))
         // Library search
         .route("/library/search", get(library_search_handler))
+        // Export
+        .route("/export/{hash}", get(export_track))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", args.port);
@@ -1073,6 +1075,290 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+// =============================================================================
+// Export
+// =============================================================================
+
+/// Export format query parameter.
+///
+/// Only `aiff` and `wav` are offered — the FLAC encoder is a stub and FLAC
+/// sources are served via passthrough when the source extension matches.
+#[derive(serde::Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+enum ExportFormatParam {
+    #[default]
+    Aiff,
+    Wav,
+}
+
+impl ExportFormatParam {
+    fn extension(&self) -> &'static str {
+        match self {
+            Self::Aiff => "aiff",
+            Self::Wav => "wav",
+        }
+    }
+
+    fn content_type(&self) -> &'static str {
+        match self {
+            Self::Aiff => "audio/aiff",
+            Self::Wav => "audio/wav",
+        }
+    }
+
+    fn to_transcoder_format(&self) -> audio_transcoder::ExportFormat {
+        match self {
+            Self::Aiff => audio_transcoder::ExportFormat::Aiff,
+            Self::Wav => audio_transcoder::ExportFormat::Wav,
+        }
+    }
+}
+
+/// Detect format of a blob file from its extension.
+fn blob_extension(blob_path: &str) -> Option<&str> {
+    std::path::Path::new(blob_path)
+        .extension()
+        .and_then(|e| e.to_str())
+}
+
+/// Build a safe download filename from track metadata.
+fn export_filename(artist: Option<&str>, title: Option<&str>, ext: &str) -> String {
+    let artist = artist.unwrap_or("Unknown Artist");
+    let title = title.unwrap_or("Unknown Title");
+    let base = format!("{} - {}", artist, title);
+    // Remove characters unsafe in filenames
+    let safe: String = base
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c => c,
+        })
+        .collect();
+    format!("{}.{}", safe, ext)
+}
+
+#[derive(serde::Deserialize)]
+struct ExportParams {
+    #[serde(default)]
+    format: ExportFormatParam,
+}
+
+/// Decode all PCM samples from a file using Symphonia.
+///
+/// Returns `(samples, channels, sample_rate)` with interleaved f32 samples
+/// normalised to `[-1.0, 1.0]`.
+fn decode_to_pcm(path: &std::path::Path) -> Result<(Vec<f32>, u16, u32), String> {
+    use symphonia::core::{
+        audio::SampleBuffer, codecs::DecoderOptions, formats::FormatOptions, io::MediaSourceStream,
+        meta::MetadataOptions, probe::Hint,
+    };
+
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| e.to_string())?;
+
+    let mut format = probed.format;
+
+    let track = format
+        .default_track()
+        .ok_or_else(|| "No default track found".to_string())?;
+
+    let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2) as u16;
+    let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
+    let track_id = track.id;
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|e| e.to_string())?;
+
+    let mut all_samples: Vec<f32> = Vec::new();
+    let mut sample_buf: Option<SampleBuffer<f32>> = None;
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(symphonia::core::errors::Error::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            Err(symphonia::core::errors::Error::DecodeError(e)) => {
+                tracing::warn!("Decode error (skipping packet): {}", e);
+                continue;
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+
+        let spec = *decoded.spec();
+        let buf = sample_buf
+            .get_or_insert_with(|| SampleBuffer::<f32>::new(decoded.capacity() as u64, spec));
+        buf.copy_interleaved_ref(decoded);
+        all_samples.extend_from_slice(buf.samples());
+    }
+
+    Ok((all_samples, channels, sample_rate))
+}
+
+async fn export_track(
+    State(state): State<Arc<AppState>>,
+    Path(hash): Path<String>,
+    Query(params): Query<ExportParams>,
+) -> impl IntoResponse {
+    use axum::http::header;
+
+    let content_hash = ContentHash(hash);
+
+    // Resolve track metadata from library
+    let lib_client = match state.library_client() {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Library service not available",
+            )
+                .into_response()
+        }
+    };
+
+    let track = match lib_client.get_track(&content_hash) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(hash = %content_hash.0, error = %e, "Track not found for export");
+            return (StatusCode::NOT_FOUND, format!("Track not found: {}", e)).into_response();
+        }
+    };
+
+    let blob_rel = match &track.blob_path {
+        Some(p) => p.clone(),
+        None => {
+            return (StatusCode::UNPROCESSABLE_ENTITY, "Track has no blob path").into_response()
+        }
+    };
+
+    let blob_path = state.music_root.join(&blob_rel);
+
+    let format = &params.format;
+    let ext = format.extension();
+    let content_type = format.content_type();
+    let filename = export_filename(track.artist.as_deref(), track.title.as_deref(), ext);
+
+    // Check if source matches requested format — serve blob directly
+    let source_ext = blob_extension(&blob_rel).unwrap_or("").to_lowercase();
+    if source_ext == ext || (source_ext == "aif" && ext == "aiff") {
+        let data = match tokio::fs::read(&blob_path).await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!(path = %blob_path.display(), error = %e, "Failed to read blob");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to read blob file",
+                )
+                    .into_response();
+            }
+        };
+
+        return (
+            [
+                (header::CONTENT_TYPE, content_type.to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}\"", filename),
+                ),
+            ],
+            data,
+        )
+            .into_response();
+    }
+
+    // Transcode: decode source to PCM, then encode to requested format
+    let blob_path_clone = blob_path.clone();
+    let pcm_result = tokio::task::spawn_blocking(move || decode_to_pcm(&blob_path_clone)).await;
+
+    let (samples, channels, sample_rate) = match pcm_result {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "Failed to decode audio for export");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Decode failed: {}", e),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Blocking task panicked during export");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal decode error").into_response();
+        }
+    };
+
+    let transcode_format = format.to_transcoder_format();
+    let transcode_result = tokio::task::spawn_blocking(move || {
+        let params = audio_transcoder::TranscodeParams {
+            format: transcode_format,
+            channels,
+            sample_rate,
+            bit_depth: audio_transcoder::BitDepth::TwentyFour,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        audio_transcoder::transcode(&mut buf, &params, &samples)?;
+        Ok::<Vec<u8>, audio_transcoder::TranscoderError>(buf)
+    })
+    .await;
+
+    let encoded = match transcode_result {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "Transcode failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Transcode failed: {}", e),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Blocking task panicked during transcode");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal transcode error",
+            )
+                .into_response();
+        }
+    };
+
+    (
+        [
+            (header::CONTENT_TYPE, content_type.to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}\"", filename),
+            ),
+        ],
+        encoded,
+    )
+        .into_response()
 }
 
 // =============================================================================
@@ -1202,5 +1488,73 @@ mod tests {
         let view = PackageView::from_installed(&pkg, &updates);
         assert_eq!(view.update_version, Some("0.2.0".to_string()));
         assert!(view.has_update());
+    }
+
+    // ── Export helpers ────────────────────────────────────────────────────────
+
+    #[test]
+    fn export_format_defaults_to_aiff() {
+        let default = ExportFormatParam::default();
+        assert_eq!(default, ExportFormatParam::Aiff);
+    }
+
+    #[test]
+    fn export_format_extensions() {
+        assert_eq!(ExportFormatParam::Aiff.extension(), "aiff");
+        assert_eq!(ExportFormatParam::Wav.extension(), "wav");
+    }
+
+    #[test]
+    fn export_format_content_types() {
+        assert_eq!(ExportFormatParam::Aiff.content_type(), "audio/aiff");
+        assert_eq!(ExportFormatParam::Wav.content_type(), "audio/wav");
+    }
+
+    #[test]
+    fn export_filename_with_artist_and_title() {
+        let name = export_filename(Some("DJ Artist"), Some("Track Title"), "aiff");
+        assert_eq!(name, "DJ Artist - Track Title.aiff");
+    }
+
+    #[test]
+    fn export_filename_with_missing_artist() {
+        let name = export_filename(None, Some("Track Title"), "wav");
+        assert_eq!(name, "Unknown Artist - Track Title.wav");
+    }
+
+    #[test]
+    fn export_filename_with_missing_title() {
+        let name = export_filename(Some("DJ Artist"), None, "flac");
+        assert_eq!(name, "DJ Artist - Unknown Title.flac");
+    }
+
+    #[test]
+    fn export_filename_sanitizes_unsafe_chars() {
+        let name = export_filename(Some("Artist/Name"), Some("Track: The \"Remix\""), "aiff");
+        assert_eq!(name, "Artist_Name - Track_ The _Remix_.aiff");
+    }
+
+    #[test]
+    fn blob_extension_detects_flac() {
+        assert_eq!(blob_extension("blobs/ab/abc123.flac"), Some("flac"));
+    }
+
+    #[test]
+    fn blob_extension_detects_mp3() {
+        assert_eq!(blob_extension("blobs/ab/abc123.mp3"), Some("mp3"));
+    }
+
+    #[test]
+    fn blob_extension_missing() {
+        assert_eq!(blob_extension("blobs/ab/noext"), None);
+    }
+
+    #[test]
+    fn aif_source_treated_as_aiff_for_passthrough() {
+        let source_ext = blob_extension("blobs/ab/track.aif").unwrap().to_lowercase();
+        let fmt = ExportFormatParam::Aiff;
+        assert!(
+            source_ext == fmt.extension() || (source_ext == "aif" && fmt.extension() == "aiff")
+        );
     }
 }
