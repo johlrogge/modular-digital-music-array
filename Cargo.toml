@@ -26,7 +26,6 @@ members = [
     "components/library_service",
     # Bases (entry points)
     "bases/mdma_playback",
-    "bases/library_crawler",
     "bases/beacon",
     "bases/mdma_console",
     "bases/mdma_library",
