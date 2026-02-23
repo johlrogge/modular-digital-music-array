@@ -1,3 +1,4 @@
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 /// Search query for tracks. Implicit AND across all non-None fields.
@@ -19,6 +20,8 @@ pub struct TrackQuery {
     pub year: Option<NumericQuery>,
     /// e.g. "bandcamp", "beatport", "upload"
     pub source: Option<String>,
+    pub played: Option<PlayedQuery>,
+    pub skipped: Option<PlayedQuery>,
 }
 
 impl TrackQuery {
@@ -36,6 +39,8 @@ impl TrackQuery {
             && self.duration.is_none()
             && self.year.is_none()
             && self.source.is_none()
+            && self.played.is_none()
+            && self.skipped.is_none()
     }
 }
 
@@ -119,4 +124,32 @@ pub enum KeyQuery {
 pub enum CamelotLetter {
     A,
     B,
+}
+
+/// Date precision used in played/skipped queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DatePrecision {
+    /// Only the year is significant.
+    Year,
+    /// Year + month.
+    YearMonth,
+    /// Year + month + day (exact).
+    YearMonthDay,
+}
+
+/// Played/skipped date matching.
+///
+/// `NA` matches tracks that have never been played/skipped.
+/// Bare date tokens are stored as `Range(date, prec, date, prec)` and the evaluator
+/// expands them to [start-of-period, end-of-period] using the precision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PlayedQuery {
+    /// Track has never been played/skipped (field is `None`)
+    NA,
+    /// `>2026-02` — strictly after the end of the given period
+    After(NaiveDate, DatePrecision),
+    /// `<2026-02` — strictly before the start of the given period
+    Before(NaiveDate, DatePrecision),
+    /// `2026-01..2026-06` — within [start-of-lo, end-of-hi]
+    Range(NaiveDate, DatePrecision, NaiveDate, DatePrecision),
 }

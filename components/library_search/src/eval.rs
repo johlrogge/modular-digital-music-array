@@ -1,6 +1,8 @@
 use crate::query::{
-    CamelotLetter, DurationQuery, DurationUnit, KeyQuery, NumericQuery, StringQuery, TrackQuery,
+    CamelotLetter, DatePrecision, DurationQuery, DurationUnit, KeyQuery, NumericQuery, PlayedQuery,
+    StringQuery, TrackQuery,
 };
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use regex::Regex;
 
 /// Flat track fields used to evaluate a `TrackQuery`.
@@ -20,6 +22,8 @@ pub struct TrackFields<'a> {
     pub duration: Option<u32>,
     pub year: Option<u32>,
     pub source: Option<&'a str>,
+    pub last_played: Option<DateTime<Utc>>,
+    pub last_skipped: Option<DateTime<Utc>>,
 }
 
 /// Evaluate a `TrackQuery` against a set of track fields.
@@ -109,6 +113,18 @@ pub fn matches_query(query: &TrackQuery, track: &TrackFields) -> bool {
         }
     }
 
+    if let Some(q) = &query.played {
+        if !matches_played(q, track.last_played) {
+            return false;
+        }
+    }
+
+    if let Some(q) = &query.skipped {
+        if !matches_played(q, track.last_skipped) {
+            return false;
+        }
+    }
+
     true
 }
 
@@ -192,6 +208,64 @@ fn matches_duration(query: &DurationQuery, secs: u32) -> bool {
     }
 }
 
+/// Evaluate a `PlayedQuery` against an optional UTC timestamp.
+///
+/// - `NA`: matches when `val` is `None`
+/// - `After(date, prec)`: matches when val > end_of_period(date, prec)
+/// - `Before(date, prec)`: matches when val < start_of_period(date, prec)
+/// - `Range(lo, lo_prec, hi, hi_prec)`: matches when start_of_period(lo, lo_prec) <= val <= end_of_period(hi, hi_prec)
+fn matches_played(query: &PlayedQuery, val: Option<DateTime<Utc>>) -> bool {
+    match query {
+        PlayedQuery::NA => val.is_none(),
+        PlayedQuery::After(date, prec) => {
+            let Some(ts) = val else { return false };
+            let end = period_end(*date, *prec);
+            ts.date_naive() > end
+        }
+        PlayedQuery::Before(date, prec) => {
+            let Some(ts) = val else { return false };
+            let start = period_start(*date, *prec);
+            ts.date_naive() < start
+        }
+        PlayedQuery::Range(lo, lo_prec, hi, hi_prec) => {
+            let Some(ts) = val else { return false };
+            let start = period_start(*lo, *lo_prec);
+            let end = period_end(*hi, *hi_prec);
+            let d = ts.date_naive();
+            d >= start && d <= end
+        }
+    }
+}
+
+/// Returns the first day of the period described by `date` at `prec`.
+fn period_start(date: NaiveDate, prec: DatePrecision) -> NaiveDate {
+    match prec {
+        DatePrecision::Year => NaiveDate::from_ymd_opt(date.year(), 1, 1).unwrap(),
+        DatePrecision::YearMonth => NaiveDate::from_ymd_opt(date.year(), date.month(), 1).unwrap(),
+        DatePrecision::YearMonthDay => date,
+    }
+}
+
+/// Returns the last day of the period described by `date` at `prec`.
+fn period_end(date: NaiveDate, prec: DatePrecision) -> NaiveDate {
+    match prec {
+        DatePrecision::Year => NaiveDate::from_ymd_opt(date.year(), 12, 31).unwrap(),
+        DatePrecision::YearMonth => {
+            // Last day of the month: go to first day of next month, subtract 1
+            let (y, m) = if date.month() == 12 {
+                (date.year() + 1, 1)
+            } else {
+                (date.year(), date.month() + 1)
+            };
+            NaiveDate::from_ymd_opt(y, m, 1)
+                .unwrap()
+                .pred_opt()
+                .unwrap()
+        }
+        DatePrecision::YearMonthDay => date,
+    }
+}
+
 /// Key matching stub: compares the Camelot string against the stored key display string.
 ///
 /// Full Camelot tolerance math (circular arithmetic on the wheel) is deferred.
@@ -214,7 +288,7 @@ fn matches_key(query: &KeyQuery, key_str: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::{NumericQuery, StringQuery, TrackQuery};
+    use crate::query::{DatePrecision, NumericQuery, PlayedQuery, StringQuery, TrackQuery};
 
     fn empty_fields() -> TrackFields<'static> {
         TrackFields {
@@ -229,6 +303,8 @@ mod tests {
             duration: None,
             year: None,
             source: None,
+            last_played: None,
+            last_skipped: None,
         }
     }
 
@@ -353,5 +429,80 @@ mod tests {
 
         fields.bpm = Some(140.0);
         assert!(matches_query(&query, &fields)); // both match
+    }
+
+    #[test]
+    fn played_na_matches_none() {
+        let mut q = TrackQuery::default();
+        q.played = Some(PlayedQuery::NA);
+        let mut f = empty_fields();
+        f.last_played = None;
+        assert!(matches_query(&q, &f));
+    }
+
+    #[test]
+    fn played_na_no_match_when_played() {
+        let mut q = TrackQuery::default();
+        q.played = Some(PlayedQuery::NA);
+        let mut f = empty_fields();
+        f.last_played = Some(DateTime::from_timestamp(0, 0).unwrap());
+        assert!(!matches_query(&q, &f));
+    }
+
+    #[test]
+    fn played_after_year_month() {
+        use chrono::NaiveDate;
+        let mut q = TrackQuery::default();
+        // After January 2026 — matches February onwards
+        q.played = Some(PlayedQuery::After(
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            DatePrecision::YearMonth,
+        ));
+        let mut f = empty_fields();
+        // Played on 2026-02-15
+        f.last_played = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-02-15T12:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        assert!(matches_query(&q, &f));
+    }
+
+    #[test]
+    fn played_after_no_match_within_period() {
+        use chrono::NaiveDate;
+        let mut q = TrackQuery::default();
+        q.played = Some(PlayedQuery::After(
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            DatePrecision::YearMonth,
+        ));
+        let mut f = empty_fields();
+        // Played on 2026-01-15 — inside January, NOT after it
+        f.last_played = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-01-15T12:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        assert!(!matches_query(&q, &f));
+    }
+
+    #[test]
+    fn played_range_year_month() {
+        use chrono::NaiveDate;
+        let mut q = TrackQuery::default();
+        q.played = Some(PlayedQuery::Range(
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            DatePrecision::YearMonth,
+            NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(),
+            DatePrecision::YearMonth,
+        ));
+        let mut f = empty_fields();
+        // Played on 2026-02-15 — within Jan-Mar 2026
+        f.last_played = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-02-15T12:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        assert!(matches_query(&q, &f));
     }
 }

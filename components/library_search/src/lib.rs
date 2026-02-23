@@ -18,6 +18,7 @@
 //!     bpm: Some(128.5),
 //!     title: None, album: None, label: None, genre: None,
 //!     styles: &[], key: None, duration: None, year: None, source: None,
+//!     last_played: None, last_skipped: None,
 //! };
 //!
 //! assert!(matches_query(&query, &fields));
@@ -29,8 +30,10 @@ pub mod query;
 
 pub use eval::{matches_query, TrackFields};
 pub use parse::{
-    parse_duration_query, parse_key_query, parse_numeric_query, parse_string_query, ParseError,
+    parse_duration_query, parse_key_query, parse_numeric_query, parse_played_query,
+    parse_string_query, ParseError,
 };
 pub use query::{
-    CamelotLetter, DurationQuery, DurationUnit, KeyQuery, NumericQuery, StringQuery, TrackQuery,
+    CamelotLetter, DatePrecision, DurationQuery, DurationUnit, KeyQuery, NumericQuery, PlayedQuery,
+    StringQuery, TrackQuery,
 };

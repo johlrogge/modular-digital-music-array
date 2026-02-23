@@ -1,6 +1,8 @@
 use crate::query::{
-    CamelotLetter, DurationQuery, DurationUnit, KeyQuery, NumericQuery, StringQuery,
+    CamelotLetter, DatePrecision, DurationQuery, DurationUnit, KeyQuery, NumericQuery, PlayedQuery,
+    StringQuery,
 };
+use chrono::NaiveDate;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -11,6 +13,8 @@ pub enum ParseError {
     InvalidDuration(String),
     #[error("invalid key query '{0}': expected Camelot (8B, 10A) or traditional (Am, C# major, A minor)")]
     InvalidKey(String),
+    #[error("invalid played/skipped query '{0}'")]
+    InvalidPlayedQuery(String),
 }
 
 /// Parse a CLI string into a StringQuery.
@@ -355,6 +359,73 @@ fn normalize_key_notation(s: &str) -> String {
     s.replace(' ', "")
 }
 
+/// Parse a CLI played/skipped date string into a `PlayedQuery`.
+///
+/// Formats:
+/// - `"N/A"` → `NA`
+/// - `"2026"` → range covering whole year
+/// - `"2026-02"` → range covering whole month
+/// - `"2026-02-20"` → range covering exact day
+/// - `">2026-01"` → `After(2026-01-01, YearMonth)`
+/// - `"<2026-01"` → `Before(2026-01-01, YearMonth)`
+/// - `"2026-01..2026-06"` → `Range(2026-01-01, YearMonth, 2026-06-01, YearMonth)`
+pub fn parse_played_query(s: &str) -> Result<PlayedQuery, ParseError> {
+    let s = s.trim();
+
+    if s.eq_ignore_ascii_case("n/a") {
+        return Ok(PlayedQuery::NA);
+    }
+
+    if let Some(rest) = s.strip_prefix('>') {
+        let (date, precision) = parse_date_with_precision(rest.trim(), s)?;
+        return Ok(PlayedQuery::After(date, precision));
+    }
+
+    if let Some(rest) = s.strip_prefix('<') {
+        let (date, precision) = parse_date_with_precision(rest.trim(), s)?;
+        return Ok(PlayedQuery::Before(date, precision));
+    }
+
+    if let Some(idx) = s.find("..") {
+        let lo_str = s[..idx].trim();
+        let hi_str = s[idx + 2..].trim();
+        let (lo_date, lo_prec) = parse_date_with_precision(lo_str, s)?;
+        let (hi_date, hi_prec) = parse_date_with_precision(hi_str, s)?;
+        return Ok(PlayedQuery::Range(lo_date, lo_prec, hi_date, hi_prec));
+    }
+
+    // Bare date: treat as range covering the full period
+    let (date, precision) = parse_date_with_precision(s, s)?;
+    Ok(PlayedQuery::Range(date, precision, date, precision))
+}
+
+fn parse_date_with_precision(
+    s: &str,
+    original: &str,
+) -> Result<(NaiveDate, DatePrecision), ParseError> {
+    let err = || ParseError::InvalidPlayedQuery(original.to_string());
+
+    if s.len() == 10 && s.as_bytes().get(4) == Some(&b'-') && s.as_bytes().get(7) == Some(&b'-') {
+        let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| err())?;
+        return Ok((date, DatePrecision::YearMonthDay));
+    }
+
+    if s.len() == 7 && s.as_bytes().get(4) == Some(&b'-') {
+        let year: i32 = s[..4].parse().map_err(|_| err())?;
+        let month: u32 = s[5..7].parse().map_err(|_| err())?;
+        let date = NaiveDate::from_ymd_opt(year, month, 1).ok_or_else(err)?;
+        return Ok((date, DatePrecision::YearMonth));
+    }
+
+    if s.len() == 4 && s.chars().all(|c| c.is_ascii_digit()) {
+        let year: i32 = s.parse().map_err(|_| err())?;
+        let date = NaiveDate::from_ymd_opt(year, 1, 1).ok_or_else(err)?;
+        return Ok((date, DatePrecision::Year));
+    }
+
+    Err(err())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,5 +608,63 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn played_na() {
+        assert!(matches!(
+            parse_played_query("N/A").unwrap(),
+            PlayedQuery::NA
+        ));
+        assert!(matches!(
+            parse_played_query("n/a").unwrap(),
+            PlayedQuery::NA
+        ));
+    }
+
+    #[test]
+    fn played_bare_year() {
+        assert!(matches!(
+            parse_played_query("2026").unwrap(),
+            PlayedQuery::Range(_, DatePrecision::Year, _, DatePrecision::Year)
+        ));
+    }
+
+    #[test]
+    fn played_bare_year_month() {
+        assert!(matches!(
+            parse_played_query("2026-02").unwrap(),
+            PlayedQuery::Range(_, DatePrecision::YearMonth, _, DatePrecision::YearMonth)
+        ));
+    }
+
+    #[test]
+    fn played_after_year_month() {
+        assert!(matches!(
+            parse_played_query(">2026-01").unwrap(),
+            PlayedQuery::After(_, DatePrecision::YearMonth)
+        ));
+    }
+
+    #[test]
+    fn played_before_year() {
+        assert!(matches!(
+            parse_played_query("<2026").unwrap(),
+            PlayedQuery::Before(_, DatePrecision::Year)
+        ));
+    }
+
+    #[test]
+    fn played_range() {
+        assert!(matches!(
+            parse_played_query("2026-01..2026-06").unwrap(),
+            PlayedQuery::Range(_, DatePrecision::YearMonth, _, DatePrecision::YearMonth)
+        ));
+    }
+
+    #[test]
+    fn played_invalid() {
+        assert!(parse_played_query("not-a-date").is_err());
+        assert!(parse_played_query("").is_err());
     }
 }
