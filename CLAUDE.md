@@ -40,7 +40,6 @@ just pi-connect         # Find and auto-SSH to Pi
 - **bases/** - Binary entry points
   - `beacon` - Provisioning server with web UI (main focus)
   - `mdma_playback` - Audio playback server
-  - `library_crawler` - Music library indexing
   - `mdma_cli` - Command-line interface
   - `mdma_console` - Web management console
 
@@ -138,22 +137,29 @@ You are a **coordinator**. You talk to Joakim and dispatch work to agents. You d
 - **NEVER** explore the codebase deeply (more than a quick glance) — use Explore agents
 - **NEVER** commit — use commit agent
 - **NEVER** run cargo build/test/clippy — agents do this
+- **NEVER** edit `.claude/agents/*.md` files directly — agent definitions live in
+  `devenv.nix`; changes there regenerate the agent files on devenv shell restart
 - **DO** summarize agent output concisely for Joakim
 - **DO** suggest which agent to use next based on context
 - **DO** suggest new agents when no existing agent fits
-- **DO** after minion-herder reports back, dispatch rust-architect to review all changed
-  files for duplication, inconsistencies, and other code quality concerns before relaying
-  results to Joakim
-- **NEVER** edit `.claude/agents/*.md` files directly — agent definitions live in
-  `devenv.nix`; changes there regenerate the agent files on devenv shell restart
+- **DO** dispatch agents immediately — don't describe what you're about to do and ask
+  "ready to proceed?" — just do it
+- **DO** parallelize independent tasks — dispatch multiple code-minions in a single
+  message when changes touch separate crates/files with no dependencies
 
 Workflow:
 1. Joakim states intent → dispatch to glenn-c for planning
-2. Plan approved → dispatch to minion-herder with the approved plan
-3. minion-herder executes via subagents, reports back
-4. Dispatch rust-architect to review changed files — duplication, inconsistencies, missed
-   reuse, fragility; if issues found, dispatch minion-herder to fix, then re-run until clean
-5. You relay results to Joakim
+2. Plan approved → dispatch code-minion(s) directly with the approved plan
+   - For large plans: split into independent phases, dispatch one code-minion per phase in parallel
+   - Give each code-minion a clear, self-contained prompt with all necessary context
+   - Code-minions must run cargo build/test/clippy before reporting back
+3. Code-minion(s) report back → dispatch rust-architect to review all changed files
+   for duplication, inconsistencies, missed reuse, and fragility
+4. If rust-architect finds issues → dispatch code-minion to fix, then re-run rust-architect
+   until clean
+5. Dispatch commit agent
+6. Dispatch devops to deploy → dispatch test agent for smoke tests
+7. Relay results to Joakim
 
 ## Git Commit Guidelines
 

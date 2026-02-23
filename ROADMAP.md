@@ -134,7 +134,6 @@ mdma-library  mdma-playback  /run/mdma/sources/*.sock
   `media_downloader`, `audio_fingerprint`, `download_cli`, `media_ctl`
 - `mdma-console` migrated from `bandcamp_ipc_client` to `gateway_client`
 - Beacon: legacy `ActionLegacy` trait + unused error variants removed
-- `library_crawler`: unused `fact_writer` module removed
 - Agent workflow: code-minion + commit agent + architect review loop
 
 ---
@@ -218,7 +217,36 @@ The web library should display cover art for tracks. This is a good case for fac
 
 ---
 
-### 9. Bandcamp Configuration
+### 9. Track Export (`mdma export`)
+
+**Why:** First real DJ workflow. Export tracks from MDMA in any format for use in Rekordbox, CDJs, or other tools. Composable Unix-style interface.
+
+**Interface:**
+
+```
+mdma search --artist CBL | mdma export --format=aiff --output ./export/
+cat my_hardcore_techno.plist | mdma export --format=aiff
+mdma search --bpm 128-132 --key 8A | mdma export --format=aiff --output ./rekordbox-prep/
+```
+
+- Reads content hashes from stdin (one per line, piped from `mdma search` or playlist files)
+- Pulls audio from Pi via gateway
+- Converts to target format (AIFF initially, MP3/WAV later)
+- Writes to output directory with metadata-based filenames (Artist - Title.aiff)
+- Preserves metadata in target format tags (ID3 for AIFF, etc.)
+- Runs on the laptop, not the Pi
+
+**Guiding use case:** Rekordbox preparation — export a set of tracks as AIFF, import into Rekordbox for club/CDJ use. But the tool is format-generic, not Rekordbox-specific.
+
+**Prerequisites:** Priority 8 (MP3 support gives us Symphonia multi-format decode). AIFF encoding needs a new `audio_transcoder` component (Symphonia decode → AIFF write).
+
+**Shared infrastructure:** The `audio_transcoder` component is reused by Rekordbox Sync (Priority 12) and Virtual CDJ (Priority 13).
+
+**Later:** `mdma rekordbox export` wraps `mdma export` + generates Rekordbox XML with BPM, key, artist, title. Identity mapping facts for round-trip sync.
+
+---
+
+### 10. Bandcamp Configuration
 
 **Missing piece:** How does a fresh install configure the bandcamp service?
 
@@ -230,7 +258,7 @@ The web library should display cover art for tracks. This is a good case for fac
 
 ---
 
-### 10. Stream Management (Silence → Off)
+### 11. Stream Management (Silence → Off)
 
 - Auto-shutdown PipeWire stream after N seconds of silence (queue empty, no track playing)
 - Auto-restart when a track is queued/played
@@ -238,7 +266,7 @@ The web library should display cover art for tracks. This is a good case for fac
 
 ---
 
-### 11. Rekordbox Sync
+### 12. Rekordbox Sync
 
 **Why:** Bridge MDMA and Rekordbox for club/CDJ preparation. Two phases.
 
@@ -247,7 +275,7 @@ The web library should display cover art for tracks. This is a good case for fac
 **Identity mapping:** `PioneerMapping` fact (ContentHash ↔ TrackID + file path).
 Persisted via stainless_facts. Created on first export, maintained across syncs.
 Named `PioneerMapping` (not Rekordbox-specific) because it maps to the Pioneer
-ecosystem broadly — shared with Priority 12 (Virtual CDJ).
+ecosystem broadly — shared with Priority 13 (Virtual CDJ).
 
 **Phase A — MDMA to Rekordbox (export):**
 - `mdma rekordbox export --playlist <name> --output <path>` on laptop
@@ -267,12 +295,12 @@ ecosystem broadly — shared with Priority 12 (Virtual CDJ).
 **Conversion runs on the laptop, not the Pi.**
 
 **Shared infrastructure:** The FLAC-to-AIFF transcoding pipeline and ContentHash-to-TrackID
-identity mapping are also used by Priority 12 (Virtual CDJ). Factor these into reusable
+identity mapping are also used by Priority 13 (Virtual CDJ). Factor these into reusable
 components when implementing.
 
 ---
 
-### 12. Virtual CDJ (Network Media Server for Physical CDJs)
+### 13. Virtual CDJ (Network Media Server for Physical CDJs)
 
 **Why:** Eliminate USB sticks entirely. MDMA serves its library directly to physical CDJs
 on the local network. The CDJ browses and plays tracks as if a USB stick were inserted.
@@ -305,12 +333,12 @@ serves it via NFSv3. The CDJ sees the NFS share as equivalent to a USB stick.
 - Foundation exists in `prodj` research project (packet parsing, player registry)
 - Reference: https://djl-analysis.deepsymmetry.org/djl-analysis/packets.html
 
-**Shared with Priority 11:**
+**Shared with Priority 12:**
 - `pioneer_export` component (PDB/ANLZ generation)
 - FLAC-to-AIFF transcoding pipeline
 - ContentHash ↔ Pioneer TrackID identity mapping facts
 
-**Prerequisites:** Priority 11 Phase A (transcoding pipeline, identity mapping).
+**Prerequisites:** Priority 12 Phase A (transcoding pipeline, identity mapping).
 
 **Hardware:** MDMA-909 variant with secondary NVMe (`/cdj-export` partition).
 
@@ -367,7 +395,7 @@ This should happen before inviting other users onto the system.
 - MDMA-101 hardware — long-term; design data model to accommodate it
 - Gapless playback — desirable but not blocking queue MVP
 - Multi-deck UI — after single queue works
-- CDJ/Pro DJ Link integration — documented as Priority 12 (Virtual CDJ); Phase C (full protocol participation) deferred until Phase A (static NFS export) is validated
+- CDJ/Pro DJ Link integration — documented as Priority 13 (Virtual CDJ); Phase C (full protocol participation) deferred until Phase A (static NFS export) is validated
 - Auto-updates — manual deploys fine during development
 - TUI client — after polybar + web UI prove the interaction model
 - mdmamp — after pub/sub, polybar, and web UI are solid
@@ -452,6 +480,8 @@ Two external ports: 5555 (gateway) and 5556 (events). No per-service TCP ports e
 ---
 
 ## Update History
+
+- **2026-02-23:** Priorities 7+8 implementation started. library_crawler removed (replaced by library_service). New Priority 9 (Track Export) added — composable `mdma export` command for Rekordbox/CDJ workflow.
 
 - **2026-02-23:** Priority 6 (Web UI Player Controls) complete.
   - Now playing display with track title, artist, album, BPM, key, duration

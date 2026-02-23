@@ -273,6 +273,7 @@ dependencies = [
  "matchit",
  "memchr",
  "mime",
+ "multer",
  "percent-encoding",
  "pin-project-lite",
  "rustversion",
@@ -2115,26 +2116,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9fbbcab51052fe104eb5e5d351cf728d30a5be1fe14d9be8a3b097481fb97de"
 
 [[package]]
-name = "library-crawler"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "clap",
- "color-eyre",
- "flac-metadata",
- "hex",
- "music-facts",
- "music-primitives",
- "serde",
- "serde_json",
- "sha2",
- "stainless-facts",
- "tempfile",
- "tokio",
- "walkdir",
-]
-
-[[package]]
 name = "library-ipc-client"
 version = "0.1.0"
 dependencies = [
@@ -2459,6 +2440,7 @@ dependencies = [
  "event-protocol",
  "futures",
  "gateway-client",
+ "inbox-utils",
  "library-ipc-client",
  "library-search",
  "media-protocol",
@@ -2615,6 +2597,23 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "multer"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83e87776546dc87511aa5ee218730c92b666d7264ab6ed41f9d215af9cd5224b"
+dependencies = [
+ "bytes",
+ "encoding_rs",
+ "futures-util",
+ "http",
+ "httparse",
+ "memchr",
+ "mime",
+ "spin",
+ "version_check",
 ]
 
 [[package]]
@@ -3931,6 +3930,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "spin"
+version = "0.9.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+
+[[package]]
 name = "spinning_top"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4017,6 +4022,7 @@ checksum = "815c942ae7ee74737bb00f965fa5b5a2ac2ce7b6c01c0cc169bbeaf7abd5f5a9"
 dependencies = [
  "lazy_static",
  "symphonia-bundle-flac",
+ "symphonia-bundle-mp3",
  "symphonia-codec-adpcm",
  "symphonia-codec-pcm",
  "symphonia-codec-vorbis",
@@ -4037,6 +4043,18 @@ dependencies = [
  "symphonia-core",
  "symphonia-metadata",
  "symphonia-utils-xiph",
+]
+
+[[package]]
+name = "symphonia-bundle-mp3"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c01c2aae70f0f1fb096b6f0ff112a930b1fb3626178fba3ae68b09dce71706d4"
+dependencies = [
+ "lazy_static",
+ "log",
+ "symphonia-core",
+ "symphonia-metadata",
 ]
 
 [[package]]
