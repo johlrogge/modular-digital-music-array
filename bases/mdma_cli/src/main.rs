@@ -234,6 +234,39 @@ enum Commands {
         #[arg(long, default_value = "/music/inbox/", env = "MDMA_INBOX_DIR")]
         inbox_dir: String,
     },
+
+    /// Export tracks from the library to local files.
+    ///
+    /// Reads content hashes from stdin (one per line, pipe-friendly).
+    /// Compatible with search output: `mdma search --artist CBL | mdma export --format aiff`
+    ///
+    /// Examples:
+    ///   mdma search --artist CBL | mdma export --format aiff
+    ///   mdma search --artist CBL | mdma export --format wav --output ./archive/
+    Export {
+        /// Output format (aiff or wav)
+        #[arg(long, default_value = "aiff", value_enum)]
+        format: ExportFormat,
+
+        /// Output directory (created if it doesn't exist)
+        #[arg(long, default_value = "./export/")]
+        output: std::path::PathBuf,
+    },
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, PartialEq, Eq)]
+enum ExportFormat {
+    Aiff,
+    Wav,
+}
+
+impl ExportFormat {
+    fn extension(&self) -> &'static str {
+        match self {
+            Self::Aiff => "aiff",
+            Self::Wav => "wav",
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -1952,6 +1985,251 @@ fn handle_upload(
 }
 
 // =============================================================================
+// Export Command Helpers
+// =============================================================================
+
+/// Build the export URL for a track given an MDMA node hostname.
+fn export_url_from_node(node: &str, hash: &str, format: &str) -> String {
+    format!("http://{}/export/{}?format={}", node, hash, format)
+}
+
+/// Extract a content hash from a line of text.
+///
+/// Handles multiple formats:
+/// - Plain hash: `abcd1234ef567890`
+/// - Full sha256: prefix: `sha256:abcdef0123...`
+/// - Search output: `{8-char-hash}  {Artist} - {Title}  [{duration}]`
+/// - Any line whose first whitespace-separated token looks like a hash
+///
+/// Returns `None` for blank lines, comment lines (starting with `#`), and lines
+/// where the first token doesn't resemble a hash.
+fn parse_hash_from_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let token = line.split_whitespace().next()?;
+    // Accept sha256: prefixed full hashes
+    if token.starts_with("sha256:") {
+        let hex_part = token.strip_prefix("sha256:")?;
+        if hex_part.len() >= 8
+            && hex_part
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        {
+            return Some(token.to_string());
+        }
+        return None;
+    }
+    // Accept plain hex tokens of 8+ chars (short or full)
+    if token.len() >= 8
+        && token
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+    {
+        return Some(token.to_string());
+    }
+    None
+}
+
+/// Parse the filename from a `Content-Disposition` header value.
+///
+/// Handles both quoted (`filename="..."`) and unquoted (`filename=...`) forms.
+fn filename_from_content_disposition(header: &str) -> Option<String> {
+    // Find `filename=` (case-insensitive search is done by lowercase comparison)
+    let lower = header.to_lowercase();
+    let pos = lower.find("filename=")?;
+    let rest = &header[pos + "filename=".len()..];
+    // Strip surrounding quotes if present
+    let name = if rest.starts_with('"') {
+        let inner = rest.strip_prefix('"')?;
+        inner.split('"').next()?.to_string()
+    } else {
+        // Unquoted: take until `;` or end of string
+        rest.split(';').next()?.trim().to_string()
+    };
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Result of a single track export attempt.
+struct ExportResult {
+    hash: String,
+    filename: String,
+    bytes: u64,
+    success: bool,
+    error: Option<String>,
+}
+
+fn handle_export(format: &ExportFormat, output: &std::path::Path) -> Result<()> {
+    use std::io::{BufRead, Write};
+
+    // Resolve MDMA_NODE
+    let node = match std::env::var("MDMA_NODE") {
+        Ok(n) if !n.is_empty() => n,
+        _ => {
+            eprintln!("MDMA_NODE is not set.");
+            eprintln!("Set MDMA_NODE to the hostname of your MDMA device (e.g. mdma-909.local)");
+            std::process::exit(1);
+        }
+    };
+
+    // Create output directory
+    if let Err(e) = std::fs::create_dir_all(output) {
+        eprintln!(
+            "Failed to create output directory {}: {}",
+            output.display(),
+            e
+        );
+        std::process::exit(1);
+    }
+
+    // Read hashes from stdin
+    let hashes: Vec<String> = std::io::stdin()
+        .lock()
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| parse_hash_from_line(&line))
+        .collect();
+
+    if hashes.is_empty() {
+        eprintln!("No hashes provided on stdin.");
+        eprintln!("Usage: mdma search --artist CBL | mdma export --format aiff");
+        std::process::exit(1);
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to build HTTP client: {}", e))?;
+
+    let ext = format.extension();
+    let total = hashes.len();
+    let mut results: Vec<ExportResult> = Vec::with_capacity(total);
+
+    for (idx, hash) in hashes.iter().enumerate() {
+        let url = export_url_from_node(&node, hash, ext);
+        eprint!("[{}/{}] Downloading {} ... ", idx + 1, total, hash);
+        let _ = std::io::stderr().flush();
+
+        let response = match client.get(&url).send() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("FAILED ({})", e);
+                results.push(ExportResult {
+                    hash: hash.clone(),
+                    filename: String::new(),
+                    bytes: 0,
+                    success: false,
+                    error: Some(e.to_string()),
+                });
+                continue;
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            eprintln!("FAILED (HTTP {})", status);
+            results.push(ExportResult {
+                hash: hash.clone(),
+                filename: String::new(),
+                bytes: 0,
+                success: false,
+                error: Some(format!("HTTP {}", status)),
+            });
+            continue;
+        }
+
+        // Determine filename from Content-Disposition or fall back to hash.ext
+        let filename = response
+            .headers()
+            .get("content-disposition")
+            .and_then(|v| v.to_str().ok())
+            .and_then(filename_from_content_disposition)
+            .unwrap_or_else(|| {
+                let clean = hash.strip_prefix("sha256:").unwrap_or(hash);
+                let short = if clean.len() > 16 {
+                    &clean[..16]
+                } else {
+                    clean
+                };
+                format!("{}.{}", short, ext)
+            });
+
+        let dest = output.join(&filename);
+        let body = match response.bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("FAILED (read error: {})", e);
+                results.push(ExportResult {
+                    hash: hash.clone(),
+                    filename,
+                    bytes: 0,
+                    success: false,
+                    error: Some(e.to_string()),
+                });
+                continue;
+            }
+        };
+
+        if let Err(e) = std::fs::write(&dest, &body) {
+            eprintln!("FAILED (write error: {})", e);
+            results.push(ExportResult {
+                hash: hash.clone(),
+                filename,
+                bytes: 0,
+                success: false,
+                error: Some(e.to_string()),
+            });
+            continue;
+        }
+
+        let bytes = body.len() as u64;
+        eprintln!("OK  {} ({} bytes)", filename, bytes);
+        results.push(ExportResult {
+            hash: hash.clone(),
+            filename,
+            bytes,
+            success: true,
+            error: None,
+        });
+    }
+
+    // Summary
+    let success_count = results.iter().filter(|r| r.success).count();
+    let total_bytes: u64 = results.iter().filter(|r| r.success).map(|r| r.bytes).sum();
+    let fail_count = results.iter().filter(|r| !r.success).count();
+    eprintln!();
+    eprintln!(
+        "Done: {} exported ({} bytes), {} failed",
+        success_count, total_bytes, fail_count
+    );
+
+    if fail_count > 0 {
+        eprintln!();
+        eprintln!("Failed tracks:");
+        for r in results.iter().filter(|r| !r.success) {
+            let target = if r.filename.is_empty() {
+                r.hash.clone()
+            } else {
+                format!("{} ({})", r.hash, r.filename)
+            };
+            eprintln!(
+                "  {} — {}",
+                target,
+                r.error.as_deref().unwrap_or("unknown error")
+            );
+        }
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -2143,6 +2421,7 @@ fn main() -> Result<()> {
             ssh_user,
             inbox_dir,
         } => handle_upload(&cli, file, ssh_key, ssh_user, inbox_dir),
+        Commands::Export { format, output } => handle_export(format, output),
     }
 }
 
@@ -2294,5 +2573,108 @@ mod tests {
         // tests) the result will be the actual terminal width, which is fine —
         // we only care that 100 is never returned as the hard-coded default.
         assert_ne!(w, 100, "terminal_width() must not fall back to 100");
+    }
+
+    // ── Export helpers ────────────────────────────────────────────────────────
+
+    #[test]
+    fn export_url_builds_from_node_aiff() {
+        let url = export_url_from_node("mdma-909.local", "sha256:abcd1234", "aiff");
+        assert_eq!(
+            url,
+            "http://mdma-909.local/export/sha256:abcd1234?format=aiff"
+        );
+    }
+
+    #[test]
+    fn export_url_builds_from_node_wav() {
+        let url = export_url_from_node("mdma-909.local", "sha256:abcd1234", "wav");
+        assert_eq!(
+            url,
+            "http://mdma-909.local/export/sha256:abcd1234?format=wav"
+        );
+    }
+
+    #[test]
+    fn export_format_extension_aiff() {
+        assert_eq!(ExportFormat::Aiff.extension(), "aiff");
+    }
+
+    #[test]
+    fn export_format_extension_wav() {
+        assert_eq!(ExportFormat::Wav.extension(), "wav");
+    }
+
+    #[test]
+    fn parse_hash_from_plain_hash_line() {
+        // Plain hash with no surrounding text
+        let result = parse_hash_from_line("abcd1234ef567890");
+        assert_eq!(result, Some("abcd1234ef567890".to_string()));
+    }
+
+    #[test]
+    fn parse_hash_from_search_output_line() {
+        // Canonical playlist line format: {short_hash}  {Artist} - {Title}  [{duration}]
+        let result = parse_hash_from_line("abcd1234  Carbon Based Lifeforms - Init  [8:28]");
+        assert_eq!(result, Some("abcd1234".to_string()));
+    }
+
+    #[test]
+    fn parse_hash_from_sha256_prefixed_line() {
+        // Full sha256: prefixed hash on its own line
+        let result = parse_hash_from_line(
+            "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        );
+        assert_eq!(
+            result,
+            Some(
+                "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn parse_hash_from_empty_line_returns_none() {
+        let result = parse_hash_from_line("");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_hash_from_comment_line_returns_none() {
+        // Lines starting with # are comments
+        let result = parse_hash_from_line("# this is a comment");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_hash_from_uppercase_returns_none() {
+        assert!(parse_hash_from_line("ABCDEF1234567890").is_none());
+    }
+
+    #[test]
+    fn parse_hash_from_short_token_returns_none() {
+        assert!(parse_hash_from_line("abcd12").is_none());
+    }
+
+    #[test]
+    fn filename_from_content_disposition_returns_filename() {
+        let header = r#"attachment; filename="Artist - Track.aiff""#;
+        let result = filename_from_content_disposition(header);
+        assert_eq!(result, Some("Artist - Track.aiff".to_string()));
+    }
+
+    #[test]
+    fn filename_from_content_disposition_no_filename_returns_none() {
+        let header = "attachment";
+        let result = filename_from_content_disposition(header);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn filename_from_content_disposition_unquoted() {
+        let header = "attachment; filename=Artist-Track.aiff";
+        let result = filename_from_content_disposition(header);
+        assert_eq!(result, Some("Artist-Track.aiff".to_string()));
     }
 }

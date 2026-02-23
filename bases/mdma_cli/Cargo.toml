@@ -31,6 +31,9 @@ library-ipc-client = { path = "../../components/library_ipc_client" }
 library-search = { path = "../../components/library_search" }
 source-protocol = { path = "../../components/source_protocol" }
 
+# HTTP client (for export command, using rustls to avoid native openssl dependency)
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
 # Output formatting
 colored = "2.0"
 corsett = { path = "../../../corsett" }
