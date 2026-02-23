@@ -58,6 +58,7 @@
         .btn:hover { opacity: 0.9; }
         .btn:disabled { opacity: 0.5; cursor: not-allowed; }
         .btn-secondary { background: var(--border); color: var(--text); }
+        .btn-danger { background: var(--error); color: #fff; }
         .btn-small { padding: 4px 12px; font-size: 0.85em; }
         .update-available { color: var(--success); }
         .no-update { color: var(--text-muted); }
@@ -76,7 +77,7 @@
         .inbox-list li { padding: 8px 0; border-bottom: 1px solid var(--border); }
         .inbox-list li:last-child { border-bottom: none; }
         .empty-msg { color: var(--text-muted); font-style: italic; }
-        .actions { margin-top: 15px; display: flex; gap: 10px; }
+        .actions { margin-top: 15px; display: flex; gap: 10px; flex-wrap: wrap; }
         #status-area { display: none; }
         .loading {
             display: inline-block;
@@ -89,13 +90,142 @@
             vertical-align: middle;
         }
         @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Player styles */
+        .player-bar {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        .player-track {
+            flex: 1;
+            min-width: 200px;
+        }
+        .player-track .track-title {
+            font-size: 1.1em;
+            font-weight: 600;
+            color: var(--accent);
+        }
+        .player-track .track-artist {
+            color: var(--text-muted);
+            font-size: 0.9em;
+        }
+        .player-track .track-meta {
+            color: var(--text-muted);
+            font-size: 0.8em;
+            margin-top: 4px;
+        }
+        .player-idle {
+            color: var(--text-muted);
+            font-style: italic;
+        }
+        .player-controls {
+            display: flex;
+            gap: 8px;
+        }
+
+        /* Queue styles */
+        .queue-list {
+            list-style: none;
+            padding: 0;
+            margin: 0 0 12px 0;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .queue-list li {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 0;
+            border-bottom: 1px solid var(--border);
+        }
+        .queue-list li:last-child { border-bottom: none; }
+        .queue-track-info { flex: 1; }
+        .queue-track-title { font-size: 0.95em; }
+        .queue-track-artist { color: var(--text-muted); font-size: 0.85em; }
+
+        /* Search styles */
+        .search-row {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-bottom: 12px;
+        }
+        .search-input {
+            flex: 1;
+            min-width: 150px;
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            background: var(--bg-dark);
+            color: var(--text);
+            border-radius: 4px;
+            font-size: 0.9em;
+        }
+        .search-input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        .search-results { max-height: 400px; overflow-y: auto; }
+
+        /* SSE indicator */
+        .sse-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--text-muted);
+            margin-left: 8px;
+            vertical-align: middle;
+            transition: background 0.3s;
+        }
+        .sse-dot.connected { background: var(--success); }
+        .sse-dot.error { background: var(--error); }
     </style>
 </head>
 <body>
-    <h1>MDMA Console</h1>
+    <h1>MDMA Console <span class="sse-dot" id="sse-dot" title="Event stream"></span></h1>
     <p class="version">v{{ version }}</p>
 
     <div id="status-area"></div>
+
+    <!-- Now Playing -->
+    <div class="card">
+        <h2>Now Playing</h2>
+        <div id="now-playing-area">
+            <p class="player-idle">Loading...</p>
+        </div>
+        <div class="actions">
+            <button class="btn btn-secondary" onclick="playerStop()">Stop</button>
+            <button class="btn btn-secondary" onclick="playerSkip()">Skip</button>
+            <button class="btn" onclick="playerPlayQueue()">Play Queue</button>
+        </div>
+    </div>
+
+    <!-- Queue -->
+    <div class="card">
+        <h2>Queue</h2>
+        <ul class="queue-list" id="queue-list">
+            <li><span class="empty-msg">Loading...</span></li>
+        </ul>
+        <div class="actions">
+            <button class="btn btn-secondary btn-small" onclick="clearQueue()">Clear All</button>
+        </div>
+    </div>
+
+    <!-- Library Search -->
+    <div class="card">
+        <h2>Library Search</h2>
+        <div class="search-row">
+            <input type="text" class="search-input" id="search-q" placeholder="Search all fields..." oninput="scheduleSearch()">
+            <input type="text" class="search-input" id="search-artist" placeholder="Artist..." oninput="scheduleSearch()" style="max-width:160px;">
+            <input type="text" class="search-input" id="search-bpm" placeholder="BPM (e.g. 128+-4)" oninput="scheduleSearch()" style="max-width:130px;">
+            <input type="text" class="search-input" id="search-key" placeholder="Key (e.g. 8B)" oninput="scheduleSearch()" style="max-width:110px;">
+        </div>
+        <div class="search-results" id="search-results">
+            <p class="empty-msg">Type to search your library.</p>
+        </div>
+    </div>
 
     <div class="card">
         <h2>Package Management</h2>
@@ -125,7 +255,7 @@
                         {% endmatch %}
                     </td>
                     <td>
-                        {% if pkg.has_update %}
+                        {% if pkg.has_update() %}
                         <button class="btn btn-small" onclick="updatePackage('{{ pkg.name }}')">Update</button>
                         {% endif %}
                     </td>
@@ -212,12 +342,16 @@
     </div>
 
     <script>
+        // =====================================================================
+        // Utilities
+        // =====================================================================
+
         function showStatus(message, isError) {
-            const area = document.getElementById('status-area');
+            var area = document.getElementById('status-area');
             area.style.display = 'block';
             area.className = 'status-msg ' + (isError ? 'status-error' : 'status-success');
             area.textContent = message;
-            setTimeout(() => { area.style.display = 'none'; }, 5000);
+            setTimeout(function() { area.style.display = 'none'; }, 5000);
         }
 
         function showLoading(btn) {
@@ -225,15 +359,243 @@
             btn.innerHTML = '<span class="loading"></span>Working...';
         }
 
+        function escapeHtml(s) {
+            if (s == null) return '';
+            return String(s)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        function fmtDuration(secs) {
+            if (!secs) return '';
+            var m = Math.floor(secs / 60);
+            var s = secs % 60;
+            return m + ':' + (s < 10 ? '0' : '') + s;
+        }
+
+        // =====================================================================
+        // SSE Event Bridge
+        // =====================================================================
+
+        var sseRetryDelay = 1000;
+
+        function connectSSE() {
+            var dot = document.getElementById('sse-dot');
+            var es = new EventSource('/player/events');
+            es.onopen = function() {
+                dot.className = 'sse-dot connected';
+                sseRetryDelay = 1000;
+            };
+            es.onmessage = function(e) {
+                var ev;
+                try { ev = JSON.parse(e.data); } catch(ex) { return; }
+                if ('TrackStarted' in ev || ev.type === 'Connected') {
+                    refreshNowPlaying();
+                    refreshQueue();
+                } else if ('TrackStopped' in ev || 'TrackEnded' in ev) {
+                    refreshNowPlaying();
+                } else if ('QueueChanged' in ev) {
+                    refreshQueue();
+                }
+            };
+            es.onerror = function() {
+                dot.className = 'sse-dot error';
+                es.close();
+                setTimeout(connectSSE, sseRetryDelay);
+                sseRetryDelay = Math.min(sseRetryDelay * 2, 30000);
+            };
+        }
+
+        // =====================================================================
+        // Player Controls
+        // =====================================================================
+
+        function refreshNowPlaying() {
+            fetch('/player/now-playing')
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    var area = document.getElementById('now-playing-area');
+                    if (!data.playing) {
+                        area.innerHTML = '<p class="player-idle">Nothing playing.</p>';
+                        return;
+                    }
+                    var t = data.track || {};
+                    var title = escapeHtml(t.title || t.content_hash || 'Unknown');
+                    var artist = escapeHtml(t.artist || '');
+                    var meta = [];
+                    if (t.album) meta.push(escapeHtml(t.album));
+                    if (t.bpm) meta.push(Math.round(t.bpm) + ' BPM');
+                    if (t.key) meta.push(escapeHtml(t.key));
+                    if (t.duration) meta.push(fmtDuration(t.duration));
+                    area.innerHTML =
+                        '<div class="player-bar">' +
+                        '<div class="player-track">' +
+                        '<div class="track-title">' + title + '</div>' +
+                        (artist ? '<div class="track-artist">' + artist + '</div>' : '') +
+                        (meta.length ? '<div class="track-meta">' + meta.join(' &middot; ') + '</div>' : '') +
+                        '</div>' +
+                        '</div>';
+                })
+                .catch(function() {});
+        }
+
+        function refreshQueue() {
+            fetch('/player/queue')
+                .then(function(r) { return r.json(); })
+                .then(function(tracks) {
+                    var list = document.getElementById('queue-list');
+                    if (!Array.isArray(tracks) || tracks.length === 0) {
+                        list.innerHTML = '<li><span class="empty-msg">Queue is empty.</span></li>';
+                        return;
+                    }
+                    list.innerHTML = tracks.map(function(t) {
+                        var title = escapeHtml(t.title || t.content_hash || 'Unknown');
+                        var artist = escapeHtml(t.artist || '');
+                        var hash = escapeHtml(t.content_hash || '');
+                        return '<li>' +
+                            '<div class="queue-track-info">' +
+                            '<div class="queue-track-title">' + title + '</div>' +
+                            (artist ? '<div class="queue-track-artist">' + artist + '</div>' : '') +
+                            '</div>' +
+                            '<button class="btn btn-danger btn-small" onclick="removeFromQueue(\'' + hash + '\')">Remove</button>' +
+                            '</li>';
+                    }).join('');
+                })
+                .catch(function() {});
+        }
+
+        function playerStop() {
+            fetch('/player/stop', { method: 'POST' })
+                .then(function() { refreshNowPlaying(); })
+                .catch(function(e) { showStatus('Stop failed: ' + e.message, true); });
+        }
+
+        function playerSkip() {
+            fetch('/player/skip', { method: 'POST' })
+                .then(function() { setTimeout(function() { refreshNowPlaying(); refreshQueue(); }, 300); })
+                .catch(function(e) { showStatus('Skip failed: ' + e.message, true); });
+        }
+
+        function playerPlayQueue() {
+            fetch('/player/play-queue', { method: 'POST' })
+                .then(function() { setTimeout(function() { refreshNowPlaying(); refreshQueue(); }, 300); })
+                .catch(function(e) { showStatus('Play failed: ' + e.message, true); });
+        }
+
+        function addToQueue(hash) {
+            fetch('/player/queue/append', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ hash: hash })
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (data.success) {
+                    showStatus('Added to queue', false);
+                    refreshQueue();
+                } else {
+                    showStatus('Failed: ' + (data.error || 'Unknown'), true);
+                }
+            })
+            .catch(function(e) { showStatus('Error: ' + e.message, true); });
+        }
+
+        function removeFromQueue(hash) {
+            fetch('/player/queue/remove', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ hashes: [hash] })
+            })
+            .then(function() { refreshQueue(); })
+            .catch(function(e) { showStatus('Error: ' + e.message, true); });
+        }
+
+        function clearQueue() {
+            fetch('/player/queue/clear', { method: 'POST' })
+                .then(function() { refreshQueue(); })
+                .catch(function(e) { showStatus('Error: ' + e.message, true); });
+        }
+
+        // =====================================================================
+        // Library Search
+        // =====================================================================
+
+        var searchTimer = null;
+
+        function scheduleSearch() {
+            clearTimeout(searchTimer);
+            searchTimer = setTimeout(doSearch, 350);
+        }
+
+        function doSearch() {
+            var q = document.getElementById('search-q').value.trim();
+            var artist = document.getElementById('search-artist').value.trim();
+            var bpm = document.getElementById('search-bpm').value.trim();
+            var key = document.getElementById('search-key').value.trim();
+
+            if (!q && !artist && !bpm && !key) {
+                document.getElementById('search-results').innerHTML =
+                    '<p class="empty-msg">Type to search your library.</p>';
+                return;
+            }
+
+            var params = new URLSearchParams();
+            if (q) params.set('q', q);
+            if (artist) params.set('artist', artist);
+            if (bpm) params.set('bpm', bpm);
+            if (key) params.set('key', key);
+
+            fetch('/library/search?' + params.toString())
+                .then(function(r) { return r.json(); })
+                .then(function(tracks) {
+                    var area = document.getElementById('search-results');
+                    if (!Array.isArray(tracks) || tracks.length === 0) {
+                        area.innerHTML = '<p class="empty-msg">No results.</p>';
+                        return;
+                    }
+                    var rows = tracks.map(function(t) {
+                        var hash = escapeHtml(t.content_hash || '');
+                        var title = escapeHtml(t.title || 'Unknown');
+                        var artist = escapeHtml(t.artist || '');
+                        var bpmStr = t.bpm ? Math.round(t.bpm) : '';
+                        var keyStr = escapeHtml(t.key || '');
+                        var dur = t.duration ? fmtDuration(t.duration) : '';
+                        return '<tr>' +
+                            '<td>' + title + '</td>' +
+                            '<td>' + artist + '</td>' +
+                            '<td>' + bpmStr + '</td>' +
+                            '<td>' + keyStr + '</td>' +
+                            '<td>' + dur + '</td>' +
+                            '<td><button class="btn btn-small" onclick="addToQueue(\'' + hash + '\')">+Queue</button></td>' +
+                            '</tr>';
+                    }).join('');
+                    area.innerHTML =
+                        '<table>' +
+                        '<thead><tr><th>Title</th><th>Artist</th><th>BPM</th><th>Key</th><th>Duration</th><th></th></tr></thead>' +
+                        '<tbody>' + rows + '</tbody>' +
+                        '</table>';
+                })
+                .catch(function(e) {
+                    document.getElementById('search-results').innerHTML =
+                        '<p class="empty-msg" style="color:var(--error)">Search error: ' + escapeHtml(e.message) + '</p>';
+                });
+        }
+
+        // =====================================================================
+        // Package Management
+        // =====================================================================
+
         async function checkUpdates() {
-            const btn = event.target;
+            var btn = event.target;
             showLoading(btn);
             try {
-                const response = await fetch('/check-updates', { method: 'POST' });
+                var response = await fetch('/check-updates', { method: 'POST' });
                 if (response.ok) {
                     location.reload();
                 } else {
-                    const text = await response.text();
+                    var text = await response.text();
                     showStatus('Failed: ' + text, true);
                     btn.disabled = false;
                     btn.textContent = 'Check for Updates';
@@ -246,15 +608,15 @@
         }
 
         async function updatePackage(name) {
-            const btn = event.target;
+            var btn = event.target;
             showLoading(btn);
             try {
-                const response = await fetch('/update/' + encodeURIComponent(name), { method: 'POST' });
+                var response = await fetch('/update/' + encodeURIComponent(name), { method: 'POST' });
                 if (response.ok) {
                     showStatus('Package ' + name + ' updated successfully', false);
-                    setTimeout(() => location.reload(), 1000);
+                    setTimeout(function() { location.reload(); }, 1000);
                 } else {
-                    const text = await response.text();
+                    var text = await response.text();
                     showStatus('Failed to update ' + name + ': ' + text, true);
                     btn.disabled = false;
                     btn.textContent = 'Update';
@@ -267,16 +629,16 @@
         }
 
         async function ingestAll() {
-            const btn = event.target;
+            var btn = event.target;
             showLoading(btn);
             try {
-                const response = await fetch('/ingest-all', { method: 'POST' });
-                const data = await response.json();
+                var response = await fetch('/ingest-all', { method: 'POST' });
+                var data = await response.json();
                 if (response.ok) {
-                    const success = data.filter(r => r.success).length;
-                    const fail = data.filter(r => !r.success).length;
+                    var success = data.filter(function(r) { return r.success; }).length;
+                    var fail = data.filter(function(r) { return !r.success; }).length;
                     showStatus('Ingested ' + success + ' file(s), ' + fail + ' failed', fail > 0);
-                    setTimeout(() => location.reload(), 1000);
+                    setTimeout(function() { location.reload(); }, 1000);
                 } else {
                     showStatus('Failed: ' + (data.error || 'Unknown error'), true);
                     btn.disabled = false;
@@ -289,16 +651,20 @@
             }
         }
 
+        // =====================================================================
+        // Bandcamp
+        // =====================================================================
+
         async function pauseDownloads() {
-            const btn = event.target;
+            var btn = event.target;
             showLoading(btn);
             try {
-                const response = await fetch('/bandcamp/pause', { method: 'POST' });
+                var response = await fetch('/bandcamp/pause', { method: 'POST' });
                 if (response.ok) {
                     showStatus('Downloads paused', false);
-                    setTimeout(() => location.reload(), 1000);
+                    setTimeout(function() { location.reload(); }, 1000);
                 } else {
-                    const data = await response.json();
+                    var data = await response.json();
                     showStatus('Failed: ' + (data.error || 'Unknown error'), true);
                     btn.disabled = false;
                     btn.textContent = 'Pause';
@@ -311,15 +677,15 @@
         }
 
         async function resumeDownloads() {
-            const btn = event.target;
+            var btn = event.target;
             showLoading(btn);
             try {
-                const response = await fetch('/bandcamp/resume', { method: 'POST' });
+                var response = await fetch('/bandcamp/resume', { method: 'POST' });
                 if (response.ok) {
                     showStatus('Downloads resumed', false);
-                    setTimeout(() => location.reload(), 1000);
+                    setTimeout(function() { location.reload(); }, 1000);
                 } else {
-                    const data = await response.json();
+                    var data = await response.json();
                     showStatus('Failed: ' + (data.error || 'Unknown error'), true);
                     btn.disabled = false;
                     btn.textContent = 'Resume';
@@ -341,22 +707,22 @@
         }
 
         async function syncCollection() {
-            const username = document.getElementById('bandcamp-username').value.trim();
+            var username = document.getElementById('bandcamp-username').value.trim();
             if (!username) {
                 showStatus('Please enter a username', true);
                 return;
             }
             hideSyncDialog();
             try {
-                const response = await fetch('/bandcamp/sync', {
+                var response = await fetch('/bandcamp/sync', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ username: username })
                 });
-                const data = await response.json();
+                var data = await response.json();
                 if (response.ok && data.success) {
                     showStatus('Sync started: ' + data.new_items + ' new items', false);
-                    setTimeout(() => location.reload(), 2000);
+                    setTimeout(function() { location.reload(); }, 2000);
                 } else {
                     showStatus('Sync failed: ' + (data.error || 'Unknown error'), true);
                 }
@@ -364,6 +730,14 @@
                 showStatus('Error: ' + e.message, true);
             }
         }
+
+        // =====================================================================
+        // Init
+        // =====================================================================
+
+        connectSSE();
+        refreshNowPlaying();
+        refreshQueue();
     </script>
 </body>
 </html>
