@@ -386,39 +386,7 @@ impl BandcampService {
     }
 }
 
-/// Supported audio file extensions
-const AUDIO_EXTENSIONS: &[&str] = &["flac", "mp3", "wav", "aif", "aiff"];
-
-/// Check if a file has an audio extension
-fn is_audio_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| AUDIO_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
-        .unwrap_or(false)
-}
-
-/// Detect file type by magic bytes
-fn detect_file_type(path: &Path) -> Option<&'static str> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut magic = [0u8; 4];
-    file.read_exact(&mut magic).ok()?;
-
-    match &magic {
-        // ZIP: PK\x03\x04
-        [0x50, 0x4B, 0x03, 0x04] => Some("zip"),
-        // FLAC: fLaC
-        [0x66, 0x4C, 0x61, 0x43] => Some("flac"),
-        // MP3: ID3 or \xFF\xFB
-        [0x49, 0x44, 0x33, _] => Some("mp3"),
-        [0xFF, 0xFB, _, _] => Some("mp3"),
-        // WAV: RIFF
-        [0x52, 0x49, 0x46, 0x46] => Some("wav"),
-        // AIFF: FORM
-        [0x46, 0x4F, 0x52, 0x4D] => Some("aiff"),
-        _ => None,
-    }
-}
+use inbox_utils::{detect_file_type, extract_zip, sanitize_filename, unique_path};
 
 /// Process a downloaded file - extract if ZIP, move if audio file.
 /// Returns the list of files moved to inbox.
@@ -432,7 +400,7 @@ fn process_download_to_inbox(
     tracing::debug!(path = %download_path.display(), file_type = ?file_type, "Detected file type");
 
     match file_type {
-        Some("zip") => extract_zip_to_inbox(download_path, inbox_dir),
+        Some("zip") => extract_zip(download_path, inbox_dir),
         Some(ext @ ("flac" | "mp3" | "wav" | "aiff")) => {
             // Single track - move directly to inbox with proper name
             let safe_artist = sanitize_filename(artist);
@@ -449,91 +417,6 @@ fn process_download_to_inbox(
             format!("Unknown file type for {:?}", download_path),
         )),
     }
-}
-
-/// Sanitize a string for use in filenames
-fn sanitize_filename(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            c => c,
-        })
-        .collect()
-}
-
-/// Generate a unique path, adding suffix if file exists
-fn unique_path(dir: &Path, filename: &str) -> PathBuf {
-    let dest_path = dir.join(filename);
-    if !dest_path.exists() {
-        return dest_path;
-    }
-
-    let path = Path::new(filename);
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("flac");
-
-    let mut counter = 1;
-    loop {
-        let new_name = format!("{}_{}.{}", stem, counter, ext);
-        let new_path = dir.join(&new_name);
-        if !new_path.exists() {
-            return new_path;
-        }
-        counter += 1;
-    }
-}
-
-/// Extract audio files from a ZIP archive to the inbox directory.
-/// Returns the list of extracted file paths.
-fn extract_zip_to_inbox(zip_path: &Path, inbox_dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
-    let file = std::fs::File::open(zip_path)?;
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-    let mut extracted = Vec::new();
-
-    for i in 0..archive.len() {
-        let mut entry = archive
-            .by_index(i)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        // Skip directories
-        if entry.is_dir() {
-            continue;
-        }
-
-        let entry_path = match entry.enclosed_name() {
-            Some(p) => p.to_path_buf(),
-            None => continue, // Skip entries with invalid paths
-        };
-
-        // Only extract audio files
-        if !is_audio_file(&entry_path) {
-            tracing::debug!(path = %entry_path.display(), "Skipping non-audio file");
-            continue;
-        }
-
-        // Use just the filename, not the full path from the ZIP
-        let filename = match entry_path.file_name().and_then(|f| f.to_str()) {
-            Some(f) => f.to_string(),
-            None => continue,
-        };
-
-        let final_path = unique_path(inbox_dir, &filename);
-
-        // Extract the file
-        let mut outfile = std::fs::File::create(&final_path)?;
-        std::io::copy(&mut entry, &mut outfile)?;
-
-        tracing::info!(
-            source = %entry_path.display(),
-            dest = %final_path.display(),
-            "Extracted audio file"
-        );
-        extracted.push(final_path);
-    }
-
-    Ok(extracted)
 }
 
 /// Run the async IPC server

@@ -17,7 +17,9 @@ color-eyre = { workspace = true }
 
 # Client abstraction (gateway or direct)
 event-protocol = { path = "../../components/event_protocol" }
+inbox-utils = { path = "../../components/inbox_utils" }
 mdma-client = { path = "../../components/mdma_client" }
+tempfile = "3"
 
 # Event subscription
 nng = { workspace = true }

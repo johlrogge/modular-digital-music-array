@@ -15,6 +15,7 @@ path = "src/main.rs"
 bandcamp-api = { path = "../../components/bandcamp_api" }
 source-protocol = { path = "../../components/source_protocol" }
 library-ipc-client = { path = "../../components/library_ipc_client" }
+inbox-utils = { path = "../../components/inbox_utils" }
 nng = { workspace = true }
 
 # Async runtime

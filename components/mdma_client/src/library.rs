@@ -2,7 +2,7 @@
 
 use crate::error::map_gw_to_lib_error;
 use library_ipc_client::{
-    ClientError, ContentHash, InboxPath, IngestAllItem, IngestResult, LibraryClient,
+    ClientError, ContentHash, InboxPath, IngestAllItem, IngestResult, IngestSource, LibraryClient,
     LibraryRequest, LibraryResponse, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
 };
 
@@ -128,9 +128,17 @@ impl LibraryBackend {
     }
 
     pub fn ingest_file(&self, path: &InboxPath) -> Result<IngestResult, ClientError> {
+        self.ingest_file_with_source(path, None)
+    }
+
+    pub fn ingest_file_with_source(
+        &self,
+        path: &InboxPath,
+        source: Option<IngestSource>,
+    ) -> Result<IngestResult, ClientError> {
         match self.request(&LibraryRequest::IngestFile {
             path: path.clone(),
-            source: None,
+            source,
         })? {
             LibraryResponse::IngestResult(result) => Ok(result),
             LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),

@@ -22,6 +22,7 @@ members = [
     "components/gateway_protocol",
     "components/gateway_client",
     "components/mdma_client",
+    "components/inbox_utils",
     "components/library_service",
     # Bases (entry points)
     "bases/mdma_playback",

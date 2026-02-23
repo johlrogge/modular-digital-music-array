@@ -1892,6 +1892,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "inbox-utils"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "tracing",
+ "zip",
+]
+
+[[package]]
 name = "indenter"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2153,6 +2162,7 @@ dependencies = [
 name = "library-search"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "regex",
  "serde",
  "serde_json",
@@ -2363,6 +2373,7 @@ dependencies = [
  "bandcamp-api",
  "clap",
  "color-eyre",
+ "inbox-utils",
  "library-ipc-client",
  "nng",
  "parking_lot",
@@ -2407,6 +2418,7 @@ dependencies = [
  "colored",
  "corsett",
  "event-protocol",
+ "inbox-utils",
  "library-ipc-client",
  "library-search",
  "mdma-client",
@@ -2414,6 +2426,7 @@ dependencies = [
  "nng-transport",
  "serde_json",
  "source-protocol",
+ "tempfile",
  "terminal_size",
 ]
 
