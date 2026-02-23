@@ -2,7 +2,7 @@
 
 use askama::Template;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::StatusCode,
     response::sse::{Event, KeepAlive, Sse},
     response::{Html, IntoResponse, Json},
@@ -326,6 +326,72 @@ struct IngestResultJson {
     success: bool,
     message: String,
     hash: Option<String>,
+}
+
+async fn upload_file(
+    State(state): State<Arc<AppState>>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let inbox_dir = state.music_root.join("inbox");
+
+    // Ensure inbox directory exists
+    if let Err(e) = tokio::fs::create_dir_all(&inbox_dir).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Cannot create inbox dir: {}", e)})),
+        )
+            .into_response();
+    }
+
+    let mut results = Vec::new();
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let file_name = match field.file_name() {
+            Some(name) => inbox_utils::sanitize_filename(name),
+            None => continue,
+        };
+
+        let data = match field.bytes().await {
+            Ok(d) => d,
+            Err(e) => {
+                results.push(serde_json::json!({"file": file_name, "error": e.to_string()}));
+                continue;
+            }
+        };
+
+        // Write to inbox
+        let dest = inbox_utils::unique_path(&inbox_dir, &file_name);
+        if let Err(e) = tokio::fs::write(&dest, &data).await {
+            results.push(serde_json::json!({"file": file_name, "error": e.to_string()}));
+            continue;
+        }
+
+        // Check if ZIP — extract audio files, then remove the ZIP
+        let file_type = inbox_utils::detect_file_type(&dest);
+        if file_type == Some("zip") {
+            match inbox_utils::extract_zip(&dest, &inbox_dir) {
+                Ok(extracted) => {
+                    let _ = std::fs::remove_file(&dest);
+                    for path in &extracted {
+                        let name = path.file_name().unwrap_or_default().to_string_lossy();
+                        results.push(serde_json::json!({"file": name, "success": true}));
+                    }
+                }
+                Err(e) => {
+                    results.push(serde_json::json!({"file": file_name, "error": e.to_string()}));
+                }
+            }
+        } else if inbox_utils::is_audio_file(&dest) {
+            results.push(serde_json::json!({"file": file_name, "success": true}));
+        } else {
+            let _ = std::fs::remove_file(&dest);
+            results.push(
+                serde_json::json!({"file": file_name, "error": "Not a supported audio file or ZIP"}),
+            );
+        }
+    }
+
+    Json(serde_json::json!({"files": results})).into_response()
 }
 
 async fn ingest_all(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -969,6 +1035,10 @@ async fn main() -> Result<()> {
         .route("/check-updates", post(check_updates))
         .route("/update/{name}", post(update_package))
         .route("/ingest-all", post(ingest_all))
+        .route(
+            "/upload",
+            post(upload_file).layer(DefaultBodyLimit::max(500 * 1024 * 1024)),
+        )
         // Bandcamp routes
         .route("/bandcamp/status", get(bandcamp_status))
         .route("/bandcamp/sync", post(bandcamp_sync))

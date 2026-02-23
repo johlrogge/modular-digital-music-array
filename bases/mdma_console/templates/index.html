@@ -281,6 +281,11 @@
             {% endfor %}
         </ul>
         {% endif %}
+        <div style="margin-bottom: 15px;">
+            <input type="file" id="upload-input" multiple accept=".flac,.mp3,.wav,.aif,.aiff,.zip" style="display:none;">
+            <button class="btn" onclick="document.getElementById('upload-input').click()">Upload Files</button>
+            <span id="upload-status" style="margin-left: 10px;"></span>
+        </div>
         <div class="actions">
             <button class="btn" onclick="ingestAll()" {% if inbox.is_empty() %}disabled{% endif %}>Ingest All</button>
         </div>
@@ -730,6 +735,39 @@
                 showStatus('Error: ' + e.message, true);
             }
         }
+
+        // =====================================================================
+        // Upload
+        // =====================================================================
+
+        document.getElementById('upload-input').addEventListener('change', async function() {
+            var files = this.files;
+            if (!files.length) return;
+
+            var statusEl = document.getElementById('upload-status');
+            statusEl.textContent = 'Uploading ' + files.length + ' file(s)...';
+
+            var formData = new FormData();
+            for (var i = 0; i < files.length; i++) {
+                formData.append('files', files[i]);
+            }
+
+            try {
+                var response = await fetch('/upload', { method: 'POST', body: formData });
+                var data = await response.json();
+                if (response.ok) {
+                    var fileCount = data.files ? data.files.length : 0;
+                    statusEl.textContent = 'Uploaded ' + fileCount + ' file(s) to inbox';
+                    setTimeout(function() { location.reload(); }, 1500);
+                } else {
+                    statusEl.textContent = 'Upload failed: ' + (data.error || 'Unknown error');
+                }
+            } catch (e) {
+                statusEl.textContent = 'Upload error: ' + e.message;
+            }
+
+            this.value = '';
+        });
 
         // =====================================================================
         // Init
