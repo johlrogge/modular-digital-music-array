@@ -67,6 +67,8 @@ struct IndexedTrackInfo {
     year: Option<u32>,
     source: Option<String>,
     blob_path: PathBuf,
+    last_played: Option<chrono::DateTime<chrono::Utc>>,
+    last_skipped: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Result of loading tracks from the fact stream
@@ -164,6 +166,8 @@ impl LibraryService {
                     year: None,
                     source: None,
                     blob_path: PathBuf::new(),
+                    last_played: None,
+                    last_skipped: None,
                 });
 
             // Index fact values for HasFact/HasFacts lookups
@@ -187,6 +191,16 @@ impl LibraryService {
                 MusicValue::Key(v) => entry.key = Some(v.to_string()),
                 MusicValue::Year(v) => entry.year = Some(v.0),
                 MusicValue::Source(v) => entry.source = Some(v.clone()),
+                MusicValue::Played(ts) => {
+                    if entry.last_played.is_none_or(|existing| ts > &existing) {
+                        entry.last_played = Some(*ts);
+                    }
+                }
+                MusicValue::Skipped(ts) => {
+                    if entry.last_skipped.is_none_or(|existing| ts > &existing) {
+                        entry.last_skipped = Some(*ts);
+                    }
+                }
                 _ => {}
             }
         }
@@ -496,6 +510,8 @@ impl LibraryService {
                     duration: t.duration_seconds,
                     year: t.year,
                     source: t.source.as_deref(),
+                    last_played: t.last_played,
+                    last_skipped: t.last_skipped,
                 };
                 matches_query(query, &fields)
             })
@@ -594,7 +610,11 @@ impl LibraryService {
                 MusicValue::Source("beatport".to_string()),
                 fact_source.clone(),
             )],
-            _ => vec![],
+            Some(IngestSource::Upload) => vec![(
+                MusicValue::Source("upload".to_string()),
+                fact_source.clone(),
+            )],
+            None => vec![],
         }
     }
 
@@ -619,7 +639,7 @@ impl LibraryService {
         let validated = inbox.validate()?;
         let content_hash = validated.content_hash.clone();
 
-        // Dedup: if content hash already exists, delete inbox file and return success
+        // Dedup: if content hash already exists, still append any new source facts
         {
             let hashes = self.content_hashes.lock().unwrap();
             if hashes.contains(&content_hash.0) {
@@ -629,6 +649,67 @@ impl LibraryService {
                     "Duplicate content hash, removing inbox file"
                 );
                 let _ = std::fs::remove_file(path);
+
+                // Append source facts that don't exist yet for this track
+                let fact_source = music_facts::FactSource::new(
+                    "mdma-library",
+                    env!("CARGO_PKG_VERSION"),
+                    music_facts::FactOrigin::Unknown,
+                );
+                let new_facts = Self::source_facts(source, &fact_source);
+                if !new_facts.is_empty() {
+                    // Check if this track already has a Source fact
+                    let needs_source = {
+                        let tracks = self.tracks.lock().unwrap();
+                        tracks
+                            .iter()
+                            .find(|t| t.content_hash.0 == content_hash.0)
+                            .map(|t| t.source.is_none())
+                            .unwrap_or(false)
+                    };
+
+                    if needs_source {
+                        // Write to fact stream
+                        if let Ok(()) = self
+                            .fact_writer
+                            .lock()
+                            .unwrap()
+                            .write_track_facts(&content_hash, &new_facts)
+                        {
+                            tracing::info!(
+                                hash = %content_hash.0,
+                                facts = new_facts.len(),
+                                "Appended source facts to existing track"
+                            );
+
+                            // Update in-memory index
+                            let mut tracks = self.tracks.lock().unwrap();
+                            if let Some(track) = tracks
+                                .iter_mut()
+                                .find(|t| t.content_hash.0 == content_hash.0)
+                            {
+                                for (value, _) in &new_facts {
+                                    if let MusicValue::Source(s) = value {
+                                        track.source = Some(s.clone());
+                                    }
+                                }
+                            }
+
+                            // Update fact index
+                            let mut fact_index = self.fact_index.lock().unwrap();
+                            for (value, _) in &new_facts {
+                                fact_index
+                                    .entry(value.variant_name().to_string())
+                                    .or_default()
+                                    .insert(value.to_string());
+                            }
+
+                            self.facts_count
+                                .fetch_add(new_facts.len(), Ordering::Relaxed);
+                        }
+                    }
+                }
+
                 return Ok(content_hash);
             }
         }
@@ -703,6 +784,8 @@ impl LibraryService {
                 year,
                 source: source_str,
                 blob_path: indexed.blob_path,
+                last_played: None,
+                last_skipped: None,
             });
         }
 
@@ -728,6 +811,132 @@ impl LibraryService {
         self.facts_count.fetch_add(facts.len(), Ordering::Relaxed);
 
         Ok(content_hash)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fact_writer::FactWriter;
+    use chrono::{TimeZone, Utc};
+    use music_facts::{ContentHash, FactOrigin, FactSource, MusicValue, Title};
+    use tempfile::NamedTempFile;
+
+    fn write_facts_file(facts: &[(ContentHash, MusicValue)]) -> NamedTempFile {
+        let temp = NamedTempFile::new().unwrap();
+        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let mut writer = FactWriter::open(temp.path()).unwrap();
+
+        // Group by entity and write
+        for (hash, value) in facts {
+            writer
+                .write_track_facts(hash, &[(value.clone(), source.clone())])
+                .unwrap();
+        }
+        temp
+    }
+
+    #[test]
+    fn load_tracks_aggregates_played_timestamp() {
+        let hash = ContentHash("sha256:aabbcc".to_string());
+        let ts = Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
+
+        let temp = write_facts_file(&[
+            (hash.clone(), MusicValue::Title(Title::new("Test Track"))),
+            (hash.clone(), MusicValue::Played(ts)),
+        ]);
+
+        let result = LibraryService::load_tracks_from_facts(&temp.path().to_path_buf());
+
+        assert_eq!(result.tracks.len(), 1);
+        let track = &result.tracks[0];
+        assert_eq!(
+            track.last_played,
+            Some(ts),
+            "last_played should be set from Played fact"
+        );
+        assert_eq!(track.last_skipped, None);
+    }
+
+    #[test]
+    fn load_tracks_aggregates_skipped_timestamp() {
+        let hash = ContentHash("sha256:ddeeff".to_string());
+        let ts = Utc.with_ymd_and_hms(2026, 2, 1, 8, 30, 0).unwrap();
+
+        let temp = write_facts_file(&[
+            (hash.clone(), MusicValue::Title(Title::new("Skip Me"))),
+            (hash.clone(), MusicValue::Skipped(ts)),
+        ]);
+
+        let result = LibraryService::load_tracks_from_facts(&temp.path().to_path_buf());
+
+        let track = &result.tracks[0];
+        assert_eq!(
+            track.last_skipped,
+            Some(ts),
+            "last_skipped should be set from Skipped fact"
+        );
+        assert_eq!(track.last_played, None);
+    }
+
+    #[test]
+    fn load_tracks_keeps_most_recent_played() {
+        let hash = ContentHash("sha256:112233".to_string());
+        let older = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+        let newer = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
+
+        let temp = write_facts_file(&[
+            (hash.clone(), MusicValue::Title(Title::new("Two Plays"))),
+            (hash.clone(), MusicValue::Played(older)),
+            (hash.clone(), MusicValue::Played(newer)),
+        ]);
+
+        let result = LibraryService::load_tracks_from_facts(&temp.path().to_path_buf());
+
+        let track = &result.tracks[0];
+        assert_eq!(
+            track.last_played,
+            Some(newer),
+            "should keep the most recent Played timestamp"
+        );
+    }
+
+    #[test]
+    fn search_passes_last_played_to_evaluator() {
+        use library_search::{query::PlayedQuery, TrackQuery};
+
+        let hash = ContentHash("sha256:445566".to_string());
+        let ts = Utc.with_ymd_and_hms(2026, 1, 10, 0, 0, 0).unwrap();
+
+        let temp = write_facts_file(&[
+            (hash.clone(), MusicValue::Title(Title::new("Played Track"))),
+            (hash.clone(), MusicValue::Played(ts)),
+        ]);
+
+        // Build a minimal LibraryService pointing at temp facts
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+
+        // Copy the temp facts file to where the service expects it
+        let facts_dest = metadata_dir.path().join("facts.jsonl");
+        std::fs::copy(temp.path(), &facts_dest).unwrap();
+
+        let service = LibraryService::new(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+        )
+        .unwrap();
+
+        // A query asking for tracks that have NOT been played (NA) should return 0 results
+        let query = TrackQuery {
+            played: Some(PlayedQuery::NA),
+            ..Default::default()
+        };
+        let results = service.search_tracks(&query);
+        assert!(
+            results.is_empty(),
+            "PlayedQuery::NA should not match a track with last_played set"
+        );
     }
 }
 
