@@ -20,8 +20,8 @@ pub struct TrackQuery {
     pub year: Option<NumericQuery>,
     /// e.g. "bandcamp", "beatport", "upload"
     pub source: Option<String>,
-    pub played: Option<PlayedQuery>,
-    pub skipped: Option<PlayedQuery>,
+    pub started: Option<DateQuery>,
+    pub stopped: Option<DateQuery>,
 }
 
 impl TrackQuery {
@@ -39,8 +39,8 @@ impl TrackQuery {
             && self.duration.is_none()
             && self.year.is_none()
             && self.source.is_none()
-            && self.played.is_none()
-            && self.skipped.is_none()
+            && self.started.is_none()
+            && self.stopped.is_none()
     }
 }
 
@@ -126,7 +126,7 @@ pub enum CamelotLetter {
     B,
 }
 
-/// Date precision used in played/skipped queries.
+/// Date precision used in started/stopped date queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DatePrecision {
     /// Only the year is significant.
@@ -137,14 +137,14 @@ pub enum DatePrecision {
     YearMonthDay,
 }
 
-/// Played/skipped date matching.
+/// Date matching for track events (started/stopped).
 ///
-/// `NA` matches tracks that have never been played/skipped.
+/// `NA` matches tracks that have never been started/stopped.
 /// Bare date tokens are stored as `Range(date, prec, date, prec)` and the evaluator
 /// expands them to [start-of-period, end-of-period] using the precision.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum PlayedQuery {
-    /// Track has never been played/skipped (field is `None`)
+pub enum DateQuery {
+    /// Track has never been started/stopped (field is `None`)
     NA,
     /// `>2026-02` — strictly after the end of the given period
     After(NaiveDate, DatePrecision),

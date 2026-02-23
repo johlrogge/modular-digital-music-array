@@ -67,8 +67,8 @@ struct IndexedTrackInfo {
     year: Option<u32>,
     source: Option<String>,
     blob_path: PathBuf,
-    last_played: Option<chrono::DateTime<chrono::Utc>>,
-    last_skipped: Option<chrono::DateTime<chrono::Utc>>,
+    last_started: Option<chrono::DateTime<chrono::Utc>>,
+    last_stopped: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Result of loading tracks from the fact stream
@@ -166,8 +166,8 @@ impl LibraryService {
                     year: None,
                     source: None,
                     blob_path: PathBuf::new(),
-                    last_played: None,
-                    last_skipped: None,
+                    last_started: None,
+                    last_stopped: None,
                 });
 
             // Index fact values for HasFact/HasFacts lookups
@@ -191,14 +191,14 @@ impl LibraryService {
                 MusicValue::Key(v) => entry.key = Some(v.to_string()),
                 MusicValue::Year(v) => entry.year = Some(v.0),
                 MusicValue::Source(v) => entry.source = Some(v.clone()),
-                MusicValue::Played(ts) => {
-                    if entry.last_played.is_none_or(|existing| ts > &existing) {
-                        entry.last_played = Some(*ts);
+                MusicValue::TrackStarted(ts) => {
+                    if entry.last_started.is_none_or(|existing| ts > &existing) {
+                        entry.last_started = Some(*ts);
                     }
                 }
-                MusicValue::Skipped(ts) => {
-                    if entry.last_skipped.is_none_or(|existing| ts > &existing) {
-                        entry.last_skipped = Some(*ts);
+                MusicValue::TrackStopped(ts) => {
+                    if entry.last_stopped.is_none_or(|existing| ts > &existing) {
+                        entry.last_stopped = Some(*ts);
                     }
                 }
                 _ => {}
@@ -491,11 +491,11 @@ impl LibraryService {
         }
     }
 
-    /// Re-read the facts file and update only `last_played` / `last_skipped` in the
-    /// in-memory index.  Called before any search that filters on played/skipped so
+    /// Re-read the facts file and update only `last_started` / `last_stopped` in the
+    /// in-memory index.  Called before any search that filters on started/stopped so
     /// that facts written by external services (e.g. mdma-playback) after startup
     /// are picked up without a full reload.
-    fn refresh_play_timestamps(&self) {
+    fn refresh_event_timestamps(&self) {
         use music_facts::FactSource;
         use stainless_facts::FactStreamReader;
 
@@ -506,16 +506,16 @@ impl LibraryService {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(
-                        "refresh_play_timestamps: failed to open facts file: {:?}",
+                        "refresh_event_timestamps: failed to open facts file: {:?}",
                         e
                     );
                     return;
                 }
             };
 
-        // Collect the most-recent Played/Skipped timestamp per content hash
-        let mut last_played: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
-        let mut last_skipped: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+        // Collect the most-recent TrackStarted/TrackStopped timestamp per content hash
+        let mut last_started: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+        let mut last_stopped: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
 
         for fact_result in reader {
             let fact = match fact_result {
@@ -525,14 +525,14 @@ impl LibraryService {
 
             let entity = fact.entity().0.clone();
             match fact.value() {
-                MusicValue::Played(ts) => {
-                    let entry = last_played.entry(entity).or_insert(*ts);
+                MusicValue::TrackStarted(ts) => {
+                    let entry = last_started.entry(entity).or_insert(*ts);
                     if ts > entry {
                         *entry = *ts;
                     }
                 }
-                MusicValue::Skipped(ts) => {
-                    let entry = last_skipped.entry(entity).or_insert(*ts);
+                MusicValue::TrackStopped(ts) => {
+                    let entry = last_stopped.entry(entity).or_insert(*ts);
                     if ts > entry {
                         *entry = *ts;
                     }
@@ -545,19 +545,19 @@ impl LibraryService {
         let mut tracks = self.tracks.lock().unwrap();
         for track in tracks.iter_mut() {
             let hash = &track.content_hash.0;
-            if let Some(&ts) = last_played.get(hash) {
-                track.last_played = Some(ts);
+            if let Some(&ts) = last_started.get(hash) {
+                track.last_started = Some(ts);
             }
-            if let Some(&ts) = last_skipped.get(hash) {
-                track.last_skipped = Some(ts);
+            if let Some(&ts) = last_stopped.get(hash) {
+                track.last_stopped = Some(ts);
             }
         }
     }
 
     /// Search tracks by structured query (uses library-search for evaluation)
     fn search_tracks(&self, query: &TrackQuery) -> Vec<TrackInfo> {
-        if query.played.is_some() || query.skipped.is_some() {
-            self.refresh_play_timestamps();
+        if query.started.is_some() || query.stopped.is_some() {
+            self.refresh_event_timestamps();
         }
         let tracks = self.tracks.lock().unwrap();
 
@@ -576,8 +576,8 @@ impl LibraryService {
                     duration: t.duration_seconds,
                     year: t.year,
                     source: t.source.as_deref(),
-                    last_played: t.last_played,
-                    last_skipped: t.last_skipped,
+                    last_started: t.last_started,
+                    last_stopped: t.last_stopped,
                 };
                 matches_query(query, &fields)
             })
@@ -850,8 +850,8 @@ impl LibraryService {
                 year,
                 source: source_str,
                 blob_path: indexed.blob_path,
-                last_played: None,
-                last_skipped: None,
+                last_started: None,
+                last_stopped: None,
             });
         }
 
@@ -909,7 +909,7 @@ mod tests {
 
         let temp = write_facts_file(&[
             (hash.clone(), MusicValue::Title(Title::new("Test Track"))),
-            (hash.clone(), MusicValue::Played(ts)),
+            (hash.clone(), MusicValue::TrackStarted(ts)),
         ]);
 
         let result = LibraryService::load_tracks_from_facts(&temp.path().to_path_buf());
@@ -917,11 +917,11 @@ mod tests {
         assert_eq!(result.tracks.len(), 1);
         let track = &result.tracks[0];
         assert_eq!(
-            track.last_played,
+            track.last_started,
             Some(ts),
-            "last_played should be set from Played fact"
+            "last_started should be set from TrackStarted fact"
         );
-        assert_eq!(track.last_skipped, None);
+        assert_eq!(track.last_stopped, None);
     }
 
     #[test]
@@ -931,18 +931,18 @@ mod tests {
 
         let temp = write_facts_file(&[
             (hash.clone(), MusicValue::Title(Title::new("Skip Me"))),
-            (hash.clone(), MusicValue::Skipped(ts)),
+            (hash.clone(), MusicValue::TrackStopped(ts)),
         ]);
 
         let result = LibraryService::load_tracks_from_facts(&temp.path().to_path_buf());
 
         let track = &result.tracks[0];
         assert_eq!(
-            track.last_skipped,
+            track.last_stopped,
             Some(ts),
-            "last_skipped should be set from Skipped fact"
+            "last_stopped should be set from TrackStopped fact"
         );
-        assert_eq!(track.last_played, None);
+        assert_eq!(track.last_started, None);
     }
 
     #[test]
@@ -953,30 +953,30 @@ mod tests {
 
         let temp = write_facts_file(&[
             (hash.clone(), MusicValue::Title(Title::new("Two Plays"))),
-            (hash.clone(), MusicValue::Played(older)),
-            (hash.clone(), MusicValue::Played(newer)),
+            (hash.clone(), MusicValue::TrackStarted(older)),
+            (hash.clone(), MusicValue::TrackStarted(newer)),
         ]);
 
         let result = LibraryService::load_tracks_from_facts(&temp.path().to_path_buf());
 
         let track = &result.tracks[0];
         assert_eq!(
-            track.last_played,
+            track.last_started,
             Some(newer),
-            "should keep the most recent Played timestamp"
+            "should keep the most recent TrackStarted timestamp"
         );
     }
 
     #[test]
-    fn search_passes_last_played_to_evaluator() {
-        use library_search::{query::PlayedQuery, TrackQuery};
+    fn search_passes_last_started_to_evaluator() {
+        use library_search::{query::DateQuery, TrackQuery};
 
         let hash = ContentHash("sha256:445566".to_string());
         let ts = Utc.with_ymd_and_hms(2026, 1, 10, 0, 0, 0).unwrap();
 
         let temp = write_facts_file(&[
             (hash.clone(), MusicValue::Title(Title::new("Played Track"))),
-            (hash.clone(), MusicValue::Played(ts)),
+            (hash.clone(), MusicValue::TrackStarted(ts)),
         ]);
 
         // Build a minimal LibraryService pointing at temp facts
@@ -995,23 +995,23 @@ mod tests {
 
         // A query asking for tracks that have NOT been played (NA) should return 0 results
         let query = TrackQuery {
-            played: Some(PlayedQuery::NA),
+            started: Some(DateQuery::NA),
             ..Default::default()
         };
         let results = service.search_tracks(&query);
         assert!(
             results.is_empty(),
-            "PlayedQuery::NA should not match a track with last_played set"
+            "DateQuery::NA should not match a track with last_started set"
         );
     }
 
     #[test]
     fn search_played_na_excludes_after_external_append() {
-        use library_search::{query::PlayedQuery, TrackQuery};
+        use library_search::{query::DateQuery, TrackQuery};
 
         let hash = ContentHash("sha256:778899aabbcc".to_string());
 
-        // Setup: one track with no Played fact
+        // Setup: one track with no TrackStarted fact
         let temp = write_facts_file(&[(
             hash.clone(),
             MusicValue::Title(Title::new("External Append Track")),
@@ -1030,7 +1030,7 @@ mod tests {
         .unwrap();
 
         let na_query = TrackQuery {
-            played: Some(PlayedQuery::NA),
+            started: Some(DateQuery::NA),
             ..Default::default()
         };
 
@@ -1038,7 +1038,7 @@ mod tests {
         let before = service.search_tracks(&na_query);
         assert_eq!(before.len(), 1, "track should appear before play event");
 
-        // Simulate playback service appending a Played fact after startup
+        // Simulate playback service appending a TrackStarted fact after startup
         let ts = Utc.with_ymd_and_hms(2026, 2, 20, 12, 0, 0).unwrap();
         let source = music_facts::FactSource::new(
             "test-playback",
@@ -1047,7 +1047,7 @@ mod tests {
         );
         let mut writer = FactWriter::open(&facts_dest).unwrap();
         writer
-            .write_track_facts(&hash, &[(MusicValue::Played(ts), source)])
+            .write_track_facts(&hash, &[(MusicValue::TrackStarted(ts), source)])
             .unwrap();
         drop(writer);
 
@@ -1055,7 +1055,7 @@ mod tests {
         let after = service.search_tracks(&na_query);
         assert!(
             after.is_empty(),
-            "PlayedQuery::NA should exclude track after Played fact appended externally"
+            "DateQuery::NA should exclude track after TrackStarted fact appended externally"
         );
     }
 }

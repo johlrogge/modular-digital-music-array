@@ -11,7 +11,7 @@ use corsett::{
 };
 use event_protocol::{from_topic_message, PlaybackEvent, TOPIC_PLAYBACK};
 use library_ipc_client::{ClientError, ContentHash, InboxPath, ProtocolError, TrackInfo};
-use library_search::{parse_numeric_query, parse_played_query, parse_string_query, TrackQuery};
+use library_search::{parse_date_query, parse_numeric_query, parse_string_query, TrackQuery};
 use mdma_client::{
     Deck, IngestSource, LibraryBackend, PlaybackBackend, PlaybackClientError, SourceClient,
 };
@@ -144,13 +144,13 @@ enum Commands {
         #[arg(long)]
         no_stdin: bool,
 
-        /// Filter by last played date. Format: N/A, >2026-02, <2026, 2026-01..2026-06
+        /// Filter by last started date. Format: N/A, >2026-02, <2026, 2026-01..2026-06
         #[arg(long)]
-        played: Option<String>,
+        started: Option<String>,
 
-        /// Filter by last skipped date. Same format as --played.
+        /// Filter by last stopped date. Same format as --started.
         #[arg(long)]
-        skipped: Option<String>,
+        stopped: Option<String>,
 
         #[command(subcommand)]
         subcommand: Option<SearchSubcommands>,
@@ -825,25 +825,25 @@ fn build_track_query(
     _duration_str: Option<String>,
     year_str: Option<String>,
     source: Option<String>,
-    played_str: Option<String>,
-    skipped_str: Option<String>,
+    started_str: Option<String>,
+    stopped_str: Option<String>,
 ) -> TrackQuery {
-    let played = if let Some(s) = played_str {
-        match parse_played_query(&s) {
+    let started = if let Some(s) = started_str {
+        match parse_date_query(&s) {
             Ok(q) => Some(q),
             Err(e) => {
-                eprintln!("Invalid --played value: {}", e);
+                eprintln!("Invalid --started value: {}", e);
                 std::process::exit(1);
             }
         }
     } else {
         None
     };
-    let skipped = if let Some(s) = skipped_str {
-        match parse_played_query(&s) {
+    let stopped = if let Some(s) = stopped_str {
+        match parse_date_query(&s) {
             Ok(q) => Some(q),
             Err(e) => {
-                eprintln!("Invalid --skipped value: {}", e);
+                eprintln!("Invalid --stopped value: {}", e);
                 std::process::exit(1);
             }
         }
@@ -863,8 +863,8 @@ fn build_track_query(
         duration: None, // duration parsing deferred
         year: year_str.and_then(|s| parse_numeric_query(&s).ok()),
         source,
-        played,
-        skipped,
+        started,
+        stopped,
     }
 }
 
@@ -2033,8 +2033,8 @@ fn main() -> Result<()> {
             year,
             source,
             no_stdin,
-            played,
-            skipped,
+            started,
+            stopped,
             subcommand,
         } => {
             let client = connect_library(&cli);
@@ -2058,8 +2058,8 @@ fn main() -> Result<()> {
                     duration.clone(),
                     year.clone(),
                     source.clone(),
-                    played.clone(),
-                    skipped.clone(),
+                    started.clone(),
+                    stopped.clone(),
                 );
                 handle_search(&client, &track_query, *no_stdin)
             }

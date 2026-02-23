@@ -27,19 +27,6 @@ struct PersistEntry {
     path: String,
 }
 
-/// Minimum wall-clock seconds a track must play before Stop is recorded as Played.
-const PLAYED_THRESHOLD_SECS: u64 = 30;
-
-/// Decide whether a Stop should be recorded as `Played` or `Skipped` based on
-/// how many seconds elapsed since playback started.
-fn played_or_skipped(elapsed_secs: u64) -> MusicValue {
-    if elapsed_secs >= PLAYED_THRESHOLD_SECS {
-        MusicValue::Played(Utc::now())
-    } else {
-        MusicValue::Skipped(Utc::now())
-    }
-}
-
 pub struct Server {
     engine: Arc<Mutex<PlaybackEngine>>,
     socket: Socket,
@@ -48,7 +35,6 @@ pub struct Server {
     queue_file: PathBuf,
     event_pub: Socket,
     facts_path: PathBuf,
-    play_started_at: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 impl Server {
@@ -67,7 +53,6 @@ impl Server {
             queue_file,
             event_pub,
             facts_path,
-            play_started_at: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -155,7 +140,6 @@ impl Server {
             self.event_pub.clone(),
             self.facts_path.clone(),
             self.queue_file.clone(),
-            self.play_started_at.clone(),
         ));
 
         loop {
@@ -184,8 +168,6 @@ impl Server {
                 info!("Loading track {:?} on deck {:?}", path, deck);
                 let result = self.engine.lock().await.load_track(deck, &path).await;
                 info!("Track loaded");
-                // A newly loaded (but not yet played) track must not inherit old timing.
-                *self.play_started_at.lock().await = None;
                 self.create_response(result, None)
             }
             Command::Play { deck } => {
@@ -193,7 +175,9 @@ impl Server {
                 let result = self.engine.lock().await.play(deck);
                 info!("Play command completed for deck {:?}: {:?}", deck, result);
                 if result.is_ok() {
-                    *self.play_started_at.lock().await = Some(std::time::Instant::now());
+                    if let Some(ref hash) = self.current_hash.lock().await.clone() {
+                        self.append_fact(hash, MusicValue::TrackStarted(Utc::now()));
+                    }
                 }
                 self.create_response(result, None)
             }
@@ -203,15 +187,7 @@ impl Server {
                 let result = self.engine.lock().await.stop(deck);
                 if result.is_ok() {
                     if let Some(h) = stopped_hash {
-                        let elapsed = self
-                            .play_started_at
-                            .lock()
-                            .await
-                            .take()
-                            .map(|t| t.elapsed().as_secs())
-                            .unwrap_or(0);
-                        let fact_value = played_or_skipped(elapsed);
-                        self.append_fact(&h, fact_value);
+                        self.append_fact(&h, MusicValue::TrackStopped(Utc::now()));
                         self.publish_event(&PlaybackEvent::TrackStopped { hash: h.0.clone() });
                     }
                     *self.current_hash.lock().await = None;
@@ -226,9 +202,6 @@ impl Server {
             Command::Unload { deck } => {
                 info!("Unloading deck {:?}", deck);
                 let result = self.engine.lock().await.unload_track(deck);
-                if result.is_ok() {
-                    *self.play_started_at.lock().await = None;
-                }
                 self.create_response(result, None)
             }
             Command::Seek { deck, position } => {
@@ -334,7 +307,7 @@ impl Server {
                         *self.current_hash.lock().await = Some(e.hash.clone());
                         let result = load_and_play(&self.engine, &e.path).await;
                         if result.is_ok() {
-                            *self.play_started_at.lock().await = Some(std::time::Instant::now());
+                            self.append_fact(&e.hash, MusicValue::TrackStarted(Utc::now()));
                             self.publish_event(&PlaybackEvent::TrackStarted {
                                 hash: e.hash.0.clone(),
                             });
@@ -454,7 +427,6 @@ async fn auto_advance_task(
     event_pub: nng::Socket,
     facts_path: PathBuf,
     queue_file: PathBuf,
-    play_started_at: Arc<Mutex<Option<std::time::Instant>>>,
 ) {
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -471,10 +443,8 @@ async fn auto_advance_task(
             if let Err(e) = event_pub.send(&msg) {
                 warn!("Failed to publish TrackEnded: {:?}", e);
             }
-            // Track finished naturally — record as played to completion.
-            append_play_fact(&facts_path, h, MusicValue::Played(Utc::now()));
-            // Clear the start time so a subsequent Stop doesn't double-count.
-            *play_started_at.lock().await = None;
+            // Track finished naturally — record as stopped.
+            append_play_fact(&facts_path, h, MusicValue::TrackStopped(Utc::now()));
         }
 
         let next = {
@@ -499,7 +469,11 @@ async fn auto_advance_task(
         if let Err(e) = load_and_play(&engine, &entry.path).await {
             warn!("Auto-advance failed to load {:?}: {}", entry.path, e);
         } else {
-            *play_started_at.lock().await = Some(std::time::Instant::now());
+            append_play_fact(
+                &facts_path,
+                &entry.hash,
+                MusicValue::TrackStarted(Utc::now()),
+            );
             let msg = to_topic_message(&PlaybackEvent::TrackStarted {
                 hash: entry.hash.0.clone(),
             });
@@ -514,46 +488,6 @@ async fn auto_advance_task(
 mod tests {
     use super::*;
     use std::path::PathBuf;
-
-    /// Unit test for the played-vs-skipped threshold decision.
-    ///
-    /// The function `played_or_skipped` must exist and return `MusicValue::Played`
-    /// when elapsed seconds >= PLAYED_THRESHOLD_SECS, and `MusicValue::Skipped`
-    /// otherwise.
-    #[test]
-    fn stop_after_short_play_is_skipped() {
-        let elapsed = PLAYED_THRESHOLD_SECS - 1;
-        let value = played_or_skipped(elapsed);
-        assert!(
-            matches!(value, MusicValue::Skipped(_)),
-            "Expected Skipped for {} secs elapsed, got {:?}",
-            elapsed,
-            value
-        );
-    }
-
-    #[test]
-    fn stop_after_long_play_is_played() {
-        let elapsed = PLAYED_THRESHOLD_SECS;
-        let value = played_or_skipped(elapsed);
-        assert!(
-            matches!(value, MusicValue::Played(_)),
-            "Expected Played for {} secs elapsed, got {:?}",
-            elapsed,
-            value
-        );
-    }
-
-    #[test]
-    fn stop_with_no_start_time_is_skipped() {
-        // elapsed = 0 (no start time recorded) must be Skipped
-        let value = played_or_skipped(0);
-        assert!(
-            matches!(value, MusicValue::Skipped(_)),
-            "Expected Skipped when elapsed == 0, got {:?}",
-            value
-        );
-    }
 
     #[tokio::test]
     #[ignore]

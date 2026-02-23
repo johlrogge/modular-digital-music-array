@@ -140,11 +140,11 @@ pub enum MusicValue {
     // ========================================================================
     // Play History
     // ========================================================================
-    /// Track was played to completion (or near-completion)
-    Played(DateTime<Utc>),
+    /// Track started playing
+    TrackStarted(DateTime<Utc>),
 
-    /// Track was stopped before finishing (skipped)
-    Skipped(DateTime<Utc>),
+    /// Track stopped playing (any reason)
+    TrackStopped(DateTime<Utc>),
 }
 
 impl MusicValue {
@@ -183,8 +183,8 @@ impl MusicValue {
             MusicValue::HasAlbumArt(_) => "HasAlbumArt",
             MusicValue::EncoderSoftware(_) => "EncoderSoftware",
             MusicValue::EncodedBy(_) => "EncodedBy",
-            MusicValue::Played(_) => "Played",
-            MusicValue::Skipped(_) => "Skipped",
+            MusicValue::TrackStarted(_) => "TrackStarted",
+            MusicValue::TrackStopped(_) => "TrackStopped",
         }
     }
 }
@@ -224,8 +224,8 @@ impl fmt::Display for MusicValue {
             MusicValue::HasAlbumArt(b) => write!(f, "{}", if *b { "yes" } else { "no" }),
             MusicValue::EncoderSoftware(s) => write!(f, "{}", s),
             MusicValue::EncodedBy(s) => write!(f, "{}", s),
-            MusicValue::Played(dt) => write!(f, "{}", dt.to_rfc3339()),
-            MusicValue::Skipped(dt) => write!(f, "{}", dt.to_rfc3339()),
+            MusicValue::TrackStarted(dt) => write!(f, "{}", dt.to_rfc3339()),
+            MusicValue::TrackStopped(dt) => write!(f, "{}", dt.to_rfc3339()),
         }
     }
 }
