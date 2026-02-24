@@ -3,6 +3,10 @@
 
 set -euo pipefail
 
+# Nix-provided zig bakes in a build-time cache path that doesn't exist at runtime
+export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+
 echo "Building beacon for aarch64..."
 
 # Use cargo-zigbuild if available (devenv), otherwise fall back to plain cargo
