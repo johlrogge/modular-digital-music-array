@@ -36,6 +36,16 @@ members = [
     # Tests
     "tests/bdd",
 ]
+default-members = [
+    "components/*",
+    "bases/beacon",
+    "bases/mdma_bandcamp",
+    "bases/mdma_cli",
+    "bases/mdma_console",
+    "bases/mdma_gateway",
+    "bases/mdma_library",
+    "bases/mdma_playback",
+]
 resolver = "2"
 
 [workspace.package]
