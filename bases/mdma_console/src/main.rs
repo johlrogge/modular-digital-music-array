@@ -1086,7 +1086,7 @@ async fn main() -> Result<()> {
         .route("/", get(index))
         .route("/health", get(health))
         .route("/check-updates", post(check_updates))
-        .route("/update/{name}", post(update_package))
+        .route("/update/:name", post(update_package))
         .route("/ingest-all", post(ingest_all))
         .route(
             "/upload",
@@ -1114,7 +1114,7 @@ async fn main() -> Result<()> {
         // Library search
         .route("/library/search", get(library_search_handler))
         // Export
-        .route("/export/{hash}", get(export_track))
+        .route("/export/:hash", get(export_track))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", args.port);
