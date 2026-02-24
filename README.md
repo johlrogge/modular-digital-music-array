@@ -123,14 +123,14 @@ Library: immutable fact stream (`stainless_facts`) — every track attribute is 
 
 **Target:** Raspberry Pi 5, Void Linux, NVMe via M.2 HAT, iFi USB DAC
 
-**Network:** Pi is at `mdma-909.local`. Services accessible over TCP from the local network.
+**Network:** Pi is at `mdma-909.local`. All services are reached through a single gateway on port 5555.
 
 ```bash
 # Environment (add to shell profile)
-export MDMA_LIBRARY_SOCKET="tcp://mdma-909.local:5555"
-export MDMA_BANDCAMP_SOCKET="tcp://mdma-909.local:5556"
-export MDMA_PLAYBACK_SOCKET="tcp://mdma-909.local:5557"
+export MDMA_NODE="mdma-909.local"
 ```
+
+The CLI derives the gateway address (`tcp://mdma-909.local:5555`) from `MDMA_NODE` automatically.
 
 **SSH to Pi:**
 ```bash
@@ -140,7 +140,16 @@ just pi-ssh-beacon   # unprovisioned Pi (welcome-to-mdma.local)
 
 ## Installing the CLI (macOS)
 
-Download the latest `mdma-cli-macos-arm64` artifact from [GitHub Actions](https://github.com/johlrogge/modular-digital-music-array/actions/workflows/build-and-package.yml) (select the latest successful run, scroll to Artifacts).
+Download the latest `mdma-cli-macos-arm64` artifact from [GitHub Actions](https://github.com/johlrogge/modular-digital-music-array/actions/workflows/build-and-package.yml) (select the latest successful run, scroll to Artifacts). Downloading artifacts requires being logged into GitHub.
+
+Or download via the command line (requires [GitHub CLI](https://cli.github.com/)):
+
+```bash
+gh run download -R johlrogge/modular-digital-music-array -n mdma-cli-macos-arm64
+xattr -d com.apple.quarantine mdma
+chmod +x mdma
+sudo mv mdma /usr/local/bin/
+```
 
 Or build from source:
 
@@ -150,14 +159,15 @@ cargo build --release -p mdma-cli
 cp target/release/mdma /usr/local/bin/
 ```
 
-### Setup
-
-Set the Pi's hostname so the CLI knows where to connect:
+macOS will block the unsigned binary on first run. Remove the quarantine flag:
 
 ```bash
-echo 'export MDMA_NODE="mdma-909.local"' >> ~/.zshrc
-source ~/.zshrc
+xattr -d com.apple.quarantine /usr/local/bin/mdma
 ```
+
+### Setup
+
+Set `MDMA_NODE` as described in the [Setup](#setup) section above, then reload your shell profile.
 
 ### Verify
 

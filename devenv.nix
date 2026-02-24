@@ -8,7 +8,7 @@
     just
     bacon
     socat              # For Claude Code sandboxing
-    inputs.claude-code-nix.packages.${pkgs.system}.default  # Claude Code from sadjow/claude-code-nix flake
+    inputs.claude-code-nix.packages.${pkgs.stdenv.hostPlatform.system}.default  # Claude Code from sadjow/claude-code-nix flake
 
     # Rust build dependencies
     clang
