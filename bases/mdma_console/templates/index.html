@@ -181,6 +181,35 @@
         }
         .sse-dot.connected { background: var(--success); }
         .sse-dot.error { background: var(--error); }
+
+        /* Progress bar */
+        .progress-wrap {
+            margin-top: 10px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .progress-bar-track {
+            flex: 1;
+            height: 4px;
+            background: var(--border);
+            border-radius: 2px;
+            overflow: hidden;
+        }
+        .progress-bar-fill {
+            height: 100%;
+            background: var(--accent);
+            border-radius: 2px;
+            transition: width 0.9s linear;
+            width: 0%;
+        }
+        .progress-time {
+            color: var(--text-muted);
+            font-size: 0.8em;
+            white-space: nowrap;
+            min-width: 70px;
+            text-align: right;
+        }
     </style>
 </head>
 <body>
@@ -195,7 +224,17 @@
         <div id="now-playing-area">
             <p class="player-idle">Loading...</p>
         </div>
+        <div id="progress-area" style="display:none;">
+            <div class="progress-wrap">
+                <div class="progress-bar-track">
+                    <div class="progress-bar-fill" id="progress-fill"></div>
+                </div>
+                <span class="progress-time" id="progress-time">0:00 / 0:00</span>
+            </div>
+        </div>
         <div class="actions">
+            <button class="btn btn-secondary" onclick="playerPause()">Pause</button>
+            <button class="btn btn-secondary" onclick="playerResume()">Resume</button>
             <button class="btn btn-secondary" onclick="playerStop()">Stop</button>
             <button class="btn btn-secondary" onclick="playerSkip()">Skip</button>
             <button class="btn" onclick="playerPlayQueue()">Play Queue</button>
@@ -380,6 +419,28 @@
             return m + ':' + (s < 10 ? '0' : '') + s;
         }
 
+        function fmtMs(ms) {
+            var secs = Math.floor(ms / 1000);
+            var m = Math.floor(secs / 60);
+            var s = secs % 60;
+            return m + ':' + (s < 10 ? '0' : '') + s;
+        }
+
+        function updateProgressBar(position_ms, duration_ms) {
+            var area = document.getElementById('progress-area');
+            var fill = document.getElementById('progress-fill');
+            var time = document.getElementById('progress-time');
+            if (!area || !fill || !time) return;
+            if (!duration_ms || duration_ms === 0) {
+                area.style.display = 'none';
+                return;
+            }
+            area.style.display = 'block';
+            var pct = Math.min(100, (position_ms / duration_ms) * 100);
+            fill.style.width = pct + '%';
+            time.textContent = fmtMs(position_ms) + ' / ' + fmtMs(duration_ms);
+        }
+
         // =====================================================================
         // SSE Event Bridge
         // =====================================================================
@@ -396,13 +457,18 @@
             es.onmessage = function(e) {
                 var ev;
                 try { ev = JSON.parse(e.data); } catch(ex) { return; }
-                if ('TrackStarted' in ev || ev.type === 'Connected') {
+                if (ev.type === 'TrackStarted' || ev.type === 'Connected') {
                     refreshNowPlaying();
                     refreshQueue();
-                } else if ('TrackStopped' in ev || 'TrackEnded' in ev) {
+                } else if (ev.type === 'TrackStopped' || ev.type === 'TrackEnded') {
                     refreshNowPlaying();
-                } else if ('QueueChanged' in ev) {
+                    document.getElementById('progress-area').style.display = 'none';
+                } else if (ev.type === 'TrackPaused' || ev.type === 'TrackResumed') {
+                    refreshNowPlaying();
+                } else if (ev.type === 'QueueChanged') {
                     refreshQueue();
+                } else if (ev.type === 'PositionUpdate') {
+                    updateProgressBar(ev.position_ms, ev.duration_ms);
                 }
             };
             es.onerror = function() {
@@ -422,8 +488,10 @@
                 .then(function(r) { return r.json(); })
                 .then(function(data) {
                     var area = document.getElementById('now-playing-area');
+                    var progressArea = document.getElementById('progress-area');
                     if (!data.playing) {
                         area.innerHTML = '<p class="player-idle">Nothing playing.</p>';
+                        if (progressArea) progressArea.style.display = 'none';
                         return;
                     }
                     var t = data.track || {};
@@ -442,6 +510,8 @@
                         (meta.length ? '<div class="track-meta">' + meta.join(' &middot; ') + '</div>' : '') +
                         '</div>' +
                         '</div>';
+                    // Show the progress bar area (position will be populated by PositionUpdate events)
+                    if (progressArea) progressArea.style.display = 'block';
                 })
                 .catch(function() {});
         }
@@ -469,6 +539,18 @@
                     }).join('');
                 })
                 .catch(function() {});
+        }
+
+        function playerPause() {
+            fetch('/player/pause', { method: 'POST' })
+                .then(function() { refreshNowPlaying(); })
+                .catch(function(e) { showStatus('Pause failed: ' + e.message, true); });
+        }
+
+        function playerResume() {
+            fetch('/player/resume', { method: 'POST' })
+                .then(function() { refreshNowPlaying(); })
+                .catch(function(e) { showStatus('Resume failed: ' + e.message, true); });
         }
 
         function playerStop() {

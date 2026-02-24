@@ -71,8 +71,10 @@ pub trait Source: Send + Sync {
     // Basic metadata
     fn sample_rate(&self) -> u32;
     fn audio_channels(&self) -> u16;
-    // New method to get current position
+    // Current playback position in samples
     fn current_position(&self) -> usize;
+    // Total duration in milliseconds, if known
+    fn duration_ms(&self) -> Option<u64>;
 }
 
 pub struct AudioSource {
@@ -85,6 +87,9 @@ pub struct AudioSource {
     // Basic metadata
     sample_rate: u32,
     audio_channels: u16,
+
+    // Total duration in milliseconds (None if unknown)
+    total_duration_ms: Option<u64>,
 
     // End-of-file status
     is_eof: AtomicBool,
@@ -101,6 +106,7 @@ type DecoderResult = Result<
         Box<dyn symphonia::core::codecs::Decoder>,
         u32,
         u16,
+        Option<u64>,
     ),
     PlaybackError,
 >;
@@ -109,7 +115,7 @@ impl AudioSource {
     pub fn new(path: impl AsRef<Path>) -> Result<Self, PlaybackError> {
         tracing::debug!("Opening file: {:?}", path.as_ref());
         // Initialize the decoder and format reader
-        let (format_reader, decoder, sample_rate, audio_channels) =
+        let (format_reader, decoder, sample_rate, audio_channels, total_duration_ms) =
             Self::init_decoder(path.as_ref())?;
 
         // Create the decoder state
@@ -124,6 +130,7 @@ impl AudioSource {
             current_position: AtomicUsize::new(0),
             sample_rate,
             audio_channels,
+            total_duration_ms,
             is_eof: AtomicBool::new(false),
         };
 
@@ -158,12 +165,25 @@ impl AudioSource {
         let audio_channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2) as u16;
         let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
 
+        // Compute total duration in milliseconds from n_frames and sample_rate.
+        // n_frames is the number of audio frames (one frame = one sample per channel).
+        let total_duration_ms = track
+            .codec_params
+            .n_frames
+            .map(|frames| frames * 1000 / sample_rate as u64);
+
         // Create decoder
         let decoder = symphonia::default::get_codecs()
             .make(&track.codec_params, &DecoderOptions::default())
             .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
 
-        Ok((probed.format, decoder, sample_rate, audio_channels))
+        Ok((
+            probed.format,
+            decoder,
+            sample_rate,
+            audio_channels,
+            total_duration_ms,
+        ))
     }
 
     fn position_to_time(&self, position: usize) -> Time {
@@ -304,6 +324,10 @@ impl Source for AudioSource {
     }
     fn current_position(&self) -> usize {
         self.current_position.load(Ordering::Relaxed)
+    }
+
+    fn duration_ms(&self) -> Option<u64> {
+        self.total_duration_ms
     }
 }
 

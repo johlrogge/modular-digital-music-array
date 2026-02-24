@@ -336,14 +336,26 @@ enum SourceCommands {
 
 #[derive(Subcommand, Debug)]
 enum PlaybackCommands {
-    /// Play from the queue (use `mdma queue append <hash>` to enqueue tracks)
-    Play,
+    /// Start playback from the queue (use `mdma queue append <hash>` to enqueue tracks)
+    Start,
 
     /// Stop playback on deck A
     Stop,
 
+    /// Pause playback on deck A (keeps the current track loaded; resume to continue)
+    Pause,
+
+    /// Resume playback on deck A after a pause
+    Resume,
+
+    /// Skip to the next track in the queue
+    Skip,
+
     /// Show what is currently playing
     Now,
+
+    /// Show the current session ID (a session spans from first play to queue empty)
+    Session,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1310,7 +1322,7 @@ fn handle_playback_error(err: PlaybackClientError) -> ! {
     std::process::exit(1);
 }
 
-fn handle_playback_play(media_client: &PlaybackBackend) -> Result<()> {
+fn handle_playback_start(media_client: &PlaybackBackend) -> Result<()> {
     if let Err(e) = media_client.play_queue() {
         handle_playback_error(e);
     }
@@ -1702,12 +1714,52 @@ fn handle_sort(
     Ok(())
 }
 
+fn handle_playback_session(media_client: &PlaybackBackend) -> Result<()> {
+    match media_client.session() {
+        Ok(Some(id)) => {
+            println!("{}", id);
+        }
+        Ok(None) => {
+            println!("No active session");
+        }
+        Err(e) => handle_playback_error(e),
+    }
+    Ok(())
+}
+
 fn handle_playback_stop(media_client: &PlaybackBackend) -> Result<()> {
     if let Err(e) = media_client.stop(Deck::A) {
         handle_playback_error(e);
     }
 
     println!("Stopped");
+    Ok(())
+}
+
+fn handle_playback_skip(media_client: &PlaybackBackend) -> Result<()> {
+    if let Err(e) = media_client.skip() {
+        handle_playback_error(e);
+    }
+
+    println!("Skipped");
+    Ok(())
+}
+
+fn handle_playback_pause(media_client: &PlaybackBackend) -> Result<()> {
+    if let Err(e) = media_client.pause(Deck::A) {
+        handle_playback_error(e);
+    }
+
+    println!("Paused");
+    Ok(())
+}
+
+fn handle_playback_resume(media_client: &PlaybackBackend) -> Result<()> {
+    if let Err(e) = media_client.resume(Deck::A) {
+        handle_playback_error(e);
+    }
+
+    println!("Resumed");
     Ok(())
 }
 
@@ -1802,12 +1854,31 @@ fn print_event_human(event: &PlaybackEvent, library: Option<&LibraryBackend>) {
         PlaybackEvent::TrackStopped { hash } => {
             println!("{} {}", "⏹ stopped".red().bold(), hash.bright_black());
         }
+        PlaybackEvent::TrackPaused { hash } => {
+            println!("{} {}", "⏸ paused".yellow().bold(), hash.bright_black());
+        }
+        PlaybackEvent::TrackResumed { hash } => {
+            println!("{} {}", "▶ resumed".green().bold(), hash.bright_black());
+        }
         PlaybackEvent::QueueChanged { length } => {
             println!(
                 "{} {} track(s)",
                 "♫ queue".blue().bold(),
                 length.to_string().bold()
             );
+        }
+        PlaybackEvent::PositionUpdate { .. } => {
+            // Position updates are high-frequency; suppress from the human-readable event stream.
+        }
+        PlaybackEvent::SessionStarted { id } => {
+            println!(
+                "{} {}",
+                "◉ session started".cyan().bold(),
+                id.bright_black()
+            );
+        }
+        PlaybackEvent::SessionEnded { id } => {
+            println!("{} {}", "◎ session ended".cyan().bold(), id.bright_black());
         }
     }
 }
@@ -2243,8 +2314,11 @@ fn main() -> Result<()> {
         Commands::Playback { command } => {
             let pb = connect_playback(&cli);
             match command {
-                PlaybackCommands::Play => handle_playback_play(&pb),
+                PlaybackCommands::Start => handle_playback_start(&pb),
                 PlaybackCommands::Stop => handle_playback_stop(&pb),
+                PlaybackCommands::Pause => handle_playback_pause(&pb),
+                PlaybackCommands::Resume => handle_playback_resume(&pb),
+                PlaybackCommands::Skip => handle_playback_skip(&pb),
                 PlaybackCommands::Now => {
                     use std::io::IsTerminal;
                     if std::io::stdout().is_terminal() {
@@ -2254,6 +2328,7 @@ fn main() -> Result<()> {
                         handle_playback_now(&pb, None)
                     }
                 }
+                PlaybackCommands::Session => handle_playback_session(&pb),
             }
         }
 

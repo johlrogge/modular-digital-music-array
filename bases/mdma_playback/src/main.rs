@@ -1,4 +1,5 @@
 mod error;
+mod playback_state;
 mod server;
 
 use std::path::PathBuf;

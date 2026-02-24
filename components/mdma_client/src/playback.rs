@@ -65,10 +65,31 @@ impl PlaybackBackend {
         }
     }
 
+    pub fn skip(&self) -> Result<(), ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.skip(),
+            PlaybackBackend::Gateway(_) => self.gw_command(Command::Skip),
+        }
+    }
+
     pub fn stop(&self, deck: Deck) -> Result<(), ClientError> {
         match self {
             PlaybackBackend::Direct(c) => c.stop(deck),
             PlaybackBackend::Gateway(_) => self.gw_command(Command::Stop { deck }),
+        }
+    }
+
+    pub fn pause(&self, deck: Deck) -> Result<(), ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.pause(deck),
+            PlaybackBackend::Gateway(_) => self.gw_command(Command::Pause { deck }),
+        }
+    }
+
+    pub fn resume(&self, deck: Deck) -> Result<(), ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.resume(deck),
+            PlaybackBackend::Gateway(_) => self.gw_command(Command::Resume { deck }),
         }
     }
 
@@ -139,6 +160,22 @@ impl PlaybackBackend {
                 let data = self.gw_command_with_data(Command::QueueRemove { hashes })?;
                 if let ResponseData::Count(n) = data {
                     Ok(n)
+                } else {
+                    Err(ClientError::Command(
+                        "Unexpected response data type".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    pub fn session(&self) -> Result<Option<String>, ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.get_session(),
+            PlaybackBackend::Gateway(_) => {
+                let data = self.gw_command_with_data(Command::GetSession)?;
+                if let ResponseData::Session(id) = data {
+                    Ok(id)
                 } else {
                     Err(ClientError::Command(
                         "Unexpected response data type".to_string(),

@@ -1,9 +1,9 @@
 use crate::error::ServerError;
-use chrono::Utc;
+use crate::playback_state::{PlaybackEffect, PlaybackState, PlaybackStateMachine};
 use color_eyre::Result;
 use event_protocol::{to_topic_message, PlaybackEvent};
 use media_protocol::{Command, ContentHash, Response, ResponseData};
-use music_facts::{FactOrigin, FactSource, MusicValue};
+use music_facts::{FactOrigin, FactSource, MusicValue, StartReason};
 use nng::Socket;
 use playback_engine::{Deck, PlaybackEngine, PlaybackError};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,7 @@ struct QueueEntry {
 }
 
 fn write_fact(facts_path: &std::path::Path, hash: &ContentHash, value: MusicValue) {
+    use chrono::Utc;
     let source = FactSource::new(
         "mdma-playback",
         env!("CARGO_PKG_VERSION"),
@@ -50,7 +51,9 @@ pub struct Server {
     engine: Arc<Mutex<PlaybackEngine>>,
     socket: Socket,
     queue: Arc<Mutex<VecDeque<QueueEntry>>>,
-    current_hash: Arc<Mutex<Option<ContentHash>>>,
+    /// State machine that owns the canonical playback state (replaces the old
+    /// `current_hash` and `is_paused` boolean flags).
+    state: Arc<Mutex<PlaybackStateMachine>>,
     queue_file: PathBuf,
     event_pub: Socket,
     facts_path: PathBuf,
@@ -68,7 +71,7 @@ impl Server {
             engine,
             socket,
             queue: Arc::new(Mutex::new(VecDeque::new())),
-            current_hash: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(PlaybackStateMachine::new())),
             queue_file,
             event_pub,
             facts_path,
@@ -76,14 +79,7 @@ impl Server {
     }
 
     fn publish_event(&self, event: &PlaybackEvent) {
-        let msg = to_topic_message(event);
-        if let Err(e) = self.event_pub.send(&msg) {
-            warn!("Failed to publish event: {:?}", e);
-        }
-    }
-
-    fn append_fact(&self, hash: &ContentHash, value: MusicValue) {
-        write_fact(&self.facts_path, hash, value);
+        publish_event_on_socket(&self.event_pub, event);
     }
 
     /// Serialize and write the queue to disk atomically. Logs a warning on error.
@@ -140,7 +136,7 @@ impl Server {
         tokio::spawn(auto_advance_task(
             self.engine.clone(),
             self.queue.clone(),
-            self.current_hash.clone(),
+            self.state.clone(),
             self.event_pub.clone(),
             self.facts_path.clone(),
             self.queue_file.clone(),
@@ -168,6 +164,11 @@ impl Server {
 
     async fn handle_command(&self, command: Command) -> Response {
         match command {
+            // ---------------------------------------------------------------
+            // Low-level deck commands — bypass the state machine.
+            // TODO: deprecate these in favour of queue-based commands once all
+            // callers have been migrated.
+            // ---------------------------------------------------------------
             Command::LoadTrack { path, deck } => {
                 info!("Loading track {:?} on deck {:?}", path, deck);
                 let result = self.engine.lock().await.load_track(deck, &path).await;
@@ -179,23 +180,38 @@ impl Server {
                 let result = self.engine.lock().await.play(deck);
                 info!("Play command completed for deck {:?}: {:?}", deck, result);
                 if result.is_ok() {
-                    if let Some(ref hash) = self.current_hash.lock().await.clone() {
-                        self.append_fact(hash, MusicValue::TrackStarted(Utc::now()));
+                    if let Some(hash) = self.state.lock().await.current_hash().cloned() {
+                        write_fact(
+                            &self.facts_path,
+                            &hash,
+                            MusicValue::TrackStarted(StartReason::OnRequest),
+                        );
                     }
                 }
                 self.create_response(result, None)
             }
-            Command::Stop { deck } => {
-                let stopped_hash = self.current_hash.lock().await.clone();
-                info!("Stopping deck {:?}", deck);
-                let result = self.engine.lock().await.stop(deck);
-                if result.is_ok() {
-                    if let Some(h) = stopped_hash {
-                        self.append_fact(&h, MusicValue::TrackStopped(Utc::now()));
-                        self.publish_event(&PlaybackEvent::TrackStopped { hash: h.0.clone() });
-                    }
-                    *self.current_hash.lock().await = None;
-                }
+            // ---------------------------------------------------------------
+            // State-machine-backed commands
+            // ---------------------------------------------------------------
+            Command::Stop { deck: _ } => {
+                info!("Stopping playback");
+                let effects = self.state.lock().await.stop();
+                let result =
+                    execute_effects(effects, &self.engine, &self.event_pub, &self.facts_path).await;
+                self.create_response(result, None)
+            }
+            Command::Pause { deck: _ } => {
+                info!("Pausing playback");
+                let effects = self.state.lock().await.pause();
+                let result =
+                    execute_effects(effects, &self.engine, &self.event_pub, &self.facts_path).await;
+                self.create_response(result, None)
+            }
+            Command::Resume { deck: _ } => {
+                info!("Resuming playback");
+                let effects = self.state.lock().await.resume();
+                let result =
+                    execute_effects(effects, &self.engine, &self.event_pub, &self.facts_path).await;
                 self.create_response(result, None)
             }
             Command::SetVolume { deck, db } => {
@@ -308,25 +324,56 @@ impl Server {
                         data: None,
                     },
                     Some(e) => {
-                        *self.current_hash.lock().await = Some(e.hash.clone());
-                        let result = load_and_play(&self.engine, &e.path).await;
-                        if result.is_ok() {
-                            self.append_fact(&e.hash, MusicValue::TrackStarted(Utc::now()));
-                            self.publish_event(&PlaybackEvent::TrackStarted {
-                                hash: e.hash.0.clone(),
-                            });
-                        }
+                        let effects = self
+                            .state
+                            .lock()
+                            .await
+                            .play_queue(e.hash.clone(), e.path.clone());
+                        let result = execute_effects(
+                            effects,
+                            &self.engine,
+                            &self.event_pub,
+                            &self.facts_path,
+                        )
+                        .await;
                         self.create_response(result, None)
                     }
                 }
             }
             Command::NowPlaying => {
-                let hash = self.current_hash.lock().await.clone();
+                let hash = self.state.lock().await.current_hash().cloned();
                 info!("Now playing: {:?}", hash);
                 Response {
                     success: true,
                     error_message: String::new(),
                     data: Some(ResponseData::NowPlaying(hash)),
+                }
+            }
+            Command::Skip => {
+                info!("Skip: stopping current track and advancing queue");
+                let next = {
+                    let mut queue = self.queue.lock().await;
+                    let e = queue.pop_front();
+                    if e.is_some() {
+                        self.persist_queue(&queue);
+                        self.publish_event(&PlaybackEvent::QueueChanged {
+                            length: queue.len(),
+                        });
+                    }
+                    e.map(|entry| (entry.hash, entry.path))
+                };
+                let effects = self.state.lock().await.skip(next);
+                let result =
+                    execute_effects(effects, &self.engine, &self.event_pub, &self.facts_path).await;
+                self.create_response(result, None)
+            }
+            Command::GetSession => {
+                let session_id = self.state.lock().await.session_id().map(|id| id.0.clone());
+                info!("GetSession: {:?}", session_id);
+                Response {
+                    success: true,
+                    error_message: String::new(),
+                    data: Some(ResponseData::Session(session_id)),
                 }
             }
         }
@@ -366,13 +413,42 @@ impl Server {
     }
 }
 
-async fn load_and_play(
+/// Execute a list of effects produced by the state machine.
+async fn execute_effects(
+    effects: Vec<PlaybackEffect>,
     engine: &Arc<Mutex<PlaybackEngine>>,
-    path: &Path,
+    event_pub: &nng::Socket,
+    facts_path: &Path,
 ) -> Result<(), PlaybackError> {
-    let mut eng = engine.lock().await;
-    eng.load_track(Deck::A, path).await?;
-    eng.play(Deck::A)
+    for effect in effects {
+        match effect {
+            PlaybackEffect::StopEngine => {
+                engine.lock().await.stop(Deck::A)?;
+            }
+            PlaybackEffect::PlayEngine => {
+                engine.lock().await.play(Deck::A)?;
+            }
+            PlaybackEffect::LoadAndPlay { hash: _, path } => {
+                let mut eng = engine.lock().await;
+                eng.load_track(Deck::A, &path).await?;
+                eng.play(Deck::A)?;
+            }
+            PlaybackEffect::EmitEvent(event) => {
+                publish_event_on_socket(event_pub, &event);
+            }
+            PlaybackEffect::WriteFact { hash, value } => {
+                write_fact(facts_path, &hash, value);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn publish_event_on_socket(socket: &nng::Socket, event: &PlaybackEvent) {
+    let msg = to_topic_message(event);
+    if let Err(e) = socket.send(&msg) {
+        warn!("Failed to publish event: {:?}", e);
+    }
 }
 
 /// Persist queue to disk (free function for use in auto_advance_task).
@@ -403,72 +479,80 @@ fn persist_queue_to_file(queue_file: &Path, queue: &VecDeque<QueueEntry>) {
     }
 }
 
-fn append_play_fact(facts_path: &Path, hash: &ContentHash, value: MusicValue) {
-    write_fact(facts_path, hash, value);
-}
-
 /// Polls deck A every 200 ms. When the track reaches `Finished`, pops the next
 /// entry from the queue and starts playing it automatically.
+/// Auto-advance is suppressed while playback is paused (state machine handles this).
+/// Every 5th poll iteration (~1 s) broadcasts a `PositionUpdate` event while playing.
 async fn auto_advance_task(
     engine: Arc<Mutex<PlaybackEngine>>,
     queue: Arc<Mutex<VecDeque<QueueEntry>>>,
-    current_hash: Arc<Mutex<Option<ContentHash>>>,
+    state: Arc<Mutex<PlaybackStateMachine>>,
     event_pub: nng::Socket,
     facts_path: PathBuf,
     queue_file: PathBuf,
 ) {
+    let mut tick: u8 = 0;
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
+        tick = tick.wrapping_add(1);
+
+        // Every 5th tick (~1 s) broadcast a position update while playing.
+        if tick.is_multiple_of(5) {
+            let current_state = state.lock().await;
+            if let PlaybackState::Playing { hash } = current_state.state() {
+                let h = hash.clone();
+                drop(current_state);
+                let eng = engine.lock().await;
+                if let (Some(position_ms), Some(duration_ms)) =
+                    (eng.position_ms(Deck::A), eng.duration_ms(Deck::A))
+                {
+                    drop(eng);
+                    publish_event_on_socket(
+                        &event_pub,
+                        &PlaybackEvent::PositionUpdate {
+                            hash: h.0.clone(),
+                            position_ms,
+                            duration_ms,
+                        },
+                    );
+                }
+            }
+        }
+
+        // Check whether the current state is Playing before checking engine.
+        // If Paused or Idle, do not auto-advance.
+        {
+            let current_state = state.lock().await;
+            match current_state.state() {
+                PlaybackState::Playing { .. } => {}
+                PlaybackState::Paused { .. } | PlaybackState::Idle => continue,
+            }
+        }
 
         let finished = engine.lock().await.is_track_finished(Deck::A);
         if !finished {
             continue;
         }
 
-        // Track ended — emit event for the track that just finished.
-        let ended_hash = current_hash.lock().await.clone();
-        if let Some(ref h) = ended_hash {
-            let msg = to_topic_message(&PlaybackEvent::TrackEnded { hash: h.0.clone() });
-            if let Err(e) = event_pub.send(&msg) {
-                warn!("Failed to publish TrackEnded: {:?}", e);
-            }
-            // Track finished naturally — record as stopped.
-            append_play_fact(&facts_path, h, MusicValue::TrackStopped(Utc::now()));
-        }
-
+        // Track ended — pop next from queue.
         let next = {
             let mut q = queue.lock().await;
             let entry = q.pop_front();
             if entry.is_some() {
                 persist_queue_to_file(&queue_file, &q);
-                let msg = to_topic_message(&PlaybackEvent::QueueChanged { length: q.len() });
-                if let Err(e) = event_pub.send(&msg) {
-                    warn!("Failed to publish QueueChanged: {:?}", e);
-                }
+                publish_event_on_socket(
+                    &event_pub,
+                    &PlaybackEvent::QueueChanged { length: q.len() },
+                );
             }
-            entry
-        };
-        let Some(entry) = next else {
-            *current_hash.lock().await = None;
-            continue;
+            entry.map(|e| (e.hash, e.path))
         };
 
-        info!("Auto-advance: loading {:?}", entry.path);
-        *current_hash.lock().await = Some(entry.hash.clone());
-        if let Err(e) = load_and_play(&engine, &entry.path).await {
-            warn!("Auto-advance failed to load {:?}: {}", entry.path, e);
-        } else {
-            append_play_fact(
-                &facts_path,
-                &entry.hash,
-                MusicValue::TrackStarted(Utc::now()),
-            );
-            let msg = to_topic_message(&PlaybackEvent::TrackStarted {
-                hash: entry.hash.0.clone(),
-            });
-            if let Err(e) = event_pub.send(&msg) {
-                warn!("Failed to publish TrackStarted: {:?}", e);
-            }
+        // Drive the state machine.
+        let effects = state.lock().await.track_ended(next);
+
+        if let Err(e) = execute_effects(effects, &engine, &event_pub, &facts_path).await {
+            warn!("Auto-advance failed: {}", e);
         }
     }
 }
@@ -477,6 +561,62 @@ async fn auto_advance_task(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn make_server() -> Server {
+        let engine = PlaybackEngine::new().unwrap();
+        let engine = Arc::new(Mutex::new(engine));
+        let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
+        let event_pub = nng::Socket::new(nng::Protocol::Pub0).unwrap();
+        Server::new(
+            engine,
+            socket,
+            PathBuf::from("/tmp/test_queue.json"),
+            event_pub,
+            PathBuf::from("/tmp/test_facts.jsonl"),
+        )
+    }
+
+    /// After pause -> skip, the state machine must be in Idle (not Paused).
+    /// This is the regression test for the original bug where Skip didn't clear
+    /// `is_paused`.
+    #[tokio::test]
+    async fn skip_after_pause_state_is_not_paused() {
+        let server = make_server();
+
+        // Drive the state machine directly into Paused.
+        {
+            let mut sm = server.state.lock().await;
+            let hash = ContentHash("sha256:test".to_string());
+            let path = PathBuf::from("/nonexistent/track.flac");
+            sm.play_queue(hash, path);
+            sm.pause();
+        }
+
+        assert!(
+            matches!(
+                server.state.lock().await.state(),
+                PlaybackState::Paused { .. }
+            ),
+            "Expected Paused state before Skip"
+        );
+
+        // Issue Skip via state machine (engine stop may error on no-loaded track,
+        // but state must still transition to Idle).
+        let effects = server.state.lock().await.skip(None);
+        // Ignore engine errors — we only care about the state transition.
+        let _ = execute_effects(
+            effects,
+            &server.engine,
+            &server.event_pub,
+            &server.facts_path,
+        )
+        .await;
+
+        assert!(
+            matches!(server.state.lock().await.state(), PlaybackState::Idle),
+            "Expected Idle after Skip from Paused"
+        );
+    }
 
     #[tokio::test]
     #[ignore]

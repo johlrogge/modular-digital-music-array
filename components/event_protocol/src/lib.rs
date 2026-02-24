@@ -12,17 +12,57 @@ pub const TOPIC_TRACK_ENDED: &str = "playback/track_ended";
 /// Topic for track stopped events.
 pub const TOPIC_TRACK_STOPPED: &str = "playback/track_stopped";
 
+/// Topic for track paused events.
+pub const TOPIC_TRACK_PAUSED: &str = "playback/track_paused";
+
+/// Topic for track resumed events.
+pub const TOPIC_TRACK_RESUMED: &str = "playback/track_resumed";
+
 /// Topic for queue changed events.
 pub const TOPIC_QUEUE_CHANGED: &str = "playback/queue_changed";
+
+/// Topic for position update events.
+pub const TOPIC_POSITION_UPDATE: &str = "playback/position";
+
+/// Topic for session started events.
+pub const TOPIC_SESSION_STARTED: &str = "playback/session_started";
+
+/// Topic for session ended events.
+pub const TOPIC_SESSION_ENDED: &str = "playback/session_ended";
 
 /// Events emitted by the playback service.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum PlaybackEvent {
-    TrackStarted { hash: String },
-    TrackEnded { hash: String },
-    TrackStopped { hash: String },
-    QueueChanged { length: usize },
+    TrackStarted {
+        hash: String,
+    },
+    TrackEnded {
+        hash: String,
+    },
+    TrackStopped {
+        hash: String,
+    },
+    TrackPaused {
+        hash: String,
+    },
+    TrackResumed {
+        hash: String,
+    },
+    QueueChanged {
+        length: usize,
+    },
+    PositionUpdate {
+        hash: String,
+        position_ms: u64,
+        duration_ms: u64,
+    },
+    SessionStarted {
+        id: String,
+    },
+    SessionEnded {
+        id: String,
+    },
 }
 
 impl PlaybackEvent {
@@ -32,7 +72,12 @@ impl PlaybackEvent {
             PlaybackEvent::TrackStarted { .. } => TOPIC_TRACK_STARTED,
             PlaybackEvent::TrackEnded { .. } => TOPIC_TRACK_ENDED,
             PlaybackEvent::TrackStopped { .. } => TOPIC_TRACK_STOPPED,
+            PlaybackEvent::TrackPaused { .. } => TOPIC_TRACK_PAUSED,
+            PlaybackEvent::TrackResumed { .. } => TOPIC_TRACK_RESUMED,
             PlaybackEvent::QueueChanged { .. } => TOPIC_QUEUE_CHANGED,
+            PlaybackEvent::PositionUpdate { .. } => TOPIC_POSITION_UPDATE,
+            PlaybackEvent::SessionStarted { .. } => TOPIC_SESSION_STARTED,
+            PlaybackEvent::SessionEnded { .. } => TOPIC_SESSION_ENDED,
         }
     }
 }
@@ -125,11 +170,68 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_track_paused() {
+        let event = PlaybackEvent::TrackPaused {
+            hash: "sha256:abc123".into(),
+        };
+        let bytes = to_topic_message(&event);
+        let (topic, decoded) = from_topic_message(&bytes).unwrap();
+        assert_eq!(topic, TOPIC_TRACK_PAUSED);
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn roundtrip_track_resumed() {
+        let event = PlaybackEvent::TrackResumed {
+            hash: "sha256:abc123".into(),
+        };
+        let bytes = to_topic_message(&event);
+        let (topic, decoded) = from_topic_message(&bytes).unwrap();
+        assert_eq!(topic, TOPIC_TRACK_RESUMED);
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
     fn roundtrip_queue_changed() {
         let event = PlaybackEvent::QueueChanged { length: 42 };
         let bytes = to_topic_message(&event);
         let (topic, decoded) = from_topic_message(&bytes).unwrap();
         assert_eq!(topic, TOPIC_QUEUE_CHANGED);
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn roundtrip_position_update() {
+        let event = PlaybackEvent::PositionUpdate {
+            hash: "sha256:abc123".into(),
+            position_ms: 12_345,
+            duration_ms: 240_000,
+        };
+        let bytes = to_topic_message(&event);
+        let (topic, decoded) = from_topic_message(&bytes).unwrap();
+        assert_eq!(topic, TOPIC_POSITION_UPDATE);
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn roundtrip_session_started() {
+        let event = PlaybackEvent::SessionStarted {
+            id: "2026-02-24T12:00:00+00:00".into(),
+        };
+        let bytes = to_topic_message(&event);
+        let (topic, decoded) = from_topic_message(&bytes).unwrap();
+        assert_eq!(topic, TOPIC_SESSION_STARTED);
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn roundtrip_session_ended() {
+        let event = PlaybackEvent::SessionEnded {
+            id: "2026-02-24T12:00:00+00:00".into(),
+        };
+        let bytes = to_topic_message(&event);
+        let (topic, decoded) = from_topic_message(&bytes).unwrap();
+        assert_eq!(topic, TOPIC_SESSION_ENDED);
         assert_eq!(decoded, event);
     }
 

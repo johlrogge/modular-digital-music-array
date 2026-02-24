@@ -1,9 +1,72 @@
 use crate::primitives::*;
-use chrono::{DateTime, Utc};
 use music_primitives::{Bpm, Key};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use std::path::PathBuf;
+
+/// Why a track started playing
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum StartReason {
+    /// Started in response to an explicit user request
+    OnRequest,
+    /// Started automatically because it was next in the queue
+    ByQueue,
+}
+
+impl fmt::Display for StartReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StartReason::OnRequest => write!(f, "OnRequest"),
+            StartReason::ByQueue => write!(f, "ByQueue"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StartReason {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "OnRequest" => Ok(StartReason::OnRequest),
+            "ByQueue" => Ok(StartReason::ByQueue),
+            // Legacy DateTime strings or any unrecognized value → OnRequest
+            _ => Ok(StartReason::OnRequest),
+        }
+    }
+}
+
+/// Why a track stopped playing
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum StopReason {
+    /// Stopped in response to an explicit user request
+    OnRequest,
+    /// Stopped because the track played to its natural end
+    OnCompletion,
+    /// Stopped because the track was skipped
+    OnSkip,
+}
+
+impl fmt::Display for StopReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StopReason::OnRequest => write!(f, "OnRequest"),
+            StopReason::OnCompletion => write!(f, "OnCompletion"),
+            StopReason::OnSkip => write!(f, "OnSkip"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StopReason {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "OnRequest" => Ok(StopReason::OnRequest),
+            "OnCompletion" => Ok(StopReason::OnCompletion),
+            "OnSkip" => Ok(StopReason::OnSkip),
+            // Legacy DateTime strings or any unrecognized value → OnRequest
+            _ => Ok(StopReason::OnRequest),
+        }
+    }
+}
 
 /// Audio file format
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -29,7 +92,7 @@ impl fmt::Display for MusicFormat {
 ///
 /// Each variant represents a single fact that can be asserted or retracted
 /// about a track. Facts are stored in the stainless-facts stream.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", content = "v")]
 pub enum MusicValue {
     // ========================================================================
@@ -164,10 +227,10 @@ pub enum MusicValue {
     // Play History
     // ========================================================================
     /// Track started playing
-    TrackStarted(DateTime<Utc>),
+    TrackStarted(StartReason),
 
-    /// Track stopped playing (any reason)
-    TrackStopped(DateTime<Utc>),
+    /// Track stopped playing
+    TrackStopped(StopReason),
 }
 
 impl MusicValue {
@@ -249,8 +312,8 @@ impl fmt::Display for MusicValue {
             MusicValue::Format(ref fmt_val) => write!(f, "{}", fmt_val),
             MusicValue::EncoderSoftware(s) => write!(f, "{}", s),
             MusicValue::EncodedBy(s) => write!(f, "{}", s),
-            MusicValue::TrackStarted(dt) => write!(f, "{}", dt.to_rfc3339()),
-            MusicValue::TrackStopped(dt) => write!(f, "{}", dt.to_rfc3339()),
+            MusicValue::TrackStarted(r) => write!(f, "{}", r),
+            MusicValue::TrackStopped(r) => write!(f, "{}", r),
         }
     }
 }
@@ -267,6 +330,87 @@ mod tests {
         assert_fact_value_format!(MusicValue::Title(Title::new("Test")));
         assert_fact_value_format!(MusicValue::Artist(Artist::new("Test Artist")));
         assert_fact_value_format!(MusicValue::HasAlbumArt(true));
+    }
+
+    #[test]
+    fn track_started_carries_start_reason() {
+        // TrackStarted should carry a StartReason, not a DateTime
+        let v = MusicValue::TrackStarted(StartReason::OnRequest);
+        let json = serde_json::to_string(&v).unwrap();
+        let back: MusicValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, MusicValue::TrackStarted(StartReason::OnRequest));
+    }
+
+    #[test]
+    fn track_stopped_carries_stop_reason() {
+        // TrackStopped should carry a StopReason, not a DateTime
+        let v = MusicValue::TrackStopped(StopReason::OnCompletion);
+        let json = serde_json::to_string(&v).unwrap();
+        let back: MusicValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, MusicValue::TrackStopped(StopReason::OnCompletion));
+    }
+
+    #[test]
+    fn start_reason_all_variants_roundtrip() {
+        for reason in [StartReason::OnRequest, StartReason::ByQueue] {
+            let json = serde_json::to_string(&reason).unwrap();
+            let back: StartReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(reason, back);
+        }
+    }
+
+    #[test]
+    fn stop_reason_all_variants_roundtrip() {
+        for reason in [
+            StopReason::OnRequest,
+            StopReason::OnCompletion,
+            StopReason::OnSkip,
+        ] {
+            let json = serde_json::to_string(&reason).unwrap();
+            let back: StopReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(reason, back);
+        }
+    }
+
+    #[test]
+    fn start_reason_legacy_datetime_falls_back_to_on_request() {
+        // Legacy DateTime strings should deserialize to OnRequest
+        let legacy_json = "\"2026-01-15T10:00:00Z\"";
+        let reason: StartReason = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(reason, StartReason::OnRequest);
+    }
+
+    #[test]
+    fn stop_reason_legacy_datetime_falls_back_to_on_request() {
+        // Legacy DateTime strings should deserialize to OnRequest (sensible default)
+        let legacy_json = "\"2026-01-15T10:00:00Z\"";
+        let reason: StopReason = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(reason, StopReason::OnRequest);
+    }
+
+    #[test]
+    fn track_started_display_shows_reason_not_timestamp() {
+        let v = MusicValue::TrackStarted(StartReason::ByQueue);
+        let s = v.to_string();
+        // Should show the reason, not a timestamp
+        assert_eq!(s, "ByQueue");
+    }
+
+    #[test]
+    fn track_stopped_display_shows_reason_not_timestamp() {
+        let v = MusicValue::TrackStopped(StopReason::OnSkip);
+        let s = v.to_string();
+        assert_eq!(s, "OnSkip");
+    }
+
+    #[test]
+    fn track_started_fact_value_format() {
+        assert_fact_value_format!(MusicValue::TrackStarted(StartReason::OnRequest));
+    }
+
+    #[test]
+    fn track_stopped_fact_value_format() {
+        assert_fact_value_format!(MusicValue::TrackStopped(StopReason::OnCompletion));
     }
 
     #[test]
@@ -324,5 +468,19 @@ mod tests {
     #[test]
     fn format_fact_serde() {
         assert_fact_value_format!(MusicValue::Format(MusicFormat::Flac));
+    }
+
+    #[test]
+    fn music_value_track_started_legacy_datetime_deserializes() {
+        let legacy = r#"{"t":"TrackStarted","v":"2026-01-15T10:00:00Z"}"#;
+        let v: MusicValue = serde_json::from_str(legacy).unwrap();
+        assert_eq!(v, MusicValue::TrackStarted(StartReason::OnRequest));
+    }
+
+    #[test]
+    fn music_value_track_stopped_legacy_datetime_deserializes() {
+        let legacy = r#"{"t":"TrackStopped","v":"2026-01-15T10:00:00Z"}"#;
+        let v: MusicValue = serde_json::from_str(legacy).unwrap();
+        assert_eq!(v, MusicValue::TrackStopped(StopReason::OnRequest));
     }
 }

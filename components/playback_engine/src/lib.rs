@@ -230,6 +230,20 @@ impl PlaybackEngine {
         }
     }
 
+    /// Returns the current playback position in milliseconds for the given deck,
+    /// or `None` if no track is loaded.
+    pub fn position_ms(&self, deck: Deck) -> Option<u64> {
+        self.find_track(deck)
+            .map(|track| track.read().position_ms())
+    }
+
+    /// Returns the total duration in milliseconds for the track on the given deck,
+    /// or `None` if no track is loaded. Returns `Some(0)` if duration is unknown.
+    pub fn duration_ms(&self, deck: Deck) -> Option<u64> {
+        self.find_track(deck)
+            .map(|track| track.read().duration_ms())
+    }
+
     pub async fn seek(&mut self, deck: Deck, position: usize) -> Result<(), PlaybackError> {
         if let Some(track) = self.find_track(deck) {
             tracing::info!("Seeking deck {:?} to position {}", deck, position);

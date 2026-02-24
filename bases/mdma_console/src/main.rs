@@ -665,6 +665,30 @@ impl TrackInfoJson {
 // Player Handlers
 // =============================================================================
 
+async fn player_session(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let client = match require_gateway(&state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+
+    match client.playback_command(&Command::GetSession) {
+        Ok(resp) => match resp.data {
+            Some(media_protocol::ResponseData::Session(Some(id))) => {
+                Json(serde_json::json!({"session": id})).into_response()
+            }
+            Some(media_protocol::ResponseData::Session(None)) | None => {
+                Json(serde_json::json!({"session": null})).into_response()
+            }
+            _ => Json(serde_json::json!({"session": null})).into_response(),
+        },
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 async fn player_now_playing(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let client = match require_gateway(&state) {
         Ok(c) => c,
@@ -838,9 +862,32 @@ async fn player_stop(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     playback_success_or_error(&client, &Command::Stop { deck: Deck::A })
 }
 
-/// Skip: play the next item in the queue (PlayQueue pops head and starts playing)
-async fn player_skip(state: State<Arc<AppState>>) -> impl IntoResponse {
-    player_play_queue(state).await
+/// Skip: atomically stop the current track and advance to the next in the queue.
+async fn player_skip(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let client = match require_gateway(&state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+
+    playback_success_or_error(&client, &Command::Skip)
+}
+
+async fn player_pause(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let client = match require_gateway(&state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+
+    playback_success_or_error(&client, &Command::Pause { deck: Deck::A })
+}
+
+async fn player_resume(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let client = match require_gateway(&state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+
+    playback_success_or_error(&client, &Command::Resume { deck: Deck::A })
 }
 
 async fn player_events(
@@ -1052,6 +1099,7 @@ async fn main() -> Result<()> {
         .route("/bandcamp/pause", post(bandcamp_pause))
         .route("/bandcamp/resume", post(bandcamp_resume))
         // Player routes
+        .route("/player/session", get(player_session))
         .route("/player/now-playing", get(player_now_playing))
         .route("/player/queue", get(player_queue))
         .route("/player/queue/append", post(player_queue_append))
@@ -1060,6 +1108,8 @@ async fn main() -> Result<()> {
         .route("/player/play-queue", post(player_play_queue))
         .route("/player/stop", post(player_stop))
         .route("/player/skip", post(player_skip))
+        .route("/player/pause", post(player_pause))
+        .route("/player/resume", post(player_resume))
         .route("/player/events", get(player_events))
         // Library search
         .route("/library/search", get(library_search_handler))

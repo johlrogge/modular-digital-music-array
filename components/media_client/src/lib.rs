@@ -58,6 +58,16 @@ impl MediaClient {
         self.send_command(cmd)
     }
 
+    pub fn pause(&self, deck: Deck) -> Result<(), ClientError> {
+        let cmd = Command::Pause { deck };
+        self.send_command(cmd)
+    }
+
+    pub fn resume(&self, deck: Deck) -> Result<(), ClientError> {
+        let cmd = Command::Resume { deck };
+        self.send_command(cmd)
+    }
+
     pub fn set_volume(&self, deck: Deck, db: f32) -> Result<(), ClientError> {
         let cmd = Command::SetVolume { deck, db };
         self.send_command(cmd)
@@ -140,6 +150,20 @@ impl MediaClient {
 
     pub fn play_queue(&self) -> Result<(), ClientError> {
         self.send_command(Command::PlayQueue)
+    }
+
+    pub fn skip(&self) -> Result<(), ClientError> {
+        self.send_command(Command::Skip)
+    }
+
+    pub fn get_session(&self) -> Result<Option<String>, ClientError> {
+        self.send_command_with_response(Command::GetSession, |data| {
+            if let ResponseData::Session(id) = data {
+                Some(id)
+            } else {
+                None
+            }
+        })
     }
 
     fn send_command(&self, cmd: Command) -> Result<(), ClientError> {

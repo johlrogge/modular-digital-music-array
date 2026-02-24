@@ -5,4 +5,4 @@ mod value;
 pub use music_primitives::{Bpm, BpmError, Key, KeyError, Mode, PitchClass};
 pub use primitives::*;
 pub use source::{FactOrigin, FactSource};
-pub use value::{MusicFormat, MusicValue};
+pub use value::{MusicFormat, MusicValue, StartReason, StopReason};

@@ -3,6 +3,23 @@ use std::fmt::Display;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Identifies a playback session — spans from the first track playing to the queue emptying.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SessionId(pub String);
+
+impl SessionId {
+    /// Create a new session ID using the current UTC timestamp in RFC 3339 format.
+    pub fn now() -> Self {
+        Self(chrono::Utc::now().to_rfc3339())
+    }
+}
+
+impl Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// Content hash of audio file — THE cross-service track identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

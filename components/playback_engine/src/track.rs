@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use std::collections::VecDeque;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 use std::sync::Arc;
 
@@ -44,6 +44,10 @@ pub struct Track {
     state: Arc<AtomicU8>,
     command_tx: mpsc::Sender<TrackCommand>,
     decoder_task: Option<tokio::task::JoinHandle<()>>,
+    /// Current playback position in milliseconds (updated by decoder task).
+    position_ms: Arc<AtomicU64>,
+    /// Total track duration in milliseconds (0 if unknown).
+    duration_ms: u64,
 }
 
 pub enum TrackCommand {
@@ -62,6 +66,7 @@ async fn decoder_task<S: Source + Send + Sync + 'static>(
     state: Arc<AtomicU8>,
     source_rate: u32,
     target_rate: u32,
+    position_ms: Arc<AtomicU64>,
 ) {
     let channels = source.audio_channels() as usize;
 
@@ -116,6 +121,17 @@ async fn decoder_task<S: Source + Send + Sync + 'static>(
                         };
                         pending.extend(samples);
                     }
+                    // Update position_ms from the source's current sample position.
+                    // current_position() counts all interleaved samples; divide by channels to get frames.
+                    let channels = source.audio_channels() as u64;
+                    let sample_pos = source.current_position() as u64;
+                    let frames = if channels > 0 {
+                        sample_pos / channels
+                    } else {
+                        sample_pos
+                    };
+                    let ms = frames * 1000 / source_rate as u64;
+                    position_ms.store(ms, Ordering::Relaxed);
                 }
                 Err(e) => {
                     tracing::error!("Decode error: {e}");
@@ -164,6 +180,15 @@ async fn decoder_task<S: Source + Send + Sync + 'static>(
                     }
                     pending.clear();
                     eof = false;
+                    // Update position_ms after seek
+                    let ch = source.audio_channels() as u64;
+                    let frames = if ch > 0 {
+                        position as u64 / ch
+                    } else {
+                        position as u64
+                    };
+                    let ms = frames * 1000 / source_rate as u64;
+                    position_ms.store(ms, Ordering::Relaxed);
                     // Seek resets to Stopped — caller must call play() again if desired
                     state.store(TrackState::Stopped as u8, Ordering::Relaxed);
                     // Reset resampler state by recreating it
@@ -188,10 +213,13 @@ impl Track {
         target_rate: u32,
     ) -> Result<Self, PlaybackError> {
         let state = Arc::new(AtomicU8::new(TrackState::Stopped as u8));
+        let position_ms = Arc::new(AtomicU64::new(0));
+        let duration_ms = source.duration_ms().unwrap_or(0);
 
         let (command_tx, command_rx) = mpsc::channel(32);
 
         let state_clone = state.clone();
+        let position_ms_clone = position_ms.clone();
         let decoder_task = tokio::spawn(async move {
             decoder_task(
                 source,
@@ -200,6 +228,7 @@ impl Track {
                 state_clone,
                 source_rate,
                 target_rate,
+                position_ms_clone,
             )
             .await;
         });
@@ -208,6 +237,8 @@ impl Track {
             state,
             command_tx,
             decoder_task: Some(decoder_task),
+            position_ms,
+            duration_ms,
         })
     }
 
@@ -235,6 +266,16 @@ impl Track {
 
     pub fn is_finished(&self) -> bool {
         TrackState::from_u8(self.state.load(Ordering::Relaxed)) == TrackState::Finished
+    }
+
+    /// Current playback position in milliseconds (from decoder progress).
+    pub fn position_ms(&self) -> u64 {
+        self.position_ms.load(Ordering::Relaxed)
+    }
+
+    /// Total track duration in milliseconds (0 if unknown).
+    pub fn duration_ms(&self) -> u64 {
+        self.duration_ms
     }
 }
 
@@ -467,6 +508,11 @@ impl Source for TestSource {
 
     fn current_position(&self) -> usize {
         self.current_sample_position.load(Ordering::Relaxed)
+    }
+
+    fn duration_ms(&self) -> Option<u64> {
+        // TestSource duration is not meaningful; return None
+        None
     }
 }
 

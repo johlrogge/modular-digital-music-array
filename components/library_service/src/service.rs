@@ -209,8 +209,12 @@ impl LibraryService {
                 MusicValue::Key(v) => entry.key = Some(v.to_string()),
                 MusicValue::Year(v) => entry.year = Some(v.0),
                 MusicValue::Source(v) => entry.source = Some(v.clone()),
-                MusicValue::TrackStarted(ts) => update_if_more_recent(&mut entry.last_started, *ts),
-                MusicValue::TrackStopped(ts) => update_if_more_recent(&mut entry.last_stopped, *ts),
+                MusicValue::TrackStarted(_) => {
+                    update_if_more_recent(&mut entry.last_started, *fact.timestamp());
+                }
+                MusicValue::TrackStopped(_) => {
+                    update_if_more_recent(&mut entry.last_stopped, *fact.timestamp());
+                }
                 MusicValue::FilePath(p) => {
                     // Reconstruct blob path from the stored file path extension
                     let hash = entry.content_hash.0.as_str();
@@ -607,11 +611,17 @@ impl LibraryService {
 
             let entity = fact.entity().0.clone();
             match fact.value() {
-                MusicValue::TrackStarted(ts) => {
-                    update_if_more_recent(last_started.entry(entity).or_insert(None), *ts);
+                MusicValue::TrackStarted(_) => {
+                    update_if_more_recent(
+                        last_started.entry(entity).or_insert(None),
+                        *fact.timestamp(),
+                    );
                 }
-                MusicValue::TrackStopped(ts) => {
-                    update_if_more_recent(last_stopped.entry(entity).or_insert(None), *ts);
+                MusicValue::TrackStopped(_) => {
+                    update_if_more_recent(
+                        last_stopped.entry(entity).or_insert(None),
+                        *fact.timestamp(),
+                    );
                 }
                 _ => {}
             }
@@ -961,7 +971,10 @@ mod tests {
     use super::*;
     use crate::fact_writer::FactWriter;
     use chrono::{TimeZone, Utc};
-    use music_facts::{ContentHash, FactOrigin, FactSource, MusicValue, Title};
+    use music_facts::{
+        ContentHash, FactOrigin, FactSource, MusicValue, StartReason, StopReason, Title,
+    };
+    use stainless_facts::{Fact, FactStreamWriter, Operation};
     use tempfile::NamedTempFile;
 
     fn write_facts_file(facts: &[(ContentHash, MusicValue)]) -> NamedTempFile {
@@ -978,14 +991,47 @@ mod tests {
         temp
     }
 
+    /// Write facts with explicit timestamps for testing ordering logic.
+    fn write_facts_file_with_timestamps(
+        facts: &[(ContentHash, MusicValue, chrono::DateTime<Utc>)],
+    ) -> NamedTempFile {
+        let temp = NamedTempFile::new().unwrap();
+        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let mut writer = FactStreamWriter::open(temp.path()).unwrap();
+
+        let fact_structs: Vec<Fact<ContentHash, MusicValue, FactSource>> = facts
+            .iter()
+            .map(|(hash, value, ts)| {
+                Fact::new(
+                    hash.clone(),
+                    value.clone(),
+                    *ts,
+                    source.clone(),
+                    Operation::Assert,
+                )
+            })
+            .collect();
+        writer.write_batch(&fact_structs).unwrap();
+        temp
+    }
+
     #[test]
     fn load_tracks_aggregates_played_timestamp() {
         let hash = ContentHash("sha256:aabbcc".to_string());
         let ts = Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
 
-        let temp = write_facts_file(&[
-            (hash.clone(), MusicValue::Title(Title::new("Test Track"))),
-            (hash.clone(), MusicValue::TrackStarted(ts)),
+        // TrackStarted now carries a StartReason; the fact timestamp is used for last_started
+        let temp = write_facts_file_with_timestamps(&[
+            (
+                hash.clone(),
+                MusicValue::Title(Title::new("Test Track")),
+                ts,
+            ),
+            (
+                hash.clone(),
+                MusicValue::TrackStarted(StartReason::OnRequest),
+                ts,
+            ),
         ]);
 
         let result = LibraryService::load_tracks_from_facts(&temp.path().to_path_buf());
@@ -995,7 +1041,7 @@ mod tests {
         assert_eq!(
             track.last_started,
             Some(ts),
-            "last_started should be set from TrackStarted fact"
+            "last_started should be set from TrackStarted fact timestamp"
         );
         assert_eq!(track.last_stopped, None);
     }
@@ -1005,9 +1051,14 @@ mod tests {
         let hash = ContentHash("sha256:ddeeff".to_string());
         let ts = Utc.with_ymd_and_hms(2026, 2, 1, 8, 30, 0).unwrap();
 
-        let temp = write_facts_file(&[
-            (hash.clone(), MusicValue::Title(Title::new("Skip Me"))),
-            (hash.clone(), MusicValue::TrackStopped(ts)),
+        // TrackStopped now carries a StopReason; the fact timestamp is used for last_stopped
+        let temp = write_facts_file_with_timestamps(&[
+            (hash.clone(), MusicValue::Title(Title::new("Skip Me")), ts),
+            (
+                hash.clone(),
+                MusicValue::TrackStopped(StopReason::OnSkip),
+                ts,
+            ),
         ]);
 
         let result = LibraryService::load_tracks_from_facts(&temp.path().to_path_buf());
@@ -1016,7 +1067,7 @@ mod tests {
         assert_eq!(
             track.last_stopped,
             Some(ts),
-            "last_stopped should be set from TrackStopped fact"
+            "last_stopped should be set from TrackStopped fact timestamp"
         );
         assert_eq!(track.last_started, None);
     }
@@ -1027,10 +1078,23 @@ mod tests {
         let older = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
         let newer = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
 
-        let temp = write_facts_file(&[
-            (hash.clone(), MusicValue::Title(Title::new("Two Plays"))),
-            (hash.clone(), MusicValue::TrackStarted(older)),
-            (hash.clone(), MusicValue::TrackStarted(newer)),
+        // Write two TrackStarted facts with different fact-level timestamps
+        let temp = write_facts_file_with_timestamps(&[
+            (
+                hash.clone(),
+                MusicValue::Title(Title::new("Two Plays")),
+                older,
+            ),
+            (
+                hash.clone(),
+                MusicValue::TrackStarted(StartReason::OnRequest),
+                older,
+            ),
+            (
+                hash.clone(),
+                MusicValue::TrackStarted(StartReason::ByQueue),
+                newer,
+            ),
         ]);
 
         let result = LibraryService::load_tracks_from_facts(&temp.path().to_path_buf());
@@ -1039,7 +1103,7 @@ mod tests {
         assert_eq!(
             track.last_started,
             Some(newer),
-            "should keep the most recent TrackStarted timestamp"
+            "should keep the most recent TrackStarted fact timestamp"
         );
     }
 
@@ -1050,9 +1114,17 @@ mod tests {
         let hash = ContentHash("sha256:445566".to_string());
         let ts = Utc.with_ymd_and_hms(2026, 1, 10, 0, 0, 0).unwrap();
 
-        let temp = write_facts_file(&[
-            (hash.clone(), MusicValue::Title(Title::new("Played Track"))),
-            (hash.clone(), MusicValue::TrackStarted(ts)),
+        let temp = write_facts_file_with_timestamps(&[
+            (
+                hash.clone(),
+                MusicValue::Title(Title::new("Played Track")),
+                ts,
+            ),
+            (
+                hash.clone(),
+                MusicValue::TrackStarted(StartReason::OnRequest),
+                ts,
+            ),
         ]);
 
         // Build a minimal LibraryService pointing at temp facts
@@ -1115,7 +1187,6 @@ mod tests {
         assert_eq!(before.len(), 1, "track should appear before play event");
 
         // Simulate playback service appending a TrackStarted fact after startup
-        let ts = Utc.with_ymd_and_hms(2026, 2, 20, 12, 0, 0).unwrap();
         let source = music_facts::FactSource::new(
             "test-playback",
             "1.0.0",
@@ -1123,7 +1194,10 @@ mod tests {
         );
         let mut writer = FactWriter::open(&facts_dest).unwrap();
         writer
-            .write_track_facts(&hash, &[(MusicValue::TrackStarted(ts), source)])
+            .write_track_facts(
+                &hash,
+                &[(MusicValue::TrackStarted(StartReason::OnRequest), source)],
+            )
             .unwrap();
         drop(writer);
 
