@@ -107,6 +107,12 @@ pub fn transcode_with_metadata(
     // Inject metadata tags
     metadata::inject_metadata(path, &params.format, meta)?;
 
+    // DJ software (Rekordbox, CDJs, Serato) expects the ID3 chunk before SSND.
+    // Lofty appends ID3 after SSND, so reorder the chunks here.
+    if matches!(params.format, ExportFormat::Aiff) {
+        aiff::reorder_aiff_chunks(path)?;
+    }
+
     Ok(())
 }
 
