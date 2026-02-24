@@ -807,6 +807,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 [[package]]
 name = "corsett"
 version = "0.1.0"
+source = "git+https://github.com/johlrogge/corsett.git#bf16c1aa2e8d6ba1f833e33009f2deecadc3ee26"
 
 [[package]]
 name = "cpufeatures"
@@ -2513,6 +2514,7 @@ dependencies = [
  "nng",
  "parking_lot",
  "playback-engine",
+ "playback-primitives",
  "serde",
  "serde_json",
  "stainless-facts",
@@ -3086,6 +3088,7 @@ name = "playback-primitives"
 version = "0.1.0"
 dependencies = [
  "assert_matches",
+ "chrono",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

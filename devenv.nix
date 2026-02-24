@@ -26,6 +26,7 @@
     # Network tools
     nmap
     sshpass
+    gh
   ];
 
   # Rust language support
