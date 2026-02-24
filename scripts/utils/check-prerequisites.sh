@@ -36,23 +36,37 @@ else
     echo "✅ xbps-rindex installed"
 fi
 
-# Check for cross-compilation target
-if ! rustup target list | grep -q "aarch64-unknown-linux-gnu (installed)"; then
-    echo "❌ Rust ARM64 target not installed"
-    MISSING+=("rust-target")
-else
-    echo "✅ Rust ARM64 target installed"
+# Check ARM64 target availability
+TARGET_FOUND=false
+
+# First try rustup (if available and managing targets)
+if command -v rustup &> /dev/null; then
+    if rustup target list 2>/dev/null | grep -q "aarch64-unknown-linux-gnu (installed)"; then
+        echo "✅ Rust ARM64 target installed (rustup)"
+        TARGET_FOUND=true
+    fi
 fi
 
-# Check for cross-compiler (optional but recommended)
-if command -v aarch64-linux-gnu-gcc &> /dev/null; then
-    echo "✅ aarch64-linux-gnu-gcc installed"
-elif command -v cross &> /dev/null; then
-    echo "✅ cross (Docker-based) installed"
+# Fallback: check rustc directly (Nix-managed Rust)
+if [ "$TARGET_FOUND" = false ] && command -v rustc &> /dev/null; then
+    if rustc --print target-list 2>/dev/null | grep -q "aarch64-unknown-linux-gnu"; then
+        echo "✅ Rust ARM64 target available (Nix-managed)"
+        TARGET_FOUND=true
+    fi
+fi
+
+if [ "$TARGET_FOUND" = false ]; then
+    echo "❌ Rust ARM64 target not installed"
+    MISSING+=("rust-target")
+fi
+
+# Check for cross-compiler (cargo-zigbuild preferred, gcc as fallback)
+if command -v cargo-zigbuild &> /dev/null; then
+    echo "✅ Cross-compilation via cargo-zigbuild"
+elif command -v aarch64-linux-gnu-gcc &> /dev/null; then
+    echo "✅ Cross-compiler available (aarch64-linux-gnu-gcc)"
 else
-    echo "⚠️  No ARM64 cross-compiler found (optional)"
-    echo "   For native builds: install aarch64-linux-gnu-gcc"
-    echo "   For Docker builds: cargo install cross"
+    MISSING+=("cross-compiler")
 fi
 
 # ============================================================================
@@ -103,6 +117,12 @@ if [ ${#MISSING[@]} -ne 0 ]; then
             rust-target)
                 echo "  # Install Rust ARM64 target"
                 echo "  rustup target add aarch64-unknown-linux-gnu"
+                echo ""
+                ;;
+            cross-compiler)
+                echo "  # Install a cross-compiler (choose one)"
+                echo "  cargo install cargo-zigbuild   # recommended"
+                echo "  # or: install aarch64-linux-gnu-gcc via your package manager"
                 echo ""
                 ;;
             libguestfs)

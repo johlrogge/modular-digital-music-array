@@ -31,72 +31,57 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
-    
+
     # Add environment for GitHub Pages deployment
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    
+
     steps:
     - uses: actions/checkout@v4
-    
-    - name: Install system dependencies
-      run: |
-        # Remove broken Microsoft repos from GitHub runner
-        sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/azure-cli.list || true
-        sudo apt-get update
-        sudo apt-get install -y gcc-aarch64-linux-gnu wget
-    
-    - name: Install xbps tools
-      run: |
-        echo "Downloading xbps static binaries..."
-        wget -q https://repo-default.voidlinux.org/static/xbps-static-latest.x86_64-musl.tar.xz
-        
-        echo "Extracting to /usr/local..."
-        sudo tar -xf xbps-static-latest.x86_64-musl.tar.xz -C /usr/local --strip-components=2
-        
-        echo "Making binaries executable..."
-        sudo chmod +x /usr/local/bin/xbps*
-        
-        echo "Verifying installation:"
-        xbps-rindex --version
-    
-    - name: Install Rust with ARM64 target
-      uses: dtolnay/rust-toolchain@stable
+
+    - uses: cachix/install-nix-action@v31
+    - uses: cachix/cachix-action@v16
       with:
-        targets: aarch64-unknown-linux-gnu
-    
-    - name: Install just
-      uses: extractions/setup-just@v2
-    
-    - name: Verify all prerequisites
-      run: |
-        echo "Checking all tools:"
-        just --version
-        xbps-rindex --version
-        aarch64-linux-gnu-gcc --version | head -1
-    
+        name: devenv
+    - run: nix profile install nixpkgs#devenv
+
+    - name: Setup cross-compilation sysroot
+      run: devenv shell -- ./scripts/ci/setup-cross-sysroot.sh
+
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: cargo-aarch64-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: cargo-aarch64-
+
+    - uses: actions/cache@v4
+      with:
+        path: .cross/aarch64-sysroot
+        key: sysroot-${{ hashFiles('scripts/ci/setup-cross-sysroot.sh') }}
+
     - name: Build packages
-      env:
-        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
       run: |
-        just pkg-build-all
-    
+        devenv shell -- just pkg-build-all
+
     - name: Setup signing key
       env:
         SIGNING_KEY: ${{ secrets.XBPS_SIGNING_KEY }}
       run: |
         if [ -n "$SIGNING_KEY" ]; then
           echo "Setting up RSA signing key for xbps-rindex..."
-          
+
           # Create .ssh directory
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          
+
           # Write private key
           echo "$SIGNING_KEY" > ~/.ssh/mdma-signing-key.pem
           chmod 600 ~/.ssh/mdma-signing-key.pem
-          
+
           echo "✅ Signing key configured"
           echo "HAS_SIGNING_KEY=true" >> $GITHUB_ENV
         else
@@ -104,61 +89,63 @@ jobs:
           echo "⚠️  Packages will not be signed (insecure)"
           echo "HAS_SIGNING_KEY=false" >> $GITHUB_ENV
         fi
-    
+
     - name: Sign packages
       if: env.HAS_SIGNING_KEY == 'true'
       run: |
-        cd build/repository
-        
-        REPOSITORY_DIR="$(pwd)/aarch64"
-        
-        echo "Repository directory: ${REPOSITORY_DIR}"
-        echo ""
-        
-        echo "Creating repository index..."
-        XBPS_TARGET_ARCH=aarch64 xbps-rindex -a ${REPOSITORY_DIR}/*.xbps
-        
-        echo ""
-        echo "Signing repository (embeds public key in metadata)..."
-        XBPS_TARGET_ARCH=aarch64 xbps-rindex --sign \
-          --signedby "MDMA Package Signing" \
-          --privkey ~/.ssh/mdma-signing-key.pem \
-          ${REPOSITORY_DIR}
-        
-        echo ""
-        echo "Signing individual packages..."
-        for pkg in ${REPOSITORY_DIR}/*.xbps; do
-          echo "  Signing $(basename $pkg)..."
-          XBPS_TARGET_ARCH=aarch64 xbps-rindex --privkey ~/.ssh/mdma-signing-key.pem --sign-pkg ${pkg}
-        done
-        
-        echo ""
-        echo "Verifying signatures created:"
-        ls -lh ${REPOSITORY_DIR}/*.sig2
-        
-        echo ""
-        echo "Repository metadata (contains public key):"
-        ls -lh ${REPOSITORY_DIR}/*-repodata
-    
+        devenv shell -- bash -c '
+          cd build/repository
+
+          REPOSITORY_DIR="$(pwd)/aarch64"
+
+          echo "Repository directory: ${REPOSITORY_DIR}"
+          echo ""
+
+          echo "Creating repository index..."
+          XBPS_TARGET_ARCH=aarch64 xbps-rindex -a ${REPOSITORY_DIR}/*.xbps
+
+          echo ""
+          echo "Signing repository (embeds public key in metadata)..."
+          XBPS_TARGET_ARCH=aarch64 xbps-rindex --sign \
+            --signedby "MDMA Package Signing" \
+            --privkey ~/.ssh/mdma-signing-key.pem \
+            ${REPOSITORY_DIR}
+
+          echo ""
+          echo "Signing individual packages..."
+          for pkg in ${REPOSITORY_DIR}/*.xbps; do
+            echo "  Signing $(basename $pkg)..."
+            XBPS_TARGET_ARCH=aarch64 xbps-rindex --privkey ~/.ssh/mdma-signing-key.pem --sign-pkg ${pkg}
+          done
+
+          echo ""
+          echo "Verifying signatures created:"
+          ls -lh ${REPOSITORY_DIR}/*.sig2
+
+          echo ""
+          echo "Repository metadata (contains public key):"
+          ls -lh ${REPOSITORY_DIR}/*-repodata
+        '
+
     - name: Verify repository
       run: |
         echo "Repository contents:"
         find build/repository -type f
-        
+
         echo ""
         echo "Package index:"
         ls -lh build/repository/aarch64/aarch64-repodata
-    
+
     - name: Setup Pages
       if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
       uses: actions/configure-pages@v4
-    
+
     - name: Upload artifact
       if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
       uses: actions/upload-pages-artifact@v3
       with:
         path: ./build/repository
-    
+
     - name: Deploy to GitHub Pages
       if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
       id: deployment

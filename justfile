@@ -43,25 +43,7 @@ beacon-native:
     @file target/aarch64-unknown-linux-gnu/release/beacon
     @ls -lh target/aarch64-unknown-linux-gnu/release/beacon
 
-# Strip beacon binary for production
-[group('build')]
-beacon-strip:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    BEACON="target/aarch64-unknown-linux-gnu/release/beacon"
-    if [ ! -f "$BEACON" ]; then
-        echo "❌ Beacon not built yet. Run 'just beacon-cross' first"
-        exit 1
-    fi
-    SIZE_BEFORE=$(stat -c%s "$BEACON" 2>/dev/null || stat -f%z "$BEACON")
-    aarch64-linux-gnu-strip "$BEACON" || strip "$BEACON"
-    SIZE_AFTER=$(stat -c%s "$BEACON" 2>/dev/null || stat -f%z "$BEACON")
-    echo "Beacon stripped:"
-    echo "  Before: $(numfmt --to=iec-i $SIZE_BEFORE 2>/dev/null || echo $SIZE_BEFORE bytes)"
-    echo "  After:  $(numfmt --to=iec-i $SIZE_AFTER 2>/dev/null || echo $SIZE_AFTER bytes)"
-    ls -lh "$BEACON"
-
-# Check beacon dependencies for cross-compilation compatibility  
+# Check beacon dependencies for cross-compilation compatibility
 [group('build')]
 beacon-deps:
     cargo tree --target aarch64-unknown-linux-gnu --package mdma-beacon
@@ -190,11 +172,6 @@ deploy-dev: beacon-cross
 ci-build-beacon:
     ./scripts/ci/build-beacon.sh
 
-# Strip beacon for CI/CD deployment
-[group('ci')]
-ci-strip-beacon:
-    ./scripts/ci/strip-beacon.sh
-
 # Package beacon into deployable archive (legacy tar.gz format)
 [group('ci')]
 ci-package-beacon:
@@ -203,18 +180,18 @@ ci-package-beacon:
     echo "📦 Packaging beacon..."
     TIMESTAMP=$(date +%Y%m%d-%H%M%S)
     PACKAGE_NAME="mdma-beacon-${TIMESTAMP}.tar.gz"
-    
+
     mkdir -p dist
     tar -czf "dist/${PACKAGE_NAME}" \
         -C target/aarch64-unknown-linux-gnu/release \
         beacon
-    
+
     echo "✅ Packaged: dist/${PACKAGE_NAME}"
     ls -lh "dist/${PACKAGE_NAME}"
 
 # Full CI pipeline (build + strip + package) - legacy tar.gz
 [group('ci')]
-ci-pipeline: ci-build-beacon ci-strip-beacon ci-package-beacon
+ci-pipeline: ci-build-beacon ci-package-beacon
     @echo ""
     @echo "✅ CI Pipeline Complete!"
     @echo "   Beacon is ready for deployment"
@@ -230,20 +207,20 @@ ci-test-beacon:
         echo "❌ Beacon not built. Run 'just ci-build-beacon' first"
         exit 1
     fi
-    
+
     # Can't actually run ARM binary on x86, but we can check it's valid
     echo "Checking binary format..."
     file "$BEACON" | grep -q "ARM aarch64" || {
         echo "❌ Not an ARM64 binary!"
         exit 1
     }
-    
+
     echo "Checking binary is executable..."
     test -x "$BEACON" || {
         echo "❌ Not executable!"
         exit 1
     }
-    
+
     echo "✅ Beacon binary looks good (ARM64, executable)"
 
 # Clean CI artifacts
@@ -273,7 +250,7 @@ ci-check-deps:
     #!/usr/bin/env bash
     set -euo pipefail
     echo "🔍 Checking for local path dependencies..."
-    
+
     FOUND_PATHS=0
     for file in $(find . -name "Cargo.toml" -not -path "./target/*"); do
         if grep -E '^\s*path\s*=\s*"' "$file" | grep -v "workspace = true" > /dev/null 2>&1; then
@@ -289,7 +266,7 @@ ci-check-deps:
         echo '  stainless-facts = { git = "https://github.com/johlrogge/stainless_facts" }'
         exit 1
     fi
-    
+
     echo "✅ No local path dependencies found"
 
 # ============================================================================
@@ -298,7 +275,7 @@ ci-check-deps:
 
 # Build beacon Void package
 [group('package')]
-pkg-beacon: ci-build-beacon ci-strip-beacon
+pkg-beacon: ci-build-beacon
     ./scripts/package/create-package.sh
 
 # Build mdma-library for CI
@@ -329,61 +306,26 @@ ci-build-bandcamp:
 # Build mdma-library Void package
 [group('package')]
 pkg-library: ci-build-library
-    #!/usr/bin/env bash
-    set -euo pipefail
-    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-library"
-    if [ -f "$BINARY" ]; then
-        echo "Stripping mdma-library..."
-        aarch64-linux-gnu-strip "$BINARY" 2>/dev/null || strip "$BINARY" 2>/dev/null || true
-    fi
     ./scripts/package/create-library-package.sh
 
 # Build mdma-console Void package
 [group('package')]
 pkg-console: ci-build-console
-    #!/usr/bin/env bash
-    set -euo pipefail
-    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-console"
-    if [ -f "$BINARY" ]; then
-        echo "Stripping mdma-console..."
-        aarch64-linux-gnu-strip "$BINARY" 2>/dev/null || strip "$BINARY" 2>/dev/null || true
-    fi
     ./scripts/package/create-console-package.sh
 
 # Build mdma-playback Void package
 [group('package')]
 pkg-playback: ci-build-playback
-    #!/usr/bin/env bash
-    set -euo pipefail
-    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-playback"
-    if [ -f "$BINARY" ]; then
-        echo "Stripping mdma-playback..."
-        aarch64-linux-gnu-strip "$BINARY" 2>/dev/null || strip "$BINARY" 2>/dev/null || true
-    fi
     ./scripts/package/create-playback-package.sh
 
 # Build mdma-gateway Void package
 [group('package')]
 pkg-gateway: ci-build-gateway
-    #!/usr/bin/env bash
-    set -euo pipefail
-    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-gateway"
-    if [ -f "$BINARY" ]; then
-        echo "Stripping mdma-gateway..."
-        aarch64-linux-gnu-strip "$BINARY" 2>/dev/null || strip "$BINARY" 2>/dev/null || true
-    fi
     ./scripts/package/create-gateway-package.sh
 
 # Build mdma-bandcamp Void package
 [group('package')]
 pkg-bandcamp: ci-build-bandcamp
-    #!/usr/bin/env bash
-    set -euo pipefail
-    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-bandcamp"
-    if [ -f "$BINARY" ]; then
-        echo "Stripping mdma-bandcamp..."
-        aarch64-linux-gnu-strip "$BINARY" 2>/dev/null || strip "$BINARY" 2>/dev/null || true
-    fi
     ./scripts/package/create-bandcamp-package.sh
 
 # Create repository structure and index (all packages)
@@ -492,31 +434,31 @@ create-image: check-prereqs-image pkg-build-all
 pi-scan:
     #!/usr/bin/env bash
     set -euo pipefail
-    
+
     echo "🔍 Scanning for Raspberry Pi devices on network..."
     echo ""
-    
+
     # Get local network range
     NETWORK=$(ip route | grep default | awk '{print $3}' | cut -d. -f1-3)
-    
+
     if [ -z "$NETWORK" ]; then
         echo "❌ Could not detect network range"
         exit 1
     fi
-    
+
     echo "Network: $NETWORK.0/24"
     echo ""
-    
+
     # Check if nmap is installed
     if ! command -v nmap &> /dev/null; then
         echo "❌ nmap not found. Install it with:"
         echo "   sudo pacman -S nmap"
         exit 1
     fi
-    
+
     echo "Scanning... (this takes ~30 seconds)"
     echo ""
-    
+
     # Scan for devices and filter for Raspberry Pi
     sudo nmap -sn $NETWORK.0/24 | grep -B 2 "Raspberry\|DC:A6:32\|B8:27:EB\|E4:5F:01" || {
         echo "❌ No Raspberry Pi devices found"
@@ -527,7 +469,7 @@ pi-scan:
         echo "  - Pi has had 60 seconds to boot"
         exit 1
     }
-    
+
     echo ""
     echo "💡 To connect:"
     echo "   ssh root@<IP>"
@@ -537,17 +479,17 @@ pi-scan:
 pi-scan-quick:
     #!/usr/bin/env bash
     set -euo pipefail
-    
+
     echo "🔍 Quick network scan..."
     echo ""
-    
+
     NETWORK=$(ip route | grep default | awk '{print $3}' | cut -d. -f1-3)
-    
+
     if [ -z "$NETWORK" ]; then
         echo "❌ Could not detect network range"
         exit 1
     fi
-    
+
     # Use arp-scan if available (faster)
     if command -v arp-scan &> /dev/null; then
         sudo arp-scan --localnet | grep -i "raspberry\|b8:27:eb\|dc:a6:32\|e4:5f:01" || {
@@ -574,56 +516,56 @@ pi-ssh-beacon:
 pi-connect:
     #!/usr/bin/env bash
     set -euo pipefail
-    
+
     echo "🔍 Finding Raspberry Pi..."
-    
+
     NETWORK=$(ip route | grep default | awk '{print $3}' | cut -d. -f1-3)
-    
+
     if ! command -v nmap &> /dev/null; then
         echo "❌ nmap not found. Install: sudo pacman -S nmap"
         exit 1
     fi
-    
+
     # Scan and extract IP
     PI_IP=$(sudo nmap -sn $NETWORK.0/24 | grep -B 2 "Raspberry\|DC:A6:32\|B8:27:EB\|E4:5F:01" | grep "Nmap scan report" | head -1 | awk '{print $5}')
-    
+
     if [ -z "$PI_IP" ]; then
         echo "❌ No Raspberry Pi found"
         exit 1
     fi
-    
+
     echo "✅ Found Pi at: $PI_IP"
     echo ""
     echo "Connecting... (password: voidlinux)"
     echo ""
-    
+
     ssh root@$PI_IP
 
 # Check if specific IP is a Raspberry Pi
 pi-check IP:
     #!/usr/bin/env bash
     set -euo pipefail
-    
+
     echo "🔍 Checking {{IP}}..."
     echo ""
-    
+
     if ! command -v nmap &> /dev/null; then
         echo "❌ nmap not found. Install: sudo pacman -S nmap"
         exit 1
     fi
-    
+
     # Check if host is up
     if ! ping -c 1 -W 1 {{IP}} &> /dev/null; then
         echo "❌ Host {{IP}} is not responding"
         exit 1
     fi
-    
+
     echo "Host is up, checking details..."
     echo ""
-    
+
     # Get MAC and manufacturer
     sudo nmap -sn {{IP}} | grep -A 1 "{{IP}}"
-    
+
     echo ""
     echo "💡 To connect:"
     echo "   ssh root@{{IP}}"
@@ -657,25 +599,25 @@ pi-scan-help:
 pi-wait:
     #!/usr/bin/env bash
     set -euo pipefail
-    
+
     echo "⏳ Waiting for Raspberry Pi to appear on network..."
     echo "   (Press Ctrl+C to stop)"
     echo ""
-    
+
     NETWORK=$(ip route | grep default | awk '{print $3}' | cut -d. -f1-3)
-    
+
     if ! command -v nmap &> /dev/null; then
         echo "❌ nmap not found. Install: sudo pacman -S nmap"
         exit 1
     fi
-    
+
     COUNT=0
     while true; do
         COUNT=$((COUNT + 1))
         echo "Scan #$COUNT..."
-        
+
         PI_IP=$(sudo nmap -sn $NETWORK.0/24 | grep -B 2 "Raspberry\|DC:A6:32\|B8:27:EB\|E4:5F:01" | grep "Nmap scan report" | head -1 | awk '{print $5}' || true)
-        
+
         if [ -n "$PI_IP" ]; then
             echo ""
             echo "✅ Found Pi at: $PI_IP"
@@ -685,7 +627,7 @@ pi-wait:
             echo "   Password: voidlinux"
             break
         fi
-        
+
         sleep 5
     done
 
@@ -710,37 +652,37 @@ golden-ssh PI_IP:
 golden-create-image DEVICE:
     #!/usr/bin/env bash
     set -euo pipefail
-    
+
     # Verify device exists
     if [ ! -b "{{DEVICE}}" ]; then
         echo "❌ Device {{DEVICE}} not found"
         echo "   Use: lsblk to find your SD card"
         exit 1
     fi
-    
+
     # Safety check
     echo "⚠️  About to read entire device {{DEVICE}}"
     echo "   This will create an image of the SD card"
     read -p "Continue? (yes/no): " confirm
-    
+
     if [ "$confirm" != "yes" ]; then
         echo "Aborted"
         exit 1
     fi
-    
+
     TIMESTAMP=$(date +%Y%m%d-%H%M%S)
     OUTPUT_DIR=~/mdma-images/golden
     mkdir -p "$OUTPUT_DIR"
-    
+
     IMAGE_FILE="$OUTPUT_DIR/mdma-beacon-golden-$TIMESTAMP.img"
-    
+
     echo ""
     echo "📀 Reading SD card..."
     sudo dd if={{DEVICE}} of="$IMAGE_FILE" bs=4M status=progress conv=fsync
-    
+
     # Fix ownership so compression works
     sudo chown $(whoami):$(whoami) "$IMAGE_FILE"
-    
+
     # Check if PiShrink is available
     PISHRINK=""
     if [ -f ~/mdma-images/pishrink.sh ]; then
@@ -748,7 +690,7 @@ golden-create-image DEVICE:
     elif command -v pishrink.sh &> /dev/null; then
         PISHRINK=pishrink.sh
     fi
-    
+
     if [ -n "$PISHRINK" ]; then
         echo ""
         echo "🔧 Shrinking image with PiShrink..."
@@ -770,24 +712,24 @@ golden-create-image DEVICE:
             exit 1
         fi
     fi
-    
+
     echo ""
     echo "🗜️  Compressing image..."
     xz -9 -T0 "$IMAGE_FILE"
-    
+
     echo ""
     echo "✅ Golden image created!"
     echo "   Location: $IMAGE_FILE.xz"
-    
+
     SIZE=$(du -h "$IMAGE_FILE.xz" | cut -f1)
     echo "   Compressed size: $SIZE"
-    
+
     if [ -n "$PISHRINK" ]; then
         echo "   Extracted size: ~3-4GB (shrunk)"
     else
         echo "   Extracted size: ~32GB (not shrunk)"
     fi
-    
+
     echo ""
     echo "🎯 To flash this image:"
     echo "   xz -dc $IMAGE_FILE.xz | sudo dd of=/dev/sdX bs=4M status=progress"

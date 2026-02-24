@@ -27,6 +27,8 @@
     nmap
     sshpass
     gh
+
+    xbps              # Void Linux package tools (xbps-create, xbps-rindex)
   ];
 
   # Rust language support
@@ -106,10 +108,13 @@
     echo ""
 
     # Build mdma-cli and expose it directly as `mdma` on PATH
-    cargo build -q --package mdma-cli 2>/dev/null \
-      && export PATH="$MDMA_PROJECT_ROOT/target/debug:$PATH" \
-      && echo "mdma CLI ready (gateway mode)" \
-      || echo "mdma CLI not built — run: cargo build --package mdma-cli"
+    # Skip in CI — the build is wasted work there (~30s)
+    if [ -z "''${CI:-}" ]; then
+      cargo build -q --package mdma-cli 2>/dev/null \
+        && export PATH="$MDMA_PROJECT_ROOT/target/debug:$PATH" \
+        && echo "mdma CLI ready (gateway mode)" \
+        || echo "mdma CLI not built — run: cargo build --package mdma-cli"
+    fi
 
     echo ""
     echo "Commands:  mdma --help"

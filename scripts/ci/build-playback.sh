@@ -25,7 +25,8 @@ export PKG_CONFIG_ALLOW_CROSS=1
 export BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu="--sysroot=$SYSROOT -I$SYSROOT/usr/include/pipewire-0.3 -I$SYSROOT/usr/include/spa-0.2"
 
 # Nix-provided zig bakes in a build-time cache path that doesn't exist at runtime
-export ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache"
+export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
 
 # Target glibc 2.38 to match Void Linux's PipeWire build
 if command -v cargo-zigbuild &> /dev/null; then

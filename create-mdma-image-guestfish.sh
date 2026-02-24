@@ -70,7 +70,7 @@ if [ ! -f "$BEACON_BINARY" ]; then
     echo "Expected: $BEACON_BINARY"
     echo ""
     echo "Build it:"
-    echo "  just beacon-native && just beacon-strip"
+    echo "  just beacon-cross"
     exit 1
 fi
 
