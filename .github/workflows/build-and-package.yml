@@ -64,7 +64,7 @@ jobs:
         key: sysroot-${{ hashFiles('scripts/ci/setup-cross-sysroot.sh') }}
 
     - name: Run tests
-      run: devenv shell -- cargo test
+      run: devenv shell -- bash -c 'cargo build && cargo test'
 
     - name: Build packages
       run: |
