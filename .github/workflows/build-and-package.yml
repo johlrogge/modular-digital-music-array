@@ -63,6 +63,9 @@ jobs:
         path: .cross/aarch64-sysroot
         key: sysroot-${{ hashFiles('scripts/ci/setup-cross-sysroot.sh') }}
 
+    - name: Run tests
+      run: devenv shell -- cargo test
+
     - name: Build packages
       run: |
         devenv shell -- just pkg-build-all
