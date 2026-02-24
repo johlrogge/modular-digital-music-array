@@ -15,6 +15,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Install cmake
+      run: brew install cmake
+    - name: Build mdma_cli for Apple Silicon
+      run: cargo build --release -p mdma-cli
+    - uses: actions/upload-artifact@v4
+      with:
+        name: mdma-cli-macos-arm64
+        path: target/release/mdma
+
   build:
     runs-on: ubuntu-latest
     
