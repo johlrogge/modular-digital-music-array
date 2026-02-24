@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use lofty::{Accessor, AudioFile, ItemKey, ItemValue, Probe, Tag, TagItem, TagType, TaggedFileExt};
+use lofty::{
+    Accessor, AudioFile, ItemKey, ItemValue, MimeType, Picture, Probe, Tag, TagItem, TagType,
+    TaggedFileExt,
+};
 
 use crate::{ExportFormat, TrackMetadata, TranscoderError};
 
@@ -49,6 +52,13 @@ pub fn inject_metadata(
         let _ = tag.insert(TagItem::new(key_item_key, key_value));
     }
 
+    for pic in &meta.pictures {
+        let mime = MimeType::from_str(&pic.mime_type);
+        let lofty_pic_type = pic.picture_type.to_lofty();
+        let picture = Picture::new_unchecked(lofty_pic_type, Some(mime), None, pic.data.clone());
+        tag.push_picture(picture);
+    }
+
     tagged_file.save_to_path(path)?;
     Ok(())
 }
@@ -64,7 +74,10 @@ fn tag_type_for_format(format: &ExportFormat) -> TagType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{transcode_with_metadata, BitDepth, ExportFormat, TrackMetadata, TranscodeParams};
+    use crate::{
+        transcode_with_metadata, BitDepth, ExportFormat, PictureData, PictureType, TrackMetadata,
+        TranscodeParams,
+    };
     use tempfile::NamedTempFile;
 
     fn make_wav_file(channels: u16, sample_rate: u32, bit_depth: BitDepth) -> NamedTempFile {
@@ -81,6 +94,7 @@ mod tests {
             album: Some("Test Album".to_string()),
             bpm: Some(128.0),
             key: Some("Am".to_string()),
+            pictures: vec![],
         };
         let tmp = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
         transcode_with_metadata(tmp.path(), &params, &samples, &meta).unwrap();
@@ -134,6 +148,7 @@ mod tests {
             album: None,
             bpm: None,
             key: None,
+            pictures: vec![],
         };
         let tmp = tempfile::Builder::new().suffix(".aiff").tempfile().unwrap();
         transcode_with_metadata(tmp.path(), &params, &samples, &meta).unwrap();
@@ -149,5 +164,48 @@ mod tests {
             .or_else(|| tagged.first_tag())
             .expect("expected a tag");
         assert_eq!(tag.title().as_deref(), Some("AIFF Title"));
+    }
+
+    #[test]
+    fn cover_art_roundtrip_aiff() {
+        // Dummy PNG-like bytes (not a real PNG, but sufficient for storage roundtrip)
+        let fake_png: Vec<u8> = b"fake-png-data".to_vec();
+        let params = TranscodeParams {
+            format: ExportFormat::Aiff,
+            channels: 2,
+            sample_rate: 44100,
+            bit_depth: BitDepth::Sixteen,
+        };
+        let samples: Vec<f32> = vec![0.0f32; 1000];
+        let meta = TrackMetadata {
+            title: Some("Cover Art Test".to_string()),
+            artist: None,
+            album: None,
+            bpm: None,
+            key: None,
+            pictures: vec![PictureData {
+                data: fake_png.clone(),
+                mime_type: "image/png".to_string(),
+                picture_type: PictureType::CoverFront,
+            }],
+        };
+        let tmp = tempfile::Builder::new().suffix(".aiff").tempfile().unwrap();
+        transcode_with_metadata(tmp.path(), &params, &samples, &meta).unwrap();
+
+        let tagged = Probe::open(tmp.path()).unwrap().read().unwrap();
+        let tag = tagged
+            .primary_tag()
+            .or_else(|| tagged.first_tag())
+            .expect("expected a tag");
+        assert!(
+            tag.picture_count() > 0,
+            "AIFF should have at least one embedded picture"
+        );
+        let pic = tag.pictures().first().expect("expected a picture");
+        assert_eq!(
+            pic.data(),
+            fake_png.as_slice(),
+            "picture data should roundtrip"
+        );
     }
 }

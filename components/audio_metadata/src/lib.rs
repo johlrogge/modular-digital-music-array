@@ -19,6 +19,49 @@ pub enum MetadataError {
     ParseError(String),
 }
 
+/// Picture type corresponding to the embedded picture's role.
+///
+/// This is a local enum that mirrors the relevant variants of lofty's
+/// `PictureType` without leaking lofty types into the public API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PictureType {
+    CoverFront,
+    CoverBack,
+    Other,
+}
+
+impl From<lofty::PictureType> for PictureType {
+    fn from(pt: lofty::PictureType) -> Self {
+        match pt {
+            lofty::PictureType::CoverFront => PictureType::CoverFront,
+            lofty::PictureType::CoverBack => PictureType::CoverBack,
+            _ => PictureType::Other,
+        }
+    }
+}
+
+impl PictureType {
+    /// Convert back to lofty's `PictureType` for use when writing tags.
+    pub fn to_lofty(self) -> lofty::PictureType {
+        match self {
+            PictureType::CoverFront => lofty::PictureType::CoverFront,
+            PictureType::CoverBack => lofty::PictureType::CoverBack,
+            PictureType::Other => lofty::PictureType::Other,
+        }
+    }
+}
+
+/// Raw picture data extracted from or to be embedded in an audio file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PictureData {
+    /// Raw bytes of the image.
+    pub data: Vec<u8>,
+    /// MIME type string, e.g. `"image/jpeg"` or `"image/png"`.
+    pub mime_type: String,
+    /// The role/type of this picture (front cover, back cover, other).
+    pub picture_type: PictureType,
+}
+
 #[derive(Debug, Clone)]
 pub struct TrackMetadata {
     // Basic metadata
@@ -237,6 +280,42 @@ pub fn discover_all_fields(
     Ok(all_fields)
 }
 
+/// Extract all pictures from the audio file at `path`.
+///
+/// Returns a `Vec<PictureData>` containing all pictures found across all tags
+/// in the file, preserving the original picture type. Duplicate pictures
+/// (identical bytes) are removed. Returns an empty `Vec` if no pictures are
+/// present — this is not an error.
+pub fn extract_pictures(path: impl AsRef<Path>) -> Result<Vec<PictureData>, MetadataError> {
+    let path = path.as_ref();
+    let tagged_file = Probe::open(path)?.read()?;
+
+    let mut pictures = Vec::new();
+
+    for tag in tagged_file.tags() {
+        for picture in tag.pictures() {
+            let data = picture.data().to_vec();
+            let mime = picture
+                .mime_type()
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            let picture_type = PictureType::from(picture.pic_type());
+            pictures.push(PictureData {
+                data,
+                mime_type: mime,
+                picture_type,
+            });
+        }
+    }
+
+    // Deduplicate by raw data bytes — same image embedded in multiple tags
+    // should only appear once in the output.
+    pictures.sort_by(|a, b| a.data.cmp(&b.data));
+    pictures.dedup_by(|a, b| a.data == b.data);
+
+    Ok(pictures)
+}
+
 /// Try to extract metadata from file path when tags are missing
 pub fn infer_from_path(path: &Path) -> (Option<String>, Option<String>, Option<String>) {
     let components: Vec<_> = path
@@ -288,4 +367,142 @@ pub fn infer_from_path(path: &Path) -> (Option<String>, Option<String>, Option<S
     }
 
     (artist, album, title)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lofty::{MimeType, Picture, PictureType as LoftyPictureType, Tag, TagExt, TagType};
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    /// Copy the silence fixture to a writable temp file, tag it with a picture, and return the
+    /// temp file (kept alive for the duration of the test).
+    fn write_tagged_flac_with_picture(
+        pic_data: Vec<u8>,
+        mime: MimeType,
+        pic_type: LoftyPictureType,
+    ) -> NamedTempFile {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../components/playback_engine/benches/test_data/silence.flac"
+        );
+
+        let mut tmp = NamedTempFile::with_suffix(".flac").expect("tmpfile");
+        let audio_bytes = std::fs::read(fixture).expect("read fixture");
+        tmp.write_all(&audio_bytes).expect("write fixture bytes");
+        tmp.flush().expect("flush");
+
+        let path = tmp.path();
+        let mut tagged_file = lofty::Probe::open(path)
+            .expect("probe")
+            .read()
+            .expect("read");
+
+        let picture = Picture::new_unchecked(pic_type, Some(mime), None, pic_data);
+
+        // FLAC primary tag is VorbisComments; insert one if absent.
+        if tagged_file.primary_tag_mut().is_none() {
+            tagged_file.insert_tag(Tag::new(TagType::VorbisComments));
+        }
+        let tag = tagged_file.primary_tag_mut().expect("tag");
+        tag.push_picture(picture);
+        tag.save_to_path(path).expect("save tag");
+
+        tmp
+    }
+
+    #[test]
+    fn extract_pictures_returns_empty_for_file_without_pictures() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../components/playback_engine/benches/test_data/silence.flac"
+        );
+        let result = extract_pictures(fixture).expect("extract_pictures should not error");
+        assert!(
+            result.is_empty(),
+            "expected no pictures, got {}",
+            result.len()
+        );
+    }
+
+    #[test]
+    fn extract_pictures_returns_picture_data_and_mime_type() {
+        // Minimal 1x1 PNG
+        let png_1x1: Vec<u8> = vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
+            0x00, 0x00, 0x00, 0x0D, // IHDR length
+            0x49, 0x48, 0x44, 0x52, // IHDR
+            0x00, 0x00, 0x00, 0x01, // width = 1
+            0x00, 0x00, 0x00, 0x01, // height = 1
+            0x08, 0x02, // bit depth=8, color type=2 (RGB)
+            0x00, 0x00, 0x00, // compression, filter, interlace
+            0x90, 0x77, 0x53, 0xDE, // IHDR CRC
+            0x00, 0x00, 0x00, 0x0C, // IDAT length
+            0x49, 0x44, 0x41, 0x54, // IDAT
+            0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00,
+            0x01, // compressed data
+            0xE2, 0x21, 0xBC, 0x33, // IDAT CRC
+            0x00, 0x00, 0x00, 0x00, // IEND length
+            0x49, 0x45, 0x4E, 0x44, // IEND
+            0xAE, 0x42, 0x60, 0x82, // IEND CRC
+        ];
+
+        let tmp = write_tagged_flac_with_picture(
+            png_1x1.clone(),
+            MimeType::Png,
+            LoftyPictureType::CoverFront,
+        );
+
+        let result = extract_pictures(tmp.path()).expect("extract_pictures should not error");
+
+        assert_eq!(result.len(), 1, "expected exactly one picture");
+        let pic = &result[0];
+        assert_eq!(pic.mime_type, "image/png");
+        assert_eq!(pic.data, png_1x1);
+        assert_eq!(pic.picture_type, PictureType::CoverFront);
+    }
+
+    #[test]
+    fn extract_pictures_preserves_cover_back_type() {
+        let fake_jpg: Vec<u8> = b"fake-jpeg-data".to_vec();
+        let tmp = write_tagged_flac_with_picture(
+            fake_jpg.clone(),
+            MimeType::Jpeg,
+            LoftyPictureType::CoverBack,
+        );
+
+        let result = extract_pictures(tmp.path()).expect("extract_pictures should not error");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].picture_type, PictureType::CoverBack);
+    }
+
+    #[test]
+    fn extract_pictures_maps_unknown_type_to_other() {
+        let fake_data: Vec<u8> = b"some-image".to_vec();
+        let tmp = write_tagged_flac_with_picture(
+            fake_data.clone(),
+            MimeType::Jpeg,
+            LoftyPictureType::Artist,
+        );
+
+        let result = extract_pictures(tmp.path()).expect("extract_pictures should not error");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].picture_type, PictureType::Other);
+    }
+
+    #[test]
+    fn picture_type_to_lofty_roundtrip() {
+        assert_eq!(
+            PictureType::CoverFront.to_lofty(),
+            lofty::PictureType::CoverFront
+        );
+        assert_eq!(
+            PictureType::CoverBack.to_lofty(),
+            lofty::PictureType::CoverBack
+        );
+        assert_eq!(PictureType::Other.to_lofty(), lofty::PictureType::Other);
+    }
 }

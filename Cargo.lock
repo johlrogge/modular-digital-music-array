@@ -252,6 +252,7 @@ name = "audio-metadata"
 version = "0.2.0"
 dependencies = [
  "lofty",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 
@@ -259,6 +260,7 @@ dependencies = [
 name = "audio-transcoder"
 version = "0.2.0"
 dependencies = [
+ "audio-metadata",
  "extended",
  "lofty",
  "symphonia",
@@ -2447,6 +2449,7 @@ version = "0.2.1"
 dependencies = [
  "askama",
  "async-stream",
+ "audio-metadata",
  "audio-transcoder",
  "axum",
  "clap",
@@ -2465,6 +2468,7 @@ dependencies = [
  "serde_json",
  "source-protocol",
  "symphonia",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tower-http 0.5.2",

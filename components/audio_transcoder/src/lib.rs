@@ -39,6 +39,10 @@ pub struct TranscodeParams {
     pub bit_depth: BitDepth,
 }
 
+// Re-export picture types from audio_metadata so consumers don't need two deps.
+pub use audio_metadata::PictureData;
+pub use audio_metadata::PictureType;
+
 /// Metadata to inject into exported files.
 #[derive(Debug, Clone, Default)]
 pub struct TrackMetadata {
@@ -47,6 +51,8 @@ pub struct TrackMetadata {
     pub album: Option<String>,
     pub bpm: Option<f64>,
     pub key: Option<String>,
+    /// Cover art and other pictures to embed.
+    pub pictures: Vec<PictureData>,
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -358,6 +364,7 @@ mod tests {
             album: None,
             bpm: Some(128.0),
             key: Some("Cm".to_string()),
+            pictures: vec![],
         };
         transcode_with_metadata(tmp.path(), &params, &samples, &meta).unwrap();
         let metadata = std::fs::metadata(tmp.path()).unwrap();

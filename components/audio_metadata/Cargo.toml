@@ -9,3 +9,6 @@ license.workspace = true
 [dependencies]
 lofty = {workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

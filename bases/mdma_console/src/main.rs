@@ -1385,12 +1385,23 @@ async fn export_track(
             .into_response();
     }
 
-    // Transcode: decode source to PCM, then encode to requested format
+    // Transcode: decode source to PCM and extract cover art, then encode to requested format.
+    // Both operations are blocking I/O and CPU work, so we run them together in spawn_blocking.
     let blob_path_clone = blob_path.clone();
-    let pcm_result = tokio::task::spawn_blocking(move || decode_to_pcm(&blob_path_clone)).await;
+    let decode_result = tokio::task::spawn_blocking(move || {
+        let pcm = decode_to_pcm(&blob_path_clone)
+            .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
+        let pictures = audio_metadata::extract_pictures(&blob_path_clone)
+            .inspect_err(
+                |e| tracing::warn!(error = %e, "Failed to extract cover art, exporting without"),
+            )
+            .unwrap_or_default();
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((pcm, pictures))
+    })
+    .await;
 
-    let (samples, channels, sample_rate) = match pcm_result {
-        Ok(Ok(r)) => r,
+    let ((samples, channels, sample_rate), pictures) = match decode_result {
+        Ok(Ok((pcm, pics))) => (pcm, pics),
         Ok(Err(e)) => {
             tracing::error!(error = %e, "Failed to decode audio for export");
             return (
@@ -1406,16 +1417,33 @@ async fn export_track(
     };
 
     let transcode_format = req_format.to_transcoder_format();
+
+    let metadata = audio_transcoder::TrackMetadata {
+        title: track.title.clone(),
+        artist: track.artist.clone(),
+        album: track.album.clone(),
+        bpm: track.bpm.map(|b| b.as_f32() as f64),
+        key: track.key.map(|k| k.to_traditional_sharp()),
+        pictures,
+    };
+
     let transcode_result = tokio::task::spawn_blocking(move || {
+        let tmp = tempfile::Builder::new()
+            .suffix(match transcode_format {
+                audio_transcoder::ExportFormat::Aiff => ".aiff",
+                audio_transcoder::ExportFormat::Wav => ".wav",
+                audio_transcoder::ExportFormat::Flac => ".flac",
+            })
+            .tempfile()?;
         let params = audio_transcoder::TranscodeParams {
             format: transcode_format,
             channels,
             sample_rate,
             bit_depth: audio_transcoder::BitDepth::TwentyFour,
         };
-        let mut buf: Vec<u8> = Vec::new();
-        audio_transcoder::transcode(&mut buf, &params, &samples)?;
-        Ok::<Vec<u8>, audio_transcoder::TranscoderError>(buf)
+        audio_transcoder::transcode_with_metadata(tmp.path(), &params, &samples, &metadata)?;
+        let data = std::fs::read(tmp.path())?;
+        Ok::<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>(data)
     })
     .await;
 

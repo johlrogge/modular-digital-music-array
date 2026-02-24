@@ -7,6 +7,7 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
+audio-metadata = { path = "../audio_metadata" }
 extended = "0.1"
 lofty = { workspace = true }
 thiserror = { workspace = true }

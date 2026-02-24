@@ -12,6 +12,8 @@ tokio = { workspace = true, features = ["process"] }
 
 # Audio export
 audio-transcoder = { path = "../../components/audio_transcoder" }
+audio-metadata = { path = "../../components/audio_metadata" }
+tempfile = "3"
 symphonia = { version = "0.5", features = ["default", "flac", "mp3", "aiff", "wav", "pcm"] }
 color-eyre = { workspace = true }
 tracing = { workspace = true }
