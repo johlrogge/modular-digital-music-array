@@ -2680,9 +2680,20 @@ mod tests {
         }
     }
 
+    // Mutex to serialize tests that mutate the $COLUMNS environment variable.
+    // std::env::set_var / remove_var are not thread-safe across parallel tests,
+    // so both tests acquire this lock before touching the env.
+    static COLUMNS_ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    fn columns_env_lock() -> &'static std::sync::Mutex<()> {
+        COLUMNS_ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
     #[test]
     fn terminal_width_reads_columns_env_var() {
         // When $COLUMNS is set to a valid integer, terminal_width() must return it.
+        // Hold the lock for the entire test to avoid racing with the fallback test.
+        let _guard = columns_env_lock().lock().unwrap();
         std::env::set_var("COLUMNS", "75");
         let w = terminal_width();
         std::env::remove_var("COLUMNS");
@@ -2696,6 +2707,7 @@ mod tests {
     fn terminal_width_fallback_is_80_not_100() {
         // When $COLUMNS is absent and there is no real TTY (CI / piped),
         // terminal_width() must fall back to 80, not 100.
+        let _guard = columns_env_lock().lock().unwrap();
         std::env::remove_var("COLUMNS");
         let w = terminal_width();
         // In a CI environment there is no TTY, so terminal_size() returns None
