@@ -3,7 +3,7 @@
 use audio_metadata::{discover_all_fields, extract_metadata, TrackMetadata};
 use music_facts::{
     Album, Artist, BitDepth, Bitrate, Channels, ContentHash, DurationSeconds, FactOrigin,
-    FactSource, FileSizeBytes, Isrc, MusicValue, SampleRate, Title, TrackNumber, Year,
+    FactSource, FileSizeBytes, Isrc, MusicFormat, MusicValue, SampleRate, Title, TrackNumber, Year,
 };
 use music_primitives::{Bpm, Key};
 use std::collections::HashMap;
@@ -11,18 +11,37 @@ use std::path::Path;
 
 use crate::pipeline::{AudioFormat, IngestError};
 
+impl From<AudioFormat> for MusicFormat {
+    fn from(fmt: AudioFormat) -> Self {
+        match fmt {
+            AudioFormat::Flac => MusicFormat::Flac,
+            AudioFormat::Mp3 => MusicFormat::Mp3,
+            AudioFormat::Aiff => MusicFormat::Aiff,
+            AudioFormat::Wav => MusicFormat::Wav,
+        }
+    }
+}
+
 /// Generate facts from audio file metadata
 pub fn generate_facts(
     path: &Path,
     content_hash: &ContentHash,
-    _format: AudioFormat,
+    format: AudioFormat,
 ) -> Result<Vec<(MusicValue, FactSource)>, IngestError> {
     let metadata = extract_metadata(path).map_err(|e| IngestError::MetadataError(e.to_string()))?;
 
     let all_fields =
         discover_all_fields(path).map_err(|e| IngestError::MetadataError(e.to_string()))?;
 
-    generate_facts_from_metadata(content_hash, &metadata, &all_fields)
+    let mut facts = generate_facts_from_metadata(content_hash, &metadata, &all_fields)?;
+
+    // Add format fact
+    let music_format = MusicFormat::from(format);
+    let origin = FactOrigin::infer(&metadata.file_path, &metadata.comment);
+    let source = FactSource::new("mdma-library", env!("CARGO_PKG_VERSION"), origin);
+    facts.push((MusicValue::Format(music_format), source));
+
+    Ok(facts)
 }
 
 /// Look up a field name across all known tag type prefixes
@@ -243,6 +262,25 @@ fn parse_genre(genre: &str) -> (String, Vec<String>, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_fact_generated_for_audio_formats() {
+        // Verify AudioFormat → MusicFormat mapping via From impl
+        use crate::pipeline::AudioFormat;
+        use music_facts::MusicFormat;
+
+        let mappings = vec![
+            (AudioFormat::Flac, "FLAC"),
+            (AudioFormat::Mp3, "MP3"),
+            (AudioFormat::Aiff, "AIFF"),
+            (AudioFormat::Wav, "WAV"),
+        ];
+
+        for (audio_fmt, expected_display) in mappings {
+            let music_fmt = MusicFormat::from(audio_fmt);
+            assert_eq!(music_fmt.to_string(), expected_display);
+        }
+    }
 
     #[test]
     fn parse_genre_with_descriptors() {

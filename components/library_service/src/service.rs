@@ -77,6 +77,8 @@ struct LoadResult {
     facts_count: usize,
     fact_index: HashMap<String, HashSet<String>>,
     content_hashes: HashSet<String>,
+    /// Content hashes of tracks that already have a Format fact
+    has_format: HashSet<String>,
 }
 
 fn update_if_more_recent(
@@ -105,7 +107,7 @@ impl LibraryService {
         // Open writer for future writes
         let fact_writer = FactWriter::open(&facts_path)?;
 
-        Ok(Self {
+        let service = Self {
             music_dir,
             metadata_dir,
             start_time: Instant::now(),
@@ -115,7 +117,12 @@ impl LibraryService {
             fact_writer: Mutex::new(fact_writer),
             fact_index: Mutex::new(loaded.fact_index),
             content_hashes: Mutex::new(loaded.content_hashes),
-        })
+        };
+
+        // Backfill Format facts for tracks that don't have one yet
+        service.backfill_format_facts(&loaded.has_format);
+
+        Ok(service)
     }
 
     /// Load tracks from facts file into memory for search
@@ -133,6 +140,7 @@ impl LibraryService {
                         facts_count: 0,
                         fact_index: HashMap::new(),
                         content_hashes: HashSet::new(),
+                        has_format: HashSet::new(),
                     };
                 }
             };
@@ -140,6 +148,7 @@ impl LibraryService {
         // Aggregate facts by content hash
         let mut tracks_map: HashMap<String, IndexedTrackInfo> = HashMap::new();
         let mut fact_index: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut has_format: HashSet<String> = HashSet::new();
         let mut errors = 0;
         let mut total = 0;
 
@@ -217,6 +226,9 @@ impl LibraryService {
                         }
                     }
                 }
+                MusicValue::Format(_) => {
+                    has_format.insert(fact.entity().0.clone());
+                }
                 _ => {}
             }
         }
@@ -231,7 +243,68 @@ impl LibraryService {
             facts_count: total,
             fact_index,
             content_hashes,
+            has_format,
         }
+    }
+
+    /// Backfill Format facts for tracks that have a file path but no Format fact
+    fn backfill_format_facts(&self, has_format: &HashSet<String>) {
+        use crate::pipeline::AudioFormat;
+        use music_facts::MusicFormat;
+
+        let tracks = self.tracks.lock().unwrap();
+
+        // Find tracks needing backfill
+        let needs_backfill: Vec<_> = tracks
+            .iter()
+            .filter(|t| !has_format.contains(&t.content_hash.0))
+            .filter(|t| !t.blob_path.as_os_str().is_empty())
+            .filter_map(|t| {
+                let ext = t.blob_path.extension()?.to_str()?;
+                let music_format = AudioFormat::from_extension(ext).map(MusicFormat::from)?;
+                Some((t.content_hash.clone(), music_format))
+            })
+            .collect();
+
+        drop(tracks);
+
+        if needs_backfill.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            count = needs_backfill.len(),
+            "Backfilling Format facts for tracks"
+        );
+
+        let source = music_facts::FactSource::new(
+            "mdma-library",
+            env!("CARGO_PKG_VERSION"),
+            music_facts::FactOrigin::Unknown,
+        );
+
+        let mut writer = self.fact_writer.lock().unwrap();
+        let mut fact_index = self.fact_index.lock().unwrap();
+        let mut backfilled = 0;
+
+        for (hash, music_format) in &needs_backfill {
+            let value = MusicValue::Format(*music_format);
+            if writer
+                .write_track_facts(hash, &[(value.clone(), source.clone())])
+                .is_ok()
+            {
+                fact_index
+                    .entry("Format".to_string())
+                    .or_default()
+                    .insert(music_format.to_string());
+                backfilled += 1;
+            }
+        }
+
+        // Update facts count
+        self.facts_count.fetch_add(backfilled, Ordering::Relaxed);
+
+        tracing::info!(backfilled, "Format fact backfill complete");
     }
 
     /// Get number of indexed tracks
@@ -1089,6 +1162,85 @@ mod tests {
             path_str.contains("blobs/"),
             "blob_path should be under blobs/, got: {}",
             path_str
+        );
+    }
+
+    #[test]
+    fn backfill_writes_format_fact_for_tracks_without_one() {
+        use music_facts::{ContentHash, MusicValue, Title};
+
+        let hash = ContentHash("sha256:backfill01".to_string());
+
+        // Track has FilePath (so blob_path is set) but no Format fact
+        let temp = write_facts_file(&[
+            (
+                hash.clone(),
+                MusicValue::Title(Title::new("Backfill Track")),
+            ),
+            (
+                hash.clone(),
+                MusicValue::FilePath(std::path::PathBuf::from("some/track.flac")),
+            ),
+        ]);
+
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+        let facts_dest = metadata_dir.path().join("facts.jsonl");
+        std::fs::copy(temp.path(), &facts_dest).unwrap();
+
+        let service = LibraryService::new(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+        )
+        .unwrap();
+
+        // The backfill should have run during new() — check the fact index
+        let fact_index = service.fact_index.lock().unwrap();
+        let format_values = fact_index
+            .get("Format")
+            .expect("Format should be in fact index");
+        assert!(
+            format_values.contains("FLAC"),
+            "Should have backfilled FLAC format fact"
+        );
+    }
+
+    #[test]
+    fn backfill_skips_tracks_that_already_have_format() {
+        use music_facts::{ContentHash, MusicFormat, MusicValue, Title};
+
+        let hash = ContentHash("sha256:hasformat01".to_string());
+
+        let temp = write_facts_file(&[
+            (hash.clone(), MusicValue::Title(Title::new("Has Format"))),
+            (
+                hash.clone(),
+                MusicValue::FilePath(std::path::PathBuf::from("some/track.flac")),
+            ),
+            (hash.clone(), MusicValue::Format(MusicFormat::Flac)),
+        ]);
+
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+        let facts_dest = metadata_dir.path().join("facts.jsonl");
+        std::fs::copy(temp.path(), &facts_dest).unwrap();
+
+        // Count facts before
+        let before_content = std::fs::read_to_string(&facts_dest).unwrap();
+        let before_lines = before_content.lines().count();
+
+        let _service = LibraryService::new(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+        )
+        .unwrap();
+
+        // No new facts should have been written
+        let after_content = std::fs::read_to_string(&facts_dest).unwrap();
+        let after_lines = after_content.lines().count();
+        assert_eq!(
+            before_lines, after_lines,
+            "Should not write new facts when Format already exists"
         );
     }
 

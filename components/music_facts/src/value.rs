@@ -5,6 +5,26 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
 
+/// Audio file format
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MusicFormat {
+    Flac,
+    Mp3,
+    Aiff,
+    Wav,
+}
+
+impl fmt::Display for MusicFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MusicFormat::Flac => write!(f, "FLAC"),
+            MusicFormat::Mp3 => write!(f, "MP3"),
+            MusicFormat::Aiff => write!(f, "AIFF"),
+            MusicFormat::Wav => write!(f, "WAV"),
+        }
+    }
+}
+
 /// All possible metadata values for a music track
 ///
 /// Each variant represents a single fact that can be asserted or retracted
@@ -128,6 +148,9 @@ pub enum MusicValue {
     /// Whether the file has embedded album art
     HasAlbumArt(bool),
 
+    /// Audio file format (FLAC, MP3, AIFF, WAV)
+    Format(MusicFormat),
+
     // ========================================================================
     // Encoder Information
     // ========================================================================
@@ -181,6 +204,7 @@ impl MusicValue {
             MusicValue::Bitrate(_) => "Bitrate",
             MusicValue::FileSizeBytes(_) => "FileSize",
             MusicValue::HasAlbumArt(_) => "HasAlbumArt",
+            MusicValue::Format(_) => "Format",
             MusicValue::EncoderSoftware(_) => "EncoderSoftware",
             MusicValue::EncodedBy(_) => "EncodedBy",
             MusicValue::TrackStarted(_) => "TrackStarted",
@@ -222,6 +246,7 @@ impl fmt::Display for MusicValue {
             MusicValue::Bitrate(b) => write!(f, "{}", b),
             MusicValue::FileSizeBytes(s) => write!(f, "{}", s),
             MusicValue::HasAlbumArt(b) => write!(f, "{}", if *b { "yes" } else { "no" }),
+            MusicValue::Format(ref fmt_val) => write!(f, "{}", fmt_val),
             MusicValue::EncoderSoftware(s) => write!(f, "{}", s),
             MusicValue::EncodedBy(s) => write!(f, "{}", s),
             MusicValue::TrackStarted(dt) => write!(f, "{}", dt.to_rfc3339()),
@@ -273,5 +298,31 @@ mod tests {
         let title_val = MusicValue::Title(Title::new("test"));
         assert!(!title_val.display_name().is_empty());
         assert_eq!(title_val.display_name(), "Title");
+    }
+
+    #[test]
+    fn music_format_serde_roundtrip() {
+        let format = MusicFormat::Flac;
+        let json = serde_json::to_string(&format).unwrap();
+        let back: MusicFormat = serde_json::from_str(&json).unwrap();
+        assert_eq!(format, back);
+
+        let mp3 = MusicFormat::Mp3;
+        let json = serde_json::to_string(&mp3).unwrap();
+        let back: MusicFormat = serde_json::from_str(&json).unwrap();
+        assert_eq!(mp3, back);
+    }
+
+    #[test]
+    fn music_format_display() {
+        assert_eq!(MusicFormat::Flac.to_string(), "FLAC");
+        assert_eq!(MusicFormat::Mp3.to_string(), "MP3");
+        assert_eq!(MusicFormat::Aiff.to_string(), "AIFF");
+        assert_eq!(MusicFormat::Wav.to_string(), "WAV");
+    }
+
+    #[test]
+    fn format_fact_serde() {
+        assert_fact_value_format!(MusicValue::Format(MusicFormat::Flac));
     }
 }

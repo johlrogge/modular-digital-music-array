@@ -1,6 +1,6 @@
 # MDMA Roadmap
 
-**Last updated:** February 23, 2026
+**Last updated:** February 24, 2026
 
 ## Where We Are
 
@@ -10,7 +10,7 @@ NVMe boot working. mdma-console stub deployed. `just deploy-dev` working.
 
 **Milestone 1 Part 2 (Music Library): Operational**
 
-mdma-library running with nng IPC. 339 tracks indexed. Bandcamp sync operational. mdma-cli for search/list/facts from laptop.
+mdma-library running with nng IPC. 347 tracks indexed. Bandcamp sync operational. mdma-cli for search/list/facts from laptop.
 
 **Milestone 1 Part 3 (Audio Playback): COMPLETE — Feb 20, 2026**
 
@@ -194,32 +194,32 @@ The web library should display cover art for tracks. This is a good case for fac
 
 ---
 
-### 7. ZIP Upload for Library Ingestion
+### ~~7. ZIP Upload for Library Ingestion~~ — COMPLETE
 
-**Why:** Beatport tracks come as ZIP downloads of FLACs. The inbox mechanism and ZIP extraction logic already exist — this just connects the laptop to the inbox.
+Web upload via console operational. CLI `mdma upload` deferred — web workflow sufficient for now.
 
 - ~~Extract `extract_zip_to_inbox` from `mdma-bandcamp` into a shared component~~ — DONE (`components/inbox_utils/` exists)
-- Add `Upload` command to gateway protocol (accepts file bytes + source metadata)
-- CLI: `mdma upload <file>` — sends ZIP or single FLAC through the gateway
-- Gateway: receives file, extracts to inbox, triggers ingest, returns hashes
-- Supports: ZIP archives (extracts audio files), individual FLAC/WAV/AIFF files
-- Uses existing `IngestSource::Upload` provenance tracking
+- ~~Add `Upload` command to gateway protocol (accepts file bytes + source metadata)~~ — DONE
+- ~~Gateway: receives file, extracts to inbox, triggers ingest, returns hashes~~ — DONE
+- ~~Supports: ZIP archives (extracts audio files), individual FLAC/WAV/AIFF files~~ — DONE
+- ~~Uses existing `IngestSource::Upload` provenance tracking~~ — DONE
+- CLI: `mdma upload <file>` — deferred; web workflow sufficient for now
 
 ---
 
-### 8. MP3 Support
+### ~~8. MP3 Support~~ — COMPLETE
 
-**Why:** Beta testers have large MP3 libraries. FLAC-only blocks adoption. Not "hifi" but pragmatic.
+MP3 decoding enabled in Symphonia. Library accepts .mp3 files in inbox. 8 MP3 tracks in library alongside 339 FLACs.
 
-- Add MP3 decoding to playback engine (Symphonia supports it — enable the feature)
-- `mdma-library` must accept `.mp3` files in inbox alongside `.flac`
-- `mdma upload` (priority 7) already handles getting files onto the Pi
+- ~~Add MP3 decoding to playback engine (Symphonia supports it — enable the feature)~~ — DONE
+- ~~`mdma-library` must accept `.mp3` files in inbox alongside `.flac`~~ — DONE
+- ~~`mdma upload` (priority 7) already handles getting files onto the Pi~~ — DONE
 
 ---
 
-### 9. Track Export (`mdma export`)
+### ~~9. Track Export (`mdma export`)~~ — COMPLETE
 
-**Why:** First real DJ workflow. Export tracks from MDMA in any format for use in Rekordbox, CDJs, or other tools. Composable Unix-style interface.
+CLI `mdma export` operational. Reads hashes from stdin, pulls audio from Pi via gateway, transcodes to AIFF/WAV. Console export endpoint also working.
 
 **Interface:**
 
@@ -229,16 +229,14 @@ cat my_hardcore_techno.plist | mdma export --format=aiff
 mdma search --bpm 128-132 --key 8A | mdma export --format=aiff --output ./rekordbox-prep/
 ```
 
-- Reads content hashes from stdin (one per line, piped from `mdma search` or playlist files)
-- Pulls audio from Pi via gateway
-- Converts to target format (AIFF initially, MP3/WAV later)
-- Writes to output directory with metadata-based filenames (Artist - Title.aiff)
-- Preserves metadata in target format tags (ID3 for AIFF, etc.)
-- Runs on the laptop, not the Pi
+- ~~Reads content hashes from stdin (one per line, piped from `mdma search` or playlist files)~~ — DONE
+- ~~Pulls audio from Pi via gateway~~ — DONE
+- ~~Converts to target format (AIFF/WAV)~~ — DONE
+- ~~Writes to output directory with metadata-based filenames (Artist - Title.aiff)~~ — DONE
+- ~~Runs on the laptop, not the Pi~~ — DONE
+- Console export endpoint also working
 
 **Guiding use case:** Rekordbox preparation — export a set of tracks as AIFF, import into Rekordbox for club/CDJ use. But the tool is format-generic, not Rekordbox-specific.
-
-**Prerequisites:** Priority 8 (MP3 support gives us Symphonia multi-format decode). AIFF encoding needs a new `audio_transcoder` component (Symphonia decode → AIFF write).
 
 **Shared infrastructure:** The `audio_transcoder` component is reused by Rekordbox Sync (Priority 12) and Virtual CDJ (Priority 13).
 
@@ -459,9 +457,9 @@ just watch
 ssh -4 -i ~/.ssh/mdma_pi admin@mdma-909.local
 ```
 
-**Environment vars for CLI from laptop (gateway mode — preferred):**
+**Environment vars for CLI from laptop:** `MDMA_NODE` sets the node hostname; the CLI derives the gateway address automatically.
 ```bash
-export MDMA_GATEWAY="tcp://mdma-909.local:5555"
+export MDMA_NODE="mdma-909.local"
 ```
 
 Two external ports: 5555 (gateway) and 5556 (events). No per-service TCP ports exposed.
