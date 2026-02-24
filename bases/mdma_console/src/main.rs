@@ -1133,33 +1133,50 @@ async fn main() -> Result<()> {
 
 /// Export format query parameter.
 ///
-/// Only `aiff` and `wav` are offered — the FLAC encoder is a stub and FLAC
-/// sources are served via passthrough when the source extension matches.
+/// `original` serves the blob file without any transcoding (default).
+/// `aiff` and `wav` transcode the source to the requested format.
 #[derive(serde::Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 enum ExportFormatParam {
+    /// Serve the source file as-is without transcoding (default)
     #[default]
+    Original,
     Aiff,
     Wav,
 }
 
 impl ExportFormatParam {
-    fn extension(&self) -> &'static str {
+    /// Return the file extension for converted formats, or `None` for `Original`.
+    ///
+    /// For `Original`, the extension must be derived from the blob path.
+    fn extension(&self) -> Option<&'static str> {
         match self {
-            Self::Aiff => "aiff",
-            Self::Wav => "wav",
+            Self::Original => None,
+            Self::Aiff => Some("aiff"),
+            Self::Wav => Some("wav"),
         }
     }
 
-    fn content_type(&self) -> &'static str {
+    /// Return the MIME content type for converted formats, or `None` for `Original`.
+    ///
+    /// For `Original`, the content type must be derived from the blob path.
+    fn content_type(&self) -> Option<&'static str> {
         match self {
-            Self::Aiff => "audio/aiff",
-            Self::Wav => "audio/wav",
+            Self::Original => None,
+            Self::Aiff => Some("audio/aiff"),
+            Self::Wav => Some("audio/wav"),
         }
+    }
+
+    /// Returns `true` when the format should be served as a direct blob passthrough
+    /// without any transcoding.
+    fn is_passthrough(&self) -> bool {
+        matches!(self, Self::Original)
     }
 
     fn to_transcoder_format(&self) -> audio_transcoder::ExportFormat {
         match self {
+            Self::Original => unreachable!("Original format must be handled via passthrough"),
             Self::Aiff => audio_transcoder::ExportFormat::Aiff,
             Self::Wav => audio_transcoder::ExportFormat::Wav,
         }
@@ -1311,14 +1328,38 @@ async fn export_track(
 
     let blob_path = state.music_root.join(&blob_rel);
 
-    let format = &params.format;
-    let ext = format.extension();
-    let content_type = format.content_type();
-    let filename = export_filename(track.artist.as_deref(), track.title.as_deref(), ext);
+    let req_format = &params.format;
 
-    // Check if source matches requested format — serve blob directly
-    let source_ext = blob_extension(&blob_rel).unwrap_or("").to_lowercase();
-    if source_ext == ext || (source_ext == "aif" && ext == "aiff") {
+    // Determine actual extension and content-type.
+    // For Original, derive from blob_path; for others use fixed values.
+    let source_ext = blob_extension(&blob_rel).unwrap_or("bin").to_lowercase();
+    let (ext, content_type_str): (String, String) = if req_format.is_passthrough() {
+        let ct = match source_ext.as_str() {
+            "flac" => "audio/flac",
+            "mp3" => "audio/mpeg",
+            "aiff" | "aif" => "audio/aiff",
+            "wav" => "audio/wav",
+            "ogg" => "audio/ogg",
+            "opus" => "audio/opus",
+            _ => "application/octet-stream",
+        };
+        (source_ext.clone(), ct.to_string())
+    } else {
+        let fixed_ext = req_format.extension().unwrap_or("bin");
+        let fixed_ct = req_format
+            .content_type()
+            .unwrap_or("application/octet-stream");
+        (fixed_ext.to_string(), fixed_ct.to_string())
+    };
+
+    let filename = export_filename(track.artist.as_deref(), track.title.as_deref(), &ext);
+
+    // Original always takes the direct-serve path.
+    // For converted formats, also take the direct path when source already matches.
+    let serve_directly =
+        req_format.is_passthrough() || source_ext == ext || (source_ext == "aif" && ext == "aiff");
+
+    if serve_directly {
         let data = match tokio::fs::read(&blob_path).await {
             Ok(d) => d,
             Err(e) => {
@@ -1333,7 +1374,7 @@ async fn export_track(
 
         return (
             [
-                (header::CONTENT_TYPE, content_type.to_string()),
+                (header::CONTENT_TYPE, content_type_str.clone()),
                 (
                     header::CONTENT_DISPOSITION,
                     format!("attachment; filename=\"{}\"", filename),
@@ -1364,7 +1405,7 @@ async fn export_track(
         }
     };
 
-    let transcode_format = format.to_transcoder_format();
+    let transcode_format = req_format.to_transcoder_format();
     let transcode_result = tokio::task::spawn_blocking(move || {
         let params = audio_transcoder::TranscodeParams {
             format: transcode_format,
@@ -1400,7 +1441,7 @@ async fn export_track(
 
     (
         [
-            (header::CONTENT_TYPE, content_type.to_string()),
+            (header::CONTENT_TYPE, content_type_str),
             (
                 header::CONTENT_DISPOSITION,
                 format!("attachment; filename=\"{}\"", filename),
@@ -1543,21 +1584,33 @@ mod tests {
     // ── Export helpers ────────────────────────────────────────────────────────
 
     #[test]
-    fn export_format_defaults_to_aiff() {
+    fn export_format_defaults_to_original() {
         let default = ExportFormatParam::default();
-        assert_eq!(default, ExportFormatParam::Aiff);
+        assert_eq!(default, ExportFormatParam::Original);
     }
 
     #[test]
     fn export_format_extensions() {
-        assert_eq!(ExportFormatParam::Aiff.extension(), "aiff");
-        assert_eq!(ExportFormatParam::Wav.extension(), "wav");
+        assert_eq!(ExportFormatParam::Aiff.extension(), Some("aiff"));
+        assert_eq!(ExportFormatParam::Wav.extension(), Some("wav"));
+        // Original has no fixed extension
+        assert_eq!(ExportFormatParam::Original.extension(), None);
     }
 
     #[test]
     fn export_format_content_types() {
-        assert_eq!(ExportFormatParam::Aiff.content_type(), "audio/aiff");
-        assert_eq!(ExportFormatParam::Wav.content_type(), "audio/wav");
+        assert_eq!(ExportFormatParam::Aiff.content_type(), Some("audio/aiff"));
+        assert_eq!(ExportFormatParam::Wav.content_type(), Some("audio/wav"));
+        // Original defers content type to the blob
+        assert_eq!(ExportFormatParam::Original.content_type(), None);
+    }
+
+    #[test]
+    fn export_format_original_is_passthrough() {
+        // Original must always take the direct-serve path (is_passthrough returns true)
+        assert!(ExportFormatParam::Original.is_passthrough());
+        assert!(!ExportFormatParam::Aiff.is_passthrough());
+        assert!(!ExportFormatParam::Wav.is_passthrough());
     }
 
     #[test]
@@ -1604,7 +1657,8 @@ mod tests {
         let source_ext = blob_extension("blobs/ab/track.aif").unwrap().to_lowercase();
         let fmt = ExportFormatParam::Aiff;
         assert!(
-            source_ext == fmt.extension() || (source_ext == "aif" && fmt.extension() == "aiff")
+            Some(source_ext.as_str()) == fmt.extension()
+                || (source_ext == "aif" && fmt.extension() == Some("aiff"))
         );
     }
 }

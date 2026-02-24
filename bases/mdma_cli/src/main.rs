@@ -238,14 +238,15 @@ enum Commands {
     /// Export tracks from the library to local files.
     ///
     /// Reads content hashes from stdin (one per line, pipe-friendly).
-    /// Compatible with search output: `mdma search --artist CBL | mdma export --format aiff`
+    /// Compatible with search output: `mdma search --artist CBL | mdma export`
     ///
     /// Examples:
+    ///   mdma search --artist CBL | mdma export
     ///   mdma search --artist CBL | mdma export --format aiff
     ///   mdma search --artist CBL | mdma export --format wav --output ./archive/
     Export {
-        /// Output format (aiff or wav)
-        #[arg(long, default_value = "aiff", value_enum)]
+        /// Output format (original, aiff or wav). Default: original (no conversion)
+        #[arg(long, default_value = "original", value_enum)]
         format: ExportFormat,
 
         /// Output directory (created if it doesn't exist)
@@ -256,13 +257,26 @@ enum Commands {
 
 #[derive(clap::ValueEnum, Debug, Clone, PartialEq, Eq)]
 enum ExportFormat {
+    /// Transfer the file without conversion (default)
+    Original,
     Aiff,
     Wav,
 }
 
 impl ExportFormat {
-    fn extension(&self) -> &'static str {
+    /// Return the fixed file extension for converted formats, or `None` for `Original`.
+    fn static_extension(&self) -> Option<&'static str> {
         match self {
+            Self::Original => None,
+            Self::Aiff => Some("aiff"),
+            Self::Wav => Some("wav"),
+        }
+    }
+
+    /// Format string to pass in the `?format=` query parameter.
+    fn format_param(&self) -> &'static str {
+        match self {
+            Self::Original => "original",
             Self::Aiff => "aiff",
             Self::Wav => "wav",
         }
@@ -2064,6 +2078,32 @@ fn export_url_from_node(node: &str, hash: &str, format: &str) -> String {
     format!("http://{}/export/{}?format={}", node, hash, format)
 }
 
+/// Sanitize a single path component by replacing unsafe filesystem characters.
+fn sanitize_path_component(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c => c,
+        })
+        .collect()
+}
+
+/// Build the destination path for an exported track.
+///
+/// Layout: `<output>/<artist>/<album>/<title>.<ext>`
+///
+/// Each path component is sanitized to remove filesystem-unsafe characters.
+/// Missing metadata falls back to `"Unknown Artist"`, `"Unknown Album"`, `"Unknown"`.
+fn export_dest_path(output: &std::path::Path, track: &TrackInfo, ext: &str) -> std::path::PathBuf {
+    let artist = sanitize_path_component(track.artist.as_deref().unwrap_or("Unknown Artist"));
+    let album = sanitize_path_component(track.album.as_deref().unwrap_or("Unknown Album"));
+    let title = sanitize_path_component(track.title.as_deref().unwrap_or("Unknown"));
+    output
+        .join(artist)
+        .join(album)
+        .join(format!("{}.{}", title, ext))
+}
+
 /// Extract a content hash from a line of text.
 ///
 /// Handles multiple formats:
@@ -2103,29 +2143,6 @@ fn parse_hash_from_line(line: &str) -> Option<String> {
     None
 }
 
-/// Parse the filename from a `Content-Disposition` header value.
-///
-/// Handles both quoted (`filename="..."`) and unquoted (`filename=...`) forms.
-fn filename_from_content_disposition(header: &str) -> Option<String> {
-    // Find `filename=` (case-insensitive search is done by lowercase comparison)
-    let lower = header.to_lowercase();
-    let pos = lower.find("filename=")?;
-    let rest = &header[pos + "filename=".len()..];
-    // Strip surrounding quotes if present
-    let name = if rest.starts_with('"') {
-        let inner = rest.strip_prefix('"')?;
-        inner.split('"').next()?.to_string()
-    } else {
-        // Unquoted: take until `;` or end of string
-        rest.split(';').next()?.trim().to_string()
-    };
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
-}
-
 /// Result of a single track export attempt.
 struct ExportResult {
     hash: String,
@@ -2135,7 +2152,11 @@ struct ExportResult {
     error: Option<String>,
 }
 
-fn handle_export(format: &ExportFormat, output: &std::path::Path) -> Result<()> {
+fn handle_export(
+    library: &LibraryBackend,
+    format: &ExportFormat,
+    output: &std::path::Path,
+) -> Result<()> {
     use std::io::{BufRead, Write};
 
     // Resolve MDMA_NODE
@@ -2148,50 +2169,61 @@ fn handle_export(format: &ExportFormat, output: &std::path::Path) -> Result<()> 
         }
     };
 
-    // Create output directory
-    if let Err(e) = std::fs::create_dir_all(output) {
-        eprintln!(
-            "Failed to create output directory {}: {}",
-            output.display(),
-            e
-        );
-        std::process::exit(1);
-    }
-
     // Read hashes from stdin
-    let hashes: Vec<String> = std::io::stdin()
+    let raw_hashes: Vec<String> = std::io::stdin()
         .lock()
         .lines()
         .map_while(Result::ok)
         .filter_map(|line| parse_hash_from_line(&line))
         .collect();
 
-    if hashes.is_empty() {
+    if raw_hashes.is_empty() {
         eprintln!("No hashes provided on stdin.");
-        eprintln!("Usage: mdma search --artist CBL | mdma export --format aiff");
+        eprintln!("Usage: mdma search --artist CBL | mdma export");
         std::process::exit(1);
     }
 
-    let client = reqwest::blocking::Client::builder()
+    // Resolve each hash (short or full) to a full TrackInfo via the library
+    let mut tracks: Vec<TrackInfo> = Vec::with_capacity(raw_hashes.len());
+    for raw in &raw_hashes {
+        let ch = ContentHash(raw.clone());
+        match library.get_track(&ch) {
+            Ok(t) => tracks.push(t),
+            Err(e) => {
+                eprintln!(
+                    "WARNING: could not resolve hash '{}': {} — skipping",
+                    raw, e
+                );
+            }
+        }
+    }
+
+    if tracks.is_empty() {
+        eprintln!("No tracks could be resolved. Aborting.");
+        std::process::exit(1);
+    }
+
+    let http = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| color_eyre::eyre::eyre!("Failed to build HTTP client: {}", e))?;
 
-    let ext = format.extension();
-    let total = hashes.len();
+    let format_param = format.format_param();
+    let total = tracks.len();
     let mut results: Vec<ExportResult> = Vec::with_capacity(total);
 
-    for (idx, hash) in hashes.iter().enumerate() {
-        let url = export_url_from_node(&node, hash, ext);
-        eprint!("[{}/{}] Downloading {} ... ", idx + 1, total, hash);
+    for (idx, track) in tracks.iter().enumerate() {
+        let full_hash = &track.content_hash.0;
+        let url = export_url_from_node(&node, full_hash, format_param);
+        eprint!("[{}/{}] Downloading {} ... ", idx + 1, total, full_hash);
         let _ = std::io::stderr().flush();
 
-        let response = match client.get(&url).send() {
+        let response = match http.get(&url).send() {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("FAILED ({})", e);
                 results.push(ExportResult {
-                    hash: hash.clone(),
+                    hash: full_hash.clone(),
                     filename: String::new(),
                     bytes: 0,
                     success: false,
@@ -2205,7 +2237,7 @@ fn handle_export(format: &ExportFormat, output: &std::path::Path) -> Result<()> 
             let status = response.status();
             eprintln!("FAILED (HTTP {})", status);
             results.push(ExportResult {
-                hash: hash.clone(),
+                hash: full_hash.clone(),
                 filename: String::new(),
                 bytes: 0,
                 success: false,
@@ -2214,30 +2246,49 @@ fn handle_export(format: &ExportFormat, output: &std::path::Path) -> Result<()> 
             continue;
         }
 
-        // Determine filename from Content-Disposition or fall back to hash.ext
-        let filename = response
-            .headers()
-            .get("content-disposition")
-            .and_then(|v| v.to_str().ok())
-            .and_then(filename_from_content_disposition)
-            .unwrap_or_else(|| {
-                let clean = hash.strip_prefix("sha256:").unwrap_or(hash);
-                let short = if clean.len() > 16 {
-                    &clean[..16]
-                } else {
-                    clean
-                };
-                format!("{}.{}", short, ext)
-            });
+        // Determine the file extension: fixed for converted formats, derived from
+        // blob_path for Original.
+        let source_ext_owned: String;
+        let ext: &str = match format.static_extension() {
+            Some(fixed) => fixed,
+            None => {
+                // Original: derive from blob_path
+                source_ext_owned = track
+                    .blob_path
+                    .as_deref()
+                    .and_then(|p| std::path::Path::new(p).extension())
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("bin")
+                    .to_lowercase();
+                &source_ext_owned
+            }
+        };
 
-        let dest = output.join(&filename);
+        // Build the structured destination path: output/artist/album/title.ext
+        let dest = export_dest_path(output, track, ext);
+
+        // Create intermediate directories
+        if let Some(parent) = dest.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("FAILED (mkdir: {})", e);
+                results.push(ExportResult {
+                    hash: full_hash.clone(),
+                    filename: dest.display().to_string(),
+                    bytes: 0,
+                    success: false,
+                    error: Some(e.to_string()),
+                });
+                continue;
+            }
+        }
+
         let body = match response.bytes() {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("FAILED (read error: {})", e);
                 results.push(ExportResult {
-                    hash: hash.clone(),
-                    filename,
+                    hash: full_hash.clone(),
+                    filename: dest.display().to_string(),
                     bytes: 0,
                     success: false,
                     error: Some(e.to_string()),
@@ -2249,8 +2300,8 @@ fn handle_export(format: &ExportFormat, output: &std::path::Path) -> Result<()> 
         if let Err(e) = std::fs::write(&dest, &body) {
             eprintln!("FAILED (write error: {})", e);
             results.push(ExportResult {
-                hash: hash.clone(),
-                filename,
+                hash: full_hash.clone(),
+                filename: dest.display().to_string(),
                 bytes: 0,
                 success: false,
                 error: Some(e.to_string()),
@@ -2259,10 +2310,11 @@ fn handle_export(format: &ExportFormat, output: &std::path::Path) -> Result<()> 
         }
 
         let bytes = body.len() as u64;
-        eprintln!("OK  {} ({} bytes)", filename, bytes);
+        let display = dest.display().to_string();
+        eprintln!("OK  {} ({} bytes)", display, bytes);
         results.push(ExportResult {
-            hash: hash.clone(),
-            filename,
+            hash: full_hash.clone(),
+            filename: display,
             bytes,
             success: true,
             error: None,
@@ -2496,7 +2548,10 @@ fn main() -> Result<()> {
             ssh_user,
             inbox_dir,
         } => handle_upload(&cli, file, ssh_key, ssh_user, inbox_dir),
-        Commands::Export { format, output } => handle_export(format, output),
+        Commands::Export { format, output } => {
+            let lib = connect_library(&cli);
+            handle_export(&lib, format, output)
+        }
     }
 }
 
@@ -2672,12 +2727,12 @@ mod tests {
 
     #[test]
     fn export_format_extension_aiff() {
-        assert_eq!(ExportFormat::Aiff.extension(), "aiff");
+        assert_eq!(ExportFormat::Aiff.static_extension(), Some("aiff"));
     }
 
     #[test]
     fn export_format_extension_wav() {
-        assert_eq!(ExportFormat::Wav.extension(), "wav");
+        assert_eq!(ExportFormat::Wav.static_extension(), Some("wav"));
     }
 
     #[test]
@@ -2732,24 +2787,120 @@ mod tests {
         assert!(parse_hash_from_line("abcd12").is_none());
     }
 
+    // ── ExportFormat::Original ────────────────────────────────────────────────
+
     #[test]
-    fn filename_from_content_disposition_returns_filename() {
-        let header = r#"attachment; filename="Artist - Track.aiff""#;
-        let result = filename_from_content_disposition(header);
-        assert_eq!(result, Some("Artist - Track.aiff".to_string()));
+    fn export_format_original_is_default() {
+        // Default value should be "original", not "aiff"
+        let default: ExportFormat = ExportFormat::Original;
+        assert_eq!(default, ExportFormat::Original);
     }
 
     #[test]
-    fn filename_from_content_disposition_no_filename_returns_none() {
-        let header = "attachment";
-        let result = filename_from_content_disposition(header);
-        assert!(result.is_none());
+    fn export_format_original_extension_returns_none() {
+        // Original has no fixed extension — caller derives it from blob_path
+        assert!(ExportFormat::Original.static_extension().is_none());
     }
 
     #[test]
-    fn filename_from_content_disposition_unquoted() {
-        let header = "attachment; filename=Artist-Track.aiff";
-        let result = filename_from_content_disposition(header);
-        assert_eq!(result, Some("Artist-Track.aiff".to_string()));
+    fn export_format_aiff_extension_is_aiff() {
+        assert_eq!(ExportFormat::Aiff.static_extension(), Some("aiff"));
+    }
+
+    #[test]
+    fn export_format_wav_extension_is_wav() {
+        assert_eq!(ExportFormat::Wav.static_extension(), Some("wav"));
+    }
+
+    #[test]
+    fn export_url_builds_with_original_format() {
+        // Original passes format=original in the query string
+        let url = export_url_from_node("mdma-909.local", "sha256:abcd1234", "original");
+        assert_eq!(
+            url,
+            "http://mdma-909.local/export/sha256:abcd1234?format=original"
+        );
+    }
+
+    // ── export_dest_path builds artist/album/title hierarchy ─────────────────
+
+    fn make_track_full(artist: &str, album: &str, title: &str, blob_path: &str) -> TrackInfo {
+        use library_ipc_client::{ContentHash, DurationSeconds};
+        TrackInfo {
+            content_hash: ContentHash("sha256:aa000001".to_string()),
+            title: Some(title.to_string()),
+            artist: Some(artist.to_string()),
+            album: Some(album.to_string()),
+            duration: Some(DurationSeconds(300)),
+            bpm: None,
+            key: None,
+            blob_path: Some(blob_path.to_string()),
+        }
+    }
+
+    #[test]
+    fn export_dest_path_uses_artist_album_title() {
+        let track = make_track_full(
+            "Carbon Based Lifeforms",
+            "Twentythree",
+            "Polyrytmi",
+            "ab/abc123.flac",
+        );
+        let output = std::path::Path::new("/tmp/export");
+        let path = export_dest_path(output, &track, "flac");
+        assert_eq!(
+            path,
+            std::path::PathBuf::from(
+                "/tmp/export/Carbon Based Lifeforms/Twentythree/Polyrytmi.flac"
+            )
+        );
+    }
+
+    #[test]
+    fn export_dest_path_sanitizes_slash_in_artist() {
+        let track = make_track_full("AC/DC", "Back in Black", "Thunderstruck", "ab/abc123.mp3");
+        let output = std::path::Path::new("/tmp/export");
+        let path = export_dest_path(output, &track, "mp3");
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/tmp/export/AC_DC/Back in Black/Thunderstruck.mp3")
+        );
+    }
+
+    #[test]
+    fn export_dest_path_uses_fallbacks_for_missing_metadata() {
+        use library_ipc_client::{ContentHash, DurationSeconds};
+        let track = TrackInfo {
+            content_hash: ContentHash("sha256:deadbeef".to_string()),
+            title: None,
+            artist: None,
+            album: None,
+            duration: Some(DurationSeconds(120)),
+            bpm: None,
+            key: None,
+            blob_path: Some("ab/abc123.flac".to_string()),
+        };
+        let output = std::path::Path::new("/tmp/export");
+        let path = export_dest_path(output, &track, "flac");
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/tmp/export/Unknown Artist/Unknown Album/Unknown.flac")
+        );
+    }
+
+    #[test]
+    fn export_dest_path_sanitizes_all_unsafe_chars() {
+        let track = make_track_full(
+            "Art:ist*Name",
+            "Album?<>|Name",
+            r#"Track "Remix""#,
+            "ab/abc123.aiff",
+        );
+        let output = std::path::Path::new("/out");
+        let path = export_dest_path(output, &track, "aiff");
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/out/Art_ist_Name/Album____Name/Track _Remix_.aiff")
+        );
     }
 }
