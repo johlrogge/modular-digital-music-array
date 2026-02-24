@@ -138,6 +138,34 @@ just pi-ssh          # provisioned Pi (mdma-909.local)
 just pi-ssh-beacon   # unprovisioned Pi (welcome-to-mdma.local)
 ```
 
+## Installing the CLI (macOS)
+
+Download the latest `mdma-cli-macos-arm64` artifact from [GitHub Actions](https://github.com/johlrogge/modular-digital-music-array/actions/workflows/build-and-package.yml) (select the latest successful run, scroll to Artifacts).
+
+Or build from source:
+
+```bash
+# Requires Rust toolchain (https://rustup.rs)
+cargo build --release -p mdma-cli
+cp target/release/mdma /usr/local/bin/
+```
+
+### Setup
+
+Set the Pi's hostname so the CLI knows where to connect:
+
+```bash
+echo 'export MDMA_NODE="mdma-909.local"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+### Verify
+
+```bash
+mdma --help
+mdma source list
+```
+
 ## Development
 
 Requires: Rust, Zig, cargo-zigbuild, PipeWire libs (enter `devenv shell`)

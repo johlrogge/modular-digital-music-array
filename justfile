@@ -273,9 +273,14 @@ ci-check-deps:
 # Void Package Building (Scripts-Based - No Auto-Install!)
 # ============================================================================
 
+# Build all binaries for CI in minimal cargo zigbuild invocations (Phase 1: 5 simple, Phase 2: playback)
+[group('ci')]
+ci-build-all: setup-playback-sysroot
+    ./scripts/ci/build-all.sh
+
 # Build beacon Void package
 [group('package')]
-pkg-beacon: ci-build-beacon
+pkg-beacon:
     ./scripts/package/create-package.sh
 
 # Build mdma-library for CI
@@ -305,32 +310,32 @@ ci-build-bandcamp:
 
 # Build mdma-library Void package
 [group('package')]
-pkg-library: ci-build-library
+pkg-library:
     ./scripts/package/create-library-package.sh
 
 # Build mdma-console Void package
 [group('package')]
-pkg-console: ci-build-console
+pkg-console:
     ./scripts/package/create-console-package.sh
 
 # Build mdma-playback Void package
 [group('package')]
-pkg-playback: ci-build-playback
+pkg-playback:
     ./scripts/package/create-playback-package.sh
 
 # Build mdma-gateway Void package
 [group('package')]
-pkg-gateway: ci-build-gateway
+pkg-gateway:
     ./scripts/package/create-gateway-package.sh
 
 # Build mdma-bandcamp Void package
 [group('package')]
-pkg-bandcamp: ci-build-bandcamp
+pkg-bandcamp:
     ./scripts/package/create-bandcamp-package.sh
 
 # Create repository structure and index (all packages)
 [group('package')]
-pkg-repository: pkg-beacon pkg-library pkg-console pkg-playback pkg-gateway pkg-bandcamp
+pkg-repository: ci-build-all pkg-beacon pkg-library pkg-console pkg-playback pkg-gateway pkg-bandcamp
     ./scripts/package/create-repository.sh
 
 # Full package build pipeline (what CI runs!)

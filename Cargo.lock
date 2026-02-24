@@ -249,7 +249,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "audio-metadata"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lofty",
  "thiserror 1.0.69",
@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "audio-transcoder"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "extended",
  "lofty",
@@ -357,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "bandcamp-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-stream",
  "chrono",
@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "beacon"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "askama",
  "async-stream",
@@ -669,7 +669,7 @@ checksum = "f46ad14479a25103f283c0f10005961cf086d8dc42205bb44c46ac563475dca6"
 
 [[package]]
 name = "clock"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "assert_matches",
  "parking_lot",
@@ -1185,7 +1185,7 @@ dependencies = [
 
 [[package]]
 name = "event-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1378,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "gateway-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gateway-protocol",
  "library-ipc-protocol",
@@ -1393,7 +1393,7 @@ dependencies = [
 
 [[package]]
 name = "gateway-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "library-ipc-protocol",
  "media-protocol",
@@ -1906,7 +1906,7 @@ dependencies = [
 
 [[package]]
 name = "inbox-utils"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tempfile",
  "tracing",
@@ -2129,7 +2129,7 @@ checksum = "f9fbbcab51052fe104eb5e5d351cf728d30a5be1fe14d9be8a3b097481fb97de"
 
 [[package]]
 name = "library-ipc-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "library-ipc-protocol",
  "nng",
@@ -2141,7 +2141,7 @@ dependencies = [
 
 [[package]]
 name = "library-ipc-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "library-search",
  "music-facts",
@@ -2153,7 +2153,7 @@ dependencies = [
 
 [[package]]
 name = "library-search"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "regex",
@@ -2164,7 +2164,7 @@ dependencies = [
 
 [[package]]
 name = "library-service"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "audio-metadata",
  "chrono",
@@ -2361,7 +2361,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "mdma-bandcamp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bandcamp-api",
  "clap",
@@ -2404,7 +2404,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "color-eyre",
@@ -2426,7 +2426,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gateway-client",
  "library-ipc-client",
@@ -2443,7 +2443,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-console"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "askama",
  "async-stream",
@@ -2474,7 +2474,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-gateway"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "color-eyre",
@@ -2491,7 +2491,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-library"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "color-eyre",
@@ -2503,7 +2503,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-playback"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "clap",
@@ -2526,7 +2526,7 @@ dependencies = [
 
 [[package]]
 name = "media-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "media-protocol",
  "nng",
@@ -2538,7 +2538,7 @@ dependencies = [
 
 [[package]]
 name = "media-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "playback-primitives",
  "serde",
@@ -2634,7 +2634,7 @@ dependencies = [
 
 [[package]]
 name = "music-facts"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "music-primitives",
@@ -2647,7 +2647,7 @@ dependencies = [
 
 [[package]]
 name = "music-primitives"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2693,7 +2693,7 @@ dependencies = [
 
 [[package]]
 name = "nng-transport"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nng",
  "thiserror 1.0.69",
@@ -3062,7 +3062,7 @@ checksum = "953ec861398dccce10c670dfeaf3ec4911ca479e9c02154b3a215178c5f566f2"
 
 [[package]]
 name = "playback-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -3085,7 +3085,7 @@ dependencies = [
 
 [[package]]
 name = "playback-primitives"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "assert_matches",
  "chrono",
@@ -3939,7 +3939,7 @@ dependencies = [
 
 [[package]]
 name = "source-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rstest",
  "serde",
@@ -3983,7 +3983,7 @@ dependencies = [
 
 [[package]]
 name = "storage_primitives"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -4401,7 +4401,7 @@ dependencies = [
 
 [[package]]
 name = "time-primitives"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "assert_matches",
  "serde",

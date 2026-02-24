@@ -1,6 +1,6 @@
 # Template file for mdma-bandcamp package
 pkgname=mdma-bandcamp
-version=0.1.0
+version=0.2.0
 revision=1
 archs="aarch64"
 build_style=cargo
