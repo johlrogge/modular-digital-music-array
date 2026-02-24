@@ -2,7 +2,7 @@
 //!
 //! Connects to services via gateway (single address) or direct IPC.
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use color_eyre::Result;
 use colored::Colorize;
 use corsett::{
@@ -252,6 +252,13 @@ enum Commands {
         /// Output directory (created if it doesn't exist)
         #[arg(long, default_value = "./export/")]
         output: std::path::PathBuf,
+    },
+
+    /// Generate shell completions
+    #[command(hide = true)]
+    GenerateCompletions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
 }
 
@@ -2353,6 +2360,15 @@ fn handle_export(
 }
 
 // =============================================================================
+// Shell Completions
+// =============================================================================
+
+fn generate_completions(shell: clap_complete::Shell, out: &mut dyn std::io::Write) {
+    let mut cmd = Cli::command();
+    clap_complete::generate(shell, &mut cmd, "mdma", out);
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -2551,6 +2567,10 @@ fn main() -> Result<()> {
         Commands::Export { format, output } => {
             let lib = connect_library(&cli);
             handle_export(&lib, format, output)
+        }
+        Commands::GenerateCompletions { shell } => {
+            generate_completions(*shell, &mut std::io::stdout());
+            Ok(())
         }
     }
 }
@@ -2913,6 +2933,24 @@ mod tests {
         assert_eq!(
             path,
             std::path::PathBuf::from("/out/Art_ist_Name/Album____Name/Track _Remix_.aiff")
+        );
+    }
+
+    // ── Shell completions ─────────────────────────────────────────────────────
+
+    #[test]
+    fn generate_completions_bash_produces_nonempty_output() {
+        // The generate_completions function must produce a non-empty bash script.
+        let mut buf = Vec::new();
+        generate_completions(clap_complete::Shell::Bash, &mut buf);
+        let output = String::from_utf8(buf).expect("completion output is valid UTF-8");
+        assert!(
+            !output.is_empty(),
+            "bash completion output must not be empty"
+        );
+        assert!(
+            output.contains("mdma"),
+            "bash completion output must reference the binary name 'mdma'"
         );
     }
 }

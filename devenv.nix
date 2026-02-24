@@ -114,6 +114,7 @@
         && export PATH="$MDMA_PROJECT_ROOT/target/debug:$PATH" \
         && echo "mdma CLI ready (gateway mode)" \
         || echo "mdma CLI not built — run: cargo build --package mdma-cli"
+      eval "$(mdma generate-completions bash 2>/dev/null)" || true
     fi
 
     echo ""
