@@ -2450,12 +2450,13 @@ dependencies = [
 
 [[package]]
 name = "mdma-console"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "askama",
  "async-stream",
  "audio-transcoder",
  "axum",
+ "bandcamp-api",
  "clap",
  "color-eyre",
  "event-protocol",

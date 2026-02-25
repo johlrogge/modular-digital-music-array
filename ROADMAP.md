@@ -1,6 +1,6 @@
 # MDMA Roadmap
 
-**Last updated:** February 24, 2026
+**Last updated:** February 25, 2026
 
 ## Where We Are
 
@@ -236,11 +236,30 @@ mdma search --bpm 128-132 --key 8A | mdma export --format=aiff --output ./rekord
 - ~~Runs on the laptop, not the Pi~~ — DONE
 - Console export endpoint also working
 
+**Smart format selection (Feb 25, 2026):**
+- `--lossless-format` and `--lossy-format` CLI flags for per-category format selection
+- `FormatCategory` enum classifies source formats as lossless (FLAC, WAV, AIFF) or lossy (MP3, AAC, OGG)
+- `--format` still works as blanket override; new flags enable smart per-source decisions
+- 75 tests passing
+
 **Guiding use case:** Rekordbox preparation — export a set of tracks as AIFF, import into Rekordbox for club/CDJ use. But the tool is format-generic, not Rekordbox-specific.
 
 **Shared infrastructure:** The `audio_transcoder` component is reused by Rekordbox Sync (Priority 12) and Virtual CDJ (Priority 13).
 
 **Later:** `mdma rekordbox export` wraps `mdma export` + generates Rekordbox XML with BPM, key, artist, title. Identity mapping facts for round-trip sync.
+
+---
+
+### ~~Infrastructure: Git-flow, Conventional Commits, CI, Release Workflow~~ — COMPLETE (Feb 25, 2026)
+
+Developer tooling and process improvements to support sustainable releases.
+
+- **Git-flow branching**: `develop` branch established, gitflow CLI added to devenv. CI runs tests on all branches; packages built only on main/master.
+- **Conventional Commits**: Skill file (`.claude/skills/conventional-commits/SKILL.md`) added. All commits follow `<type>(<scope>): <description>` format enforced by agent workflow.
+- **Documenter agent**: Agent definition added for release workflow README updates.
+- **Release process**: 9-step git-flow release workflow documented in `.claude/skills/mdma-devops/references/releases.md`.
+- **DevOps skill overhaul**: Ansible references removed. xbps command reference added. Provisioning and recovery docs updated.
+- **CI split**: Test job (all branches) separated from build-and-publish job (main/master only).
 
 ---
 
@@ -478,6 +497,8 @@ Two external ports: 5555 (gateway) and 5556 (events). No per-service TCP ports e
 ---
 
 ## Update History
+
+- **2026-02-25:** Smart export: per-category format resolution (`--lossless-format`, `--lossy-format`). Infrastructure: git-flow branching, conventional commits skill, CI split (test all branches / publish main only), 9-step release workflow, devops skill overhaul (Ansible removed, xbps added), documenter agent defined.
 
 - **2026-02-23:** Priorities 7+8 implementation started. library_crawler removed (replaced by library_service). New Priority 9 (Track Export) added — composable `mdma export` command for Rekordbox/CDJ workflow.
 

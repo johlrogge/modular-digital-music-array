@@ -36,6 +36,7 @@ event-protocol = { path = "../../components/event_protocol" }
 nng-transport = { path = "../../components/nng_transport" }
 media-protocol = { path = "../../components/media_protocol" }
 library-search = { path = "../../components/library_search" }
+bandcamp-api = { path = "../../components/bandcamp_api" }
 
 # CLI and logging
 clap = { workspace = true, features = ["derive"] }
