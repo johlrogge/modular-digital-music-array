@@ -1294,14 +1294,11 @@ fn playlist_expect_content(
 // =============================================================================
 
 fn handle_playlist_list(client: &LibraryBackend) -> Result<()> {
-    use library_ipc_client::{LibraryRequest, LibraryResponse};
+    use library_ipc_client::{DurationSeconds, LibraryRequest, LibraryResponse};
+
     let response = client.request(&LibraryRequest::PlaylistList);
-    match response {
-        Ok(LibraryResponse::PlaylistNames(names)) => {
-            for name in names {
-                println!("{}", name);
-            }
-        }
+    let names = match response {
+        Ok(LibraryResponse::PlaylistNames(names)) => names,
         Ok(LibraryResponse::Error(e)) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
@@ -1310,7 +1307,50 @@ fn handle_playlist_list(client: &LibraryBackend) -> Result<()> {
             eprintln!("Unexpected response");
             std::process::exit(1);
         }
+    };
+
+    for name in &names {
+        let content = match client.request(&LibraryRequest::PlaylistGet { name: name.clone() }) {
+            Ok(LibraryResponse::PlaylistContent(c)) => c,
+            _ => continue,
+        };
+
+        let hashes: Vec<ContentHash> = content
+            .lines()
+            .filter_map(|line| {
+                let first = line.split_whitespace().next()?;
+                let len = first.len();
+                if (8..=12).contains(&len)
+                    && first
+                        .chars()
+                        .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+                {
+                    Some(ContentHash(first.to_string()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let track_count = hashes.len();
+
+        let total_secs: u32 = hashes
+            .iter()
+            .filter_map(|h| {
+                let track = client.get_track(h).ok()?;
+                track.duration.map(|d| d.0)
+            })
+            .sum();
+
+        let duration = DurationSeconds(total_secs);
+        println!(
+            "{}  {}  [{}]",
+            name.to_string().bold(),
+            format!("{} tracks", track_count).green(),
+            duration
+        );
     }
+
     Ok(())
 }
 
