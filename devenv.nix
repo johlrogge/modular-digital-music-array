@@ -388,6 +388,8 @@
         IMPORTANT: MDMA_NODE is already set in your environment. The mdma CLI derives
         the gateway address from it automatically. Do NOT set or export MDMA_GATEWAY.
         Run mdma commands directly (e.g. "mdma ping", NOT "MDMA_GATEWAY=... mdma ping").
+        IMPORTANT: Always use --no-stdin with `mdma search` to prevent it from waiting
+        for piped input. Without --no-stdin, search hangs when called from agents.
 
         Run these checks IN ORDER and report results as a table:
 
@@ -405,7 +407,7 @@
            Expected: exit code 0, track count > 0
 
         4. SEARCH — verify search works:
-           mdma search --artist "a" --limit 1
+           mdma search --no-stdin --artist "a" --limit 1
            Expected: exit code 0, at least 1 result
 
         5. PLAYBACK — verify playback service responds:
