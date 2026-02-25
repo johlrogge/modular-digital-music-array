@@ -266,6 +266,12 @@ enum Commands {
         output: std::path::PathBuf,
     },
 
+    /// Manage playlists
+    Playlist {
+        #[command(subcommand)]
+        command: PlaylistCommands,
+    },
+
     /// Generate shell completions
     #[command(hide = true)]
     GenerateCompletions {
@@ -455,6 +461,48 @@ enum QueueCommands {
     /// Edit the queue in $EDITOR (falls back to vi).
     /// Opens the current queue as a playlist file; save to apply changes.
     Edit,
+}
+
+#[derive(Subcommand, Debug)]
+enum PlaylistCommands {
+    /// List all playlists
+    List,
+
+    /// Get playlist content (pipe to mdma queue replace to load)
+    Get {
+        /// Playlist name
+        name: String,
+    },
+
+    /// Create a new playlist from stdin (fails if it already exists)
+    New {
+        /// Playlist name
+        name: String,
+    },
+
+    /// Append stdin to an existing playlist
+    Append {
+        /// Playlist name
+        name: String,
+    },
+
+    /// Replace playlist content from stdin
+    Replace {
+        /// Playlist name
+        name: String,
+    },
+
+    /// Edit playlist in $EDITOR
+    Edit {
+        /// Playlist name
+        name: String,
+    },
+
+    /// Remove a playlist
+    Remove {
+        /// Playlist name
+        name: String,
+    },
 }
 
 // =============================================================================
@@ -1192,6 +1240,202 @@ fn handle_inbox_ingest_all(client: &LibraryBackend) -> Result<()> {
         }
         Err(e) => handle_error(e),
     }
+}
+
+// =============================================================================
+// Playlist Helpers
+// =============================================================================
+
+fn parse_playlist_name(name: &str) -> library_ipc_client::PlaylistName {
+    library_ipc_client::PlaylistName::new(name).unwrap_or_else(|e| {
+        eprintln!("Invalid playlist name: {}", e);
+        std::process::exit(1);
+    })
+}
+
+fn read_stdin_to_string() -> String {
+    use std::io::Read;
+    let mut content = String::new();
+    std::io::stdin()
+        .read_to_string(&mut content)
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to read stdin: {}", e);
+            std::process::exit(1);
+        });
+    content
+}
+
+fn playlist_expect_content(
+    response: std::result::Result<
+        library_ipc_client::LibraryResponse,
+        library_ipc_client::ClientError,
+    >,
+) -> String {
+    use library_ipc_client::LibraryResponse;
+    match response {
+        Ok(LibraryResponse::PlaylistContent(c)) => c,
+        Ok(LibraryResponse::Error(e)) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        Ok(_) => {
+            eprintln!("Unexpected response");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Request failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+// =============================================================================
+// Playlist Command Handlers
+// =============================================================================
+
+fn handle_playlist_list(client: &LibraryBackend) -> Result<()> {
+    use library_ipc_client::{LibraryRequest, LibraryResponse};
+    let response = client.request(&LibraryRequest::PlaylistList);
+    match response {
+        Ok(LibraryResponse::PlaylistNames(names)) => {
+            for name in names {
+                println!("{}", name);
+            }
+        }
+        Ok(LibraryResponse::Error(e)) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("Unexpected response");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+fn handle_playlist_get(client: &LibraryBackend, name: &str) -> Result<()> {
+    use library_ipc_client::LibraryRequest;
+    let pname = parse_playlist_name(name);
+    let content =
+        playlist_expect_content(client.request(&LibraryRequest::PlaylistGet { name: pname }));
+    print!("{}", content);
+    Ok(())
+}
+
+fn handle_playlist_new(client: &LibraryBackend, name: &str) -> Result<()> {
+    use library_ipc_client::LibraryRequest;
+    let pname = parse_playlist_name(name);
+    let content = read_stdin_to_string();
+    playlist_expect_content(client.request(&LibraryRequest::PlaylistNew {
+        name: pname,
+        content,
+    }));
+    eprintln!("Created playlist '{}'", name);
+    Ok(())
+}
+
+fn handle_playlist_append(client: &LibraryBackend, name: &str) -> Result<()> {
+    use library_ipc_client::LibraryRequest;
+    let pname = parse_playlist_name(name);
+    let content = read_stdin_to_string();
+    playlist_expect_content(client.request(&LibraryRequest::PlaylistAppend {
+        name: pname,
+        content,
+    }));
+    eprintln!("Appended to playlist '{}'", name);
+    Ok(())
+}
+
+fn handle_playlist_replace(client: &LibraryBackend, name: &str) -> Result<()> {
+    use library_ipc_client::LibraryRequest;
+    let pname = parse_playlist_name(name);
+    let content = read_stdin_to_string();
+    playlist_expect_content(client.request(&LibraryRequest::PlaylistReplace {
+        name: pname,
+        content,
+    }));
+    eprintln!("Replaced playlist '{}'", name);
+    Ok(())
+}
+
+fn handle_playlist_edit(client: &LibraryBackend, name: &str) -> Result<()> {
+    use library_ipc_client::{LibraryRequest, LibraryResponse, ProtocolError};
+
+    let pname = parse_playlist_name(name);
+
+    // 1. Get current content (or start empty if not found)
+    let current = match client.request(&LibraryRequest::PlaylistGet {
+        name: pname.clone(),
+    }) {
+        Ok(LibraryResponse::PlaylistContent(c)) => c,
+        Ok(LibraryResponse::Error(ProtocolError::PlaylistNotFound { .. })) => String::new(),
+        Ok(LibraryResponse::Error(e)) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("Unexpected response");
+            std::process::exit(1);
+        }
+    };
+
+    // 2. Write to temp file
+    let tmp_path = std::env::temp_dir().join(format!("mdma_playlist_{}.plist", name));
+    std::fs::write(&tmp_path, &current).unwrap_or_else(|e| {
+        eprintln!("Failed to write temp file: {}", e);
+        std::process::exit(1);
+    });
+
+    // 3. Open in $EDITOR
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let status = std::process::Command::new(&editor)
+        .arg(&tmp_path)
+        .status()
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to launch editor '{}': {}", editor, e);
+            std::process::exit(1);
+        });
+    if !status.success() {
+        eprintln!("Editor exited with non-zero status");
+        std::process::exit(1);
+    }
+
+    // 4. Read back and replace
+    let new_content = std::fs::read_to_string(&tmp_path).unwrap_or_else(|e| {
+        eprintln!("Failed to read temp file: {}", e);
+        std::process::exit(1);
+    });
+
+    playlist_expect_content(client.request(&LibraryRequest::PlaylistReplace {
+        name: pname,
+        content: new_content,
+    }));
+    eprintln!("Updated playlist '{}'", name);
+
+    // Cleanup
+    let _ = std::fs::remove_file(&tmp_path);
+    Ok(())
+}
+
+fn handle_playlist_remove(client: &LibraryBackend, name: &str) -> Result<()> {
+    use library_ipc_client::{LibraryRequest, LibraryResponse};
+    let pname = parse_playlist_name(name);
+    let response = client.request(&LibraryRequest::PlaylistRemove { name: pname });
+    match response {
+        Ok(LibraryResponse::Pong) => {
+            eprintln!("Removed playlist '{}'", name);
+        }
+        Ok(LibraryResponse::Error(e)) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("Unexpected response");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
 }
 
 // =============================================================================
@@ -2577,6 +2821,19 @@ fn main() -> Result<()> {
                 handle_search(&client, &track_query, *no_stdin)
             }
         }
+        Commands::Playlist { command } => {
+            let lib = connect_library(&cli);
+            match command {
+                PlaylistCommands::List => handle_playlist_list(&lib),
+                PlaylistCommands::Get { name } => handle_playlist_get(&lib, name),
+                PlaylistCommands::New { name } => handle_playlist_new(&lib, name),
+                PlaylistCommands::Append { name } => handle_playlist_append(&lib, name),
+                PlaylistCommands::Replace { name } => handle_playlist_replace(&lib, name),
+                PlaylistCommands::Edit { name } => handle_playlist_edit(&lib, name),
+                PlaylistCommands::Remove { name } => handle_playlist_remove(&lib, name),
+            }
+        }
+
         Commands::Inbox { command } => {
             let client = connect_library(&cli);
             match command {

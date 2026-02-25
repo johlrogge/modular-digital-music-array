@@ -83,6 +83,66 @@ impl std::fmt::Display for InboxPath {
 }
 
 // ============================================================================
+// Playlist Name Validation
+// ============================================================================
+
+/// Validated playlist name — only allows `[a-zA-Z0-9_-]`, rejects empty strings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct PlaylistName(String);
+
+/// Errors when constructing a PlaylistName
+#[derive(Debug, Clone, Error)]
+pub enum PlaylistNameError {
+    #[error("playlist name cannot be empty")]
+    Empty,
+    #[error(
+        "playlist name contains invalid characters (only a-z, A-Z, 0-9, _, - allowed): {name}"
+    )]
+    InvalidCharacters { name: String },
+}
+
+impl PlaylistName {
+    pub fn new(name: &str) -> Result<Self, PlaylistNameError> {
+        if name.is_empty() {
+            return Err(PlaylistNameError::Empty);
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(PlaylistNameError::InvalidCharacters {
+                name: name.to_string(),
+            });
+        }
+        Ok(Self(name.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for PlaylistName {
+    type Error = PlaylistNameError;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Self::new(&s)
+    }
+}
+
+impl From<PlaylistName> for String {
+    fn from(p: PlaylistName) -> String {
+        p.0
+    }
+}
+
+impl std::fmt::Display for PlaylistName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+// ============================================================================
 // Protocol Errors
 // ============================================================================
 
@@ -100,6 +160,15 @@ pub enum ProtocolError {
 
     #[error("internal error: {message}")]
     Internal { message: String },
+
+    #[error("playlist not found: {name}")]
+    PlaylistNotFound { name: String },
+
+    #[error("playlist already exists: {name}")]
+    PlaylistAlreadyExists { name: String },
+
+    #[error("invalid playlist name: {name}")]
+    InvalidPlaylistName { name: String },
 }
 
 // ============================================================================
@@ -176,6 +245,24 @@ pub enum LibraryRequest {
         fact_type: String,
         values: Vec<String>,
     },
+
+    /// List all playlist names.
+    PlaylistList,
+
+    /// Get playlist content verbatim.
+    PlaylistGet { name: PlaylistName },
+
+    /// Create a new playlist (fails if it already exists).
+    PlaylistNew { name: PlaylistName, content: String },
+
+    /// Append content to an existing playlist.
+    PlaylistAppend { name: PlaylistName, content: String },
+
+    /// Replace (overwrite) a playlist's content.
+    PlaylistReplace { name: PlaylistName, content: String },
+
+    /// Remove a playlist.
+    PlaylistRemove { name: PlaylistName },
 }
 
 // ============================================================================
@@ -231,6 +318,12 @@ pub enum LibraryResponse {
         fact_type: String,
         existing: Vec<String>,
     },
+
+    /// List of playlist names.
+    PlaylistNames(Vec<PlaylistName>),
+
+    /// Verbatim playlist content.
+    PlaylistContent(String),
 
     /// Error response.
     Error(ProtocolError),
@@ -337,6 +430,44 @@ mod tests {
     fn inbox_path_serde_rejects_invalid() {
         // Malicious JSON should fail deserialization
         let result: Result<InboxPath, _> = serde_json::from_str("\"../../../etc/passwd\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn playlist_name_valid() {
+        assert!(PlaylistName::new("techno-set").is_ok());
+        assert!(PlaylistName::new("My_Playlist_2").is_ok());
+        assert!(PlaylistName::new("a").is_ok());
+    }
+
+    #[test]
+    fn playlist_name_rejects_empty() {
+        assert!(matches!(
+            PlaylistName::new(""),
+            Err(PlaylistNameError::Empty)
+        ));
+    }
+
+    #[test]
+    fn playlist_name_rejects_invalid_chars() {
+        assert!(PlaylistName::new("foo/bar").is_err());
+        assert!(PlaylistName::new("foo bar").is_err());
+        assert!(PlaylistName::new("../etc").is_err());
+        assert!(PlaylistName::new("name.plist").is_err());
+    }
+
+    #[test]
+    fn playlist_name_serde_roundtrip() {
+        let name = PlaylistName::new("my-set").unwrap();
+        let json = serde_json::to_string(&name).unwrap();
+        assert_eq!(json, "\"my-set\"");
+        let parsed: PlaylistName = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.as_str(), "my-set");
+    }
+
+    #[test]
+    fn playlist_name_serde_rejects_invalid() {
+        let result: Result<PlaylistName, _> = serde_json::from_str("\"../../../etc\"");
         assert!(result.is_err());
     }
 
