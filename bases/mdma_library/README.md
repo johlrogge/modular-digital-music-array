@@ -1,6 +1,39 @@
-# mdma_library
+# mdma-library
 
-Music library service for MDMA. Scans the music directory, indexes track metadata, and serves search and lookup requests over an NNG IPC socket.
+Version: **0.3.3**
+
+Music library service for MDMA. Manages a content-addressed blob store, indexes track metadata as an immutable fact stream, and serves search and lookup requests over NNG IPC.
+
+[Back to workspace README](../../README.md)
+
+---
+
+## What it does
+
+- Watches `/music/inbox/` for new audio files; ingests on arrival
+- Stores audio in content-addressed blobs under `/music/blobs/<hash-prefix>/<full-hash>.<ext>`
+- Tracks all metadata — artist, title, album, BPM, key, play history — as typed facts in `/metadata/facts.jsonl`
+- Facts are immutable and append-only (`stainless_facts`). The entire library state can be rebuilt from `facts.jsonl` at any time
+- Serves search, list, get, and facts queries via NNG IPC
+- Accepts file ingest requests (inbox management) from the CLI and console
+
+## Storage layout
+
+```
+/music/
+    inbox/              # drop files here — watched by mdma-library
+    downloads/          # staging area for in-progress downloads
+    blobs/              # content-addressed audio storage
+        a1/
+            b2c3d4...sha256.flac
+
+/metadata/
+    facts.jsonl         # main fact stream — source of truth for all metadata
+```
+
+## IPC interface
+
+Listens on `ipc:///run/mdma/library.sock`. Accepts `LibraryRequest` messages. Not directly accessible externally — all traffic is routed through the gateway on TCP port 5555.
 
 ## Build
 
@@ -13,9 +46,3 @@ cargo build --package mdma-library
 ```bash
 cargo run --package mdma-library
 ```
-
-Listens on `ipc:///run/mdma/library.sock` by default.
-
-## Back to workspace
-
-[Workspace README](../../README.md)
