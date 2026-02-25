@@ -1,4 +1,83 @@
-# Modular Distributed Music Architecture (MDMA)
+# MDMA — Modular Distributed Music Architecture
+
+Version: **0.3.1**
+
+MDMA is a distributed DJ system for Raspberry Pi 5 running Void Linux. It moves the music experience from a phone to a dedicated device with professional playback capabilities, using NVMe storage via M.2 HAT.
+
+---
+
+## Workspace members
+
+| Base | Description | README |
+|------|-------------|--------|
+| [beacon](bases/beacon/) | Provisioning server with web UI — installs and configures MDMA on a fresh Pi | [bases/beacon/README.md](bases/beacon/README.md) |
+| [mdma_playback](bases/mdma_playback/) | Real-time audio playback server (Symphonia + PipeWire) | [bases/mdma_playback/README.md](bases/mdma_playback/README.md) |
+| [mdma_cli](bases/mdma_cli/) | Command-line interface for controlling MDMA over the gateway | [bases/mdma_cli/README.md](bases/mdma_cli/README.md) |
+| [mdma_console](bases/mdma_console/) | Web management console (Axum + Askama) | [bases/mdma_console/README.md](bases/mdma_console/README.md) |
+| [mdma_library](bases/mdma_library/) | Music library service — scans, indexes, and serves track metadata | [bases/mdma_library/README.md](bases/mdma_library/README.md) |
+| [mdma_bandcamp](bases/mdma_bandcamp/) | Bandcamp download service — fetches purchases and imports to inbox | [bases/mdma_bandcamp/README.md](bases/mdma_bandcamp/README.md) |
+| [mdma_gateway](bases/mdma_gateway/) | Single TCP gateway (port 5555) that routes to all internal IPC services | [bases/mdma_gateway/README.md](bases/mdma_gateway/README.md) |
+
+---
+
+## Build quickstart
+
+```bash
+# Enter reproducible dev environment (Nix/devenv)
+devenv shell
+
+# Build everything
+cargo build
+
+# Run all tests
+cargo test
+
+# Watch mode: check → test → build → clippy on save
+just watch
+```
+
+### Cross-compile beacon for Raspberry Pi
+
+```bash
+just beacon-cross   # Uses cargo-zigbuild (recommended)
+```
+
+### Deploy to a running Pi
+
+```bash
+just deploy-dev     # Build and deploy to welcome-to-mdma.local
+```
+
+---
+
+## Architecture overview
+
+```
+bases/          Binary entry points (services and tools)
+  beacon/         Provisioning server
+  mdma_playback/  Audio playback
+  mdma_cli/       CLI tool
+  mdma_console/   Web console
+  mdma_library/   Library service
+  mdma_bandcamp/  Bandcamp source
+  mdma_gateway/   API gateway
+
+components/     Shared libraries
+  playback_engine/      Real-time audio (Symphonia + PipeWire)
+  music_primitives/     BPM, Key, Mode types
+  playback_primitives/  Volume, Deck types
+  media_protocol/       Command/response protocol
+  storage_primitives/   Type-safe ByteSize
+  bandcamp_api/         Bandcamp HTTP client
+  gateway_protocol/     Gateway request/response types
+  ... (see Cargo.toml for full list)
+```
+
+All services communicate over NNG IPC sockets locally. The gateway exposes a single TCP endpoint (`tcp://<host>:5555`) to the outside world.
+
+See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
 
 A hi-fi music player for Raspberry Pi 5. Indexes your FLAC library, streams to a USB DAC at 192 kHz, and is fully controlled from the command line — composable with dmenu for keyboard-driven browsing and queuing.
 
