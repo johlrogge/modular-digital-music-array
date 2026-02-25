@@ -1047,20 +1047,27 @@ deploy-bandcamp: bandcamp-cross
     BINARY="target/aarch64-unknown-linux-gnu/release/mdma-bandcamp"
     SSH_KEY="$HOME/.ssh/mdma_pi"
     RUN_SCRIPT="void-packages/srcpkgs/mdma-bandcamp/files/mdma-bandcamp/run"
+    CONF_FILE="void-packages/srcpkgs/mdma-bandcamp/files/mdma-bandcamp/conf"
 
     echo "Deploying mdma-bandcamp to $HOST..."
 
-    scp -4 -i "$SSH_KEY" "$BINARY" "$RUN_SCRIPT" "admin@${HOST}:/tmp/"
+    scp -4 -i "$SSH_KEY" "$BINARY" "$RUN_SCRIPT" "$CONF_FILE" "admin@${HOST}:/tmp/"
 
     ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-bandcamp 2>/dev/null || true
         sudo mv /tmp/mdma-bandcamp /usr/bin/
         sudo chmod +x /usr/bin/mdma-bandcamp
-        sudo mkdir -p /etc/sv/mdma-bandcamp/log /var/log/mdma-bandcamp /music/downloads /music/inbox /run/mdma/sources /var/lib/mdma
+        sudo mkdir -p /etc/sv/mdma-bandcamp/log /var/log/mdma-bandcamp /music/downloads /music/inbox /run/mdma/sources /var/lib/mdma /etc/mdma
         sudo chown -R mdma:mdma /music /run/mdma /var/lib/mdma
         sudo cp /tmp/run /etc/sv/mdma-bandcamp/run
         sudo chmod +x /etc/sv/mdma-bandcamp/run
         printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-bandcamp\n" | sudo tee /etc/sv/mdma-bandcamp/log/run > /dev/null
         sudo chmod +x /etc/sv/mdma-bandcamp/log/run
+        if [ ! -f /etc/mdma/bandcamp.conf ]; then
+            sudo install -Dm644 /tmp/conf /etc/mdma/bandcamp.conf
+            echo "Installed default bandcamp.conf — edit MDMA_BANDCAMP_USERNAME if needed"
+        else
+            echo "Skipping bandcamp.conf (already exists)"
+        fi
         sudo ln -sf /etc/sv/mdma-bandcamp /var/service/mdma-bandcamp 2>/dev/null || true
         for i in 1 2 3 4 5; do sleep 1; [ -d /var/service/mdma-bandcamp/supervise ] && break; done
         sudo sv start mdma-bandcamp 2>/dev/null || true

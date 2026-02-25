@@ -374,6 +374,36 @@
         {% endif %}
     </div>
 
+    <div class="card">
+        <h2>Bandcamp Configuration</h2>
+        <table style="margin-bottom:12px;">
+            <tbody>
+                <tr>
+                    <td>Username</td>
+                    <td>{% if bandcamp.configured_username.is_empty() %}<span class="no-update">not set</span>{% else %}{{ bandcamp.configured_username }}{% endif %}</td>
+                </tr>
+                <tr>
+                    <td>Cookies</td>
+                    <td>{% if bandcamp.cookies_valid %}<span class="update-available">valid</span>{% else %}<span class="no-update">missing / invalid</span>{% endif %}</td>
+                </tr>
+            </tbody>
+        </table>
+        <form id="bandcamp-configure-form" onsubmit="submitBandcampConfigure(event)" style="display:flex; flex-direction:column; gap:10px;">
+            <div>
+                <label style="display:block; margin-bottom:4px; color:var(--text-muted);">Cookie file (.json or .txt)</label>
+                <input type="file" id="bandcamp-cookie-file" accept=".json,.txt" style="color:var(--text);">
+            </div>
+            <div>
+                <label style="display:block; margin-bottom:4px; color:var(--text-muted);">Bandcamp username</label>
+                <input type="text" id="bandcamp-conf-username" value="{{ bandcamp.configured_username }}" placeholder="e.g. johlyroger" style="width:100%; padding:8px; border:1px solid var(--border); background:var(--bg-dark); color:var(--text); border-radius:4px;">
+            </div>
+            <div style="display:flex; gap:10px; align-items:center;">
+                <button class="btn" type="submit" id="bandcamp-configure-btn">Save Configuration</button>
+                <span id="bandcamp-configure-status" style="font-size:0.9em;"></span>
+            </div>
+        </form>
+    </div>
+
     <div id="sync-dialog" style="display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.7); z-index:1000;">
         <div style="position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:var(--bg-card); padding:20px; border-radius:8px; min-width:300px;">
             <h3 style="margin-top:0;">Sync Bandcamp Collection</h3>
@@ -819,6 +849,50 @@
                 }
             } catch (e) {
                 showStatus('Error: ' + e.message, true);
+            }
+        }
+
+        // =====================================================================
+        // Bandcamp Configuration
+        // =====================================================================
+
+        async function submitBandcampConfigure(event) {
+            event.preventDefault();
+            var fileInput = document.getElementById('bandcamp-cookie-file');
+            var usernameInput = document.getElementById('bandcamp-conf-username');
+            var statusEl = document.getElementById('bandcamp-configure-status');
+            var btn = document.getElementById('bandcamp-configure-btn');
+
+            if (!fileInput.files.length) {
+                statusEl.style.color = 'var(--error)';
+                statusEl.textContent = 'Please select a cookie file.';
+                return;
+            }
+
+            var formData = new FormData();
+            formData.append('cookies', fileInput.files[0]);
+            formData.append('username', usernameInput.value.trim());
+
+            btn.disabled = true;
+            statusEl.style.color = 'var(--text-muted)';
+            statusEl.textContent = 'Saving...';
+
+            try {
+                var response = await fetch('/bandcamp/configure', { method: 'POST', body: formData });
+                var data = await response.json();
+                if (data.success) {
+                    statusEl.style.color = 'var(--success)';
+                    statusEl.textContent = 'Configuration saved. Service restarting...';
+                    setTimeout(function() { location.reload(); }, 2500);
+                } else {
+                    statusEl.style.color = 'var(--error)';
+                    statusEl.textContent = 'Error: ' + (data.error || 'Unknown error');
+                }
+            } catch (e) {
+                statusEl.style.color = 'var(--error)';
+                statusEl.textContent = 'Error: ' + e.message;
+            } finally {
+                btn.disabled = false;
             }
         }
 

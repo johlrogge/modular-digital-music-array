@@ -32,6 +32,10 @@ echo "  → Copying service script from void-packages..."
 cp "void-packages/srcpkgs/mdma-bandcamp/files/mdma-bandcamp/run" "$PACKAGE_DIR/etc/sv/mdma-bandcamp/run"
 chmod +x "$PACKAGE_DIR/etc/sv/mdma-bandcamp/run"
 
+# Install default conf file (only installed if not already present on the system)
+echo "  → Copying default conf file from void-packages..."
+cp "void-packages/srcpkgs/mdma-bandcamp/files/mdma-bandcamp/conf" "$PACKAGE_DIR/etc/mdma/bandcamp.conf.example"
+
 # Create runit log service
 echo "  → Creating log service script..."
 cat > "$PACKAGE_DIR/etc/sv/mdma-bandcamp/log/run" <<'LOGSCRIPT'
@@ -51,6 +55,13 @@ post)
     mkdir -p /run/mdma/sources /var/lib/mdma
     mkdir -p /music/downloads /music/inbox
     mkdir -p /etc/mdma
+
+    # Install default conf if not already present
+    if [ ! -f /etc/mdma/bandcamp.conf ]; then
+        cp /etc/mdma/bandcamp.conf.example /etc/mdma/bandcamp.conf
+        echo "mdma-bandcamp: installed default conf at /etc/mdma/bandcamp.conf"
+        echo "  Edit MDMA_BANDCAMP_USERNAME to match your Bandcamp account"
+    fi
 
     # Create mdma user if doesn't exist
     if ! id mdma >/dev/null 2>&1; then

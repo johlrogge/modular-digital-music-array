@@ -1,6 +1,6 @@
 [package]
 name = "mdma-console"
-version = "0.2.2"
+version = "0.3.0"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -36,6 +36,7 @@ event-protocol = { path = "../../components/event_protocol" }
 nng-transport = { path = "../../components/nng_transport" }
 media-protocol = { path = "../../components/media_protocol" }
 library-search = { path = "../../components/library_search" }
+bandcamp-api = { path = "../../components/bandcamp_api" }
 
 # CLI and logging
 clap = { workspace = true, features = ["derive"] }

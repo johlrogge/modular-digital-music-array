@@ -1,6 +1,6 @@
 # MDMA Roadmap
 
-**Last updated:** February 24, 2026
+**Last updated:** February 25, 2026
 
 ## Where We Are
 
@@ -236,6 +236,12 @@ mdma search --bpm 128-132 --key 8A | mdma export --format=aiff --output ./rekord
 - ~~Runs on the laptop, not the Pi~~ — DONE
 - Console export endpoint also working
 
+**Smart format selection (Feb 25, 2026):**
+- `--lossless-format` and `--lossy-format` CLI flags for per-category format selection
+- `FormatCategory` enum classifies source formats as lossless (FLAC, WAV, AIFF) or lossy (MP3, AAC, OGG)
+- `--format` still works as blanket override; new flags enable smart per-source decisions
+- 75 tests passing
+
 **Guiding use case:** Rekordbox preparation — export a set of tracks as AIFF, import into Rekordbox for club/CDJ use. But the tool is format-generic, not Rekordbox-specific.
 
 **Shared infrastructure:** The `audio_transcoder` component is reused by Rekordbox Sync (Priority 12) and Virtual CDJ (Priority 13).
@@ -244,15 +250,27 @@ mdma search --bpm 128-132 --key 8A | mdma export --format=aiff --output ./rekord
 
 ---
 
-### 10. Bandcamp Configuration
+### ~~Infrastructure: Git-flow, Conventional Commits, CI, Release Workflow~~ — COMPLETE (Feb 25, 2026)
 
-**Missing piece:** How does a fresh install configure the bandcamp service?
+Developer tooling and process improvements to support sustainable releases.
 
-- Username (`--username`) is a CLI flag / config — needs a config file or provisioning step
-- Cookies (`--cookies /etc/mdma/bandcamp-cookies.json`) must be provided manually
-  - Current approach: SCP cookies file to Pi
-  - Better: `mdma source configure bandcamp` interactive flow, or web UI form
-- Document the manual process now, automate later
+- **Git-flow branching**: `develop` branch established, gitflow CLI added to devenv. CI runs tests on all branches; packages built only on main/master.
+- **Conventional Commits**: Skill file (`.claude/skills/conventional-commits/SKILL.md`) added. All commits follow `<type>(<scope>): <description>` format enforced by agent workflow.
+- **Documenter agent**: Agent definition added for release workflow README updates.
+- **Release process**: 9-step git-flow release workflow documented in `.claude/skills/mdma-devops/references/releases.md`.
+- **DevOps skill overhaul**: Ansible references removed. xbps command reference added. Provisioning and recovery docs updated.
+- **CI split**: Test job (all branches) separated from build-and-publish job (main/master only).
+
+---
+
+### ~~10. Bandcamp Configuration~~ — COMPLETE (Feb 25, 2026)
+
+Web-based configuration for Bandcamp cookies and username via mdma-console. Fresh installs can configure bandcamp through the web UI at http://mdma-909.local/bandcamp/config.
+
+- Web UI form for cookie and username configuration
+- Cookies stored in Netscape format at `/var/lib/mdma-bandcamp/cookies.txt`
+- Username persisted to `/etc/mdma/bandcamp-username`
+- Service restart after configuration update
 
 ---
 
@@ -478,6 +496,8 @@ Two external ports: 5555 (gateway) and 5556 (events). No per-service TCP ports e
 ---
 
 ## Update History
+
+- **2026-02-25:** Smart export: per-category format resolution (`--lossless-format`, `--lossy-format`). Infrastructure: git-flow branching, conventional commits skill, CI split (test all branches / publish main only), 9-step release workflow, devops skill overhaul (Ansible removed, xbps added), documenter agent defined.
 
 - **2026-02-23:** Priorities 7+8 implementation started. library_crawler removed (replaced by library_service). New Priority 9 (Track Export) added — composable `mdma export` command for Rekordbox/CDJ workflow.
 

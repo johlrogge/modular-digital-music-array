@@ -45,7 +45,7 @@ mod error;
 mod types;
 
 pub use client::BandcampClient;
-pub use cookies::load_cookies;
+pub use cookies::{load_cookies, parse_cookies};
 pub use error::BandcampError;
 pub use types::{
     AudioFormat, CollectionItem, DigitalItem, DownloadEvent, DownloadProgress, FanId, ItemId,

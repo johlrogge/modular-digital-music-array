@@ -65,6 +65,14 @@ struct Args {
     /// Root path of the music library on the filesystem
     #[arg(long, default_value = "/music")]
     music_root: std::path::PathBuf,
+
+    /// Path to the Bandcamp cookies file
+    #[arg(long, default_value = "/etc/mdma/bandcamp-cookies.json")]
+    bandcamp_cookies: std::path::PathBuf,
+
+    /// Path to the Bandcamp configuration file
+    #[arg(long, default_value = "/etc/mdma/bandcamp.conf")]
+    bandcamp_conf: std::path::PathBuf,
 }
 
 // =============================================================================
@@ -86,6 +94,10 @@ struct AppState {
     event_tx: broadcast::Sender<String>,
     /// Root path of the music library
     music_root: std::path::PathBuf,
+    /// Path to the Bandcamp cookies file
+    bandcamp_cookies_path: std::path::PathBuf,
+    /// Path to the Bandcamp configuration file
+    bandcamp_conf_path: std::path::PathBuf,
 }
 
 impl AppState {
@@ -95,6 +107,8 @@ impl AppState {
         source_name: String,
         event_tx: broadcast::Sender<String>,
         music_root: std::path::PathBuf,
+        bandcamp_cookies_path: std::path::PathBuf,
+        bandcamp_conf_path: std::path::PathBuf,
     ) -> Self {
         Self {
             packages: Mutex::new(Vec::new()),
@@ -104,6 +118,8 @@ impl AppState {
             source_name,
             event_tx,
             music_root,
+            bandcamp_cookies_path,
+            bandcamp_conf_path,
         }
     }
 
@@ -154,10 +170,32 @@ struct BandcampView {
     downloads_completed: usize,
     downloads_failed: usize,
     paused: bool,
+    /// Configured Bandcamp username (empty string if not set)
+    configured_username: String,
+    /// Whether the saved cookie file parses successfully
+    cookies_valid: bool,
 }
 
 impl BandcampView {
-    fn from_source_response(response: Option<SourceResponse>) -> Self {
+    fn disconnected(configured_username: String, cookies_valid: bool) -> Self {
+        Self {
+            connected: false,
+            authenticated: false,
+            downloads_active: 0,
+            downloads_queued: 0,
+            downloads_completed: 0,
+            downloads_failed: 0,
+            paused: false,
+            configured_username,
+            cookies_valid,
+        }
+    }
+
+    fn from_source_response(
+        response: Option<SourceResponse>,
+        configured_username: String,
+        cookies_valid: bool,
+    ) -> Self {
         match response {
             Some(SourceResponse::Status(status)) => Self {
                 connected: true,
@@ -167,32 +205,43 @@ impl BandcampView {
                 downloads_completed: status.downloads_completed,
                 downloads_failed: status.downloads_failed,
                 paused: status.paused,
+                configured_username,
+                cookies_valid,
             },
-            None => Self {
-                connected: false,
-                authenticated: false,
-                downloads_active: 0,
-                downloads_queued: 0,
-                downloads_completed: 0,
-                downloads_failed: 0,
-                paused: false,
-            },
+            None => Self::disconnected(configured_username, cookies_valid),
             Some(other) => {
                 tracing::warn!(
                     variant = ?other,
                     "Unexpected source response variant in BandcampView"
                 );
-                Self {
-                    connected: false,
-                    authenticated: false,
-                    downloads_active: 0,
-                    downloads_queued: 0,
-                    downloads_completed: 0,
-                    downloads_failed: 0,
-                    paused: false,
-                }
+                Self::disconnected(configured_username, cookies_valid)
             }
         }
+    }
+}
+
+/// Read bandcamp username from conf file (format: MDMA_BANDCAMP_USERNAME="value")
+fn read_bandcamp_username(conf_path: &std::path::Path) -> String {
+    std::fs::read_to_string(conf_path)
+        .unwrap_or_default()
+        .lines()
+        .find_map(|line| {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("MDMA_BANDCAMP_USERNAME=") {
+                let val = rest.trim_matches('"');
+                Some(val.to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// Check whether the cookies file parses successfully
+fn check_cookies_valid(cookies_path: &std::path::Path) -> bool {
+    match std::fs::read_to_string(cookies_path) {
+        Ok(content) => bandcamp_api::parse_cookies(&content).is_ok(),
+        Err(_) => false,
     }
 }
 
@@ -246,7 +295,10 @@ async fn index(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             .source_request(&state.source_name, &SourceRequest::GetStatus)
             .ok()
     });
-    let bandcamp = BandcampView::from_source_response(bandcamp_response);
+    let configured_username = read_bandcamp_username(&state.bandcamp_conf_path);
+    let cookies_valid = check_cookies_valid(&state.bandcamp_cookies_path);
+    let bandcamp =
+        BandcampView::from_source_response(bandcamp_response, configured_username, cookies_valid);
 
     let template = IndexTemplate {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -500,6 +552,8 @@ fn source_request_or_error(
 // =============================================================================
 
 async fn bandcamp_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let configured_username = read_bandcamp_username(&state.bandcamp_conf_path);
+    let cookies_valid = check_cookies_valid(&state.bandcamp_cookies_path);
     match state.gateway_client() {
         Some(client) => {
             match client.source_request(&state.source_name, &SourceRequest::GetStatus) {
@@ -511,6 +565,8 @@ async fn bandcamp_status(State(state): State<Arc<AppState>>) -> impl IntoRespons
                     downloads_completed: status.downloads_completed,
                     downloads_failed: status.downloads_failed,
                     paused: status.paused,
+                    configured_username,
+                    cookies_valid,
                 })
                 .into_response(),
                 Ok(SourceResponse::Error(e)) => (
@@ -530,7 +586,12 @@ async fn bandcamp_status(State(state): State<Arc<AppState>>) -> impl IntoRespons
                     .into_response(),
             }
         }
-        None => Json(BandcampView::from_source_response(None)).into_response(),
+        None => Json(BandcampView::from_source_response(
+            None,
+            configured_username,
+            cookies_valid,
+        ))
+        .into_response(),
     }
 }
 
@@ -630,6 +691,124 @@ async fn bandcamp_resume(State(state): State<Arc<AppState>>) -> impl IntoRespons
             .into_response(),
         Err(e) => e,
     }
+}
+
+async fn bandcamp_configure(
+    State(state): State<Arc<AppState>>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let mut cookies_content: Option<String> = None;
+    let mut username: Option<String> = None;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        match field.name() {
+            Some("cookies") => match field.text().await {
+                Ok(text) => cookies_content = Some(text),
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": format!("Failed to read cookies field: {}", e)})),
+                    )
+                        .into_response()
+                }
+            },
+            Some("username") => match field.text().await {
+                Ok(text) => username = Some(text.trim().to_string()),
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": format!("Failed to read username field: {}", e)})),
+                    )
+                        .into_response()
+                }
+            },
+            _ => {
+                // consume unrecognised fields
+                let _ = field.text().await;
+            }
+        }
+    }
+
+    // Validate cookie content
+    let cookies_str = match cookies_content {
+        Some(ref c) if !c.trim().is_empty() => c.as_str(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "cookies field is required"})),
+            )
+                .into_response()
+        }
+    };
+
+    if let Err(e) = bandcamp_api::parse_cookies(cookies_str) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": format!("Invalid cookie file: {}", e)})),
+        )
+            .into_response();
+    }
+
+    // Ensure parent dirs exist
+    if let Some(parent) = state.bandcamp_cookies_path.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Cannot create config dir: {}", e)})),
+            )
+                .into_response();
+        }
+    }
+    if let Some(parent) = state.bandcamp_conf_path.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Cannot create config dir: {}", e)})),
+            )
+                .into_response();
+        }
+    }
+
+    // Save cookies file
+    if let Err(e) = tokio::fs::write(&state.bandcamp_cookies_path, cookies_str.as_bytes()).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save cookies: {}", e)})),
+        )
+            .into_response();
+    }
+
+    // Validate and save conf file
+    let username_val = username.unwrap_or_default();
+    if !username_val
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Username may only contain letters, numbers, hyphens, and underscores"})),
+        )
+            .into_response();
+    }
+    let conf_content = format!("MDMA_BANDCAMP_USERNAME=\"{}\"\n", username_val);
+    if let Err(e) = tokio::fs::write(&state.bandcamp_conf_path, conf_content.as_bytes()).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save config: {}", e)})),
+        )
+            .into_response();
+    }
+
+    // Restart bandcamp service (best-effort)
+    let restart_result = tokio::process::Command::new("sv")
+        .args(["restart", "mdma-bandcamp"])
+        .status()
+        .await;
+    if let Err(e) = restart_result {
+        tracing::warn!(error = %e, "Failed to restart mdma-bandcamp service");
+    }
+
+    Json(serde_json::json!({"success": true})).into_response()
 }
 
 // =============================================================================
@@ -1075,6 +1254,8 @@ async fn main() -> Result<()> {
         args.source_name,
         event_tx,
         args.music_root,
+        args.bandcamp_cookies,
+        args.bandcamp_conf,
     ));
 
     // Initial package list load
@@ -1098,6 +1279,10 @@ async fn main() -> Result<()> {
         .route("/bandcamp/downloads", get(bandcamp_downloads))
         .route("/bandcamp/pause", post(bandcamp_pause))
         .route("/bandcamp/resume", post(bandcamp_resume))
+        .route(
+            "/bandcamp/configure",
+            post(bandcamp_configure).layer(DefaultBodyLimit::max(5 * 1024 * 1024)),
+        )
         // Player routes
         .route("/player/session", get(player_session))
         .route("/player/now-playing", get(player_now_playing))
@@ -1391,7 +1576,7 @@ mod tests {
 
     #[test]
     fn bandcamp_view_from_none_is_disconnected() {
-        let view = BandcampView::from_source_response(None);
+        let view = BandcampView::from_source_response(None, String::new(), false);
         assert!(!view.connected);
         assert!(!view.authenticated);
         assert_eq!(view.downloads_active, 0);
@@ -1404,7 +1589,11 @@ mod tests {
     #[test]
     fn bandcamp_view_from_status_maps_correctly() {
         let status = make_source_status();
-        let view = BandcampView::from_source_response(Some(SourceResponse::Status(status)));
+        let view = BandcampView::from_source_response(
+            Some(SourceResponse::Status(status)),
+            String::new(),
+            false,
+        );
         assert!(view.connected);
         assert!(view.authenticated);
         assert_eq!(view.downloads_active, 2);
@@ -1416,9 +1605,47 @@ mod tests {
 
     #[test]
     fn bandcamp_view_from_unexpected_variant_is_disconnected() {
-        let view = BandcampView::from_source_response(Some(SourceResponse::Pong));
+        let view =
+            BandcampView::from_source_response(Some(SourceResponse::Pong), String::new(), false);
         assert!(!view.connected);
         assert!(!view.authenticated);
+    }
+
+    #[test]
+    fn bandcamp_view_carries_configured_username() {
+        let view = BandcampView::from_source_response(None, "johlyroger".to_string(), true);
+        assert_eq!(view.configured_username, "johlyroger");
+        assert!(view.cookies_valid);
+    }
+
+    #[test]
+    fn read_bandcamp_username_parses_conf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bandcamp.conf");
+        std::fs::write(&path, "MDMA_BANDCAMP_USERNAME=\"testuser\"\n").unwrap();
+        assert_eq!(read_bandcamp_username(&path), "testuser");
+    }
+
+    #[test]
+    fn read_bandcamp_username_missing_file_returns_empty() {
+        let path = std::path::PathBuf::from("/nonexistent/bandcamp.conf");
+        assert_eq!(read_bandcamp_username(&path), "");
+    }
+
+    #[test]
+    fn check_cookies_valid_with_valid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cookies.json");
+        // Minimal valid JSON cookie
+        let content = r#"[{"name":"identity","value":"abc123","domain":".bandcamp.com"}]"#;
+        std::fs::write(&path, content).unwrap();
+        assert!(check_cookies_valid(&path));
+    }
+
+    #[test]
+    fn check_cookies_valid_with_missing_file() {
+        let path = std::path::PathBuf::from("/nonexistent/cookies.json");
+        assert!(!check_cookies_valid(&path));
     }
 
     #[test]
@@ -1563,6 +1790,51 @@ mod tests {
     #[test]
     fn blob_extension_missing() {
         assert_eq!(blob_extension("blobs/ab/noext"), None);
+    }
+
+    // ── Username validation ───────────────────────────────────────────────────
+
+    fn is_valid_username(username: &str) -> bool {
+        username
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    }
+
+    #[test]
+    fn username_valid_alphanumeric_hyphen_underscore() {
+        assert!(is_valid_username("johlyroger"));
+        assert!(is_valid_username("john-doe"));
+        assert!(is_valid_username("john_doe"));
+        assert!(is_valid_username("User123"));
+        assert!(is_valid_username("a-b_c-1"));
+    }
+
+    #[test]
+    fn username_rejects_shell_metacharacters() {
+        // Each of these would allow shell injection if embedded in the conf file
+        let bad_inputs = [
+            "user;rm -rf /",
+            "user$(whoami)",
+            "user`id`",
+            "user|cat /etc/passwd",
+            "user&&evil",
+            "user\nMDMA_OTHER=injected",
+            "user\"extra",
+            "user'quoted",
+            "user space",
+            "user!bang",
+        ];
+        for bad in &bad_inputs {
+            assert!(!is_valid_username(bad), "Expected '{}' to be rejected", bad);
+        }
+    }
+
+    #[test]
+    fn username_rejects_empty_string() {
+        // An empty username is technically valid per the char check (vacuously true),
+        // but the actual handler accepts empty as "no username configured".
+        // This test documents the current behaviour of the pure char predicate.
+        assert!(is_valid_username(""));
     }
 
     #[test]

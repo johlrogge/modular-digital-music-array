@@ -740,6 +740,17 @@ sv restart beacon
 - `/cdj-export` (909) for transcoded AIFF/WAV
 - NFS export enables CDJ network access
 
+### With Bandcamp Source
+
+The Bandcamp source requires browser cookies and a username to authenticate purchases.
+
+See [references/bandcamp-setup.md](references/bandcamp-setup.md) for:
+- How to export cookies from Firefox (Cookie Quick Manager) or Chrome (get-cookies.txt)
+- Uploading via the web console at `http://mdma-909.local`
+- Manual SCP method as alternative
+- Verifying configuration with `mdma source status bandcamp`
+- Troubleshooting expired or missing cookies
+
 ### With Development Workflow
 
 - Git push triggers package build

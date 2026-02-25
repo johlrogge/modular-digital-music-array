@@ -42,7 +42,7 @@ pub fn load_cookies(path: &Path) -> Result<Arc<Jar>, BandcampError> {
 }
 
 /// Parse cookies from string content (auto-detects format)
-fn parse_cookies(content: &str) -> Result<Vec<(String, String, String)>, BandcampError> {
+pub fn parse_cookies(content: &str) -> Result<Vec<(String, String, String)>, BandcampError> {
     let content = content.trim();
 
     // Try JSON format first

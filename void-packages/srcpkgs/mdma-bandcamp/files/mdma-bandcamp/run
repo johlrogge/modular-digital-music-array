@@ -1,5 +1,19 @@
 #!/bin/sh
 exec 2>&1
+
+CONF=/etc/mdma/bandcamp.conf
+if [ ! -f "$CONF" ]; then
+    echo "ERROR: config file $CONF not found"
+    exit 1
+fi
+
+. "$CONF"
+
+if [ -z "$MDMA_BANDCAMP_USERNAME" ]; then
+    echo "ERROR: MDMA_BANDCAMP_USERNAME is not set in $CONF"
+    exit 1
+fi
+
 mkdir -p /run/mdma/sources /var/lib/mdma
 exec chpst -u mdma /usr/bin/mdma-bandcamp \
     --cookies /etc/mdma/bandcamp-cookies.json \
@@ -8,4 +22,4 @@ exec chpst -u mdma /usr/bin/mdma-bandcamp \
     --cache /var/lib/mdma/bandcamp.cache \
     --socket ipc:///run/mdma/sources/bandcamp.sock \
     --library-socket ipc:///run/mdma/library.sock \
-    --username johlyroger
+    --username "$MDMA_BANDCAMP_USERNAME"
