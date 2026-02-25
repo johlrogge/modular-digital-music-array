@@ -29,11 +29,12 @@ type Decks = Arc<RwLock<HashMap<Deck, Arc<RwLock<Track>>>>>;
 
 pub struct PlaybackEngine {
     decks: Decks,
-    _audio_output: Option<PipewireOutput>,
+    audio_output: Option<PipewireOutput>,
     mixer_consumer: Option<HeapConsumer<f32>>,
     current_sample_rate: Option<u32>,
     command_sender: mpsc::Sender<MixerCommand>,
     _mix_task: Option<std::thread::JoinHandle<()>>,
+    stream_active: bool,
 }
 enum MixerCommand {
     RegisterTrack {
@@ -92,12 +93,24 @@ impl PlaybackEngine {
         // Return the engine — PipeWire output deferred until first track load
         Ok(Self {
             decks: Arc::new(RwLock::new(HashMap::new())),
-            _audio_output: None,
+            audio_output: None,
             mixer_consumer: Some(mixer_consumer),
             current_sample_rate: None,
             command_sender,
             _mix_task: Some(mix_task),
+            stream_active: true,
         })
+    }
+
+    /// Activate or deactivate the PipeWire stream.
+    /// Only sends the command when the state actually changes.
+    pub fn set_stream_active(&mut self, active: bool) {
+        if self.stream_active != active {
+            if let Some(ref output) = self.audio_output {
+                output.set_active(active);
+            }
+            self.stream_active = active;
+        }
     }
 
     pub async fn load_track(&mut self, deck: Deck, path: &Path) -> Result<(), PlaybackError> {
@@ -118,7 +131,7 @@ impl PlaybackEngine {
 
         // Create PipeWire output on first track load, always at TARGET_RATE.
         // All sources are upsampled by the decoder task regardless of their native rate.
-        if self._audio_output.is_none() {
+        if self.audio_output.is_none() {
             if let Some(consumer) = self.mixer_consumer.take() {
                 info!(
                     "Creating PipeWire output at {}Hz (source: {}Hz)",
@@ -126,7 +139,7 @@ impl PlaybackEngine {
                 );
                 let audio_output = PipewireOutput::new(consumer, TARGET_RATE)
                     .map_err(|e| PlaybackError::AudioDevice(format!("PipeWire error: {}", e)))?;
-                self._audio_output = Some(audio_output);
+                self.audio_output = Some(audio_output);
                 self.current_sample_rate = Some(TARGET_RATE);
             }
         }
@@ -244,6 +257,11 @@ impl PlaybackEngine {
             .map(|track| track.read().duration_ms())
     }
 
+    /// Returns whether the stream is currently active.
+    pub fn is_stream_active(&self) -> bool {
+        self.stream_active
+    }
+
     pub async fn seek(&mut self, deck: Deck, position: usize) -> Result<(), PlaybackError> {
         if let Some(track) = self.find_track(deck) {
             tracing::info!("Seeking deck {:?} to position {}", deck, position);
@@ -255,5 +273,33 @@ impl PlaybackEngine {
             tracing::error!("No track loaded in deck {:?}", deck);
             Err(PlaybackError::NoTrackLoaded(deck))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that set_stream_active only flips the flag when the value changes.
+    #[test]
+    fn set_stream_active_tracks_state() {
+        let mut engine = PlaybackEngine::new().expect("engine created");
+        assert!(engine.is_stream_active(), "should start active");
+
+        engine.set_stream_active(false);
+        assert!(
+            !engine.is_stream_active(),
+            "should be inactive after deactivate"
+        );
+
+        // Calling again with same value should be idempotent.
+        engine.set_stream_active(false);
+        assert!(!engine.is_stream_active(), "should remain inactive");
+
+        engine.set_stream_active(true);
+        assert!(
+            engine.is_stream_active(),
+            "should be active after reactivate"
+        );
     }
 }

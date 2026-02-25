@@ -1,3 +1,4 @@
+use std::rc::Rc;
 use std::thread;
 
 use pipewire as pw;
@@ -9,13 +10,21 @@ use tracing::{debug, info};
 pub const DEFAULT_CHANNELS: u32 = 2;
 pub const CHAN_SIZE: usize = std::mem::size_of::<f32>();
 
+#[derive(Debug)]
+pub enum StreamCommand {
+    SetActive(bool),
+}
+
 pub struct PipewireOutput {
     // Thread handle to keep the PipeWire thread alive
     _pw_thread: thread::JoinHandle<Result<(), pw::Error>>,
+    command_sender: pw::channel::Sender<StreamCommand>,
 }
 
 impl PipewireOutput {
     pub fn new(sample_consumer: HeapConsumer<f32>, sample_rate: u32) -> Result<Self, pw::Error> {
+        let (cmd_sender, cmd_receiver) = pw::channel::channel::<StreamCommand>();
+
         // Create a ring buffer for audio samples
         info!("create pipe wire thread");
         // Spawn PipeWire thread
@@ -36,7 +45,7 @@ impl PipewireOutput {
                 frame_count: 0,
             };
 
-            let stream = pw::stream::Stream::new(
+            let stream = Rc::new(pw::stream::Stream::new(
                 &core,
                 "mdma-audio-output",
                 properties! {
@@ -45,8 +54,9 @@ impl PipewireOutput {
                     *pw::keys::MEDIA_CATEGORY => "Playback",
                     *pw::keys::AUDIO_CHANNELS => "2",
                 },
-            )?;
+            )?);
 
+            // Held alive until the mainloop exits; dropping it would detach the process callback.
             let _listener = stream
                 .add_local_listener_with_user_data(user_data)
                 .process(|stream, user_data| match stream.dequeue_buffer() {
@@ -142,12 +152,34 @@ impl PipewireOutput {
                 &mut params,
             )?;
 
+            // Attach command receiver to the mainloop. The stream is shared via Rc.
+            // Held alive until the mainloop exits; dropping it would detach the channel listener.
+            let stream_for_cmd = stream.clone();
+            let _cmd_receiver = cmd_receiver.attach(mainloop.loop_(), move |cmd| match cmd {
+                StreamCommand::SetActive(active) => {
+                    if let Err(e) = stream_for_cmd.set_active(active) {
+                        tracing::warn!("Failed to set stream active={}: {}", active, e);
+                    } else {
+                        info!("Stream set_active({})", active);
+                    }
+                }
+            });
+
             mainloop.run();
             Ok(())
         });
 
         Ok(Self {
             _pw_thread: pw_thread,
+            command_sender: cmd_sender,
         })
+    }
+
+    /// Activate or deactivate the PipeWire stream.
+    /// Deactivating causes the DAC indicator to go dark; reactivating resumes output.
+    pub fn set_active(&self, active: bool) {
+        if let Err(e) = self.command_sender.send(StreamCommand::SetActive(active)) {
+            tracing::warn!("Failed to send SetActive({}) to PW thread: {:?}", active, e);
+        }
     }
 }

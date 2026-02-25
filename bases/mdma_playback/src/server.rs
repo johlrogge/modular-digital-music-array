@@ -426,10 +426,13 @@ async fn execute_effects(
                 engine.lock().await.stop(Deck::A)?;
             }
             PlaybackEffect::PlayEngine => {
-                engine.lock().await.play(Deck::A)?;
+                let mut eng = engine.lock().await;
+                eng.set_stream_active(true);
+                eng.play(Deck::A)?;
             }
             PlaybackEffect::LoadAndPlay { hash: _, path } => {
                 let mut eng = engine.lock().await;
+                eng.set_stream_active(true);
                 eng.load_track(Deck::A, &path).await?;
                 eng.play(Deck::A)?;
             }
@@ -492,6 +495,7 @@ async fn auto_advance_task(
     queue_file: PathBuf,
 ) {
     let mut tick: u8 = 0;
+    let mut idle_since: Option<tokio::time::Instant> = None;
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
         tick = tick.wrapping_add(1);
@@ -524,8 +528,37 @@ async fn auto_advance_task(
         {
             let current_state = state.lock().await;
             match current_state.state() {
-                PlaybackState::Playing { .. } => {}
-                PlaybackState::Paused { .. } | PlaybackState::Idle => continue,
+                PlaybackState::Playing { .. } => {
+                    // If the stream was deactivated during idle, reactivate it now.
+                    // The engine is the source of truth for stream active state.
+                    if !engine.lock().await.is_stream_active() {
+                        engine.lock().await.set_stream_active(true);
+                        idle_since = None;
+                        info!("Stream reactivated: playback resumed");
+                    } else {
+                        idle_since = None;
+                    }
+                }
+                PlaybackState::Paused { .. } => {
+                    idle_since = None;
+                    continue;
+                }
+                PlaybackState::Idle => {
+                    // Track idle start time.
+                    if idle_since.is_none() {
+                        idle_since = Some(tokio::time::Instant::now());
+                    }
+                    // Deactivate stream after 5 seconds of idle.
+                    if let Some(since) = idle_since {
+                        if since.elapsed() >= Duration::from_secs(5)
+                            && engine.lock().await.is_stream_active()
+                        {
+                            engine.lock().await.set_stream_active(false);
+                            info!("Stream deactivated: idle for 5 seconds");
+                        }
+                    }
+                    continue;
+                }
             }
         }
 
