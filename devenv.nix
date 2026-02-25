@@ -226,6 +226,7 @@
            NEVER use --no-verify to skip hooks.
         6. NEVER run git push
         7. NEVER amend previous commits unless explicitly told to
+        8. When finishing a feature, release, or hotfix, use `git flow` commands (e.g. `git flow feature finish <name>`), never manual merge
         Do NOT include "Co-Authored-By: Claude" in commit messages.
       '';
     };
@@ -338,6 +339,7 @@
         Network: just pi-scan | just pi-connect
 
         NEVER wipe /music on the Pi (contains the music library).
+        Releases go through `git flow release` — see .claude/skills/mdma-devops/references/releases.md.
         Do NOT write application Rust code.
         Do NOT include "Co-Authored-By: Claude" in commit messages.
       '';

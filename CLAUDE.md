@@ -166,3 +166,11 @@ Workflow:
 - Do NOT include "Generated with Claude Code" or similar references in commit messages
 - Do NOT include "Co-Authored-By: Claude" or similar in commit messages
 - Write commit messages as if written by the developer directly
+
+## Git Flow
+
+- All branch management uses `git flow` commands (`git flow feature start/finish`, `git flow release start/finish`, `git flow hotfix start/finish`)
+- Never use manual `git merge` or `git checkout -b` for feature/release/hotfix branches
+- Never manually create release tags — `git flow release finish` handles tagging
+- Production branch: `master`, development branch: `develop`
+- Release process documented in `.claude/skills/mdma-devops/references/releases.md`
