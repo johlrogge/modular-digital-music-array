@@ -1,6 +1,6 @@
 ---
 name: mdma-devops
-description: Complete DevOps workflow for MDMA (Modular Distributed Music Architecture) deployment on Raspberry Pi 5 with Void Linux. Covers beacon provisioning, golden image creation, SD card setup, NVMe drive provisioning, Ansible automation, package building and distribution, system updates, and recovery procedures. Implements the "deploy first" philosophy where code runs on live units within minutes.
+description: Complete DevOps workflow for MDMA (Modular Distributed Music Architecture) deployment on Raspberry Pi 5 with Void Linux. Covers beacon provisioning, golden image creation, SD card setup, NVMe drive provisioning, package building and distribution, system updates, and recovery procedures. Implements the "deploy first" philosophy where code runs on live units within minutes.
 ---
 
 # MDMA DevOps
@@ -22,9 +22,7 @@ Production deployment infrastructure for MDMA music system on Raspberry Pi 5 har
 
 **Never Build on the Pi:** All compilation happens on the dev machine via cross-compilation. Never install Rust, cargo, gcc, cmake, or other build tools on the Pi. The Pi is a deployment target only.
 
-**Ansible vs Packages:**
-- **Void Packages:** Application code, binaries, services (changes with git commits)
-- **Ansible:** System topology, configuration, provisioning (defines system shape)
+**Package-Driven Deployment:** All application changes are delivered via xbps packages built in CI. System configuration is managed via provisioning scripts and beacon, not configuration management tools.
 
 ## Quick Start - Beacon Provisioning
 
@@ -556,6 +554,10 @@ ls /var/lib/mdma/snapshots/
 xbps-install -f mdma-909-0.0.9_1
 ```
 
+## Release Process
+
+See [references/releases.md](references/releases.md) for the complete release workflow including version bumping, git-flow commands, and CI verification.
+
 ## Common Tasks
 
 ### Provision Fresh Beacon
@@ -728,7 +730,7 @@ sv restart beacon
 
 - Packages built from Rust workspace
 - Service definitions in package templates
-- Configuration files templated by Ansible (future)
+- Configuration files managed via package INSTALL scripts
 - Health checks verify application state
 
 ### With Music Library Management (Future)

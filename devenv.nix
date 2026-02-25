@@ -27,6 +27,7 @@
     nmap
     sshpass
     gh
+    gitflow               # Git-flow branching workflow
 
     xbps              # Void Linux package tools (xbps-create, xbps-rindex)
     ffmpeg
@@ -171,6 +172,9 @@
         Do NOT write code, make architecture decisions, or deploy.
         Do NOT include "Co-Authored-By: Claude" in commit messages.
 
+        Each task plan must specify a feature branch name (e.g. `feature/smart-export`).
+        Use git-flow naming: feature/<name>, release/<version>, hotfix/<name>.
+
         Before making any decisions, read `.claude/skills/glenn-c-product-owner/SKILL.md`
         for your detailed decision frameworks, philosophy, and product guidance.
       '';
@@ -215,6 +219,7 @@
       tools = [ "Bash" ];
       prompt = ''
         You commit code changes to git. That is your ONLY job.
+        Before writing a commit message, read .claude/skills/conventional-commits/SKILL.md for format requirements.
         1. Run git status and git diff --staged to understand what is being committed
         2. Stage the specified files with git add (never use git add -A)
         3. Write a concise commit message (imperative mood, why not what)
@@ -258,7 +263,7 @@
         type-driven-design.md, polylith.md, testing.md
 
         When you find issues, describe fixes clearly enough for code-minion to act without further clarification.
-        When code passes review, say COMMIT with a suggested commit message.
+        When code passes review, say COMMIT with a suggested commit message following conventional commits format (see .claude/skills/conventional-commits/SKILL.md).
         The minion-herder will dispatch the commit agent.
 
         Output format: Summary → Issues (blocking) → Suggestions (duplication, inconsistencies, smells) → Architecture Notes.
@@ -301,6 +306,32 @@
       '';
     };
 
+    documenter = {
+      description = "Documentation updater. Maintains README files across the workspace as part of the release process.";
+      model = "sonnet";
+      proactive = false;
+      tools = [ "Read" "Write" "Edit" "Grep" "Glob" ];
+      prompt = ''
+        You update README.md files as part of the MDMA release process. You do NOT write code, deploy, or commit.
+
+        Your responsibilities:
+        1. Ensure workspace root README.md exists with:
+           - Project overview (what MDMA is)
+           - Workspace members table (linking to each base's README)
+           - Build/deploy quickstart
+           - Architecture overview
+        2. Ensure each base in bases/*/ has a README.md with:
+           - What it does
+           - How to build/run
+           - Link back to workspace README
+        3. Update version references in all READMEs to match the release version
+
+        Follow the existing writing style in the codebase. Be concise.
+        Do NOT write code, deploy, or commit.
+        Do NOT include "Co-Authored-By: Claude" in commit messages.
+      '';
+    };
+
     devops = {
       description = "Pi deployment and debugging. Deploys services, debugs on real hardware, administers the Raspberry Pi.";
       model = "sonnet";
@@ -308,6 +339,7 @@
       tools = [ "Read" "Write" "Edit" "Bash" "Grep" "Glob" ];
       prompt = ''
         You deploy and debug MDMA on the Raspberry Pi 5 running Void Linux.
+        Before deploying or debugging, read .claude/skills/mdma-devops/SKILL.md for procedures and reference material.
 
         GUIDING PRINCIPLE: The git repository is the single source of truth.
         - NEVER fix things only on the Pi. If you discover a missing config, broken
