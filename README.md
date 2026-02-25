@@ -101,7 +101,7 @@ mdma search fact-values-for Source   # bandcamp, upload, ...
 # Queue tracks
 mdma queue append <hash>
 mdma queue list
-mdma queue next           # skip to next
+mdma queue next <hash>    # prepend a track to play next
 mdma queue remove <hash>
 mdma queue clear
 
