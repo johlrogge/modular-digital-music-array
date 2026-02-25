@@ -468,11 +468,18 @@ enum PlaylistCommands {
     /// List all playlists
     List,
 
-    /// Get playlist content (pipe to mdma queue replace to load)
+    /// Get playlist content (pipe to mdma queue replace to load).
+    /// If name is omitted, reads playlist names from stdin (first whitespace-delimited
+    /// token per line — handles both bare names and enriched `playlist list` output).
     Get {
-        /// Playlist name
-        name: String,
+        /// Playlist name. Omit to read names from stdin.
+        name: Option<String>,
     },
+
+    /// Print the name of every playlist that contains any of the tracks piped in on stdin.
+    /// Reads track lines from stdin (8–12 char hex hash as first token).
+    /// Output: one playlist name per match; pipe to `sort -u` to deduplicate.
+    Contains,
 
     /// Create a new playlist from stdin (fails if it already exists)
     New {
@@ -1297,6 +1304,30 @@ fn playlist_expect_content(
     }
 }
 
+fn playlist_expect_names(
+    response: std::result::Result<
+        library_ipc_client::LibraryResponse,
+        library_ipc_client::ClientError,
+    >,
+) -> Vec<library_ipc_client::PlaylistName> {
+    use library_ipc_client::LibraryResponse;
+    match response {
+        Ok(LibraryResponse::PlaylistNames(names)) => names,
+        Ok(LibraryResponse::Error(e)) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        Ok(_) => {
+            eprintln!("Unexpected response");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Request failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
 // =============================================================================
 // Playlist Command Handlers
 // =============================================================================
@@ -1304,18 +1335,7 @@ fn playlist_expect_content(
 fn handle_playlist_list(client: &LibraryBackend) -> Result<()> {
     use library_ipc_client::{DurationSeconds, LibraryRequest, LibraryResponse};
 
-    let response = client.request(&LibraryRequest::PlaylistList);
-    let names = match response {
-        Ok(LibraryResponse::PlaylistNames(names)) => names,
-        Ok(LibraryResponse::Error(e)) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-        _ => {
-            eprintln!("Unexpected response");
-            std::process::exit(1);
-        }
-    };
+    let names = playlist_expect_names(client.request(&LibraryRequest::PlaylistList));
 
     for name in &names {
         let content = match client.request(&LibraryRequest::PlaylistGet { name: name.clone() }) {
@@ -1325,19 +1345,7 @@ fn handle_playlist_list(client: &LibraryBackend) -> Result<()> {
 
         let hashes: Vec<ContentHash> = content
             .lines()
-            .filter_map(|line| {
-                let first = line.split_whitespace().next()?;
-                let len = first.len();
-                if (8..=12).contains(&len)
-                    && first
-                        .chars()
-                        .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
-                {
-                    Some(ContentHash(first.to_string()))
-                } else {
-                    None
-                }
-            })
+            .filter_map(|line| parse_hash_from_line(line).map(ContentHash))
             .collect();
 
         let track_count = hashes.len();
@@ -1362,12 +1370,81 @@ fn handle_playlist_list(client: &LibraryBackend) -> Result<()> {
     Ok(())
 }
 
-fn handle_playlist_get(client: &LibraryBackend, name: &str) -> Result<()> {
+fn handle_playlist_get(client: &LibraryBackend, name: &Option<String>) -> Result<()> {
     use library_ipc_client::LibraryRequest;
-    let pname = parse_playlist_name(name);
-    let content =
-        playlist_expect_content(client.request(&LibraryRequest::PlaylistGet { name: pname }));
-    print!("{}", content);
+    match name {
+        Some(n) => {
+            let pname = parse_playlist_name(n);
+            let content = playlist_expect_content(
+                client.request(&LibraryRequest::PlaylistGet { name: pname }),
+            );
+            print!("{}", content);
+        }
+        None => {
+            use std::io::BufRead;
+            let names: Vec<String> = std::io::stdin()
+                .lock()
+                .lines()
+                .map_while(Result::ok)
+                .filter_map(|line| {
+                    let first = line.split_whitespace().next()?;
+                    Some(first.to_string())
+                })
+                .collect();
+            if names.is_empty() {
+                eprintln!("No playlist name provided and stdin was empty");
+                std::process::exit(1);
+            }
+            for n in &names {
+                let pname = parse_playlist_name(n);
+                let content = playlist_expect_content(
+                    client.request(&LibraryRequest::PlaylistGet { name: pname }),
+                );
+                print!("{}", content);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn handle_playlist_contains(client: &LibraryBackend) -> Result<()> {
+    use library_ipc_client::{LibraryRequest, LibraryResponse};
+    use std::collections::HashSet;
+    use std::io::BufRead;
+
+    // 1. Read hashes from stdin
+    let input_hashes: HashSet<String> = std::io::stdin()
+        .lock()
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| parse_hash_from_line(&line))
+        .collect();
+
+    if input_hashes.is_empty() {
+        eprintln!("No hashes provided on stdin.");
+        std::process::exit(1);
+    }
+
+    // 2. Get all playlist names
+    let names = playlist_expect_names(client.request(&LibraryRequest::PlaylistList));
+
+    // 3. For each playlist, check if any input hash appears in its content
+    for pname in &names {
+        let content = match client.request(&LibraryRequest::PlaylistGet {
+            name: pname.clone(),
+        }) {
+            Ok(LibraryResponse::PlaylistContent(c)) => c,
+            _ => continue,
+        };
+
+        let playlist_hashes: HashSet<String> =
+            content.lines().filter_map(parse_hash_from_line).collect();
+
+        if input_hashes.iter().any(|h| playlist_hashes.contains(h)) {
+            println!("{}", pname);
+        }
+    }
+
     Ok(())
 }
 
@@ -1905,19 +1982,7 @@ fn handle_queue_edit(
     let edited_hashes: Vec<String> = std::io::BufReader::new(file)
         .lines()
         .map_while(Result::ok)
-        .filter_map(|line| {
-            let first = line.split_whitespace().next()?;
-            let len = first.len();
-            if (8..=12).contains(&len)
-                && first
-                    .chars()
-                    .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
-            {
-                Some(first.to_string())
-            } else {
-                None
-            }
-        })
+        .filter_map(|line| parse_hash_from_line(&line))
         .collect();
 
     let _ = std::fs::remove_file(&tmp_path);
@@ -1936,7 +2001,7 @@ fn handle_queue_edit(
 }
 
 /// Return the provided hash as a single-element vec, or read ALL lines from stdin and
-/// extract valid short hashes (8–12 lowercase hex chars as first token).
+/// extract valid hashes (8+ lowercase hex chars, or sha256:-prefixed full hashes, as first token).
 fn hashes_arg_or_stdin(hash: Option<String>) -> Vec<String> {
     match hash {
         Some(h) => vec![h],
@@ -1946,19 +2011,7 @@ fn hashes_arg_or_stdin(hash: Option<String>) -> Vec<String> {
                 .lock()
                 .lines()
                 .map_while(Result::ok)
-                .filter_map(|line| {
-                    let first = line.split_whitespace().next()?;
-                    let len = first.len();
-                    if (8..=12).contains(&len)
-                        && first
-                            .chars()
-                            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
-                    {
-                        Some(first.to_string())
-                    } else {
-                        None
-                    }
-                })
+                .filter_map(|line| parse_hash_from_line(&line))
                 .collect();
             if hashes.is_empty() {
                 eprintln!("No hash provided and stdin was empty");
@@ -2898,6 +2951,7 @@ fn main() -> Result<()> {
             match command {
                 PlaylistCommands::List => handle_playlist_list(&lib),
                 PlaylistCommands::Get { name } => handle_playlist_get(&lib, name),
+                PlaylistCommands::Contains => handle_playlist_contains(&lib),
                 PlaylistCommands::New { name } => handle_playlist_new(&lib, name),
                 PlaylistCommands::Append { name } => handle_playlist_append(&lib, name),
                 PlaylistCommands::Replace { name } => handle_playlist_replace(&lib, name),
