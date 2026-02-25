@@ -479,7 +479,17 @@ enum PlaylistCommands {
     /// Print the name of every playlist that contains any of the tracks piped in on stdin.
     /// Reads track lines from stdin (8–12 char hex hash as first token).
     /// Output: one playlist name per match; pipe to `sort -u` to deduplicate.
-    Contains,
+    Contains {
+        /// Print playlist only if it contains ALL input tracks
+        #[arg(long)]
+        all: bool,
+        /// Print playlist only if it contains at least N input tracks
+        #[arg(long)]
+        at_least: Option<usize>,
+        /// Print playlist only if it contains NONE of the input tracks
+        #[arg(long)]
+        no: bool,
+    },
 
     /// Create a new playlist from stdin (fails if it already exists)
     New {
@@ -1407,13 +1417,51 @@ fn handle_playlist_get(client: &LibraryBackend, name: &Option<String>) -> Result
     Ok(())
 }
 
-fn handle_playlist_contains(client: &LibraryBackend) -> Result<()> {
+/// Resolve the match threshold and invert flag from the `contains` filter flags.
+/// Assumes mutual exclusivity and `at_least > 0` have already been validated.
+/// Returns `(threshold, invert)`.
+fn resolve_contains_threshold(
+    all: bool,
+    at_least: Option<usize>,
+    no: bool,
+    input_len: usize,
+) -> (usize, bool) {
+    if no {
+        (1, true)
+    } else if all {
+        (input_len, false)
+    } else if let Some(n) = at_least {
+        (n, false)
+    } else {
+        (1, false)
+    }
+}
+
+fn handle_playlist_contains(
+    client: &LibraryBackend,
+    all: bool,
+    at_least: Option<usize>,
+    no: bool,
+) -> Result<()> {
     use library_ipc_client::{LibraryRequest, LibraryResponse};
     use std::collections::HashSet;
     use std::io::BufRead;
 
+    // Validate mutually exclusive flags
+    let flag_count = usize::from(all) + usize::from(at_least.is_some()) + usize::from(no);
+    if flag_count > 1 {
+        eprintln!("Error: --all, --at-least, and --no are mutually exclusive.");
+        std::process::exit(1);
+    }
+
+    // Validate --at-least value
+    if let Some(0) = at_least {
+        eprintln!("Error: --at-least requires a value of at least 1.");
+        std::process::exit(1);
+    }
+
     // 1. Read hashes from stdin
-    let input_hashes: HashSet<String> = std::io::stdin()
+    let input_hashes: Vec<String> = std::io::stdin()
         .lock()
         .lines()
         .map_while(Result::ok)
@@ -1425,10 +1473,15 @@ fn handle_playlist_contains(client: &LibraryBackend) -> Result<()> {
         std::process::exit(1);
     }
 
-    // 2. Get all playlist names
+    // 2. Determine threshold and invert
+    let (threshold, invert) = resolve_contains_threshold(all, at_least, no, input_hashes.len());
+
+    let input_set: HashSet<&String> = input_hashes.iter().collect();
+
+    // 3. Get all playlist names
     let names = playlist_expect_names(client.request(&LibraryRequest::PlaylistList));
 
-    // 3. For each playlist, check if any input hash appears in its content
+    // 4. For each playlist, count how many input hashes appear in it
     for pname in &names {
         let content = match client.request(&LibraryRequest::PlaylistGet {
             name: pname.clone(),
@@ -1440,7 +1493,18 @@ fn handle_playlist_contains(client: &LibraryBackend) -> Result<()> {
         let playlist_hashes: HashSet<String> =
             content.lines().filter_map(parse_hash_from_line).collect();
 
-        if input_hashes.iter().any(|h| playlist_hashes.contains(h)) {
+        let match_count = input_set
+            .iter()
+            .filter(|h| playlist_hashes.contains(h.as_str()))
+            .count();
+
+        let should_print = if invert {
+            match_count == 0
+        } else {
+            match_count >= threshold
+        };
+
+        if should_print {
             println!("{}", pname);
         }
     }
@@ -2951,7 +3015,9 @@ fn main() -> Result<()> {
             match command {
                 PlaylistCommands::List => handle_playlist_list(&lib),
                 PlaylistCommands::Get { name } => handle_playlist_get(&lib, name),
-                PlaylistCommands::Contains => handle_playlist_contains(&lib),
+                PlaylistCommands::Contains { all, at_least, no } => {
+                    handle_playlist_contains(&lib, *all, *at_least, *no)
+                }
                 PlaylistCommands::New { name } => handle_playlist_new(&lib, name),
                 PlaylistCommands::Append { name } => handle_playlist_append(&lib, name),
                 PlaylistCommands::Replace { name } => handle_playlist_replace(&lib, name),
@@ -3505,5 +3571,31 @@ mod tests {
             &Some(ExportFormat::Wav),
         );
         assert_eq!(result, ExportFormat::Original);
+    }
+
+    #[test]
+    fn contains_threshold_default_is_one_not_inverted() {
+        assert_eq!(
+            resolve_contains_threshold(false, None, false, 3),
+            (1, false)
+        );
+    }
+
+    #[test]
+    fn contains_threshold_all_uses_input_len() {
+        assert_eq!(resolve_contains_threshold(true, None, false, 5), (5, false));
+    }
+
+    #[test]
+    fn contains_threshold_at_least_uses_given_value() {
+        assert_eq!(
+            resolve_contains_threshold(false, Some(3), false, 7),
+            (3, false)
+        );
+    }
+
+    #[test]
+    fn contains_threshold_no_flag_inverts() {
+        assert_eq!(resolve_contains_threshold(false, None, true, 4), (1, true));
     }
 }
