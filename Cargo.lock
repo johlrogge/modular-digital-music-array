@@ -260,11 +260,6 @@ dependencies = [
 name = "audio-transcoder"
 version = "0.2.0"
 dependencies = [
- "audio-metadata",
- "extended",
- "lofty",
- "symphonia",
- "tempfile",
  "thiserror 1.0.69",
 ]
 
@@ -2459,7 +2454,6 @@ version = "0.2.1"
 dependencies = [
  "askama",
  "async-stream",
- "audio-metadata",
  "audio-transcoder",
  "axum",
  "clap",
@@ -2477,7 +2471,6 @@ dependencies = [
  "serde",
  "serde_json",
  "source-protocol",
- "symphonia",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

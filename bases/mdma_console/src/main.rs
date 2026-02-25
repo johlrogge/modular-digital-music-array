@@ -1152,8 +1152,8 @@ impl ExportFormatParam {
     fn extension(&self) -> Option<&'static str> {
         match self {
             Self::Original => None,
-            Self::Aiff => Some("aiff"),
-            Self::Wav => Some("wav"),
+            Self::Aiff => Some(audio_transcoder::ExportFormat::Aiff.extension()),
+            Self::Wav => Some(audio_transcoder::ExportFormat::Wav.extension()),
         }
     }
 
@@ -1210,84 +1210,6 @@ fn export_filename(artist: Option<&str>, title: Option<&str>, ext: &str) -> Stri
 struct ExportParams {
     #[serde(default)]
     format: ExportFormatParam,
-}
-
-/// Decode all PCM samples from a file using Symphonia.
-///
-/// Returns `(samples, channels, sample_rate)` with interleaved f32 samples
-/// normalised to `[-1.0, 1.0]`.
-fn decode_to_pcm(path: &std::path::Path) -> Result<(Vec<f32>, u16, u32), String> {
-    use symphonia::core::{
-        audio::SampleBuffer, codecs::DecoderOptions, formats::FormatOptions, io::MediaSourceStream,
-        meta::MetadataOptions, probe::Hint,
-    };
-
-    let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(ext);
-    }
-
-    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-
-    let probed = symphonia::default::get_probe()
-        .format(
-            &hint,
-            mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )
-        .map_err(|e| e.to_string())?;
-
-    let mut format = probed.format;
-
-    let track = format
-        .default_track()
-        .ok_or_else(|| "No default track found".to_string())?;
-
-    let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2) as u16;
-    let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
-    let track_id = track.id;
-
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
-        .map_err(|e| e.to_string())?;
-
-    let mut all_samples: Vec<f32> = Vec::new();
-    let mut sample_buf: Option<SampleBuffer<f32>> = None;
-
-    loop {
-        let packet = match format.next_packet() {
-            Ok(p) => p,
-            Err(symphonia::core::errors::Error::IoError(ref e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                break
-            }
-            Err(e) => return Err(e.to_string()),
-        };
-
-        if packet.track_id() != track_id {
-            continue;
-        }
-
-        let decoded = match decoder.decode(&packet) {
-            Ok(d) => d,
-            Err(symphonia::core::errors::Error::DecodeError(e)) => {
-                tracing::warn!("Decode error (skipping packet): {}", e);
-                continue;
-            }
-            Err(e) => return Err(e.to_string()),
-        };
-
-        let spec = *decoded.spec();
-        let buf = sample_buf
-            .get_or_insert_with(|| SampleBuffer::<f32>::new(decoded.capacity() as u64, spec));
-        buf.copy_interleaved_ref(decoded);
-        all_samples.extend_from_slice(buf.samples());
-    }
-
-    Ok((all_samples, channels, sample_rate))
 }
 
 async fn export_track(
@@ -1385,37 +1307,8 @@ async fn export_track(
             .into_response();
     }
 
-    // Transcode: decode source to PCM and extract cover art, then encode to requested format.
-    // Both operations are blocking I/O and CPU work, so we run them together in spawn_blocking.
-    let blob_path_clone = blob_path.clone();
-    let decode_result = tokio::task::spawn_blocking(move || {
-        let pcm = decode_to_pcm(&blob_path_clone)
-            .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
-        let pictures = audio_metadata::extract_pictures(&blob_path_clone)
-            .inspect_err(
-                |e| tracing::warn!(error = %e, "Failed to extract cover art, exporting without"),
-            )
-            .unwrap_or_default();
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((pcm, pictures))
-    })
-    .await;
-
-    let ((samples, channels, sample_rate), pictures) = match decode_result {
-        Ok(Ok((pcm, pics))) => (pcm, pics),
-        Ok(Err(e)) => {
-            tracing::error!(error = %e, "Failed to decode audio for export");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Decode failed: {}", e),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "Blocking task panicked during export");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal decode error").into_response();
-        }
-    };
-
+    // Transcode: ffmpeg reads the source directly and writes to a temp file.
+    // This is blocking CPU/IO work so we run it in spawn_blocking.
     let transcode_format = req_format.to_transcoder_format();
 
     let metadata = audio_transcoder::TrackMetadata {
@@ -1424,26 +1317,18 @@ async fn export_track(
         album: track.album.clone(),
         bpm: track.bpm.map(|b| b.as_f32() as f64),
         key: track.key.map(|k| k.to_traditional_sharp()),
-        pictures,
     };
 
     let transcode_result = tokio::task::spawn_blocking(move || {
+        let ext_suffix = transcode_format.suffix();
         let tmp = tempfile::Builder::new()
-            .suffix(match transcode_format {
-                audio_transcoder::ExportFormat::Aiff => ".aiff",
-                audio_transcoder::ExportFormat::Wav => ".wav",
-                audio_transcoder::ExportFormat::Flac => ".flac",
-            })
-            .tempfile()?;
-        let params = audio_transcoder::TranscodeParams {
-            format: transcode_format,
-            channels,
-            sample_rate,
-            bit_depth: audio_transcoder::BitDepth::TwentyFour,
-        };
-        audio_transcoder::transcode_with_metadata(tmp.path(), &params, &samples, &metadata)?;
-        let data = std::fs::read(tmp.path())?;
-        Ok::<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>(data)
+            .suffix(ext_suffix)
+            .tempfile()
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+        audio_transcoder::transcode(&blob_path, tmp.path(), &transcode_format, &metadata)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+        std::fs::read(tmp.path())
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
     })
     .await;
 

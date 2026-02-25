@@ -29,6 +29,7 @@
     gh
 
     xbps              # Void Linux package tools (xbps-create, xbps-rindex)
+    ffmpeg
   ];
 
   # Rust language support

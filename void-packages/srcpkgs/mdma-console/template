@@ -6,6 +6,7 @@ archs="aarch64"
 build_style=cargo
 hostmakedepends="cargo"
 makedepends="rust-std"
+depends="ffmpeg"
 short_desc="MDMA web console"
 maintainer="Joakim Ohlrogge <joakim.ohlrogge@agical.se>"
 license="MIT"
