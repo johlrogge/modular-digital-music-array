@@ -1,6 +1,6 @@
 # MDMA — Modular Distributed Music Architecture
 
-Version: **0.3.3**
+Version: **0.4.0**
 
 A hi-fi music player for Raspberry Pi 5. Indexes your FLAC and MP3 library, streams to a USB DAC at 192 kHz via PipeWire, and is fully controlled from the command line — composable with dmenu for keyboard-driven browsing and queuing.
 
@@ -25,6 +25,14 @@ mdma search --artist CBL | mdma sort title -a | mdma queue append
 
 # Export a set of tracks as AIFF (e.g. for Rekordbox import)
 mdma search --bpm "128..132" --key "8A" | mdma export --lossless-format aiff --output ./rekordbox-prep/
+
+# Playlists — create, populate, and compose with pipes
+mdma playlist create friday-night
+mdma search --genre Techno | mdma playlist add friday-night
+mdma playlist get friday-night | mdma queue replace
+
+# Find which playlists contain a track (or a set of tracks from stdin)
+mdma search --artist CBL | mdma playlist contains --all
 
 # Subscribe to live events (now playing, queue changes)
 mdma subscribe
@@ -69,7 +77,7 @@ Audio path: FLAC/MP3 → Symphonia decoder → rubato resampler → 192 kHz Pipe
 | [mdma_playback](bases/mdma_playback/) | Audio playback — Symphonia + rubato resampler + PipeWire | [README](bases/mdma_playback/README.md) |
 | [mdma_bandcamp](bases/mdma_bandcamp/) | Bandcamp collection sync — downloads purchases into the library inbox | [README](bases/mdma_bandcamp/README.md) |
 | [mdma_console](bases/mdma_console/) | Web management console — player controls, search, queue, upload, export | [README](bases/mdma_console/README.md) |
-| [mdma_cli](bases/mdma_cli/) | CLI — search, queue, playback, export, subscribe, shell completions | [README](bases/mdma_cli/README.md) |
+| [mdma_cli](bases/mdma_cli/) | CLI — search, queue, playlists, playback, export, subscribe, shell completions | [README](bases/mdma_cli/README.md) |
 
 ---
 

@@ -1,6 +1,6 @@
 # mdma-cli
 
-Version: **0.3.3**
+Version: **0.4.0**
 
 Command-line interface for MDMA. Talks to the Pi over the gateway — search the library, manage the queue, control playback, export tracks, and subscribe to live events. The binary is named `mdma`.
 
@@ -170,6 +170,51 @@ mdma upload ./album.zip             # ZIP of audio files
 
 Transfers to the Pi inbox via SCP, then triggers ingest.
 
+### Playlist
+
+Named, persistent playlists stored on the Pi. All commands compose with pipes.
+
+```bash
+mdma playlist create <name>         # create an empty playlist
+mdma playlist delete <name>         # delete a playlist
+mdma playlist rename <name> <new>   # rename a playlist
+mdma playlist list                  # list all playlists (name, track count, duration)
+mdma playlist get <name>            # print track hashes for a playlist
+mdma playlist get                   # read playlist name(s) from stdin (pipe from list)
+mdma playlist add <name>            # read hashes from stdin, append to playlist
+mdma playlist remove <name>         # read hashes from stdin, remove from playlist
+mdma playlist contains [flags]      # read hashes from stdin, output matching playlist names
+```
+
+`playlist contains` flags:
+
+| Flag | Meaning |
+|------|---------|
+| _(none)_ | playlists that contain at least one of the input tracks |
+| `--all` | playlists that contain every input track |
+| `--at-least N` | playlists that contain at least N of the input tracks |
+| `--no` | playlists that contain none of the input tracks |
+
+```bash
+# Populate a playlist from a search
+mdma search --genre Techno | mdma playlist add friday-night
+
+# Load a playlist into the queue
+mdma playlist get friday-night | mdma queue replace
+
+# Pipe list into get: get tracks for every playlist
+mdma playlist list | mdma playlist get
+
+# Which playlists contain all tracks by an artist?
+mdma search --artist CBL | mdma playlist contains --all
+
+# Which playlists contain none of the tracks in the queue?
+mdma queue list | mdma playlist contains --no
+
+# Which playlists share at least 3 tracks with the current queue?
+mdma queue list | mdma playlist contains --at-least 3
+```
+
 ---
 
 ## Pipe composition
@@ -198,6 +243,11 @@ cat friday_night.plist | mdma queue replace
 mdma search fact-values-for Artist | dmenu | xargs -I{} mdma search --artist {}
 mdma search --artist CBL | dmenu | mdma queue append
 mdma queue list | dmenu | mdma queue remove
+
+# Playlist pipe examples
+mdma search --bpm "128..132" | mdma playlist add deep-cuts
+mdma playlist get friday-night | mdma sort bpm -a | mdma queue replace
+mdma playlist list | mdma playlist get | mdma sort artist -a > all-tracks.plist
 ```
 
 ---
