@@ -386,7 +386,33 @@ Long-term vision: the primary way non-technical users interact with the system.
 
 ---
 
-## Validation: Full Reinstall from SD Card
+## Before Beta
+
+The following must work reliably before inviting beta testers onto the system.
+
+### Getting Started (Onboarding)
+
+The golden path for setting up a new MDMA node:
+
+1. Start with a Raspberry Pi running Void Linux from SD card
+2. SSH in and run the install script — it sets the hostname and installs the beacon via XBPS
+3. Browse to `welcome-to-mdma.local` and provision through the web UI
+4. All services start automatically on the NVMe
+
+This flow must be smooth and require no manual intervention. It is the first thing a beta tester will experience.
+
+### Recovery
+
+If the system becomes unbootable or needs to be reprovisioned:
+
+1. Edit `cmdline.txt` on the SD card to boot back into beacon mode
+2. Browse to `welcome-to-mdma.local` and re-provision through the web UI
+3. Re-provisioning will NOT overwrite existing partitions
+4. Music and metadata are preserved on the NVMe
+
+This gives users a safe path back without losing their library.
+
+### Validation: Full Reinstall from SD Card
 
 Deferred until time permits. Not blocking current work, but must happen before beta.
 
