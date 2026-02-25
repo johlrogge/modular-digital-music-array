@@ -263,15 +263,14 @@ Developer tooling and process improvements to support sustainable releases.
 
 ---
 
-### 10. Bandcamp Configuration
+### ~~10. Bandcamp Configuration~~ — COMPLETE (Feb 25, 2026)
 
-**Missing piece:** How does a fresh install configure the bandcamp service?
+Web-based configuration for Bandcamp cookies and username via mdma-console. Fresh installs can configure bandcamp through the web UI at http://mdma-909.local/bandcamp/config.
 
-- Username (`--username`) is a CLI flag / config — needs a config file or provisioning step
-- Cookies (`--cookies /etc/mdma/bandcamp-cookies.json`) must be provided manually
-  - Current approach: SCP cookies file to Pi
-  - Better: `mdma source configure bandcamp` interactive flow, or web UI form
-- Document the manual process now, automate later
+- Web UI form for cookie and username configuration
+- Cookies stored in Netscape format at `/var/lib/mdma-bandcamp/cookies.txt`
+- Username persisted to `/etc/mdma/bandcamp-username`
+- Service restart after configuration update
 
 ---
 
