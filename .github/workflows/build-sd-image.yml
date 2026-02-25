@@ -1,10 +1,7 @@
 name: Build SD Card Images
 
 on:
-  push:
-    tags:
-      - 'v*'  # Trigger on version tags
-  workflow_dispatch:  # Allow manual triggers
+  workflow_dispatch:  # Manual trigger only
 
 permissions:
   contents: write  # Needed to create releases
