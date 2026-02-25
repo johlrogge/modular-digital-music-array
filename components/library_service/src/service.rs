@@ -422,7 +422,134 @@ impl LibraryService {
                     existing,
                 }
             }
+
+            LibraryRequest::PlaylistList => {
+                let dir = self.metadata_dir.join("playlists");
+                let mut names: Vec<library_ipc_protocol::PlaylistName> = std::fs::read_dir(&dir)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| {
+                        let path = e.path();
+                        if path.extension().and_then(|x| x.to_str()) == Some("plist") {
+                            path.file_stem()
+                                .and_then(|s| s.to_str())
+                                .and_then(|s| library_ipc_protocol::PlaylistName::new(s).ok())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+                LibraryResponse::PlaylistNames(names)
+            }
+
+            LibraryRequest::PlaylistGet { name } => {
+                let path = self.resolve_playlist_path(&name);
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => LibraryResponse::PlaylistContent(content),
+                    Err(_) => LibraryResponse::Error(ProtocolError::PlaylistNotFound {
+                        name: name.to_string(),
+                    }),
+                }
+            }
+
+            LibraryRequest::PlaylistNew { name, content } => {
+                let path = self.resolve_playlist_path(&name);
+                if path.exists() {
+                    LibraryResponse::Error(ProtocolError::PlaylistAlreadyExists {
+                        name: name.to_string(),
+                    })
+                } else {
+                    match std::fs::write(&path, &content) {
+                        Ok(()) => LibraryResponse::PlaylistContent(content),
+                        Err(e) => LibraryResponse::Error(ProtocolError::Internal {
+                            message: format!("Failed to write playlist: {}", e),
+                        }),
+                    }
+                }
+            }
+
+            LibraryRequest::PlaylistAppend { name, content } => {
+                let path = self.resolve_playlist_path(&name);
+                if !path.exists() {
+                    return LibraryResponse::Error(ProtocolError::PlaylistNotFound {
+                        name: name.to_string(),
+                    });
+                }
+                match std::fs::read_to_string(&path) {
+                    Ok(existing) => {
+                        let mut new_content = existing;
+                        if !new_content.is_empty() && !new_content.ends_with('\n') {
+                            new_content.push('\n');
+                        }
+                        new_content.push_str(&content);
+                        match std::fs::write(&path, &new_content) {
+                            Ok(()) => LibraryResponse::PlaylistContent(new_content),
+                            Err(e) => LibraryResponse::Error(ProtocolError::Internal {
+                                message: format!("Failed to write playlist: {}", e),
+                            }),
+                        }
+                    }
+                    Err(e) => LibraryResponse::Error(ProtocolError::Internal {
+                        message: format!("Failed to read playlist: {}", e),
+                    }),
+                }
+            }
+
+            LibraryRequest::PlaylistReplace { name, content } => {
+                let path = self.resolve_playlist_path(&name);
+                match std::fs::write(&path, &content) {
+                    Ok(()) => LibraryResponse::PlaylistContent(content),
+                    Err(e) => LibraryResponse::Error(ProtocolError::Internal {
+                        message: format!("Failed to write playlist: {}", e),
+                    }),
+                }
+            }
+
+            LibraryRequest::PlaylistRename { from, to } => {
+                let from_path = self.resolve_playlist_path(&from);
+                let to_path = self.resolve_playlist_path(&to);
+                if !from_path.exists() {
+                    return LibraryResponse::Error(ProtocolError::PlaylistNotFound {
+                        name: from.to_string(),
+                    });
+                }
+                if to_path.exists() {
+                    return LibraryResponse::Error(ProtocolError::PlaylistAlreadyExists {
+                        name: to.to_string(),
+                    });
+                }
+                match std::fs::rename(&from_path, &to_path) {
+                    Ok(()) => LibraryResponse::Pong,
+                    Err(e) => LibraryResponse::Error(ProtocolError::Internal {
+                        message: format!("Failed to rename playlist: {}", e),
+                    }),
+                }
+            }
+
+            LibraryRequest::PlaylistRemove { name } => {
+                let path = self.resolve_playlist_path(&name);
+                if !path.exists() {
+                    return LibraryResponse::Error(ProtocolError::PlaylistNotFound {
+                        name: name.to_string(),
+                    });
+                }
+                match std::fs::remove_file(&path) {
+                    Ok(()) => LibraryResponse::Pong,
+                    Err(e) => LibraryResponse::Error(ProtocolError::Internal {
+                        message: format!("Failed to remove playlist: {}", e),
+                    }),
+                }
+            }
         }
+    }
+
+    /// Resolve a PlaylistName to an absolute filesystem path
+    fn resolve_playlist_path(&self, name: &library_ipc_protocol::PlaylistName) -> PathBuf {
+        self.metadata_dir
+            .join("playlists")
+            .join(format!("{}.plist", name.as_str()))
     }
 
     /// Get files in inbox directory (internal, returns PathBuf)
@@ -1316,6 +1443,231 @@ mod tests {
             before_lines, after_lines,
             "Should not write new facts when Format already exists"
         );
+    }
+
+    // =========================================================================
+    // Playlist handler tests
+    // =========================================================================
+
+    fn make_service_with_playlists_dir() -> (LibraryService, tempfile::TempDir) {
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+        // create the playlists sub-directory
+        std::fs::create_dir_all(metadata_dir.path().join("playlists")).unwrap();
+        let service = LibraryService::new(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+        )
+        .unwrap();
+        (service, metadata_dir)
+    }
+
+    #[test]
+    fn playlist_list_returns_empty_when_no_playlists() {
+        let (service, _dir) = make_service_with_playlists_dir();
+        let response = service.handle_request(LibraryRequest::PlaylistList);
+        match response {
+            LibraryResponse::PlaylistNames(names) => assert!(names.is_empty()),
+            other => panic!("Expected PlaylistNames, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn playlist_new_creates_and_returns_content() {
+        use library_ipc_protocol::PlaylistName;
+        let (service, _dir) = make_service_with_playlists_dir();
+        let name = PlaylistName::new("test-set").unwrap();
+        let content = "sha256:abc\nsha256:def\n".to_string();
+        let response = service.handle_request(LibraryRequest::PlaylistNew {
+            name,
+            content: content.clone(),
+        });
+        match response {
+            LibraryResponse::PlaylistContent(c) => assert_eq!(c, content),
+            other => panic!("Expected PlaylistContent, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn playlist_list_returns_created_playlist() {
+        use library_ipc_protocol::PlaylistName;
+        let (service, _dir) = make_service_with_playlists_dir();
+        let name = PlaylistName::new("my-set").unwrap();
+        service.handle_request(LibraryRequest::PlaylistNew {
+            name,
+            content: "sha256:abc\n".to_string(),
+        });
+        let response = service.handle_request(LibraryRequest::PlaylistList);
+        match response {
+            LibraryResponse::PlaylistNames(names) => {
+                assert_eq!(
+                    names,
+                    vec![library_ipc_protocol::PlaylistName::new("my-set").unwrap()]
+                );
+            }
+            other => panic!("Expected PlaylistNames, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn playlist_new_fails_if_already_exists() {
+        use library_ipc_protocol::PlaylistName;
+        let (service, _dir) = make_service_with_playlists_dir();
+        let name = PlaylistName::new("dupe").unwrap();
+        service.handle_request(LibraryRequest::PlaylistNew {
+            name: name.clone(),
+            content: "sha256:abc\n".to_string(),
+        });
+        let response = service.handle_request(LibraryRequest::PlaylistNew {
+            name,
+            content: "sha256:xyz\n".to_string(),
+        });
+        match response {
+            LibraryResponse::Error(ProtocolError::PlaylistAlreadyExists { .. }) => {}
+            other => panic!("Expected PlaylistAlreadyExists error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn playlist_get_returns_content() {
+        use library_ipc_protocol::PlaylistName;
+        let (service, _dir) = make_service_with_playlists_dir();
+        let name = PlaylistName::new("get-me").unwrap();
+        let content = "sha256:abc\n".to_string();
+        service.handle_request(LibraryRequest::PlaylistNew {
+            name: name.clone(),
+            content: content.clone(),
+        });
+        let response = service.handle_request(LibraryRequest::PlaylistGet { name });
+        match response {
+            LibraryResponse::PlaylistContent(c) => assert_eq!(c, content),
+            other => panic!("Expected PlaylistContent, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn playlist_get_returns_not_found_for_missing() {
+        use library_ipc_protocol::PlaylistName;
+        let (service, _dir) = make_service_with_playlists_dir();
+        let name = PlaylistName::new("missing").unwrap();
+        let response = service.handle_request(LibraryRequest::PlaylistGet { name });
+        match response {
+            LibraryResponse::Error(ProtocolError::PlaylistNotFound { .. }) => {}
+            other => panic!("Expected PlaylistNotFound error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn playlist_append_adds_to_existing_content() {
+        use library_ipc_protocol::PlaylistName;
+        let (service, _dir) = make_service_with_playlists_dir();
+        let name = PlaylistName::new("append-me").unwrap();
+        service.handle_request(LibraryRequest::PlaylistNew {
+            name: name.clone(),
+            content: "sha256:aaa\n".to_string(),
+        });
+        let response = service.handle_request(LibraryRequest::PlaylistAppend {
+            name,
+            content: "sha256:bbb\n".to_string(),
+        });
+        match response {
+            LibraryResponse::PlaylistContent(c) => {
+                assert!(c.contains("sha256:aaa"), "should contain original");
+                assert!(c.contains("sha256:bbb"), "should contain appended");
+            }
+            other => panic!("Expected PlaylistContent, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn playlist_append_fails_if_not_found() {
+        use library_ipc_protocol::PlaylistName;
+        let (service, _dir) = make_service_with_playlists_dir();
+        let name = PlaylistName::new("no-such-playlist").unwrap();
+        let response = service.handle_request(LibraryRequest::PlaylistAppend {
+            name,
+            content: "sha256:abc\n".to_string(),
+        });
+        match response {
+            LibraryResponse::Error(ProtocolError::PlaylistNotFound { .. }) => {}
+            other => panic!("Expected PlaylistNotFound error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn playlist_replace_overwrites_content() {
+        use library_ipc_protocol::PlaylistName;
+        let (service, _dir) = make_service_with_playlists_dir();
+        let name = PlaylistName::new("replace-me").unwrap();
+        service.handle_request(LibraryRequest::PlaylistNew {
+            name: name.clone(),
+            content: "sha256:old\n".to_string(),
+        });
+        let new_content = "sha256:new\n".to_string();
+        let response = service.handle_request(LibraryRequest::PlaylistReplace {
+            name,
+            content: new_content.clone(),
+        });
+        match response {
+            LibraryResponse::PlaylistContent(c) => assert_eq!(c, new_content),
+            other => panic!("Expected PlaylistContent, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn playlist_remove_deletes_playlist() {
+        use library_ipc_protocol::PlaylistName;
+        let (service, _dir) = make_service_with_playlists_dir();
+        let name = PlaylistName::new("remove-me").unwrap();
+        service.handle_request(LibraryRequest::PlaylistNew {
+            name: name.clone(),
+            content: "sha256:abc\n".to_string(),
+        });
+        let response = service.handle_request(LibraryRequest::PlaylistRemove { name });
+        match response {
+            LibraryResponse::Pong => {}
+            other => panic!("Expected Pong, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn playlist_rename_works() {
+        use library_ipc_protocol::PlaylistName;
+        let (service, _dir) = make_service_with_playlists_dir();
+        // Create
+        let name = PlaylistName::new("old-name").unwrap();
+        service.handle_request(LibraryRequest::PlaylistNew {
+            name: name.clone(),
+            content: "test content".to_string(),
+        });
+        // Rename
+        let new_name = PlaylistName::new("new-name").unwrap();
+        let resp = service.handle_request(LibraryRequest::PlaylistRename {
+            from: name.clone(),
+            to: new_name.clone(),
+        });
+        assert!(matches!(resp, LibraryResponse::Pong));
+        // Old name gone
+        let resp = service.handle_request(LibraryRequest::PlaylistGet { name });
+        assert!(matches!(
+            resp,
+            LibraryResponse::Error(ProtocolError::PlaylistNotFound { .. })
+        ));
+        // New name has content
+        let resp = service.handle_request(LibraryRequest::PlaylistGet { name: new_name });
+        assert!(matches!(resp, LibraryResponse::PlaylistContent(c) if c == "test content"));
+    }
+
+    #[test]
+    fn playlist_remove_fails_if_not_found() {
+        use library_ipc_protocol::PlaylistName;
+        let (service, _dir) = make_service_with_playlists_dir();
+        let name = PlaylistName::new("not-there").unwrap();
+        let response = service.handle_request(LibraryRequest::PlaylistRemove { name });
+        match response {
+            LibraryResponse::Error(ProtocolError::PlaylistNotFound { .. }) => {}
+            other => panic!("Expected PlaylistNotFound error, got {:?}", other),
+        }
     }
 
     #[test]

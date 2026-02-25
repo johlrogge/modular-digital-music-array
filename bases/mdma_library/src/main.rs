@@ -52,6 +52,7 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(args.music_dir.join("blobs"))?;
     std::fs::create_dir_all(args.music_dir.join("by-artist"))?;
     std::fs::create_dir_all(&args.metadata_dir)?;
+    std::fs::create_dir_all(args.metadata_dir.join("playlists"))?;
 
     // Create socket directory if needed
     if args.socket.starts_with("ipc://") {
