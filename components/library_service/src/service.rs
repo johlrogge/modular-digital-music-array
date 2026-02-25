@@ -507,6 +507,27 @@ impl LibraryService {
                 }
             }
 
+            LibraryRequest::PlaylistRename { from, to } => {
+                let from_path = self.resolve_playlist_path(&from);
+                let to_path = self.resolve_playlist_path(&to);
+                if !from_path.exists() {
+                    return LibraryResponse::Error(ProtocolError::PlaylistNotFound {
+                        name: from.to_string(),
+                    });
+                }
+                if to_path.exists() {
+                    return LibraryResponse::Error(ProtocolError::PlaylistAlreadyExists {
+                        name: to.to_string(),
+                    });
+                }
+                match std::fs::rename(&from_path, &to_path) {
+                    Ok(()) => LibraryResponse::Pong,
+                    Err(e) => LibraryResponse::Error(ProtocolError::Internal {
+                        message: format!("Failed to rename playlist: {}", e),
+                    }),
+                }
+            }
+
             LibraryRequest::PlaylistRemove { name } => {
                 let path = self.resolve_playlist_path(&name);
                 if !path.exists() {
@@ -1607,6 +1628,34 @@ mod tests {
             LibraryResponse::Pong => {}
             other => panic!("Expected Pong, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn playlist_rename_works() {
+        use library_ipc_protocol::PlaylistName;
+        let (service, _dir) = make_service_with_playlists_dir();
+        // Create
+        let name = PlaylistName::new("old-name").unwrap();
+        service.handle_request(LibraryRequest::PlaylistNew {
+            name: name.clone(),
+            content: "test content".to_string(),
+        });
+        // Rename
+        let new_name = PlaylistName::new("new-name").unwrap();
+        let resp = service.handle_request(LibraryRequest::PlaylistRename {
+            from: name.clone(),
+            to: new_name.clone(),
+        });
+        assert!(matches!(resp, LibraryResponse::Pong));
+        // Old name gone
+        let resp = service.handle_request(LibraryRequest::PlaylistGet { name });
+        assert!(matches!(
+            resp,
+            LibraryResponse::Error(ProtocolError::PlaylistNotFound { .. })
+        ));
+        // New name has content
+        let resp = service.handle_request(LibraryRequest::PlaylistGet { name: new_name });
+        assert!(matches!(resp, LibraryResponse::PlaylistContent(c) if c == "test content"));
     }
 
     #[test]

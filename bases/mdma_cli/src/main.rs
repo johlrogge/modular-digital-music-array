@@ -503,6 +503,14 @@ enum PlaylistCommands {
         /// Playlist name
         name: String,
     },
+
+    /// Rename a playlist
+    Rename {
+        /// Current playlist name
+        from: String,
+        /// New playlist name
+        to: String,
+    },
 }
 
 // =============================================================================
@@ -1455,6 +1463,30 @@ fn handle_playlist_edit(client: &LibraryBackend, name: &str) -> Result<()> {
 
     // Cleanup
     let _ = std::fs::remove_file(&tmp_path);
+    Ok(())
+}
+
+fn handle_playlist_rename(client: &LibraryBackend, from: &str, to: &str) -> Result<()> {
+    use library_ipc_client::{LibraryRequest, LibraryResponse};
+    let from_name = parse_playlist_name(from);
+    let to_name = parse_playlist_name(to);
+    let response = client.request(&LibraryRequest::PlaylistRename {
+        from: from_name,
+        to: to_name,
+    });
+    match response {
+        Ok(LibraryResponse::Pong) => {
+            eprintln!("Renamed playlist '{}' to '{}'", from, to);
+        }
+        Ok(LibraryResponse::Error(e)) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("Unexpected response");
+            std::process::exit(1);
+        }
+    }
     Ok(())
 }
 
@@ -2871,6 +2903,7 @@ fn main() -> Result<()> {
                 PlaylistCommands::Replace { name } => handle_playlist_replace(&lib, name),
                 PlaylistCommands::Edit { name } => handle_playlist_edit(&lib, name),
                 PlaylistCommands::Remove { name } => handle_playlist_remove(&lib, name),
+                PlaylistCommands::Rename { from, to } => handle_playlist_rename(&lib, from, to),
             }
         }
 

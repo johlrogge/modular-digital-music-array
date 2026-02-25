@@ -263,6 +263,12 @@ pub enum LibraryRequest {
 
     /// Remove a playlist.
     PlaylistRemove { name: PlaylistName },
+
+    /// Rename a playlist.
+    PlaylistRename {
+        from: PlaylistName,
+        to: PlaylistName,
+    },
 }
 
 // ============================================================================
