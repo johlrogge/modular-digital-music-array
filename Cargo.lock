@@ -2412,6 +2412,7 @@ dependencies = [
 name = "mdma-cli"
 version = "0.4.0"
 dependencies = [
+ "audio-transcoder",
  "clap",
  "clap_complete",
  "color-eyre",
@@ -2450,7 +2451,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-console"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "askama",
  "async-stream",
