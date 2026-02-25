@@ -5,7 +5,7 @@ revision=2
 archs="aarch64"
 build_style=cargo
 hostmakedepends="cargo"
-makedepends="rust-std libcap-progs"
+makedepends="rust-std"
 depends="ffmpeg"
 short_desc="MDMA web console"
 maintainer="Joakim Ohlrogge <joakim.ohlrogge@agical.se>"
@@ -22,5 +22,4 @@ do_build() {
 do_install() {
     vbin target/aarch64-unknown-linux-gnu/release/mdma-console
     vsv mdma-console
-    setcap cap_net_bind_service=+ep ${DESTDIR}/usr/bin/mdma-console
 }
