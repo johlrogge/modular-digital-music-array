@@ -34,9 +34,9 @@ just discover-units
 # Should find: mdma-909-studio.local (needs provisioning)
 ```
 
-5. **Reprovision via Ansible**:
+5. **Reprovision via beacon**:
 ```bash
-just ansible-provision mdma-909-studio.local
+just provision mdma-909-studio.local
 ```
 
 This reformats OS partition but preserves `/music` and `/metadata`.
@@ -110,7 +110,7 @@ sudo sv restart mdma-909
 
 3. **Provision new drive**:
 ```bash
-just ansible-provision mdma-909-studio.local
+just provision mdma-909-studio.local
 ```
 
 4. **Restore music library**:
@@ -250,7 +250,7 @@ just provision-sd --hostname mdma-909-studio --role 909 --device /dev/sdX
 3. **Boot and provision**:
 ```bash
 just discover-units
-just ansible-provision mdma-909-studio.local
+just provision mdma-909-studio.local
 ```
 
 4. **Restore music**:
@@ -422,7 +422,7 @@ sudo xbps-install -S
 
 **Not needed (can regenerate):**
 - `/cdj-export` - Cache, rebuilt from `/music`
-- `/` - OS, reinstalled via Ansible
+- `/` - OS, reinstalled via beacon provisioning
 - Package cache
 
 ### Backup Strategies

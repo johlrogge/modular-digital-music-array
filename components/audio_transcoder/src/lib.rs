@@ -6,6 +6,27 @@ use thiserror::Error;
 
 // ── Public types ───────────────────────────────────────────────────────────────
 
+/// Whether an audio format is lossless or lossy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormatCategory {
+    Lossless,
+    Lossy,
+}
+
+impl FormatCategory {
+    /// Classify a file extension (without leading dot) into a format category.
+    /// Returns `None` for unrecognised extensions.
+    pub fn from_extension(ext: &str) -> Option<Self> {
+        match ext.to_ascii_lowercase().as_str() {
+            "flac" | "wav" | "aiff" | "aif" => Some(Self::Lossless),
+            // m4a can contain ALAC (lossless) or AAC (lossy), but we cannot
+            // distinguish from the extension alone; default to lossy.
+            "mp3" | "ogg" | "opus" | "aac" | "m4a" | "wma" => Some(Self::Lossy),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExportFormat {
     /// Uncompressed PCM, big-endian — CDJ/Rekordbox standard
@@ -117,6 +138,73 @@ mod tests {
                 fmt
             );
         }
+    }
+
+    // ── FormatCategory ────────────────────────────────────────────────────────
+
+    #[test]
+    fn format_category_flac_is_lossless() {
+        assert_eq!(
+            FormatCategory::from_extension("flac"),
+            Some(FormatCategory::Lossless)
+        );
+    }
+
+    #[test]
+    fn format_category_wav_is_lossless() {
+        assert_eq!(
+            FormatCategory::from_extension("wav"),
+            Some(FormatCategory::Lossless)
+        );
+    }
+
+    #[test]
+    fn format_category_aiff_is_lossless() {
+        assert_eq!(
+            FormatCategory::from_extension("aiff"),
+            Some(FormatCategory::Lossless)
+        );
+    }
+
+    #[test]
+    fn format_category_mp3_is_lossy() {
+        assert_eq!(
+            FormatCategory::from_extension("mp3"),
+            Some(FormatCategory::Lossy)
+        );
+    }
+
+    #[test]
+    fn format_category_ogg_is_lossy() {
+        assert_eq!(
+            FormatCategory::from_extension("ogg"),
+            Some(FormatCategory::Lossy)
+        );
+    }
+
+    #[test]
+    fn format_category_opus_is_lossy() {
+        assert_eq!(
+            FormatCategory::from_extension("opus"),
+            Some(FormatCategory::Lossy)
+        );
+    }
+
+    #[test]
+    fn format_category_unknown_returns_none() {
+        assert_eq!(FormatCategory::from_extension("txt"), None);
+    }
+
+    #[test]
+    fn format_category_case_insensitive() {
+        assert_eq!(
+            FormatCategory::from_extension("FLAC"),
+            Some(FormatCategory::Lossless)
+        );
+        assert_eq!(
+            FormatCategory::from_extension("Mp3"),
+            Some(FormatCategory::Lossy)
+        );
     }
 }
 

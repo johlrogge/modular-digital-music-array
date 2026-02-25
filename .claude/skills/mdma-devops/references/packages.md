@@ -8,22 +8,14 @@ Code should run on live units within minutes of being written. This requires:
 - Fast distribution to all units
 - Safe rollback if issues arise
 
-## Package vs Ansible Boundary
+## Package Scope
 
 **Void Packages contain:**
 - MDMA application binaries (Rust executables)
 - Runtime dependencies
 - runit service definitions
 - Application configuration templates
-
-**Ansible manages:**
-- System topology (partitions, mounts)
-- System packages (rarely change)
-- Service configuration files
-- Directory structures
-- Secrets deployment
-
-**The Principle**: If it changes with git commits, it's a package. If it defines how the system is shaped, it's Ansible.
+- INSTALL scripts for service setup (supervise symlinks, service enabling)
 
 ## xbps-src Package Structure
 
@@ -216,7 +208,7 @@ server {
 
 5. **Configure units to use repository**:
 
-Ansible template for `/etc/xbps.d/mdma-repo.conf`:
+Create `/etc/xbps.d/mdma-repo.conf`:
 ```
 repository=http://repo.mdma.local/aarch64
 ```
@@ -418,6 +410,48 @@ fi
 exit $EXIT_CODE
 ```
 
+## xbps Command Reference
+
+### Package Management
+
+| Command | Purpose |
+|---------|---------|
+| `xbps-install -S` | Sync repository index |
+| `xbps-install -Su` | Sync and upgrade all packages |
+| `xbps-install -Suy` | Sync, upgrade, and auto-confirm |
+| `xbps-install <pkg>` | Install a package |
+| `xbps-install -f <pkg>` | Force reinstall (for downgrades) |
+| `xbps-query -l` | List installed packages |
+| `xbps-query -Rs <pattern>` | Search remote repository |
+| `xbps-query -S <pkg>` | Show package details |
+| `xbps-remove <pkg>` | Remove a package |
+| `xbps-remove -o` | Remove orphaned dependencies |
+| `xbps-rindex -a <dir>/*.xbps` | Add packages to repository index |
+| `xbps-rindex --sign` | Sign repository |
+| `xbps-rindex --sign-pkg` | Sign individual package |
+| `xbps-pkgdb -a` | Repair package database |
+
+### Repository Configuration on Pi
+
+Repository sources live in `/etc/xbps.d/`:
+
+```bash
+# Official Void repo (default)
+/etc/xbps.d/00-repository-main.conf
+# Content: repository=https://repo-default.voidlinux.org/current/aarch64
+
+# MDMA package repo
+/etc/xbps.d/10-mdma-repo.conf
+# Content: repository=https://johlrogge.github.io/modular-digital-music-array/aarch64
+```
+
+### Troubleshooting xbps
+
+**Stale cache:** `xbps-install -S` to force re-sync
+**Signature errors:** Ensure signing key matches between CI and Pi repo config
+**Dependency conflicts:** `xbps-pkgdb -a` to repair, then `xbps-install -Su`
+**Locked database:** `rm /var/db/xbps/.*.lock` (only if no xbps process running)
+
 ## Development Workflow
 
 ### Local Development → Live Deployment
@@ -448,7 +482,7 @@ Time to live: **<60 seconds** after package built
 
 ### Cron-based Update Check
 
-Ansible template for `/etc/cron.d/mdma-update-check`:
+Configure `/etc/cron.d/mdma-update-check`:
 
 ```cron
 # Check for updates daily at 4 AM

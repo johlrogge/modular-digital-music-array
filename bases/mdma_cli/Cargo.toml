@@ -27,6 +27,9 @@ nng = { workspace = true }
 nng-transport = { path = "../../components/nng_transport" }
 serde_json = { workspace = true }
 
+# Audio format classification (for smart export)
+audio-transcoder = { path = "../../components/audio_transcoder" }
+
 # IPC (still needed for protocol types re-exported by mdma-client)
 library-ipc-client = { path = "../../components/library_ipc_client" }
 library-search = { path = "../../components/library_search" }

@@ -161,8 +161,33 @@ Workflow:
 6. Dispatch devops to deploy → dispatch test agent for smoke tests
 7. Relay results to Joakim
 
+### Git-flow Branching
+
+- **Feature branches**: `git flow feature start <name>` for new features
+- **Release branches**: `git flow release start <version>` for version bumps
+- **Hotfix branches**: `git flow hotfix start <name>` for urgent fixes
+- All development happens on feature branches off `develop`
+- Only releases and hotfixes merge to `main`
+- CI builds packages only on `main` push; tests run on all branches
+
+### Release Workflow
+
+1. `git flow release start <version>`
+2. Bump workspace version in `Cargo.toml`
+3. Bump xbps template versions in `void-packages/srcpkgs/*/template`
+4. Dispatch **documenter** agent to update all READMEs
+5. Dispatch **commit** agent: `chore(release): bump to <version>`
+6. `git flow release finish <version>`
+7. Push main + develop + tags
+8. CI builds and publishes packages
+9. Dispatch **devops** to verify packages install on Pi
+
+See `.claude/skills/mdma-devops/references/releases.md` for detailed procedure.
+
 ## Git Commit Guidelines
 
 - Do NOT include "Generated with Claude Code" or similar references in commit messages
 - Do NOT include "Co-Authored-By: Claude" or similar in commit messages
 - Write commit messages as if written by the developer directly
+- All commits must follow Conventional Commits format (see `.claude/skills/conventional-commits/SKILL.md`)
+- Format: `<type>(<scope>): <description>` (e.g., `feat(export): add smart format selection`)

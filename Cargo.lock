@@ -2412,6 +2412,7 @@ dependencies = [
 name = "mdma-cli"
 version = "0.4.0"
 dependencies = [
+ "audio-transcoder",
  "clap",
  "clap_complete",
  "color-eyre",
@@ -2456,7 +2457,6 @@ dependencies = [
  "async-stream",
  "audio-transcoder",
  "axum",
- "bandcamp-api",
  "clap",
  "color-eyre",
  "event-protocol",

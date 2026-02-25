@@ -244,10 +244,22 @@ enum Commands {
     ///   mdma search --artist CBL | mdma export
     ///   mdma search --artist CBL | mdma export --format aiff
     ///   mdma search --artist CBL | mdma export --format wav --output ./archive/
+    ///   mdma search --artist CBL | mdma export --lossless-format aiff --lossy-format wav
     Export {
-        /// Output format (original, aiff or wav). Default: original (no conversion)
-        #[arg(long, default_value = "original", value_enum)]
-        format: ExportFormat,
+        /// Output format for ALL tracks (original, aiff or wav). Default: original.
+        /// Conflicts with --lossless-format and --lossy-format.
+        #[arg(long, value_enum, conflicts_with_all = ["lossless_format", "lossy_format"])]
+        format: Option<ExportFormat>,
+
+        /// Target format for lossless sources (flac, wav, aiff).
+        /// Lossy sources pass through unchanged.
+        #[arg(long, value_enum)]
+        lossless_format: Option<ExportFormat>,
+
+        /// Target format for lossy sources (mp3, ogg, opus).
+        /// Lossless sources pass through unchanged.
+        #[arg(long, value_enum)]
+        lossy_format: Option<ExportFormat>,
 
         /// Output directory (created if it doesn't exist)
         #[arg(long, default_value = "./export/")]
@@ -2159,9 +2171,50 @@ struct ExportResult {
     error: Option<String>,
 }
 
+/// Resolve the export format for a track based on its source extension and CLI flags.
+///
+/// Priority:
+/// 1. `--format` — applies to all tracks unconditionally.
+/// 2. `--lossless-format` / `--lossy-format` — applied per source category.
+/// 3. No flags — defaults to `ExportFormat::Original` (pass-through).
+fn resolve_export_format(
+    blob_path: Option<&str>,
+    format: &Option<ExportFormat>,
+    lossless_format: &Option<ExportFormat>,
+    lossy_format: &Option<ExportFormat>,
+) -> ExportFormat {
+    // If --format is given, use it for everything.
+    if let Some(fmt) = format {
+        return fmt.clone();
+    }
+
+    // If neither category flag is given, default to Original.
+    if lossless_format.is_none() && lossy_format.is_none() {
+        return ExportFormat::Original;
+    }
+
+    // Classify the source file by extension.
+    let ext = blob_path
+        .and_then(|p| std::path::Path::new(p).extension())
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+
+    match audio_transcoder::FormatCategory::from_extension(ext) {
+        Some(audio_transcoder::FormatCategory::Lossless) => {
+            lossless_format.clone().unwrap_or(ExportFormat::Original)
+        }
+        Some(audio_transcoder::FormatCategory::Lossy) => {
+            lossy_format.clone().unwrap_or(ExportFormat::Original)
+        }
+        None => ExportFormat::Original,
+    }
+}
+
 fn handle_export(
     library: &LibraryBackend,
-    format: &ExportFormat,
+    format: &Option<ExportFormat>,
+    lossless_format: &Option<ExportFormat>,
+    lossy_format: &Option<ExportFormat>,
     output: &std::path::Path,
 ) -> Result<()> {
     use std::io::{BufRead, Write};
@@ -2215,11 +2268,17 @@ fn handle_export(
         .build()
         .map_err(|e| color_eyre::eyre::eyre!("Failed to build HTTP client: {}", e))?;
 
-    let format_param = format.format_param();
     let total = tracks.len();
     let mut results: Vec<ExportResult> = Vec::with_capacity(total);
 
     for (idx, track) in tracks.iter().enumerate() {
+        let resolved_format = resolve_export_format(
+            track.blob_path.as_deref(),
+            format,
+            lossless_format,
+            lossy_format,
+        );
+        let format_param = resolved_format.format_param();
         let full_hash = &track.content_hash.0;
         let url = export_url_from_node(&node, full_hash, format_param);
         eprint!("[{}/{}] Downloading {} ... ", idx + 1, total, full_hash);
@@ -2256,7 +2315,7 @@ fn handle_export(
         // Determine the file extension: fixed for converted formats, derived from
         // blob_path for Original.
         let source_ext_owned: String;
-        let ext: &str = match format.static_extension() {
+        let ext: &str = match resolved_format.static_extension() {
             Some(fixed) => fixed,
             None => {
                 // Original: derive from blob_path
@@ -2564,9 +2623,14 @@ fn main() -> Result<()> {
             ssh_user,
             inbox_dir,
         } => handle_upload(&cli, file, ssh_key, ssh_user, inbox_dir),
-        Commands::Export { format, output } => {
+        Commands::Export {
+            format,
+            lossless_format,
+            lossy_format,
+            output,
+        } => {
             let lib = connect_library(&cli);
-            handle_export(&lib, format, output)
+            handle_export(&lib, format, lossless_format, lossy_format, output)
         }
         Commands::GenerateCompletions { shell } => {
             generate_completions(*shell, &mut std::io::stdout());
@@ -2952,5 +3016,110 @@ mod tests {
             output.contains("mdma"),
             "bash completion output must reference the binary name 'mdma'"
         );
+    }
+
+    // ── resolve_export_format ────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_format_with_format_flag_overrides_everything() {
+        let result = resolve_export_format(
+            Some("ab/abc123.flac"),
+            &Some(ExportFormat::Wav),
+            &None,
+            &None,
+        );
+        assert_eq!(result, ExportFormat::Wav);
+    }
+
+    #[test]
+    fn resolve_format_no_flags_defaults_to_original() {
+        let result = resolve_export_format(Some("ab/abc123.flac"), &None, &None, &None);
+        assert_eq!(result, ExportFormat::Original);
+    }
+
+    #[test]
+    fn resolve_format_lossless_flag_converts_flac() {
+        let result = resolve_export_format(
+            Some("ab/abc123.flac"),
+            &None,
+            &Some(ExportFormat::Aiff),
+            &None,
+        );
+        assert_eq!(result, ExportFormat::Aiff);
+    }
+
+    #[test]
+    fn resolve_format_lossless_flag_passes_through_mp3() {
+        let result = resolve_export_format(
+            Some("ab/abc123.mp3"),
+            &None,
+            &Some(ExportFormat::Aiff),
+            &None,
+        );
+        assert_eq!(result, ExportFormat::Original);
+    }
+
+    #[test]
+    fn resolve_format_lossy_flag_converts_mp3() {
+        let result = resolve_export_format(
+            Some("ab/abc123.mp3"),
+            &None,
+            &None,
+            &Some(ExportFormat::Wav),
+        );
+        assert_eq!(result, ExportFormat::Wav);
+    }
+
+    #[test]
+    fn resolve_format_lossy_flag_passes_through_flac() {
+        let result = resolve_export_format(
+            Some("ab/abc123.flac"),
+            &None,
+            &None,
+            &Some(ExportFormat::Wav),
+        );
+        assert_eq!(result, ExportFormat::Original);
+    }
+
+    #[test]
+    fn resolve_format_both_category_flags() {
+        // lossless → aiff, lossy → wav
+        let lossless = resolve_export_format(
+            Some("ab/abc123.flac"),
+            &None,
+            &Some(ExportFormat::Aiff),
+            &Some(ExportFormat::Wav),
+        );
+        assert_eq!(lossless, ExportFormat::Aiff);
+
+        let lossy = resolve_export_format(
+            Some("ab/abc123.mp3"),
+            &None,
+            &Some(ExportFormat::Aiff),
+            &Some(ExportFormat::Wav),
+        );
+        assert_eq!(lossy, ExportFormat::Wav);
+    }
+
+    #[test]
+    fn resolve_format_unknown_extension_passes_through() {
+        let result = resolve_export_format(
+            Some("ab/abc123.txt"),
+            &None,
+            &Some(ExportFormat::Aiff),
+            &Some(ExportFormat::Wav),
+        );
+        assert_eq!(result, ExportFormat::Original);
+    }
+
+    #[test]
+    fn resolve_format_no_blob_path_with_category_flags_passes_through() {
+        let result = resolve_export_format(
+            None,
+            &None,
+            &Some(ExportFormat::Aiff),
+            &Some(ExportFormat::Wav),
+        );
+        assert_eq!(result, ExportFormat::Original);
     }
 }

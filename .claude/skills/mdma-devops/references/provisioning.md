@@ -5,7 +5,7 @@
 MDMA provisioning follows a two-stage process:
 
 1. **SD Card Provisioning** (local, via `just`): Creates bootable beacon mode
-2. **NVMe Provisioning** (remote, via Ansible): Full system setup
+2. **NVMe Provisioning** (beacon): Full system setup via the beacon web UI
 
 This separates local hardware preparation from remote system configuration.
 
@@ -85,7 +85,7 @@ The SD card boots into "beacon mode":
 }
 ```
 
-## Stage 2: NVMe Provisioning via Ansible
+## Stage 2: NVMe Provisioning (Beacon)
 
 ### Purpose
 
@@ -119,10 +119,10 @@ Found 2 units:
 ### Provisioning Workflow
 
 ```bash
-just ansible-provision mdma-909-studio.local
+just provision mdma-909-studio.local
 ```
 
-Ansible playbook executes:
+Provisioning executes:
 
 #### 1. Pre-flight Checks
 - Verify SSH connectivity
@@ -294,18 +294,13 @@ just provision-sd --hostname mdma-303-kitchen --role 303 --device /dev/sdZ
 # Discover all
 just discover-units
 
-# Provision each
-just ansible-provision mdma-909-studio.local
-just ansible-provision mdma-101-bedroom.local
-just ansible-provision mdma-303-kitchen.local
+# Provision each via beacon web UI or:
+just provision mdma-909-studio.local
+just provision mdma-101-bedroom.local
+just provision mdma-303-kitchen.local
 ```
 
-Or provision all at once:
-```bash
-just ansible-provision-all
-```
-
-This runs Ansible against all discovered units in parallel.
+Batch provisioning of multiple units simultaneously will be supported via beacon fleet management (future).
 
 ## Troubleshooting
 
@@ -320,11 +315,10 @@ This runs Ansible against all discovered units in parallel.
 - Check kernel drivers: `lsmod | grep nvme`
 - Check `dmesg | grep nvme` for errors
 
-### Ansible provisioning fails
+### Provisioning fails
 - Check SSH connectivity: `ssh root@mdma-909-studio.local`
 - Verify deployment keys accepted
-- Check Ansible inventory file
-- Run with verbose: `ansible-playbook -vvv`
+- Check beacon provisioning logs
 
 ### Beacon mode stuck
 - Unit may need manual intervention
