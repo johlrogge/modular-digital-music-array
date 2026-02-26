@@ -1,6 +1,6 @@
 # mdma-library
 
-Version: **0.3.3**
+Version: **0.5.0**
 
 Music library service for MDMA. Manages a content-addressed blob store, indexes track metadata as an immutable fact stream, and serves search and lookup requests over NNG IPC.
 
@@ -14,6 +14,7 @@ Music library service for MDMA. Manages a content-addressed blob store, indexes 
 - Stores audio in content-addressed blobs under `/music/blobs/<hash-prefix>/<full-hash>.<ext>`
 - Tracks all metadata — artist, title, album, BPM, key, play history — as typed facts in `/metadata/facts.jsonl`
 - Facts are immutable and append-only (`stainless_facts`). The entire library state can be rebuilt from `facts.jsonl` at any time
+- Fact writes are delegated to `mdma-acid` (`ipc:///run/mdma/acid.sock`) — the library service does not write directly to `facts.jsonl`
 - Serves search, list, get, and facts queries via NNG IPC
 - Accepts file ingest requests (inbox management) from the CLI and console
 

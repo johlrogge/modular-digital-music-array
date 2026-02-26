@@ -3,6 +3,27 @@
 version = 4
 
 [[package]]
+name = "acid-client"
+version = "0.4.0"
+dependencies = [
+ "acid_protocol",
+ "music-facts",
+ "nng",
+ "playback-primitives",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "acid_protocol"
+version = "0.4.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1106,6 +1127,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirs"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
+name = "dirs-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
+dependencies = [
+ "libc",
+ "option-ext",
+ "redox_users",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
 name = "displaydoc"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1386,6 +1428,7 @@ dependencies = [
 name = "gateway-client"
 version = "0.4.0"
 dependencies = [
+ "acid_protocol",
  "gateway-protocol",
  "library-ipc-protocol",
  "media-protocol",
@@ -1401,6 +1444,7 @@ dependencies = [
 name = "gateway-protocol"
 version = "0.4.0"
 dependencies = [
+ "acid_protocol",
  "library-ipc-protocol",
  "media-protocol",
  "rstest",
@@ -2172,6 +2216,7 @@ dependencies = [
 name = "library-service"
 version = "0.3.0"
 dependencies = [
+ "acid-client",
  "audio-metadata",
  "chrono",
  "hex",
@@ -2366,6 +2411,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
+name = "mdma-acid"
+version = "0.4.0"
+dependencies = [
+ "acid_protocol",
+ "chrono",
+ "clap",
+ "color-eyre",
+ "nng",
+ "serde_json",
+ "stainless-facts",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mdma-bandcamp"
 version = "0.4.0"
 dependencies = [
@@ -2485,6 +2547,7 @@ dependencies = [
 name = "mdma-gateway"
 version = "0.4.0"
 dependencies = [
+ "acid_protocol",
  "clap",
  "color-eyre",
  "event-protocol",
@@ -2514,7 +2577,7 @@ dependencies = [
 name = "mdma-playback"
 version = "0.3.0"
 dependencies = [
- "chrono",
+ "acid-client",
  "clap",
  "color-eyre",
  "event-protocol",
@@ -2526,7 +2589,6 @@ dependencies = [
  "playback-primitives",
  "serde",
  "serde_json",
- "stainless-facts",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -2704,7 +2766,9 @@ dependencies = [
 name = "nng-transport"
 version = "0.4.0"
 dependencies = [
+ "dirs",
  "nng",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 
@@ -2832,6 +2896,12 @@ name = "oorandom"
 version = "11.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b410bbe7e14ab526a0e86877eb47c6996a2bd7746f027ba551028c925390e4e9"
+
+[[package]]
+name = "option-ext"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "overload"
@@ -3399,6 +3469,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35985aa610addc02e24fc232012c86fd11f14111180f902b67e2d5331f8ebf2b"
 dependencies = [
  "bitflags 2.7.0",
+]
+
+[[package]]
+name = "redox_users"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
+dependencies = [
+ "getrandom 0.2.15",
+ "libredox",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

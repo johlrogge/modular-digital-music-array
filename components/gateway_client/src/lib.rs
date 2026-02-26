@@ -3,6 +3,7 @@
 //! NNG client for connecting to the API gateway.
 //! Provides typed facades for library, playback, and source services.
 
+pub use acid_protocol::{AcidRequest, AcidResponse};
 pub use gateway_protocol::{GatewayRequest, GatewayResponse};
 pub use library_ipc_protocol::{LibraryRequest, LibraryResponse};
 pub use media_protocol::{Command, Response};
@@ -108,6 +109,24 @@ impl GatewayClient {
             GatewayResponse::Error { message } => Err(ClientError::Gateway(message)),
             _ => Err(ClientError::Gateway(
                 "Unexpected response type for source request".to_string(),
+            )),
+        }
+    }
+
+    // =========================================================================
+    // ACID facade
+    // =========================================================================
+
+    /// Send an ACID request through the gateway.
+    pub fn acid_request(&self, req: &AcidRequest) -> Result<AcidResponse, ClientError> {
+        let envelope = GatewayRequest::Acid {
+            request: req.clone(),
+        };
+        match self.request(&envelope)? {
+            GatewayResponse::Acid { response } => Ok(response),
+            GatewayResponse::Error { message } => Err(ClientError::Gateway(message)),
+            _ => Err(ClientError::Gateway(
+                "Unexpected response type for acid request".to_string(),
             )),
         }
     }

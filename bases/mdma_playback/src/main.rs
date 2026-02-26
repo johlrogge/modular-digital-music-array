@@ -2,6 +2,7 @@ mod error;
 mod playback_state;
 mod server;
 
+use acid_client::AcidClient;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -36,9 +37,9 @@ struct Args {
     #[arg(long, default_value = "ipc:///run/mdma/events.sock")]
     event_socket: String,
 
-    /// Path to the facts stream file for play history
-    #[arg(long, default_value = "/metadata/facts.jsonl")]
-    facts_path: PathBuf,
+    /// ACID service socket address for writing play history facts
+    #[arg(long, default_value = "ipc:///run/mdma/acid.sock")]
+    acid_socket: String,
 }
 
 fn main() -> Result<()> {
@@ -64,7 +65,8 @@ fn main() -> Result<()> {
     info!("Event publishing on {}", args.event_socket);
     event_pub.listen(&args.event_socket)?;
 
-    let server = Server::new(engine, socket, args.queue_file, event_pub, args.facts_path);
+    let acid_client = Arc::new(AcidClient::connect(&args.acid_socket)?);
+    let server = Server::new(engine, socket, args.queue_file, event_pub, acid_client);
     runtime.block_on(server.run())?;
 
     Ok(())

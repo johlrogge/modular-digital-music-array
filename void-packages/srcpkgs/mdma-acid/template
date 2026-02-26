@@ -1,12 +1,12 @@
-# Template file for mdma-bandcamp package
-pkgname=mdma-bandcamp
+# Template file for mdma-acid package
+pkgname=mdma-acid
 version=0.5.0
 revision=1
 archs="aarch64"
 build_style=cargo
 hostmakedepends="cargo"
 makedepends="rust-std"
-short_desc="MDMA Bandcamp music source"
+short_desc="MDMA ACID metadata service"
 maintainer="Joakim Ohlrogge <joakim.ohlrogge@agical.se>"
 license="MIT"
 homepage="https://github.com/johlrogge/modular-digital-music-array"
@@ -15,10 +15,10 @@ distfiles="https://github.com/johlrogge/modular-digital-music-array/archive/v${v
 checksum="SKIP"
 
 do_build() {
-    cargo build --release --bin mdma-bandcamp --target aarch64-unknown-linux-gnu
+    cargo build --release --bin mdma-acid --target aarch64-unknown-linux-gnu
 }
 
 do_install() {
-    vbin target/aarch64-unknown-linux-gnu/release/mdma-bandcamp
-    vsv mdma-bandcamp
+    vbin target/aarch64-unknown-linux-gnu/release/mdma-acid
+    vsv mdma-acid
 }

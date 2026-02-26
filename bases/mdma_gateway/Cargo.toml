@@ -11,6 +11,7 @@ name = "mdma-gateway"
 path = "src/main.rs"
 
 [dependencies]
+acid_protocol = { path = "../../components/acid_protocol" }
 event-protocol = { path = "../../components/event_protocol" }
 gateway-protocol = { path = "../../components/gateway_protocol" }
 source-protocol = { path = "../../components/source_protocol" }

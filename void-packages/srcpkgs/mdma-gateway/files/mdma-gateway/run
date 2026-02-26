@@ -6,4 +6,5 @@ exec chpst -u mdma /usr/bin/mdma-gateway \
     --listen tcp://0.0.0.0:5555 \
     --library-socket ipc:///run/mdma/library.sock \
     --playback-socket ipc:///run/mdma/playback.sock \
+    --acid-socket ipc:///run/mdma/acid.sock \
     --sources-dir /run/mdma/sources

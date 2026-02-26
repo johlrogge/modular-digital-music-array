@@ -26,6 +26,10 @@ struct Args {
     #[arg(long, default_value = "ipc:///run/mdma/playback.sock")]
     playback_socket: String,
 
+    /// ACID service IPC socket
+    #[arg(long, default_value = "ipc:///run/mdma/acid.sock")]
+    acid_socket: String,
+
     /// Directory containing source service sockets
     #[arg(long, default_value = "/run/mdma/sources")]
     sources_dir: PathBuf,
@@ -152,6 +156,10 @@ fn main() -> Result<()> {
     let playback_backend = connect_backend(&args.playback_socket)
         .map_err(|e| color_eyre::eyre::eyre!("Failed to connect to playback: {}", e))?;
     tracing::info!(address = %args.playback_socket, "Connected to playback backend");
+
+    let acid_backend = connect_backend(&args.acid_socket)
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to connect to acid: {}", e))?;
+    tracing::info!(address = %args.acid_socket, "Connected to acid backend");
 
     // Event bridge: Sub0 (local) -> Pub0 (TCP)
     let event_pub = nng::Socket::new(nng::Protocol::Pub0)?;
@@ -286,6 +294,21 @@ fn main() -> Result<()> {
                         }
                     }
                     Err(e) => GatewayResponse::Error { message: e },
+                }
+            }
+
+            GatewayRequest::Acid { request } => {
+                let request_bytes = serde_json::to_vec(&request).unwrap();
+                match forward_raw(&acid_backend, &request_bytes) {
+                    Ok(resp_bytes) => match serde_json::from_slice(&resp_bytes) {
+                        Ok(resp) => GatewayResponse::Acid { response: resp },
+                        Err(e) => GatewayResponse::Error {
+                            message: format!("acid response parse error: {}", e),
+                        },
+                    },
+                    Err(e) => GatewayResponse::Error {
+                        message: format!("acid service unreachable: {}", e),
+                    },
                 }
             }
 
