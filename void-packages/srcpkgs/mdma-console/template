@@ -1,6 +1,6 @@
 # Template file for mdma-console package
 pkgname=mdma-console
-version=0.4.0
+version=0.5.0
 revision=1
 archs="aarch64"
 build_style=cargo
