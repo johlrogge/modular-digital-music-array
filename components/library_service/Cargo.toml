@@ -20,6 +20,7 @@ music-facts = { path = "../music_facts" }
 music-primitives = { path = "../music_primitives" }
 audio-metadata = { path = "../audio_metadata" }
 library-ipc-protocol = { path = "../library_ipc_protocol" }
+acid-client = { path = "../acid_client", features = ["music"] }
 
 # Fact stream
 stainless-facts = { git = "https://github.com/johlrogge/stainless_facts" }

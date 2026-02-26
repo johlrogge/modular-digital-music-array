@@ -25,6 +25,10 @@ struct Args {
     /// Also listen on TCP for remote connections (e.g., "tcp://0.0.0.0:5555")
     #[arg(long)]
     tcp: Option<String>,
+
+    /// ACID service socket address
+    #[arg(long, default_value = "ipc:///run/mdma/acid.sock")]
+    acid_socket: String,
 }
 
 #[tokio::main]
@@ -64,7 +68,7 @@ async fn main() -> Result<()> {
     }
 
     // Initialize service
-    let library = LibraryService::new(args.music_dir, args.metadata_dir)?;
+    let library = LibraryService::new(args.music_dir, args.metadata_dir, &args.acid_socket)?;
 
     tracing::info!(
         tracks = library.tracks_count(),

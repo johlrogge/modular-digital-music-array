@@ -1,5 +1,6 @@
 use crate::error::ServerError;
 use crate::playback_state::{PlaybackEffect, PlaybackState, PlaybackStateMachine};
+use acid_client::AcidClient;
 use color_eyre::Result;
 use event_protocol::{to_topic_message, PlaybackEvent};
 use media_protocol::{Command, ContentHash, Response, ResponseData};
@@ -7,7 +8,6 @@ use music_facts::{FactOrigin, FactSource, MusicValue, StartReason};
 use nng::Socket;
 use playback_engine::{Deck, PlaybackEngine, PlaybackError};
 use serde::{Deserialize, Serialize};
-use stainless_facts::{Fact, FactStreamWriter, Operation};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,23 +20,14 @@ struct QueueEntry {
     path: PathBuf,
 }
 
-fn write_fact(facts_path: &std::path::Path, hash: &ContentHash, value: MusicValue) {
-    use chrono::Utc;
+fn write_fact(acid_client: &AcidClient, hash: &ContentHash, value: MusicValue) {
     let source = FactSource::new(
         "mdma-playback",
         env!("CARGO_PKG_VERSION"),
         FactOrigin::Unknown,
     );
-    let fact = Fact::new(hash.clone(), value, Utc::now(), source, Operation::Assert);
-    match FactStreamWriter::open(facts_path) {
-        Ok(mut writer) => {
-            if let Err(e) = writer.write_batch(&[fact]) {
-                warn!("Failed to write fact: {}", e);
-            }
-        }
-        Err(e) => {
-            warn!("Failed to open facts file {:?}: {}", facts_path, e);
-        }
+    if let Err(e) = acid_client.write_music_facts(hash, &[(value, source)]) {
+        warn!("Failed to write fact via ACID: {}", e);
     }
 }
 
@@ -56,7 +47,7 @@ pub struct Server {
     state: Arc<Mutex<PlaybackStateMachine>>,
     queue_file: PathBuf,
     event_pub: Socket,
-    facts_path: PathBuf,
+    acid_client: Arc<AcidClient>,
 }
 
 impl Server {
@@ -65,7 +56,7 @@ impl Server {
         socket: Socket,
         queue_file: PathBuf,
         event_pub: Socket,
-        facts_path: PathBuf,
+        acid_client: Arc<AcidClient>,
     ) -> Self {
         Self {
             engine,
@@ -74,7 +65,7 @@ impl Server {
             state: Arc::new(Mutex::new(PlaybackStateMachine::new())),
             queue_file,
             event_pub,
-            facts_path,
+            acid_client,
         }
     }
 
@@ -138,7 +129,7 @@ impl Server {
             self.queue.clone(),
             self.state.clone(),
             self.event_pub.clone(),
-            self.facts_path.clone(),
+            self.acid_client.clone(),
             self.queue_file.clone(),
         ));
 
@@ -182,7 +173,7 @@ impl Server {
                 if result.is_ok() {
                     if let Some(hash) = self.state.lock().await.current_hash().cloned() {
                         write_fact(
-                            &self.facts_path,
+                            &self.acid_client,
                             &hash,
                             MusicValue::TrackStarted(StartReason::OnRequest),
                         );
@@ -197,21 +188,24 @@ impl Server {
                 info!("Stopping playback");
                 let effects = self.state.lock().await.stop();
                 let result =
-                    execute_effects(effects, &self.engine, &self.event_pub, &self.facts_path).await;
+                    execute_effects(effects, &self.engine, &self.event_pub, &self.acid_client)
+                        .await;
                 self.create_response(result, None)
             }
             Command::Pause { deck: _ } => {
                 info!("Pausing playback");
                 let effects = self.state.lock().await.pause();
                 let result =
-                    execute_effects(effects, &self.engine, &self.event_pub, &self.facts_path).await;
+                    execute_effects(effects, &self.engine, &self.event_pub, &self.acid_client)
+                        .await;
                 self.create_response(result, None)
             }
             Command::Resume { deck: _ } => {
                 info!("Resuming playback");
                 let effects = self.state.lock().await.resume();
                 let result =
-                    execute_effects(effects, &self.engine, &self.event_pub, &self.facts_path).await;
+                    execute_effects(effects, &self.engine, &self.event_pub, &self.acid_client)
+                        .await;
                 self.create_response(result, None)
             }
             Command::SetVolume { deck, db } => {
@@ -333,7 +327,7 @@ impl Server {
                             effects,
                             &self.engine,
                             &self.event_pub,
-                            &self.facts_path,
+                            &self.acid_client,
                         )
                         .await;
                         self.create_response(result, None)
@@ -364,7 +358,8 @@ impl Server {
                 };
                 let effects = self.state.lock().await.skip(next);
                 let result =
-                    execute_effects(effects, &self.engine, &self.event_pub, &self.facts_path).await;
+                    execute_effects(effects, &self.engine, &self.event_pub, &self.acid_client)
+                        .await;
                 self.create_response(result, None)
             }
             Command::GetSession => {
@@ -418,7 +413,7 @@ async fn execute_effects(
     effects: Vec<PlaybackEffect>,
     engine: &Arc<Mutex<PlaybackEngine>>,
     event_pub: &nng::Socket,
-    facts_path: &Path,
+    acid_client: &AcidClient,
 ) -> Result<(), PlaybackError> {
     for effect in effects {
         match effect {
@@ -440,7 +435,7 @@ async fn execute_effects(
                 publish_event_on_socket(event_pub, &event);
             }
             PlaybackEffect::WriteFact { hash, value } => {
-                write_fact(facts_path, &hash, value);
+                write_fact(acid_client, &hash, value);
             }
         }
     }
@@ -491,7 +486,7 @@ async fn auto_advance_task(
     queue: Arc<Mutex<VecDeque<QueueEntry>>>,
     state: Arc<Mutex<PlaybackStateMachine>>,
     event_pub: nng::Socket,
-    facts_path: PathBuf,
+    acid_client: Arc<AcidClient>,
     queue_file: PathBuf,
 ) {
     let mut tick: u8 = 0;
@@ -584,7 +579,7 @@ async fn auto_advance_task(
         // Drive the state machine.
         let effects = state.lock().await.track_ended(next);
 
-        if let Err(e) = execute_effects(effects, &engine, &event_pub, &facts_path).await {
+        if let Err(e) = execute_effects(effects, &engine, &event_pub, &acid_client).await {
             warn!("Auto-advance failed: {}", e);
         }
     }
@@ -593,6 +588,7 @@ async fn auto_advance_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use acid_client::AcidClient;
     use std::path::PathBuf;
 
     fn make_server() -> Server {
@@ -600,12 +596,18 @@ mod tests {
         let engine = Arc::new(Mutex::new(engine));
         let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
         let event_pub = nng::Socket::new(nng::Protocol::Pub0).unwrap();
+        // Create a dummy ACID listener so the client can connect.
+        let acid_listen = nng::Socket::new(nng::Protocol::Rep0).unwrap();
+        let acid_addr = format!("ipc:///tmp/test_acid_{}.sock", std::process::id());
+        acid_listen.listen(&acid_addr).unwrap();
+        let acid_client = Arc::new(AcidClient::connect(&acid_addr).unwrap());
+        std::mem::forget(acid_listen);
         Server::new(
             engine,
             socket,
             PathBuf::from("/tmp/test_queue.json"),
             event_pub,
-            PathBuf::from("/tmp/test_facts.jsonl"),
+            acid_client,
         )
     }
 
@@ -641,7 +643,7 @@ mod tests {
             effects,
             &server.engine,
             &server.event_pub,
-            &server.facts_path,
+            &server.acid_client,
         )
         .await;
 
@@ -659,12 +661,17 @@ mod tests {
 
         let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
         let event_pub = nng::Socket::new(nng::Protocol::Pub0).unwrap();
+        let acid_listen = nng::Socket::new(nng::Protocol::Rep0).unwrap();
+        let acid_addr = format!("ipc:///tmp/test_acid_ignored_{}.sock", std::process::id());
+        acid_listen.listen(&acid_addr).unwrap();
+        let acid_client = Arc::new(AcidClient::connect(&acid_addr).unwrap());
+        std::mem::forget(acid_listen);
         let server = Server::new(
             engine,
             socket,
             PathBuf::from("/tmp/test_queue.json"),
             event_pub,
-            PathBuf::from("/tmp/test_facts.jsonl"),
+            acid_client,
         );
 
         let nonexistent_path = PathBuf::from("/this/file/does/not/exist.flac");

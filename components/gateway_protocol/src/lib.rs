@@ -3,6 +3,7 @@
 //! Envelope types for routing requests through the API gateway.
 //! Three routing domains: library (core), playback (core), source (generic).
 
+use acid_protocol::{AcidRequest, AcidResponse};
 use library_ipc_protocol::{LibraryRequest, LibraryResponse};
 use media_protocol::{Command, Response};
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,10 @@ pub enum GatewayRequest {
     /// List available music sources (handled by gateway itself).
     #[serde(rename = "list_sources")]
     ListSources,
+
+    /// Route to the ACID fact store service.
+    #[serde(rename = "acid")]
+    Acid { request: AcidRequest },
 }
 
 // ============================================================================
@@ -63,6 +68,10 @@ pub enum GatewayResponse {
     /// List of available source names.
     #[serde(rename = "sources")]
     Sources { names: Vec<String> },
+
+    /// Response from the ACID fact store service.
+    #[serde(rename = "acid")]
+    Acid { response: AcidResponse },
 
     /// Gateway-level error (routing failure, service unreachable, etc.).
     #[serde(rename = "error")]
@@ -130,6 +139,38 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let parsed: GatewayRequest = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, GatewayRequest::ListSources));
+    }
+
+    #[test]
+    fn acid_request_roundtrip() {
+        let req = GatewayRequest::Acid {
+            request: AcidRequest::Ping,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"service\":\"acid\""));
+        let parsed: GatewayRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            GatewayRequest::Acid {
+                request: AcidRequest::Ping
+            }
+        ));
+    }
+
+    #[test]
+    fn acid_response_roundtrip() {
+        let resp = GatewayResponse::Acid {
+            response: AcidResponse::Pong,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"service\":\"acid\""));
+        let parsed: GatewayResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            GatewayResponse::Acid {
+                response: AcidResponse::Pong
+            }
+        ));
     }
 
     #[test]

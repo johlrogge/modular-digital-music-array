@@ -955,6 +955,20 @@ gateway-cross:
     file target/aarch64-unknown-linux-gnu/release/mdma-gateway
     ls -lh target/aarch64-unknown-linux-gnu/release/mdma-gateway
 
+# Cross-compile acid service for aarch64
+[group('build')]
+acid-cross:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building mdma-acid for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin mdma-acid
+    echo ""
+    echo "Acid built!"
+    file target/aarch64-unknown-linux-gnu/release/mdma-acid
+    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-acid
+
 # Cross-compile bandcamp for aarch64
 [group('build')]
 bandcamp-cross:
@@ -1076,3 +1090,36 @@ deploy-bandcamp: bandcamp-cross
 
     echo ""
     echo "Bandcamp deployed!"
+
+# Deploy acid service to Pi
+[group('dev')]
+deploy-acid: acid-cross
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    HOST="${PI_HOST:-mdma-909.local}"
+    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-acid"
+    SSH_KEY="$HOME/.ssh/mdma_pi"
+    RUN_SCRIPT="void-packages/srcpkgs/mdma-acid/files/mdma-acid/run"
+
+    echo "Deploying mdma-acid to $HOST..."
+
+    scp -4 -i "$SSH_KEY" "$BINARY" "$RUN_SCRIPT" "admin@${HOST}:/tmp/"
+
+    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-acid 2>/dev/null || true
+        sudo mv /tmp/mdma-acid /usr/bin/
+        sudo chmod +x /usr/bin/mdma-acid
+        sudo mkdir -p /etc/sv/mdma-acid/log /var/log/mdma-acid /metadata /run/mdma
+        sudo chown -R mdma:mdma /metadata /run/mdma
+        sudo cp /tmp/run /etc/sv/mdma-acid/run
+        sudo chmod +x /etc/sv/mdma-acid/run
+        printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-acid\n" | sudo tee /etc/sv/mdma-acid/log/run > /dev/null
+        sudo chmod +x /etc/sv/mdma-acid/log/run
+        sudo ln -sf /etc/sv/mdma-acid /var/service/mdma-acid 2>/dev/null || true
+        for i in 1 2 3 4 5; do sleep 1; [ -d /var/service/mdma-acid/supervise ] && break; done
+        sudo sv start mdma-acid 2>/dev/null || true
+        sleep 1
+        sudo sv status mdma-acid 2>/dev/null || echo "mdma-acid: waiting for runit (check manually)"'
+
+    echo ""
+    echo "Acid deployed!"

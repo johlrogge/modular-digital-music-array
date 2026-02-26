@@ -3,6 +3,27 @@
 version = 4
 
 [[package]]
+name = "acid-client"
+version = "0.4.0"
+dependencies = [
+ "acid_protocol",
+ "music-facts",
+ "nng",
+ "playback-primitives",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "acid_protocol"
+version = "0.4.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1386,6 +1407,7 @@ dependencies = [
 name = "gateway-client"
 version = "0.4.0"
 dependencies = [
+ "acid_protocol",
  "gateway-protocol",
  "library-ipc-protocol",
  "media-protocol",
@@ -1401,6 +1423,7 @@ dependencies = [
 name = "gateway-protocol"
 version = "0.4.0"
 dependencies = [
+ "acid_protocol",
  "library-ipc-protocol",
  "media-protocol",
  "rstest",
@@ -2172,6 +2195,7 @@ dependencies = [
 name = "library-service"
 version = "0.3.0"
 dependencies = [
+ "acid-client",
  "audio-metadata",
  "chrono",
  "hex",
@@ -2366,6 +2390,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
+name = "mdma-acid"
+version = "0.4.0"
+dependencies = [
+ "acid_protocol",
+ "chrono",
+ "clap",
+ "color-eyre",
+ "nng",
+ "serde_json",
+ "stainless-facts",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mdma-bandcamp"
 version = "0.4.0"
 dependencies = [
@@ -2485,6 +2526,7 @@ dependencies = [
 name = "mdma-gateway"
 version = "0.4.0"
 dependencies = [
+ "acid_protocol",
  "clap",
  "color-eyre",
  "event-protocol",
@@ -2514,7 +2556,7 @@ dependencies = [
 name = "mdma-playback"
 version = "0.3.0"
 dependencies = [
- "chrono",
+ "acid-client",
  "clap",
  "color-eyre",
  "event-protocol",
@@ -2526,7 +2568,6 @@ dependencies = [
  "playback-primitives",
  "serde",
  "serde_json",
- "stainless-facts",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

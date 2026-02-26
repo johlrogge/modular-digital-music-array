@@ -1,7 +1,9 @@
 #!/bin/sh
 exec 2>&1
+sv check mdma-acid || exit 1
 mkdir -p /music/inbox /music/blobs /metadata /run/mdma
 exec chpst -u mdma /usr/bin/mdma-library \
     --music-dir /music \
     --metadata-dir /metadata \
-    --socket ipc:///run/mdma/library.sock
+    --socket ipc:///run/mdma/library.sock \
+    --acid-socket ipc:///run/mdma/acid.sock

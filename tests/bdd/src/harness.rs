@@ -129,8 +129,12 @@ pub fn boot_test_env(tracks: &[SeedTrack]) -> TestEnv {
     seed_facts(&metadata_dir, tracks);
 
     // Create library service
-    let library_service =
-        LibraryService::new(music_dir.clone(), metadata_dir).expect("failed to create service");
+    let library_service = LibraryService::new(
+        music_dir.clone(),
+        metadata_dir,
+        "ipc:///tmp/mdma-bdd-acid-nonexistent.sock",
+    )
+    .expect("failed to create service");
     let library_service = Arc::new(library_service);
 
     // Choose unique IPC addresses (avoid collisions between parallel tests)
