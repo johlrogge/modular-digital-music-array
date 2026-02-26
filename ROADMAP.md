@@ -106,14 +106,6 @@ This should happen before inviting other users onto the system.
 
 ## Active Priorities
 
-### 11. Stream Management (Silence → Off)
-
-- Auto-shutdown PipeWire stream after N seconds of silence (queue empty, no track playing)
-- Auto-restart when a track is queued/played
-- Quality-of-life, not a blocker
-
----
-
 ### 12. Rekordbox Sync
 
 **Why:** Bridge MDMA and Rekordbox for club/CDJ preparation. Two phases.
@@ -671,6 +663,16 @@ Unix pipes.
 - Playlists stored on NVMe at `/music/playlists/`
 
 **Status:** Complete (v0.4.0).
+
+---
+
+### ~~11. Stream Management (Silence → Off)~~ ✅
+
+- Auto-shutdown PipeWire stream after N seconds of silence (queue empty, no track playing)
+- Auto-restart when a track is queued/played
+- Quality-of-life, not a blocker
+
+**Status:** Complete (v0.4.0). Idle timeout hardcoded to 5 seconds; configurability deferred.
 
 ---
 
