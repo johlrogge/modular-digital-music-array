@@ -25,6 +25,8 @@ members = [
     "components/audio_transcoder",
     "components/inbox_utils",
     "components/library_service",
+    "components/acid_protocol",
+    "components/acid_client",
     # Bases (entry points)
     "bases/mdma_playback",
     "bases/beacon",
@@ -33,6 +35,7 @@ members = [
     "bases/mdma_cli",
     "bases/mdma_bandcamp",
     "bases/mdma_gateway",
+    "bases/mdma_acid",
     # Tests
     "tests/bdd",
 ]
@@ -42,6 +45,7 @@ default-members = [
     "bases/mdma_bandcamp",
     "bases/mdma_cli",
     "bases/mdma_console",
+    "bases/mdma_acid",
     "bases/mdma_gateway",
     "bases/mdma_library",
     "bases/mdma_playback",
