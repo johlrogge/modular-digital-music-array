@@ -1,6 +1,6 @@
 # mdma-cli
 
-Version: **0.4.0**
+Version: **0.5.0**
 
 Command-line interface for MDMA. Talks to the Pi over the gateway — search the library, manage the queue, control playback, export tracks, and subscribe to live events. The binary is named `mdma`.
 

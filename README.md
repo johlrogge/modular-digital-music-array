@@ -1,6 +1,6 @@
 # MDMA — Modular Distributed Music Architecture
 
-Version: **0.4.0**
+Version: **0.5.0**
 
 A hi-fi music player for Raspberry Pi 5. Indexes your FLAC and MP3 library, streams to a USB DAC at 192 kHz via PipeWire, and is fully controlled from the command line — composable with dmenu for keyboard-driven browsing and queuing.
 
@@ -56,12 +56,13 @@ Your laptop (mdma CLI)
    |         |           |            |
 mdma-library  mdma-playback  mdma-bandcamp  /run/mdma/sources/*.sock
                                             (auto-discovered sources)
+mdma-acid                — standalone fact-writing service (ipc:///run/mdma/acid.sock)
 
 mdma-console             — web UI on port 80
 Event bus (port 5556)    — pub/sub for live clients
 ```
 
-The library is a content-addressed blob store with an immutable fact stream (`stainless_facts`). Every track attribute — artist, BPM, key, play history — is a typed fact appended to `facts.jsonl`. Nothing is ever overwritten.
+The library is a content-addressed blob store with an immutable fact stream (`stainless_facts`). Every track attribute — artist, BPM, key, play history — is a typed fact appended to `facts.jsonl`. Nothing is ever overwritten. Fact writes go through `mdma-acid`, a dedicated service that owns the `facts.jsonl` file and accepts batched writes from any other service via IPC.
 
 Audio path: FLAC/MP3 → Symphonia decoder → rubato resampler → 192 kHz PipeWire stream → iFi USB DAC
 
@@ -74,6 +75,7 @@ Audio path: FLAC/MP3 → Symphonia decoder → rubato resampler → 192 kHz Pipe
 | [beacon](bases/beacon/) | Provisioning server — installs and configures MDMA on a fresh Raspberry Pi | [README](bases/beacon/README.md) |
 | [mdma_gateway](bases/mdma_gateway/) | Single TCP gateway (port 5555) routing to all internal IPC services | [README](bases/mdma_gateway/README.md) |
 | [mdma_library](bases/mdma_library/) | Library service — content-addressed storage and fact-based metadata | [README](bases/mdma_library/README.md) |
+| [mdma_acid](bases/mdma_acid/) | ACID service — standalone append-only fact stream writer | [README](bases/mdma_acid/README.md) |
 | [mdma_playback](bases/mdma_playback/) | Audio playback — Symphonia + rubato resampler + PipeWire | [README](bases/mdma_playback/README.md) |
 | [mdma_bandcamp](bases/mdma_bandcamp/) | Bandcamp collection sync — downloads purchases into the library inbox | [README](bases/mdma_bandcamp/README.md) |
 | [mdma_console](bases/mdma_console/) | Web management console — player controls, search, queue, upload, export | [README](bases/mdma_console/README.md) |

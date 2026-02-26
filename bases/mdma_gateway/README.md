@@ -1,6 +1,6 @@
 # mdma-gateway
 
-Version: **0.3.3**
+Version: **0.5.0**
 
 Single TCP entry point for MDMA. Listens on port 5555, inspects the request envelope, and routes to the appropriate internal IPC service. This is the only externally exposed port on the Pi (besides port 80 for the web console).
 
@@ -13,6 +13,7 @@ Single TCP entry point for MDMA. Listens on port 5555, inspects the request enve
 - Accepts NNG TCP connections on `tcp://0.0.0.0:5555`
 - Routes `LibraryRequest` messages to `ipc:///run/mdma/library.sock`
 - Routes `PlaybackCommand` messages to `ipc:///run/mdma/playback.sock`
+- Routes `AcidRequest` messages to `ipc:///run/mdma/acid.sock`
 - Routes `SourceRequest` messages to the appropriate socket in `/run/mdma/sources/` (auto-discovered)
 - Handles `ListSources` to enumerate all connected source services
 - Bridges the playback event socket (IPC Pub0) to TCP port 5556 for external pub/sub clients
@@ -26,11 +27,11 @@ External clients (laptop CLI, web console)
           v
     mdma-gateway
           |
-     -----+-------+---------------------------+
-     |            |                           |
-     v            v                           v
-mdma-library  mdma-playback   /run/mdma/sources/*.sock
-(ipc fixed)   (ipc fixed)     (auto-discovered)
+     -----+-------+----------+---------------------------+
+     |            |          |                           |
+     v            v          v                           v
+mdma-library  mdma-playback  mdma-acid  /run/mdma/sources/*.sock
+(ipc fixed)   (ipc fixed)   (ipc fixed) (auto-discovered)
 
 Event bus: tcp://0.0.0.0:5556 (bridges playback-events IPC)
 ```
