@@ -12,6 +12,8 @@ NVMe boot working. mdma-console stub deployed. `just deploy-dev` working.
 
 mdma-library running with nng IPC. 347 tracks indexed. Bandcamp sync operational. mdma-cli for search/list/facts from laptop.
 
+> **Note:** The library service currently embeds what will become the ACID service (Audio Collection Indexing Database) — see `documents/acid-summary.md` and Priority 15. The fact stream, content-hash identity, and in-memory indexes will be extracted into `mdma-acid` as a standalone service. The library will become a client that builds music-domain projections from ACID's fact stream.
+
 **Milestone 1 Part 3 (Audio Playback): COMPLETE — Feb 20, 2026**
 
 Playback bugs fixed and verified on real hardware. 192 kHz upsampled output through iFi USB DAC. Full chain working.
@@ -24,7 +26,7 @@ All services behind the gateway. Only port 5555 exposed. void-packages as single
 
 ## The Vision
 
-**A continuous hi-fi stream for parties.**
+**A continuous hi-fi stream that brings people together through music.**
 
 Always output at the iFi DAC's maximum supported rate (probe at startup — likely 192 kHz). Upsample all sources. A single ordered queue feeds the stream. The system is a music player first; DJ tools come later.
 
@@ -45,7 +47,402 @@ Always output at the iFi DAC's maximum supported rate (probe at startup — like
 
 ---
 
-## Priorities
+## Before Beta
+
+The following must work reliably before inviting beta testers onto the system.
+
+### Getting Started (Onboarding)
+
+The ideal golden path for setting up a new MDMA node:
+
+1. Flash the MDMA ISO to an SD card
+2. Insert SD card into the Raspberry Pi and boot
+3. Browse to `welcome-to-mdma.local` and provision through the web UI
+4. All services start automatically on the NVMe
+
+The ISO contains a minimal Void Linux image with the beacon service pre-installed
+and running. No SSH, no scripts, no manual intervention — just flash, boot, and
+provision.
+
+**Current workaround:** We have been unable to produce a working bootable ISO with
+the beacon pre-installed. Until that is solved, onboarding uses a bootstrap script:
+
+1. Start with a Raspberry Pi running Void Linux from SD card
+2. SSH in and run the bootstrap script — it installs the beacon via XBPS
+3. Browse to `welcome-to-mdma.local` and provision through the web UI
+
+The workaround adds friction (SSH access, running a script) that we want to eliminate
+before beta.
+
+### Recovery
+
+If the system becomes unbootable or needs to be reprovisioned:
+
+1. Edit `cmdline.txt` on the SD card to boot back into beacon mode
+2. Browse to `welcome-to-mdma.local` and re-provision through the web UI
+3. Re-provisioning will NOT overwrite existing partitions
+4. Music and metadata are preserved on the NVMe
+
+This gives users a safe path back without losing their library.
+
+### Validation: Full Reinstall from SD Card
+
+Deferred until time permits. Not blocking current work, but must happen before beta.
+
+**Constraint:** `/music` must survive. The NVMe partition layout keeps `/music` on its
+own partition (`/dev/nvme0n1p4`), so reinstalling root does not touch it. Verify this
+holds before wiping anything.
+
+**What to test:**
+- Fresh SD card boot → beacon → provision NVMe → all services start automatically
+- `/music` and `/metadata` intact after reinstall
+- `mdma search` works immediately against the existing library
+- Bandcamp sync resumes without re-downloading
+- Bandcamp cookies + username configured correctly
+
+This should happen before inviting other users onto the system.
+
+---
+
+## Active Priorities
+
+### 11. Stream Management (Silence → Off)
+
+- Auto-shutdown PipeWire stream after N seconds of silence (queue empty, no track playing)
+- Auto-restart when a track is queued/played
+- Quality-of-life, not a blocker
+
+---
+
+### 12. Rekordbox Sync
+
+**Why:** Bridge MDMA and Rekordbox for club/CDJ preparation. Two phases.
+
+**Interface:** Rekordbox XML format (official, stable). Not the encrypted SQLite DB.
+
+**Identity mapping:** `PioneerMapping` fact (ContentHash ↔ TrackID + file path).
+Persisted via stainless_facts. Created on first export, maintained across syncs.
+Named `PioneerMapping` (not Rekordbox-specific) because it maps to the Pioneer
+ecosystem broadly — shared with Priority 13 (Virtual CDJ).
+
+**Phase A — MDMA to Rekordbox (export):**
+- `mdma rekordbox export --playlist <name> --output <path>` on laptop
+- Pulls tracks from Pi, converts FLAC to AIFF locally (metadata + album art support)
+- Generates Rekordbox XML with file paths, BPM, key, artist, title
+- Records identity mapping as facts for future syncs
+- User imports XML in Rekordbox
+
+**Phase B — Rekordbox to MDMA (import):**
+- `mdma rekordbox import <rekordbox.xml>`
+- Matches tracks via identity mapping facts (falls back to metadata matching)
+- Imports playlists into MDMA playlist system
+- Imports/updates metadata: tags, rating, comments
+
+**Prerequisites:** First-class playlists are done. Tags/rating facts come from Priority 15 — User Enrichment Facts (required before Phase B import).
+
+**Conversion runs on the laptop, not the Pi.**
+
+**Shared infrastructure:** The FLAC-to-AIFF transcoding pipeline and ContentHash-to-TrackID
+identity mapping are also used by Priority 13 (Virtual CDJ). Factor these into reusable
+components when implementing.
+
+---
+
+### 13. Virtual CDJ (Network Media Server for Physical CDJs)
+
+**Why:** Eliminate USB sticks entirely. MDMA serves its library directly to physical CDJs
+on the local network. The CDJ browses and plays tracks as if a USB stick were inserted.
+
+**Target hardware:** CDJ-900 (confirmed on local network). CDJ-2000/3000 also supported.
+
+**How it works:** CDJs can mount NFS shares and treat them as media sources. MDMA generates
+the Pioneer directory structure (PDB database + ANLZ analysis files) on `/cdj-export` and
+serves it via NFSv3. The CDJ sees the NFS share as equivalent to a USB stick.
+
+**Phase A — Static NFS Export (MVP):**
+- `pioneer_export` component: generates `PIONEER/` directory structure from MDMA library
+  - PDB database: tracks, artists, albums, playlists (via `rekordcrate` crate)
+  - ANLZ files: beatgrid, basic waveform data (from BPM/key facts)
+  - Tracks without BPM/key facts will need Priority 15 Phase A (audio analysis) for accurate beatgrids
+  - Audio files: AIFF transcoded from FLAC (reuses Rekordbox Sync transcoding pipeline)
+- Generates to `/cdj-export` on MDMA-909 (secondary NVMe, already provisioned)
+- NFS export already configured in provisioning (NFSv3, read-only, LAN only)
+- CLI: `mdma cdj export` — full library export, `mdma cdj export --playlist <name>`
+- Incremental: only transcode/regenerate changed tracks
+
+**Phase B — Reactive Export:**
+- Subscribe to library change events (new tracks, metadata updates)
+- Automatically regenerate affected PDB entries and ANLZ files
+- Background AIFF transcoding on ingest (Pi has the CPU headroom)
+
+**Phase C — Pro DJ Link Participation (stretch):**
+- MDMA announces itself on the Pro DJ Link network (port 50000)
+- Responds to DeviceSQL queries from CDJs (port 12523/1051)
+- Serves track data and metadata on demand
+- Foundation exists in `prodj` research project (packet parsing, player registry)
+- Reference: https://djl-analysis.deepsymmetry.org/djl-analysis/packets.html
+
+**Shared with Priority 12:**
+- `pioneer_export` component (PDB/ANLZ generation)
+- FLAC-to-AIFF transcoding pipeline
+- ContentHash ↔ Pioneer TrackID identity mapping facts
+
+**Prerequisites:** Priority 12 Phase A (transcoding pipeline, identity mapping).
+
+**Hardware:** MDMA-909 variant with secondary NVMe (`/cdj-export` partition).
+
+**Key crate:** `rekordcrate` (PDB/ANLZ read/write, Rust, available on crates.io).
+
+---
+
+### 15. ACID — The Fact Store Service
+
+> **Ordering rationale:** ACID is architecturally foundational but placed after Rekordbox/CDJ
+> priorities because the current library service already provides a working fact store. The
+> extraction is a refactoring — it improves the architecture without adding user-facing
+> features. It can be pulled forward if the single-process constraint becomes a bottleneck.
+
+**Why:** Every service that produces or consumes facts currently does so through the
+library service, which both owns the fact stream AND implements music-domain logic.
+ACID separates these concerns: it is the single process that owns and protects the
+fact stream. There can be only one.
+
+**What it is:** A standalone service (`mdma-acid`) inspired by Datomic's index model.
+ACID is the sole writer to the fact stream. All other services interact with facts
+exclusively via nng IPC. Nobody touches the fact stream file directly.
+
+**Core responsibilities:**
+- **Append** — accept facts from producers (bandcamp, analyzer, CLI), validate
+  timestamp ordering, write atomically
+- **Index** — maintain Datomic-style EAVT indexes in memory for fast queries
+- **Query** — execute queries over the indexes, return matching facts/entities
+- **Subscribe** — filter and stream facts to clients that want to build local
+  projections (e.g., library builds its search index from the fact stream)
+- **Derived facts** — in the future, ACID can compute and write derived facts
+  (e.g., duplicate detection, missing-metadata flags)
+
+**Architecture:**
+
+```
+Producers (bandcamp, analyzer, CLI)
+    │
+    ▼  nng req/rep
+┌──────────┐
+│   ACID   │──▶ Fact Stream (JSONL) — ACID is sole writer
+│  Service │
+│          │──▶ EAVT Indexes (in-memory)
+└──────────┘
+    │
+    ▼  nng pub/sub (filtered)
+Consumers (library, playback, future clients)
+    build local projections from fact stream
+```
+
+**Fact value types:** ACID is generic over `V: Serialize + DeserializeOwned`. It does
+not know about `MusicValue`. Domain-specific value enums live in their respective
+crates. ACID needs only a type discriminant string (for indexing) and the serialized
+form (for storage/queries).
+
+**Phases:**
+
+**Phase A — Extract and Stand Alone:**
+- New binary `bases/mdma_acid/` with nng IPC socket
+- Move fact writing from library service into ACID
+- Library service becomes a fact stream subscriber, builds projections locally
+- Existing functionality preserved — just separated into two processes
+
+**Phase B — EAVT Indexes and Queries:**
+- Implement Datomic-style Entity-Attribute-Value-Time indexes
+- Query protocol: find entities by attribute, value ranges, time ranges
+- Library delegates fact queries to ACID instead of maintaining its own indexes
+
+**Phase C — Filtered Subscriptions:**
+- Clients subscribe with filters (e.g., "only BPM facts", "only new entities")
+- ACID pushes matching facts as they arrive
+- Enables future services to react to new facts without polling
+
+**Phase D — Derived Facts:**
+- ACID computes derived facts from existing data (dedup detection, completeness flags)
+- Written back to the stream like any other fact
+- Opens the door for analysis services that enrich the stream
+
+**Prerequisites:** None for Phase A — it's an extraction of existing code.
+
+**Service entry:** `mdma-acid` runs as a runit service, owns `ipc:///run/mdma/acid.sock`.
+
+---
+
+#### Audio Analysis (sub-priority of 15)
+
+Once ACID exists as a service, analysis becomes a fact producer that writes through ACID:
+
+- **BPM and Key Detection** — analyze audio, write `Bpm`, `Key` facts via ACID
+- **ReplayGain** — loudness normalization facts
+- **Audio Fingerprinting** — Chromaprint fingerprints for near-duplicate detection
+
+These are separate binaries or services that talk to ACID. They do NOT touch the
+fact stream directly.
+
+#### User Enrichment Facts
+
+User-authored metadata written as facts through ACID:
+- `Rating`, `Energy`, `Tag`, `Comment` for tracks
+- `CuePoint`, `LoopRegion` for DJ performance data
+- Written via CLI and web UI
+- Prerequisite for Rekordbox round-trip sync (Priority 12 Phase B)
+
+---
+
+## Post-Beta: Party Modes (placeholder — needs design discussion)
+
+See `documents/vision/The_Art_of_Shared_Listening_-_Party_Modes_Marketing_Copy.md` for initial thinking.
+
+Two listening modes are envisioned:
+- **Gathered Experience** — curated, pre-collected music for retreats and celebrations
+- **Living Room** — spontaneous sharing, guests add songs in real-time
+
+Party modes introduce temporary music collections and ephemeral downloads (e.g., via
+yt-dlp from YouTube Music, SoundCloud) where tracks are not permanently added to the
+main music collection.
+
+Details on mode design, USPs, guest access model, contributor attribution, ambient
+display, gapless/crossfade, and temporary collection lifecycle to be discussed before
+scoping work.
+
+**Prerequisites:** Gapless playback, guest-scoped web UI, temporary collection support.
+
+---
+
+## Future Clients
+
+Ordered by complexity — simplest ships first.
+
+### ~~Polybar Widget~~ (priority 5 — COMPLETE)
+
+Status bar module. Shell script + polybar config. First pub/sub consumer — proved the event model works from an external process.
+
+### TUI Client
+
+Terminal-based player interface. Real-time display of now playing, queue, search. Runs on the laptop. Talks to the gateway.
+
+Think: `cmus` or `ncmpcpp` but for MDMA. Rust TUI framework (ratatui or similar).
+
+### mdmamp (Desktop Player)
+
+**mdmamp** — MDMA Music Player. Graphical desktop client built with **Bevy**. The name flirts with Winamp.
+
+Full-featured player UI: library browser, queue management, now playing with waveform, search. Connects to the Pi's gateway from any machine on the network.
+
+Long-term vision: the primary way non-technical users interact with the system.
+
+### Future Enhancements
+
+**Tabbed UI:**
+The current single-page layout mixes playback (now playing, queue, controls) with library management (search, inbox, bandcamp, packages). As the UI grows, split into two tabs:
+- **Playback tab:** Now playing, queue, player controls — the DJ-facing view
+- **Library tab:** Search, inbox management, bandcamp sync, package updates — the librarian view
+
+This keeps each view focused and prevents the page from becoming an endless scroll. Not blocking current work.
+
+**Cover Art & Fact Stream Aggregation:**
+The web library should display cover art for tracks. This is a good case for fact stream aggregation and persisting: generate library pages as new tracks are added to the library, and use Stainless facts functionality to only request facts after a certain timestamp to update as needed. This avoids rebuilding the entire library view on every request and enables incremental, event-driven UI updates.
+
+---
+
+## What to Defer
+
+- Manual DJ mixing (MIDI, crossfader) — after queue + virtual decks proven
+- MDMA-101 hardware — long-term; design data model to accommodate it
+- Gapless playback — desirable, becomes prerequisite for post-beta Party Modes. Not blocking current work.
+- Multi-deck UI — after single queue works
+- CDJ/Pro DJ Link integration — documented as Priority 13 (Virtual CDJ); Phase C (full protocol participation) deferred until Phase A (static NFS export) is validated
+- Auto-updates — manual deploys fine during development
+- TUI client — after polybar + web UI prove the interaction model
+- mdmamp — after pub/sub, polybar, and web UI are solid
+- MCP tools for smoke testing — custom MCP server wrapping mdma CLI for structured, approval-free agent testing; Bash allowlisting suffices for now
+- Audio fingerprinting / near-duplicate detection — useful but not blocking any current milestone; Phase C of Priority 15
+- User enrichment facts (rating, tags, cue points) — Priority 15 — User Enrichment Facts; needed before Rekordbox import (Priority 12 Phase B)
+
+---
+
+## Active Service Architecture
+
+```
+stainless_facts    = Generic fact stream operations (crate, mandatory access layer)
+music_facts        = Types only (MusicValue, FactSource, ContentHash, newtypes)
+mdma-gateway       = API gateway: single TCP port, routes to all services
+mdma-library       = Library service with nng IPC interface
+mdma-playback      = Audio playback service (Symphonia + PipeWire + rubato)
+mdma-bandcamp      = Bandcamp download service (source_protocol)
+mdma-console       = HTTP frontend (web UI player)
+mdma-cli           = CLI frontend (gateway-aware, dual-mode dispatch)
+mdma-tui           = TUI client (ratatui, future)
+mdma-acid          = Fact store service — sole owner of the fact stream (Priority 15)
+mdmamp             = Desktop player (Bevy, future)
+beacon             = Provisioning and service discovery
+
+source_protocol    = Unified request/response for music sources
+gateway_protocol   = Envelope types (library + playback + source)
+gateway_client     = NNG client for the gateway
+event_protocol     = Pub/sub event types + topic-prefixed wire format
+```
+
+**Storage layout:**
+```
+/music/
+    inbox/              # Drop files here (watched by mdma-library)
+    downloads/          # Staging area for in-progress downloads
+    blobs/              # Content-addressed storage
+        a1/
+            b2c3d4...sha256.flac
+
+/metadata/
+    facts.jsonl         # Main fact stream (source of truth)
+
+/var/lib/mdma-bandcamp/
+    cookies.txt         # Bandcamp session cookies (Netscape format)
+    bandcamp.cache      # Track-oriented download cache
+```
+
+---
+
+## Development Workflow
+
+```bash
+# Cross-compile and deploy playback to Pi
+just playback-cross && just deploy-playback
+
+# Deploy library service
+just deploy-dev
+
+# Watch mode (check → test → build → clippy)
+just watch
+
+# Connect to Pi
+ssh -4 -i ~/.ssh/mdma_pi admin@mdma-909.local
+```
+
+**Environment vars for CLI from laptop:** `MDMA_NODE` sets the node hostname; the CLI derives the gateway address automatically.
+```bash
+export MDMA_NODE="mdma-909.local"
+```
+
+Two external ports: 5555 (gateway) and 5556 (events). No per-service TCP ports exposed.
+
+---
+
+## Strategic Principles
+
+- **Deploy First:** Code runs on live hardware within minutes of being written
+- **stainless_facts is the access layer:** Never parse or write JSONL directly
+- **Facts are immutable:** Append new facts, never mutate existing ones
+- **Type-driven safety:** Rust's type system prevents illegal states
+- **Void-first:** Never build on the Pi; cross-compile from dev machine
+- **Minimal complexity:** The right amount of abstraction is the minimum needed now
+
+---
+
+## Completed Priorities
 
 ### ~~1. Hi-Res Resampler~~ — COMPLETE
 
@@ -122,7 +519,7 @@ mdma-library  mdma-playback  /run/mdma/sources/*.sock
 - All 6 services have srcpkg entries: `void-packages/srcpkgs/<name>/template` + `files/<name>/run`
 - Package scripts and deploy recipes copy run scripts from void-packages (no more heredocs)
 - CLI: `LibraryBackend` + `PlaybackBackend` enums dispatch via gateway or direct IPC
-- `MDMA_GATEWAY` is the only env var needed from laptop
+- `MDMA_NODE` is the only env var needed from laptop; the CLI derives the gateway address automatically
 - Provisioning (stage5) installs and enables all 6 services
 
 ---
@@ -179,18 +576,6 @@ First external pub/sub consumer. Proves the event model works from a separate pr
 - Basic controls: play, stop, next, queue append/remove
 - Search and browse library
 - Uses pub/sub for live updates (no polling)
-
----
-
-**Future enhancement -- Tabbed UI:**
-The current single-page layout mixes playback (now playing, queue, controls) with library management (search, inbox, bandcamp, packages). As the UI grows, split into two tabs:
-- **Playback tab:** Now playing, queue, player controls -- the DJ-facing view
-- **Library tab:** Search, inbox management, bandcamp sync, package updates -- the librarian view
-
-This keeps each view focused and prevents the page from becoming an endless scroll. Not blocking current work.
-
-**Future enhancement -- Cover Art & Fact Stream Aggregation:**
-The web library should display cover art for tracks. This is a good case for fact stream aggregation and persisting: generate library pages as new tracks are added to the library, and use Stainless facts functionality to only request facts after a certain timestamp to update as needed. This avoids rebuilding the entire library view on every request and enables incremental, event-driven UI updates.
 
 ---
 
@@ -274,250 +659,18 @@ Web-based configuration for Bandcamp cookies and username via mdma-console. Fres
 
 ---
 
-### 11. Stream Management (Silence → Off)
+### 10. Playlists ✅
 
-- Auto-shutdown PipeWire stream after N seconds of silence (queue empty, no track playing)
-- Auto-restart when a track is queued/played
-- Quality-of-life, not a blocker
+Playlist CRUD, piping support, and containment queries. Playlists are stored as
+plain-text files (one content hash per line with comments). Fully composable in
+Unix pipes.
 
----
+- `playlist create/delete/rename/list/get/add/remove`
+- `playlist get` reads names from stdin (pipe from `playlist list`)
+- `playlist contains` with `--all`, `--at-least N`, `--no` flags
+- Playlists stored on NVMe at `/music/playlists/`
 
-### 12. Rekordbox Sync
-
-**Why:** Bridge MDMA and Rekordbox for club/CDJ preparation. Two phases.
-
-**Interface:** Rekordbox XML format (official, stable). Not the encrypted SQLite DB.
-
-**Identity mapping:** `PioneerMapping` fact (ContentHash ↔ TrackID + file path).
-Persisted via stainless_facts. Created on first export, maintained across syncs.
-Named `PioneerMapping` (not Rekordbox-specific) because it maps to the Pioneer
-ecosystem broadly — shared with Priority 13 (Virtual CDJ).
-
-**Phase A — MDMA to Rekordbox (export):**
-- `mdma rekordbox export --playlist <name> --output <path>` on laptop
-- Pulls tracks from Pi, converts FLAC to AIFF locally (metadata + album art support)
-- Generates Rekordbox XML with file paths, BPM, key, artist, title
-- Records identity mapping as facts for future syncs
-- User imports XML in Rekordbox
-
-**Phase B — Rekordbox to MDMA (import):**
-- `mdma rekordbox import <rekordbox.xml>`
-- Matches tracks via identity mapping facts (falls back to metadata matching)
-- Imports playlists into MDMA playlist system
-- Imports/updates metadata: tags, rating, comments
-
-**Prerequisites:** First-class playlists, tags/rating facts.
-
-**Conversion runs on the laptop, not the Pi.**
-
-**Shared infrastructure:** The FLAC-to-AIFF transcoding pipeline and ContentHash-to-TrackID
-identity mapping are also used by Priority 13 (Virtual CDJ). Factor these into reusable
-components when implementing.
-
----
-
-### 13. Virtual CDJ (Network Media Server for Physical CDJs)
-
-**Why:** Eliminate USB sticks entirely. MDMA serves its library directly to physical CDJs
-on the local network. The CDJ browses and plays tracks as if a USB stick were inserted.
-
-**Target hardware:** CDJ-900 (confirmed on local network). CDJ-2000/3000 also supported.
-
-**How it works:** CDJs can mount NFS shares and treat them as media sources. MDMA generates
-the Pioneer directory structure (PDB database + ANLZ analysis files) on `/cdj-export` and
-serves it via NFSv3. The CDJ sees the NFS share as equivalent to a USB stick.
-
-**Phase A — Static NFS Export (MVP):**
-- `pioneer_export` component: generates `PIONEER/` directory structure from MDMA library
-  - PDB database: tracks, artists, albums, playlists (via `rekordcrate` crate)
-  - ANLZ files: beatgrid, basic waveform data (from BPM/key facts)
-  - Audio files: AIFF transcoded from FLAC (reuses Rekordbox Sync transcoding pipeline)
-- Generates to `/cdj-export` on MDMA-909 (secondary NVMe, already provisioned)
-- NFS export already configured in provisioning (NFSv3, read-only, LAN only)
-- CLI: `mdma cdj export` — full library export, `mdma cdj export --playlist <name>`
-- Incremental: only transcode/regenerate changed tracks
-
-**Phase B — Reactive Export:**
-- Subscribe to library change events (new tracks, metadata updates)
-- Automatically regenerate affected PDB entries and ANLZ files
-- Background AIFF transcoding on ingest (Pi has the CPU headroom)
-
-**Phase C — Pro DJ Link Participation (stretch):**
-- MDMA announces itself on the Pro DJ Link network (port 50000)
-- Responds to DeviceSQL queries from CDJs (port 12523/1051)
-- Serves track data and metadata on demand
-- Foundation exists in `prodj` research project (packet parsing, player registry)
-- Reference: https://djl-analysis.deepsymmetry.org/djl-analysis/packets.html
-
-**Shared with Priority 12:**
-- `pioneer_export` component (PDB/ANLZ generation)
-- FLAC-to-AIFF transcoding pipeline
-- ContentHash ↔ Pioneer TrackID identity mapping facts
-
-**Prerequisites:** Priority 12 Phase A (transcoding pipeline, identity mapping).
-
-**Hardware:** MDMA-909 variant with secondary NVMe (`/cdj-export` partition).
-
-**Key crate:** `rekordcrate` (PDB/ANLZ read/write, Rust, available on crates.io).
-
----
-
-## Future Clients
-
-Ordered by complexity — simplest ships first.
-
-### ~~Polybar Widget~~ (priority 5 — COMPLETE)
-
-Status bar module. Shell script + polybar config. First pub/sub consumer — proved the event model works from an external process.
-
-### TUI Client
-
-Terminal-based player interface. Real-time display of now playing, queue, search. Runs on the laptop. Talks to the gateway.
-
-Think: `cmus` or `ncmpcpp` but for MDMA. Rust TUI framework (ratatui or similar).
-
-### mdmamp (Desktop Player)
-
-**mdmamp** — MDMA Music Player. Graphical desktop client built with **Bevy**. The name flirts with Winamp.
-
-Full-featured player UI: library browser, queue management, now playing with waveform, search. Connects to the Pi's gateway from any machine on the network.
-
-Long-term vision: the primary way non-technical users interact with the system.
-
----
-
-## Before Beta
-
-The following must work reliably before inviting beta testers onto the system.
-
-### Getting Started (Onboarding)
-
-The golden path for setting up a new MDMA node:
-
-1. Start with a Raspberry Pi running Void Linux from SD card
-2. SSH in and run the install script — it sets the hostname and installs the beacon via XBPS
-3. Browse to `welcome-to-mdma.local` and provision through the web UI
-4. All services start automatically on the NVMe
-
-This flow must be smooth and require no manual intervention. It is the first thing a beta tester will experience.
-
-### Recovery
-
-If the system becomes unbootable or needs to be reprovisioned:
-
-1. Edit `cmdline.txt` on the SD card to boot back into beacon mode
-2. Browse to `welcome-to-mdma.local` and re-provision through the web UI
-3. Re-provisioning will NOT overwrite existing partitions
-4. Music and metadata are preserved on the NVMe
-
-This gives users a safe path back without losing their library.
-
-### Validation: Full Reinstall from SD Card
-
-Deferred until time permits. Not blocking current work, but must happen before beta.
-
-**Constraint:** `/music` must survive. The NVMe partition layout keeps `/music` on its
-own partition (`/dev/nvme0n1p4`), so reinstalling root does not touch it. Verify this
-holds before wiping anything.
-
-**What to test:**
-- Fresh SD card boot → beacon → provision NVMe → all services start automatically
-- `/music` and `/metadata` intact after reinstall
-- `mdma search` works immediately against the existing library
-- Bandcamp sync resumes without re-downloading
-- Bandcamp cookies + username configured correctly
-
-This should happen before inviting other users onto the system.
-
----
-
-## What to Defer
-
-- Manual DJ mixing (MIDI, crossfader) — after queue + virtual decks proven
-- MDMA-101 hardware — long-term; design data model to accommodate it
-- Gapless playback — desirable but not blocking queue MVP
-- Multi-deck UI — after single queue works
-- CDJ/Pro DJ Link integration — documented as Priority 13 (Virtual CDJ); Phase C (full protocol participation) deferred until Phase A (static NFS export) is validated
-- Auto-updates — manual deploys fine during development
-- TUI client — after polybar + web UI prove the interaction model
-- mdmamp — after pub/sub, polybar, and web UI are solid
-- MCP tools for smoke testing — custom MCP server wrapping mdma CLI for structured, approval-free agent testing; Bash allowlisting suffices for now
-
----
-
-## Active Service Architecture
-
-```
-stainless_facts    = Generic fact stream operations (crate, mandatory access layer)
-music_facts        = Types only (MusicValue, FactSource, ContentHash, newtypes)
-mdma-gateway       = API gateway: single TCP port, routes to all services
-mdma-library       = Library service with nng IPC interface
-mdma-playback      = Audio playback service (Symphonia + PipeWire + rubato)
-mdma-bandcamp      = Bandcamp download service (source_protocol)
-mdma-console       = HTTP frontend (web UI player)
-mdma-cli           = CLI frontend (gateway-aware, dual-mode dispatch)
-mdma-tui           = TUI client (ratatui, future)
-mdmamp             = Desktop player (Bevy, future)
-beacon             = Provisioning and service discovery
-
-source_protocol    = Unified request/response for music sources
-gateway_protocol   = Envelope types (library + playback + source)
-gateway_client     = NNG client for the gateway
-event_protocol     = Pub/sub event types + topic-prefixed wire format
-```
-
-**Storage layout:**
-```
-/music/
-    inbox/              # Drop files here (watched by mdma-library)
-    downloads/          # Staging area for in-progress downloads
-    blobs/              # Content-addressed storage
-        a1/
-            b2c3d4...sha256.flac
-
-/metadata/
-    facts.jsonl         # Main fact stream (source of truth)
-
-/var/lib/mdma-bandcamp/
-    cookies.txt         # Bandcamp session cookies (Netscape format)
-    bandcamp.cache      # Track-oriented download cache
-```
-
----
-
-## Development Workflow
-
-```bash
-# Cross-compile and deploy playback to Pi
-just playback-cross && just deploy-playback
-
-# Deploy library service
-just deploy-dev
-
-# Watch mode (check → test → build → clippy)
-just watch
-
-# Connect to Pi
-ssh -4 -i ~/.ssh/mdma_pi admin@mdma-909.local
-```
-
-**Environment vars for CLI from laptop:** `MDMA_NODE` sets the node hostname; the CLI derives the gateway address automatically.
-```bash
-export MDMA_NODE="mdma-909.local"
-```
-
-Two external ports: 5555 (gateway) and 5556 (events). No per-service TCP ports exposed.
-
----
-
-## Strategic Principles
-
-- **Deploy First:** Code runs on live hardware within minutes of being written
-- **stainless_facts is the access layer:** Never parse or write JSONL directly
-- **Facts are immutable:** Append new facts, never mutate existing ones
-- **Type-driven safety:** Rust's type system prevents illegal states
-- **Void-first:** Never build on the Pi; cross-compile from dev machine
-- **Minimal complexity:** The right amount of abstraction is the minimum needed now
+**Status:** Complete (v0.4.0).
 
 ---
 
