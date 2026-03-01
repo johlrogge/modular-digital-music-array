@@ -1,273 +1,123 @@
 #!/usr/bin/env bash
-# Simple SD card image creation using online package repository
-# Now that beacon is available online, this is MUCH simpler!
+# MDMA SD Card Image Builder
+# Uses void-mklive (Void Linux's official image builder) to create
+# a bootable Raspberry Pi 5 SD card image with beacon pre-installed.
+#
+# void-mklive runs xbps-reconfigure -a after package installation,
+# which executes post-install scripts (creating users, enabling services, etc.)
+# correctly — unlike a manual chroot approach.
+#
+# Usage: sudo ./create-sd-card-simple.sh
+# Output: ~/mdma-images/output/mdma-beacon-YYYYMMDD-rpi5.img.xz
 
 set -euo pipefail
 
-# Configuration
-ONLINE_REPO="https://johlrogge.github.io/modular-digital-music-array/aarch64"
-VOID_BASE_URL="https://repo-default.voidlinux.org/live/current"
-WORK_DIR="${HOME}/mdma-images"
-OUTPUT_DIR="${WORK_DIR}/output"
-MOUNT_POINT="${WORK_DIR}/mnt"
-
-# Cleanup function
-cleanup() {
-    if [ -d "$MOUNT_POINT" ]; then
-        echo ""
-        echo "🧹 Cleaning up..."
-        
-        # Unmount chroot filesystems if they exist
-        if mountpoint -q "$MOUNT_POINT/sys" 2>/dev/null; then
-            echo "   Unmounting /sys..."
-            sudo umount "$MOUNT_POINT/sys" || sudo umount -l "$MOUNT_POINT/sys" || true
-        fi
-        
-        if mountpoint -q "$MOUNT_POINT/proc" 2>/dev/null; then
-            echo "   Unmounting /proc..."
-            sudo umount "$MOUNT_POINT/proc" || sudo umount -l "$MOUNT_POINT/proc" || true
-        fi
-        
-        if mountpoint -q "$MOUNT_POINT/dev" 2>/dev/null; then
-            echo "   Unmounting /dev..."
-            sudo umount "$MOUNT_POINT/dev" || sudo umount -l "$MOUNT_POINT/dev" || true
-        fi
-        
-        # Unmount main image
-        if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
-            echo "   Unmounting image..."
-            sudo guestunmount "$MOUNT_POINT" || sudo umount -l "$MOUNT_POINT" || true
-        fi
-    fi
-}
-
-# Set trap to cleanup on exit (success or failure)
-trap cleanup EXIT INT TERM
-
-echo "🔧 Creating MDMA SD card image..."
-echo ""
-
-# Create directories
-mkdir -p "$WORK_DIR" "$OUTPUT_DIR" "$MOUNT_POINT"
-
-# Download Void Pi bootable image (complete disk image, not just filesystem!)
-# Latest as of 2025-02-02 from https://repo-default.voidlinux.org/live/current/
-VOID_IMAGE="void-rpi-aarch64-20250202.img.xz"
-BASE_IMAGE_URL="https://repo-default.voidlinux.org/live/current/${VOID_IMAGE}"
-
-echo "📥 Downloading Void Linux bootable image..."
-echo "   Image: $VOID_IMAGE (116 MB)"
-
-if [ ! -f "$WORK_DIR/$VOID_IMAGE" ]; then
-    echo "   Downloading from Void Linux repository..."
-    echo "   URL: $BASE_IMAGE_URL"
-    echo ""
-    
-    # Download with progress bar
-    if curl -L -f --progress-bar "$BASE_IMAGE_URL" -o "$WORK_DIR/$VOID_IMAGE"; then
-        echo ""
-        echo "✅ Downloaded successfully"
-    else
-        CURL_EXIT=$?
-        echo ""
-        echo "❌ Download failed (exit code: $CURL_EXIT)"
-        echo ""
-        echo "This could be due to:"
-        echo "  1. Network restrictions in your environment"
-        echo "  2. Repository temporarily unavailable"
-        echo ""
-        echo "Manual workaround:"
-        echo "  1. Visit: https://voidlinux.org/download/"
-        echo "  2. Download: Raspberry Pi (aarch64) bootable image"
-        echo "  3. Or direct link: $BASE_IMAGE_URL"
-        echo "  4. Save to: $WORK_DIR/$VOID_IMAGE"
-        echo "  5. Re-run: just create-image"
-        echo ""
-        rm -f "$WORK_DIR/$VOID_IMAGE"
-        exit 1
-    fi
-    
-    # Verify it's actually an xz file
-    if ! file "$WORK_DIR/$VOID_IMAGE" | grep -q "XZ compressed"; then
-        echo "❌ Downloaded file is not a valid XZ archive!"
-        echo ""
-        file "$WORK_DIR/$VOID_IMAGE"
-        echo ""
-        echo "File appears to be:"
-        head -c 100 "$WORK_DIR/$VOID_IMAGE"
-        echo ""
-        rm -f "$WORK_DIR/$VOID_IMAGE"
-        exit 1
-    fi
-    
-    FILE_SIZE=$(du -h "$WORK_DIR/$VOID_IMAGE" | cut -f1)
-    echo "   Size: $FILE_SIZE"
-else
-    echo "✅ Using cached image: $VOID_IMAGE"
-    FILE_SIZE=$(du -h "$WORK_DIR/$VOID_IMAGE" | cut -f1)
-    echo "   Size: $FILE_SIZE"
-fi
-echo ""
-
-# Extract the bootable image
-EXTRACTED_IMG="${WORK_DIR}/void-rpi-aarch64-20250202.img"
-if [ ! -f "$EXTRACTED_IMG" ]; then
-    echo "📦 Extracting bootable image..."
-    xz -d -k "$WORK_DIR/$VOID_IMAGE"
-    echo "✅ Image extracted"
-else
-    echo "✅ Using cached extracted image"
-fi
-echo ""
-
-# Create work copy of the image
-TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-WORK_IMAGE="${WORK_DIR}/mdma-beacon-${TIMESTAMP}-rpi5.img"
-OUTPUT_IMAGE="${OUTPUT_DIR}/mdma-beacon-${TIMESTAMP}-rpi5.img.xz"
-
-echo "💾 Creating work copy of image..."
-cp "$EXTRACTED_IMG" "$WORK_IMAGE"
-echo "✅ Work image created"
-echo ""
-
-# Setup loop device for the existing partitions
-echo "📍 Setting up loop device..."
-LOOP_DEV=$(sudo losetup --show -fP "$WORK_IMAGE")
-echo "   Loop device: $LOOP_DEV"
-echo ""
-
-# Mount root filesystem (partition 2)
-echo "📂 Mounting root filesystem..."
-sudo guestmount -a "$WORK_IMAGE" -m /dev/sda2 --rw "$MOUNT_POINT"
-echo "✅ Mounted at $MOUNT_POINT"
-echo ""
-
-# Configure repository
-echo "🔧 Configuring package repositories..."
-sudo bash -c "cat > '$MOUNT_POINT/etc/xbps.d/10-mdma-repo.conf'" <<EOF
-repository=$ONLINE_REPO
-EOF
-echo "✅ Repository configured"
-echo ""
-
-# Check for QEMU user emulation
-echo "🔍 Checking for QEMU user emulation..."
-if [ ! -f /usr/bin/qemu-aarch64-static ]; then
-    echo "❌ Error: QEMU user emulation not found!"
-    echo ""
-    echo "Install with:"
-    echo "  sudo pacman -S qemu-user-static qemu-user-static-binfmt"
-    echo "  sudo systemctl restart systemd-binfmt.service"
+# Must run as root
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Error: must run as root (sudo)"
     exit 1
 fi
 
-if [ ! -f /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
-    echo "⚠️  Warning: binfmt_misc not registered for ARM64"
-    echo "Run: sudo systemctl restart systemd-binfmt.service"
+# Configuration
+MDMA_REPO="https://johlrogge.github.io/modular-digital-music-array/aarch64"
+WORK_DIR="${WORK_DIR:-${HOME}/mdma-images}"
+MKLIVE_DIR="${WORK_DIR}/void-mklive"
+OUTPUT_DIR="${WORK_DIR}/output"
+TIMESTAMP=$(date +%Y%m%d)
+
+# Step 0: Clone/update void-mklive
+if [ ! -d "$MKLIVE_DIR" ]; then
+    echo "Cloning void-mklive..."
+    git clone --depth 1 https://github.com/void-linux/void-mklive.git "$MKLIVE_DIR"
+else
+    echo "Updating void-mklive..."
+    git -C "$MKLIVE_DIR" pull --ff-only || true
 fi
 
-echo "✅ QEMU user emulation available"
-echo ""
+mkdir -p "$OUTPUT_DIR"
+cd "$MKLIVE_DIR"
 
-# Copy QEMU into chroot
-echo "📋 Setting up ARM64 emulation in chroot..."
-sudo mkdir -p "$MOUNT_POINT/usr/bin"
-sudo cp /usr/bin/qemu-aarch64-static "$MOUNT_POINT/usr/bin/"
-echo "✅ QEMU copied to chroot"
-echo ""
-
-# Mount required filesystems for chroot
-echo "📂 Mounting filesystems for chroot..."
-sudo mount --bind /dev "$MOUNT_POINT/dev"
-sudo mount --bind /proc "$MOUNT_POINT/proc"
-sudo mount --bind /sys "$MOUNT_POINT/sys"
-
-# Copy DNS configuration for network access in chroot
-echo "🌐 Configuring DNS resolution..."
-sudo cp /etc/resolv.conf "$MOUNT_POINT/etc/resolv.conf"
-
-echo "✅ Filesystems mounted and DNS configured"
-echo ""
-
-# Note: Public key is embedded in repository metadata by xbps-rindex --sign
-# xbps-install will download it automatically when syncing the repository
-echo "📦 Installing packages via chroot (this runs post-install scripts)..."
-echo "   This creates users, directories, and sets up everything properly"
-echo ""
-
-# Update xbps first
-echo "Updating xbps..."
-sudo XBPS_ARCH=aarch64 chroot "$MOUNT_POINT" xbps-install -Suy xbps
-
-echo ""
-echo "Installing dependencies (dbus, avahi)..."
-sudo XBPS_ARCH=aarch64 chroot "$MOUNT_POINT" xbps-install -y dbus avahi
-
-echo ""
-echo "Installing beacon..."
-sudo XBPS_ARCH=aarch64 chroot "$MOUNT_POINT" xbps-install -y beacon
-
-echo ""
-echo "✅ Packages installed with post-install scripts executed!"
-echo ""
-
-# Enable services explicitly (in case INSTALL scripts had issues in chroot)
-echo "🔧 Ensuring services are enabled..."
-sudo chroot "$MOUNT_POINT" bash -c '
-# Ensure /var/service exists as a directory
-if [ ! -d /var/service ]; then
-    # Remove if it exists as a file/symlink
-    rm -f /var/service
-    mkdir -p /var/service
+# Step 1: Create base rootfs (architecture-generic)
+# Skip if already exists from a previous run today
+ROOTFS_TAR="void-aarch64-ROOTFS-${TIMESTAMP}.tar.xz"
+if [ ! -f "$ROOTFS_TAR" ]; then
+    echo "Step 1/3: Building aarch64 base rootfs..."
+    ./mkrootfs.sh aarch64
+else
+    echo "Step 1/3: Using cached rootfs: $ROOTFS_TAR"
 fi
 
-# Enable services by creating symlinks
-cd /var/service
-ln -sf /etc/sv/beacon .
-ln -sf /etc/sv/dbus .
-ln -sf /etc/sv/avahi-daemon .
-'
-echo "✅ Services enabled"
-echo ""
+# Step 2: Create platform-specific rootfs with beacon
+# -p adds extra packages, -r adds our custom repo
+# -k runs a post-install hook script after xbps-reconfigure -a
+PLATFORMFS_TAR="void-rpi-aarch64-PLATFORMFS-${TIMESTAMP}.tar.xz"
 
-# Set default hostname for beacon discovery mode
-# All fresh units boot as "welcome-to-mdma.local" for initial discovery
-# Beacon provisioning process assigns final hostname (mdma-909-studio, etc.)
-echo "🏷️  Setting hostname to 'welcome-to-mdma'..."
-echo "welcome-to-mdma" | sudo tee "$MOUNT_POINT/etc/hostname" > /dev/null
-echo "✅ Hostname configured"
-echo ""
+# Create post-install hook that configures beacon for first boot.
+# void-mklive calls this hook with the rootfs path as $1.
+HOOK_SCRIPT="${WORK_DIR}/mdma-hook.sh"
+cat > "$HOOK_SCRIPT" << 'HOOKEOF'
+#!/bin/bash
+# Post-install hook for void-mklive mkplatformfs.sh
+# Called after xbps-reconfigure -a has run inside the rootfs.
+# $1 = path to the rootfs being built
+ROOTFS="$1"
 
-# Unmount chroot filesystems
-echo "📂 Unmounting chroot filesystems..."
-sudo umount "$MOUNT_POINT/sys" || true
-sudo umount "$MOUNT_POINT/proc" || true
-sudo umount "$MOUNT_POINT/dev" || true
-echo "✅ Chroot filesystems unmounted"
-echo ""
+# Set hostname for beacon discovery
+echo "welcome-to-mdma" > "${ROOTFS}/etc/hostname"
 
-# Unmount and cleanup
-echo "💾 Unmounting..."
-sudo guestunmount "$MOUNT_POINT"
-sudo losetup -d "$LOOP_DEV" 2>/dev/null || true
-echo "✅ Unmounted"
-echo ""
+# Enable services in runit by linking into the default runsvdir.
+# void-mklive creates /etc/runit/runsvdir/default for enabled services.
+mkdir -p "${ROOTFS}/etc/runit/runsvdir/default"
+ln -sf /etc/sv/beacon "${ROOTFS}/etc/runit/runsvdir/default/beacon"
+ln -sf /etc/sv/dbus "${ROOTFS}/etc/runit/runsvdir/default/dbus"
+ln -sf /etc/sv/avahi-daemon "${ROOTFS}/etc/runit/runsvdir/default/avahi-daemon"
 
-# Compress
-echo "🗜️  Compressing..."
-xz -9 -T0 "$WORK_IMAGE"
-mv "${WORK_IMAGE}.xz" "$OUTPUT_IMAGE"
-echo "✅ Compressed"
-echo ""
+echo "MDMA beacon configured for first boot"
+HOOKEOF
+chmod +x "$HOOK_SCRIPT"
 
-# Summary
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "✅ SD card image ready!"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Image: $OUTPUT_IMAGE"
-ls -lh "$OUTPUT_IMAGE"
+if [ ! -f "$PLATFORMFS_TAR" ]; then
+    echo "Step 2/3: Building platform rootfs with beacon..."
+    ./mkplatformfs.sh \
+        -p "beacon dbus avahi" \
+        -r "$MDMA_REPO" \
+        -k "$HOOK_SCRIPT" \
+        rpi-aarch64 \
+        "$ROOTFS_TAR"
+else
+    echo "Step 2/3: Using cached platformfs: $PLATFORMFS_TAR"
+fi
+
+# Step 3: Create bootable disk image
+echo "Step 3/3: Creating bootable SD card image..."
+./mkimage.sh "$PLATFORMFS_TAR"
+
+# Move and rename output
+# mkimage.sh outputs: void-rpi-aarch64-YYYYMMDD.img.xz
+MKLIVE_OUTPUT="void-rpi-aarch64-${TIMESTAMP}.img.xz"
+FINAL_OUTPUT="${OUTPUT_DIR}/mdma-beacon-${TIMESTAMP}-rpi5.img.xz"
+
+if [ -f "$MKLIVE_OUTPUT" ]; then
+    mv "$MKLIVE_OUTPUT" "$FINAL_OUTPUT"
+elif ls void-rpi-aarch64-*.img.xz 1>/dev/null 2>&1; then
+    # Fallback: find whatever mkimage produced
+    mv void-rpi-aarch64-*.img.xz "$FINAL_OUTPUT"
+else
+    echo "Error: could not find output image from mkimage.sh"
+    exit 1
+fi
+
+echo ""
+echo "========================================"
+echo "  MDMA SD Card Image Ready!"
+echo "========================================"
+echo "Image: $FINAL_OUTPUT"
+ls -lh "$FINAL_OUTPUT"
 echo ""
 echo "Flash with:"
-echo "  xz -dc $OUTPUT_IMAGE | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync"
+echo "  xzcat $FINAL_OUTPUT | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync"
 echo ""
-echo "🎉 That was MUCH simpler than before!"
+echo "Then:"
+echo "  1. Insert SD card into Raspberry Pi 5"
+echo "  2. Boot the Pi"
+echo "  3. Browse to http://welcome-to-mdma.local"
