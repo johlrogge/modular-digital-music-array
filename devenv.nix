@@ -98,59 +98,61 @@
   process.manager.before = ''
     rm -f /tmp/mdma-dev/run/*.sock
     mkdir -p /tmp/mdma-dev/run/sources /tmp/mdma-dev/music/inbox /tmp/mdma-dev/music/blobs /tmp/mdma-dev/metadata
+    echo "Building all services..."
+    cargo build --release --package mdma-acid --package mdma-library --package mdma-playback --package mdma-gateway --package mdma-console
   '';
 
   processes = {
     mdma-acid = {
-      exec = "cargo run --package mdma-acid -- --metadata-dir /tmp/mdma-dev/metadata --socket ipc:///tmp/mdma-dev/run/acid.sock";
+      exec = "target/release/mdma-acid --metadata-dir /tmp/mdma-dev/metadata --socket ipc:///tmp/mdma-dev/run/acid.sock";
       process-compose = {
         readiness_probe = {
           exec.command = "test -S /tmp/mdma-dev/run/acid.sock";
-          initial_delay_seconds = 2;
+          initial_delay_seconds = 1;
           period_seconds = 1;
         };
       };
     };
 
     mdma-library = {
-      exec = "cargo run --package mdma-library -- --music-dir /tmp/mdma-dev/music --metadata-dir /tmp/mdma-dev/metadata --socket ipc:///tmp/mdma-dev/run/library.sock --acid-socket ipc:///tmp/mdma-dev/run/acid.sock";
+      exec = "target/release/mdma-library --music-dir /tmp/mdma-dev/music --metadata-dir /tmp/mdma-dev/metadata --socket ipc:///tmp/mdma-dev/run/library.sock --acid-socket ipc:///tmp/mdma-dev/run/acid.sock";
       process-compose = {
         depends_on.mdma-acid.condition = "process_healthy";
         readiness_probe = {
           exec.command = "test -S /tmp/mdma-dev/run/library.sock";
-          initial_delay_seconds = 2;
+          initial_delay_seconds = 1;
           period_seconds = 1;
         };
       };
     };
 
     mdma-playback = {
-      exec = "cargo run --package mdma-playback -- --socket ipc:///tmp/mdma-dev/run/playback.sock --event-socket ipc:///tmp/mdma-dev/run/events.sock --acid-socket ipc:///tmp/mdma-dev/run/acid.sock --queue-file /tmp/mdma-dev/music/queue.json";
+      exec = "target/release/mdma-playback --socket ipc:///tmp/mdma-dev/run/playback.sock --event-socket ipc:///tmp/mdma-dev/run/events.sock --acid-socket ipc:///tmp/mdma-dev/run/acid.sock --queue-file /tmp/mdma-dev/music/queue.json";
       process-compose = {
         depends_on.mdma-acid.condition = "process_healthy";
         readiness_probe = {
           exec.command = "test -S /tmp/mdma-dev/run/playback.sock";
-          initial_delay_seconds = 2;
+          initial_delay_seconds = 1;
           period_seconds = 1;
         };
       };
     };
 
     mdma-gateway = {
-      exec = "cargo run --package mdma-gateway -- --listen tcp://127.0.0.1:5555 --library-socket ipc:///tmp/mdma-dev/run/library.sock --playback-socket ipc:///tmp/mdma-dev/run/playback.sock --acid-socket ipc:///tmp/mdma-dev/run/acid.sock --event-listen tcp://127.0.0.1:5556 --event-source ipc:///tmp/mdma-dev/run/events.sock --sources-dir /tmp/mdma-dev/run/sources";
+      exec = "target/release/mdma-gateway --listen tcp://127.0.0.1:5555 --library-socket ipc:///tmp/mdma-dev/run/library.sock --playback-socket ipc:///tmp/mdma-dev/run/playback.sock --acid-socket ipc:///tmp/mdma-dev/run/acid.sock --event-listen tcp://127.0.0.1:5556 --event-source ipc:///tmp/mdma-dev/run/events.sock --sources-dir /tmp/mdma-dev/run/sources";
       process-compose = {
         depends_on.mdma-library.condition = "process_healthy";
         depends_on.mdma-playback.condition = "process_healthy";
         readiness_probe = {
           exec.command = "nc -z 127.0.0.1 5555";
-          initial_delay_seconds = 3;
+          initial_delay_seconds = 1;
           period_seconds = 1;
         };
       };
     };
 
     mdma-console = {
-      exec = "cargo run --package mdma-console -- --port 3000 --library-socket ipc:///tmp/mdma-dev/run/library.sock --gateway tcp://127.0.0.1:5555 --event-socket tcp://127.0.0.1:5556 --music-root /tmp/mdma-dev/music";
+      exec = "target/release/mdma-console --port 3000 --library-socket ipc:///tmp/mdma-dev/run/library.sock --gateway tcp://127.0.0.1:5555 --event-socket tcp://127.0.0.1:5556 --music-root /tmp/mdma-dev/music";
       process-compose = {
         depends_on.mdma-gateway.condition = "process_healthy";
       };
