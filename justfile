@@ -171,10 +171,14 @@ deploy-dev: beacon-cross
 # CI/CD Build Recipes (Work Locally and in GitHub Actions)
 # ============================================================================
 
+# Build a single MDMA binary for CI
+[group('ci')]
+ci-build bin:
+    ./scripts/ci/build-binary.sh {{bin}}
+
 # Build beacon for CI/CD (local or GitHub Actions)
 [group('ci')]
-ci-build-beacon:
-    ./scripts/ci/build-binary.sh beacon
+ci-build-beacon: (ci-build "beacon")
 
 # Package beacon into deployable archive (legacy tar.gz format)
 [group('ci')]
@@ -289,13 +293,11 @@ pkg-beacon:
 
 # Build mdma-library for CI
 [group('ci')]
-ci-build-library:
-    ./scripts/ci/build-binary.sh mdma-library
+ci-build-library: (ci-build "mdma-library")
 
 # Build mdma-console for CI
 [group('ci')]
-ci-build-console:
-    ./scripts/ci/build-binary.sh mdma-console
+ci-build-console: (ci-build "mdma-console")
 
 # Build mdma-playback for CI
 [group('ci')]
@@ -304,13 +306,11 @@ ci-build-playback:
 
 # Build mdma-gateway for CI
 [group('ci')]
-ci-build-gateway:
-    ./scripts/ci/build-binary.sh mdma-gateway
+ci-build-gateway: (ci-build "mdma-gateway")
 
 # Build mdma-bandcamp for CI
 [group('ci')]
-ci-build-bandcamp:
-    ./scripts/ci/build-binary.sh mdma-bandcamp
+ci-build-bandcamp: (ci-build "mdma-bandcamp")
 
 # Build mdma-library Void package
 [group('package')]
