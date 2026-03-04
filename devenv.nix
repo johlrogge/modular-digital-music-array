@@ -199,11 +199,6 @@
     claude --version
   '';
 
-  tasks."test:integration" = {
-    exec = "just test-integration";
-    after = [ "devenv:enterTest" ];
-  };
-
   # Claude Code integration
   claude.code.enable = true;
 
