@@ -1,13 +1,7 @@
 use cucumber::World;
 
-#[path = "../src/harness.rs"]
-mod harness;
-#[path = "../src/playback_simulator.rs"]
-mod playback_simulator;
-#[path = "../src/steps/mod.rs"]
-mod steps;
-#[path = "../src/world.rs"]
-mod world;
+use mdma_bdd::steps;
+use mdma_bdd::world;
 
 use world::MdmaWorld;
 

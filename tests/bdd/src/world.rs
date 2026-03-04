@@ -89,16 +89,11 @@ impl MdmaWorld {
         &self.env.as_ref().expect("env not booted").playback_addr
     }
 
-    /// Run the `mdma` CLI binary as a subprocess, capturing stdout/stderr/exit code.
-    ///
-    /// Environment variables point the CLI at the test harness IPC sockets.
-    /// When `stdin_data` is Some, it is piped to the process's stdin.
-    /// Stdout is captured via `Stdio::piped()`, so the CLI uses pipe-mode output.
-    pub fn run_cli(&mut self, args: &[&str], stdin_data: Option<&str>) {
-        self.ensure_env();
-
+    /// Build a `Command` with the common CLI setup:
+    /// binary path, `--socket` / `--playback-socket` flags, user-provided args,
+    /// and removal of env vars that would interfere with the test harness.
+    fn base_command(&self, args: &[&str]) -> std::process::Command {
         let binary = cli_binary_path();
-
         let mut cmd = std::process::Command::new(&binary);
         cmd.arg("--socket")
             .arg(self.library_addr())
@@ -109,11 +104,23 @@ impl MdmaWorld {
             .env_remove("MDMA_LIBRARY_SOCKET")
             .env_remove("MDMA_PLAYBACK_SOCKET");
         cmd.args(args);
-        cmd.stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+        cmd
+    }
 
-        // Keep PTY master alive until after child exits (when stdin_data is None).
-        let _stdin_master: Option<std::fs::File> = if stdin_data.is_some() {
+    /// Configure stdin on `cmd` based on whether `stdin_data` will be provided.
+    ///
+    /// When `stdin_data` is `Some`, stdin is set to `Stdio::piped()` so the
+    /// caller can write data to it later; returns `None`.
+    ///
+    /// When `stdin_data` is `None`, a PTY slave is attached so the child sees
+    /// a real terminal for stdin (preventing an empty stdin intersection filter).
+    /// Returns `Some(master)` so the caller can keep the master fd alive until
+    /// the child exits.
+    fn configure_stdin(
+        cmd: &mut std::process::Command,
+        stdin_data: &Option<String>,
+    ) -> Option<std::fs::File> {
+        if stdin_data.is_some() {
             cmd.stdin(std::process::Stdio::piped());
             None
         } else {
@@ -123,18 +130,43 @@ impl MdmaWorld {
             let (master, slave) = open_pty();
             cmd.stdin(std::process::Stdio::from(slave));
             Some(master)
-        };
+        }
+    }
 
-        let mut child = cmd.spawn().unwrap_or_else(|e| {
-            panic!("Failed to spawn mdma binary at {:?}: {}", binary, e);
-        });
-
+    /// Write `stdin_data` to the child's stdin and close it so the child sees EOF.
+    /// Does nothing when `stdin_data` is `None`.
+    fn write_stdin_and_close(child: &mut std::process::Child, stdin_data: &Option<String>) {
         if let Some(data) = stdin_data {
             use std::io::Write;
             let stdin = child.stdin.as_mut().expect("stdin was piped");
             stdin.write_all(data.as_bytes()).expect("write to stdin");
             drop(child.stdin.take()); // close stdin so child sees EOF
         }
+    }
+
+    /// Run the `mdma` CLI binary as a subprocess, capturing stdout/stderr/exit code.
+    ///
+    /// Environment variables point the CLI at the test harness IPC sockets.
+    /// When `stdin_data` is Some, it is piped to the process's stdin.
+    /// Stdout is captured via `Stdio::piped()`, so the CLI uses pipe-mode output.
+    pub fn run_cli(&mut self, args: &[&str], stdin_data: Option<&str>) {
+        self.ensure_env();
+
+        let stdin_data = stdin_data.map(str::to_owned);
+
+        let mut cmd = self.base_command(args);
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        // Keep PTY master alive until after child exits (when stdin_data is None).
+        let _stdin_master = Self::configure_stdin(&mut cmd, &stdin_data);
+
+        let binary = cli_binary_path();
+        let mut child = cmd.spawn().unwrap_or_else(|e| {
+            panic!("Failed to spawn mdma binary at {:?}: {}", binary, e);
+        });
+
+        Self::write_stdin_and_close(&mut child, &stdin_data);
 
         let output = child.wait_with_output().expect("wait_with_output");
         self.last_cli_stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -154,18 +186,9 @@ impl MdmaWorld {
         use std::os::fd::AsRawFd;
         self.ensure_env();
 
-        let binary = cli_binary_path();
+        let stdin_data = stdin_data.map(str::to_owned);
 
-        let mut cmd = std::process::Command::new(&binary);
-        cmd.arg("--socket")
-            .arg(self.library_addr())
-            .arg("--playback-socket")
-            .arg(self.playback_addr())
-            .env_remove("MDMA_GATEWAY")
-            .env_remove("MDMA_NODE")
-            .env_remove("MDMA_LIBRARY_SOCKET")
-            .env_remove("MDMA_PLAYBACK_SOCKET");
-        cmd.args(args);
+        let mut cmd = self.base_command(args);
         cmd.env("COLUMNS", columns.to_string())
             .stderr(std::process::Stdio::piped());
 
@@ -174,16 +197,9 @@ impl MdmaWorld {
         cmd.stdout(std::process::Stdio::from(stdout_slave));
 
         // Keep PTY master alive until after child exits (when stdin_data is None).
-        let _stdin_master: Option<std::fs::File> = if stdin_data.is_some() {
-            cmd.stdin(std::process::Stdio::piped());
-            None
-        } else {
-            // Separate PTY for stdin (same pattern as run_cli)
-            let (stdin_master, stdin_slave) = open_pty();
-            cmd.stdin(std::process::Stdio::from(stdin_slave));
-            Some(stdin_master)
-        };
+        let _stdin_master = Self::configure_stdin(&mut cmd, &stdin_data);
 
+        let binary = cli_binary_path();
         let mut child = cmd.spawn().unwrap_or_else(|e| {
             panic!("Failed to spawn mdma binary at {:?}: {}", binary, e);
         });
@@ -196,12 +212,7 @@ impl MdmaWorld {
         // stays >0), and the reader thread hangs forever.
         drop(cmd);
 
-        if let Some(data) = stdin_data {
-            use std::io::Write;
-            let stdin = child.stdin.as_mut().expect("stdin was piped");
-            stdin.write_all(data.as_bytes()).expect("write to stdin");
-            drop(child.stdin.take());
-        }
+        Self::write_stdin_and_close(&mut child, &stdin_data);
 
         // Reader thread drains PTY master to avoid blocking the child.
         // PTY buffer is small (~4KB); child blocks on write if we don't read.
