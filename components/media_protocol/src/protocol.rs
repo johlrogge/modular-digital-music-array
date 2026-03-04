@@ -1,4 +1,4 @@
-use playback_primitives::{ContentHash, Deck};
+use playback_primitives::{ContentHash, Deck, Volume};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -25,7 +25,7 @@ pub enum Command {
     },
     SetVolume {
         deck: Deck,
-        db: f32,
+        volume: Volume,
     },
     Unload {
         deck: Deck,
@@ -86,6 +86,25 @@ pub enum ResponseData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_set_volume_command_serialization() {
+        use playback_primitives::Volume;
+        let vol = Volume::new(-6.0).unwrap();
+        let cmd = Command::SetVolume {
+            deck: Deck::A,
+            volume: vol,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let decoded: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            Command::SetVolume {
+                deck: Deck::A,
+                volume: _
+            }
+        ));
+    }
 
     #[test]
     fn test_play_command_serialization() {

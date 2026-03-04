@@ -17,9 +17,6 @@ pub enum PlaybackError {
     #[error("No track loaded on channel {0:?}")]
     NoTrackLoaded(crate::Deck),
 
-    #[error("Invalid volume: {0}dB")]
-    InvalidVolume(f32),
-
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Task cancelled")]

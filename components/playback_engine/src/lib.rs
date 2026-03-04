@@ -15,7 +15,7 @@ pub use error::PlaybackError;
 use mixer::Mixer;
 use parking_lot::RwLock;
 use pipewire_output::PipewireOutput;
-pub use playback_primitives::Deck;
+pub use playback_primitives::{Db, Deck, Volume};
 use ringbuf::{HeapConsumer, HeapRb};
 pub use source::{AudioSource, Source};
 use tracing::info;
@@ -43,7 +43,7 @@ enum MixerCommand {
     },
     SetVolume {
         deck: Deck,
-        db: f32,
+        volume: Volume,
     },
 }
 impl PlaybackEngine {
@@ -73,8 +73,8 @@ impl PlaybackEngine {
                             tracing::info!("MIX THREAD: Registering track for deck {:?}", deck);
                             consumers.insert(deck, consumer);
                         }
-                        MixerCommand::SetVolume { deck, db } => {
-                            mixer.set_volume(deck, db);
+                        MixerCommand::SetVolume { deck, volume } => {
+                            mixer.set_volume(deck, volume);
                         }
                     }
                 }
@@ -168,19 +168,13 @@ impl PlaybackEngine {
         Ok(())
     }
 
-    pub fn set_volume(&mut self, deck: Deck, db: f32) -> Result<(), PlaybackError> {
-        // Validate the volume value first
-        if !(-96.0..=0.0).contains(&db) {
-            return Err(PlaybackError::InvalidVolume(db));
-        }
-
-        // Send the volume command through the channel - use send instead of try_send
+    pub fn set_volume(&mut self, deck: Deck, volume: Volume) -> Result<(), PlaybackError> {
         match self
             .command_sender
-            .send(MixerCommand::SetVolume { deck, db })
+            .send(MixerCommand::SetVolume { deck, volume })
         {
             Ok(_) => {
-                tracing::info!("Setting volume for deck {:?} to {}dB", deck, db);
+                tracing::info!("Setting volume for deck {:?} to {}dB", deck, volume.raw());
                 Ok(())
             }
             Err(_) => {

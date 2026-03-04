@@ -4,6 +4,7 @@
 //! Used by mdma-cli.
 
 pub use media_protocol::{Command, ContentHash, Deck, Response, ResponseData};
+pub use playback_primitives::Volume;
 
 use std::path::PathBuf;
 use thiserror::Error;
@@ -68,8 +69,8 @@ impl MediaClient {
         self.send_command(cmd)
     }
 
-    pub fn set_volume(&self, deck: Deck, db: f32) -> Result<(), ClientError> {
-        let cmd = Command::SetVolume { deck, db };
+    pub fn set_volume(&self, deck: Deck, volume: Volume) -> Result<(), ClientError> {
+        let cmd = Command::SetVolume { deck, volume };
         self.send_command(cmd)
     }
 

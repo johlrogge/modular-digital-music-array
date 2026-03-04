@@ -208,9 +208,9 @@ impl Server {
                         .await;
                 self.create_response(result, None)
             }
-            Command::SetVolume { deck, db } => {
-                info!("Setting volume on deck {:?} to {}dB", deck, db);
-                let result = self.engine.lock().await.set_volume(deck, db);
+            Command::SetVolume { deck, volume } => {
+                info!("Setting volume on deck {:?}", deck);
+                let result = self.engine.lock().await.set_volume(deck, volume);
                 self.create_response(result, None)
             }
             Command::Unload { deck } => {
