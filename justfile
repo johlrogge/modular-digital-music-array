@@ -428,10 +428,16 @@ check-prereqs-image:
 # Image Creation
 # ============================================================================
 
+# Validate sudo credentials early (before long builds)
+[group('image')]
+confirm-sudo:
+    @echo "Image creation requires root. Requesting sudo now..."
+    @sudo -v
+
 # Create SD card image with beacon installed via xbps
 [group('image')]
-create-image: check-prereqs-image pkg-build-all
-    ./scripts/image/create-sd-card-simple.sh
+create-image: confirm-sudo check-prereqs-image pkg-build-all
+    sudo ./scripts/image/create-sd-card-simple.sh
 
 # Network scanning recipes for finding Raspberry Pi
 
