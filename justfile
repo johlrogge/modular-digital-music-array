@@ -21,19 +21,23 @@ build:
 bdd:
     cargo test --package mdma-bdd --test cucumber -- -vv
 
-# Quick cross-compile beacon using cargo-zigbuild (devenv provides zig + target)
+# Cross-compile a standard MDMA binary for aarch64
 [group('build')]
-beacon-cross:
+cross bin label=bin:
     #!/usr/bin/env bash
     set -euo pipefail
     export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
-    echo "Building beacon for aarch64..."
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin beacon
+    echo "Building {{label}} for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin {{bin}}
     echo ""
-    echo "Beacon built!"
-    file target/aarch64-unknown-linux-gnu/release/beacon
-    ls -lh target/aarch64-unknown-linux-gnu/release/beacon
+    echo "{{label}} built!"
+    file target/aarch64-unknown-linux-gnu/release/{{bin}}
+    ls -lh target/aarch64-unknown-linux-gnu/release/{{bin}}
+
+# Quick cross-compile beacon using cargo-zigbuild (devenv provides zig + target)
+[group('build')]
+beacon-cross: (cross "beacon" "Beacon")
 
 # Build beacon with native cargo (requires system cross-compiler)
 [group('build')]
@@ -170,7 +174,7 @@ deploy-dev: beacon-cross
 # Build beacon for CI/CD (local or GitHub Actions)
 [group('ci')]
 ci-build-beacon:
-    ./scripts/ci/build-beacon.sh
+    ./scripts/ci/build-binary.sh beacon
 
 # Package beacon into deployable archive (legacy tar.gz format)
 [group('ci')]
@@ -286,12 +290,12 @@ pkg-beacon:
 # Build mdma-library for CI
 [group('ci')]
 ci-build-library:
-    ./scripts/ci/build-library.sh
+    ./scripts/ci/build-binary.sh mdma-library
 
 # Build mdma-console for CI
 [group('ci')]
 ci-build-console:
-    ./scripts/ci/build-console.sh
+    ./scripts/ci/build-binary.sh mdma-console
 
 # Build mdma-playback for CI
 [group('ci')]
@@ -301,12 +305,12 @@ ci-build-playback:
 # Build mdma-gateway for CI
 [group('ci')]
 ci-build-gateway:
-    ./scripts/ci/build-gateway.sh
+    ./scripts/ci/build-binary.sh mdma-gateway
 
 # Build mdma-bandcamp for CI
 [group('ci')]
 ci-build-bandcamp:
-    ./scripts/ci/build-bandcamp.sh
+    ./scripts/ci/build-binary.sh mdma-bandcamp
 
 # Build mdma-library Void package
 [group('package')]
@@ -650,17 +654,7 @@ run-console:
 
 # Cross-compile console for aarch64
 [group('build')]
-console-cross:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
-    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
-    echo "Building console for aarch64..."
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin mdma-console
-    echo ""
-    echo "Console built!"
-    file target/aarch64-unknown-linux-gnu/release/mdma-console
-    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-console
+console-cross: (cross "mdma-console" "Console")
 
 # Set up aarch64 PipeWire sysroot for cross-compiling playback
 [group('build')]
@@ -681,17 +675,7 @@ playback-cross: setup-playback-sysroot
 
 # Cross-compile library service for aarch64
 [group('build')]
-library-cross:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
-    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
-    echo "Building mdma-library for aarch64..."
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin mdma-library
-    echo ""
-    echo "Library built!"
-    file target/aarch64-unknown-linux-gnu/release/mdma-library
-    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-library
+library-cross: (cross "mdma-library" "Library")
 
 # Deploy console to Pi
 [group('dev')]
@@ -804,45 +788,15 @@ deploy-playback: playback-cross
 
 # Cross-compile gateway for aarch64
 [group('build')]
-gateway-cross:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
-    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
-    echo "Building mdma-gateway for aarch64..."
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin mdma-gateway
-    echo ""
-    echo "Gateway built!"
-    file target/aarch64-unknown-linux-gnu/release/mdma-gateway
-    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-gateway
+gateway-cross: (cross "mdma-gateway" "Gateway")
 
 # Cross-compile acid service for aarch64
 [group('build')]
-acid-cross:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
-    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
-    echo "Building mdma-acid for aarch64..."
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin mdma-acid
-    echo ""
-    echo "Acid built!"
-    file target/aarch64-unknown-linux-gnu/release/mdma-acid
-    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-acid
+acid-cross: (cross "mdma-acid" "Acid")
 
 # Cross-compile bandcamp for aarch64
 [group('build')]
-bandcamp-cross:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
-    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
-    echo "Building mdma-bandcamp for aarch64..."
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin mdma-bandcamp
-    echo ""
-    echo "Bandcamp built!"
-    file target/aarch64-unknown-linux-gnu/release/mdma-bandcamp
-    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-bandcamp
+bandcamp-cross: (cross "mdma-bandcamp" "Bandcamp")
 
 # Deploy gateway to Pi (single external TCP port)
 [group('dev')]
@@ -879,17 +833,7 @@ deploy-gateway: gateway-cross
 
 # Cross-compile CLI (mdma) for aarch64
 [group('build')]
-cli-cross:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
-    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
-    echo "Building mdma CLI for aarch64..."
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin mdma
-    echo ""
-    echo "CLI built!"
-    file target/aarch64-unknown-linux-gnu/release/mdma
-    ls -lh target/aarch64-unknown-linux-gnu/release/mdma
+cli-cross: (cross "mdma" "CLI")
 
 # Deploy CLI (mdma) to Pi - installs as /usr/bin/mdma, no service required
 [group('dev')]
