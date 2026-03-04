@@ -677,114 +677,58 @@ playback-cross: setup-playback-sysroot
 [group('build')]
 library-cross: (cross "mdma-library" "Library")
 
+# Internal: deploy a standard MDMA service to the provisioned Pi
+[group('dev')]
+_deploy-svc svc bin *extra_scp:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    HOST="${PI_HOST:-mdma-909.local}"
+    SSH_KEY="$HOME/.ssh/mdma_pi"
+    BINARY="target/aarch64-unknown-linux-gnu/release/{{bin}}"
+    RUN_SCRIPT="void-packages/srcpkgs/{{svc}}/files/{{svc}}/run"
+    POST_INSTALL="scripts/deploy/post-install-{{svc}}.sh"
+
+    echo "Deploying {{svc}} to $HOST..."
+
+    # Upload binary, run script, and any extra files
+    scp -4 -i "$SSH_KEY" "$BINARY" "$RUN_SCRIPT" {{extra_scp}} "admin@${HOST}:/tmp/"
+
+    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop {{svc}} 2>/dev/null || true
+        sudo mv /tmp/{{bin}} /usr/bin/
+        sudo chmod +x /usr/bin/{{bin}}
+        sudo mkdir -p /etc/sv/{{svc}}/log /var/log/{{svc}} /run/mdma
+        sudo cp /tmp/run /etc/sv/{{svc}}/run
+        sudo chmod +x /etc/sv/{{svc}}/run
+        printf "#!/bin/sh\nexec svlogd -tt /var/log/{{svc}}\n" | sudo tee /etc/sv/{{svc}}/log/run > /dev/null
+        sudo chmod +x /etc/sv/{{svc}}/log/run
+        sudo ln -sf /etc/sv/{{svc}} /var/service/{{svc}} 2>/dev/null || true
+        for i in 1 2 3 4 5; do sleep 1; [ -d /var/service/{{svc}}/supervise ] && break; done
+        sudo sv start {{svc}} 2>/dev/null || true
+        sleep 1
+        sudo sv status {{svc}} 2>/dev/null || echo "{{svc}}: waiting for runit (check manually)"'
+
+    # Run post-install hook if it exists
+    if [ -f "$POST_INSTALL" ]; then
+        echo "Running post-install for {{svc}}..."
+        ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'bash -s' < "$POST_INSTALL"
+    fi
+
+    echo "{{svc}} deployed!"
+
 # Deploy console to Pi
 [group('dev')]
 deploy-console: console-cross
-    #!/usr/bin/env bash
-    set -euo pipefail
+    @just _deploy-svc mdma-console mdma-console
 
-    HOST="${PI_HOST:-mdma-909.local}"
-    CONSOLE="target/aarch64-unknown-linux-gnu/release/mdma-console"
-    SSH_KEY="$HOME/.ssh/mdma_pi"
-    RUN_SCRIPT="void-packages/srcpkgs/mdma-console/files/mdma-console/run"
-
-    echo "Deploying console to $HOST..."
-
-    scp -4 -i "$SSH_KEY" "$CONSOLE" "$RUN_SCRIPT" "admin@${HOST}:/tmp/"
-
-    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-console 2>/dev/null || true
-        sudo mv /tmp/mdma-console /usr/bin/
-        sudo chmod +x /usr/bin/mdma-console
-        sudo setcap "cap_net_bind_service=+ep" /usr/bin/mdma-console
-        sudo mkdir -p /etc/sv/mdma-console/log /var/log/mdma-console
-        sudo cp /tmp/run /etc/sv/mdma-console/run
-        sudo chmod +x /etc/sv/mdma-console/run
-        printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-console\n" | sudo tee /etc/sv/mdma-console/log/run > /dev/null
-        sudo chmod +x /etc/sv/mdma-console/log/run
-        sudo ln -sf /etc/sv/mdma-console /var/service/mdma-console 2>/dev/null || true
-        for i in 1 2 3 4 5; do sleep 1; [ -d /var/service/mdma-console/supervise ] && break; done
-        sudo sv start mdma-console 2>/dev/null || true
-        sleep 1
-        sudo sv status mdma-console 2>/dev/null || echo "mdma-console: waiting for runit (check manually)"'
-
-    echo ""
-    echo "Console deployed! Access at: http://$HOST/"
-
-# Deploy library service to Pi
+# Deploy library to Pi
 [group('dev')]
 deploy-library: library-cross
-    #!/usr/bin/env bash
-    set -euo pipefail
+    @just _deploy-svc mdma-library mdma-library
 
-    HOST="${PI_HOST:-mdma-909.local}"
-    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-library"
-    SSH_KEY="$HOME/.ssh/mdma_pi"
-    RUN_SCRIPT="void-packages/srcpkgs/mdma-library/files/mdma-library/run"
-
-    echo "Deploying mdma-library to $HOST..."
-
-    scp -4 -i "$SSH_KEY" "$BINARY" "$RUN_SCRIPT" "admin@${HOST}:/tmp/"
-
-    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-library 2>/dev/null || true
-        sudo mv /tmp/mdma-library /usr/bin/
-        sudo chmod +x /usr/bin/mdma-library
-        sudo mkdir -p /etc/sv/mdma-library/log /var/log/mdma-library /music/inbox /music/blobs /metadata /run/mdma
-        sudo chown -R mdma:mdma /music /metadata /run/mdma
-        sudo cp /tmp/run /etc/sv/mdma-library/run
-        sudo chmod +x /etc/sv/mdma-library/run
-        printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-library\n" | sudo tee /etc/sv/mdma-library/log/run > /dev/null
-        sudo chmod +x /etc/sv/mdma-library/log/run
-        sudo ln -sf /etc/sv/mdma-library /var/service/mdma-library 2>/dev/null || true
-        for i in 1 2 3 4 5; do sleep 1; [ -d /var/service/mdma-library/supervise ] && break; done
-        sudo sv start mdma-library 2>/dev/null || true
-        sleep 1
-        sudo sv status mdma-library 2>/dev/null || echo "mdma-library: waiting for runit (check manually)"'
-
-    echo ""
-    echo "Library deployed!"
-
-# Deploy playback server to Pi
+# Deploy playback to Pi
 [group('dev')]
 deploy-playback: playback-cross
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    HOST="${PI_HOST:-mdma-909.local}"
-    PLAYBACK="target/aarch64-unknown-linux-gnu/release/mdma-playback"
-    SSH_KEY="$HOME/.ssh/mdma_pi"
-    RUN_SCRIPT="void-packages/srcpkgs/mdma-playback/files/mdma-playback/run"
-
-    echo "Deploying mdma-playback to $HOST..."
-
-    scp -4 -i "$SSH_KEY" "$PLAYBACK" "$RUN_SCRIPT" "admin@${HOST}:/tmp/"
-
-    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-playback 2>/dev/null || true
-        sudo mv /tmp/mdma-playback /usr/bin/
-        sudo chmod +x /usr/bin/mdma-playback
-        sudo mkdir -p /etc/sv/mdma-playback/log /var/log/mdma-playback /run/mdma
-        sudo chown -R mdma:mdma /run/mdma
-        sudo usermod -a -G audio,video,_pipewire mdma 2>/dev/null || true
-        sudo cp /tmp/run /etc/sv/mdma-playback/run
-        sudo chmod +x /etc/sv/mdma-playback/run
-        printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-playback\n" | sudo tee /etc/sv/mdma-playback/log/run > /dev/null
-        sudo chmod +x /etc/sv/mdma-playback/log/run
-        # Ensure PipeWire WirePlumber drop-in is configured
-        sudo mkdir -p /etc/pipewire/pipewire.conf.d
-        sudo ln -sf /usr/share/examples/wireplumber/10-wireplumber.conf /etc/pipewire/pipewire.conf.d/ 2>/dev/null || true
-        # Ensure stock pipewire service is enabled
-        if [ -d /etc/sv/pipewire ] && [ ! -e /var/service/pipewire ]; then
-            sudo cp -a /usr/share/examples/sv/pipewire /etc/sv/pipewire
-            sudo ln -sf /etc/sv/pipewire /var/service/pipewire
-            sleep 3
-        fi
-        sudo ln -sf /etc/sv/mdma-playback /var/service/mdma-playback 2>/dev/null || true
-        for i in 1 2 3 4 5; do sleep 1; [ -d /var/service/mdma-playback/supervise ] && break; done
-        sudo sv start mdma-playback 2>/dev/null || true
-        sleep 1
-        sudo sv status pipewire mdma-playback 2>/dev/null || echo "mdma-playback: waiting for runit (check manually)"'
-
-    echo ""
-    echo "Playback deployed! IPC only (gateway exposes TCP)"
+    @just _deploy-svc mdma-playback mdma-playback
 
 # Cross-compile gateway for aarch64
 [group('build')]
@@ -801,35 +745,7 @@ bandcamp-cross: (cross "mdma-bandcamp" "Bandcamp")
 # Deploy gateway to Pi (single external TCP port)
 [group('dev')]
 deploy-gateway: gateway-cross
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    HOST="${PI_HOST:-mdma-909.local}"
-    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-gateway"
-    SSH_KEY="$HOME/.ssh/mdma_pi"
-    RUN_SCRIPT="void-packages/srcpkgs/mdma-gateway/files/mdma-gateway/run"
-
-    echo "Deploying mdma-gateway to $HOST..."
-
-    scp -4 -i "$SSH_KEY" "$BINARY" "$RUN_SCRIPT" "admin@${HOST}:/tmp/"
-
-    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-gateway 2>/dev/null || true
-        sudo mv /tmp/mdma-gateway /usr/bin/
-        sudo chmod +x /usr/bin/mdma-gateway
-        sudo mkdir -p /etc/sv/mdma-gateway/log /var/log/mdma-gateway /run/mdma/sources
-        sudo chown -R mdma:mdma /run/mdma
-        sudo cp /tmp/run /etc/sv/mdma-gateway/run
-        sudo chmod +x /etc/sv/mdma-gateway/run
-        printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-gateway\n" | sudo tee /etc/sv/mdma-gateway/log/run > /dev/null
-        sudo chmod +x /etc/sv/mdma-gateway/log/run
-        sudo ln -sf /etc/sv/mdma-gateway /var/service/mdma-gateway 2>/dev/null || true
-        for i in 1 2 3 4 5; do sleep 1; [ -d /var/service/mdma-gateway/supervise ] && break; done
-        sudo sv start mdma-gateway 2>/dev/null || true
-        sleep 1
-        sudo sv status mdma-gateway 2>/dev/null || echo "mdma-gateway: waiting for runit (check manually)"'
-
-    echo ""
-    echo "Gateway deployed! TCP on port 5555"
+    @just _deploy-svc mdma-gateway mdma-gateway
 
 # Cross-compile CLI (mdma) for aarch64
 [group('build')]
@@ -856,75 +772,12 @@ deploy-cli: cli-cross
     echo ""
     echo "CLI deployed! Run: mdma --help"
 
-# Deploy bandcamp service to Pi
+# Deploy bandcamp service to Pi (includes conf file)
 [group('dev')]
 deploy-bandcamp: bandcamp-cross
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    HOST="${PI_HOST:-mdma-909.local}"
-    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-bandcamp"
-    SSH_KEY="$HOME/.ssh/mdma_pi"
-    RUN_SCRIPT="void-packages/srcpkgs/mdma-bandcamp/files/mdma-bandcamp/run"
-    CONF_FILE="void-packages/srcpkgs/mdma-bandcamp/files/mdma-bandcamp/conf"
-
-    echo "Deploying mdma-bandcamp to $HOST..."
-
-    scp -4 -i "$SSH_KEY" "$BINARY" "$RUN_SCRIPT" "$CONF_FILE" "admin@${HOST}:/tmp/"
-
-    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-bandcamp 2>/dev/null || true
-        sudo mv /tmp/mdma-bandcamp /usr/bin/
-        sudo chmod +x /usr/bin/mdma-bandcamp
-        sudo mkdir -p /etc/sv/mdma-bandcamp/log /var/log/mdma-bandcamp /music/downloads /music/inbox /run/mdma/sources /var/lib/mdma /etc/mdma
-        sudo chown -R mdma:mdma /music /run/mdma /var/lib/mdma
-        sudo cp /tmp/run /etc/sv/mdma-bandcamp/run
-        sudo chmod +x /etc/sv/mdma-bandcamp/run
-        printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-bandcamp\n" | sudo tee /etc/sv/mdma-bandcamp/log/run > /dev/null
-        sudo chmod +x /etc/sv/mdma-bandcamp/log/run
-        if [ ! -f /etc/mdma/bandcamp.conf ]; then
-            sudo install -Dm644 /tmp/conf /etc/mdma/bandcamp.conf
-            echo "Installed default bandcamp.conf — edit MDMA_BANDCAMP_USERNAME if needed"
-        else
-            echo "Skipping bandcamp.conf (already exists)"
-        fi
-        sudo ln -sf /etc/sv/mdma-bandcamp /var/service/mdma-bandcamp 2>/dev/null || true
-        for i in 1 2 3 4 5; do sleep 1; [ -d /var/service/mdma-bandcamp/supervise ] && break; done
-        sudo sv start mdma-bandcamp 2>/dev/null || true
-        sleep 1
-        sudo sv status mdma-bandcamp 2>/dev/null || echo "mdma-bandcamp: waiting for runit (check manually)"'
-
-    echo ""
-    echo "Bandcamp deployed!"
+    @just _deploy-svc mdma-bandcamp mdma-bandcamp "void-packages/srcpkgs/mdma-bandcamp/files/mdma-bandcamp/conf"
 
 # Deploy acid service to Pi
 [group('dev')]
 deploy-acid: acid-cross
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    HOST="${PI_HOST:-mdma-909.local}"
-    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-acid"
-    SSH_KEY="$HOME/.ssh/mdma_pi"
-    RUN_SCRIPT="void-packages/srcpkgs/mdma-acid/files/mdma-acid/run"
-
-    echo "Deploying mdma-acid to $HOST..."
-
-    scp -4 -i "$SSH_KEY" "$BINARY" "$RUN_SCRIPT" "admin@${HOST}:/tmp/"
-
-    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-acid 2>/dev/null || true
-        sudo mv /tmp/mdma-acid /usr/bin/
-        sudo chmod +x /usr/bin/mdma-acid
-        sudo mkdir -p /etc/sv/mdma-acid/log /var/log/mdma-acid /metadata /run/mdma
-        sudo chown -R mdma:mdma /metadata /run/mdma
-        sudo cp /tmp/run /etc/sv/mdma-acid/run
-        sudo chmod +x /etc/sv/mdma-acid/run
-        printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-acid\n" | sudo tee /etc/sv/mdma-acid/log/run > /dev/null
-        sudo chmod +x /etc/sv/mdma-acid/log/run
-        sudo ln -sf /etc/sv/mdma-acid /var/service/mdma-acid 2>/dev/null || true
-        for i in 1 2 3 4 5; do sleep 1; [ -d /var/service/mdma-acid/supervise ] && break; done
-        sudo sv start mdma-acid 2>/dev/null || true
-        sleep 1
-        sudo sv status mdma-acid 2>/dev/null || echo "mdma-acid: waiting for runit (check manually)"'
-
-    echo ""
-    echo "Acid deployed!"
+    @just _deploy-svc mdma-acid mdma-acid
