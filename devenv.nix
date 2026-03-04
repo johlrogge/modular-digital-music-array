@@ -191,12 +191,7 @@
 
   # Tests
   enterTest = ''
-    echo "Running tests"
-    git --version | grep --color=auto "${pkgs.git.version}"
-    rustc --version
-    hx --version
-    clang --version
-    claude --version
+    cargo test
   '';
 
   # Claude Code integration

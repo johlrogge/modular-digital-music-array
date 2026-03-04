@@ -1,17 +1,27 @@
 use cucumber::World;
-use mdma_bdd::world::MdmaWorld;
+
+#[path = "../src/harness.rs"]
+mod harness;
+#[path = "../src/playback_simulator.rs"]
+mod playback_simulator;
+#[path = "../src/steps/mod.rs"]
+mod steps;
+#[path = "../src/world.rs"]
+mod world;
+
+use world::MdmaWorld;
 
 // Import step modules so the proc-macro registrations get linked in.
 #[allow(unused_imports)]
-use mdma_bdd::steps::cli_steps;
+use steps::cli_steps;
 #[allow(unused_imports)]
-use mdma_bdd::steps::library_steps;
+use steps::library_steps;
 #[allow(unused_imports)]
-use mdma_bdd::steps::playback_steps;
+use steps::playback_steps;
 #[allow(unused_imports)]
-use mdma_bdd::steps::queue_steps;
+use steps::queue_steps;
 #[allow(unused_imports)]
-use mdma_bdd::steps::search_steps;
+use steps::search_steps;
 
 #[tokio::main]
 async fn main() {

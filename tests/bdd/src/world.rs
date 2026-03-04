@@ -62,18 +62,8 @@ impl MdmaWorld {
     /// Boot the test environment with the tracks accumulated in Background steps.
     pub fn ensure_env(&mut self) {
         if self.env.is_none() {
-            if let Ok(gateway) = std::env::var("MDMA_TEST_GATEWAY") {
-                if !self.pending_tracks.is_empty() {
-                    eprintln!(
-                        "WARNING: {} pending tracks ignored in integration mode (using pre-seeded data)",
-                        self.pending_tracks.len()
-                    );
-                }
-                self.env = Some(harness::boot_integration_env(&gateway));
-            } else {
-                let tracks = std::mem::take(&mut self.pending_tracks);
-                self.env = Some(harness::boot_test_env(&tracks));
-            }
+            let tracks = std::mem::take(&mut self.pending_tracks);
+            self.env = Some(harness::boot_test_env(&tracks));
         }
     }
 
@@ -110,7 +100,14 @@ impl MdmaWorld {
         let binary = cli_binary_path();
 
         let mut cmd = std::process::Command::new(&binary);
-        configure_cli_target(&mut cmd, self.library_addr(), self.playback_addr());
+        cmd.arg("--socket")
+            .arg(self.library_addr())
+            .arg("--playback-socket")
+            .arg(self.playback_addr())
+            .env_remove("MDMA_GATEWAY")
+            .env_remove("MDMA_NODE")
+            .env_remove("MDMA_LIBRARY_SOCKET")
+            .env_remove("MDMA_PLAYBACK_SOCKET");
         cmd.args(args);
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -160,7 +157,14 @@ impl MdmaWorld {
         let binary = cli_binary_path();
 
         let mut cmd = std::process::Command::new(&binary);
-        configure_cli_target(&mut cmd, self.library_addr(), self.playback_addr());
+        cmd.arg("--socket")
+            .arg(self.library_addr())
+            .arg("--playback-socket")
+            .arg(self.playback_addr())
+            .env_remove("MDMA_GATEWAY")
+            .env_remove("MDMA_NODE")
+            .env_remove("MDMA_LIBRARY_SOCKET")
+            .env_remove("MDMA_PLAYBACK_SOCKET");
         cmd.args(args);
         cmd.env("COLUMNS", columns.to_string())
             .stderr(std::process::Stdio::piped());
@@ -231,22 +235,6 @@ impl MdmaWorld {
             self.last_cli_stderr.clear();
         }
         self.last_cli_exit_code = status.code();
-    }
-}
-
-/// Configure CLI command for either integration (gateway) or in-process (socket) mode.
-fn configure_cli_target(cmd: &mut std::process::Command, library_addr: &str, playback_addr: &str) {
-    if let Ok(gw) = std::env::var("MDMA_TEST_GATEWAY") {
-        cmd.env("MDMA_GATEWAY", &gw);
-    } else {
-        cmd.arg("--socket")
-            .arg(library_addr)
-            .arg("--playback-socket")
-            .arg(playback_addr)
-            .env_remove("MDMA_GATEWAY")
-            .env_remove("MDMA_NODE")
-            .env_remove("MDMA_LIBRARY_SOCKET")
-            .env_remove("MDMA_PLAYBACK_SOCKET");
     }
 }
 
