@@ -21,6 +21,25 @@ build:
 bdd:
     cargo test --package mdma-bdd --test cucumber -- -vv
 
+# Run BDD tests against local service stack
+[group('test')]
+test-integration:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Seeding test data..."
+    rm -rf /tmp/mdma-dev/metadata
+    mkdir -p /tmp/mdma-dev/{metadata,music/inbox,music/blobs,run/sources}
+    cargo run --package mdma-bdd-seed -- /tmp/mdma-dev/metadata
+    echo "Starting local services..."
+    devenv up --detach
+    # Wait for gateway to be ready (up to 30s)
+    for i in $(seq 1 30); do nc -z 127.0.0.1 5555 2>/dev/null && break; sleep 1; done
+    echo "Running BDD tests against local gateway..."
+    MDMA_TEST_GATEWAY="tcp://127.0.0.1:5555" \
+        cargo test --package mdma-bdd --test cucumber -- -vv
+    echo "Stopping services..."
+    devenv processes stop
+
 # Cross-compile a standard MDMA binary for aarch64
 [group('build')]
 cross bin label=bin:

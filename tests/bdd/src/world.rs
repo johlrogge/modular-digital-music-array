@@ -62,8 +62,18 @@ impl MdmaWorld {
     /// Boot the test environment with the tracks accumulated in Background steps.
     pub fn ensure_env(&mut self) {
         if self.env.is_none() {
-            let tracks = std::mem::take(&mut self.pending_tracks);
-            self.env = Some(harness::boot_test_env(&tracks));
+            if let Ok(gateway) = std::env::var("MDMA_TEST_GATEWAY") {
+                if !self.pending_tracks.is_empty() {
+                    eprintln!(
+                        "WARNING: {} pending tracks ignored in integration mode (using pre-seeded data)",
+                        self.pending_tracks.len()
+                    );
+                }
+                self.env = Some(harness::boot_integration_env(&gateway));
+            } else {
+                let tracks = std::mem::take(&mut self.pending_tracks);
+                self.env = Some(harness::boot_test_env(&tracks));
+            }
         }
     }
 
@@ -100,30 +110,23 @@ impl MdmaWorld {
         let binary = cli_binary_path();
 
         let mut cmd = std::process::Command::new(&binary);
-        // Pass socket addresses as explicit CLI flags (more reliable than env vars)
-        cmd.arg("--socket")
-            .arg(self.library_addr())
-            .arg("--playback-socket")
-            .arg(self.playback_addr())
-            .args(args)
-            .env_remove("MDMA_GATEWAY")
-            .env_remove("MDMA_NODE")
-            .env_remove("MDMA_LIBRARY_SOCKET")
-            .env_remove("MDMA_PLAYBACK_SOCKET")
-            .stdout(std::process::Stdio::piped())
+        configure_cli_target(&mut cmd, self.library_addr(), self.playback_addr());
+        cmd.args(args);
+        cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        if stdin_data.is_some() {
+        // Keep PTY master alive until after child exits (when stdin_data is None).
+        let _stdin_master: Option<std::fs::File> = if stdin_data.is_some() {
             cmd.stdin(std::process::Stdio::piped());
+            None
         } else {
             // Create a PTY so the CLI subprocess sees a real terminal for stdin.
             // This prevents search from applying an empty stdin intersection filter
             // (which triggers when stdin is not a terminal).
             let (master, slave) = open_pty();
             cmd.stdin(std::process::Stdio::from(slave));
-            // Keep master alive until child exits — PTY closes when master drops.
-            std::mem::forget(master);
-        }
+            Some(master)
+        };
 
         let mut child = cmd.spawn().unwrap_or_else(|e| {
             panic!("Failed to spawn mdma binary at {:?}: {}", binary, e);
@@ -157,30 +160,25 @@ impl MdmaWorld {
         let binary = cli_binary_path();
 
         let mut cmd = std::process::Command::new(&binary);
-        cmd.arg("--socket")
-            .arg(self.library_addr())
-            .arg("--playback-socket")
-            .arg(self.playback_addr())
-            .args(args)
-            .env_remove("MDMA_GATEWAY")
-            .env_remove("MDMA_NODE")
-            .env_remove("MDMA_LIBRARY_SOCKET")
-            .env_remove("MDMA_PLAYBACK_SOCKET")
-            .env("COLUMNS", columns.to_string())
+        configure_cli_target(&mut cmd, self.library_addr(), self.playback_addr());
+        cmd.args(args);
+        cmd.env("COLUMNS", columns.to_string())
             .stderr(std::process::Stdio::piped());
 
         // PTY for stdout — enables is_terminal() in the child
         let (stdout_master, stdout_slave) = open_pty();
         cmd.stdout(std::process::Stdio::from(stdout_slave));
 
-        if stdin_data.is_some() {
+        // Keep PTY master alive until after child exits (when stdin_data is None).
+        let _stdin_master: Option<std::fs::File> = if stdin_data.is_some() {
             cmd.stdin(std::process::Stdio::piped());
+            None
         } else {
             // Separate PTY for stdin (same pattern as run_cli)
             let (stdin_master, stdin_slave) = open_pty();
             cmd.stdin(std::process::Stdio::from(stdin_slave));
-            std::mem::forget(stdin_master);
-        }
+            Some(stdin_master)
+        };
 
         let mut child = cmd.spawn().unwrap_or_else(|e| {
             panic!("Failed to spawn mdma binary at {:?}: {}", binary, e);
@@ -233,6 +231,22 @@ impl MdmaWorld {
             self.last_cli_stderr.clear();
         }
         self.last_cli_exit_code = status.code();
+    }
+}
+
+/// Configure CLI command for either integration (gateway) or in-process (socket) mode.
+fn configure_cli_target(cmd: &mut std::process::Command, library_addr: &str, playback_addr: &str) {
+    if let Ok(gw) = std::env::var("MDMA_TEST_GATEWAY") {
+        cmd.env("MDMA_GATEWAY", &gw);
+    } else {
+        cmd.arg("--socket")
+            .arg(library_addr)
+            .arg("--playback-socket")
+            .arg(playback_addr)
+            .env_remove("MDMA_GATEWAY")
+            .env_remove("MDMA_NODE")
+            .env_remove("MDMA_LIBRARY_SOCKET")
+            .env_remove("MDMA_PLAYBACK_SOCKET");
     }
 }
 

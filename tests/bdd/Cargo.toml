@@ -8,6 +8,10 @@ publish = false
 name = "cucumber"
 harness = false
 
+[[bin]]
+name = "mdma-bdd-seed"
+path = "src/bin/seed.rs"
+
 [dependencies]
 cucumber = "0.21"
 tokio = { workspace = true, features = ["full"] }

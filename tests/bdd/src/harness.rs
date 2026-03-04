@@ -29,13 +29,13 @@ pub struct TestEnv {
     pub playback_state: Arc<Mutex<PlaybackState>>,
     pub library_addr: String,
     pub playback_addr: String,
-    pub _temp_dir: tempfile::TempDir,
-    pub _library_thread: std::thread::JoinHandle<()>,
-    pub _playback_thread: std::thread::JoinHandle<()>,
+    pub _temp_dir: Option<tempfile::TempDir>,
+    pub _library_thread: Option<std::thread::JoinHandle<()>>,
+    pub _playback_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Seed a facts.jsonl file with the given tracks.
-fn seed_facts(metadata_dir: &std::path::Path, tracks: &[SeedTrack]) {
+pub fn seed_facts(metadata_dir: &std::path::Path, tracks: &[SeedTrack]) {
     let facts_path = metadata_dir.join("facts.jsonl");
     let mut writer = FactStreamWriter::open(&facts_path).expect("failed to open fact stream");
 
@@ -181,8 +181,28 @@ pub fn boot_test_env(tracks: &[SeedTrack]) -> TestEnv {
         playback_state,
         library_addr,
         playback_addr,
-        _temp_dir: temp_dir,
-        _library_thread: library_thread,
-        _playback_thread: playback_thread,
+        _temp_dir: Some(temp_dir),
+        _library_thread: Some(library_thread),
+        _playback_thread: Some(playback_thread),
+    }
+}
+
+/// Boot a test environment that connects to an already-running service stack.
+pub fn boot_integration_env(gateway: &str) -> TestEnv {
+    let library =
+        LibraryBackend::connect_direct(gateway).expect("failed to connect library via gateway");
+    let playback =
+        PlaybackBackend::connect_direct(gateway).expect("failed to connect playback via gateway");
+    let playback_state = Arc::new(Mutex::new(PlaybackState::default()));
+
+    TestEnv {
+        library,
+        playback,
+        playback_state,
+        library_addr: gateway.to_string(),
+        playback_addr: gateway.to_string(),
+        _temp_dir: None,
+        _library_thread: None,
+        _playback_thread: None,
     }
 }
