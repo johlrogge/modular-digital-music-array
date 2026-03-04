@@ -27,35 +27,28 @@ use std::path::Path;
 #[command(name = "mdma")]
 #[command(author, version, about = "MDMA CLI - Control the music services")]
 struct Cli {
-    /// Gateway address (routes all requests through a single endpoint)
-    #[arg(long, global = true, env = "MDMA_GATEWAY")]
-    gateway: Option<String>,
+    /// Node hostname (e.g. mdma-909.local). Derives gateway addresses automatically.
+    #[arg(long, env = "MDMA_NODE")]
+    node: Option<String>,
 
-    /// Library IPC socket address (direct mode, ignored when --gateway is set)
+    /// Library IPC socket address (direct mode, ignored when --node is set)
     #[arg(
         long,
         default_value = "ipc:///run/mdma/library.sock",
-        global = true,
         env = "MDMA_LIBRARY_SOCKET"
     )]
     socket: String,
 
-    /// Playback server socket address (direct mode, ignored when --gateway is set)
+    /// Playback server socket address (direct mode, ignored when --node is set)
     #[arg(
         long,
         default_value = "ipc:///run/mdma/playback.sock",
-        global = true,
         env = "MDMA_PLAYBACK_SOCKET"
     )]
     playback_socket: String,
 
     /// Sources directory for direct mode (contains *.sock files)
-    #[arg(
-        long,
-        default_value = "/run/mdma/sources",
-        global = true,
-        env = "MDMA_SOURCES_DIR"
-    )]
+    #[arg(long, default_value = "/run/mdma/sources", env = "MDMA_SOURCES_DIR")]
     sources_dir: String,
 
     #[command(subcommand)]
@@ -208,10 +201,6 @@ enum Commands {
 
     /// Subscribe to real-time events from the playback system
     Subscribe {
-        /// Event gateway address
-        #[arg(long, env = "MDMA_EVENT_GATEWAY")]
-        event_gateway: Option<String>,
-
         /// Topic filter (e.g. "playback/track_started"). Default: all playback events.
         #[arg(long)]
         topic: Option<String>,
@@ -546,37 +535,18 @@ fn event_gateway_from_node(node: &str) -> String {
     format!("tcp://{}:5556", node)
 }
 
-/// Resolve the effective gateway address using the precedence rules:
-///   1. `--gateway` flag / `MDMA_GATEWAY` env (already in `cli.gateway` via clap)
-///   2. Derived from `MDMA_NODE` env var: `tcp://<node>:5555`
-///   3. `None` — caller falls back to direct IPC
+/// Resolve the effective gateway address.
+/// Derived from `--node` / `MDMA_NODE` (already in `cli.node` via clap): `tcp://<node>:5555`
+/// Returns `None` when `--node` is not set — caller falls back to direct IPC.
 fn resolve_gateway(cli: &Cli) -> Option<String> {
-    if cli.gateway.is_some() {
-        return cli.gateway.clone();
-    }
-    std::env::var("MDMA_NODE")
-        .ok()
-        .map(|n| gateway_from_node(&n))
+    cli.node.as_deref().map(gateway_from_node)
 }
 
-/// Resolve the effective event gateway address using the precedence rules:
-///   1. Explicit `event_gateway` argument (from `--event-gateway` / `MDMA_EVENT_GATEWAY`)
-///   2. Derived from the resolved command gateway by replacing port with 5556
-///   3. Derived from `MDMA_NODE` env var: `tcp://<node>:5556`
-fn resolve_event_gateway(cli: &Cli, event_gateway: Option<&str>) -> Option<String> {
-    if let Some(eg) = event_gateway {
-        return Some(eg.to_string());
-    }
-    // Try command gateway (already resolved to include MDMA_NODE fallback)
-    if let Some(gw) = resolve_gateway(cli) {
-        if let Some(base) = gw.rsplit_once(':') {
-            return Some(format!("{}:5556", base.0));
-        }
-    }
-    // Direct MDMA_NODE fallback (covers the case where resolve_gateway returned None)
-    std::env::var("MDMA_NODE")
-        .ok()
-        .map(|n| event_gateway_from_node(&n))
+/// Resolve the effective event gateway address.
+/// Derived from `--node` / `MDMA_NODE`: `tcp://<node>:5556`
+/// Returns `None` when `--node` is not set.
+fn resolve_event_gateway(cli: &Cli) -> Option<String> {
+    cli.node.as_deref().map(event_gateway_from_node)
 }
 
 // =============================================================================
@@ -2415,13 +2385,11 @@ fn handle_upload(
         std::process::exit(1);
     }
 
-    // 2. Extract hostname from gateway (supports --gateway, MDMA_GATEWAY, and MDMA_NODE)
+    // 2. Extract hostname from gateway (derived from --node / MDMA_NODE)
     let gateway_resolved = match resolve_gateway(cli) {
         Some(gw) => gw,
         None => {
-            eprintln!(
-                "Upload requires --gateway, MDMA_GATEWAY, or MDMA_NODE to determine the Pi hostname"
-            );
+            eprintln!("Upload requires --node or MDMA_NODE to determine the Pi hostname");
             std::process::exit(1);
         }
     };
@@ -2644,6 +2612,7 @@ fn resolve_export_format(
 }
 
 fn handle_export(
+    cli: &Cli,
     library: &LibraryBackend,
     format: &Option<ExportFormat>,
     lossless_format: &Option<ExportFormat>,
@@ -2652,12 +2621,14 @@ fn handle_export(
 ) -> Result<()> {
     use std::io::{BufRead, Write};
 
-    // Resolve MDMA_NODE
-    let node = match std::env::var("MDMA_NODE") {
-        Ok(n) if !n.is_empty() => n,
+    // Resolve node from --node / MDMA_NODE (already in cli.node via clap)
+    let node = match cli.node.as_deref() {
+        Some(n) if !n.is_empty() => n.to_string(),
         _ => {
             eprintln!("MDMA_NODE is not set.");
-            eprintln!("Set MDMA_NODE to the hostname of your MDMA device (e.g. mdma-909.local)");
+            eprintln!(
+                "Set --node or MDMA_NODE to the hostname of your MDMA device (e.g. mdma-909.local)"
+            );
             std::process::exit(1);
         }
     };
@@ -3048,19 +3019,13 @@ fn main() -> Result<()> {
             let client = connect_library(&cli);
             handle_sort(&client, field.clone(), *ascending, *descending)
         }
-        Commands::Subscribe {
-            event_gateway,
-            topic,
-        } => {
-            // Resolve event gateway: --event-gateway / MDMA_EVENT_GATEWAY > derived from
-            // MDMA_GATEWAY > derived from MDMA_NODE (tcp://<node>:5556)
-            let addr = match resolve_event_gateway(&cli, event_gateway.as_deref()) {
+        Commands::Subscribe { topic } => {
+            // Resolve event gateway from --node / MDMA_NODE (tcp://<node>:5556)
+            let addr = match resolve_event_gateway(&cli) {
                 Some(a) => a,
                 None => {
-                    eprintln!("No event gateway specified.");
-                    eprintln!(
-                        "Set --event-gateway, MDMA_EVENT_GATEWAY, MDMA_GATEWAY, or MDMA_NODE"
-                    );
+                    eprintln!("No node specified.");
+                    eprintln!("Set --node or MDMA_NODE to the hostname of your MDMA device");
                     std::process::exit(1);
                 }
             };
@@ -3080,7 +3045,7 @@ fn main() -> Result<()> {
             output,
         } => {
             let lib = connect_library(&cli);
-            handle_export(&lib, format, lossless_format, lossy_format, output)
+            handle_export(&cli, &lib, format, lossless_format, lossy_format, output)
         }
         Commands::GenerateCompletions { shell } => {
             generate_completions(*shell, &mut std::io::stdout());
@@ -3095,16 +3060,44 @@ mod tests {
 
     #[test]
     fn resolve_gateway_from_mdma_node() {
-        // MDMA_NODE set, no MDMA_GATEWAY → derive tcp://<node>:5555
+        // MDMA_NODE set, no MDMA_GATEWAY -> derive tcp://<node>:5555
         let result = gateway_from_node("some-pi.local");
         assert_eq!(result, "tcp://some-pi.local:5555");
     }
 
     #[test]
     fn resolve_event_gateway_from_mdma_node() {
-        // MDMA_NODE set → event gateway is tcp://<node>:5556
+        // MDMA_NODE set -> event gateway is tcp://<node>:5556
         let result = event_gateway_from_node("some-pi.local");
         assert_eq!(result, "tcp://some-pi.local:5556");
+    }
+
+    #[test]
+    fn resolve_gateway_uses_cli_node_field() {
+        // When cli.node is set, resolve_gateway derives tcp://<node>:5555
+        let cli = Cli {
+            node: Some("mdma-909.local".to_string()),
+            socket: "ipc:///run/mdma/library.sock".to_string(),
+            playback_socket: "ipc:///run/mdma/playback.sock".to_string(),
+            sources_dir: "/run/mdma/sources".to_string(),
+            command: Commands::Ping,
+        };
+        let result = resolve_gateway(&cli);
+        assert_eq!(result, Some("tcp://mdma-909.local:5555".to_string()));
+    }
+
+    #[test]
+    fn resolve_gateway_returns_none_when_node_unset() {
+        // When cli.node is None, resolve_gateway returns None
+        let cli = Cli {
+            node: None,
+            socket: "ipc:///run/mdma/library.sock".to_string(),
+            playback_socket: "ipc:///run/mdma/playback.sock".to_string(),
+            sources_dir: "/run/mdma/sources".to_string(),
+            command: Commands::Ping,
+        };
+        let result = resolve_gateway(&cli);
+        assert_eq!(result, None);
     }
 
     fn make_track(artist: &str, title: &str, duration_secs: u32) -> TrackInfo {
