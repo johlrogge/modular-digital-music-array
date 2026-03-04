@@ -47,6 +47,7 @@ pub trait Db {
 
 /// Volume level in dBFS (decibels full scale)
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "f32", into = "f32")]
 pub struct Volume(f32);
 
 impl Volume {
@@ -62,6 +63,20 @@ impl Volume {
         } else {
             Err(PlaybackError::ValueOutOfRange)
         }
+    }
+}
+
+impl TryFrom<f32> for Volume {
+    type Error = PlaybackError;
+
+    fn try_from(value: f32) -> Result<Self, Self::Error> {
+        Volume::new(value)
+    }
+}
+
+impl From<Volume> for f32 {
+    fn from(v: Volume) -> f32 {
+        v.0
     }
 }
 
@@ -155,6 +170,15 @@ mod tests {
             let json = serde_json::to_string(&vol).unwrap();
             let decoded: Volume = serde_json::from_str(&json).unwrap();
             assert_eq!(vol, decoded);
+        }
+
+        #[test]
+        fn deserializing_out_of_range_returns_error() {
+            let result: Result<Volume, _> = serde_json::from_str("10.0");
+            assert!(
+                result.is_err(),
+                "expected error for out-of-range dBFS value"
+            );
         }
     }
 

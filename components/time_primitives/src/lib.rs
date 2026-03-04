@@ -44,6 +44,7 @@ impl Sub for Ticks {
 
 /// Pulses per quarter note - resolution of the musical timeline
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u32", into = "u32")]
 pub struct Ppqn(u32);
 
 impl Ppqn {
@@ -61,8 +62,23 @@ impl Ppqn {
     }
 }
 
+impl TryFrom<u32> for Ppqn {
+    type Error = TimeError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        Ppqn::new(value)
+    }
+}
+
+impl From<Ppqn> for u32 {
+    fn from(p: Ppqn) -> u32 {
+        p.0
+    }
+}
+
 /// Tempo in beats per minute
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
 pub struct Tempo(f64);
 
 impl Tempo {
@@ -83,6 +99,20 @@ impl Tempo {
 
     pub fn raw(&self) -> f64 {
         self.0
+    }
+}
+
+impl TryFrom<f64> for Tempo {
+    type Error = TimeError;
+
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        Tempo::new(value)
+    }
+}
+
+impl From<Tempo> for f64 {
+    fn from(t: Tempo) -> f64 {
+        t.0
     }
 }
 
@@ -140,5 +170,22 @@ mod tests {
         let json = serde_json::to_string(&tempo).unwrap();
         let decoded: Tempo = serde_json::from_str(&json).unwrap();
         assert_eq!(tempo, decoded);
+
+        let ppqn = Ppqn::new(480).unwrap();
+        let json = serde_json::to_string(&ppqn).unwrap();
+        let decoded: Ppqn = serde_json::from_str(&json).unwrap();
+        assert_eq!(ppqn, decoded);
+    }
+
+    #[test]
+    fn tempo_deserializing_out_of_range_returns_error() {
+        let result: Result<Tempo, _> = serde_json::from_str("0.0");
+        assert!(result.is_err(), "expected error for out-of-range tempo");
+    }
+
+    #[test]
+    fn ppqn_deserializing_zero_returns_error() {
+        let result: Result<Ppqn, _> = serde_json::from_str("0");
+        assert!(result.is_err(), "expected error for zero PPQN");
     }
 }
