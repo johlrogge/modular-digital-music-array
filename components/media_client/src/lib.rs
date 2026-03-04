@@ -183,11 +183,10 @@ impl MediaClient {
 
         let response: Response = serde_json::from_slice(&response_msg)?;
 
-        if !response.success {
-            return Err(ClientError::Command(response.error_message));
+        match response {
+            Response::Ok { .. } => Ok(()),
+            Response::Err { message } => Err(ClientError::Command(message)),
         }
-
-        Ok(())
     }
 
     fn send_command_with_response<T>(
@@ -205,14 +204,13 @@ impl MediaClient {
         let response_msg = self.socket.recv()?;
         let response: Response = serde_json::from_slice(&response_msg)?;
 
-        if !response.success {
-            return Err(ClientError::Command(response.error_message));
-        }
-
-        match response.data {
-            Some(data) => extract(data)
+        match response {
+            Response::Err { message } => Err(ClientError::Command(message)),
+            Response::Ok { data: Some(data) } => extract(data)
                 .ok_or_else(|| ClientError::Command("Unexpected response data type".to_string())),
-            None => Err(ClientError::Command("Missing response data".to_string())),
+            Response::Ok { data: None } => {
+                Err(ClientError::Command("Missing response data".to_string()))
+            }
         }
     }
 }

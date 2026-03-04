@@ -811,14 +811,11 @@ impl LibraryService {
         let path = self.resolve_inbox_path(inbox_path);
 
         match self.ingest_file_internal(&path, source) {
-            Ok(hash) => IngestResult {
+            Ok(hash) => IngestResult::Success {
                 hash: Some(hash),
-                success: true,
                 message: "File ingested successfully".to_string(),
             },
-            Err(e) => IngestResult {
-                hash: None,
-                success: false,
+            Err(e) => IngestResult::Failure {
                 message: e.to_string(),
             },
         }
@@ -829,22 +826,17 @@ impl LibraryService {
         let path = self.resolve_inbox_path(inbox_path);
 
         if !path.exists() {
-            return IngestResult {
-                hash: None,
-                success: false,
+            return IngestResult::Failure {
                 message: format!("File not found: {}", inbox_path.as_str()),
             };
         }
 
         match std::fs::remove_file(&path) {
-            Ok(()) => IngestResult {
+            Ok(()) => IngestResult::Success {
                 hash: None,
-                success: true,
                 message: format!("Deleted: {}", inbox_path.as_str()),
             },
-            Err(e) => IngestResult {
-                hash: None,
-                success: false,
+            Err(e) => IngestResult::Failure {
                 message: format!("Failed to delete: {}", e),
             },
         }

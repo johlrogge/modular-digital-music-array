@@ -77,18 +77,32 @@ pub enum SourceResponse {
 // Data Types
 // ============================================================================
 
+/// Authentication state of a source service.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum AuthStatus {
+    Authenticated,
+    NotAuthenticated,
+}
+
+/// Queue state of a source service.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum QueueState {
+    Active,
+    Paused,
+}
+
 /// Service status information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceStatus {
     pub name: String,
     pub version: String,
-    pub authenticated: bool,
+    pub auth: AuthStatus,
     pub downloads_active: usize,
     pub downloads_queued: usize,
     pub downloads_completed: usize,
     pub downloads_failed: usize,
     pub uptime_seconds: u64,
-    pub paused: bool,
+    pub queue: QueueState,
 }
 
 /// Download status for a single item.
@@ -222,20 +236,20 @@ mod tests {
         let status = SourceStatus {
             name: "bandcamp".to_string(),
             version: "0.1.0".to_string(),
-            authenticated: true,
+            auth: AuthStatus::Authenticated,
             downloads_active: 1,
             downloads_queued: 5,
             downloads_completed: 10,
             downloads_failed: 2,
             uptime_seconds: 3600,
-            paused: false,
+            queue: QueueState::Active,
         };
 
         let json = serde_json::to_string(&status).unwrap();
         let parsed: SourceStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.name, "bandcamp");
         assert_eq!(parsed.version, "0.1.0");
-        assert!(parsed.authenticated);
+        assert_eq!(parsed.auth, AuthStatus::Authenticated);
     }
 
     #[test]

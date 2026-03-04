@@ -199,12 +199,12 @@ impl BandcampView {
         match response {
             Some(SourceResponse::Status(status)) => Self {
                 connected: true,
-                authenticated: status.authenticated,
+                authenticated: status.auth == source_protocol::AuthStatus::Authenticated,
                 downloads_active: status.downloads_active,
                 downloads_queued: status.downloads_queued,
                 downloads_completed: status.downloads_completed,
                 downloads_failed: status.downloads_failed,
-                paused: status.paused,
+                paused: status.queue == source_protocol::QueueState::Paused,
                 configured_username,
                 cookies_valid,
             },
@@ -466,13 +466,22 @@ async fn ingest_all(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
     match client.ingest_all() {
         Ok(results) => {
+            use library_ipc_client::IngestResult;
             let json_results: Vec<IngestResultJson> = results
                 .into_iter()
-                .map(|item| IngestResultJson {
-                    path: item.path.to_string(),
-                    success: item.result.success,
-                    message: item.result.message,
-                    hash: item.result.hash.map(|h| h.0),
+                .map(|item| match item.result {
+                    IngestResult::Success { hash, message } => IngestResultJson {
+                        path: item.path.to_string(),
+                        success: true,
+                        message,
+                        hash: hash.map(|h| h.0),
+                    },
+                    IngestResult::Failure { message } => IngestResultJson {
+                        path: item.path.to_string(),
+                        success: false,
+                        message,
+                        hash: None,
+                    },
                 })
                 .collect();
 
@@ -505,11 +514,12 @@ fn playback_success_or_error(
     client: &GatewayClient,
     command: &Command,
 ) -> axum::response::Response {
+    use gateway_client::Response;
     match client.playback_command(command) {
-        Ok(resp) if resp.success => Json(serde_json::json!({"success": true})).into_response(),
-        Ok(resp) => (
+        Ok(Response::Ok { .. }) => Json(serde_json::json!({"success": true})).into_response(),
+        Ok(Response::Err { message }) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": resp.error_message})),
+            Json(serde_json::json!({"error": message})),
         )
             .into_response(),
         Err(e) => (
@@ -559,12 +569,12 @@ async fn bandcamp_status(State(state): State<Arc<AppState>>) -> impl IntoRespons
             match client.source_request(&state.source_name, &SourceRequest::GetStatus) {
                 Ok(SourceResponse::Status(status)) => Json(BandcampView {
                     connected: true,
-                    authenticated: status.authenticated,
+                    authenticated: status.auth == source_protocol::AuthStatus::Authenticated,
                     downloads_active: status.downloads_active,
                     downloads_queued: status.downloads_queued,
                     downloads_completed: status.downloads_completed,
                     downloads_failed: status.downloads_failed,
-                    paused: status.paused,
+                    paused: status.queue == source_protocol::QueueState::Paused,
                     configured_username,
                     cookies_valid,
                 })
@@ -850,8 +860,9 @@ async fn player_session(State(state): State<Arc<AppState>>) -> impl IntoResponse
         Err(e) => return e,
     };
 
+    use gateway_client::Response;
     match client.playback_command(&Command::GetSession) {
-        Ok(resp) => match resp.data {
+        Ok(Response::Ok { data }) => match data {
             Some(media_protocol::ResponseData::Session(Some(id))) => {
                 Json(serde_json::json!({"session": id})).into_response()
             }
@@ -860,6 +871,11 @@ async fn player_session(State(state): State<Arc<AppState>>) -> impl IntoResponse
             }
             _ => Json(serde_json::json!({"session": null})).into_response(),
         },
+        Ok(Response::Err { message }) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": message})),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -874,8 +890,9 @@ async fn player_now_playing(State(state): State<Arc<AppState>>) -> impl IntoResp
         Err(e) => return e,
     };
 
+    use gateway_client::Response;
     match client.playback_command(&Command::NowPlaying) {
-        Ok(resp) => match resp.data {
+        Ok(Response::Ok { data }) => match data {
             Some(ResponseData::NowPlaying(Some(hash))) => {
                 let track = state
                     .library_client()
@@ -898,6 +915,7 @@ async fn player_now_playing(State(state): State<Arc<AppState>>) -> impl IntoResp
             }
             _ => Json(serde_json::json!({"playing": false})).into_response(),
         },
+        Ok(Response::Err { .. }) => Json(serde_json::json!({"playing": false})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -912,8 +930,9 @@ async fn player_queue(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         Err(e) => return e,
     };
 
+    use gateway_client::Response;
     match client.playback_command(&Command::QueueList) {
-        Ok(resp) => match resp.data {
+        Ok(Response::Ok { data }) => match data {
             Some(ResponseData::Queue(hashes)) => {
                 let tracks: Vec<serde_json::Value> = hashes
                     .iter()
@@ -932,6 +951,7 @@ async fn player_queue(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             }
             _ => Json(serde_json::json!([])).into_response(),
         },
+        Ok(Response::Err { .. }) => Json(serde_json::json!([])).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -1558,19 +1578,19 @@ async fn export_track(
 mod tests {
     use super::*;
     use library_ipc_client::{Bpm, ContentHash, DurationSeconds, Key};
-    use source_protocol::{SourceResponse, SourceStatus};
+    use source_protocol::{AuthStatus, QueueState, SourceResponse, SourceStatus};
 
     fn make_source_status() -> SourceStatus {
         SourceStatus {
             name: "bandcamp".to_string(),
             version: "0.1.0".to_string(),
-            authenticated: true,
+            auth: AuthStatus::Authenticated,
             downloads_active: 2,
             downloads_queued: 3,
             downloads_completed: 10,
             downloads_failed: 1,
             uptime_seconds: 3600,
-            paused: false,
+            queue: QueueState::Active,
         }
     }
 

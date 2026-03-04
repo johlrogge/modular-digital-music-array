@@ -190,13 +190,21 @@ impl BandcampService {
                 let status = SourceStatus {
                     name: "bandcamp".to_string(),
                     version: env!("CARGO_PKG_VERSION").to_string(),
-                    authenticated: self.cookies_loaded.load(Ordering::Relaxed),
+                    auth: if self.cookies_loaded.load(Ordering::Relaxed) {
+                        source_protocol::AuthStatus::Authenticated
+                    } else {
+                        source_protocol::AuthStatus::NotAuthenticated
+                    },
                     downloads_active: self.active_downloads.lock().len(),
                     downloads_queued: self.download_queue.lock().len(),
                     downloads_completed: self.downloads_completed.load(Ordering::Relaxed),
                     downloads_failed: self.downloads_failed.load(Ordering::Relaxed),
                     uptime_seconds: self.start_time.elapsed().as_secs(),
-                    paused: self.paused.load(Ordering::Relaxed),
+                    queue: if self.paused.load(Ordering::Relaxed) {
+                        source_protocol::QueueState::Paused
+                    } else {
+                        source_protocol::QueueState::Active
+                    },
                 };
                 SourceResponse::Status(status)
             }
@@ -671,17 +679,22 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
                                         match lib_client
                                             .ingest_file_with_source(&inbox_path, Some(source))
                                         {
-                                            Ok(result) if result.success => {
+                                            Ok(library_ipc_client::IngestResult::Success {
+                                                hash,
+                                                ..
+                                            }) => {
                                                 tracing::info!(
                                                     file = %filename,
-                                                    hash = ?result.hash,
+                                                    hash = ?hash,
                                                     "Auto-ingested into library"
                                                 );
                                             }
-                                            Ok(result) => {
+                                            Ok(library_ipc_client::IngestResult::Failure {
+                                                message,
+                                            }) => {
                                                 tracing::warn!(
                                                     file = %filename,
-                                                    msg = %result.message,
+                                                    msg = %message,
                                                     "Library ingest returned failure"
                                                 );
                                             }

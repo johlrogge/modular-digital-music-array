@@ -41,21 +41,20 @@ impl PlaybackBackend {
     }
 
     fn gw_command(&self, cmd: Command) -> Result<(), ClientError> {
-        let response = self.gw_send(cmd)?;
-        if !response.success {
-            return Err(ClientError::Command(response.error_message));
+        match self.gw_send(cmd)? {
+            Response::Ok { .. } => Ok(()),
+            Response::Err { message } => Err(ClientError::Command(message)),
         }
-        Ok(())
     }
 
     fn gw_command_with_data(&self, cmd: Command) -> Result<ResponseData, ClientError> {
-        let response = self.gw_send(cmd)?;
-        if !response.success {
-            return Err(ClientError::Command(response.error_message));
+        match self.gw_send(cmd)? {
+            Response::Err { message } => Err(ClientError::Command(message)),
+            Response::Ok { data: Some(data) } => Ok(data),
+            Response::Ok { data: None } => {
+                Err(ClientError::Command("Missing response data".to_string()))
+            }
         }
-        response
-            .data
-            .ok_or_else(|| ClientError::Command("Missing response data".to_string()))
     }
 
     pub fn play_queue(&self) -> Result<(), ClientError> {

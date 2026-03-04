@@ -365,10 +365,15 @@ pub struct ServiceStatus {
 
 /// Result of a single file ingestion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IngestResult {
-    pub hash: Option<ContentHash>,
-    pub success: bool,
-    pub message: String,
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum IngestResult {
+    Success {
+        hash: Option<ContentHash>,
+        message: String,
+    },
+    Failure {
+        message: String,
+    },
 }
 
 /// Result item for ingest-all operation.
@@ -489,6 +494,39 @@ mod tests {
         let resp = LibraryResponse::Pong;
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("Pong"));
+    }
+
+    #[test]
+    fn ingest_result_success_serialization() {
+        let hash = ContentHash("sha256:abc".to_string());
+        let result = IngestResult::Success {
+            hash: Some(hash.clone()),
+            message: "ingested".to_string(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: IngestResult = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, IngestResult::Success { .. }));
+        if let IngestResult::Success {
+            hash: h,
+            message: m,
+        } = decoded
+        {
+            assert_eq!(h, Some(hash));
+            assert_eq!(m, "ingested");
+        }
+    }
+
+    #[test]
+    fn ingest_result_failure_serialization() {
+        let result = IngestResult::Failure {
+            message: "something failed".to_string(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: IngestResult = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, IngestResult::Failure { .. }));
+        if let IngestResult::Failure { message } = decoded {
+            assert_eq!(message, "something failed");
+        }
     }
 
     #[test]

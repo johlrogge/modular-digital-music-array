@@ -38,8 +38,15 @@ pub enum Message {
     SetMute {
         channel: Deck,
         tick: Ticks,
-        muted: bool,
+        mute: MuteState,
     },
+}
+
+/// Mute state for a channel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum MuteState {
+    Muted,
+    Unmuted,
 }
 
 #[cfg(test)]
@@ -52,7 +59,7 @@ mod tests {
             Message::SetMute {
                 channel: Deck::A,
                 tick: Ticks::new(0),
-                muted: true,
+                mute: MuteState::Muted,
             },
             Message::SetVolume {
                 channel: Deck::B,
@@ -62,7 +69,7 @@ mod tests {
             Message::SetMute {
                 channel: Deck::A,
                 tick: Ticks::new(960),
-                muted: false,
+                mute: MuteState::Unmuted,
             },
         ];
 

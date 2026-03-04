@@ -1157,11 +1157,13 @@ fn handle_inbox_delete(client: &LibraryBackend, filename: String) -> Result<()> 
 
     match client.delete_inbox_file(&path) {
         Ok(result) => {
-            if result.success {
-                println!("{}", result.message);
-            } else {
-                eprintln!("Failed: {}", result.message);
-                std::process::exit(1);
+            use mdma_client::IngestResult;
+            match result {
+                IngestResult::Success { message, .. } => println!("{}", message),
+                IngestResult::Failure { message } => {
+                    eprintln!("Failed: {}", message);
+                    std::process::exit(1);
+                }
             }
             Ok(())
         }
@@ -1182,15 +1184,19 @@ fn handle_inbox_ingest(client: &LibraryBackend, filename: String) -> Result<()> 
 
     match client.ingest_file(&path) {
         Ok(result) => {
-            if result.success {
-                if let Some(hash) = result.hash {
-                    println!("Success: {}", hash.0);
-                } else {
-                    println!("Success: {}", result.message);
+            use mdma_client::IngestResult;
+            match result {
+                IngestResult::Success { hash, message } => {
+                    if let Some(h) = hash {
+                        println!("Success: {}", h.0);
+                    } else {
+                        println!("Success: {}", message);
+                    }
                 }
-            } else {
-                eprintln!("Failed: {}", result.message);
-                std::process::exit(1);
+                IngestResult::Failure { message } => {
+                    eprintln!("Failed: {}", message);
+                    std::process::exit(1);
+                }
             }
             Ok(())
         }
@@ -1211,17 +1217,21 @@ fn handle_inbox_ingest_all(client: &LibraryBackend) -> Result<()> {
             let mut success_count = 0;
             let mut fail_count = 0;
 
+            use mdma_client::IngestResult;
             for item in results {
-                if item.result.success {
-                    success_count += 1;
-                    if let Some(hash) = item.result.hash {
-                        println!("  OK: {} -> {}", item.path.as_str(), short_hash(&hash));
-                    } else {
-                        println!("  OK: {}", item.path.as_str());
+                match item.result {
+                    IngestResult::Success { hash, .. } => {
+                        success_count += 1;
+                        if let Some(hash) = hash {
+                            println!("  OK: {} -> {}", item.path.as_str(), short_hash(&hash));
+                        } else {
+                            println!("  OK: {}", item.path.as_str());
+                        }
                     }
-                } else {
-                    fail_count += 1;
-                    println!("  FAIL: {} - {}", item.path.as_str(), item.result.message);
+                    IngestResult::Failure { message } => {
+                        fail_count += 1;
+                        println!("  FAIL: {} - {}", item.path.as_str(), message);
+                    }
                 }
             }
 
@@ -1668,7 +1678,11 @@ fn handle_source_status(client: &SourceClient, name: &str) -> Result<()> {
             println!("{}", "=".repeat(40));
             println!(
                 "Authenticated:     {}",
-                if status.authenticated { "yes" } else { "no" }
+                if status.auth == source_protocol::AuthStatus::Authenticated {
+                    "yes"
+                } else {
+                    "no"
+                }
             );
             println!("Downloads active:  {}", status.downloads_active);
             println!("Downloads queued:  {}", status.downloads_queued);
@@ -1677,7 +1691,11 @@ fn handle_source_status(client: &SourceClient, name: &str) -> Result<()> {
             println!("Uptime:            {} seconds", status.uptime_seconds);
             println!(
                 "Paused:            {}",
-                if status.paused { "yes" } else { "no" }
+                if status.queue == source_protocol::QueueState::Paused {
+                    "yes"
+                } else {
+                    "no"
+                }
             );
             Ok(())
         }
@@ -2460,17 +2478,16 @@ fn handle_upload(
         };
 
         match lib.ingest_file_with_source(&inbox_path, Some(IngestSource::Upload)) {
-            Ok(result) if result.success => {
-                let hash_str = result
-                    .hash
+            Ok(mdma_client::IngestResult::Success { hash, .. }) => {
+                let hash_str = hash
                     .as_ref()
                     .map(|h| short_hash(h).to_string())
                     .unwrap_or_default();
                 println!("  OK: {} -> {}", filename, hash_str);
                 success_count += 1;
             }
-            Ok(result) => {
-                eprintln!("  FAIL: {} - {}", filename, result.message);
+            Ok(mdma_client::IngestResult::Failure { message }) => {
+                eprintln!("  FAIL: {} - {}", filename, message);
                 fail_count += 1;
             }
             Err(e) => {

@@ -2,8 +2,9 @@
 
 use audio_metadata::{discover_all_fields, extract_metadata, TrackMetadata};
 use music_facts::{
-    Album, Artist, BitDepth, Bitrate, Channels, ContentHash, DurationSeconds, FactOrigin,
-    FactSource, FileSizeBytes, Isrc, MusicFormat, MusicValue, SampleRate, Title, TrackNumber, Year,
+    Album, AlbumArtPresence, Artist, BitDepth, Bitrate, Channels, ContentHash, DurationSeconds,
+    FactOrigin, FactSource, FileSizeBytes, Isrc, MusicFormat, MusicValue, SampleRate, Title,
+    TrackNumber, Year,
 };
 use music_primitives::{Bpm, Key};
 use std::collections::HashMap;
@@ -222,7 +223,11 @@ fn generate_facts_from_metadata(
     }
 
     facts.push((
-        MusicValue::HasAlbumArt(metadata.has_picture),
+        MusicValue::HasAlbumArt(if metadata.has_picture {
+            AlbumArtPresence::Present
+        } else {
+            AlbumArtPresence::Absent
+        }),
         source.clone(),
     ));
 

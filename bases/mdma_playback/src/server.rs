@@ -256,9 +256,7 @@ impl Server {
                     .map(|e| e.hash.clone())
                     .collect();
                 info!("Queue list: {} items", hashes.len());
-                Response {
-                    success: true,
-                    error_message: String::new(),
+                Response::Ok {
                     data: Some(ResponseData::Queue(hashes)),
                 }
             }
@@ -280,9 +278,7 @@ impl Server {
                 self.publish_event(&PlaybackEvent::QueueChanged {
                     length: queue.len(),
                 });
-                Response {
-                    success: true,
-                    error_message: String::new(),
+                Response::Ok {
                     data: Some(ResponseData::Count(removed)),
                 }
             }
@@ -312,10 +308,8 @@ impl Server {
                     e
                 };
                 match entry {
-                    None => Response {
-                        success: false,
-                        error_message: "Queue is empty".to_string(),
-                        data: None,
+                    None => Response::Err {
+                        message: "Queue is empty".to_string(),
                     },
                     Some(e) => {
                         let effects = self
@@ -337,9 +331,7 @@ impl Server {
             Command::NowPlaying => {
                 let hash = self.state.lock().await.current_hash().cloned();
                 info!("Now playing: {:?}", hash);
-                Response {
-                    success: true,
-                    error_message: String::new(),
+                Response::Ok {
                     data: Some(ResponseData::NowPlaying(hash)),
                 }
             }
@@ -365,9 +357,7 @@ impl Server {
             Command::GetSession => {
                 let session_id = self.state.lock().await.session_id().map(|id| id.0.clone());
                 info!("GetSession: {:?}", session_id);
-                Response {
-                    success: true,
-                    error_message: String::new(),
+                Response::Ok {
                     data: Some(ResponseData::Session(session_id)),
                 }
             }
@@ -375,11 +365,7 @@ impl Server {
     }
 
     fn ok_response(&self) -> Response {
-        Response {
-            success: true,
-            error_message: String::new(),
-            data: None,
-        }
+        Response::Ok { data: None }
     }
 
     fn create_response(
@@ -390,18 +376,12 @@ impl Server {
         match result {
             Ok(()) => {
                 info!("Command completed successfully");
-                Response {
-                    success: true,
-                    error_message: String::new(),
-                    data,
-                }
+                Response::Ok { data }
             }
             Err(e) => {
                 warn!("Command failed: {}", e);
-                Response {
-                    success: false,
-                    error_message: e.to_string(),
-                    data: None,
+                Response::Err {
+                    message: e.to_string(),
                 }
             }
         }
@@ -681,13 +661,15 @@ mod tests {
         };
 
         let response = server.handle_command(command).await;
-        assert!(!response.success);
-        assert!(
-            response.error_message.contains("No such file or directory"),
-            "Error message '{}' should contain path '{}'",
-            response.error_message,
-            nonexistent_path.display()
-        );
-        assert!(response.data.is_none());
+        match response {
+            Response::Err { message } => {
+                assert!(
+                    message.contains("No such file or directory"),
+                    "Error message '{}' should contain 'No such file or directory'",
+                    message
+                );
+            }
+            Response::Ok { .. } => panic!("Expected Err response for nonexistent track"),
+        }
     }
 }

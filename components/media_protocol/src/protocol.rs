@@ -66,10 +66,10 @@ pub enum Command {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Response {
-    pub success: bool,
-    pub error_message: String,
-    pub data: Option<ResponseData>,
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum Response {
+    Ok { data: Option<ResponseData> },
+    Err { message: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +86,42 @@ pub enum ResponseData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_response_ok_serialization() {
+        let resp = Response::Ok { data: None };
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, Response::Ok { data: None }));
+    }
+
+    #[test]
+    fn test_response_err_serialization() {
+        let resp = Response::Err {
+            message: "something went wrong".to_string(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, Response::Err { .. }));
+        if let Response::Err { message } = decoded {
+            assert_eq!(message, "something went wrong");
+        }
+    }
+
+    #[test]
+    fn test_response_ok_with_data_serialization() {
+        let resp = Response::Ok {
+            data: Some(ResponseData::Position(42)),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            Response::Ok {
+                data: Some(ResponseData::Position(42))
+            }
+        ));
+    }
 
     #[test]
     fn test_set_volume_command_serialization() {

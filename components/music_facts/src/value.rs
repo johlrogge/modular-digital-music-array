@@ -88,6 +88,13 @@ impl fmt::Display for MusicFormat {
     }
 }
 
+/// Presence or absence of embedded album art in a music file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AlbumArtPresence {
+    Present,
+    Absent,
+}
+
 /// All possible metadata values for a music track
 ///
 /// Each variant represents a single fact that can be asserted or retracted
@@ -209,7 +216,7 @@ pub enum MusicValue {
     FileSizeBytes(FileSizeBytes),
 
     /// Whether the file has embedded album art
-    HasAlbumArt(bool),
+    HasAlbumArt(AlbumArtPresence),
 
     /// Audio file format (FLAC, MP3, AIFF, WAV)
     Format(MusicFormat),
@@ -308,7 +315,15 @@ impl fmt::Display for MusicValue {
             MusicValue::DurationSeconds(d) => write!(f, "{}", d),
             MusicValue::Bitrate(b) => write!(f, "{}", b),
             MusicValue::FileSizeBytes(s) => write!(f, "{}", s),
-            MusicValue::HasAlbumArt(b) => write!(f, "{}", if *b { "yes" } else { "no" }),
+            MusicValue::HasAlbumArt(p) => write!(
+                f,
+                "{}",
+                if *p == AlbumArtPresence::Present {
+                    "yes"
+                } else {
+                    "no"
+                }
+            ),
             MusicValue::Format(ref fmt_val) => write!(f, "{}", fmt_val),
             MusicValue::EncoderSoftware(s) => write!(f, "{}", s),
             MusicValue::EncodedBy(s) => write!(f, "{}", s),
@@ -329,7 +344,7 @@ mod tests {
         // This will fail at compile time if the serde attributes are wrong
         assert_fact_value_format!(MusicValue::Title(Title::new("Test")));
         assert_fact_value_format!(MusicValue::Artist(Artist::new("Test Artist")));
-        assert_fact_value_format!(MusicValue::HasAlbumArt(true));
+        assert_fact_value_format!(MusicValue::HasAlbumArt(AlbumArtPresence::Present));
     }
 
     #[test]
