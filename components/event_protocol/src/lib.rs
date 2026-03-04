@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// Topic prefix for all playback events.
 pub const TOPIC_PLAYBACK: &str = "playback/";
@@ -113,24 +114,15 @@ pub fn from_topic_message(bytes: &[u8]) -> Result<(&str, PlaybackEvent), ParseEr
     Ok((topic, event))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum ParseError {
+    #[error("no null separator in topic message")]
     MissingSeparator,
+    #[error("topic is not valid UTF-8")]
     InvalidTopic,
-    Json(serde_json::Error),
+    #[error("JSON parse error: {0}")]
+    Json(#[from] serde_json::Error),
 }
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ParseError::MissingSeparator => write!(f, "no null separator in topic message"),
-            ParseError::InvalidTopic => write!(f, "topic is not valid UTF-8"),
-            ParseError::Json(e) => write!(f, "JSON parse error: {}", e),
-        }
-    }
-}
-
-impl std::error::Error for ParseError {}
 
 #[cfg(test)]
 mod tests {

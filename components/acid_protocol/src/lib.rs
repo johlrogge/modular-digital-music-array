@@ -5,7 +5,6 @@
 //! - acid-ipc-client (used by services that write/read facts)
 
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 // ============================================================================
 // Fact Entry
@@ -69,16 +68,6 @@ pub enum AcidResponse {
 
     /// Error response.
     Error { message: String },
-}
-
-// ============================================================================
-// Protocol Errors
-// ============================================================================
-
-#[derive(Debug, Error)]
-pub enum ProtocolError {
-    #[error("serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
 }
 
 // ============================================================================
