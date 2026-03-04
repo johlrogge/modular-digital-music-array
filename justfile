@@ -29,7 +29,7 @@ test-integration:
     echo "Seeding test data..."
     rm -rf /tmp/mdma-dev/metadata
     mkdir -p /tmp/mdma-dev/{metadata,music/inbox,music/blobs,run/sources}
-    cargo run --package mdma-bdd-seed -- /tmp/mdma-dev/metadata
+    cargo run --package mdma-bdd --bin mdma-bdd-seed -- /tmp/mdma-dev/metadata
     echo "Starting local services..."
     devenv up --detach
     # Wait for gateway to be ready (up to 30s)
