@@ -186,6 +186,7 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use acid_protocol::FactEntry;
+    use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 
     fn temp_metadata() -> TempDir {
@@ -250,7 +251,7 @@ mod tests {
         let response = handle_request(&request, dir.path());
         match response {
             AcidResponse::StreamChunk(chunk) => {
-                assert!(chunk.lines.is_empty());
+                assert_eq!(chunk.lines, Vec::<String>::new());
                 assert_eq!(chunk.next_offset, 0);
             }
             other => panic!("unexpected response: {other:?}"),

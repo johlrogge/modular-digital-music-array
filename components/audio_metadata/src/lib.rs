@@ -373,6 +373,7 @@ pub fn infer_from_path(path: &Path) -> (Option<String>, Option<String>, Option<S
 mod tests {
     use super::*;
     use lofty::{MimeType, Picture, PictureType as LoftyPictureType, Tag, TagExt, TagType};
+    use pretty_assertions::assert_eq;
     use std::io::Write;
     use tempfile::NamedTempFile;
 

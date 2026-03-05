@@ -20,6 +20,9 @@ package = "music-facts"
 path = "../music_facts"
 optional = true
 
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+
 [dependencies.playback-primitives]
 package = "playback-primitives"
 path = "../playback_primitives"

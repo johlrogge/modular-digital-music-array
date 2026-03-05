@@ -13,4 +13,5 @@ thiserror = { workspace = true }
 dirs = "6"
 
 [dev-dependencies]
+pretty_assertions = { workspace = true }
 tempfile = "3"

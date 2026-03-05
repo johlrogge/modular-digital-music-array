@@ -270,6 +270,7 @@ fn parse_genre(genre: &str) -> (String, Vec<String>, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn format_fact_generated_for_audio_formats() {

@@ -483,7 +483,7 @@ mod tests {
     use crate::provisioning::types::{DevicePath, MountPoint, Partition, PartitionSize};
 
     #[test]
-    fn test_verify_partition_with_valid_data() {
+    fn verify_partition_with_valid_data() {
         let lsblk_json = r#"{
             "blockdevices": [
                 {
@@ -516,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_partition_fstype_mismatch() {
+    fn verify_partition_fstype_mismatch() {
         let lsblk_json = r#"{
             "blockdevices": [
                 {
@@ -552,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_partition_label_mismatch() {
+    fn verify_partition_label_mismatch() {
         let lsblk_json = r#"{
             "blockdevices": [
                 {
@@ -588,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_partition_not_found() {
+    fn verify_partition_not_found() {
         let lsblk_json = r#"{
             "blockdevices": [
                 {

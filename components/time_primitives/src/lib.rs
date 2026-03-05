@@ -119,9 +119,10 @@ impl From<Tempo> for f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
-    fn test_ticks_operations() {
+    fn ticks_operations() {
         let t1 = Ticks::new(100);
         let t2 = Ticks::new(50);
 
@@ -131,14 +132,14 @@ mod tests {
     }
 
     #[test]
-    fn test_ppqn_validation() {
+    fn ppqn_validation() {
         assert!(matches!(Ppqn::new(0).unwrap_err(), TimeError::ZeroPpqn));
         assert!(Ppqn::new(960).is_ok());
         assert_eq!(Ppqn::DEFAULT.raw(), 960);
     }
 
     #[test]
-    fn test_tempo_validation() {
+    fn tempo_validation() {
         assert!(matches!(
             Tempo::new(0.0).unwrap_err(),
             TimeError::TempoOutOfRange {
@@ -160,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn test_serialization() {
+    fn serialization() {
         let ticks = Ticks::new(42);
         let json = serde_json::to_string(&ticks).unwrap();
         let decoded: Ticks = serde_json::from_str(&json).unwrap();

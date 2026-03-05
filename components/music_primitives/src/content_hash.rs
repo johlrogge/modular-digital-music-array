@@ -26,6 +26,7 @@ impl Display for ContentHash {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn new_stores_hash_string() {

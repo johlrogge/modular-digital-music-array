@@ -182,6 +182,7 @@ fn validate_cookies(cookies: &[(String, String, String)]) -> Result<(), Bandcamp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn parse_json_array_format() {

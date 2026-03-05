@@ -1093,6 +1093,7 @@ mod tests {
     use music_facts::{
         ContentHash, FactOrigin, FactSource, MusicValue, StartReason, StopReason, Title,
     };
+    use pretty_assertions::assert_eq;
     use stainless_facts::{Fact, FactStreamWriter, Operation};
     use tempfile::NamedTempFile;
 
@@ -1461,7 +1462,9 @@ mod tests {
         let (service, _dir) = make_service_with_playlists_dir();
         let response = service.handle_request(LibraryRequest::PlaylistList);
         match response {
-            LibraryResponse::PlaylistNames(names) => assert!(names.is_empty()),
+            LibraryResponse::PlaylistNames(names) => {
+                assert!(names.is_empty())
+            }
             other => panic!("Expected PlaylistNames, got {:?}", other),
         }
     }

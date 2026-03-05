@@ -11,4 +11,5 @@ lofty = {workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+pretty_assertions = { workspace = true }
 tempfile = "3"

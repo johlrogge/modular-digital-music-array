@@ -145,6 +145,7 @@ pub fn extract_zip(zip_path: &Path, output_dir: &Path) -> Result<Vec<PathBuf>, s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
     use std::io::Write;
 
     #[test]

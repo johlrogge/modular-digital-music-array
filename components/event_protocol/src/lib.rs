@@ -128,6 +128,7 @@ pub enum ParseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn event_uses_content_hash_type() {

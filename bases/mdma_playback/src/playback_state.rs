@@ -290,6 +290,7 @@ impl Default for PlaybackStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     fn hash_a() -> ContentHash {
         ContentHash::new("sha256:aaaaaa")
@@ -447,7 +448,7 @@ mod tests {
         let mut sm = PlaybackStateMachine::new();
         let effects = sm.stop();
         assert_eq!(sm.state(), &PlaybackState::Idle);
-        assert!(effects.is_empty());
+        assert_eq!(effects, vec![]);
     }
 
     // -------------------------------------------------------------------------
@@ -560,7 +561,7 @@ mod tests {
         let effects = sm.skip(None);
 
         assert_eq!(sm.state(), &PlaybackState::Idle);
-        assert!(effects.is_empty());
+        assert_eq!(effects, vec![]);
     }
 
     // -------------------------------------------------------------------------
@@ -594,7 +595,7 @@ mod tests {
         let effects = sm.pause();
 
         assert!(matches!(sm.state(), PlaybackState::Paused { .. }));
-        assert!(effects.is_empty());
+        assert_eq!(effects, vec![]);
     }
 
     #[test]
@@ -604,7 +605,7 @@ mod tests {
         let effects = sm.pause();
 
         assert_eq!(sm.state(), &PlaybackState::Idle);
-        assert!(effects.is_empty());
+        assert_eq!(effects, vec![]);
     }
 
     // -------------------------------------------------------------------------
@@ -638,7 +639,7 @@ mod tests {
         let effects = sm.resume();
 
         assert!(matches!(sm.state(), PlaybackState::Playing { .. }));
-        assert!(effects.is_empty());
+        assert_eq!(effects, vec![]);
     }
 
     #[test]
@@ -648,7 +649,7 @@ mod tests {
         let effects = sm.resume();
 
         assert_eq!(sm.state(), &PlaybackState::Idle);
-        assert!(effects.is_empty());
+        assert_eq!(effects, vec![]);
     }
 
     // -------------------------------------------------------------------------
@@ -704,7 +705,7 @@ mod tests {
 
         // Safe no-op — should not happen but handled gracefully.
         assert!(matches!(sm.state(), PlaybackState::Paused { .. }));
-        assert!(effects.is_empty());
+        assert_eq!(effects, vec![]);
     }
 
     #[test]
@@ -714,7 +715,7 @@ mod tests {
         let effects = sm.track_ended(None);
 
         assert_eq!(sm.state(), &PlaybackState::Idle);
-        assert!(effects.is_empty());
+        assert_eq!(effects, vec![]);
     }
 
     // -------------------------------------------------------------------------
@@ -753,7 +754,7 @@ mod tests {
         assert_eq!(sm.state(), &PlaybackState::Idle);
         // Auto-advance (track_ended) should now be a no-op.
         let effects = sm.track_ended(None);
-        assert!(effects.is_empty());
+        assert_eq!(effects, vec![]);
     }
 
     #[test]

@@ -410,9 +410,10 @@ pub struct ProvisionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
-    fn test_hostname_validation() {
+    fn hostname_validation() {
         // Valid hostnames
         assert!(Hostname::new("mdma-909".to_string()).is_ok());
         assert!(Hostname::new("test.example.com".to_string()).is_ok());
@@ -433,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ssh_key_validation() {
+    fn ssh_key_validation() {
         let valid_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ user@host";
         assert!(SshPublicKey::new(valid_key.to_string()).is_ok());
 
@@ -444,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn test_device_path_validation() {
+    fn device_path_validation() {
         assert!(DevicePath::new("/dev/nvme0n1").is_ok());
         assert!(DevicePath::new("/dev/sda1").is_ok());
 
@@ -459,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mount_point() {
+    fn mount_point() {
         let mp = MountPoint::Music;
         assert_eq!(mp.as_str(), "/music");
         assert_eq!(mp.to_string(), "/music");
@@ -479,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unit_type_display() {
+    fn unit_type_display() {
         assert_eq!(UnitType::Mdma909.to_string(), "mdma-909");
         assert_eq!(UnitType::Mdma101.as_str(), "mdma-101");
         assert!(UnitType::Mdma909.requires_dual_nvme());

@@ -101,6 +101,7 @@ mod music {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     /// Verify that ClientError::Service variant is constructable and displays correctly.
     #[test]

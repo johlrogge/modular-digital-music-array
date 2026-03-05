@@ -80,6 +80,7 @@ impl FactWriter {
 mod tests {
     use super::*;
     use music_facts::{Artist, FactOrigin, Title};
+    use pretty_assertions::assert_eq;
     use tempfile::NamedTempFile;
 
     #[test]

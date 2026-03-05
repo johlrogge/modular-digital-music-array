@@ -167,9 +167,10 @@ pub type StorageCapacity = ByteSize;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
-    fn test_constructors() {
+    fn constructors() {
         assert_eq!(ByteSize::from_gb(1).bytes(), 1_000_000_000);
         assert_eq!(ByteSize::from_mb(1).bytes(), 1_000_000);
         assert_eq!(ByteSize::from_kb(1).bytes(), 1_000);
@@ -177,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn test_conversions() {
+    fn conversions() {
         let size = ByteSize::from_gb(512);
         assert_eq!(size.gigabytes(), 512);
         assert_eq!(size.megabytes(), 512_000);
@@ -185,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn test_display_formatting() {
+    fn display_formatting() {
         assert_eq!(ByteSize::from_tb(2).to_string(), "2.0 TB");
         assert_eq!(ByteSize::from_gb(512).to_string(), "512 GB");
         assert_eq!(ByteSize::from_mb(100).to_string(), "100 MB");
@@ -194,13 +195,13 @@ mod tests {
     }
 
     #[test]
-    fn test_fractional_gb() {
+    fn fractional_gb() {
         let size = ByteSize::new(1_500_000_000);
         assert_eq!(size.gigabytes_f64(), 1.5);
     }
 
     #[test]
-    fn test_saturating_arithmetic() {
+    fn saturating_arithmetic() {
         let size1 = ByteSize::from_gb(100);
         let size2 = ByteSize::from_gb(200);
 
@@ -210,13 +211,13 @@ mod tests {
     }
 
     #[test]
-    fn test_ordering() {
+    fn ordering() {
         assert!(ByteSize::from_gb(100) < ByteSize::from_gb(200));
         assert!(ByteSize::from_mb(100) < ByteSize::from_gb(1));
     }
 
     #[test]
-    fn test_type_aliases() {
+    fn type_aliases() {
         let _file: FileSize = ByteSize::from_mb(50);
         let _partition: PartitionSize = ByteSize::from_gb(400);
         let _storage: StorageCapacity = ByteSize::from_tb(2);

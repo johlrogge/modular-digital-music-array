@@ -198,6 +198,7 @@ pub enum SourceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn request_ping_roundtrip() {

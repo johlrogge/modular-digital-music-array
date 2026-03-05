@@ -120,8 +120,9 @@ impl Deck {
 mod tests {
     use super::*;
 
-    mod volume_tests {
+    mod volume {
         use super::*;
+        use pretty_assertions::assert_eq;
 
         #[test]
         fn unity_is_linear_one() {
@@ -165,7 +166,7 @@ mod tests {
         }
 
         #[test]
-        fn test_serialization() {
+        fn serialization() {
             let vol = Volume::new(-6.0).unwrap();
             let json = serde_json::to_string(&vol).unwrap();
             let decoded: Volume = serde_json::from_str(&json).unwrap();
@@ -182,8 +183,9 @@ mod tests {
         }
     }
 
-    mod channel_tests {
+    mod channel {
         use super::*;
+        use pretty_assertions::assert_eq;
 
         #[test]
         fn creates_channel_a() {
@@ -201,7 +203,7 @@ mod tests {
         }
 
         #[test]
-        fn test_serialization() {
+        fn serialization() {
             let channel = Deck::A;
             let json = serde_json::to_string(&channel).unwrap();
             let decoded: Deck = serde_json::from_str(&json).unwrap();

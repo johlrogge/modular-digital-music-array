@@ -336,6 +336,7 @@ impl fmt::Display for MusicValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
     use stainless_facts::assert_fact_value_format;
 
     #[test]

@@ -110,6 +110,7 @@ pub(crate) fn run_ffmpeg(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
     use std::path::PathBuf;
 
     fn source() -> PathBuf {

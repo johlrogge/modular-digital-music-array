@@ -1578,6 +1578,7 @@ async fn export_track(
 mod tests {
     use super::*;
     use library_ipc_client::{Bpm, ContentHash, DurationSeconds, Key};
+    use pretty_assertions::assert_eq;
     use source_protocol::{AuthStatus, QueueState, SourceResponse, SourceStatus};
 
     fn make_source_status() -> SourceStatus {

@@ -86,9 +86,10 @@ pub enum ResponseData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
-    fn test_response_ok_serialization() {
+    fn response_ok_serialization() {
         let resp = Response::Ok { data: None };
         let json = serde_json::to_string(&resp).unwrap();
         let decoded: Response = serde_json::from_str(&json).unwrap();
@@ -96,7 +97,7 @@ mod tests {
     }
 
     #[test]
-    fn test_response_err_serialization() {
+    fn response_err_serialization() {
         let resp = Response::Err {
             message: "something went wrong".to_string(),
         };
@@ -109,7 +110,7 @@ mod tests {
     }
 
     #[test]
-    fn test_response_ok_with_data_serialization() {
+    fn response_ok_with_data_serialization() {
         let resp = Response::Ok {
             data: Some(ResponseData::Position(42)),
         };
@@ -124,7 +125,7 @@ mod tests {
     }
 
     #[test]
-    fn test_set_volume_command_serialization() {
+    fn set_volume_command_serialization() {
         use playback_primitives::Volume;
         let vol = Volume::new(-6.0).unwrap();
         let cmd = Command::SetVolume {
@@ -143,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn test_play_command_serialization() {
+    fn play_command_serialization() {
         let cmd = Command::Play { deck: Deck::A };
         let json = serde_json::to_string(&cmd).unwrap();
         let decoded: Command = serde_json::from_str(&json).unwrap();
@@ -152,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn test_skip_command_serialization() {
+    fn skip_command_serialization() {
         let cmd = Command::Skip;
         let json = serde_json::to_string(&cmd).unwrap();
         assert_eq!(json, r#""skip""#);
@@ -161,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_session_command_serialization() {
+    fn get_session_command_serialization() {
         let cmd = Command::GetSession;
         let json = serde_json::to_string(&cmd).unwrap();
         assert_eq!(json, r#""get_session""#);
@@ -170,7 +171,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pause_command_serialization() {
+    fn pause_command_serialization() {
         let cmd = Command::Pause { deck: Deck::A };
         let json = serde_json::to_string(&cmd).unwrap();
         let decoded: Command = serde_json::from_str(&json).unwrap();
@@ -178,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resume_command_serialization() {
+    fn resume_command_serialization() {
         let cmd = Command::Resume { deck: Deck::A };
         let json = serde_json::to_string(&cmd).unwrap();
         let decoded: Command = serde_json::from_str(&json).unwrap();
@@ -186,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_response_data_serialization() {
+    fn session_response_data_serialization() {
         let data = ResponseData::Session(Some("2026-02-24T12:00:00+00:00".to_string()));
         let json = serde_json::to_string(&data).unwrap();
         let decoded: ResponseData = serde_json::from_str(&json).unwrap();
