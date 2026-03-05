@@ -18,6 +18,116 @@ Five non-negotiable rules:
 
 5. **Unit tests must be fast** — thousands per second. No I/O, no network, no `thread::sleep`.
 
+## Test Grouping
+
+Two tools for grouping tests:
+
+- **rstest `#[case]`** — when multiple tests share the same assertion pattern with different inputs. This is the primary tool for parameterization.
+- **submodules** — when breaking up a test that covers multiple *distinct behaviors* of the same subject that cannot be parameterized. Group related single-assert tests under a descriptive submodule.
+
+Submodules are valid for *topic* grouping (different tests, same subject area). rstest replaces *scenario* modules (same test, different inputs) — not topic grouping.
+
+Example of submodule grouping for a state machine:
+
+```rust
+#[cfg(test)]
+mod tests {
+    mod play_queue {
+        #[test]
+        fn from_idle_state_becomes_playing() { /* ... */ }
+
+        #[test]
+        fn from_idle_emits_load_and_play() { /* ... */ }
+
+        #[test]
+        fn from_playing_stops_current_then_loads_new() { /* ... */ }
+    }
+
+    mod skip {
+        #[test]
+        fn with_next_track_advances_queue() { /* ... */ }
+
+        #[test]
+        fn on_empty_queue_transitions_to_idle() { /* ... */ }
+    }
+}
+```
+
+## Test Naming
+
+### Rule 1: DRY — don't repeat context
+
+- No `test_` prefix on functions inside `mod tests`
+- No repeating the submodule name in the function name
+- No repeating the type name in associated test methods
+- Rename `foo_tests` submodules to just `foo`
+
+```rust
+// Bad
+mod tests { fn test_playlist_create() { ... } }
+mod volume { fn volume_converts_to_linear() { ... } }
+
+// Good
+mod tests { fn playlist_create() { ... } }
+mod volume { fn converts_to_linear() { ... } }
+```
+
+### Rule 2: Name describes the outcome/behavior being verified
+
+The test name states *what should happen*, not *what action is performed*. The submodule provides the action context; the function name states the expected outcome.
+
+```rust
+mod tests {
+    mod add_track {
+        #[test]
+        fn does_not_allow_adding_the_same_track_twice() {
+            add_track("track1").expect("first add should succeed");
+            assert_eq!(add_track("track1"), Err(DuplicateTrack));
+        }
+    }
+}
+```
+
+## Assertion Rules
+
+### Use `pretty_assertions`
+
+Add `use pretty_assertions::assert_eq;` in test modules. It produces structured diffs on failure instead of raw Debug output, making it far easier to spot what differs.
+
+### Avoid bare `assert!()`
+
+Prefer `assert_eq!` with an explicit expected value so failures show what was actually received.
+
+### Test collection equality, not length
+
+```rust
+// Bad
+assert!(my_vec.is_empty());
+// Good
+assert_eq!(my_vec, vec![]);
+
+// Bad
+assert_eq!(results.len(), 2);
+// Good
+assert_eq!(results, vec![expected_a, expected_b]);
+```
+
+### Exception: selective field assertions on one value
+
+Multiple asserts on the *same returned value* checking different fields is acceptable when they all answer "did we get the right thing?" This is one logical assertion split across fields you care about.
+
+```rust
+#[test]
+fn returns_the_matching_track() {
+    let track = library.search("Init").first();
+    assert_eq!(track.artist, "Carbon Based Lifeforms");
+    assert_eq!(track.title, "Init");
+    // duration, bpm, key — don't care, don't assert
+}
+```
+
+If you find yourself writing eight field assertions selectively, ask: does this struct need to be this large? Needing many selective field assertions is a design smell.
+
 ## Serialization Testing
 
 - Serialize and deserialize are **separate concerns** — never test as round-trip in example-based tests
@@ -72,14 +182,14 @@ use rstest::*;
 #[case(1, 2, 3)]
 #[case(5, 5, 10)]
 #[case(0, 100, 100)]
-fn test_addition(#[case] a: i32, #[case] b: i32, #[case] expected: i32) {
+fn addition(#[case] a: i32, #[case] b: i32, #[case] expected: i32) {
     assert_eq!(a + b, expected);
 }
 ```
 
-**Replaces scenario modules**: Instead of creating submodules for different scenarios, use rstest with multiple cases.
+**Replaces scenario modules**: Instead of creating submodules for different scenarios of the *same test with different inputs*, use rstest with multiple cases. Submodules remain valid for topic grouping of *different tests on the same subject*.
 
-#### Before (submodule pattern):
+#### Before (scenario submodule — replaced by rstest):
 ```rust
 #[cfg(test)]
 mod tests {
@@ -104,7 +214,7 @@ mod tests {
     #[rstest]
     #[case::user_exists(UserId(1), Some(user))]
     #[case::user_missing(UserId(999), None)]
-    fn test_get_user(#[case] id: UserId, #[case] expected: Option<User>) {
+    fn get_user(#[case] id: UserId, #[case] expected: Option<User>) {
         let result = get_user(id);
         assert_eq!(result, expected);
     }
@@ -122,7 +232,7 @@ fn sample_user() -> User {
 }
 
 #[rstest]
-fn test_user_operations(sample_user: User) {
+fn user_has_expected_id(sample_user: User) {
     assert_eq!(sample_user.id, UserId(1));
 }
 ```
@@ -142,7 +252,7 @@ use proptest::prelude::*;
 
 proptest! {
     #[test]
-    fn test_reversing_twice_is_identity(s: String) {
+    fn reversing_twice_is_identity(s: String) {
         let reversed_twice = s.chars().rev().collect::<String>()
             .chars().rev().collect::<String>();
         prop_assert_eq!(s, reversed_twice);
@@ -181,7 +291,7 @@ criterion_main!(benches);
 use tokio::test;
 
 #[tokio::test]
-async fn test_async_operation() {
+async fn async_operation_succeeds() {
     let result = fetch_data().await;
     assert!(result.is_ok());
 }
@@ -209,11 +319,12 @@ impl User {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
     use rstest::*;
 
     #[rstest]
     #[case(UserId(1), "test@example.com")]
-    fn test_user_creation(#[case] id: UserId, #[case] email: &str) {
+    fn user_creation(#[case] id: UserId, #[case] email: &str) {
         let user = User::new(id, email.into());
         assert_eq!(user.id, id);
         assert_eq!(user.email, email);
@@ -224,7 +335,6 @@ mod tests {
 **Access to private items**: Tests can access private module items because they're in the same module.
 
 ```rust
-// Private function in module
 fn internal_helper(x: i32) -> i32 {
     x * 2
 }
@@ -234,8 +344,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_internal_helper() {
-        // Can test private functions
+    fn internal_helper_doubles_input() {
         assert_eq!(internal_helper(5), 10);
     }
 }
@@ -262,7 +371,16 @@ fn internal_function() -> i32 {
 
 ## Builder Pattern for Test Fixtures (Object Mother)
 
-Use the builder pattern to create test fixtures with sensible defaults and easy customization.
+Builders serve double duty: they set up test state AND construct expected values for `assert_eq!`. When you need to express "I only care about these fields," builders let you declare what matters without spelling out every irrelevant default.
+
+```rust
+assert_eq!(
+    library.get_track(hash),
+    TrackBuilder::new().artist("Carbon Based Lifeforms").title("Init").build()
+);
+```
+
+Without builders, `assert_eq!` on structs forces you to spell out every field, burying the test's intent. With builders, the test declares what matters.
 
 ### Basic Test Builder
 
@@ -271,7 +389,6 @@ Use the builder pattern to create test fixtures with sensible defaults and easy 
 mod tests {
     use super::*;
 
-    // Builder with sensible test defaults
     struct UserBuilder {
         id: UserId,
         email: String,
@@ -317,12 +434,12 @@ mod tests {
     #[rstest]
     #[case::verified_user(UserBuilder::new().build())]
     #[case::unverified_user(UserBuilder::new().unverified().build())]
-    fn test_user_scenarios(#[case] user: User) {
+    fn user_scenarios(#[case] user: User) {
         // Test with different user configurations
     }
 
     #[test]
-    fn test_specific_email() {
+    fn specific_email_is_stored() {
         let user = UserBuilder::new()
             .with_email("specific@example.com")
             .build();
@@ -332,24 +449,55 @@ mod tests {
 }
 ```
 
+### Composable Closure-Based Builder
+
+For test fixtures that combine multiple nested objects, the closure pattern composes cleanly and reads like a declarative description of the test state:
+
+```rust
+struct TestBuilder<S>(S);
+
+impl TestBuilder<TestLibrary> {
+    fn build(setup: impl FnOnce(Self) -> Self) -> TestLibrary {
+        let TestBuilder(library) = setup(Self(TestLibrary::default()));
+        library
+    }
+
+    fn track(self, tb: impl FnOnce(TestBuilder<&mut Track>) -> TestBuilder<&mut Track>) -> Self {
+        let mut library = self.0;
+        let track = library.add_default_track();
+        tb(TestBuilder(track));
+        Self(library)
+    }
+}
+
+impl TestBuilder<&mut Track> {
+    fn artist(self, name: &str) -> Self { self.0.artist = name.into(); self }
+    fn title(self, name: &str) -> Self { self.0.title = name.into(); self }
+    fn bpm(self, bpm: f32) -> Self { self.0.bpm = Some(Bpm::from_f32(bpm).unwrap()); self }
+}
+
+// Usage in tests:
+let library = TestBuilder::build(|lib| lib
+    .track(|t| t.artist("Carbon Based Lifeforms").title("Init").bpm(128.0))
+    .track(|t| t.artist("Sunju Hargun").title("Silverhaze"))
+);
+```
+
 ### Multiple Builders for Different Scenarios
 
 ```rust
 #[cfg(test)]
 mod tests {
-    // Default happy-path user
     fn user() -> UserBuilder {
         UserBuilder::new()
     }
 
-    // Admin user preset
     fn admin_user() -> UserBuilder {
         UserBuilder::new()
             .with_role(Role::Admin)
             .with_permissions(all_permissions())
     }
 
-    // Suspended user preset
     fn suspended_user() -> UserBuilder {
         UserBuilder::new()
             .suspended()
@@ -431,13 +579,13 @@ mod tests {
     }
 
     #[test]
-    fn test_with_environment() {
+    fn environment_starts_with_correct_port() {
         let env = TestEnvironmentBuilder::new()
             .with_database(TestDb::in_memory())
             .with_port(8080)
             .build();
 
-        // Test with fully configured environment
+        assert_eq!(env.port, 8080);
     }
 }
 ```
@@ -472,7 +620,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_user_creation(test_db: TestDatabase) {
+    fn saved_user_is_retrievable_by_email(test_db: TestDatabase) {
         let user = UserBuilder::new()
             .with_email("new@example.com")
             .build();
@@ -498,6 +646,7 @@ mod tests {
 3. **Readable tests** - Intent is clear from builder chain
 4. **DRY** - Reuse builders across tests
 5. **Type safety** - When combined with typestate, ensures valid setup
+6. **Expressive assertions** - Build expected values with the same builders used for setup
 
 ## Test Doubles: Terminology and Usage
 
@@ -639,7 +788,7 @@ mod tests {
     #[rstest]
     #[case(vec![1, 2, 3], 6)]
     #[case(vec![10, 20], 30)]
-    fn test_sum(#[case] input: Vec<i32>, #[case] expected: i32) {
+    fn sum_of_inputs(#[case] input: Vec<i32>, #[case] expected: i32) {
         assert_eq!(sum(&input), expected);
     }
 }
@@ -726,7 +875,6 @@ Balance type-level guarantees with test coverage:
 - **Tests**: Verify correct behavior given valid states
 
 ```rust
-// Type prevents invalid age
 struct Age(u8);  // 0-255 range
 
 impl Age {
@@ -746,7 +894,7 @@ mod tests {
     #[case(50, true)]
     #[case(150, true)]
     #[case(151, false)]
-    fn test_age_validation(#[case] years: u8, #[case] valid: bool) {
+    fn age_validation(#[case] years: u8, #[case] valid: bool) {
         assert_eq!(Age::new(years).is_ok(), valid);
     }
 }
@@ -813,6 +961,8 @@ fn end_to_end_user_workflow() {
 8. **Doctests for examples only**, not comprehensive coverage
 9. **Avoid `#[cfg(test)]` exposure** when possible (code smell)
 10. **Use proptest** for round-trip invariants and property verification — it is mandated for any type implementing `Serialize + Deserialize`
+11. **Use `pretty_assertions`** in test modules for clear diffs on failure
+12. **Use builders** to construct both test fixtures and expected values
 
 ## Review Checklist
 
@@ -825,3 +975,10 @@ fn end_to_end_user_workflow() {
 - [ ] No `thread::sleep` or real network calls
 - [ ] Test names describe the single behavior being verified
 - [ ] New code follows TDD (test written before implementation)
+- [ ] No `test_` prefix on functions inside `mod tests`
+- [ ] Function names do not repeat their enclosing module or type name
+- [ ] Test names describe the outcome/behavior, not the action
+- [ ] Related tests grouped in submodules when not parameterizable by rstest
+- [ ] Uses `pretty_assertions::assert_eq!` in test modules
+- [ ] No bare `assert!()` when `assert_eq!` with expected value is possible
+- [ ] Collection assertions compare full contents, not `.len()` or `.is_empty()`
