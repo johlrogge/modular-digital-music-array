@@ -3,7 +3,6 @@
 members = [
     # Components (bricks)
     "components/bandcamp_api",
-    "components/clock",
     "components/audio_metadata",
     "components/library_ipc_client",
     "components/library_ipc_protocol",

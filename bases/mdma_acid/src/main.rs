@@ -22,10 +22,6 @@ struct Args {
     /// nng IPC socket path
     #[arg(long, default_value = "ipc:///run/mdma/acid.sock")]
     socket: String,
-
-    /// Also listen on TCP for remote connections (e.g., "tcp://0.0.0.0:5560")
-    #[arg(long)]
-    tcp: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -161,11 +157,6 @@ fn main() -> Result<()> {
     let socket = nng::Socket::new(nng::Protocol::Rep0)?;
     socket.listen(&args.socket)?;
     tracing::info!(address = %args.socket, "ACID service listening");
-
-    if let Some(ref tcp) = args.tcp {
-        socket.listen(tcp)?;
-        tracing::info!(address = %tcp, "ACID service also listening on TCP");
-    }
 
     loop {
         let msg = socket.recv()?;

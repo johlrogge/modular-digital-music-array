@@ -433,7 +433,6 @@ fn process_download_to_inbox(
 pub async fn run_async_ipc_server(
     service: Arc<BandcampService>,
     address: String,
-    tcp_address: Option<String>,
 ) -> Result<(), ServiceError> {
     // Create channel for requests from NNG thread to async runtime
     let (request_tx, mut request_rx) = mpsc::channel::<IpcMessage>(32);
@@ -441,8 +440,7 @@ pub async fn run_async_ipc_server(
     // Spawn the NNG server in a blocking task
     let nng_handle = {
         let address = address.clone();
-        let tcp_address = tcp_address.clone();
-        tokio::task::spawn_blocking(move || run_nng_bridge(address, tcp_address, request_tx))
+        tokio::task::spawn_blocking(move || run_nng_bridge(address, request_tx))
     };
 
     tracing::info!("Async IPC server running");
@@ -464,14 +462,9 @@ pub async fn run_async_ipc_server(
 /// NNG bridge - runs in a blocking thread, communicates via channels
 fn run_nng_bridge(
     address: String,
-    tcp_address: Option<String>,
     request_tx: mpsc::Sender<IpcMessage>,
 ) -> Result<(), ServiceError> {
     let server = IpcServer::bind(&address)?;
-
-    if let Some(tcp) = tcp_address {
-        server.listen_also(&tcp)?;
-    }
 
     tracing::info!(address = %address, "NNG server listening");
 

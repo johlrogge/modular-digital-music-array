@@ -694,19 +694,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f46ad14479a25103f283c0f10005961cf086d8dc42205bb44c46ac563475dca6"
 
 [[package]]
-name = "clock"
-version = "0.5.0"
-dependencies = [
- "assert_matches",
- "parking_lot",
- "playback-primitives",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "time-primitives",
-]
-
-[[package]]
 name = "cmake"
 version = "0.1.52"
 source = "registry+https://github.com/rust-lang/crates.io-index"

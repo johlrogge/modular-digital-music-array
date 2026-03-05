@@ -160,7 +160,7 @@ pub fn boot_test_env(tracks: &[SeedTrack]) -> TestEnv {
     let lib_svc = Arc::clone(&library_service);
     let lib_addr = library_addr.clone();
     let library_thread = std::thread::spawn(move || {
-        let _ = library_service::service::run_ipc_server(lib_svc, &lib_addr, None);
+        let _ = library_service::service::run_ipc_server(lib_svc, &lib_addr);
     });
 
     // Give the library server a moment to bind

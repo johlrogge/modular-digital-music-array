@@ -22,10 +22,6 @@ struct Args {
     #[arg(long, default_value = "ipc:///run/mdma/library.sock")]
     socket: String,
 
-    /// Also listen on TCP for remote connections (e.g., "tcp://0.0.0.0:5555")
-    #[arg(long)]
-    tcp: Option<String>,
-
     /// ACID service socket address
     #[arg(long, default_value = "ipc:///run/mdma/acid.sock")]
     acid_socket: String,
@@ -79,7 +75,7 @@ async fn main() -> Result<()> {
     let library = std::sync::Arc::new(library);
 
     // Run IPC server (blocking)
-    service::run_ipc_server(library, &args.socket, args.tcp.as_deref())?;
+    service::run_ipc_server(library, &args.socket)?;
 
     Ok(())
 }

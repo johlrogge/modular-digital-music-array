@@ -25,10 +25,6 @@ struct Args {
     #[arg(long, default_value = "ipc:///run/mdma/playback.sock")]
     socket: String,
 
-    /// Also listen on TCP for remote connections (e.g., "tcp://0.0.0.0:5557")
-    #[arg(long)]
-    tcp: Option<String>,
-
     /// Path to queue persistence file (relative to cwd, which should be /music)
     #[arg(long, default_value = "queue.json")]
     queue_file: PathBuf,
@@ -55,11 +51,6 @@ fn main() -> Result<()> {
     let socket = Socket::new(Protocol::Rep0)?;
     info!("Listening on {}", args.socket);
     socket.listen(&args.socket)?;
-
-    if let Some(ref tcp) = args.tcp {
-        info!("Also listening on TCP: {}", tcp);
-        socket.listen(tcp)?;
-    }
 
     let event_pub = Socket::new(Protocol::Pub0)?;
     info!("Event publishing on {}", args.event_socket);

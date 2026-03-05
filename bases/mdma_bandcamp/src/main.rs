@@ -32,10 +32,6 @@ struct Args {
     #[arg(long, default_value = "ipc:///run/mdma/sources/bandcamp.sock")]
     socket: String,
 
-    /// Also listen on TCP for remote connections (e.g., "tcp://0.0.0.0:5556")
-    #[arg(long)]
-    tcp: Option<String>,
-
     /// Library service socket address for auto-ingest
     #[arg(long, default_value = "ipc:///run/mdma/library.sock")]
     library_socket: String,
@@ -144,7 +140,7 @@ async fn main() -> Result<()> {
 
     // Run async IPC server
     // NNG blocking I/O runs in a spawn_blocking task, bridged to async via channels
-    service::run_async_ipc_server(service, args.socket, args.tcp).await?;
+    service::run_async_ipc_server(service, args.socket).await?;
 
     Ok(())
 }
