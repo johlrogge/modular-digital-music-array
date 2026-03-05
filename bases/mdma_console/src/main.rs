@@ -1516,7 +1516,7 @@ async fn export_track(
     // This is blocking CPU/IO work so we run it in spawn_blocking.
     let transcode_format = req_format.to_transcoder_format();
 
-    let metadata = audio_transcoder::TrackMetadata {
+    let metadata = audio_transcoder::ExportMetadata {
         title: track.title.clone(),
         artist: track.artist.clone(),
         album: track.album.clone(),

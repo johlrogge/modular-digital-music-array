@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::{ExportFormat, TrackMetadata, TranscoderError};
+use crate::{ExportFormat, ExportMetadata, TranscoderError};
 
 /// Build the ffmpeg argument list for a transcode operation.
 ///
@@ -10,7 +10,7 @@ pub(crate) fn build_ffmpeg_args(
     source: &Path,
     output: &Path,
     format: &ExportFormat,
-    meta: &TrackMetadata,
+    meta: &ExportMetadata,
 ) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
 
@@ -84,7 +84,7 @@ pub(crate) fn run_ffmpeg(
     source: &Path,
     output: &Path,
     format: &ExportFormat,
-    meta: &TrackMetadata,
+    meta: &ExportMetadata,
 ) -> Result<(), TranscoderError> {
     let args = build_ffmpeg_args(source, output, format, meta);
 
@@ -128,8 +128,8 @@ mod tests {
         PathBuf::from("/output/track.flac")
     }
 
-    fn full_meta() -> TrackMetadata {
-        TrackMetadata {
+    fn full_meta() -> ExportMetadata {
+        ExportMetadata {
             title: Some("Test Track".to_string()),
             artist: Some("Test Artist".to_string()),
             album: Some("Test Album".to_string()),
@@ -138,8 +138,8 @@ mod tests {
         }
     }
 
-    fn empty_meta() -> TrackMetadata {
-        TrackMetadata {
+    fn empty_meta() -> ExportMetadata {
+        ExportMetadata {
             title: None,
             artist: None,
             album: None,
@@ -402,7 +402,7 @@ mod tests {
 
     #[test]
     fn partial_metadata_only_includes_present_fields() {
-        let meta = TrackMetadata {
+        let meta = ExportMetadata {
             title: Some("Only Title".to_string()),
             artist: None,
             album: None,
@@ -456,7 +456,7 @@ mod tests {
 
     #[test]
     fn bpm_is_formatted_with_two_decimal_places() {
-        let meta = TrackMetadata {
+        let meta = ExportMetadata {
             title: None,
             artist: None,
             album: None,

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-pub use playback_primitives::ContentHash;
+pub use music_primitives::ContentHash;
 
 /// International Standard Recording Code
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,35 +156,7 @@ impl fmt::Display for DurationSeconds {
     }
 }
 
-/// File size in bytes
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct FileSizeBytes(u64);
-
-impl FileSizeBytes {
-    pub fn new(val: u64) -> Self {
-        Self(val)
-    }
-
-    pub fn value(self) -> u64 {
-        self.0
-    }
-}
-
-impl fmt::Display for FileSizeBytes {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let bytes = self.0;
-        if bytes >= 1_000_000_000 {
-            write!(f, "{:.2} GB", bytes as f64 / 1_000_000_000.0)
-        } else if bytes >= 1_000_000 {
-            write!(f, "{:.2} MB", bytes as f64 / 1_000_000.0)
-        } else if bytes >= 1_000 {
-            write!(f, "{:.2} KB", bytes as f64 / 1_000.0)
-        } else {
-            write!(f, "{} bytes", bytes)
-        }
-    }
-}
+pub use storage_primitives::ByteSize as FileSizeBytes;
 
 /// Bitrate in kbps
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

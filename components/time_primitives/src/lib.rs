@@ -30,7 +30,7 @@ impl Add for Ticks {
     type Output = Self;
 
     fn add(self, other: Self) -> Self {
-        Self(self.0 + other.0)
+        Self(self.0.saturating_add(other.0))
     }
 }
 

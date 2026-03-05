@@ -59,7 +59,7 @@ impl ExportFormat {
 
 /// Metadata to inject into exported files.
 #[derive(Debug, Clone, Default)]
-pub struct TrackMetadata {
+pub struct ExportMetadata {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
@@ -219,7 +219,7 @@ pub fn transcode(
     source: &Path,
     output: &Path,
     format: &ExportFormat,
-    meta: &TrackMetadata,
+    meta: &ExportMetadata,
 ) -> Result<(), TranscoderError> {
     ffmpeg::run_ffmpeg(source, output, format, meta)
 }

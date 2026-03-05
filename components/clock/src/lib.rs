@@ -2,6 +2,7 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use time_primitives::{Tempo, Ticks};
 
 pub mod protocol;
 
@@ -9,6 +10,14 @@ pub mod protocol;
 pub enum ClockError {
     #[error("Invalid tick update")]
     InvalidTick,
+    #[error("Invalid tempo: {0}")]
+    InvalidTempo(String),
+}
+
+impl From<time_primitives::TimeError> for ClockError {
+    fn from(e: time_primitives::TimeError) -> Self {
+        ClockError::InvalidTempo(e.to_string())
+    }
 }
 
 pub trait TimeSource {
@@ -25,16 +34,16 @@ impl TimeSource for SystemTimeSource {
 }
 
 pub struct ClockState {
-    ticks: u64,
-    tempo: f64,
+    ticks: Ticks,
+    tempo: Tempo,
     last_tick_time: Instant,
 }
 
 impl ClockState {
     fn new(time_source: &dyn TimeSource) -> Self {
         Self {
-            ticks: 0,
-            tempo: 120.0,
+            ticks: Ticks::ZERO,
+            tempo: Tempo::DEFAULT,
             last_tick_time: time_source.now(),
         }
     }
@@ -55,18 +64,19 @@ impl<T: TimeSource> MusicalClock<T> {
 
     pub fn tick(&self) -> Result<(), ClockError> {
         let mut state = self.state.write();
-        state.ticks += 1;
+        state.ticks = state.ticks + Ticks::new(1);
         state.last_tick_time = self.time_source.now();
         Ok(())
     }
 
     pub fn set_tempo(&self, bpm: f64) -> Result<(), ClockError> {
+        let tempo = Tempo::new(bpm)?;
         let mut state = self.state.write();
-        state.tempo = bpm.clamp(20.0, 400.0);
+        state.tempo = tempo;
         Ok(())
     }
 
-    pub fn get_position(&self) -> (u64, f64) {
+    pub fn get_position(&self) -> (Ticks, Tempo) {
         let state = self.state.read();
         (state.ticks, state.tempo)
     }
@@ -115,8 +125,8 @@ mod tests {
         let clock = MusicalClock::new(time_source);
         let (ticks, tempo) = clock.get_position();
 
-        assert_eq!(ticks, 0);
-        assert_eq!(tempo, 120.0);
+        assert_eq!(ticks, Ticks::ZERO);
+        assert_eq!(tempo, Tempo::DEFAULT);
     }
 
     #[test]
@@ -131,5 +141,22 @@ mod tests {
 
         time_source.advance(Duration::from_millis(5));
         assert_eq!(clock.time_since_last_tick().as_millis(), 5);
+    }
+
+    #[test]
+    fn test_set_tempo_valid() {
+        let time_source = TimeSourceStub::new();
+        let clock = MusicalClock::new(time_source);
+        clock.set_tempo(140.0).unwrap();
+        let (_, tempo) = clock.get_position();
+        assert_eq!(tempo.raw(), 140.0);
+    }
+
+    #[test]
+    fn test_set_tempo_out_of_range_returns_error() {
+        let time_source = TimeSourceStub::new();
+        let clock = MusicalClock::new(time_source);
+        assert!(clock.set_tempo(5.0).is_err());
+        assert!(clock.set_tempo(500.0).is_err());
     }
 }

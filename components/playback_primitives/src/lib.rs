@@ -29,26 +29,7 @@ impl Display for SessionId {
     }
 }
 
-/// Content hash of audio file — THE cross-service track identifier.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ContentHash(String);
-
-impl ContentHash {
-    pub fn new(hash: impl Into<String>) -> Self {
-        Self(hash.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Display for ContentHash {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+pub use music_primitives::ContentHash;
 
 #[derive(Debug, Error)]
 pub enum PlaybackError {
