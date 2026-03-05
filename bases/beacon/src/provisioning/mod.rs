@@ -105,102 +105,8 @@ pub async fn provision_system(
     if execution_mode == crate::actions::ExecutionMode::DryRun {
         let _ = log_tx.send("✅ Dry-run complete - no changes made".to_string());
 
-        // In dry-run mode, build a mock ProvisionedSystem
-        // This represents what WOULD be created
-        let drives = match config.unit_type {
-            UnitType::Mdma909 => {
-                if hardware.nvme_drives.len() >= 2 {
-                    ValidatedDrives::TwoDrives(
-                        DriveInfo {
-                            device: hardware.nvme_drives[0].device.clone(),
-                            size_bytes: hardware.nvme_drives[0].capacity,
-                            model: hardware.nvme_drives[0]
-                                .model
-                                .clone()
-                                .unwrap_or_else(|| "Unknown".to_string()),
-                        },
-                        DriveInfo {
-                            device: hardware.nvme_drives[1].device.clone(),
-                            size_bytes: hardware.nvme_drives[1].capacity,
-                            model: hardware.nvme_drives[1]
-                                .model
-                                .clone()
-                                .unwrap_or_else(|| "Unknown".to_string()),
-                        },
-                    )
-                } else if !hardware.nvme_drives.is_empty() {
-                    ValidatedDrives::OneDrive(DriveInfo {
-                        device: hardware.nvme_drives[0].device.clone(),
-                        size_bytes: hardware.nvme_drives[0].capacity,
-                        model: hardware.nvme_drives[0]
-                            .model
-                            .clone()
-                            .unwrap_or_else(|| "Unknown".to_string()),
-                    })
-                } else {
-                    return Err(crate::error::BeaconError::Hardware(
-                        "No NVMe drives found".to_string(),
-                    ));
-                }
-            }
-            _ => {
-                if hardware.nvme_drives.is_empty() {
-                    return Err(crate::error::BeaconError::Hardware(
-                        "No NVMe drives found".to_string(),
-                    ));
-                }
-                ValidatedDrives::OneDrive(DriveInfo {
-                    device: hardware.nvme_drives[0].device.clone(),
-                    size_bytes: hardware.nvme_drives[0].capacity,
-                    model: hardware.nvme_drives[0]
-                        .model
-                        .clone()
-                        .unwrap_or_else(|| "Unknown".to_string()),
-                })
-            }
-        };
-
-        // Build the nested type structure
-        let formatted = types::FormattedSystem {
-            partitioned: types::CompletedPartitionedDrives {
-                validated: types::ValidatedHardware {
-                    config,
-                    drives: drives.clone(),
-                },
-                plan: match drives {
-                    ValidatedDrives::OneDrive(drive_info) => CompletedPartitionPlan::SingleDrive {
-                        device: drive_info,
-                        partitions: vec![],
-                    },
-                    ValidatedDrives::TwoDrives(primary_device, secondary_device) => {
-                        CompletedPartitionPlan::DualDrive {
-                            primary_device,
-                            primary_partitions: vec![],
-                            secondary_device,
-                            secondary_partitions: vec![],
-                        }
-                    }
-                },
-            },
-            format_actions: vec![],
-        };
-
-        let mounted = types::MountedPartitions {
-            formatted,
-            mount_root: std::path::PathBuf::from("/mnt/mdma-install"),
-            partitions: vec![],
-        };
-
-        let installed = types::InstalledPackages {
-            mounted,
-            packages: vec!["base-system".to_string()],
-        };
-
-        let fstab_configured = types::ConfiguredFstab { installed };
-
-        let configured = types::ConfiguredSystem { fstab_configured };
-
-        return Ok(types::ProvisionedSystem { configured });
+        // In dry-run mode, build a mock ProvisionedSystem representing what WOULD be created
+        return build_provisioned_system_from_hardware(&config, &hardware);
     }
 
     // Execute with progress feedback
@@ -237,12 +143,24 @@ pub async fn provision_system(
         .map_err(|e| {
             crate::error::BeaconError::Provisioning(format!("Execution task panicked: {}", e))
         })?
-        .expect("should succeed");
+        .map_err(|e| crate::error::BeaconError::Provisioning(format!("Execution failed: {}", e)))?;
 
     let _ = log_tx.send("✅ Provisioning complete!".to_string());
 
     // TODO: In real implementation, need to return actual ProvisionedSystem
     // For now, since stages are stubs, build a mock result
+    build_provisioned_system_from_hardware(&config, &hardware)
+}
+
+/// Build a mock `ProvisionedSystem` from config and hardware info.
+///
+/// Used in both dry-run mode (to represent what would be created) and after
+/// real execution (since stages are currently stubs that do not return typed
+/// output yet).
+fn build_provisioned_system_from_hardware(
+    config: &ProvisionConfig,
+    hardware: &HardwareInfo,
+) -> Result<types::ProvisionedSystem> {
     let drives = match config.unit_type {
         UnitType::Mdma909 => {
             if hardware.nvme_drives.len() >= 2 {
@@ -296,11 +214,10 @@ pub async fn provision_system(
         }
     };
 
-    // Build the nested type structure
     let formatted = types::FormattedSystem {
         partitioned: types::CompletedPartitionedDrives {
             validated: types::ValidatedHardware {
-                config,
+                config: config.clone(),
                 drives: drives.clone(),
             },
             plan: match drives {

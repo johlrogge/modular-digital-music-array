@@ -2555,6 +2555,7 @@ dependencies = [
  "library-ipc-protocol",
  "media-protocol",
  "nng",
+ "serde",
  "serde_json",
  "source-protocol",
  "tracing",

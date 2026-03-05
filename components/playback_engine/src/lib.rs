@@ -8,7 +8,10 @@ mod track;
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{mpsc, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
 };
 
 pub use error::PlaybackError;
@@ -35,6 +38,7 @@ pub struct PlaybackEngine {
     command_sender: mpsc::Sender<MixerCommand>,
     _mix_task: Option<std::thread::JoinHandle<()>>,
     stream_active: bool,
+    mix_thread_running: Arc<AtomicBool>,
 }
 enum MixerCommand {
     RegisterTrack {
@@ -57,6 +61,9 @@ impl PlaybackEngine {
         let mixer_rb = HeapRb::<f32>::new(MIXER_BUFFER_SIZE);
         let (mixer_producer, mixer_consumer) = mixer_rb.split();
 
+        let mix_thread_running = Arc::new(AtomicBool::new(true));
+        let running = Arc::clone(&mix_thread_running);
+
         // Start the mix thread with command receiver
         let mix_task = std::thread::spawn(move || {
             let mut mixer = Mixer::new(mixer_producer);
@@ -65,7 +72,7 @@ impl PlaybackEngine {
 
             tracing::info!("MIX THREAD: Started, will process audio");
 
-            loop {
+            while running.load(Ordering::Relaxed) {
                 // Process any pending commands
                 while let Ok(cmd) = command_receiver.try_recv() {
                     match cmd {
@@ -88,6 +95,8 @@ impl PlaybackEngine {
                 // Sleep briefly
                 std::thread::sleep(std::time::Duration::from_micros(500)); // 0.5ms instead of 5ms
             }
+
+            tracing::info!("MIX THREAD: Exiting cleanly");
         });
 
         // Return the engine — PipeWire output deferred until first track load
@@ -99,7 +108,16 @@ impl PlaybackEngine {
             command_sender,
             _mix_task: Some(mix_task),
             stream_active: true,
+            mix_thread_running,
         })
+    }
+
+    /// Signal the mix thread to stop and wait for it to join.
+    pub fn shutdown(&mut self) {
+        self.mix_thread_running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self._mix_task.take() {
+            let _ = handle.join();
+        }
     }
 
     /// Activate or deactivate the PipeWire stream.
@@ -256,16 +274,23 @@ impl PlaybackEngine {
         self.stream_active
     }
 
-    pub async fn seek(&mut self, deck: Deck, position: usize) -> Result<(), PlaybackError> {
+    pub fn seek(&mut self, deck: Deck, position: usize) -> Result<(), PlaybackError> {
         if let Some(track) = self.find_track(deck) {
             tracing::info!("Seeking deck {:?} to position {}", deck, position);
-            // We need to pass the RwLockWriteGuard to the async context, which is tricky
-            // We'll need to get a write lock, perform the seek, and release
             let mut track_guard = track.write();
             track_guard.seek(position)
         } else {
             tracing::error!("No track loaded in deck {:?}", deck);
             Err(PlaybackError::NoTrackLoaded(deck))
+        }
+    }
+}
+
+impl Drop for PlaybackEngine {
+    fn drop(&mut self) {
+        self.mix_thread_running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self._mix_task.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -295,5 +320,14 @@ mod tests {
             engine.is_stream_active(),
             "should be active after reactivate"
         );
+    }
+
+    /// Verify that the mix thread stops cleanly when shutdown() is called.
+    #[test]
+    fn shutdown_stops_mix_thread() {
+        let mut engine = PlaybackEngine::new().expect("engine created");
+        assert!(engine._mix_task.is_some());
+        engine.shutdown();
+        assert!(engine._mix_task.is_none());
     }
 }

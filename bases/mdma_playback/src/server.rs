@@ -220,12 +220,19 @@ impl Server {
             }
             Command::Seek { deck, position } => {
                 info!("Seeking deck {:?} to position {}", deck, position);
-                let result = self.engine.lock().await.seek(deck, position).await;
+                let result = self.engine.lock().await.seek(deck, position);
                 self.create_response(result, None)
             }
             Command::GetLength { deck } => {
                 info!("Getting length for deck {:?}", deck);
-                todo!("get length of track, or remove opportunity")
+                match self.engine.lock().await.duration_ms(deck) {
+                    Some(ms) => Response::Ok {
+                        data: Some(ResponseData::Length(ms as usize)),
+                    },
+                    None => Response::Err {
+                        message: PlaybackError::NoTrackLoaded(deck).to_string(),
+                    },
+                }
             }
             Command::QueueNext { hash, path } => {
                 info!("Queue next: {:?}", path);
@@ -577,13 +584,16 @@ mod tests {
     use std::path::PathBuf;
 
     fn make_server() -> Server {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let engine = PlaybackEngine::new().unwrap();
         let engine = Arc::new(Mutex::new(engine));
         let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
         let event_pub = nng::Socket::new(nng::Protocol::Pub0).unwrap();
         // Create a dummy ACID listener so the client can connect.
         let acid_listen = nng::Socket::new(nng::Protocol::Rep0).unwrap();
-        let acid_addr = format!("ipc:///tmp/test_acid_{}.sock", std::process::id());
+        let acid_addr = format!("ipc:///tmp/test_acid_{}_{}.sock", std::process::id(), id);
         acid_listen.listen(&acid_addr).unwrap();
         let acid_client = Arc::new(AcidClient::connect(&acid_addr).unwrap());
         std::mem::forget(acid_listen);
@@ -676,5 +686,33 @@ mod tests {
             }
             Response::Ok { .. } => panic!("Expected Err response for nonexistent track"),
         }
+    }
+
+    #[tokio::test]
+    async fn get_length_with_no_track_returns_error() {
+        let server = make_server();
+        let response = server
+            .handle_command(Command::GetLength {
+                deck: playback_engine::Deck::A,
+            })
+            .await;
+        assert!(
+            matches!(response, Response::Err { .. }),
+            "Expected Err when no track is loaded on deck A"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_length_with_no_track_returns_error_deck_b() {
+        let server = make_server();
+        let response = server
+            .handle_command(Command::GetLength {
+                deck: playback_engine::Deck::B,
+            })
+            .await;
+        assert!(
+            matches!(response, Response::Err { .. }),
+            "Expected Err when no track is loaded on deck B"
+        );
     }
 }

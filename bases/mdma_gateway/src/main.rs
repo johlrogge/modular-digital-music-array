@@ -2,6 +2,7 @@ use clap::Parser;
 use color_eyre::Result;
 use gateway_protocol::{GatewayRequest, GatewayResponse, SourceName};
 use nng::options::Options;
+use serde::{de::DeserializeOwned, Serialize};
 use source_protocol::{SourceRequest, SourceResponse};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -71,6 +72,31 @@ fn forward_raw(backend: &nng::Socket, request_bytes: &[u8]) -> Result<Vec<u8>, S
     let response_msg = backend.recv().map_err(|e| format!("recv failed: {}", e))?;
 
     Ok(response_msg.as_slice().to_vec())
+}
+
+/// Serialize a request, forward it to a backend, and deserialize the typed response.
+///
+/// Returns `Ok(response)` on success, or `Err(GatewayResponse::Error { .. })` on any failure
+/// so callers can propagate an error envelope without extra boilerplate.
+fn forward_typed<Req, Resp>(
+    backend: &nng::Socket,
+    request: &Req,
+    service_name: &str,
+) -> Result<Resp, GatewayResponse>
+where
+    Req: Serialize,
+    Resp: DeserializeOwned,
+{
+    let request_bytes = serde_json::to_vec(request)
+        .expect("request serialization must not fail for well-formed protocol types");
+
+    let resp_bytes = forward_raw(backend, &request_bytes).map_err(|e| GatewayResponse::Error {
+        message: format!("{} service unreachable: {}", service_name, e),
+    })?;
+
+    serde_json::from_slice(&resp_bytes).map_err(|e| GatewayResponse::Error {
+        message: format!("{} response parse error: {}", service_name, e),
+    })
 }
 
 /// Get or create a cached connection to a source service.
@@ -224,7 +250,8 @@ fn main() -> Result<()> {
                 let response = GatewayResponse::Error {
                     message: format!("Invalid request: {}", e),
                 };
-                let data = serde_json::to_vec(&response).unwrap();
+                let data = serde_json::to_vec(&response)
+                    .expect("GatewayResponse::Error serialization must not fail");
                 let _ = frontend.send(nng::Message::from(&data[..]));
                 continue;
             }
@@ -232,64 +259,32 @@ fn main() -> Result<()> {
 
         let response = match envelope {
             GatewayRequest::Library { request } => {
-                let request_bytes = serde_json::to_vec(&request).unwrap();
-                match forward_raw(&library_backend, &request_bytes) {
-                    Ok(resp_bytes) => match serde_json::from_slice(&resp_bytes) {
-                        Ok(resp) => GatewayResponse::Library { response: resp },
-                        Err(e) => GatewayResponse::Error {
-                            message: format!("library response parse error: {}", e),
-                        },
-                    },
-                    Err(e) => GatewayResponse::Error {
-                        message: format!("library service unreachable: {}", e),
-                    },
+                match forward_typed(&library_backend, &request, "library") {
+                    Ok(resp) => GatewayResponse::Library { response: resp },
+                    Err(e) => e,
                 }
             }
 
             GatewayRequest::Playback { request } => {
-                let request_bytes = serde_json::to_vec(&request).unwrap();
-                match forward_raw(&playback_backend, &request_bytes) {
-                    Ok(resp_bytes) => match serde_json::from_slice(&resp_bytes) {
-                        Ok(resp) => GatewayResponse::Playback { response: resp },
-                        Err(e) => GatewayResponse::Error {
-                            message: format!("playback response parse error: {}", e),
-                        },
-                    },
-                    Err(e) => GatewayResponse::Error {
-                        message: format!("playback service unreachable: {}", e),
-                    },
+                match forward_typed(&playback_backend, &request, "playback") {
+                    Ok(resp) => GatewayResponse::Playback { response: resp },
+                    Err(e) => e,
                 }
             }
 
             GatewayRequest::Source { name, request } => {
                 match get_or_connect_source(&args.sources_dir, name.as_str(), &mut source_cache) {
                     Ok(backend) => {
-                        let request_bytes = serde_json::to_vec(&request).unwrap();
-                        match forward_raw(backend, &request_bytes) {
-                            Ok(resp_bytes) => {
-                                match serde_json::from_slice::<SourceResponse>(&resp_bytes) {
-                                    Ok(resp) => GatewayResponse::Source {
-                                        name,
-                                        response: resp,
-                                    },
-                                    Err(e) => {
-                                        // Remove broken connection from cache
-                                        source_cache.remove(name.as_str());
-                                        GatewayResponse::Error {
-                                            message: format!(
-                                                "source '{}' response parse error: {}",
-                                                name, e
-                                            ),
-                                        }
-                                    }
-                                }
-                            }
+                        let svc = format!("source '{}'", name);
+                        match forward_typed::<_, SourceResponse>(backend, &request, &svc) {
+                            Ok(resp) => GatewayResponse::Source {
+                                name,
+                                response: resp,
+                            },
                             Err(e) => {
-                                // Remove broken connection from cache
+                                // Remove broken connection from cache on any forwarding error
                                 source_cache.remove(name.as_str());
-                                GatewayResponse::Error {
-                                    message: format!("source '{}' unreachable: {}", name, e),
-                                }
+                                e
                             }
                         }
                     }
@@ -298,17 +293,9 @@ fn main() -> Result<()> {
             }
 
             GatewayRequest::Acid { request } => {
-                let request_bytes = serde_json::to_vec(&request).unwrap();
-                match forward_raw(&acid_backend, &request_bytes) {
-                    Ok(resp_bytes) => match serde_json::from_slice(&resp_bytes) {
-                        Ok(resp) => GatewayResponse::Acid { response: resp },
-                        Err(e) => GatewayResponse::Error {
-                            message: format!("acid response parse error: {}", e),
-                        },
-                    },
-                    Err(e) => GatewayResponse::Error {
-                        message: format!("acid service unreachable: {}", e),
-                    },
+                match forward_typed(&acid_backend, &request, "acid") {
+                    Ok(resp) => GatewayResponse::Acid { response: resp },
+                    Err(e) => e,
                 }
             }
 
@@ -324,7 +311,8 @@ fn main() -> Result<()> {
                     {
                         Ok(backend) => {
                             let ping = SourceRequest::Ping;
-                            let ping_bytes = serde_json::to_vec(&ping).unwrap();
+                            let ping_bytes = serde_json::to_vec(&ping)
+                                .expect("SourceRequest::Ping serialization must not fail");
                             forward_raw(backend, &ping_bytes).is_ok()
                         }
                         Err(_) => false,
@@ -337,7 +325,8 @@ fn main() -> Result<()> {
             }
         };
 
-        let data = serde_json::to_vec(&response).unwrap();
+        let data =
+            serde_json::to_vec(&response).expect("GatewayResponse serialization must not fail");
         if let Err((_, e)) = frontend.send(nng::Message::from(&data[..])) {
             tracing::error!(error = %e, "Failed to send response");
         }
