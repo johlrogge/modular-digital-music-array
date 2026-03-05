@@ -872,7 +872,7 @@ fn handle_error(err: ClientError) -> ! {
         ClientError::Protocol(e) => {
             eprintln!("Error: {}", e);
         }
-        ClientError::Connection(e) => {
+        ClientError::Transport(nng_transport::NngClientError::Connection(e)) => {
             eprintln!("Connection failed: {}", e);
             eprintln!("Is mdma-library running?");
         }
@@ -884,7 +884,7 @@ fn handle_error(err: ClientError) -> ! {
 }
 
 /// Handle source errors uniformly
-fn handle_source_error(err: &str) -> ! {
+fn handle_source_error(err: &dyn std::fmt::Display) -> ! {
     eprintln!("Error: {}", err);
     std::process::exit(1);
 }
@@ -1669,7 +1669,7 @@ fn handle_source_sync(client: &SourceClient, name: &str) -> Result<()> {
             Ok(())
         }
         Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
-        Ok(_) => handle_source_error("Unexpected response"),
+        Ok(_) => handle_source_error(&"Unexpected response"),
         Err(e) => handle_source_error(&e),
     }
 }
@@ -1703,7 +1703,7 @@ fn handle_source_status(client: &SourceClient, name: &str) -> Result<()> {
             Ok(())
         }
         Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
-        Ok(_) => handle_source_error("Unexpected response"),
+        Ok(_) => handle_source_error(&"Unexpected response"),
         Err(e) => handle_source_error(&e),
     }
 }
@@ -1745,7 +1745,7 @@ fn handle_source_downloads(client: &SourceClient, name: &str) -> Result<()> {
             Ok(())
         }
         Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
-        Ok(_) => handle_source_error("Unexpected response"),
+        Ok(_) => handle_source_error(&"Unexpected response"),
         Err(e) => handle_source_error(&e),
     }
 }
@@ -1762,7 +1762,7 @@ fn handle_source_cancel(client: &SourceClient, name: &str, id: String) -> Result
             Ok(())
         }
         Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
-        Ok(_) => handle_source_error("Unexpected response"),
+        Ok(_) => handle_source_error(&"Unexpected response"),
         Err(e) => handle_source_error(&e),
     }
 }
@@ -1774,7 +1774,7 @@ fn handle_source_pause(client: &SourceClient, name: &str) -> Result<()> {
             Ok(())
         }
         Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
-        Ok(_) => handle_source_error("Unexpected response"),
+        Ok(_) => handle_source_error(&"Unexpected response"),
         Err(e) => handle_source_error(&e),
     }
 }
@@ -1786,7 +1786,7 @@ fn handle_source_resume(client: &SourceClient, name: &str) -> Result<()> {
             Ok(())
         }
         Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
-        Ok(_) => handle_source_error("Unexpected response"),
+        Ok(_) => handle_source_error(&"Unexpected response"),
         Err(e) => handle_source_error(&e),
     }
 }

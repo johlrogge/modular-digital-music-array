@@ -1,6 +1,5 @@
 //! Playback backend abstraction — works in both gateway and direct mode.
 
-use crate::error::map_gw_to_media_error;
 use media_client::{ClientError, Command, ContentHash, Deck, MediaClient, Response, ResponseData};
 use std::path::PathBuf;
 
@@ -19,7 +18,7 @@ impl PlaybackBackend {
 
     /// Connect to playback via gateway.
     pub fn connect_gateway(gateway: &str) -> Result<Self, ClientError> {
-        let gw = gateway_client::GatewayClient::connect(gateway).map_err(map_gw_to_media_error)?;
+        let gw = gateway_client::GatewayClient::connect(gateway)?;
         Ok(PlaybackBackend::Gateway(gw))
     }
 
@@ -33,9 +32,7 @@ impl PlaybackBackend {
 
     fn gw_send(&self, cmd: Command) -> Result<Response, ClientError> {
         match self {
-            PlaybackBackend::Gateway(gw) => {
-                gw.playback_command(&cmd).map_err(map_gw_to_media_error)
-            }
+            PlaybackBackend::Gateway(gw) => gw.playback_command(&cmd),
             PlaybackBackend::Direct(_) => unreachable!(),
         }
     }
@@ -43,16 +40,16 @@ impl PlaybackBackend {
     fn gw_command(&self, cmd: Command) -> Result<(), ClientError> {
         match self.gw_send(cmd)? {
             Response::Ok { .. } => Ok(()),
-            Response::Err { message } => Err(ClientError::Command(message)),
+            Response::Err { message } => Err(ClientError::Service(message)),
         }
     }
 
     fn gw_command_with_data(&self, cmd: Command) -> Result<ResponseData, ClientError> {
         match self.gw_send(cmd)? {
-            Response::Err { message } => Err(ClientError::Command(message)),
+            Response::Err { message } => Err(ClientError::Service(message)),
             Response::Ok { data: Some(data) } => Ok(data),
             Response::Ok { data: None } => {
-                Err(ClientError::Command("Missing response data".to_string()))
+                Err(ClientError::Service("Missing response data".to_string()))
             }
         }
     }
@@ -100,7 +97,7 @@ impl PlaybackBackend {
                 if let ResponseData::NowPlaying(hash) = data {
                     Ok(hash)
                 } else {
-                    Err(ClientError::Command(
+                    Err(ClientError::Service(
                         "Unexpected response data type".to_string(),
                     ))
                 }
@@ -130,7 +127,7 @@ impl PlaybackBackend {
                 if let ResponseData::Queue(hashes) = data {
                     Ok(hashes)
                 } else {
-                    Err(ClientError::Command(
+                    Err(ClientError::Service(
                         "Unexpected response data type".to_string(),
                     ))
                 }
@@ -160,7 +157,7 @@ impl PlaybackBackend {
                 if let ResponseData::Count(n) = data {
                     Ok(n)
                 } else {
-                    Err(ClientError::Command(
+                    Err(ClientError::Service(
                         "Unexpected response data type".to_string(),
                     ))
                 }
@@ -176,7 +173,7 @@ impl PlaybackBackend {
                 if let ResponseData::Session(id) = data {
                     Ok(id)
                 } else {
-                    Err(ClientError::Command(
+                    Err(ClientError::Service(
                         "Unexpected response data type".to_string(),
                     ))
                 }

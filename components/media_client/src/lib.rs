@@ -7,23 +7,12 @@ pub use media_protocol::{Command, ContentHash, Deck, Response, ResponseData};
 pub use playback_primitives::Volume;
 
 use std::path::PathBuf;
-use thiserror::Error;
 
 /// Errors that can occur when communicating with the playback service.
-#[derive(Debug, Error)]
-pub enum ClientError {
-    #[error("Connection error: {0}")]
-    Connection(#[from] nng_transport::ConnectionError),
-
-    #[error("NNG error: {0}")]
-    Nng(#[from] nng::Error),
-
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
-
-    #[error("Command failed: {0}")]
-    Command(String),
-}
+///
+/// This is an alias for [`nng_transport::NngClientError`]. The `Service` variant
+/// carries command-level error messages.
+pub type ClientError = nng_transport::NngClientError;
 
 pub struct MediaClient {
     socket: nng::Socket,
@@ -185,7 +174,7 @@ impl MediaClient {
 
         match response {
             Response::Ok { .. } => Ok(()),
-            Response::Err { message } => Err(ClientError::Command(message)),
+            Response::Err { message } => Err(ClientError::Service(message)),
         }
     }
 
@@ -205,11 +194,11 @@ impl MediaClient {
         let response: Response = serde_json::from_slice(&response_msg)?;
 
         match response {
-            Response::Err { message } => Err(ClientError::Command(message)),
+            Response::Err { message } => Err(ClientError::Service(message)),
             Response::Ok { data: Some(data) } => extract(data)
-                .ok_or_else(|| ClientError::Command("Unexpected response data type".to_string())),
+                .ok_or_else(|| ClientError::Service("Unexpected response data type".to_string())),
             Response::Ok { data: None } => {
-                Err(ClientError::Command("Missing response data".to_string()))
+                Err(ClientError::Service("Missing response data".to_string()))
             }
         }
     }

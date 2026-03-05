@@ -9,8 +9,8 @@ license.workspace = true
 [dependencies]
 acid_protocol = { path = "../acid_protocol" }
 nng = { workspace = true }
+nng-transport = { path = "../nng_transport" }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 
 [features]
 music = ["music-facts", "playback-primitives"]

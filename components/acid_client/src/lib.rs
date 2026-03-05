@@ -3,22 +3,10 @@
 //! NNG client for connecting to the ACID fact store service.
 
 pub use acid_protocol::{AcidRequest, AcidResponse, FactEntry, StreamChunk};
+pub use nng_transport::NngClientError as ClientError;
 
 use nng::options::{Options, RecvTimeout, SendTimeout};
 use std::time::Duration;
-use thiserror::Error;
-
-#[derive(Debug, Error)]
-pub enum ClientError {
-    #[error("NNG error: {0}")]
-    Nng(#[from] nng::Error),
-
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
-
-    #[error("ACID error: {0}")]
-    Acid(String),
-}
 
 pub struct AcidClient {
     socket: nng::Socket,
@@ -47,8 +35,8 @@ impl AcidClient {
     pub fn ping(&self) -> Result<(), ClientError> {
         match self.request(&AcidRequest::Ping)? {
             AcidResponse::Pong => Ok(()),
-            AcidResponse::Error { message } => Err(ClientError::Acid(message)),
-            other => Err(ClientError::Acid(format!(
+            AcidResponse::Error { message } => Err(ClientError::Service(message)),
+            other => Err(ClientError::Service(format!(
                 "unexpected response: {:?}",
                 other
             ))),
@@ -62,8 +50,8 @@ impl AcidClient {
         };
         match self.request(&req)? {
             AcidResponse::WriteOk { facts_written } => Ok(facts_written),
-            AcidResponse::Error { message } => Err(ClientError::Acid(message)),
-            other => Err(ClientError::Acid(format!(
+            AcidResponse::Error { message } => Err(ClientError::Service(message)),
+            other => Err(ClientError::Service(format!(
                 "unexpected response: {:?}",
                 other
             ))),
@@ -74,8 +62,8 @@ impl AcidClient {
         let req = AcidRequest::ReadStream { after_line, limit };
         match self.request(&req)? {
             AcidResponse::StreamChunk(chunk) => Ok(chunk),
-            AcidResponse::Error { message } => Err(ClientError::Acid(message)),
-            other => Err(ClientError::Acid(format!(
+            AcidResponse::Error { message } => Err(ClientError::Service(message)),
+            other => Err(ClientError::Service(format!(
                 "unexpected response: {:?}",
                 other
             ))),
@@ -114,11 +102,11 @@ mod music {
 mod tests {
     use super::*;
 
-    /// Verify that ClientError variants are constructable and display correctly.
+    /// Verify that ClientError::Service variant is constructable and displays correctly.
     #[test]
-    fn client_error_acid_display() {
-        let err = ClientError::Acid("something failed".to_string());
-        assert_eq!(err.to_string(), "ACID error: something failed");
+    fn client_error_service_display() {
+        let err = ClientError::Service("something failed".to_string());
+        assert!(err.to_string().contains("something failed"));
     }
 
     /// Verify that ClientError::Serialization wraps serde_json::Error via From.
@@ -127,7 +115,7 @@ mod tests {
         let bad_json = b"not valid json {{{";
         let serde_err = serde_json::from_slice::<AcidRequest>(bad_json).unwrap_err();
         let client_err = ClientError::from(serde_err);
-        assert!(client_err.to_string().starts_with("Serialization error:"));
+        assert!(client_err.to_string().starts_with("serialization error:"));
     }
 
     /// Verify that protocol types are re-exported from this crate.

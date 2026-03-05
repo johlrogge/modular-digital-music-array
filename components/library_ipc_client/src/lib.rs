@@ -8,19 +8,34 @@ pub use library_ipc_protocol::*;
 use thiserror::Error;
 
 /// Errors that can occur when communicating with the library.
+///
+/// Extends [`nng_transport::NngClientError`] with a `Protocol` variant for
+/// library-level protocol errors.
 #[derive(Debug, Error)]
 pub enum ClientError {
-    #[error("Connection error: {0}")]
-    Connection(#[from] nng_transport::ConnectionError),
-
-    #[error("NNG error: {0}")]
-    Nng(#[from] nng::Error),
-
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
+    #[error("{0}")]
+    Transport(#[from] nng_transport::NngClientError),
 
     #[error("Protocol error: {0}")]
     Protocol(ProtocolError),
+}
+
+impl From<serde_json::Error> for ClientError {
+    fn from(e: serde_json::Error) -> Self {
+        ClientError::Transport(nng_transport::NngClientError::Serialization(e))
+    }
+}
+
+impl From<nng::Error> for ClientError {
+    fn from(e: nng::Error) -> Self {
+        ClientError::Transport(nng_transport::NngClientError::Nng(e))
+    }
+}
+
+impl From<nng_transport::ConnectionError> for ClientError {
+    fn from(e: nng_transport::ConnectionError) -> Self {
+        ClientError::Transport(nng_transport::NngClientError::Connection(e))
+    }
 }
 
 /// Client for connecting to the library service.
@@ -57,7 +72,7 @@ impl LibraryClient {
         let msg = nng::Message::from(&data[..]);
         self.socket
             .send(msg)
-            .map_err(|(_, e)| ClientError::Nng(e))?;
+            .map_err(|(_, e)| ClientError::Transport(nng_transport::NngClientError::Nng(e)))?;
 
         let response_msg = self.socket.recv()?;
         let response: LibraryResponse = serde_json::from_slice(&response_msg)?;

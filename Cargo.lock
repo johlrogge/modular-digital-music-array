@@ -9,9 +9,9 @@ dependencies = [
  "acid_protocol",
  "music-facts",
  "nng",
+ "nng-transport",
  "playback-primitives",
  "serde_json",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2770,6 +2770,7 @@ version = "0.5.0"
 dependencies = [
  "dirs",
  "nng",
+ "serde_json",
  "tempfile",
  "thiserror 1.0.69",
 ]
