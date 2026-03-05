@@ -4,6 +4,61 @@
 
 **Test behaviors, not conformance.** The type system eliminates illegal states and guarantees correctness. Tests verify that correct behaviors emerge from correct states.
 
+## Unit Test Laws
+
+Five non-negotiable rules:
+
+1. **One reason to fail** — each `#[test]` has exactly one `assert!`/`assert_eq!`/`prop_assert!`. Multiple inputs → `rstest #[case]`. Multiple behaviors → multiple tests.
+
+2. **Never trust a test you haven't seen fail** — TDD red-green-refactor. Write the failing test first. `todo!()` counts as seeing it fail.
+
+3. **Simplest code that could possibly work** — if you need complexity, prove it with a failing test first.
+
+4. **No filesystem in unit tests** — no `std::fs`, `File::open`, `tempfile`, `TempDir`. Use `&[u8]`, `Cursor`, or `Path::new("fake.ext")` for extension checks (no I/O).
+
+5. **Unit tests must be fast** — thousands per second. No I/O, no network, no `thread::sleep`.
+
+## Serialization Testing
+
+- Serialize and deserialize are **separate concerns** — never test as round-trip in example-based tests
+- A round-trip test hides symmetric bugs (serialize and deserialize both wrong in the same way)
+- Use `proptest` for round-trip **invariants** — that's the one place both appear together
+
+Bad:
+```rust
+#[test]
+fn bpm_serialization() {
+    let bpm = Bpm::from_f32(125.45).unwrap();
+    let json = serde_json::to_string(&bpm).unwrap();
+    assert_eq!(json, "12545");
+    let back: Bpm = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, bpm);  // hides symmetric bugs
+}
+```
+
+Good:
+```rust
+#[test]
+fn bpm_serializes_as_hundredths() {
+    assert_eq!(serde_json::to_string(&Bpm::from_f32(125.45).unwrap()).unwrap(), "12545");
+}
+
+#[test]
+fn bpm_deserializes_from_hundredths() {
+    assert_eq!(serde_json::from_str::<Bpm>("12545").unwrap().as_f32(), 125.45);
+}
+
+proptest! {
+    #[test]
+    fn bpm_roundtrip(hundredths in 2000u32..=99999u32) {
+        let bpm = Bpm::try_from(hundredths).unwrap();
+        let json = serde_json::to_string(&bpm).unwrap();
+        let back: Bpm = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(bpm, back);
+    }
+}
+```
+
 ## Testing Tools
 
 ### rstest - Parametric Testing
@@ -32,7 +87,7 @@ mod tests {
         #[test]
         fn returns_user() { /* ... */ }
     }
-    
+
     mod when_user_missing {
         #[test]
         fn returns_none() { /* ... */ }
@@ -45,7 +100,7 @@ mod tests {
 #[cfg(test)]
 mod tests {
     use rstest::*;
-    
+
     #[rstest]
     #[case::user_exists(UserId(1), Some(user))]
     #[case::user_missing(UserId(999), None)]
@@ -72,12 +127,15 @@ fn test_user_operations(sample_user: User) {
 }
 ```
 
-### Property-Based Testing (Future Exploration)
+### Property-Based Testing with proptest
 
-Consider **proptest** or **quickcheck** for:
-- Testing invariants across input space
+**Mandated** for round-trip invariants and property verification across the input space. Use `proptest` whenever you need to assert that a property holds for all valid inputs — not just the examples you thought of.
+
+Use proptest for:
+- Round-trip invariants (serialize → deserialize → same value)
+- Algebraic properties (commutativity, associativity, idempotency)
 - Finding edge cases automatically
-- Verifying algebraic properties
+- Verifying correctness across the full valid input domain
 
 ```rust
 use proptest::prelude::*;
@@ -92,13 +150,13 @@ proptest! {
 }
 ```
 
-**Status**: Curious about, not yet in regular use.
+**Rule**: Any type that implements `Serialize + Deserialize` must have a proptest round-trip test. Example-based tests cover the specific known values; proptest covers the invariant.
 
 ### Benchmarking with Criterion
 
 **When to benchmark:**
 - Testing algorithm performance
-- Evaluating caching strategies  
+- Evaluating caching strategies
 - Comparing implementation approaches
 - Optimizing hot paths
 
@@ -152,7 +210,7 @@ impl User {
 mod tests {
     use super::*;
     use rstest::*;
-    
+
     #[rstest]
     #[case(UserId(1), "test@example.com")]
     fn test_user_creation(#[case] id: UserId, #[case] email: &str) {
@@ -174,7 +232,7 @@ fn internal_helper(x: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_internal_helper() {
         // Can test private functions
@@ -212,7 +270,7 @@ Use the builder pattern to create test fixtures with sensible defaults and easy 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     // Builder with sensible test defaults
     struct UserBuilder {
         id: UserId,
@@ -220,7 +278,7 @@ mod tests {
         verified: bool,
         created_at: DateTime<Utc>,
     }
-    
+
     impl UserBuilder {
         fn new() -> Self {
             Self {
@@ -230,22 +288,22 @@ mod tests {
                 created_at: Utc::now(),
             }
         }
-        
+
         fn with_id(mut self, id: UserId) -> Self {
             self.id = id;
             self
         }
-        
+
         fn with_email(mut self, email: impl Into<String>) -> Self {
             self.email = email.into();
             self
         }
-        
+
         fn unverified(mut self) -> Self {
             self.verified = false;
             self
         }
-        
+
         fn build(self) -> User {
             User {
                 id: self.id,
@@ -255,20 +313,20 @@ mod tests {
             }
         }
     }
-    
+
     #[rstest]
     #[case::verified_user(UserBuilder::new().build())]
     #[case::unverified_user(UserBuilder::new().unverified().build())]
     fn test_user_scenarios(#[case] user: User) {
         // Test with different user configurations
     }
-    
+
     #[test]
     fn test_specific_email() {
         let user = UserBuilder::new()
             .with_email("specific@example.com")
             .build();
-        
+
         assert_eq!(user.email, "specific@example.com");
     }
 }
@@ -283,33 +341,33 @@ mod tests {
     fn user() -> UserBuilder {
         UserBuilder::new()
     }
-    
+
     // Admin user preset
     fn admin_user() -> UserBuilder {
         UserBuilder::new()
             .with_role(Role::Admin)
             .with_permissions(all_permissions())
     }
-    
+
     // Suspended user preset
     fn suspended_user() -> UserBuilder {
         UserBuilder::new()
             .suspended()
             .with_suspension_reason("Terms violation")
     }
-    
+
     #[test]
     fn admins_can_delete_users() {
         let admin = admin_user().build();
         let target = user().build();
-        
+
         assert!(admin.can_delete(&target));
     }
-    
+
     #[test]
     fn suspended_users_cannot_login() {
         let user = suspended_user().build();
-        
+
         assert!(user.login().is_err());
     }
 }
@@ -324,13 +382,13 @@ When test setup has required steps, combine builder with typestate:
 mod tests {
     struct NoDatabase;
     struct WithDatabase;
-    
+
     struct TestEnvironmentBuilder<D> {
         database: D,
         port: u16,
         log_level: LogLevel,
     }
-    
+
     impl TestEnvironmentBuilder<NoDatabase> {
         fn new() -> Self {
             Self {
@@ -339,7 +397,7 @@ mod tests {
                 log_level: LogLevel::Error,
             }
         }
-        
+
         fn with_database(self, db: TestDb) -> TestEnvironmentBuilder<WithDatabase> {
             TestEnvironmentBuilder {
                 database: WithDatabase(db),
@@ -348,19 +406,19 @@ mod tests {
             }
         }
     }
-    
+
     impl<D> TestEnvironmentBuilder<D> {
         fn with_port(mut self, port: u16) -> Self {
             self.port = port;
             self
         }
-        
+
         fn with_log_level(mut self, level: LogLevel) -> Self {
             self.log_level = level;
             self
         }
     }
-    
+
     // Can only build with database set
     impl TestEnvironmentBuilder<WithDatabase> {
         fn build(self) -> TestEnvironment {
@@ -371,14 +429,14 @@ mod tests {
             }
         }
     }
-    
+
     #[test]
     fn test_with_environment() {
         let env = TestEnvironmentBuilder::new()
             .with_database(TestDb::in_memory())
             .with_port(8080)
             .build();
-        
+
         // Test with fully configured environment
     }
 }
@@ -392,19 +450,19 @@ Combine builders with rstest fixtures for reusable test data:
 #[cfg(test)]
 mod tests {
     use rstest::*;
-    
+
     #[fixture]
     fn test_user() -> User {
         UserBuilder::new().build()
     }
-    
+
     #[fixture]
     fn admin_user() -> User {
         UserBuilder::new()
             .with_role(Role::Admin)
             .build()
     }
-    
+
     #[fixture]
     fn test_db() -> TestDatabase {
         DatabaseBuilder::new()
@@ -412,19 +470,19 @@ mod tests {
             .with_schema()
             .build()
     }
-    
+
     #[rstest]
     fn test_user_creation(test_db: TestDatabase) {
         let user = UserBuilder::new()
             .with_email("new@example.com")
             .build();
-        
+
         test_db.save_user(&user).unwrap();
-        
+
         let retrieved = test_db.get_user(user.id).unwrap();
         assert_eq!(retrieved.email, "new@example.com");
     }
-    
+
     #[rstest]
     fn admins_have_all_permissions(admin_user: User) {
         assert!(admin_user.has_permission(Permission::DeleteUser));
@@ -463,7 +521,7 @@ impl Database for StubDatabase {
     fn get_user(&self, _id: UserId) -> Option<User> {
         None  // Minimal implementation
     }
-    
+
     fn save_user(&self, _user: User) -> Result<(), Error> {
         Ok(())  // No-op
     }
@@ -484,7 +542,7 @@ impl Database for SimulatedDatabase {
     fn get_user(&self, id: UserId) -> Option<User> {
         self.users.get(&id).cloned()
     }
-    
+
     fn save_user(&mut self, user: User) -> Result<(), Error> {
         self.users.insert(user.id, user);
         Ok(())
@@ -497,7 +555,7 @@ impl SimulatedDatabase {
             users: HashMap::new(),
         }
     }
-    
+
     fn with_users(users: Vec<User>) -> Self {
         Self {
             users: users.into_iter()
@@ -535,14 +593,14 @@ impl TestPaymentProcessor {
             transactions: RefCell::new(vec![]),
         }
     }
-    
+
     fn failing() -> Self {
         Self {
             should_fail: true,
             transactions: RefCell::new(vec![]),
         }
     }
-    
+
     fn transactions(&self) -> Vec<Transaction> {
         self.transactions.borrow().clone()
     }
@@ -553,13 +611,13 @@ impl PaymentProcessor for TestPaymentProcessor {
         if self.should_fail {
             return Err(PaymentError::ProcessingFailed);
         }
-        
+
         let tx = Transaction {
             id: TransactionId::new(),
             amount,
             status: TransactionStatus::Success,
         };
-        
+
         self.transactions.borrow_mut().push(tx.clone());
         Ok(tx)
     }
@@ -577,7 +635,7 @@ Use `todo!()` liberally during development:
 mod tests {
     use super::*;
     use rstest::*;
-    
+
     #[rstest]
     #[case(vec![1, 2, 3], 6)]
     #[case(vec![10, 20], 30)]
@@ -601,14 +659,14 @@ macro_rules! dev_todo {
     () => {
         #[cfg(debug_assertions)]
         { todo!() }
-        
+
         #[cfg(not(debug_assertions))]
         compile_error!("dev_todo!() must be implemented before release build")
     };
     ($msg:expr) => {
         #[cfg(debug_assertions)]
         { todo!($msg) }
-        
+
         #[cfg(not(debug_assertions))]
         compile_error!(concat!("dev_todo!() must be implemented: ", $msg))
     };
@@ -754,4 +812,16 @@ fn end_to_end_user_workflow() {
 7. **Consider benchmarks** for algorithms and caching strategies
 8. **Doctests for examples only**, not comprehensive coverage
 9. **Avoid `#[cfg(test)]` exposure** when possible (code smell)
-10. **Explore property-based testing** for invariants and edge cases
+10. **Use proptest** for round-trip invariants and property verification — it is mandated for any type implementing `Serialize + Deserialize`
+
+## Review Checklist
+
+- [ ] Each `#[test]` has exactly one assert
+- [ ] No multi-assert tests that should be `rstest #[case]`
+- [ ] No loops containing assertions — use `#[case]` instead
+- [ ] Serialization and deserialization tested separately
+- [ ] Round-trip invariants use `proptest`, not example-based tests
+- [ ] No filesystem I/O in unit tests
+- [ ] No `thread::sleep` or real network calls
+- [ ] Test names describe the single behavior being verified
+- [ ] New code follows TDD (test written before implementation)

@@ -128,6 +128,7 @@ Always consider:
 2. Suggest type-driven improvements
 3. Propose pattern applications
 4. Consider performance implications
+5. Check tests against Unit Test Laws (see references/testing.md → Review Checklist)
 
 **For Architecture Discussions**:
 1. Understand requirements and constraints
