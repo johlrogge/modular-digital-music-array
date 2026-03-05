@@ -104,9 +104,9 @@ pub enum Mode {
 impl FromStr for Mode {
     type Err = KeyError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "major" | "maj" | "m" => Ok(Mode::Major),
-            "minor" | "min" => Ok(Mode::Minor),
+        match s {
+            "M" | "major" | "Major" | "maj" | "Maj" => Ok(Mode::Major),
+            "m" | "minor" | "Minor" | "min" | "Min" => Ok(Mode::Minor),
             _ => Err(Self::Err::InvalidNotation(format!("Unknown mode: {}", s))),
         }
     }
@@ -349,6 +349,21 @@ mod tests {
             Key::from_traditional("G Major").unwrap().to_open_key(),
             "2d"
         );
+    }
+
+    #[test]
+    fn mode_from_str_aliases() {
+        // "m" must be Minor (was incorrectly mapped to Major)
+        assert_eq!("m".parse::<Mode>().unwrap(), Mode::Minor);
+        // "M" must be Major
+        assert_eq!("M".parse::<Mode>().unwrap(), Mode::Major);
+        // Standard long-form aliases
+        assert_eq!("major".parse::<Mode>().unwrap(), Mode::Major);
+        assert_eq!("Major".parse::<Mode>().unwrap(), Mode::Major);
+        assert_eq!("minor".parse::<Mode>().unwrap(), Mode::Minor);
+        assert_eq!("Minor".parse::<Mode>().unwrap(), Mode::Minor);
+        assert_eq!("maj".parse::<Mode>().unwrap(), Mode::Major);
+        assert_eq!("min".parse::<Mode>().unwrap(), Mode::Minor);
     }
 
     #[test]
