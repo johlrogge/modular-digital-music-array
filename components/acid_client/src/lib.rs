@@ -105,7 +105,7 @@ mod music {
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            self.write_facts(&hash.0, &entries)
+            self.write_facts(hash.as_str(), &entries)
         }
     }
 }

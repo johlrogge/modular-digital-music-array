@@ -4,7 +4,7 @@
 //! Provides typed facades for library, playback, and source services.
 
 pub use acid_protocol::{AcidRequest, AcidResponse};
-pub use gateway_protocol::{GatewayRequest, GatewayResponse};
+pub use gateway_protocol::{GatewayRequest, GatewayResponse, SourceName};
 pub use library_ipc_protocol::{LibraryRequest, LibraryResponse};
 pub use media_protocol::{Command, Response};
 pub use source_protocol::{SourceRequest, SourceResponse};
@@ -101,7 +101,7 @@ impl GatewayClient {
         req: &SourceRequest,
     ) -> Result<SourceResponse, ClientError> {
         let envelope = GatewayRequest::Source {
-            name: name.to_string(),
+            name: SourceName::new(name),
             request: req.clone(),
         };
         match self.request(&envelope)? {
@@ -132,7 +132,7 @@ impl GatewayClient {
     }
 
     /// List available music sources.
-    pub fn list_sources(&self) -> Result<Vec<String>, ClientError> {
+    pub fn list_sources(&self) -> Result<Vec<SourceName>, ClientError> {
         match self.request(&GatewayRequest::ListSources)? {
             GatewayResponse::Sources { names } => Ok(names),
             GatewayResponse::Error { message } => Err(ClientError::Gateway(message)),

@@ -93,13 +93,13 @@ fn generate_facts_from_metadata(
 
     if let Some(track_number) = metadata.track_number {
         facts.push((
-            MusicValue::TrackNumber(TrackNumber(track_number)),
+            MusicValue::TrackNumber(TrackNumber::new(track_number)),
             source.clone(),
         ));
     }
 
     if let Some(year) = metadata.year {
-        facts.push((MusicValue::Year(Year(year)), source.clone()));
+        facts.push((MusicValue::Year(Year::new(year)), source.clone()));
     }
 
     // DJ-specific metadata
@@ -129,7 +129,7 @@ fn generate_facts_from_metadata(
 
     // Catalog info (from all_fields for Beatport)
     if let Some(isrc) = find_field(all_fields, "Isrc") {
-        facts.push((MusicValue::Isrc(Isrc(isrc.clone())), source.clone()));
+        facts.push((MusicValue::Isrc(Isrc::new(isrc.clone())), source.clone()));
     }
 
     if let Some(label) = find_field(all_fields, "Label") {
@@ -140,7 +140,7 @@ fn generate_facts_from_metadata(
     if let Some(recording_date) = all_fields.get("VorbisComments.Unknown(\"recording_date\")") {
         if let Some(year_str) = recording_date.split('-').next() {
             if let Ok(year) = year_str.parse::<u32>() {
-                facts.push((MusicValue::RecordingYear(Year(year)), source.clone()));
+                facts.push((MusicValue::RecordingYear(Year::new(year)), source.clone()));
             }
         }
 
@@ -186,38 +186,41 @@ fn generate_facts_from_metadata(
 
     // Audio properties
     if let Some(bit_depth) = metadata.bit_depth {
-        facts.push((MusicValue::BitDepth(BitDepth(bit_depth)), source.clone()));
+        facts.push((
+            MusicValue::BitDepth(BitDepth::new(bit_depth)),
+            source.clone(),
+        ));
     }
 
     if let Some(channels) = metadata.channels {
         facts.push((
-            MusicValue::Channels(Channels(channels as u8)),
+            MusicValue::Channels(Channels::new(channels as u8)),
             source.clone(),
         ));
     }
 
     if let Some(sample_rate) = metadata.sample_rate {
         facts.push((
-            MusicValue::SampleRate(SampleRate(sample_rate)),
+            MusicValue::SampleRate(SampleRate::new(sample_rate)),
             source.clone(),
         ));
     }
 
     if let Some(duration) = metadata.duration {
         facts.push((
-            MusicValue::DurationSeconds(DurationSeconds(duration.as_secs() as u32)),
+            MusicValue::DurationSeconds(DurationSeconds::new(duration.as_secs() as u32)),
             source.clone(),
         ));
     }
 
     if let Some(bitrate) = metadata.bitrate {
-        facts.push((MusicValue::Bitrate(Bitrate(bitrate)), source.clone()));
+        facts.push((MusicValue::Bitrate(Bitrate::new(bitrate)), source.clone()));
     }
 
     // File properties
     if let Some(file_size) = metadata.file_size_bytes {
         facts.push((
-            MusicValue::FileSizeBytes(FileSizeBytes(file_size)),
+            MusicValue::FileSizeBytes(FileSizeBytes::new(file_size)),
             source.clone(),
         ));
     }

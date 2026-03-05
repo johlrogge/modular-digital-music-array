@@ -148,7 +148,7 @@ impl LibraryClient {
     /// ```
     pub fn get_fact_values(&self, fact_type: &str) -> Result<Vec<String>, ClientError> {
         match self.request(&LibraryRequest::GetFactValues {
-            fact_type: fact_type.to_string(),
+            fact_type: FactType::new(fact_type),
         })? {
             LibraryResponse::FactValues(values) => Ok(values),
             LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
@@ -206,7 +206,7 @@ impl LibraryClient {
     /// Check if a fact with the given type and value exists.
     pub fn has_fact(&self, fact_type: &str, value: &str) -> Result<bool, ClientError> {
         match self.request(&LibraryRequest::HasFact {
-            fact_type: fact_type.to_string(),
+            fact_type: FactType::new(fact_type),
             value: value.to_string(),
         })? {
             LibraryResponse::FactExists { exists, .. } => Ok(exists),
@@ -225,7 +225,7 @@ impl LibraryClient {
         values: Vec<String>,
     ) -> Result<Vec<String>, ClientError> {
         match self.request(&LibraryRequest::HasFacts {
-            fact_type: fact_type.to_string(),
+            fact_type: FactType::new(fact_type),
             values,
         })? {
             LibraryResponse::FactsExist { existing, .. } => Ok(existing),

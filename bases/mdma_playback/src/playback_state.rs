@@ -67,7 +67,7 @@ impl PlaybackStateMachine {
             let id = SessionId::now();
             self.session_id = Some(id.clone());
             effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::SessionStarted {
-                id: id.0,
+                id: id,
             }));
         }
     }
@@ -77,7 +77,7 @@ impl PlaybackStateMachine {
     fn maybe_end_session(&mut self, effects: &mut Vec<PlaybackEffect>) {
         if let Some(id) = self.session_id.take() {
             effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::SessionEnded {
-                id: id.0,
+                id: id,
             }));
         }
     }
@@ -96,7 +96,7 @@ impl PlaybackStateMachine {
                     value: MusicValue::TrackStopped(StopReason::OnRequest),
                 });
                 effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::TrackStopped {
-                    hash: h.0.clone(),
+                    hash: h.clone(),
                 }));
             }
             PlaybackState::Idle => {}
@@ -117,7 +117,7 @@ impl PlaybackStateMachine {
             value: MusicValue::TrackStarted(StartReason::ByQueue),
         });
         effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::TrackStarted {
-            hash: hash.0.clone(),
+            hash: hash.clone(),
         }));
 
         effects
@@ -134,9 +134,7 @@ impl PlaybackStateMachine {
                         hash: hash.clone(),
                         value: MusicValue::TrackStopped(StopReason::OnRequest),
                     },
-                    PlaybackEffect::EmitEvent(PlaybackEvent::TrackStopped {
-                        hash: hash.0.clone(),
-                    }),
+                    PlaybackEffect::EmitEvent(PlaybackEvent::TrackStopped { hash: hash.clone() }),
                 ];
                 self.maybe_end_session(&mut effects);
                 effects
@@ -157,7 +155,7 @@ impl PlaybackStateMachine {
                     value: MusicValue::TrackStopped(StopReason::OnSkip),
                 });
                 effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::TrackStopped {
-                    hash: h.0.clone(),
+                    hash: h.clone(),
                 }));
 
                 match next {
@@ -175,7 +173,7 @@ impl PlaybackStateMachine {
                             value: MusicValue::TrackStarted(StartReason::ByQueue),
                         });
                         effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::TrackStarted {
-                            hash: next_hash.0.clone(),
+                            hash: next_hash.clone(),
                         }));
                     }
                     None => {
@@ -199,7 +197,7 @@ impl PlaybackStateMachine {
                         value: MusicValue::TrackStarted(StartReason::ByQueue),
                     });
                     effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::TrackStarted {
-                        hash: next_hash.0.clone(),
+                        hash: next_hash.clone(),
                     }));
                 }
                 // Idle + None => no-op
@@ -216,9 +214,7 @@ impl PlaybackStateMachine {
                 self.state = PlaybackState::Paused { hash: hash.clone() };
                 vec![
                     PlaybackEffect::StopEngine,
-                    PlaybackEffect::EmitEvent(PlaybackEvent::TrackPaused {
-                        hash: hash.0.clone(),
-                    }),
+                    PlaybackEffect::EmitEvent(PlaybackEvent::TrackPaused { hash: hash.clone() }),
                 ]
             }
             PlaybackState::Paused { .. } | PlaybackState::Idle => vec![],
@@ -232,9 +228,7 @@ impl PlaybackStateMachine {
                 self.state = PlaybackState::Playing { hash: hash.clone() };
                 vec![
                     PlaybackEffect::PlayEngine,
-                    PlaybackEffect::EmitEvent(PlaybackEvent::TrackResumed {
-                        hash: hash.0.clone(),
-                    }),
+                    PlaybackEffect::EmitEvent(PlaybackEvent::TrackResumed { hash: hash.clone() }),
                 ]
             }
             PlaybackState::Playing { .. } | PlaybackState::Idle => vec![],
@@ -252,7 +246,7 @@ impl PlaybackStateMachine {
                     value: MusicValue::TrackStopped(StopReason::OnCompletion),
                 });
                 effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::TrackStopped {
-                    hash: hash.0.clone(),
+                    hash: hash.clone(),
                 }));
 
                 match next {
@@ -270,7 +264,7 @@ impl PlaybackStateMachine {
                             value: MusicValue::TrackStarted(StartReason::ByQueue),
                         });
                         effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::TrackStarted {
-                            hash: next_hash.0.clone(),
+                            hash: next_hash.clone(),
                         }));
                     }
                     None => {
@@ -298,11 +292,11 @@ mod tests {
     use super::*;
 
     fn hash_a() -> ContentHash {
-        ContentHash("sha256:aaaaaa".to_string())
+        ContentHash::new("sha256:aaaaaa")
     }
 
     fn hash_b() -> ContentHash {
-        ContentHash("sha256:bbbbbb".to_string())
+        ContentHash::new("sha256:bbbbbb")
     }
 
     fn path_a() -> PathBuf {
@@ -352,7 +346,7 @@ mod tests {
         )));
         assert!(effects.iter().any(|e| matches!(e,
             PlaybackEffect::EmitEvent(PlaybackEvent::TrackStarted { hash })
-            if hash == &hash_a().0
+            if *hash == hash_a()
         )));
     }
 
@@ -426,7 +420,7 @@ mod tests {
         )));
         assert!(effects.iter().any(|e| matches!(e,
             PlaybackEffect::EmitEvent(PlaybackEvent::TrackStopped { hash })
-            if hash == &hash_a().0
+            if *hash == hash_a()
         )));
     }
 
@@ -587,7 +581,7 @@ mod tests {
             .any(|e| matches!(e, PlaybackEffect::StopEngine)));
         assert!(effects.iter().any(|e| matches!(e,
             PlaybackEffect::EmitEvent(PlaybackEvent::TrackPaused { hash })
-            if hash == &hash_a().0
+            if *hash == hash_a()
         )));
     }
 
@@ -632,7 +626,7 @@ mod tests {
             .any(|e| matches!(e, PlaybackEffect::PlayEngine)));
         assert!(effects.iter().any(|e| matches!(e,
             PlaybackEffect::EmitEvent(PlaybackEvent::TrackResumed { hash })
-            if hash == &hash_a().0
+            if *hash == hash_a()
         )));
     }
 
@@ -696,7 +690,7 @@ mod tests {
         )));
         assert!(effects.iter().any(|e| matches!(e,
             PlaybackEffect::EmitEvent(PlaybackEvent::TrackStopped { hash })
-            if hash == &hash_a().0
+            if *hash == hash_a()
         )));
     }
 
@@ -907,7 +901,7 @@ mod tests {
         let second_id = sm.session_id().cloned().expect("new session active");
 
         // The IDs must differ (different timestamps).
-        assert_ne!(first_id.0, second_id.0);
+        assert_ne!(first_id.as_str(), second_id.as_str());
 
         assert!(effects.iter().any(|e| matches!(
             e,
@@ -931,6 +925,6 @@ mod tests {
             }
         });
 
-        assert_eq!(event_id.as_deref(), Some(session_id.0.as_str()));
+        assert_eq!(event_id, Some(session_id.clone()));
     }
 }

@@ -11,7 +11,36 @@ pub use library_search::{
     CamelotLetter, DurationQuery, DurationUnit, KeyQuery, NumericQuery, StringQuery, TrackQuery,
 };
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use thiserror::Error;
+
+// ============================================================================
+// FactType Newtype
+// ============================================================================
+
+/// Typed fact name (e.g. "artist", "genre", "isrc").
+///
+/// Replaces bare `String` in request/response types to prevent accidental
+/// confusion between a fact type name and a fact value.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FactType(String);
+
+impl FactType {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for FactType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 // ============================================================================
 // Security Newtypes
@@ -219,7 +248,7 @@ pub enum LibraryRequest {
 
     /// Get all distinct values stored for a given fact type.
     /// Returns a sorted list usable for discovery (e.g. all genres, all labels).
-    GetFactValues { fact_type: String },
+    GetFactValues { fact_type: FactType },
 
     /// Get files currently in inbox queue.
     GetInboxQueue,
@@ -238,11 +267,11 @@ pub enum LibraryRequest {
     IngestAll,
 
     /// Check if any track has a fact matching the given type and value.
-    HasFact { fact_type: String, value: String },
+    HasFact { fact_type: FactType, value: String },
 
     /// Batch check: which of these values exist for a given fact type?
     HasFacts {
-        fact_type: String,
+        fact_type: FactType,
         values: Vec<String>,
     },
 
@@ -314,14 +343,14 @@ pub enum LibraryResponse {
 
     /// Whether a single fact exists.
     FactExists {
-        fact_type: String,
+        fact_type: FactType,
         value: String,
         exists: bool,
     },
 
     /// Batch result: which values exist for a given fact type.
     FactsExist {
-        fact_type: String,
+        fact_type: FactType,
         existing: Vec<String>,
     },
 
@@ -498,7 +527,7 @@ mod tests {
 
     #[test]
     fn ingest_result_success_serialization() {
-        let hash = ContentHash("sha256:abc".to_string());
+        let hash = ContentHash::new("sha256:abc");
         let result = IngestResult::Success {
             hash: Some(hash.clone()),
             message: "ingested".to_string(),
@@ -532,11 +561,11 @@ mod tests {
     #[test]
     fn track_info_roundtrip() {
         let track = TrackInfo {
-            content_hash: ContentHash("sha256:abc123".to_string()),
+            content_hash: ContentHash::new("sha256:abc123"),
             title: Some("Test Track".to_string()),
             artist: Some("Test Artist".to_string()),
             album: None,
-            duration: Some(DurationSeconds(180)),
+            duration: Some(DurationSeconds::new(180)),
             bpm: Some(Bpm::from_u32(128).unwrap()),
             key: None,
             blob_path: Some("ab/abc123.flac".to_string()),
@@ -545,6 +574,6 @@ mod tests {
         let json = serde_json::to_string(&track).unwrap();
         let parsed: TrackInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.title, track.title);
-        assert_eq!(parsed.content_hash.0, track.content_hash.0);
+        assert_eq!(parsed.content_hash.as_str(), track.content_hash.as_str());
     }
 }

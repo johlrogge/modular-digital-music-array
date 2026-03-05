@@ -474,7 +474,7 @@ async fn ingest_all(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                         path: item.path.to_string(),
                         success: true,
                         message,
-                        hash: hash.map(|h| h.0),
+                        hash: hash.map(|h| h.as_str().to_owned()),
                     },
                     IngestResult::Failure { message } => IngestResultJson {
                         path: item.path.to_string(),
@@ -658,7 +658,7 @@ async fn bandcamp_downloads(State(state): State<Arc<AppState>>) -> impl IntoResp
                         _ => None,
                     };
                     DownloadJson {
-                        id: d.id,
+                        id: d.id.to_string(),
                         artist: d.artist,
                         title: d.title,
                         state: d.state.to_string(),
@@ -839,11 +839,11 @@ struct TrackInfoJson {
 impl TrackInfoJson {
     fn from_track_info(t: &TrackInfo) -> Self {
         Self {
-            content_hash: t.content_hash.0.clone(),
+            content_hash: t.content_hash.as_str().to_owned(),
             title: t.title.clone(),
             artist: t.artist.clone(),
             album: t.album.clone(),
-            duration: t.duration.map(|d| d.0),
+            duration: t.duration.map(|d| d.value()),
             bpm: t.bpm.map(|b| b.as_f32()),
             key: t.key.map(|k| k.to_string()),
         }
@@ -905,7 +905,7 @@ async fn player_now_playing(State(state): State<Arc<AppState>>) -> impl IntoResp
                     .into_response(),
                     None => Json(serde_json::json!({
                         "playing": true,
-                        "track": { "content_hash": hash.0 }
+                        "track": { "content_hash": hash.as_str() }
                     }))
                     .into_response(),
                 }
@@ -942,8 +942,8 @@ async fn player_queue(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                             .and_then(|lib| lib.get_track(hash).ok());
                         match track {
                             Some(t) => serde_json::to_value(TrackInfoJson::from_track_info(&t))
-                                .unwrap_or(serde_json::json!({"content_hash": hash.0})),
-                            None => serde_json::json!({"content_hash": hash.0}),
+                                .unwrap_or(serde_json::json!({"content_hash": hash.as_str()})),
+                            None => serde_json::json!({"content_hash": hash.as_str()}),
                         }
                     })
                     .collect();
@@ -969,7 +969,7 @@ async fn player_queue_append(
     State(state): State<Arc<AppState>>,
     Json(req): Json<QueueAppendRequest>,
 ) -> impl IntoResponse {
-    let hash = ContentHash(req.hash);
+    let hash = ContentHash::new(req.hash);
 
     // Resolve the blob path via library
     let lib_client = match state.library_client() {
@@ -1024,7 +1024,7 @@ async fn player_queue_remove(
     State(state): State<Arc<AppState>>,
     Json(req): Json<QueueRemoveRequest>,
 ) -> impl IntoResponse {
-    let hashes: Vec<ContentHash> = req.hashes.into_iter().map(ContentHash).collect();
+    let hashes: Vec<ContentHash> = req.hashes.into_iter().map(ContentHash::new).collect();
 
     let client = match require_gateway(&state) {
         Ok(c) => c,
@@ -1424,7 +1424,7 @@ async fn export_track(
 ) -> impl IntoResponse {
     use axum::http::header;
 
-    let content_hash = ContentHash(hash);
+    let content_hash = ContentHash::new(hash);
 
     // Resolve track metadata from library
     let lib_client = match state.library_client() {
@@ -1441,7 +1441,7 @@ async fn export_track(
     let track = match lib_client.get_track(&content_hash) {
         Ok(t) => t,
         Err(e) => {
-            tracing::warn!(hash = %content_hash.0, error = %e, "Track not found for export");
+            tracing::warn!(hash = %content_hash.as_str(), error = %e, "Track not found for export");
             return (StatusCode::NOT_FOUND, format!("Track not found: {}", e)).into_response();
         }
     };
@@ -1671,11 +1671,11 @@ mod tests {
     #[test]
     fn track_info_json_from_full_track() {
         let track = TrackInfo {
-            content_hash: ContentHash("sha256:abc123".to_string()),
+            content_hash: ContentHash::new("sha256:abc123"),
             title: Some("Test Track".to_string()),
             artist: Some("Test Artist".to_string()),
             album: Some("Test Album".to_string()),
-            duration: Some(DurationSeconds(180)),
+            duration: Some(DurationSeconds::new(180)),
             bpm: Some(Bpm::from_u32(128).unwrap()),
             key: Some(Key::from_traditional("C Major").unwrap()),
             blob_path: Some("ab/abc123.flac".to_string()),
@@ -1693,7 +1693,7 @@ mod tests {
     #[test]
     fn track_info_json_from_minimal_track() {
         let track = TrackInfo {
-            content_hash: ContentHash("sha256:deadbeef".to_string()),
+            content_hash: ContentHash::new("sha256:deadbeef"),
             title: None,
             artist: None,
             album: None,

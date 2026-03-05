@@ -441,11 +441,11 @@ mod tests {
             "MusicValue"
         );
         assert_eq!(
-            MusicValue::DurationSeconds(DurationSeconds(300)).display_name(),
+            MusicValue::DurationSeconds(DurationSeconds::new(300)).display_name(),
             "Duration"
         );
         assert_eq!(
-            MusicValue::FileSizeBytes(FileSizeBytes(1024)).display_name(),
+            MusicValue::FileSizeBytes(FileSizeBytes::new(1024)).display_name(),
             "FileSize"
         );
     }

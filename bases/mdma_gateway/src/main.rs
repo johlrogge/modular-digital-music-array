@@ -1,6 +1,6 @@
 use clap::Parser;
 use color_eyre::Result;
-use gateway_protocol::{GatewayRequest, GatewayResponse};
+use gateway_protocol::{GatewayRequest, GatewayResponse, SourceName};
 use nng::options::Options;
 use source_protocol::{SourceRequest, SourceResponse};
 use std::collections::HashMap;
@@ -262,7 +262,7 @@ fn main() -> Result<()> {
             }
 
             GatewayRequest::Source { name, request } => {
-                match get_or_connect_source(&args.sources_dir, &name, &mut source_cache) {
+                match get_or_connect_source(&args.sources_dir, name.as_str(), &mut source_cache) {
                     Ok(backend) => {
                         let request_bytes = serde_json::to_vec(&request).unwrap();
                         match forward_raw(backend, &request_bytes) {
@@ -274,7 +274,7 @@ fn main() -> Result<()> {
                                     },
                                     Err(e) => {
                                         // Remove broken connection from cache
-                                        source_cache.remove(&name);
+                                        source_cache.remove(name.as_str());
                                         GatewayResponse::Error {
                                             message: format!(
                                                 "source '{}' response parse error: {}",
@@ -286,7 +286,7 @@ fn main() -> Result<()> {
                             }
                             Err(e) => {
                                 // Remove broken connection from cache
-                                source_cache.remove(&name);
+                                source_cache.remove(name.as_str());
                                 GatewayResponse::Error {
                                     message: format!("source '{}' unreachable: {}", name, e),
                                 }
@@ -314,11 +314,14 @@ fn main() -> Result<()> {
 
             GatewayRequest::ListSources => {
                 // Handle ListSources with optional liveness check
-                let mut source_names = list_sources(&args.sources_dir);
+                let raw_names = list_sources(&args.sources_dir);
+                let mut source_names: Vec<SourceName> =
+                    raw_names.into_iter().map(SourceName::new).collect();
 
                 // Try to ping each source to verify it's alive
                 source_names.retain(|name| {
-                    match get_or_connect_source(&args.sources_dir, name, &mut source_cache) {
+                    match get_or_connect_source(&args.sources_dir, name.as_str(), &mut source_cache)
+                    {
                         Ok(backend) => {
                             let ping = SourceRequest::Ping;
                             let ping_bytes = serde_json::to_vec(&ping).unwrap();

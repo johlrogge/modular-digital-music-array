@@ -1,3 +1,4 @@
+use playback_primitives::{ContentHash, SessionId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -36,33 +37,33 @@ pub const TOPIC_SESSION_ENDED: &str = "playback/session_ended";
 #[serde(tag = "type")]
 pub enum PlaybackEvent {
     TrackStarted {
-        hash: String,
+        hash: ContentHash,
     },
     TrackEnded {
-        hash: String,
+        hash: ContentHash,
     },
     TrackStopped {
-        hash: String,
+        hash: ContentHash,
     },
     TrackPaused {
-        hash: String,
+        hash: ContentHash,
     },
     TrackResumed {
-        hash: String,
+        hash: ContentHash,
     },
     QueueChanged {
         length: usize,
     },
     PositionUpdate {
-        hash: String,
+        hash: ContentHash,
         position_ms: u64,
         duration_ms: u64,
     },
     SessionStarted {
-        id: String,
+        id: SessionId,
     },
     SessionEnded {
-        id: String,
+        id: SessionId,
     },
 }
 
@@ -129,9 +130,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn event_uses_content_hash_type() {
+        let hash = playback_primitives::ContentHash::new("sha256:abc123");
+        let event = PlaybackEvent::TrackStarted { hash: hash.clone() };
+        let bytes = to_topic_message(&event);
+        let (_, decoded) = from_topic_message(&bytes).unwrap();
+        match decoded {
+            PlaybackEvent::TrackStarted { hash: decoded_hash } => assert_eq!(decoded_hash, hash),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn event_uses_session_id_type() {
+        let id = playback_primitives::SessionId::new("2026-02-24T12:00:00+00:00");
+        let event = PlaybackEvent::SessionStarted { id: id.clone() };
+        let bytes = to_topic_message(&event);
+        let (_, decoded) = from_topic_message(&bytes).unwrap();
+        match decoded {
+            PlaybackEvent::SessionStarted { id: decoded_id } => assert_eq!(decoded_id, id),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn roundtrip_track_started() {
         let event = PlaybackEvent::TrackStarted {
-            hash: "sha256:abc123".into(),
+            hash: playback_primitives::ContentHash::new("sha256:abc123"),
         };
         let bytes = to_topic_message(&event);
         let (topic, decoded) = from_topic_message(&bytes).unwrap();
@@ -142,7 +167,7 @@ mod tests {
     #[test]
     fn roundtrip_track_ended() {
         let event = PlaybackEvent::TrackEnded {
-            hash: "sha256:def456".into(),
+            hash: ContentHash::new("sha256:def456"),
         };
         let bytes = to_topic_message(&event);
         let (topic, decoded) = from_topic_message(&bytes).unwrap();
@@ -153,7 +178,7 @@ mod tests {
     #[test]
     fn roundtrip_track_stopped() {
         let event = PlaybackEvent::TrackStopped {
-            hash: "sha256:789ghi".into(),
+            hash: ContentHash::new("sha256:789ghi"),
         };
         let bytes = to_topic_message(&event);
         let (topic, decoded) = from_topic_message(&bytes).unwrap();
@@ -164,7 +189,7 @@ mod tests {
     #[test]
     fn roundtrip_track_paused() {
         let event = PlaybackEvent::TrackPaused {
-            hash: "sha256:abc123".into(),
+            hash: ContentHash::new("sha256:abc123"),
         };
         let bytes = to_topic_message(&event);
         let (topic, decoded) = from_topic_message(&bytes).unwrap();
@@ -175,7 +200,7 @@ mod tests {
     #[test]
     fn roundtrip_track_resumed() {
         let event = PlaybackEvent::TrackResumed {
-            hash: "sha256:abc123".into(),
+            hash: ContentHash::new("sha256:abc123"),
         };
         let bytes = to_topic_message(&event);
         let (topic, decoded) = from_topic_message(&bytes).unwrap();
@@ -195,7 +220,7 @@ mod tests {
     #[test]
     fn roundtrip_position_update() {
         let event = PlaybackEvent::PositionUpdate {
-            hash: "sha256:abc123".into(),
+            hash: ContentHash::new("sha256:abc123"),
             position_ms: 12_345,
             duration_ms: 240_000,
         };
@@ -208,7 +233,7 @@ mod tests {
     #[test]
     fn roundtrip_session_started() {
         let event = PlaybackEvent::SessionStarted {
-            id: "2026-02-24T12:00:00+00:00".into(),
+            id: SessionId::new("2026-02-24T12:00:00+00:00"),
         };
         let bytes = to_topic_message(&event);
         let (topic, decoded) = from_topic_message(&bytes).unwrap();
@@ -219,7 +244,7 @@ mod tests {
     #[test]
     fn roundtrip_session_ended() {
         let event = PlaybackEvent::SessionEnded {
-            id: "2026-02-24T12:00:00+00:00".into(),
+            id: SessionId::new("2026-02-24T12:00:00+00:00"),
         };
         let bytes = to_topic_message(&event);
         let (topic, decoded) = from_topic_message(&bytes).unwrap();
@@ -230,7 +255,7 @@ mod tests {
     #[test]
     fn wire_format_has_null_separator() {
         let event = PlaybackEvent::TrackStarted {
-            hash: "test".into(),
+            hash: ContentHash::new("test"),
         };
         let bytes = to_topic_message(&event);
         // Should start with topic, then null, then JSON

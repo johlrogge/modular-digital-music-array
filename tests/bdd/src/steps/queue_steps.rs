@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[given(regex = r#"^the queue contains "([^"]*)"$"#)]
 async fn queue_contains(world: &mut MdmaWorld, hash: String) {
     world.ensure_env();
-    let content_hash = ContentHash(hash);
+    let content_hash = ContentHash::new(hash);
     if let Err(e) = world
         .playback()
         .queue_append(content_hash, PathBuf::from("/fake/path.flac"))
@@ -20,7 +20,7 @@ async fn queue_contains(world: &mut MdmaWorld, hash: String) {
 #[when(regex = r#"^I append "([^"]*)" to the queue$"#)]
 async fn append_to_queue(world: &mut MdmaWorld, hash: String) {
     world.ensure_env();
-    let content_hash = ContentHash(hash);
+    let content_hash = ContentHash::new(hash);
     match world
         .playback()
         .queue_append(content_hash, PathBuf::from("/fake/path.flac"))
@@ -33,7 +33,7 @@ async fn append_to_queue(world: &mut MdmaWorld, hash: String) {
 #[when(regex = r#"^I prepend "([^"]*)" to the queue$"#)]
 async fn prepend_to_queue(world: &mut MdmaWorld, hash: String) {
     world.ensure_env();
-    let content_hash = ContentHash(hash);
+    let content_hash = ContentHash::new(hash);
     match world
         .playback()
         .queue_next(content_hash, PathBuf::from("/fake/path.flac"))

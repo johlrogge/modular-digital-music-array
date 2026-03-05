@@ -5,9 +5,18 @@ use thiserror::Error;
 
 /// Identifies a playback session — spans from the first track playing to the queue emptying.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SessionId(pub String);
+#[serde(transparent)]
+pub struct SessionId(String);
 
 impl SessionId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     /// Create a new session ID using the current UTC timestamp in RFC 3339 format.
     pub fn now() -> Self {
         Self(chrono::Utc::now().to_rfc3339())
@@ -23,7 +32,17 @@ impl Display for SessionId {
 /// Content hash of audio file — THE cross-service track identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct ContentHash(pub String);
+pub struct ContentHash(String);
+
+impl ContentHash {
+    pub fn new(hash: impl Into<String>) -> Self {
+        Self(hash.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 impl Display for ContentHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

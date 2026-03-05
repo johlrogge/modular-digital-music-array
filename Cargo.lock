@@ -1234,6 +1234,7 @@ dependencies = [
 name = "event-protocol"
 version = "0.5.0"
 dependencies = [
+ "playback-primitives",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

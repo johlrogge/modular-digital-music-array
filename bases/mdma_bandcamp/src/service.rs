@@ -5,8 +5,8 @@
 
 use crate::cache::DownloadCache;
 use crate::ipc::{
-    DownloadState, DownloadStatus, IpcServer, SourceError, SourceRequest, SourceResponse,
-    SourceStatus,
+    DownloadId, DownloadState, DownloadStatus, IpcServer, SourceError, SourceRequest,
+    SourceResponse, SourceStatus,
 };
 use bandcamp_api::{AudioFormat, BandcampClient, CollectionItem};
 use library_ipc_client::{InboxPath, IngestSource, LibraryClient};
@@ -217,7 +217,7 @@ impl BandcampService {
             }
 
             SourceRequest::CancelDownload { id } => {
-                self.cancel_download(&id);
+                self.cancel_download(id.as_str());
                 SourceResponse::Cancelled { id }
             }
 
@@ -356,7 +356,7 @@ impl BandcampService {
         // Add active downloads
         for (id, dl) in self.active_downloads.lock().iter() {
             downloads.push(DownloadStatus {
-                id: id.clone(),
+                id: DownloadId::new(id.clone()),
                 artist: dl.item.artist.to_string(),
                 title: dl.item.title.to_string(),
                 state: dl.state.to_protocol(&dl.error),
@@ -368,7 +368,7 @@ impl BandcampService {
         // Add queued downloads
         for dl in self.download_queue.lock().iter() {
             downloads.push(DownloadStatus {
-                id: dl.item.id.as_str().to_string(),
+                id: DownloadId::new(dl.item.id.as_str()),
                 artist: dl.item.artist.to_string(),
                 title: dl.item.title.to_string(),
                 state: DownloadState::Queued,

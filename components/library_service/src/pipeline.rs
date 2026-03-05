@@ -29,7 +29,7 @@ pub enum IngestError {
     #[error("Failed to extract metadata: {0}")]
     MetadataError(String),
 
-    #[error("Duplicate track (already indexed): {}", .0.0)]
+    #[error("Duplicate track (already indexed): {0}")]
     Duplicate(ContentHash),
 
     #[error("IO error: {0}")]
@@ -185,9 +185,9 @@ impl ExtractedTrack {
     pub fn import(self, music_dir: &std::path::Path) -> Result<IndexedTrack, IngestError> {
         let hash_str = self
             .content_hash
-            .0
+            .as_str()
             .strip_prefix("sha256:")
-            .unwrap_or(&self.content_hash.0);
+            .unwrap_or(self.content_hash.as_str());
 
         // Blob path: /music/blobs/a1/b2c3d4...sha256.flac
         let blob_dir = music_dir.join("blobs").join(&hash_str[..2]);
@@ -244,7 +244,7 @@ fn compute_hash(path: &std::path::Path) -> Result<ContentHash, IngestError> {
 
     let result = hasher.finalize();
     let hash_string = hex::encode(result);
-    Ok(ContentHash(format!("sha256:{}", hash_string)))
+    Ok(ContentHash::new(format!("sha256:{}", hash_string)))
 }
 
 /// Extract metadata facts from audio file
@@ -270,10 +270,10 @@ fn create_symlink(
 
     for (value, _source) in facts {
         match value {
-            MusicValue::Artist(a) => artist = Some(a.0.clone()),
-            MusicValue::Album(a) => album = Some(a.0.clone()),
-            MusicValue::Title(t) => title = Some(t.0.clone()),
-            MusicValue::TrackNumber(n) => track_num = Some(n.0),
+            MusicValue::Artist(a) => artist = Some(a.as_str().to_string()),
+            MusicValue::Album(a) => album = Some(a.as_str().to_string()),
+            MusicValue::Title(t) => title = Some(t.as_str().to_string()),
+            MusicValue::TrackNumber(n) => track_num = Some(n.value()),
             _ => {}
         }
     }

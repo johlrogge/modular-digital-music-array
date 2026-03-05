@@ -1,5 +1,6 @@
 //! Source client abstraction — works in both gateway and direct mode.
 
+use gateway_client::SourceName;
 use source_protocol::{SourceRequest, SourceResponse};
 
 /// Abstraction for sending source requests, works in both gateway and direct mode.
@@ -61,7 +62,7 @@ impl SourceClient {
 pub fn list_available_sources(
     gateway: Option<&str>,
     sources_dir: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<SourceName>, String> {
     if let Some(gw_addr) = gateway {
         let gw = gateway_client::GatewayClient::connect(gw_addr)
             .map_err(|e| format!("Failed to connect to gateway at {}: {}", gw_addr, e))?;
@@ -78,7 +79,7 @@ pub fn list_available_sources(
                 let entry = entry.ok()?;
                 let path = entry.path();
                 if path.extension()?.to_str()? == "sock" {
-                    path.file_stem()?.to_str().map(|s| s.to_string())
+                    path.file_stem()?.to_str().map(|s| SourceName::new(s))
                 } else {
                     None
                 }

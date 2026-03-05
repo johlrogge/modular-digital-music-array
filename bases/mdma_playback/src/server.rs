@@ -105,7 +105,7 @@ impl Server {
             let path = PathBuf::from(&e.path);
             if path.exists() {
                 queue.push_back(QueueEntry {
-                    hash: ContentHash(e.hash),
+                    hash: ContentHash::new(e.hash),
                     path,
                 });
             } else {
@@ -355,7 +355,12 @@ impl Server {
                 self.create_response(result, None)
             }
             Command::GetSession => {
-                let session_id = self.state.lock().await.session_id().map(|id| id.0.clone());
+                let session_id = self
+                    .state
+                    .lock()
+                    .await
+                    .session_id()
+                    .map(|id| id.as_str().to_owned());
                 info!("GetSession: {:?}", session_id);
                 Response::Ok {
                     data: Some(ResponseData::Session(session_id)),
@@ -434,7 +439,7 @@ fn persist_queue_to_file(queue_file: &Path, queue: &VecDeque<QueueEntry>) {
     let entries: Vec<PersistEntry> = queue
         .iter()
         .map(|e| PersistEntry {
-            hash: e.hash.0.clone(),
+            hash: e.hash.as_str().to_owned(),
             path: e.path.to_string_lossy().into_owned(),
         })
         .collect();
@@ -489,7 +494,7 @@ async fn auto_advance_task(
                     publish_event_on_socket(
                         &event_pub,
                         &PlaybackEvent::PositionUpdate {
-                            hash: h.0.clone(),
+                            hash: h.clone(),
                             position_ms,
                             duration_ms,
                         },
@@ -601,7 +606,7 @@ mod tests {
         // Drive the state machine directly into Paused.
         {
             let mut sm = server.state.lock().await;
-            let hash = ContentHash("sha256:test".to_string());
+            let hash = ContentHash::new("sha256:test");
             let path = PathBuf::from("/nonexistent/track.flac");
             sm.play_queue(hash, path);
             sm.pause();

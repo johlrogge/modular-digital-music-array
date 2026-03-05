@@ -2,8 +2,9 @@
 
 use crate::error::map_gw_to_lib_error;
 use library_ipc_client::{
-    ClientError, ContentHash, InboxPath, IngestAllItem, IngestResult, IngestSource, LibraryClient,
-    LibraryRequest, LibraryResponse, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
+    ClientError, ContentHash, FactType, InboxPath, IngestAllItem, IngestResult, IngestSource,
+    LibraryClient, LibraryRequest, LibraryResponse, ProtocolError, ServiceStatus, TrackInfo,
+    TrackQuery,
 };
 
 /// Abstraction for library requests, works in both gateway and direct mode.
@@ -107,7 +108,7 @@ impl LibraryBackend {
 
     pub fn get_fact_values(&self, fact_type: &str) -> Result<Vec<String>, ClientError> {
         match self.request(&LibraryRequest::GetFactValues {
-            fact_type: fact_type.to_string(),
+            fact_type: FactType::new(fact_type),
         })? {
             LibraryResponse::FactValues(values) => Ok(values),
             LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),

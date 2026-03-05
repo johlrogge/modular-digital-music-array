@@ -604,7 +604,10 @@ fn connect_source(cli: &Cli, name: &str) -> SourceClient {
 
 /// Get a short hash for display (8 chars after sha256: prefix)
 fn short_hash(hash: &ContentHash) -> &str {
-    let clean = hash.0.strip_prefix("sha256:").unwrap_or(&hash.0);
+    let clean = hash
+        .as_str()
+        .strip_prefix("sha256:")
+        .unwrap_or(hash.as_str());
     if clean.len() >= 8 {
         &clean[..8]
     } else {
@@ -940,10 +943,10 @@ fn handle_list(client: &LibraryBackend, limit: Option<usize>) -> Result<()> {
 }
 
 fn handle_get(client: &LibraryBackend, hash: String) -> Result<()> {
-    let content_hash = ContentHash(hash);
+    let content_hash = ContentHash::new(hash);
     match client.get_track(&content_hash) {
         Ok(track) => {
-            println!("Track: {}", track.content_hash.0);
+            println!("Track: {}", track.content_hash.as_str());
             println!("{}", "=".repeat(65));
             if let Some(title) = track.title {
                 println!("Title:    {}", title);
@@ -973,10 +976,10 @@ fn handle_get(client: &LibraryBackend, hash: String) -> Result<()> {
 }
 
 fn handle_facts(client: &LibraryBackend, hash: String) -> Result<()> {
-    let content_hash = ContentHash(hash);
+    let content_hash = ContentHash::new(hash);
     match client.get_facts(&content_hash) {
         Ok((full_hash, facts)) => {
-            println!("Facts for: {}", full_hash.0);
+            println!("Facts for: {}", full_hash.as_str());
             println!("{}", "=".repeat(65));
             for (fact_type, fact_value) in facts {
                 println!("{:20} | {}", fact_type, fact_value);
@@ -1072,9 +1075,9 @@ fn handle_search(client: &LibraryBackend, query: &TrackQuery, no_stdin: bool) ->
                     .filter(|t| {
                         let clean = t
                             .content_hash
-                            .0
+                            .as_str()
                             .strip_prefix("sha256:")
-                            .unwrap_or(&t.content_hash.0);
+                            .unwrap_or(t.content_hash.as_str());
                         filter.iter().any(|token| {
                             let token_clean =
                                 token.strip_prefix("sha256:").unwrap_or(token.as_str());
@@ -1188,7 +1191,7 @@ fn handle_inbox_ingest(client: &LibraryBackend, filename: String) -> Result<()> 
             match result {
                 IngestResult::Success { hash, message } => {
                     if let Some(h) = hash {
-                        println!("Success: {}", h.0);
+                        println!("Success: {}", h.as_str());
                     } else {
                         println!("Success: {}", message);
                     }
@@ -1335,7 +1338,7 @@ fn handle_playlist_list(client: &LibraryBackend) -> Result<()> {
 
         let hashes: Vec<ContentHash> = content
             .lines()
-            .filter_map(|line| parse_hash_from_line(line).map(ContentHash))
+            .filter_map(|line| parse_hash_from_line(line).map(ContentHash::new))
             .collect();
 
         let track_count = hashes.len();
@@ -1344,11 +1347,11 @@ fn handle_playlist_list(client: &LibraryBackend) -> Result<()> {
             .iter()
             .filter_map(|h| {
                 let track = client.get_track(h).ok()?;
-                track.duration.map(|d| d.0)
+                track.duration.map(|d| d.value())
             })
             .sum();
 
-        let duration = DurationSeconds(total_secs);
+        let duration = DurationSeconds::new(total_secs);
         println!(
             "{}  {}  [{}]",
             name.to_string().bold(),
@@ -1748,7 +1751,12 @@ fn handle_source_downloads(client: &SourceClient, name: &str) -> Result<()> {
 }
 
 fn handle_source_cancel(client: &SourceClient, name: &str, id: String) -> Result<()> {
-    match client.request(name, &SourceRequest::CancelDownload { id: id.clone() }) {
+    match client.request(
+        name,
+        &SourceRequest::CancelDownload {
+            id: source_protocol::DownloadId::new(id.clone()),
+        },
+    ) {
         Ok(SourceResponse::Cancelled { .. }) => {
             println!("Cancelled download: {}", id);
             Ok(())
@@ -1822,7 +1830,7 @@ fn handle_playback_now(
             std::process::exit(1);
         }
         Some(h) => match library_client {
-            None => println!("{}", h.0),
+            None => println!("{}", h.as_str()),
             Some(lib) => {
                 let track = lib
                     .get_track(&h)
@@ -1919,7 +1927,7 @@ fn handle_queue_remove(
     let content_hashes: Vec<ContentHash> = hashes
         .into_iter()
         .filter_map(|hash| {
-            let content_hash = ContentHash(hash);
+            let content_hash = ContentHash::new(hash);
             match library_client.get_track(&content_hash) {
                 Ok(t) => Some(t.content_hash),
                 Err(e) => {
@@ -2079,7 +2087,7 @@ fn resolve_track(
     library_client: &LibraryBackend,
     hash: String,
 ) -> (ContentHash, std::path::PathBuf) {
-    let content_hash = ContentHash(hash);
+    let content_hash = ContentHash::new(hash);
     let track = match library_client.get_track(&content_hash) {
         Ok(t) => t,
         Err(e) => handle_error(e),
@@ -2129,7 +2137,7 @@ fn handle_sort(
     let mut tracks: Vec<TrackInfo> = hashes
         .into_iter()
         .filter_map(|hash| {
-            let content_hash = ContentHash(hash);
+            let content_hash = ContentHash::new(hash);
             match client.get_track(&content_hash) {
                 Ok(t) => Some(t),
                 Err(e) => {
@@ -2158,8 +2166,8 @@ fn handle_sort(
             direction_asc,
         ),
         SortField::Duration => compare_optional(
-            a.duration.map(|d| d.0),
-            b.duration.map(|d| d.0),
+            a.duration.map(|d| d.value()),
+            b.duration.map(|d| d.value()),
             direction_asc,
         ),
     });
@@ -2279,7 +2287,7 @@ fn handle_subscribe(
 fn print_event_human(event: &PlaybackEvent, library: Option<&LibraryBackend>) {
     match event {
         PlaybackEvent::TrackStarted { hash } => {
-            let track_info = library.and_then(|lib| lib.get_track(&ContentHash(hash.clone())).ok());
+            let track_info = library.and_then(|lib| lib.get_track(hash).ok());
             match track_info {
                 Some(track) => {
                     let artist = track.artist.as_deref().unwrap_or("Unknown");
@@ -2298,21 +2306,41 @@ fn print_event_human(event: &PlaybackEvent, library: Option<&LibraryBackend>) {
                     );
                 }
                 None => {
-                    println!("{} {}", "▶ started".green().bold(), hash.bright_black());
+                    println!(
+                        "{} {}",
+                        "▶ started".green().bold(),
+                        hash.as_str().bright_black()
+                    );
                 }
             }
         }
         PlaybackEvent::TrackEnded { hash } => {
-            println!("{} {}", "■ ended".yellow().bold(), hash.bright_black());
+            println!(
+                "{} {}",
+                "■ ended".yellow().bold(),
+                hash.as_str().bright_black()
+            );
         }
         PlaybackEvent::TrackStopped { hash } => {
-            println!("{} {}", "⏹ stopped".red().bold(), hash.bright_black());
+            println!(
+                "{} {}",
+                "⏹ stopped".red().bold(),
+                hash.as_str().bright_black()
+            );
         }
         PlaybackEvent::TrackPaused { hash } => {
-            println!("{} {}", "⏸ paused".yellow().bold(), hash.bright_black());
+            println!(
+                "{} {}",
+                "⏸ paused".yellow().bold(),
+                hash.as_str().bright_black()
+            );
         }
         PlaybackEvent::TrackResumed { hash } => {
-            println!("{} {}", "▶ resumed".green().bold(), hash.bright_black());
+            println!(
+                "{} {}",
+                "▶ resumed".green().bold(),
+                hash.as_str().bright_black()
+            );
         }
         PlaybackEvent::QueueChanged { length } => {
             println!(
@@ -2328,11 +2356,15 @@ fn print_event_human(event: &PlaybackEvent, library: Option<&LibraryBackend>) {
             println!(
                 "{} {}",
                 "◉ session started".cyan().bold(),
-                id.bright_black()
+                id.to_string().bright_black()
             );
         }
         PlaybackEvent::SessionEnded { id } => {
-            println!("{} {}", "◎ session ended".cyan().bold(), id.bright_black());
+            println!(
+                "{} {}",
+                "◎ session ended".cyan().bold(),
+                id.to_string().bright_black()
+            );
         }
     }
 }
@@ -2667,7 +2699,7 @@ fn handle_export(
     // Resolve each hash (short or full) to a full TrackInfo via the library
     let mut tracks: Vec<TrackInfo> = Vec::with_capacity(raw_hashes.len());
     for raw in &raw_hashes {
-        let ch = ContentHash(raw.clone());
+        let ch = ContentHash::new(raw.clone());
         match library.get_track(&ch) {
             Ok(t) => tracks.push(t),
             Err(e) => {
@@ -2700,7 +2732,7 @@ fn handle_export(
             lossy_format,
         );
         let format_param = resolved_format.format_param();
-        let full_hash = &track.content_hash.0;
+        let full_hash = track.content_hash.as_str();
         let url = export_url_from_node(&node, full_hash, format_param);
         eprint!("[{}/{}] Downloading {} ... ", idx + 1, total, full_hash);
         let _ = std::io::stderr().flush();
@@ -2710,7 +2742,7 @@ fn handle_export(
             Err(e) => {
                 eprintln!("FAILED ({})", e);
                 results.push(ExportResult {
-                    hash: full_hash.clone(),
+                    hash: full_hash.to_string(),
                     filename: String::new(),
                     bytes: 0,
                     success: false,
@@ -2724,7 +2756,7 @@ fn handle_export(
             let status = response.status();
             eprintln!("FAILED (HTTP {})", status);
             results.push(ExportResult {
-                hash: full_hash.clone(),
+                hash: full_hash.to_string(),
                 filename: String::new(),
                 bytes: 0,
                 success: false,
@@ -2759,7 +2791,7 @@ fn handle_export(
             if let Err(e) = std::fs::create_dir_all(parent) {
                 eprintln!("FAILED (mkdir: {})", e);
                 results.push(ExportResult {
-                    hash: full_hash.clone(),
+                    hash: full_hash.to_string(),
                     filename: dest.display().to_string(),
                     bytes: 0,
                     success: false,
@@ -2774,7 +2806,7 @@ fn handle_export(
             Err(e) => {
                 eprintln!("FAILED (read error: {})", e);
                 results.push(ExportResult {
-                    hash: full_hash.clone(),
+                    hash: full_hash.to_string(),
                     filename: dest.display().to_string(),
                     bytes: 0,
                     success: false,
@@ -2787,7 +2819,7 @@ fn handle_export(
         if let Err(e) = std::fs::write(&dest, &body) {
             eprintln!("FAILED (write error: {})", e);
             results.push(ExportResult {
-                hash: full_hash.clone(),
+                hash: full_hash.to_string(),
                 filename: dest.display().to_string(),
                 bytes: 0,
                 success: false,
@@ -2800,7 +2832,7 @@ fn handle_export(
         let display = dest.display().to_string();
         eprintln!("OK  {} ({} bytes)", display, bytes);
         results.push(ExportResult {
-            hash: full_hash.clone(),
+            hash: full_hash.to_string(),
             filename: display,
             bytes,
             success: true,
@@ -3120,11 +3152,11 @@ mod tests {
     fn make_track(artist: &str, title: &str, duration_secs: u32) -> TrackInfo {
         use library_ipc_client::{ContentHash, DurationSeconds};
         TrackInfo {
-            content_hash: ContentHash("sha256:aa000001".to_string()),
+            content_hash: ContentHash::new("sha256:aa000001"),
             title: Some(title.to_string()),
             artist: Some(artist.to_string()),
             album: None,
-            duration: Some(DurationSeconds(duration_secs)),
+            duration: Some(DurationSeconds::new(duration_secs)),
             bpm: None,
             key: None,
             blob_path: None,
@@ -3383,11 +3415,11 @@ mod tests {
     fn make_track_full(artist: &str, album: &str, title: &str, blob_path: &str) -> TrackInfo {
         use library_ipc_client::{ContentHash, DurationSeconds};
         TrackInfo {
-            content_hash: ContentHash("sha256:aa000001".to_string()),
+            content_hash: ContentHash::new("sha256:aa000001"),
             title: Some(title.to_string()),
             artist: Some(artist.to_string()),
             album: Some(album.to_string()),
-            duration: Some(DurationSeconds(300)),
+            duration: Some(DurationSeconds::new(300)),
             bpm: None,
             key: None,
             blob_path: Some(blob_path.to_string()),
@@ -3427,11 +3459,11 @@ mod tests {
     fn export_dest_path_uses_fallbacks_for_missing_metadata() {
         use library_ipc_client::{ContentHash, DurationSeconds};
         let track = TrackInfo {
-            content_hash: ContentHash("sha256:deadbeef".to_string()),
+            content_hash: ContentHash::new("sha256:deadbeef"),
             title: None,
             artist: None,
             album: None,
-            duration: Some(DurationSeconds(120)),
+            duration: Some(DurationSeconds::new(120)),
             bpm: None,
             key: None,
             blob_path: Some("ab/abc123.flac".to_string()),

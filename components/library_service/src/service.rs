@@ -3,9 +3,9 @@
 //! Handles IPC requests and manages library state
 
 use crate::ipc::{
-    Bpm, ContentHash, DurationSeconds, InboxPath, IngestAllItem, IngestResult, IngestSource,
-    IpcServer, Key, LibraryRequest, LibraryResponse, ProtocolError, ServiceStatus, TrackInfo,
-    TrackQuery,
+    Bpm, ContentHash, DurationSeconds, FactType, InboxPath, IngestAllItem, IngestResult,
+    IngestSource, IpcServer, Key, LibraryRequest, LibraryResponse, ProtocolError, ServiceStatus,
+    TrackInfo, TrackQuery,
 };
 use crate::pipeline::{InboxFile, UploadSource};
 use acid_client::AcidClient;
@@ -46,7 +46,7 @@ pub struct LibraryService {
     acid_client: AcidClient,
     /// Generic fact value index: fact_type -> set of values
     /// Used for fast HasFact/HasFacts lookups (e.g., ItemId -> {"p123", "p456"})
-    fact_index: Mutex<HashMap<String, HashSet<String>>>,
+    fact_index: Mutex<HashMap<FactType, HashSet<String>>>,
     /// Set of known content hashes for dedup on ingest
     content_hashes: Mutex<HashSet<String>>,
 }
@@ -75,7 +75,7 @@ struct IndexedTrackInfo {
 struct LoadResult {
     tracks: Vec<IndexedTrackInfo>,
     facts_count: usize,
-    fact_index: HashMap<String, HashSet<String>>,
+    fact_index: HashMap<FactType, HashSet<String>>,
     content_hashes: HashSet<String>,
     /// Content hashes of tracks that already have a Format fact
     has_format: HashSet<String>,
@@ -151,7 +151,7 @@ impl LibraryService {
 
         // Aggregate facts by content hash
         let mut tracks_map: HashMap<String, IndexedTrackInfo> = HashMap::new();
-        let mut fact_index: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut fact_index: HashMap<FactType, HashSet<String>> = HashMap::new();
         let mut has_format: HashSet<String> = HashSet::new();
         let mut errors = 0;
         let mut total = 0;
@@ -169,13 +169,13 @@ impl LibraryService {
                 }
             };
 
-            let entity = fact.entity().0.clone();
+            let entity = fact.entity().as_str().to_owned();
 
             // Build track summary
             let entry = tracks_map
                 .entry(entity.clone())
                 .or_insert_with(|| IndexedTrackInfo {
-                    content_hash: ContentHash(entity),
+                    content_hash: ContentHash::new(entity),
                     title: None,
                     artist: None,
                     album: None,
@@ -196,22 +196,22 @@ impl LibraryService {
             let variant_name = fact.value().display_name();
             let value_str = fact.value().to_string();
             fact_index
-                .entry(variant_name.to_string())
+                .entry(FactType::new(variant_name))
                 .or_default()
                 .insert(value_str);
 
             // Extract key fields for search
             match fact.value() {
-                MusicValue::Title(v) => entry.title = Some(v.0.clone()),
-                MusicValue::Artist(v) => entry.artist = Some(v.0.clone()),
-                MusicValue::Album(v) => entry.album = Some(v.0.clone()),
+                MusicValue::Title(v) => entry.title = Some(v.as_str().to_string()),
+                MusicValue::Artist(v) => entry.artist = Some(v.as_str().to_string()),
+                MusicValue::Album(v) => entry.album = Some(v.as_str().to_string()),
                 MusicValue::Label(v) => entry.label = Some(v.clone()),
                 MusicValue::MainGenre(v) => entry.genre = Some(v.clone()),
                 MusicValue::StyleDescriptor(v) => entry.styles.push(v.clone()),
-                MusicValue::DurationSeconds(v) => entry.duration_seconds = Some(v.0),
+                MusicValue::DurationSeconds(v) => entry.duration_seconds = Some(v.value()),
                 MusicValue::Bpm(v) => entry.bpm = Some(v.as_f32()),
                 MusicValue::Key(v) => entry.key = Some(v.to_string()),
-                MusicValue::Year(v) => entry.year = Some(v.0),
+                MusicValue::Year(v) => entry.year = Some(v.value()),
                 MusicValue::Source(v) => entry.source = Some(v.clone()),
                 MusicValue::TrackStarted(_) => {
                     update_if_more_recent(&mut entry.last_started, *fact.timestamp());
@@ -221,7 +221,7 @@ impl LibraryService {
                 }
                 MusicValue::FilePath(p) => {
                     // Reconstruct blob path from the stored file path extension
-                    let hash = entry.content_hash.0.as_str();
+                    let hash = entry.content_hash.as_str();
                     let hash_clean = hash.strip_prefix("sha256:").unwrap_or(hash);
                     if hash_clean.len() >= 2 {
                         if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
@@ -235,7 +235,7 @@ impl LibraryService {
                     }
                 }
                 MusicValue::Format(_) => {
-                    has_format.insert(fact.entity().0.clone());
+                    has_format.insert(fact.entity().as_str().to_owned());
                 }
                 _ => {}
             }
@@ -265,7 +265,7 @@ impl LibraryService {
         // Find tracks needing backfill
         let needs_backfill: Vec<_> = tracks
             .iter()
-            .filter(|t| !has_format.contains(&t.content_hash.0))
+            .filter(|t| !has_format.contains(t.content_hash.as_str()))
             .filter(|t| !t.blob_path.as_os_str().is_empty())
             .filter_map(|t| {
                 let ext = t.blob_path.extension()?.to_str()?;
@@ -302,7 +302,7 @@ impl LibraryService {
                 .is_ok()
             {
                 fact_index
-                    .entry("Format".to_string())
+                    .entry(FactType::new("Format"))
                     .or_default()
                     .insert(music_format.to_string());
                 backfilled += 1;
@@ -594,7 +594,7 @@ impl LibraryService {
             title: t.title.clone(),
             artist: t.artist.clone(),
             album: t.album.clone(),
-            duration: t.duration_seconds.map(DurationSeconds),
+            duration: t.duration_seconds.map(DurationSeconds::new),
             bpm: t.bpm.and_then(|b| Bpm::from_f32(b).ok()),
             key: t.key.as_ref().and_then(|k| Key::from_traditional(k).ok()),
             blob_path: Some(t.blob_path.to_string_lossy().to_string()),
@@ -616,9 +616,9 @@ impl LibraryService {
     /// Resolve a partial hash to a full hash (like git short refs)
     fn resolve_hash(&self, partial: &ContentHash) -> Result<ContentHash, ProtocolError> {
         let partial_clean = partial
-            .0
+            .as_str()
             .strip_prefix("sha256:")
-            .unwrap_or(&partial.0)
+            .unwrap_or(partial.as_str())
             .to_lowercase();
 
         let tracks = self.tracks.lock().unwrap();
@@ -627,16 +627,16 @@ impl LibraryService {
             .filter(|t| {
                 let hash = t
                     .content_hash
-                    .0
+                    .as_str()
                     .strip_prefix("sha256:")
-                    .unwrap_or(&t.content_hash.0);
+                    .unwrap_or(t.content_hash.as_str());
                 hash.to_lowercase().starts_with(&partial_clean)
             })
             .collect();
 
         match matches.len() {
             0 => Err(ProtocolError::TrackNotFound {
-                hash: partial.0.clone(),
+                hash: partial.as_str().to_owned(),
             }),
             1 => Ok(matches[0].content_hash.clone()),
             n => {
@@ -644,7 +644,7 @@ impl LibraryService {
                     .iter()
                     .take(3)
                     .map(|t| {
-                        let short = &t.content_hash.0[7..15]; // sha256: prefix + 8 chars
+                        let short = &t.content_hash.as_str()[7..15]; // sha256: prefix + 8 chars
                         let name = t.title.as_deref().unwrap_or("Unknown");
                         format!("  {} ({})", short, name)
                     })
@@ -652,7 +652,7 @@ impl LibraryService {
                 Err(ProtocolError::Internal {
                     message: format!(
                         "Ambiguous hash '{}' matches {} tracks:\n{}",
-                        partial.0,
+                        partial.as_str(),
                         n,
                         examples.join("\n")
                     ),
@@ -668,10 +668,10 @@ impl LibraryService {
         let tracks = self.tracks.lock().unwrap();
         tracks
             .iter()
-            .find(|t| t.content_hash.0 == full_hash.0)
+            .find(|t| t.content_hash.as_str() == full_hash.as_str())
             .map(|t| self.to_track_info(t))
             .ok_or_else(|| ProtocolError::TrackNotFound {
-                hash: hash.0.clone(),
+                hash: hash.as_str().to_owned(),
             })
     }
 
@@ -693,13 +693,13 @@ impl LibraryService {
 
         let facts: Vec<_> = reader
             .filter_map(|r| r.ok())
-            .filter(|f| f.entity().0 == full_hash.0)
+            .filter(|f| f.entity().as_str() == full_hash.as_str())
             .map(|f| format_fact_for_display(f.value()))
             .collect();
 
         if facts.is_empty() {
             Err(ProtocolError::TrackNotFound {
-                hash: full_hash.0.clone(),
+                hash: full_hash.as_str().to_owned(),
             })
         } else {
             Ok((full_hash, facts))
@@ -740,7 +740,7 @@ impl LibraryService {
                 Err(_) => continue,
             };
 
-            let entity = fact.entity().0.clone();
+            let entity = fact.entity().as_str().to_owned();
             match fact.value() {
                 MusicValue::TrackStarted(_) => {
                     update_if_more_recent(
@@ -761,7 +761,7 @@ impl LibraryService {
         // Acquire the lock only after reading the file to avoid deadlock
         let mut tracks = self.tracks.lock().unwrap();
         for track in tracks.iter_mut() {
-            let hash = &track.content_hash.0;
+            let hash = track.content_hash.as_str();
             if let Some(Some(ts)) = last_started.get(hash) {
                 track.last_started = Some(*ts);
             }
@@ -917,9 +917,9 @@ impl LibraryService {
         // Dedup: if content hash already exists, still append any new source facts
         {
             let hashes = self.content_hashes.lock().unwrap();
-            if hashes.contains(&content_hash.0) {
+            if hashes.contains(content_hash.as_str()) {
                 tracing::info!(
-                    hash = %content_hash.0,
+                    hash = %content_hash.as_str(),
                     path = %path.display(),
                     "Duplicate content hash, removing inbox file"
                 );
@@ -938,7 +938,7 @@ impl LibraryService {
                         let tracks = self.tracks.lock().unwrap();
                         tracks
                             .iter()
-                            .find(|t| t.content_hash.0 == content_hash.0)
+                            .find(|t| t.content_hash.as_str() == content_hash.as_str())
                             .map(|t| t.source.is_none())
                             .unwrap_or(false)
                     };
@@ -951,7 +951,7 @@ impl LibraryService {
                             .is_ok()
                         {
                             tracing::info!(
-                                hash = %content_hash.0,
+                                hash = %content_hash.as_str(),
                                 facts = new_facts.len(),
                                 "Appended source facts to existing track"
                             );
@@ -960,7 +960,7 @@ impl LibraryService {
                             let mut tracks = self.tracks.lock().unwrap();
                             if let Some(track) = tracks
                                 .iter_mut()
-                                .find(|t| t.content_hash.0 == content_hash.0)
+                                .find(|t| t.content_hash.as_str() == content_hash.as_str())
                             {
                                 for (value, _) in &new_facts {
                                     if let MusicValue::Source(s) = value {
@@ -973,7 +973,7 @@ impl LibraryService {
                             let mut fact_index = self.fact_index.lock().unwrap();
                             for (value, _) in &new_facts {
                                 fact_index
-                                    .entry(value.display_name().to_string())
+                                    .entry(FactType::new(value.display_name()))
                                     .or_default()
                                     .insert(value.to_string());
                             }
@@ -1026,16 +1026,16 @@ impl LibraryService {
 
             for (value, _source) in &facts {
                 match value {
-                    MusicValue::Title(t) => title = Some(t.0.clone()),
-                    MusicValue::Artist(a) => artist = Some(a.0.clone()),
-                    MusicValue::Album(a) => album = Some(a.0.clone()),
+                    MusicValue::Title(t) => title = Some(t.as_str().to_string()),
+                    MusicValue::Artist(a) => artist = Some(a.as_str().to_string()),
+                    MusicValue::Album(a) => album = Some(a.as_str().to_string()),
                     MusicValue::Label(l) => label = Some(l.clone()),
                     MusicValue::MainGenre(g) => genre = Some(g.clone()),
                     MusicValue::StyleDescriptor(s) => styles.push(s.clone()),
-                    MusicValue::DurationSeconds(d) => duration_seconds = Some(d.0),
+                    MusicValue::DurationSeconds(d) => duration_seconds = Some(d.value()),
                     MusicValue::Bpm(b) => bpm = Some(b.as_f32()),
                     MusicValue::Key(k) => key = Some(k.to_string()),
-                    MusicValue::Year(y) => year = Some(y.0),
+                    MusicValue::Year(y) => year = Some(y.value()),
                     MusicValue::Source(s) => source_str = Some(s.clone()),
                     _ => {}
                 }
@@ -1065,7 +1065,7 @@ impl LibraryService {
             let mut fact_index = self.fact_index.lock().unwrap();
             for (value, _) in &facts {
                 fact_index
-                    .entry(value.display_name().to_string())
+                    .entry(FactType::new(value.display_name()))
                     .or_default()
                     .insert(value.to_string());
             }
@@ -1074,7 +1074,7 @@ impl LibraryService {
         // Update content hash set
         {
             let mut hashes = self.content_hashes.lock().unwrap();
-            hashes.insert(content_hash.0.clone());
+            hashes.insert(content_hash.as_str().to_owned());
         }
 
         // Update counters
@@ -1136,7 +1136,7 @@ mod tests {
 
     #[test]
     fn load_tracks_aggregates_played_timestamp() {
-        let hash = ContentHash("sha256:aabbcc".to_string());
+        let hash = ContentHash::new("sha256:aabbcc");
         let ts = Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
 
         // TrackStarted now carries a StartReason; the fact timestamp is used for last_started
@@ -1167,7 +1167,7 @@ mod tests {
 
     #[test]
     fn load_tracks_aggregates_skipped_timestamp() {
-        let hash = ContentHash("sha256:ddeeff".to_string());
+        let hash = ContentHash::new("sha256:ddeeff");
         let ts = Utc.with_ymd_and_hms(2026, 2, 1, 8, 30, 0).unwrap();
 
         // TrackStopped now carries a StopReason; the fact timestamp is used for last_stopped
@@ -1193,7 +1193,7 @@ mod tests {
 
     #[test]
     fn load_tracks_keeps_most_recent_played() {
-        let hash = ContentHash("sha256:112233".to_string());
+        let hash = ContentHash::new("sha256:112233");
         let older = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
         let newer = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
 
@@ -1230,7 +1230,7 @@ mod tests {
     fn search_passes_last_started_to_evaluator() {
         use library_search::{query::DateQuery, TrackQuery};
 
-        let hash = ContentHash("sha256:445566".to_string());
+        let hash = ContentHash::new("sha256:445566");
         let ts = Utc.with_ymd_and_hms(2026, 1, 10, 0, 0, 0).unwrap();
 
         let temp = write_facts_file_with_timestamps(&[
@@ -1277,7 +1277,7 @@ mod tests {
     fn search_played_na_excludes_after_external_append() {
         use library_search::{query::DateQuery, TrackQuery};
 
-        let hash = ContentHash("sha256:778899aabbcc".to_string());
+        let hash = ContentHash::new("sha256:778899aabbcc");
 
         // Setup: one track with no TrackStarted fact
         let temp = write_facts_file(&[(
@@ -1333,7 +1333,7 @@ mod tests {
     #[test]
     fn blob_path_uses_extension_from_file_path_fact() {
         // For MP3 files, blob_path should use .mp3 extension, not hardcoded .flac
-        let hash = ContentHash("sha256:aabbccddeeff".to_string());
+        let hash = ContentHash::new("sha256:aabbccddeeff");
 
         let temp = write_facts_file(&[
             (hash.clone(), MusicValue::Title(Title::new("MP3 Track"))),
@@ -1364,7 +1364,7 @@ mod tests {
     fn backfill_writes_format_fact_for_tracks_without_one() {
         use music_facts::{ContentHash, MusicValue, Title};
 
-        let hash = ContentHash("sha256:backfill01".to_string());
+        let hash = ContentHash::new("sha256:backfill01");
 
         // Track has FilePath (so blob_path is set) but no Format fact
         let temp = write_facts_file(&[
@@ -1402,7 +1402,7 @@ mod tests {
     fn backfill_skips_tracks_that_already_have_format() {
         use music_facts::{ContentHash, MusicFormat, MusicValue, Title};
 
-        let hash = ContentHash("sha256:hasformat01".to_string());
+        let hash = ContentHash::new("sha256:hasformat01");
 
         let temp = write_facts_file(&[
             (hash.clone(), MusicValue::Title(Title::new("Has Format"))),
@@ -1666,7 +1666,7 @@ mod tests {
 
     #[test]
     fn blob_path_uses_flac_extension_from_file_path_fact() {
-        let hash = ContentHash("sha256:001122334455".to_string());
+        let hash = ContentHash::new("sha256:001122334455");
 
         let temp = write_facts_file(&[
             (hash.clone(), MusicValue::Title(Title::new("FLAC Track"))),

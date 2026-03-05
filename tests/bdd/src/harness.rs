@@ -47,9 +47,9 @@ fn seed_facts(metadata_dir: &std::path::Path, tracks: &[SeedTrack]) {
         let hash = match &track.hash {
             Some(h) => {
                 let padded = format!("{:0<64}", h);
-                ContentHash(format!("sha256:{}", padded))
+                ContentHash::new(format!("sha256:{}", padded))
             }
-            None => ContentHash(format!("sha256:{:064x}", i + 1)),
+            None => ContentHash::new(format!("sha256:{:064x}", i + 1)),
         };
 
         let mut facts: Vec<Fact<ContentHash, MusicValue, FactSource>> = vec![
@@ -94,7 +94,7 @@ fn seed_facts(metadata_dir: &std::path::Path, tracks: &[SeedTrack]) {
         if let Some(dur) = track.duration {
             facts.push(Fact::new(
                 hash.clone(),
-                MusicValue::DurationSeconds(DurationSeconds(dur)),
+                MusicValue::DurationSeconds(DurationSeconds::new(dur)),
                 now,
                 source.clone(),
                 Operation::Assert,
@@ -104,7 +104,7 @@ fn seed_facts(metadata_dir: &std::path::Path, tracks: &[SeedTrack]) {
         if let Some(year) = track.year {
             facts.push(Fact::new(
                 hash.clone(),
-                MusicValue::Year(Year(year)),
+                MusicValue::Year(Year::new(year)),
                 now,
                 source.clone(),
                 Operation::Assert,

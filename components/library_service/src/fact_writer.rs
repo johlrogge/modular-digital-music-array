@@ -85,7 +85,7 @@ mod tests {
     #[test]
     fn write_track_facts() {
         let temp = NamedTempFile::new().unwrap();
-        let content_hash = ContentHash("sha256:abc123".to_string());
+        let content_hash = ContentHash::new("sha256:abc123");
         let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
 
         let facts = vec![
