@@ -51,7 +51,7 @@
            ============================================================ */
 
         .shell {
-            max-width: 960px;
+            max-width: 1200px;
             margin: 0 auto;
             padding: 0 20px;
         }
@@ -814,6 +814,31 @@
         ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 2px; }
 
         /* ============================================================
+           CONTENT LAYOUT — Sidebar + Main
+           ============================================================ */
+
+        .content-layout { display: flex; gap: 32px; }
+        .main-content { flex: 1; min-width: 0; }
+        .sidebar {
+            flex: 0 0 300px;
+            min-width: 0;
+            position: sticky;
+            top: 20px;
+            align-self: flex-start;
+            max-height: calc(100vh - 40px);
+            overflow-y: auto;
+        }
+
+        /* Desktop: details always open, summary non-interactive */
+        .sidebar-section { display: block; }
+        .sidebar-section > summary { list-style: none; cursor: default; pointer-events: none; }
+        .sidebar-section > summary::-webkit-details-marker { display: none; }
+        .sidebar-section > summary::marker { display: none; content: ''; }
+
+        /* Remove outer border from now-playing when inside sidebar */
+        .sidebar .now-playing { border-bottom: none; padding: 12px 0 4px; }
+
+        /* ============================================================
            RESPONSIVE
            ============================================================ */
 
@@ -828,6 +853,28 @@
             .search-field-sm { flex: 1 1 100%; min-width: 100%; }
             .btn { padding: 10px 16px; font-size: 0.74rem; }
             .btn-sm { padding: 8px 14px; }
+            .content-layout { flex-direction: column; gap: 0; }
+            .sidebar {
+                position: static;
+                max-height: none;
+                flex: none;
+                padding-bottom: 8px;
+            }
+            .sidebar-section > summary {
+                cursor: pointer;
+                pointer-events: auto;
+                position: relative;
+                padding-right: 20px;
+            }
+            .sidebar-section > summary::after {
+                content: '\25B8';
+                position: absolute;
+                right: 0;
+                transition: transform 0.2s;
+            }
+            .sidebar-section[open] > summary::after {
+                transform: rotate(90deg);
+            }
         }
 
         /* ============================================================
@@ -866,31 +913,57 @@
             </div>
         </header>
 
+        <div class="content-layout">
+
         <!-- ============================================================
-             NOW PLAYING — persistent hero
+             SIDEBAR — Now Playing + Queue
              ============================================================ -->
 
-        <div class="now-playing">
-            <div id="now-playing-area">
-                <div class="np-idle">No active playback</div>
-            </div>
-            <div id="progress-area" style="display:none;">
-                <div class="np-progress">
-                    <div class="progress-track">
-                        <div class="progress-fill" id="progress-fill"></div>
+        <aside class="sidebar">
+
+            <details class="sidebar-section" open>
+                <summary class="section-header">Now Playing</summary>
+                <div class="now-playing">
+                    <div id="now-playing-area">
+                        <div class="np-idle">No active playback</div>
                     </div>
-                    <span class="progress-time" id="progress-time">0:00 / 0:00</span>
+                    <div id="progress-area" style="display:none;">
+                        <div class="np-progress">
+                            <div class="progress-track">
+                                <div class="progress-fill" id="progress-fill"></div>
+                            </div>
+                            <span class="progress-time" id="progress-time">0:00 / 0:00</span>
+                        </div>
+                    </div>
                 </div>
-            </div>
-        </div>
+            </details>
+
+            <details class="sidebar-section" open>
+                <summary class="section-header">Queue</summary>
+                <ul class="queue-list" id="queue-list">
+                    <li><span class="empty-state">Queue is empty</span></li>
+                </ul>
+                <div class="btn-row" style="margin-top: 14px;">
+                    <button class="btn btn-accent btn-sm" onclick="playerPlayQueue()">Play Queue</button>
+                    <button class="btn btn-sm" onclick="clearQueue()">Clear</button>
+                </div>
+            </details>
+
+        </aside>
+
+        <!-- ============================================================
+             MAIN CONTENT — Tabs
+             ============================================================ -->
+
+        <div class="main-content">
 
         <!-- ============================================================
              TAB NAVIGATION
              ============================================================ -->
 
         <nav class="tab-nav">
-            <button class="tab-btn active" data-tab="status">Status</button>
-            <button class="tab-btn" data-tab="playback">Playback</button>
+            <button class="tab-btn" data-tab="status">Status</button>
+            <button class="tab-btn active" data-tab="playback">Playback</button>
             <button class="tab-btn" data-tab="maintenance">Maintenance</button>
         </nav>
 
@@ -898,7 +971,7 @@
              TAB: STATUS
              ============================================================ -->
 
-        <div class="tab-panel active" id="tab-status">
+        <div class="tab-panel" id="tab-status">
 
             <!-- System health -->
             <div class="section">
@@ -998,7 +1071,7 @@
              TAB: PLAYBACK
              ============================================================ -->
 
-        <div class="tab-panel" id="tab-playback">
+        <div class="tab-panel active" id="tab-playback">
 
             <!-- Search -->
             <div class="section">
@@ -1014,17 +1087,6 @@
                 </div>
             </div>
 
-            <!-- Queue -->
-            <div class="section">
-                <div class="section-header">Queue</div>
-                <ul class="queue-list" id="queue-list">
-                    <li><span class="empty-state">Queue is empty</span></li>
-                </ul>
-                <div class="btn-row" style="margin-top: 14px;">
-                    <button class="btn btn-accent btn-sm" onclick="playerPlayQueue()">Play Queue</button>
-                    <button class="btn btn-sm" onclick="clearQueue()">Clear</button>
-                </div>
-            </div>
 
         </div>
 
@@ -1126,6 +1188,10 @@
             </div>
 
         </div>
+
+        </div><!-- /.main-content -->
+
+        </div><!-- /.content-layout -->
 
     </div>
 
