@@ -1960,6 +1960,7 @@ name = "inbox-utils"
 version = "0.5.0"
 dependencies = [
  "pretty_assertions",
+ "rstest",
  "tempfile",
  "tracing",
  "zip",

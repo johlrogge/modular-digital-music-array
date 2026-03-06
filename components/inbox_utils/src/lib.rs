@@ -146,81 +146,50 @@ pub fn extract_zip(zip_path: &Path, output_dir: &Path) -> Result<Vec<PathBuf>, s
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use rstest::rstest;
     use std::io::Write;
 
-    #[test]
-    fn audio_extension_recognition() {
-        assert!(is_audio_file(Path::new("track.flac")));
-        assert!(is_audio_file(Path::new("track.FLAC")));
-        assert!(is_audio_file(Path::new("track.mp3")));
-        assert!(is_audio_file(Path::new("track.wav")));
-        assert!(is_audio_file(Path::new("track.aif")));
-        assert!(is_audio_file(Path::new("track.aiff")));
-        assert!(!is_audio_file(Path::new("cover.jpg")));
-        assert!(!is_audio_file(Path::new("notes.txt")));
-        assert!(!is_audio_file(Path::new("noext")));
+    #[rstest]
+    #[case("track.flac", true)]
+    #[case("track.FLAC", true)]
+    #[case("track.mp3", true)]
+    #[case("track.wav", true)]
+    #[case("track.aif", true)]
+    #[case("track.aiff", true)]
+    #[case("cover.jpg", false)]
+    #[case("notes.txt", false)]
+    #[case("noext", false)]
+    fn audio_extension_recognition(#[case] filename: &str, #[case] expected: bool) {
+        assert_eq!(is_audio_file(Path::new(filename)), expected);
     }
 
-    #[test]
-    fn ingestible_audio_only_flac_and_mp3() {
-        assert!(is_ingestible_audio(Path::new("track.flac")));
-        assert!(is_ingestible_audio(Path::new("track.FLAC")));
-        assert!(is_ingestible_audio(Path::new("track.mp3")));
-        assert!(is_ingestible_audio(Path::new("track.MP3")));
-        // WAV and AIFF are export-only, not ingestible
-        assert!(!is_ingestible_audio(Path::new("track.wav")));
-        assert!(!is_ingestible_audio(Path::new("track.aif")));
-        assert!(!is_ingestible_audio(Path::new("track.aiff")));
-        assert!(!is_ingestible_audio(Path::new("cover.jpg")));
-        assert!(!is_ingestible_audio(Path::new("noext")));
+    #[rstest]
+    #[case("track.flac", true)]
+    #[case("track.FLAC", true)]
+    #[case("track.mp3", true)]
+    #[case("track.MP3", true)]
+    #[case("track.wav", false)]
+    #[case("track.aif", false)]
+    #[case("track.aiff", false)]
+    #[case("cover.jpg", false)]
+    #[case("noext", false)]
+    fn ingestible_audio_only_flac_and_mp3(#[case] filename: &str, #[case] expected: bool) {
+        assert_eq!(is_ingestible_audio(Path::new(filename)), expected);
     }
 
-    #[test]
-    fn detect_file_type_flac_magic_bytes() {
+    #[rstest]
+    #[case(b"fLaC\x00\x00" as &[u8], Some("flac"))]
+    #[case(b"\x50\x4B\x03\x04extra", Some("zip"))]
+    #[case(b"\x49\x44\x33\x04data", Some("mp3"))]
+    #[case(b"\xFF\xFBdata\x00", Some("mp3"))]
+    #[case(b"RIFFdata", Some("wav"))]
+    #[case(b"FORMdata", Some("aiff"))]
+    #[case(b"\x00\x00\x00\x00", None)]
+    fn magic_byte_detection(#[case] bytes: &[u8], #[case] expected: Option<&'static str>) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.flac");
-        std::fs::write(&path, b"fLaC\x00\x00").unwrap();
-        assert_eq!(detect_file_type(&path), Some("flac"));
-    }
-
-    #[test]
-    fn detect_file_type_zip_magic_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.zip");
-        std::fs::write(&path, b"\x50\x4B\x03\x04extra").unwrap();
-        assert_eq!(detect_file_type(&path), Some("zip"));
-    }
-
-    #[test]
-    fn detect_file_type_mp3_id3_magic_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.mp3");
-        std::fs::write(&path, b"\x49\x44\x33\x04data").unwrap();
-        assert_eq!(detect_file_type(&path), Some("mp3"));
-    }
-
-    #[test]
-    fn detect_file_type_wav_magic_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.wav");
-        std::fs::write(&path, b"RIFFdata").unwrap();
-        assert_eq!(detect_file_type(&path), Some("wav"));
-    }
-
-    #[test]
-    fn detect_file_type_aiff_magic_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.aiff");
-        std::fs::write(&path, b"FORMdata").unwrap();
-        assert_eq!(detect_file_type(&path), Some("aiff"));
-    }
-
-    #[test]
-    fn detect_file_type_unknown_magic_bytes_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("unknown");
-        std::fs::write(&path, b"\x00\x00\x00\x00").unwrap();
-        assert_eq!(detect_file_type(&path), None);
+        let path = dir.path().join("test_file");
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(detect_file_type(&path), expected);
     }
 
     #[test]
