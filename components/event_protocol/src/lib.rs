@@ -129,6 +129,7 @@ pub enum ParseError {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use rstest::rstest;
 
     #[test]
     fn event_uses_content_hash_type() {
@@ -154,102 +155,47 @@ mod tests {
         }
     }
 
-    #[test]
-    fn roundtrip_track_started() {
-        let event = PlaybackEvent::TrackStarted {
-            hash: playback_primitives::ContentHash::new("sha256:abc123"),
-        };
+    #[rstest]
+    #[case(
+        PlaybackEvent::TrackStarted { hash: ContentHash::new("sha256:abc123") },
+        TOPIC_TRACK_STARTED
+    )]
+    #[case(
+        PlaybackEvent::TrackEnded { hash: ContentHash::new("sha256:def456") },
+        TOPIC_TRACK_ENDED
+    )]
+    #[case(
+        PlaybackEvent::TrackStopped { hash: ContentHash::new("sha256:789ghi") },
+        TOPIC_TRACK_STOPPED
+    )]
+    #[case(
+        PlaybackEvent::TrackPaused { hash: ContentHash::new("sha256:abc123") },
+        TOPIC_TRACK_PAUSED
+    )]
+    #[case(
+        PlaybackEvent::TrackResumed { hash: ContentHash::new("sha256:abc123") },
+        TOPIC_TRACK_RESUMED
+    )]
+    #[case(
+        PlaybackEvent::QueueChanged { length: 42 },
+        TOPIC_QUEUE_CHANGED
+    )]
+    #[case(
+        PlaybackEvent::PositionUpdate { hash: ContentHash::new("sha256:abc123"), position_ms: 12_345, duration_ms: 240_000 },
+        TOPIC_POSITION_UPDATE
+    )]
+    #[case(
+        PlaybackEvent::SessionStarted { id: SessionId::new("2026-02-24T12:00:00+00:00") },
+        TOPIC_SESSION_STARTED
+    )]
+    #[case(
+        PlaybackEvent::SessionEnded { id: SessionId::new("2026-02-24T12:00:00+00:00") },
+        TOPIC_SESSION_ENDED
+    )]
+    fn roundtrip(#[case] event: PlaybackEvent, #[case] expected_topic: &str) {
         let bytes = to_topic_message(&event);
         let (topic, decoded) = from_topic_message(&bytes).unwrap();
-        assert_eq!(topic, TOPIC_TRACK_STARTED);
-        assert_eq!(decoded, event);
-    }
-
-    #[test]
-    fn roundtrip_track_ended() {
-        let event = PlaybackEvent::TrackEnded {
-            hash: ContentHash::new("sha256:def456"),
-        };
-        let bytes = to_topic_message(&event);
-        let (topic, decoded) = from_topic_message(&bytes).unwrap();
-        assert_eq!(topic, TOPIC_TRACK_ENDED);
-        assert_eq!(decoded, event);
-    }
-
-    #[test]
-    fn roundtrip_track_stopped() {
-        let event = PlaybackEvent::TrackStopped {
-            hash: ContentHash::new("sha256:789ghi"),
-        };
-        let bytes = to_topic_message(&event);
-        let (topic, decoded) = from_topic_message(&bytes).unwrap();
-        assert_eq!(topic, TOPIC_TRACK_STOPPED);
-        assert_eq!(decoded, event);
-    }
-
-    #[test]
-    fn roundtrip_track_paused() {
-        let event = PlaybackEvent::TrackPaused {
-            hash: ContentHash::new("sha256:abc123"),
-        };
-        let bytes = to_topic_message(&event);
-        let (topic, decoded) = from_topic_message(&bytes).unwrap();
-        assert_eq!(topic, TOPIC_TRACK_PAUSED);
-        assert_eq!(decoded, event);
-    }
-
-    #[test]
-    fn roundtrip_track_resumed() {
-        let event = PlaybackEvent::TrackResumed {
-            hash: ContentHash::new("sha256:abc123"),
-        };
-        let bytes = to_topic_message(&event);
-        let (topic, decoded) = from_topic_message(&bytes).unwrap();
-        assert_eq!(topic, TOPIC_TRACK_RESUMED);
-        assert_eq!(decoded, event);
-    }
-
-    #[test]
-    fn roundtrip_queue_changed() {
-        let event = PlaybackEvent::QueueChanged { length: 42 };
-        let bytes = to_topic_message(&event);
-        let (topic, decoded) = from_topic_message(&bytes).unwrap();
-        assert_eq!(topic, TOPIC_QUEUE_CHANGED);
-        assert_eq!(decoded, event);
-    }
-
-    #[test]
-    fn roundtrip_position_update() {
-        let event = PlaybackEvent::PositionUpdate {
-            hash: ContentHash::new("sha256:abc123"),
-            position_ms: 12_345,
-            duration_ms: 240_000,
-        };
-        let bytes = to_topic_message(&event);
-        let (topic, decoded) = from_topic_message(&bytes).unwrap();
-        assert_eq!(topic, TOPIC_POSITION_UPDATE);
-        assert_eq!(decoded, event);
-    }
-
-    #[test]
-    fn roundtrip_session_started() {
-        let event = PlaybackEvent::SessionStarted {
-            id: SessionId::new("2026-02-24T12:00:00+00:00"),
-        };
-        let bytes = to_topic_message(&event);
-        let (topic, decoded) = from_topic_message(&bytes).unwrap();
-        assert_eq!(topic, TOPIC_SESSION_STARTED);
-        assert_eq!(decoded, event);
-    }
-
-    #[test]
-    fn roundtrip_session_ended() {
-        let event = PlaybackEvent::SessionEnded {
-            id: SessionId::new("2026-02-24T12:00:00+00:00"),
-        };
-        let bytes = to_topic_message(&event);
-        let (topic, decoded) = from_topic_message(&bytes).unwrap();
-        assert_eq!(topic, TOPIC_SESSION_ENDED);
+        assert_eq!(topic, expected_topic);
         assert_eq!(decoded, event);
     }
 

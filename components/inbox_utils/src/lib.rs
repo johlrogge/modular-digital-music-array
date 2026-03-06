@@ -192,11 +192,12 @@ mod tests {
         assert_eq!(detect_file_type(&path), expected);
     }
 
-    #[test]
-    fn sanitize_special_chars() {
-        assert_eq!(sanitize_filename("a/b\\c:d"), "a_b_c_d");
-        assert_eq!(sanitize_filename("ok name"), "ok name");
-        assert_eq!(sanitize_filename("a*b?c\"d<e>f|g"), "a_b_c_d_e_f_g");
+    #[rstest]
+    #[case("a/b\\c:d", "a_b_c_d")]
+    #[case("ok name", "ok name")]
+    #[case("a*b?c\"d<e>f|g", "a_b_c_d_e_f_g")]
+    fn sanitize_special_chars(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(sanitize_filename(input), expected);
     }
 
     #[test]

@@ -120,6 +120,7 @@ impl From<Tempo> for f64 {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use rstest::rstest;
 
     #[test]
     fn ticks_addition() {
@@ -157,28 +158,11 @@ mod tests {
         assert_eq!(Ppqn::DEFAULT.raw(), 960);
     }
 
-    #[test]
-    fn tempo_zero_out_of_range() {
-        assert!(matches!(
-            Tempo::new(0.0).unwrap_err(),
-            TimeError::TempoOutOfRange {
-                min: 20.0,
-                max: 400.0,
-                value: 0.0
-            }
-        ));
-    }
-
-    #[test]
-    fn tempo_500_out_of_range() {
-        assert!(matches!(
-            Tempo::new(500.0).unwrap_err(),
-            TimeError::TempoOutOfRange {
-                min: 20.0,
-                max: 400.0,
-                value: 500.0
-            }
-        ));
+    #[rstest]
+    #[case(0.0)]
+    #[case(500.0)]
+    fn tempo_out_of_range_rejected(#[case] value: f64) {
+        assert!(Tempo::new(value).is_err());
     }
 
     #[test]

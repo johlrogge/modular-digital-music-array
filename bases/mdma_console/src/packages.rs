@@ -216,11 +216,13 @@ pub fn package_to_service(pkg: &PackageName) -> Option<ServiceName> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use rstest::rstest;
 
-    #[test]
-    fn version_split() {
-        assert_eq!(find_version_split("mdma-console-0.1.3"), Some(12));
-        assert_eq!(find_version_split("beacon-0.5.3"), Some(6));
-        assert_eq!(find_version_split("mdma-library-0.1.0_1"), Some(12));
+    #[rstest]
+    #[case("mdma-console-0.1.3", Some(12))]
+    #[case("beacon-0.5.3", Some(6))]
+    #[case("mdma-library-0.1.0_1", Some(12))]
+    fn version_split(#[case] input: &str, #[case] expected: Option<usize>) {
+        assert_eq!(find_version_split(input), expected);
     }
 }

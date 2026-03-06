@@ -40,4 +40,5 @@ pathdiff = "0.2"
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
+rstest = { workspace = true }
 tempfile = "3"

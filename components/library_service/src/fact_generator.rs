@@ -271,24 +271,20 @@ fn parse_genre(genre: &str) -> (String, Vec<String>, String) {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use rstest::rstest;
 
-    #[test]
-    fn format_fact_generated_for_audio_formats() {
-        // Verify AudioFormat → MusicFormat mapping via From impl
-        use crate::pipeline::AudioFormat;
+    #[rstest]
+    #[case(AudioFormat::Flac, "FLAC")]
+    #[case(AudioFormat::Mp3, "MP3")]
+    #[case(AudioFormat::Aiff, "AIFF")]
+    #[case(AudioFormat::Wav, "WAV")]
+    fn format_fact_generated_for_audio_formats(
+        #[case] audio_fmt: AudioFormat,
+        #[case] expected_display: &str,
+    ) {
         use music_facts::MusicFormat;
-
-        let mappings = vec![
-            (AudioFormat::Flac, "FLAC"),
-            (AudioFormat::Mp3, "MP3"),
-            (AudioFormat::Aiff, "AIFF"),
-            (AudioFormat::Wav, "WAV"),
-        ];
-
-        for (audio_fmt, expected_display) in mappings {
-            let music_fmt = MusicFormat::from(audio_fmt);
-            assert_eq!(music_fmt.to_string(), expected_display);
-        }
+        let music_fmt = MusicFormat::from(audio_fmt);
+        assert_eq!(music_fmt.to_string(), expected_display);
     }
 
     #[test]

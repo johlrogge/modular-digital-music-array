@@ -324,24 +324,27 @@ fn create_symlink(
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use rstest::rstest;
 
-    #[test]
-    fn audio_format_is_ingestible() {
-        assert!(AudioFormat::Flac.is_ingestible());
-        assert!(AudioFormat::Mp3.is_ingestible());
-        assert!(!AudioFormat::Wav.is_ingestible());
-        assert!(!AudioFormat::Aiff.is_ingestible());
+    #[rstest]
+    #[case(AudioFormat::Flac, true)]
+    #[case(AudioFormat::Mp3, true)]
+    #[case(AudioFormat::Wav, false)]
+    #[case(AudioFormat::Aiff, false)]
+    fn audio_format_is_ingestible(#[case] format: AudioFormat, #[case] expected: bool) {
+        assert_eq!(format.is_ingestible(), expected);
     }
 
-    #[test]
-    fn audio_format_from_extension() {
-        assert_eq!(AudioFormat::from_extension("flac"), Some(AudioFormat::Flac));
-        assert_eq!(AudioFormat::from_extension("FLAC"), Some(AudioFormat::Flac));
-        assert_eq!(AudioFormat::from_extension("mp3"), Some(AudioFormat::Mp3));
-        assert_eq!(AudioFormat::from_extension("aiff"), Some(AudioFormat::Aiff));
-        assert_eq!(AudioFormat::from_extension("aif"), Some(AudioFormat::Aiff));
-        assert_eq!(AudioFormat::from_extension("wav"), Some(AudioFormat::Wav));
-        assert_eq!(AudioFormat::from_extension("ogg"), None);
+    #[rstest]
+    #[case("flac", Some(AudioFormat::Flac))]
+    #[case("FLAC", Some(AudioFormat::Flac))]
+    #[case("mp3", Some(AudioFormat::Mp3))]
+    #[case("aiff", Some(AudioFormat::Aiff))]
+    #[case("aif", Some(AudioFormat::Aiff))]
+    #[case("wav", Some(AudioFormat::Wav))]
+    #[case("ogg", None)]
+    fn audio_format_from_extension(#[case] ext: &str, #[case] expected: Option<AudioFormat>) {
+        assert_eq!(AudioFormat::from_extension(ext), expected);
     }
 
     #[test]

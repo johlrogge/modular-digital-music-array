@@ -44,3 +44,4 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
+rstest = { workspace = true }
