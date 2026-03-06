@@ -9,28 +9,28 @@
     <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Outfit:wght@200;300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-base: #08080c;
-            --bg-surface: #0e0e14;
-            --bg-elevated: #14141c;
-            --bg-hover: #1a1a24;
-            --border-subtle: #2a2a3a;
-            --border-strong: #2a2a3c;
-            --text-primary: #e4e4f0;
-            --text-secondary: #9090b4;
-            --text-tertiary: #707094;
-            --accent: #e860f0;
-            --accent-dim: rgba(224, 64, 232, 0.10);
-            --accent-glow: rgba(224, 64, 232, 0.35);
-            --accent-bright: #f080ff;
-            --accent2: #40d8f0;
-            --accent2-dim: rgba(64, 216, 240, 0.10);
-            --accent2-glow: rgba(64, 216, 240, 0.30);
-            --success: #40d8a0;
-            --success-dim: rgba(64, 216, 160, 0.10);
-            --warning: #e8a840;
-            --warning-dim: rgba(232, 168, 64, 0.10);
-            --error: #f06880;
-            --error-dim: rgba(240, 72, 104, 0.10);
+            --bg-base: #141420;
+            --bg-surface: #1c1c2a;
+            --bg-elevated: #252534;
+            --bg-hover: #2e2e40;
+            --border-subtle: #38384e;
+            --border-strong: #48485e;
+            --text-primary: #f0f0f8;
+            --text-secondary: #b8b8d0;
+            --text-tertiary: #9898b8;
+            --accent: #ec88f4;
+            --accent-dim: rgba(236, 136, 244, 0.16);
+            --accent-glow: rgba(236, 136, 244, 0.45);
+            --accent-bright: #f4a8ff;
+            --accent2: #68e8ff;
+            --accent2-dim: rgba(104, 232, 255, 0.16);
+            --accent2-glow: rgba(104, 232, 255, 0.40);
+            --success: #60e8b8;
+            --success-dim: rgba(96, 232, 184, 0.16);
+            --warning: #f0c060;
+            --warning-dim: rgba(240, 192, 96, 0.16);
+            --error: #f88898;
+            --error-dim: rgba(248, 136, 152, 0.16);
             --radius-sm: 4px;
             --radius-md: 8px;
             --radius-lg: 12px;
@@ -422,6 +422,9 @@
             transition: opacity 0.15s;
         }
         .queue-item:hover .queue-remove { opacity: 1; }
+        @media (hover: none) {
+            .queue-remove { opacity: 0.7; }
+        }
 
         /* ============================================================
            SEARCH
@@ -818,10 +821,13 @@
             .masthead { padding: 16px 0 14px; }
             .np-active { flex-direction: column; gap: 12px; }
             .np-transport { align-self: flex-start; }
-            .tab-btn { padding: 12px 16px; font-size: 0.68rem; }
+            .transport-btn { width: 44px; height: 44px; font-size: 1rem; }
+            .tab-btn { padding: 14px 16px; font-size: 0.7rem; }
             .kv-grid { grid-template-columns: 120px 1fr; }
             .search-field { min-width: 100%; }
             .search-field-sm { flex: 1 1 100%; min-width: 100%; }
+            .btn { padding: 10px 16px; font-size: 0.74rem; }
+            .btn-sm { padding: 8px 14px; }
         }
 
         /* ============================================================
@@ -832,8 +838,8 @@
             content: '';
             position: fixed;
             inset: 0;
-            background: radial-gradient(ellipse at 20% 0%, rgba(224, 64, 232, 0.04) 0%, transparent 50%),
-                        radial-gradient(ellipse at 80% 100%, rgba(64, 216, 240, 0.03) 0%, transparent 40%);
+            background: radial-gradient(ellipse at 20% 0%, rgba(236, 136, 244, 0.07) 0%, transparent 50%),
+                        radial-gradient(ellipse at 80% 100%, rgba(104, 232, 255, 0.06) 0%, transparent 40%);
             pointer-events: none;
             z-index: 0;
         }
