@@ -112,11 +112,33 @@ assert_eq!(results.len(), 2);
 assert_eq!(results, vec![expected_a, expected_b]);
 ```
 
-### Exception: selective field assertions on one value
+### Multiple asserts decision tree
 
-Multiple asserts on the *same returned value* checking different fields is acceptable when they all answer "did we get the right thing?" This is one logical assertion split across fields you care about.
+When you see a test with multiple asserts, apply this decision tree:
+
+1. **Function called multiple times with different inputs, output asserted each time** → convert to `rstest #[case]`. Each input/output pair is a separate case.
+
+2. **Function called once, multiple asserts on the output:**
+   - **All fields asserted** → replace with a single `assert_eq!` comparing the whole value against an expected value (use a builder if the struct is large)
+   - **Only some fields asserted** → keep as selective field assertions, but verify they check the *relevant* fields. This is the one exception to "one assert per test."
 
 ```rust
+// Pattern 1: multiple inputs → rstest (NOT multiple asserts in one test)
+#[rstest]
+#[case("track.flac", true)]
+#[case("track.mp3", true)]
+#[case("cover.jpg", false)]
+fn audio_extension_recognition(#[case] filename: &str, #[case] expected: bool) {
+    assert_eq!(is_audio_file(Path::new(filename)), expected);
+}
+
+// Pattern 2a: all fields → single assert_eq!
+#[test]
+fn returns_correct_config() {
+    assert_eq!(build_config(), Config { host: "localhost", port: 8080 });
+}
+
+// Pattern 2b: selective fields on one value — acceptable exception
 #[test]
 fn returns_the_matching_track() {
     let track = library.search("Init").first();
@@ -967,8 +989,9 @@ fn end_to_end_user_workflow() {
 ## Review Checklist
 
 - [ ] Each `#[test]` has exactly one assert
-- [ ] No multi-assert tests that should be `rstest #[case]`
+- [ ] No multi-assert tests where function is called multiple times — use `rstest #[case]`
 - [ ] No loops containing assertions — use `#[case]` instead
+- [ ] Multi-assert on single return value: whole-value `assert_eq!` or justified selective fields
 - [ ] Serialization and deserialization tested separately
 - [ ] Round-trip invariants use `proptest`, not example-based tests
 - [ ] No filesystem I/O in unit tests
