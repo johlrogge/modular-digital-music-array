@@ -391,32 +391,26 @@ fn parse_date_with_precision(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
-    #[test]
-    fn string_query_contains() {
+    #[rstest]
+    #[case("rymden")]
+    #[case("carbon based lifeforms")]
+    fn string_query_contains(#[case] input: &str) {
         assert!(matches!(
-            parse_string_query("rymden"),
-            StringQuery::Contains(_)
-        ));
-        assert!(matches!(
-            parse_string_query("carbon based lifeforms"),
+            parse_string_query(input),
             StringQuery::Contains(_)
         ));
     }
 
-    #[test]
-    fn string_query_initialism() {
+    #[rstest]
+    #[case("CarbBased")]
+    #[case("CarbBasedLife")]
+    // All-caps is also treated as initialism
+    #[case("CBL")]
+    fn string_query_initialism(#[case] input: &str) {
         assert!(matches!(
-            parse_string_query("CarbBased"),
-            StringQuery::Initialism(_)
-        ));
-        assert!(matches!(
-            parse_string_query("CarbBasedLife"),
-            StringQuery::Initialism(_)
-        ));
-        // All-caps is also treated as initialism
-        assert!(matches!(
-            parse_string_query("CBL"),
+            parse_string_query(input),
             StringQuery::Initialism(_)
         ));
     }
@@ -572,10 +566,11 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn date_query_na() {
-        assert!(matches!(parse_date_query("N/A").unwrap(), DateQuery::NA));
-        assert!(matches!(parse_date_query("n/a").unwrap(), DateQuery::NA));
+    #[rstest]
+    #[case("N/A")]
+    #[case("n/a")]
+    fn date_query_na(#[case] input: &str) {
+        assert!(matches!(parse_date_query(input).unwrap(), DateQuery::NA));
     }
 
     #[test]
@@ -618,9 +613,10 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn date_query_invalid() {
-        assert!(parse_date_query("not-a-date").is_err());
-        assert!(parse_date_query("").is_err());
+    #[rstest]
+    #[case("not-a-date")]
+    #[case("")]
+    fn date_query_invalid(#[case] input: &str) {
+        assert!(parse_date_query(input).is_err());
     }
 }

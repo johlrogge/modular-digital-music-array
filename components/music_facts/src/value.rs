@@ -337,6 +337,7 @@ impl fmt::Display for MusicValue {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use rstest::rstest;
     use stainless_facts::assert_fact_value_format;
 
     #[test]
@@ -366,26 +367,23 @@ mod tests {
         assert_eq!(back, MusicValue::TrackStopped(StopReason::OnCompletion));
     }
 
-    #[test]
-    fn start_reason_all_variants_roundtrip() {
-        for reason in [StartReason::OnRequest, StartReason::ByQueue] {
-            let json = serde_json::to_string(&reason).unwrap();
-            let back: StartReason = serde_json::from_str(&json).unwrap();
-            assert_eq!(reason, back);
-        }
+    #[rstest]
+    #[case(StartReason::OnRequest)]
+    #[case(StartReason::ByQueue)]
+    fn start_reason_all_variants_roundtrip(#[case] reason: StartReason) {
+        let json = serde_json::to_string(&reason).unwrap();
+        let back: StartReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(reason, back);
     }
 
-    #[test]
-    fn stop_reason_all_variants_roundtrip() {
-        for reason in [
-            StopReason::OnRequest,
-            StopReason::OnCompletion,
-            StopReason::OnSkip,
-        ] {
-            let json = serde_json::to_string(&reason).unwrap();
-            let back: StopReason = serde_json::from_str(&json).unwrap();
-            assert_eq!(reason, back);
-        }
+    #[rstest]
+    #[case(StopReason::OnRequest)]
+    #[case(StopReason::OnCompletion)]
+    #[case(StopReason::OnSkip)]
+    fn stop_reason_all_variants_roundtrip(#[case] reason: StopReason) {
+        let json = serde_json::to_string(&reason).unwrap();
+        let back: StopReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(reason, back);
     }
 
     #[test]
@@ -460,25 +458,24 @@ mod tests {
         assert_eq!(title_val.display_name(), "Title");
     }
 
-    #[test]
-    fn music_format_serde_roundtrip() {
-        let format = MusicFormat::Flac;
+    #[rstest]
+    #[case(MusicFormat::Flac)]
+    #[case(MusicFormat::Mp3)]
+    #[case(MusicFormat::Aiff)]
+    #[case(MusicFormat::Wav)]
+    fn music_format_serde_roundtrip(#[case] format: MusicFormat) {
         let json = serde_json::to_string(&format).unwrap();
         let back: MusicFormat = serde_json::from_str(&json).unwrap();
         assert_eq!(format, back);
-
-        let mp3 = MusicFormat::Mp3;
-        let json = serde_json::to_string(&mp3).unwrap();
-        let back: MusicFormat = serde_json::from_str(&json).unwrap();
-        assert_eq!(mp3, back);
     }
 
-    #[test]
-    fn music_format_display() {
-        assert_eq!(MusicFormat::Flac.to_string(), "FLAC");
-        assert_eq!(MusicFormat::Mp3.to_string(), "MP3");
-        assert_eq!(MusicFormat::Aiff.to_string(), "AIFF");
-        assert_eq!(MusicFormat::Wav.to_string(), "WAV");
+    #[rstest]
+    #[case(MusicFormat::Flac, "FLAC")]
+    #[case(MusicFormat::Mp3, "MP3")]
+    #[case(MusicFormat::Aiff, "AIFF")]
+    #[case(MusicFormat::Wav, "WAV")]
+    fn music_format_display(#[case] format: MusicFormat, #[case] expected: &str) {
+        assert_eq!(format.to_string(), expected);
     }
 
     #[test]

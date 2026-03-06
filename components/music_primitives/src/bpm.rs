@@ -133,6 +133,7 @@ impl fmt::Display for Bpm {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use rstest::rstest;
 
     #[test]
     fn bpm_from_f32_stores_correctly() {
@@ -154,19 +155,19 @@ mod tests {
         assert_eq!(bpm.as_f32(), 125.46); // Rounded to 2 decimals
     }
 
-    #[test]
-    fn bpm_out_of_range_errors() {
-        assert!(Bpm::from_f32(10.0).is_err());
-        assert!(Bpm::from_f32(1000.0).is_err());
+    #[rstest]
+    #[case(10.0)]
+    #[case(1000.0)]
+    fn bpm_out_of_range_errors(#[case] bpm: f32) {
+        assert!(Bpm::from_f32(bpm).is_err());
     }
 
-    #[test]
-    fn bpm_display_formatting() {
-        let bpm = Bpm::from_f32(125.45).unwrap();
-        assert_eq!(format!("{}", bpm), "125.45");
-
-        let bpm = Bpm::from_u32(128).unwrap();
-        assert_eq!(format!("{}", bpm), "128.00");
+    #[rstest]
+    #[case(125.45, "125.45")]
+    #[case(128.0, "128.00")]
+    fn bpm_display_formatting(#[case] value: f32, #[case] expected: &str) {
+        let bpm = Bpm::from_f32(value).unwrap();
+        assert_eq!(format!("{}", bpm), expected);
     }
 
     #[test]

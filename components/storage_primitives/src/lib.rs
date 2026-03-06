@@ -168,13 +168,15 @@ pub type StorageCapacity = ByteSize;
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use rstest::rstest;
 
-    #[test]
-    fn constructors() {
-        assert_eq!(ByteSize::from_gb(1).bytes(), 1_000_000_000);
-        assert_eq!(ByteSize::from_mb(1).bytes(), 1_000_000);
-        assert_eq!(ByteSize::from_kb(1).bytes(), 1_000);
-        assert_eq!(ByteSize::from_tb(1).bytes(), 1_000_000_000_000);
+    #[rstest]
+    #[case(ByteSize::from_gb(1), 1_000_000_000)]
+    #[case(ByteSize::from_mb(1), 1_000_000)]
+    #[case(ByteSize::from_kb(1), 1_000)]
+    #[case(ByteSize::from_tb(1), 1_000_000_000_000)]
+    fn constructors(#[case] size: ByteSize, #[case] expected_bytes: u64) {
+        assert_eq!(size.bytes(), expected_bytes);
     }
 
     #[test]
@@ -185,13 +187,14 @@ mod tests {
         assert_eq!(size.bytes(), 512_000_000_000);
     }
 
-    #[test]
-    fn display_formatting() {
-        assert_eq!(ByteSize::from_tb(2).to_string(), "2.0 TB");
-        assert_eq!(ByteSize::from_gb(512).to_string(), "512 GB");
-        assert_eq!(ByteSize::from_mb(100).to_string(), "100 MB");
-        assert_eq!(ByteSize::from_kb(50).to_string(), "50 KB");
-        assert_eq!(ByteSize::new(500).to_string(), "500 bytes");
+    #[rstest]
+    #[case(ByteSize::from_tb(2), "2.0 TB")]
+    #[case(ByteSize::from_gb(512), "512 GB")]
+    #[case(ByteSize::from_mb(100), "100 MB")]
+    #[case(ByteSize::from_kb(50), "50 KB")]
+    #[case(ByteSize::new(500), "500 bytes")]
+    fn display_formatting(#[case] size: ByteSize, #[case] expected: &str) {
+        assert_eq!(size.to_string(), expected);
     }
 
     #[test]
@@ -211,8 +214,12 @@ mod tests {
     }
 
     #[test]
-    fn ordering() {
+    fn ordering_gb_less_than_gb() {
         assert!(ByteSize::from_gb(100) < ByteSize::from_gb(200));
+    }
+
+    #[test]
+    fn ordering_mb_less_than_gb() {
         assert!(ByteSize::from_mb(100) < ByteSize::from_gb(1));
     }
 

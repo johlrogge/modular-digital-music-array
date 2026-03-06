@@ -123,6 +123,7 @@ mod tests {
     mod volume {
         use super::*;
         use pretty_assertions::assert_eq;
+        use rstest::rstest;
 
         #[test]
         fn unity_is_linear_one() {
@@ -134,27 +135,21 @@ mod tests {
             assert!(Volume::SILENT.to_linear() < 0.0001);
         }
 
-        #[test]
-        fn converts_common_values() {
-            let test_points: [(f32, f32); 3] = [
-                (0.0, 1.0),    // 0 dBFS = 1.0
-                (-6.0, 0.501), // -6 dBFS ≈ 0.501
-                (-20.0, 0.1),  // -20 dBFS = 0.1
-            ];
-
-            for (db, expected) in test_points {
-                let vol = Volume::new(db).unwrap();
-                let actual = vol.to_linear();
-
-                let tolerance = expected * 0.001; // 0.1% tolerance
-                assert!(
-                    (actual - expected).abs() <= tolerance,
-                    "For {}dBFS: expected {}, got {}",
-                    db,
-                    expected,
-                    actual
-                );
-            }
+        #[rstest]
+        #[case(0.0_f32, 1.0_f32)]
+        #[case(-6.0, 0.501)]
+        #[case(-20.0, 0.1)]
+        fn converts_common_values(#[case] db: f32, #[case] expected: f32) {
+            let vol = Volume::new(db).unwrap();
+            let actual = vol.to_linear();
+            let tolerance = expected * 0.001; // 0.1% tolerance
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "For {}dBFS: expected {}, got {}",
+                db,
+                expected,
+                actual
+            );
         }
 
         #[test]

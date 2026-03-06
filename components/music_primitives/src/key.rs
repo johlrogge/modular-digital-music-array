@@ -303,68 +303,69 @@ impl<'de> Deserialize<'de> for Key {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use rstest::rstest;
 
-    #[test]
-    fn parse_traditional_notation() {
-        let key = Key::from_traditional("C Major").unwrap();
-        assert_eq!(key.pitch(), PitchClass::C);
-        assert_eq!(key.mode(), Mode::Major);
-
-        let key = Key::from_traditional("A Minor").unwrap();
-        assert_eq!(key.pitch(), PitchClass::A);
-        assert_eq!(key.mode(), Mode::Minor);
-
-        let key = Key::from_traditional("Eb Major").unwrap();
-        assert_eq!(key.pitch(), PitchClass::DSharp);
-        assert_eq!(key.mode(), Mode::Major);
+    #[rstest]
+    #[case("C Major", PitchClass::C, Mode::Major)]
+    #[case("A Minor", PitchClass::A, Mode::Minor)]
+    #[case("Eb Major", PitchClass::DSharp, Mode::Major)]
+    fn parse_traditional_notation(
+        #[case] notation: &str,
+        #[case] expected_pitch: PitchClass,
+        #[case] expected_mode: Mode,
+    ) {
+        let key = Key::from_traditional(notation).unwrap();
+        assert_eq!(key.pitch(), expected_pitch);
+        assert_eq!(key.mode(), expected_mode);
     }
 
-    #[test]
-    fn traditional_notation_round_trip() {
-        let key = Key::from_traditional("F# Major").unwrap();
-        assert_eq!(key.to_traditional_sharp(), "F# Major");
-
-        let key = Key::from_traditional("Gb Major").unwrap();
-        assert_eq!(key.to_traditional_flat(), "Gb Major");
+    #[rstest]
+    #[case("F# Major", "F# Major", "Gb Major")]
+    #[case("Gb Major", "F# Major", "Gb Major")]
+    fn traditional_notation_round_trip(
+        #[case] input: &str,
+        #[case] expected_sharp: &str,
+        #[case] expected_flat: &str,
+    ) {
+        let key = Key::from_traditional(input).unwrap();
+        assert_eq!(key.to_traditional_sharp(), expected_sharp);
+        assert_eq!(key.to_traditional_flat(), expected_flat);
     }
 
-    #[test]
-    fn camelot_conversion() {
-        assert_eq!(Key::from_traditional("C Major").unwrap().to_camelot(), "8B");
-        assert_eq!(Key::from_traditional("A Minor").unwrap().to_camelot(), "8A");
-        assert_eq!(Key::from_traditional("G Major").unwrap().to_camelot(), "9B");
-        assert_eq!(Key::from_traditional("E Minor").unwrap().to_camelot(), "9A");
-    }
-
-    #[test]
-    fn open_key_conversion() {
+    #[rstest]
+    #[case("C Major", "8B")]
+    #[case("A Minor", "8A")]
+    #[case("G Major", "9B")]
+    #[case("E Minor", "9A")]
+    fn camelot_conversion(#[case] notation: &str, #[case] expected: &str) {
         assert_eq!(
-            Key::from_traditional("C Major").unwrap().to_open_key(),
-            "1d"
-        );
-        assert_eq!(
-            Key::from_traditional("A Minor").unwrap().to_open_key(),
-            "1m"
-        );
-        assert_eq!(
-            Key::from_traditional("G Major").unwrap().to_open_key(),
-            "2d"
+            Key::from_traditional(notation).unwrap().to_camelot(),
+            expected
         );
     }
 
-    #[test]
-    fn mode_from_str_aliases() {
-        // "m" must be Minor (was incorrectly mapped to Major)
-        assert_eq!("m".parse::<Mode>().unwrap(), Mode::Minor);
-        // "M" must be Major
-        assert_eq!("M".parse::<Mode>().unwrap(), Mode::Major);
-        // Standard long-form aliases
-        assert_eq!("major".parse::<Mode>().unwrap(), Mode::Major);
-        assert_eq!("Major".parse::<Mode>().unwrap(), Mode::Major);
-        assert_eq!("minor".parse::<Mode>().unwrap(), Mode::Minor);
-        assert_eq!("Minor".parse::<Mode>().unwrap(), Mode::Minor);
-        assert_eq!("maj".parse::<Mode>().unwrap(), Mode::Major);
-        assert_eq!("min".parse::<Mode>().unwrap(), Mode::Minor);
+    #[rstest]
+    #[case("C Major", "1d")]
+    #[case("A Minor", "1m")]
+    #[case("G Major", "2d")]
+    fn open_key_conversion(#[case] notation: &str, #[case] expected: &str) {
+        assert_eq!(
+            Key::from_traditional(notation).unwrap().to_open_key(),
+            expected
+        );
+    }
+
+    #[rstest]
+    #[case("m", Mode::Minor)]
+    #[case("M", Mode::Major)]
+    #[case("major", Mode::Major)]
+    #[case("Major", Mode::Major)]
+    #[case("minor", Mode::Minor)]
+    #[case("Minor", Mode::Minor)]
+    #[case("maj", Mode::Major)]
+    #[case("min", Mode::Minor)]
+    fn mode_from_str_aliases(#[case] input: &str, #[case] expected: Mode) {
+        assert_eq!(input.parse::<Mode>().unwrap(), expected);
     }
 
     #[test]

@@ -416,12 +416,14 @@ pub struct IngestAllItem {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use rstest::rstest;
 
-    #[test]
-    fn inbox_path_valid() {
-        assert!(InboxPath::new("track.flac").is_ok());
-        assert!(InboxPath::new("subdir/track.flac").is_ok());
-        assert!(InboxPath::new("a/b/c/track.flac").is_ok());
+    #[rstest]
+    #[case("track.flac")]
+    #[case("subdir/track.flac")]
+    #[case("a/b/c/track.flac")]
+    fn inbox_path_valid(#[case] path: &str) {
+        assert!(InboxPath::new(path).is_ok());
     }
 
     #[test]
@@ -437,14 +439,12 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn inbox_path_rejects_traversal() {
+    #[rstest]
+    #[case("../../../etc/passwd")]
+    #[case("foo/../bar")]
+    fn inbox_path_rejects_traversal(#[case] path: &str) {
         assert!(matches!(
-            InboxPath::new("../../../etc/passwd"),
-            Err(InboxPathError::PathTraversal)
-        ));
-        assert!(matches!(
-            InboxPath::new("foo/../bar"),
+            InboxPath::new(path),
             Err(InboxPathError::PathTraversal)
         ));
     }
@@ -474,11 +474,12 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn playlist_name_valid() {
-        assert!(PlaylistName::new("techno-set").is_ok());
-        assert!(PlaylistName::new("My_Playlist_2").is_ok());
-        assert!(PlaylistName::new("a").is_ok());
+    #[rstest]
+    #[case("techno-set")]
+    #[case("My_Playlist_2")]
+    #[case("a")]
+    fn playlist_name_valid(#[case] name: &str) {
+        assert!(PlaylistName::new(name).is_ok());
     }
 
     #[test]
@@ -489,12 +490,13 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn playlist_name_rejects_invalid_chars() {
-        assert!(PlaylistName::new("foo/bar").is_err());
-        assert!(PlaylistName::new("foo bar").is_err());
-        assert!(PlaylistName::new("../etc").is_err());
-        assert!(PlaylistName::new("name.plist").is_err());
+    #[rstest]
+    #[case("foo/bar")]
+    #[case("foo bar")]
+    #[case("../etc")]
+    #[case("name.plist")]
+    fn playlist_name_rejects_invalid_chars(#[case] name: &str) {
+        assert!(PlaylistName::new(name).is_err());
     }
 
     #[test]

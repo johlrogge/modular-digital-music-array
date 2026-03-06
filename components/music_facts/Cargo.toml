@@ -16,5 +16,6 @@ chrono = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
+rstest = { workspace = true }
 serde_json = { workspace = true }
 stainless-facts = { git = "https://github.com/johlrogge/stainless_facts" }

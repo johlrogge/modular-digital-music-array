@@ -122,24 +122,43 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn ticks_operations() {
+    fn ticks_addition() {
         let t1 = Ticks::new(100);
         let t2 = Ticks::new(50);
-
         assert_eq!(t1 + t2, Ticks::new(150));
-        assert_eq!(t1 - t2, Ticks::new(50));
-        assert_eq!(t2 - t1, Ticks::ZERO); // Tests saturation
     }
 
     #[test]
-    fn ppqn_validation() {
+    fn ticks_subtraction() {
+        let t1 = Ticks::new(100);
+        let t2 = Ticks::new(50);
+        assert_eq!(t1 - t2, Ticks::new(50));
+    }
+
+    #[test]
+    fn ticks_saturating_sub() {
+        let t1 = Ticks::new(100);
+        let t2 = Ticks::new(50);
+        assert_eq!(t2 - t1, Ticks::ZERO);
+    }
+
+    #[test]
+    fn ppqn_zero_returns_error() {
         assert!(matches!(Ppqn::new(0).unwrap_err(), TimeError::ZeroPpqn));
+    }
+
+    #[test]
+    fn ppqn_960_is_valid() {
         assert!(Ppqn::new(960).is_ok());
+    }
+
+    #[test]
+    fn ppqn_default_is_960() {
         assert_eq!(Ppqn::DEFAULT.raw(), 960);
     }
 
     #[test]
-    fn tempo_validation() {
+    fn tempo_zero_out_of_range() {
         assert!(matches!(
             Tempo::new(0.0).unwrap_err(),
             TimeError::TempoOutOfRange {
@@ -148,6 +167,10 @@ mod tests {
                 value: 0.0
             }
         ));
+    }
+
+    #[test]
+    fn tempo_500_out_of_range() {
         assert!(matches!(
             Tempo::new(500.0).unwrap_err(),
             TimeError::TempoOutOfRange {
@@ -156,7 +179,15 @@ mod tests {
                 value: 500.0
             }
         ));
+    }
+
+    #[test]
+    fn tempo_120_is_valid() {
         assert!(Tempo::new(120.0).is_ok());
+    }
+
+    #[test]
+    fn tempo_default_is_120() {
         assert_eq!(Tempo::DEFAULT.raw(), 120.0);
     }
 
