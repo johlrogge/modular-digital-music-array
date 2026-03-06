@@ -176,38 +176,51 @@ mod tests {
     }
 
     #[test]
-    fn magic_byte_detection() {
+    fn detect_file_type_flac_magic_bytes() {
         let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.flac");
+        std::fs::write(&path, b"fLaC\x00\x00").unwrap();
+        assert_eq!(detect_file_type(&path), Some("flac"));
+    }
 
-        // FLAC magic bytes
-        let flac_path = dir.path().join("test.flac");
-        std::fs::write(&flac_path, b"fLaC\x00\x00").unwrap();
-        assert_eq!(detect_file_type(&flac_path), Some("flac"));
+    #[test]
+    fn detect_file_type_zip_magic_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.zip");
+        std::fs::write(&path, b"\x50\x4B\x03\x04extra").unwrap();
+        assert_eq!(detect_file_type(&path), Some("zip"));
+    }
 
-        // ZIP magic bytes
-        let zip_path = dir.path().join("test.zip");
-        std::fs::write(&zip_path, b"\x50\x4B\x03\x04extra").unwrap();
-        assert_eq!(detect_file_type(&zip_path), Some("zip"));
+    #[test]
+    fn detect_file_type_mp3_id3_magic_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, b"\x49\x44\x33\x04data").unwrap();
+        assert_eq!(detect_file_type(&path), Some("mp3"));
+    }
 
-        // MP3 ID3 magic bytes
-        let mp3_path = dir.path().join("test.mp3");
-        std::fs::write(&mp3_path, b"\x49\x44\x33\x04data").unwrap();
-        assert_eq!(detect_file_type(&mp3_path), Some("mp3"));
+    #[test]
+    fn detect_file_type_wav_magic_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.wav");
+        std::fs::write(&path, b"RIFFdata").unwrap();
+        assert_eq!(detect_file_type(&path), Some("wav"));
+    }
 
-        // WAV magic bytes
-        let wav_path = dir.path().join("test.wav");
-        std::fs::write(&wav_path, b"RIFFdata").unwrap();
-        assert_eq!(detect_file_type(&wav_path), Some("wav"));
+    #[test]
+    fn detect_file_type_aiff_magic_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aiff");
+        std::fs::write(&path, b"FORMdata").unwrap();
+        assert_eq!(detect_file_type(&path), Some("aiff"));
+    }
 
-        // AIFF magic bytes
-        let aiff_path = dir.path().join("test.aiff");
-        std::fs::write(&aiff_path, b"FORMdata").unwrap();
-        assert_eq!(detect_file_type(&aiff_path), Some("aiff"));
-
-        // Unknown
-        let unknown = dir.path().join("unknown");
-        std::fs::write(&unknown, b"\x00\x00\x00\x00").unwrap();
-        assert_eq!(detect_file_type(&unknown), None);
+    #[test]
+    fn detect_file_type_unknown_magic_bytes_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unknown");
+        std::fs::write(&path, b"\x00\x00\x00\x00").unwrap();
+        assert_eq!(detect_file_type(&path), None);
     }
 
     #[test]
