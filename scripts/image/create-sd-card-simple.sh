@@ -8,7 +8,7 @@
 # correctly — unlike a manual chroot approach.
 #
 # Usage: sudo ./create-sd-card-simple.sh
-# Output: ~/mdma-images/output/mdma-beacon-YYYYMMDD-rpi5.img.xz
+# Output: ~/mdma-images/output/mdma-beacon-YYYYMMDD-rpi5.img.xz (under invoking user's home)
 
 set -euo pipefail
 
@@ -20,7 +20,8 @@ fi
 
 # Configuration
 MDMA_REPO="https://johlrogge.github.io/modular-digital-music-array/aarch64"
-WORK_DIR="${WORK_DIR:-${HOME}/mdma-images}"
+INVOKING_HOME=$(eval echo "~${SUDO_USER:-$(whoami)}")
+WORK_DIR="${WORK_DIR:-${INVOKING_HOME}/mdma-images}"
 MKLIVE_DIR="${WORK_DIR}/void-mklive"
 OUTPUT_DIR="${WORK_DIR}/output"
 
@@ -43,7 +44,7 @@ cd "$MKLIVE_DIR"
 
 # Step 1: Create base rootfs (architecture-generic)
 # Skip if already exists from a previous run
-ROOTFS_TAR=$(ls -t void-aarch64-ROOTFS-*.tar.xz 2>/dev/null | head -1)
+ROOTFS_TAR=$(ls -t void-aarch64-ROOTFS-*.tar.xz 2>/dev/null | head -1 || true)
 if [ -z "$ROOTFS_TAR" ]; then
     echo "Step 1/3: Building aarch64 base rootfs..."
     ./mkrootfs.sh aarch64
@@ -55,7 +56,7 @@ fi
 # Step 2: Create platform-specific rootfs with beacon
 # -p adds extra packages, -r adds our custom repo
 # -k runs a post-install hook script after xbps-reconfigure -a
-PLATFORMFS_TAR=$(ls -t void-rpi-aarch64-PLATFORMFS-*.tar.xz 2>/dev/null | head -1)
+PLATFORMFS_TAR=$(ls -t void-rpi-aarch64-PLATFORMFS-*.tar.xz 2>/dev/null | head -1 || true)
 
 # Create post-install hook that configures beacon for first boot.
 # void-mklive calls this hook with the rootfs path as $1.
@@ -99,11 +100,12 @@ echo "Step 3/3: Creating bootable SD card image..."
 ./mkimage.sh "$PLATFORMFS_TAR"
 
 # Move and rename output
-MKLIVE_OUTPUT=$(ls -t void-rpi-aarch64-*.img.xz 2>/dev/null | head -1)
+MKLIVE_OUTPUT=$(ls -t void-rpi-aarch64-*.img.xz 2>/dev/null | head -1 || true)
 FINAL_OUTPUT="${OUTPUT_DIR}/mdma-beacon-$(date +%Y%m%d)-rpi5.img.xz"
 
 if [ -n "$MKLIVE_OUTPUT" ]; then
     mv "$MKLIVE_OUTPUT" "$FINAL_OUTPUT"
+    chmod 644 "$FINAL_OUTPUT"
 else
     echo "Error: could not find output image from mkimage.sh"
     exit 1
