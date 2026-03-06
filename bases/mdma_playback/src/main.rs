@@ -36,6 +36,10 @@ struct Args {
     /// ACID service socket address for writing play history facts
     #[arg(long, default_value = "ipc:///run/mdma/acid.sock")]
     acid_socket: String,
+
+    /// Path to audio output configuration file
+    #[arg(long, default_value = "/metadata/audio-output.json")]
+    audio_config: PathBuf,
 }
 
 fn main() -> Result<()> {
@@ -46,7 +50,9 @@ fn main() -> Result<()> {
 
     let runtime = Runtime::new()?;
 
-    let engine = Arc::new(tokio::sync::Mutex::new(PlaybackEngine::new()?));
+    let engine = Arc::new(tokio::sync::Mutex::new(PlaybackEngine::new(
+        args.audio_config,
+    )?));
 
     let socket = Socket::new(Protocol::Rep0)?;
     info!("Listening on {}", args.socket);

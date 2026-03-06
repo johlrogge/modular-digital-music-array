@@ -384,6 +384,18 @@ enum PlaybackCommands {
 
     /// Show the current session ID (a session spans from first play to queue empty)
     Session,
+
+    /// List available audio output devices
+    Outputs,
+
+    /// Select an audio output device by name
+    SetOutput {
+        /// Device name as shown by `mdma playback outputs`
+        name: String,
+    },
+
+    /// Show the currently selected audio output
+    GetOutput,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2189,6 +2201,42 @@ fn handle_playback_session(media_client: &PlaybackBackend) -> Result<()> {
     Ok(())
 }
 
+fn handle_playback_outputs(media_client: &PlaybackBackend) -> Result<()> {
+    let sinks = match media_client.list_audio_outputs() {
+        Ok(s) => s,
+        Err(e) => handle_playback_error(e),
+    };
+    println!("{:<40} {:<40} MAX RATE", "NAME", "DESCRIPTION");
+    println!("{}", "-".repeat(90));
+    for sink in &sinks {
+        println!(
+            "{:<40} {:<40} {}",
+            sink.name, sink.description, sink.max_sample_rate
+        );
+    }
+    Ok(())
+}
+
+fn handle_playback_set_output(media_client: &PlaybackBackend, name: &str) -> Result<()> {
+    let cfg = match media_client.set_audio_output(name.to_string()) {
+        Ok(c) => c,
+        Err(e) => handle_playback_error(e),
+    };
+    let device = cfg.device_name.as_deref().unwrap_or("auto");
+    println!("Audio output set to: {} ({}Hz)", device, cfg.sample_rate);
+    Ok(())
+}
+
+fn handle_playback_get_output(media_client: &PlaybackBackend) -> Result<()> {
+    let cfg = match media_client.get_audio_output() {
+        Ok(c) => c,
+        Err(e) => handle_playback_error(e),
+    };
+    let device = cfg.device_name.as_deref().unwrap_or("auto");
+    println!("{} ({}Hz)", device, cfg.sample_rate);
+    Ok(())
+}
+
 fn handle_playback_stop(media_client: &PlaybackBackend) -> Result<()> {
     if let Err(e) = media_client.stop(Deck::A) {
         handle_playback_error(e);
@@ -2909,6 +2957,9 @@ fn main() -> Result<()> {
                     }
                 }
                 PlaybackCommands::Session => handle_playback_session(&pb),
+                PlaybackCommands::Outputs => handle_playback_outputs(&pb),
+                PlaybackCommands::SetOutput { name } => handle_playback_set_output(&pb, name),
+                PlaybackCommands::GetOutput => handle_playback_get_output(&pb),
             }
         }
 

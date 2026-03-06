@@ -22,8 +22,15 @@ pub struct PipewireOutput {
 }
 
 impl PipewireOutput {
-    pub fn new(sample_consumer: HeapConsumer<f32>, sample_rate: u32) -> Result<Self, pw::Error> {
+    pub fn new(
+        sample_consumer: HeapConsumer<f32>,
+        sample_rate: u32,
+        target_device: Option<&str>,
+    ) -> Result<Self, pw::Error> {
         let (cmd_sender, cmd_receiver) = pw::channel::channel::<StreamCommand>();
+
+        // Clone target_device into an owned String so it can move into the thread.
+        let target_device: Option<String> = target_device.map(|s| s.to_owned());
 
         // Create a ring buffer for audio samples
         info!("create pipe wire thread");
@@ -45,16 +52,30 @@ impl PipewireOutput {
                 frame_count: 0,
             };
 
-            let stream = Rc::new(pw::stream::Stream::new(
-                &core,
-                "mdma-audio-output",
-                properties! {
-                    *pw::keys::MEDIA_TYPE => "Audio",
-                    *pw::keys::MEDIA_ROLE => "Music",
-                    *pw::keys::MEDIA_CATEGORY => "Playback",
-                    *pw::keys::AUDIO_CHANNELS => "2",
-                },
-            )?);
+            let stream = if let Some(ref name) = target_device {
+                Rc::new(pw::stream::Stream::new(
+                    &core,
+                    "mdma-audio-output",
+                    properties! {
+                        *pw::keys::MEDIA_TYPE => "Audio",
+                        *pw::keys::MEDIA_ROLE => "Music",
+                        *pw::keys::MEDIA_CATEGORY => "Playback",
+                        *pw::keys::AUDIO_CHANNELS => "2",
+                        "target.object" => name.as_str(),
+                    },
+                )?)
+            } else {
+                Rc::new(pw::stream::Stream::new(
+                    &core,
+                    "mdma-audio-output",
+                    properties! {
+                        *pw::keys::MEDIA_TYPE => "Audio",
+                        *pw::keys::MEDIA_ROLE => "Music",
+                        *pw::keys::MEDIA_CATEGORY => "Playback",
+                        *pw::keys::AUDIO_CHANNELS => "2",
+                    },
+                )?)
+            };
 
             // Held alive until the mainloop exits; dropping it would detach the process callback.
             let _listener = stream
@@ -143,12 +164,14 @@ impl PipewireOutput {
 
             let mut params = [Pod::from_bytes(&values).unwrap()];
 
+            let stream_flags = pw::stream::StreamFlags::AUTOCONNECT
+                | pw::stream::StreamFlags::MAP_BUFFERS
+                | pw::stream::StreamFlags::RT_PROCESS;
+
             stream.connect(
                 spa::utils::Direction::Output,
                 None,
-                pw::stream::StreamFlags::AUTOCONNECT
-                    | pw::stream::StreamFlags::MAP_BUFFERS
-                    | pw::stream::StreamFlags::RT_PROCESS,
+                stream_flags,
                 &mut params,
             )?;
 

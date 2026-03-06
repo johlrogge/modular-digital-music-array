@@ -1,6 +1,9 @@
 //! Playback backend abstraction — works in both gateway and direct mode.
 
-use media_client::{ClientError, Command, ContentHash, Deck, MediaClient, Response, ResponseData};
+use media_client::{
+    AudioOutputConfig, AudioSinkInfo, ClientError, Command, ContentHash, Deck, MediaClient,
+    Response, ResponseData,
+};
 use std::path::PathBuf;
 
 /// Abstraction for playback commands, works in both gateway and direct mode.
@@ -172,6 +175,54 @@ impl PlaybackBackend {
                 let data = self.gw_command_with_data(Command::GetSession)?;
                 if let ResponseData::Session(id) = data {
                     Ok(id)
+                } else {
+                    Err(ClientError::Service(
+                        "Unexpected response data type".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    pub fn list_audio_outputs(&self) -> Result<Vec<AudioSinkInfo>, ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.list_audio_outputs(),
+            PlaybackBackend::Gateway(_) => {
+                let data = self.gw_command_with_data(Command::ListAudioOutputs)?;
+                if let ResponseData::AudioOutputs(sinks) = data {
+                    Ok(sinks)
+                } else {
+                    Err(ClientError::Service(
+                        "Unexpected response data type".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    pub fn set_audio_output(&self, device_name: String) -> Result<AudioOutputConfig, ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.set_audio_output(device_name),
+            PlaybackBackend::Gateway(_) => {
+                let data = self.gw_command_with_data(Command::SetAudioOutput { device_name })?;
+                if let ResponseData::AudioOutput(cfg) = data {
+                    Ok(cfg)
+                } else {
+                    Err(ClientError::Service(
+                        "Unexpected response data type".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    pub fn get_audio_output(&self) -> Result<AudioOutputConfig, ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.get_audio_output(),
+            PlaybackBackend::Gateway(_) => {
+                let data = self.gw_command_with_data(Command::GetAudioOutput)?;
+                if let ResponseData::AudioOutput(cfg) = data {
+                    Ok(cfg)
                 } else {
                     Err(ClientError::Service(
                         "Unexpected response data type".to_string(),

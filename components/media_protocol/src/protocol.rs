@@ -63,6 +63,14 @@ pub enum Command {
     Skip,
     /// Return the current session ID (None if no session is active).
     GetSession,
+    /// List available audio output devices.
+    ListAudioOutputs,
+    /// Select an audio output device by name.
+    SetAudioOutput {
+        device_name: String,
+    },
+    /// Get the currently selected audio output.
+    GetAudioOutput,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +89,21 @@ pub enum ResponseData {
     NowPlaying(Option<ContentHash>),
     Count(usize),
     Session(Option<String>),
+    AudioOutputs(Vec<AudioSinkInfo>),
+    AudioOutput(AudioOutputConfig),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioSinkInfo {
+    pub name: String,
+    pub description: String,
+    pub max_sample_rate: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioOutputConfig {
+    pub device_name: Option<String>,
+    pub sample_rate: u32,
 }
 
 #[cfg(test)]
@@ -184,6 +207,88 @@ mod tests {
         let json = serde_json::to_string(&cmd).unwrap();
         let decoded: Command = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, Command::Resume { deck: Deck::A }));
+    }
+
+    #[test]
+    fn list_audio_outputs_command_serialization() {
+        let cmd = Command::ListAudioOutputs;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#""list_audio_outputs""#);
+        let decoded: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, Command::ListAudioOutputs));
+    }
+
+    #[test]
+    fn set_audio_output_command_serialization() {
+        let cmd = Command::SetAudioOutput {
+            device_name: "alsa_output.pci-0000_00_1f.3.analog-stereo".to_string(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let decoded: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, Command::SetAudioOutput { .. }));
+        if let Command::SetAudioOutput { device_name } = decoded {
+            assert_eq!(device_name, "alsa_output.pci-0000_00_1f.3.analog-stereo");
+        }
+    }
+
+    #[test]
+    fn get_audio_output_command_serialization() {
+        let cmd = Command::GetAudioOutput;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#""get_audio_output""#);
+        let decoded: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, Command::GetAudioOutput));
+    }
+
+    #[test]
+    fn audio_outputs_response_data_serialization() {
+        let sinks = vec![AudioSinkInfo {
+            name: "alsa_output.pci-0000_00_1f.3.analog-stereo".to_string(),
+            description: "Built-in Audio Analog Stereo".to_string(),
+            max_sample_rate: 48000,
+        }];
+        let data = ResponseData::AudioOutputs(sinks);
+        let json = serde_json::to_string(&data).unwrap();
+        let decoded: ResponseData = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, ResponseData::AudioOutputs(_)));
+        if let ResponseData::AudioOutputs(sinks) = decoded {
+            assert_eq!(sinks.len(), 1);
+            assert_eq!(sinks[0].name, "alsa_output.pci-0000_00_1f.3.analog-stereo");
+            assert_eq!(sinks[0].description, "Built-in Audio Analog Stereo");
+            assert_eq!(sinks[0].max_sample_rate, 48000);
+        }
+    }
+
+    #[test]
+    fn audio_output_response_data_serialization() {
+        let config = AudioOutputConfig {
+            device_name: Some("alsa_output.pci-0000_00_1f.3.analog-stereo".to_string()),
+            sample_rate: 44100,
+        };
+        let data = ResponseData::AudioOutput(config);
+        let json = serde_json::to_string(&data).unwrap();
+        let decoded: ResponseData = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, ResponseData::AudioOutput(_)));
+        if let ResponseData::AudioOutput(cfg) = decoded {
+            assert_eq!(
+                cfg.device_name.as_deref(),
+                Some("alsa_output.pci-0000_00_1f.3.analog-stereo")
+            );
+            assert_eq!(cfg.sample_rate, 44100);
+        }
+
+        let none_config = AudioOutputConfig {
+            device_name: None,
+            sample_rate: 48000,
+        };
+        let data2 = ResponseData::AudioOutput(none_config);
+        let json2 = serde_json::to_string(&data2).unwrap();
+        let decoded2: ResponseData = serde_json::from_str(&json2).unwrap();
+        assert!(matches!(decoded2, ResponseData::AudioOutput(_)));
+        if let ResponseData::AudioOutput(cfg) = decoded2 {
+            assert!(cfg.device_name.is_none());
+            assert_eq!(cfg.sample_rate, 48000);
+        }
     }
 
     #[test]

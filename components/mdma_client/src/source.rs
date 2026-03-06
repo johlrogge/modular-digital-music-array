@@ -75,7 +75,7 @@ pub fn list_available_sources(
                 let entry = entry.ok()?;
                 let path = entry.path();
                 if path.extension()?.to_str()? == "sock" {
-                    path.file_stem()?.to_str().map(|s| SourceName::new(s))
+                    path.file_stem()?.to_str().map(SourceName::new)
                 } else {
                     None
                 }

@@ -17,6 +17,8 @@ playback-primitives = { path = "../playback_primitives" }
 tracing.workspace=true
 ringbuf = "0.3"
 rubato = "0.15"
+serde = { workspace = true }
+serde_json = { workspace = true }
 pipewire = "0.8"
 spa_sys = { package = "libspa-sys", version = "0.8" }
 

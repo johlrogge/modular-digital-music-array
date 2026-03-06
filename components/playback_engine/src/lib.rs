@@ -1,5 +1,7 @@
+pub mod audio_config;
 mod error;
 mod mixer;
+pub mod pipewire_devices;
 mod pipewire_output;
 mod resampler;
 mod source;
@@ -7,16 +9,18 @@ mod track;
 
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc,
     },
 };
 
+pub use audio_config::{load_audio_config, save_audio_config, AudioOutputConfig};
 pub use error::PlaybackError;
 use mixer::Mixer;
 use parking_lot::RwLock;
+pub use pipewire_devices::AudioSink;
 use pipewire_output::PipewireOutput;
 pub use playback_primitives::{Db, Deck, Volume};
 use ringbuf::{HeapConsumer, HeapRb};
@@ -24,9 +28,7 @@ pub use source::{AudioSource, Source};
 use tracing::info;
 pub use track::Track;
 
-/// Fixed output sample rate. All sources are upsampled to this rate.
-/// Matches the iFi HD USB Audio maximum capability.
-const TARGET_RATE: u32 = 192_000;
+use crate::pipewire_devices::list_sinks;
 
 type Decks = Arc<RwLock<HashMap<Deck, Arc<RwLock<Track>>>>>;
 
@@ -39,6 +41,8 @@ pub struct PlaybackEngine {
     _mix_task: Option<std::thread::JoinHandle<()>>,
     stream_active: bool,
     mix_thread_running: Arc<AtomicBool>,
+    config_path: PathBuf,
+    audio_config: AudioOutputConfig,
 }
 enum MixerCommand {
     RegisterTrack {
@@ -51,7 +55,9 @@ enum MixerCommand {
     },
 }
 impl PlaybackEngine {
-    pub fn new() -> Result<Self, PlaybackError> {
+    pub fn new(config_path: PathBuf) -> Result<Self, PlaybackError> {
+        let audio_config = load_audio_config(&config_path)?;
+
         // Create a channel for mixer commands - std::sync::mpsc doesn't take a capacity
         let (command_sender, command_receiver) = std::sync::mpsc::channel();
 
@@ -109,6 +115,8 @@ impl PlaybackEngine {
             _mix_task: Some(mix_task),
             stream_active: true,
             mix_thread_running,
+            config_path,
+            audio_config,
         })
     }
 
@@ -131,6 +139,47 @@ impl PlaybackEngine {
         }
     }
 
+    /// Enumerate available audio output sinks via pw-dump.
+    pub fn list_outputs(&self) -> Result<Vec<AudioSink>, PlaybackError> {
+        list_sinks()
+    }
+
+    /// Return the current audio output configuration.
+    pub fn get_output(&self) -> &AudioOutputConfig {
+        &self.audio_config
+    }
+
+    /// Select a named audio output device.
+    ///
+    /// Looks up the device in the live sink list to obtain its maximum sample rate,
+    /// persists the new config, and drops the existing PipeWire output so it is
+    /// recreated with the new settings on the next `load_track()` call.
+    pub fn set_output(&mut self, device_name: String) -> Result<AudioOutputConfig, PlaybackError> {
+        let sinks = list_sinks()?;
+        let sink = sinks
+            .iter()
+            .find(|s| s.name == device_name)
+            .ok_or_else(|| {
+                PlaybackError::AudioDevice(format!("Audio device not found: {device_name}"))
+            })?;
+
+        let new_config = AudioOutputConfig {
+            device_name: Some(device_name),
+            sample_rate: sink.max_sample_rate,
+        };
+
+        save_audio_config(&self.config_path, &new_config)?;
+        self.audio_config = new_config.clone();
+
+        // Drop the current output so it is recreated on next load_track().
+        if self.audio_output.is_some() {
+            tracing::warn!("Changing audio output while stream is active — output will take effect on next track load");
+        }
+        self.audio_output = None;
+
+        Ok(new_config)
+    }
+
     pub async fn load_track(&mut self, deck: Deck, path: &Path) -> Result<(), PlaybackError> {
         tracing::info!("Starting track load for deck {:?}", deck);
 
@@ -147,18 +196,23 @@ impl PlaybackEngine {
         let source = AudioSource::new(path)?;
         let source_rate = source.sample_rate();
 
-        // Create PipeWire output on first track load, always at TARGET_RATE.
+        let target_rate = self.audio_config.sample_rate;
+        let target_device = self.audio_config.device_name.clone();
+
+        // Create PipeWire output on first track load at the configured rate.
         // All sources are upsampled by the decoder task regardless of their native rate.
         if self.audio_output.is_none() {
             if let Some(consumer) = self.mixer_consumer.take() {
                 info!(
-                    "Creating PipeWire output at {}Hz (source: {}Hz)",
-                    TARGET_RATE, source_rate
+                    "Creating PipeWire output at {}Hz (source: {}Hz, device: {:?})",
+                    target_rate, source_rate, target_device
                 );
-                let audio_output = PipewireOutput::new(consumer, TARGET_RATE)
-                    .map_err(|e| PlaybackError::AudioDevice(format!("PipeWire error: {}", e)))?;
+                let audio_output =
+                    PipewireOutput::new(consumer, target_rate, target_device.as_deref()).map_err(
+                        |e| PlaybackError::AudioDevice(format!("PipeWire error: {}", e)),
+                    )?;
                 self.audio_output = Some(audio_output);
-                self.current_sample_rate = Some(TARGET_RATE);
+                self.current_sample_rate = Some(target_rate);
             }
         }
 
@@ -168,8 +222,8 @@ impl PlaybackEngine {
         let rb = HeapRb::<f32>::new(BUFFER_SIZE);
         let (producer, consumer) = rb.split();
 
-        // Create new track — decoder task will resample source_rate → TARGET_RATE
-        let track = Track::new(source, producer, source_rate, TARGET_RATE).await?;
+        // Create new track — decoder task will resample source_rate → target_rate
+        let track = Track::new(source, producer, source_rate, target_rate).await?;
         tracing::info!("Track is ready for playback");
 
         // Store the track - no lock conflicts possible with mix thread now
@@ -299,10 +353,17 @@ impl Drop for PlaybackEngine {
 mod tests {
     use super::*;
 
+    fn engine_with_tempdir() -> (PlaybackEngine, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("audio_config.json");
+        let engine = PlaybackEngine::new(config_path).expect("engine created");
+        (engine, tmp)
+    }
+
     /// Verify that set_stream_active only flips the flag when the value changes.
     #[test]
     fn set_stream_active_tracks_state() {
-        let mut engine = PlaybackEngine::new().expect("engine created");
+        let (mut engine, _tmp) = engine_with_tempdir();
         assert!(engine.is_stream_active(), "should start active");
 
         engine.set_stream_active(false);
@@ -325,9 +386,35 @@ mod tests {
     /// Verify that the mix thread stops cleanly when shutdown() is called.
     #[test]
     fn shutdown_stops_mix_thread() {
-        let mut engine = PlaybackEngine::new().expect("engine created");
+        let (mut engine, _tmp) = engine_with_tempdir();
         assert!(engine._mix_task.is_some());
         engine.shutdown();
         assert!(engine._mix_task.is_none());
+    }
+
+    /// Verify that a missing config file results in the default config being used.
+    #[test]
+    fn new_with_missing_config_uses_defaults() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("nonexistent.json");
+        let engine = PlaybackEngine::new(config_path).expect("engine created");
+        let config = engine.get_output();
+        assert_eq!(config.device_name, None);
+        assert_eq!(config.sample_rate, 192_000);
+    }
+
+    /// Verify that a pre-existing config file is loaded on construction.
+    #[test]
+    fn new_loads_existing_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("audio_config.json");
+        let saved = AudioOutputConfig {
+            device_name: Some("test-device".to_string()),
+            sample_rate: 48_000,
+        };
+        save_audio_config(&config_path, &saved).expect("save");
+
+        let engine = PlaybackEngine::new(config_path).expect("engine created");
+        assert_eq!(engine.get_output(), &saved);
     }
 }
