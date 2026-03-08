@@ -14,7 +14,7 @@ use color_eyre::Result;
 use futures::stream::Stream;
 use gateway_client::{Command, GatewayClient};
 use library_ipc_client::{ContentHash, LibraryClient, TrackInfo, TrackQuery};
-use media_protocol::{Deck, ResponseData};
+use media_protocol::{AudioSinkInfo, Deck, ResponseData};
 use nng::options::Options;
 use source_protocol::{DownloadState, SourceRequest, SourceResponse};
 use std::convert::Infallible;
@@ -825,6 +825,11 @@ async fn bandcamp_configure(
 // Player Types
 // =============================================================================
 
+#[derive(serde::Deserialize)]
+struct SetAudioOutputRequest {
+    device_name: String,
+}
+
 #[derive(serde::Serialize)]
 struct TrackInfoJson {
     content_hash: String,
@@ -1089,6 +1094,77 @@ async fn player_resume(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     playback_success_or_error(&client, &Command::Resume { deck: Deck::A })
 }
 
+async fn player_audio_outputs(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let client = match require_gateway(&state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+
+    use gateway_client::Response;
+    match client.playback_command(&Command::ListAudioOutputs) {
+        Ok(Response::Ok { data }) => match data {
+            Some(ResponseData::AudioOutputs(sinks)) => Json(sinks).into_response(),
+            _ => Json(Vec::<AudioSinkInfo>::new()).into_response(),
+        },
+        Ok(Response::Err { message }) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": message})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn player_audio_output(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let client = match require_gateway(&state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+
+    use gateway_client::Response;
+    match client.playback_command(&Command::GetAudioOutput) {
+        Ok(Response::Ok { data }) => match data {
+            Some(ResponseData::AudioOutput(config)) => Json(config).into_response(),
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Unexpected response"})),
+            )
+                .into_response(),
+        },
+        Ok(Response::Err { message }) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": message})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn player_set_audio_output(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SetAudioOutputRequest>,
+) -> impl IntoResponse {
+    let client = match require_gateway(&state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+
+    playback_success_or_error(
+        &client,
+        &Command::SetAudioOutput {
+            device_name: req.device_name,
+        },
+    )
+}
+
 async fn player_events(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -1315,6 +1391,11 @@ async fn main() -> Result<()> {
         .route("/player/skip", post(player_skip))
         .route("/player/pause", post(player_pause))
         .route("/player/resume", post(player_resume))
+        .route("/player/audio-outputs", get(player_audio_outputs))
+        .route(
+            "/player/audio-output",
+            get(player_audio_output).post(player_set_audio_output),
+        )
         .route("/player/events", get(player_events))
         // Library search
         .route("/library/search", get(library_search_handler))

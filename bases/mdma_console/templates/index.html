@@ -658,6 +658,44 @@
             border-color: var(--accent);
         }
 
+        /* Audio output selector */
+        .audio-output-section {
+            padding: 4px 0 8px;
+        }
+
+        .audio-output-select {
+            width: 100%;
+            padding: 10px 14px;
+            font-family: 'Outfit', sans-serif;
+            font-size: 0.85rem;
+            font-weight: 300;
+            background: var(--bg-surface);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            cursor: pointer;
+            transition: border-color 0.2s;
+            appearance: none;
+            -webkit-appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath fill='%239898b8' d='M0 0l6 8 6-8z'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 14px center;
+            padding-right: 36px;
+        }
+        .audio-output-select:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 1px var(--accent-dim), 0 0 12px var(--accent-dim);
+        }
+        .audio-output-select:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .audio-output-select option {
+            background: var(--bg-elevated);
+            color: var(--text-primary);
+        }
+
         .form-input[type="file"] {
             padding: 8px;
             font-size: 0.78rem;
@@ -1045,6 +1083,17 @@
                 {% endif %}
             </div>
 
+            <!-- Audio Output -->
+            <div class="section">
+                <div class="section-header">Audio Output</div>
+                <div class="audio-output-section">
+                    <label class="form-label" for="audio-output-select">Output Device</label>
+                    <select id="audio-output-select" class="audio-output-select" disabled>
+                        <option value="">Loading...</option>
+                    </select>
+                </div>
+            </div>
+
             <!-- Music inbox -->
             <div class="section">
                 <div class="section-header">Music Inbox</div>
@@ -1248,6 +1297,9 @@
             btn.addEventListener('click', function() {
                 userSelectedTab = true;
                 activateTab(btn.dataset.tab);
+                if (btn.dataset.tab === 'status') {
+                    loadAudioOutputs();
+                }
             });
         });
 
@@ -1819,12 +1871,77 @@
         });
 
         // =================================================================
+        // Audio Output Selection
+        // =================================================================
+
+        async function loadAudioOutputs() {
+            var select = document.getElementById('audio-output-select');
+            if (!select) return;
+
+            try {
+                var outputsRes = await fetch('/player/audio-outputs');
+                var currentRes = await fetch('/player/audio-output');
+
+                if (!outputsRes.ok || !currentRes.ok) {
+                    throw new Error('Request failed');
+                }
+
+                var outputs = await outputsRes.json();
+                var current = await currentRes.json();
+                var currentName = current && current.device_name ? current.device_name : '';
+
+                select.innerHTML = '';
+                if (!Array.isArray(outputs) || outputs.length === 0) {
+                    var opt = document.createElement('option');
+                    opt.value = '';
+                    opt.textContent = 'No devices found';
+                    select.appendChild(opt);
+                } else {
+                    outputs.forEach(function(sink) {
+                        var opt = document.createElement('option');
+                        opt.value = sink.name;
+                        opt.textContent = sink.description || sink.name;
+                        if (sink.name === currentName) {
+                            opt.selected = true;
+                        }
+                        select.appendChild(opt);
+                    });
+                    select.disabled = false;
+                }
+            } catch (e) {
+                select.innerHTML = '<option value="">Unavailable</option>';
+                select.disabled = true;
+            }
+        }
+
+        document.getElementById('audio-output-select').addEventListener('change', async function() {
+            var deviceName = this.value;
+            if (!deviceName) return;
+            try {
+                var response = await fetch('/player/audio-output', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ device_name: deviceName })
+                });
+                if (response.ok) {
+                    showStatus('Audio output changed', false);
+                } else {
+                    var text = await response.text();
+                    showStatus('Failed to change output: ' + text, true);
+                }
+            } catch (e) {
+                showStatus('Error: ' + e.message, true);
+            }
+        });
+
+        // =================================================================
         // Init
         // =================================================================
 
         connectSSE();
         refreshNowPlaying();
         refreshQueue();
+        loadAudioOutputs();
     </script>
 
 </body>
