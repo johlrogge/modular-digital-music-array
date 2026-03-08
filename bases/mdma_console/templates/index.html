@@ -189,8 +189,7 @@
             display: flex;
             gap: 4px;
             align-items: center;
-            flex-shrink: 0;
-            padding-top: 4px;
+            margin-top: 10px;
         }
 
         /* Cover art thumbnails */
@@ -905,7 +904,6 @@
         @media (max-width: 640px) {
             .masthead { padding: 16px 0 14px; }
             .np-active { flex-direction: column; gap: 12px; }
-            .np-transport { align-self: flex-start; }
             .transport-btn { width: 44px; height: 44px; font-size: 1rem; }
             .tab-btn { padding: 14px 16px; font-size: 0.7rem; }
             .kv-grid { grid-template-columns: 120px 1fr; }
@@ -1300,6 +1298,7 @@
         // =================================================================
 
         var userSelectedTab = false;
+        var isPlaybackPaused = false;
 
         function activateTab(tabName) {
             document.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
@@ -1416,12 +1415,18 @@
                 var ev;
                 try { ev = JSON.parse(e.data); } catch(ex) { return; }
                 if (ev.type === 'TrackStarted' || ev.type === 'Connected') {
+                    isPlaybackPaused = false;
                     refreshNowPlaying();
                     refreshQueue();
                 } else if (ev.type === 'TrackStopped' || ev.type === 'TrackEnded') {
+                    isPlaybackPaused = false;
                     refreshNowPlaying();
                     document.getElementById('progress-area').style.display = 'none';
-                } else if (ev.type === 'TrackPaused' || ev.type === 'TrackResumed') {
+                } else if (ev.type === 'TrackPaused') {
+                    isPlaybackPaused = true;
+                    refreshNowPlaying();
+                } else if (ev.type === 'TrackResumed') {
+                    isPlaybackPaused = false;
                     refreshNowPlaying();
                 } else if (ev.type === 'QueueChanged') {
                     refreshQueue();
@@ -1462,6 +1467,8 @@
                     if (!data.playing) {
                         area.innerHTML = '<div class="np-idle">No active playback</div>';
                         if (progressArea) progressArea.style.display = 'none';
+                        var existingTransport = document.getElementById('np-transport-controls');
+                        if (existingTransport) existingTransport.remove();
                         if (!userSelectedTab) { deactivateAllTabs(); }
                         return;
                     }
@@ -1482,6 +1489,9 @@
                         ? '<img class="cover-art cover-art-np" src="/cover/' + encodeURIComponent(t.content_hash) + '" onerror="this.style.display=\'none\'" alt="">'
                         : '';
 
+                    var pauseClass = isPlaybackPaused ? 'transport-btn primary' : 'transport-btn';
+                    var resumeClass = (!isPlaybackPaused) ? 'transport-btn primary' : 'transport-btn';
+
                     area.innerHTML =
                         '<div class="np-active">' +
                             coverHtml +
@@ -1491,15 +1501,26 @@
                                 (artist ? '<div class="np-artist">' + artist + '</div>' : '') +
                                 (metaHtml ? '<div class="np-meta">' + metaHtml + '</div>' : '') +
                             '</div>' +
-                            '<div class="np-transport">' +
-                                '<button class="transport-btn" onclick="playerPause()" title="Pause">&#10074;&#10074;</button>' +
-                                '<button class="transport-btn" onclick="playerResume()" title="Resume">&#9654;</button>' +
-                                '<button class="transport-btn" onclick="playerStop()" title="Stop">&#9632;</button>' +
-                                '<button class="transport-btn primary" onclick="playerSkip()" title="Skip">&#9197;</button>' +
-                            '</div>' +
                         '</div>';
 
                     if (progressArea) progressArea.style.display = 'block';
+
+                    // Transport controls go after the progress bar — injected into now-playing-area
+                    // We append after progressArea by setting innerHTML on a wrapper then inserting
+                    var existingTransport = document.getElementById('np-transport-controls');
+                    if (!existingTransport) {
+                        var transportDiv = document.createElement('div');
+                        transportDiv.id = 'np-transport-controls';
+                        area.parentNode.appendChild(transportDiv);
+                        existingTransport = transportDiv;
+                    }
+                    existingTransport.innerHTML =
+                        '<div class="np-transport">' +
+                            '<button id="btn-pause" class="' + pauseClass + '" onclick="playerPause()" title="Pause">&#10074;&#10074;</button>' +
+                            '<button id="btn-play" class="' + resumeClass + '" onclick="playerResume()" title="Resume">&#9654;</button>' +
+                            '<button id="btn-stop" class="transport-btn" onclick="playerStop()" title="Stop">&#9632;</button>' +
+                            '<button id="btn-skip" class="transport-btn" onclick="playerSkip()" title="Skip">&#9197;</button>' +
+                        '</div>';
                     if (!userSelectedTab) { activateTab('playback'); }
                 })
                 .catch(function() {});
