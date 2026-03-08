@@ -39,6 +39,16 @@ fi
 # without qemu-user-static. We pre-install it via mkplatformfs -p instead.
 sed -i 's/run_cmd_target "xbps-install -Syr $ROOTFS cloud-guest-utils"/# [MDMA] skipped: cloud-guest-utils pre-installed via mkplatformfs/' "$MKLIVE_DIR/mkimage.sh"
 
+# Patch: force initramfs generation for aarch64 platforms (needed for Pi 5)
+# void-mklive only generates initramfs for arm* targets, but aarch64 Pi 5
+# needs it because the RP1 I/O controller driver (rp1-fw.ko) is a module.
+sed -i 's/\[ -z "${XBPS_TARGET_ARCH##\*arm\*}" \]/[ -z "${XBPS_TARGET_ARCH##*arm*}" ] || [ "$PLATFORM" = "rpi-aarch64" ]/' "$MKLIVE_DIR/mkplatformfs.sh"
+
+# Patch: configure Pi 5 boot (initramfs + correct dtoverlay)
+# These config.txt tweaks must be in mkimage.sh (after boot partition is mounted)
+# not in the post-install hook (before boot partition is populated).
+sed -i '/PARTUUID.*cmdline.txt/a\\techo "initramfs initrd followkernel" >> "${ROOTFS}/boot/config.txt"\n\tsed -i "s/^dtoverlay=vc4-kms-v3d$/dtoverlay=vc4-kms-v3d-pi5/" "${ROOTFS}/boot/config.txt"' "$MKLIVE_DIR/mkimage.sh"
+
 mkdir -p "$OUTPUT_DIR"
 cd "$MKLIVE_DIR"
 
@@ -85,7 +95,7 @@ chmod +x "$HOOK_SCRIPT"
 if [ -z "$PLATFORMFS_TAR" ]; then
     echo "Step 2/3: Building platform rootfs with beacon..."
     ./mkplatformfs.sh \
-        -p "beacon dbus avahi cloud-guest-utils" \
+        -p "beacon dbus avahi cloud-guest-utils rpi5-kernel dracut uboot-mkimage" \
         -r "$MDMA_REPO" \
         -k "$HOOK_SCRIPT" \
         rpi-aarch64 \
