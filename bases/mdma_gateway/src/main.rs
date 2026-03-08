@@ -6,6 +6,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use source_protocol::{SourceRequest, SourceResponse};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -42,6 +43,10 @@ struct Args {
     /// Local event source to subscribe to (Sub0)
     #[arg(long, default_value = "ipc:///run/mdma/events.sock")]
     event_source: String,
+
+    /// ACID event source to subscribe to (Sub0)
+    #[arg(long, default_value = "ipc:///run/mdma/acid-events.sock")]
+    acid_event_source: String,
 }
 
 /// Connect a Req0 socket to a backend with reconnect options.
@@ -146,6 +151,50 @@ fn list_sources(sources_dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Spawn a background thread that subscribes to an IPC Pub0 source and
+/// re-publishes every message on the shared TCP `event_pub` socket.
+///
+/// All topics are forwarded — the Pub0 wire format already contains the topic
+/// prefix so downstream TCP subscribers can filter by topic themselves.
+fn spawn_event_bridge(event_pub: Arc<nng::Socket>, source_addr: String) {
+    std::thread::spawn(move || {
+        let event_sub = match nng::Socket::new(nng::Protocol::Sub0) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, source = %source_addr, "Failed to create Sub0 socket for event bridge");
+                return;
+            }
+        };
+
+        // Subscribe to all topics (empty prefix = wildcard)
+        if let Err(e) = event_sub.set_opt::<nng::options::protocol::pubsub::Subscribe>(vec![]) {
+            tracing::error!(error = %e, "Failed to set subscription filter");
+            return;
+        }
+
+        if let Err(e) = event_sub.dial_async(&source_addr) {
+            tracing::error!(address = %source_addr, error = %e, "Failed to connect to event source");
+            return;
+        }
+
+        tracing::info!(address = %source_addr, "Event bridge connected to source");
+
+        loop {
+            match event_sub.recv() {
+                Ok(msg) => {
+                    if let Err((_, e)) = event_pub.send(nng::Message::from(msg.as_slice())) {
+                        tracing::warn!(error = %e, "Failed to re-publish event");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, source = %source_addr, "Event bridge recv error, retrying...");
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+    });
+}
+
 fn main() -> Result<()> {
     color_eyre::install()?;
 
@@ -188,46 +237,16 @@ fn main() -> Result<()> {
     tracing::info!(address = %args.acid_socket, "Connected to acid backend");
 
     // Event bridge: Sub0 (local) -> Pub0 (TCP)
-    let event_pub = nng::Socket::new(nng::Protocol::Pub0)?;
+    // A single Pub0 socket re-publishes events from all IPC sources to TCP subscribers.
+    let event_pub = Arc::new(nng::Socket::new(nng::Protocol::Pub0)?);
     event_pub.listen(&args.event_listen)?;
     tracing::info!(address = %args.event_listen, "Event publishing on TCP");
 
-    let event_source_addr = args.event_source.clone();
-    std::thread::spawn(move || {
-        let event_sub = match nng::Socket::new(nng::Protocol::Sub0) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to create Sub0 socket for event bridge");
-                return;
-            }
-        };
+    // Bridge playback events (playback/ topic)
+    spawn_event_bridge(Arc::clone(&event_pub), args.event_source.clone());
 
-        if let Err(e) = event_sub.set_opt::<nng::options::protocol::pubsub::Subscribe>(vec![]) {
-            tracing::error!(error = %e, "Failed to set subscription filter");
-            return;
-        }
-
-        if let Err(e) = event_sub.dial_async(&event_source_addr) {
-            tracing::error!(address = %event_source_addr, error = %e, "Failed to connect to event source");
-            return;
-        }
-
-        tracing::info!(address = %event_source_addr, "Event bridge connected to source");
-
-        loop {
-            match event_sub.recv() {
-                Ok(msg) => {
-                    if let Err((_, e)) = event_pub.send(nng::Message::from(msg.as_slice())) {
-                        tracing::warn!(error = %e, "Failed to re-publish event");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Event bridge recv error, retrying...");
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-            }
-        }
-    });
+    // Bridge ACID events (acid/ topic)
+    spawn_event_bridge(Arc::clone(&event_pub), args.acid_event_source.clone());
 
     // Source backend cache (connected on demand)
     let mut source_cache: HashMap<String, nng::Socket> = HashMap::new();

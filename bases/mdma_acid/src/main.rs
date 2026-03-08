@@ -1,10 +1,13 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use acid_protocol::{AcidRequest, AcidResponse, StreamChunk};
+use acid_protocol::{
+    cursor_from_offset, offset_from_cursor, AcidRequest, AcidResponse, StreamChunk,
+};
 use chrono::Utc;
 use clap::Parser;
 use color_eyre::Result;
+use event_protocol::{acid_event_to_topic_message, AcidEvent};
 use stainless_facts::{Fact, FactStreamWriter, Operation};
 use thiserror::Error;
 
@@ -19,9 +22,13 @@ struct Args {
     #[arg(long, default_value = "/metadata")]
     metadata_dir: PathBuf,
 
-    /// nng IPC socket path
+    /// nng IPC socket path (Rep0 — request/response)
     #[arg(long, default_value = "ipc:///run/mdma/acid.sock")]
     socket: String,
+
+    /// nng IPC socket path for event publishing (Pub0)
+    #[arg(long, default_value = "ipc:///run/mdma/acid-events.sock")]
+    event_socket: String,
 }
 
 #[derive(Debug, Error)]
@@ -55,8 +62,10 @@ fn handle_request(request: &AcidRequest, metadata_dir: &Path) -> AcidResponse {
             }
         }
 
-        AcidRequest::ReadStream { after_line, limit } => {
-            match read_stream(*after_line, *limit, metadata_dir) {
+        AcidRequest::ReadStream { cursor, limit } => {
+            // Decode opaque cursor to internal line offset (None => start from 0)
+            let after_line = cursor.as_deref().and_then(offset_from_cursor).unwrap_or(0);
+            match read_stream(after_line, *limit, metadata_dir) {
                 Ok(chunk) => AcidResponse::StreamChunk(chunk),
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to read stream");
@@ -110,7 +119,7 @@ fn read_stream(
     if !facts_path.exists() {
         return Ok(StreamChunk {
             lines: vec![],
-            next_offset: after_line,
+            cursor: cursor_from_offset(after_line),
         });
     }
 
@@ -123,7 +132,26 @@ fn read_stream(
         .collect::<Result<_, _>>()?;
 
     let next_offset = after_line + lines.len();
-    Ok(StreamChunk { lines, next_offset })
+    Ok(StreamChunk {
+        lines,
+        cursor: cursor_from_offset(next_offset),
+    })
+}
+
+/// Publish a `FactsWritten` notification on the Pub0 event socket.
+///
+/// Errors are logged but not fatal — the write already succeeded.
+fn publish_facts_written(event_pub: &nng::Socket, entity: &str, count: usize, cursor: &str) {
+    let event = AcidEvent::FactsWritten {
+        entity: entity.to_string(),
+        count,
+        cursor: cursor.to_string(),
+    };
+    let bytes = acid_event_to_topic_message(&event);
+    let msg = nng::Message::from(&bytes[..]);
+    if let Err((_, e)) = event_pub.send(msg) {
+        tracing::warn!(error = %e, "Failed to publish acid/facts event");
+    }
 }
 
 fn main() -> Result<()> {
@@ -141,22 +169,38 @@ fn main() -> Result<()> {
     tracing::info!(
         metadata_dir = %args.metadata_dir.display(),
         socket = %args.socket,
+        event_socket = %args.event_socket,
         "Starting MDMA ACID service"
     );
 
     std::fs::create_dir_all(&args.metadata_dir)?;
 
-    if args.socket.starts_with("ipc://") {
-        if let Some(path) = args.socket.strip_prefix("ipc://") {
-            if let Some(parent) = Path::new(path).parent() {
-                std::fs::create_dir_all(parent)?;
+    // Ensure IPC socket directories exist
+    for addr in [&args.socket, &args.event_socket] {
+        if addr.starts_with("ipc://") {
+            if let Some(path) = addr.strip_prefix("ipc://") {
+                if let Some(parent) = Path::new(path).parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
             }
         }
     }
 
+    // Rep0 — request/response for reads and writes
     let socket = nng::Socket::new(nng::Protocol::Rep0)?;
     socket.listen(&args.socket)?;
     tracing::info!(address = %args.socket, "ACID service listening");
+
+    // Pub0 — publish lightweight notifications after successful writes
+    let event_pub = nng::Socket::new(nng::Protocol::Pub0)?;
+    event_pub.listen(&args.event_socket)?;
+    tracing::info!(address = %args.event_socket, "ACID event socket listening");
+
+    // Track total line count in-memory; initialise once by counting existing lines.
+    // This avoids re-reading the whole file after every write (TOCTOU-safe for our
+    // single-writer model because only this process appends to facts.jsonl).
+    let mut line_count = count_facts_lines(&args.metadata_dir);
+    tracing::debug!(line_count, "Initial facts line count");
 
     loop {
         let msg = socket.recv()?;
@@ -175,10 +219,40 @@ fn main() -> Result<()> {
         };
 
         tracing::debug!(request = ?request, "Received request");
+
+        // Capture write entity before handling so we can publish after
+        let write_entity: Option<String> = match &request {
+            AcidRequest::WriteFacts { entity, .. } => Some(entity.clone()),
+            _ => None,
+        };
+
         let response = handle_request(&request, &args.metadata_dir);
+
+        // After a successful write, increment the in-memory counter and publish.
+        if let (Some(entity), AcidResponse::WriteOk { facts_written }) = (&write_entity, &response)
+        {
+            line_count += facts_written;
+            let cursor = acid_protocol::cursor_from_offset(line_count);
+            publish_facts_written(&event_pub, entity, *facts_written, &cursor);
+        }
+
         let data = serde_json::to_vec(&response)?;
         let out = nng::Message::from(&data[..]);
         socket.send(out).map_err(|(_, e)| e)?;
+    }
+}
+
+/// Count the number of lines currently in the facts file.
+///
+/// Called once at startup to initialise the in-memory line counter.
+fn count_facts_lines(metadata_dir: &Path) -> usize {
+    let facts_path = metadata_dir.join("facts.jsonl");
+    if !facts_path.exists() {
+        return 0;
+    }
+    match std::fs::File::open(&facts_path) {
+        Ok(file) => BufReader::new(file).lines().count(),
+        Err(_) => 0,
     }
 }
 
@@ -245,14 +319,15 @@ mod tests {
     fn handle_read_stream_missing_file_returns_empty() {
         let dir = temp_metadata();
         let request = AcidRequest::ReadStream {
-            after_line: 0,
+            cursor: None,
             limit: 10,
         };
         let response = handle_request(&request, dir.path());
         match response {
             AcidResponse::StreamChunk(chunk) => {
                 assert_eq!(chunk.lines, Vec::<String>::new());
-                assert_eq!(chunk.next_offset, 0);
+                // cursor should point to offset 0 (beginning)
+                assert_eq!(acid_protocol::offset_from_cursor(&chunk.cursor), Some(0));
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -273,17 +348,66 @@ mod tests {
         handle_request(&write_req, dir.path());
 
         let read_req = AcidRequest::ReadStream {
-            after_line: 0,
+            cursor: None,
             limit: 10,
         };
         let response = handle_request(&read_req, dir.path());
         match response {
             AcidResponse::StreamChunk(chunk) => {
                 assert!(!chunk.lines.is_empty(), "should have at least one line");
-                assert_eq!(chunk.next_offset, chunk.lines.len());
+                // cursor should advance past the returned lines
+                let offset = acid_protocol::offset_from_cursor(&chunk.cursor).unwrap();
+                assert_eq!(offset, chunk.lines.len());
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn handle_read_stream_with_cursor_continues_from_offset() {
+        let dir = temp_metadata();
+
+        // Write two facts
+        let write_req = AcidRequest::WriteFacts {
+            entity: "track:test".to_string(),
+            facts: vec![
+                FactEntry {
+                    value_json: r#"{"bpm": 140}"#.to_string(),
+                    source_json: r#"{"source": "test"}"#.to_string(),
+                },
+                FactEntry {
+                    value_json: r#"{"key": "Cm"}"#.to_string(),
+                    source_json: r#"{"source": "test"}"#.to_string(),
+                },
+            ],
+        };
+        handle_request(&write_req, dir.path());
+
+        // Read first line only
+        let read1 = AcidRequest::ReadStream {
+            cursor: None,
+            limit: 1,
+        };
+        let chunk1 = match handle_request(&read1, dir.path()) {
+            AcidResponse::StreamChunk(c) => c,
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(chunk1.lines.len(), 1);
+
+        // Continue reading from the returned cursor
+        let read2 = AcidRequest::ReadStream {
+            cursor: Some(chunk1.cursor.clone()),
+            limit: 10,
+        };
+        let chunk2 = match handle_request(&read2, dir.path()) {
+            AcidResponse::StreamChunk(c) => c,
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(
+            chunk2.lines.len(),
+            1,
+            "should read exactly one remaining line"
+        );
     }
 
     #[test]
@@ -300,6 +424,36 @@ mod tests {
         assert!(
             matches!(response, AcidResponse::Error { .. }),
             "should return error for invalid JSON"
+        );
+    }
+
+    #[test]
+    fn count_facts_lines_returns_line_count() {
+        let dir = temp_metadata();
+
+        // No file yet -> 0
+        assert_eq!(count_facts_lines(dir.path()), 0);
+
+        // Write two facts
+        let write_req = AcidRequest::WriteFacts {
+            entity: "track:test".to_string(),
+            facts: vec![
+                FactEntry {
+                    value_json: r#"{"x": 1}"#.to_string(),
+                    source_json: r#"{"source": "test"}"#.to_string(),
+                },
+                FactEntry {
+                    value_json: r#"{"x": 2}"#.to_string(),
+                    source_json: r#"{"source": "test"}"#.to_string(),
+                },
+            ],
+        };
+        handle_request(&write_req, dir.path());
+
+        assert_eq!(
+            count_facts_lines(dir.path()),
+            2,
+            "should count both written lines"
         );
     }
 }

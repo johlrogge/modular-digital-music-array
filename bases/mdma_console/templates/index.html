@@ -193,6 +193,28 @@
             padding-top: 4px;
         }
 
+        /* Cover art thumbnails */
+        .cover-art {
+            object-fit: cover;
+            border-radius: 4px;
+            flex-shrink: 0;
+        }
+
+        .cover-art-np {
+            width: 80px;
+            height: 80px;
+        }
+
+        .cover-art-queue {
+            width: 48px;
+            height: 48px;
+        }
+
+        .cover-art-search {
+            width: 48px;
+            height: 48px;
+        }
+
         .transport-btn {
             width: 36px;
             height: 36px;
@@ -1405,6 +1427,13 @@
                     refreshQueue();
                 } else if (ev.type === 'PositionUpdate') {
                     updateProgressBar(ev.position_ms, ev.duration_ms);
+                } else if (ev.type === 'FactsWritten') {
+                    // New facts written — re-run any active search to pick up updated metadata
+                    var hasSearch = (document.getElementById('search-q').value.trim() ||
+                                     document.getElementById('search-artist').value.trim() ||
+                                     document.getElementById('search-bpm').value.trim() ||
+                                     document.getElementById('search-key').value.trim());
+                    if (hasSearch) { scheduleSearch(); }
                 }
             };
 
@@ -1449,8 +1478,13 @@
 
                     var metaHtml = metaParts.map(function(m) { return '<span>' + m + '</span>'; }).join('');
 
+                    var coverHtml = t.content_hash
+                        ? '<img class="cover-art cover-art-np" src="/cover/' + encodeURIComponent(t.content_hash) + '" onerror="this.style.display=\'none\'" alt="">'
+                        : '';
+
                     area.innerHTML =
                         '<div class="np-active">' +
+                            coverHtml +
                             '<div class="np-info">' +
                                 '<div class="np-label">Now Playing</div>' +
                                 '<div class="np-title">' + title + '</div>' +
@@ -1484,8 +1518,12 @@
                         var title = escapeHtml(t.title || t.content_hash || 'Unknown');
                         var artist = escapeHtml(t.artist || '');
                         var hash = escapeHtml(t.content_hash || '');
+                        var coverHtml = t.content_hash
+                            ? '<img class="cover-art cover-art-queue" src="/cover/' + encodeURIComponent(t.content_hash) + '" onerror="this.style.display=\'none\'" alt="">'
+                            : '';
                         return '<li class="queue-item">' +
                             '<span class="queue-num">' + (i + 1) + '</span>' +
+                            coverHtml +
                             '<div class="queue-info">' +
                                 '<div class="queue-title">' + title + '</div>' +
                                 (artist ? '<div class="queue-artist">' + artist + '</div>' : '') +
@@ -1606,7 +1644,11 @@
                         var keyStr = escapeHtml(t.key || '');
                         var dur = t.duration ? fmtDuration(t.duration) : '';
                         var exportHref = '/export/' + encodeURIComponent(t.content_hash || '') + '?format=aiff';
+                        var coverHtml = t.content_hash
+                            ? '<img class="cover-art cover-art-search" src="/cover/' + encodeURIComponent(t.content_hash) + '" onerror="this.style.display=\'none\'" alt="">'
+                            : '';
                         return '<tr>' +
+                            '<td style="width:56px;padding-right:8px">' + coverHtml + '</td>' +
                             '<td>' + title + '</td>' +
                             '<td style="color:var(--text-secondary)">' + artist + '</td>' +
                             '<td class="col-mono">' + bpmStr + '</td>' +
@@ -1621,7 +1663,7 @@
 
                     area.innerHTML =
                         '<table class="results-table">' +
-                        '<thead><tr><th>Title</th><th>Artist</th><th>BPM</th><th>Key</th><th>Dur</th><th></th></tr></thead>' +
+                        '<thead><tr><th></th><th>Title</th><th>Artist</th><th>BPM</th><th>Key</th><th>Dur</th><th></th></tr></thead>' +
                         '<tbody>' + rows + '</tbody>' +
                         '</table>';
                 })

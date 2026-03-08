@@ -58,8 +58,12 @@ impl AcidClient {
         }
     }
 
-    pub fn read_stream(&self, after_line: usize, limit: usize) -> Result<StreamChunk, ClientError> {
-        let req = AcidRequest::ReadStream { after_line, limit };
+    pub fn read_stream(
+        &self,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> Result<StreamChunk, ClientError> {
+        let req = AcidRequest::ReadStream { cursor, limit };
         match self.request(&req)? {
             AcidResponse::StreamChunk(chunk) => Ok(chunk),
             AcidResponse::Error { message } => Err(ClientError::Service(message)),
@@ -135,8 +139,8 @@ mod tests {
 
         let chunk = StreamChunk {
             lines: vec!["line".to_string()],
-            next_offset: 1,
+            cursor: "line:1".to_string(),
         };
-        assert_eq!(chunk.next_offset, 1);
+        assert_eq!(chunk.cursor, "line:1");
     }
 }

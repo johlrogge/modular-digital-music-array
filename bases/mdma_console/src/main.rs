@@ -1274,7 +1274,9 @@ async fn library_search_handler(
 // =============================================================================
 
 fn spawn_event_bridge(event_socket: String, event_tx: broadcast::Sender<String>) {
-    use event_protocol::{from_topic_message, TOPIC_PLAYBACK};
+    use event_protocol::{
+        acid_event_from_topic_message, from_topic_message, TOPIC_ACID_FACTS_WRITTEN, TOPIC_PLAYBACK,
+    };
     std::thread::spawn(move || {
         let sub = match nng::Socket::new(nng::Protocol::Sub0) {
             Ok(s) => s,
@@ -1286,7 +1288,13 @@ fn spawn_event_bridge(event_socket: String, event_tx: broadcast::Sender<String>)
         if let Err(e) = sub.set_opt::<nng::options::protocol::pubsub::Subscribe>(
             TOPIC_PLAYBACK.as_bytes().to_vec(),
         ) {
-            tracing::error!(error = %e, "SSE: subscribe failed");
+            tracing::error!(error = %e, "SSE: subscribe (playback) failed");
+            return;
+        }
+        if let Err(e) = sub.set_opt::<nng::options::protocol::pubsub::Subscribe>(
+            TOPIC_ACID_FACTS_WRITTEN.as_bytes().to_vec(),
+        ) {
+            tracing::error!(error = %e, "SSE: subscribe (acid/facts) failed");
             return;
         }
         loop {
@@ -1307,8 +1315,16 @@ fn spawn_event_bridge(event_socket: String, event_tx: broadcast::Sender<String>)
             loop {
                 match sub.recv() {
                     Ok(msg) => {
-                        if let Ok((_topic, event)) = from_topic_message(msg.as_slice()) {
+                        let bytes = msg.as_slice();
+                        // Try playback events first, then ACID events
+                        if let Ok((_topic, event)) = from_topic_message(bytes) {
                             if let Ok(json) = serde_json::to_string(&event) {
+                                let _ = event_tx.send(json);
+                            }
+                        } else if let Ok((_topic, acid_event)) =
+                            acid_event_from_topic_message(bytes)
+                        {
+                            if let Ok(json) = serde_json::to_string(&acid_event) {
                                 let _ = event_tx.send(json);
                             }
                         }
@@ -1399,6 +1415,8 @@ async fn main() -> Result<()> {
         .route("/player/events", get(player_events))
         // Library search
         .route("/library/search", get(library_search_handler))
+        // Cover art
+        .route("/cover/:hash", get(cover_art))
         // Export
         .route("/export/:hash", get(export_track))
         .with_state(state);
@@ -1652,6 +1670,71 @@ async fn export_track(
 }
 
 // =============================================================================
+// Cover Art Handler
+// =============================================================================
+
+/// Detect MIME type from cover art file extension.
+fn cover_art_content_type(path: &str) -> &'static str {
+    match std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase())
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn cover_art(
+    State(state): State<Arc<AppState>>,
+    Path(hash): Path<String>,
+) -> impl IntoResponse {
+    use axum::http::header;
+
+    let content_hash = ContentHash::new(hash);
+
+    let lib_client = match state.library_client() {
+        Some(c) => c,
+        None => {
+            return (StatusCode::SERVICE_UNAVAILABLE, "Library not available").into_response();
+        }
+    };
+
+    let track = match lib_client.get_track(&content_hash) {
+        Ok(t) => t,
+        Err(_) => {
+            return (StatusCode::NOT_FOUND, "Track not found").into_response();
+        }
+    };
+
+    let cover_rel = match track.cover_art_path {
+        Some(p) => p,
+        None => {
+            return (StatusCode::NOT_FOUND, "No cover art").into_response();
+        }
+    };
+
+    let cover_path = state.music_root.join(&cover_rel);
+    let content_type = cover_art_content_type(&cover_rel);
+
+    match tokio::fs::read(&cover_path).await {
+        Ok(data) => (
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            data,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "Cover art file not found").into_response(),
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -1761,6 +1844,7 @@ mod tests {
             bpm: Some(Bpm::from_u32(128).unwrap()),
             key: Some(Key::from_traditional("C Major").unwrap()),
             blob_path: Some("ab/abc123.flac".to_string()),
+            cover_art_path: None,
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.content_hash, "sha256:abc123");
@@ -1783,6 +1867,7 @@ mod tests {
             bpm: None,
             key: None,
             blob_path: None,
+            cover_art_path: None,
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.content_hash, "sha256:deadbeef");
@@ -1937,6 +2022,42 @@ mod tests {
         // but the actual handler accepts empty as "no username configured".
         // This test documents the current behaviour of the pure char predicate.
         assert!(is_valid_username(""));
+    }
+
+    // ── Cover art content type ─────────────────────────────────────────────
+
+    #[test]
+    fn cover_art_content_type_jpeg() {
+        assert_eq!(cover_art_content_type("cover-art/abc.jpg"), "image/jpeg");
+        assert_eq!(cover_art_content_type("cover-art/abc.jpeg"), "image/jpeg");
+    }
+
+    #[test]
+    fn cover_art_content_type_png() {
+        assert_eq!(cover_art_content_type("cover-art/abc.png"), "image/png");
+    }
+
+    #[test]
+    fn cover_art_content_type_webp() {
+        assert_eq!(cover_art_content_type("cover-art/abc.webp"), "image/webp");
+    }
+
+    #[test]
+    fn cover_art_content_type_unknown_defaults_to_octet_stream() {
+        assert_eq!(
+            cover_art_content_type("cover-art/abc.bmp"),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            cover_art_content_type("cover-art/noext"),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn cover_art_content_type_case_insensitive() {
+        assert_eq!(cover_art_content_type("cover-art/abc.JPG"), "image/jpeg");
+        assert_eq!(cover_art_content_type("cover-art/abc.PNG"), "image/png");
     }
 
     #[test]

@@ -261,6 +261,12 @@ enum Commands {
         command: PlaylistCommands,
     },
 
+    /// Library maintenance commands
+    Library {
+        #[command(subcommand)]
+        command: LibraryCommands,
+    },
+
     /// Generate shell completions
     #[command(hide = true)]
     GenerateCompletions {
@@ -529,6 +535,16 @@ enum PlaylistCommands {
         /// New playlist name
         to: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum LibraryCommands {
+    /// Re-extract and store cover art for tracks that don't have a CoverArtPath fact yet.
+    ///
+    /// Reads embedded artwork from each track's audio blob and writes the image to
+    /// `/music/cover-art/<hash>.<ext>`. Only tracks without an existing CoverArtPath
+    /// fact are processed.
+    ReindexCovers,
 }
 
 // =============================================================================
@@ -1634,6 +1650,35 @@ fn handle_playlist_remove(client: &LibraryBackend, name: &str) -> Result<()> {
         Ok(LibraryResponse::Pong) => {
             eprintln!("Removed playlist '{}'", name);
         }
+        Ok(LibraryResponse::Error(e)) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("Unexpected response");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+// =============================================================================
+// Library Maintenance Command Handlers
+// =============================================================================
+
+fn handle_library_reindex_covers(client: &LibraryBackend) -> Result<()> {
+    use library_ipc_client::{LibraryRequest, LibraryResponse};
+    let response = client.request(&LibraryRequest::ReindexCovers);
+    match response {
+        Ok(LibraryResponse::IngestResult(result)) => match result {
+            library_ipc_client::IngestResult::Success { message, .. } => {
+                println!("{}", message);
+            }
+            library_ipc_client::IngestResult::Failure { message } => {
+                eprintln!("Error: {}", message);
+                std::process::exit(1);
+            }
+        },
         Ok(LibraryResponse::Error(e)) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
@@ -3151,6 +3196,13 @@ fn main() -> Result<()> {
             generate_completions(*shell, &mut std::io::stdout());
             Ok(())
         }
+
+        Commands::Library { command } => {
+            let lib = connect_library(&cli);
+            match command {
+                LibraryCommands::ReindexCovers => handle_library_reindex_covers(&lib),
+            }
+        }
     }
 }
 
@@ -3212,6 +3264,7 @@ mod tests {
             bpm: None,
             key: None,
             blob_path: None,
+            cover_art_path: None,
         }
     }
 
@@ -3475,6 +3528,7 @@ mod tests {
             bpm: None,
             key: None,
             blob_path: Some(blob_path.to_string()),
+            cover_art_path: None,
         }
     }
 
@@ -3519,6 +3573,7 @@ mod tests {
             bpm: None,
             key: None,
             blob_path: Some("ab/abc123.flac".to_string()),
+            cover_art_path: None,
         };
         let output = std::path::Path::new("/tmp/export");
         let path = export_dest_path(output, &track, "flac");
