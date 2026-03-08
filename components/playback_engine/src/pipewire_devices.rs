@@ -88,7 +88,17 @@ fn rate_from_value(v: &Value) -> Option<u64> {
     None
 }
 
+/// Returns true when a format entry describes a PCM (raw) audio stream.
+/// DSD and other non-PCM subtypes are excluded from sample-rate comparisons
+/// so they cannot inflate the reported maximum PCM rate.
+fn is_pcm_entry(entry: &Value) -> bool {
+    entry.get("mediaSubtype").and_then(|v| v.as_str()) == Some("raw")
+}
+
 /// Walk `info.params.EnumFormat` entries to find the highest `rate` value.
+/// PCM entries (mediaSubtype == "raw") are preferred; if none carry a
+/// `mediaSubtype` field the function falls back to all entries so that
+/// older pw-dump output without that field still works.
 /// Returns 48000 when no rate information is available.
 fn extract_max_rate(params: Option<&Value>) -> u32 {
     const DEFAULT_RATE: u32 = 48_000;
@@ -103,13 +113,18 @@ fn extract_max_rate(params: Option<&Value>) -> u32 {
         None => return DEFAULT_RATE,
     };
 
-    let max = enum_formats
-        .iter()
-        .filter_map(|entry| entry.get("rate").and_then(rate_from_value))
-        .max()
-        .map(|r| r as u32);
+    let rate_from_entry = |entry: &Value| entry.get("rate").and_then(rate_from_value);
 
-    max.unwrap_or(DEFAULT_RATE)
+    // Prefer PCM-only entries; fall back to all if none have mediaSubtype.
+    let pcm_max = enum_formats
+        .iter()
+        .filter(|e| is_pcm_entry(e))
+        .filter_map(rate_from_entry)
+        .max();
+
+    let max = pcm_max.or_else(|| enum_formats.iter().filter_map(rate_from_entry).max());
+
+    max.map(|r| r as u32).unwrap_or(DEFAULT_RATE)
 }
 
 /// Enumerate audio sinks by running `pw-dump` and parsing its JSON output.
@@ -147,8 +162,8 @@ mod tests {
               },
               "params": {
                 "EnumFormat": [
-                  { "mediaType": "audio", "rate": { "default": 48000, "min": 44100, "max": 384000 } },
-                  { "mediaType": "audio", "rate": { "default": 48000, "min": 44100, "max": 96000 } }
+                  { "mediaType": "audio", "mediaSubtype": "raw", "rate": { "default": 48000, "min": 44100, "max": 384000 } },
+                  { "mediaType": "audio", "mediaSubtype": "raw", "rate": { "default": 48000, "min": 44100, "max": 96000 } }
                 ]
               }
             }
@@ -176,8 +191,52 @@ mod tests {
               },
               "params": {
                 "EnumFormat": [
-                  { "mediaType": "audio", "rate": { "default": 48000, "min": 44100, "max": 48000 } },
-                  { "mediaType": "audio", "rate": { "default": 48000, "min": 44100, "max": 48000 } }
+                  { "mediaType": "audio", "mediaSubtype": "raw", "rate": { "default": 48000, "min": 44100, "max": 48000 } },
+                  { "mediaType": "audio", "mediaSubtype": "raw", "rate": { "default": 48000, "min": 44100, "max": 48000 } }
+                ]
+              }
+            }
+          }
+        ]"#
+    }
+
+    fn dsd_sink_fixture() -> &'static str {
+        r#"[
+          {
+            "id": 55,
+            "type": "PipeWire:Interface:Node",
+            "info": {
+              "props": {
+                "media.class": "Audio/Sink",
+                "node.name": "alsa_output.dsd-dac",
+                "node.description": "DSD DAC"
+              },
+              "params": {
+                "EnumFormat": [
+                  { "mediaType": "audio", "mediaSubtype": "raw", "rate": { "default": 48000, "min": 44100, "max": 384000 } },
+                  { "mediaType": "audio", "mediaSubtype": "dsd", "rate": { "default": 48000, "min": 44100, "max": 1536000 } }
+                ]
+              }
+            }
+          }
+        ]"#
+    }
+
+    fn no_subtype_fixture() -> &'static str {
+        r#"[
+          {
+            "id": 88,
+            "type": "PipeWire:Interface:Node",
+            "info": {
+              "props": {
+                "media.class": "Audio/Sink",
+                "node.name": "alsa_output.legacy",
+                "node.description": "Legacy Sink"
+              },
+              "params": {
+                "EnumFormat": [
+                  { "mediaType": "audio", "rate": { "default": 48000, "min": 44100, "max": 192000 } },
+                  { "mediaType": "audio", "rate": { "default": 48000, "min": 44100, "max": 96000 } }
                 ]
               }
             }
@@ -229,6 +288,26 @@ mod tests {
     fn rate_from_value_uses_default_when_max_absent() {
         let v = serde_json::json!({ "default": 48000 });
         assert_eq!(rate_from_value(&v), Some(48000));
+    }
+
+    #[test]
+    fn dsd_entries_are_excluded_from_max_sample_rate() {
+        let sinks = parse_sinks(dsd_sink_fixture()).expect("parse should succeed");
+        assert_eq!(sinks.len(), 1);
+        assert_eq!(
+            sinks[0].max_sample_rate, 384_000,
+            "DSD entry with rate 1536000 must not inflate max_sample_rate"
+        );
+    }
+
+    #[test]
+    fn entries_without_media_subtype_fall_back_to_all_entries() {
+        let sinks = parse_sinks(no_subtype_fixture()).expect("parse should succeed");
+        assert_eq!(sinks.len(), 1);
+        assert_eq!(
+            sinks[0].max_sample_rate, 192_000,
+            "when no entry has mediaSubtype, should fall back to max across all entries"
+        );
     }
 
     #[test]
