@@ -1,10 +1,20 @@
 # MDMA — Modular Distributed Music Architecture
 
-Version: **0.5.0**
+Version: **0.6.0**
 
 A hi-fi music player for Raspberry Pi 5. Indexes your FLAC and MP3 library, streams to a USB DAC at 192 kHz via PipeWire, and is fully controlled from the command line — composable with dmenu for keyboard-driven browsing and queuing.
 
 The acronym is a nod to electronic music culture. The system exists to keep the music going at parties without being physically tied to equipment.
+
+---
+
+## What's new in 0.6.0
+
+- **Album Order** — CLI and console album views now sort by DiscNumber then TrackNumber, so albums appear in the correct playing order.
+- **AddedAt Tracking** — Every track records when it was added to the library. Query with `--added` in the CLI and sort by added date.
+- **Album Art Cache** — Album-level cover art fallback: when a track has no embedded art, MDMA serves the album's cached cover instead.
+- **Date Expressions** — New `date_expression` crate with a concise relative date syntax. Use `~` for today, `^` for start-of-period, `$` for end-of-period, `+/-N` for offsets, and `/`-separated components for arbitrary dates. Integrated into all date-based queries including `--added`.
+- **CI** — git-hooks input added to devenv.yaml; hook pipeline now runs in CI.
 
 ---
 
@@ -15,6 +25,9 @@ MDMA runs headlessly on a Pi 5 with an NVMe drive. You control it from your lapt
 ```bash
 # Search — implicit AND, all filters composable
 mdma search --artist CBL --bpm "128+-4"
+
+# Filter by when tracks were added (date expressions: ~ = today, ^week = start of week)
+mdma search --added "^week"
 
 # Compose with dmenu for keyboard-driven browsing
 mdma search fact-values-for Artist | dmenu | xargs -I{} mdma search --artist {}
@@ -80,6 +93,17 @@ Audio path: FLAC/MP3 → Symphonia decoder → rubato resampler → 192 kHz Pipe
 | [mdma_bandcamp](bases/mdma_bandcamp/) | Bandcamp collection sync — downloads purchases into the library inbox | [README](bases/mdma_bandcamp/README.md) |
 | [mdma_console](bases/mdma_console/) | Web management console — player controls, search, queue, upload, export | [README](bases/mdma_console/README.md) |
 | [mdma_cli](bases/mdma_cli/) | CLI — search, queue, playlists, playback, export, subscribe, shell completions | [README](bases/mdma_cli/README.md) |
+
+**Key components** (shared libraries):
+
+| Component | Description |
+|-----------|-------------|
+| `date_expression` | Relative date syntax parser used by all date-based queries (`~`, `^`, `$`, `+/-N`, `/`-separated components) |
+| `library_search` | Composable `TrackQuery` with string, numeric, duration, key, and date filters |
+| `playback_engine` | Real-time audio: Symphonia decoder + rubato resampler + PipeWire output |
+| `music_primitives` | BPM, Key, Mode types |
+| `storage_primitives` | Type-safe `ByteSize` |
+| `media_protocol` | Command/Response protocol between CLI and services |
 
 ---
 
