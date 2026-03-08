@@ -69,6 +69,25 @@ pub fn parse_sinks(json: &str) -> Result<Vec<AudioSink>, PlaybackError> {
     Ok(sinks)
 }
 
+/// Resolve a `rate` JSON value to a u64 sample rate.
+///
+/// PipeWire pw-dump can represent rate as either a bare integer or an object
+/// of the form `{"default": N, "min": N, "max": N}`. This helper handles both.
+fn rate_from_value(v: &Value) -> Option<u64> {
+    // Bare integer (simplified pw-dump or older PipeWire)
+    if let Some(n) = v.as_u64() {
+        return Some(n);
+    }
+    // Object form: { "default": N, "min": N, "max": N }
+    if let Some(obj) = v.as_object() {
+        return obj
+            .get("max")
+            .or_else(|| obj.get("default"))
+            .and_then(|n| n.as_u64());
+    }
+    None
+}
+
 /// Walk `info.params.EnumFormat` entries to find the highest `rate` value.
 /// Returns 48000 when no rate information is available.
 fn extract_max_rate(params: Option<&Value>) -> u32 {
@@ -86,7 +105,7 @@ fn extract_max_rate(params: Option<&Value>) -> u32 {
 
     let max = enum_formats
         .iter()
-        .filter_map(|entry| entry.get("rate").and_then(|r| r.as_u64()))
+        .filter_map(|entry| entry.get("rate").and_then(rate_from_value))
         .max()
         .map(|r| r as u32);
 
@@ -128,8 +147,8 @@ mod tests {
               },
               "params": {
                 "EnumFormat": [
-                  { "mediaType": "audio", "rate": 44100 },
-                  { "mediaType": "audio", "rate": 96000 }
+                  { "mediaType": "audio", "rate": { "default": 48000, "min": 44100, "max": 384000 } },
+                  { "mediaType": "audio", "rate": { "default": 48000, "min": 44100, "max": 96000 } }
                 ]
               }
             }
@@ -157,7 +176,8 @@ mod tests {
               },
               "params": {
                 "EnumFormat": [
-                  { "mediaType": "audio", "rate": 48000 }
+                  { "mediaType": "audio", "rate": { "default": 48000, "min": 44100, "max": 48000 } },
+                  { "mediaType": "audio", "rate": { "default": 48000, "min": 44100, "max": 48000 } }
                 ]
               }
             }
@@ -191,12 +211,24 @@ mod tests {
         let sinks = parse_sinks(two_sinks_fixture()).expect("parse should succeed");
         let usb = sinks.iter().find(|s| s.id == 42).unwrap();
         assert_eq!(
-            usb.max_sample_rate, 96_000,
+            usb.max_sample_rate, 384_000,
             "should pick the highest rate from EnumFormat"
         );
 
         let builtin = sinks.iter().find(|s| s.id == 7).unwrap();
         assert_eq!(builtin.max_sample_rate, 48_000);
+    }
+
+    #[test]
+    fn rate_from_value_handles_bare_integer() {
+        let v = serde_json::json!(96000u64);
+        assert_eq!(rate_from_value(&v), Some(96000));
+    }
+
+    #[test]
+    fn rate_from_value_uses_default_when_max_absent() {
+        let v = serde_json::json!({ "default": 48000 });
+        assert_eq!(rate_from_value(&v), Some(48000));
     }
 
     #[test]
