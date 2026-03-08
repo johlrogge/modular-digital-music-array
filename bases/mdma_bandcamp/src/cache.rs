@@ -140,16 +140,17 @@ impl DownloadCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
     #[test]
-    fn test_make_track_key() {
+    fn make_track_key() {
         let key = DownloadCache::make_track_key("Artist", "Album", "Track One", 234);
         assert_eq!(key, "Artist|Album|Track One|234");
     }
 
     #[test]
-    fn test_cache_operations() {
+    fn cache_operations() {
         let dir = tempdir().unwrap();
         let cache_path = dir.path().join("cache.txt");
 
@@ -169,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_persistence() {
+    fn cache_persistence() {
         let dir = tempdir().unwrap();
         let cache_path = dir.path().join("cache.txt");
 

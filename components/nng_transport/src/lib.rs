@@ -181,13 +181,46 @@ fn resolve_with_std(host: &str) -> Option<String> {
         .map(|addr| addr.ip().to_string())
 }
 
+/// Shared NNG client error type for use across all NNG-based clients.
+///
+/// Covers the common error cases: failed connection, NNG transport errors,
+/// JSON serialization errors, and service-level errors (e.g. command rejected).
+#[derive(Debug, thiserror::Error)]
+pub enum NngClientError {
+    #[error("connection error: {0}")]
+    Connection(#[from] ConnectionError),
+
+    #[error("nng error: {0}")]
+    Nng(#[from] nng::Error),
+
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    #[error("service error: {0}")]
+    Service(String),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
     use std::path::PathBuf;
 
     fn temp_cache_path(dir: &std::path::Path) -> PathBuf {
         dir.join("mdma").join("dns-cache")
+    }
+
+    #[test]
+    fn nng_client_error_from_connection_error() {
+        let conn_err = ConnectionError::ConnectionFailed("test".to_string());
+        let client_err: NngClientError = conn_err.into();
+        assert!(client_err.to_string().contains("connection error"));
+    }
+
+    #[test]
+    fn nng_client_error_service_variant() {
+        let err = NngClientError::Service("rejected".to_string());
+        assert!(err.to_string().contains("rejected"));
     }
 
     #[test]

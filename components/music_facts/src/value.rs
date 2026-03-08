@@ -88,6 +88,13 @@ impl fmt::Display for MusicFormat {
     }
 }
 
+/// Presence or absence of embedded album art in a music file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AlbumArtPresence {
+    Present,
+    Absent,
+}
+
 /// All possible metadata values for a music track
 ///
 /// Each variant represents a single fact that can be asserted or retracted
@@ -118,6 +125,9 @@ pub enum MusicValue {
 
     /// Track number on album
     TrackNumber(TrackNumber),
+
+    /// Disc number on a multi-disc release
+    DiscNumber(DiscNumber),
 
     /// Release year
     Year(Year),
@@ -209,7 +219,7 @@ pub enum MusicValue {
     FileSizeBytes(FileSizeBytes),
 
     /// Whether the file has embedded album art
-    HasAlbumArt(bool),
+    HasAlbumArt(AlbumArtPresence),
 
     /// Audio file format (FLAC, MP3, AIFF, WAV)
     Format(MusicFormat),
@@ -224,6 +234,12 @@ pub enum MusicValue {
     EncodedBy(String),
 
     // ========================================================================
+    // Cover Art
+    // ========================================================================
+    /// Relative path to extracted cover art image (e.g. "cover-art/<hash>.jpg")
+    CoverArtPath(String),
+
+    // ========================================================================
     // Play History
     // ========================================================================
     /// Track started playing
@@ -231,6 +247,12 @@ pub enum MusicValue {
 
     /// Track stopped playing
     TrackStopped(StopReason),
+
+    // ========================================================================
+    // Import Provenance
+    // ========================================================================
+    /// When the track was added to the library (ISO 8601 datetime string)
+    AddedAt(String),
 }
 
 impl MusicValue {
@@ -243,6 +265,7 @@ impl MusicValue {
             MusicValue::Album(_) => "Album",
             MusicValue::AlbumArtist(_) => "AlbumArtist",
             MusicValue::TrackNumber(_) => "TrackNumber",
+            MusicValue::DiscNumber(_) => "DiscNumber",
             MusicValue::Year(_) => "Year",
             MusicValue::Bpm(_) => "BPM",
             MusicValue::Key(_) => "Key",
@@ -270,8 +293,10 @@ impl MusicValue {
             MusicValue::Format(_) => "Format",
             MusicValue::EncoderSoftware(_) => "EncoderSoftware",
             MusicValue::EncodedBy(_) => "EncodedBy",
+            MusicValue::CoverArtPath(_) => "CoverArtPath",
             MusicValue::TrackStarted(_) => "TrackStarted",
             MusicValue::TrackStopped(_) => "TrackStopped",
+            MusicValue::AddedAt(_) => "AddedAt",
         }
     }
 }
@@ -285,6 +310,7 @@ impl fmt::Display for MusicValue {
             MusicValue::Album(s) => write!(f, "{}", s),
             MusicValue::AlbumArtist(s) => write!(f, "{}", s),
             MusicValue::TrackNumber(n) => write!(f, "{}", n),
+            MusicValue::DiscNumber(n) => write!(f, "{}", n),
             MusicValue::Year(y) => write!(f, "{}", y),
             MusicValue::Bpm(b) => write!(f, "{}", b),
             MusicValue::Key(k) => write!(f, "{}", k),
@@ -308,12 +334,22 @@ impl fmt::Display for MusicValue {
             MusicValue::DurationSeconds(d) => write!(f, "{}", d),
             MusicValue::Bitrate(b) => write!(f, "{}", b),
             MusicValue::FileSizeBytes(s) => write!(f, "{}", s),
-            MusicValue::HasAlbumArt(b) => write!(f, "{}", if *b { "yes" } else { "no" }),
+            MusicValue::HasAlbumArt(p) => write!(
+                f,
+                "{}",
+                if *p == AlbumArtPresence::Present {
+                    "yes"
+                } else {
+                    "no"
+                }
+            ),
             MusicValue::Format(ref fmt_val) => write!(f, "{}", fmt_val),
             MusicValue::EncoderSoftware(s) => write!(f, "{}", s),
             MusicValue::EncodedBy(s) => write!(f, "{}", s),
+            MusicValue::CoverArtPath(s) => write!(f, "{}", s),
             MusicValue::TrackStarted(r) => write!(f, "{}", r),
             MusicValue::TrackStopped(r) => write!(f, "{}", r),
+            MusicValue::AddedAt(s) => write!(f, "{}", s),
         }
     }
 }
@@ -321,6 +357,8 @@ impl fmt::Display for MusicValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
+    use rstest::rstest;
     use stainless_facts::assert_fact_value_format;
 
     #[test]
@@ -329,7 +367,7 @@ mod tests {
         // This will fail at compile time if the serde attributes are wrong
         assert_fact_value_format!(MusicValue::Title(Title::new("Test")));
         assert_fact_value_format!(MusicValue::Artist(Artist::new("Test Artist")));
-        assert_fact_value_format!(MusicValue::HasAlbumArt(true));
+        assert_fact_value_format!(MusicValue::HasAlbumArt(AlbumArtPresence::Present));
     }
 
     #[test]
@@ -350,26 +388,23 @@ mod tests {
         assert_eq!(back, MusicValue::TrackStopped(StopReason::OnCompletion));
     }
 
-    #[test]
-    fn start_reason_all_variants_roundtrip() {
-        for reason in [StartReason::OnRequest, StartReason::ByQueue] {
-            let json = serde_json::to_string(&reason).unwrap();
-            let back: StartReason = serde_json::from_str(&json).unwrap();
-            assert_eq!(reason, back);
-        }
+    #[rstest]
+    #[case(StartReason::OnRequest)]
+    #[case(StartReason::ByQueue)]
+    fn start_reason_all_variants_roundtrip(#[case] reason: StartReason) {
+        let json = serde_json::to_string(&reason).unwrap();
+        let back: StartReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(reason, back);
     }
 
-    #[test]
-    fn stop_reason_all_variants_roundtrip() {
-        for reason in [
-            StopReason::OnRequest,
-            StopReason::OnCompletion,
-            StopReason::OnSkip,
-        ] {
-            let json = serde_json::to_string(&reason).unwrap();
-            let back: StopReason = serde_json::from_str(&json).unwrap();
-            assert_eq!(reason, back);
-        }
+    #[rstest]
+    #[case(StopReason::OnRequest)]
+    #[case(StopReason::OnCompletion)]
+    #[case(StopReason::OnSkip)]
+    fn stop_reason_all_variants_roundtrip(#[case] reason: StopReason) {
+        let json = serde_json::to_string(&reason).unwrap();
+        let back: StopReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(reason, back);
     }
 
     #[test]
@@ -426,11 +461,11 @@ mod tests {
             "MusicValue"
         );
         assert_eq!(
-            MusicValue::DurationSeconds(DurationSeconds(300)).display_name(),
+            MusicValue::DurationSeconds(DurationSeconds::new(300)).display_name(),
             "Duration"
         );
         assert_eq!(
-            MusicValue::FileSizeBytes(FileSizeBytes(1024)).display_name(),
+            MusicValue::FileSizeBytes(FileSizeBytes::new(1024)).display_name(),
             "FileSize"
         );
     }
@@ -444,25 +479,24 @@ mod tests {
         assert_eq!(title_val.display_name(), "Title");
     }
 
-    #[test]
-    fn music_format_serde_roundtrip() {
-        let format = MusicFormat::Flac;
+    #[rstest]
+    #[case(MusicFormat::Flac)]
+    #[case(MusicFormat::Mp3)]
+    #[case(MusicFormat::Aiff)]
+    #[case(MusicFormat::Wav)]
+    fn music_format_serde_roundtrip(#[case] format: MusicFormat) {
         let json = serde_json::to_string(&format).unwrap();
         let back: MusicFormat = serde_json::from_str(&json).unwrap();
         assert_eq!(format, back);
-
-        let mp3 = MusicFormat::Mp3;
-        let json = serde_json::to_string(&mp3).unwrap();
-        let back: MusicFormat = serde_json::from_str(&json).unwrap();
-        assert_eq!(mp3, back);
     }
 
-    #[test]
-    fn music_format_display() {
-        assert_eq!(MusicFormat::Flac.to_string(), "FLAC");
-        assert_eq!(MusicFormat::Mp3.to_string(), "MP3");
-        assert_eq!(MusicFormat::Aiff.to_string(), "AIFF");
-        assert_eq!(MusicFormat::Wav.to_string(), "WAV");
+    #[rstest]
+    #[case(MusicFormat::Flac, "FLAC")]
+    #[case(MusicFormat::Mp3, "MP3")]
+    #[case(MusicFormat::Aiff, "AIFF")]
+    #[case(MusicFormat::Wav, "WAV")]
+    fn music_format_display(#[case] format: MusicFormat, #[case] expected: &str) {
+        assert_eq!(format.to_string(), expected);
     }
 
     #[test]
@@ -482,5 +516,80 @@ mod tests {
         let legacy = r#"{"t":"TrackStopped","v":"2026-01-15T10:00:00Z"}"#;
         let v: MusicValue = serde_json::from_str(legacy).unwrap();
         assert_eq!(v, MusicValue::TrackStopped(StopReason::OnRequest));
+    }
+
+    #[test]
+    fn cover_art_path_roundtrip() {
+        let v = MusicValue::CoverArtPath("cover-art/abc123.jpg".to_string());
+        let json = serde_json::to_string(&v).unwrap();
+        let back: MusicValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn cover_art_path_display_name() {
+        let v = MusicValue::CoverArtPath("cover-art/abc123.jpg".to_string());
+        assert_eq!(v.display_name(), "CoverArtPath");
+    }
+
+    #[test]
+    fn cover_art_path_display() {
+        let v = MusicValue::CoverArtPath("cover-art/abc123.jpg".to_string());
+        assert_eq!(v.to_string(), "cover-art/abc123.jpg");
+    }
+
+    #[test]
+    fn cover_art_path_fact_value_format() {
+        assert_fact_value_format!(MusicValue::CoverArtPath("cover-art/test.jpg".to_string()));
+    }
+
+    #[test]
+    fn disc_number_roundtrip() {
+        let v = MusicValue::DiscNumber(DiscNumber::new(2));
+        let json = serde_json::to_string(&v).unwrap();
+        let back: MusicValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn disc_number_display_name() {
+        let v = MusicValue::DiscNumber(DiscNumber::new(1));
+        assert_eq!(v.display_name(), "DiscNumber");
+    }
+
+    #[test]
+    fn disc_number_display() {
+        let v = MusicValue::DiscNumber(DiscNumber::new(3));
+        assert_eq!(v.to_string(), "3");
+    }
+
+    #[test]
+    fn disc_number_fact_value_format() {
+        assert_fact_value_format!(MusicValue::DiscNumber(DiscNumber::new(1)));
+    }
+
+    #[test]
+    fn added_at_roundtrip() {
+        let v = MusicValue::AddedAt("2026-03-08T12:00:00Z".to_string());
+        let json = serde_json::to_string(&v).unwrap();
+        let back: MusicValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn added_at_display_name() {
+        let v = MusicValue::AddedAt("2026-03-08T12:00:00Z".to_string());
+        assert_eq!(v.display_name(), "AddedAt");
+    }
+
+    #[test]
+    fn added_at_display() {
+        let v = MusicValue::AddedAt("2026-03-08T12:00:00Z".to_string());
+        assert_eq!(v.to_string(), "2026-03-08T12:00:00Z");
+    }
+
+    #[test]
+    fn added_at_fact_value_format() {
+        assert_fact_value_format!(MusicValue::AddedAt("2026-03-08T12:00:00Z".to_string()));
     }
 }

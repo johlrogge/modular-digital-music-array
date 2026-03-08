@@ -24,6 +24,7 @@ pub struct TrackFields<'a> {
     pub source: Option<&'a str>,
     pub last_started: Option<DateTime<Utc>>,
     pub last_stopped: Option<DateTime<Utc>>,
+    pub added: Option<DateTime<Utc>>,
 }
 
 /// Evaluate a `TrackQuery` against a set of track fields, respecting `query.not`.
@@ -123,6 +124,12 @@ fn matches_query_inner(query: &TrackQuery, track: &TrackFields) -> bool {
 
     if let Some(q) = &query.stopped {
         if !matches_date(q, track.last_stopped) {
+            return false;
+        }
+    }
+
+    if let Some(q) = &query.added {
+        if !matches_date(q, track.added) {
             return false;
         }
     }
@@ -295,6 +302,7 @@ fn matches_key(query: &KeyQuery, key_str: &str) -> bool {
 mod tests {
     use super::*;
     use crate::query::{DatePrecision, DateQuery, NumericQuery, StringQuery, TrackQuery};
+    use rstest::rstest;
 
     fn empty_fields() -> TrackFields<'static> {
         TrackFields {
@@ -311,6 +319,7 @@ mod tests {
             source: None,
             last_started: None,
             last_stopped: None,
+            added: None,
         }
     }
 
@@ -341,26 +350,29 @@ mod tests {
         assert!(!matches_query(&query, &fields));
     }
 
-    #[test]
-    fn contains_all_words_required() {
+    #[rstest]
+    #[case("Carbon Based Lifeforms", true)]
+    #[case("Carbon Only", false)]
+    fn contains_all_words_required(#[case] field: &str, #[case] expected: bool) {
         let sq = StringQuery::Contains("carbon lifeforms".to_string());
-        assert!(matches_string(&sq, "Carbon Based Lifeforms"));
-        assert!(!matches_string(&sq, "Carbon Only"));
+        assert_eq!(matches_string(&sq, field), expected);
     }
 
-    #[test]
-    fn initialism_match() {
+    #[rstest]
+    #[case("Carbon Based Lifeforms", true)]
+    #[case("carbon based lifeforms", true)]
+    #[case("Rymden Vild och Vacker", false)]
+    fn initialism_match(#[case] field: &str, #[case] expected: bool) {
         let sq = StringQuery::Initialism("CarbBased".to_string());
-        assert!(matches_string(&sq, "Carbon Based Lifeforms"));
-        assert!(matches_string(&sq, "carbon based lifeforms"));
-        assert!(!matches_string(&sq, "Rymden Vild och Vacker"));
+        assert_eq!(matches_string(&sq, field), expected);
     }
 
-    #[test]
-    fn regex_match() {
+    #[rstest]
+    #[case("Carbon Based Lifeforms", true)]
+    #[case("Rymden", false)]
+    fn regex_match(#[case] field: &str, #[case] expected: bool) {
         let sq = StringQuery::Regex("^Carbon.*".to_string());
-        assert!(matches_string(&sq, "Carbon Based Lifeforms"));
-        assert!(!matches_string(&sq, "Rymden"));
+        assert_eq!(matches_string(&sq, field), expected);
     }
 
     #[test]
@@ -374,8 +386,10 @@ mod tests {
         assert!(matches_query(&query, &fields));
     }
 
-    #[test]
-    fn bpm_tolerance_match() {
+    #[rstest]
+    #[case(130.0, true)]
+    #[case(133.0, false)]
+    fn bpm_tolerance_match(#[case] bpm: f32, #[case] expected: bool) {
         let query = TrackQuery {
             bpm: Some(NumericQuery::Tolerance {
                 value: 128.0,
@@ -385,28 +399,27 @@ mod tests {
             ..Default::default()
         };
         let mut fields = empty_fields();
-        fields.bpm = Some(130.0);
-        assert!(matches_query(&query, &fields));
-        fields.bpm = Some(133.0);
-        assert!(!matches_query(&query, &fields));
+        fields.bpm = Some(bpm);
+        assert_eq!(matches_query(&query, &fields), expected);
     }
 
-    #[test]
-    fn any_text_or_semantics() {
+    #[rstest]
+    #[case(Some("Rymden"), None, true)]
+    #[case(None, Some("Rymden - Something"), true)]
+    #[case(None, Some("Carbon Based Lifeforms"), false)]
+    fn any_text_or_semantics(
+        #[case] artist: Option<&'static str>,
+        #[case] title: Option<&'static str>,
+        #[case] expected: bool,
+    ) {
         let query = TrackQuery {
             any_text: Some(StringQuery::Contains("rymden".to_string())),
             ..Default::default()
         };
         let mut fields = empty_fields();
-        fields.artist = Some("Rymden");
-        assert!(matches_query(&query, &fields));
-
-        fields.artist = None;
-        fields.title = Some("Rymden - Something");
-        assert!(matches_query(&query, &fields));
-
-        fields.title = Some("Carbon Based Lifeforms");
-        assert!(!matches_query(&query, &fields));
+        fields.artist = artist;
+        fields.title = title;
+        assert_eq!(matches_query(&query, &fields), expected);
     }
 
     #[test]
@@ -512,18 +525,18 @@ mod tests {
         assert!(matches_query(&q, &f));
     }
 
-    #[test]
-    fn not_flag_inverts_result() {
+    #[rstest]
+    #[case("Carbon Based Lifeforms", false)]
+    #[case("Rymden", true)]
+    fn not_flag_inverts_result(#[case] artist: &str, #[case] expected: bool) {
         let query = TrackQuery {
             artist: Some(StringQuery::Contains("carbon".to_string())),
             not: true,
             ..Default::default()
         };
         let mut fields = empty_fields();
-        fields.artist = Some("Carbon Based Lifeforms");
-        assert!(!matches_query(&query, &fields));
-        fields.artist = Some("Rymden");
-        assert!(matches_query(&query, &fields));
+        fields.artist = Some(artist);
+        assert_eq!(matches_query(&query, &fields), expected);
     }
 
     #[test]
@@ -546,5 +559,40 @@ mod tests {
         };
         let fields = empty_fields();
         assert!(!matches_query(&query, &fields));
+    }
+
+    #[test]
+    fn added_na_matches_none() {
+        let mut q = TrackQuery::default();
+        q.added = Some(DateQuery::NA);
+        let mut f = empty_fields();
+        f.added = None;
+        assert!(matches_query(&q, &f));
+    }
+
+    #[test]
+    fn added_na_no_match_when_added() {
+        let mut q = TrackQuery::default();
+        q.added = Some(DateQuery::NA);
+        let mut f = empty_fields();
+        f.added = Some(DateTime::from_timestamp(0, 0).unwrap());
+        assert!(!matches_query(&q, &f));
+    }
+
+    #[test]
+    fn added_after_year_matches() {
+        use chrono::NaiveDate;
+        let mut q = TrackQuery::default();
+        q.added = Some(DateQuery::After(
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            DatePrecision::Year,
+        ));
+        let mut f = empty_fields();
+        f.added = Some(
+            chrono::DateTime::parse_from_rfc3339("2027-01-01T00:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        assert!(matches_query(&q, &f));
     }
 }

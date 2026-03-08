@@ -6,17 +6,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
-/// Fan/user ID on Bandcamp
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
-#[serde(transparent)]
-pub struct FanId(pub String);
-
-impl fmt::Display for FanId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 /// Item ID (sale/purchase ID) on Bandcamp
 /// Format: "p123456" for purchases or "t789" for tracks
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]

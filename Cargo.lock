@@ -4,23 +4,24 @@ version = 4
 
 [[package]]
 name = "acid-client"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "acid_protocol",
  "music-facts",
  "nng",
+ "nng-transport",
  "playback-primitives",
+ "pretty_assertions",
  "serde_json",
- "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "acid_protocol"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
+ "pretty_assertions",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -270,17 +271,21 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "audio-metadata"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "lofty",
+ "pretty_assertions",
+ "rstest",
  "tempfile",
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "audio-transcoder"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
+ "pretty_assertions",
+ "rstest",
  "thiserror 1.0.69",
 ]
 
@@ -383,6 +388,7 @@ dependencies = [
  "governor",
  "music-facts",
  "nonzero_ext",
+ "pretty_assertions",
  "reqwest",
  "scraper",
  "serde",
@@ -420,6 +426,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "futures",
+ "pretty_assertions",
  "rstest",
  "serde",
  "serde_json",
@@ -693,19 +700,6 @@ name = "clap_lex"
 version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f46ad14479a25103f283c0f10005961cf086d8dc42205bb44c46ac563475dca6"
-
-[[package]]
-name = "clock"
-version = "0.4.0"
-dependencies = [
- "assert_matches",
- "parking_lot",
- "playback-primitives",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "time-primitives",
-]
 
 [[package]]
 name = "cmake"
@@ -1079,6 +1073,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a2330da5de22e8a3cb63252ce2abb30116bf5265e89c0e01bc17015ce30a476"
 
 [[package]]
+name = "date-expression"
+version = "0.5.0"
+dependencies = [
+ "chrono",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "deflate64"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1114,6 +1116,12 @@ dependencies = [
  "quote",
  "syn 2.0.96",
 ]
+
+[[package]]
+name = "diff"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
 
 [[package]]
 name = "digest"
@@ -1233,10 +1241,14 @@ dependencies = [
 
 [[package]]
 name = "event-protocol"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
+ "playback-primitives",
+ "pretty_assertions",
+ "rstest",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1426,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "gateway-client"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "acid_protocol",
  "gateway-protocol",
@@ -1442,12 +1454,12 @@ dependencies = [
 
 [[package]]
 name = "gateway-protocol"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "acid_protocol",
  "library-ipc-protocol",
  "media-protocol",
- "rstest",
+ "pretty_assertions",
  "serde",
  "serde_json",
  "source-protocol",
@@ -1956,8 +1968,10 @@ dependencies = [
 
 [[package]]
 name = "inbox-utils"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
+ "pretty_assertions",
+ "rstest",
  "tempfile",
  "tracing",
  "zip",
@@ -2179,22 +2193,22 @@ checksum = "f9fbbcab51052fe104eb5e5d351cf728d30a5be1fe14d9be8a3b097481fb97de"
 
 [[package]]
 name = "library-ipc-client"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "library-ipc-protocol",
  "nng",
  "nng-transport",
- "rstest",
  "serde_json",
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "library-ipc-protocol"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "library-search",
  "music-facts",
+ "pretty_assertions",
  "rstest",
  "serde",
  "serde_json",
@@ -2203,10 +2217,12 @@ dependencies = [
 
 [[package]]
 name = "library-search"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
+ "date-expression",
  "regex",
+ "rstest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -2219,6 +2235,7 @@ dependencies = [
  "acid-client",
  "audio-metadata",
  "chrono",
+ "event-protocol",
  "hex",
  "library-ipc-protocol",
  "library-search",
@@ -2227,6 +2244,7 @@ dependencies = [
  "nng",
  "notify",
  "pathdiff",
+ "pretty_assertions",
  "rstest",
  "serde",
  "serde_json",
@@ -2412,13 +2430,15 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "mdma-acid"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "acid_protocol",
  "chrono",
  "clap",
  "color-eyre",
+ "event-protocol",
  "nng",
+ "pretty_assertions",
  "serde_json",
  "stainless-facts",
  "tempfile",
@@ -2429,7 +2449,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-bandcamp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bandcamp-api",
  "clap",
@@ -2438,6 +2458,7 @@ dependencies = [
  "library-ipc-client",
  "nng",
  "parking_lot",
+ "pretty_assertions",
  "serde",
  "serde_json",
  "source-protocol",
@@ -2487,6 +2508,7 @@ dependencies = [
  "mdma-client",
  "nng",
  "nng-transport",
+ "pretty_assertions",
  "reqwest",
  "serde_json",
  "source-protocol",
@@ -2531,6 +2553,7 @@ dependencies = [
  "media-protocol",
  "nng",
  "nng-transport",
+ "pretty_assertions",
  "rstest",
  "serde",
  "serde_json",
@@ -2545,7 +2568,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-gateway"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "acid_protocol",
  "clap",
@@ -2555,6 +2578,7 @@ dependencies = [
  "library-ipc-protocol",
  "media-protocol",
  "nng",
+ "serde",
  "serde_json",
  "source-protocol",
  "tracing",
@@ -2587,8 +2611,10 @@ dependencies = [
  "parking_lot",
  "playback-engine",
  "playback-primitives",
+ "pretty_assertions",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -2597,11 +2623,12 @@ dependencies = [
 
 [[package]]
 name = "media-client"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "media-protocol",
  "nng",
  "nng-transport",
+ "playback-primitives",
  "serde_json",
  "thiserror 1.0.69",
  "tracing",
@@ -2609,9 +2636,10 @@ dependencies = [
 
 [[package]]
 name = "media-protocol"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "playback-primitives",
+ "pretty_assertions",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -2705,21 +2733,26 @@ dependencies = [
 
 [[package]]
 name = "music-facts"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "music-primitives",
  "playback-primitives",
+ "pretty_assertions",
+ "rstest",
  "serde",
  "serde_json",
  "stainless-facts",
+ "storage_primitives",
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "music-primitives"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
+ "pretty_assertions",
+ "rstest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -2764,10 +2797,12 @@ dependencies = [
 
 [[package]]
 name = "nng-transport"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "dirs",
  "nng",
+ "pretty_assertions",
+ "serde_json",
  "tempfile",
  "thiserror 1.0.69",
 ]
@@ -3141,7 +3176,7 @@ checksum = "953ec861398dccce10c670dfeaf3ec4911ca479e9c02154b3a215178c5f566f2"
 
 [[package]]
 name = "playback-engine"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -3151,8 +3186,11 @@ dependencies = [
  "parking_lot",
  "pipewire",
  "playback-primitives",
+ "pretty_assertions",
  "ringbuf",
  "rubato",
+ "serde",
+ "serde_json",
  "symphonia",
  "tempfile",
  "thiserror 1.0.69",
@@ -3164,10 +3202,13 @@ dependencies = [
 
 [[package]]
 name = "playback-primitives"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "assert_matches",
  "chrono",
+ "music-primitives",
+ "pretty_assertions",
+ "rstest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -3227,6 +3268,16 @@ name = "precomputed-hash"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
+
+[[package]]
+name = "pretty_assertions"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ae130e2f271fbc2ac3a40fb1d07180839cdbbe443c7a27e1e3c13c5cac0116d"
+dependencies = [
+ "diff",
+ "yansi",
+]
 
 [[package]]
 name = "primal-check"
@@ -4029,9 +4080,9 @@ dependencies = [
 
 [[package]]
 name = "source-protocol"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
- "rstest",
+ "pretty_assertions",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -4075,8 +4126,9 @@ dependencies = [
 name = "storage_primitives"
 version = "0.2.0"
 dependencies = [
+ "pretty_assertions",
+ "rstest",
  "serde",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -4491,9 +4543,11 @@ dependencies = [
 
 [[package]]
 name = "time-primitives"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "assert_matches",
+ "pretty_assertions",
+ "rstest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -5400,6 +5454,12 @@ checksum = "388c44dc09d76f1536602ead6d325eb532f5c122f17782bd57fb47baeeb767e2"
 dependencies = [
  "lzma-sys",
 ]
+
+[[package]]
+name = "yansi"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
 name = "yansi-term"

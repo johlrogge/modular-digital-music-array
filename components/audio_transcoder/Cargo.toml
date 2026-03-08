@@ -8,3 +8,7 @@ license.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+rstest = { workspace = true }

@@ -3,26 +3,18 @@
 //! NNG client wrapper for connecting to the playback service.
 //! Used by mdma-cli.
 
-pub use media_protocol::{Command, ContentHash, Deck, Response, ResponseData};
+pub use media_protocol::{
+    AudioOutputConfig, AudioSinkInfo, Command, ContentHash, Deck, Response, ResponseData,
+};
+pub use playback_primitives::Volume;
 
 use std::path::PathBuf;
-use thiserror::Error;
 
 /// Errors that can occur when communicating with the playback service.
-#[derive(Debug, Error)]
-pub enum ClientError {
-    #[error("Connection error: {0}")]
-    Connection(#[from] nng_transport::ConnectionError),
-
-    #[error("NNG error: {0}")]
-    Nng(#[from] nng::Error),
-
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
-
-    #[error("Command failed: {0}")]
-    Command(String),
-}
+///
+/// This is an alias for [`nng_transport::NngClientError`]. The `Service` variant
+/// carries command-level error messages.
+pub type ClientError = nng_transport::NngClientError;
 
 pub struct MediaClient {
     socket: nng::Socket,
@@ -68,8 +60,8 @@ impl MediaClient {
         self.send_command(cmd)
     }
 
-    pub fn set_volume(&self, deck: Deck, db: f32) -> Result<(), ClientError> {
-        let cmd = Command::SetVolume { deck, db };
+    pub fn set_volume(&self, deck: Deck, volume: Volume) -> Result<(), ClientError> {
+        let cmd = Command::SetVolume { deck, volume };
         self.send_command(cmd)
     }
 
@@ -166,6 +158,36 @@ impl MediaClient {
         })
     }
 
+    pub fn list_audio_outputs(&self) -> Result<Vec<AudioSinkInfo>, ClientError> {
+        self.send_command_with_response(Command::ListAudioOutputs, |data| {
+            if let ResponseData::AudioOutputs(sinks) = data {
+                Some(sinks)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn set_audio_output(&self, device_name: String) -> Result<AudioOutputConfig, ClientError> {
+        self.send_command_with_response(Command::SetAudioOutput { device_name }, |data| {
+            if let ResponseData::AudioOutput(cfg) = data {
+                Some(cfg)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn get_audio_output(&self) -> Result<AudioOutputConfig, ClientError> {
+        self.send_command_with_response(Command::GetAudioOutput, |data| {
+            if let ResponseData::AudioOutput(cfg) = data {
+                Some(cfg)
+            } else {
+                None
+            }
+        })
+    }
+
     fn send_command(&self, cmd: Command) -> Result<(), ClientError> {
         tracing::debug!("Serializing command: {:?}", cmd);
         let data = serde_json::to_vec(&cmd)?;
@@ -182,11 +204,10 @@ impl MediaClient {
 
         let response: Response = serde_json::from_slice(&response_msg)?;
 
-        if !response.success {
-            return Err(ClientError::Command(response.error_message));
+        match response {
+            Response::Ok { .. } => Ok(()),
+            Response::Err { message } => Err(ClientError::Service(message)),
         }
-
-        Ok(())
     }
 
     fn send_command_with_response<T>(
@@ -204,14 +225,13 @@ impl MediaClient {
         let response_msg = self.socket.recv()?;
         let response: Response = serde_json::from_slice(&response_msg)?;
 
-        if !response.success {
-            return Err(ClientError::Command(response.error_message));
-        }
-
-        match response.data {
-            Some(data) => extract(data)
-                .ok_or_else(|| ClientError::Command("Unexpected response data type".to_string())),
-            None => Err(ClientError::Command("Missing response data".to_string())),
+        match response {
+            Response::Err { message } => Err(ClientError::Service(message)),
+            Response::Ok { data: Some(data) } => extract(data)
+                .ok_or_else(|| ClientError::Service("Unexpected response data type".to_string())),
+            Response::Ok { data: None } => {
+                Err(ClientError::Service("Missing response data".to_string()))
+            }
         }
     }
 }

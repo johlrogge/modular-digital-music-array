@@ -8,6 +8,32 @@ use library_ipc_protocol::{LibraryRequest, LibraryResponse};
 use media_protocol::{Command, Response};
 use serde::{Deserialize, Serialize};
 use source_protocol::{SourceRequest, SourceResponse};
+use std::fmt;
+
+// ============================================================================
+// SourceName newtype
+// ============================================================================
+
+/// Identifies a named music source (e.g. "bandcamp", "beatport").
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SourceName(String);
+
+impl SourceName {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SourceName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 // ============================================================================
 // Request Envelope
@@ -29,7 +55,7 @@ pub enum GatewayRequest {
     /// Route to a named music source.
     #[serde(rename = "source")]
     Source {
-        name: String,
+        name: SourceName,
         request: SourceRequest,
     },
 
@@ -61,13 +87,13 @@ pub enum GatewayResponse {
     /// Response from a music source.
     #[serde(rename = "source")]
     Source {
-        name: String,
+        name: SourceName,
         response: SourceResponse,
     },
 
     /// List of available source names.
     #[serde(rename = "sources")]
-    Sources { names: Vec<String> },
+    Sources { names: Vec<SourceName> },
 
     /// Response from the ACID fact store service.
     #[serde(rename = "acid")]
@@ -81,6 +107,7 @@ pub enum GatewayResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn library_request_roundtrip() {
@@ -115,9 +142,20 @@ mod tests {
     }
 
     #[test]
+    fn source_name_newtype_roundtrip() {
+        let name = SourceName::new("bandcamp");
+        let json = serde_json::to_string(&name).unwrap();
+        assert_eq!(json, "\"bandcamp\"");
+        let parsed: SourceName = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, name);
+        assert_eq!(parsed.as_str(), "bandcamp");
+        assert_eq!(parsed.to_string(), "bandcamp");
+    }
+
+    #[test]
     fn source_request_roundtrip() {
         let req = GatewayRequest::Source {
-            name: "bandcamp".to_string(),
+            name: SourceName::new("bandcamp"),
             request: SourceRequest::Sync,
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -126,7 +164,7 @@ mod tests {
         let parsed: GatewayRequest = serde_json::from_str(&json).unwrap();
         match parsed {
             GatewayRequest::Source { name, request } => {
-                assert_eq!(name, "bandcamp");
+                assert_eq!(name, SourceName::new("bandcamp"));
                 assert!(matches!(request, SourceRequest::Sync));
             }
             _ => panic!("wrong variant"),
@@ -192,13 +230,16 @@ mod tests {
     #[test]
     fn sources_response_roundtrip() {
         let resp = GatewayResponse::Sources {
-            names: vec!["bandcamp".to_string(), "beatport".to_string()],
+            names: vec![SourceName::new("bandcamp"), SourceName::new("beatport")],
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: GatewayResponse = serde_json::from_str(&json).unwrap();
         match parsed {
             GatewayResponse::Sources { names } => {
-                assert_eq!(names, vec!["bandcamp", "beatport"]);
+                assert_eq!(
+                    names,
+                    vec![SourceName::new("bandcamp"), SourceName::new("beatport")]
+                );
             }
             _ => panic!("wrong variant"),
         }

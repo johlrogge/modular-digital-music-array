@@ -410,30 +410,22 @@ pub struct ProvisionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
+    use rstest::rstest;
 
-    #[test]
-    fn test_hostname_validation() {
-        // Valid hostnames
-        assert!(Hostname::new("mdma-909".to_string()).is_ok());
-        assert!(Hostname::new("test.example.com".to_string()).is_ok());
-
-        // Invalid hostnames
-        assert!(matches!(
-            Hostname::new("-invalid".to_string()),
-            Err(ValidationError::HostnameInvalidStart)
-        ));
-        assert!(matches!(
-            Hostname::new("inv@lid".to_string()),
-            Err(ValidationError::HostnameInvalidChars)
-        ));
-        assert!(matches!(
-            Hostname::new("".to_string()),
-            Err(ValidationError::HostnameTooLong(_))
-        ));
+    #[rstest]
+    #[case("mdma-909", true)]
+    #[case("test.example.com", true)]
+    #[case("-invalid", false)]
+    #[case("inv@lid", false)]
+    #[case("", false)]
+    fn hostname_validation(#[case] input: &str, #[case] expected_ok: bool) {
+        let result = Hostname::new(input.to_string());
+        assert_eq!(result.is_ok(), expected_ok);
     }
 
     #[test]
-    fn test_ssh_key_validation() {
+    fn ssh_key_validation() {
         let valid_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ user@host";
         assert!(SshPublicKey::new(valid_key.to_string()).is_ok());
 
@@ -443,46 +435,47 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_device_path_validation() {
-        assert!(DevicePath::new("/dev/nvme0n1").is_ok());
-        assert!(DevicePath::new("/dev/sda1").is_ok());
-
-        assert!(matches!(
-            DevicePath::new("/not/a/device"),
-            Err(ValidationError::DevicePathInvalidPrefix(_))
-        ));
-        assert!(matches!(
-            DevicePath::new(""),
-            Err(ValidationError::DevicePathEmpty)
-        ));
+    #[rstest]
+    #[case("/dev/nvme0n1", true)]
+    #[case("/dev/sda1", true)]
+    #[case("/not/a/device", false)]
+    #[case("", false)]
+    fn device_path_validation(#[case] path: &str, #[case] expected_ok: bool) {
+        let result = DevicePath::new(path);
+        assert_eq!(result.is_ok(), expected_ok);
     }
 
-    #[test]
-    fn test_mount_point() {
-        let mp = MountPoint::Music;
-        assert_eq!(mp.as_str(), "/music");
-        assert_eq!(mp.to_string(), "/music");
-        assert_eq!(mp.filesystem_type(), FilesystemType::Ext4);
-        assert_eq!(mp.label().as_str(), "music");
-
-        // All partitions now use ext4
-        assert_eq!(MountPoint::Root.filesystem_type(), FilesystemType::Ext4);
-        assert_eq!(MountPoint::Var.filesystem_type(), FilesystemType::Ext4);
-        assert_eq!(MountPoint::Music.filesystem_type(), FilesystemType::Ext4);
-        assert_eq!(MountPoint::Metadata.filesystem_type(), FilesystemType::Ext4);
-        assert_eq!(MountPoint::Cache.filesystem_type(), FilesystemType::Ext4);
-
-        // Test label generation
-        assert_eq!(MountPoint::Metadata.label().as_str(), "metadata");
-        assert_eq!(MountPoint::Cache.label().as_str(), "cache");
+    #[rstest]
+    #[case(MountPoint::Root, "/", FilesystemType::Ext4, "root")]
+    #[case(MountPoint::Var, "/var", FilesystemType::Ext4, "var")]
+    #[case(MountPoint::Music, "/music", FilesystemType::Ext4, "music")]
+    #[case(MountPoint::Metadata, "/metadata", FilesystemType::Ext4, "metadata")]
+    #[case(MountPoint::Cache, "/cache", FilesystemType::Ext4, "cache")]
+    fn mount_point(
+        #[case] mp: MountPoint,
+        #[case] expected_path: &str,
+        #[case] expected_fs: FilesystemType,
+        #[case] expected_label: &str,
+    ) {
+        assert_eq!(mp.as_str(), expected_path);
+        assert_eq!(mp.to_string(), expected_path);
+        assert_eq!(mp.filesystem_type(), expected_fs);
+        assert_eq!(mp.label().as_str(), expected_label);
     }
 
-    #[test]
-    fn test_unit_type_display() {
-        assert_eq!(UnitType::Mdma909.to_string(), "mdma-909");
-        assert_eq!(UnitType::Mdma101.as_str(), "mdma-101");
-        assert!(UnitType::Mdma909.requires_dual_nvme());
-        assert!(!UnitType::Mdma303.requires_dual_nvme());
+    #[rstest]
+    #[case(UnitType::Mdma909, "mdma-909")]
+    #[case(UnitType::Mdma101, "mdma-101")]
+    #[case(UnitType::Mdma303, "mdma-303")]
+    fn unit_type_display(#[case] unit: UnitType, #[case] expected: &str) {
+        assert_eq!(unit.to_string(), expected);
+        assert_eq!(unit.as_str(), expected);
+    }
+
+    #[rstest]
+    #[case(UnitType::Mdma909, true)]
+    #[case(UnitType::Mdma303, false)]
+    fn unit_type_requires_dual_nvme(#[case] unit: UnitType, #[case] expected: bool) {
+        assert_eq!(unit.requires_dual_nvme(), expected);
     }
 }

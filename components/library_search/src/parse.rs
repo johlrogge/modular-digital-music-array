@@ -367,6 +367,20 @@ fn parse_date_with_precision(
 ) -> Result<(NaiveDate, DatePrecision), ParseError> {
     let err = || ParseError::InvalidDateQuery(original.to_string());
 
+    // Try date expression syntax (e.g. `~`, `-3/2`, `~/~/^`) only when the string
+    // contains date expression tokens, to avoid intercepting plain date strings
+    // like "2026" or "2026-02".
+    let looks_like_date_expr = s.contains('~')
+        || s.contains('^')
+        || s.contains('$')
+        || s.starts_with('+')
+        || s.starts_with('-');
+    if looks_like_date_expr {
+        if let Ok(date) = date_expression::resolve(s, chrono::Local::now().date_naive()) {
+            return Ok((date, DatePrecision::YearMonthDay));
+        }
+    }
+
     if s.len() == 10 && s.as_bytes().get(4) == Some(&b'-') && s.as_bytes().get(7) == Some(&b'-') {
         let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| err())?;
         return Ok((date, DatePrecision::YearMonthDay));
@@ -391,32 +405,26 @@ fn parse_date_with_precision(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
-    #[test]
-    fn string_query_contains() {
+    #[rstest]
+    #[case("rymden")]
+    #[case("carbon based lifeforms")]
+    fn string_query_contains(#[case] input: &str) {
         assert!(matches!(
-            parse_string_query("rymden"),
-            StringQuery::Contains(_)
-        ));
-        assert!(matches!(
-            parse_string_query("carbon based lifeforms"),
+            parse_string_query(input),
             StringQuery::Contains(_)
         ));
     }
 
-    #[test]
-    fn string_query_initialism() {
+    #[rstest]
+    #[case("CarbBased")]
+    #[case("CarbBasedLife")]
+    // All-caps is also treated as initialism
+    #[case("CBL")]
+    fn string_query_initialism(#[case] input: &str) {
         assert!(matches!(
-            parse_string_query("CarbBased"),
-            StringQuery::Initialism(_)
-        ));
-        assert!(matches!(
-            parse_string_query("CarbBasedLife"),
-            StringQuery::Initialism(_)
-        ));
-        // All-caps is also treated as initialism
-        assert!(matches!(
-            parse_string_query("CBL"),
+            parse_string_query(input),
             StringQuery::Initialism(_)
         ));
     }
@@ -572,10 +580,11 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn date_query_na() {
-        assert!(matches!(parse_date_query("N/A").unwrap(), DateQuery::NA));
-        assert!(matches!(parse_date_query("n/a").unwrap(), DateQuery::NA));
+    #[rstest]
+    #[case("N/A")]
+    #[case("n/a")]
+    fn date_query_na(#[case] input: &str) {
+        assert!(matches!(parse_date_query(input).unwrap(), DateQuery::NA));
     }
 
     #[test]
@@ -618,9 +627,49 @@ mod tests {
         ));
     }
 
+    #[rstest]
+    #[case("not-a-date")]
+    #[case("")]
+    fn date_query_invalid(#[case] input: &str) {
+        assert!(parse_date_query(input).is_err());
+    }
+
+    // --- date expression integration tests ---
+
     #[test]
-    fn date_query_invalid() {
-        assert!(parse_date_query("not-a-date").is_err());
-        assert!(parse_date_query("").is_err());
+    fn date_query_expr_today() {
+        // `~` resolves to today with YearMonthDay precision
+        assert!(matches!(
+            parse_date_query("~").unwrap(),
+            DateQuery::Range(
+                _,
+                DatePrecision::YearMonthDay,
+                _,
+                DatePrecision::YearMonthDay
+            )
+        ));
+    }
+
+    #[test]
+    fn date_query_expr_first_of_month() {
+        let result = parse_date_query("~/~/^");
+        assert!(result.is_ok());
+        assert!(matches!(
+            result.unwrap(),
+            DateQuery::Range(
+                _,
+                DatePrecision::YearMonthDay,
+                _,
+                DatePrecision::YearMonthDay
+            )
+        ));
+    }
+
+    #[test]
+    fn date_query_expr_range_tilde_based() {
+        // `~/~/^..~/~/$` -- first to last day of current month
+        let result = parse_date_query("~/~/^..~/~/$");
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), DateQuery::Range(..)));
     }
 }

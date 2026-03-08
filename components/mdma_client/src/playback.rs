@@ -1,7 +1,9 @@
 //! Playback backend abstraction — works in both gateway and direct mode.
 
-use crate::error::map_gw_to_media_error;
-use media_client::{ClientError, Command, ContentHash, Deck, MediaClient, Response, ResponseData};
+use media_client::{
+    AudioOutputConfig, AudioSinkInfo, ClientError, Command, ContentHash, Deck, MediaClient,
+    Response, ResponseData,
+};
 use std::path::PathBuf;
 
 /// Abstraction for playback commands, works in both gateway and direct mode.
@@ -19,7 +21,7 @@ impl PlaybackBackend {
 
     /// Connect to playback via gateway.
     pub fn connect_gateway(gateway: &str) -> Result<Self, ClientError> {
-        let gw = gateway_client::GatewayClient::connect(gateway).map_err(map_gw_to_media_error)?;
+        let gw = gateway_client::GatewayClient::connect(gateway)?;
         Ok(PlaybackBackend::Gateway(gw))
     }
 
@@ -33,29 +35,26 @@ impl PlaybackBackend {
 
     fn gw_send(&self, cmd: Command) -> Result<Response, ClientError> {
         match self {
-            PlaybackBackend::Gateway(gw) => {
-                gw.playback_command(&cmd).map_err(map_gw_to_media_error)
-            }
+            PlaybackBackend::Gateway(gw) => gw.playback_command(&cmd),
             PlaybackBackend::Direct(_) => unreachable!(),
         }
     }
 
     fn gw_command(&self, cmd: Command) -> Result<(), ClientError> {
-        let response = self.gw_send(cmd)?;
-        if !response.success {
-            return Err(ClientError::Command(response.error_message));
+        match self.gw_send(cmd)? {
+            Response::Ok { .. } => Ok(()),
+            Response::Err { message } => Err(ClientError::Service(message)),
         }
-        Ok(())
     }
 
     fn gw_command_with_data(&self, cmd: Command) -> Result<ResponseData, ClientError> {
-        let response = self.gw_send(cmd)?;
-        if !response.success {
-            return Err(ClientError::Command(response.error_message));
+        match self.gw_send(cmd)? {
+            Response::Err { message } => Err(ClientError::Service(message)),
+            Response::Ok { data: Some(data) } => Ok(data),
+            Response::Ok { data: None } => {
+                Err(ClientError::Service("Missing response data".to_string()))
+            }
         }
-        response
-            .data
-            .ok_or_else(|| ClientError::Command("Missing response data".to_string()))
     }
 
     pub fn play_queue(&self) -> Result<(), ClientError> {
@@ -101,7 +100,7 @@ impl PlaybackBackend {
                 if let ResponseData::NowPlaying(hash) = data {
                     Ok(hash)
                 } else {
-                    Err(ClientError::Command(
+                    Err(ClientError::Service(
                         "Unexpected response data type".to_string(),
                     ))
                 }
@@ -131,7 +130,7 @@ impl PlaybackBackend {
                 if let ResponseData::Queue(hashes) = data {
                     Ok(hashes)
                 } else {
-                    Err(ClientError::Command(
+                    Err(ClientError::Service(
                         "Unexpected response data type".to_string(),
                     ))
                 }
@@ -161,7 +160,7 @@ impl PlaybackBackend {
                 if let ResponseData::Count(n) = data {
                     Ok(n)
                 } else {
-                    Err(ClientError::Command(
+                    Err(ClientError::Service(
                         "Unexpected response data type".to_string(),
                     ))
                 }
@@ -177,7 +176,55 @@ impl PlaybackBackend {
                 if let ResponseData::Session(id) = data {
                     Ok(id)
                 } else {
-                    Err(ClientError::Command(
+                    Err(ClientError::Service(
+                        "Unexpected response data type".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    pub fn list_audio_outputs(&self) -> Result<Vec<AudioSinkInfo>, ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.list_audio_outputs(),
+            PlaybackBackend::Gateway(_) => {
+                let data = self.gw_command_with_data(Command::ListAudioOutputs)?;
+                if let ResponseData::AudioOutputs(sinks) = data {
+                    Ok(sinks)
+                } else {
+                    Err(ClientError::Service(
+                        "Unexpected response data type".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    pub fn set_audio_output(&self, device_name: String) -> Result<AudioOutputConfig, ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.set_audio_output(device_name),
+            PlaybackBackend::Gateway(_) => {
+                let data = self.gw_command_with_data(Command::SetAudioOutput { device_name })?;
+                if let ResponseData::AudioOutput(cfg) = data {
+                    Ok(cfg)
+                } else {
+                    Err(ClientError::Service(
+                        "Unexpected response data type".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    pub fn get_audio_output(&self) -> Result<AudioOutputConfig, ClientError> {
+        match self {
+            PlaybackBackend::Direct(c) => c.get_audio_output(),
+            PlaybackBackend::Gateway(_) => {
+                let data = self.gw_command_with_data(Command::GetAudioOutput)?;
+                if let ResponseData::AudioOutput(cfg) = data {
+                    Ok(cfg)
+                } else {
+                    Err(ClientError::Service(
                         "Unexpected response data type".to_string(),
                     ))
                 }

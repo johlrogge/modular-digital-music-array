@@ -59,7 +59,7 @@ impl ExportFormat {
 
 /// Metadata to inject into exported files.
 #[derive(Debug, Clone, Default)]
-pub struct TrackMetadata {
+pub struct ExportMetadata {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
@@ -86,125 +86,64 @@ pub enum TranscoderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
+    use rstest::rstest;
 
-    #[test]
-    fn export_format_extension_aiff() {
-        assert_eq!(ExportFormat::Aiff.extension(), "aiff");
+    #[rstest]
+    #[case(ExportFormat::Aiff, "aiff")]
+    #[case(ExportFormat::Wav, "wav")]
+    #[case(ExportFormat::Flac, "flac")]
+    fn export_format_extension(#[case] fmt: ExportFormat, #[case] expected: &str) {
+        assert_eq!(fmt.extension(), expected);
     }
 
-    #[test]
-    fn export_format_extension_wav() {
-        assert_eq!(ExportFormat::Wav.extension(), "wav");
+    #[rstest]
+    #[case(ExportFormat::Aiff, ".aiff")]
+    #[case(ExportFormat::Wav, ".wav")]
+    #[case(ExportFormat::Flac, ".flac")]
+    fn export_format_suffix(#[case] fmt: ExportFormat, #[case] expected: &str) {
+        assert_eq!(fmt.suffix(), expected);
     }
 
-    #[test]
-    fn export_format_extension_flac() {
-        assert_eq!(ExportFormat::Flac.extension(), "flac");
+    #[rstest]
+    #[case(ExportFormat::Aiff)]
+    #[case(ExportFormat::Wav)]
+    #[case(ExportFormat::Flac)]
+    fn export_format_suffix_has_leading_dot(#[case] fmt: ExportFormat) {
+        assert!(
+            fmt.suffix().starts_with('.'),
+            "suffix() must start with '.' for {:?}",
+            fmt
+        );
     }
 
-    #[test]
-    fn export_format_suffix_aiff() {
-        assert_eq!(ExportFormat::Aiff.suffix(), ".aiff");
-    }
-
-    #[test]
-    fn export_format_suffix_wav() {
-        assert_eq!(ExportFormat::Wav.suffix(), ".wav");
-    }
-
-    #[test]
-    fn export_format_suffix_flac() {
-        assert_eq!(ExportFormat::Flac.suffix(), ".flac");
-    }
-
-    #[test]
-    fn export_format_suffix_has_leading_dot() {
-        for fmt in [ExportFormat::Aiff, ExportFormat::Wav, ExportFormat::Flac] {
-            assert!(
-                fmt.suffix().starts_with('.'),
-                "suffix() must start with '.' for {:?}",
-                fmt
-            );
-        }
-    }
-
-    #[test]
-    fn export_format_extension_matches_suffix_without_dot() {
-        for fmt in [ExportFormat::Aiff, ExportFormat::Wav, ExportFormat::Flac] {
-            assert_eq!(
-                fmt.extension(),
-                &fmt.suffix()[1..],
-                "extension() must equal suffix() without leading dot for {:?}",
-                fmt
-            );
-        }
+    #[rstest]
+    #[case(ExportFormat::Aiff)]
+    #[case(ExportFormat::Wav)]
+    #[case(ExportFormat::Flac)]
+    fn export_format_extension_matches_suffix_without_dot(#[case] fmt: ExportFormat) {
+        assert_eq!(
+            fmt.extension(),
+            &fmt.suffix()[1..],
+            "extension() must equal suffix() without leading dot for {:?}",
+            fmt
+        );
     }
 
     // ── FormatCategory ────────────────────────────────────────────────────────
 
-    #[test]
-    fn format_category_flac_is_lossless() {
-        assert_eq!(
-            FormatCategory::from_extension("flac"),
-            Some(FormatCategory::Lossless)
-        );
-    }
-
-    #[test]
-    fn format_category_wav_is_lossless() {
-        assert_eq!(
-            FormatCategory::from_extension("wav"),
-            Some(FormatCategory::Lossless)
-        );
-    }
-
-    #[test]
-    fn format_category_aiff_is_lossless() {
-        assert_eq!(
-            FormatCategory::from_extension("aiff"),
-            Some(FormatCategory::Lossless)
-        );
-    }
-
-    #[test]
-    fn format_category_mp3_is_lossy() {
-        assert_eq!(
-            FormatCategory::from_extension("mp3"),
-            Some(FormatCategory::Lossy)
-        );
-    }
-
-    #[test]
-    fn format_category_ogg_is_lossy() {
-        assert_eq!(
-            FormatCategory::from_extension("ogg"),
-            Some(FormatCategory::Lossy)
-        );
-    }
-
-    #[test]
-    fn format_category_opus_is_lossy() {
-        assert_eq!(
-            FormatCategory::from_extension("opus"),
-            Some(FormatCategory::Lossy)
-        );
-    }
-
-    #[test]
-    fn format_category_unknown_returns_none() {
-        assert_eq!(FormatCategory::from_extension("txt"), None);
-    }
-
-    #[test]
-    fn format_category_case_insensitive() {
-        assert_eq!(
-            FormatCategory::from_extension("FLAC"),
-            Some(FormatCategory::Lossless)
-        );
-        assert_eq!(
-            FormatCategory::from_extension("Mp3"),
-            Some(FormatCategory::Lossy)
-        );
+    #[rstest]
+    #[case("flac", Some(FormatCategory::Lossless))]
+    #[case("wav", Some(FormatCategory::Lossless))]
+    #[case("aiff", Some(FormatCategory::Lossless))]
+    #[case("mp3", Some(FormatCategory::Lossy))]
+    #[case("ogg", Some(FormatCategory::Lossy))]
+    #[case("opus", Some(FormatCategory::Lossy))]
+    #[case("txt", None)]
+    #[case("FLAC", Some(FormatCategory::Lossless))]
+    #[case("MP3", Some(FormatCategory::Lossy))]
+    fn format_category_from_extension(#[case] ext: &str, #[case] expected: Option<FormatCategory>) {
+        assert_eq!(FormatCategory::from_extension(ext), expected);
     }
 }
 
@@ -219,7 +158,7 @@ pub fn transcode(
     source: &Path,
     output: &Path,
     format: &ExportFormat,
-    meta: &TrackMetadata,
+    meta: &ExportMetadata,
 ) -> Result<(), TranscoderError> {
     ffmpeg::run_ffmpeg(source, output, format, meta)
 }

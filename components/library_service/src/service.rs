@@ -3,16 +3,17 @@
 //! Handles IPC requests and manages library state
 
 use crate::ipc::{
-    Bpm, ContentHash, DurationSeconds, InboxPath, IngestAllItem, IngestResult, IngestSource,
-    IpcServer, Key, LibraryRequest, LibraryResponse, ProtocolError, ServiceStatus, TrackInfo,
-    TrackQuery,
+    Bpm, ContentHash, DurationSeconds, FactType, InboxPath, IngestAllItem, IngestResult,
+    IngestSource, IpcServer, Key, LibraryRequest, LibraryResponse, ProtocolError, ServiceStatus,
+    TrackInfo, TrackQuery,
 };
 use crate::pipeline::{InboxFile, UploadSource};
 use acid_client::AcidClient;
+use event_protocol::{acid_event_from_topic_message, AcidEvent, TOPIC_ACID_FACTS_WRITTEN};
 use library_search::{matches_query, TrackFields};
 use music_facts::MusicValue;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -44,11 +45,20 @@ pub struct LibraryService {
     tracks: Mutex<Vec<IndexedTrackInfo>>,
     /// ACID client for writing facts
     acid_client: AcidClient,
+    /// Album name -> cover_art_path for tracks that have cover art.
+    /// Used as a fallback when a track on the same album has no cover art of its own.
+    album_cover_cache: Mutex<HashMap<String, String>>,
     /// Generic fact value index: fact_type -> set of values
     /// Used for fast HasFact/HasFacts lookups (e.g., ItemId -> {"p123", "p456"})
-    fact_index: Mutex<HashMap<String, HashSet<String>>>,
+    fact_index: Mutex<HashMap<FactType, HashSet<String>>>,
     /// Set of known content hashes for dedup on ingest
     content_hashes: Mutex<HashSet<String>>,
+    /// Current position in the ACID fact stream (opaque cursor string).
+    cursor: Mutex<Option<String>>,
+    /// Address of the ACID request socket (used by background subscriber thread).
+    acid_socket: String,
+    /// Address of the ACID events pub/sub socket.
+    acid_events_socket: String,
 }
 
 /// Track info stored in memory for search
@@ -67,18 +77,111 @@ struct IndexedTrackInfo {
     year: Option<u32>,
     source: Option<String>,
     blob_path: PathBuf,
+    cover_art_path: Option<PathBuf>,
+    track_number: Option<u32>,
+    disc_number: Option<u32>,
     last_started: Option<chrono::DateTime<chrono::Utc>>,
     last_stopped: Option<chrono::DateTime<chrono::Utc>>,
+    added_at: Option<String>,
+}
+
+impl IndexedTrackInfo {
+    fn new_empty(entity: String) -> Self {
+        Self {
+            content_hash: ContentHash::new(entity),
+            title: None,
+            artist: None,
+            album: None,
+            label: None,
+            genre: None,
+            styles: vec![],
+            duration_seconds: None,
+            bpm: None,
+            key: None,
+            year: None,
+            source: None,
+            blob_path: PathBuf::new(),
+            cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            last_started: None,
+            last_stopped: None,
+            added_at: None,
+        }
+    }
+}
+
+/// Apply a single `MusicValue` fact to a mutable `IndexedTrackInfo` entry.
+///
+/// The fact timestamp is needed only for `TrackStarted` / `TrackStopped` to
+/// preserve the most-recent-wins ordering; callers must supply it.
+fn apply_fact_to_track(
+    entry: &mut IndexedTrackInfo,
+    value: &MusicValue,
+    timestamp: chrono::DateTime<chrono::Utc>,
+    has_format: Option<&mut HashSet<String>>,
+    has_cover_art: Option<&mut HashSet<String>>,
+) {
+    match value {
+        MusicValue::Title(v) => entry.title = Some(v.as_str().to_string()),
+        MusicValue::Artist(v) => entry.artist = Some(v.as_str().to_string()),
+        MusicValue::Album(v) => entry.album = Some(v.as_str().to_string()),
+        MusicValue::Label(v) => entry.label = Some(v.clone()),
+        MusicValue::MainGenre(v) => entry.genre = Some(v.clone()),
+        MusicValue::StyleDescriptor(v) => entry.styles.push(v.clone()),
+        MusicValue::DurationSeconds(v) => entry.duration_seconds = Some(v.value()),
+        MusicValue::Bpm(v) => entry.bpm = Some(v.as_f32()),
+        MusicValue::Key(v) => entry.key = Some(v.to_string()),
+        MusicValue::Year(v) => entry.year = Some(v.value()),
+        MusicValue::TrackNumber(v) => entry.track_number = Some(v.value()),
+        MusicValue::DiscNumber(v) => entry.disc_number = Some(v.value()),
+        MusicValue::Source(v) => entry.source = Some(v.clone()),
+        MusicValue::TrackStarted(_) => {
+            update_if_more_recent(&mut entry.last_started, timestamp);
+        }
+        MusicValue::TrackStopped(_) => {
+            update_if_more_recent(&mut entry.last_stopped, timestamp);
+        }
+        MusicValue::FilePath(p) => {
+            let hash = entry.content_hash.as_str();
+            let hash_clean = hash.strip_prefix("sha256:").unwrap_or(hash);
+            if hash_clean.len() >= 2 {
+                if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                    entry.blob_path =
+                        PathBuf::from(format!("blobs/{}/{}.{}", &hash_clean[..2], hash_clean, ext));
+                }
+            }
+        }
+        MusicValue::Format(_) => {
+            if let Some(set) = has_format {
+                set.insert(entry.content_hash.as_str().to_owned());
+            }
+        }
+        MusicValue::CoverArtPath(p) => {
+            entry.cover_art_path = Some(PathBuf::from(p));
+            if let Some(set) = has_cover_art {
+                set.insert(entry.content_hash.as_str().to_owned());
+            }
+        }
+        MusicValue::AddedAt(s) => {
+            if entry.added_at.is_none() {
+                entry.added_at = Some(s.clone());
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Result of loading tracks from the fact stream
 struct LoadResult {
     tracks: Vec<IndexedTrackInfo>,
     facts_count: usize,
-    fact_index: HashMap<String, HashSet<String>>,
+    fact_index: HashMap<FactType, HashSet<String>>,
     content_hashes: HashSet<String>,
     /// Content hashes of tracks that already have a Format fact
     has_format: HashSet<String>,
+    /// Content hashes of tracks that already have a CoverArtPath fact
+    has_cover_art: HashSet<String>,
 }
 
 fn update_if_more_recent(
@@ -102,14 +205,48 @@ impl LibraryService {
         metadata_dir: PathBuf,
         acid_socket: &str,
     ) -> Result<Self, ServiceError> {
-        let facts_path = metadata_dir.join("facts.jsonl");
+        Self::new_with_events(
+            music_dir,
+            metadata_dir,
+            acid_socket,
+            "ipc:///run/mdma/acid-events.sock",
+        )
+    }
 
-        // Load existing tracks from facts file
-        let loaded = Self::load_tracks_from_facts(&facts_path);
-        let tracks_count = loaded.tracks.len();
-
-        // Connect to ACID service for fact writing
+    /// Create a new library service with an explicit ACID events socket address.
+    pub fn new_with_events(
+        music_dir: PathBuf,
+        metadata_dir: PathBuf,
+        acid_socket: &str,
+        acid_events_socket: &str,
+    ) -> Result<Self, ServiceError> {
+        // Connect to ACID service for writing and streaming
         let acid_client = AcidClient::connect(acid_socket)?;
+
+        // Try to load from the ACID stream (incremental if cursor exists)
+        let cursor_path = metadata_dir.join("facts.cursor");
+        let saved_cursor = Self::load_saved_cursor(&cursor_path);
+        let used_full_load = saved_cursor.is_none();
+
+        let (loaded, final_cursor) = Self::load_from_acid_stream(&acid_client, saved_cursor);
+
+        // If ACID stream returned nothing and we had no cursor, fall back to local file
+        let (loaded, final_cursor) = if loaded.tracks.is_empty() && used_full_load {
+            tracing::info!("ACID stream empty or unavailable, falling back to local facts file");
+            let facts_path = metadata_dir.join("facts.jsonl");
+            let file_loaded = Self::load_tracks_from_facts(&facts_path);
+            (file_loaded, None)
+        } else {
+            (loaded, final_cursor)
+        };
+
+        // Persist the cursor so next restart can resume incrementally
+        if let Some(ref c) = final_cursor {
+            Self::save_cursor(&cursor_path, c);
+        }
+
+        let tracks_count = loaded.tracks.len();
+        let album_cover_cache = Self::build_album_cover_cache(&loaded.tracks);
 
         let service = Self {
             music_dir,
@@ -119,14 +256,135 @@ impl LibraryService {
             facts_count: AtomicUsize::new(loaded.facts_count),
             tracks: Mutex::new(loaded.tracks),
             acid_client,
+            album_cover_cache: Mutex::new(album_cover_cache),
             fact_index: Mutex::new(loaded.fact_index),
             content_hashes: Mutex::new(loaded.content_hashes),
+            cursor: Mutex::new(final_cursor),
+            acid_socket: acid_socket.to_string(),
+            acid_events_socket: acid_events_socket.to_string(),
         };
 
         // Backfill Format facts for tracks that don't have one yet
         service.backfill_format_facts(&loaded.has_format);
 
+        // Backfill cover art for tracks that don't have CoverArtPath yet
+        service.backfill_cover_art(&loaded.has_cover_art);
+
         Ok(service)
+    }
+
+    /// Load tracks from the ACID read_stream API.
+    ///
+    /// Returns the LoadResult plus the final cursor position.
+    /// On failure (ACID not available), returns an empty result with no cursor.
+    fn load_from_acid_stream(
+        acid_client: &AcidClient,
+        start_cursor: Option<String>,
+    ) -> (LoadResult, Option<String>) {
+        const PAGE_SIZE: usize = 10_000;
+
+        let mut tracks_map: HashMap<String, IndexedTrackInfo> = HashMap::new();
+        let mut fact_index: HashMap<FactType, HashSet<String>> = HashMap::new();
+        let mut has_format: HashSet<String> = HashSet::new();
+        let mut has_cover_art: HashSet<String> = HashSet::new();
+        let mut total = 0;
+        let mut current_cursor = start_cursor;
+        let mut last_cursor: Option<String> = None;
+
+        loop {
+            let chunk = match acid_client.read_stream(current_cursor.clone(), PAGE_SIZE) {
+                Ok(c) => c,
+                Err(e) => {
+                    if total == 0 {
+                        tracing::debug!("ACID stream unavailable: {:?}", e);
+                    } else {
+                        tracing::warn!("ACID stream error after {} facts: {:?}", total, e);
+                    }
+                    break;
+                }
+            };
+
+            last_cursor = Some(chunk.cursor.clone());
+
+            if chunk.lines.is_empty() {
+                break;
+            }
+
+            let lines_count = chunk.lines.len();
+            Self::apply_lines_to_map(
+                &chunk.lines,
+                &mut tracks_map,
+                &mut fact_index,
+                &mut has_format,
+                &mut has_cover_art,
+                &mut total,
+            );
+            current_cursor = Some(chunk.cursor);
+
+            if lines_count < PAGE_SIZE {
+                break;
+            }
+        }
+
+        if total > 0 {
+            tracing::info!("Loaded {} facts from ACID stream", total);
+        }
+
+        let content_hashes: HashSet<String> = tracks_map.keys().cloned().collect();
+        let loaded = LoadResult {
+            tracks: tracks_map.into_values().collect(),
+            facts_count: total,
+            fact_index,
+            content_hashes,
+            has_format,
+            has_cover_art,
+        };
+        (loaded, last_cursor)
+    }
+
+    /// Apply raw JSON fact lines to maps during bulk loading (used by load_from_acid_stream).
+    fn apply_lines_to_map(
+        lines: &[String],
+        tracks_map: &mut HashMap<String, IndexedTrackInfo>,
+        fact_index: &mut HashMap<FactType, HashSet<String>>,
+        has_format: &mut HashSet<String>,
+        has_cover_art: &mut HashSet<String>,
+        total: &mut usize,
+    ) {
+        use music_facts::FactSource;
+
+        for line in lines {
+            let fact: stainless_facts::Fact<ContentHash, MusicValue, FactSource> =
+                match serde_json::from_str(line) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!("Failed to parse stream line during load: {:?}", e);
+                        continue;
+                    }
+                };
+
+            *total += 1;
+            let entity = fact.entity().as_str().to_owned();
+
+            let entry = tracks_map
+                .entry(entity.clone())
+                .or_insert_with(|| IndexedTrackInfo::new_empty(entity));
+
+            let variant_name = fact.value().display_name();
+            let value_str = fact.value().to_string();
+            fact_index
+                .entry(FactType::new(variant_name))
+                .or_default()
+                .insert(value_str);
+
+            apply_fact_to_track(
+                entry,
+                fact.value(),
+                *fact.timestamp(),
+                Some(has_format),
+                Some(has_cover_art),
+            );
+        }
     }
 
     /// Load tracks from facts file into memory for search
@@ -145,14 +403,16 @@ impl LibraryService {
                         fact_index: HashMap::new(),
                         content_hashes: HashSet::new(),
                         has_format: HashSet::new(),
+                        has_cover_art: HashSet::new(),
                     };
                 }
             };
 
         // Aggregate facts by content hash
         let mut tracks_map: HashMap<String, IndexedTrackInfo> = HashMap::new();
-        let mut fact_index: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut fact_index: HashMap<FactType, HashSet<String>> = HashMap::new();
         let mut has_format: HashSet<String> = HashSet::new();
+        let mut has_cover_art: HashSet<String> = HashSet::new();
         let mut errors = 0;
         let mut total = 0;
 
@@ -169,76 +429,29 @@ impl LibraryService {
                 }
             };
 
-            let entity = fact.entity().0.clone();
+            let entity = fact.entity().as_str().to_owned();
 
             // Build track summary
             let entry = tracks_map
                 .entry(entity.clone())
-                .or_insert_with(|| IndexedTrackInfo {
-                    content_hash: ContentHash(entity),
-                    title: None,
-                    artist: None,
-                    album: None,
-                    label: None,
-                    genre: None,
-                    styles: vec![],
-                    duration_seconds: None,
-                    bpm: None,
-                    key: None,
-                    year: None,
-                    source: None,
-                    blob_path: PathBuf::new(),
-                    last_started: None,
-                    last_stopped: None,
-                });
+                .or_insert_with(|| IndexedTrackInfo::new_empty(entity));
 
             // Index fact values for HasFact/HasFacts lookups
             let variant_name = fact.value().display_name();
             let value_str = fact.value().to_string();
             fact_index
-                .entry(variant_name.to_string())
+                .entry(FactType::new(variant_name))
                 .or_default()
                 .insert(value_str);
 
             // Extract key fields for search
-            match fact.value() {
-                MusicValue::Title(v) => entry.title = Some(v.0.clone()),
-                MusicValue::Artist(v) => entry.artist = Some(v.0.clone()),
-                MusicValue::Album(v) => entry.album = Some(v.0.clone()),
-                MusicValue::Label(v) => entry.label = Some(v.clone()),
-                MusicValue::MainGenre(v) => entry.genre = Some(v.clone()),
-                MusicValue::StyleDescriptor(v) => entry.styles.push(v.clone()),
-                MusicValue::DurationSeconds(v) => entry.duration_seconds = Some(v.0),
-                MusicValue::Bpm(v) => entry.bpm = Some(v.as_f32()),
-                MusicValue::Key(v) => entry.key = Some(v.to_string()),
-                MusicValue::Year(v) => entry.year = Some(v.0),
-                MusicValue::Source(v) => entry.source = Some(v.clone()),
-                MusicValue::TrackStarted(_) => {
-                    update_if_more_recent(&mut entry.last_started, *fact.timestamp());
-                }
-                MusicValue::TrackStopped(_) => {
-                    update_if_more_recent(&mut entry.last_stopped, *fact.timestamp());
-                }
-                MusicValue::FilePath(p) => {
-                    // Reconstruct blob path from the stored file path extension
-                    let hash = entry.content_hash.0.as_str();
-                    let hash_clean = hash.strip_prefix("sha256:").unwrap_or(hash);
-                    if hash_clean.len() >= 2 {
-                        if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                            entry.blob_path = PathBuf::from(format!(
-                                "blobs/{}/{}.{}",
-                                &hash_clean[..2],
-                                hash_clean,
-                                ext
-                            ));
-                        }
-                    }
-                }
-                MusicValue::Format(_) => {
-                    has_format.insert(fact.entity().0.clone());
-                }
-                _ => {}
-            }
+            apply_fact_to_track(
+                entry,
+                fact.value(),
+                *fact.timestamp(),
+                Some(&mut has_format),
+                Some(&mut has_cover_art),
+            );
         }
 
         tracing::info!("Processed {} facts from file, {} errors", total, errors);
@@ -252,6 +465,7 @@ impl LibraryService {
             fact_index,
             content_hashes,
             has_format,
+            has_cover_art,
         }
     }
 
@@ -265,7 +479,7 @@ impl LibraryService {
         // Find tracks needing backfill
         let needs_backfill: Vec<_> = tracks
             .iter()
-            .filter(|t| !has_format.contains(&t.content_hash.0))
+            .filter(|t| !has_format.contains(t.content_hash.as_str()))
             .filter(|t| !t.blob_path.as_os_str().is_empty())
             .filter_map(|t| {
                 let ext = t.blob_path.extension()?.to_str()?;
@@ -302,7 +516,7 @@ impl LibraryService {
                 .is_ok()
             {
                 fact_index
-                    .entry("Format".to_string())
+                    .entry(FactType::new("Format"))
                     .or_default()
                     .insert(music_format.to_string());
                 backfilled += 1;
@@ -313,6 +527,248 @@ impl LibraryService {
         self.facts_count.fetch_add(backfilled, Ordering::Relaxed);
 
         tracing::info!(backfilled, "Format fact backfill complete");
+    }
+
+    /// Map MIME type to file extension for cover art images.
+    fn mime_to_ext(mime: &str) -> Option<&'static str> {
+        match mime {
+            "image/jpeg" => Some("jpg"),
+            "image/png" => Some("png"),
+            "image/gif" => Some("gif"),
+            "image/webp" => Some("webp"),
+            _ => None,
+        }
+    }
+
+    /// Extract the best available picture from an audio file and write it to cover-art storage.
+    ///
+    /// Returns the relative path (e.g. `cover-art/<hash>.jpg`) on success, or `None` if no
+    /// picture is present or writing fails.
+    fn extract_and_store_cover_art(
+        &self,
+        blob_path: &PathBuf,
+        content_hash: &ContentHash,
+    ) -> Option<PathBuf> {
+        use audio_metadata::{extract_pictures, PictureType};
+
+        let pictures = match extract_pictures(blob_path) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to extract pictures from blob");
+                return None;
+            }
+        };
+
+        if pictures.is_empty() {
+            return None;
+        }
+
+        // Prefer CoverFront; fall back to first available
+        let picture = pictures
+            .iter()
+            .find(|p| p.picture_type == PictureType::CoverFront)
+            .or_else(|| pictures.first())?;
+
+        let ext = Self::mime_to_ext(&picture.mime_type)?;
+
+        let hash_clean = content_hash
+            .as_str()
+            .strip_prefix("sha256:")
+            .unwrap_or(content_hash.as_str());
+        let filename = format!("{}.{}", hash_clean, ext);
+        let rel_path = PathBuf::from("cover-art").join(&filename);
+        let abs_path = self.music_dir.join(&rel_path);
+
+        // Ensure cover-art directory exists
+        if let Some(parent) = abs_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!(error = %e, "Failed to create cover-art directory");
+                return None;
+            }
+        }
+
+        if let Err(e) = std::fs::write(&abs_path, &picture.data) {
+            tracing::warn!(error = %e, path = %abs_path.display(), "Failed to write cover art");
+            return None;
+        }
+
+        tracing::debug!(path = %rel_path.display(), "Stored cover art");
+        Some(rel_path)
+    }
+
+    /// Backfill CoverArtPath facts for tracks that don't have cover art stored yet.
+    fn backfill_cover_art(&self, has_cover_art: &HashSet<String>) {
+        let tracks = self.tracks.lock().unwrap();
+
+        // Collect tracks that need backfill: have a blob_path but no CoverArtPath fact
+        let needs_backfill: Vec<_> = tracks
+            .iter()
+            .filter(|t| !has_cover_art.contains(t.content_hash.as_str()))
+            .filter(|t| !t.blob_path.as_os_str().is_empty())
+            .map(|t| (t.content_hash.clone(), t.blob_path.clone()))
+            .collect();
+
+        drop(tracks);
+
+        if needs_backfill.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            count = needs_backfill.len(),
+            "Backfilling CoverArtPath facts for tracks"
+        );
+
+        let fact_source = music_facts::FactSource::new(
+            "mdma-library",
+            env!("CARGO_PKG_VERSION"),
+            music_facts::FactOrigin::Unknown,
+        );
+
+        let mut backfilled = 0;
+
+        for (hash, blob_rel_path) in &needs_backfill {
+            let blob_abs = self.music_dir.join(blob_rel_path);
+            if let Some(rel_path) = self.extract_and_store_cover_art(&blob_abs, hash) {
+                let value = MusicValue::CoverArtPath(rel_path.to_string_lossy().to_string());
+                if self
+                    .acid_client
+                    .write_music_facts(hash, &[(value.clone(), fact_source.clone())])
+                    .is_ok()
+                {
+                    // Update in-memory index
+                    let mut tracks = self.tracks.lock().unwrap();
+                    if let Some(track) = tracks
+                        .iter_mut()
+                        .find(|t| t.content_hash.as_str() == hash.as_str())
+                    {
+                        track.cover_art_path = Some(rel_path.clone());
+                    }
+                    drop(tracks);
+
+                    let mut fact_index = self.fact_index.lock().unwrap();
+                    fact_index
+                        .entry(FactType::new("CoverArtPath"))
+                        .or_default()
+                        .insert(rel_path.to_string_lossy().to_string());
+                    drop(fact_index);
+
+                    self.facts_count.fetch_add(1, Ordering::Relaxed);
+                    backfilled += 1;
+                }
+            }
+        }
+
+        tracing::info!(backfilled, "CoverArtPath fact backfill complete");
+    }
+
+    /// Re-extract and store cover art for all tracks missing a CoverArtPath fact.
+    /// Returns the number of tracks processed.
+    fn reindex_covers_internal(&self) -> usize {
+        let has_cover_art: HashSet<String> = {
+            let tracks = self.tracks.lock().unwrap();
+            tracks
+                .iter()
+                .filter(|t| t.cover_art_path.is_some())
+                .map(|t| t.content_hash.as_str().to_owned())
+                .collect()
+        };
+
+        let before = self.facts_count.load(Ordering::Relaxed);
+        self.backfill_cover_art(&has_cover_art);
+        let after = self.facts_count.load(Ordering::Relaxed);
+        after.saturating_sub(before)
+    }
+
+    // =========================================================================
+    // Cursor persistence
+    // =========================================================================
+
+    /// Load the saved ACID stream cursor from a file.
+    ///
+    /// Returns `None` if the file does not exist or contains only whitespace.
+    pub fn load_saved_cursor(cursor_path: &Path) -> Option<String> {
+        let content = std::fs::read_to_string(cursor_path).ok()?;
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    }
+
+    /// Persist the current ACID stream cursor to a file so it survives restarts.
+    pub fn save_cursor(cursor_path: &Path, cursor: &str) {
+        if let Err(e) = std::fs::write(cursor_path, cursor) {
+            tracing::warn!(error = %e, "Failed to save ACID stream cursor");
+        }
+    }
+
+    // =========================================================================
+    // Incremental stream application
+    // =========================================================================
+
+    /// Apply a slice of raw JSONL lines (from an ACID `ReadStream` response) to
+    /// the in-memory track index.
+    ///
+    /// Each line is a JSON-serialised `Fact<ContentHash, MusicValue, FactSource>`.
+    /// Unknown or malformed lines are silently skipped.
+    pub fn apply_stream_lines(&self, lines: &[String]) {
+        use music_facts::FactSource;
+        use stainless_facts::Fact;
+
+        let mut tracks = self.tracks.lock().unwrap();
+        let mut fact_index = self.fact_index.lock().unwrap();
+        let mut content_hashes = self.content_hashes.lock().unwrap();
+        let mut applied: usize = 0;
+
+        // Build a temporary O(1) index: content_hash -> position in tracks Vec.
+        // Rebuilt once per call to avoid O(n*m) linear scans.
+        let mut index: HashMap<String, usize> = tracks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.content_hash.as_str().to_owned(), i))
+            .collect();
+
+        for line in lines {
+            let fact: Fact<ContentHash, MusicValue, FactSource> = match serde_json::from_str(line) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::debug!(error = %e, "Failed to parse stream line — skipping");
+                    continue;
+                }
+            };
+
+            applied += 1;
+            let entity = fact.entity().as_str().to_owned();
+
+            // Insert or fetch the track entry using the O(1) index
+            let pos = if let Some(&pos) = index.get(&entity) {
+                pos
+            } else {
+                content_hashes.insert(entity.clone());
+                let pos = tracks.len();
+                tracks.push(IndexedTrackInfo::new_empty(entity.clone()));
+                index.insert(entity.clone(), pos);
+                pos
+            };
+            let entry = &mut tracks[pos];
+
+            // Index the fact value
+            let variant_name = fact.value().display_name();
+            let value_str = fact.value().to_string();
+            fact_index
+                .entry(FactType::new(variant_name))
+                .or_default()
+                .insert(value_str);
+
+            // Apply to track fields
+            apply_fact_to_track(entry, fact.value(), *fact.timestamp(), None, None);
+        }
+
+        // Update tracks_indexed counter for any new entries
+        self.tracks_indexed.store(tracks.len(), Ordering::Relaxed);
+        self.facts_count.fetch_add(applied, Ordering::Relaxed);
     }
 
     /// Get number of indexed tracks
@@ -546,6 +1002,14 @@ impl LibraryService {
                     }),
                 }
             }
+
+            LibraryRequest::ReindexCovers => {
+                let reindexed = self.reindex_covers_internal();
+                LibraryResponse::IngestResult(IngestResult::Success {
+                    hash: None,
+                    message: format!("Cover art reindexed for {} tracks", reindexed),
+                })
+            }
         }
     }
 
@@ -594,11 +1058,39 @@ impl LibraryService {
             title: t.title.clone(),
             artist: t.artist.clone(),
             album: t.album.clone(),
-            duration: t.duration_seconds.map(DurationSeconds),
+            duration: t.duration_seconds.map(DurationSeconds::new),
             bpm: t.bpm.and_then(|b| Bpm::from_f32(b).ok()),
             key: t.key.as_ref().and_then(|k| Key::from_traditional(k).ok()),
             blob_path: Some(t.blob_path.to_string_lossy().to_string()),
+            cover_art_path: t
+                .cover_art_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .or_else(|| {
+                    t.album.as_ref().and_then(|album| {
+                        self.album_cover_cache.lock().unwrap().get(album).cloned()
+                    })
+                }),
+            track_number: t.track_number,
+            disc_number: t.disc_number,
+            added: t.added_at.clone(),
         }
+    }
+
+    /// Build a mapping of album name -> cover_art_path from an indexed track list.
+    ///
+    /// Only tracks that have both an album and a cover_art_path contribute to the cache.
+    /// The first cover art path seen for each album wins.
+    fn build_album_cover_cache(tracks: &[IndexedTrackInfo]) -> HashMap<String, String> {
+        let mut cache = HashMap::new();
+        for track in tracks {
+            if let (Some(album), Some(cover)) = (&track.album, &track.cover_art_path) {
+                cache
+                    .entry(album.clone())
+                    .or_insert_with(|| cover.to_string_lossy().to_string());
+            }
+        }
+        cache
     }
 
     /// List tracks from in-memory index
@@ -616,9 +1108,9 @@ impl LibraryService {
     /// Resolve a partial hash to a full hash (like git short refs)
     fn resolve_hash(&self, partial: &ContentHash) -> Result<ContentHash, ProtocolError> {
         let partial_clean = partial
-            .0
+            .as_str()
             .strip_prefix("sha256:")
-            .unwrap_or(&partial.0)
+            .unwrap_or(partial.as_str())
             .to_lowercase();
 
         let tracks = self.tracks.lock().unwrap();
@@ -627,16 +1119,16 @@ impl LibraryService {
             .filter(|t| {
                 let hash = t
                     .content_hash
-                    .0
+                    .as_str()
                     .strip_prefix("sha256:")
-                    .unwrap_or(&t.content_hash.0);
+                    .unwrap_or(t.content_hash.as_str());
                 hash.to_lowercase().starts_with(&partial_clean)
             })
             .collect();
 
         match matches.len() {
             0 => Err(ProtocolError::TrackNotFound {
-                hash: partial.0.clone(),
+                hash: partial.as_str().to_owned(),
             }),
             1 => Ok(matches[0].content_hash.clone()),
             n => {
@@ -644,7 +1136,7 @@ impl LibraryService {
                     .iter()
                     .take(3)
                     .map(|t| {
-                        let short = &t.content_hash.0[7..15]; // sha256: prefix + 8 chars
+                        let short = &t.content_hash.as_str()[7..15]; // sha256: prefix + 8 chars
                         let name = t.title.as_deref().unwrap_or("Unknown");
                         format!("  {} ({})", short, name)
                     })
@@ -652,7 +1144,7 @@ impl LibraryService {
                 Err(ProtocolError::Internal {
                     message: format!(
                         "Ambiguous hash '{}' matches {} tracks:\n{}",
-                        partial.0,
+                        partial.as_str(),
                         n,
                         examples.join("\n")
                     ),
@@ -668,10 +1160,10 @@ impl LibraryService {
         let tracks = self.tracks.lock().unwrap();
         tracks
             .iter()
-            .find(|t| t.content_hash.0 == full_hash.0)
+            .find(|t| t.content_hash.as_str() == full_hash.as_str())
             .map(|t| self.to_track_info(t))
             .ok_or_else(|| ProtocolError::TrackNotFound {
-                hash: hash.0.clone(),
+                hash: hash.as_str().to_owned(),
             })
     }
 
@@ -693,13 +1185,13 @@ impl LibraryService {
 
         let facts: Vec<_> = reader
             .filter_map(|r| r.ok())
-            .filter(|f| f.entity().0 == full_hash.0)
+            .filter(|f| f.entity().as_str() == full_hash.as_str())
             .map(|f| format_fact_for_display(f.value()))
             .collect();
 
         if facts.is_empty() {
             Err(ProtocolError::TrackNotFound {
-                hash: full_hash.0.clone(),
+                hash: full_hash.as_str().to_owned(),
             })
         } else {
             Ok((full_hash, facts))
@@ -740,7 +1232,7 @@ impl LibraryService {
                 Err(_) => continue,
             };
 
-            let entity = fact.entity().0.clone();
+            let entity = fact.entity().as_str().to_owned();
             match fact.value() {
                 MusicValue::TrackStarted(_) => {
                     update_if_more_recent(
@@ -761,7 +1253,7 @@ impl LibraryService {
         // Acquire the lock only after reading the file to avoid deadlock
         let mut tracks = self.tracks.lock().unwrap();
         for track in tracks.iter_mut() {
-            let hash = &track.content_hash.0;
+            let hash = track.content_hash.as_str();
             if let Some(Some(ts)) = last_started.get(hash) {
                 track.last_started = Some(*ts);
             }
@@ -795,6 +1287,11 @@ impl LibraryService {
                     source: t.source.as_deref(),
                     last_started: t.last_started,
                     last_stopped: t.last_stopped,
+                    added: t
+                        .added_at
+                        .as_deref()
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|dt| dt.with_timezone(&chrono::Utc)),
                 };
                 matches_query(query, &fields)
             })
@@ -811,14 +1308,11 @@ impl LibraryService {
         let path = self.resolve_inbox_path(inbox_path);
 
         match self.ingest_file_internal(&path, source) {
-            Ok(hash) => IngestResult {
+            Ok(hash) => IngestResult::Success {
                 hash: Some(hash),
-                success: true,
                 message: "File ingested successfully".to_string(),
             },
-            Err(e) => IngestResult {
-                hash: None,
-                success: false,
+            Err(e) => IngestResult::Failure {
                 message: e.to_string(),
             },
         }
@@ -829,22 +1323,17 @@ impl LibraryService {
         let path = self.resolve_inbox_path(inbox_path);
 
         if !path.exists() {
-            return IngestResult {
-                hash: None,
-                success: false,
+            return IngestResult::Failure {
                 message: format!("File not found: {}", inbox_path.as_str()),
             };
         }
 
         match std::fs::remove_file(&path) {
-            Ok(()) => IngestResult {
+            Ok(()) => IngestResult::Success {
                 hash: None,
-                success: true,
                 message: format!("Deleted: {}", inbox_path.as_str()),
             },
-            Err(e) => IngestResult {
-                hash: None,
-                success: false,
+            Err(e) => IngestResult::Failure {
                 message: format!("Failed to delete: {}", e),
             },
         }
@@ -925,9 +1414,9 @@ impl LibraryService {
         // Dedup: if content hash already exists, still append any new source facts
         {
             let hashes = self.content_hashes.lock().unwrap();
-            if hashes.contains(&content_hash.0) {
+            if hashes.contains(content_hash.as_str()) {
                 tracing::info!(
-                    hash = %content_hash.0,
+                    hash = %content_hash.as_str(),
                     path = %path.display(),
                     "Duplicate content hash, removing inbox file"
                 );
@@ -946,7 +1435,7 @@ impl LibraryService {
                         let tracks = self.tracks.lock().unwrap();
                         tracks
                             .iter()
-                            .find(|t| t.content_hash.0 == content_hash.0)
+                            .find(|t| t.content_hash.as_str() == content_hash.as_str())
                             .map(|t| t.source.is_none())
                             .unwrap_or(false)
                     };
@@ -959,7 +1448,7 @@ impl LibraryService {
                             .is_ok()
                         {
                             tracing::info!(
-                                hash = %content_hash.0,
+                                hash = %content_hash.as_str(),
                                 facts = new_facts.len(),
                                 "Appended source facts to existing track"
                             );
@@ -968,7 +1457,7 @@ impl LibraryService {
                             let mut tracks = self.tracks.lock().unwrap();
                             if let Some(track) = tracks
                                 .iter_mut()
-                                .find(|t| t.content_hash.0 == content_hash.0)
+                                .find(|t| t.content_hash.as_str() == content_hash.as_str())
                             {
                                 for (value, _) in &new_facts {
                                     if let MusicValue::Source(s) = value {
@@ -981,7 +1470,7 @@ impl LibraryService {
                             let mut fact_index = self.fact_index.lock().unwrap();
                             for (value, _) in &new_facts {
                                 fact_index
-                                    .entry(value.display_name().to_string())
+                                    .entry(FactType::new(value.display_name()))
                                     .or_default()
                                     .insert(value.to_string());
                             }
@@ -1003,12 +1492,22 @@ impl LibraryService {
         // Stage 4: Import to blob storage
         let indexed = extracted.import(&self.music_dir)?;
 
-        // Add provenance facts from source metadata
+        // Stage 5: Extract cover art from blob and store it
         let fact_source = music_facts::FactSource::new(
             "mdma-library",
             env!("CARGO_PKG_VERSION"),
             music_facts::FactOrigin::Unknown,
         );
+        let blob_path = self.music_dir.join(&indexed.blob_path);
+        let cover_art_path = self.extract_and_store_cover_art(&blob_path, &content_hash);
+        if let Some(ref rel_path) = cover_art_path {
+            facts.push((
+                MusicValue::CoverArtPath(rel_path.to_string_lossy().to_string()),
+                fact_source.clone(),
+            ));
+        }
+
+        // Add provenance facts from source metadata
         let source_facts = Self::source_facts(source, &fact_source);
         facts.extend(source_facts);
 
@@ -1031,20 +1530,24 @@ impl LibraryService {
             let mut key = None;
             let mut year = None;
             let mut source_str = None;
+            let mut track_number = None;
+            let mut disc_number = None;
 
             for (value, _source) in &facts {
                 match value {
-                    MusicValue::Title(t) => title = Some(t.0.clone()),
-                    MusicValue::Artist(a) => artist = Some(a.0.clone()),
-                    MusicValue::Album(a) => album = Some(a.0.clone()),
+                    MusicValue::Title(t) => title = Some(t.as_str().to_string()),
+                    MusicValue::Artist(a) => artist = Some(a.as_str().to_string()),
+                    MusicValue::Album(a) => album = Some(a.as_str().to_string()),
                     MusicValue::Label(l) => label = Some(l.clone()),
                     MusicValue::MainGenre(g) => genre = Some(g.clone()),
                     MusicValue::StyleDescriptor(s) => styles.push(s.clone()),
-                    MusicValue::DurationSeconds(d) => duration_seconds = Some(d.0),
+                    MusicValue::DurationSeconds(d) => duration_seconds = Some(d.value()),
                     MusicValue::Bpm(b) => bpm = Some(b.as_f32()),
                     MusicValue::Key(k) => key = Some(k.to_string()),
-                    MusicValue::Year(y) => year = Some(y.0),
+                    MusicValue::Year(y) => year = Some(y.value()),
                     MusicValue::Source(s) => source_str = Some(s.clone()),
+                    MusicValue::TrackNumber(n) => track_number = Some(n.value()),
+                    MusicValue::DiscNumber(n) => disc_number = Some(n.value()),
                     _ => {}
                 }
             }
@@ -1063,8 +1566,12 @@ impl LibraryService {
                 year,
                 source: source_str,
                 blob_path: indexed.blob_path,
+                cover_art_path: cover_art_path.clone(),
+                track_number,
+                disc_number,
                 last_started: None,
                 last_stopped: None,
+                added_at: None,
             });
         }
 
@@ -1073,7 +1580,7 @@ impl LibraryService {
             let mut fact_index = self.fact_index.lock().unwrap();
             for (value, _) in &facts {
                 fact_index
-                    .entry(value.display_name().to_string())
+                    .entry(FactType::new(value.display_name()))
                     .or_default()
                     .insert(value.to_string());
             }
@@ -1082,7 +1589,7 @@ impl LibraryService {
         // Update content hash set
         {
             let mut hashes = self.content_hashes.lock().unwrap();
-            hashes.insert(content_hash.0.clone());
+            hashes.insert(content_hash.as_str().to_owned());
         }
 
         // Update counters
@@ -1101,6 +1608,7 @@ mod tests {
     use music_facts::{
         ContentHash, FactOrigin, FactSource, MusicValue, StartReason, StopReason, Title,
     };
+    use pretty_assertions::assert_eq;
     use stainless_facts::{Fact, FactStreamWriter, Operation};
     use tempfile::NamedTempFile;
 
@@ -1144,7 +1652,7 @@ mod tests {
 
     #[test]
     fn load_tracks_aggregates_played_timestamp() {
-        let hash = ContentHash("sha256:aabbcc".to_string());
+        let hash = ContentHash::new("sha256:aabbcc");
         let ts = Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
 
         // TrackStarted now carries a StartReason; the fact timestamp is used for last_started
@@ -1175,7 +1683,7 @@ mod tests {
 
     #[test]
     fn load_tracks_aggregates_skipped_timestamp() {
-        let hash = ContentHash("sha256:ddeeff".to_string());
+        let hash = ContentHash::new("sha256:ddeeff");
         let ts = Utc.with_ymd_and_hms(2026, 2, 1, 8, 30, 0).unwrap();
 
         // TrackStopped now carries a StopReason; the fact timestamp is used for last_stopped
@@ -1201,7 +1709,7 @@ mod tests {
 
     #[test]
     fn load_tracks_keeps_most_recent_played() {
-        let hash = ContentHash("sha256:112233".to_string());
+        let hash = ContentHash::new("sha256:112233");
         let older = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
         let newer = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
 
@@ -1238,7 +1746,7 @@ mod tests {
     fn search_passes_last_started_to_evaluator() {
         use library_search::{query::DateQuery, TrackQuery};
 
-        let hash = ContentHash("sha256:445566".to_string());
+        let hash = ContentHash::new("sha256:445566");
         let ts = Utc.with_ymd_and_hms(2026, 1, 10, 0, 0, 0).unwrap();
 
         let temp = write_facts_file_with_timestamps(&[
@@ -1285,7 +1793,7 @@ mod tests {
     fn search_played_na_excludes_after_external_append() {
         use library_search::{query::DateQuery, TrackQuery};
 
-        let hash = ContentHash("sha256:778899aabbcc".to_string());
+        let hash = ContentHash::new("sha256:778899aabbcc");
 
         // Setup: one track with no TrackStarted fact
         let temp = write_facts_file(&[(
@@ -1341,7 +1849,7 @@ mod tests {
     #[test]
     fn blob_path_uses_extension_from_file_path_fact() {
         // For MP3 files, blob_path should use .mp3 extension, not hardcoded .flac
-        let hash = ContentHash("sha256:aabbccddeeff".to_string());
+        let hash = ContentHash::new("sha256:aabbccddeeff");
 
         let temp = write_facts_file(&[
             (hash.clone(), MusicValue::Title(Title::new("MP3 Track"))),
@@ -1372,7 +1880,7 @@ mod tests {
     fn backfill_writes_format_fact_for_tracks_without_one() {
         use music_facts::{ContentHash, MusicValue, Title};
 
-        let hash = ContentHash("sha256:backfill01".to_string());
+        let hash = ContentHash::new("sha256:backfill01");
 
         // Track has FilePath (so blob_path is set) but no Format fact
         let temp = write_facts_file(&[
@@ -1410,7 +1918,7 @@ mod tests {
     fn backfill_skips_tracks_that_already_have_format() {
         use music_facts::{ContentHash, MusicFormat, MusicValue, Title};
 
-        let hash = ContentHash("sha256:hasformat01".to_string());
+        let hash = ContentHash::new("sha256:hasformat01");
 
         let temp = write_facts_file(&[
             (hash.clone(), MusicValue::Title(Title::new("Has Format"))),
@@ -1469,7 +1977,9 @@ mod tests {
         let (service, _dir) = make_service_with_playlists_dir();
         let response = service.handle_request(LibraryRequest::PlaylistList);
         match response {
-            LibraryResponse::PlaylistNames(names) => assert!(names.is_empty()),
+            LibraryResponse::PlaylistNames(names) => {
+                assert!(names.is_empty())
+            }
             other => panic!("Expected PlaylistNames, got {:?}", other),
         }
     }
@@ -1672,9 +2182,101 @@ mod tests {
         }
     }
 
+    // =========================================================================
+    // Cursor persistence tests
+    // =========================================================================
+
+    #[test]
+    fn save_and_load_cursor_roundtrip() {
+        let metadata_dir = tempfile::tempdir().unwrap();
+        let cursor_path = metadata_dir.path().join("facts.cursor");
+
+        // Nothing saved yet — should return None
+        assert!(
+            LibraryService::load_saved_cursor(&cursor_path).is_none(),
+            "cursor should be None when file does not exist"
+        );
+
+        // Save a cursor
+        LibraryService::save_cursor(&cursor_path, "line:42");
+
+        // Should load back correctly
+        let loaded = LibraryService::load_saved_cursor(&cursor_path);
+        assert_eq!(
+            loaded.as_deref(),
+            Some("line:42"),
+            "loaded cursor should match saved cursor"
+        );
+    }
+
+    #[test]
+    fn save_cursor_overwrites_previous() {
+        let metadata_dir = tempfile::tempdir().unwrap();
+        let cursor_path = metadata_dir.path().join("facts.cursor");
+
+        LibraryService::save_cursor(&cursor_path, "line:10");
+        LibraryService::save_cursor(&cursor_path, "line:99");
+
+        let loaded = LibraryService::load_saved_cursor(&cursor_path);
+        assert_eq!(loaded.as_deref(), Some("line:99"));
+    }
+
+    #[test]
+    fn load_saved_cursor_returns_none_for_invalid_content() {
+        let metadata_dir = tempfile::tempdir().unwrap();
+        let cursor_path = metadata_dir.path().join("facts.cursor");
+
+        // Write garbage (whitespace only)
+        std::fs::write(&cursor_path, "   \n  ").unwrap();
+
+        let loaded = LibraryService::load_saved_cursor(&cursor_path);
+        assert!(
+            loaded.is_none(),
+            "empty/whitespace cursor file should return None"
+        );
+    }
+
+    #[test]
+    fn apply_stream_lines_updates_index() {
+        use music_facts::{ContentHash, FactOrigin, FactSource, MusicValue, Title};
+        use stainless_facts::{Fact, Operation};
+
+        let hash = ContentHash::new("sha256:streamtest01");
+        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let now = chrono::Utc::now();
+
+        let fact = Fact::new(
+            hash.clone(),
+            MusicValue::Title(Title::new("Stream Track")),
+            now,
+            source,
+            Operation::Assert,
+        );
+        let line = serde_json::to_string(&fact).unwrap();
+
+        // Start with empty service
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+        let service = LibraryService::new(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+            "ipc:///tmp/mdma-test-acid-nonexistent.sock",
+        )
+        .unwrap();
+
+        assert_eq!(service.tracks.lock().unwrap().len(), 0);
+
+        // Apply a stream chunk
+        service.apply_stream_lines(&[line]);
+
+        let tracks = service.tracks.lock().unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].title.as_deref(), Some("Stream Track"));
+    }
+
     #[test]
     fn blob_path_uses_flac_extension_from_file_path_fact() {
-        let hash = ContentHash("sha256:001122334455".to_string());
+        let hash = ContentHash::new("sha256:001122334455");
 
         let temp = write_facts_file(&[
             (hash.clone(), MusicValue::Title(Title::new("FLAC Track"))),
@@ -1695,20 +2297,131 @@ mod tests {
             path_str
         );
     }
+
+    // =========================================================================
+    // Album cover cache tests
+    // =========================================================================
+
+    #[test]
+    fn track_without_cover_art_falls_back_to_album_cover() {
+        // Track A has cover art; Track B is on the same album but has no cover art.
+        // After loading, to_track_info on Track B should return the album cover.
+        let hash_a = ContentHash::new("sha256:albumcovertrack01");
+        let hash_b = ContentHash::new("sha256:albumcovertrack02");
+        let album_name = "Shared Album";
+        let cover_path = "cover-art/abc123.jpg";
+
+        let temp = write_facts_file(&[
+            (
+                hash_a.clone(),
+                MusicValue::Title(Title::new("Track With Cover")),
+            ),
+            (
+                hash_a.clone(),
+                MusicValue::Album(music_facts::Album::new(album_name)),
+            ),
+            (
+                hash_a.clone(),
+                MusicValue::CoverArtPath(cover_path.to_string()),
+            ),
+            (
+                hash_b.clone(),
+                MusicValue::Title(Title::new("Track Without Cover")),
+            ),
+            (
+                hash_b.clone(),
+                MusicValue::Album(music_facts::Album::new(album_name)),
+            ),
+        ]);
+
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+        let facts_dest = metadata_dir.path().join("facts.jsonl");
+        std::fs::copy(temp.path(), &facts_dest).unwrap();
+
+        let service = LibraryService::new(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+            "ipc:///tmp/mdma-test-acid-nonexistent.sock",
+        )
+        .unwrap();
+
+        let tracks = service.tracks.lock().unwrap();
+        let track_b = tracks
+            .iter()
+            .find(|t| t.content_hash.as_str() == hash_b.as_str())
+            .expect("Track B should be indexed");
+        let track_b_info = service.to_track_info(track_b);
+        drop(tracks);
+
+        assert_eq!(
+            track_b_info.cover_art_path.as_deref(),
+            Some(cover_path),
+            "Track B should inherit album cover art from Track A on the same album"
+        );
+    }
+
+    #[test]
+    fn track_with_cover_art_is_not_overridden_by_album_cover() {
+        // Both tracks on the same album but have their own cover art — no fallback needed.
+        let hash_a = ContentHash::new("sha256:owncover01");
+        let hash_b = ContentHash::new("sha256:owncover02");
+        let album_name = "Another Album";
+        let cover_a = "cover-art/aaa.jpg";
+        let cover_b = "cover-art/bbb.jpg";
+
+        let temp = write_facts_file(&[
+            (hash_a.clone(), MusicValue::Title(Title::new("Track A"))),
+            (
+                hash_a.clone(),
+                MusicValue::Album(music_facts::Album::new(album_name)),
+            ),
+            (
+                hash_a.clone(),
+                MusicValue::CoverArtPath(cover_a.to_string()),
+            ),
+            (hash_b.clone(), MusicValue::Title(Title::new("Track B"))),
+            (
+                hash_b.clone(),
+                MusicValue::Album(music_facts::Album::new(album_name)),
+            ),
+            (
+                hash_b.clone(),
+                MusicValue::CoverArtPath(cover_b.to_string()),
+            ),
+        ]);
+
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+        let facts_dest = metadata_dir.path().join("facts.jsonl");
+        std::fs::copy(temp.path(), &facts_dest).unwrap();
+
+        let service = LibraryService::new(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+            "ipc:///tmp/mdma-test-acid-nonexistent.sock",
+        )
+        .unwrap();
+
+        let tracks = service.tracks.lock().unwrap();
+        let track_b = tracks
+            .iter()
+            .find(|t| t.content_hash.as_str() == hash_b.as_str())
+            .expect("Track B should be indexed");
+        let track_b_info = service.to_track_info(track_b);
+        drop(tracks);
+
+        assert_eq!(
+            track_b_info.cover_art_path.as_deref(),
+            Some(cover_b),
+            "Track B should keep its own cover art, not be replaced by Track A's"
+        );
+    }
 }
 
 /// Run the IPC server loop
-pub fn run_ipc_server(
-    service: Arc<LibraryService>,
-    address: &str,
-    tcp_address: Option<&str>,
-) -> Result<(), ServiceError> {
+pub fn run_ipc_server(service: Arc<LibraryService>, address: &str) -> Result<(), ServiceError> {
     let server = IpcServer::bind(address)?;
-
-    // Also listen on TCP if specified (for remote connections)
-    if let Some(tcp) = tcp_address {
-        server.listen_also(tcp)?;
-    }
 
     tracing::info!("IPC server running, waiting for requests...");
 
@@ -1731,4 +2444,112 @@ pub fn run_ipc_server(
             }
         }
     }
+}
+
+/// Spawn a background thread that subscribes to ACID fact notifications and
+/// applies incremental updates to the library index.
+///
+/// On receiving an `acid/facts` event, fetches new facts from the ACID stream
+/// starting at the saved cursor, applies them to the in-memory index, and
+/// updates the persisted cursor.
+///
+/// The thread retries indefinitely on dial or recv failure with a 5-second backoff.
+pub fn spawn_fact_subscriber(service: Arc<LibraryService>) {
+    let acid_events_socket = service.acid_events_socket.clone();
+    let acid_socket_addr = service.acid_socket.clone();
+
+    std::thread::spawn(move || {
+        use nng::options::Options;
+
+        let sub = match nng::Socket::new(nng::Protocol::Sub0) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to create Sub0 socket for ACID events");
+                return;
+            }
+        };
+
+        if let Err(e) = sub.set_opt::<nng::options::protocol::pubsub::Subscribe>(
+            TOPIC_ACID_FACTS_WRITTEN.as_bytes().to_vec(),
+        ) {
+            tracing::error!(error = %e, "Failed to subscribe to ACID facts topic");
+            return;
+        }
+
+        let cursor_path = service.metadata_dir.join("facts.cursor");
+
+        // Outer retry loop: reconnect after dial or recv failure.
+        loop {
+            if let Err(e) = sub.dial(&acid_events_socket) {
+                tracing::warn!(
+                    error = %e,
+                    socket = %acid_events_socket,
+                    "Failed to connect to ACID events socket, retrying in 5s"
+                );
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                continue;
+            }
+
+            tracing::info!(
+                socket = %acid_events_socket,
+                "Subscribed to ACID facts events"
+            );
+
+            // Create a dedicated ACID client for the subscriber thread
+            let acid_client = match AcidClient::connect(&acid_socket_addr) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Subscriber: failed to connect to ACID service, retrying in 5s"
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    continue;
+                }
+            };
+
+            // Inner recv loop: process events until a recv error forces reconnect.
+            loop {
+                let msg = match sub.recv() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ACID subscriber: recv error, reconnecting in 5s");
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        break;
+                    }
+                };
+
+                let event = match acid_event_from_topic_message(&msg) {
+                    Ok((_, e)) => e,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ACID subscriber: failed to parse event");
+                        continue;
+                    }
+                };
+
+                let AcidEvent::FactsWritten { cursor, .. } = event;
+                tracing::debug!(cursor = %cursor, "Received ACID facts-written notification");
+
+                // Fetch new facts starting from our current cursor
+                let current_cursor = service.cursor.lock().unwrap().clone();
+                match acid_client.read_stream(current_cursor, 10_000) {
+                    Ok(chunk) => {
+                        if !chunk.lines.is_empty() {
+                            tracing::debug!(
+                                count = chunk.lines.len(),
+                                "Applying incremental facts from ACID stream"
+                            );
+                            service.apply_stream_lines(&chunk.lines);
+                        }
+                        // Update and persist cursor
+                        *service.cursor.lock().unwrap() = Some(chunk.cursor.clone());
+                        LibraryService::save_cursor(&cursor_path, &chunk.cursor);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Subscriber: failed to read incremental stream");
+                    }
+                }
+            }
+        }
+    });
 }

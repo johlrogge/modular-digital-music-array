@@ -1,6 +1,6 @@
 # mdma-cli
 
-Version: **0.5.0**
+Version: **0.6.0**
 
 Command-line interface for MDMA. Talks to the Pi over the gateway — search the library, manage the queue, control playback, export tracks, and subscribe to live events. The binary is named `mdma`.
 
@@ -54,6 +54,10 @@ mdma search --duration ">5m"        # longer than 5 minutes
 mdma search --year "2019..2022"     # release year range
 mdma search --source bandcamp       # by ingest source
 mdma search --not --bpm "128..140"  # invert: tracks outside that BPM range
+mdma search --added "~"             # added today (~ = today)
+mdma search --added "^week"         # added this week (^ = start of period)
+mdma search --added "^month"        # added this month
+mdma search --added "-7"            # added in the last 7 days (relative offset)
 
 # Combine filters (implicit AND)
 mdma search --artist CBL --bpm "128+-4" --key "8A"
@@ -67,7 +71,20 @@ mdma search fact-values-for Source
 cat friday.plist | mdma search --artist CBL
 ```
 
-**String field modes:**
+****Date expression syntax** (used by `--added` and any date field):
+
+| Expression | Meaning |
+|------------|---------|
+| `~` | today |
+| `^week` / `^month` / `^year` | start of current week/month/year |
+| `$week` / `$month` / `$year` | end of current week/month/year |
+| `-7` | 7 days ago |
+| `+3` | 3 days from now |
+| `2025/3/1` | specific date (year/month/day) |
+
+Ranges use `..`: `^month..~` means "from start of month to today".
+
+String field modes:**
 
 | Input | Mode | Example |
 |-------|------|---------|
@@ -111,7 +128,7 @@ mdma queue list | mdma sort bpm -d
 cat friday.plist | mdma sort title -a | mdma sort artist -a > sorted.plist
 ```
 
-Sort fields: `bpm`, `title`, `artist`, `album`, `duration`
+Sort fields: `bpm`, `title`, `artist`, `album`, `duration`, `added`
 Directions: `-a` (ascending), `-d` (descending). Null values sort last.
 
 ### Export

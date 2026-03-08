@@ -2,8 +2,9 @@
 
 use audio_metadata::{discover_all_fields, extract_metadata, TrackMetadata};
 use music_facts::{
-    Album, Artist, BitDepth, Bitrate, Channels, ContentHash, DurationSeconds, FactOrigin,
-    FactSource, FileSizeBytes, Isrc, MusicFormat, MusicValue, SampleRate, Title, TrackNumber, Year,
+    Album, AlbumArtPresence, Artist, BitDepth, Bitrate, Channels, ContentHash, DiscNumber,
+    DurationSeconds, FactOrigin, FactSource, FileSizeBytes, Isrc, MusicFormat, MusicValue,
+    SampleRate, Title, TrackNumber, Year,
 };
 use music_primitives::{Bpm, Key};
 use std::collections::HashMap;
@@ -39,7 +40,10 @@ pub fn generate_facts(
     let music_format = MusicFormat::from(format);
     let origin = FactOrigin::infer(&metadata.file_path, &metadata.comment);
     let source = FactSource::new("mdma-library", env!("CARGO_PKG_VERSION"), origin);
-    facts.push((MusicValue::Format(music_format), source));
+    facts.push((MusicValue::Format(music_format), source.clone()));
+
+    // Record import timestamp
+    facts.push((MusicValue::AddedAt(chrono::Utc::now().to_rfc3339()), source));
 
     Ok(facts)
 }
@@ -92,13 +96,20 @@ fn generate_facts_from_metadata(
 
     if let Some(track_number) = metadata.track_number {
         facts.push((
-            MusicValue::TrackNumber(TrackNumber(track_number)),
+            MusicValue::TrackNumber(TrackNumber::new(track_number)),
+            source.clone(),
+        ));
+    }
+
+    if let Some(disc_number) = metadata.disc_number {
+        facts.push((
+            MusicValue::DiscNumber(DiscNumber::new(disc_number)),
             source.clone(),
         ));
     }
 
     if let Some(year) = metadata.year {
-        facts.push((MusicValue::Year(Year(year)), source.clone()));
+        facts.push((MusicValue::Year(Year::new(year)), source.clone()));
     }
 
     // DJ-specific metadata
@@ -128,7 +139,7 @@ fn generate_facts_from_metadata(
 
     // Catalog info (from all_fields for Beatport)
     if let Some(isrc) = find_field(all_fields, "Isrc") {
-        facts.push((MusicValue::Isrc(Isrc(isrc.clone())), source.clone()));
+        facts.push((MusicValue::Isrc(Isrc::new(isrc.clone())), source.clone()));
     }
 
     if let Some(label) = find_field(all_fields, "Label") {
@@ -139,7 +150,7 @@ fn generate_facts_from_metadata(
     if let Some(recording_date) = all_fields.get("VorbisComments.Unknown(\"recording_date\")") {
         if let Some(year_str) = recording_date.split('-').next() {
             if let Ok(year) = year_str.parse::<u32>() {
-                facts.push((MusicValue::RecordingYear(Year(year)), source.clone()));
+                facts.push((MusicValue::RecordingYear(Year::new(year)), source.clone()));
             }
         }
 
@@ -185,44 +196,51 @@ fn generate_facts_from_metadata(
 
     // Audio properties
     if let Some(bit_depth) = metadata.bit_depth {
-        facts.push((MusicValue::BitDepth(BitDepth(bit_depth)), source.clone()));
+        facts.push((
+            MusicValue::BitDepth(BitDepth::new(bit_depth)),
+            source.clone(),
+        ));
     }
 
     if let Some(channels) = metadata.channels {
         facts.push((
-            MusicValue::Channels(Channels(channels as u8)),
+            MusicValue::Channels(Channels::new(channels as u8)),
             source.clone(),
         ));
     }
 
     if let Some(sample_rate) = metadata.sample_rate {
         facts.push((
-            MusicValue::SampleRate(SampleRate(sample_rate)),
+            MusicValue::SampleRate(SampleRate::new(sample_rate)),
             source.clone(),
         ));
     }
 
     if let Some(duration) = metadata.duration {
         facts.push((
-            MusicValue::DurationSeconds(DurationSeconds(duration.as_secs() as u32)),
+            MusicValue::DurationSeconds(DurationSeconds::new(duration.as_secs() as u32)),
             source.clone(),
         ));
     }
 
     if let Some(bitrate) = metadata.bitrate {
-        facts.push((MusicValue::Bitrate(Bitrate(bitrate)), source.clone()));
+        facts.push((MusicValue::Bitrate(Bitrate::new(bitrate)), source.clone()));
     }
 
     // File properties
     if let Some(file_size) = metadata.file_size_bytes {
         facts.push((
-            MusicValue::FileSizeBytes(FileSizeBytes(file_size)),
+            MusicValue::FileSizeBytes(FileSizeBytes::new(file_size)),
             source.clone(),
         ));
     }
 
     facts.push((
-        MusicValue::HasAlbumArt(metadata.has_picture),
+        MusicValue::HasAlbumArt(if metadata.has_picture {
+            AlbumArtPresence::Present
+        } else {
+            AlbumArtPresence::Absent
+        }),
         source.clone(),
     ));
 
@@ -262,24 +280,21 @@ fn parse_genre(genre: &str) -> (String, Vec<String>, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
+    use rstest::rstest;
 
-    #[test]
-    fn format_fact_generated_for_audio_formats() {
-        // Verify AudioFormat → MusicFormat mapping via From impl
-        use crate::pipeline::AudioFormat;
+    #[rstest]
+    #[case(AudioFormat::Flac, "FLAC")]
+    #[case(AudioFormat::Mp3, "MP3")]
+    #[case(AudioFormat::Aiff, "AIFF")]
+    #[case(AudioFormat::Wav, "WAV")]
+    fn format_fact_generated_for_audio_formats(
+        #[case] audio_fmt: AudioFormat,
+        #[case] expected_display: &str,
+    ) {
         use music_facts::MusicFormat;
-
-        let mappings = vec![
-            (AudioFormat::Flac, "FLAC"),
-            (AudioFormat::Mp3, "MP3"),
-            (AudioFormat::Aiff, "AIFF"),
-            (AudioFormat::Wav, "WAV"),
-        ];
-
-        for (audio_fmt, expected_display) in mappings {
-            let music_fmt = MusicFormat::from(audio_fmt);
-            assert_eq!(music_fmt.to_string(), expected_display);
-        }
+        let music_fmt = MusicFormat::from(audio_fmt);
+        assert_eq!(music_fmt.to_string(), expected_display);
     }
 
     #[test]

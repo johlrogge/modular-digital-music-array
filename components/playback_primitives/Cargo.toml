@@ -10,7 +10,10 @@ license.workspace = true
 thiserror.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 chrono = { workspace = true }
+music-primitives = { path = "../music_primitives" }
 
 [dev-dependencies]
+pretty_assertions = { workspace = true }
 assert_matches.workspace = true
 serde_json = "1.0"
+rstest = { workspace = true }

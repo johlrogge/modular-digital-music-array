@@ -19,7 +19,7 @@ pub enum BpmError {
 ///
 /// Valid range: 20.0 to 999.99 BPM
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "u32", into = "u32")]
 pub struct Bpm(u32);
 
 impl Bpm {
@@ -98,6 +98,31 @@ impl Bpm {
     }
 }
 
+/// Minimum valid value in hundredths (20.0 BPM → 2000)
+const MIN_HUNDREDTHS: u32 = 2000;
+/// Maximum valid value in hundredths (999.99 BPM → 99999)
+const MAX_HUNDREDTHS: u32 = 99999;
+
+impl TryFrom<u32> for Bpm {
+    type Error = BpmError;
+
+    /// Convert from hundredths representation (the wire format).
+    ///
+    /// The value `12545` represents 125.45 BPM.
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        if !(MIN_HUNDREDTHS..=MAX_HUNDREDTHS).contains(&value) {
+            return Err(BpmError::OutOfRange(value as f32 / 100.0));
+        }
+        Ok(Bpm(value))
+    }
+}
+
+impl From<Bpm> for u32 {
+    fn from(b: Bpm) -> u32 {
+        b.0
+    }
+}
+
 impl fmt::Display for Bpm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:.2}", self.as_f32())
@@ -107,6 +132,8 @@ impl fmt::Display for Bpm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
+    use rstest::rstest;
 
     #[test]
     fn bpm_from_f32_stores_correctly() {
@@ -128,19 +155,19 @@ mod tests {
         assert_eq!(bpm.as_f32(), 125.46); // Rounded to 2 decimals
     }
 
-    #[test]
-    fn bpm_out_of_range_errors() {
-        assert!(Bpm::from_f32(10.0).is_err());
-        assert!(Bpm::from_f32(1000.0).is_err());
+    #[rstest]
+    #[case(10.0)]
+    #[case(1000.0)]
+    fn bpm_out_of_range_errors(#[case] bpm: f32) {
+        assert!(Bpm::from_f32(bpm).is_err());
     }
 
-    #[test]
-    fn bpm_display_formatting() {
-        let bpm = Bpm::from_f32(125.45).unwrap();
-        assert_eq!(format!("{}", bpm), "125.45");
-
-        let bpm = Bpm::from_u32(128).unwrap();
-        assert_eq!(format!("{}", bpm), "128.00");
+    #[rstest]
+    #[case(125.45, "125.45")]
+    #[case(128.0, "128.00")]
+    fn bpm_display_formatting(#[case] value: f32, #[case] expected: &str) {
+        let bpm = Bpm::from_f32(value).unwrap();
+        assert_eq!(format!("{}", bpm), expected);
     }
 
     #[test]
@@ -165,5 +192,15 @@ mod tests {
         let json = "12800";
         let bpm: Bpm = serde_json::from_str(json).unwrap();
         assert_eq!(bpm.as_f32(), 128.0);
+    }
+
+    #[test]
+    fn bpm_deserializing_out_of_range_returns_error() {
+        // 500 hundredths = 5.0 BPM, below minimum of 20.0 BPM
+        let result: Result<Bpm, _> = serde_json::from_str("500");
+        assert!(
+            result.is_err(),
+            "expected error for out-of-range BPM hundredths"
+        );
     }
 }

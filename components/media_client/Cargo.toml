@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 media-protocol = { path = "../media_protocol" }
+playback-primitives = { path = "../playback_primitives" }
 nng-transport = { path = "../nng_transport" }
 nng = { workspace = true }
 serde_json.workspace = true

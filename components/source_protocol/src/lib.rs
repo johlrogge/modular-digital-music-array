@@ -5,7 +5,33 @@
 //! service reads its own config files.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use thiserror::Error;
+
+// ============================================================================
+// DownloadId newtype
+// ============================================================================
+
+/// Identifies a specific download task.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DownloadId(String);
+
+impl DownloadId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for DownloadId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 // ============================================================================
 // Request Types
@@ -28,7 +54,7 @@ pub enum SourceRequest {
     ListDownloads,
 
     /// Cancel a specific download.
-    CancelDownload { id: String },
+    CancelDownload { id: DownloadId },
 
     /// Pause all downloads.
     PauseAll,
@@ -61,7 +87,7 @@ pub enum SourceResponse {
     Downloads(Vec<DownloadStatus>),
 
     /// Download cancelled.
-    Cancelled { id: String },
+    Cancelled { id: DownloadId },
 
     /// Downloads paused.
     Paused,
@@ -77,24 +103,38 @@ pub enum SourceResponse {
 // Data Types
 // ============================================================================
 
+/// Authentication state of a source service.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum AuthStatus {
+    Authenticated,
+    NotAuthenticated,
+}
+
+/// Queue state of a source service.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum QueueState {
+    Active,
+    Paused,
+}
+
 /// Service status information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceStatus {
     pub name: String,
     pub version: String,
-    pub authenticated: bool,
+    pub auth: AuthStatus,
     pub downloads_active: usize,
     pub downloads_queued: usize,
     pub downloads_completed: usize,
     pub downloads_failed: usize,
     pub uptime_seconds: u64,
-    pub paused: bool,
+    pub queue: QueueState,
 }
 
 /// Download status for a single item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadStatus {
-    pub id: String,
+    pub id: DownloadId,
     pub artist: String,
     pub title: String,
     pub state: DownloadState,
@@ -146,7 +186,7 @@ pub enum SourceError {
     SyncFailed { message: String },
 
     #[error("download failed: {id} - {message}")]
-    DownloadFailed { id: String, message: String },
+    DownloadFailed { id: DownloadId, message: String },
 
     #[error("rate limited, retry after {retry_after_secs} seconds")]
     RateLimited { retry_after_secs: u64 },
@@ -158,6 +198,7 @@ pub enum SourceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn request_ping_roundtrip() {
@@ -177,14 +218,25 @@ mod tests {
     }
 
     #[test]
+    fn download_id_newtype_roundtrip() {
+        let id = DownloadId::new("p123456");
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "\"p123456\"");
+        let parsed: DownloadId = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, id);
+        assert_eq!(parsed.as_str(), "p123456");
+        assert_eq!(parsed.to_string(), "p123456");
+    }
+
+    #[test]
     fn request_cancel_download_roundtrip() {
         let req = SourceRequest::CancelDownload {
-            id: "p123456".to_string(),
+            id: DownloadId::new("p123456"),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: SourceRequest = serde_json::from_str(&json).unwrap();
         match parsed {
-            SourceRequest::CancelDownload { id } => assert_eq!(id, "p123456"),
+            SourceRequest::CancelDownload { id } => assert_eq!(id, DownloadId::new("p123456")),
             _ => panic!("wrong variant"),
         }
     }
@@ -222,26 +274,26 @@ mod tests {
         let status = SourceStatus {
             name: "bandcamp".to_string(),
             version: "0.1.0".to_string(),
-            authenticated: true,
+            auth: AuthStatus::Authenticated,
             downloads_active: 1,
             downloads_queued: 5,
             downloads_completed: 10,
             downloads_failed: 2,
             uptime_seconds: 3600,
-            paused: false,
+            queue: QueueState::Active,
         };
 
         let json = serde_json::to_string(&status).unwrap();
         let parsed: SourceStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.name, "bandcamp");
         assert_eq!(parsed.version, "0.1.0");
-        assert!(parsed.authenticated);
+        assert_eq!(parsed.auth, AuthStatus::Authenticated);
     }
 
     #[test]
     fn download_status_roundtrip() {
         let status = DownloadStatus {
-            id: "p123456".to_string(),
+            id: DownloadId::new("p123456"),
             artist: "Test Artist".to_string(),
             title: "Test Album".to_string(),
             state: DownloadState::Downloading,
@@ -251,7 +303,7 @@ mod tests {
 
         let json = serde_json::to_string(&status).unwrap();
         let parsed: DownloadStatus = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.id, "p123456");
+        assert_eq!(parsed.id, DownloadId::new("p123456"));
         assert_eq!(parsed.state, DownloadState::Downloading);
     }
 

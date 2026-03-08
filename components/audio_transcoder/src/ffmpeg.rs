@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::{ExportFormat, TrackMetadata, TranscoderError};
+use crate::{ExportFormat, ExportMetadata, TranscoderError};
 
 /// Build the ffmpeg argument list for a transcode operation.
 ///
@@ -10,7 +10,7 @@ pub(crate) fn build_ffmpeg_args(
     source: &Path,
     output: &Path,
     format: &ExportFormat,
-    meta: &TrackMetadata,
+    meta: &ExportMetadata,
 ) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
 
@@ -84,7 +84,7 @@ pub(crate) fn run_ffmpeg(
     source: &Path,
     output: &Path,
     format: &ExportFormat,
-    meta: &TrackMetadata,
+    meta: &ExportMetadata,
 ) -> Result<(), TranscoderError> {
     let args = build_ffmpeg_args(source, output, format, meta);
 
@@ -110,6 +110,8 @@ pub(crate) fn run_ffmpeg(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
+    use rstest::rstest;
     use std::path::PathBuf;
 
     fn source() -> PathBuf {
@@ -128,8 +130,16 @@ mod tests {
         PathBuf::from("/output/track.flac")
     }
 
-    fn full_meta() -> TrackMetadata {
-        TrackMetadata {
+    fn output_for(format: &ExportFormat) -> PathBuf {
+        match format {
+            ExportFormat::Aiff => output_aiff(),
+            ExportFormat::Wav => output_wav(),
+            ExportFormat::Flac => output_flac(),
+        }
+    }
+
+    fn full_meta() -> ExportMetadata {
+        ExportMetadata {
             title: Some("Test Track".to_string()),
             artist: Some("Test Artist".to_string()),
             album: Some("Test Album".to_string()),
@@ -138,8 +148,8 @@ mod tests {
         }
     }
 
-    fn empty_meta() -> TrackMetadata {
-        TrackMetadata {
+    fn empty_meta() -> ExportMetadata {
+        ExportMetadata {
             title: None,
             artist: None,
             album: None,
@@ -265,72 +275,61 @@ mod tests {
 
     // ── common flags ──────────────────────────────────────────────────────────
 
-    #[test]
-    fn all_formats_include_map_metadata() {
-        for format in [ExportFormat::Aiff, ExportFormat::Wav, ExportFormat::Flac] {
-            let output = match format {
-                ExportFormat::Aiff => output_aiff(),
-                ExportFormat::Wav => output_wav(),
-                ExportFormat::Flac => output_flac(),
-            };
-            let args = build_ffmpeg_args(&source(), &output, &format, &empty_meta());
-            let pos = args
-                .iter()
-                .position(|a| a == "-map_metadata")
-                .unwrap_or_else(|| panic!("-map_metadata must be present for {:?}", format));
-            assert_eq!(args[pos + 1], "0");
-        }
+    #[rstest]
+    #[case(ExportFormat::Aiff)]
+    #[case(ExportFormat::Wav)]
+    #[case(ExportFormat::Flac)]
+    fn all_formats_include_map_metadata(#[case] format: ExportFormat) {
+        let output = output_for(&format);
+        let args = build_ffmpeg_args(&source(), &output, &format, &empty_meta());
+        let pos = args
+            .iter()
+            .position(|a| a == "-map_metadata")
+            .unwrap_or_else(|| panic!("-map_metadata must be present for {:?}", format));
+        assert_eq!(args[pos + 1], "0");
     }
 
-    #[test]
-    fn all_formats_include_loglevel_error() {
-        for format in [ExportFormat::Aiff, ExportFormat::Wav, ExportFormat::Flac] {
-            let output = match format {
-                ExportFormat::Aiff => output_aiff(),
-                ExportFormat::Wav => output_wav(),
-                ExportFormat::Flac => output_flac(),
-            };
-            let args = build_ffmpeg_args(&source(), &output, &format, &empty_meta());
-            let pos = args
-                .iter()
-                .position(|a| a == "-loglevel")
-                .unwrap_or_else(|| panic!("-loglevel must be present for {:?}", format));
-            assert_eq!(args[pos + 1], "error");
-        }
+    #[rstest]
+    #[case(ExportFormat::Aiff)]
+    #[case(ExportFormat::Wav)]
+    #[case(ExportFormat::Flac)]
+    fn all_formats_include_loglevel_error(#[case] format: ExportFormat) {
+        let output = output_for(&format);
+        let args = build_ffmpeg_args(&source(), &output, &format, &empty_meta());
+        let pos = args
+            .iter()
+            .position(|a| a == "-loglevel")
+            .unwrap_or_else(|| panic!("-loglevel must be present for {:?}", format));
+        assert_eq!(args[pos + 1], "error");
     }
 
-    #[test]
-    fn all_formats_include_overwrite_flag() {
-        for format in [ExportFormat::Aiff, ExportFormat::Wav, ExportFormat::Flac] {
-            let output = match format {
-                ExportFormat::Aiff => output_aiff(),
-                ExportFormat::Wav => output_wav(),
-                ExportFormat::Flac => output_flac(),
-            };
-            let args = build_ffmpeg_args(&source(), &output, &format, &empty_meta());
-            assert!(
-                args.iter().any(|a| a == "-y"),
-                "-y must be present for {:?}",
-                format
-            );
-        }
+    #[rstest]
+    #[case(ExportFormat::Aiff)]
+    #[case(ExportFormat::Wav)]
+    #[case(ExportFormat::Flac)]
+    fn all_formats_include_overwrite_flag(#[case] format: ExportFormat) {
+        let output = output_for(&format);
+        let args = build_ffmpeg_args(&source(), &output, &format, &empty_meta());
+        assert!(
+            args.iter().any(|a| a == "-y"),
+            "-y must be present for {:?}",
+            format
+        );
     }
 
-    #[test]
-    fn all_formats_end_with_output_path() {
-        for (format, output) in [
-            (ExportFormat::Aiff, output_aiff()),
-            (ExportFormat::Wav, output_wav()),
-            (ExportFormat::Flac, output_flac()),
-        ] {
-            let args = build_ffmpeg_args(&source(), &output, &format, &empty_meta());
-            assert_eq!(
-                args.last().expect("args must not be empty"),
-                output.to_str().unwrap(),
-                "last arg must be output path for {:?}",
-                format
-            );
-        }
+    #[rstest]
+    #[case(ExportFormat::Aiff)]
+    #[case(ExportFormat::Wav)]
+    #[case(ExportFormat::Flac)]
+    fn all_formats_end_with_output_path(#[case] format: ExportFormat) {
+        let output = output_for(&format);
+        let args = build_ffmpeg_args(&source(), &output, &format, &empty_meta());
+        assert_eq!(
+            args.last().expect("args must not be empty"),
+            output.to_str().unwrap(),
+            "last arg must be output path for {:?}",
+            format
+        );
     }
 
     // ── metadata injection ────────────────────────────────────────────────────
@@ -402,7 +401,7 @@ mod tests {
 
     #[test]
     fn partial_metadata_only_includes_present_fields() {
-        let meta = TrackMetadata {
+        let meta = ExportMetadata {
             title: Some("Only Title".to_string()),
             artist: None,
             album: None,
@@ -456,7 +455,7 @@ mod tests {
 
     #[test]
     fn bpm_is_formatted_with_two_decimal_places() {
-        let meta = TrackMetadata {
+        let meta = ExportMetadata {
             title: None,
             artist: None,
             album: None,

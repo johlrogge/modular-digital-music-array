@@ -17,6 +17,8 @@ playback-primitives = { path = "../playback_primitives" }
 tracing.workspace=true
 ringbuf = "0.3"
 rubato = "0.15"
+serde = { workspace = true }
+serde_json = { workspace = true }
 pipewire = "0.8"
 spa_sys = { package = "libspa-sys", version = "0.8" }
 
@@ -30,6 +32,7 @@ name = "track_loading"
 harness = false
 
 [dev-dependencies]
+pretty_assertions = { workspace = true }
 criterion = "0.5"
 tempfile = "3.8"
 hound = "3.5"

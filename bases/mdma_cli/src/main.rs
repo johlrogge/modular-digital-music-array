@@ -27,35 +27,28 @@ use std::path::Path;
 #[command(name = "mdma")]
 #[command(author, version, about = "MDMA CLI - Control the music services")]
 struct Cli {
-    /// Gateway address (routes all requests through a single endpoint)
-    #[arg(long, global = true, env = "MDMA_GATEWAY")]
-    gateway: Option<String>,
+    /// Node hostname (e.g. mdma-909.local). Derives gateway addresses automatically.
+    #[arg(long, env = "MDMA_NODE")]
+    node: Option<String>,
 
-    /// Library IPC socket address (direct mode, ignored when --gateway is set)
+    /// Library IPC socket address (direct mode, ignored when --node is set)
     #[arg(
         long,
         default_value = "ipc:///run/mdma/library.sock",
-        global = true,
         env = "MDMA_LIBRARY_SOCKET"
     )]
     socket: String,
 
-    /// Playback server socket address (direct mode, ignored when --gateway is set)
+    /// Playback server socket address (direct mode, ignored when --node is set)
     #[arg(
         long,
         default_value = "ipc:///run/mdma/playback.sock",
-        global = true,
         env = "MDMA_PLAYBACK_SOCKET"
     )]
     playback_socket: String,
 
     /// Sources directory for direct mode (contains *.sock files)
-    #[arg(
-        long,
-        default_value = "/run/mdma/sources",
-        global = true,
-        env = "MDMA_SOURCES_DIR"
-    )]
+    #[arg(long, default_value = "/run/mdma/sources", env = "MDMA_SOURCES_DIR")]
     sources_dir: String,
 
     #[command(subcommand)]
@@ -152,6 +145,10 @@ enum Commands {
         #[arg(long)]
         stopped: Option<String>,
 
+        /// Filter by date added to library. Same format as --started.
+        #[arg(long)]
+        added: Option<String>,
+
         /// Invert the search results — return tracks that do NOT match the filters.
         #[arg(long)]
         not: bool,
@@ -208,10 +205,6 @@ enum Commands {
 
     /// Subscribe to real-time events from the playback system
     Subscribe {
-        /// Event gateway address
-        #[arg(long, env = "MDMA_EVENT_GATEWAY")]
-        event_gateway: Option<String>,
-
         /// Topic filter (e.g. "playback/track_started"). Default: all playback events.
         #[arg(long)]
         topic: Option<String>,
@@ -270,6 +263,12 @@ enum Commands {
     Playlist {
         #[command(subcommand)]
         command: PlaylistCommands,
+    },
+
+    /// Library maintenance commands
+    Library {
+        #[command(subcommand)]
+        command: LibraryCommands,
     },
 
     /// Generate shell completions
@@ -395,6 +394,18 @@ enum PlaybackCommands {
 
     /// Show the current session ID (a session spans from first play to queue empty)
     Session,
+
+    /// List available audio output devices
+    Outputs,
+
+    /// Select an audio output device by name
+    SetOutput {
+        /// Device name as shown by `mdma playback outputs`
+        name: String,
+    },
+
+    /// Show the currently selected audio output
+    GetOutput,
 }
 
 #[derive(Subcommand, Debug)]
@@ -418,6 +429,9 @@ enum SortField {
     Artist,
     Album,
     Duration,
+    TrackNumber,
+    DiscNumber,
+    Added,
 }
 
 #[derive(Subcommand, Debug)]
@@ -530,6 +544,16 @@ enum PlaylistCommands {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum LibraryCommands {
+    /// Re-extract and store cover art for tracks that don't have a CoverArtPath fact yet.
+    ///
+    /// Reads embedded artwork from each track's audio blob and writes the image to
+    /// `/music/cover-art/<hash>.<ext>`. Only tracks without an existing CoverArtPath
+    /// fact are processed.
+    ReindexCovers,
+}
+
 // =============================================================================
 // Gateway Resolution Helpers
 // =============================================================================
@@ -546,37 +570,18 @@ fn event_gateway_from_node(node: &str) -> String {
     format!("tcp://{}:5556", node)
 }
 
-/// Resolve the effective gateway address using the precedence rules:
-///   1. `--gateway` flag / `MDMA_GATEWAY` env (already in `cli.gateway` via clap)
-///   2. Derived from `MDMA_NODE` env var: `tcp://<node>:5555`
-///   3. `None` — caller falls back to direct IPC
+/// Resolve the effective gateway address.
+/// Derived from `--node` / `MDMA_NODE` (already in `cli.node` via clap): `tcp://<node>:5555`
+/// Returns `None` when `--node` is not set — caller falls back to direct IPC.
 fn resolve_gateway(cli: &Cli) -> Option<String> {
-    if cli.gateway.is_some() {
-        return cli.gateway.clone();
-    }
-    std::env::var("MDMA_NODE")
-        .ok()
-        .map(|n| gateway_from_node(&n))
+    cli.node.as_deref().map(gateway_from_node)
 }
 
-/// Resolve the effective event gateway address using the precedence rules:
-///   1. Explicit `event_gateway` argument (from `--event-gateway` / `MDMA_EVENT_GATEWAY`)
-///   2. Derived from the resolved command gateway by replacing port with 5556
-///   3. Derived from `MDMA_NODE` env var: `tcp://<node>:5556`
-fn resolve_event_gateway(cli: &Cli, event_gateway: Option<&str>) -> Option<String> {
-    if let Some(eg) = event_gateway {
-        return Some(eg.to_string());
-    }
-    // Try command gateway (already resolved to include MDMA_NODE fallback)
-    if let Some(gw) = resolve_gateway(cli) {
-        if let Some(base) = gw.rsplit_once(':') {
-            return Some(format!("{}:5556", base.0));
-        }
-    }
-    // Direct MDMA_NODE fallback (covers the case where resolve_gateway returned None)
-    std::env::var("MDMA_NODE")
-        .ok()
-        .map(|n| event_gateway_from_node(&n))
+/// Resolve the effective event gateway address.
+/// Derived from `--node` / `MDMA_NODE`: `tcp://<node>:5556`
+/// Returns `None` when `--node` is not set.
+fn resolve_event_gateway(cli: &Cli) -> Option<String> {
+    cli.node.as_deref().map(event_gateway_from_node)
 }
 
 // =============================================================================
@@ -634,7 +639,10 @@ fn connect_source(cli: &Cli, name: &str) -> SourceClient {
 
 /// Get a short hash for display (8 chars after sha256: prefix)
 fn short_hash(hash: &ContentHash) -> &str {
-    let clean = hash.0.strip_prefix("sha256:").unwrap_or(&hash.0);
+    let clean = hash
+        .as_str()
+        .strip_prefix("sha256:")
+        .unwrap_or(hash.as_str());
     if clean.len() >= 8 {
         &clean[..8]
     } else {
@@ -899,7 +907,7 @@ fn handle_error(err: ClientError) -> ! {
         ClientError::Protocol(e) => {
             eprintln!("Error: {}", e);
         }
-        ClientError::Connection(e) => {
+        ClientError::Transport(nng_transport::NngClientError::Connection(e)) => {
             eprintln!("Connection failed: {}", e);
             eprintln!("Is mdma-library running?");
         }
@@ -911,7 +919,7 @@ fn handle_error(err: ClientError) -> ! {
 }
 
 /// Handle source errors uniformly
-fn handle_source_error(err: &str) -> ! {
+fn handle_source_error(err: &dyn std::fmt::Display) -> ! {
     eprintln!("Error: {}", err);
     std::process::exit(1);
 }
@@ -970,10 +978,10 @@ fn handle_list(client: &LibraryBackend, limit: Option<usize>) -> Result<()> {
 }
 
 fn handle_get(client: &LibraryBackend, hash: String) -> Result<()> {
-    let content_hash = ContentHash(hash);
+    let content_hash = ContentHash::new(hash);
     match client.get_track(&content_hash) {
         Ok(track) => {
-            println!("Track: {}", track.content_hash.0);
+            println!("Track: {}", track.content_hash.as_str());
             println!("{}", "=".repeat(65));
             if let Some(title) = track.title {
                 println!("Title:    {}", title);
@@ -1003,10 +1011,10 @@ fn handle_get(client: &LibraryBackend, hash: String) -> Result<()> {
 }
 
 fn handle_facts(client: &LibraryBackend, hash: String) -> Result<()> {
-    let content_hash = ContentHash(hash);
+    let content_hash = ContentHash::new(hash);
     match client.get_facts(&content_hash) {
         Ok((full_hash, facts)) => {
-            println!("Facts for: {}", full_hash.0);
+            println!("Facts for: {}", full_hash.as_str());
             println!("{}", "=".repeat(65));
             for (fact_type, fact_value) in facts {
                 println!("{:20} | {}", fact_type, fact_value);
@@ -1034,6 +1042,7 @@ fn build_track_query(
     source: Option<String>,
     started_str: Option<String>,
     stopped_str: Option<String>,
+    added_str: Option<String>,
 ) -> TrackQuery {
     let started = if let Some(s) = started_str {
         match parse_date_query(&s) {
@@ -1057,6 +1066,17 @@ fn build_track_query(
     } else {
         None
     };
+    let added = if let Some(s) = added_str {
+        match parse_date_query(&s) {
+            Ok(q) => Some(q),
+            Err(e) => {
+                eprintln!("Invalid --added value: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
     TrackQuery {
         any_text: any_text.map(|s| parse_string_query(&s)),
         artist: artist.map(|s| parse_string_query(&s)),
@@ -1072,6 +1092,7 @@ fn build_track_query(
         source,
         started,
         stopped,
+        added,
         not: false,
     }
 }
@@ -1102,9 +1123,9 @@ fn handle_search(client: &LibraryBackend, query: &TrackQuery, no_stdin: bool) ->
                     .filter(|t| {
                         let clean = t
                             .content_hash
-                            .0
+                            .as_str()
                             .strip_prefix("sha256:")
-                            .unwrap_or(&t.content_hash.0);
+                            .unwrap_or(t.content_hash.as_str());
                         filter.iter().any(|token| {
                             let token_clean =
                                 token.strip_prefix("sha256:").unwrap_or(token.as_str());
@@ -1187,11 +1208,13 @@ fn handle_inbox_delete(client: &LibraryBackend, filename: String) -> Result<()> 
 
     match client.delete_inbox_file(&path) {
         Ok(result) => {
-            if result.success {
-                println!("{}", result.message);
-            } else {
-                eprintln!("Failed: {}", result.message);
-                std::process::exit(1);
+            use mdma_client::IngestResult;
+            match result {
+                IngestResult::Success { message, .. } => println!("{}", message),
+                IngestResult::Failure { message } => {
+                    eprintln!("Failed: {}", message);
+                    std::process::exit(1);
+                }
             }
             Ok(())
         }
@@ -1212,15 +1235,19 @@ fn handle_inbox_ingest(client: &LibraryBackend, filename: String) -> Result<()> 
 
     match client.ingest_file(&path) {
         Ok(result) => {
-            if result.success {
-                if let Some(hash) = result.hash {
-                    println!("Success: {}", hash.0);
-                } else {
-                    println!("Success: {}", result.message);
+            use mdma_client::IngestResult;
+            match result {
+                IngestResult::Success { hash, message } => {
+                    if let Some(h) = hash {
+                        println!("Success: {}", h.as_str());
+                    } else {
+                        println!("Success: {}", message);
+                    }
                 }
-            } else {
-                eprintln!("Failed: {}", result.message);
-                std::process::exit(1);
+                IngestResult::Failure { message } => {
+                    eprintln!("Failed: {}", message);
+                    std::process::exit(1);
+                }
             }
             Ok(())
         }
@@ -1241,17 +1268,21 @@ fn handle_inbox_ingest_all(client: &LibraryBackend) -> Result<()> {
             let mut success_count = 0;
             let mut fail_count = 0;
 
+            use mdma_client::IngestResult;
             for item in results {
-                if item.result.success {
-                    success_count += 1;
-                    if let Some(hash) = item.result.hash {
-                        println!("  OK: {} -> {}", item.path.as_str(), short_hash(&hash));
-                    } else {
-                        println!("  OK: {}", item.path.as_str());
+                match item.result {
+                    IngestResult::Success { hash, .. } => {
+                        success_count += 1;
+                        if let Some(hash) = hash {
+                            println!("  OK: {} -> {}", item.path.as_str(), short_hash(&hash));
+                        } else {
+                            println!("  OK: {}", item.path.as_str());
+                        }
                     }
-                } else {
-                    fail_count += 1;
-                    println!("  FAIL: {} - {}", item.path.as_str(), item.result.message);
+                    IngestResult::Failure { message } => {
+                        fail_count += 1;
+                        println!("  FAIL: {} - {}", item.path.as_str(), message);
+                    }
                 }
             }
 
@@ -1355,7 +1386,7 @@ fn handle_playlist_list(client: &LibraryBackend) -> Result<()> {
 
         let hashes: Vec<ContentHash> = content
             .lines()
-            .filter_map(|line| parse_hash_from_line(line).map(ContentHash))
+            .filter_map(|line| parse_hash_from_line(line).map(ContentHash::new))
             .collect();
 
         let track_count = hashes.len();
@@ -1364,11 +1395,11 @@ fn handle_playlist_list(client: &LibraryBackend) -> Result<()> {
             .iter()
             .filter_map(|h| {
                 let track = client.get_track(h).ok()?;
-                track.duration.map(|d| d.0)
+                track.duration.map(|d| d.value())
             })
             .sum();
 
-        let duration = DurationSeconds(total_secs);
+        let duration = DurationSeconds::new(total_secs);
         println!(
             "{}  {}  [{}]",
             name.to_string().bold(),
@@ -1652,6 +1683,35 @@ fn handle_playlist_remove(client: &LibraryBackend, name: &str) -> Result<()> {
 }
 
 // =============================================================================
+// Library Maintenance Command Handlers
+// =============================================================================
+
+fn handle_library_reindex_covers(client: &LibraryBackend) -> Result<()> {
+    use library_ipc_client::{LibraryRequest, LibraryResponse};
+    let response = client.request(&LibraryRequest::ReindexCovers);
+    match response {
+        Ok(LibraryResponse::IngestResult(result)) => match result {
+            library_ipc_client::IngestResult::Success { message, .. } => {
+                println!("{}", message);
+            }
+            library_ipc_client::IngestResult::Failure { message } => {
+                eprintln!("Error: {}", message);
+                std::process::exit(1);
+            }
+        },
+        Ok(LibraryResponse::Error(e)) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("Unexpected response");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+// =============================================================================
 // Source Command Handlers
 // =============================================================================
 
@@ -1686,7 +1746,7 @@ fn handle_source_sync(client: &SourceClient, name: &str) -> Result<()> {
             Ok(())
         }
         Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
-        Ok(_) => handle_source_error("Unexpected response"),
+        Ok(_) => handle_source_error(&"Unexpected response"),
         Err(e) => handle_source_error(&e),
     }
 }
@@ -1698,7 +1758,11 @@ fn handle_source_status(client: &SourceClient, name: &str) -> Result<()> {
             println!("{}", "=".repeat(40));
             println!(
                 "Authenticated:     {}",
-                if status.authenticated { "yes" } else { "no" }
+                if status.auth == source_protocol::AuthStatus::Authenticated {
+                    "yes"
+                } else {
+                    "no"
+                }
             );
             println!("Downloads active:  {}", status.downloads_active);
             println!("Downloads queued:  {}", status.downloads_queued);
@@ -1707,12 +1771,16 @@ fn handle_source_status(client: &SourceClient, name: &str) -> Result<()> {
             println!("Uptime:            {} seconds", status.uptime_seconds);
             println!(
                 "Paused:            {}",
-                if status.paused { "yes" } else { "no" }
+                if status.queue == source_protocol::QueueState::Paused {
+                    "yes"
+                } else {
+                    "no"
+                }
             );
             Ok(())
         }
         Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
-        Ok(_) => handle_source_error("Unexpected response"),
+        Ok(_) => handle_source_error(&"Unexpected response"),
         Err(e) => handle_source_error(&e),
     }
 }
@@ -1754,19 +1822,24 @@ fn handle_source_downloads(client: &SourceClient, name: &str) -> Result<()> {
             Ok(())
         }
         Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
-        Ok(_) => handle_source_error("Unexpected response"),
+        Ok(_) => handle_source_error(&"Unexpected response"),
         Err(e) => handle_source_error(&e),
     }
 }
 
 fn handle_source_cancel(client: &SourceClient, name: &str, id: String) -> Result<()> {
-    match client.request(name, &SourceRequest::CancelDownload { id: id.clone() }) {
+    match client.request(
+        name,
+        &SourceRequest::CancelDownload {
+            id: source_protocol::DownloadId::new(id.clone()),
+        },
+    ) {
         Ok(SourceResponse::Cancelled { .. }) => {
             println!("Cancelled download: {}", id);
             Ok(())
         }
         Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
-        Ok(_) => handle_source_error("Unexpected response"),
+        Ok(_) => handle_source_error(&"Unexpected response"),
         Err(e) => handle_source_error(&e),
     }
 }
@@ -1778,7 +1851,7 @@ fn handle_source_pause(client: &SourceClient, name: &str) -> Result<()> {
             Ok(())
         }
         Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
-        Ok(_) => handle_source_error("Unexpected response"),
+        Ok(_) => handle_source_error(&"Unexpected response"),
         Err(e) => handle_source_error(&e),
     }
 }
@@ -1790,7 +1863,7 @@ fn handle_source_resume(client: &SourceClient, name: &str) -> Result<()> {
             Ok(())
         }
         Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
-        Ok(_) => handle_source_error("Unexpected response"),
+        Ok(_) => handle_source_error(&"Unexpected response"),
         Err(e) => handle_source_error(&e),
     }
 }
@@ -1834,7 +1907,7 @@ fn handle_playback_now(
             std::process::exit(1);
         }
         Some(h) => match library_client {
-            None => println!("{}", h.0),
+            None => println!("{}", h.as_str()),
             Some(lib) => {
                 let track = lib
                     .get_track(&h)
@@ -1931,7 +2004,7 @@ fn handle_queue_remove(
     let content_hashes: Vec<ContentHash> = hashes
         .into_iter()
         .filter_map(|hash| {
-            let content_hash = ContentHash(hash);
+            let content_hash = ContentHash::new(hash);
             match library_client.get_track(&content_hash) {
                 Ok(t) => Some(t.content_hash),
                 Err(e) => {
@@ -2091,7 +2164,7 @@ fn resolve_track(
     library_client: &LibraryBackend,
     hash: String,
 ) -> (ContentHash, std::path::PathBuf) {
-    let content_hash = ContentHash(hash);
+    let content_hash = ContentHash::new(hash);
     let track = match library_client.get_track(&content_hash) {
         Ok(t) => t,
         Err(e) => handle_error(e),
@@ -2141,7 +2214,7 @@ fn handle_sort(
     let mut tracks: Vec<TrackInfo> = hashes
         .into_iter()
         .filter_map(|hash| {
-            let content_hash = ContentHash(hash);
+            let content_hash = ContentHash::new(hash);
             match client.get_track(&content_hash) {
                 Ok(t) => Some(t),
                 Err(e) => {
@@ -2170,8 +2243,15 @@ fn handle_sort(
             direction_asc,
         ),
         SortField::Duration => compare_optional(
-            a.duration.map(|d| d.0),
-            b.duration.map(|d| d.0),
+            a.duration.map(|d| d.value()),
+            b.duration.map(|d| d.value()),
+            direction_asc,
+        ),
+        SortField::TrackNumber => compare_optional(a.track_number, b.track_number, direction_asc),
+        SortField::DiscNumber => compare_optional(a.disc_number, b.disc_number, direction_asc),
+        SortField::Added => compare_optional(
+            a.added.as_deref().map(str::to_string),
+            b.added.as_deref().map(str::to_string),
             direction_asc,
         ),
     });
@@ -2190,6 +2270,42 @@ fn handle_playback_session(media_client: &PlaybackBackend) -> Result<()> {
         }
         Err(e) => handle_playback_error(e),
     }
+    Ok(())
+}
+
+fn handle_playback_outputs(media_client: &PlaybackBackend) -> Result<()> {
+    let sinks = match media_client.list_audio_outputs() {
+        Ok(s) => s,
+        Err(e) => handle_playback_error(e),
+    };
+    println!("{:<40} {:<40} MAX RATE", "NAME", "DESCRIPTION");
+    println!("{}", "-".repeat(90));
+    for sink in &sinks {
+        println!(
+            "{:<40} {:<40} {}",
+            sink.name, sink.description, sink.max_sample_rate
+        );
+    }
+    Ok(())
+}
+
+fn handle_playback_set_output(media_client: &PlaybackBackend, name: &str) -> Result<()> {
+    let cfg = match media_client.set_audio_output(name.to_string()) {
+        Ok(c) => c,
+        Err(e) => handle_playback_error(e),
+    };
+    let device = cfg.device_name.as_deref().unwrap_or("auto");
+    println!("Audio output set to: {} ({}Hz)", device, cfg.sample_rate);
+    Ok(())
+}
+
+fn handle_playback_get_output(media_client: &PlaybackBackend) -> Result<()> {
+    let cfg = match media_client.get_audio_output() {
+        Ok(c) => c,
+        Err(e) => handle_playback_error(e),
+    };
+    let device = cfg.device_name.as_deref().unwrap_or("auto");
+    println!("{} ({}Hz)", device, cfg.sample_rate);
     Ok(())
 }
 
@@ -2291,7 +2407,7 @@ fn handle_subscribe(
 fn print_event_human(event: &PlaybackEvent, library: Option<&LibraryBackend>) {
     match event {
         PlaybackEvent::TrackStarted { hash } => {
-            let track_info = library.and_then(|lib| lib.get_track(&ContentHash(hash.clone())).ok());
+            let track_info = library.and_then(|lib| lib.get_track(hash).ok());
             match track_info {
                 Some(track) => {
                     let artist = track.artist.as_deref().unwrap_or("Unknown");
@@ -2310,21 +2426,41 @@ fn print_event_human(event: &PlaybackEvent, library: Option<&LibraryBackend>) {
                     );
                 }
                 None => {
-                    println!("{} {}", "▶ started".green().bold(), hash.bright_black());
+                    println!(
+                        "{} {}",
+                        "▶ started".green().bold(),
+                        hash.as_str().bright_black()
+                    );
                 }
             }
         }
         PlaybackEvent::TrackEnded { hash } => {
-            println!("{} {}", "■ ended".yellow().bold(), hash.bright_black());
+            println!(
+                "{} {}",
+                "■ ended".yellow().bold(),
+                hash.as_str().bright_black()
+            );
         }
         PlaybackEvent::TrackStopped { hash } => {
-            println!("{} {}", "⏹ stopped".red().bold(), hash.bright_black());
+            println!(
+                "{} {}",
+                "⏹ stopped".red().bold(),
+                hash.as_str().bright_black()
+            );
         }
         PlaybackEvent::TrackPaused { hash } => {
-            println!("{} {}", "⏸ paused".yellow().bold(), hash.bright_black());
+            println!(
+                "{} {}",
+                "⏸ paused".yellow().bold(),
+                hash.as_str().bright_black()
+            );
         }
         PlaybackEvent::TrackResumed { hash } => {
-            println!("{} {}", "▶ resumed".green().bold(), hash.bright_black());
+            println!(
+                "{} {}",
+                "▶ resumed".green().bold(),
+                hash.as_str().bright_black()
+            );
         }
         PlaybackEvent::QueueChanged { length } => {
             println!(
@@ -2340,11 +2476,15 @@ fn print_event_human(event: &PlaybackEvent, library: Option<&LibraryBackend>) {
             println!(
                 "{} {}",
                 "◉ session started".cyan().bold(),
-                id.bright_black()
+                id.to_string().bright_black()
             );
         }
         PlaybackEvent::SessionEnded { id } => {
-            println!("{} {}", "◎ session ended".cyan().bold(), id.bright_black());
+            println!(
+                "{} {}",
+                "◎ session ended".cyan().bold(),
+                id.to_string().bright_black()
+            );
         }
     }
 }
@@ -2415,13 +2555,11 @@ fn handle_upload(
         std::process::exit(1);
     }
 
-    // 2. Extract hostname from gateway (supports --gateway, MDMA_GATEWAY, and MDMA_NODE)
+    // 2. Extract hostname from gateway (derived from --node / MDMA_NODE)
     let gateway_resolved = match resolve_gateway(cli) {
         Some(gw) => gw,
         None => {
-            eprintln!(
-                "Upload requires --gateway, MDMA_GATEWAY, or MDMA_NODE to determine the Pi hostname"
-            );
+            eprintln!("Upload requires --node or MDMA_NODE to determine the Pi hostname");
             std::process::exit(1);
         }
     };
@@ -2492,17 +2630,16 @@ fn handle_upload(
         };
 
         match lib.ingest_file_with_source(&inbox_path, Some(IngestSource::Upload)) {
-            Ok(result) if result.success => {
-                let hash_str = result
-                    .hash
+            Ok(mdma_client::IngestResult::Success { hash, .. }) => {
+                let hash_str = hash
                     .as_ref()
                     .map(|h| short_hash(h).to_string())
                     .unwrap_or_default();
                 println!("  OK: {} -> {}", filename, hash_str);
                 success_count += 1;
             }
-            Ok(result) => {
-                eprintln!("  FAIL: {} - {}", filename, result.message);
+            Ok(mdma_client::IngestResult::Failure { message }) => {
+                eprintln!("  FAIL: {} - {}", filename, message);
                 fail_count += 1;
             }
             Err(e) => {
@@ -2644,6 +2781,7 @@ fn resolve_export_format(
 }
 
 fn handle_export(
+    cli: &Cli,
     library: &LibraryBackend,
     format: &Option<ExportFormat>,
     lossless_format: &Option<ExportFormat>,
@@ -2652,12 +2790,14 @@ fn handle_export(
 ) -> Result<()> {
     use std::io::{BufRead, Write};
 
-    // Resolve MDMA_NODE
-    let node = match std::env::var("MDMA_NODE") {
-        Ok(n) if !n.is_empty() => n,
+    // Resolve node from --node / MDMA_NODE (already in cli.node via clap)
+    let node = match cli.node.as_deref() {
+        Some(n) if !n.is_empty() => n.to_string(),
         _ => {
             eprintln!("MDMA_NODE is not set.");
-            eprintln!("Set MDMA_NODE to the hostname of your MDMA device (e.g. mdma-909.local)");
+            eprintln!(
+                "Set --node or MDMA_NODE to the hostname of your MDMA device (e.g. mdma-909.local)"
+            );
             std::process::exit(1);
         }
     };
@@ -2679,7 +2819,7 @@ fn handle_export(
     // Resolve each hash (short or full) to a full TrackInfo via the library
     let mut tracks: Vec<TrackInfo> = Vec::with_capacity(raw_hashes.len());
     for raw in &raw_hashes {
-        let ch = ContentHash(raw.clone());
+        let ch = ContentHash::new(raw.clone());
         match library.get_track(&ch) {
             Ok(t) => tracks.push(t),
             Err(e) => {
@@ -2712,7 +2852,7 @@ fn handle_export(
             lossy_format,
         );
         let format_param = resolved_format.format_param();
-        let full_hash = &track.content_hash.0;
+        let full_hash = track.content_hash.as_str();
         let url = export_url_from_node(&node, full_hash, format_param);
         eprint!("[{}/{}] Downloading {} ... ", idx + 1, total, full_hash);
         let _ = std::io::stderr().flush();
@@ -2722,7 +2862,7 @@ fn handle_export(
             Err(e) => {
                 eprintln!("FAILED ({})", e);
                 results.push(ExportResult {
-                    hash: full_hash.clone(),
+                    hash: full_hash.to_string(),
                     filename: String::new(),
                     bytes: 0,
                     success: false,
@@ -2736,7 +2876,7 @@ fn handle_export(
             let status = response.status();
             eprintln!("FAILED (HTTP {})", status);
             results.push(ExportResult {
-                hash: full_hash.clone(),
+                hash: full_hash.to_string(),
                 filename: String::new(),
                 bytes: 0,
                 success: false,
@@ -2771,7 +2911,7 @@ fn handle_export(
             if let Err(e) = std::fs::create_dir_all(parent) {
                 eprintln!("FAILED (mkdir: {})", e);
                 results.push(ExportResult {
-                    hash: full_hash.clone(),
+                    hash: full_hash.to_string(),
                     filename: dest.display().to_string(),
                     bytes: 0,
                     success: false,
@@ -2786,7 +2926,7 @@ fn handle_export(
             Err(e) => {
                 eprintln!("FAILED (read error: {})", e);
                 results.push(ExportResult {
-                    hash: full_hash.clone(),
+                    hash: full_hash.to_string(),
                     filename: dest.display().to_string(),
                     bytes: 0,
                     success: false,
@@ -2799,7 +2939,7 @@ fn handle_export(
         if let Err(e) = std::fs::write(&dest, &body) {
             eprintln!("FAILED (write error: {})", e);
             results.push(ExportResult {
-                hash: full_hash.clone(),
+                hash: full_hash.to_string(),
                 filename: dest.display().to_string(),
                 bytes: 0,
                 success: false,
@@ -2812,7 +2952,7 @@ fn handle_export(
         let display = dest.display().to_string();
         eprintln!("OK  {} ({} bytes)", display, bytes);
         results.push(ExportResult {
-            hash: full_hash.clone(),
+            hash: full_hash.to_string(),
             filename: display,
             bytes,
             success: true,
@@ -2889,6 +3029,9 @@ fn main() -> Result<()> {
                     }
                 }
                 PlaybackCommands::Session => handle_playback_session(&pb),
+                PlaybackCommands::Outputs => handle_playback_outputs(&pb),
+                PlaybackCommands::SetOutput { name } => handle_playback_set_output(&pb, name),
+                PlaybackCommands::GetOutput => handle_playback_get_output(&pb),
             }
         }
 
@@ -2979,6 +3122,7 @@ fn main() -> Result<()> {
             no_stdin,
             started,
             stopped,
+            added,
             not,
             subcommand,
         } => {
@@ -3005,6 +3149,7 @@ fn main() -> Result<()> {
                     source.clone(),
                     started.clone(),
                     stopped.clone(),
+                    added.clone(),
                 );
                 track_query.not = *not;
                 handle_search(&client, &track_query, *no_stdin)
@@ -3048,19 +3193,13 @@ fn main() -> Result<()> {
             let client = connect_library(&cli);
             handle_sort(&client, field.clone(), *ascending, *descending)
         }
-        Commands::Subscribe {
-            event_gateway,
-            topic,
-        } => {
-            // Resolve event gateway: --event-gateway / MDMA_EVENT_GATEWAY > derived from
-            // MDMA_GATEWAY > derived from MDMA_NODE (tcp://<node>:5556)
-            let addr = match resolve_event_gateway(&cli, event_gateway.as_deref()) {
+        Commands::Subscribe { topic } => {
+            // Resolve event gateway from --node / MDMA_NODE (tcp://<node>:5556)
+            let addr = match resolve_event_gateway(&cli) {
                 Some(a) => a,
                 None => {
-                    eprintln!("No event gateway specified.");
-                    eprintln!(
-                        "Set --event-gateway, MDMA_EVENT_GATEWAY, MDMA_GATEWAY, or MDMA_NODE"
-                    );
+                    eprintln!("No node specified.");
+                    eprintln!("Set --node or MDMA_NODE to the hostname of your MDMA device");
                     std::process::exit(1);
                 }
             };
@@ -3080,11 +3219,18 @@ fn main() -> Result<()> {
             output,
         } => {
             let lib = connect_library(&cli);
-            handle_export(&lib, format, lossless_format, lossy_format, output)
+            handle_export(&cli, &lib, format, lossless_format, lossy_format, output)
         }
         Commands::GenerateCompletions { shell } => {
             generate_completions(*shell, &mut std::io::stdout());
             Ok(())
+        }
+
+        Commands::Library { command } => {
+            let lib = connect_library(&cli);
+            match command {
+                LibraryCommands::ReindexCovers => handle_library_reindex_covers(&lib),
+            }
         }
     }
 }
@@ -3092,32 +3238,65 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn resolve_gateway_from_mdma_node() {
-        // MDMA_NODE set, no MDMA_GATEWAY → derive tcp://<node>:5555
+        // MDMA_NODE set, no MDMA_GATEWAY -> derive tcp://<node>:5555
         let result = gateway_from_node("some-pi.local");
         assert_eq!(result, "tcp://some-pi.local:5555");
     }
 
     #[test]
     fn resolve_event_gateway_from_mdma_node() {
-        // MDMA_NODE set → event gateway is tcp://<node>:5556
+        // MDMA_NODE set -> event gateway is tcp://<node>:5556
         let result = event_gateway_from_node("some-pi.local");
         assert_eq!(result, "tcp://some-pi.local:5556");
+    }
+
+    #[test]
+    fn resolve_gateway_uses_cli_node_field() {
+        // When cli.node is set, resolve_gateway derives tcp://<node>:5555
+        let cli = Cli {
+            node: Some("mdma-909.local".to_string()),
+            socket: "ipc:///run/mdma/library.sock".to_string(),
+            playback_socket: "ipc:///run/mdma/playback.sock".to_string(),
+            sources_dir: "/run/mdma/sources".to_string(),
+            command: Commands::Ping,
+        };
+        let result = resolve_gateway(&cli);
+        assert_eq!(result, Some("tcp://mdma-909.local:5555".to_string()));
+    }
+
+    #[test]
+    fn resolve_gateway_returns_none_when_node_unset() {
+        // When cli.node is None, resolve_gateway returns None
+        let cli = Cli {
+            node: None,
+            socket: "ipc:///run/mdma/library.sock".to_string(),
+            playback_socket: "ipc:///run/mdma/playback.sock".to_string(),
+            sources_dir: "/run/mdma/sources".to_string(),
+            command: Commands::Ping,
+        };
+        let result = resolve_gateway(&cli);
+        assert_eq!(result, None);
     }
 
     fn make_track(artist: &str, title: &str, duration_secs: u32) -> TrackInfo {
         use library_ipc_client::{ContentHash, DurationSeconds};
         TrackInfo {
-            content_hash: ContentHash("sha256:aa000001".to_string()),
+            content_hash: ContentHash::new("sha256:aa000001"),
             title: Some(title.to_string()),
             artist: Some(artist.to_string()),
             album: None,
-            duration: Some(DurationSeconds(duration_secs)),
+            duration: Some(DurationSeconds::new(duration_secs)),
             bpm: None,
             key: None,
             blob_path: None,
+            cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
         }
     }
 
@@ -3373,14 +3552,18 @@ mod tests {
     fn make_track_full(artist: &str, album: &str, title: &str, blob_path: &str) -> TrackInfo {
         use library_ipc_client::{ContentHash, DurationSeconds};
         TrackInfo {
-            content_hash: ContentHash("sha256:aa000001".to_string()),
+            content_hash: ContentHash::new("sha256:aa000001"),
             title: Some(title.to_string()),
             artist: Some(artist.to_string()),
             album: Some(album.to_string()),
-            duration: Some(DurationSeconds(300)),
+            duration: Some(DurationSeconds::new(300)),
             bpm: None,
             key: None,
             blob_path: Some(blob_path.to_string()),
+            cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
         }
     }
 
@@ -3417,14 +3600,18 @@ mod tests {
     fn export_dest_path_uses_fallbacks_for_missing_metadata() {
         use library_ipc_client::{ContentHash, DurationSeconds};
         let track = TrackInfo {
-            content_hash: ContentHash("sha256:deadbeef".to_string()),
+            content_hash: ContentHash::new("sha256:deadbeef"),
             title: None,
             artist: None,
             album: None,
-            duration: Some(DurationSeconds(120)),
+            duration: Some(DurationSeconds::new(120)),
             bpm: None,
             key: None,
             blob_path: Some("ab/abc123.flac".to_string()),
+            cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
         };
         let output = std::path::Path::new("/tmp/export");
         let path = export_dest_path(output, &track, "flac");

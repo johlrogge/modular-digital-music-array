@@ -5,8 +5,8 @@
 
 use crate::cache::DownloadCache;
 use crate::ipc::{
-    DownloadState, DownloadStatus, IpcServer, SourceError, SourceRequest, SourceResponse,
-    SourceStatus,
+    DownloadId, DownloadState, DownloadStatus, IpcServer, SourceError, SourceRequest,
+    SourceResponse, SourceStatus,
 };
 use bandcamp_api::{AudioFormat, BandcampClient, CollectionItem};
 use library_ipc_client::{InboxPath, IngestSource, LibraryClient};
@@ -190,13 +190,21 @@ impl BandcampService {
                 let status = SourceStatus {
                     name: "bandcamp".to_string(),
                     version: env!("CARGO_PKG_VERSION").to_string(),
-                    authenticated: self.cookies_loaded.load(Ordering::Relaxed),
+                    auth: if self.cookies_loaded.load(Ordering::Relaxed) {
+                        source_protocol::AuthStatus::Authenticated
+                    } else {
+                        source_protocol::AuthStatus::NotAuthenticated
+                    },
                     downloads_active: self.active_downloads.lock().len(),
                     downloads_queued: self.download_queue.lock().len(),
                     downloads_completed: self.downloads_completed.load(Ordering::Relaxed),
                     downloads_failed: self.downloads_failed.load(Ordering::Relaxed),
                     uptime_seconds: self.start_time.elapsed().as_secs(),
-                    paused: self.paused.load(Ordering::Relaxed),
+                    queue: if self.paused.load(Ordering::Relaxed) {
+                        source_protocol::QueueState::Paused
+                    } else {
+                        source_protocol::QueueState::Active
+                    },
                 };
                 SourceResponse::Status(status)
             }
@@ -209,7 +217,7 @@ impl BandcampService {
             }
 
             SourceRequest::CancelDownload { id } => {
-                self.cancel_download(&id);
+                self.cancel_download(id.as_str());
                 SourceResponse::Cancelled { id }
             }
 
@@ -348,7 +356,7 @@ impl BandcampService {
         // Add active downloads
         for (id, dl) in self.active_downloads.lock().iter() {
             downloads.push(DownloadStatus {
-                id: id.clone(),
+                id: DownloadId::new(id.clone()),
                 artist: dl.item.artist.to_string(),
                 title: dl.item.title.to_string(),
                 state: dl.state.to_protocol(&dl.error),
@@ -360,7 +368,7 @@ impl BandcampService {
         // Add queued downloads
         for dl in self.download_queue.lock().iter() {
             downloads.push(DownloadStatus {
-                id: dl.item.id.as_str().to_string(),
+                id: DownloadId::new(dl.item.id.as_str()),
                 artist: dl.item.artist.to_string(),
                 title: dl.item.title.to_string(),
                 state: DownloadState::Queued,
@@ -425,7 +433,6 @@ fn process_download_to_inbox(
 pub async fn run_async_ipc_server(
     service: Arc<BandcampService>,
     address: String,
-    tcp_address: Option<String>,
 ) -> Result<(), ServiceError> {
     // Create channel for requests from NNG thread to async runtime
     let (request_tx, mut request_rx) = mpsc::channel::<IpcMessage>(32);
@@ -433,8 +440,7 @@ pub async fn run_async_ipc_server(
     // Spawn the NNG server in a blocking task
     let nng_handle = {
         let address = address.clone();
-        let tcp_address = tcp_address.clone();
-        tokio::task::spawn_blocking(move || run_nng_bridge(address, tcp_address, request_tx))
+        tokio::task::spawn_blocking(move || run_nng_bridge(address, request_tx))
     };
 
     tracing::info!("Async IPC server running");
@@ -456,14 +462,9 @@ pub async fn run_async_ipc_server(
 /// NNG bridge - runs in a blocking thread, communicates via channels
 fn run_nng_bridge(
     address: String,
-    tcp_address: Option<String>,
     request_tx: mpsc::Sender<IpcMessage>,
 ) -> Result<(), ServiceError> {
     let server = IpcServer::bind(&address)?;
-
-    if let Some(tcp) = tcp_address {
-        server.listen_also(&tcp)?;
-    }
 
     tracing::info!(address = %address, "NNG server listening");
 
@@ -671,17 +672,22 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
                                         match lib_client
                                             .ingest_file_with_source(&inbox_path, Some(source))
                                         {
-                                            Ok(result) if result.success => {
+                                            Ok(library_ipc_client::IngestResult::Success {
+                                                hash,
+                                                ..
+                                            }) => {
                                                 tracing::info!(
                                                     file = %filename,
-                                                    hash = ?result.hash,
+                                                    hash = ?hash,
                                                     "Auto-ingested into library"
                                                 );
                                             }
-                                            Ok(result) => {
+                                            Ok(library_ipc_client::IngestResult::Failure {
+                                                message,
+                                            }) => {
                                                 tracing::warn!(
                                                     file = %filename,
-                                                    msg = %result.message,
+                                                    msg = %message,
                                                     "Library ingest returned failure"
                                                 );
                                             }

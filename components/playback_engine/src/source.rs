@@ -340,6 +340,7 @@ impl Drop for AudioSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
     use std::path::PathBuf;
 
     fn file_path(name: &str) -> PathBuf {
@@ -778,9 +779,9 @@ mod tests {
         );
     }
 
-    #[cfg(test)]
-    mod audio_source_position_tests {
+    mod audio_source_position {
         use super::*;
+        use pretty_assertions::assert_eq;
         use std::path::PathBuf;
 
         fn test_file_path(name: &str) -> PathBuf {
@@ -790,7 +791,7 @@ mod tests {
         }
 
         #[test]
-        fn test_initial_position() {
+        fn initial_position() {
             let source = AudioSource::new(test_file_path("short.flac")).unwrap();
             assert_eq!(
                 source.current_position.load(Ordering::Relaxed),
@@ -801,7 +802,7 @@ mod tests {
 
         #[test]
         #[ignore]
-        fn test_position_after_decode() {
+        fn position_after_decode() {
             let source = AudioSource::new(test_file_path("short.flac")).unwrap();
 
             // Decode one frame
@@ -823,7 +824,7 @@ mod tests {
         }
 
         #[test]
-        fn test_position_after_seek() {
+        fn position_after_seek() {
             let source = AudioSource::new(test_file_path("short.flac")).unwrap();
 
             // Seek to a specific position
@@ -840,7 +841,7 @@ mod tests {
 
         #[test]
         #[ignore]
-        fn test_decode_after_seek() {
+        fn decode_after_seek() {
             let source = AudioSource::new(test_file_path("short.flac")).unwrap();
 
             // Seek to a specific position
@@ -866,7 +867,7 @@ mod tests {
         }
 
         #[test]
-        fn test_position_at_eof() {
+        fn position_at_eof() {
             let source = AudioSource::new(test_file_path("short.flac")).unwrap();
 
             // Read until EOF

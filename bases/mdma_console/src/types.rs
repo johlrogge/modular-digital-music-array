@@ -91,38 +91,44 @@ impl std::fmt::Display for ServiceName {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
-    #[test]
-    fn package_name_valid() {
-        assert!(PackageName::new("mdma-library").is_ok());
-        assert!(PackageName::new("mdma-console").is_ok());
-        assert!(PackageName::new("beacon").is_ok());
+    #[rstest]
+    #[case("mdma-library")]
+    #[case("mdma-console")]
+    #[case("beacon")]
+    fn package_name_valid(#[case] name: &str) {
+        assert!(PackageName::new(name).is_ok());
     }
 
-    #[test]
-    fn package_name_rejects_non_mdma() {
-        assert!(PackageName::new("vim").is_err());
-        assert!(PackageName::new("nginx").is_err());
-        assert!(PackageName::new("some-package").is_err());
+    #[rstest]
+    #[case("vim")]
+    #[case("nginx")]
+    #[case("some-package")]
+    fn package_name_rejects_non_mdma(#[case] name: &str) {
+        assert!(PackageName::new(name).is_err());
     }
 
-    #[test]
-    fn package_name_rejects_injection() {
-        assert!(PackageName::new("mdma-library; rm -rf /").is_err());
-        assert!(PackageName::new("mdma-library$(whoami)").is_err());
-        assert!(PackageName::new("mdma-library`id`").is_err());
+    #[rstest]
+    #[case("mdma-library; rm -rf /")]
+    #[case("mdma-library$(whoami)")]
+    #[case("mdma-library`id`")]
+    fn package_name_rejects_injection(#[case] name: &str) {
+        assert!(PackageName::new(name).is_err());
     }
 
-    #[test]
-    fn service_name_valid() {
-        assert!(ServiceName::new("mdma-library").is_ok());
-        assert!(ServiceName::new("mdma-console").is_ok());
-        assert!(ServiceName::new("beacon").is_ok());
+    #[rstest]
+    #[case("mdma-library")]
+    #[case("mdma-console")]
+    #[case("beacon")]
+    fn service_name_valid(#[case] name: &str) {
+        assert!(ServiceName::new(name).is_ok());
     }
 
-    #[test]
-    fn service_name_rejects_non_mdma() {
-        assert!(ServiceName::new("sshd").is_err());
-        assert!(ServiceName::new("nginx").is_err());
+    #[rstest]
+    #[case("sshd")]
+    #[case("nginx")]
+    fn service_name_rejects_non_mdma(#[case] name: &str) {
+        assert!(ServiceName::new(name).is_err());
     }
 }

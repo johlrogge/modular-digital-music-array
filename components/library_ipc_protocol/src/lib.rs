@@ -11,7 +11,36 @@ pub use library_search::{
     CamelotLetter, DurationQuery, DurationUnit, KeyQuery, NumericQuery, StringQuery, TrackQuery,
 };
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use thiserror::Error;
+
+// ============================================================================
+// FactType Newtype
+// ============================================================================
+
+/// Typed fact name (e.g. "artist", "genre", "isrc").
+///
+/// Replaces bare `String` in request/response types to prevent accidental
+/// confusion between a fact type name and a fact value.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FactType(String);
+
+impl FactType {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for FactType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 // ============================================================================
 // Security Newtypes
@@ -219,7 +248,7 @@ pub enum LibraryRequest {
 
     /// Get all distinct values stored for a given fact type.
     /// Returns a sorted list usable for discovery (e.g. all genres, all labels).
-    GetFactValues { fact_type: String },
+    GetFactValues { fact_type: FactType },
 
     /// Get files currently in inbox queue.
     GetInboxQueue,
@@ -238,11 +267,11 @@ pub enum LibraryRequest {
     IngestAll,
 
     /// Check if any track has a fact matching the given type and value.
-    HasFact { fact_type: String, value: String },
+    HasFact { fact_type: FactType, value: String },
 
     /// Batch check: which of these values exist for a given fact type?
     HasFacts {
-        fact_type: String,
+        fact_type: FactType,
         values: Vec<String>,
     },
 
@@ -269,6 +298,9 @@ pub enum LibraryRequest {
         from: PlaylistName,
         to: PlaylistName,
     },
+
+    /// Re-extract cover art for tracks that don't have a CoverArtPath fact yet.
+    ReindexCovers,
 }
 
 // ============================================================================
@@ -314,14 +346,14 @@ pub enum LibraryResponse {
 
     /// Whether a single fact exists.
     FactExists {
-        fact_type: String,
+        fact_type: FactType,
         value: String,
         exists: bool,
     },
 
     /// Batch result: which values exist for a given fact type.
     FactsExist {
-        fact_type: String,
+        fact_type: FactType,
         existing: Vec<String>,
     },
 
@@ -351,6 +383,14 @@ pub struct TrackInfo {
     pub key: Option<Key>,
     /// Relative blob path (no absolute paths in protocol).
     pub blob_path: Option<String>,
+    /// Relative path to cover art image (e.g. "cover-art/<hash>.jpg"). No absolute paths.
+    pub cover_art_path: Option<String>,
+    /// Track number on album (from tags).
+    pub track_number: Option<u32>,
+    /// Disc number on a multi-disc release (from tags).
+    pub disc_number: Option<u32>,
+    /// ISO 8601 datetime when track was added to the library.
+    pub added: Option<String>,
 }
 
 /// Service status information.
@@ -365,10 +405,15 @@ pub struct ServiceStatus {
 
 /// Result of a single file ingestion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IngestResult {
-    pub hash: Option<ContentHash>,
-    pub success: bool,
-    pub message: String,
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum IngestResult {
+    Success {
+        hash: Option<ContentHash>,
+        message: String,
+    },
+    Failure {
+        message: String,
+    },
 }
 
 /// Result item for ingest-all operation.
@@ -381,12 +426,15 @@ pub struct IngestAllItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
+    use rstest::rstest;
 
-    #[test]
-    fn inbox_path_valid() {
-        assert!(InboxPath::new("track.flac").is_ok());
-        assert!(InboxPath::new("subdir/track.flac").is_ok());
-        assert!(InboxPath::new("a/b/c/track.flac").is_ok());
+    #[rstest]
+    #[case("track.flac")]
+    #[case("subdir/track.flac")]
+    #[case("a/b/c/track.flac")]
+    fn inbox_path_valid(#[case] path: &str) {
+        assert!(InboxPath::new(path).is_ok());
     }
 
     #[test]
@@ -402,14 +450,12 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn inbox_path_rejects_traversal() {
+    #[rstest]
+    #[case("../../../etc/passwd")]
+    #[case("foo/../bar")]
+    fn inbox_path_rejects_traversal(#[case] path: &str) {
         assert!(matches!(
-            InboxPath::new("../../../etc/passwd"),
-            Err(InboxPathError::PathTraversal)
-        ));
-        assert!(matches!(
-            InboxPath::new("foo/../bar"),
+            InboxPath::new(path),
             Err(InboxPathError::PathTraversal)
         ));
     }
@@ -439,11 +485,12 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn playlist_name_valid() {
-        assert!(PlaylistName::new("techno-set").is_ok());
-        assert!(PlaylistName::new("My_Playlist_2").is_ok());
-        assert!(PlaylistName::new("a").is_ok());
+    #[rstest]
+    #[case("techno-set")]
+    #[case("My_Playlist_2")]
+    #[case("a")]
+    fn playlist_name_valid(#[case] name: &str) {
+        assert!(PlaylistName::new(name).is_ok());
     }
 
     #[test]
@@ -454,12 +501,13 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn playlist_name_rejects_invalid_chars() {
-        assert!(PlaylistName::new("foo/bar").is_err());
-        assert!(PlaylistName::new("foo bar").is_err());
-        assert!(PlaylistName::new("../etc").is_err());
-        assert!(PlaylistName::new("name.plist").is_err());
+    #[rstest]
+    #[case("foo/bar")]
+    #[case("foo bar")]
+    #[case("../etc")]
+    #[case("name.plist")]
+    fn playlist_name_rejects_invalid_chars(#[case] name: &str) {
+        assert!(PlaylistName::new(name).is_err());
     }
 
     #[test]
@@ -492,21 +540,58 @@ mod tests {
     }
 
     #[test]
+    fn ingest_result_success_serialization() {
+        let hash = ContentHash::new("sha256:abc");
+        let result = IngestResult::Success {
+            hash: Some(hash.clone()),
+            message: "ingested".to_string(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: IngestResult = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, IngestResult::Success { .. }));
+        if let IngestResult::Success {
+            hash: h,
+            message: m,
+        } = decoded
+        {
+            assert_eq!(h, Some(hash));
+            assert_eq!(m, "ingested");
+        }
+    }
+
+    #[test]
+    fn ingest_result_failure_serialization() {
+        let result = IngestResult::Failure {
+            message: "something failed".to_string(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: IngestResult = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, IngestResult::Failure { .. }));
+        if let IngestResult::Failure { message } = decoded {
+            assert_eq!(message, "something failed");
+        }
+    }
+
+    #[test]
     fn track_info_roundtrip() {
         let track = TrackInfo {
-            content_hash: ContentHash("sha256:abc123".to_string()),
+            content_hash: ContentHash::new("sha256:abc123"),
             title: Some("Test Track".to_string()),
             artist: Some("Test Artist".to_string()),
             album: None,
-            duration: Some(DurationSeconds(180)),
+            duration: Some(DurationSeconds::new(180)),
             bpm: Some(Bpm::from_u32(128).unwrap()),
             key: None,
             blob_path: Some("ab/abc123.flac".to_string()),
+            cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
         };
 
         let json = serde_json::to_string(&track).unwrap();
         let parsed: TrackInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.title, track.title);
-        assert_eq!(parsed.content_hash.0, track.content_hash.0);
+        assert_eq!(parsed.content_hash.as_str(), track.content_hash.as_str());
     }
 }

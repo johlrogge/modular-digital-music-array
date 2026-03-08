@@ -1,10 +1,12 @@
 use clap::Parser;
 use color_eyre::Result;
-use gateway_protocol::{GatewayRequest, GatewayResponse};
+use gateway_protocol::{GatewayRequest, GatewayResponse, SourceName};
 use nng::options::Options;
+use serde::{de::DeserializeOwned, Serialize};
 use source_protocol::{SourceRequest, SourceResponse};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -41,6 +43,10 @@ struct Args {
     /// Local event source to subscribe to (Sub0)
     #[arg(long, default_value = "ipc:///run/mdma/events.sock")]
     event_source: String,
+
+    /// ACID event source to subscribe to (Sub0)
+    #[arg(long, default_value = "ipc:///run/mdma/acid-events.sock")]
+    acid_event_source: String,
 }
 
 /// Connect a Req0 socket to a backend with reconnect options.
@@ -71,6 +77,31 @@ fn forward_raw(backend: &nng::Socket, request_bytes: &[u8]) -> Result<Vec<u8>, S
     let response_msg = backend.recv().map_err(|e| format!("recv failed: {}", e))?;
 
     Ok(response_msg.as_slice().to_vec())
+}
+
+/// Serialize a request, forward it to a backend, and deserialize the typed response.
+///
+/// Returns `Ok(response)` on success, or `Err(GatewayResponse::Error { .. })` on any failure
+/// so callers can propagate an error envelope without extra boilerplate.
+fn forward_typed<Req, Resp>(
+    backend: &nng::Socket,
+    request: &Req,
+    service_name: &str,
+) -> Result<Resp, GatewayResponse>
+where
+    Req: Serialize,
+    Resp: DeserializeOwned,
+{
+    let request_bytes = serde_json::to_vec(request)
+        .expect("request serialization must not fail for well-formed protocol types");
+
+    let resp_bytes = forward_raw(backend, &request_bytes).map_err(|e| GatewayResponse::Error {
+        message: format!("{} service unreachable: {}", service_name, e),
+    })?;
+
+    serde_json::from_slice(&resp_bytes).map_err(|e| GatewayResponse::Error {
+        message: format!("{} response parse error: {}", service_name, e),
+    })
 }
 
 /// Get or create a cached connection to a source service.
@@ -120,6 +151,50 @@ fn list_sources(sources_dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Spawn a background thread that subscribes to an IPC Pub0 source and
+/// re-publishes every message on the shared TCP `event_pub` socket.
+///
+/// All topics are forwarded — the Pub0 wire format already contains the topic
+/// prefix so downstream TCP subscribers can filter by topic themselves.
+fn spawn_event_bridge(event_pub: Arc<nng::Socket>, source_addr: String) {
+    std::thread::spawn(move || {
+        let event_sub = match nng::Socket::new(nng::Protocol::Sub0) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, source = %source_addr, "Failed to create Sub0 socket for event bridge");
+                return;
+            }
+        };
+
+        // Subscribe to all topics (empty prefix = wildcard)
+        if let Err(e) = event_sub.set_opt::<nng::options::protocol::pubsub::Subscribe>(vec![]) {
+            tracing::error!(error = %e, "Failed to set subscription filter");
+            return;
+        }
+
+        if let Err(e) = event_sub.dial_async(&source_addr) {
+            tracing::error!(address = %source_addr, error = %e, "Failed to connect to event source");
+            return;
+        }
+
+        tracing::info!(address = %source_addr, "Event bridge connected to source");
+
+        loop {
+            match event_sub.recv() {
+                Ok(msg) => {
+                    if let Err((_, e)) = event_pub.send(nng::Message::from(msg.as_slice())) {
+                        tracing::warn!(error = %e, "Failed to re-publish event");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, source = %source_addr, "Event bridge recv error, retrying...");
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+    });
+}
+
 fn main() -> Result<()> {
     color_eyre::install()?;
 
@@ -162,46 +237,16 @@ fn main() -> Result<()> {
     tracing::info!(address = %args.acid_socket, "Connected to acid backend");
 
     // Event bridge: Sub0 (local) -> Pub0 (TCP)
-    let event_pub = nng::Socket::new(nng::Protocol::Pub0)?;
+    // A single Pub0 socket re-publishes events from all IPC sources to TCP subscribers.
+    let event_pub = Arc::new(nng::Socket::new(nng::Protocol::Pub0)?);
     event_pub.listen(&args.event_listen)?;
     tracing::info!(address = %args.event_listen, "Event publishing on TCP");
 
-    let event_source_addr = args.event_source.clone();
-    std::thread::spawn(move || {
-        let event_sub = match nng::Socket::new(nng::Protocol::Sub0) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to create Sub0 socket for event bridge");
-                return;
-            }
-        };
+    // Bridge playback events (playback/ topic)
+    spawn_event_bridge(Arc::clone(&event_pub), args.event_source.clone());
 
-        if let Err(e) = event_sub.set_opt::<nng::options::protocol::pubsub::Subscribe>(vec![]) {
-            tracing::error!(error = %e, "Failed to set subscription filter");
-            return;
-        }
-
-        if let Err(e) = event_sub.dial_async(&event_source_addr) {
-            tracing::error!(address = %event_source_addr, error = %e, "Failed to connect to event source");
-            return;
-        }
-
-        tracing::info!(address = %event_source_addr, "Event bridge connected to source");
-
-        loop {
-            match event_sub.recv() {
-                Ok(msg) => {
-                    if let Err((_, e)) = event_pub.send(nng::Message::from(msg.as_slice())) {
-                        tracing::warn!(error = %e, "Failed to re-publish event");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Event bridge recv error, retrying...");
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-            }
-        }
-    });
+    // Bridge ACID events (acid/ topic)
+    spawn_event_bridge(Arc::clone(&event_pub), args.acid_event_source.clone());
 
     // Source backend cache (connected on demand)
     let mut source_cache: HashMap<String, nng::Socket> = HashMap::new();
@@ -224,7 +269,8 @@ fn main() -> Result<()> {
                 let response = GatewayResponse::Error {
                     message: format!("Invalid request: {}", e),
                 };
-                let data = serde_json::to_vec(&response).unwrap();
+                let data = serde_json::to_vec(&response)
+                    .expect("GatewayResponse::Error serialization must not fail");
                 let _ = frontend.send(nng::Message::from(&data[..]));
                 continue;
             }
@@ -232,64 +278,32 @@ fn main() -> Result<()> {
 
         let response = match envelope {
             GatewayRequest::Library { request } => {
-                let request_bytes = serde_json::to_vec(&request).unwrap();
-                match forward_raw(&library_backend, &request_bytes) {
-                    Ok(resp_bytes) => match serde_json::from_slice(&resp_bytes) {
-                        Ok(resp) => GatewayResponse::Library { response: resp },
-                        Err(e) => GatewayResponse::Error {
-                            message: format!("library response parse error: {}", e),
-                        },
-                    },
-                    Err(e) => GatewayResponse::Error {
-                        message: format!("library service unreachable: {}", e),
-                    },
+                match forward_typed(&library_backend, &request, "library") {
+                    Ok(resp) => GatewayResponse::Library { response: resp },
+                    Err(e) => e,
                 }
             }
 
             GatewayRequest::Playback { request } => {
-                let request_bytes = serde_json::to_vec(&request).unwrap();
-                match forward_raw(&playback_backend, &request_bytes) {
-                    Ok(resp_bytes) => match serde_json::from_slice(&resp_bytes) {
-                        Ok(resp) => GatewayResponse::Playback { response: resp },
-                        Err(e) => GatewayResponse::Error {
-                            message: format!("playback response parse error: {}", e),
-                        },
-                    },
-                    Err(e) => GatewayResponse::Error {
-                        message: format!("playback service unreachable: {}", e),
-                    },
+                match forward_typed(&playback_backend, &request, "playback") {
+                    Ok(resp) => GatewayResponse::Playback { response: resp },
+                    Err(e) => e,
                 }
             }
 
             GatewayRequest::Source { name, request } => {
-                match get_or_connect_source(&args.sources_dir, &name, &mut source_cache) {
+                match get_or_connect_source(&args.sources_dir, name.as_str(), &mut source_cache) {
                     Ok(backend) => {
-                        let request_bytes = serde_json::to_vec(&request).unwrap();
-                        match forward_raw(backend, &request_bytes) {
-                            Ok(resp_bytes) => {
-                                match serde_json::from_slice::<SourceResponse>(&resp_bytes) {
-                                    Ok(resp) => GatewayResponse::Source {
-                                        name,
-                                        response: resp,
-                                    },
-                                    Err(e) => {
-                                        // Remove broken connection from cache
-                                        source_cache.remove(&name);
-                                        GatewayResponse::Error {
-                                            message: format!(
-                                                "source '{}' response parse error: {}",
-                                                name, e
-                                            ),
-                                        }
-                                    }
-                                }
-                            }
+                        let svc = format!("source '{}'", name);
+                        match forward_typed::<_, SourceResponse>(backend, &request, &svc) {
+                            Ok(resp) => GatewayResponse::Source {
+                                name,
+                                response: resp,
+                            },
                             Err(e) => {
-                                // Remove broken connection from cache
-                                source_cache.remove(&name);
-                                GatewayResponse::Error {
-                                    message: format!("source '{}' unreachable: {}", name, e),
-                                }
+                                // Remove broken connection from cache on any forwarding error
+                                source_cache.remove(name.as_str());
+                                e
                             }
                         }
                     }
@@ -298,30 +312,26 @@ fn main() -> Result<()> {
             }
 
             GatewayRequest::Acid { request } => {
-                let request_bytes = serde_json::to_vec(&request).unwrap();
-                match forward_raw(&acid_backend, &request_bytes) {
-                    Ok(resp_bytes) => match serde_json::from_slice(&resp_bytes) {
-                        Ok(resp) => GatewayResponse::Acid { response: resp },
-                        Err(e) => GatewayResponse::Error {
-                            message: format!("acid response parse error: {}", e),
-                        },
-                    },
-                    Err(e) => GatewayResponse::Error {
-                        message: format!("acid service unreachable: {}", e),
-                    },
+                match forward_typed(&acid_backend, &request, "acid") {
+                    Ok(resp) => GatewayResponse::Acid { response: resp },
+                    Err(e) => e,
                 }
             }
 
             GatewayRequest::ListSources => {
                 // Handle ListSources with optional liveness check
-                let mut source_names = list_sources(&args.sources_dir);
+                let raw_names = list_sources(&args.sources_dir);
+                let mut source_names: Vec<SourceName> =
+                    raw_names.into_iter().map(SourceName::new).collect();
 
                 // Try to ping each source to verify it's alive
                 source_names.retain(|name| {
-                    match get_or_connect_source(&args.sources_dir, name, &mut source_cache) {
+                    match get_or_connect_source(&args.sources_dir, name.as_str(), &mut source_cache)
+                    {
                         Ok(backend) => {
                             let ping = SourceRequest::Ping;
-                            let ping_bytes = serde_json::to_vec(&ping).unwrap();
+                            let ping_bytes = serde_json::to_vec(&ping)
+                                .expect("SourceRequest::Ping serialization must not fail");
                             forward_raw(backend, &ping_bytes).is_ok()
                         }
                         Err(_) => false,
@@ -334,7 +344,8 @@ fn main() -> Result<()> {
             }
         };
 
-        let data = serde_json::to_vec(&response).unwrap();
+        let data =
+            serde_json::to_vec(&response).expect("GatewayResponse serialization must not fail");
         if let Err((_, e)) = frontend.send(nng::Message::from(&data[..])) {
             tracing::error!(error = %e, "Failed to send response");
         }

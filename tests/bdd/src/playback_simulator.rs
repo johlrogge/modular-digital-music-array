@@ -47,10 +47,8 @@ fn run_simulator(address: &str, state: &Arc<Mutex<PlaybackState>>) {
         let cmd: Command = match serde_json::from_slice(&msg) {
             Ok(c) => c,
             Err(e) => {
-                let resp = Response {
-                    success: false,
-                    error_message: format!("Failed to parse command: {}", e),
-                    data: None,
+                let resp = Response::Err {
+                    message: format!("Failed to parse command: {}", e),
                 };
                 let _ = send_response(&socket, &resp);
                 continue;
@@ -82,9 +80,7 @@ fn handle_command(cmd: Command, state: &Arc<Mutex<PlaybackState>>) -> Response {
         }
         Command::QueueList => {
             let hashes: Vec<ContentHash> = s.queue.iter().map(|(h, _)| h.clone()).collect();
-            Response {
-                success: true,
-                error_message: String::new(),
+            Response::Ok {
                 data: Some(ResponseData::Queue(hashes)),
             }
         }
@@ -96,9 +92,7 @@ fn handle_command(cmd: Command, state: &Arc<Mutex<PlaybackState>>) -> Response {
             let before = s.queue.len();
             s.queue.retain(|(h, _)| !hashes.contains(h));
             let removed = before - s.queue.len();
-            Response {
-                success: true,
-                error_message: String::new(),
+            Response::Ok {
                 data: Some(ResponseData::Count(removed)),
             }
         }
@@ -111,10 +105,8 @@ fn handle_command(cmd: Command, state: &Arc<Mutex<PlaybackState>>) -> Response {
                 s.now_playing = Some(hash);
                 ok_response()
             } else {
-                Response {
-                    success: false,
-                    error_message: "Queue is empty".to_string(),
-                    data: None,
+                Response::Err {
+                    message: "Queue is empty".to_string(),
                 }
             }
         }
@@ -122,23 +114,15 @@ fn handle_command(cmd: Command, state: &Arc<Mutex<PlaybackState>>) -> Response {
             s.now_playing = None;
             ok_response()
         }
-        Command::NowPlaying => Response {
-            success: true,
-            error_message: String::new(),
+        Command::NowPlaying => Response::Ok {
             data: Some(ResponseData::NowPlaying(s.now_playing.clone())),
         },
-        _ => Response {
-            success: false,
-            error_message: format!("Unsupported command in simulator: {:?}", cmd),
-            data: None,
+        _ => Response::Err {
+            message: format!("Unsupported command in simulator: {:?}", cmd),
         },
     }
 }
 
 fn ok_response() -> Response {
-    Response {
-        success: true,
-        error_message: String::new(),
-        data: None,
-    }
+    Response::Ok { data: None }
 }

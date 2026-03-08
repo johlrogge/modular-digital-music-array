@@ -5,9 +5,18 @@ use thiserror::Error;
 
 /// Identifies a playback session — spans from the first track playing to the queue emptying.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SessionId(pub String);
+#[serde(transparent)]
+pub struct SessionId(String);
 
 impl SessionId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     /// Create a new session ID using the current UTC timestamp in RFC 3339 format.
     pub fn now() -> Self {
         Self(chrono::Utc::now().to_rfc3339())
@@ -20,16 +29,7 @@ impl Display for SessionId {
     }
 }
 
-/// Content hash of audio file — THE cross-service track identifier.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ContentHash(pub String);
-
-impl Display for ContentHash {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+pub use music_primitives::ContentHash;
 
 #[derive(Debug, Error)]
 pub enum PlaybackError {
@@ -47,6 +47,7 @@ pub trait Db {
 
 /// Volume level in dBFS (decibels full scale)
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "f32", into = "f32")]
 pub struct Volume(f32);
 
 impl Volume {
@@ -62,6 +63,20 @@ impl Volume {
         } else {
             Err(PlaybackError::ValueOutOfRange)
         }
+    }
+}
+
+impl TryFrom<f32> for Volume {
+    type Error = PlaybackError;
+
+    fn try_from(value: f32) -> Result<Self, Self::Error> {
+        Volume::new(value)
+    }
+}
+
+impl From<Volume> for f32 {
+    fn from(v: Volume) -> f32 {
+        v.0
     }
 }
 
@@ -105,8 +120,10 @@ impl Deck {
 mod tests {
     use super::*;
 
-    mod volume_tests {
+    mod volume {
         use super::*;
+        use pretty_assertions::assert_eq;
+        use rstest::rstest;
 
         #[test]
         fn unity_is_linear_one() {
@@ -118,27 +135,21 @@ mod tests {
             assert!(Volume::SILENT.to_linear() < 0.0001);
         }
 
-        #[test]
-        fn converts_common_values() {
-            let test_points: [(f32, f32); 3] = [
-                (0.0, 1.0),    // 0 dBFS = 1.0
-                (-6.0, 0.501), // -6 dBFS ≈ 0.501
-                (-20.0, 0.1),  // -20 dBFS = 0.1
-            ];
-
-            for (db, expected) in test_points {
-                let vol = Volume::new(db).unwrap();
-                let actual = vol.to_linear();
-
-                let tolerance = expected * 0.001; // 0.1% tolerance
-                assert!(
-                    (actual - expected).abs() <= tolerance,
-                    "For {}dBFS: expected {}, got {}",
-                    db,
-                    expected,
-                    actual
-                );
-            }
+        #[rstest]
+        #[case(0.0_f32, 1.0_f32)]
+        #[case(-6.0, 0.501)]
+        #[case(-20.0, 0.1)]
+        fn converts_common_values(#[case] db: f32, #[case] expected: f32) {
+            let vol = Volume::new(db).unwrap();
+            let actual = vol.to_linear();
+            let tolerance = expected * 0.001; // 0.1% tolerance
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "For {}dBFS: expected {}, got {}",
+                db,
+                expected,
+                actual
+            );
         }
 
         #[test]
@@ -150,16 +161,26 @@ mod tests {
         }
 
         #[test]
-        fn test_serialization() {
+        fn serialization() {
             let vol = Volume::new(-6.0).unwrap();
             let json = serde_json::to_string(&vol).unwrap();
             let decoded: Volume = serde_json::from_str(&json).unwrap();
             assert_eq!(vol, decoded);
         }
+
+        #[test]
+        fn deserializing_out_of_range_returns_error() {
+            let result: Result<Volume, _> = serde_json::from_str("10.0");
+            assert!(
+                result.is_err(),
+                "expected error for out-of-range dBFS value"
+            );
+        }
     }
 
-    mod channel_tests {
+    mod channel {
         use super::*;
+        use pretty_assertions::assert_eq;
 
         #[test]
         fn creates_channel_a() {
@@ -177,7 +198,7 @@ mod tests {
         }
 
         #[test]
-        fn test_serialization() {
+        fn serialization() {
             let channel = Deck::A;
             let json = serde_json::to_string(&channel).unwrap();
             let decoded: Deck = serde_json::from_str(&json).unwrap();

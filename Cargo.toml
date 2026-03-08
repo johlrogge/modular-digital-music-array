@@ -2,8 +2,8 @@
 [workspace]
 members = [
     # Components (bricks)
+    "components/date_expression",
     "components/bandcamp_api",
-    "components/clock",
     "components/audio_metadata",
     "components/library_ipc_client",
     "components/library_ipc_protocol",
@@ -53,7 +53,7 @@ default-members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 authors = ["MDMA Development Team"]
 repository = "https://github.com/your-org/mdma"
@@ -72,6 +72,8 @@ futures = "0.3"
 lofty = "0.18"
 nng = "1.0"
 parking_lot = "0.12"
+pretty_assertions = "1"
+proptest = "1"
 rstest = "0.26"
 serde_json = "1.0"
 serde = { version = "1", features = ["derive"] }

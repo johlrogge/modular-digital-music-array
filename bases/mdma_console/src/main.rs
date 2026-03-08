@@ -13,8 +13,8 @@ use clap::Parser;
 use color_eyre::Result;
 use futures::stream::Stream;
 use gateway_client::{Command, GatewayClient};
-use library_ipc_client::{ContentHash, LibraryClient, TrackInfo, TrackQuery};
-use media_protocol::{Deck, ResponseData};
+use library_ipc_client::{ContentHash, FactType, LibraryClient, TrackInfo, TrackQuery};
+use media_protocol::{AudioSinkInfo, Deck, ResponseData};
 use nng::options::Options;
 use source_protocol::{DownloadState, SourceRequest, SourceResponse};
 use std::convert::Infallible;
@@ -199,12 +199,12 @@ impl BandcampView {
         match response {
             Some(SourceResponse::Status(status)) => Self {
                 connected: true,
-                authenticated: status.authenticated,
+                authenticated: status.auth == source_protocol::AuthStatus::Authenticated,
                 downloads_active: status.downloads_active,
                 downloads_queued: status.downloads_queued,
                 downloads_completed: status.downloads_completed,
                 downloads_failed: status.downloads_failed,
-                paused: status.paused,
+                paused: status.queue == source_protocol::QueueState::Paused,
                 configured_username,
                 cookies_valid,
             },
@@ -466,13 +466,22 @@ async fn ingest_all(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
     match client.ingest_all() {
         Ok(results) => {
+            use library_ipc_client::IngestResult;
             let json_results: Vec<IngestResultJson> = results
                 .into_iter()
-                .map(|item| IngestResultJson {
-                    path: item.path.to_string(),
-                    success: item.result.success,
-                    message: item.result.message,
-                    hash: item.result.hash.map(|h| h.0),
+                .map(|item| match item.result {
+                    IngestResult::Success { hash, message } => IngestResultJson {
+                        path: item.path.to_string(),
+                        success: true,
+                        message,
+                        hash: hash.map(|h| h.as_str().to_owned()),
+                    },
+                    IngestResult::Failure { message } => IngestResultJson {
+                        path: item.path.to_string(),
+                        success: false,
+                        message,
+                        hash: None,
+                    },
                 })
                 .collect();
 
@@ -505,11 +514,12 @@ fn playback_success_or_error(
     client: &GatewayClient,
     command: &Command,
 ) -> axum::response::Response {
+    use gateway_client::Response;
     match client.playback_command(command) {
-        Ok(resp) if resp.success => Json(serde_json::json!({"success": true})).into_response(),
-        Ok(resp) => (
+        Ok(Response::Ok { .. }) => Json(serde_json::json!({"success": true})).into_response(),
+        Ok(Response::Err { message }) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": resp.error_message})),
+            Json(serde_json::json!({"error": message})),
         )
             .into_response(),
         Err(e) => (
@@ -559,12 +569,12 @@ async fn bandcamp_status(State(state): State<Arc<AppState>>) -> impl IntoRespons
             match client.source_request(&state.source_name, &SourceRequest::GetStatus) {
                 Ok(SourceResponse::Status(status)) => Json(BandcampView {
                     connected: true,
-                    authenticated: status.authenticated,
+                    authenticated: status.auth == source_protocol::AuthStatus::Authenticated,
                     downloads_active: status.downloads_active,
                     downloads_queued: status.downloads_queued,
                     downloads_completed: status.downloads_completed,
                     downloads_failed: status.downloads_failed,
-                    paused: status.paused,
+                    paused: status.queue == source_protocol::QueueState::Paused,
                     configured_username,
                     cookies_valid,
                 })
@@ -648,7 +658,7 @@ async fn bandcamp_downloads(State(state): State<Arc<AppState>>) -> impl IntoResp
                         _ => None,
                     };
                     DownloadJson {
-                        id: d.id,
+                        id: d.id.to_string(),
                         artist: d.artist,
                         title: d.title,
                         state: d.state.to_string(),
@@ -815,6 +825,11 @@ async fn bandcamp_configure(
 // Player Types
 // =============================================================================
 
+#[derive(serde::Deserialize)]
+struct SetAudioOutputRequest {
+    device_name: String,
+}
+
 #[derive(serde::Serialize)]
 struct TrackInfoJson {
     content_hash: String,
@@ -824,18 +839,22 @@ struct TrackInfoJson {
     duration: Option<u32>,
     bpm: Option<f32>,
     key: Option<String>,
+    disc_number: Option<u32>,
+    added: Option<String>,
 }
 
 impl TrackInfoJson {
     fn from_track_info(t: &TrackInfo) -> Self {
         Self {
-            content_hash: t.content_hash.0.clone(),
+            content_hash: t.content_hash.as_str().to_owned(),
             title: t.title.clone(),
             artist: t.artist.clone(),
             album: t.album.clone(),
-            duration: t.duration.map(|d| d.0),
+            duration: t.duration.map(|d| d.value()),
             bpm: t.bpm.map(|b| b.as_f32()),
             key: t.key.map(|k| k.to_string()),
+            disc_number: t.disc_number,
+            added: t.added.clone(),
         }
     }
 }
@@ -850,8 +869,9 @@ async fn player_session(State(state): State<Arc<AppState>>) -> impl IntoResponse
         Err(e) => return e,
     };
 
+    use gateway_client::Response;
     match client.playback_command(&Command::GetSession) {
-        Ok(resp) => match resp.data {
+        Ok(Response::Ok { data }) => match data {
             Some(media_protocol::ResponseData::Session(Some(id))) => {
                 Json(serde_json::json!({"session": id})).into_response()
             }
@@ -860,6 +880,11 @@ async fn player_session(State(state): State<Arc<AppState>>) -> impl IntoResponse
             }
             _ => Json(serde_json::json!({"session": null})).into_response(),
         },
+        Ok(Response::Err { message }) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": message})),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -874,8 +899,9 @@ async fn player_now_playing(State(state): State<Arc<AppState>>) -> impl IntoResp
         Err(e) => return e,
     };
 
+    use gateway_client::Response;
     match client.playback_command(&Command::NowPlaying) {
-        Ok(resp) => match resp.data {
+        Ok(Response::Ok { data }) => match data {
             Some(ResponseData::NowPlaying(Some(hash))) => {
                 let track = state
                     .library_client()
@@ -888,7 +914,7 @@ async fn player_now_playing(State(state): State<Arc<AppState>>) -> impl IntoResp
                     .into_response(),
                     None => Json(serde_json::json!({
                         "playing": true,
-                        "track": { "content_hash": hash.0 }
+                        "track": { "content_hash": hash.as_str() }
                     }))
                     .into_response(),
                 }
@@ -898,6 +924,7 @@ async fn player_now_playing(State(state): State<Arc<AppState>>) -> impl IntoResp
             }
             _ => Json(serde_json::json!({"playing": false})).into_response(),
         },
+        Ok(Response::Err { .. }) => Json(serde_json::json!({"playing": false})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -912,8 +939,9 @@ async fn player_queue(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         Err(e) => return e,
     };
 
+    use gateway_client::Response;
     match client.playback_command(&Command::QueueList) {
-        Ok(resp) => match resp.data {
+        Ok(Response::Ok { data }) => match data {
             Some(ResponseData::Queue(hashes)) => {
                 let tracks: Vec<serde_json::Value> = hashes
                     .iter()
@@ -923,8 +951,8 @@ async fn player_queue(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                             .and_then(|lib| lib.get_track(hash).ok());
                         match track {
                             Some(t) => serde_json::to_value(TrackInfoJson::from_track_info(&t))
-                                .unwrap_or(serde_json::json!({"content_hash": hash.0})),
-                            None => serde_json::json!({"content_hash": hash.0}),
+                                .unwrap_or(serde_json::json!({"content_hash": hash.as_str()})),
+                            None => serde_json::json!({"content_hash": hash.as_str()}),
                         }
                     })
                     .collect();
@@ -932,6 +960,7 @@ async fn player_queue(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             }
             _ => Json(serde_json::json!([])).into_response(),
         },
+        Ok(Response::Err { .. }) => Json(serde_json::json!([])).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -949,7 +978,7 @@ async fn player_queue_append(
     State(state): State<Arc<AppState>>,
     Json(req): Json<QueueAppendRequest>,
 ) -> impl IntoResponse {
-    let hash = ContentHash(req.hash);
+    let hash = ContentHash::new(req.hash);
 
     // Resolve the blob path via library
     let lib_client = match state.library_client() {
@@ -1004,7 +1033,7 @@ async fn player_queue_remove(
     State(state): State<Arc<AppState>>,
     Json(req): Json<QueueRemoveRequest>,
 ) -> impl IntoResponse {
-    let hashes: Vec<ContentHash> = req.hashes.into_iter().map(ContentHash).collect();
+    let hashes: Vec<ContentHash> = req.hashes.into_iter().map(ContentHash::new).collect();
 
     let client = match require_gateway(&state) {
         Ok(c) => c,
@@ -1069,6 +1098,77 @@ async fn player_resume(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     playback_success_or_error(&client, &Command::Resume { deck: Deck::A })
 }
 
+async fn player_audio_outputs(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let client = match require_gateway(&state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+
+    use gateway_client::Response;
+    match client.playback_command(&Command::ListAudioOutputs) {
+        Ok(Response::Ok { data }) => match data {
+            Some(ResponseData::AudioOutputs(sinks)) => Json(sinks).into_response(),
+            _ => Json(Vec::<AudioSinkInfo>::new()).into_response(),
+        },
+        Ok(Response::Err { message }) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": message})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn player_audio_output(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let client = match require_gateway(&state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+
+    use gateway_client::Response;
+    match client.playback_command(&Command::GetAudioOutput) {
+        Ok(Response::Ok { data }) => match data {
+            Some(ResponseData::AudioOutput(config)) => Json(config).into_response(),
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Unexpected response"})),
+            )
+                .into_response(),
+        },
+        Ok(Response::Err { message }) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": message})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn player_set_audio_output(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SetAudioOutputRequest>,
+) -> impl IntoResponse {
+    let client = match require_gateway(&state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+
+    playback_success_or_error(
+        &client,
+        &Command::SetAudioOutput {
+            device_name: req.device_name,
+        },
+    )
+}
+
 async fn player_events(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -1087,6 +1187,142 @@ async fn player_events(
         }
     };
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+// =============================================================================
+// Library Browse Handlers (by artist / album)
+// =============================================================================
+
+/// Shared helper: fetch all values for a fact type and return them sorted case-insensitively.
+fn library_fact_values(state: &AppState, fact_type: &str) -> axum::response::Response {
+    use gateway_client::{LibraryRequest, LibraryResponse};
+    let client = match require_gateway(state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    match client.library_request(&LibraryRequest::GetFactValues {
+        fact_type: FactType::new(fact_type),
+    }) {
+        Ok(LibraryResponse::FactValues(mut values)) => {
+            values.sort_by_key(|a| a.to_lowercase());
+            Json(values).into_response()
+        }
+        Ok(LibraryResponse::Error(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Unexpected library response"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// Shared helper: search tracks by a pre-built query and return them as JSON.
+fn library_search_tracks(state: &AppState, query: TrackQuery) -> axum::response::Response {
+    use gateway_client::{LibraryRequest, LibraryResponse};
+    let client = match require_gateway(state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    match client.library_request(&LibraryRequest::Search { query }) {
+        Ok(LibraryResponse::SearchResults(tracks)) => Json(
+            tracks
+                .iter()
+                .map(TrackInfoJson::from_track_info)
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Ok(LibraryResponse::Error(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Unexpected library response"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn library_artists_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
+    library_fact_values(&state, "Artist")
+}
+
+async fn library_albums_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
+    library_fact_values(&state, "Album")
+}
+
+async fn library_artist_tracks_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    let query = TrackQuery {
+        artist: Some(library_search::parse_string_query(&name)),
+        ..Default::default()
+    };
+    library_search_tracks(&state, query)
+}
+
+async fn library_album_tracks_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    use gateway_client::{LibraryRequest, LibraryResponse};
+    let client = match require_gateway(&state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let query = TrackQuery {
+        album: Some(library_search::parse_string_query(&name)),
+        ..Default::default()
+    };
+    match client.library_request(&LibraryRequest::Search { query }) {
+        Ok(LibraryResponse::SearchResults(mut tracks)) => {
+            tracks.sort_by(|a, b| {
+                let disc_a = a.disc_number.unwrap_or(1);
+                let disc_b = b.disc_number.unwrap_or(1);
+                disc_a
+                    .cmp(&disc_b)
+                    .then_with(|| a.track_number.cmp(&b.track_number))
+            });
+            Json(
+                tracks
+                    .iter()
+                    .map(TrackInfoJson::from_track_info)
+                    .collect::<Vec<_>>(),
+            )
+            .into_response()
+        }
+        Ok(LibraryResponse::Error(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Unexpected library response"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 // =============================================================================
@@ -1178,7 +1414,9 @@ async fn library_search_handler(
 // =============================================================================
 
 fn spawn_event_bridge(event_socket: String, event_tx: broadcast::Sender<String>) {
-    use event_protocol::{from_topic_message, TOPIC_PLAYBACK};
+    use event_protocol::{
+        acid_event_from_topic_message, from_topic_message, TOPIC_ACID_FACTS_WRITTEN, TOPIC_PLAYBACK,
+    };
     std::thread::spawn(move || {
         let sub = match nng::Socket::new(nng::Protocol::Sub0) {
             Ok(s) => s,
@@ -1190,7 +1428,13 @@ fn spawn_event_bridge(event_socket: String, event_tx: broadcast::Sender<String>)
         if let Err(e) = sub.set_opt::<nng::options::protocol::pubsub::Subscribe>(
             TOPIC_PLAYBACK.as_bytes().to_vec(),
         ) {
-            tracing::error!(error = %e, "SSE: subscribe failed");
+            tracing::error!(error = %e, "SSE: subscribe (playback) failed");
+            return;
+        }
+        if let Err(e) = sub.set_opt::<nng::options::protocol::pubsub::Subscribe>(
+            TOPIC_ACID_FACTS_WRITTEN.as_bytes().to_vec(),
+        ) {
+            tracing::error!(error = %e, "SSE: subscribe (acid/facts) failed");
             return;
         }
         loop {
@@ -1211,8 +1455,16 @@ fn spawn_event_bridge(event_socket: String, event_tx: broadcast::Sender<String>)
             loop {
                 match sub.recv() {
                     Ok(msg) => {
-                        if let Ok((_topic, event)) = from_topic_message(msg.as_slice()) {
+                        let bytes = msg.as_slice();
+                        // Try playback events first, then ACID events
+                        if let Ok((_topic, event)) = from_topic_message(bytes) {
                             if let Ok(json) = serde_json::to_string(&event) {
+                                let _ = event_tx.send(json);
+                            }
+                        } else if let Ok((_topic, acid_event)) =
+                            acid_event_from_topic_message(bytes)
+                        {
+                            if let Ok(json) = serde_json::to_string(&acid_event) {
                                 let _ = event_tx.send(json);
                             }
                         }
@@ -1295,9 +1547,26 @@ async fn main() -> Result<()> {
         .route("/player/skip", post(player_skip))
         .route("/player/pause", post(player_pause))
         .route("/player/resume", post(player_resume))
+        .route("/player/audio-outputs", get(player_audio_outputs))
+        .route(
+            "/player/audio-output",
+            get(player_audio_output).post(player_set_audio_output),
+        )
         .route("/player/events", get(player_events))
-        // Library search
+        // Library search and browse
         .route("/library/search", get(library_search_handler))
+        .route("/library/artists", get(library_artists_handler))
+        .route("/library/albums", get(library_albums_handler))
+        .route(
+            "/library/artists/:name/tracks",
+            get(library_artist_tracks_handler),
+        )
+        .route(
+            "/library/albums/:name/tracks",
+            get(library_album_tracks_handler),
+        )
+        // Cover art
+        .route("/cover/:hash", get(cover_art))
         // Export
         .route("/export/:hash", get(export_track))
         .with_state(state);
@@ -1404,7 +1673,7 @@ async fn export_track(
 ) -> impl IntoResponse {
     use axum::http::header;
 
-    let content_hash = ContentHash(hash);
+    let content_hash = ContentHash::new(hash);
 
     // Resolve track metadata from library
     let lib_client = match state.library_client() {
@@ -1421,7 +1690,7 @@ async fn export_track(
     let track = match lib_client.get_track(&content_hash) {
         Ok(t) => t,
         Err(e) => {
-            tracing::warn!(hash = %content_hash.0, error = %e, "Track not found for export");
+            tracing::warn!(hash = %content_hash.as_str(), error = %e, "Track not found for export");
             return (StatusCode::NOT_FOUND, format!("Track not found: {}", e)).into_response();
         }
     };
@@ -1496,7 +1765,7 @@ async fn export_track(
     // This is blocking CPU/IO work so we run it in spawn_blocking.
     let transcode_format = req_format.to_transcoder_format();
 
-    let metadata = audio_transcoder::TrackMetadata {
+    let metadata = audio_transcoder::ExportMetadata {
         title: track.title.clone(),
         artist: track.artist.clone(),
         album: track.album.clone(),
@@ -1551,6 +1820,71 @@ async fn export_track(
 }
 
 // =============================================================================
+// Cover Art Handler
+// =============================================================================
+
+/// Detect MIME type from cover art file extension.
+fn cover_art_content_type(path: &str) -> &'static str {
+    match std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase())
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn cover_art(
+    State(state): State<Arc<AppState>>,
+    Path(hash): Path<String>,
+) -> impl IntoResponse {
+    use axum::http::header;
+
+    let content_hash = ContentHash::new(hash);
+
+    let lib_client = match state.library_client() {
+        Some(c) => c,
+        None => {
+            return (StatusCode::SERVICE_UNAVAILABLE, "Library not available").into_response();
+        }
+    };
+
+    let track = match lib_client.get_track(&content_hash) {
+        Ok(t) => t,
+        Err(_) => {
+            return (StatusCode::NOT_FOUND, "Track not found").into_response();
+        }
+    };
+
+    let cover_rel = match track.cover_art_path {
+        Some(p) => p,
+        None => {
+            return (StatusCode::NOT_FOUND, "No cover art").into_response();
+        }
+    };
+
+    let cover_path = state.music_root.join(&cover_rel);
+    let content_type = cover_art_content_type(&cover_rel);
+
+    match tokio::fs::read(&cover_path).await {
+        Ok(data) => (
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            data,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "Cover art file not found").into_response(),
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -1558,19 +1892,20 @@ async fn export_track(
 mod tests {
     use super::*;
     use library_ipc_client::{Bpm, ContentHash, DurationSeconds, Key};
-    use source_protocol::{SourceResponse, SourceStatus};
+    use pretty_assertions::assert_eq;
+    use source_protocol::{AuthStatus, QueueState, SourceResponse, SourceStatus};
 
     fn make_source_status() -> SourceStatus {
         SourceStatus {
             name: "bandcamp".to_string(),
             version: "0.1.0".to_string(),
-            authenticated: true,
+            auth: AuthStatus::Authenticated,
             downloads_active: 2,
             downloads_queued: 3,
             downloads_completed: 10,
             downloads_failed: 1,
             uptime_seconds: 3600,
-            paused: false,
+            queue: QueueState::Active,
         }
     }
 
@@ -1651,14 +1986,18 @@ mod tests {
     #[test]
     fn track_info_json_from_full_track() {
         let track = TrackInfo {
-            content_hash: ContentHash("sha256:abc123".to_string()),
+            content_hash: ContentHash::new("sha256:abc123"),
             title: Some("Test Track".to_string()),
             artist: Some("Test Artist".to_string()),
             album: Some("Test Album".to_string()),
-            duration: Some(DurationSeconds(180)),
+            duration: Some(DurationSeconds::new(180)),
             bpm: Some(Bpm::from_u32(128).unwrap()),
             key: Some(Key::from_traditional("C Major").unwrap()),
             blob_path: Some("ab/abc123.flac".to_string()),
+            cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.content_hash, "sha256:abc123");
@@ -1668,12 +2007,14 @@ mod tests {
         assert_eq!(json.duration, Some(180));
         assert!(json.bpm.is_some());
         assert!(json.key.is_some());
+        assert!(json.disc_number.is_none());
+        assert!(json.added.is_none());
     }
 
     #[test]
     fn track_info_json_from_minimal_track() {
         let track = TrackInfo {
-            content_hash: ContentHash("sha256:deadbeef".to_string()),
+            content_hash: ContentHash::new("sha256:deadbeef"),
             title: None,
             artist: None,
             album: None,
@@ -1681,6 +2022,10 @@ mod tests {
             bpm: None,
             key: None,
             blob_path: None,
+            cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.content_hash, "sha256:deadbeef");
@@ -1690,6 +2035,29 @@ mod tests {
         assert!(json.duration.is_none());
         assert!(json.bpm.is_none());
         assert!(json.key.is_none());
+        assert!(json.disc_number.is_none());
+        assert!(json.added.is_none());
+    }
+
+    #[test]
+    fn track_info_json_populates_disc_number_and_added() {
+        let track = TrackInfo {
+            content_hash: ContentHash::new("sha256:abc"),
+            title: None,
+            artist: None,
+            album: None,
+            duration: None,
+            bpm: None,
+            key: None,
+            blob_path: None,
+            cover_art_path: None,
+            track_number: None,
+            disc_number: Some(2),
+            added: Some("2024-01-15T12:00:00Z".to_string()),
+        };
+        let json = TrackInfoJson::from_track_info(&track);
+        assert_eq!(json.disc_number, Some(2));
+        assert_eq!(json.added, Some("2024-01-15T12:00:00Z".to_string()));
     }
 
     #[test]
@@ -1837,6 +2205,42 @@ mod tests {
         assert!(is_valid_username(""));
     }
 
+    // ── Cover art content type ─────────────────────────────────────────────
+
+    #[test]
+    fn cover_art_content_type_jpeg() {
+        assert_eq!(cover_art_content_type("cover-art/abc.jpg"), "image/jpeg");
+        assert_eq!(cover_art_content_type("cover-art/abc.jpeg"), "image/jpeg");
+    }
+
+    #[test]
+    fn cover_art_content_type_png() {
+        assert_eq!(cover_art_content_type("cover-art/abc.png"), "image/png");
+    }
+
+    #[test]
+    fn cover_art_content_type_webp() {
+        assert_eq!(cover_art_content_type("cover-art/abc.webp"), "image/webp");
+    }
+
+    #[test]
+    fn cover_art_content_type_unknown_defaults_to_octet_stream() {
+        assert_eq!(
+            cover_art_content_type("cover-art/abc.bmp"),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            cover_art_content_type("cover-art/noext"),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn cover_art_content_type_case_insensitive() {
+        assert_eq!(cover_art_content_type("cover-art/abc.JPG"), "image/jpeg");
+        assert_eq!(cover_art_content_type("cover-art/abc.PNG"), "image/png");
+    }
+
     #[test]
     fn aif_source_treated_as_aiff_for_passthrough() {
         let source_ext = blob_extension("blobs/ab/track.aif").unwrap().to_lowercase();
@@ -1845,5 +2249,30 @@ mod tests {
             Some(source_ext.as_str()) == fmt.extension()
                 || (source_ext == "aif" && fmt.extension() == Some("aiff"))
         );
+    }
+
+    // ── Artist/album list sort ─────────────────────────────────────────────
+
+    #[test]
+    fn artist_list_sorts_case_insensitively() {
+        let mut values = vec![
+            "Zebra".to_string(),
+            "apple".to_string(),
+            "Mango".to_string(),
+            "banana".to_string(),
+        ];
+        values.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        assert_eq!(values, vec!["apple", "banana", "Mango", "Zebra"],);
+    }
+
+    #[test]
+    fn album_list_sorts_case_insensitively() {
+        let mut values = vec![
+            "Ziggy Stardust".to_string(),
+            "abbey road".to_string(),
+            "Kind of Blue".to_string(),
+        ];
+        values.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        assert_eq!(values, vec!["abbey road", "Kind of Blue", "Ziggy Stardust"],);
     }
 }

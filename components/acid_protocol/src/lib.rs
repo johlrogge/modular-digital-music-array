@@ -5,7 +5,24 @@
 //! - acid-ipc-client (used by services that write/read facts)
 
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
+
+// ============================================================================
+// Cursor helpers
+// ============================================================================
+
+/// Encode a line offset as an opaque cursor token.
+///
+/// Internal format is `"line:<n>"` but callers must treat this as opaque.
+pub fn cursor_from_offset(offset: usize) -> String {
+    format!("line:{offset}")
+}
+
+/// Decode a line offset from an opaque cursor token.
+///
+/// Returns `None` if the cursor is unrecognised or malformed.
+pub fn offset_from_cursor(cursor: &str) -> Option<usize> {
+    cursor.strip_prefix("line:")?.parse().ok()
+}
 
 // ============================================================================
 // Fact Entry
@@ -39,8 +56,14 @@ pub enum AcidRequest {
         facts: Vec<FactEntry>,
     },
 
-    /// Read a chunk of the append-only stream starting after a given line offset.
-    ReadStream { after_line: usize, limit: usize },
+    /// Read a chunk of the append-only stream starting after the given cursor.
+    ///
+    /// `cursor: None` means "start from the beginning".
+    /// Pass the `cursor` from the previous `StreamChunk` to page forward.
+    ReadStream {
+        cursor: Option<String>,
+        limit: usize,
+    },
 }
 
 // ============================================================================
@@ -51,7 +74,9 @@ pub enum AcidRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamChunk {
     pub lines: Vec<String>,
-    pub next_offset: usize,
+    /// Opaque cursor pointing past the last returned line.
+    /// Pass this back in the next `ReadStream` request to continue paging.
+    pub cursor: String,
 }
 
 /// Responses from the ACID service.
@@ -72,22 +97,35 @@ pub enum AcidResponse {
 }
 
 // ============================================================================
-// Protocol Errors
-// ============================================================================
-
-#[derive(Debug, Error)]
-pub enum ProtocolError {
-    #[error("serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
-}
-
-// ============================================================================
 // Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
+
+    // ---- cursor helpers -----------------------------------------------------
+
+    #[test]
+    fn cursor_roundtrip() {
+        let cursor = cursor_from_offset(42);
+        assert_eq!(cursor, "line:42");
+        assert_eq!(offset_from_cursor(&cursor), Some(42));
+    }
+
+    #[test]
+    fn cursor_from_zero() {
+        let cursor = cursor_from_offset(0);
+        assert_eq!(offset_from_cursor(&cursor), Some(0));
+    }
+
+    #[test]
+    fn offset_from_invalid_cursor_returns_none() {
+        assert_eq!(offset_from_cursor("timestamp:1234"), None);
+        assert_eq!(offset_from_cursor("line:notanumber"), None);
+        assert_eq!(offset_from_cursor("garbage"), None);
+    }
 
     // ---- FactEntry ----------------------------------------------------------
 
@@ -137,18 +175,35 @@ mod tests {
     }
 
     #[test]
-    fn acid_request_read_stream_roundtrip() {
+    fn acid_request_read_stream_with_none_cursor() {
         let req = AcidRequest::ReadStream {
-            after_line: 42,
+            cursor: None,
             limit: 100,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"type\":\"ReadStream\""), "json was: {json}");
         let parsed: AcidRequest = serde_json::from_str(&json).unwrap();
         match parsed {
-            AcidRequest::ReadStream { after_line, limit } => {
-                assert_eq!(after_line, 42);
+            AcidRequest::ReadStream { cursor, limit } => {
+                assert_eq!(cursor, None);
                 assert_eq!(limit, 100);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn acid_request_read_stream_with_cursor() {
+        let req = AcidRequest::ReadStream {
+            cursor: Some("line:42".to_string()),
+            limit: 10,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: AcidRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            AcidRequest::ReadStream { cursor, limit } => {
+                assert_eq!(cursor.as_deref(), Some("line:42"));
+                assert_eq!(limit, 10);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -181,7 +236,7 @@ mod tests {
     fn acid_response_stream_chunk_roundtrip() {
         let chunk = StreamChunk {
             lines: vec!["line1".to_string(), "line2".to_string()],
-            next_offset: 2,
+            cursor: "line:2".to_string(),
         };
         let resp = AcidResponse::StreamChunk(chunk);
         let json = serde_json::to_string(&resp).unwrap();
@@ -193,7 +248,7 @@ mod tests {
         match parsed {
             AcidResponse::StreamChunk(c) => {
                 assert_eq!(c.lines, vec!["line1", "line2"]);
-                assert_eq!(c.next_offset, 2);
+                assert_eq!(c.cursor, "line:2");
             }
             other => panic!("unexpected variant: {other:?}"),
         }

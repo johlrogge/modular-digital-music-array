@@ -373,6 +373,8 @@ pub fn infer_from_path(path: &Path) -> (Option<String>, Option<String>, Option<S
 mod tests {
     use super::*;
     use lofty::{MimeType, Picture, PictureType as LoftyPictureType, Tag, TagExt, TagType};
+    use pretty_assertions::assert_eq;
+    use rstest::rstest;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -493,16 +495,14 @@ mod tests {
         assert_eq!(result[0].picture_type, PictureType::Other);
     }
 
-    #[test]
-    fn picture_type_to_lofty_roundtrip() {
-        assert_eq!(
-            PictureType::CoverFront.to_lofty(),
-            lofty::PictureType::CoverFront
-        );
-        assert_eq!(
-            PictureType::CoverBack.to_lofty(),
-            lofty::PictureType::CoverBack
-        );
-        assert_eq!(PictureType::Other.to_lofty(), lofty::PictureType::Other);
+    #[rstest]
+    #[case(PictureType::CoverFront, lofty::PictureType::CoverFront)]
+    #[case(PictureType::CoverBack, lofty::PictureType::CoverBack)]
+    #[case(PictureType::Other, lofty::PictureType::Other)]
+    fn picture_type_to_lofty_roundtrip(
+        #[case] input: PictureType,
+        #[case] expected: lofty::PictureType,
+    ) {
+        assert_eq!(input.to_lofty(), expected);
     }
 }

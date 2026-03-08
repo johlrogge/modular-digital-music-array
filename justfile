@@ -21,19 +21,23 @@ build:
 bdd:
     cargo test --package mdma-bdd --test cucumber -- -vv
 
-# Quick cross-compile beacon using cargo-zigbuild (devenv provides zig + target)
+# Cross-compile a standard MDMA binary for aarch64
 [group('build')]
-beacon-cross:
+cross bin label=bin:
     #!/usr/bin/env bash
     set -euo pipefail
     export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
-    echo "Building beacon for aarch64..."
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin beacon
+    echo "Building {{label}} for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin {{bin}}
     echo ""
-    echo "Beacon built!"
-    file target/aarch64-unknown-linux-gnu/release/beacon
-    ls -lh target/aarch64-unknown-linux-gnu/release/beacon
+    echo "{{label}} built!"
+    file target/aarch64-unknown-linux-gnu/release/{{bin}}
+    ls -lh target/aarch64-unknown-linux-gnu/release/{{bin}}
+
+# Quick cross-compile beacon using cargo-zigbuild (devenv provides zig + target)
+[group('build')]
+beacon-cross: (cross "beacon" "Beacon")
 
 # Build beacon with native cargo (requires system cross-compiler)
 [group('build')]
@@ -167,10 +171,14 @@ deploy-dev: beacon-cross
 # CI/CD Build Recipes (Work Locally and in GitHub Actions)
 # ============================================================================
 
+# Build a single MDMA binary for CI
+[group('ci')]
+ci-build bin:
+    ./scripts/ci/build-binary.sh {{bin}}
+
 # Build beacon for CI/CD (local or GitHub Actions)
 [group('ci')]
-ci-build-beacon:
-    ./scripts/ci/build-beacon.sh
+ci-build-beacon: (ci-build "beacon")
 
 # Package beacon into deployable archive (legacy tar.gz format)
 [group('ci')]
@@ -285,13 +293,11 @@ pkg-beacon:
 
 # Build mdma-library for CI
 [group('ci')]
-ci-build-library:
-    ./scripts/ci/build-library.sh
+ci-build-library: (ci-build "mdma-library")
 
 # Build mdma-console for CI
 [group('ci')]
-ci-build-console:
-    ./scripts/ci/build-console.sh
+ci-build-console: (ci-build "mdma-console")
 
 # Build mdma-playback for CI
 [group('ci')]
@@ -300,13 +306,11 @@ ci-build-playback:
 
 # Build mdma-gateway for CI
 [group('ci')]
-ci-build-gateway:
-    ./scripts/ci/build-gateway.sh
+ci-build-gateway: (ci-build "mdma-gateway")
 
 # Build mdma-bandcamp for CI
 [group('ci')]
-ci-build-bandcamp:
-    ./scripts/ci/build-bandcamp.sh
+ci-build-bandcamp: (ci-build "mdma-bandcamp")
 
 # Build mdma-library Void package
 [group('package')]
@@ -419,19 +423,20 @@ archive:
     echo "✅ Created: ${ARCHIVE_NAME}"
     ls -lh "${ARCHIVE_NAME}"
 
-# Check prerequisites including image creation tools
-[group('setup')]
-check-prereqs-image:
-    ./scripts/utils/check-prerequisites.sh --image
-
 # ============================================================================
 # Image Creation
 # ============================================================================
 
+# Validate sudo credentials early (before long builds)
+[group('image')]
+confirm-sudo:
+    @echo "Image creation requires root. Requesting sudo now..."
+    @sudo -v
+
 # Create SD card image with beacon installed via xbps
 [group('image')]
-create-image: check-prereqs-image pkg-build-all
-    ./scripts/image/create-sd-card-simple.sh
+create-image: confirm-sudo pkg-build-all
+    sudo ./scripts/image/create-sd-card-simple.sh
 
 # Network scanning recipes for finding Raspberry Pi
 
@@ -636,146 +641,6 @@ pi-wait:
         sleep 5
     done
 
-    # Golden Image Workflow - Create bootable image from working SD card
-
-# Copy setup script to Pi
-golden-copy-script PI_IP:
-    @echo "📤 Copying setup script to Pi..."
-    scp scripts/setup-beacon-on-pi.sh root@{{PI_IP}}:/root/
-    @echo "✅ Script copied!"
-    @echo ""
-    @echo "Now SSH in and run it:"
-    @echo "  ssh root@{{PI_IP}}"
-    @echo "  chmod +x setup-beacon-on-pi.sh"
-    @echo "  ./setup-beacon-on-pi.sh"
-
-# SSH to Pi for manual setup
-golden-ssh PI_IP:
-    ssh root@{{PI_IP}}
-
-# Create image from SD card (after Pi is shutdown and SD card in dev machine)
-golden-create-image DEVICE:
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    # Verify device exists
-    if [ ! -b "{{DEVICE}}" ]; then
-        echo "❌ Device {{DEVICE}} not found"
-        echo "   Use: lsblk to find your SD card"
-        exit 1
-    fi
-
-    # Safety check
-    echo "⚠️  About to read entire device {{DEVICE}}"
-    echo "   This will create an image of the SD card"
-    read -p "Continue? (yes/no): " confirm
-
-    if [ "$confirm" != "yes" ]; then
-        echo "Aborted"
-        exit 1
-    fi
-
-    TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-    OUTPUT_DIR=~/mdma-images/golden
-    mkdir -p "$OUTPUT_DIR"
-
-    IMAGE_FILE="$OUTPUT_DIR/mdma-beacon-golden-$TIMESTAMP.img"
-
-    echo ""
-    echo "📀 Reading SD card..."
-    sudo dd if={{DEVICE}} of="$IMAGE_FILE" bs=4M status=progress conv=fsync
-
-    # Fix ownership so compression works
-    sudo chown $(whoami):$(whoami) "$IMAGE_FILE"
-
-    # Check if PiShrink is available
-    PISHRINK=""
-    if [ -f ~/mdma-images/pishrink.sh ]; then
-        PISHRINK=~/mdma-images/pishrink.sh
-    elif command -v pishrink.sh &> /dev/null; then
-        PISHRINK=pishrink.sh
-    fi
-
-    if [ -n "$PISHRINK" ]; then
-        echo ""
-        echo "🔧 Shrinking image with PiShrink..."
-        echo "   (This may take a few minutes)"
-        sudo "$PISHRINK" "$IMAGE_FILE"
-        echo "✅ Image shrunk"
-    else
-        echo ""
-        echo "⚠️  PiShrink not found - image not shrunk"
-        echo "   Image will be ~32GB when extracted"
-        echo ""
-        echo "   To install PiShrink:"
-        echo "   curl -L https://raw.githubusercontent.com/Drewsif/PiShrink/master/pishrink.sh -o ~/mdma-images/pishrink.sh"
-        echo "   chmod +x ~/mdma-images/pishrink.sh"
-        echo ""
-        read -p "Continue without shrinking? (yes/no): " continue_unshrunk
-        if [ "$continue_unshrunk" != "yes" ]; then
-            echo "Aborted - image saved at: $IMAGE_FILE"
-            exit 1
-        fi
-    fi
-
-    echo ""
-    echo "🗜️  Compressing image..."
-    xz -9 -T0 "$IMAGE_FILE"
-
-    echo ""
-    echo "✅ Golden image created!"
-    echo "   Location: $IMAGE_FILE.xz"
-
-    SIZE=$(du -h "$IMAGE_FILE.xz" | cut -f1)
-    echo "   Compressed size: $SIZE"
-
-    if [ -n "$PISHRINK" ]; then
-        echo "   Extracted size: ~3-4GB (shrunk)"
-    else
-        echo "   Extracted size: ~32GB (not shrunk)"
-    fi
-
-    echo ""
-    echo "🎯 To flash this image:"
-    echo "   xz -dc $IMAGE_FILE.xz | sudo dd of=/dev/sdX bs=4M status=progress"
-
-# Complete golden image workflow guide
-golden-help:
-    @echo "📋 Golden Image Workflow"
-    @echo ""
-    @echo "This creates a 'golden master' image from a working Pi."
-    @echo ""
-    @echo "Steps:"
-    @echo "  1. Flash vanilla Void to SD card"
-    @echo "     curl -LO https://repo-default.voidlinux.org/live/current/void-rpi-aarch64-20250202.img.xz"
-    @echo "     xz -dc void-rpi-aarch64-20250202.img.xz | sudo dd of=/dev/sdX bs=4M status=progress"
-    @echo ""
-    @echo "  2. Boot Pi, find its IP (check router or use nmap)"
-    @echo ""
-    @echo "  3. Copy setup script to Pi"
-    @echo "     just golden-copy-script 192.168.0.XXX"
-    @echo ""
-    @echo "  4. SSH to Pi and run setup"
-    @echo "     just golden-ssh 192.168.0.XXX"
-    @echo "     chmod +x setup-beacon-on-pi.sh"
-    @echo "     ./setup-beacon-on-pi.sh"
-    @echo ""
-    @echo "  5. Test everything works"
-    @echo "     ping welcome-to-mdma.local"
-    @echo "     http://welcome-to-mdma.local/"
-    @echo ""
-    @echo "  6. Shutdown Pi"
-    @echo "     shutdown -h now"
-    @echo ""
-    @echo "  7. Remove SD card, put in dev machine"
-    @echo ""
-    @echo "  8. Create golden image"
-    @echo "     just golden-create-image /dev/sdX"
-    @echo ""
-    @echo "  9. Result: ~/mdma-images/golden/mdma-beacon-golden-TIMESTAMP.img.xz"
-    @echo ""
-    @echo "🎉 Now you have a working golden image to flash to all Pis!"
-
 
 # run beacon
 [group("run")]
@@ -789,17 +654,7 @@ run-console:
 
 # Cross-compile console for aarch64
 [group('build')]
-console-cross:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
-    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
-    echo "Building console for aarch64..."
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin mdma-console
-    echo ""
-    echo "Console built!"
-    file target/aarch64-unknown-linux-gnu/release/mdma-console
-    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-console
+console-cross: (cross "mdma-console" "Console")
 
 # Set up aarch64 PipeWire sysroot for cross-compiling playback
 [group('build')]
@@ -820,215 +675,81 @@ playback-cross: setup-playback-sysroot
 
 # Cross-compile library service for aarch64
 [group('build')]
-library-cross:
+library-cross: (cross "mdma-library" "Library")
+
+# Internal: deploy a standard MDMA service to the provisioned Pi
+[group('dev')]
+_deploy-svc svc bin *extra_scp:
     #!/usr/bin/env bash
     set -euo pipefail
-    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
-    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
-    echo "Building mdma-library for aarch64..."
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin mdma-library
-    echo ""
-    echo "Library built!"
-    file target/aarch64-unknown-linux-gnu/release/mdma-library
-    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-library
+    HOST="${PI_HOST:-mdma-909.local}"
+    SSH_KEY="$HOME/.ssh/mdma_pi"
+    BINARY="target/aarch64-unknown-linux-gnu/release/{{bin}}"
+    RUN_SCRIPT="void-packages/srcpkgs/{{svc}}/files/{{svc}}/run"
+    POST_INSTALL="scripts/deploy/post-install-{{svc}}.sh"
+
+    echo "Deploying {{svc}} to $HOST..."
+
+    # Upload binary, run script, and any extra files
+    scp -4 -i "$SSH_KEY" "$BINARY" "$RUN_SCRIPT" {{extra_scp}} "admin@${HOST}:/tmp/"
+
+    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop {{svc}} 2>/dev/null || true
+        sudo mv /tmp/{{bin}} /usr/bin/
+        sudo chmod +x /usr/bin/{{bin}}
+        sudo mkdir -p /etc/sv/{{svc}}/log /var/log/{{svc}} /run/mdma
+        sudo cp /tmp/run /etc/sv/{{svc}}/run
+        sudo chmod +x /etc/sv/{{svc}}/run
+        printf "#!/bin/sh\nexec svlogd -tt /var/log/{{svc}}\n" | sudo tee /etc/sv/{{svc}}/log/run > /dev/null
+        sudo chmod +x /etc/sv/{{svc}}/log/run
+        sudo ln -sf /etc/sv/{{svc}} /var/service/{{svc}} 2>/dev/null || true
+        for i in 1 2 3 4 5; do sleep 1; [ -d /var/service/{{svc}}/supervise ] && break; done
+        sudo sv start {{svc}} 2>/dev/null || true
+        sleep 1
+        sudo sv status {{svc}} 2>/dev/null || echo "{{svc}}: waiting for runit (check manually)"'
+
+    # Run post-install hook if it exists
+    if [ -f "$POST_INSTALL" ]; then
+        echo "Running post-install for {{svc}}..."
+        ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'bash -s' < "$POST_INSTALL"
+    fi
+
+    echo "{{svc}} deployed!"
 
 # Deploy console to Pi
 [group('dev')]
 deploy-console: console-cross
-    #!/usr/bin/env bash
-    set -euo pipefail
+    @just _deploy-svc mdma-console mdma-console
 
-    HOST="${PI_HOST:-mdma-909.local}"
-    CONSOLE="target/aarch64-unknown-linux-gnu/release/mdma-console"
-    SSH_KEY="$HOME/.ssh/mdma_pi"
-    RUN_SCRIPT="void-packages/srcpkgs/mdma-console/files/mdma-console/run"
-
-    echo "Deploying console to $HOST..."
-
-    scp -4 -i "$SSH_KEY" "$CONSOLE" "$RUN_SCRIPT" "admin@${HOST}:/tmp/"
-
-    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-console 2>/dev/null || true
-        sudo mv /tmp/mdma-console /usr/bin/
-        sudo chmod +x /usr/bin/mdma-console
-        sudo setcap "cap_net_bind_service=+ep" /usr/bin/mdma-console
-        sudo mkdir -p /etc/sv/mdma-console/log /var/log/mdma-console
-        sudo cp /tmp/run /etc/sv/mdma-console/run
-        sudo chmod +x /etc/sv/mdma-console/run
-        printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-console\n" | sudo tee /etc/sv/mdma-console/log/run > /dev/null
-        sudo chmod +x /etc/sv/mdma-console/log/run
-        sudo ln -sf /etc/sv/mdma-console /var/service/mdma-console 2>/dev/null || true
-        for i in 1 2 3 4 5; do sleep 1; [ -d /var/service/mdma-console/supervise ] && break; done
-        sudo sv start mdma-console 2>/dev/null || true
-        sleep 1
-        sudo sv status mdma-console 2>/dev/null || echo "mdma-console: waiting for runit (check manually)"'
-
-    echo ""
-    echo "Console deployed! Access at: http://$HOST/"
-
-# Deploy library service to Pi
+# Deploy library to Pi
 [group('dev')]
 deploy-library: library-cross
-    #!/usr/bin/env bash
-    set -euo pipefail
+    @just _deploy-svc mdma-library mdma-library
 
-    HOST="${PI_HOST:-mdma-909.local}"
-    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-library"
-    SSH_KEY="$HOME/.ssh/mdma_pi"
-    RUN_SCRIPT="void-packages/srcpkgs/mdma-library/files/mdma-library/run"
-
-    echo "Deploying mdma-library to $HOST..."
-
-    scp -4 -i "$SSH_KEY" "$BINARY" "$RUN_SCRIPT" "admin@${HOST}:/tmp/"
-
-    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-library 2>/dev/null || true
-        sudo mv /tmp/mdma-library /usr/bin/
-        sudo chmod +x /usr/bin/mdma-library
-        sudo mkdir -p /etc/sv/mdma-library/log /var/log/mdma-library /music/inbox /music/blobs /metadata /run/mdma
-        sudo chown -R mdma:mdma /music /metadata /run/mdma
-        sudo cp /tmp/run /etc/sv/mdma-library/run
-        sudo chmod +x /etc/sv/mdma-library/run
-        printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-library\n" | sudo tee /etc/sv/mdma-library/log/run > /dev/null
-        sudo chmod +x /etc/sv/mdma-library/log/run
-        sudo ln -sf /etc/sv/mdma-library /var/service/mdma-library 2>/dev/null || true
-        for i in 1 2 3 4 5; do sleep 1; [ -d /var/service/mdma-library/supervise ] && break; done
-        sudo sv start mdma-library 2>/dev/null || true
-        sleep 1
-        sudo sv status mdma-library 2>/dev/null || echo "mdma-library: waiting for runit (check manually)"'
-
-    echo ""
-    echo "Library deployed!"
-
-# Deploy playback server to Pi
+# Deploy playback to Pi
 [group('dev')]
 deploy-playback: playback-cross
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    HOST="${PI_HOST:-mdma-909.local}"
-    PLAYBACK="target/aarch64-unknown-linux-gnu/release/mdma-playback"
-    SSH_KEY="$HOME/.ssh/mdma_pi"
-    RUN_SCRIPT="void-packages/srcpkgs/mdma-playback/files/mdma-playback/run"
-
-    echo "Deploying mdma-playback to $HOST..."
-
-    scp -4 -i "$SSH_KEY" "$PLAYBACK" "$RUN_SCRIPT" "admin@${HOST}:/tmp/"
-
-    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-playback 2>/dev/null || true
-        sudo mv /tmp/mdma-playback /usr/bin/
-        sudo chmod +x /usr/bin/mdma-playback
-        sudo mkdir -p /etc/sv/mdma-playback/log /var/log/mdma-playback /run/mdma
-        sudo chown -R mdma:mdma /run/mdma
-        sudo usermod -a -G audio,video,_pipewire mdma 2>/dev/null || true
-        sudo cp /tmp/run /etc/sv/mdma-playback/run
-        sudo chmod +x /etc/sv/mdma-playback/run
-        printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-playback\n" | sudo tee /etc/sv/mdma-playback/log/run > /dev/null
-        sudo chmod +x /etc/sv/mdma-playback/log/run
-        # Ensure PipeWire WirePlumber drop-in is configured
-        sudo mkdir -p /etc/pipewire/pipewire.conf.d
-        sudo ln -sf /usr/share/examples/wireplumber/10-wireplumber.conf /etc/pipewire/pipewire.conf.d/ 2>/dev/null || true
-        # Ensure stock pipewire service is enabled
-        if [ -d /etc/sv/pipewire ] && [ ! -e /var/service/pipewire ]; then
-            sudo cp -a /usr/share/examples/sv/pipewire /etc/sv/pipewire
-            sudo ln -sf /etc/sv/pipewire /var/service/pipewire
-            sleep 3
-        fi
-        sudo ln -sf /etc/sv/mdma-playback /var/service/mdma-playback 2>/dev/null || true
-        for i in 1 2 3 4 5; do sleep 1; [ -d /var/service/mdma-playback/supervise ] && break; done
-        sudo sv start mdma-playback 2>/dev/null || true
-        sleep 1
-        sudo sv status pipewire mdma-playback 2>/dev/null || echo "mdma-playback: waiting for runit (check manually)"'
-
-    echo ""
-    echo "Playback deployed! IPC only (gateway exposes TCP)"
+    @just _deploy-svc mdma-playback mdma-playback
 
 # Cross-compile gateway for aarch64
 [group('build')]
-gateway-cross:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
-    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
-    echo "Building mdma-gateway for aarch64..."
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin mdma-gateway
-    echo ""
-    echo "Gateway built!"
-    file target/aarch64-unknown-linux-gnu/release/mdma-gateway
-    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-gateway
+gateway-cross: (cross "mdma-gateway" "Gateway")
 
 # Cross-compile acid service for aarch64
 [group('build')]
-acid-cross:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
-    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
-    echo "Building mdma-acid for aarch64..."
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin mdma-acid
-    echo ""
-    echo "Acid built!"
-    file target/aarch64-unknown-linux-gnu/release/mdma-acid
-    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-acid
+acid-cross: (cross "mdma-acid" "Acid")
 
 # Cross-compile bandcamp for aarch64
 [group('build')]
-bandcamp-cross:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
-    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
-    echo "Building mdma-bandcamp for aarch64..."
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin mdma-bandcamp
-    echo ""
-    echo "Bandcamp built!"
-    file target/aarch64-unknown-linux-gnu/release/mdma-bandcamp
-    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-bandcamp
+bandcamp-cross: (cross "mdma-bandcamp" "Bandcamp")
 
 # Deploy gateway to Pi (single external TCP port)
 [group('dev')]
 deploy-gateway: gateway-cross
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    HOST="${PI_HOST:-mdma-909.local}"
-    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-gateway"
-    SSH_KEY="$HOME/.ssh/mdma_pi"
-    RUN_SCRIPT="void-packages/srcpkgs/mdma-gateway/files/mdma-gateway/run"
-
-    echo "Deploying mdma-gateway to $HOST..."
-
-    scp -4 -i "$SSH_KEY" "$BINARY" "$RUN_SCRIPT" "admin@${HOST}:/tmp/"
-
-    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-gateway 2>/dev/null || true
-        sudo mv /tmp/mdma-gateway /usr/bin/
-        sudo chmod +x /usr/bin/mdma-gateway
-        sudo mkdir -p /etc/sv/mdma-gateway/log /var/log/mdma-gateway /run/mdma/sources
-        sudo chown -R mdma:mdma /run/mdma
-        sudo cp /tmp/run /etc/sv/mdma-gateway/run
-        sudo chmod +x /etc/sv/mdma-gateway/run
-        printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-gateway\n" | sudo tee /etc/sv/mdma-gateway/log/run > /dev/null
-        sudo chmod +x /etc/sv/mdma-gateway/log/run
-        sudo ln -sf /etc/sv/mdma-gateway /var/service/mdma-gateway 2>/dev/null || true
-        for i in 1 2 3 4 5; do sleep 1; [ -d /var/service/mdma-gateway/supervise ] && break; done
-        sudo sv start mdma-gateway 2>/dev/null || true
-        sleep 1
-        sudo sv status mdma-gateway 2>/dev/null || echo "mdma-gateway: waiting for runit (check manually)"'
-
-    echo ""
-    echo "Gateway deployed! TCP on port 5555"
+    @just _deploy-svc mdma-gateway mdma-gateway
 
 # Cross-compile CLI (mdma) for aarch64
 [group('build')]
-cli-cross:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
-    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
-    echo "Building mdma CLI for aarch64..."
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin mdma
-    echo ""
-    echo "CLI built!"
-    file target/aarch64-unknown-linux-gnu/release/mdma
-    ls -lh target/aarch64-unknown-linux-gnu/release/mdma
+cli-cross: (cross "mdma" "CLI")
 
 # Deploy CLI (mdma) to Pi - installs as /usr/bin/mdma, no service required
 [group('dev')]
@@ -1051,75 +772,12 @@ deploy-cli: cli-cross
     echo ""
     echo "CLI deployed! Run: mdma --help"
 
-# Deploy bandcamp service to Pi
+# Deploy bandcamp service to Pi (includes conf file)
 [group('dev')]
 deploy-bandcamp: bandcamp-cross
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    HOST="${PI_HOST:-mdma-909.local}"
-    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-bandcamp"
-    SSH_KEY="$HOME/.ssh/mdma_pi"
-    RUN_SCRIPT="void-packages/srcpkgs/mdma-bandcamp/files/mdma-bandcamp/run"
-    CONF_FILE="void-packages/srcpkgs/mdma-bandcamp/files/mdma-bandcamp/conf"
-
-    echo "Deploying mdma-bandcamp to $HOST..."
-
-    scp -4 -i "$SSH_KEY" "$BINARY" "$RUN_SCRIPT" "$CONF_FILE" "admin@${HOST}:/tmp/"
-
-    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-bandcamp 2>/dev/null || true
-        sudo mv /tmp/mdma-bandcamp /usr/bin/
-        sudo chmod +x /usr/bin/mdma-bandcamp
-        sudo mkdir -p /etc/sv/mdma-bandcamp/log /var/log/mdma-bandcamp /music/downloads /music/inbox /run/mdma/sources /var/lib/mdma /etc/mdma
-        sudo chown -R mdma:mdma /music /run/mdma /var/lib/mdma
-        sudo cp /tmp/run /etc/sv/mdma-bandcamp/run
-        sudo chmod +x /etc/sv/mdma-bandcamp/run
-        printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-bandcamp\n" | sudo tee /etc/sv/mdma-bandcamp/log/run > /dev/null
-        sudo chmod +x /etc/sv/mdma-bandcamp/log/run
-        if [ ! -f /etc/mdma/bandcamp.conf ]; then
-            sudo install -Dm644 /tmp/conf /etc/mdma/bandcamp.conf
-            echo "Installed default bandcamp.conf — edit MDMA_BANDCAMP_USERNAME if needed"
-        else
-            echo "Skipping bandcamp.conf (already exists)"
-        fi
-        sudo ln -sf /etc/sv/mdma-bandcamp /var/service/mdma-bandcamp 2>/dev/null || true
-        for i in 1 2 3 4 5; do sleep 1; [ -d /var/service/mdma-bandcamp/supervise ] && break; done
-        sudo sv start mdma-bandcamp 2>/dev/null || true
-        sleep 1
-        sudo sv status mdma-bandcamp 2>/dev/null || echo "mdma-bandcamp: waiting for runit (check manually)"'
-
-    echo ""
-    echo "Bandcamp deployed!"
+    @just _deploy-svc mdma-bandcamp mdma-bandcamp "void-packages/srcpkgs/mdma-bandcamp/files/mdma-bandcamp/conf"
 
 # Deploy acid service to Pi
 [group('dev')]
 deploy-acid: acid-cross
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    HOST="${PI_HOST:-mdma-909.local}"
-    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-acid"
-    SSH_KEY="$HOME/.ssh/mdma_pi"
-    RUN_SCRIPT="void-packages/srcpkgs/mdma-acid/files/mdma-acid/run"
-
-    echo "Deploying mdma-acid to $HOST..."
-
-    scp -4 -i "$SSH_KEY" "$BINARY" "$RUN_SCRIPT" "admin@${HOST}:/tmp/"
-
-    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop mdma-acid 2>/dev/null || true
-        sudo mv /tmp/mdma-acid /usr/bin/
-        sudo chmod +x /usr/bin/mdma-acid
-        sudo mkdir -p /etc/sv/mdma-acid/log /var/log/mdma-acid /metadata /run/mdma
-        sudo chown -R mdma:mdma /metadata /run/mdma
-        sudo cp /tmp/run /etc/sv/mdma-acid/run
-        sudo chmod +x /etc/sv/mdma-acid/run
-        printf "#!/bin/sh\nexec svlogd -tt /var/log/mdma-acid\n" | sudo tee /etc/sv/mdma-acid/log/run > /dev/null
-        sudo chmod +x /etc/sv/mdma-acid/log/run
-        sudo ln -sf /etc/sv/mdma-acid /var/service/mdma-acid 2>/dev/null || true
-        for i in 1 2 3 4 5; do sleep 1; [ -d /var/service/mdma-acid/supervise ] && break; done
-        sudo sv start mdma-acid 2>/dev/null || true
-        sleep 1
-        sudo sv status mdma-acid 2>/dev/null || echo "mdma-acid: waiting for runit (check manually)"'
-
-    echo ""
-    echo "Acid deployed!"
+    @just _deploy-svc mdma-acid mdma-acid

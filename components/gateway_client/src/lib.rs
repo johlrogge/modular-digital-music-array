@@ -4,28 +4,16 @@
 //! Provides typed facades for library, playback, and source services.
 
 pub use acid_protocol::{AcidRequest, AcidResponse};
-pub use gateway_protocol::{GatewayRequest, GatewayResponse};
+pub use gateway_protocol::{GatewayRequest, GatewayResponse, SourceName};
 pub use library_ipc_protocol::{LibraryRequest, LibraryResponse};
 pub use media_protocol::{Command, Response};
 pub use source_protocol::{SourceRequest, SourceResponse};
 
-use thiserror::Error;
-
 /// Errors that can occur when communicating through the gateway.
-#[derive(Debug, Error)]
-pub enum ClientError {
-    #[error("Connection error: {0}")]
-    Connection(#[from] nng_transport::ConnectionError),
-
-    #[error("NNG error: {0}")]
-    Nng(#[from] nng::Error),
-
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
-
-    #[error("Gateway error: {0}")]
-    Gateway(String),
-}
+///
+/// This is an alias for [`nng_transport::NngClientError`]. The `Service` variant
+/// carries gateway-level error messages.
+pub type ClientError = nng_transport::NngClientError;
 
 /// Client for connecting to the API gateway.
 pub struct GatewayClient {
@@ -65,8 +53,8 @@ impl GatewayClient {
         };
         match self.request(&envelope)? {
             GatewayResponse::Library { response } => Ok(response),
-            GatewayResponse::Error { message } => Err(ClientError::Gateway(message)),
-            _ => Err(ClientError::Gateway(
+            GatewayResponse::Error { message } => Err(ClientError::Service(message)),
+            _ => Err(ClientError::Service(
                 "Unexpected response type for library request".to_string(),
             )),
         }
@@ -83,8 +71,8 @@ impl GatewayClient {
         };
         match self.request(&envelope)? {
             GatewayResponse::Playback { response } => Ok(response),
-            GatewayResponse::Error { message } => Err(ClientError::Gateway(message)),
-            _ => Err(ClientError::Gateway(
+            GatewayResponse::Error { message } => Err(ClientError::Service(message)),
+            _ => Err(ClientError::Service(
                 "Unexpected response type for playback request".to_string(),
             )),
         }
@@ -101,13 +89,13 @@ impl GatewayClient {
         req: &SourceRequest,
     ) -> Result<SourceResponse, ClientError> {
         let envelope = GatewayRequest::Source {
-            name: name.to_string(),
+            name: SourceName::new(name),
             request: req.clone(),
         };
         match self.request(&envelope)? {
             GatewayResponse::Source { response, .. } => Ok(response),
-            GatewayResponse::Error { message } => Err(ClientError::Gateway(message)),
-            _ => Err(ClientError::Gateway(
+            GatewayResponse::Error { message } => Err(ClientError::Service(message)),
+            _ => Err(ClientError::Service(
                 "Unexpected response type for source request".to_string(),
             )),
         }
@@ -124,19 +112,19 @@ impl GatewayClient {
         };
         match self.request(&envelope)? {
             GatewayResponse::Acid { response } => Ok(response),
-            GatewayResponse::Error { message } => Err(ClientError::Gateway(message)),
-            _ => Err(ClientError::Gateway(
+            GatewayResponse::Error { message } => Err(ClientError::Service(message)),
+            _ => Err(ClientError::Service(
                 "Unexpected response type for acid request".to_string(),
             )),
         }
     }
 
     /// List available music sources.
-    pub fn list_sources(&self) -> Result<Vec<String>, ClientError> {
+    pub fn list_sources(&self) -> Result<Vec<SourceName>, ClientError> {
         match self.request(&GatewayRequest::ListSources)? {
             GatewayResponse::Sources { names } => Ok(names),
-            GatewayResponse::Error { message } => Err(ClientError::Gateway(message)),
-            _ => Err(ClientError::Gateway(
+            GatewayResponse::Error { message } => Err(ClientError::Service(message)),
+            _ => Err(ClientError::Service(
                 "Unexpected response type for list_sources".to_string(),
             )),
         }

@@ -21,6 +21,7 @@ music-primitives = { path = "../music_primitives" }
 audio-metadata = { path = "../audio_metadata" }
 library-ipc-protocol = { path = "../library_ipc_protocol" }
 acid-client = { path = "../acid_client", features = ["music"] }
+event-protocol = { path = "../event_protocol" }
 
 # Fact stream
 stainless-facts = { git = "https://github.com/johlrogge/stainless_facts" }
@@ -39,5 +40,6 @@ notify = "6.1"
 pathdiff = "0.2"
 
 [dev-dependencies]
+pretty_assertions = { workspace = true }
 rstest = { workspace = true }
 tempfile = "3"

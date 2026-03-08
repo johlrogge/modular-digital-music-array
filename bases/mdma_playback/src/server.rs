@@ -3,7 +3,9 @@ use crate::playback_state::{PlaybackEffect, PlaybackState, PlaybackStateMachine}
 use acid_client::AcidClient;
 use color_eyre::Result;
 use event_protocol::{to_topic_message, PlaybackEvent};
-use media_protocol::{Command, ContentHash, Response, ResponseData};
+use media_protocol::{
+    AudioOutputConfig, AudioSinkInfo, Command, ContentHash, Response, ResponseData,
+};
 use music_facts::{FactOrigin, FactSource, MusicValue, StartReason};
 use nng::Socket;
 use playback_engine::{Deck, PlaybackEngine, PlaybackError};
@@ -14,6 +16,21 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
+
+fn audio_output_config_to_protocol(c: playback_engine::AudioOutputConfig) -> AudioOutputConfig {
+    AudioOutputConfig {
+        device_name: c.device_name,
+        sample_rate: c.sample_rate,
+    }
+}
+
+fn audio_sink_to_protocol(s: playback_engine::AudioSink) -> AudioSinkInfo {
+    AudioSinkInfo {
+        name: s.name,
+        description: s.description,
+        max_sample_rate: s.max_sample_rate,
+    }
+}
 
 struct QueueEntry {
     hash: ContentHash,
@@ -105,7 +122,7 @@ impl Server {
             let path = PathBuf::from(&e.path);
             if path.exists() {
                 queue.push_back(QueueEntry {
-                    hash: ContentHash(e.hash),
+                    hash: ContentHash::new(e.hash),
                     path,
                 });
             } else {
@@ -208,9 +225,9 @@ impl Server {
                         .await;
                 self.create_response(result, None)
             }
-            Command::SetVolume { deck, db } => {
-                info!("Setting volume on deck {:?} to {}dB", deck, db);
-                let result = self.engine.lock().await.set_volume(deck, db);
+            Command::SetVolume { deck, volume } => {
+                info!("Setting volume on deck {:?}", deck);
+                let result = self.engine.lock().await.set_volume(deck, volume);
                 self.create_response(result, None)
             }
             Command::Unload { deck } => {
@@ -220,12 +237,19 @@ impl Server {
             }
             Command::Seek { deck, position } => {
                 info!("Seeking deck {:?} to position {}", deck, position);
-                let result = self.engine.lock().await.seek(deck, position).await;
+                let result = self.engine.lock().await.seek(deck, position);
                 self.create_response(result, None)
             }
             Command::GetLength { deck } => {
                 info!("Getting length for deck {:?}", deck);
-                todo!("get length of track, or remove opportunity")
+                match self.engine.lock().await.duration_ms(deck) {
+                    Some(ms) => Response::Ok {
+                        data: Some(ResponseData::Length(ms as usize)),
+                    },
+                    None => Response::Err {
+                        message: PlaybackError::NoTrackLoaded(deck).to_string(),
+                    },
+                }
             }
             Command::QueueNext { hash, path } => {
                 info!("Queue next: {:?}", path);
@@ -256,9 +280,7 @@ impl Server {
                     .map(|e| e.hash.clone())
                     .collect();
                 info!("Queue list: {} items", hashes.len());
-                Response {
-                    success: true,
-                    error_message: String::new(),
+                Response::Ok {
                     data: Some(ResponseData::Queue(hashes)),
                 }
             }
@@ -280,9 +302,7 @@ impl Server {
                 self.publish_event(&PlaybackEvent::QueueChanged {
                     length: queue.len(),
                 });
-                Response {
-                    success: true,
-                    error_message: String::new(),
+                Response::Ok {
                     data: Some(ResponseData::Count(removed)),
                 }
             }
@@ -312,10 +332,8 @@ impl Server {
                     e
                 };
                 match entry {
-                    None => Response {
-                        success: false,
-                        error_message: "Queue is empty".to_string(),
-                        data: None,
+                    None => Response::Err {
+                        message: "Queue is empty".to_string(),
                     },
                     Some(e) => {
                         let effects = self
@@ -337,9 +355,7 @@ impl Server {
             Command::NowPlaying => {
                 let hash = self.state.lock().await.current_hash().cloned();
                 info!("Now playing: {:?}", hash);
-                Response {
-                    success: true,
-                    error_message: String::new(),
+                Response::Ok {
                     data: Some(ResponseData::NowPlaying(hash)),
                 }
             }
@@ -363,23 +379,58 @@ impl Server {
                 self.create_response(result, None)
             }
             Command::GetSession => {
-                let session_id = self.state.lock().await.session_id().map(|id| id.0.clone());
+                let session_id = self
+                    .state
+                    .lock()
+                    .await
+                    .session_id()
+                    .map(|id| id.as_str().to_owned());
                 info!("GetSession: {:?}", session_id);
-                Response {
-                    success: true,
-                    error_message: String::new(),
+                Response::Ok {
                     data: Some(ResponseData::Session(session_id)),
+                }
+            }
+            Command::ListAudioOutputs => {
+                info!("Listing audio outputs");
+                match self.engine.lock().await.list_outputs() {
+                    Ok(sinks) => {
+                        let sink_infos = sinks.into_iter().map(audio_sink_to_protocol).collect();
+                        Response::Ok {
+                            data: Some(ResponseData::AudioOutputs(sink_infos)),
+                        }
+                    }
+                    Err(e) => Response::Err {
+                        message: e.to_string(),
+                    },
+                }
+            }
+            Command::SetAudioOutput { device_name } => {
+                info!("Setting audio output to {:?}", device_name);
+                match self.engine.lock().await.set_output(device_name) {
+                    Ok(config) => Response::Ok {
+                        data: Some(ResponseData::AudioOutput(audio_output_config_to_protocol(
+                            config,
+                        ))),
+                    },
+                    Err(e) => Response::Err {
+                        message: e.to_string(),
+                    },
+                }
+            }
+            Command::GetAudioOutput => {
+                info!("Getting current audio output");
+                let config = self.engine.lock().await.get_output().clone();
+                Response::Ok {
+                    data: Some(ResponseData::AudioOutput(audio_output_config_to_protocol(
+                        config,
+                    ))),
                 }
             }
         }
     }
 
     fn ok_response(&self) -> Response {
-        Response {
-            success: true,
-            error_message: String::new(),
-            data: None,
-        }
+        Response::Ok { data: None }
     }
 
     fn create_response(
@@ -390,18 +441,12 @@ impl Server {
         match result {
             Ok(()) => {
                 info!("Command completed successfully");
-                Response {
-                    success: true,
-                    error_message: String::new(),
-                    data,
-                }
+                Response::Ok { data }
             }
             Err(e) => {
                 warn!("Command failed: {}", e);
-                Response {
-                    success: false,
-                    error_message: e.to_string(),
-                    data: None,
+                Response::Err {
+                    message: e.to_string(),
                 }
             }
         }
@@ -454,7 +499,7 @@ fn persist_queue_to_file(queue_file: &Path, queue: &VecDeque<QueueEntry>) {
     let entries: Vec<PersistEntry> = queue
         .iter()
         .map(|e| PersistEntry {
-            hash: e.hash.0.clone(),
+            hash: e.hash.as_str().to_owned(),
             path: e.path.to_string_lossy().into_owned(),
         })
         .collect();
@@ -509,7 +554,7 @@ async fn auto_advance_task(
                     publish_event_on_socket(
                         &event_pub,
                         &PlaybackEvent::PositionUpdate {
-                            hash: h.0.clone(),
+                            hash: h.clone(),
                             position_ms,
                             duration_ms,
                         },
@@ -592,13 +637,18 @@ mod tests {
     use std::path::PathBuf;
 
     fn make_server() -> Server {
-        let engine = PlaybackEngine::new().unwrap();
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("audio_config.json");
+        let engine = PlaybackEngine::new(config_path).unwrap();
         let engine = Arc::new(Mutex::new(engine));
         let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
         let event_pub = nng::Socket::new(nng::Protocol::Pub0).unwrap();
         // Create a dummy ACID listener so the client can connect.
         let acid_listen = nng::Socket::new(nng::Protocol::Rep0).unwrap();
-        let acid_addr = format!("ipc:///tmp/test_acid_{}.sock", std::process::id());
+        let acid_addr = format!("ipc:///tmp/test_acid_{}_{}.sock", std::process::id(), id);
         acid_listen.listen(&acid_addr).unwrap();
         let acid_client = Arc::new(AcidClient::connect(&acid_addr).unwrap());
         std::mem::forget(acid_listen);
@@ -621,7 +671,7 @@ mod tests {
         // Drive the state machine directly into Paused.
         {
             let mut sm = server.state.lock().await;
-            let hash = ContentHash("sha256:test".to_string());
+            let hash = ContentHash::new("sha256:test");
             let path = PathBuf::from("/nonexistent/track.flac");
             sm.play_queue(hash, path);
             sm.pause();
@@ -655,8 +705,10 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
-    async fn test_handle_nonexistent_track() {
-        let engine = PlaybackEngine::new().unwrap();
+    async fn handle_nonexistent_track() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("audio_config.json");
+        let engine = PlaybackEngine::new(config_path).unwrap();
         let engine = Arc::new(Mutex::new(engine));
 
         let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
@@ -681,13 +733,43 @@ mod tests {
         };
 
         let response = server.handle_command(command).await;
-        assert!(!response.success);
+        match response {
+            Response::Err { message } => {
+                assert!(
+                    message.contains("No such file or directory"),
+                    "Error message '{}' should contain 'No such file or directory'",
+                    message
+                );
+            }
+            Response::Ok { .. } => panic!("Expected Err response for nonexistent track"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_length_with_no_track_returns_error() {
+        let server = make_server();
+        let response = server
+            .handle_command(Command::GetLength {
+                deck: playback_engine::Deck::A,
+            })
+            .await;
         assert!(
-            response.error_message.contains("No such file or directory"),
-            "Error message '{}' should contain path '{}'",
-            response.error_message,
-            nonexistent_path.display()
+            matches!(response, Response::Err { .. }),
+            "Expected Err when no track is loaded on deck A"
         );
-        assert!(response.data.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_length_with_no_track_returns_error_deck_b() {
+        let server = make_server();
+        let response = server
+            .handle_command(Command::GetLength {
+                deck: playback_engine::Deck::B,
+            })
+            .await;
+        assert!(
+            matches!(response, Response::Err { .. }),
+            "Expected Err when no track is loaded on deck B"
+        );
     }
 }

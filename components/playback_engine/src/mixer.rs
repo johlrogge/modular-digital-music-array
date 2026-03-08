@@ -80,8 +80,7 @@ impl Mixer {
 
         Ok(())
     }
-    pub(crate) fn set_volume(&mut self, deck: Deck, db: f32) {
-        let linear = Volume::new(db).map(|v| v.to_linear()).unwrap_or(1.0);
-        self.volumes.insert(deck, linear);
+    pub(crate) fn set_volume(&mut self, deck: Deck, volume: Volume) {
+        self.volumes.insert(deck, volume.to_linear());
     }
 }

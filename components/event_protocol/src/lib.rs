@@ -1,7 +1,15 @@
-use serde::{Deserialize, Serialize};
+use playback_primitives::{ContentHash, SessionId};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use thiserror::Error;
 
 /// Topic prefix for all playback events.
 pub const TOPIC_PLAYBACK: &str = "playback/";
+
+/// Topic prefix for all ACID events.
+pub const TOPIC_ACID: &str = "acid/";
+
+/// Topic for facts-written notifications.
+pub const TOPIC_ACID_FACTS_WRITTEN: &str = "acid/facts";
 
 /// Topic for track started events.
 pub const TOPIC_TRACK_STARTED: &str = "playback/track_started";
@@ -35,33 +43,33 @@ pub const TOPIC_SESSION_ENDED: &str = "playback/session_ended";
 #[serde(tag = "type")]
 pub enum PlaybackEvent {
     TrackStarted {
-        hash: String,
+        hash: ContentHash,
     },
     TrackEnded {
-        hash: String,
+        hash: ContentHash,
     },
     TrackStopped {
-        hash: String,
+        hash: ContentHash,
     },
     TrackPaused {
-        hash: String,
+        hash: ContentHash,
     },
     TrackResumed {
-        hash: String,
+        hash: ContentHash,
     },
     QueueChanged {
         length: usize,
     },
     PositionUpdate {
-        hash: String,
+        hash: ContentHash,
         position_ms: u64,
         duration_ms: u64,
     },
     SessionStarted {
-        id: String,
+        id: SessionId,
     },
     SessionEnded {
-        id: String,
+        id: SessionId,
     },
 }
 
@@ -82,15 +90,66 @@ impl PlaybackEvent {
     }
 }
 
-/// Encode an event as a topic-prefixed message for nng Pub/Sub.
+// ============================================================================
+// ACID Events
+// ============================================================================
+
+/// Events emitted by the ACID service.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type")]
+pub enum AcidEvent {
+    /// New facts have been appended for an entity.
+    ///
+    /// This is a lightweight notification — it does NOT contain the fact data.
+    /// Subscribers should issue a `ReadStream` request with the provided cursor
+    /// to fetch the new facts.
+    FactsWritten {
+        entity: String,
+        count: usize,
+        cursor: String,
+    },
+}
+
+impl AcidEvent {
+    /// Returns the topic string for this event.
+    fn topic(&self) -> &'static str {
+        match self {
+            AcidEvent::FactsWritten { .. } => TOPIC_ACID_FACTS_WRITTEN,
+        }
+    }
+}
+
+// ============================================================================
+// Generic topic-message encoding/decoding
+// ============================================================================
+
+/// Trait for events that carry a topic string used in nng Pub/Sub routing.
+pub trait TopicEvent {
+    /// Returns the nng topic string for this event variant.
+    fn topic(&self) -> &'static str;
+}
+
+impl TopicEvent for PlaybackEvent {
+    fn topic(&self) -> &'static str {
+        PlaybackEvent::topic(self)
+    }
+}
+
+impl TopicEvent for AcidEvent {
+    fn topic(&self) -> &'static str {
+        AcidEvent::topic(self)
+    }
+}
+
+/// Encode any `TopicEvent + Serialize` as a topic-prefixed message for nng Pub/Sub.
 ///
 /// Wire format: `{topic}\0{json}`
 ///
 /// The null byte separates the topic from the JSON body so that nng's
 /// topic-based subscription filtering works (subscribers match on prefix).
-pub fn to_topic_message(event: &PlaybackEvent) -> Vec<u8> {
+pub fn encode_topic_message<T: TopicEvent + Serialize>(event: &T) -> Vec<u8> {
     let topic = event.topic();
-    let json = serde_json::to_string(event).expect("PlaybackEvent serialization is infallible");
+    let json = serde_json::to_string(event).expect("TopicEvent serialization is infallible");
     let mut buf = Vec::with_capacity(topic.len() + 1 + json.len());
     buf.extend_from_slice(topic.as_bytes());
     buf.push(0);
@@ -98,147 +157,135 @@ pub fn to_topic_message(event: &PlaybackEvent) -> Vec<u8> {
     buf
 }
 
-/// Decode a topic-prefixed message back into an event.
+/// Decode a topic-prefixed message back into any `TopicEvent + DeserializeOwned`.
 ///
 /// Returns `(topic, event)` on success.
-pub fn from_topic_message(bytes: &[u8]) -> Result<(&str, PlaybackEvent), ParseError> {
+pub fn decode_topic_message<T: DeserializeOwned>(bytes: &[u8]) -> Result<(&str, T), ParseError> {
     let sep = bytes
         .iter()
         .position(|&b| b == 0)
         .ok_or(ParseError::MissingSeparator)?;
-
     let topic = std::str::from_utf8(&bytes[..sep]).map_err(|_| ParseError::InvalidTopic)?;
-    let event: PlaybackEvent =
-        serde_json::from_slice(&bytes[sep + 1..]).map_err(ParseError::Json)?;
+    let event: T = serde_json::from_slice(&bytes[sep + 1..]).map_err(ParseError::Json)?;
     Ok((topic, event))
 }
 
-#[derive(Debug)]
+// ============================================================================
+// Backward-compatible thin wrappers
+// ============================================================================
+
+/// Encode a `PlaybackEvent` as a topic-prefixed message for nng Pub/Sub.
+#[inline]
+pub fn to_topic_message(event: &PlaybackEvent) -> Vec<u8> {
+    encode_topic_message(event)
+}
+
+/// Decode a topic-prefixed message back into a `PlaybackEvent`.
+#[inline]
+pub fn from_topic_message(bytes: &[u8]) -> Result<(&str, PlaybackEvent), ParseError> {
+    decode_topic_message(bytes)
+}
+
+/// Encode an `AcidEvent` as a topic-prefixed message for nng Pub/Sub.
+#[inline]
+pub fn acid_event_to_topic_message(event: &AcidEvent) -> Vec<u8> {
+    encode_topic_message(event)
+}
+
+/// Decode a topic-prefixed message back into an `AcidEvent`.
+#[inline]
+pub fn acid_event_from_topic_message(bytes: &[u8]) -> Result<(&str, AcidEvent), ParseError> {
+    decode_topic_message(bytes)
+}
+
+#[derive(Debug, Error)]
 pub enum ParseError {
+    #[error("no null separator in topic message")]
     MissingSeparator,
+    #[error("topic is not valid UTF-8")]
     InvalidTopic,
-    Json(serde_json::Error),
+    #[error("JSON parse error: {0}")]
+    Json(#[from] serde_json::Error),
 }
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ParseError::MissingSeparator => write!(f, "no null separator in topic message"),
-            ParseError::InvalidTopic => write!(f, "topic is not valid UTF-8"),
-            ParseError::Json(e) => write!(f, "JSON parse error: {}", e),
-        }
-    }
-}
-
-impl std::error::Error for ParseError {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
+    use rstest::rstest;
 
     #[test]
-    fn roundtrip_track_started() {
-        let event = PlaybackEvent::TrackStarted {
-            hash: "sha256:abc123".into(),
-        };
+    fn event_uses_content_hash_type() {
+        let hash = playback_primitives::ContentHash::new("sha256:abc123");
+        let event = PlaybackEvent::TrackStarted { hash: hash.clone() };
         let bytes = to_topic_message(&event);
-        let (topic, decoded) = from_topic_message(&bytes).unwrap();
-        assert_eq!(topic, TOPIC_TRACK_STARTED);
-        assert_eq!(decoded, event);
+        let (_, decoded) = from_topic_message(&bytes).unwrap();
+        match decoded {
+            PlaybackEvent::TrackStarted { hash: decoded_hash } => assert_eq!(decoded_hash, hash),
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]
-    fn roundtrip_track_ended() {
-        let event = PlaybackEvent::TrackEnded {
-            hash: "sha256:def456".into(),
-        };
+    fn event_uses_session_id_type() {
+        let id = playback_primitives::SessionId::new("2026-02-24T12:00:00+00:00");
+        let event = PlaybackEvent::SessionStarted { id: id.clone() };
         let bytes = to_topic_message(&event);
-        let (topic, decoded) = from_topic_message(&bytes).unwrap();
-        assert_eq!(topic, TOPIC_TRACK_ENDED);
-        assert_eq!(decoded, event);
+        let (_, decoded) = from_topic_message(&bytes).unwrap();
+        match decoded {
+            PlaybackEvent::SessionStarted { id: decoded_id } => assert_eq!(decoded_id, id),
+            _ => panic!("wrong variant"),
+        }
     }
 
-    #[test]
-    fn roundtrip_track_stopped() {
-        let event = PlaybackEvent::TrackStopped {
-            hash: "sha256:789ghi".into(),
-        };
+    #[rstest]
+    #[case(
+        PlaybackEvent::TrackStarted { hash: ContentHash::new("sha256:abc123") },
+        TOPIC_TRACK_STARTED
+    )]
+    #[case(
+        PlaybackEvent::TrackEnded { hash: ContentHash::new("sha256:def456") },
+        TOPIC_TRACK_ENDED
+    )]
+    #[case(
+        PlaybackEvent::TrackStopped { hash: ContentHash::new("sha256:789ghi") },
+        TOPIC_TRACK_STOPPED
+    )]
+    #[case(
+        PlaybackEvent::TrackPaused { hash: ContentHash::new("sha256:abc123") },
+        TOPIC_TRACK_PAUSED
+    )]
+    #[case(
+        PlaybackEvent::TrackResumed { hash: ContentHash::new("sha256:abc123") },
+        TOPIC_TRACK_RESUMED
+    )]
+    #[case(
+        PlaybackEvent::QueueChanged { length: 42 },
+        TOPIC_QUEUE_CHANGED
+    )]
+    #[case(
+        PlaybackEvent::PositionUpdate { hash: ContentHash::new("sha256:abc123"), position_ms: 12_345, duration_ms: 240_000 },
+        TOPIC_POSITION_UPDATE
+    )]
+    #[case(
+        PlaybackEvent::SessionStarted { id: SessionId::new("2026-02-24T12:00:00+00:00") },
+        TOPIC_SESSION_STARTED
+    )]
+    #[case(
+        PlaybackEvent::SessionEnded { id: SessionId::new("2026-02-24T12:00:00+00:00") },
+        TOPIC_SESSION_ENDED
+    )]
+    fn roundtrip(#[case] event: PlaybackEvent, #[case] expected_topic: &str) {
         let bytes = to_topic_message(&event);
         let (topic, decoded) = from_topic_message(&bytes).unwrap();
-        assert_eq!(topic, TOPIC_TRACK_STOPPED);
-        assert_eq!(decoded, event);
-    }
-
-    #[test]
-    fn roundtrip_track_paused() {
-        let event = PlaybackEvent::TrackPaused {
-            hash: "sha256:abc123".into(),
-        };
-        let bytes = to_topic_message(&event);
-        let (topic, decoded) = from_topic_message(&bytes).unwrap();
-        assert_eq!(topic, TOPIC_TRACK_PAUSED);
-        assert_eq!(decoded, event);
-    }
-
-    #[test]
-    fn roundtrip_track_resumed() {
-        let event = PlaybackEvent::TrackResumed {
-            hash: "sha256:abc123".into(),
-        };
-        let bytes = to_topic_message(&event);
-        let (topic, decoded) = from_topic_message(&bytes).unwrap();
-        assert_eq!(topic, TOPIC_TRACK_RESUMED);
-        assert_eq!(decoded, event);
-    }
-
-    #[test]
-    fn roundtrip_queue_changed() {
-        let event = PlaybackEvent::QueueChanged { length: 42 };
-        let bytes = to_topic_message(&event);
-        let (topic, decoded) = from_topic_message(&bytes).unwrap();
-        assert_eq!(topic, TOPIC_QUEUE_CHANGED);
-        assert_eq!(decoded, event);
-    }
-
-    #[test]
-    fn roundtrip_position_update() {
-        let event = PlaybackEvent::PositionUpdate {
-            hash: "sha256:abc123".into(),
-            position_ms: 12_345,
-            duration_ms: 240_000,
-        };
-        let bytes = to_topic_message(&event);
-        let (topic, decoded) = from_topic_message(&bytes).unwrap();
-        assert_eq!(topic, TOPIC_POSITION_UPDATE);
-        assert_eq!(decoded, event);
-    }
-
-    #[test]
-    fn roundtrip_session_started() {
-        let event = PlaybackEvent::SessionStarted {
-            id: "2026-02-24T12:00:00+00:00".into(),
-        };
-        let bytes = to_topic_message(&event);
-        let (topic, decoded) = from_topic_message(&bytes).unwrap();
-        assert_eq!(topic, TOPIC_SESSION_STARTED);
-        assert_eq!(decoded, event);
-    }
-
-    #[test]
-    fn roundtrip_session_ended() {
-        let event = PlaybackEvent::SessionEnded {
-            id: "2026-02-24T12:00:00+00:00".into(),
-        };
-        let bytes = to_topic_message(&event);
-        let (topic, decoded) = from_topic_message(&bytes).unwrap();
-        assert_eq!(topic, TOPIC_SESSION_ENDED);
+        assert_eq!(topic, expected_topic);
         assert_eq!(decoded, event);
     }
 
     #[test]
     fn wire_format_has_null_separator() {
         let event = PlaybackEvent::TrackStarted {
-            hash: "test".into(),
+            hash: ContentHash::new("test"),
         };
         let bytes = to_topic_message(&event);
         // Should start with topic, then null, then JSON
@@ -258,5 +305,32 @@ mod tests {
         bytes.push(0);
         bytes.extend_from_slice(b"not json");
         assert!(from_topic_message(&bytes).is_err());
+    }
+
+    // ---- AcidEvent ----------------------------------------------------------
+
+    #[test]
+    fn acid_facts_written_roundtrip() {
+        let event = AcidEvent::FactsWritten {
+            entity: "sha256:abc123".to_string(),
+            count: 5,
+            cursor: "line:42".to_string(),
+        };
+        let bytes = acid_event_to_topic_message(&event);
+        let (topic, decoded) = acid_event_from_topic_message(&bytes).unwrap();
+        assert_eq!(topic, TOPIC_ACID_FACTS_WRITTEN);
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn acid_event_wire_format_has_null_separator() {
+        let event = AcidEvent::FactsWritten {
+            entity: "sha256:abc".to_string(),
+            count: 1,
+            cursor: "line:0".to_string(),
+        };
+        let bytes = acid_event_to_topic_message(&event);
+        assert!(bytes.starts_with(TOPIC_ACID_FACTS_WRITTEN.as_bytes()));
+        assert_eq!(bytes[TOPIC_ACID_FACTS_WRITTEN.len()], 0);
     }
 }

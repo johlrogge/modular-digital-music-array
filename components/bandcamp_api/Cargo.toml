@@ -45,3 +45,6 @@ async-stream = "0.3"
 
 # URL parsing
 url = "2"
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

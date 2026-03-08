@@ -617,6 +617,7 @@ mod tests {
         provisioning::{DriveInfo, UnitType, ValidatedDrives},
         types::{DevicePath, Hostname, SshPublicKey},
     };
+    use pretty_assertions::assert_eq;
 
     use super::*;
     use rstest::rstest;
@@ -731,7 +732,7 @@ mod tests {
         Some(Vec::new())  // Secondary left unpartitioned
     )]
     #[tokio::test]
-    async fn test_two_drive_size_based_assignment(
+    async fn two_drive_size_based_assignment(
         #[case] primary_gb: u64,
         #[case] secondary_gb: u64,
         #[case] description: &str,
@@ -807,7 +808,7 @@ mod tests {
         vec![("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 988)]
     )]
     #[tokio::test]
-    async fn test_single_drive_partitioning(
+    async fn single_drive_partitioning(
         #[case] drive_gb: u64,
         #[case] description: &str,
         #[case] expected: Vec<(&str, u64)>,
@@ -846,7 +847,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_music_capacity_at_threshold() {
+    async fn music_capacity_at_threshold() {
         // 768GB primary (exactly 1.5× after OS overhead threshold)
         let input = create_validated_drives(768, Some(512));
         let action = PartitionDrivesAction;
@@ -872,7 +873,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_just_below_threshold_keeps_dedicated() {
+    async fn just_below_threshold_keeps_dedicated() {
         // 730GB primary (1.43× after OS overhead) - just below 1.5×
         let input = create_validated_drives(730, Some(512));
         let action = PartitionDrivesAction;
@@ -893,7 +894,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_realistic_scenario_equal_drives() {
+    async fn realistic_scenario_equal_drives() {
         // Most common case: 2× 512GB drives
         let input = create_validated_drives(512, Some(512));
         let action = PartitionDrivesAction;

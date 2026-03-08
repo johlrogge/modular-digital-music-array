@@ -31,9 +31,11 @@ async fn now_playing_should_be(world: &mut MdmaWorld, expected_hash: String) {
         .expect("failed to get now playing");
     let hash = now.expect("nothing is playing");
     assert_eq!(
-        hash.0, expected_hash,
+        hash.as_str(),
+        expected_hash,
         "Expected now playing '{}', got '{}'",
-        expected_hash, hash.0
+        expected_hash,
+        hash.as_str()
     );
 }
 

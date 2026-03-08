@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 acid_protocol = { path = "../../components/acid_protocol" }
+event-protocol = { path = "../../components/event_protocol" }
 stainless-facts = { git = "https://github.com/johlrogge/stainless_facts" }
 nng = { workspace = true }
 serde_json = { workspace = true }
@@ -19,4 +20,5 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
+pretty_assertions = { workspace = true }
 tempfile = "3"

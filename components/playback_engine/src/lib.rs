@@ -1,5 +1,7 @@
+pub mod audio_config;
 mod error;
 mod mixer;
+pub mod pipewire_devices;
 mod pipewire_output;
 mod resampler;
 mod source;
@@ -7,23 +9,26 @@ mod track;
 
 use std::{
     collections::HashMap,
-    path::Path,
-    sync::{mpsc, Arc},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
 };
 
+pub use audio_config::{load_audio_config, save_audio_config, AudioOutputConfig};
 pub use error::PlaybackError;
 use mixer::Mixer;
 use parking_lot::RwLock;
+pub use pipewire_devices::AudioSink;
 use pipewire_output::PipewireOutput;
-pub use playback_primitives::Deck;
+pub use playback_primitives::{Db, Deck, Volume};
 use ringbuf::{HeapConsumer, HeapRb};
 pub use source::{AudioSource, Source};
 use tracing::info;
 pub use track::Track;
 
-/// Fixed output sample rate. All sources are upsampled to this rate.
-/// Matches the iFi HD USB Audio maximum capability.
-const TARGET_RATE: u32 = 192_000;
+use crate::pipewire_devices::list_sinks;
 
 type Decks = Arc<RwLock<HashMap<Deck, Arc<RwLock<Track>>>>>;
 
@@ -35,6 +40,9 @@ pub struct PlaybackEngine {
     command_sender: mpsc::Sender<MixerCommand>,
     _mix_task: Option<std::thread::JoinHandle<()>>,
     stream_active: bool,
+    mix_thread_running: Arc<AtomicBool>,
+    config_path: PathBuf,
+    audio_config: AudioOutputConfig,
 }
 enum MixerCommand {
     RegisterTrack {
@@ -43,11 +51,13 @@ enum MixerCommand {
     },
     SetVolume {
         deck: Deck,
-        db: f32,
+        volume: Volume,
     },
 }
 impl PlaybackEngine {
-    pub fn new() -> Result<Self, PlaybackError> {
+    pub fn new(config_path: PathBuf) -> Result<Self, PlaybackError> {
+        let audio_config = load_audio_config(&config_path)?;
+
         // Create a channel for mixer commands - std::sync::mpsc doesn't take a capacity
         let (command_sender, command_receiver) = std::sync::mpsc::channel();
 
@@ -57,6 +67,9 @@ impl PlaybackEngine {
         let mixer_rb = HeapRb::<f32>::new(MIXER_BUFFER_SIZE);
         let (mixer_producer, mixer_consumer) = mixer_rb.split();
 
+        let mix_thread_running = Arc::new(AtomicBool::new(true));
+        let running = Arc::clone(&mix_thread_running);
+
         // Start the mix thread with command receiver
         let mix_task = std::thread::spawn(move || {
             let mut mixer = Mixer::new(mixer_producer);
@@ -65,7 +78,7 @@ impl PlaybackEngine {
 
             tracing::info!("MIX THREAD: Started, will process audio");
 
-            loop {
+            while running.load(Ordering::Relaxed) {
                 // Process any pending commands
                 while let Ok(cmd) = command_receiver.try_recv() {
                     match cmd {
@@ -73,8 +86,8 @@ impl PlaybackEngine {
                             tracing::info!("MIX THREAD: Registering track for deck {:?}", deck);
                             consumers.insert(deck, consumer);
                         }
-                        MixerCommand::SetVolume { deck, db } => {
-                            mixer.set_volume(deck, db);
+                        MixerCommand::SetVolume { deck, volume } => {
+                            mixer.set_volume(deck, volume);
                         }
                     }
                 }
@@ -88,6 +101,8 @@ impl PlaybackEngine {
                 // Sleep briefly
                 std::thread::sleep(std::time::Duration::from_micros(500)); // 0.5ms instead of 5ms
             }
+
+            tracing::info!("MIX THREAD: Exiting cleanly");
         });
 
         // Return the engine — PipeWire output deferred until first track load
@@ -99,7 +114,18 @@ impl PlaybackEngine {
             command_sender,
             _mix_task: Some(mix_task),
             stream_active: true,
+            mix_thread_running,
+            config_path,
+            audio_config,
         })
+    }
+
+    /// Signal the mix thread to stop and wait for it to join.
+    pub fn shutdown(&mut self) {
+        self.mix_thread_running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self._mix_task.take() {
+            let _ = handle.join();
+        }
     }
 
     /// Activate or deactivate the PipeWire stream.
@@ -111,6 +137,78 @@ impl PlaybackEngine {
             }
             self.stream_active = active;
         }
+    }
+
+    /// Enumerate available audio output sinks via pw-dump.
+    pub fn list_outputs(&self) -> Result<Vec<AudioSink>, PlaybackError> {
+        list_sinks()
+    }
+
+    /// Return the current audio output configuration.
+    pub fn get_output(&self) -> &AudioOutputConfig {
+        &self.audio_config
+    }
+
+    /// Select a named audio output device.
+    ///
+    /// Looks up the device in the live sink list to obtain its maximum sample rate,
+    /// persists the new config, then hot-swaps the PipeWire output: if one is
+    /// currently active its consumer is recovered via `shutdown()` and a new output
+    /// is created immediately on the new device.
+    pub fn set_output(&mut self, device_name: String) -> Result<AudioOutputConfig, PlaybackError> {
+        let sinks = list_sinks()?;
+        let sink = sinks
+            .iter()
+            .find(|s| s.name == device_name)
+            .ok_or_else(|| {
+                PlaybackError::AudioDevice(format!("Audio device not found: {device_name}"))
+            })?;
+
+        let new_config = AudioOutputConfig {
+            device_name: Some(device_name.clone()),
+            sample_rate: sink.max_sample_rate,
+        };
+
+        save_audio_config(&self.config_path, &new_config)?;
+
+        // If the sample rate is changing, note that existing audio will continue
+        // at the old rate until the next track load.
+        if let Some(current_rate) = self.current_sample_rate {
+            if current_rate != sink.max_sample_rate {
+                tracing::info!(
+                    "Sample rate change from {}Hz to {}Hz takes effect on next track load",
+                    current_rate,
+                    sink.max_sample_rate
+                );
+            }
+        }
+
+        // Recover the consumer from the old output (if active), then immediately
+        // create a new output on the selected device with the recovered consumer.
+        let recovered_consumer = if let Some(old_output) = self.audio_output.take() {
+            old_output.shutdown()
+        } else {
+            // No active output — consumer is still sitting in self.mixer_consumer
+            // and will be picked up by the next load_track() call when it creates
+            // the PipeWire output for the first time.
+            None
+        };
+
+        self.audio_config = new_config.clone();
+
+        if let Some(consumer) = recovered_consumer {
+            tracing::info!(
+                "Hot-swapping PipeWire output to device {:?} at {}Hz",
+                new_config.device_name,
+                new_config.sample_rate
+            );
+            let audio_output =
+                PipewireOutput::new(consumer, new_config.sample_rate, Some(device_name.as_str()))
+                    .map_err(|e| PlaybackError::AudioDevice(format!("PipeWire error: {}", e)))?;
+            self.audio_output = Some(audio_output);
+        }
+
+        Ok(new_config)
     }
 
     pub async fn load_track(&mut self, deck: Deck, path: &Path) -> Result<(), PlaybackError> {
@@ -129,18 +227,28 @@ impl PlaybackEngine {
         let source = AudioSource::new(path)?;
         let source_rate = source.sample_rate();
 
-        // Create PipeWire output on first track load, always at TARGET_RATE.
+        let target_rate = self.audio_config.sample_rate;
+        let target_device = self.audio_config.device_name.clone();
+
+        // Create PipeWire output on first track load at the configured rate.
         // All sources are upsampled by the decoder task regardless of their native rate.
         if self.audio_output.is_none() {
+            if self.mixer_consumer.is_none() {
+                tracing::error!(
+                    "load_track: no mixer consumer available and no audio output — audio will be silent"
+                );
+            }
             if let Some(consumer) = self.mixer_consumer.take() {
                 info!(
-                    "Creating PipeWire output at {}Hz (source: {}Hz)",
-                    TARGET_RATE, source_rate
+                    "Creating PipeWire output at {}Hz (source: {}Hz, device: {:?})",
+                    target_rate, source_rate, target_device
                 );
-                let audio_output = PipewireOutput::new(consumer, TARGET_RATE)
-                    .map_err(|e| PlaybackError::AudioDevice(format!("PipeWire error: {}", e)))?;
+                let audio_output =
+                    PipewireOutput::new(consumer, target_rate, target_device.as_deref()).map_err(
+                        |e| PlaybackError::AudioDevice(format!("PipeWire error: {}", e)),
+                    )?;
                 self.audio_output = Some(audio_output);
-                self.current_sample_rate = Some(TARGET_RATE);
+                self.current_sample_rate = Some(target_rate);
             }
         }
 
@@ -150,8 +258,8 @@ impl PlaybackEngine {
         let rb = HeapRb::<f32>::new(BUFFER_SIZE);
         let (producer, consumer) = rb.split();
 
-        // Create new track — decoder task will resample source_rate → TARGET_RATE
-        let track = Track::new(source, producer, source_rate, TARGET_RATE).await?;
+        // Create new track — decoder task will resample source_rate → target_rate
+        let track = Track::new(source, producer, source_rate, target_rate).await?;
         tracing::info!("Track is ready for playback");
 
         // Store the track - no lock conflicts possible with mix thread now
@@ -168,19 +276,13 @@ impl PlaybackEngine {
         Ok(())
     }
 
-    pub fn set_volume(&mut self, deck: Deck, db: f32) -> Result<(), PlaybackError> {
-        // Validate the volume value first
-        if !(-96.0..=0.0).contains(&db) {
-            return Err(PlaybackError::InvalidVolume(db));
-        }
-
-        // Send the volume command through the channel - use send instead of try_send
+    pub fn set_volume(&mut self, deck: Deck, volume: Volume) -> Result<(), PlaybackError> {
         match self
             .command_sender
-            .send(MixerCommand::SetVolume { deck, db })
+            .send(MixerCommand::SetVolume { deck, volume })
         {
             Ok(_) => {
-                tracing::info!("Setting volume for deck {:?} to {}dB", deck, db);
+                tracing::info!("Setting volume for deck {:?} to {}dB", deck, volume.raw());
                 Ok(())
             }
             Err(_) => {
@@ -262,11 +364,9 @@ impl PlaybackEngine {
         self.stream_active
     }
 
-    pub async fn seek(&mut self, deck: Deck, position: usize) -> Result<(), PlaybackError> {
+    pub fn seek(&mut self, deck: Deck, position: usize) -> Result<(), PlaybackError> {
         if let Some(track) = self.find_track(deck) {
             tracing::info!("Seeking deck {:?} to position {}", deck, position);
-            // We need to pass the RwLockWriteGuard to the async context, which is tricky
-            // We'll need to get a write lock, perform the seek, and release
             let mut track_guard = track.write();
             track_guard.seek(position)
         } else {
@@ -276,14 +376,30 @@ impl PlaybackEngine {
     }
 }
 
+impl Drop for PlaybackEngine {
+    fn drop(&mut self) {
+        self.mix_thread_running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self._mix_task.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn engine_with_tempdir() -> (PlaybackEngine, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("audio_config.json");
+        let engine = PlaybackEngine::new(config_path).expect("engine created");
+        (engine, tmp)
+    }
+
     /// Verify that set_stream_active only flips the flag when the value changes.
     #[test]
     fn set_stream_active_tracks_state() {
-        let mut engine = PlaybackEngine::new().expect("engine created");
+        let (mut engine, _tmp) = engine_with_tempdir();
         assert!(engine.is_stream_active(), "should start active");
 
         engine.set_stream_active(false);
@@ -300,6 +416,68 @@ mod tests {
         assert!(
             engine.is_stream_active(),
             "should be active after reactivate"
+        );
+    }
+
+    /// Verify that the mix thread stops cleanly when shutdown() is called.
+    #[test]
+    fn shutdown_stops_mix_thread() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        assert!(engine._mix_task.is_some());
+        engine.shutdown();
+        assert!(engine._mix_task.is_none());
+    }
+
+    /// Verify that a missing config file results in the default config being used.
+    #[test]
+    fn new_with_missing_config_uses_defaults() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("nonexistent.json");
+        let engine = PlaybackEngine::new(config_path).expect("engine created");
+        let config = engine.get_output();
+        assert_eq!(config.device_name, None);
+        assert_eq!(config.sample_rate, 192_000);
+    }
+
+    /// Verify that a pre-existing config file is loaded on construction.
+    #[test]
+    fn new_loads_existing_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("audio_config.json");
+        let saved = AudioOutputConfig {
+            device_name: Some("test-device".to_string()),
+            sample_rate: 48_000,
+        };
+        save_audio_config(&config_path, &saved).expect("save");
+
+        let engine = PlaybackEngine::new(config_path).expect("engine created");
+        assert_eq!(engine.get_output(), &saved);
+    }
+
+    /// Verify that when mixer_consumer is None and audio_output is None,
+    /// the engine starts with a consumer available (the normal path), and that
+    /// taking the consumer leaves it as None (simulating the post-hot-swap state
+    /// where audio_output is Some and mixer_consumer is None).
+    #[test]
+    fn mixer_consumer_is_some_after_new_and_none_after_take() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        // Fresh engine: consumer present, no output yet
+        assert!(
+            engine.mixer_consumer.is_some(),
+            "mixer_consumer should be Some after new()"
+        );
+        assert!(
+            engine.audio_output.is_none(),
+            "audio_output should be None after new()"
+        );
+
+        // Simulate what set_output hot-swap does when there is no active output:
+        // consumer stays put (we only take it when we actually spawn PW).
+        // Manually drain it to represent the post-spawn state.
+        let _ = engine.mixer_consumer.take();
+        assert!(
+            engine.mixer_consumer.is_none(),
+            "mixer_consumer should be None after take()"
         );
     }
 }

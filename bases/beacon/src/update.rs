@@ -185,11 +185,9 @@ pub fn full_version() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
-    fn test_current_version() {
-        let version = current_version();
+    fn current_version() {
+        let version = super::current_version();
         assert!(!version.is_empty());
         println!("Current beacon version: {}", version);
     }

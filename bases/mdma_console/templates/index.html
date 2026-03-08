@@ -4,434 +4,1389 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MDMA Console</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Outfit:wght@200;300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-dark: #1a1a2e;
-            --bg-card: #16213e;
-            --text: #eee;
-            --text-muted: #888;
-            --accent: #00d9ff;
-            --success: #00ff88;
-            --error: #ff4757;
-            --border: #2a2a4e;
+            --bg-base: #141420;
+            --bg-surface: #1c1c2a;
+            --bg-elevated: #252534;
+            --bg-hover: #2e2e40;
+            --border-subtle: #38384e;
+            --border-strong: #48485e;
+            --text-primary: #f0f0f8;
+            --text-secondary: #b8b8d0;
+            --text-tertiary: #9898b8;
+            --accent: #ec88f4;
+            --accent-dim: rgba(236, 136, 244, 0.16);
+            --accent-glow: rgba(236, 136, 244, 0.45);
+            --accent-bright: #f4a8ff;
+            --accent2: #68e8ff;
+            --accent2-dim: rgba(104, 232, 255, 0.16);
+            --accent2-glow: rgba(104, 232, 255, 0.40);
+            --success: #60e8b8;
+            --success-dim: rgba(96, 232, 184, 0.16);
+            --warning: #f0c060;
+            --warning-dim: rgba(240, 192, 96, 0.16);
+            --error: #f88898;
+            --error-dim: rgba(248, 136, 152, 0.16);
+            --radius-sm: 4px;
+            --radius-md: 8px;
+            --radius-lg: 12px;
         }
-        * { box-sizing: border-box; }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
         body {
-            font-family: system-ui, -apple-system, sans-serif;
-            max-width: 900px;
+            font-family: 'Outfit', sans-serif;
+            background: var(--bg-base);
+            color: var(--text-primary);
+            min-height: 100vh;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* ============================================================
+           SHELL — Header & Navigation
+           ============================================================ */
+
+        .shell {
+            max-width: 1200px;
             margin: 0 auto;
-            padding: 20px;
-            background: var(--bg-dark);
-            color: var(--text);
+            padding: 0 20px;
         }
-        h1 { color: var(--accent); margin-bottom: 5px; }
-        .version { color: var(--text-muted); margin-bottom: 30px; }
-        .card {
-            background: var(--bg-card);
-            padding: 20px;
-            border-radius: 8px;
-            margin: 20px 0;
+
+        .masthead {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 24px 0 20px;
+            border-bottom: 1px solid var(--border-subtle);
         }
-        .card h2 {
-            margin-top: 0;
-            color: var(--text);
-            border-bottom: 1px solid var(--border);
-            padding-bottom: 10px;
+
+        .brand {
+            display: flex;
+            align-items: baseline;
+            gap: 10px;
         }
-        table { width: 100%; border-collapse: collapse; }
-        th, td {
-            text-align: left;
-            padding: 10px 8px;
-            border-bottom: 1px solid var(--border);
-        }
-        th { color: var(--text-muted); font-weight: normal; font-size: 0.9em; }
-        .btn {
-            background: var(--accent);
-            color: var(--bg-dark);
-            border: none;
-            padding: 8px 16px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 0.9em;
+
+        .brand-name {
+            font-family: 'DM Mono', monospace;
             font-weight: 500;
+            font-size: 1.15rem;
+            letter-spacing: 0.12em;
+            color: var(--text-primary);
+            text-transform: uppercase;
+            text-shadow: 0 0 20px var(--accent2-glow);
         }
-        .btn:hover { opacity: 0.9; }
-        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-        .btn-secondary { background: var(--border); color: var(--text); }
-        .btn-danger { background: var(--error); color: #fff; }
-        .btn-small { padding: 4px 12px; font-size: 0.85em; }
-        .update-available { color: var(--success); }
-        .no-update { color: var(--text-muted); }
-        .status-msg { padding: 10px; border-radius: 4px; margin: 10px 0; }
-        .status-success {
-            background: rgba(0, 255, 136, 0.1);
-            border: 1px solid var(--success);
-            color: var(--success);
+
+        .brand-version {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.7rem;
+            color: var(--text-tertiary);
+            letter-spacing: 0.06em;
         }
-        .status-error {
-            background: rgba(255, 71, 87, 0.1);
-            border: 1px solid var(--error);
-            color: var(--error);
+
+        .connection-indicator {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-family: 'DM Mono', monospace;
+            font-size: 0.7rem;
+            color: var(--text-tertiary);
+            letter-spacing: 0.04em;
         }
-        .inbox-list { list-style: none; padding: 0; margin: 0; }
-        .inbox-list li { padding: 8px 0; border-bottom: 1px solid var(--border); }
-        .inbox-list li:last-child { border-bottom: none; }
-        .empty-msg { color: var(--text-muted); font-style: italic; }
-        .actions { margin-top: 15px; display: flex; gap: 10px; flex-wrap: wrap; }
-        #status-area { display: none; }
-        .loading {
-            display: inline-block;
-            width: 16px; height: 16px;
-            border: 2px solid var(--text-muted);
-            border-top-color: var(--accent);
+
+        .conn-dot {
+            width: 6px;
+            height: 6px;
             border-radius: 50%;
-            animation: spin 1s linear infinite;
+            background: var(--text-tertiary);
+            transition: background 0.4s, box-shadow 0.4s;
+        }
+        .conn-dot.connected {
+            background: var(--accent2);
+            box-shadow: 0 0 8px var(--accent2-glow);
+        }
+        .conn-dot.error {
+            background: var(--error);
+            box-shadow: 0 0 8px var(--error);
+        }
+
+        /* ============================================================
+           NOW PLAYING — Always-visible hero strip
+           ============================================================ */
+
+        .now-playing {
+            padding: 20px 0;
+            border-bottom: 1px solid var(--border-subtle);
+            min-height: 80px;
+        }
+
+        .np-idle {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.8rem;
+            color: var(--text-tertiary);
+            letter-spacing: 0.04em;
+            padding: 8px 0;
+        }
+
+        .np-active {
+            display: flex;
+            align-items: flex-start;
+            gap: 20px;
+        }
+
+        .np-info { flex: 1; }
+
+        .np-label {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.6rem;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            color: var(--accent2);
+            margin-bottom: 6px;
+            text-shadow: 0 0 10px var(--accent2-glow);
+        }
+
+        .np-title {
+            font-size: 1.3rem;
+            font-weight: 600;
+            color: var(--text-primary);
+            line-height: 1.3;
+        }
+
+        .np-artist {
+            font-size: 0.9rem;
+            font-weight: 300;
+            color: var(--text-secondary);
+            margin-top: 2px;
+        }
+
+        .np-meta {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.7rem;
+            color: var(--text-tertiary);
+            margin-top: 6px;
+            display: flex;
+            gap: 16px;
+            letter-spacing: 0.02em;
+        }
+
+        .np-meta span::before {
+            content: '';
+            display: inline-block;
+            width: 3px;
+            height: 3px;
+            border-radius: 50%;
+            background: var(--text-tertiary);
             margin-right: 8px;
             vertical-align: middle;
         }
-        @keyframes spin { to { transform: rotate(360deg); } }
+        .np-meta span:first-child::before { display: none; }
 
-        /* Player styles */
-        .player-bar {
+        .np-transport {
             display: flex;
+            gap: 4px;
             align-items: center;
-            gap: 12px;
-            flex-wrap: wrap;
-        }
-        .player-track {
-            flex: 1;
-            min-width: 200px;
-        }
-        .player-track .track-title {
-            font-size: 1.1em;
-            font-weight: 600;
-            color: var(--accent);
-        }
-        .player-track .track-artist {
-            color: var(--text-muted);
-            font-size: 0.9em;
-        }
-        .player-track .track-meta {
-            color: var(--text-muted);
-            font-size: 0.8em;
-            margin-top: 4px;
-        }
-        .player-idle {
-            color: var(--text-muted);
-            font-style: italic;
-        }
-        .player-controls {
-            display: flex;
-            gap: 8px;
+            margin-top: 10px;
         }
 
-        /* Queue styles */
-        .queue-list {
-            list-style: none;
-            padding: 0;
-            margin: 0 0 12px 0;
-            max-height: 300px;
-            overflow-y: auto;
-        }
-        .queue-list li {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            padding: 8px 0;
-            border-bottom: 1px solid var(--border);
-        }
-        .queue-list li:last-child { border-bottom: none; }
-        .queue-track-info { flex: 1; }
-        .queue-track-title { font-size: 0.95em; }
-        .queue-track-artist { color: var(--text-muted); font-size: 0.85em; }
-
-        /* Search styles */
-        .search-row {
-            display: flex;
-            gap: 8px;
-            flex-wrap: wrap;
-            margin-bottom: 12px;
-        }
-        .search-input {
-            flex: 1;
-            min-width: 150px;
-            padding: 8px 12px;
-            border: 1px solid var(--border);
-            background: var(--bg-dark);
-            color: var(--text);
+        /* Cover art thumbnails */
+        .cover-art {
+            object-fit: cover;
             border-radius: 4px;
-            font-size: 0.9em;
+            flex-shrink: 0;
         }
-        .search-input:focus {
-            outline: none;
-            border-color: var(--accent);
-        }
-        .search-results { max-height: 400px; overflow-y: auto; }
 
-        /* SSE indicator */
-        .sse-dot {
-            display: inline-block;
+        .cover-art-np {
+            width: 80px;
+            height: 80px;
+        }
+
+        .cover-art-queue {
+            width: 48px;
+            height: 48px;
+        }
+
+        .cover-art-search {
+            width: 48px;
+            height: 48px;
+        }
+
+        .transport-btn {
+            width: 36px;
+            height: 36px;
+            border: 1px solid var(--border-strong);
+            border-radius: var(--radius-sm);
+            background: var(--bg-surface);
+            color: var(--text-secondary);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.15s ease;
+            font-size: 0.85rem;
+        }
+        .transport-btn:hover {
+            border-color: var(--text-secondary);
+            color: var(--text-primary);
+            background: var(--bg-elevated);
+        }
+        .transport-btn.primary {
+            border-color: var(--accent);
+            color: var(--accent);
+            box-shadow: 0 0 8px var(--accent-dim);
+        }
+        .transport-btn.primary:hover {
+            background: var(--accent-dim);
+            box-shadow: 0 0 14px var(--accent-glow);
+        }
+
+        /* Progress bar */
+        .np-progress {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 12px;
+        }
+
+        .progress-track {
+            flex: 1;
+            height: 2px;
+            background: var(--border-subtle);
+            border-radius: 1px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent), var(--accent-bright));
+            border-radius: 1px;
+            transition: width 0.9s linear;
+            width: 0%;
+            position: relative;
+            box-shadow: 0 0 8px var(--accent-glow);
+        }
+        .progress-fill::after {
+            content: '';
+            position: absolute;
+            right: 0;
+            top: -3px;
             width: 8px;
             height: 8px;
             border-radius: 50%;
-            background: var(--text-muted);
-            margin-left: 8px;
-            vertical-align: middle;
-            transition: background 0.3s;
+            background: var(--accent-bright);
+            box-shadow: 0 0 12px var(--accent-glow), 0 0 24px var(--accent-glow);
         }
-        .sse-dot.connected { background: var(--success); }
-        .sse-dot.error { background: var(--error); }
 
-        /* Progress bar */
-        .progress-wrap {
-            margin-top: 10px;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        .progress-bar-track {
-            flex: 1;
-            height: 4px;
-            background: var(--border);
-            border-radius: 2px;
-            overflow: hidden;
-        }
-        .progress-bar-fill {
-            height: 100%;
-            background: var(--accent);
-            border-radius: 2px;
-            transition: width 0.9s linear;
-            width: 0%;
-        }
         .progress-time {
-            color: var(--text-muted);
-            font-size: 0.8em;
+            font-family: 'DM Mono', monospace;
+            font-size: 0.65rem;
+            color: var(--text-tertiary);
             white-space: nowrap;
             min-width: 70px;
             text-align: right;
+            letter-spacing: 0.04em;
         }
+
+        /* ============================================================
+           TAB NAVIGATION
+           ============================================================ */
+
+        .tab-nav {
+            display: flex;
+            gap: 0;
+            border-bottom: 1px solid var(--border-subtle);
+            padding-top: 4px;
+        }
+
+        .tab-btn {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.72rem;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            padding: 14px 24px;
+            background: none;
+            border: none;
+            color: var(--text-tertiary);
+            cursor: pointer;
+            position: relative;
+            transition: color 0.2s;
+        }
+        .tab-btn:hover { color: var(--text-secondary); }
+        .tab-btn.active { color: var(--accent); }
+        .tab-btn.active::after {
+            content: '';
+            position: absolute;
+            bottom: -1px;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: var(--accent);
+            box-shadow: 0 0 10px var(--accent-glow), 0 2px 20px var(--accent-glow);
+        }
+
+        /* ============================================================
+           TAB CONTENT PANELS
+           ============================================================ */
+
+        .tab-panel { display: none; padding: 24px 0 40px; }
+        .tab-panel.active { display: block; }
+
+        /* Section blocks */
+        .section {
+            margin-bottom: 32px;
+        }
+
+        .section-header {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.65rem;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            color: var(--text-tertiary);
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--border-subtle);
+            margin-bottom: 16px;
+        }
+
+        /* Key-value rows */
+        .kv-grid {
+            display: grid;
+            grid-template-columns: 160px 1fr;
+            gap: 0;
+        }
+
+        .kv-label, .kv-value {
+            padding: 8px 0;
+            border-bottom: 1px solid var(--border-subtle);
+            font-size: 0.85rem;
+        }
+        .kv-label {
+            color: var(--text-tertiary);
+            font-weight: 300;
+        }
+        .kv-value {
+            color: var(--text-primary);
+        }
+
+        .kv-value .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            font-family: 'DM Mono', monospace;
+            font-size: 0.7rem;
+            padding: 2px 8px;
+            border-radius: var(--radius-sm);
+            letter-spacing: 0.04em;
+        }
+        .badge.ok {
+            color: var(--accent2);
+            background: var(--accent2-dim);
+        }
+        .badge.warn {
+            color: var(--warning);
+            background: var(--warning-dim);
+        }
+        .badge.err {
+            color: var(--error);
+            background: var(--error-dim);
+        }
+
+        /* ============================================================
+           QUEUE
+           ============================================================ */
+
+        .queue-list {
+            list-style: none;
+        }
+
+        .queue-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 10px 0;
+            border-bottom: 1px solid var(--border-subtle);
+            transition: background 0.1s;
+        }
+        .queue-item:last-child { border-bottom: none; }
+
+        .queue-num {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.7rem;
+            color: var(--text-tertiary);
+            width: 24px;
+            text-align: right;
+            flex-shrink: 0;
+        }
+
+        .queue-info { flex: 1; min-width: 0; }
+
+        .queue-title {
+            font-size: 0.88rem;
+            font-weight: 400;
+            color: var(--text-primary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .queue-artist {
+            font-size: 0.78rem;
+            font-weight: 300;
+            color: var(--text-secondary);
+        }
+
+        .queue-remove {
+            opacity: 0;
+            transition: opacity 0.15s;
+        }
+        .queue-item:hover .queue-remove { opacity: 1; }
+        @media (hover: none) {
+            .queue-remove { opacity: 0.7; }
+        }
+
+        /* ============================================================
+           SEARCH
+           ============================================================ */
+
+        .search-bar {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+        }
+
+        .search-field {
+            flex: 1;
+            min-width: 180px;
+            padding: 10px 14px;
+            font-family: 'Outfit', sans-serif;
+            font-size: 0.85rem;
+            font-weight: 300;
+            background: var(--bg-surface);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            transition: border-color 0.2s;
+        }
+        .search-field::placeholder { color: var(--text-tertiary); }
+        .search-field:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 1px var(--accent-dim), 0 0 12px var(--accent-dim);
+        }
+
+        .search-field-sm {
+            flex: 0 1 120px;
+            min-width: 100px;
+        }
+
+        .search-results-area {
+            max-height: 480px;
+            overflow-y: auto;
+            scrollbar-width: thin;
+            scrollbar-color: var(--border-strong) transparent;
+        }
+
+        /* Results table */
+        .results-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .results-table th {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.6rem;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--text-tertiary);
+            text-align: left;
+            padding: 8px 8px 8px 0;
+            border-bottom: 1px solid var(--border-subtle);
+            font-weight: 400;
+            position: sticky;
+            top: 0;
+            background: var(--bg-base);
+        }
+
+        .results-table td {
+            padding: 8px 8px 8px 0;
+            border-bottom: 1px solid var(--border-subtle);
+            font-size: 0.85rem;
+            color: var(--text-primary);
+            vertical-align: middle;
+        }
+
+        .results-table tr:hover td { background: var(--bg-surface); }
+
+        .results-table .col-actions {
+            white-space: nowrap;
+            text-align: right;
+            padding-right: 0;
+        }
+
+        .results-table .col-mono {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        .empty-state {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.78rem;
+            color: var(--text-tertiary);
+            padding: 24px 0;
+            letter-spacing: 0.02em;
+        }
+
+        /* ============================================================
+           BUTTONS
+           ============================================================ */
+
+        .btn {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.72rem;
+            letter-spacing: 0.06em;
+            padding: 8px 16px;
+            border-radius: var(--radius-sm);
+            border: 1px solid var(--border-strong);
+            background: var(--bg-surface);
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: all 0.15s ease;
+            white-space: nowrap;
+        }
+        .btn:hover {
+            color: var(--text-primary);
+            border-color: var(--text-secondary);
+            background: var(--bg-elevated);
+        }
+        .btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+        .btn-accent {
+            border-color: var(--accent);
+            color: var(--accent);
+            background: var(--accent-dim);
+            box-shadow: 0 0 6px var(--accent-dim);
+        }
+        .btn-accent:hover {
+            color: #fff;
+            background: var(--accent);
+            border-color: var(--accent);
+            box-shadow: 0 0 16px var(--accent-glow), 0 0 30px var(--accent-dim);
+        }
+
+        .btn-ghost {
+            border: none;
+            background: none;
+            padding: 6px 10px;
+            color: var(--text-tertiary);
+        }
+        .btn-ghost:hover { color: var(--text-primary); background: var(--bg-hover); }
+
+        .btn-danger {
+            border-color: transparent;
+            background: none;
+            color: var(--text-tertiary);
+        }
+        .btn-danger:hover {
+            color: var(--error);
+            background: var(--error-dim);
+            border-color: transparent;
+        }
+
+        .btn-sm { padding: 5px 10px; font-size: 0.68rem; }
+
+        .btn-row {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        /* ============================================================
+           PACKAGE TABLE (Maintenance)
+           ============================================================ */
+
+        .pkg-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .pkg-table th {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.6rem;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--text-tertiary);
+            text-align: left;
+            padding: 8px 12px 8px 0;
+            border-bottom: 1px solid var(--border-subtle);
+            font-weight: 400;
+        }
+
+        .pkg-table td {
+            padding: 10px 12px 10px 0;
+            border-bottom: 1px solid var(--border-subtle);
+            font-size: 0.85rem;
+        }
+
+        .pkg-name {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.8rem;
+            color: var(--text-primary);
+        }
+
+        .pkg-version {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        /* ============================================================
+           FORMS (Maintenance)
+           ============================================================ */
+
+        .form-group {
+            margin-bottom: 14px;
+        }
+
+        .form-label {
+            display: block;
+            font-family: 'DM Mono', monospace;
+            font-size: 0.65rem;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: var(--text-tertiary);
+            margin-bottom: 6px;
+        }
+
+        .form-input {
+            width: 100%;
+            padding: 10px 14px;
+            font-family: 'Outfit', sans-serif;
+            font-size: 0.85rem;
+            font-weight: 300;
+            background: var(--bg-surface);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            transition: border-color 0.2s;
+        }
+        .form-input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        /* Audio output selector */
+        .audio-output-section {
+            padding: 4px 0 8px;
+        }
+
+        .audio-output-select {
+            width: 100%;
+            padding: 10px 14px;
+            font-family: 'Outfit', sans-serif;
+            font-size: 0.85rem;
+            font-weight: 300;
+            background: var(--bg-surface);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            cursor: pointer;
+            transition: border-color 0.2s;
+            appearance: none;
+            -webkit-appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath fill='%239898b8' d='M0 0l6 8 6-8z'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 14px center;
+            padding-right: 36px;
+        }
+        .audio-output-select:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 1px var(--accent-dim), 0 0 12px var(--accent-dim);
+        }
+        .audio-output-select:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .audio-output-select option {
+            background: var(--bg-elevated);
+            color: var(--text-primary);
+        }
+
+        .form-input[type="file"] {
+            padding: 8px;
+            font-size: 0.78rem;
+        }
+        .form-input[type="file"]::file-selector-button {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.68rem;
+            padding: 5px 12px;
+            margin-right: 10px;
+            border: 1px solid var(--border-strong);
+            border-radius: var(--radius-sm);
+            background: var(--bg-elevated);
+            color: var(--text-secondary);
+            cursor: pointer;
+        }
+
+        .form-status {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.72rem;
+            margin-top: 8px;
+            letter-spacing: 0.02em;
+        }
+
+        /* Upload zone */
+        .upload-zone {
+            border: 1px dashed var(--border-strong);
+            border-radius: var(--radius-md);
+            padding: 24px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .upload-zone:hover {
+            border-color: var(--accent);
+            background: var(--accent-dim);
+            box-shadow: inset 0 0 20px var(--accent-dim);
+        }
+        .upload-zone-text {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.75rem;
+            color: var(--text-tertiary);
+            letter-spacing: 0.04em;
+        }
+        .upload-zone-hint {
+            font-size: 0.65rem;
+            color: var(--text-tertiary);
+            margin-top: 4px;
+            opacity: 0.6;
+        }
+
+        /* ============================================================
+           STATUS TOAST
+           ============================================================ */
+
+        .toast {
+            position: fixed;
+            bottom: 24px;
+            left: 50%;
+            transform: translateX(-50%) translateY(20px);
+            font-family: 'DM Mono', monospace;
+            font-size: 0.75rem;
+            padding: 10px 20px;
+            border-radius: var(--radius-md);
+            border: 1px solid var(--border-strong);
+            background: var(--bg-elevated);
+            color: var(--text-primary);
+            opacity: 0;
+            pointer-events: none;
+            transition: all 0.3s ease;
+            z-index: 1000;
+            max-width: 90%;
+            letter-spacing: 0.02em;
+        }
+        .toast.visible {
+            opacity: 1;
+            transform: translateX(-50%) translateY(0);
+        }
+        .toast.toast-error {
+            border-color: var(--error);
+            background: var(--error-dim);
+            color: var(--error);
+        }
+        .toast.toast-ok {
+            border-color: var(--accent2);
+            background: var(--accent2-dim);
+            color: var(--accent2);
+        }
+
+        /* ============================================================
+           MODAL
+           ============================================================ */
+
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(4px);
+            z-index: 900;
+            display: none;
+            justify-content: center;
+            align-items: center;
+        }
+        .modal-overlay.open { display: flex; }
+
+        .modal {
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-strong);
+            border-radius: var(--radius-lg);
+            padding: 28px;
+            min-width: 340px;
+            max-width: 90vw;
+        }
+
+        .modal-title {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.72rem;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--text-primary);
+            margin-bottom: 16px;
+        }
+
+        .modal-actions {
+            display: flex;
+            gap: 8px;
+            justify-content: flex-end;
+            margin-top: 20px;
+        }
+
+        /* ============================================================
+           LOADING SPINNER
+           ============================================================ */
+
+        .spinner {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border: 1.5px solid var(--text-tertiary);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-right: 6px;
+            vertical-align: middle;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* ============================================================
+           SCROLLBAR
+           ============================================================ */
+
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 2px; }
+
+        /* ============================================================
+           CONTENT LAYOUT — Sidebar + Main
+           ============================================================ */
+
+        .content-layout { display: flex; gap: 32px; }
+        .main-content { flex: 1; min-width: 0; }
+        .sidebar {
+            flex: 0 0 300px;
+            min-width: 0;
+            position: sticky;
+            top: 20px;
+            align-self: flex-start;
+            max-height: calc(100vh - 40px);
+            overflow-y: auto;
+        }
+
+        /* Desktop: details always open, summary non-interactive */
+        .sidebar-section { display: block; }
+        .sidebar-section > summary { list-style: none; cursor: default; pointer-events: none; }
+        .sidebar-section > summary::-webkit-details-marker { display: none; }
+        .sidebar-section > summary::marker { display: none; content: ''; }
+
+        /* Remove outer border from now-playing when inside sidebar */
+        .sidebar .now-playing { border-bottom: none; padding: 12px 0 4px; }
+
+        /* ============================================================
+           RESPONSIVE
+           ============================================================ */
+
+        @media (max-width: 640px) {
+            .masthead { padding: 16px 0 14px; }
+            .np-active { flex-direction: column; gap: 12px; }
+            .transport-btn { width: 44px; height: 44px; font-size: 1rem; }
+            .tab-btn { padding: 14px 16px; font-size: 0.7rem; }
+            .kv-grid { grid-template-columns: 120px 1fr; }
+            .search-field { min-width: 100%; }
+            .search-field-sm { flex: 1 1 100%; min-width: 100%; }
+            .btn { padding: 10px 16px; font-size: 0.74rem; }
+            .btn-sm { padding: 8px 14px; }
+            .content-layout { flex-direction: column; gap: 0; }
+            .sidebar {
+                position: static;
+                max-height: none;
+                flex: none;
+                padding-bottom: 8px;
+            }
+            .sidebar-section > summary {
+                cursor: pointer;
+                pointer-events: auto;
+                position: relative;
+                padding-right: 20px;
+            }
+            .sidebar-section > summary::after {
+                content: '\25B8';
+                position: absolute;
+                right: 0;
+                transition: transform 0.2s;
+            }
+            .sidebar-section[open] > summary::after {
+                transform: rotate(90deg);
+            }
+        }
+
+        /* ============================================================
+           SUBTLE AMBIENT TEXTURE
+           ============================================================ */
+
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background: radial-gradient(ellipse at 20% 0%, rgba(236, 136, 244, 0.07) 0%, transparent 50%),
+                        radial-gradient(ellipse at 80% 100%, rgba(104, 232, 255, 0.06) 0%, transparent 40%);
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        .shell { position: relative; z-index: 1; }
+
+        /* ============================================================
+           BROWSE TAB
+           ============================================================ */
+
+        .browse-list { max-height: 70vh; overflow-y: auto; }
+        .browse-item { padding: 10px 12px; cursor: pointer; border-bottom: 1px solid var(--border); font-family: 'DM Mono', monospace; }
+        .browse-item:hover { background: rgba(236,136,244,0.08); }
+        .album-card { display: inline-block; width: 140px; margin: 8px; cursor: pointer; text-align: center; vertical-align: top; }
+        .album-card img { width: 120px; height: 120px; object-fit: cover; border-radius: 4px; }
+        .album-card .album-card-title { font-size: 0.85em; margin-top: 4px; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .album-card .album-card-artist { font-size: 0.75em; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .album-group { margin-bottom: 24px; }
+        .album-group-header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; padding: 8px 0; border-bottom: 1px solid var(--border); }
+        .album-group-header img { width: 60px; height: 60px; object-fit: cover; border-radius: 4px; }
+        .album-group-header .album-group-name { font-family: 'DM Mono', monospace; font-size: 1.1em; color: var(--accent2); }
+        .browse-mode-btn.active { background: var(--accent); color: #000; }
     </style>
 </head>
 <body>
-    <h1>MDMA Console <span class="sse-dot" id="sse-dot" title="Event stream"></span></h1>
-    <p class="version">v{{ version }}</p>
 
-    <div id="status-area"></div>
+    <div class="shell">
 
-    <!-- Now Playing -->
-    <div class="card">
-        <h2>Now Playing</h2>
-        <div id="now-playing-area">
-            <p class="player-idle">Loading...</p>
-        </div>
-        <div id="progress-area" style="display:none;">
-            <div class="progress-wrap">
-                <div class="progress-bar-track">
-                    <div class="progress-bar-fill" id="progress-fill"></div>
+        <!-- ============================================================
+             MASTHEAD
+             ============================================================ -->
+
+        <header class="masthead">
+            <div class="brand">
+                <span class="brand-name">MDMA</span>
+                <span class="brand-version">v{{ version }}</span>
+            </div>
+            <div class="connection-indicator">
+                <span class="conn-dot" id="sse-dot"></span>
+                <span id="conn-label">connecting</span>
+            </div>
+        </header>
+
+        <div class="content-layout">
+
+        <!-- ============================================================
+             SIDEBAR — Now Playing + Queue
+             ============================================================ -->
+
+        <aside class="sidebar">
+
+            <details class="sidebar-section" open>
+                <div class="now-playing">
+                    <div id="now-playing-area">
+                        <div class="np-idle">No active playback</div>
+                    </div>
+                    <div id="progress-area" style="display:none;">
+                        <div class="np-progress">
+                            <div class="progress-track">
+                                <div class="progress-fill" id="progress-fill"></div>
+                            </div>
+                            <span class="progress-time" id="progress-time">0:00 / 0:00</span>
+                        </div>
+                    </div>
                 </div>
-                <span class="progress-time" id="progress-time">0:00 / 0:00</span>
-            </div>
-        </div>
-        <div class="actions">
-            <button class="btn btn-secondary" onclick="playerPause()">Pause</button>
-            <button class="btn btn-secondary" onclick="playerResume()">Resume</button>
-            <button class="btn btn-secondary" onclick="playerStop()">Stop</button>
-            <button class="btn btn-secondary" onclick="playerSkip()">Skip</button>
-            <button class="btn" onclick="playerPlayQueue()">Play Queue</button>
-        </div>
-    </div>
+            </details>
 
-    <!-- Queue -->
-    <div class="card">
-        <h2>Queue</h2>
-        <ul class="queue-list" id="queue-list">
-            <li><span class="empty-msg">Loading...</span></li>
-        </ul>
-        <div class="actions">
-            <button class="btn btn-secondary btn-small" onclick="clearQueue()">Clear All</button>
-        </div>
-    </div>
+            <details class="sidebar-section" open>
+                <summary class="section-header">Queue</summary>
+                <ul class="queue-list" id="queue-list">
+                    <li><span class="empty-state">Queue is empty</span></li>
+                </ul>
+                <div class="btn-row" style="margin-top: 14px;">
+                    <button class="btn btn-accent btn-sm" onclick="playerPlayQueue()">Play Queue</button>
+                    <button class="btn btn-sm" onclick="clearQueue()">Clear</button>
+                </div>
+            </details>
 
-    <!-- Library Search -->
-    <div class="card">
-        <h2>Library Search</h2>
-        <div class="search-row">
-            <input type="text" class="search-input" id="search-q" placeholder="Search all fields..." oninput="scheduleSearch()">
-            <input type="text" class="search-input" id="search-artist" placeholder="Artist..." oninput="scheduleSearch()" style="max-width:160px;">
-            <input type="text" class="search-input" id="search-bpm" placeholder="BPM (e.g. 128+-4)" oninput="scheduleSearch()" style="max-width:130px;">
-            <input type="text" class="search-input" id="search-key" placeholder="Key (e.g. 8B)" oninput="scheduleSearch()" style="max-width:110px;">
-        </div>
-        <div class="search-results" id="search-results">
-            <p class="empty-msg">Type to search your library.</p>
-        </div>
-    </div>
+        </aside>
 
-    <div class="card">
-        <h2>Package Management</h2>
-        {% if packages.is_empty() %}
-        <p class="empty-msg">No MDMA packages installed</p>
-        {% else %}
-        <table>
-            <thead>
-                <tr>
-                    <th>Package</th>
-                    <th>Version</th>
-                    <th>Update</th>
-                    <th>Action</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for pkg in packages %}
-                <tr>
-                    <td>{{ pkg.name }}</td>
-                    <td>{{ pkg.version }}</td>
-                    <td>
-                        {% match pkg.update_version %}
-                            {% when Some with (ver) %}
-                                <span class="update-available">{{ ver }}</span>
-                            {% when None %}
-                                <span class="no-update">-</span>
-                        {% endmatch %}
-                    </td>
-                    <td>
-                        {% if pkg.has_update() %}
-                        <button class="btn btn-small" onclick="updatePackage('{{ pkg.name }}')">Update</button>
+        <!-- ============================================================
+             MAIN CONTENT — Tabs
+             ============================================================ -->
+
+        <div class="main-content">
+
+        <!-- ============================================================
+             TAB NAVIGATION
+             ============================================================ -->
+
+        <nav class="tab-nav">
+            <button class="tab-btn" data-tab="status">Status</button>
+            <button class="tab-btn" data-tab="playback">Playback</button>
+            <button class="tab-btn" data-tab="browse">Browse</button>
+            <button class="tab-btn" data-tab="maintenance">Maintenance</button>
+        </nav>
+
+        <!-- ============================================================
+             TAB: STATUS
+             ============================================================ -->
+
+        <div class="tab-panel" id="tab-status">
+
+            <!-- System health -->
+            <div class="section">
+                <div class="section-header">System Services</div>
+                <div class="kv-grid" id="service-status">
+                    <div class="kv-label">Event Stream</div>
+                    <div class="kv-value"><span class="badge ok" id="sse-badge">connected</span></div>
+                    <div class="kv-label">Playback Engine</div>
+                    <div class="kv-value"><span class="badge ok">online</span></div>
+                    <div class="kv-label">Library</div>
+                    <div class="kv-value"><span class="badge ok">online</span></div>
+                    <div class="kv-label">Bandcamp Sync</div>
+                    <div class="kv-value" id="bandcamp-status-badge">
+                        {% if !bandcamp.connected %}
+                        <span class="badge err">not connected</span>
+                        {% else if bandcamp.paused %}
+                        <span class="badge warn">paused</span>
+                        {% else %}
+                        <span class="badge ok">running</span>
                         {% endif %}
-                    </td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-        {% endif %}
-        <div class="actions">
-            <button class="btn btn-secondary" onclick="checkUpdates()">Check for Updates</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Bandcamp status -->
+            <div class="section">
+                <div class="section-header">Bandcamp Downloader</div>
+                {% if !bandcamp.connected %}
+                <div class="empty-state">Bandcamp service not connected</div>
+                {% else %}
+                <div class="kv-grid">
+                    <div class="kv-label">Authenticated</div>
+                    <div class="kv-value">
+                        {% if bandcamp.authenticated %}
+                        <span class="badge ok">yes</span>
+                        {% else %}
+                        <span class="badge err">no</span>
+                        {% endif %}
+                    </div>
+                    <div class="kv-label">Active</div>
+                    <div class="kv-value" id="bc-active">{{ bandcamp.downloads_active }}</div>
+                    <div class="kv-label">Queued</div>
+                    <div class="kv-value" id="bc-queued">{{ bandcamp.downloads_queued }}</div>
+                    <div class="kv-label">Completed</div>
+                    <div class="kv-value" id="bc-completed">{{ bandcamp.downloads_completed }}</div>
+                    <div class="kv-label">Failed</div>
+                    <div class="kv-value" id="bc-failed">
+                        {% if bandcamp.downloads_failed > 0 %}
+                        <span class="badge err">{{ bandcamp.downloads_failed }}</span>
+                        {% else %}
+                        0
+                        {% endif %}
+                    </div>
+                    <div class="kv-label">Status</div>
+                    <div class="kv-value">
+                        {% if bandcamp.paused %}
+                        <span class="badge warn">Paused</span>
+                        {% else %}
+                        <span class="badge ok">Running</span>
+                        {% endif %}
+                    </div>
+                </div>
+                <div class="btn-row" style="margin-top: 14px;">
+                    {% if bandcamp.paused %}
+                    <button class="btn btn-accent btn-sm" onclick="resumeDownloads()">Resume</button>
+                    {% else %}
+                    <button class="btn btn-sm" onclick="pauseDownloads()">Pause</button>
+                    {% endif %}
+                    <button class="btn btn-accent btn-sm" onclick="showSyncDialog()">Sync Collection</button>
+                </div>
+                {% endif %}
+            </div>
+
+            <!-- Audio Output -->
+            <div class="section">
+                <div class="section-header">Audio Output</div>
+                <div class="audio-output-section">
+                    <label class="form-label" for="audio-output-select">Output Device</label>
+                    <select id="audio-output-select" class="audio-output-select" disabled>
+                        <option value="">Loading...</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Music inbox -->
+            <div class="section">
+                <div class="section-header">Music Inbox</div>
+                <div id="inbox-area">
+                    {% if inbox.is_empty() %}
+                    <div class="empty-state">Inbox is empty</div>
+                    {% else %}
+                    <div style="font-family:'DM Mono',monospace; font-size:0.75rem; color:var(--text-secondary); margin-bottom:10px;">{{ inbox.len() }} file(s) waiting</div>
+                    <ul style="list-style:none; margin:0; padding:0;">
+                        {% for file in inbox %}
+                        <li style="padding:6px 0; border-bottom:1px solid var(--border-subtle); font-family:'DM Mono',monospace; font-size:0.78rem; color:var(--text-primary);">{{ file }}</li>
+                        {% endfor %}
+                    </ul>
+                    {% endif %}
+                </div>
+                <div class="btn-row" style="margin-top: 14px;">
+                    <button class="btn btn-sm" onclick="ingestAll()" id="ingest-btn" {% if inbox.is_empty() %}disabled{% endif %}>Ingest All</button>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- ============================================================
+             TAB: PLAYBACK
+             ============================================================ -->
+
+        <div class="tab-panel" id="tab-playback">
+
+            <!-- Search -->
+            <div class="section">
+                <div class="section-header">Library Search</div>
+                <div class="search-bar">
+                    <input type="text" class="search-field" id="search-q" placeholder="Search all fields..." oninput="scheduleSearch()">
+                    <input type="text" class="search-field search-field-sm" id="search-artist" placeholder="Artist" oninput="scheduleSearch()">
+                    <input type="text" class="search-field search-field-sm" id="search-bpm" placeholder="BPM" oninput="scheduleSearch()">
+                    <input type="text" class="search-field search-field-sm" id="search-key" placeholder="Key" oninput="scheduleSearch()">
+                </div>
+                <div class="search-results-area" id="search-results">
+                    <div class="empty-state">Type to search your library</div>
+                </div>
+            </div>
+
+
+        </div>
+
+        <!-- ============================================================
+             TAB: BROWSE
+             ============================================================ -->
+
+        <div class="tab-panel" id="tab-browse">
+
+            <div class="section">
+                <div style="display:flex;gap:8px;margin-bottom:16px">
+                    <button class="btn btn-accent btn-sm browse-mode-btn active" data-mode="artists" onclick="switchBrowseMode('artists')">Artists</button>
+                    <button class="btn btn-sm browse-mode-btn" data-mode="albums" onclick="switchBrowseMode('albums')">Albums</button>
+                </div>
+                <div id="browse-content" class="empty-state">Select Artists or Albums to browse</div>
+            </div>
+
+        </div>
+
+        <!-- ============================================================
+             TAB: MAINTENANCE
+             ============================================================ -->
+
+        <div class="tab-panel" id="tab-maintenance">
+
+            <!-- Packages -->
+            <div class="section">
+                <div class="section-header">Packages</div>
+                {% if packages.is_empty() %}
+                <div class="empty-state">No MDMA packages installed</div>
+                {% else %}
+                <table class="pkg-table">
+                    <thead>
+                        <tr>
+                            <th>Package</th>
+                            <th>Installed</th>
+                            <th>Available</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for pkg in packages %}
+                        <tr>
+                            <td class="pkg-name">{{ pkg.name }}</td>
+                            <td class="pkg-version">{{ pkg.version }}</td>
+                            <td class="pkg-version">
+                                {% match pkg.update_version %}
+                                    {% when Some with (ver) %}
+                                        <span style="color:var(--success)">{{ ver }}</span>
+                                    {% when None %}
+                                        <span style="color:var(--text-tertiary)">—</span>
+                                {% endmatch %}
+                            </td>
+                            <td>
+                                {% if pkg.has_update() %}
+                                <button class="btn btn-accent btn-sm" onclick="updatePackage('{{ pkg.name }}')">Update</button>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                {% endif %}
+                <div class="btn-row" style="margin-top: 14px;">
+                    <button class="btn btn-sm" onclick="checkUpdates()">Check for Updates</button>
+                </div>
+            </div>
+
+            <!-- Bandcamp Configuration -->
+            <div class="section">
+                <div class="section-header">Bandcamp Configuration</div>
+                <div class="kv-grid" style="margin-bottom: 20px;">
+                    <div class="kv-label">Username</div>
+                    <div class="kv-value">
+                        {% if bandcamp.configured_username.is_empty() %}
+                        <span style="color:var(--text-tertiary)">not set</span>
+                        {% else %}
+                        {{ bandcamp.configured_username }}
+                        {% endif %}
+                    </div>
+                    <div class="kv-label">Cookies</div>
+                    <div class="kv-value">
+                        {% if bandcamp.cookies_valid %}
+                        <span class="badge ok">valid</span>
+                        {% else %}
+                        <span class="badge err">missing / invalid</span>
+                        {% endif %}
+                    </div>
+                </div>
+                <form id="bandcamp-configure-form" onsubmit="submitBandcampConfigure(event)">
+                    <div class="form-group">
+                        <label class="form-label">Cookie file (.json or .txt)</label>
+                        <input type="file" class="form-input" id="bandcamp-cookie-file" accept=".json,.txt">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Bandcamp username</label>
+                        <input type="text" class="form-input" id="bandcamp-conf-username" value="{{ bandcamp.configured_username }}" placeholder="e.g. johlyroger">
+                    </div>
+                    <div class="btn-row">
+                        <button class="btn btn-accent btn-sm" type="submit" id="bandcamp-configure-btn">Save Configuration</button>
+                    </div>
+                    <div class="form-status" id="bandcamp-configure-status"></div>
+                </form>
+            </div>
+
+            <!-- Upload -->
+            <div class="section">
+                <div class="section-header">Upload Music</div>
+                <div class="upload-zone" onclick="document.getElementById('upload-input').click()">
+                    <div class="upload-zone-text">Click to upload FLAC, MP3, WAV, AIFF, or ZIP</div>
+                    <div class="upload-zone-hint">Files will be added to your inbox for ingestion</div>
+                </div>
+                <input type="file" id="upload-input" multiple accept=".flac,.mp3,.wav,.aif,.aiff,.zip" style="display:none">
+                <div class="form-status" id="upload-status"></div>
+            </div>
+
+        </div>
+
+        </div><!-- /.main-content -->
+
+        </div><!-- /.content-layout -->
+
+    </div>
+
+    <!-- ============================================================
+         SYNC DIALOG
+         ============================================================ -->
+
+    <div class="modal-overlay" id="sync-dialog">
+        <div class="modal">
+            <div class="modal-title">Sync Bandcamp Collection</div>
+            <div class="form-group">
+                <label class="form-label">Bandcamp username</label>
+                <input type="text" class="form-input" id="bandcamp-username" placeholder="e.g. johlyroger">
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-sm" onclick="hideSyncDialog()">Cancel</button>
+                <button class="btn btn-accent btn-sm" onclick="syncCollection()">Sync</button>
+            </div>
         </div>
     </div>
 
-    <div class="card">
-        <h2>Music Inbox</h2>
-        {% if inbox.is_empty() %}
-        <p class="empty-msg">Inbox is empty</p>
-        {% else %}
-        <p>{{ inbox.len() }} file(s) waiting</p>
-        <ul class="inbox-list">
-            {% for file in inbox %}
-            <li>{{ file }}</li>
-            {% endfor %}
-        </ul>
-        {% endif %}
-        <div style="margin-bottom: 15px;">
-            <input type="file" id="upload-input" multiple accept=".flac,.mp3,.wav,.aif,.aiff,.zip" style="display:none;">
-            <button class="btn" onclick="document.getElementById('upload-input').click()">Upload Files</button>
-            <span id="upload-status" style="margin-left: 10px;"></span>
-        </div>
-        <div class="actions">
-            <button class="btn" onclick="ingestAll()" {% if inbox.is_empty() %}disabled{% endif %}>Ingest All</button>
-        </div>
-    </div>
+    <!-- ============================================================
+         TOAST
+         ============================================================ -->
 
-    <div class="card">
-        <h2>Bandcamp Downloads</h2>
-        {% if !bandcamp.connected %}
-        <p class="empty-msg">Bandcamp service not connected</p>
-        {% else %}
-        <table>
-            <tbody>
-                <tr>
-                    <td>Authenticated</td>
-                    <td>{% if bandcamp.authenticated %}<span class="update-available">yes</span>{% else %}<span class="no-update">no</span>{% endif %}</td>
-                </tr>
-                <tr>
-                    <td>Downloads Active</td>
-                    <td>{{ bandcamp.downloads_active }}</td>
-                </tr>
-                <tr>
-                    <td>Downloads Queued</td>
-                    <td>{{ bandcamp.downloads_queued }}</td>
-                </tr>
-                <tr>
-                    <td>Downloads Completed</td>
-                    <td>{{ bandcamp.downloads_completed }}</td>
-                </tr>
-                <tr>
-                    <td>Downloads Failed</td>
-                    <td>{% if bandcamp.downloads_failed > 0 %}<span class="status-error">{{ bandcamp.downloads_failed }}</span>{% else %}0{% endif %}</td>
-                </tr>
-                <tr>
-                    <td>Status</td>
-                    <td>{% if bandcamp.paused %}<span class="no-update">Paused</span>{% else %}<span class="update-available">Running</span>{% endif %}</td>
-                </tr>
-            </tbody>
-        </table>
-        <div class="actions">
-            {% if bandcamp.paused %}
-            <button class="btn" onclick="resumeDownloads()">Resume</button>
-            {% else %}
-            <button class="btn btn-secondary" onclick="pauseDownloads()">Pause</button>
-            {% endif %}
-            <button class="btn" onclick="showSyncDialog()">Sync Collection</button>
-        </div>
-        {% endif %}
-    </div>
+    <div class="toast" id="toast"></div>
 
-    <div class="card">
-        <h2>Bandcamp Configuration</h2>
-        <table style="margin-bottom:12px;">
-            <tbody>
-                <tr>
-                    <td>Username</td>
-                    <td>{% if bandcamp.configured_username.is_empty() %}<span class="no-update">not set</span>{% else %}{{ bandcamp.configured_username }}{% endif %}</td>
-                </tr>
-                <tr>
-                    <td>Cookies</td>
-                    <td>{% if bandcamp.cookies_valid %}<span class="update-available">valid</span>{% else %}<span class="no-update">missing / invalid</span>{% endif %}</td>
-                </tr>
-            </tbody>
-        </table>
-        <form id="bandcamp-configure-form" onsubmit="submitBandcampConfigure(event)" style="display:flex; flex-direction:column; gap:10px;">
-            <div>
-                <label style="display:block; margin-bottom:4px; color:var(--text-muted);">Cookie file (.json or .txt)</label>
-                <input type="file" id="bandcamp-cookie-file" accept=".json,.txt" style="color:var(--text);">
-            </div>
-            <div>
-                <label style="display:block; margin-bottom:4px; color:var(--text-muted);">Bandcamp username</label>
-                <input type="text" id="bandcamp-conf-username" value="{{ bandcamp.configured_username }}" placeholder="e.g. johlyroger" style="width:100%; padding:8px; border:1px solid var(--border); background:var(--bg-dark); color:var(--text); border-radius:4px;">
-            </div>
-            <div style="display:flex; gap:10px; align-items:center;">
-                <button class="btn" type="submit" id="bandcamp-configure-btn">Save Configuration</button>
-                <span id="bandcamp-configure-status" style="font-size:0.9em;"></span>
-            </div>
-        </form>
-    </div>
-
-    <div id="sync-dialog" style="display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.7); z-index:1000;">
-        <div style="position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:var(--bg-card); padding:20px; border-radius:8px; min-width:300px;">
-            <h3 style="margin-top:0;">Sync Bandcamp Collection</h3>
-            <input type="text" id="bandcamp-username" placeholder="Bandcamp username" style="width:100%; padding:8px; border:1px solid var(--border); background:var(--bg-dark); color:var(--text); border-radius:4px; margin-bottom:10px;">
-            <div style="display:flex; gap:10px; justify-content:flex-end;">
-                <button class="btn btn-secondary" onclick="hideSyncDialog()">Cancel</button>
-                <button class="btn" onclick="syncCollection()">Sync</button>
-            </div>
-        </div>
-    </div>
+    <!-- ============================================================
+         JAVASCRIPT
+         ============================================================ -->
 
     <script>
-        // =====================================================================
-        // Utilities
-        // =====================================================================
+        // =================================================================
+        // Tab Navigation
+        // =================================================================
+
+        var userSelectedTab = false;
+        var isPlaybackPaused = false;
+
+        function activateTab(tabName) {
+            document.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
+            document.querySelectorAll('.tab-panel').forEach(function(p) { p.classList.remove('active'); });
+            var btn = document.querySelector('.tab-btn[data-tab="' + tabName + '"]');
+            if (btn) btn.classList.add('active');
+            var panel = document.getElementById('tab-' + tabName);
+            if (panel) panel.classList.add('active');
+            if (tabName === 'browse') {
+                var browseContent = document.getElementById('browse-content');
+                if (browseContent && browseContent.classList.contains('empty-state')) {
+                    loadBrowseContent();
+                }
+            }
+        }
+
+        function deactivateAllTabs() {
+            document.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
+            document.querySelectorAll('.tab-panel').forEach(function(p) { p.classList.remove('active'); });
+        }
+
+        document.querySelectorAll('.tab-btn').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+                userSelectedTab = true;
+                activateTab(btn.dataset.tab);
+                if (btn.dataset.tab === 'status') {
+                    loadAudioOutputs();
+                }
+            });
+        });
+
+        // =================================================================
+        // Toast Notifications
+        // =================================================================
+
+        var toastTimer = null;
 
         function showStatus(message, isError) {
-            var area = document.getElementById('status-area');
-            area.style.display = 'block';
-            area.className = 'status-msg ' + (isError ? 'status-error' : 'status-success');
-            area.textContent = message;
-            setTimeout(function() { area.style.display = 'none'; }, 5000);
+            var el = document.getElementById('toast');
+            el.textContent = message;
+            el.className = 'toast visible ' + (isError ? 'toast-error' : 'toast-ok');
+            clearTimeout(toastTimer);
+            toastTimer = setTimeout(function() {
+                el.className = 'toast';
+            }, 4000);
         }
 
         function showLoading(btn) {
             btn.disabled = true;
-            btn.innerHTML = '<span class="loading"></span>Working...';
+            btn.innerHTML = '<span class="spinner"></span>Working...';
         }
+
+        // =================================================================
+        // Utilities
+        // =================================================================
 
         function escapeHtml(s) {
             if (s == null) return '';
@@ -456,6 +1411,10 @@
             return m + ':' + (s < 10 ? '0' : '') + s;
         }
 
+        // =================================================================
+        // Progress Bar
+        // =================================================================
+
         function updateProgressBar(position_ms, duration_ms) {
             var area = document.getElementById('progress-area');
             var fill = document.getElementById('progress-fill');
@@ -471,47 +1430,71 @@
             time.textContent = fmtMs(position_ms) + ' / ' + fmtMs(duration_ms);
         }
 
-        // =====================================================================
+        // =================================================================
         // SSE Event Bridge
-        // =====================================================================
+        // =================================================================
 
         var sseRetryDelay = 1000;
 
         function connectSSE() {
             var dot = document.getElementById('sse-dot');
+            var label = document.getElementById('conn-label');
+            var badge = document.getElementById('sse-badge');
             var es = new EventSource('/player/events');
+
             es.onopen = function() {
-                dot.className = 'sse-dot connected';
+                dot.className = 'conn-dot connected';
+                label.textContent = 'live';
+                badge.className = 'badge ok';
+                badge.textContent = 'connected';
                 sseRetryDelay = 1000;
             };
+
             es.onmessage = function(e) {
                 var ev;
                 try { ev = JSON.parse(e.data); } catch(ex) { return; }
                 if (ev.type === 'TrackStarted' || ev.type === 'Connected') {
+                    isPlaybackPaused = false;
                     refreshNowPlaying();
                     refreshQueue();
                 } else if (ev.type === 'TrackStopped' || ev.type === 'TrackEnded') {
+                    isPlaybackPaused = false;
                     refreshNowPlaying();
                     document.getElementById('progress-area').style.display = 'none';
-                } else if (ev.type === 'TrackPaused' || ev.type === 'TrackResumed') {
+                } else if (ev.type === 'TrackPaused') {
+                    isPlaybackPaused = true;
+                    refreshNowPlaying();
+                } else if (ev.type === 'TrackResumed') {
+                    isPlaybackPaused = false;
                     refreshNowPlaying();
                 } else if (ev.type === 'QueueChanged') {
                     refreshQueue();
                 } else if (ev.type === 'PositionUpdate') {
                     updateProgressBar(ev.position_ms, ev.duration_ms);
+                } else if (ev.type === 'FactsWritten') {
+                    // New facts written — re-run any active search to pick up updated metadata
+                    var hasSearch = (document.getElementById('search-q').value.trim() ||
+                                     document.getElementById('search-artist').value.trim() ||
+                                     document.getElementById('search-bpm').value.trim() ||
+                                     document.getElementById('search-key').value.trim());
+                    if (hasSearch) { scheduleSearch(); }
                 }
             };
+
             es.onerror = function() {
-                dot.className = 'sse-dot error';
+                dot.className = 'conn-dot error';
+                label.textContent = 'offline';
+                badge.className = 'badge err';
+                badge.textContent = 'disconnected';
                 es.close();
                 setTimeout(connectSSE, sseRetryDelay);
                 sseRetryDelay = Math.min(sseRetryDelay * 2, 30000);
             };
         }
 
-        // =====================================================================
+        // =================================================================
         // Player Controls
-        // =====================================================================
+        // =================================================================
 
         function refreshNowPlaying() {
             fetch('/player/now-playing')
@@ -519,29 +1502,65 @@
                 .then(function(data) {
                     var area = document.getElementById('now-playing-area');
                     var progressArea = document.getElementById('progress-area');
+
                     if (!data.playing) {
-                        area.innerHTML = '<p class="player-idle">Nothing playing.</p>';
+                        area.innerHTML = '<div class="np-idle">No active playback</div>';
                         if (progressArea) progressArea.style.display = 'none';
+                        var existingTransport = document.getElementById('np-transport-controls');
+                        if (existingTransport) existingTransport.remove();
+                        if (!userSelectedTab) { deactivateAllTabs(); }
                         return;
                     }
+
                     var t = data.track || {};
                     var title = escapeHtml(t.title || t.content_hash || 'Unknown');
                     var artist = escapeHtml(t.artist || '');
-                    var meta = [];
-                    if (t.album) meta.push(escapeHtml(t.album));
-                    if (t.bpm) meta.push(Math.round(t.bpm) + ' BPM');
-                    if (t.key) meta.push(escapeHtml(t.key));
-                    if (t.duration) meta.push(fmtDuration(t.duration));
+
+                    var metaParts = [];
+                    if (t.album) metaParts.push(escapeHtml(t.album));
+                    if (t.bpm) metaParts.push(Math.round(t.bpm) + ' BPM');
+                    if (t.key) metaParts.push(escapeHtml(t.key));
+                    if (t.duration) metaParts.push(fmtDuration(t.duration));
+
+                    var metaHtml = metaParts.map(function(m) { return '<span>' + m + '</span>'; }).join('');
+
+                    var coverHtml = t.content_hash
+                        ? '<img class="cover-art cover-art-np" src="/cover/' + encodeURIComponent(t.content_hash) + '" onerror="this.style.display=\'none\'" alt="">'
+                        : '';
+
+                    var pauseClass = isPlaybackPaused ? 'transport-btn primary' : 'transport-btn';
+                    var resumeClass = (!isPlaybackPaused) ? 'transport-btn primary' : 'transport-btn';
+
                     area.innerHTML =
-                        '<div class="player-bar">' +
-                        '<div class="player-track">' +
-                        '<div class="track-title">' + title + '</div>' +
-                        (artist ? '<div class="track-artist">' + artist + '</div>' : '') +
-                        (meta.length ? '<div class="track-meta">' + meta.join(' &middot; ') + '</div>' : '') +
-                        '</div>' +
+                        '<div class="np-active">' +
+                            coverHtml +
+                            '<div class="np-info">' +
+                                '<div class="np-label">Now Playing</div>' +
+                                '<div class="np-title">' + title + '</div>' +
+                                (artist ? '<div class="np-artist">' + artist + '</div>' : '') +
+                                (metaHtml ? '<div class="np-meta">' + metaHtml + '</div>' : '') +
+                            '</div>' +
                         '</div>';
-                    // Show the progress bar area (position will be populated by PositionUpdate events)
+
                     if (progressArea) progressArea.style.display = 'block';
+
+                    // Transport controls go after the progress bar — injected into now-playing-area
+                    // We append after progressArea by setting innerHTML on a wrapper then inserting
+                    var existingTransport = document.getElementById('np-transport-controls');
+                    if (!existingTransport) {
+                        var transportDiv = document.createElement('div');
+                        transportDiv.id = 'np-transport-controls';
+                        area.parentNode.appendChild(transportDiv);
+                        existingTransport = transportDiv;
+                    }
+                    existingTransport.innerHTML =
+                        '<div class="np-transport">' +
+                            '<button id="btn-pause" class="' + pauseClass + '" onclick="playerPause()" title="Pause">&#10074;&#10074;</button>' +
+                            '<button id="btn-play" class="' + resumeClass + '" onclick="playerResume()" title="Resume">&#9654;</button>' +
+                            '<button id="btn-stop" class="transport-btn" onclick="playerStop()" title="Stop">&#9632;</button>' +
+                            '<button id="btn-skip" class="transport-btn" onclick="playerSkip()" title="Skip">&#9197;</button>' +
+                        '</div>';
+                    if (!userSelectedTab) { activateTab('playback'); }
                 })
                 .catch(function() {});
         }
@@ -552,19 +1571,24 @@
                 .then(function(tracks) {
                     var list = document.getElementById('queue-list');
                     if (!Array.isArray(tracks) || tracks.length === 0) {
-                        list.innerHTML = '<li><span class="empty-msg">Queue is empty.</span></li>';
+                        list.innerHTML = '<li><span class="empty-state">Queue is empty</span></li>';
                         return;
                     }
-                    list.innerHTML = tracks.map(function(t) {
+                    list.innerHTML = tracks.map(function(t, i) {
                         var title = escapeHtml(t.title || t.content_hash || 'Unknown');
                         var artist = escapeHtml(t.artist || '');
                         var hash = escapeHtml(t.content_hash || '');
-                        return '<li>' +
-                            '<div class="queue-track-info">' +
-                            '<div class="queue-track-title">' + title + '</div>' +
-                            (artist ? '<div class="queue-track-artist">' + artist + '</div>' : '') +
+                        var coverHtml = t.content_hash
+                            ? '<img class="cover-art cover-art-queue" src="/cover/' + encodeURIComponent(t.content_hash) + '" onerror="this.style.display=\'none\'" alt="">'
+                            : '';
+                        return '<li class="queue-item">' +
+                            '<span class="queue-num">' + (i + 1) + '</span>' +
+                            coverHtml +
+                            '<div class="queue-info">' +
+                                '<div class="queue-title">' + title + '</div>' +
+                                (artist ? '<div class="queue-artist">' + artist + '</div>' : '') +
                             '</div>' +
-                            '<button class="btn btn-danger btn-small" onclick="removeFromQueue(\'' + hash + '\')">Remove</button>' +
+                            '<button class="btn btn-danger btn-sm queue-remove" onclick="removeFromQueue(\'' + hash + '\')">Remove</button>' +
                             '</li>';
                     }).join('');
                 })
@@ -635,9 +1659,9 @@
                 .catch(function(e) { showStatus('Error: ' + e.message, true); });
         }
 
-        // =====================================================================
+        // =================================================================
         // Library Search
-        // =====================================================================
+        // =================================================================
 
         var searchTimer = null;
 
@@ -654,7 +1678,7 @@
 
             if (!q && !artist && !bpm && !key) {
                 document.getElementById('search-results').innerHTML =
-                    '<p class="empty-msg">Type to search your library.</p>';
+                    '<div class="empty-state">Type to search your library</div>';
                 return;
             }
 
@@ -669,7 +1693,7 @@
                 .then(function(tracks) {
                     var area = document.getElementById('search-results');
                     if (!Array.isArray(tracks) || tracks.length === 0) {
-                        area.innerHTML = '<p class="empty-msg">No results.</p>';
+                        area.innerHTML = '<div class="empty-state">No results found</div>';
                         return;
                     }
                     var rows = tracks.map(function(t) {
@@ -680,33 +1704,38 @@
                         var keyStr = escapeHtml(t.key || '');
                         var dur = t.duration ? fmtDuration(t.duration) : '';
                         var exportHref = '/export/' + encodeURIComponent(t.content_hash || '') + '?format=aiff';
+                        var coverHtml = t.content_hash
+                            ? '<img class="cover-art cover-art-search" src="/cover/' + encodeURIComponent(t.content_hash) + '" onerror="this.style.display=\'none\'" alt="">'
+                            : '';
                         return '<tr>' +
+                            '<td style="width:56px;padding-right:8px">' + coverHtml + '</td>' +
                             '<td>' + title + '</td>' +
-                            '<td>' + artist + '</td>' +
-                            '<td>' + bpmStr + '</td>' +
-                            '<td>' + keyStr + '</td>' +
-                            '<td>' + dur + '</td>' +
-                            '<td style="white-space:nowrap">' +
-                            '<button class="btn btn-small" onclick="addToQueue(\'' + hash + '\')" style="margin-right:4px">+Queue</button>' +
-                            '<a class="btn btn-secondary btn-small" href="' + exportHref + '" download>Export</a>' +
+                            '<td style="color:var(--text-secondary)">' + artist + '</td>' +
+                            '<td class="col-mono">' + bpmStr + '</td>' +
+                            '<td class="col-mono">' + keyStr + '</td>' +
+                            '<td class="col-mono">' + dur + '</td>' +
+                            '<td class="col-actions">' +
+                                '<button class="btn btn-accent btn-sm" onclick="addToQueue(\'' + hash + '\')" style="margin-right:4px">+ Queue</button>' +
+                                '<a class="btn btn-sm" href="' + exportHref + '" download>Export</a>' +
                             '</td>' +
                             '</tr>';
                     }).join('');
+
                     area.innerHTML =
-                        '<table>' +
-                        '<thead><tr><th>Title</th><th>Artist</th><th>BPM</th><th>Key</th><th>Duration</th><th></th></tr></thead>' +
+                        '<table class="results-table">' +
+                        '<thead><tr><th></th><th>Title</th><th>Artist</th><th>BPM</th><th>Key</th><th>Dur</th><th></th></tr></thead>' +
                         '<tbody>' + rows + '</tbody>' +
                         '</table>';
                 })
                 .catch(function(e) {
                     document.getElementById('search-results').innerHTML =
-                        '<p class="empty-msg" style="color:var(--error)">Search error: ' + escapeHtml(e.message) + '</p>';
+                        '<div class="empty-state" style="color:var(--error)">Search error: ' + escapeHtml(e.message) + '</div>';
                 });
         }
 
-        // =====================================================================
+        // =================================================================
         // Package Management
-        // =====================================================================
+        // =================================================================
 
         async function checkUpdates() {
             var btn = event.target;
@@ -734,7 +1763,7 @@
             try {
                 var response = await fetch('/update/' + encodeURIComponent(name), { method: 'POST' });
                 if (response.ok) {
-                    showStatus('Package ' + name + ' updated successfully', false);
+                    showStatus('Package ' + name + ' updated', false);
                     setTimeout(function() { location.reload(); }, 1000);
                 } else {
                     var text = await response.text();
@@ -772,9 +1801,9 @@
             }
         }
 
-        // =====================================================================
+        // =================================================================
         // Bandcamp
-        // =====================================================================
+        // =================================================================
 
         async function pauseDownloads() {
             var btn = event.target;
@@ -819,12 +1848,12 @@
         }
 
         function showSyncDialog() {
-            document.getElementById('sync-dialog').style.display = 'block';
+            document.getElementById('sync-dialog').classList.add('open');
             document.getElementById('bandcamp-username').focus();
         }
 
         function hideSyncDialog() {
-            document.getElementById('sync-dialog').style.display = 'none';
+            document.getElementById('sync-dialog').classList.remove('open');
         }
 
         async function syncCollection() {
@@ -852,9 +1881,9 @@
             }
         }
 
-        // =====================================================================
+        // =================================================================
         // Bandcamp Configuration
-        // =====================================================================
+        // =================================================================
 
         async function submitBandcampConfigure(event) {
             event.preventDefault();
@@ -865,7 +1894,7 @@
 
             if (!fileInput.files.length) {
                 statusEl.style.color = 'var(--error)';
-                statusEl.textContent = 'Please select a cookie file.';
+                statusEl.textContent = 'Please select a cookie file';
                 return;
             }
 
@@ -874,7 +1903,7 @@
             formData.append('username', usernameInput.value.trim());
 
             btn.disabled = true;
-            statusEl.style.color = 'var(--text-muted)';
+            statusEl.style.color = 'var(--text-tertiary)';
             statusEl.textContent = 'Saving...';
 
             try {
@@ -882,7 +1911,7 @@
                 var data = await response.json();
                 if (data.success) {
                     statusEl.style.color = 'var(--success)';
-                    statusEl.textContent = 'Configuration saved. Service restarting...';
+                    statusEl.textContent = 'Configuration saved — service restarting';
                     setTimeout(function() { location.reload(); }, 2500);
                 } else {
                     statusEl.style.color = 'var(--error)';
@@ -896,15 +1925,16 @@
             }
         }
 
-        // =====================================================================
+        // =================================================================
         // Upload
-        // =====================================================================
+        // =================================================================
 
         document.getElementById('upload-input').addEventListener('change', async function() {
             var files = this.files;
             if (!files.length) return;
 
             var statusEl = document.getElementById('upload-status');
+            statusEl.style.color = 'var(--text-tertiary)';
             statusEl.textContent = 'Uploading ' + files.length + ' file(s)...';
 
             var formData = new FormData();
@@ -917,25 +1947,210 @@
                 var data = await response.json();
                 if (response.ok) {
                     var fileCount = data.files ? data.files.length : 0;
+                    statusEl.style.color = 'var(--success)';
                     statusEl.textContent = 'Uploaded ' + fileCount + ' file(s) to inbox';
                     setTimeout(function() { location.reload(); }, 1500);
                 } else {
+                    statusEl.style.color = 'var(--error)';
                     statusEl.textContent = 'Upload failed: ' + (data.error || 'Unknown error');
                 }
             } catch (e) {
+                statusEl.style.color = 'var(--error)';
                 statusEl.textContent = 'Upload error: ' + e.message;
             }
 
             this.value = '';
         });
 
-        // =====================================================================
+        // Close modal on overlay click
+        document.getElementById('sync-dialog').addEventListener('click', function(e) {
+            if (e.target === this) hideSyncDialog();
+        });
+
+        // Keyboard: Escape closes modals
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') hideSyncDialog();
+        });
+
+        // =================================================================
+        // Audio Output Selection
+        // =================================================================
+
+        async function loadAudioOutputs() {
+            var select = document.getElementById('audio-output-select');
+            if (!select) return;
+
+            try {
+                var outputsRes = await fetch('/player/audio-outputs');
+                var currentRes = await fetch('/player/audio-output');
+
+                if (!outputsRes.ok || !currentRes.ok) {
+                    throw new Error('Request failed');
+                }
+
+                var outputs = await outputsRes.json();
+                var current = await currentRes.json();
+                var currentName = current && current.device_name ? current.device_name : '';
+
+                select.innerHTML = '';
+                if (!Array.isArray(outputs) || outputs.length === 0) {
+                    var opt = document.createElement('option');
+                    opt.value = '';
+                    opt.textContent = 'No devices found';
+                    select.appendChild(opt);
+                } else {
+                    outputs.forEach(function(sink) {
+                        var opt = document.createElement('option');
+                        opt.value = sink.name;
+                        opt.textContent = sink.description || sink.name;
+                        if (sink.name === currentName) {
+                            opt.selected = true;
+                        }
+                        select.appendChild(opt);
+                    });
+                    select.disabled = false;
+                }
+            } catch (e) {
+                select.innerHTML = '<option value="">Unavailable</option>';
+                select.disabled = true;
+            }
+        }
+
+        document.getElementById('audio-output-select').addEventListener('change', async function() {
+            var deviceName = this.value;
+            if (!deviceName) return;
+            try {
+                var response = await fetch('/player/audio-output', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ device_name: deviceName })
+                });
+                if (response.ok) {
+                    showStatus('Audio output changed', false);
+                } else {
+                    var text = await response.text();
+                    showStatus('Failed to change output: ' + text, true);
+                }
+            } catch (e) {
+                showStatus('Error: ' + e.message, true);
+            }
+        });
+
+        // =================================================================
+        // Browse
+        // =================================================================
+
+        var currentBrowseMode = 'artists';
+
+        function switchBrowseMode(mode) {
+            currentBrowseMode = mode;
+            document.querySelectorAll('.browse-mode-btn').forEach(function(b) {
+                b.classList.toggle('active', b.dataset.mode === mode);
+            });
+            loadBrowseContent();
+        }
+
+        function loadBrowseContent() {
+            var area = document.getElementById('browse-content');
+            area.innerHTML = '<div class="empty-state">Loading...</div>';
+            var url = currentBrowseMode === 'artists' ? '/library/artists' : '/library/albums';
+            fetch(url).then(function(r) { return r.json(); }).then(function(items) {
+                if (!items.length) { area.innerHTML = '<div class="empty-state">No ' + currentBrowseMode + ' found</div>'; return; }
+                var clickFn = currentBrowseMode === 'artists' ? 'loadArtistTracks' : 'loadAlbumTracks';
+                renderNameList(items, area, clickFn);
+            }).catch(function(e) { area.innerHTML = '<div class="empty-state">Error: ' + e.message + '</div>'; });
+        }
+
+        function renderNameList(names, area, clickFn) {
+            var html = '<div class="browse-list">';
+            names.forEach(function(name) {
+                html += '<div class="browse-item" onclick="' + clickFn + '(\'' + escapeHtml(name).replace(/'/g, "\\'") + '\')">' + escapeHtml(name) + '</div>';
+            });
+            html += '</div>';
+            area.innerHTML = html;
+        }
+
+        function loadArtistTracks(artistName) {
+            var area = document.getElementById('browse-content');
+            area.innerHTML = '<div class="empty-state">Loading tracks...</div>';
+            fetch('/library/artists/' + encodeURIComponent(artistName) + '/tracks')
+                .then(function(r) { return r.json(); })
+                .then(function(tracks) {
+                    var albums = {};
+                    var albumOrder = [];
+                    tracks.forEach(function(t) {
+                        var album = t.album || 'Unknown Album';
+                        if (!albums[album]) { albums[album] = []; albumOrder.push(album); }
+                        albums[album].push(t);
+                    });
+                    var html = '<div style="margin-bottom:12px"><button class="btn btn-sm btn-ghost" onclick="loadBrowseContent()">&larr; Back</button> <span style="font-family:\'DM Mono\',monospace;color:var(--accent)">' + escapeHtml(artistName) + '</span></div>';
+                    albumOrder.forEach(function(albumName) {
+                        var albumTracks = albums[albumName];
+                        var coverHash = '';
+                        for (var i = 0; i < albumTracks.length; i++) {
+                            if (albumTracks[i].content_hash) { coverHash = albumTracks[i].content_hash; break; }
+                        }
+                        var coverHtml = coverHash ? '<img src="/cover/' + encodeURIComponent(coverHash) + '" onerror="this.style.display=\'none\'" alt="" style="width:60px;height:60px;object-fit:cover;border-radius:4px">' : '';
+                        html += '<div class="album-group">';
+                        html += '<div class="album-group-header">' + coverHtml + '<span class="album-group-name">' + escapeHtml(albumName) + '</span></div>';
+                        html += renderBrowseTrackTable(albumTracks);
+                        html += '</div>';
+                    });
+                    area.innerHTML = html;
+                })
+                .catch(function(e) { area.innerHTML = '<div class="empty-state">Error: ' + e.message + '</div>'; });
+        }
+
+        function loadAlbumTracks(albumName) {
+            var area = document.getElementById('browse-content');
+            area.innerHTML = '<div class="empty-state">Loading tracks...</div>';
+            fetch('/library/albums/' + encodeURIComponent(albumName) + '/tracks')
+                .then(function(r) { return r.json(); })
+                .then(function(tracks) {
+                    var coverHash = '';
+                    for (var i = 0; i < tracks.length; i++) {
+                        if (tracks[i].content_hash) { coverHash = tracks[i].content_hash; break; }
+                    }
+                    var coverHtml = coverHash ? '<img src="/cover/' + encodeURIComponent(coverHash) + '" onerror="this.style.display=\'none\'" alt="" style="width:80px;height:80px;object-fit:cover;border-radius:4px">' : '';
+                    var html = '<div style="margin-bottom:12px"><button class="btn btn-sm btn-ghost" onclick="loadBrowseContent()">&larr; Back</button></div>';
+                    html += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">' + coverHtml + '<span style="font-family:\'DM Mono\',monospace;font-size:1.2em;color:var(--accent)">' + escapeHtml(albumName) + '</span></div>';
+                    html += renderBrowseTrackTable(tracks);
+                    area.innerHTML = html;
+                })
+                .catch(function(e) { area.innerHTML = '<div class="empty-state">Error: ' + e.message + '</div>'; });
+        }
+
+        function renderBrowseTrackTable(tracks) {
+            var rows = tracks.map(function(t) {
+                var hash = escapeHtml(t.content_hash || '');
+                var title = escapeHtml(t.title || 'Unknown');
+                var artist = escapeHtml(t.artist || '');
+                var bpmStr = t.bpm ? parseFloat(t.bpm).toFixed(1) : '';
+                var keyStr = escapeHtml(t.key || '');
+                var dur = t.duration ? fmtDuration(t.duration) : '';
+                return '<tr>' +
+                    '<td>' + title + '</td>' +
+                    '<td style="color:var(--text-secondary)">' + artist + '</td>' +
+                    '<td class="col-mono">' + bpmStr + '</td>' +
+                    '<td class="col-mono">' + keyStr + '</td>' +
+                    '<td class="col-mono">' + dur + '</td>' +
+                    '<td class="col-actions">' +
+                        (hash ? '<button class="btn btn-accent btn-sm" onclick="addToQueue(\'' + hash + '\')">+ Queue</button>' : '') +
+                    '</td>' +
+                    '</tr>';
+            }).join('');
+            return '<table class="results-table"><thead><tr><th>Title</th><th>Artist</th><th>BPM</th><th>Key</th><th>Dur</th><th></th></tr></thead><tbody>' + rows + '</tbody></table>';
+        }
+
+        // =================================================================
         // Init
-        // =====================================================================
+        // =================================================================
 
         connectSSE();
         refreshNowPlaying();
         refreshQueue();
+        loadAudioOutputs();
     </script>
+
 </body>
 </html>

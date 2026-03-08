@@ -30,4 +30,5 @@ async-stream = {workspace = true}
 futures = {workspace = true}
 
 [dev-dependencies]
+pretty_assertions = { workspace = true }
 rstest = {workspace = true}

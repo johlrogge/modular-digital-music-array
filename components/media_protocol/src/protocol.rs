@@ -1,4 +1,4 @@
-use playback_primitives::{ContentHash, Deck};
+use playback_primitives::{ContentHash, Deck, Volume};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -25,7 +25,7 @@ pub enum Command {
     },
     SetVolume {
         deck: Deck,
-        db: f32,
+        volume: Volume,
     },
     Unload {
         deck: Deck,
@@ -63,13 +63,21 @@ pub enum Command {
     Skip,
     /// Return the current session ID (None if no session is active).
     GetSession,
+    /// List available audio output devices.
+    ListAudioOutputs,
+    /// Select an audio output device by name.
+    SetAudioOutput {
+        device_name: String,
+    },
+    /// Get the currently selected audio output.
+    GetAudioOutput,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Response {
-    pub success: bool,
-    pub error_message: String,
-    pub data: Option<ResponseData>,
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum Response {
+    Ok { data: Option<ResponseData> },
+    Err { message: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,14 +89,85 @@ pub enum ResponseData {
     NowPlaying(Option<ContentHash>),
     Count(usize),
     Session(Option<String>),
+    AudioOutputs(Vec<AudioSinkInfo>),
+    AudioOutput(AudioOutputConfig),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioSinkInfo {
+    pub name: String,
+    pub description: String,
+    pub max_sample_rate: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioOutputConfig {
+    pub device_name: Option<String>,
+    pub sample_rate: u32,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
-    fn test_play_command_serialization() {
+    fn response_ok_serialization() {
+        let resp = Response::Ok { data: None };
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, Response::Ok { data: None }));
+    }
+
+    #[test]
+    fn response_err_serialization() {
+        let resp = Response::Err {
+            message: "something went wrong".to_string(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, Response::Err { .. }));
+        if let Response::Err { message } = decoded {
+            assert_eq!(message, "something went wrong");
+        }
+    }
+
+    #[test]
+    fn response_ok_with_data_serialization() {
+        let resp = Response::Ok {
+            data: Some(ResponseData::Position(42)),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            Response::Ok {
+                data: Some(ResponseData::Position(42))
+            }
+        ));
+    }
+
+    #[test]
+    fn set_volume_command_serialization() {
+        use playback_primitives::Volume;
+        let vol = Volume::new(-6.0).unwrap();
+        let cmd = Command::SetVolume {
+            deck: Deck::A,
+            volume: vol,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let decoded: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            Command::SetVolume {
+                deck: Deck::A,
+                volume: _
+            }
+        ));
+    }
+
+    #[test]
+    fn play_command_serialization() {
         let cmd = Command::Play { deck: Deck::A };
         let json = serde_json::to_string(&cmd).unwrap();
         let decoded: Command = serde_json::from_str(&json).unwrap();
@@ -97,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn test_skip_command_serialization() {
+    fn skip_command_serialization() {
         let cmd = Command::Skip;
         let json = serde_json::to_string(&cmd).unwrap();
         assert_eq!(json, r#""skip""#);
@@ -106,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_session_command_serialization() {
+    fn get_session_command_serialization() {
         let cmd = Command::GetSession;
         let json = serde_json::to_string(&cmd).unwrap();
         assert_eq!(json, r#""get_session""#);
@@ -115,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pause_command_serialization() {
+    fn pause_command_serialization() {
         let cmd = Command::Pause { deck: Deck::A };
         let json = serde_json::to_string(&cmd).unwrap();
         let decoded: Command = serde_json::from_str(&json).unwrap();
@@ -123,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resume_command_serialization() {
+    fn resume_command_serialization() {
         let cmd = Command::Resume { deck: Deck::A };
         let json = serde_json::to_string(&cmd).unwrap();
         let decoded: Command = serde_json::from_str(&json).unwrap();
@@ -131,7 +210,89 @@ mod tests {
     }
 
     #[test]
-    fn test_session_response_data_serialization() {
+    fn list_audio_outputs_command_serialization() {
+        let cmd = Command::ListAudioOutputs;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#""list_audio_outputs""#);
+        let decoded: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, Command::ListAudioOutputs));
+    }
+
+    #[test]
+    fn set_audio_output_command_serialization() {
+        let cmd = Command::SetAudioOutput {
+            device_name: "alsa_output.pci-0000_00_1f.3.analog-stereo".to_string(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let decoded: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, Command::SetAudioOutput { .. }));
+        if let Command::SetAudioOutput { device_name } = decoded {
+            assert_eq!(device_name, "alsa_output.pci-0000_00_1f.3.analog-stereo");
+        }
+    }
+
+    #[test]
+    fn get_audio_output_command_serialization() {
+        let cmd = Command::GetAudioOutput;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#""get_audio_output""#);
+        let decoded: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, Command::GetAudioOutput));
+    }
+
+    #[test]
+    fn audio_outputs_response_data_serialization() {
+        let sinks = vec![AudioSinkInfo {
+            name: "alsa_output.pci-0000_00_1f.3.analog-stereo".to_string(),
+            description: "Built-in Audio Analog Stereo".to_string(),
+            max_sample_rate: 48000,
+        }];
+        let data = ResponseData::AudioOutputs(sinks);
+        let json = serde_json::to_string(&data).unwrap();
+        let decoded: ResponseData = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, ResponseData::AudioOutputs(_)));
+        if let ResponseData::AudioOutputs(sinks) = decoded {
+            assert_eq!(sinks.len(), 1);
+            assert_eq!(sinks[0].name, "alsa_output.pci-0000_00_1f.3.analog-stereo");
+            assert_eq!(sinks[0].description, "Built-in Audio Analog Stereo");
+            assert_eq!(sinks[0].max_sample_rate, 48000);
+        }
+    }
+
+    #[test]
+    fn audio_output_response_data_serialization() {
+        let config = AudioOutputConfig {
+            device_name: Some("alsa_output.pci-0000_00_1f.3.analog-stereo".to_string()),
+            sample_rate: 44100,
+        };
+        let data = ResponseData::AudioOutput(config);
+        let json = serde_json::to_string(&data).unwrap();
+        let decoded: ResponseData = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, ResponseData::AudioOutput(_)));
+        if let ResponseData::AudioOutput(cfg) = decoded {
+            assert_eq!(
+                cfg.device_name.as_deref(),
+                Some("alsa_output.pci-0000_00_1f.3.analog-stereo")
+            );
+            assert_eq!(cfg.sample_rate, 44100);
+        }
+
+        let none_config = AudioOutputConfig {
+            device_name: None,
+            sample_rate: 48000,
+        };
+        let data2 = ResponseData::AudioOutput(none_config);
+        let json2 = serde_json::to_string(&data2).unwrap();
+        let decoded2: ResponseData = serde_json::from_str(&json2).unwrap();
+        assert!(matches!(decoded2, ResponseData::AudioOutput(_)));
+        if let ResponseData::AudioOutput(cfg) = decoded2 {
+            assert!(cfg.device_name.is_none());
+            assert_eq!(cfg.sample_rate, 48000);
+        }
+    }
+
+    #[test]
+    fn session_response_data_serialization() {
         let data = ResponseData::Session(Some("2026-02-24T12:00:00+00:00".to_string()));
         let json = serde_json::to_string(&data).unwrap();
         let decoded: ResponseData = serde_json::from_str(&json).unwrap();

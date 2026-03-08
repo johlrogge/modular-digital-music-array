@@ -9,8 +9,8 @@ license.workspace = true
 [dependencies]
 acid_protocol = { path = "../acid_protocol" }
 nng = { workspace = true }
+nng-transport = { path = "../nng_transport" }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 
 [features]
 music = ["music-facts", "playback-primitives"]
@@ -19,6 +19,9 @@ music = ["music-facts", "playback-primitives"]
 package = "music-facts"
 path = "../music_facts"
 optional = true
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
 
 [dependencies.playback-primitives]
 package = "playback-primitives"

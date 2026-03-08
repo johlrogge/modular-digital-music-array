@@ -9,10 +9,13 @@ license.workspace = true
 [dependencies]
 music-primitives = { path = "../music_primitives" }
 playback-primitives = { path = "../playback_primitives" }
+storage_primitives = { path = "../storage_primitives" }
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
+pretty_assertions = { workspace = true }
+rstest = { workspace = true }
 serde_json = { workspace = true }
 stainless-facts = { git = "https://github.com/johlrogge/stainless_facts" }

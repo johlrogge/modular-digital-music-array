@@ -25,10 +25,6 @@ struct Args {
     #[arg(long, default_value = "ipc:///run/mdma/playback.sock")]
     socket: String,
 
-    /// Also listen on TCP for remote connections (e.g., "tcp://0.0.0.0:5557")
-    #[arg(long)]
-    tcp: Option<String>,
-
     /// Path to queue persistence file (relative to cwd, which should be /music)
     #[arg(long, default_value = "queue.json")]
     queue_file: PathBuf,
@@ -40,6 +36,10 @@ struct Args {
     /// ACID service socket address for writing play history facts
     #[arg(long, default_value = "ipc:///run/mdma/acid.sock")]
     acid_socket: String,
+
+    /// Path to audio output configuration file
+    #[arg(long, default_value = "/metadata/audio-output.json")]
+    audio_config: PathBuf,
 }
 
 fn main() -> Result<()> {
@@ -50,16 +50,13 @@ fn main() -> Result<()> {
 
     let runtime = Runtime::new()?;
 
-    let engine = Arc::new(tokio::sync::Mutex::new(PlaybackEngine::new()?));
+    let engine = Arc::new(tokio::sync::Mutex::new(PlaybackEngine::new(
+        args.audio_config,
+    )?));
 
     let socket = Socket::new(Protocol::Rep0)?;
     info!("Listening on {}", args.socket);
     socket.listen(&args.socket)?;
-
-    if let Some(ref tcp) = args.tcp {
-        info!("Also listening on TCP: {}", tcp);
-        socket.listen(tcp)?;
-    }
 
     let event_pub = Socket::new(Protocol::Pub0)?;
     info!("Event publishing on {}", args.event_socket);
