@@ -950,6 +950,23 @@
         }
 
         .shell { position: relative; z-index: 1; }
+
+        /* ============================================================
+           BROWSE TAB
+           ============================================================ */
+
+        .browse-list { max-height: 70vh; overflow-y: auto; }
+        .browse-item { padding: 10px 12px; cursor: pointer; border-bottom: 1px solid var(--border); font-family: 'DM Mono', monospace; }
+        .browse-item:hover { background: rgba(236,136,244,0.08); }
+        .album-card { display: inline-block; width: 140px; margin: 8px; cursor: pointer; text-align: center; vertical-align: top; }
+        .album-card img { width: 120px; height: 120px; object-fit: cover; border-radius: 4px; }
+        .album-card .album-card-title { font-size: 0.85em; margin-top: 4px; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .album-card .album-card-artist { font-size: 0.75em; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .album-group { margin-bottom: 24px; }
+        .album-group-header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; padding: 8px 0; border-bottom: 1px solid var(--border); }
+        .album-group-header img { width: 60px; height: 60px; object-fit: cover; border-radius: 4px; }
+        .album-group-header .album-group-name { font-family: 'DM Mono', monospace; font-size: 1.1em; color: var(--accent2); }
+        .browse-mode-btn.active { background: var(--accent); color: #000; }
     </style>
 </head>
 <body>
@@ -1021,6 +1038,7 @@
         <nav class="tab-nav">
             <button class="tab-btn" data-tab="status">Status</button>
             <button class="tab-btn" data-tab="playback">Playback</button>
+            <button class="tab-btn" data-tab="browse">Browse</button>
             <button class="tab-btn" data-tab="maintenance">Maintenance</button>
         </nav>
 
@@ -1155,6 +1173,22 @@
                 </div>
             </div>
 
+
+        </div>
+
+        <!-- ============================================================
+             TAB: BROWSE
+             ============================================================ -->
+
+        <div class="tab-panel" id="tab-browse">
+
+            <div class="section">
+                <div style="display:flex;gap:8px;margin-bottom:16px">
+                    <button class="btn btn-accent btn-sm browse-mode-btn active" data-mode="artists" onclick="switchBrowseMode('artists')">Artists</button>
+                    <button class="btn btn-sm browse-mode-btn" data-mode="albums" onclick="switchBrowseMode('albums')">Albums</button>
+                </div>
+                <div id="browse-content" class="empty-state">Select Artists or Albums to browse</div>
+            </div>
 
         </div>
 
@@ -1306,6 +1340,12 @@
             if (btn) btn.classList.add('active');
             var panel = document.getElementById('tab-' + tabName);
             if (panel) panel.classList.add('active');
+            if (tabName === 'browse') {
+                var browseContent = document.getElementById('browse-content');
+                if (browseContent && browseContent.classList.contains('empty-state')) {
+                    loadBrowseContent();
+                }
+            }
         }
 
         function deactivateAllTabs() {
@@ -1995,6 +2035,112 @@
                 showStatus('Error: ' + e.message, true);
             }
         });
+
+        // =================================================================
+        // Browse
+        // =================================================================
+
+        var currentBrowseMode = 'artists';
+
+        function switchBrowseMode(mode) {
+            currentBrowseMode = mode;
+            document.querySelectorAll('.browse-mode-btn').forEach(function(b) {
+                b.classList.toggle('active', b.dataset.mode === mode);
+            });
+            loadBrowseContent();
+        }
+
+        function loadBrowseContent() {
+            var area = document.getElementById('browse-content');
+            area.innerHTML = '<div class="empty-state">Loading...</div>';
+            var url = currentBrowseMode === 'artists' ? '/library/artists' : '/library/albums';
+            fetch(url).then(function(r) { return r.json(); }).then(function(items) {
+                if (!items.length) { area.innerHTML = '<div class="empty-state">No ' + currentBrowseMode + ' found</div>'; return; }
+                var clickFn = currentBrowseMode === 'artists' ? 'loadArtistTracks' : 'loadAlbumTracks';
+                renderNameList(items, area, clickFn);
+            }).catch(function(e) { area.innerHTML = '<div class="empty-state">Error: ' + e.message + '</div>'; });
+        }
+
+        function renderNameList(names, area, clickFn) {
+            var html = '<div class="browse-list">';
+            names.forEach(function(name) {
+                html += '<div class="browse-item" onclick="' + clickFn + '(\'' + escapeHtml(name).replace(/'/g, "\\'") + '\')">' + escapeHtml(name) + '</div>';
+            });
+            html += '</div>';
+            area.innerHTML = html;
+        }
+
+        function loadArtistTracks(artistName) {
+            var area = document.getElementById('browse-content');
+            area.innerHTML = '<div class="empty-state">Loading tracks...</div>';
+            fetch('/library/artists/' + encodeURIComponent(artistName) + '/tracks')
+                .then(function(r) { return r.json(); })
+                .then(function(tracks) {
+                    var albums = {};
+                    var albumOrder = [];
+                    tracks.forEach(function(t) {
+                        var album = t.album || 'Unknown Album';
+                        if (!albums[album]) { albums[album] = []; albumOrder.push(album); }
+                        albums[album].push(t);
+                    });
+                    var html = '<div style="margin-bottom:12px"><button class="btn btn-sm btn-ghost" onclick="loadBrowseContent()">&larr; Back</button> <span style="font-family:\'DM Mono\',monospace;color:var(--accent)">' + escapeHtml(artistName) + '</span></div>';
+                    albumOrder.forEach(function(albumName) {
+                        var albumTracks = albums[albumName];
+                        var coverHash = '';
+                        for (var i = 0; i < albumTracks.length; i++) {
+                            if (albumTracks[i].content_hash) { coverHash = albumTracks[i].content_hash; break; }
+                        }
+                        var coverHtml = coverHash ? '<img src="/cover/' + encodeURIComponent(coverHash) + '" onerror="this.style.display=\'none\'" alt="" style="width:60px;height:60px;object-fit:cover;border-radius:4px">' : '';
+                        html += '<div class="album-group">';
+                        html += '<div class="album-group-header">' + coverHtml + '<span class="album-group-name">' + escapeHtml(albumName) + '</span></div>';
+                        html += renderBrowseTrackTable(albumTracks);
+                        html += '</div>';
+                    });
+                    area.innerHTML = html;
+                })
+                .catch(function(e) { area.innerHTML = '<div class="empty-state">Error: ' + e.message + '</div>'; });
+        }
+
+        function loadAlbumTracks(albumName) {
+            var area = document.getElementById('browse-content');
+            area.innerHTML = '<div class="empty-state">Loading tracks...</div>';
+            fetch('/library/albums/' + encodeURIComponent(albumName) + '/tracks')
+                .then(function(r) { return r.json(); })
+                .then(function(tracks) {
+                    var coverHash = '';
+                    for (var i = 0; i < tracks.length; i++) {
+                        if (tracks[i].content_hash) { coverHash = tracks[i].content_hash; break; }
+                    }
+                    var coverHtml = coverHash ? '<img src="/cover/' + encodeURIComponent(coverHash) + '" onerror="this.style.display=\'none\'" alt="" style="width:80px;height:80px;object-fit:cover;border-radius:4px">' : '';
+                    var html = '<div style="margin-bottom:12px"><button class="btn btn-sm btn-ghost" onclick="loadBrowseContent()">&larr; Back</button></div>';
+                    html += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">' + coverHtml + '<span style="font-family:\'DM Mono\',monospace;font-size:1.2em;color:var(--accent)">' + escapeHtml(albumName) + '</span></div>';
+                    html += renderBrowseTrackTable(tracks);
+                    area.innerHTML = html;
+                })
+                .catch(function(e) { area.innerHTML = '<div class="empty-state">Error: ' + e.message + '</div>'; });
+        }
+
+        function renderBrowseTrackTable(tracks) {
+            var rows = tracks.map(function(t) {
+                var hash = escapeHtml(t.content_hash || '');
+                var title = escapeHtml(t.title || 'Unknown');
+                var artist = escapeHtml(t.artist || '');
+                var bpmStr = t.bpm ? parseFloat(t.bpm).toFixed(1) : '';
+                var keyStr = escapeHtml(t.key || '');
+                var dur = t.duration ? fmtDuration(t.duration) : '';
+                return '<tr>' +
+                    '<td>' + title + '</td>' +
+                    '<td style="color:var(--text-secondary)">' + artist + '</td>' +
+                    '<td class="col-mono">' + bpmStr + '</td>' +
+                    '<td class="col-mono">' + keyStr + '</td>' +
+                    '<td class="col-mono">' + dur + '</td>' +
+                    '<td class="col-actions">' +
+                        (hash ? '<button class="btn btn-accent btn-sm" onclick="addToQueue(\'' + hash + '\')">+ Queue</button>' : '') +
+                    '</td>' +
+                    '</tr>';
+            }).join('');
+            return '<table class="results-table"><thead><tr><th>Title</th><th>Artist</th><th>BPM</th><th>Key</th><th>Dur</th><th></th></tr></thead><tbody>' + rows + '</tbody></table>';
+        }
 
         // =================================================================
         // Init

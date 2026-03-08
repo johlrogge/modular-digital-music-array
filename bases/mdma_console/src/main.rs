@@ -13,7 +13,7 @@ use clap::Parser;
 use color_eyre::Result;
 use futures::stream::Stream;
 use gateway_client::{Command, GatewayClient};
-use library_ipc_client::{ContentHash, LibraryClient, TrackInfo, TrackQuery};
+use library_ipc_client::{ContentHash, FactType, LibraryClient, TrackInfo, TrackQuery};
 use media_protocol::{AudioSinkInfo, Deck, ResponseData};
 use nng::options::Options;
 use source_protocol::{DownloadState, SourceRequest, SourceResponse};
@@ -1186,6 +1186,105 @@ async fn player_events(
 }
 
 // =============================================================================
+// Library Browse Handlers (by artist / album)
+// =============================================================================
+
+/// Shared helper: fetch all values for a fact type and return them sorted case-insensitively.
+fn library_fact_values(state: &AppState, fact_type: &str) -> axum::response::Response {
+    use gateway_client::{LibraryRequest, LibraryResponse};
+    let client = match require_gateway(state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    match client.library_request(&LibraryRequest::GetFactValues {
+        fact_type: FactType::new(fact_type),
+    }) {
+        Ok(LibraryResponse::FactValues(mut values)) => {
+            values.sort_by_key(|a| a.to_lowercase());
+            Json(values).into_response()
+        }
+        Ok(LibraryResponse::Error(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Unexpected library response"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// Shared helper: search tracks by a pre-built query and return them as JSON.
+fn library_search_tracks(state: &AppState, query: TrackQuery) -> axum::response::Response {
+    use gateway_client::{LibraryRequest, LibraryResponse};
+    let client = match require_gateway(state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    match client.library_request(&LibraryRequest::Search { query }) {
+        Ok(LibraryResponse::SearchResults(tracks)) => Json(
+            tracks
+                .iter()
+                .map(TrackInfoJson::from_track_info)
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Ok(LibraryResponse::Error(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Unexpected library response"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn library_artists_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
+    library_fact_values(&state, "artist")
+}
+
+async fn library_albums_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
+    library_fact_values(&state, "album")
+}
+
+async fn library_artist_tracks_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    let query = TrackQuery {
+        artist: Some(library_search::parse_string_query(&name)),
+        ..Default::default()
+    };
+    library_search_tracks(&state, query)
+}
+
+async fn library_album_tracks_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    let query = TrackQuery {
+        album: Some(library_search::parse_string_query(&name)),
+        ..Default::default()
+    };
+    library_search_tracks(&state, query)
+}
+
+// =============================================================================
 // Library Search Handler
 // =============================================================================
 
@@ -1413,8 +1512,18 @@ async fn main() -> Result<()> {
             get(player_audio_output).post(player_set_audio_output),
         )
         .route("/player/events", get(player_events))
-        // Library search
+        // Library search and browse
         .route("/library/search", get(library_search_handler))
+        .route("/library/artists", get(library_artists_handler))
+        .route("/library/albums", get(library_albums_handler))
+        .route(
+            "/library/artists/:name/tracks",
+            get(library_artist_tracks_handler),
+        )
+        .route(
+            "/library/albums/:name/tracks",
+            get(library_album_tracks_handler),
+        )
         // Cover art
         .route("/cover/:hash", get(cover_art))
         // Export
@@ -2068,5 +2177,30 @@ mod tests {
             Some(source_ext.as_str()) == fmt.extension()
                 || (source_ext == "aif" && fmt.extension() == Some("aiff"))
         );
+    }
+
+    // ── Artist/album list sort ─────────────────────────────────────────────
+
+    #[test]
+    fn artist_list_sorts_case_insensitively() {
+        let mut values = vec![
+            "Zebra".to_string(),
+            "apple".to_string(),
+            "Mango".to_string(),
+            "banana".to_string(),
+        ];
+        values.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        assert_eq!(values, vec!["apple", "banana", "Mango", "Zebra"],);
+    }
+
+    #[test]
+    fn album_list_sorts_case_insensitively() {
+        let mut values = vec![
+            "Ziggy Stardust".to_string(),
+            "abbey road".to_string(),
+            "Kind of Blue".to_string(),
+        ];
+        values.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        assert_eq!(values, vec!["abbey road", "Kind of Blue", "Ziggy Stardust"],);
     }
 }
