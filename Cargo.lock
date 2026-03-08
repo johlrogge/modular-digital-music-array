@@ -275,6 +275,7 @@ version = "0.5.0"
 dependencies = [
  "lofty",
  "pretty_assertions",
+ "rstest",
  "tempfile",
  "thiserror 1.0.69",
 ]
@@ -284,6 +285,7 @@ name = "audio-transcoder"
 version = "0.5.0"
 dependencies = [
  "pretty_assertions",
+ "rstest",
  "thiserror 1.0.69",
 ]
 
@@ -1235,6 +1237,7 @@ version = "0.5.0"
 dependencies = [
  "playback-primitives",
  "pretty_assertions",
+ "rstest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -2187,7 +2190,6 @@ dependencies = [
  "library-ipc-protocol",
  "nng",
  "nng-transport",
- "rstest",
  "serde_json",
  "thiserror 1.0.69",
 ]
@@ -2211,6 +2213,7 @@ version = "0.5.0"
 dependencies = [
  "chrono",
  "regex",
+ "rstest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -2223,6 +2226,7 @@ dependencies = [
  "acid-client",
  "audio-metadata",
  "chrono",
+ "event-protocol",
  "hex",
  "library-ipc-protocol",
  "library-search",
@@ -2423,6 +2427,7 @@ dependencies = [
  "chrono",
  "clap",
  "color-eyre",
+ "event-protocol",
  "nng",
  "pretty_assertions",
  "serde_json",
@@ -2600,6 +2605,7 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -2724,6 +2730,7 @@ dependencies = [
  "music-primitives",
  "playback-primitives",
  "pretty_assertions",
+ "rstest",
  "serde",
  "serde_json",
  "stainless-facts",
@@ -2736,6 +2743,7 @@ name = "music-primitives"
 version = "0.5.0"
 dependencies = [
  "pretty_assertions",
+ "rstest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -3172,6 +3180,8 @@ dependencies = [
  "pretty_assertions",
  "ringbuf",
  "rubato",
+ "serde",
+ "serde_json",
  "symphonia",
  "tempfile",
  "thiserror 1.0.69",
@@ -3189,6 +3199,7 @@ dependencies = [
  "chrono",
  "music-primitives",
  "pretty_assertions",
+ "rstest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -4107,6 +4118,7 @@ name = "storage_primitives"
 version = "0.2.0"
 dependencies = [
  "pretty_assertions",
+ "rstest",
  "serde",
 ]
 
@@ -4526,6 +4538,7 @@ version = "0.5.0"
 dependencies = [
  "assert_matches",
  "pretty_assertions",
+ "rstest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

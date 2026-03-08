@@ -9,28 +9,28 @@
     <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Outfit:wght@200;300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-base: #08080c;
-            --bg-surface: #0e0e14;
-            --bg-elevated: #14141c;
-            --bg-hover: #1a1a24;
-            --border-subtle: #1e1e2a;
-            --border-strong: #2a2a3c;
-            --text-primary: #e4e4f0;
-            --text-secondary: #8080a0;
-            --text-tertiary: #4a4a68;
-            --accent: #e040e8;
-            --accent-dim: rgba(224, 64, 232, 0.10);
-            --accent-glow: rgba(224, 64, 232, 0.35);
-            --accent-bright: #f060ff;
-            --accent2: #40d8f0;
-            --accent2-dim: rgba(64, 216, 240, 0.10);
-            --accent2-glow: rgba(64, 216, 240, 0.30);
-            --success: #40d8a0;
-            --success-dim: rgba(64, 216, 160, 0.10);
-            --warning: #e8a840;
-            --warning-dim: rgba(232, 168, 64, 0.10);
-            --error: #f04868;
-            --error-dim: rgba(240, 72, 104, 0.10);
+            --bg-base: #141420;
+            --bg-surface: #1c1c2a;
+            --bg-elevated: #252534;
+            --bg-hover: #2e2e40;
+            --border-subtle: #38384e;
+            --border-strong: #48485e;
+            --text-primary: #f0f0f8;
+            --text-secondary: #b8b8d0;
+            --text-tertiary: #9898b8;
+            --accent: #ec88f4;
+            --accent-dim: rgba(236, 136, 244, 0.16);
+            --accent-glow: rgba(236, 136, 244, 0.45);
+            --accent-bright: #f4a8ff;
+            --accent2: #68e8ff;
+            --accent2-dim: rgba(104, 232, 255, 0.16);
+            --accent2-glow: rgba(104, 232, 255, 0.40);
+            --success: #60e8b8;
+            --success-dim: rgba(96, 232, 184, 0.16);
+            --warning: #f0c060;
+            --warning-dim: rgba(240, 192, 96, 0.16);
+            --error: #f88898;
+            --error-dim: rgba(248, 136, 152, 0.16);
             --radius-sm: 4px;
             --radius-md: 8px;
             --radius-lg: 12px;
@@ -51,7 +51,7 @@
            ============================================================ */
 
         .shell {
-            max-width: 960px;
+            max-width: 1200px;
             margin: 0 auto;
             padding: 0 20px;
         }
@@ -189,8 +189,29 @@
             display: flex;
             gap: 4px;
             align-items: center;
+            margin-top: 10px;
+        }
+
+        /* Cover art thumbnails */
+        .cover-art {
+            object-fit: cover;
+            border-radius: 4px;
             flex-shrink: 0;
-            padding-top: 4px;
+        }
+
+        .cover-art-np {
+            width: 80px;
+            height: 80px;
+        }
+
+        .cover-art-queue {
+            width: 48px;
+            height: 48px;
+        }
+
+        .cover-art-search {
+            width: 48px;
+            height: 48px;
         }
 
         .transport-btn {
@@ -422,6 +443,9 @@
             transition: opacity 0.15s;
         }
         .queue-item:hover .queue-remove { opacity: 1; }
+        @media (hover: none) {
+            .queue-remove { opacity: 0.7; }
+        }
 
         /* ============================================================
            SEARCH
@@ -655,6 +679,44 @@
             border-color: var(--accent);
         }
 
+        /* Audio output selector */
+        .audio-output-section {
+            padding: 4px 0 8px;
+        }
+
+        .audio-output-select {
+            width: 100%;
+            padding: 10px 14px;
+            font-family: 'Outfit', sans-serif;
+            font-size: 0.85rem;
+            font-weight: 300;
+            background: var(--bg-surface);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            cursor: pointer;
+            transition: border-color 0.2s;
+            appearance: none;
+            -webkit-appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath fill='%239898b8' d='M0 0l6 8 6-8z'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 14px center;
+            padding-right: 36px;
+        }
+        .audio-output-select:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 1px var(--accent-dim), 0 0 12px var(--accent-dim);
+        }
+        .audio-output-select:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .audio-output-select option {
+            background: var(--bg-elevated);
+            color: var(--text-primary);
+        }
+
         .form-input[type="file"] {
             padding: 8px;
             font-size: 0.78rem;
@@ -811,17 +873,66 @@
         ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 2px; }
 
         /* ============================================================
+           CONTENT LAYOUT — Sidebar + Main
+           ============================================================ */
+
+        .content-layout { display: flex; gap: 32px; }
+        .main-content { flex: 1; min-width: 0; }
+        .sidebar {
+            flex: 0 0 300px;
+            min-width: 0;
+            position: sticky;
+            top: 20px;
+            align-self: flex-start;
+            max-height: calc(100vh - 40px);
+            overflow-y: auto;
+        }
+
+        /* Desktop: details always open, summary non-interactive */
+        .sidebar-section { display: block; }
+        .sidebar-section > summary { list-style: none; cursor: default; pointer-events: none; }
+        .sidebar-section > summary::-webkit-details-marker { display: none; }
+        .sidebar-section > summary::marker { display: none; content: ''; }
+
+        /* Remove outer border from now-playing when inside sidebar */
+        .sidebar .now-playing { border-bottom: none; padding: 12px 0 4px; }
+
+        /* ============================================================
            RESPONSIVE
            ============================================================ */
 
         @media (max-width: 640px) {
             .masthead { padding: 16px 0 14px; }
             .np-active { flex-direction: column; gap: 12px; }
-            .np-transport { align-self: flex-start; }
-            .tab-btn { padding: 12px 16px; font-size: 0.68rem; }
+            .transport-btn { width: 44px; height: 44px; font-size: 1rem; }
+            .tab-btn { padding: 14px 16px; font-size: 0.7rem; }
             .kv-grid { grid-template-columns: 120px 1fr; }
             .search-field { min-width: 100%; }
             .search-field-sm { flex: 1 1 100%; min-width: 100%; }
+            .btn { padding: 10px 16px; font-size: 0.74rem; }
+            .btn-sm { padding: 8px 14px; }
+            .content-layout { flex-direction: column; gap: 0; }
+            .sidebar {
+                position: static;
+                max-height: none;
+                flex: none;
+                padding-bottom: 8px;
+            }
+            .sidebar-section > summary {
+                cursor: pointer;
+                pointer-events: auto;
+                position: relative;
+                padding-right: 20px;
+            }
+            .sidebar-section > summary::after {
+                content: '\25B8';
+                position: absolute;
+                right: 0;
+                transition: transform 0.2s;
+            }
+            .sidebar-section[open] > summary::after {
+                transform: rotate(90deg);
+            }
         }
 
         /* ============================================================
@@ -832,13 +943,30 @@
             content: '';
             position: fixed;
             inset: 0;
-            background: radial-gradient(ellipse at 20% 0%, rgba(224, 64, 232, 0.04) 0%, transparent 50%),
-                        radial-gradient(ellipse at 80% 100%, rgba(64, 216, 240, 0.03) 0%, transparent 40%);
+            background: radial-gradient(ellipse at 20% 0%, rgba(236, 136, 244, 0.07) 0%, transparent 50%),
+                        radial-gradient(ellipse at 80% 100%, rgba(104, 232, 255, 0.06) 0%, transparent 40%);
             pointer-events: none;
             z-index: 0;
         }
 
         .shell { position: relative; z-index: 1; }
+
+        /* ============================================================
+           BROWSE TAB
+           ============================================================ */
+
+        .browse-list { max-height: 70vh; overflow-y: auto; }
+        .browse-item { padding: 10px 12px; cursor: pointer; border-bottom: 1px solid var(--border); font-family: 'DM Mono', monospace; }
+        .browse-item:hover { background: rgba(236,136,244,0.08); }
+        .album-card { display: inline-block; width: 140px; margin: 8px; cursor: pointer; text-align: center; vertical-align: top; }
+        .album-card img { width: 120px; height: 120px; object-fit: cover; border-radius: 4px; }
+        .album-card .album-card-title { font-size: 0.85em; margin-top: 4px; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .album-card .album-card-artist { font-size: 0.75em; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .album-group { margin-bottom: 24px; }
+        .album-group-header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; padding: 8px 0; border-bottom: 1px solid var(--border); }
+        .album-group-header img { width: 60px; height: 60px; object-fit: cover; border-radius: 4px; }
+        .album-group-header .album-group-name { font-family: 'DM Mono', monospace; font-size: 1.1em; color: var(--accent2); }
+        .browse-mode-btn.active { background: var(--accent); color: #000; }
     </style>
 </head>
 <body>
@@ -860,31 +988,57 @@
             </div>
         </header>
 
+        <div class="content-layout">
+
         <!-- ============================================================
-             NOW PLAYING — persistent hero
+             SIDEBAR — Now Playing + Queue
              ============================================================ -->
 
-        <div class="now-playing">
-            <div id="now-playing-area">
-                <div class="np-idle">No active playback</div>
-            </div>
-            <div id="progress-area" style="display:none;">
-                <div class="np-progress">
-                    <div class="progress-track">
-                        <div class="progress-fill" id="progress-fill"></div>
+        <aside class="sidebar">
+
+            <details class="sidebar-section" open>
+                <div class="now-playing">
+                    <div id="now-playing-area">
+                        <div class="np-idle">No active playback</div>
                     </div>
-                    <span class="progress-time" id="progress-time">0:00 / 0:00</span>
+                    <div id="progress-area" style="display:none;">
+                        <div class="np-progress">
+                            <div class="progress-track">
+                                <div class="progress-fill" id="progress-fill"></div>
+                            </div>
+                            <span class="progress-time" id="progress-time">0:00 / 0:00</span>
+                        </div>
+                    </div>
                 </div>
-            </div>
-        </div>
+            </details>
+
+            <details class="sidebar-section" open>
+                <summary class="section-header">Queue</summary>
+                <ul class="queue-list" id="queue-list">
+                    <li><span class="empty-state">Queue is empty</span></li>
+                </ul>
+                <div class="btn-row" style="margin-top: 14px;">
+                    <button class="btn btn-accent btn-sm" onclick="playerPlayQueue()">Play Queue</button>
+                    <button class="btn btn-sm" onclick="clearQueue()">Clear</button>
+                </div>
+            </details>
+
+        </aside>
+
+        <!-- ============================================================
+             MAIN CONTENT — Tabs
+             ============================================================ -->
+
+        <div class="main-content">
 
         <!-- ============================================================
              TAB NAVIGATION
              ============================================================ -->
 
         <nav class="tab-nav">
-            <button class="tab-btn active" data-tab="status">Status</button>
+            <button class="tab-btn" data-tab="status">Status</button>
             <button class="tab-btn" data-tab="playback">Playback</button>
+            <button class="tab-btn" data-tab="browse">Browse</button>
             <button class="tab-btn" data-tab="maintenance">Maintenance</button>
         </nav>
 
@@ -892,7 +1046,7 @@
              TAB: STATUS
              ============================================================ -->
 
-        <div class="tab-panel active" id="tab-status">
+        <div class="tab-panel" id="tab-status">
 
             <!-- System health -->
             <div class="section">
@@ -966,6 +1120,17 @@
                 {% endif %}
             </div>
 
+            <!-- Audio Output -->
+            <div class="section">
+                <div class="section-header">Audio Output</div>
+                <div class="audio-output-section">
+                    <label class="form-label" for="audio-output-select">Output Device</label>
+                    <select id="audio-output-select" class="audio-output-select" disabled>
+                        <option value="">Loading...</option>
+                    </select>
+                </div>
+            </div>
+
             <!-- Music inbox -->
             <div class="section">
                 <div class="section-header">Music Inbox</div>
@@ -1008,16 +1173,21 @@
                 </div>
             </div>
 
-            <!-- Queue -->
+
+        </div>
+
+        <!-- ============================================================
+             TAB: BROWSE
+             ============================================================ -->
+
+        <div class="tab-panel" id="tab-browse">
+
             <div class="section">
-                <div class="section-header">Queue</div>
-                <ul class="queue-list" id="queue-list">
-                    <li><span class="empty-state">Queue is empty</span></li>
-                </ul>
-                <div class="btn-row" style="margin-top: 14px;">
-                    <button class="btn btn-accent btn-sm" onclick="playerPlayQueue()">Play Queue</button>
-                    <button class="btn btn-sm" onclick="clearQueue()">Clear</button>
+                <div style="display:flex;gap:8px;margin-bottom:16px">
+                    <button class="btn btn-accent btn-sm browse-mode-btn active" data-mode="artists" onclick="switchBrowseMode('artists')">Artists</button>
+                    <button class="btn btn-sm browse-mode-btn" data-mode="albums" onclick="switchBrowseMode('albums')">Albums</button>
                 </div>
+                <div id="browse-content" class="empty-state">Select Artists or Albums to browse</div>
             </div>
 
         </div>
@@ -1121,6 +1291,10 @@
 
         </div>
 
+        </div><!-- /.main-content -->
+
+        </div><!-- /.content-layout -->
+
     </div>
 
     <!-- ============================================================
@@ -1156,12 +1330,36 @@
         // Tab Navigation
         // =================================================================
 
+        var userSelectedTab = false;
+        var isPlaybackPaused = false;
+
+        function activateTab(tabName) {
+            document.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
+            document.querySelectorAll('.tab-panel').forEach(function(p) { p.classList.remove('active'); });
+            var btn = document.querySelector('.tab-btn[data-tab="' + tabName + '"]');
+            if (btn) btn.classList.add('active');
+            var panel = document.getElementById('tab-' + tabName);
+            if (panel) panel.classList.add('active');
+            if (tabName === 'browse') {
+                var browseContent = document.getElementById('browse-content');
+                if (browseContent && browseContent.classList.contains('empty-state')) {
+                    loadBrowseContent();
+                }
+            }
+        }
+
+        function deactivateAllTabs() {
+            document.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
+            document.querySelectorAll('.tab-panel').forEach(function(p) { p.classList.remove('active'); });
+        }
+
         document.querySelectorAll('.tab-btn').forEach(function(btn) {
             btn.addEventListener('click', function() {
-                document.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
-                document.querySelectorAll('.tab-panel').forEach(function(p) { p.classList.remove('active'); });
-                btn.classList.add('active');
-                document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+                userSelectedTab = true;
+                activateTab(btn.dataset.tab);
+                if (btn.dataset.tab === 'status') {
+                    loadAudioOutputs();
+                }
             });
         });
 
@@ -1256,17 +1454,30 @@
                 var ev;
                 try { ev = JSON.parse(e.data); } catch(ex) { return; }
                 if (ev.type === 'TrackStarted' || ev.type === 'Connected') {
+                    isPlaybackPaused = false;
                     refreshNowPlaying();
                     refreshQueue();
                 } else if (ev.type === 'TrackStopped' || ev.type === 'TrackEnded') {
+                    isPlaybackPaused = false;
                     refreshNowPlaying();
                     document.getElementById('progress-area').style.display = 'none';
-                } else if (ev.type === 'TrackPaused' || ev.type === 'TrackResumed') {
+                } else if (ev.type === 'TrackPaused') {
+                    isPlaybackPaused = true;
+                    refreshNowPlaying();
+                } else if (ev.type === 'TrackResumed') {
+                    isPlaybackPaused = false;
                     refreshNowPlaying();
                 } else if (ev.type === 'QueueChanged') {
                     refreshQueue();
                 } else if (ev.type === 'PositionUpdate') {
                     updateProgressBar(ev.position_ms, ev.duration_ms);
+                } else if (ev.type === 'FactsWritten') {
+                    // New facts written — re-run any active search to pick up updated metadata
+                    var hasSearch = (document.getElementById('search-q').value.trim() ||
+                                     document.getElementById('search-artist').value.trim() ||
+                                     document.getElementById('search-bpm').value.trim() ||
+                                     document.getElementById('search-key').value.trim());
+                    if (hasSearch) { scheduleSearch(); }
                 }
             };
 
@@ -1295,6 +1506,9 @@
                     if (!data.playing) {
                         area.innerHTML = '<div class="np-idle">No active playback</div>';
                         if (progressArea) progressArea.style.display = 'none';
+                        var existingTransport = document.getElementById('np-transport-controls');
+                        if (existingTransport) existingTransport.remove();
+                        if (!userSelectedTab) { deactivateAllTabs(); }
                         return;
                     }
 
@@ -1310,23 +1524,43 @@
 
                     var metaHtml = metaParts.map(function(m) { return '<span>' + m + '</span>'; }).join('');
 
+                    var coverHtml = t.content_hash
+                        ? '<img class="cover-art cover-art-np" src="/cover/' + encodeURIComponent(t.content_hash) + '" onerror="this.style.display=\'none\'" alt="">'
+                        : '';
+
+                    var pauseClass = isPlaybackPaused ? 'transport-btn primary' : 'transport-btn';
+                    var resumeClass = (!isPlaybackPaused) ? 'transport-btn primary' : 'transport-btn';
+
                     area.innerHTML =
                         '<div class="np-active">' +
+                            coverHtml +
                             '<div class="np-info">' +
                                 '<div class="np-label">Now Playing</div>' +
                                 '<div class="np-title">' + title + '</div>' +
                                 (artist ? '<div class="np-artist">' + artist + '</div>' : '') +
                                 (metaHtml ? '<div class="np-meta">' + metaHtml + '</div>' : '') +
                             '</div>' +
-                            '<div class="np-transport">' +
-                                '<button class="transport-btn" onclick="playerPause()" title="Pause">&#10074;&#10074;</button>' +
-                                '<button class="transport-btn" onclick="playerResume()" title="Resume">&#9654;</button>' +
-                                '<button class="transport-btn" onclick="playerStop()" title="Stop">&#9632;</button>' +
-                                '<button class="transport-btn primary" onclick="playerSkip()" title="Skip">&#9197;</button>' +
-                            '</div>' +
                         '</div>';
 
                     if (progressArea) progressArea.style.display = 'block';
+
+                    // Transport controls go after the progress bar — injected into now-playing-area
+                    // We append after progressArea by setting innerHTML on a wrapper then inserting
+                    var existingTransport = document.getElementById('np-transport-controls');
+                    if (!existingTransport) {
+                        var transportDiv = document.createElement('div');
+                        transportDiv.id = 'np-transport-controls';
+                        area.parentNode.appendChild(transportDiv);
+                        existingTransport = transportDiv;
+                    }
+                    existingTransport.innerHTML =
+                        '<div class="np-transport">' +
+                            '<button id="btn-pause" class="' + pauseClass + '" onclick="playerPause()" title="Pause">&#10074;&#10074;</button>' +
+                            '<button id="btn-play" class="' + resumeClass + '" onclick="playerResume()" title="Resume">&#9654;</button>' +
+                            '<button id="btn-stop" class="transport-btn" onclick="playerStop()" title="Stop">&#9632;</button>' +
+                            '<button id="btn-skip" class="transport-btn" onclick="playerSkip()" title="Skip">&#9197;</button>' +
+                        '</div>';
+                    if (!userSelectedTab) { activateTab('playback'); }
                 })
                 .catch(function() {});
         }
@@ -1344,8 +1578,12 @@
                         var title = escapeHtml(t.title || t.content_hash || 'Unknown');
                         var artist = escapeHtml(t.artist || '');
                         var hash = escapeHtml(t.content_hash || '');
+                        var coverHtml = t.content_hash
+                            ? '<img class="cover-art cover-art-queue" src="/cover/' + encodeURIComponent(t.content_hash) + '" onerror="this.style.display=\'none\'" alt="">'
+                            : '';
                         return '<li class="queue-item">' +
                             '<span class="queue-num">' + (i + 1) + '</span>' +
+                            coverHtml +
                             '<div class="queue-info">' +
                                 '<div class="queue-title">' + title + '</div>' +
                                 (artist ? '<div class="queue-artist">' + artist + '</div>' : '') +
@@ -1466,7 +1704,11 @@
                         var keyStr = escapeHtml(t.key || '');
                         var dur = t.duration ? fmtDuration(t.duration) : '';
                         var exportHref = '/export/' + encodeURIComponent(t.content_hash || '') + '?format=aiff';
+                        var coverHtml = t.content_hash
+                            ? '<img class="cover-art cover-art-search" src="/cover/' + encodeURIComponent(t.content_hash) + '" onerror="this.style.display=\'none\'" alt="">'
+                            : '';
                         return '<tr>' +
+                            '<td style="width:56px;padding-right:8px">' + coverHtml + '</td>' +
                             '<td>' + title + '</td>' +
                             '<td style="color:var(--text-secondary)">' + artist + '</td>' +
                             '<td class="col-mono">' + bpmStr + '</td>' +
@@ -1481,7 +1723,7 @@
 
                     area.innerHTML =
                         '<table class="results-table">' +
-                        '<thead><tr><th>Title</th><th>Artist</th><th>BPM</th><th>Key</th><th>Dur</th><th></th></tr></thead>' +
+                        '<thead><tr><th></th><th>Title</th><th>Artist</th><th>BPM</th><th>Key</th><th>Dur</th><th></th></tr></thead>' +
                         '<tbody>' + rows + '</tbody>' +
                         '</table>';
                 })
@@ -1731,12 +1973,183 @@
         });
 
         // =================================================================
+        // Audio Output Selection
+        // =================================================================
+
+        async function loadAudioOutputs() {
+            var select = document.getElementById('audio-output-select');
+            if (!select) return;
+
+            try {
+                var outputsRes = await fetch('/player/audio-outputs');
+                var currentRes = await fetch('/player/audio-output');
+
+                if (!outputsRes.ok || !currentRes.ok) {
+                    throw new Error('Request failed');
+                }
+
+                var outputs = await outputsRes.json();
+                var current = await currentRes.json();
+                var currentName = current && current.device_name ? current.device_name : '';
+
+                select.innerHTML = '';
+                if (!Array.isArray(outputs) || outputs.length === 0) {
+                    var opt = document.createElement('option');
+                    opt.value = '';
+                    opt.textContent = 'No devices found';
+                    select.appendChild(opt);
+                } else {
+                    outputs.forEach(function(sink) {
+                        var opt = document.createElement('option');
+                        opt.value = sink.name;
+                        opt.textContent = sink.description || sink.name;
+                        if (sink.name === currentName) {
+                            opt.selected = true;
+                        }
+                        select.appendChild(opt);
+                    });
+                    select.disabled = false;
+                }
+            } catch (e) {
+                select.innerHTML = '<option value="">Unavailable</option>';
+                select.disabled = true;
+            }
+        }
+
+        document.getElementById('audio-output-select').addEventListener('change', async function() {
+            var deviceName = this.value;
+            if (!deviceName) return;
+            try {
+                var response = await fetch('/player/audio-output', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ device_name: deviceName })
+                });
+                if (response.ok) {
+                    showStatus('Audio output changed', false);
+                } else {
+                    var text = await response.text();
+                    showStatus('Failed to change output: ' + text, true);
+                }
+            } catch (e) {
+                showStatus('Error: ' + e.message, true);
+            }
+        });
+
+        // =================================================================
+        // Browse
+        // =================================================================
+
+        var currentBrowseMode = 'artists';
+
+        function switchBrowseMode(mode) {
+            currentBrowseMode = mode;
+            document.querySelectorAll('.browse-mode-btn').forEach(function(b) {
+                b.classList.toggle('active', b.dataset.mode === mode);
+            });
+            loadBrowseContent();
+        }
+
+        function loadBrowseContent() {
+            var area = document.getElementById('browse-content');
+            area.innerHTML = '<div class="empty-state">Loading...</div>';
+            var url = currentBrowseMode === 'artists' ? '/library/artists' : '/library/albums';
+            fetch(url).then(function(r) { return r.json(); }).then(function(items) {
+                if (!items.length) { area.innerHTML = '<div class="empty-state">No ' + currentBrowseMode + ' found</div>'; return; }
+                var clickFn = currentBrowseMode === 'artists' ? 'loadArtistTracks' : 'loadAlbumTracks';
+                renderNameList(items, area, clickFn);
+            }).catch(function(e) { area.innerHTML = '<div class="empty-state">Error: ' + e.message + '</div>'; });
+        }
+
+        function renderNameList(names, area, clickFn) {
+            var html = '<div class="browse-list">';
+            names.forEach(function(name) {
+                html += '<div class="browse-item" onclick="' + clickFn + '(\'' + escapeHtml(name).replace(/'/g, "\\'") + '\')">' + escapeHtml(name) + '</div>';
+            });
+            html += '</div>';
+            area.innerHTML = html;
+        }
+
+        function loadArtistTracks(artistName) {
+            var area = document.getElementById('browse-content');
+            area.innerHTML = '<div class="empty-state">Loading tracks...</div>';
+            fetch('/library/artists/' + encodeURIComponent(artistName) + '/tracks')
+                .then(function(r) { return r.json(); })
+                .then(function(tracks) {
+                    var albums = {};
+                    var albumOrder = [];
+                    tracks.forEach(function(t) {
+                        var album = t.album || 'Unknown Album';
+                        if (!albums[album]) { albums[album] = []; albumOrder.push(album); }
+                        albums[album].push(t);
+                    });
+                    var html = '<div style="margin-bottom:12px"><button class="btn btn-sm btn-ghost" onclick="loadBrowseContent()">&larr; Back</button> <span style="font-family:\'DM Mono\',monospace;color:var(--accent)">' + escapeHtml(artistName) + '</span></div>';
+                    albumOrder.forEach(function(albumName) {
+                        var albumTracks = albums[albumName];
+                        var coverHash = '';
+                        for (var i = 0; i < albumTracks.length; i++) {
+                            if (albumTracks[i].content_hash) { coverHash = albumTracks[i].content_hash; break; }
+                        }
+                        var coverHtml = coverHash ? '<img src="/cover/' + encodeURIComponent(coverHash) + '" onerror="this.style.display=\'none\'" alt="" style="width:60px;height:60px;object-fit:cover;border-radius:4px">' : '';
+                        html += '<div class="album-group">';
+                        html += '<div class="album-group-header">' + coverHtml + '<span class="album-group-name">' + escapeHtml(albumName) + '</span></div>';
+                        html += renderBrowseTrackTable(albumTracks);
+                        html += '</div>';
+                    });
+                    area.innerHTML = html;
+                })
+                .catch(function(e) { area.innerHTML = '<div class="empty-state">Error: ' + e.message + '</div>'; });
+        }
+
+        function loadAlbumTracks(albumName) {
+            var area = document.getElementById('browse-content');
+            area.innerHTML = '<div class="empty-state">Loading tracks...</div>';
+            fetch('/library/albums/' + encodeURIComponent(albumName) + '/tracks')
+                .then(function(r) { return r.json(); })
+                .then(function(tracks) {
+                    var coverHash = '';
+                    for (var i = 0; i < tracks.length; i++) {
+                        if (tracks[i].content_hash) { coverHash = tracks[i].content_hash; break; }
+                    }
+                    var coverHtml = coverHash ? '<img src="/cover/' + encodeURIComponent(coverHash) + '" onerror="this.style.display=\'none\'" alt="" style="width:80px;height:80px;object-fit:cover;border-radius:4px">' : '';
+                    var html = '<div style="margin-bottom:12px"><button class="btn btn-sm btn-ghost" onclick="loadBrowseContent()">&larr; Back</button></div>';
+                    html += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">' + coverHtml + '<span style="font-family:\'DM Mono\',monospace;font-size:1.2em;color:var(--accent)">' + escapeHtml(albumName) + '</span></div>';
+                    html += renderBrowseTrackTable(tracks);
+                    area.innerHTML = html;
+                })
+                .catch(function(e) { area.innerHTML = '<div class="empty-state">Error: ' + e.message + '</div>'; });
+        }
+
+        function renderBrowseTrackTable(tracks) {
+            var rows = tracks.map(function(t) {
+                var hash = escapeHtml(t.content_hash || '');
+                var title = escapeHtml(t.title || 'Unknown');
+                var artist = escapeHtml(t.artist || '');
+                var bpmStr = t.bpm ? parseFloat(t.bpm).toFixed(1) : '';
+                var keyStr = escapeHtml(t.key || '');
+                var dur = t.duration ? fmtDuration(t.duration) : '';
+                return '<tr>' +
+                    '<td>' + title + '</td>' +
+                    '<td style="color:var(--text-secondary)">' + artist + '</td>' +
+                    '<td class="col-mono">' + bpmStr + '</td>' +
+                    '<td class="col-mono">' + keyStr + '</td>' +
+                    '<td class="col-mono">' + dur + '</td>' +
+                    '<td class="col-actions">' +
+                        (hash ? '<button class="btn btn-accent btn-sm" onclick="addToQueue(\'' + hash + '\')">+ Queue</button>' : '') +
+                    '</td>' +
+                    '</tr>';
+            }).join('');
+            return '<table class="results-table"><thead><tr><th>Title</th><th>Artist</th><th>BPM</th><th>Key</th><th>Dur</th><th></th></tr></thead><tbody>' + rows + '</tbody></table>';
+        }
+
+        // =================================================================
         // Init
         // =================================================================
 
         connectSSE();
         refreshNowPlaying();
         refreshQueue();
+        loadAudioOutputs();
     </script>
 
 </body>

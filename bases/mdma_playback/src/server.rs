@@ -3,7 +3,9 @@ use crate::playback_state::{PlaybackEffect, PlaybackState, PlaybackStateMachine}
 use acid_client::AcidClient;
 use color_eyre::Result;
 use event_protocol::{to_topic_message, PlaybackEvent};
-use media_protocol::{Command, ContentHash, Response, ResponseData};
+use media_protocol::{
+    AudioOutputConfig, AudioSinkInfo, Command, ContentHash, Response, ResponseData,
+};
 use music_facts::{FactOrigin, FactSource, MusicValue, StartReason};
 use nng::Socket;
 use playback_engine::{Deck, PlaybackEngine, PlaybackError};
@@ -14,6 +16,21 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
+
+fn audio_output_config_to_protocol(c: playback_engine::AudioOutputConfig) -> AudioOutputConfig {
+    AudioOutputConfig {
+        device_name: c.device_name,
+        sample_rate: c.sample_rate,
+    }
+}
+
+fn audio_sink_to_protocol(s: playback_engine::AudioSink) -> AudioSinkInfo {
+    AudioSinkInfo {
+        name: s.name,
+        description: s.description,
+        max_sample_rate: s.max_sample_rate,
+    }
+}
 
 struct QueueEntry {
     hash: ContentHash,
@@ -373,6 +390,42 @@ impl Server {
                     data: Some(ResponseData::Session(session_id)),
                 }
             }
+            Command::ListAudioOutputs => {
+                info!("Listing audio outputs");
+                match self.engine.lock().await.list_outputs() {
+                    Ok(sinks) => {
+                        let sink_infos = sinks.into_iter().map(audio_sink_to_protocol).collect();
+                        Response::Ok {
+                            data: Some(ResponseData::AudioOutputs(sink_infos)),
+                        }
+                    }
+                    Err(e) => Response::Err {
+                        message: e.to_string(),
+                    },
+                }
+            }
+            Command::SetAudioOutput { device_name } => {
+                info!("Setting audio output to {:?}", device_name);
+                match self.engine.lock().await.set_output(device_name) {
+                    Ok(config) => Response::Ok {
+                        data: Some(ResponseData::AudioOutput(audio_output_config_to_protocol(
+                            config,
+                        ))),
+                    },
+                    Err(e) => Response::Err {
+                        message: e.to_string(),
+                    },
+                }
+            }
+            Command::GetAudioOutput => {
+                info!("Getting current audio output");
+                let config = self.engine.lock().await.get_output().clone();
+                Response::Ok {
+                    data: Some(ResponseData::AudioOutput(audio_output_config_to_protocol(
+                        config,
+                    ))),
+                }
+            }
         }
     }
 
@@ -587,7 +640,9 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let engine = PlaybackEngine::new().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("audio_config.json");
+        let engine = PlaybackEngine::new(config_path).unwrap();
         let engine = Arc::new(Mutex::new(engine));
         let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
         let event_pub = nng::Socket::new(nng::Protocol::Pub0).unwrap();
@@ -651,7 +706,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn handle_nonexistent_track() {
-        let engine = PlaybackEngine::new().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("audio_config.json");
+        let engine = PlaybackEngine::new(config_path).unwrap();
         let engine = Arc::new(Mutex::new(engine));
 
         let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();

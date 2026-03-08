@@ -1,6 +1,7 @@
 use clap::Parser;
 use color_eyre::Result;
 
+use library_service::service::spawn_fact_subscriber;
 use library_service::{service, LibraryService};
 
 #[derive(Parser, Debug)]
@@ -25,6 +26,10 @@ struct Args {
     /// ACID service socket address
     #[arg(long, default_value = "ipc:///run/mdma/acid.sock")]
     acid_socket: String,
+
+    /// ACID events pub/sub socket address (Sub0)
+    #[arg(long, default_value = "ipc:///run/mdma/acid-events.sock")]
+    acid_events_socket: String,
 }
 
 #[tokio::main]
@@ -64,7 +69,12 @@ async fn main() -> Result<()> {
     }
 
     // Initialize service
-    let library = LibraryService::new(args.music_dir, args.metadata_dir, &args.acid_socket)?;
+    let library = LibraryService::new_with_events(
+        args.music_dir,
+        args.metadata_dir,
+        &args.acid_socket,
+        &args.acid_events_socket,
+    )?;
 
     tracing::info!(
         tracks = library.tracks_count(),
@@ -73,6 +83,9 @@ async fn main() -> Result<()> {
     );
 
     let library = std::sync::Arc::new(library);
+
+    // Spawn background ACID fact subscriber for incremental index updates
+    spawn_fact_subscriber(std::sync::Arc::clone(&library));
 
     // Run IPC server (blocking)
     service::run_ipc_server(library, &args.socket)?;

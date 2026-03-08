@@ -261,6 +261,12 @@ enum Commands {
         command: PlaylistCommands,
     },
 
+    /// Library maintenance commands
+    Library {
+        #[command(subcommand)]
+        command: LibraryCommands,
+    },
+
     /// Generate shell completions
     #[command(hide = true)]
     GenerateCompletions {
@@ -384,6 +390,18 @@ enum PlaybackCommands {
 
     /// Show the current session ID (a session spans from first play to queue empty)
     Session,
+
+    /// List available audio output devices
+    Outputs,
+
+    /// Select an audio output device by name
+    SetOutput {
+        /// Device name as shown by `mdma playback outputs`
+        name: String,
+    },
+
+    /// Show the currently selected audio output
+    GetOutput,
 }
 
 #[derive(Subcommand, Debug)]
@@ -517,6 +535,16 @@ enum PlaylistCommands {
         /// New playlist name
         to: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum LibraryCommands {
+    /// Re-extract and store cover art for tracks that don't have a CoverArtPath fact yet.
+    ///
+    /// Reads embedded artwork from each track's audio blob and writes the image to
+    /// `/music/cover-art/<hash>.<ext>`. Only tracks without an existing CoverArtPath
+    /// fact are processed.
+    ReindexCovers,
 }
 
 // =============================================================================
@@ -1635,6 +1663,35 @@ fn handle_playlist_remove(client: &LibraryBackend, name: &str) -> Result<()> {
 }
 
 // =============================================================================
+// Library Maintenance Command Handlers
+// =============================================================================
+
+fn handle_library_reindex_covers(client: &LibraryBackend) -> Result<()> {
+    use library_ipc_client::{LibraryRequest, LibraryResponse};
+    let response = client.request(&LibraryRequest::ReindexCovers);
+    match response {
+        Ok(LibraryResponse::IngestResult(result)) => match result {
+            library_ipc_client::IngestResult::Success { message, .. } => {
+                println!("{}", message);
+            }
+            library_ipc_client::IngestResult::Failure { message } => {
+                eprintln!("Error: {}", message);
+                std::process::exit(1);
+            }
+        },
+        Ok(LibraryResponse::Error(e)) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("Unexpected response");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+// =============================================================================
 // Source Command Handlers
 // =============================================================================
 
@@ -2186,6 +2243,42 @@ fn handle_playback_session(media_client: &PlaybackBackend) -> Result<()> {
         }
         Err(e) => handle_playback_error(e),
     }
+    Ok(())
+}
+
+fn handle_playback_outputs(media_client: &PlaybackBackend) -> Result<()> {
+    let sinks = match media_client.list_audio_outputs() {
+        Ok(s) => s,
+        Err(e) => handle_playback_error(e),
+    };
+    println!("{:<40} {:<40} MAX RATE", "NAME", "DESCRIPTION");
+    println!("{}", "-".repeat(90));
+    for sink in &sinks {
+        println!(
+            "{:<40} {:<40} {}",
+            sink.name, sink.description, sink.max_sample_rate
+        );
+    }
+    Ok(())
+}
+
+fn handle_playback_set_output(media_client: &PlaybackBackend, name: &str) -> Result<()> {
+    let cfg = match media_client.set_audio_output(name.to_string()) {
+        Ok(c) => c,
+        Err(e) => handle_playback_error(e),
+    };
+    let device = cfg.device_name.as_deref().unwrap_or("auto");
+    println!("Audio output set to: {} ({}Hz)", device, cfg.sample_rate);
+    Ok(())
+}
+
+fn handle_playback_get_output(media_client: &PlaybackBackend) -> Result<()> {
+    let cfg = match media_client.get_audio_output() {
+        Ok(c) => c,
+        Err(e) => handle_playback_error(e),
+    };
+    let device = cfg.device_name.as_deref().unwrap_or("auto");
+    println!("{} ({}Hz)", device, cfg.sample_rate);
     Ok(())
 }
 
@@ -2909,6 +3002,9 @@ fn main() -> Result<()> {
                     }
                 }
                 PlaybackCommands::Session => handle_playback_session(&pb),
+                PlaybackCommands::Outputs => handle_playback_outputs(&pb),
+                PlaybackCommands::SetOutput { name } => handle_playback_set_output(&pb, name),
+                PlaybackCommands::GetOutput => handle_playback_get_output(&pb),
             }
         }
 
@@ -3100,6 +3196,13 @@ fn main() -> Result<()> {
             generate_completions(*shell, &mut std::io::stdout());
             Ok(())
         }
+
+        Commands::Library { command } => {
+            let lib = connect_library(&cli);
+            match command {
+                LibraryCommands::ReindexCovers => handle_library_reindex_covers(&lib),
+            }
+        }
     }
 }
 
@@ -3161,6 +3264,7 @@ mod tests {
             bpm: None,
             key: None,
             blob_path: None,
+            cover_art_path: None,
         }
     }
 
@@ -3424,6 +3528,7 @@ mod tests {
             bpm: None,
             key: None,
             blob_path: Some(blob_path.to_string()),
+            cover_art_path: None,
         }
     }
 
@@ -3468,6 +3573,7 @@ mod tests {
             bpm: None,
             key: None,
             blob_path: Some("ab/abc123.flac".to_string()),
+            cover_art_path: None,
         };
         let output = std::path::Path::new("/tmp/export");
         let path = export_dest_path(output, &track, "flac");

@@ -231,6 +231,12 @@ pub enum MusicValue {
     EncodedBy(String),
 
     // ========================================================================
+    // Cover Art
+    // ========================================================================
+    /// Relative path to extracted cover art image (e.g. "cover-art/<hash>.jpg")
+    CoverArtPath(String),
+
+    // ========================================================================
     // Play History
     // ========================================================================
     /// Track started playing
@@ -277,6 +283,7 @@ impl MusicValue {
             MusicValue::Format(_) => "Format",
             MusicValue::EncoderSoftware(_) => "EncoderSoftware",
             MusicValue::EncodedBy(_) => "EncodedBy",
+            MusicValue::CoverArtPath(_) => "CoverArtPath",
             MusicValue::TrackStarted(_) => "TrackStarted",
             MusicValue::TrackStopped(_) => "TrackStopped",
         }
@@ -327,6 +334,7 @@ impl fmt::Display for MusicValue {
             MusicValue::Format(ref fmt_val) => write!(f, "{}", fmt_val),
             MusicValue::EncoderSoftware(s) => write!(f, "{}", s),
             MusicValue::EncodedBy(s) => write!(f, "{}", s),
+            MusicValue::CoverArtPath(s) => write!(f, "{}", s),
             MusicValue::TrackStarted(r) => write!(f, "{}", r),
             MusicValue::TrackStopped(r) => write!(f, "{}", r),
         }
@@ -495,5 +503,30 @@ mod tests {
         let legacy = r#"{"t":"TrackStopped","v":"2026-01-15T10:00:00Z"}"#;
         let v: MusicValue = serde_json::from_str(legacy).unwrap();
         assert_eq!(v, MusicValue::TrackStopped(StopReason::OnRequest));
+    }
+
+    #[test]
+    fn cover_art_path_roundtrip() {
+        let v = MusicValue::CoverArtPath("cover-art/abc123.jpg".to_string());
+        let json = serde_json::to_string(&v).unwrap();
+        let back: MusicValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn cover_art_path_display_name() {
+        let v = MusicValue::CoverArtPath("cover-art/abc123.jpg".to_string());
+        assert_eq!(v.display_name(), "CoverArtPath");
+    }
+
+    #[test]
+    fn cover_art_path_display() {
+        let v = MusicValue::CoverArtPath("cover-art/abc123.jpg".to_string());
+        assert_eq!(v.to_string(), "cover-art/abc123.jpg");
+    }
+
+    #[test]
+    fn cover_art_path_fact_value_format() {
+        assert_fact_value_format!(MusicValue::CoverArtPath("cover-art/test.jpg".to_string()));
     }
 }

@@ -298,6 +298,9 @@ pub enum LibraryRequest {
         from: PlaylistName,
         to: PlaylistName,
     },
+
+    /// Re-extract cover art for tracks that don't have a CoverArtPath fact yet.
+    ReindexCovers,
 }
 
 // ============================================================================
@@ -380,6 +383,8 @@ pub struct TrackInfo {
     pub key: Option<Key>,
     /// Relative blob path (no absolute paths in protocol).
     pub blob_path: Option<String>,
+    /// Relative path to cover art image (e.g. "cover-art/<hash>.jpg"). No absolute paths.
+    pub cover_art_path: Option<String>,
 }
 
 /// Service status information.
@@ -572,6 +577,7 @@ mod tests {
             bpm: Some(Bpm::from_u32(128).unwrap()),
             key: None,
             blob_path: Some("ab/abc123.flac".to_string()),
+            cover_art_path: None,
         };
 
         let json = serde_json::to_string(&track).unwrap();

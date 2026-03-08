@@ -17,5 +17,8 @@ pub use library_ipc_client::{
     IngestSource, LibraryRequest, LibraryResponse, ProtocolError, ServiceStatus, TrackInfo,
 };
 pub use library_search::TrackQuery;
-pub use media_client::{ClientError as PlaybackClientError, Command, Deck, Response, ResponseData};
+pub use media_client::{
+    AudioOutputConfig, AudioSinkInfo, ClientError as PlaybackClientError, Command, Deck, Response,
+    ResponseData,
+};
 pub use source_protocol::{SourceRequest, SourceResponse};

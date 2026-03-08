@@ -67,7 +67,7 @@ impl PlaybackStateMachine {
             let id = SessionId::now();
             self.session_id = Some(id.clone());
             effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::SessionStarted {
-                id: id,
+                id,
             }));
         }
     }
@@ -77,7 +77,7 @@ impl PlaybackStateMachine {
     fn maybe_end_session(&mut self, effects: &mut Vec<PlaybackEffect>) {
         if let Some(id) = self.session_id.take() {
             effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::SessionEnded {
-                id: id,
+                id,
             }));
         }
     }

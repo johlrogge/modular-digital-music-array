@@ -13,8 +13,8 @@ use clap::Parser;
 use color_eyre::Result;
 use futures::stream::Stream;
 use gateway_client::{Command, GatewayClient};
-use library_ipc_client::{ContentHash, LibraryClient, TrackInfo, TrackQuery};
-use media_protocol::{Deck, ResponseData};
+use library_ipc_client::{ContentHash, FactType, LibraryClient, TrackInfo, TrackQuery};
+use media_protocol::{AudioSinkInfo, Deck, ResponseData};
 use nng::options::Options;
 use source_protocol::{DownloadState, SourceRequest, SourceResponse};
 use std::convert::Infallible;
@@ -825,6 +825,11 @@ async fn bandcamp_configure(
 // Player Types
 // =============================================================================
 
+#[derive(serde::Deserialize)]
+struct SetAudioOutputRequest {
+    device_name: String,
+}
+
 #[derive(serde::Serialize)]
 struct TrackInfoJson {
     content_hash: String,
@@ -1089,6 +1094,77 @@ async fn player_resume(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     playback_success_or_error(&client, &Command::Resume { deck: Deck::A })
 }
 
+async fn player_audio_outputs(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let client = match require_gateway(&state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+
+    use gateway_client::Response;
+    match client.playback_command(&Command::ListAudioOutputs) {
+        Ok(Response::Ok { data }) => match data {
+            Some(ResponseData::AudioOutputs(sinks)) => Json(sinks).into_response(),
+            _ => Json(Vec::<AudioSinkInfo>::new()).into_response(),
+        },
+        Ok(Response::Err { message }) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": message})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn player_audio_output(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let client = match require_gateway(&state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+
+    use gateway_client::Response;
+    match client.playback_command(&Command::GetAudioOutput) {
+        Ok(Response::Ok { data }) => match data {
+            Some(ResponseData::AudioOutput(config)) => Json(config).into_response(),
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Unexpected response"})),
+            )
+                .into_response(),
+        },
+        Ok(Response::Err { message }) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": message})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn player_set_audio_output(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SetAudioOutputRequest>,
+) -> impl IntoResponse {
+    let client = match require_gateway(&state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+
+    playback_success_or_error(
+        &client,
+        &Command::SetAudioOutput {
+            device_name: req.device_name,
+        },
+    )
+}
+
 async fn player_events(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -1107,6 +1183,105 @@ async fn player_events(
         }
     };
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+// =============================================================================
+// Library Browse Handlers (by artist / album)
+// =============================================================================
+
+/// Shared helper: fetch all values for a fact type and return them sorted case-insensitively.
+fn library_fact_values(state: &AppState, fact_type: &str) -> axum::response::Response {
+    use gateway_client::{LibraryRequest, LibraryResponse};
+    let client = match require_gateway(state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    match client.library_request(&LibraryRequest::GetFactValues {
+        fact_type: FactType::new(fact_type),
+    }) {
+        Ok(LibraryResponse::FactValues(mut values)) => {
+            values.sort_by_key(|a| a.to_lowercase());
+            Json(values).into_response()
+        }
+        Ok(LibraryResponse::Error(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Unexpected library response"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// Shared helper: search tracks by a pre-built query and return them as JSON.
+fn library_search_tracks(state: &AppState, query: TrackQuery) -> axum::response::Response {
+    use gateway_client::{LibraryRequest, LibraryResponse};
+    let client = match require_gateway(state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    match client.library_request(&LibraryRequest::Search { query }) {
+        Ok(LibraryResponse::SearchResults(tracks)) => Json(
+            tracks
+                .iter()
+                .map(TrackInfoJson::from_track_info)
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Ok(LibraryResponse::Error(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Unexpected library response"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn library_artists_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
+    library_fact_values(&state, "Artist")
+}
+
+async fn library_albums_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
+    library_fact_values(&state, "Album")
+}
+
+async fn library_artist_tracks_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    let query = TrackQuery {
+        artist: Some(library_search::parse_string_query(&name)),
+        ..Default::default()
+    };
+    library_search_tracks(&state, query)
+}
+
+async fn library_album_tracks_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    let query = TrackQuery {
+        album: Some(library_search::parse_string_query(&name)),
+        ..Default::default()
+    };
+    library_search_tracks(&state, query)
 }
 
 // =============================================================================
@@ -1198,7 +1373,9 @@ async fn library_search_handler(
 // =============================================================================
 
 fn spawn_event_bridge(event_socket: String, event_tx: broadcast::Sender<String>) {
-    use event_protocol::{from_topic_message, TOPIC_PLAYBACK};
+    use event_protocol::{
+        acid_event_from_topic_message, from_topic_message, TOPIC_ACID_FACTS_WRITTEN, TOPIC_PLAYBACK,
+    };
     std::thread::spawn(move || {
         let sub = match nng::Socket::new(nng::Protocol::Sub0) {
             Ok(s) => s,
@@ -1210,7 +1387,13 @@ fn spawn_event_bridge(event_socket: String, event_tx: broadcast::Sender<String>)
         if let Err(e) = sub.set_opt::<nng::options::protocol::pubsub::Subscribe>(
             TOPIC_PLAYBACK.as_bytes().to_vec(),
         ) {
-            tracing::error!(error = %e, "SSE: subscribe failed");
+            tracing::error!(error = %e, "SSE: subscribe (playback) failed");
+            return;
+        }
+        if let Err(e) = sub.set_opt::<nng::options::protocol::pubsub::Subscribe>(
+            TOPIC_ACID_FACTS_WRITTEN.as_bytes().to_vec(),
+        ) {
+            tracing::error!(error = %e, "SSE: subscribe (acid/facts) failed");
             return;
         }
         loop {
@@ -1231,8 +1414,16 @@ fn spawn_event_bridge(event_socket: String, event_tx: broadcast::Sender<String>)
             loop {
                 match sub.recv() {
                     Ok(msg) => {
-                        if let Ok((_topic, event)) = from_topic_message(msg.as_slice()) {
+                        let bytes = msg.as_slice();
+                        // Try playback events first, then ACID events
+                        if let Ok((_topic, event)) = from_topic_message(bytes) {
                             if let Ok(json) = serde_json::to_string(&event) {
+                                let _ = event_tx.send(json);
+                            }
+                        } else if let Ok((_topic, acid_event)) =
+                            acid_event_from_topic_message(bytes)
+                        {
+                            if let Ok(json) = serde_json::to_string(&acid_event) {
                                 let _ = event_tx.send(json);
                             }
                         }
@@ -1315,9 +1506,26 @@ async fn main() -> Result<()> {
         .route("/player/skip", post(player_skip))
         .route("/player/pause", post(player_pause))
         .route("/player/resume", post(player_resume))
+        .route("/player/audio-outputs", get(player_audio_outputs))
+        .route(
+            "/player/audio-output",
+            get(player_audio_output).post(player_set_audio_output),
+        )
         .route("/player/events", get(player_events))
-        // Library search
+        // Library search and browse
         .route("/library/search", get(library_search_handler))
+        .route("/library/artists", get(library_artists_handler))
+        .route("/library/albums", get(library_albums_handler))
+        .route(
+            "/library/artists/:name/tracks",
+            get(library_artist_tracks_handler),
+        )
+        .route(
+            "/library/albums/:name/tracks",
+            get(library_album_tracks_handler),
+        )
+        // Cover art
+        .route("/cover/:hash", get(cover_art))
         // Export
         .route("/export/:hash", get(export_track))
         .with_state(state);
@@ -1571,6 +1779,71 @@ async fn export_track(
 }
 
 // =============================================================================
+// Cover Art Handler
+// =============================================================================
+
+/// Detect MIME type from cover art file extension.
+fn cover_art_content_type(path: &str) -> &'static str {
+    match std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase())
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn cover_art(
+    State(state): State<Arc<AppState>>,
+    Path(hash): Path<String>,
+) -> impl IntoResponse {
+    use axum::http::header;
+
+    let content_hash = ContentHash::new(hash);
+
+    let lib_client = match state.library_client() {
+        Some(c) => c,
+        None => {
+            return (StatusCode::SERVICE_UNAVAILABLE, "Library not available").into_response();
+        }
+    };
+
+    let track = match lib_client.get_track(&content_hash) {
+        Ok(t) => t,
+        Err(_) => {
+            return (StatusCode::NOT_FOUND, "Track not found").into_response();
+        }
+    };
+
+    let cover_rel = match track.cover_art_path {
+        Some(p) => p,
+        None => {
+            return (StatusCode::NOT_FOUND, "No cover art").into_response();
+        }
+    };
+
+    let cover_path = state.music_root.join(&cover_rel);
+    let content_type = cover_art_content_type(&cover_rel);
+
+    match tokio::fs::read(&cover_path).await {
+        Ok(data) => (
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            data,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "Cover art file not found").into_response(),
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -1680,6 +1953,7 @@ mod tests {
             bpm: Some(Bpm::from_u32(128).unwrap()),
             key: Some(Key::from_traditional("C Major").unwrap()),
             blob_path: Some("ab/abc123.flac".to_string()),
+            cover_art_path: None,
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.content_hash, "sha256:abc123");
@@ -1702,6 +1976,7 @@ mod tests {
             bpm: None,
             key: None,
             blob_path: None,
+            cover_art_path: None,
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.content_hash, "sha256:deadbeef");
@@ -1858,6 +2133,42 @@ mod tests {
         assert!(is_valid_username(""));
     }
 
+    // ── Cover art content type ─────────────────────────────────────────────
+
+    #[test]
+    fn cover_art_content_type_jpeg() {
+        assert_eq!(cover_art_content_type("cover-art/abc.jpg"), "image/jpeg");
+        assert_eq!(cover_art_content_type("cover-art/abc.jpeg"), "image/jpeg");
+    }
+
+    #[test]
+    fn cover_art_content_type_png() {
+        assert_eq!(cover_art_content_type("cover-art/abc.png"), "image/png");
+    }
+
+    #[test]
+    fn cover_art_content_type_webp() {
+        assert_eq!(cover_art_content_type("cover-art/abc.webp"), "image/webp");
+    }
+
+    #[test]
+    fn cover_art_content_type_unknown_defaults_to_octet_stream() {
+        assert_eq!(
+            cover_art_content_type("cover-art/abc.bmp"),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            cover_art_content_type("cover-art/noext"),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn cover_art_content_type_case_insensitive() {
+        assert_eq!(cover_art_content_type("cover-art/abc.JPG"), "image/jpeg");
+        assert_eq!(cover_art_content_type("cover-art/abc.PNG"), "image/png");
+    }
+
     #[test]
     fn aif_source_treated_as_aiff_for_passthrough() {
         let source_ext = blob_extension("blobs/ab/track.aif").unwrap().to_lowercase();
@@ -1866,5 +2177,30 @@ mod tests {
             Some(source_ext.as_str()) == fmt.extension()
                 || (source_ext == "aif" && fmt.extension() == Some("aiff"))
         );
+    }
+
+    // ── Artist/album list sort ─────────────────────────────────────────────
+
+    #[test]
+    fn artist_list_sorts_case_insensitively() {
+        let mut values = vec![
+            "Zebra".to_string(),
+            "apple".to_string(),
+            "Mango".to_string(),
+            "banana".to_string(),
+        ];
+        values.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        assert_eq!(values, vec!["apple", "banana", "Mango", "Zebra"],);
+    }
+
+    #[test]
+    fn album_list_sorts_case_insensitively() {
+        let mut values = vec![
+            "Ziggy Stardust".to_string(),
+            "abbey road".to_string(),
+            "Kind of Blue".to_string(),
+        ];
+        values.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        assert_eq!(values, vec!["abbey road", "Kind of Blue", "Ziggy Stardust"],);
     }
 }

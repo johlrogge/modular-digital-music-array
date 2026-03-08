@@ -24,3 +24,14 @@
 
     # Set ownership
     chown -R mdma:mdma /run/mdma 2>/dev/null || true
+
+    # Set default audio sink volume to 100% via WirePlumber config drop-in.
+    # WirePlumber's built-in default is 0.064 (~-24dBFS), which causes audio to
+    # be silent after reboot. This drop-in overrides it to 1.0 (0dBFS = 100%).
+    mkdir -p /etc/wireplumber/wireplumber.conf.d
+    cat > /etc/wireplumber/wireplumber.conf.d/99-mdma-volume.conf << 'WPCFG'
+# MDMA: Set default audio sink volume to 100%
+wireplumber.settings = {
+  device.routes.default-sink-volume = 1.0
+}
+WPCFG

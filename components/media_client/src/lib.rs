@@ -3,7 +3,9 @@
 //! NNG client wrapper for connecting to the playback service.
 //! Used by mdma-cli.
 
-pub use media_protocol::{Command, ContentHash, Deck, Response, ResponseData};
+pub use media_protocol::{
+    AudioOutputConfig, AudioSinkInfo, Command, ContentHash, Deck, Response, ResponseData,
+};
 pub use playback_primitives::Volume;
 
 use std::path::PathBuf;
@@ -150,6 +152,36 @@ impl MediaClient {
         self.send_command_with_response(Command::GetSession, |data| {
             if let ResponseData::Session(id) = data {
                 Some(id)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn list_audio_outputs(&self) -> Result<Vec<AudioSinkInfo>, ClientError> {
+        self.send_command_with_response(Command::ListAudioOutputs, |data| {
+            if let ResponseData::AudioOutputs(sinks) = data {
+                Some(sinks)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn set_audio_output(&self, device_name: String) -> Result<AudioOutputConfig, ClientError> {
+        self.send_command_with_response(Command::SetAudioOutput { device_name }, |data| {
+            if let ResponseData::AudioOutput(cfg) = data {
+                Some(cfg)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn get_audio_output(&self) -> Result<AudioOutputConfig, ClientError> {
+        self.send_command_with_response(Command::GetAudioOutput, |data| {
+            if let ResponseData::AudioOutput(cfg) = data {
+                Some(cfg)
             } else {
                 None
             }

@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::mpsc;
 use std::thread;
 
 use pipewire as pw;
@@ -10,20 +12,36 @@ use tracing::{debug, info};
 pub const DEFAULT_CHANNELS: u32 = 2;
 pub const CHAN_SIZE: usize = std::mem::size_of::<f32>();
 
-#[derive(Debug)]
 pub enum StreamCommand {
     SetActive(bool),
+    Shutdown(mpsc::SyncSender<HeapConsumer<f32>>),
+}
+
+impl std::fmt::Debug for StreamCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamCommand::SetActive(v) => write!(f, "SetActive({v})"),
+            StreamCommand::Shutdown(_) => write!(f, "Shutdown(..)"),
+        }
+    }
 }
 
 pub struct PipewireOutput {
     // Thread handle to keep the PipeWire thread alive
-    _pw_thread: thread::JoinHandle<Result<(), pw::Error>>,
+    pw_thread: Option<thread::JoinHandle<Result<(), pw::Error>>>,
     command_sender: pw::channel::Sender<StreamCommand>,
 }
 
 impl PipewireOutput {
-    pub fn new(sample_consumer: HeapConsumer<f32>, sample_rate: u32) -> Result<Self, pw::Error> {
+    pub fn new(
+        sample_consumer: HeapConsumer<f32>,
+        sample_rate: u32,
+        target_device: Option<&str>,
+    ) -> Result<Self, pw::Error> {
         let (cmd_sender, cmd_receiver) = pw::channel::channel::<StreamCommand>();
+
+        // Clone target_device into an owned String so it can move into the thread.
+        let target_device: Option<String> = target_device.map(|s| s.to_owned());
 
         // Create a ring buffer for audio samples
         info!("create pipe wire thread");
@@ -34,27 +52,45 @@ impl PipewireOutput {
             let context = pw::context::Context::new(&mainloop)?;
             let core = context.connect(None)?;
 
+            // Wrap consumer so it can be extracted on shutdown without moving out of UserData
+            let shared_consumer: Rc<RefCell<Option<HeapConsumer<f32>>>> =
+                Rc::new(RefCell::new(Some(sample_consumer)));
+
             // Create user data struct to hold consumer
             struct UserData {
-                consumer: HeapConsumer<f32>,
+                consumer: Rc<RefCell<Option<HeapConsumer<f32>>>>,
                 frame_count: usize, // For debugging
             }
 
             let user_data = UserData {
-                consumer: sample_consumer,
+                consumer: shared_consumer.clone(),
                 frame_count: 0,
             };
 
-            let stream = Rc::new(pw::stream::Stream::new(
-                &core,
-                "mdma-audio-output",
-                properties! {
-                    *pw::keys::MEDIA_TYPE => "Audio",
-                    *pw::keys::MEDIA_ROLE => "Music",
-                    *pw::keys::MEDIA_CATEGORY => "Playback",
-                    *pw::keys::AUDIO_CHANNELS => "2",
-                },
-            )?);
+            let stream = if let Some(ref name) = target_device {
+                Rc::new(pw::stream::Stream::new(
+                    &core,
+                    "mdma-audio-output",
+                    properties! {
+                        *pw::keys::MEDIA_TYPE => "Audio",
+                        *pw::keys::MEDIA_ROLE => "Music",
+                        *pw::keys::MEDIA_CATEGORY => "Playback",
+                        *pw::keys::AUDIO_CHANNELS => "2",
+                        "target.object" => name.as_str(),
+                    },
+                )?)
+            } else {
+                Rc::new(pw::stream::Stream::new(
+                    &core,
+                    "mdma-audio-output",
+                    properties! {
+                        *pw::keys::MEDIA_TYPE => "Audio",
+                        *pw::keys::MEDIA_ROLE => "Music",
+                        *pw::keys::MEDIA_CATEGORY => "Playback",
+                        *pw::keys::AUDIO_CHANNELS => "2",
+                    },
+                )?)
+            };
 
             // Held alive until the mainloop exits; dropping it would detach the process callback.
             let _listener = stream
@@ -71,23 +107,28 @@ impl PipewireOutput {
 
                             // Log every 100 frames for debugging
                             user_data.frame_count += 1;
-                            if user_data.frame_count % 100 == 0 {
-                                debug!(
-                                    "Processing {} frames, consumer has {} samples",
-                                    n_frames,
-                                    user_data.consumer.len()
-                                );
-                            }
 
                             // Temporary buffer to read from consumer
                             let mut f32_buffer = vec![0.0f32; n_frames * DEFAULT_CHANNELS as usize];
 
-                            // Read from consumer
-                            let samples_read = user_data.consumer.pop_slice(&mut f32_buffer);
-
-                            if user_data.frame_count % 100 == 0 && samples_read > 0 {
-                                debug!("Read {} samples from consumer", samples_read);
-                            }
+                            // Read from consumer (if still present — taken on shutdown)
+                            let samples_read =
+                                if let Some(ref mut consumer) = *user_data.consumer.borrow_mut() {
+                                    if user_data.frame_count % 100 == 0 {
+                                        debug!(
+                                            "Processing {} frames, consumer has {} samples",
+                                            n_frames,
+                                            consumer.len()
+                                        );
+                                    }
+                                    let n = consumer.pop_slice(&mut f32_buffer);
+                                    if user_data.frame_count % 100 == 0 && n > 0 {
+                                        debug!("Read {} samples from consumer", n);
+                                    }
+                                    n
+                                } else {
+                                    0
+                                };
 
                             // Write f32 samples directly to output buffer
                             for i in 0..n_frames {
@@ -143,18 +184,22 @@ impl PipewireOutput {
 
             let mut params = [Pod::from_bytes(&values).unwrap()];
 
+            let stream_flags = pw::stream::StreamFlags::AUTOCONNECT
+                | pw::stream::StreamFlags::MAP_BUFFERS
+                | pw::stream::StreamFlags::RT_PROCESS;
+
             stream.connect(
                 spa::utils::Direction::Output,
                 None,
-                pw::stream::StreamFlags::AUTOCONNECT
-                    | pw::stream::StreamFlags::MAP_BUFFERS
-                    | pw::stream::StreamFlags::RT_PROCESS,
+                stream_flags,
                 &mut params,
             )?;
 
             // Attach command receiver to the mainloop. The stream is shared via Rc.
             // Held alive until the mainloop exits; dropping it would detach the channel listener.
             let stream_for_cmd = stream.clone();
+            let mainloop_for_cmd = mainloop.clone();
+            let consumer_for_cmd = shared_consumer.clone();
             let _cmd_receiver = cmd_receiver.attach(mainloop.loop_(), move |cmd| match cmd {
                 StreamCommand::SetActive(active) => {
                     if let Err(e) = stream_for_cmd.set_active(active) {
@@ -163,6 +208,14 @@ impl PipewireOutput {
                         info!("Stream set_active({})", active);
                     }
                 }
+                StreamCommand::Shutdown(tx) => {
+                    // Take the consumer out before quitting so we can hand it back
+                    let consumer = consumer_for_cmd.borrow_mut().take();
+                    if let Some(c) = consumer {
+                        let _ = tx.send(c);
+                    }
+                    mainloop_for_cmd.quit();
+                }
             });
 
             mainloop.run();
@@ -170,7 +223,7 @@ impl PipewireOutput {
         });
 
         Ok(Self {
-            _pw_thread: pw_thread,
+            pw_thread: Some(pw_thread),
             command_sender: cmd_sender,
         })
     }
@@ -181,5 +234,84 @@ impl PipewireOutput {
         if let Err(e) = self.command_sender.send(StreamCommand::SetActive(active)) {
             tracing::warn!("Failed to send SetActive({}) to PW thread: {:?}", active, e);
         }
+    }
+
+    /// Shut down the PipeWire thread and recover the ring-buffer consumer.
+    ///
+    /// Sends `Shutdown` to the PW thread which quits the mainloop and sends the
+    /// `HeapConsumer` back via a rendezvous channel.  Returns `Some(consumer)` on
+    /// success, `None` if the thread does not respond within 1 second.
+    pub fn shutdown(mut self) -> Option<HeapConsumer<f32>> {
+        // We use capacity=1 here so the PW thread can send without blocking even
+        // if we are briefly delayed reaching recv.
+        let (tx, rx) = mpsc::sync_channel::<HeapConsumer<f32>>(1);
+
+        if let Err(e) = self.command_sender.send(StreamCommand::Shutdown(tx)) {
+            tracing::warn!("Failed to send Shutdown to PW thread: {:?}", e);
+            return None;
+        }
+
+        let consumer = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .inspect_err(|e| {
+                tracing::warn!("Timeout waiting for PW thread to shut down: {:?}", e);
+            })
+            .ok();
+
+        // Join the thread regardless of whether we got the consumer back
+        if let Some(handle) = self.pw_thread.take() {
+            let _ = handle.join();
+        }
+
+        consumer
+    }
+}
+
+/// Safety-net `Drop`: if a `PipewireOutput` is dropped without an explicit
+/// `shutdown()` call, send a `Shutdown` without expecting the consumer back
+/// (the channel sender is discarded immediately) and join the thread so the
+/// PW mainloop exits cleanly rather than being orphaned.
+impl Drop for PipewireOutput {
+    fn drop(&mut self) {
+        if let Some(handle) = self.pw_thread.take() {
+            // Capacity-1 channel: PW thread can send the consumer even if we
+            // never call recv — but we discard it here because there is nobody
+            // left to hand it back to.
+            let (tx, _rx) = mpsc::sync_channel::<HeapConsumer<f32>>(1);
+            let _ = self.command_sender.send(StreamCommand::Shutdown(tx));
+            let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ringbuf::HeapRb;
+
+    /// Verify that `StreamCommand::Shutdown` carries a `SyncSender` and that the
+    /// consumer can be round-tripped through the channel — i.e. the shutdown
+    /// protocol compiles and works at the channel level without needing a live
+    /// PipeWire daemon.
+    #[test]
+    fn shutdown_command_round_trips_consumer() {
+        let rb = HeapRb::<f32>::new(1024);
+        let (mut producer, consumer) = rb.split();
+
+        // Push a sentinel sample so we can verify identity after round-trip
+        producer.push(1.0_f32).unwrap();
+
+        let (tx, rx) = mpsc::sync_channel::<HeapConsumer<f32>>(1);
+
+        // Simulate what the PW thread does on Shutdown
+        let _cmd = StreamCommand::Shutdown(tx.clone());
+        tx.send(consumer).expect("send should succeed");
+
+        let recovered = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("should receive consumer within 1 second");
+
+        // The recovered consumer still has the sentinel sample
+        assert_eq!(recovered.len(), 1);
     }
 }
