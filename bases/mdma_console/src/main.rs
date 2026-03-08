@@ -1255,11 +1255,11 @@ fn library_search_tracks(state: &AppState, query: TrackQuery) -> axum::response:
 }
 
 async fn library_artists_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
-    library_fact_values(&state, "artist")
+    library_fact_values(&state, "Artist")
 }
 
 async fn library_albums_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
-    library_fact_values(&state, "album")
+    library_fact_values(&state, "Album")
 }
 
 async fn library_artist_tracks_handler(
