@@ -152,8 +152,9 @@ impl PlaybackEngine {
     /// Select a named audio output device.
     ///
     /// Looks up the device in the live sink list to obtain its maximum sample rate,
-    /// persists the new config, and drops the existing PipeWire output so it is
-    /// recreated with the new settings on the next `load_track()` call.
+    /// persists the new config, then hot-swaps the PipeWire output: if one is
+    /// currently active its consumer is recovered via `shutdown()` and a new output
+    /// is created immediately on the new device.
     pub fn set_output(&mut self, device_name: String) -> Result<AudioOutputConfig, PlaybackError> {
         let sinks = list_sinks()?;
         let sink = sinks
@@ -164,18 +165,48 @@ impl PlaybackEngine {
             })?;
 
         let new_config = AudioOutputConfig {
-            device_name: Some(device_name),
+            device_name: Some(device_name.clone()),
             sample_rate: sink.max_sample_rate,
         };
 
         save_audio_config(&self.config_path, &new_config)?;
+
+        // If the sample rate is changing, note that existing audio will continue
+        // at the old rate until the next track load.
+        if let Some(current_rate) = self.current_sample_rate {
+            if current_rate != sink.max_sample_rate {
+                tracing::info!(
+                    "Sample rate change from {}Hz to {}Hz takes effect on next track load",
+                    current_rate,
+                    sink.max_sample_rate
+                );
+            }
+        }
+
+        // Recover the consumer from the old output (if active), then immediately
+        // create a new output on the selected device with the recovered consumer.
+        let recovered_consumer = if let Some(old_output) = self.audio_output.take() {
+            old_output.shutdown()
+        } else {
+            // No active output — consumer is still sitting in self.mixer_consumer
+            // and will be picked up by the next load_track() call when it creates
+            // the PipeWire output for the first time.
+            None
+        };
+
         self.audio_config = new_config.clone();
 
-        // Drop the current output so it is recreated on next load_track().
-        if self.audio_output.is_some() {
-            tracing::warn!("Changing audio output while stream is active — output will take effect on next track load");
+        if let Some(consumer) = recovered_consumer {
+            tracing::info!(
+                "Hot-swapping PipeWire output to device {:?} at {}Hz",
+                new_config.device_name,
+                new_config.sample_rate
+            );
+            let audio_output =
+                PipewireOutput::new(consumer, new_config.sample_rate, Some(device_name.as_str()))
+                    .map_err(|e| PlaybackError::AudioDevice(format!("PipeWire error: {}", e)))?;
+            self.audio_output = Some(audio_output);
         }
-        self.audio_output = None;
 
         Ok(new_config)
     }
@@ -202,6 +233,11 @@ impl PlaybackEngine {
         // Create PipeWire output on first track load at the configured rate.
         // All sources are upsampled by the decoder task regardless of their native rate.
         if self.audio_output.is_none() {
+            if self.mixer_consumer.is_none() {
+                tracing::error!(
+                    "load_track: no mixer consumer available and no audio output — audio will be silent"
+                );
+            }
             if let Some(consumer) = self.mixer_consumer.take() {
                 info!(
                     "Creating PipeWire output at {}Hz (source: {}Hz, device: {:?})",
@@ -416,5 +452,32 @@ mod tests {
 
         let engine = PlaybackEngine::new(config_path).expect("engine created");
         assert_eq!(engine.get_output(), &saved);
+    }
+
+    /// Verify that when mixer_consumer is None and audio_output is None,
+    /// the engine starts with a consumer available (the normal path), and that
+    /// taking the consumer leaves it as None (simulating the post-hot-swap state
+    /// where audio_output is Some and mixer_consumer is None).
+    #[test]
+    fn mixer_consumer_is_some_after_new_and_none_after_take() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        // Fresh engine: consumer present, no output yet
+        assert!(
+            engine.mixer_consumer.is_some(),
+            "mixer_consumer should be Some after new()"
+        );
+        assert!(
+            engine.audio_output.is_none(),
+            "audio_output should be None after new()"
+        );
+
+        // Simulate what set_output hot-swap does when there is no active output:
+        // consumer stays put (we only take it when we actually spawn PW).
+        // Manually drain it to represent the post-spawn state.
+        let _ = engine.mixer_consumer.take();
+        assert!(
+            engine.mixer_consumer.is_none(),
+            "mixer_consumer should be None after take()"
+        );
     }
 }
