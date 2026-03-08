@@ -24,6 +24,7 @@ pub struct TrackFields<'a> {
     pub source: Option<&'a str>,
     pub last_started: Option<DateTime<Utc>>,
     pub last_stopped: Option<DateTime<Utc>>,
+    pub added: Option<DateTime<Utc>>,
 }
 
 /// Evaluate a `TrackQuery` against a set of track fields, respecting `query.not`.
@@ -123,6 +124,12 @@ fn matches_query_inner(query: &TrackQuery, track: &TrackFields) -> bool {
 
     if let Some(q) = &query.stopped {
         if !matches_date(q, track.last_stopped) {
+            return false;
+        }
+    }
+
+    if let Some(q) = &query.added {
+        if !matches_date(q, track.added) {
             return false;
         }
     }
@@ -312,6 +319,7 @@ mod tests {
             source: None,
             last_started: None,
             last_stopped: None,
+            added: None,
         }
     }
 
@@ -551,5 +559,40 @@ mod tests {
         };
         let fields = empty_fields();
         assert!(!matches_query(&query, &fields));
+    }
+
+    #[test]
+    fn added_na_matches_none() {
+        let mut q = TrackQuery::default();
+        q.added = Some(DateQuery::NA);
+        let mut f = empty_fields();
+        f.added = None;
+        assert!(matches_query(&q, &f));
+    }
+
+    #[test]
+    fn added_na_no_match_when_added() {
+        let mut q = TrackQuery::default();
+        q.added = Some(DateQuery::NA);
+        let mut f = empty_fields();
+        f.added = Some(DateTime::from_timestamp(0, 0).unwrap());
+        assert!(!matches_query(&q, &f));
+    }
+
+    #[test]
+    fn added_after_year_matches() {
+        use chrono::NaiveDate;
+        let mut q = TrackQuery::default();
+        q.added = Some(DateQuery::After(
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            DatePrecision::Year,
+        ));
+        let mut f = empty_fields();
+        f.added = Some(
+            chrono::DateTime::parse_from_rfc3339("2027-01-01T00:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        assert!(matches_query(&q, &f));
     }
 }

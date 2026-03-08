@@ -18,7 +18,7 @@
 //!     bpm: Some(128.5),
 //!     title: None, album: None, label: None, genre: None,
 //!     styles: &[], key: None, duration: None, year: None, source: None,
-//!     last_started: None, last_stopped: None,
+//!     last_started: None, last_stopped: None, added: None,
 //! };
 //!
 //! assert!(matches_query(&query, &fields));

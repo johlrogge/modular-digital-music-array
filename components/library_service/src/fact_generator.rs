@@ -2,9 +2,9 @@
 
 use audio_metadata::{discover_all_fields, extract_metadata, TrackMetadata};
 use music_facts::{
-    Album, AlbumArtPresence, Artist, BitDepth, Bitrate, Channels, ContentHash, DurationSeconds,
-    FactOrigin, FactSource, FileSizeBytes, Isrc, MusicFormat, MusicValue, SampleRate, Title,
-    TrackNumber, Year,
+    Album, AlbumArtPresence, Artist, BitDepth, Bitrate, Channels, ContentHash, DiscNumber,
+    DurationSeconds, FactOrigin, FactSource, FileSizeBytes, Isrc, MusicFormat, MusicValue,
+    SampleRate, Title, TrackNumber, Year,
 };
 use music_primitives::{Bpm, Key};
 use std::collections::HashMap;
@@ -40,7 +40,10 @@ pub fn generate_facts(
     let music_format = MusicFormat::from(format);
     let origin = FactOrigin::infer(&metadata.file_path, &metadata.comment);
     let source = FactSource::new("mdma-library", env!("CARGO_PKG_VERSION"), origin);
-    facts.push((MusicValue::Format(music_format), source));
+    facts.push((MusicValue::Format(music_format), source.clone()));
+
+    // Record import timestamp
+    facts.push((MusicValue::AddedAt(chrono::Utc::now().to_rfc3339()), source));
 
     Ok(facts)
 }
@@ -94,6 +97,13 @@ fn generate_facts_from_metadata(
     if let Some(track_number) = metadata.track_number {
         facts.push((
             MusicValue::TrackNumber(TrackNumber::new(track_number)),
+            source.clone(),
+        ));
+    }
+
+    if let Some(disc_number) = metadata.disc_number {
+        facts.push((
+            MusicValue::DiscNumber(DiscNumber::new(disc_number)),
             source.clone(),
         ));
     }

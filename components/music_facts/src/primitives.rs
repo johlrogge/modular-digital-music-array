@@ -45,6 +45,27 @@ impl fmt::Display for TrackNumber {
     }
 }
 
+/// Disc number on a multi-disc release
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DiscNumber(u32);
+
+impl DiscNumber {
+    pub fn new(val: u32) -> Self {
+        Self(val)
+    }
+
+    pub fn value(self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for DiscNumber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Year of release
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]

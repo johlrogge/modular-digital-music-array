@@ -2,6 +2,7 @@
 [workspace]
 members = [
     # Components (bricks)
+    "components/date_expression",
     "components/bandcamp_api",
     "components/audio_metadata",
     "components/library_ipc_client",

@@ -1073,6 +1073,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a2330da5de22e8a3cb63252ce2abb30116bf5265e89c0e01bc17015ce30a476"
 
 [[package]]
+name = "date-expression"
+version = "0.5.0"
+dependencies = [
+ "chrono",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "deflate64"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2212,6 +2220,7 @@ name = "library-search"
 version = "0.5.0"
 dependencies = [
  "chrono",
+ "date-expression",
  "regex",
  "rstest",
  "serde",

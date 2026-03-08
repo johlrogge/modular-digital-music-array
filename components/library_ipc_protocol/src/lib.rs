@@ -385,6 +385,12 @@ pub struct TrackInfo {
     pub blob_path: Option<String>,
     /// Relative path to cover art image (e.g. "cover-art/<hash>.jpg"). No absolute paths.
     pub cover_art_path: Option<String>,
+    /// Track number on album (from tags).
+    pub track_number: Option<u32>,
+    /// Disc number on a multi-disc release (from tags).
+    pub disc_number: Option<u32>,
+    /// ISO 8601 datetime when track was added to the library.
+    pub added: Option<String>,
 }
 
 /// Service status information.
@@ -578,6 +584,9 @@ mod tests {
             key: None,
             blob_path: Some("ab/abc123.flac".to_string()),
             cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
         };
 
         let json = serde_json::to_string(&track).unwrap();

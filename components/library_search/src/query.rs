@@ -22,6 +22,7 @@ pub struct TrackQuery {
     pub source: Option<String>,
     pub started: Option<DateQuery>,
     pub stopped: Option<DateQuery>,
+    pub added: Option<DateQuery>,
     /// When true, invert the match — return tracks that do NOT match the other filters.
     #[serde(default)]
     pub not: bool,
@@ -44,6 +45,7 @@ impl TrackQuery {
             && self.source.is_none()
             && self.started.is_none()
             && self.stopped.is_none()
+            && self.added.is_none()
     }
 }
 

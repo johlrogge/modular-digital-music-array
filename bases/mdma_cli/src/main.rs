@@ -145,6 +145,10 @@ enum Commands {
         #[arg(long)]
         stopped: Option<String>,
 
+        /// Filter by date added to library. Same format as --started.
+        #[arg(long)]
+        added: Option<String>,
+
         /// Invert the search results — return tracks that do NOT match the filters.
         #[arg(long)]
         not: bool,
@@ -425,6 +429,9 @@ enum SortField {
     Artist,
     Album,
     Duration,
+    TrackNumber,
+    DiscNumber,
+    Added,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1035,6 +1042,7 @@ fn build_track_query(
     source: Option<String>,
     started_str: Option<String>,
     stopped_str: Option<String>,
+    added_str: Option<String>,
 ) -> TrackQuery {
     let started = if let Some(s) = started_str {
         match parse_date_query(&s) {
@@ -1058,6 +1066,17 @@ fn build_track_query(
     } else {
         None
     };
+    let added = if let Some(s) = added_str {
+        match parse_date_query(&s) {
+            Ok(q) => Some(q),
+            Err(e) => {
+                eprintln!("Invalid --added value: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
     TrackQuery {
         any_text: any_text.map(|s| parse_string_query(&s)),
         artist: artist.map(|s| parse_string_query(&s)),
@@ -1073,6 +1092,7 @@ fn build_track_query(
         source,
         started,
         stopped,
+        added,
         not: false,
     }
 }
@@ -2227,6 +2247,13 @@ fn handle_sort(
             b.duration.map(|d| d.value()),
             direction_asc,
         ),
+        SortField::TrackNumber => compare_optional(a.track_number, b.track_number, direction_asc),
+        SortField::DiscNumber => compare_optional(a.disc_number, b.disc_number, direction_asc),
+        SortField::Added => compare_optional(
+            a.added.as_deref().map(str::to_string),
+            b.added.as_deref().map(str::to_string),
+            direction_asc,
+        ),
     });
 
     print_tracks(&tracks, &format!("Sorted ({} tracks)", tracks.len()));
@@ -3095,6 +3122,7 @@ fn main() -> Result<()> {
             no_stdin,
             started,
             stopped,
+            added,
             not,
             subcommand,
         } => {
@@ -3121,6 +3149,7 @@ fn main() -> Result<()> {
                     source.clone(),
                     started.clone(),
                     stopped.clone(),
+                    added.clone(),
                 );
                 track_query.not = *not;
                 handle_search(&client, &track_query, *no_stdin)
@@ -3265,6 +3294,9 @@ mod tests {
             key: None,
             blob_path: None,
             cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
         }
     }
 
@@ -3529,6 +3561,9 @@ mod tests {
             key: None,
             blob_path: Some(blob_path.to_string()),
             cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
         }
     }
 
@@ -3574,6 +3609,9 @@ mod tests {
             key: None,
             blob_path: Some("ab/abc123.flac".to_string()),
             cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
         };
         let output = std::path::Path::new("/tmp/export");
         let path = export_dest_path(output, &track, "flac");

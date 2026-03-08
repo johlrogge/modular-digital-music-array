@@ -839,6 +839,8 @@ struct TrackInfoJson {
     duration: Option<u32>,
     bpm: Option<f32>,
     key: Option<String>,
+    disc_number: Option<u32>,
+    added: Option<String>,
 }
 
 impl TrackInfoJson {
@@ -851,6 +853,8 @@ impl TrackInfoJson {
             duration: t.duration.map(|d| d.value()),
             bpm: t.bpm.map(|b| b.as_f32()),
             key: t.key.map(|k| k.to_string()),
+            disc_number: t.disc_number,
+            added: t.added.clone(),
         }
     }
 }
@@ -1277,11 +1281,48 @@ async fn library_album_tracks_handler(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> axum::response::Response {
+    use gateway_client::{LibraryRequest, LibraryResponse};
+    let client = match require_gateway(&state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
     let query = TrackQuery {
         album: Some(library_search::parse_string_query(&name)),
         ..Default::default()
     };
-    library_search_tracks(&state, query)
+    match client.library_request(&LibraryRequest::Search { query }) {
+        Ok(LibraryResponse::SearchResults(mut tracks)) => {
+            tracks.sort_by(|a, b| {
+                let disc_a = a.disc_number.unwrap_or(1);
+                let disc_b = b.disc_number.unwrap_or(1);
+                disc_a
+                    .cmp(&disc_b)
+                    .then_with(|| a.track_number.cmp(&b.track_number))
+            });
+            Json(
+                tracks
+                    .iter()
+                    .map(TrackInfoJson::from_track_info)
+                    .collect::<Vec<_>>(),
+            )
+            .into_response()
+        }
+        Ok(LibraryResponse::Error(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Unexpected library response"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 // =============================================================================
@@ -1954,6 +1995,9 @@ mod tests {
             key: Some(Key::from_traditional("C Major").unwrap()),
             blob_path: Some("ab/abc123.flac".to_string()),
             cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.content_hash, "sha256:abc123");
@@ -1963,6 +2007,8 @@ mod tests {
         assert_eq!(json.duration, Some(180));
         assert!(json.bpm.is_some());
         assert!(json.key.is_some());
+        assert!(json.disc_number.is_none());
+        assert!(json.added.is_none());
     }
 
     #[test]
@@ -1977,6 +2023,9 @@ mod tests {
             key: None,
             blob_path: None,
             cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.content_hash, "sha256:deadbeef");
@@ -1986,6 +2035,29 @@ mod tests {
         assert!(json.duration.is_none());
         assert!(json.bpm.is_none());
         assert!(json.key.is_none());
+        assert!(json.disc_number.is_none());
+        assert!(json.added.is_none());
+    }
+
+    #[test]
+    fn track_info_json_populates_disc_number_and_added() {
+        let track = TrackInfo {
+            content_hash: ContentHash::new("sha256:abc"),
+            title: None,
+            artist: None,
+            album: None,
+            duration: None,
+            bpm: None,
+            key: None,
+            blob_path: None,
+            cover_art_path: None,
+            track_number: None,
+            disc_number: Some(2),
+            added: Some("2024-01-15T12:00:00Z".to_string()),
+        };
+        let json = TrackInfoJson::from_track_info(&track);
+        assert_eq!(json.disc_number, Some(2));
+        assert_eq!(json.added, Some("2024-01-15T12:00:00Z".to_string()));
     }
 
     #[test]

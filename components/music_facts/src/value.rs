@@ -126,6 +126,9 @@ pub enum MusicValue {
     /// Track number on album
     TrackNumber(TrackNumber),
 
+    /// Disc number on a multi-disc release
+    DiscNumber(DiscNumber),
+
     /// Release year
     Year(Year),
 
@@ -244,6 +247,12 @@ pub enum MusicValue {
 
     /// Track stopped playing
     TrackStopped(StopReason),
+
+    // ========================================================================
+    // Import Provenance
+    // ========================================================================
+    /// When the track was added to the library (ISO 8601 datetime string)
+    AddedAt(String),
 }
 
 impl MusicValue {
@@ -256,6 +265,7 @@ impl MusicValue {
             MusicValue::Album(_) => "Album",
             MusicValue::AlbumArtist(_) => "AlbumArtist",
             MusicValue::TrackNumber(_) => "TrackNumber",
+            MusicValue::DiscNumber(_) => "DiscNumber",
             MusicValue::Year(_) => "Year",
             MusicValue::Bpm(_) => "BPM",
             MusicValue::Key(_) => "Key",
@@ -286,6 +296,7 @@ impl MusicValue {
             MusicValue::CoverArtPath(_) => "CoverArtPath",
             MusicValue::TrackStarted(_) => "TrackStarted",
             MusicValue::TrackStopped(_) => "TrackStopped",
+            MusicValue::AddedAt(_) => "AddedAt",
         }
     }
 }
@@ -299,6 +310,7 @@ impl fmt::Display for MusicValue {
             MusicValue::Album(s) => write!(f, "{}", s),
             MusicValue::AlbumArtist(s) => write!(f, "{}", s),
             MusicValue::TrackNumber(n) => write!(f, "{}", n),
+            MusicValue::DiscNumber(n) => write!(f, "{}", n),
             MusicValue::Year(y) => write!(f, "{}", y),
             MusicValue::Bpm(b) => write!(f, "{}", b),
             MusicValue::Key(k) => write!(f, "{}", k),
@@ -337,6 +349,7 @@ impl fmt::Display for MusicValue {
             MusicValue::CoverArtPath(s) => write!(f, "{}", s),
             MusicValue::TrackStarted(r) => write!(f, "{}", r),
             MusicValue::TrackStopped(r) => write!(f, "{}", r),
+            MusicValue::AddedAt(s) => write!(f, "{}", s),
         }
     }
 }
@@ -528,5 +541,55 @@ mod tests {
     #[test]
     fn cover_art_path_fact_value_format() {
         assert_fact_value_format!(MusicValue::CoverArtPath("cover-art/test.jpg".to_string()));
+    }
+
+    #[test]
+    fn disc_number_roundtrip() {
+        let v = MusicValue::DiscNumber(DiscNumber::new(2));
+        let json = serde_json::to_string(&v).unwrap();
+        let back: MusicValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn disc_number_display_name() {
+        let v = MusicValue::DiscNumber(DiscNumber::new(1));
+        assert_eq!(v.display_name(), "DiscNumber");
+    }
+
+    #[test]
+    fn disc_number_display() {
+        let v = MusicValue::DiscNumber(DiscNumber::new(3));
+        assert_eq!(v.to_string(), "3");
+    }
+
+    #[test]
+    fn disc_number_fact_value_format() {
+        assert_fact_value_format!(MusicValue::DiscNumber(DiscNumber::new(1)));
+    }
+
+    #[test]
+    fn added_at_roundtrip() {
+        let v = MusicValue::AddedAt("2026-03-08T12:00:00Z".to_string());
+        let json = serde_json::to_string(&v).unwrap();
+        let back: MusicValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn added_at_display_name() {
+        let v = MusicValue::AddedAt("2026-03-08T12:00:00Z".to_string());
+        assert_eq!(v.display_name(), "AddedAt");
+    }
+
+    #[test]
+    fn added_at_display() {
+        let v = MusicValue::AddedAt("2026-03-08T12:00:00Z".to_string());
+        assert_eq!(v.to_string(), "2026-03-08T12:00:00Z");
+    }
+
+    #[test]
+    fn added_at_fact_value_format() {
+        assert_fact_value_format!(MusicValue::AddedAt("2026-03-08T12:00:00Z".to_string()));
     }
 }

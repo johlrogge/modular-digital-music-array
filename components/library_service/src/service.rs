@@ -45,6 +45,9 @@ pub struct LibraryService {
     tracks: Mutex<Vec<IndexedTrackInfo>>,
     /// ACID client for writing facts
     acid_client: AcidClient,
+    /// Album name -> cover_art_path for tracks that have cover art.
+    /// Used as a fallback when a track on the same album has no cover art of its own.
+    album_cover_cache: Mutex<HashMap<String, String>>,
     /// Generic fact value index: fact_type -> set of values
     /// Used for fast HasFact/HasFacts lookups (e.g., ItemId -> {"p123", "p456"})
     fact_index: Mutex<HashMap<FactType, HashSet<String>>>,
@@ -75,8 +78,11 @@ struct IndexedTrackInfo {
     source: Option<String>,
     blob_path: PathBuf,
     cover_art_path: Option<PathBuf>,
+    track_number: Option<u32>,
+    disc_number: Option<u32>,
     last_started: Option<chrono::DateTime<chrono::Utc>>,
     last_stopped: Option<chrono::DateTime<chrono::Utc>>,
+    added_at: Option<String>,
 }
 
 impl IndexedTrackInfo {
@@ -96,8 +102,11 @@ impl IndexedTrackInfo {
             source: None,
             blob_path: PathBuf::new(),
             cover_art_path: None,
+            track_number: None,
+            disc_number: None,
             last_started: None,
             last_stopped: None,
+            added_at: None,
         }
     }
 }
@@ -124,6 +133,8 @@ fn apply_fact_to_track(
         MusicValue::Bpm(v) => entry.bpm = Some(v.as_f32()),
         MusicValue::Key(v) => entry.key = Some(v.to_string()),
         MusicValue::Year(v) => entry.year = Some(v.value()),
+        MusicValue::TrackNumber(v) => entry.track_number = Some(v.value()),
+        MusicValue::DiscNumber(v) => entry.disc_number = Some(v.value()),
         MusicValue::Source(v) => entry.source = Some(v.clone()),
         MusicValue::TrackStarted(_) => {
             update_if_more_recent(&mut entry.last_started, timestamp);
@@ -150,6 +161,11 @@ fn apply_fact_to_track(
             entry.cover_art_path = Some(PathBuf::from(p));
             if let Some(set) = has_cover_art {
                 set.insert(entry.content_hash.as_str().to_owned());
+            }
+        }
+        MusicValue::AddedAt(s) => {
+            if entry.added_at.is_none() {
+                entry.added_at = Some(s.clone());
             }
         }
         _ => {}
@@ -230,6 +246,7 @@ impl LibraryService {
         }
 
         let tracks_count = loaded.tracks.len();
+        let album_cover_cache = Self::build_album_cover_cache(&loaded.tracks);
 
         let service = Self {
             music_dir,
@@ -239,6 +256,7 @@ impl LibraryService {
             facts_count: AtomicUsize::new(loaded.facts_count),
             tracks: Mutex::new(loaded.tracks),
             acid_client,
+            album_cover_cache: Mutex::new(album_cover_cache),
             fact_index: Mutex::new(loaded.fact_index),
             content_hashes: Mutex::new(loaded.content_hashes),
             cursor: Mutex::new(final_cursor),
@@ -1047,8 +1065,32 @@ impl LibraryService {
             cover_art_path: t
                 .cover_art_path
                 .as_ref()
-                .map(|p| p.to_string_lossy().to_string()),
+                .map(|p| p.to_string_lossy().to_string())
+                .or_else(|| {
+                    t.album.as_ref().and_then(|album| {
+                        self.album_cover_cache.lock().unwrap().get(album).cloned()
+                    })
+                }),
+            track_number: t.track_number,
+            disc_number: t.disc_number,
+            added: t.added_at.clone(),
         }
+    }
+
+    /// Build a mapping of album name -> cover_art_path from an indexed track list.
+    ///
+    /// Only tracks that have both an album and a cover_art_path contribute to the cache.
+    /// The first cover art path seen for each album wins.
+    fn build_album_cover_cache(tracks: &[IndexedTrackInfo]) -> HashMap<String, String> {
+        let mut cache = HashMap::new();
+        for track in tracks {
+            if let (Some(album), Some(cover)) = (&track.album, &track.cover_art_path) {
+                cache
+                    .entry(album.clone())
+                    .or_insert_with(|| cover.to_string_lossy().to_string());
+            }
+        }
+        cache
     }
 
     /// List tracks from in-memory index
@@ -1245,6 +1287,11 @@ impl LibraryService {
                     source: t.source.as_deref(),
                     last_started: t.last_started,
                     last_stopped: t.last_stopped,
+                    added: t
+                        .added_at
+                        .as_deref()
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|dt| dt.with_timezone(&chrono::Utc)),
                 };
                 matches_query(query, &fields)
             })
@@ -1483,6 +1530,8 @@ impl LibraryService {
             let mut key = None;
             let mut year = None;
             let mut source_str = None;
+            let mut track_number = None;
+            let mut disc_number = None;
 
             for (value, _source) in &facts {
                 match value {
@@ -1497,6 +1546,8 @@ impl LibraryService {
                     MusicValue::Key(k) => key = Some(k.to_string()),
                     MusicValue::Year(y) => year = Some(y.value()),
                     MusicValue::Source(s) => source_str = Some(s.clone()),
+                    MusicValue::TrackNumber(n) => track_number = Some(n.value()),
+                    MusicValue::DiscNumber(n) => disc_number = Some(n.value()),
                     _ => {}
                 }
             }
@@ -1516,8 +1567,11 @@ impl LibraryService {
                 source: source_str,
                 blob_path: indexed.blob_path,
                 cover_art_path: cover_art_path.clone(),
+                track_number,
+                disc_number,
                 last_started: None,
                 last_stopped: None,
+                added_at: None,
             });
         }
 
@@ -2241,6 +2295,126 @@ mod tests {
             path_str.ends_with(".flac"),
             "blob_path should use .flac extension from FilePath fact, got: {}",
             path_str
+        );
+    }
+
+    // =========================================================================
+    // Album cover cache tests
+    // =========================================================================
+
+    #[test]
+    fn track_without_cover_art_falls_back_to_album_cover() {
+        // Track A has cover art; Track B is on the same album but has no cover art.
+        // After loading, to_track_info on Track B should return the album cover.
+        let hash_a = ContentHash::new("sha256:albumcovertrack01");
+        let hash_b = ContentHash::new("sha256:albumcovertrack02");
+        let album_name = "Shared Album";
+        let cover_path = "cover-art/abc123.jpg";
+
+        let temp = write_facts_file(&[
+            (
+                hash_a.clone(),
+                MusicValue::Title(Title::new("Track With Cover")),
+            ),
+            (
+                hash_a.clone(),
+                MusicValue::Album(music_facts::Album::new(album_name)),
+            ),
+            (
+                hash_a.clone(),
+                MusicValue::CoverArtPath(cover_path.to_string()),
+            ),
+            (
+                hash_b.clone(),
+                MusicValue::Title(Title::new("Track Without Cover")),
+            ),
+            (
+                hash_b.clone(),
+                MusicValue::Album(music_facts::Album::new(album_name)),
+            ),
+        ]);
+
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+        let facts_dest = metadata_dir.path().join("facts.jsonl");
+        std::fs::copy(temp.path(), &facts_dest).unwrap();
+
+        let service = LibraryService::new(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+            "ipc:///tmp/mdma-test-acid-nonexistent.sock",
+        )
+        .unwrap();
+
+        let tracks = service.tracks.lock().unwrap();
+        let track_b = tracks
+            .iter()
+            .find(|t| t.content_hash.as_str() == hash_b.as_str())
+            .expect("Track B should be indexed");
+        let track_b_info = service.to_track_info(track_b);
+        drop(tracks);
+
+        assert_eq!(
+            track_b_info.cover_art_path.as_deref(),
+            Some(cover_path),
+            "Track B should inherit album cover art from Track A on the same album"
+        );
+    }
+
+    #[test]
+    fn track_with_cover_art_is_not_overridden_by_album_cover() {
+        // Both tracks on the same album but have their own cover art — no fallback needed.
+        let hash_a = ContentHash::new("sha256:owncover01");
+        let hash_b = ContentHash::new("sha256:owncover02");
+        let album_name = "Another Album";
+        let cover_a = "cover-art/aaa.jpg";
+        let cover_b = "cover-art/bbb.jpg";
+
+        let temp = write_facts_file(&[
+            (hash_a.clone(), MusicValue::Title(Title::new("Track A"))),
+            (
+                hash_a.clone(),
+                MusicValue::Album(music_facts::Album::new(album_name)),
+            ),
+            (
+                hash_a.clone(),
+                MusicValue::CoverArtPath(cover_a.to_string()),
+            ),
+            (hash_b.clone(), MusicValue::Title(Title::new("Track B"))),
+            (
+                hash_b.clone(),
+                MusicValue::Album(music_facts::Album::new(album_name)),
+            ),
+            (
+                hash_b.clone(),
+                MusicValue::CoverArtPath(cover_b.to_string()),
+            ),
+        ]);
+
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+        let facts_dest = metadata_dir.path().join("facts.jsonl");
+        std::fs::copy(temp.path(), &facts_dest).unwrap();
+
+        let service = LibraryService::new(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+            "ipc:///tmp/mdma-test-acid-nonexistent.sock",
+        )
+        .unwrap();
+
+        let tracks = service.tracks.lock().unwrap();
+        let track_b = tracks
+            .iter()
+            .find(|t| t.content_hash.as_str() == hash_b.as_str())
+            .expect("Track B should be indexed");
+        let track_b_info = service.to_track_info(track_b);
+        drop(tracks);
+
+        assert_eq!(
+            track_b_info.cover_art_path.as_deref(),
+            Some(cover_b),
+            "Track B should keep its own cover art, not be replaced by Track A's"
         );
     }
 }
