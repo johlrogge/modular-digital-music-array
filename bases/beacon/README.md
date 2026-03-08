@@ -1,6 +1,6 @@
 # beacon
 
-Version: **0.5.0**
+Version: **0.6.0**
 
 Provisioning server for MDMA. Runs on an unprovisioned Raspberry Pi, serves a web UI at `http://welcome-to-mdma.local`, and walks through a 7-stage pipeline to partition the NVMe drive, install Void Linux, and configure all MDMA services.
 

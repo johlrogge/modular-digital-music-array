@@ -678,6 +678,8 @@ Unix pipes.
 
 ## Update History
 
+- **2026-03-09 (v0.6.0):** Album view sorted by DiscNumber + TrackNumber. AddedAt tracking: every ingested track records when it was added, queryable via `--added` CLI flag (date expressions) and sortable with `mdma sort added`. Album art cache: album-level cover art served as fallback when tracks have no embedded art. New `date_expression` crate with relative date syntax (`~`, `^`, `$`, `+/-N`, `/`-separated components) integrated into all date queries. CI: git-hooks input added to devenv.yaml.
+
 - **2026-02-25:** Smart export: per-category format resolution (`--lossless-format`, `--lossy-format`). Infrastructure: git-flow branching, conventional commits skill, CI split (test all branches / publish main only), 9-step release workflow, devops skill overhaul (Ansible removed, xbps added), documenter agent defined.
 
 - **2026-02-23:** Priorities 7+8 implementation started. library_crawler removed (replaced by library_service). New Priority 9 (Track Export) added — composable `mdma export` command for Rekordbox/CDJ workflow.
