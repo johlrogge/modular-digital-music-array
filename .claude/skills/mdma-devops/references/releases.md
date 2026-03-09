@@ -2,7 +2,10 @@
 
 ## Overview
 
-MDMA uses git-flow for releases. The workspace version in the root `Cargo.toml` is the single source of truth for the release version.
+MDMA uses git-flow for releases. Versioning is split between the workspace and individual packages:
+
+- **Workspace version** (`[workspace.package] version` in root `Cargo.toml`) applies to all packages that use `version.workspace = true`. This is bumped on every release.
+- **Independently versioned packages** — bases with a hardcoded `version = "x.y.z"` in their own `Cargo.toml`, and any components with hardcoded versions (e.g. `library_service`), must be bumped individually based on what changed in that package.
 
 ## Release Workflow
 
@@ -13,19 +16,27 @@ git flow release start <version>
 # e.g., git flow release start 0.3.0
 ```
 
-### 2. Bump Workspace Version
+### 2. Bump Versions
 
-Edit `Cargo.toml` at the workspace root:
+**Workspace version** — edit `Cargo.toml` at the workspace root:
 ```toml
 [workspace.package]
 version = "<new-version>"
 ```
 
+**Independently versioned bases and components** — for each `bases/*/Cargo.toml` and any component `Cargo.toml` that has a hardcoded `version = "x.y.z"` (not `version.workspace = true`), bump the version individually based on what changed:
+```toml
+[package]
+version = "<new-version>"
+```
+
+Only packages using `version.workspace = true` inherit the workspace version automatically.
+
 ### 3. Bump xbps Template Versions
 
-Update each template in `void-packages/srcpkgs/*/template`:
+Update each template in `void-packages/srcpkgs/*/template`. Each template's `version` field must match the version in its corresponding `Cargo.toml` (not necessarily the workspace version if that base is independently versioned):
 ```bash
-version=<new-version>
+version=<package-version>
 revision=1  # Reset revision on version bump
 ```
 
@@ -49,7 +60,7 @@ git flow release finish <version>
 ### 7. Push Everything
 
 ```bash
-git push origin main develop --tags
+git push github main develop --tags
 ```
 
 ### 8. CI Builds and Publishes
@@ -78,7 +89,7 @@ For urgent fixes that can't wait for a normal release:
 git flow hotfix start <version>
 # Make fix, bump patch version
 git flow hotfix finish <version>
-git push origin main develop --tags
+git push github main develop --tags
 ```
 
 ## Version Scheme
