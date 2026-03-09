@@ -1,7 +1,5 @@
 # mdma-bandcamp
 
-Version: **0.6.0**
-
 Bandcamp collection sync service for MDMA. Authenticates with Bandcamp using stored session cookies, fetches your purchased releases, stages downloads, and moves completed files to the library inbox.
 
 [Back to workspace README](../../README.md)
