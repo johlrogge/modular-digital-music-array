@@ -1,10 +1,17 @@
 # MDMA — Modular Distributed Music Architecture
 
-Version: **0.6.0**
+Version: **0.6.1**
 
 A hi-fi music player for Raspberry Pi 5. Indexes your FLAC and MP3 library, streams to a USB DAC at 192 kHz via PipeWire, and is fully controlled from the command line — composable with dmenu for keyboard-driven browsing and queuing.
 
 The acronym is a nod to electronic music culture. The system exists to keep the music going at parties without being physically tied to equipment.
+
+---
+
+## What's new in 0.6.1
+
+- **Package build fix** — package scripts now handle `version.workspace = true` correctly; all 5 service packages build and publish successfully.
+- **Independent base versioning** — each base now carries its own version in its `Cargo.toml`. Bases that use workspace versioning (gateway, bandcamp, acid) are at 0.6.1. Independently versioned bases: mdma-library 0.4.0, mdma-console 0.4.0, mdma-playback 0.4.0, mdma-cli 0.5.0.
 
 ---
 

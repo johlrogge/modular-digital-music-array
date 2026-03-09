@@ -1,6 +1,6 @@
 # mdma-console
 
-Version: **0.6.0**
+Version: **0.4.0**
 
 Web management console for MDMA. Built with Axum and Askama. Provides a browser UI for everything the CLI does — player controls, queue management, library search, Bandcamp sync, file upload, and track export.
 
