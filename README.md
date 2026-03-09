@@ -1,6 +1,6 @@
 # MDMA — Modular Distributed Music Architecture
 
-Version: **0.6.1**
+Version: **0.6.2**
 
 A hi-fi music player for Raspberry Pi 5. Indexes your FLAC and MP3 library, streams to a USB DAC at 192 kHz via PipeWire, and is fully controlled from the command line — composable with dmenu for keyboard-driven browsing and queuing.
 
@@ -8,10 +8,17 @@ The acronym is a nod to electronic music culture. The system exists to keep the 
 
 ---
 
+## What's new in 0.6.2
+
+- **Date expression fix** — single-component date expressions (e.g. `15`) are now interpreted as day, not year, matching the positional spec (most-significant to least-significant: year/month/day; specify only the least-significant components you care about). `15` means the 15th of the current month; `3/15` means March 15th of the current year.
+- **CLI `--added` help text** — the help string for `--added` now correctly describes date expression syntax and the positional component order.
+
+---
+
 ## What's new in 0.6.1
 
 - **Package build fix** — package scripts now handle `version.workspace = true` correctly; all 5 service packages build and publish successfully.
-- **Independent base versioning** — each base now carries its own version in its `Cargo.toml`. Bases that use workspace versioning (gateway, bandcamp, acid) are at 0.6.1. Independently versioned bases: mdma-library 0.4.0, mdma-console 0.4.0, mdma-playback 0.4.0, mdma-cli 0.5.0.
+- **Independent base versioning** — each base now carries its own version in its `Cargo.toml`. mdma-gateway, mdma-bandcamp, and mdma-acid are at 0.6.0. mdma-library 0.4.0, mdma-console 0.4.0, mdma-playback 0.4.0, mdma-cli 0.5.1.
 
 ---
 

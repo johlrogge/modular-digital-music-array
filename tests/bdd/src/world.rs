@@ -31,6 +31,16 @@ pub struct MdmaWorld {
 
     /// Exit code from the last CLI invocation.
     pub last_cli_exit_code: Option<i32>,
+
+    // --- date_expression step state ---
+    /// Today's date string for date expression tests.
+    pub today: Option<String>,
+
+    /// The date expression under test.
+    pub date_expression: Option<String>,
+
+    /// The parsed result (formatted date or "error").
+    pub date_result: Option<String>,
 }
 
 impl std::fmt::Debug for MdmaWorld {
@@ -56,6 +66,9 @@ impl MdmaWorld {
             last_cli_stdout: String::new(),
             last_cli_stderr: String::new(),
             last_cli_exit_code: None,
+            today: None,
+            date_expression: None,
+            date_result: None,
         }
     }
 

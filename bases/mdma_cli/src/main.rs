@@ -145,7 +145,7 @@ enum Commands {
         #[arg(long)]
         stopped: Option<String>,
 
-        /// Filter by date added to library. Same format as --started.
+        /// Filter by date added to library. Uses date expression syntax: ~/+1/15 (15th next month), -7 (7 days ago), ^ (1st of month), $ (end of month). Ranges: -7..~ (last 7 days to today).
         #[arg(long)]
         added: Option<String>,
 
