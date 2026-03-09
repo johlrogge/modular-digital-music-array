@@ -54,10 +54,13 @@ mdma search --duration ">5m"        # longer than 5 minutes
 mdma search --year "2019..2022"     # release year range
 mdma search --source bandcamp       # by ingest source
 mdma search --not --bpm "128..140"  # invert: tracks outside that BPM range
-mdma search --added "~"             # added today (~ = today)
-mdma search --added "^week"         # added this week (^ = start of period)
-mdma search --added "^month"        # added this month
-mdma search --added "-7"            # added in the last 7 days (relative offset)
+mdma search --added "~"             # added today
+mdma search --added "-7"            # added 7 days ago
+mdma search --added "^"             # added on the 1st of this month
+mdma search --added "$"             # added on the last day of this month
+mdma search --added "^/1"           # added Jan 1st this year
+mdma search --added "$/1"           # added Dec 1st this year
+mdma search --added "2025/3/1"      # added on a specific date
 
 # Combine filters (implicit AND)
 mdma search --artist CBL --bpm "128+-4" --key "8A"
@@ -71,18 +74,22 @@ mdma search fact-values-for Source
 cat friday.plist | mdma search --artist CBL
 ```
 
-****Date expression syntax** (used by `--added` and any date field):
+**Date expression syntax** (used by `--added` and any date field):
 
-| Expression | Meaning |
-|------------|---------|
-| `~` | today |
-| `^week` / `^month` / `^year` | start of current week/month/year |
-| `$week` / `$month` / `$year` | end of current week/month/year |
-| `-7` | 7 days ago |
-| `+3` | 3 days from now |
-| `2025/3/1` | specific date (year/month/day) |
+| Expression  | Meaning                              |
+|-------------|--------------------------------------|
+| `~`         | today                                |
+| `-7`        | 7 days ago                           |
+| `+3`        | 3 days from now                      |
+| `^`         | 1st of current month                 |
+| `$`         | last day of current month            |
+| `^/1`       | January 1st of current year          |
+| `$/1`       | December 1st of current year         |
+| `~/+1/15`   | 15th of next month                   |
+| `+1/2/1`    | February 1st of next year            |
+| `2025/3/1`  | specific date (year/month/day)       |
 
-Ranges use `..`: `^month..~` means "from start of month to today".
+Ranges use `..`: `^/^..~` means "from Jan 1st to today".
 
 String field modes:**
 
