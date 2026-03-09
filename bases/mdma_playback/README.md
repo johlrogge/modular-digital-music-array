@@ -1,7 +1,5 @@
 # mdma-playback
 
-Version: **0.4.0**
-
 Real-time audio playback server for MDMA. Decodes audio using Symphonia, resamples to 192 kHz with rubato, and outputs via PipeWire to the iFi USB DAC.
 
 [Back to workspace README](../../README.md)

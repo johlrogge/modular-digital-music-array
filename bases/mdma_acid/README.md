@@ -1,7 +1,5 @@
 # mdma-acid
 
-Version: **0.6.0**
-
 Standalone fact-writing service for MDMA. Owns the append-only fact stream (`facts.jsonl`) and accepts batched write and read requests over NNG IPC. Extracted from the library service so that any other service (playback, bandcamp, future analysers) can write facts without going through the library.
 
 ACID stands for Append-only Content-Indexed Database.

@@ -1,7 +1,5 @@
 # mdma-gateway
 
-Version: **0.6.0**
-
 Single TCP entry point for MDMA. Listens on port 5555, inspects the request envelope, and routes to the appropriate internal IPC service. This is the only externally exposed port on the Pi (besides port 80 for the web console).
 
 [Back to workspace README](../../README.md)
