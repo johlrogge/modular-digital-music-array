@@ -9,6 +9,8 @@ use world::MdmaWorld;
 #[allow(unused_imports)]
 use steps::cli_steps;
 #[allow(unused_imports)]
+use steps::date_expression_steps;
+#[allow(unused_imports)]
 use steps::library_steps;
 #[allow(unused_imports)]
 use steps::playback_steps;

@@ -20,6 +20,9 @@ tempfile = "3"
 # Client layer (what we're testing through)
 mdma-client = { path = "../../components/mdma_client" }
 
+# Date expression parsing
+date-expression = { path = "../../components/date_expression" }
+
 # Service (real library, in-process)
 library-service = { path = "../../components/library_service" }
 

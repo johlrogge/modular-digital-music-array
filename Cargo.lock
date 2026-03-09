@@ -2479,6 +2479,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "cucumber",
+ "date-expression",
  "library-ipc-protocol",
  "library-search",
  "library-service",

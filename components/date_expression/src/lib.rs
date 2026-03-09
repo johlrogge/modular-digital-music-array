@@ -1,3 +1,4 @@
+use chrono::Datelike;
 use chrono::NaiveDate;
 use thiserror::Error;
 
@@ -19,17 +20,23 @@ pub enum DateExpressionError {
 /// - `~` = current value for that position
 /// - `~+N` / `~-N` = current value ± N
 /// - `+N` / `-N` = current value ± N (shorthand)
-/// - `^` = first (1 for month/day)
-/// - `$` = last (12 for month, last day of month for day)
+/// - `^` = first (1 for month/day; error for year)
+/// - `$` = last (12 for month, last day of month for day; error for year)
 /// - plain integer = absolute value
+///
+/// Component count determines interpretation (least-significant first):
+/// - 1 part:  day   (year/month from today)
+/// - 2 parts: month/day  (year from today)
+/// - 3 parts: year/month/day
 ///
 /// Examples:
 /// - `"~"` → today
-/// - `"-3/2"` → 3 months ago, day 2 of that month
-/// - `"~/~/^"` → first day of current month
-/// - `"~/~/$"` → last day of current month
-/// - `"~-1"` → last year, same month/day
-/// - `"~/-3/2"` → current year, 3 months ago, day 2
+/// - `"-7"` → 7 days ago
+/// - `"^"` → 1st of current month
+/// - `"$"` → last day of current month
+/// - `"-3/2"` → 3 months ago, day 2
+/// - `"~/+1/15"` → 15th of next month
+/// - `"+1/2/1"` → February 1st of next year
 pub fn resolve(expr: &str, today: NaiveDate) -> Result<NaiveDate, DateExpressionError> {
     let parts: Vec<&str> = expr.split('/').collect();
 
@@ -41,13 +48,59 @@ pub fn resolve(expr: &str, today: NaiveDate) -> Result<NaiveDate, DateExpression
     let cur_month = today.month() as i32;
     let cur_day = today.day() as i32;
 
+    // Single component uses chrono::Duration for day arithmetic to correctly
+    // cross month/year boundaries, unlike the multi-component path which uses
+    // simple integer arithmetic with clamping.
+    // Fast path: single component → day offset/absolute with correct month/year boundary crossing
+    if parts.len() == 1 {
+        let s = parts[0].trim();
+        if s == "~" {
+            return Ok(today);
+        }
+        if s == "^" {
+            return NaiveDate::from_ymd_opt(cur_year, cur_month as u32, 1)
+                .ok_or_else(|| DateExpressionError::OutOfRange(expr.to_string()));
+        }
+        if s == "$" {
+            let last = days_in_month(cur_year, cur_month as u32);
+            return NaiveDate::from_ymd_opt(cur_year, cur_month as u32, last as u32)
+                .ok_or_else(|| DateExpressionError::OutOfRange(expr.to_string()));
+        }
+        // Relative offset: +N, -N, ~+N, ~-N
+        let delta_str = s.strip_prefix('~').unwrap_or(s);
+        if delta_str.starts_with('+')
+            || (delta_str.starts_with('-')
+                && delta_str.len() > 1
+                && delta_str[1..].chars().all(|c| c.is_ascii_digit()))
+        {
+            let delta: i64 =
+                delta_str
+                    .parse()
+                    .map_err(|_| DateExpressionError::InvalidComponent {
+                        component: s.to_string(),
+                        expr: expr.to_string(),
+                    })?;
+            return today
+                .checked_add_signed(chrono::Duration::days(delta))
+                .ok_or_else(|| DateExpressionError::OutOfRange(expr.to_string()));
+        }
+        // Absolute day number
+        if let Ok(day) = s.parse::<u32>() {
+            return NaiveDate::from_ymd_opt(cur_year, cur_month as u32, day)
+                .ok_or_else(|| DateExpressionError::OutOfRange(expr.to_string()));
+        }
+        return Err(DateExpressionError::InvalidComponent {
+            component: s.to_string(),
+            expr: expr.to_string(),
+        });
+    }
+
     // Interpretation depends on number of components:
-    // 1 part:  year  (month/day from today)
     // 2 parts: month/day  (year from today)
     // 3 parts: year/month/day
     let (year_str, month_str, day_str): (Option<&str>, Option<&str>, Option<&str>) =
         match parts.as_slice() {
-            [y] => (Some(y), None, None),
+            [d] => (None, None, Some(d)),
             [m, d] => (None, Some(m), Some(d)),
             [y, m, d] => (Some(y), Some(m), Some(d)),
             _ => unreachable!(),
@@ -100,7 +153,7 @@ fn resolve_component(
     let s = s.trim();
 
     if s == "^" {
-        return Ok(first.unwrap_or(1));
+        return first.ok_or_else(err);
     }
 
     if s == "$" {
@@ -153,8 +206,6 @@ fn days_in_month(year: i32, month: u32) -> i32 {
     last.day() as i32
 }
 
-use chrono::Datelike;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,30 +223,54 @@ mod tests {
         assert_eq!(resolve("~", today).unwrap(), today);
     }
 
-    // --- single component (year only) ---
+    // --- single component (day only, year/month from today) ---
 
     #[test]
-    fn single_year_absolute_keeps_month_day() {
+    fn single_day_absolute() {
         let today = date(2026, 3, 8);
-        assert_eq!(resolve("2024", today).unwrap(), date(2024, 3, 8));
+        assert_eq!(resolve("15", today).unwrap(), date(2026, 3, 15));
     }
 
     #[test]
-    fn single_year_offset_minus_1() {
+    fn single_day_offset_minus_1() {
         let today = date(2026, 3, 8);
-        assert_eq!(resolve("~-1", today).unwrap(), date(2025, 3, 8));
+        assert_eq!(resolve("~-1", today).unwrap(), date(2026, 3, 7));
     }
 
     #[test]
-    fn single_year_offset_plus_2() {
+    fn single_day_offset_plus_2() {
         let today = date(2026, 3, 8);
-        assert_eq!(resolve("~+2", today).unwrap(), date(2028, 3, 8));
+        assert_eq!(resolve("~+2", today).unwrap(), date(2026, 3, 10));
     }
 
     #[test]
-    fn single_year_shorthand_minus() {
+    fn single_day_shorthand_minus() {
         let today = date(2026, 3, 8);
-        assert_eq!(resolve("-1", today).unwrap(), date(2025, 3, 8));
+        assert_eq!(resolve("-1", today).unwrap(), date(2026, 3, 7));
+    }
+
+    #[test]
+    fn single_caret_is_first_of_month() {
+        let today = date(2026, 3, 15);
+        assert_eq!(resolve("^", today).unwrap(), date(2026, 3, 1));
+    }
+
+    #[test]
+    fn single_dollar_is_last_of_month() {
+        let today = date(2026, 3, 15);
+        assert_eq!(resolve("$", today).unwrap(), date(2026, 3, 31));
+    }
+
+    #[test]
+    fn caret_in_year_position_is_error() {
+        let today = date(2026, 3, 8);
+        assert!(resolve("^/3/15", today).is_err());
+    }
+
+    #[test]
+    fn dollar_in_year_position_is_error() {
+        let today = date(2026, 3, 8);
+        assert!(resolve("$/3/15", today).is_err());
     }
 
     // --- two components (month/day, implicit current year) ---
