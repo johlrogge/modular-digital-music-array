@@ -198,8 +198,17 @@ if [[ ! -f "$CARGO_TOML" ]]; then
     exit 1
 fi
 
-VERSION=$(grep '^version = ' "$CARGO_TOML" | head -1 | sed 's/version = "\(.*\)"/\1/')
+RAW=$(grep '^version[. =]' "$CARGO_TOML" | head -1)
+if echo "$RAW" | grep -q 'workspace = true'; then
+    VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+else
+    VERSION=$(echo "$RAW" | sed 's/version = "\(.*\)"/\1/')
+fi
 echo "  Version from ${CARGO_TOML}: ${VERSION}"
+if [[ -z "$VERSION" ]]; then
+    echo "Error: Could not extract version from $CARGO_TOML" >&2
+    exit 1
+fi
 
 REVISION="1"
 FULLVERSION="${VERSION}_${REVISION}"
