@@ -1,7 +1,5 @@
 # mdma-library
 
-Version: **0.4.0**
-
 Music library service for MDMA. Manages a content-addressed blob store, indexes track metadata as an immutable fact stream, and serves search and lookup requests over NNG IPC.
 
 [Back to workspace README](../../README.md)

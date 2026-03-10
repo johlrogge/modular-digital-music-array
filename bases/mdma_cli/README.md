@@ -1,10 +1,6 @@
 # mdma-cli
 
-Version: **0.5.1**
-
 Command-line interface for MDMA. Talks to the Pi over the gateway — search the library, manage the queue, control playback, export tracks, and subscribe to live events. The binary is named `mdma`.
-
-**What's new in 0.5.1:** single-component date expressions (e.g. `--added 15`) are now correctly interpreted as day, not year. The `--added` help text has been updated to reflect the positional component order (year/month/day, specify only the least-significant components you care about).
 
 [Back to workspace README](../../README.md)
 
