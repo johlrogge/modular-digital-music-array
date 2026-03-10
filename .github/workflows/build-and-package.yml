@@ -57,10 +57,8 @@ jobs:
     - name: Unit tests
       run: devenv shell -- cargo test
 
-    - name: Build native debug binaries (for BDD)
-      run: devenv shell -- cargo build
-
     - name: BDD integration tests
+      timeout-minutes: 30
       run: devenv shell -- just bdd
 
   build-and-publish:
