@@ -18,3 +18,9 @@ inputs:
     inputs:
       nixpkgs:
         follows: nixpkgs
+  metadev:
+    url: github:johlrogge/metadev
+    flake: false
+
+imports:
+  - metadev
