@@ -82,7 +82,7 @@ struct IndexedTrackInfo {
     disc_number: Option<u32>,
     last_started: Option<chrono::DateTime<chrono::Utc>>,
     last_stopped: Option<chrono::DateTime<chrono::Utc>>,
-    added_at: Option<String>,
+    added_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl IndexedTrackInfo {
@@ -163,9 +163,9 @@ fn apply_fact_to_track(
                 set.insert(entry.content_hash.as_str().to_owned());
             }
         }
-        MusicValue::AddedAt(s) => {
+        MusicValue::AddedAt(dt) => {
             if entry.added_at.is_none() {
-                entry.added_at = Some(s.clone());
+                entry.added_at = Some(*dt);
             }
         }
         _ => {}
@@ -1073,7 +1073,7 @@ impl LibraryService {
                 }),
             track_number: t.track_number,
             disc_number: t.disc_number,
-            added: t.added_at.clone(),
+            added: t.added_at.map(|dt| dt.to_rfc3339()),
         }
     }
 
@@ -1287,11 +1287,7 @@ impl LibraryService {
                     source: t.source.as_deref(),
                     last_started: t.last_started,
                     last_stopped: t.last_stopped,
-                    added: t
-                        .added_at
-                        .as_deref()
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                        .map(|dt| dt.with_timezone(&chrono::Utc)),
+                    added: t.added_at,
                 };
                 matches_query(query, &fields)
             })

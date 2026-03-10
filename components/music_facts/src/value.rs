@@ -1,4 +1,5 @@
 use crate::primitives::*;
+use chrono::{DateTime, NaiveDate, Utc};
 use music_primitives::{Bpm, Key};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
@@ -163,8 +164,8 @@ pub enum MusicValue {
     /// Recording year (extracted from RecordingDate)
     RecordingYear(Year),
 
-    /// Full recording date (when available, format: YYYY-MM-DD)
-    RecordingDate(String),
+    /// Full recording date (when available)
+    RecordingDate(NaiveDate),
 
     // ========================================================================
     // URLs & External References
@@ -251,8 +252,8 @@ pub enum MusicValue {
     // ========================================================================
     // Import Provenance
     // ========================================================================
-    /// When the track was added to the library (ISO 8601 datetime string)
-    AddedAt(String),
+    /// When the track was added to the library
+    AddedAt(DateTime<Utc>),
 }
 
 impl MusicValue {
@@ -320,7 +321,7 @@ impl fmt::Display for MusicValue {
             MusicValue::Isrc(i) => write!(f, "{}", i),
             MusicValue::Label(s) => write!(f, "{}", s),
             MusicValue::RecordingYear(y) => write!(f, "{}", y),
-            MusicValue::RecordingDate(s) => write!(f, "{}", s),
+            MusicValue::RecordingDate(d) => write!(f, "{}", d),
             MusicValue::BeatportTrackUrl(s) => write!(f, "{}", s),
             MusicValue::BeatportLabelUrl(s) => write!(f, "{}", s),
             MusicValue::BandcampUrl(s) => write!(f, "{}", s),
@@ -349,7 +350,7 @@ impl fmt::Display for MusicValue {
             MusicValue::CoverArtPath(s) => write!(f, "{}", s),
             MusicValue::TrackStarted(r) => write!(f, "{}", r),
             MusicValue::TrackStopped(r) => write!(f, "{}", r),
-            MusicValue::AddedAt(s) => write!(f, "{}", s),
+            MusicValue::AddedAt(dt) => write!(f, "{}", dt.to_rfc3339()),
         }
     }
 }
@@ -570,7 +571,10 @@ mod tests {
 
     #[test]
     fn added_at_roundtrip() {
-        let v = MusicValue::AddedAt("2026-03-08T12:00:00Z".to_string());
+        let dt = DateTime::parse_from_rfc3339("2026-03-08T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let v = MusicValue::AddedAt(dt);
         let json = serde_json::to_string(&v).unwrap();
         let back: MusicValue = serde_json::from_str(&json).unwrap();
         assert_eq!(back, v);
@@ -578,18 +582,49 @@ mod tests {
 
     #[test]
     fn added_at_display_name() {
-        let v = MusicValue::AddedAt("2026-03-08T12:00:00Z".to_string());
+        let dt = DateTime::parse_from_rfc3339("2026-03-08T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let v = MusicValue::AddedAt(dt);
         assert_eq!(v.display_name(), "AddedAt");
     }
 
     #[test]
     fn added_at_display() {
-        let v = MusicValue::AddedAt("2026-03-08T12:00:00Z".to_string());
-        assert_eq!(v.to_string(), "2026-03-08T12:00:00Z");
+        let dt = DateTime::parse_from_rfc3339("2026-03-08T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let v = MusicValue::AddedAt(dt);
+        assert_eq!(v.to_string(), "2026-03-08T12:00:00+00:00");
     }
 
     #[test]
     fn added_at_fact_value_format() {
-        assert_fact_value_format!(MusicValue::AddedAt("2026-03-08T12:00:00Z".to_string()));
+        let dt = DateTime::parse_from_rfc3339("2026-03-08T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_fact_value_format!(MusicValue::AddedAt(dt));
+    }
+
+    #[test]
+    fn recording_date_roundtrip() {
+        let date = NaiveDate::from_ymd_opt(2024, 6, 15).unwrap();
+        let v = MusicValue::RecordingDate(date);
+        let json = serde_json::to_string(&v).unwrap();
+        let back: MusicValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn recording_date_display() {
+        let date = NaiveDate::from_ymd_opt(2024, 6, 15).unwrap();
+        let v = MusicValue::RecordingDate(date);
+        assert_eq!(v.to_string(), "2024-06-15");
+    }
+
+    #[test]
+    fn recording_date_fact_value_format() {
+        let date = NaiveDate::from_ymd_opt(2024, 6, 15).unwrap();
+        assert_fact_value_format!(MusicValue::RecordingDate(date));
     }
 }

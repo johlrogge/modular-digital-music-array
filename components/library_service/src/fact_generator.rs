@@ -43,7 +43,7 @@ pub fn generate_facts(
     facts.push((MusicValue::Format(music_format), source.clone()));
 
     // Record import timestamp
-    facts.push((MusicValue::AddedAt(chrono::Utc::now().to_rfc3339()), source));
+    facts.push((MusicValue::AddedAt(chrono::Utc::now()), source));
 
     Ok(facts)
 }
@@ -155,10 +155,9 @@ fn generate_facts_from_metadata(
         }
 
         if recording_date.len() == 10 && recording_date.matches('-').count() == 2 {
-            facts.push((
-                MusicValue::RecordingDate(recording_date.clone()),
-                source.clone(),
-            ));
+            if let Ok(date) = chrono::NaiveDate::parse_from_str(recording_date, "%Y-%m-%d") {
+                facts.push((MusicValue::RecordingDate(date), source.clone()));
+            }
         }
     }
 
