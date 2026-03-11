@@ -38,6 +38,7 @@ members = [
     "bases/mdma_gateway",
     "bases/mdma_acid",
     "bases/mdma_audio",
+    "bases/mdma_tui",
     # Tests
     "tests/bdd",
 ]
@@ -52,6 +53,7 @@ default-members = [
     "bases/mdma_library",
     "bases/mdma_playback",
     "bases/mdma_audio",
+    "bases/mdma_tui",
 ]
 resolver = "2"
 
@@ -80,6 +82,7 @@ proptest = "1"
 rstest = "0.26"
 serde_json = "1.0"
 serde = { version = "1", features = ["derive"] }
+scopeguard = "1"
 thiserror = "1.0"
 tokio-util = "0.7"
 tokio = { version = "1.36", features = ["full"] }

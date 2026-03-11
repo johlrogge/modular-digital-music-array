@@ -1,0 +1,145 @@
+use crate::pane::{Pane, PaneAction, PaneKind};
+use crate::selection::SelectionState;
+use crate::track_list::render_track_list;
+use crossterm::event::{KeyCode, KeyEvent};
+use mdma_client::{ContentHash, LibraryBackend, PlaybackBackend, PlaylistName, TrackInfo};
+use ratatui::{
+    layout::Rect,
+    style::{Color, Style},
+    widgets::{Block, BorderType, Borders},
+    Frame,
+};
+use std::rc::Rc;
+
+/// Minimal proof-of-life pane that shows the current playback queue.
+#[allow(dead_code)]
+pub struct QueuePane {
+    tracks: Vec<TrackInfo>,
+    selection: SelectionState,
+    title: String,
+    playback: Rc<PlaybackBackend>,
+    library: Rc<LibraryBackend>,
+}
+
+impl QueuePane {
+    /// Create a new QueuePane, loading the queue from the playback backend
+    /// and resolving each hash against the library.
+    ///
+    /// If either backend is unavailable or returns an error, the pane starts
+    /// empty with a status placeholder.
+    pub fn new(playback: Rc<PlaybackBackend>, library: Rc<LibraryBackend>) -> Self {
+        let tracks = Self::load_queue(&playback, &library);
+        let total = tracks.len();
+        QueuePane {
+            tracks,
+            selection: SelectionState::new(total),
+            title: "Queue".to_string(),
+            playback,
+            library,
+        }
+    }
+
+    /// Load queue hashes from playback then resolve each via library.
+    fn load_queue(playback: &PlaybackBackend, library: &LibraryBackend) -> Vec<TrackInfo> {
+        let hashes = match playback.queue_list() {
+            Ok(h) => h,
+            Err(_) => return Vec::new(),
+        };
+        hashes
+            .iter()
+            .filter_map(|hash| library.get_track(hash).ok())
+            .collect()
+    }
+}
+
+impl Pane for QueuePane {
+    fn render(&self, f: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .title(self.title.as_str())
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .border_style(Style::default().fg(Color::White));
+
+        if self.tracks.is_empty() {
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            let placeholder = ratatui::widgets::Paragraph::new("Queue is empty")
+                .style(Style::default().fg(Color::DarkGray));
+            f.render_widget(placeholder, inner);
+            return;
+        }
+
+        render_track_list(f, area, &self.tracks, &self.selection, block);
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> PaneAction {
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.selection.move_cursor_down();
+                PaneAction::Consumed
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.selection.move_cursor_up();
+                PaneAction::Consumed
+            }
+            KeyCode::Char('x') => {
+                self.selection.extend_selection_down();
+                PaneAction::Consumed
+            }
+            KeyCode::Char('X') => {
+                self.selection.extend_selection_up();
+                PaneAction::Consumed
+            }
+            KeyCode::Char('%') => {
+                self.selection.select_all();
+                PaneAction::Consumed
+            }
+            KeyCode::Esc => {
+                if !self.selection.pop_filter() {
+                    self.selection.clear_selection();
+                }
+                PaneAction::Consumed
+            }
+            _ => PaneAction::Ignored,
+        }
+    }
+
+    fn resolve_selection(&self) -> Vec<ContentHash> {
+        self.selection
+            .selected
+            .iter()
+            .filter_map(|&vis_idx| self.selection.visible_index_to_data(vis_idx))
+            .map(|data_idx| self.tracks[data_idx].content_hash.clone())
+            .collect()
+    }
+
+    fn selection_state(&self) -> &SelectionState {
+        &self.selection
+    }
+
+    fn selection_state_mut(&mut self) -> &mut SelectionState {
+        &mut self.selection
+    }
+
+    fn title(&self) -> &str {
+        &self.title
+    }
+
+    fn item_count(&self) -> usize {
+        self.tracks.len()
+    }
+
+    fn pane_kind(&self) -> PaneKind {
+        PaneKind::Queue
+    }
+
+    fn playlist_name(&self) -> Option<&PlaylistName> {
+        None
+    }
+
+    fn refresh(&mut self) -> PaneAction {
+        self.tracks = Self::load_queue(&self.playback, &self.library);
+        self.selection.set_total_items(self.tracks.len());
+        PaneAction::Consumed
+    }
+}
