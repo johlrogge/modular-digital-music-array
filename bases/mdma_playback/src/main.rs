@@ -26,8 +26,8 @@ struct Args {
     #[arg(long, default_value = "ipc:///run/mdma/playback.sock")]
     socket: String,
 
-    /// Path to queue persistence file (relative to cwd, which should be /music)
-    #[arg(long, default_value = "queue.json")]
+    /// Path to queue persistence file
+    #[arg(long, default_value = "/metadata/queue.json")]
     queue_file: PathBuf,
 
     /// Event publishing socket (Pub0) for real-time notifications
