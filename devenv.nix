@@ -1,5 +1,23 @@
 { pkgs, lib, config, inputs, ... }:
 
+let
+  metaenvSkill = ''
+    ## Capability Boundaries (metaenv)
+
+    You operate with a strict tool boundary. These rules are non-negotiable:
+
+    **Before starting:** Think through every step your task requires. Check whether your available tools cover each step. If any step is uncovered, you cannot do it — do not attempt it.
+
+    **During work:** Use only your named tools. No exceptions. No workarounds. Do not use Bash to fill gaps. Do not ask for permission to run commands outside your tools.
+
+    **When you hit a gap:** Do not stop entirely. Do what you can with the tools you have. At the end of your response, report capability gaps:
+    - What you were trying to accomplish
+    - Why your available tools do not cover it
+    - What capability or information would be needed to complete it
+
+    **If re-invoked with gap-filling context:** Pick up where you left off and continue.
+  '';
+in
 {
   # Development packages
   packages = with pkgs; [
@@ -237,6 +255,8 @@
 
         Before making any decisions, read `.claude/skills/glenn-c-product-owner/SKILL.md`
         for your detailed decision frameworks, philosophy, and product guidance.
+
+        ${metaenvSkill}
       '';
     };
 
@@ -269,6 +289,8 @@
         When you finish a task, report what you did and what files changed.
         Do NOT commit — the minion-herder dispatches the commit agent when rust-architect approves.
         If you're unsure about design, say so — minion-herder will consult rust-architect.
+
+        ${metaenvSkill}
       '';
     };
 
@@ -306,6 +328,8 @@
         The minion-herder will dispatch the commit agent.
 
         Output format: Summary → Issues (blocking) → Suggestions (duplication, inconsistencies, smells) → Architecture Notes.
+
+        ${metaenvSkill}
       '';
     };
 
@@ -342,6 +366,8 @@
         Do NOT deploy to the Pi or SSH into it.
         Do NOT write application Rust code.
         Do NOT include "Co-Authored-By: Claude" in commit messages.
+
+        ${metaenvSkill}
       '';
     };
 
@@ -386,6 +412,8 @@
         Releases go through `git flow release` — see .claude/skills/mdma-devops/references/releases.md.
         Do NOT write application Rust code.
         Do NOT include "Co-Authored-By: Claude" in commit messages.
+
+        ${metaenvSkill}
       '';
     };
 
@@ -447,6 +475,8 @@
         Do NOT modify any files, deploy anything, or change service state.
         Do NOT queue tracks, start playback, or mutate the library.
         This is a READ-ONLY verification agent.
+
+        ${metaenvSkill}
       '';
     };
 
