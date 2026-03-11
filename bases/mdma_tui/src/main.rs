@@ -1,6 +1,7 @@
 mod app;
 mod browse_field;
 mod browser_pane;
+mod commands;
 mod error;
 mod events;
 mod input;
@@ -92,7 +93,12 @@ fn main() -> Result<()> {
     let right_pane: Box<dyn pane::Pane> =
         Box::new(QueuePane::new(Rc::clone(&playback), Rc::clone(&library)));
 
-    let mut app = App::new(left_pane, right_pane, Rc::clone(&library));
+    let mut app = App::new(
+        left_pane,
+        right_pane,
+        Rc::clone(&library),
+        Rc::clone(&playback),
+    );
 
     // Terminal setup
     enable_raw_mode()?;

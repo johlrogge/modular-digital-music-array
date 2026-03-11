@@ -1,14 +1,16 @@
 use crate::app::{App, InputMode};
+use crate::commands::Command;
 use crate::pane::PaneAction;
 use crate::playlist_pane::PlaylistPane;
 use crossterm::event::{KeyCode, KeyEvent};
+use mdma_client::{Deck, PlaybackBackend};
 use std::rc::Rc;
 
 /// Dispatch a key event to the application based on the current input mode.
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     match app.mode {
         InputMode::Normal => handle_normal(app, key),
-        InputMode::Command => handle_command(app, key),
+        InputMode::Palette => handle_palette(app, key),
         InputMode::FilterInput => handle_filter(app, key),
     }
 }
@@ -22,8 +24,7 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             app.toggle_active();
         }
         KeyCode::Char(':') => {
-            app.mode = InputMode::Command;
-            app.command_input.clear();
+            app.open_palette();
         }
         KeyCode::Char('s') => {
             app.mode = InputMode::FilterInput;
@@ -51,30 +52,40 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn handle_command(app: &mut App, key: KeyEvent) {
+fn handle_palette(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Char(c) => {
-            app.command_input.push(c);
+        KeyCode::Esc => {
+            app.close_palette();
         }
-        KeyCode::Backspace => {
-            app.command_input.pop();
-        }
-        KeyCode::Enter => {
-            let cmd = app.command_input.clone();
-            app.command_input.clear();
-            app.mode = InputMode::Normal;
-            match cmd.trim() {
-                "q" | "quit" => {
-                    app.should_quit = true;
-                }
-                other => {
-                    app.set_status(format!("Unknown command: {}", other));
-                }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let len = app.palette_matches.len();
+            if len > 0 {
+                app.palette_cursor = (app.palette_cursor + 1) % len;
             }
         }
-        KeyCode::Esc => {
-            app.command_input.clear();
-            app.mode = InputMode::Normal;
+        KeyCode::Up | KeyCode::Char('k') => {
+            let len = app.palette_matches.len();
+            if len > 0 {
+                app.palette_cursor = app.palette_cursor.checked_sub(1).unwrap_or(len - 1);
+            }
+        }
+        KeyCode::Char(c) => {
+            let mut query = app.palette_query.clone();
+            query.push(c);
+            app.palette_update_query(query);
+        }
+        KeyCode::Backspace => {
+            let mut query = app.palette_query.clone();
+            query.pop();
+            app.palette_update_query(query);
+        }
+        KeyCode::Enter => {
+            let cursor = app.palette_cursor;
+            if let Some(&cmd) = app.palette_matches.get(cursor) {
+                let playback = Rc::clone(&app.playback);
+                execute_command(cmd, &playback, app);
+            }
+            app.close_palette();
         }
         _ => {}
     }
@@ -106,6 +117,41 @@ fn handle_filter(app: &mut App, key: KeyEvent) {
             app.active_pane_mut().selection_state_mut().pop_filter();
         }
         _ => {}
+    }
+}
+
+/// Execute a palette command against the playback backend, updating app status.
+fn execute_command(cmd: &Command, playback: &PlaybackBackend, app: &mut App) {
+    match cmd.name {
+        "play" => {
+            let _ = playback.play_queue();
+            app.set_status("Playing");
+        }
+        "pause" => {
+            let _ = playback.pause(Deck::A);
+            app.set_status("Paused");
+        }
+        "stop" => {
+            let _ = playback.stop(Deck::A);
+            app.set_status("Stopped");
+        }
+        "next" => {
+            let _ = playback.skip();
+            app.set_status("Skipped");
+        }
+        "clear" => {
+            let _ = playback.queue_clear();
+            app.set_status("Queue cleared");
+        }
+        "shuffle" => {
+            app.set_status("shuffle not yet implemented");
+        }
+        "quit" => {
+            app.should_quit = true;
+        }
+        _ => {
+            app.set_status(format!("Unknown command: {}", cmd.name));
+        }
     }
 }
 

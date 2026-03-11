@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph},
     Frame,
 };
 
@@ -38,6 +38,11 @@ pub fn render(f: &mut Frame, app: &App) {
     render_pane_area(f, app, Side::Left, cols[0]);
     render_pane_area(f, app, Side::Right, cols[1]);
     render_status_bar(f, app, status_area);
+
+    // Render the command palette overlay on top if active.
+    if app.mode == InputMode::Palette {
+        render_palette_overlay(f, app, area);
+    }
 }
 
 /// Render one pane side with an active/inactive border highlight.
@@ -92,9 +97,9 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
 
     // Left side: hint, status message, or active input prefix
     let left_line = match app.mode {
-        InputMode::Command => Line::from(vec![
+        InputMode::Palette => Line::from(vec![
             Span::styled(":", Style::default().fg(Color::Yellow)),
-            Span::raw(app.command_input.as_str()),
+            Span::raw(app.palette_query.as_str()),
         ]),
         InputMode::FilterInput => Line::from(vec![
             Span::styled("filter: ", Style::default().fg(Color::Magenta)),
@@ -159,4 +164,97 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         ))),
         cols[1],
     );
+}
+
+/// Render the floating command palette overlay.
+///
+/// ```text
+/// ┌─ : ──────────────────────────────────────────────────────────────────────┐
+/// │ > play   Resume or start playback                                         │
+/// │   pause  Pause playback                                                   │
+/// └───────────────────────────────────────────────────────────────────────────┘
+/// ```
+///
+/// The overlay sits at the bottom of the screen, above the status bar area,
+/// and is tall enough to show the input line plus up to 5 matches (capped).
+fn render_palette_overlay(f: &mut Frame, app: &App, area: Rect) {
+    const MAX_MATCHES: usize = 5;
+
+    let visible_matches = app.palette_matches.len().min(MAX_MATCHES);
+    // block border (2) + input line (1) + match rows
+    let height = (2 + 1 + visible_matches) as u16;
+
+    // Position the overlay at the bottom of the available area.
+    // Clamp so it doesn't exceed the screen.
+    let top = area.height.saturating_sub(height + 1); // +1 for status bar
+    let overlay_area = Rect {
+        x: area.x,
+        y: area.y + top,
+        width: area.width,
+        height: height.min(area.height),
+    };
+
+    // Clear the region first so the overlay is opaque.
+    f.render_widget(Clear, overlay_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(
+            format!(" : {} ", app.palette_query),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let inner = block.inner(overlay_area);
+    f.render_widget(block, overlay_area);
+
+    // Split inner: first line is the input echo, rest is the match list.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+
+    // Input echo line
+    let input_line = Line::from(vec![
+        Span::styled(": ", Style::default().fg(Color::Yellow)),
+        Span::styled(
+            app.palette_query.as_str(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("_", Style::default().fg(Color::Yellow)),
+    ]);
+    f.render_widget(Paragraph::new(input_line), chunks[0]);
+
+    // Match list
+    if !app.palette_matches.is_empty() {
+        let items: Vec<ListItem> = app
+            .palette_matches
+            .iter()
+            .take(MAX_MATCHES)
+            .map(|cmd| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:<10}", cmd.name),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(cmd.description, Style::default().fg(Color::Gray)),
+                ]))
+            })
+            .collect();
+
+        let list = List::new(items).highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::REVERSED),
+        );
+
+        let mut list_state = ListState::default();
+        list_state.select(Some(app.palette_cursor));
+        f.render_stateful_widget(list, chunks[1], &mut list_state);
+    }
 }

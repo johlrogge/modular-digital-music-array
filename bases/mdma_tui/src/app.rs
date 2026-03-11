@@ -1,6 +1,7 @@
+use crate::commands::{matching, Command};
 use crate::now_playing::NowPlaying;
 use crate::pane::Pane;
-use mdma_client::LibraryBackend;
+use mdma_client::{LibraryBackend, PlaybackBackend};
 use std::rc::Rc;
 
 /// Which side of the split layout is active.
@@ -15,8 +16,8 @@ pub enum Side {
 pub enum InputMode {
     /// Normal navigation and pane interaction.
     Normal,
-    /// Entering a command (`:` prefix).
-    Command,
+    /// Command palette open (`:` prefix).
+    Palette,
     /// Typing a filter string (`s` prefix).
     FilterInput,
 }
@@ -29,11 +30,16 @@ pub struct App {
     pub mode: InputMode,
     pub now_playing: NowPlaying,
     pub status_message: Option<String>,
-    pub command_input: String,
     pub filter_input: String,
     pub should_quit: bool,
     /// Shared library backend, used for opening new panes (e.g. PlaylistPane).
     pub library: Rc<LibraryBackend>,
+    /// Shared playback backend, used for command palette execution.
+    pub playback: Rc<PlaybackBackend>,
+    // --- Palette state ---
+    pub palette_query: String,
+    pub palette_matches: Vec<&'static Command>,
+    pub palette_cursor: usize,
 }
 
 impl App {
@@ -41,6 +47,7 @@ impl App {
         left_pane: Box<dyn Pane>,
         right_pane: Box<dyn Pane>,
         library: Rc<LibraryBackend>,
+        playback: Rc<PlaybackBackend>,
     ) -> Self {
         Self {
             left_pane,
@@ -49,10 +56,13 @@ impl App {
             mode: InputMode::Normal,
             now_playing: NowPlaying::new(),
             status_message: None,
-            command_input: String::new(),
             filter_input: String::new(),
             should_quit: false,
             library,
+            playback,
+            palette_query: String::new(),
+            palette_matches: Vec::new(),
+            palette_cursor: 0,
         }
     }
 
@@ -108,5 +118,30 @@ impl App {
     #[allow(dead_code)]
     pub fn clear_status(&mut self) {
         self.status_message = None;
+    }
+
+    /// Open the command palette, resetting query and computing initial matches.
+    pub fn open_palette(&mut self) {
+        self.palette_query.clear();
+        self.palette_matches = matching("");
+        self.palette_cursor = 0;
+        self.mode = InputMode::Palette;
+    }
+
+    /// Close the command palette and return to normal mode.
+    pub fn close_palette(&mut self) {
+        self.palette_query.clear();
+        self.palette_matches.clear();
+        self.palette_cursor = 0;
+        self.mode = InputMode::Normal;
+    }
+
+    /// Update the palette query and recompute matches, clamping the cursor.
+    pub fn palette_update_query(&mut self, query: String) {
+        self.palette_matches = matching(&query);
+        self.palette_cursor = self
+            .palette_cursor
+            .min(self.palette_matches.len().saturating_sub(1));
+        self.palette_query = query;
     }
 }
