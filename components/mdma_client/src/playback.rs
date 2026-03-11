@@ -4,7 +4,6 @@ use media_client::{
     AudioOutputConfig, AudioSinkInfo, ClientError, Command, ContentHash, Deck, MediaClient,
     Response, ResponseData,
 };
-use std::path::PathBuf;
 
 /// Abstraction for playback commands, works in both gateway and direct mode.
 pub enum PlaybackBackend {
@@ -108,17 +107,17 @@ impl PlaybackBackend {
         }
     }
 
-    pub fn queue_next(&self, hash: ContentHash, path: PathBuf) -> Result<(), ClientError> {
+    pub fn queue_next(&self, hash: ContentHash, source: String) -> Result<(), ClientError> {
         match self {
-            PlaybackBackend::Direct(c) => c.queue_next(hash, path),
-            PlaybackBackend::Gateway(_) => self.gw_command(Command::QueueNext { hash, path }),
+            PlaybackBackend::Direct(c) => c.queue_next(hash, source),
+            PlaybackBackend::Gateway(_) => self.gw_command(Command::QueueNext { hash, source }),
         }
     }
 
-    pub fn queue_append(&self, hash: ContentHash, path: PathBuf) -> Result<(), ClientError> {
+    pub fn queue_append(&self, hash: ContentHash, source: String) -> Result<(), ClientError> {
         match self {
-            PlaybackBackend::Direct(c) => c.queue_append(hash, path),
-            PlaybackBackend::Gateway(_) => self.gw_command(Command::QueueAppend { hash, path }),
+            PlaybackBackend::Direct(c) => c.queue_append(hash, source),
+            PlaybackBackend::Gateway(_) => self.gw_command(Command::QueueAppend { hash, source }),
         }
     }
 
@@ -145,7 +144,7 @@ impl PlaybackBackend {
         }
     }
 
-    pub fn queue_replace(&self, entries: Vec<(ContentHash, PathBuf)>) -> Result<(), ClientError> {
+    pub fn queue_replace(&self, entries: Vec<(ContentHash, String)>) -> Result<(), ClientError> {
         match self {
             PlaybackBackend::Direct(c) => c.queue_replace(entries),
             PlaybackBackend::Gateway(_) => self.gw_command(Command::QueueReplace { entries }),

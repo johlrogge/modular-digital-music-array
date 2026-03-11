@@ -3,6 +3,22 @@ use std::fmt::Display;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Describes an available audio output device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioSinkInfo {
+    pub name: String,
+    pub description: Option<String>,
+    pub max_sample_rate: Option<u32>,
+}
+
+/// The currently active audio output configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioOutputConfig {
+    pub device_name: Option<String>,
+    pub sample_rate: Option<u32>,
+    pub channels: Option<u32>,
+}
+
 /// Identifies a playback session — spans from the first track playing to the queue emptying.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

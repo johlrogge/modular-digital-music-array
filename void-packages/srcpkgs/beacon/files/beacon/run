@@ -1,3 +1,4 @@
 #!/bin/sh
 exec 2>&1
+export RUST_LOG=info
 exec chpst -u root /usr/bin/beacon --apply --port 80

@@ -2,6 +2,7 @@
 exec 2>&1
 mkdir -p /run/mdma/sources
 chown mdma:mdma /run/mdma /run/mdma/sources
+export RUST_LOG=info
 exec chpst -u mdma /usr/bin/mdma-gateway \
     --listen tcp://0.0.0.0:5555 \
     --library-socket ipc:///run/mdma/library.sock \

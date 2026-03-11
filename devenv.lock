@@ -109,6 +109,21 @@
         "type": "github"
       }
     },
+    "metadev": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1773247442,
+        "owner": "johlrogge",
+        "repo": "metadev",
+        "rev": "caec34938e724cea1e03d88c82deda30ceed1028",
+        "type": "github"
+      },
+      "original": {
+        "owner": "johlrogge",
+        "repo": "metadev",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "inputs": {
         "nixpkgs-src": "nixpkgs-src"
@@ -149,6 +164,7 @@
         "claude-code-nix": "claude-code-nix",
         "devenv": "devenv",
         "git-hooks": "git-hooks",
+        "metadev": "metadev",
         "nixpkgs": "nixpkgs",
         "pre-commit-hooks": [
           "git-hooks"

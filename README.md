@@ -56,12 +56,16 @@ Your laptop (mdma CLI)
    -----+-----+----------+------------+
    |         |           |            |
 mdma-library  mdma-playback  mdma-bandcamp  /run/mdma/sources/*.sock
-                                            (auto-discovered sources)
+                   |                        (auto-discovered sources)
+              mdma-audio        — file playback source (ipc:///run/mdma/streams/audio.sock)
+
 mdma-acid                — standalone fact-writing service (ipc:///run/mdma/acid.sock)
 
 mdma-console             — web UI on port 80
 Event bus (port 5556)    — pub/sub for live clients
 ```
+
+Service startup order: mdma-library → mdma-audio → mdma-playback
 
 The library is a content-addressed blob store with an immutable fact stream (`stainless_facts`). Every track attribute — artist, BPM, key, play history — is a typed fact appended to `facts.jsonl`. Nothing is ever overwritten. Fact writes go through `mdma-acid`, a dedicated service that owns the `facts.jsonl` file and accepts batched writes from any other service via IPC.
 
@@ -77,7 +81,8 @@ Audio path: FLAC/MP3 → Symphonia decoder → rubato resampler → 192 kHz Pipe
 | [mdma_gateway](bases/mdma_gateway/) | Single TCP gateway (port 5555) routing to all internal IPC services | [README](bases/mdma_gateway/README.md) |
 | [mdma_library](bases/mdma_library/) | Library service — content-addressed storage and fact-based metadata | [README](bases/mdma_library/README.md) |
 | [mdma_acid](bases/mdma_acid/) | ACID service — standalone append-only fact stream writer | [README](bases/mdma_acid/README.md) |
-| [mdma_playback](bases/mdma_playback/) | Audio playback — Symphonia + rubato resampler + PipeWire | [README](bases/mdma_playback/README.md) |
+| [mdma_playback](bases/mdma_playback/) | Queue manager — drives audio sources via StreamClient; persists queue to `/metadata/queue.json` | [README](bases/mdma_playback/README.md) |
+| [mdma_audio](bases/mdma_audio/) | Audio playback source — wraps PlaybackEngine (Symphonia + rubato + PipeWire), speaks `stream_source_protocol` over NNG | [README](bases/mdma_audio/README.md) |
 | [mdma_bandcamp](bases/mdma_bandcamp/) | Bandcamp collection sync — downloads purchases into the library inbox | [README](bases/mdma_bandcamp/README.md) |
 | [mdma_console](bases/mdma_console/) | Web management console — player controls, search, queue, upload, export | [README](bases/mdma_console/README.md) |
 | [mdma_cli](bases/mdma_cli/) | CLI — search, queue, playlists, playback, export, subscribe, shell completions | [README](bases/mdma_cli/README.md) |
@@ -89,6 +94,7 @@ Audio path: FLAC/MP3 → Symphonia decoder → rubato resampler → 192 kHz Pipe
 | `date_expression` | Relative date syntax parser used by all date-based queries (`~`, `^`, `$`, `+/-N`, `/`-separated components) |
 | `library_search` | Composable `TrackQuery` with string, numeric, duration, key, and date filters |
 | `playback_engine` | Real-time audio: Symphonia decoder + rubato resampler + PipeWire output |
+| `stream_source_protocol` | `StreamCommand`/`StreamResponse`/`StreamTrackInfo`/`StreamPlaybackState` — protocol between playback and audio source services |
 | `music_primitives` | BPM, Key, Mode types |
 | `storage_primitives` | Type-safe `ByteSize` |
 | `media_protocol` | Command/Response protocol between CLI and services |
@@ -148,6 +154,15 @@ cp target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.7.0
+
+- **mdma-audio** (v0.1.0) — new service that wraps PlaybackEngine and speaks `stream_source_protocol` over NNG Rep0 at `ipc:///run/mdma/streams/audio.sock`. Resolves content hashes to file paths via the library IPC.
+- **mdma-playback** (v0.5.0) — now a pure queue manager. No longer has a direct PlaybackEngine dependency. Drives `mdma-audio` (and future sources) via `StreamClient`. Queue entries carry `source: String` (default `"audio"`) instead of a file path. Queue persists to `/metadata/queue.json`.
+- **stream_source_protocol** (v0.1.0) — new component defining the `StreamCommand`/`StreamResponse`/`StreamTrackInfo`/`StreamPlaybackState` types used between playback and source services.
+- **Bug fixes** — playback errors now propagate correctly; `RUST_LOG=info` added to all service run scripts for visible logging.
 
 ---
 

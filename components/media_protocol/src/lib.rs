@@ -1,4 +1,4 @@
 mod protocol;
 
-pub use playback_primitives::{ContentHash, Deck};
-pub use protocol::{AudioOutputConfig, AudioSinkInfo, Command, Response, ResponseData};
+pub use playback_primitives::{AudioOutputConfig, AudioSinkInfo, ContentHash, Deck};
+pub use protocol::{Command, Response, ResponseData};

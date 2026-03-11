@@ -1,5 +1,23 @@
 { pkgs, lib, config, inputs, ... }:
 
+let
+  metaenvSkill = ''
+    ## Capability Boundaries (metaenv)
+
+    You operate with a strict tool boundary. These rules are non-negotiable:
+
+    **Before starting:** Think through every step your task requires. Check whether your available tools cover each step. If any step is uncovered, you cannot do it — do not attempt it.
+
+    **During work:** Use only your named tools. No exceptions. No workarounds. Do not use Bash to fill gaps. Do not ask for permission to run commands outside your tools.
+
+    **When you hit a gap:** Do not stop entirely. Do what you can with the tools you have. At the end of your response, report capability gaps:
+    - What you were trying to accomplish
+    - Why your available tools do not cover it
+    - What capability or information would be needed to complete it
+
+    **If re-invoked with gap-filling context:** Pick up where you left off and continue.
+  '';
+in
 {
   # Development packages
   packages = with pkgs; [
@@ -199,6 +217,27 @@
   # Claude Code integration
   claude.code.enable = true;
 
+  # just MCP servers — scoped allowlists per agent role
+  claude.code.mcpServers.just-dev = {
+    type = "stdio";
+    command = "bb";
+    args = [ "${inputs.metadev}/tools/just/server.bb"
+             "--allow" "build" "watch" "bdd" ];
+  };
+
+  claude.code.mcpServers.just-ci = {
+    type = "stdio";
+    command = "bb";
+    args = [ "${inputs.metadev}/tools/just/server.bb"
+             "--allow"
+             "ci-build-all" "ci-build-beacon" "ci-build-library"
+             "ci-build-console" "ci-build-playback" "ci-build-gateway"
+             "ci-build-bandcamp" "ci-simulate" "ci-check-deps" "ci-clean"
+             "pkg-build-all" "pkg-beacon" "pkg-library" "pkg-console"
+             "pkg-playback" "pkg-gateway" "pkg-bandcamp" "pkg-repository"
+             "pkg-serve" "pkg-version" "pkg-bump-revision" "pkg-clean" ];
+  };
+
   claude.code.agents = {
 
     glenn-c = {
@@ -237,6 +276,8 @@
 
         Before making any decisions, read `.claude/skills/glenn-c-product-owner/SKILL.md`
         for your detailed decision frameworks, philosophy, and product guidance.
+
+        ${metaenvSkill}
       '';
     };
 
@@ -244,7 +285,8 @@
       description = "Implementation specialist. Writes Rust code, implements features, writes tests. Uses Sonnet for speed.";
       model = "sonnet";
       proactive = false;
-      tools = [ "Read" "Write" "Edit" "Bash" "Grep" "Glob" ];
+      tools = [ "Read" "Write" "Edit" "Grep" "Glob"
+                "mcp__just-dev__just_run" "mcp__just-dev__just_list" ];
       prompt = ''
         You write clean, idiomatic Rust code for the MDMA project.
         Follow existing patterns — do NOT invent new architecture.
@@ -254,7 +296,11 @@
         - components/ — Shared libraries (playback_engine, music_primitives, mdma_client, etc.)
         - tests/bdd/ — Cucumber-rs BDD tests with Gherkin features
 
-        Build: cargo build | cargo test | cargo clippy | just watch | just bdd
+        Build/test via just MCP tool (just_run with project path):
+          just build   — compile the workspace
+          just watch   — watch and run check, test, build, clippy on changes
+          just bdd     — run BDD tests
+        Use just_list to see all available recipes.
         Conventions: workspace deps, thiserror for libs, color-eyre for bins,
         tokio async, nng IPC, serde_json protocol, inline #[cfg(test)] modules.
         BDD: features in tests/bdd/features/, steps in tests/bdd/src/steps/,
@@ -269,30 +315,8 @@
         When you finish a task, report what you did and what files changed.
         Do NOT commit — the minion-herder dispatches the commit agent when rust-architect approves.
         If you're unsure about design, say so — minion-herder will consult rust-architect.
-      '';
-    };
 
-    commit = {
-      description = "Commit agent. Runs git add and git commit. Never pushes.";
-      model = "haiku";
-      proactive = false;
-      tools = [ "Bash" ];
-      prompt = ''
-        You commit code changes to git. That is your ONLY job.
-        Before writing a commit message, read .claude/skills/conventional-commits/SKILL.md for format requirements.
-        1. Run git status and git diff --staged to understand what is being committed
-        2. Stage the specified files with git add (never use git add -A)
-        3. Write a concise commit message (imperative mood, why not what)
-        4. Run git commit
-        5. If the commit fails because of the rustfmt pre-commit hook:
-           a. Run `cargo fmt`
-           b. Re-stage only the files that were already staged (use git diff --name-only --cached before the commit to know which files)
-           c. Run git commit again with the same message
-           NEVER use --no-verify to skip hooks.
-        6. NEVER run git push
-        7. NEVER amend previous commits unless explicitly told to
-        8. When finishing a feature, release, or hotfix, use `git flow` commands (e.g. `git flow feature finish <name>`), never manual merge
-        Do NOT include "Co-Authored-By: Claude" in commit messages.
+        ${metaenvSkill}
       '';
     };
 
@@ -330,6 +354,8 @@
         The minion-herder will dispatch the commit agent.
 
         Output format: Summary → Issues (blocking) → Suggestions (duplication, inconsistencies, smells) → Architecture Notes.
+
+        ${metaenvSkill}
       '';
     };
 
@@ -337,7 +363,8 @@
       description = "CI and packaging specialist. Builds void-packages (.xbps), manages GitHub Actions workflows, publishes to package repository.";
       model = "sonnet";
       proactive = false;
-      tools = [ "Read" "Write" "Edit" "Bash" "Grep" "Glob" ];
+      tools = [ "Read" "Write" "Edit" "Grep" "Glob"
+                "mcp__just-ci__just_run" "mcp__just-ci__just_list" ];
       prompt = ''
         You manage the CI pipeline and Void Linux packaging for the MDMA project.
 
@@ -354,11 +381,12 @@
         - void-packages/srcpkgs/*/template — void package templates (version, deps)
         - void-packages/srcpkgs/*/files/*/run — runit run scripts (single source of truth)
 
-        Just recipes:
+        Run tasks via just MCP tool (just_run with project path):
         - just pkg-build-all — top-level: cross-compile all → create .xbps → index repo
         - just pkg-{beacon,library,console,playback,gateway,bandcamp} — per-service package
         - just ci-build-{beacon,library,console,playback,gateway,bandcamp} — cross-compile only
         - just ci-simulate — smoke test of the legacy tar.gz pipeline
+        Use just_list to see all available recipes.
 
         Package versions come from bases/*/Cargo.toml (single source of truth).
         Repo published to: https://johlrogge.github.io/modular-digital-music-array/
@@ -366,32 +394,8 @@
         Do NOT deploy to the Pi or SSH into it.
         Do NOT write application Rust code.
         Do NOT include "Co-Authored-By: Claude" in commit messages.
-      '';
-    };
 
-    documenter = {
-      description = "Documentation updater. Maintains README files across the workspace as part of the release process.";
-      model = "sonnet";
-      proactive = false;
-      tools = [ "Read" "Write" "Edit" "Grep" "Glob" ];
-      prompt = ''
-        You update README.md files as part of the MDMA release process. You do NOT write code, deploy, or commit.
-
-        Your responsibilities:
-        1. Ensure workspace root README.md exists with:
-           - Project overview (what MDMA is)
-           - Workspace members table (linking to each base's README)
-           - Build/deploy quickstart
-           - Architecture overview
-        2. Ensure each base in bases/*/ has a README.md with:
-           - What it does
-           - How to build/run
-           - Link back to workspace README
-        3. Update version references in all READMEs to match the release version
-
-        Follow the existing writing style in the codebase. Be concise.
-        Do NOT write code, deploy, or commit.
-        Do NOT include "Co-Authored-By: Claude" in commit messages.
+        ${metaenvSkill}
       '';
     };
 
@@ -436,6 +440,8 @@
         Releases go through `git flow release` — see .claude/skills/mdma-devops/references/releases.md.
         Do NOT write application Rust code.
         Do NOT include "Co-Authored-By: Claude" in commit messages.
+
+        ${metaenvSkill}
       '';
     };
 
@@ -497,6 +503,8 @@
         Do NOT modify any files, deploy anything, or change service state.
         Do NOT queue tracks, start playback, or mutate the library.
         This is a READ-ONLY verification agent.
+
+        ${metaenvSkill}
       '';
     };
 

@@ -1,0 +1,25 @@
+# Template file for mdma-audio package
+pkgname=mdma-audio
+version=0.1.0
+revision=2
+archs="aarch64"
+build_style=cargo
+hostmakedepends="cargo"
+makedepends="rust-std pipewire-devel libspa-devel"
+depends="pipewire wireplumber libspa-alsa alsa-pipewire"
+short_desc="MDMA file playback stream source"
+maintainer="Joakim Ohlrogge <joakim.ohlrogge@agical.se>"
+license="MIT"
+homepage="https://github.com/johlrogge/modular-digital-music-array"
+
+distfiles="https://github.com/johlrogge/modular-digital-music-array/archive/v${version}.tar.gz"
+checksum="SKIP"
+
+do_build() {
+	cargo build --release --bin mdma-audio --target aarch64-unknown-linux-gnu
+}
+
+do_install() {
+	vbin target/aarch64-unknown-linux-gnu/release/mdma-audio
+	vsv mdma-audio
+}
