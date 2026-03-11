@@ -217,6 +217,27 @@ in
   # Claude Code integration
   claude.code.enable = true;
 
+  # just MCP servers — scoped allowlists per agent role
+  claude.code.mcpServers.just-dev = {
+    type = "stdio";
+    command = "bb";
+    args = [ "${inputs.metadev}/tools/just/server.bb"
+             "--allow" "build" "watch" "bdd" ];
+  };
+
+  claude.code.mcpServers.just-ci = {
+    type = "stdio";
+    command = "bb";
+    args = [ "${inputs.metadev}/tools/just/server.bb"
+             "--allow"
+             "ci-build-all" "ci-build-beacon" "ci-build-library"
+             "ci-build-console" "ci-build-playback" "ci-build-gateway"
+             "ci-build-bandcamp" "ci-simulate" "ci-check-deps" "ci-clean"
+             "pkg-build-all" "pkg-beacon" "pkg-library" "pkg-console"
+             "pkg-playback" "pkg-gateway" "pkg-bandcamp" "pkg-repository"
+             "pkg-serve" "pkg-version" "pkg-bump-revision" "pkg-clean" ];
+  };
+
   claude.code.agents = {
 
     glenn-c = {
@@ -264,7 +285,8 @@ in
       description = "Implementation specialist. Writes Rust code, implements features, writes tests. Uses Sonnet for speed.";
       model = "sonnet";
       proactive = false;
-      tools = [ "Read" "Write" "Edit" "Bash" "Grep" "Glob" ];
+      tools = [ "Read" "Write" "Edit" "Grep" "Glob"
+                "mcp__just-dev__just_run" "mcp__just-dev__just_list" ];
       prompt = ''
         You write clean, idiomatic Rust code for the MDMA project.
         Follow existing patterns — do NOT invent new architecture.
@@ -274,7 +296,11 @@ in
         - components/ — Shared libraries (playback_engine, music_primitives, mdma_client, etc.)
         - tests/bdd/ — Cucumber-rs BDD tests with Gherkin features
 
-        Build: cargo build | cargo test | cargo clippy | just watch | just bdd
+        Build/test via just MCP tool (just_run with project path):
+          just build   — compile the workspace
+          just watch   — watch and run check, test, build, clippy on changes
+          just bdd     — run BDD tests
+        Use just_list to see all available recipes.
         Conventions: workspace deps, thiserror for libs, color-eyre for bins,
         tokio async, nng IPC, serde_json protocol, inline #[cfg(test)] modules.
         BDD: features in tests/bdd/features/, steps in tests/bdd/src/steps/,
@@ -337,7 +363,8 @@ in
       description = "CI and packaging specialist. Builds void-packages (.xbps), manages GitHub Actions workflows, publishes to package repository.";
       model = "sonnet";
       proactive = false;
-      tools = [ "Read" "Write" "Edit" "Bash" "Grep" "Glob" ];
+      tools = [ "Read" "Write" "Edit" "Grep" "Glob"
+                "mcp__just-ci__just_run" "mcp__just-ci__just_list" ];
       prompt = ''
         You manage the CI pipeline and Void Linux packaging for the MDMA project.
 
@@ -354,11 +381,12 @@ in
         - void-packages/srcpkgs/*/template — void package templates (version, deps)
         - void-packages/srcpkgs/*/files/*/run — runit run scripts (single source of truth)
 
-        Just recipes:
+        Run tasks via just MCP tool (just_run with project path):
         - just pkg-build-all — top-level: cross-compile all → create .xbps → index repo
         - just pkg-{beacon,library,console,playback,gateway,bandcamp} — per-service package
         - just ci-build-{beacon,library,console,playback,gateway,bandcamp} — cross-compile only
         - just ci-simulate — smoke test of the legacy tar.gz pipeline
+        Use just_list to see all available recipes.
 
         Package versions come from bases/*/Cargo.toml (single source of truth).
         Repo published to: https://johlrogge.github.io/modular-digital-music-array/
