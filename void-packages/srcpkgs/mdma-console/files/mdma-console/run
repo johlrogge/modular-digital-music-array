@@ -1,5 +1,6 @@
 #!/bin/sh
 exec 2>&1
+export RUST_LOG=info
 exec chpst -u mdma /usr/bin/mdma-console \
     --port 80 \
     --gateway tcp://127.0.0.1:5555 \

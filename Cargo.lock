@@ -2450,6 +2450,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "mdma-audio"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "color-eyre",
+ "library-ipc-client",
+ "music-primitives",
+ "nng",
+ "playback-engine",
+ "playback-primitives",
+ "pretty_assertions",
+ "serde_json",
+ "stream-source-protocol",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mdma-bandcamp"
 version = "0.6.0"
 dependencies = [
@@ -2611,12 +2631,11 @@ dependencies = [
  "media-protocol",
  "music-facts",
  "nng",
- "parking_lot",
- "playback-engine",
  "playback-primitives",
  "pretty_assertions",
  "serde",
  "serde_json",
+ "stream-source-protocol",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -4115,6 +4134,17 @@ dependencies = [
  "pretty_assertions",
  "rstest",
  "serde",
+]
+
+[[package]]
+name = "stream-source-protocol"
+version = "0.1.0"
+dependencies = [
+ "music-primitives",
+ "playback-primitives",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -980,48 +980,18 @@ async fn player_queue_append(
 ) -> impl IntoResponse {
     let hash = ContentHash::new(req.hash);
 
-    // Resolve the blob path via library
-    let lib_client = match state.library_client() {
-        Some(c) => c,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "Library not available"})),
-            )
-                .into_response()
-        }
-    };
-
-    let track = match lib_client.get_track(&hash) {
-        Ok(t) => t,
-        Err(e) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response()
-        }
-    };
-
-    let rel = match &track.blob_path {
-        Some(p) => p.clone(),
-        None => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({"error": "Track has no blob path"})),
-            )
-                .into_response()
-        }
-    };
-
-    let path = state.music_root.join(&rel);
-
     let gw = match require_gateway(&state) {
         Ok(c) => c,
         Err(e) => return e,
     };
 
-    playback_success_or_error(&gw, &Command::QueueAppend { hash, path })
+    playback_success_or_error(
+        &gw,
+        &Command::QueueAppend {
+            hash,
+            source: "audio".to_string(),
+        },
+    )
 }
 
 #[derive(serde::Deserialize)]

@@ -27,6 +27,7 @@ members = [
     "components/library_service",
     "components/acid_protocol",
     "components/acid_client",
+    "components/stream_source_protocol",
     # Bases (entry points)
     "bases/mdma_playback",
     "bases/beacon",
@@ -36,6 +37,7 @@ members = [
     "bases/mdma_bandcamp",
     "bases/mdma_gateway",
     "bases/mdma_acid",
+    "bases/mdma_audio",
     # Tests
     "tests/bdd",
 ]
@@ -49,6 +51,7 @@ default-members = [
     "bases/mdma_gateway",
     "bases/mdma_library",
     "bases/mdma_playback",
+    "bases/mdma_audio",
 ]
 resolver = "2"
 

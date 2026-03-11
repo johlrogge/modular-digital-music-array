@@ -1,16 +1,17 @@
 mod error;
 mod playback_state;
 mod server;
+pub(crate) mod stream_client;
 
 use acid_client::AcidClient;
+use server::Server;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
 use color_eyre::Result;
 use nng::{Protocol, Socket};
-use playback_engine::PlaybackEngine;
-use server::Server;
+use stream_client::StreamClient;
 use tokio::runtime::Runtime;
 use tracing::info;
 
@@ -25,8 +26,8 @@ struct Args {
     #[arg(long, default_value = "ipc:///run/mdma/playback.sock")]
     socket: String,
 
-    /// Path to queue persistence file (relative to cwd, which should be /music)
-    #[arg(long, default_value = "queue.json")]
+    /// Path to queue persistence file
+    #[arg(long, default_value = "/metadata/queue.json")]
     queue_file: PathBuf,
 
     /// Event publishing socket (Pub0) for real-time notifications
@@ -37,9 +38,9 @@ struct Args {
     #[arg(long, default_value = "ipc:///run/mdma/acid.sock")]
     acid_socket: String,
 
-    /// Path to audio output configuration file
-    #[arg(long, default_value = "/metadata/audio-output.json")]
-    audio_config: PathBuf,
+    /// Socket address of the mdma-audio source
+    #[arg(long, default_value = "ipc:///run/mdma/streams/audio.sock")]
+    audio_socket: String,
 }
 
 fn main() -> Result<()> {
@@ -50,9 +51,10 @@ fn main() -> Result<()> {
 
     let runtime = Runtime::new()?;
 
-    let engine = Arc::new(tokio::sync::Mutex::new(PlaybackEngine::new(
-        args.audio_config,
-    )?));
+    // NNG Req0 dial is non-blocking — it starts connecting in background.
+    // The actual error only surfaces on the first send if nobody is listening.
+    let audio_client = StreamClient::connect(&args.audio_socket)?;
+    let audio = Arc::new(tokio::sync::Mutex::new(audio_client));
 
     let socket = Socket::new(Protocol::Rep0)?;
     info!("Listening on {}", args.socket);
@@ -63,7 +65,7 @@ fn main() -> Result<()> {
     event_pub.listen(&args.event_socket)?;
 
     let acid_client = Arc::new(AcidClient::connect(&args.acid_socket)?);
-    let server = Server::new(engine, socket, args.queue_file, event_pub, acid_client);
+    let server = Server::new(audio, socket, args.queue_file, event_pub, acid_client);
     runtime.block_on(server.run())?;
 
     Ok(())

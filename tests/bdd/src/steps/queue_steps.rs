@@ -3,7 +3,6 @@
 use crate::world::MdmaWorld;
 use cucumber::{given, then, when};
 use mdma_client::ContentHash;
-use std::path::PathBuf;
 
 #[given(regex = r#"^the queue contains "([^"]*)"$"#)]
 async fn queue_contains(world: &mut MdmaWorld, hash: String) {
@@ -11,7 +10,7 @@ async fn queue_contains(world: &mut MdmaWorld, hash: String) {
     let content_hash = ContentHash::new(hash);
     if let Err(e) = world
         .playback()
-        .queue_append(content_hash, PathBuf::from("/fake/path.flac"))
+        .queue_append(content_hash, "audio".to_string())
     {
         world.last_error = Some(e.to_string());
     }
@@ -23,7 +22,7 @@ async fn append_to_queue(world: &mut MdmaWorld, hash: String) {
     let content_hash = ContentHash::new(hash);
     match world
         .playback()
-        .queue_append(content_hash, PathBuf::from("/fake/path.flac"))
+        .queue_append(content_hash, "audio".to_string())
     {
         Ok(()) => world.last_error = None,
         Err(e) => world.last_error = Some(e.to_string()),
@@ -36,7 +35,7 @@ async fn prepend_to_queue(world: &mut MdmaWorld, hash: String) {
     let content_hash = ContentHash::new(hash);
     match world
         .playback()
-        .queue_next(content_hash, PathBuf::from("/fake/path.flac"))
+        .queue_next(content_hash, "audio".to_string())
     {
         Ok(()) => world.last_error = None,
         Err(e) => world.last_error = Some(e.to_string()),

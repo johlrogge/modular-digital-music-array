@@ -1926,15 +1926,15 @@ fn handle_playback_now(
 }
 
 fn handle_queue_next(
-    library_client: &LibraryBackend,
+    _library_client: &LibraryBackend,
     media_client: &PlaybackBackend,
     hashes: Vec<String>,
 ) -> Result<()> {
     let count = hashes.len();
     // Prepend in reverse so the first hash ends up at the front of the queue.
     for hash in hashes.into_iter().rev() {
-        let (content_hash, path) = resolve_track(library_client, hash);
-        if let Err(e) = media_client.queue_next(content_hash, path) {
+        let content_hash = ContentHash::new(hash);
+        if let Err(e) = media_client.queue_next(content_hash, "audio".to_string()) {
             handle_playback_error(e);
         }
     }
@@ -1943,14 +1943,14 @@ fn handle_queue_next(
 }
 
 fn handle_queue_append(
-    library_client: &LibraryBackend,
+    _library_client: &LibraryBackend,
     media_client: &PlaybackBackend,
     hashes: Vec<String>,
 ) -> Result<()> {
     let count = hashes.len();
     for hash in hashes {
-        let (content_hash, path) = resolve_track(library_client, hash);
-        if let Err(e) = media_client.queue_append(content_hash, path) {
+        let content_hash = ContentHash::new(hash);
+        if let Err(e) = media_client.queue_append(content_hash, "audio".to_string()) {
             handle_playback_error(e);
         }
     }
@@ -1997,23 +1997,11 @@ fn handle_queue_list(
 }
 
 fn handle_queue_remove(
-    library_client: &LibraryBackend,
+    _library_client: &LibraryBackend,
     media_client: &PlaybackBackend,
     hashes: Vec<String>,
 ) -> Result<()> {
-    let content_hashes: Vec<ContentHash> = hashes
-        .into_iter()
-        .filter_map(|hash| {
-            let content_hash = ContentHash::new(hash);
-            match library_client.get_track(&content_hash) {
-                Ok(t) => Some(t.content_hash),
-                Err(e) => {
-                    eprintln!("Warning: could not resolve hash: {}", e);
-                    None
-                }
-            }
-        })
-        .collect();
+    let content_hashes: Vec<ContentHash> = hashes.into_iter().map(ContentHash::new).collect();
 
     if content_hashes.is_empty() {
         return Ok(());
@@ -2038,13 +2026,13 @@ fn handle_queue_clear(media_client: &PlaybackBackend) -> Result<()> {
 }
 
 fn handle_queue_replace(
-    library_client: &LibraryBackend,
+    _library_client: &LibraryBackend,
     media_client: &PlaybackBackend,
     hashes: Vec<String>,
 ) -> Result<()> {
-    let entries: Vec<(ContentHash, std::path::PathBuf)> = hashes
+    let entries: Vec<(ContentHash, String)> = hashes
         .into_iter()
-        .map(|hash| resolve_track(library_client, hash))
+        .map(|hash| (ContentHash::new(hash), "audio".to_string()))
         .collect();
     let count = entries.len();
     if let Err(e) = media_client.queue_replace(entries) {
@@ -2124,10 +2112,10 @@ fn handle_queue_edit(
 
     let _ = std::fs::remove_file(&tmp_path);
 
-    // 6. Resolve and replace.
-    let entries: Vec<(ContentHash, std::path::PathBuf)> = edited_hashes
+    // 6. Replace queue with reordered hashes.
+    let entries: Vec<(ContentHash, String)> = edited_hashes
         .into_iter()
-        .map(|hash| resolve_track(library_client, hash))
+        .map(|hash| (ContentHash::new(hash), "audio".to_string()))
         .collect();
     let count = entries.len();
     if let Err(e) = media_client.queue_replace(entries) {
@@ -2155,25 +2143,6 @@ fn hashes_arg_or_stdin(hash: Option<String>) -> Vec<String> {
                 std::process::exit(1);
             }
             hashes
-        }
-    }
-}
-
-/// Resolve a hash to a (ContentHash, PathBuf) pair via the library service.
-fn resolve_track(
-    library_client: &LibraryBackend,
-    hash: String,
-) -> (ContentHash, std::path::PathBuf) {
-    let content_hash = ContentHash::new(hash);
-    let track = match library_client.get_track(&content_hash) {
-        Ok(t) => t,
-        Err(e) => handle_error(e),
-    };
-    match track.blob_path {
-        Some(p) => (track.content_hash, std::path::PathBuf::from(p)),
-        None => {
-            eprintln!("Track {} has no blob path", short_hash(&track.content_hash));
-            std::process::exit(1);
         }
     }
 }
@@ -2283,7 +2252,11 @@ fn handle_playback_outputs(media_client: &PlaybackBackend) -> Result<()> {
     for sink in &sinks {
         println!(
             "{:<40} {:<40} {}",
-            sink.name, sink.description, sink.max_sample_rate
+            sink.name,
+            sink.description.as_deref().unwrap_or("-"),
+            sink.max_sample_rate
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "-".to_string())
         );
     }
     Ok(())
@@ -2295,7 +2268,11 @@ fn handle_playback_set_output(media_client: &PlaybackBackend, name: &str) -> Res
         Err(e) => handle_playback_error(e),
     };
     let device = cfg.device_name.as_deref().unwrap_or("auto");
-    println!("Audio output set to: {} ({}Hz)", device, cfg.sample_rate);
+    let rate = cfg
+        .sample_rate
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    println!("Audio output set to: {} ({}Hz)", device, rate);
     Ok(())
 }
 
@@ -2305,7 +2282,11 @@ fn handle_playback_get_output(media_client: &PlaybackBackend) -> Result<()> {
         Err(e) => handle_playback_error(e),
     };
     let device = cfg.device_name.as_deref().unwrap_or("auto");
-    println!("{} ({}Hz)", device, cfg.sample_rate);
+    let rate = cfg
+        .sample_rate
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    println!("{} ({}Hz)", device, rate);
     Ok(())
 }
 

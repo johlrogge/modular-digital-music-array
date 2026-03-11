@@ -15,6 +15,7 @@ if [ -z "$MDMA_BANDCAMP_USERNAME" ]; then
 fi
 
 mkdir -p /run/mdma/sources /var/lib/mdma
+export RUST_LOG=info
 exec chpst -u mdma /usr/bin/mdma-bandcamp \
     --cookies /etc/mdma/bandcamp-cookies.json \
     --downloads-dir /music/downloads \

@@ -2,7 +2,6 @@ use event_protocol::PlaybackEvent;
 use media_protocol::ContentHash;
 use music_facts::{MusicValue, StartReason, StopReason};
 use playback_primitives::SessionId;
-use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlaybackState {
@@ -14,10 +13,11 @@ pub enum PlaybackState {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlaybackEffect {
     StopEngine,
+    PauseEngine,
     PlayEngine,
     LoadAndPlay {
         hash: ContentHash,
-        path: PathBuf,
+        source: String,
     },
     EmitEvent(PlaybackEvent),
     WriteFact {
@@ -84,7 +84,7 @@ impl PlaybackStateMachine {
 
     /// Pop from queue and start playing. If a track is currently Playing or
     /// Paused, it is stopped first.
-    pub fn play_queue(&mut self, hash: ContentHash, path: PathBuf) -> Vec<PlaybackEffect> {
+    pub fn play_queue(&mut self, hash: ContentHash, source: String) -> Vec<PlaybackEffect> {
         let mut effects = Vec::new();
 
         // Stop whatever is currently playing/paused.
@@ -110,7 +110,7 @@ impl PlaybackStateMachine {
 
         effects.push(PlaybackEffect::LoadAndPlay {
             hash: hash.clone(),
-            path,
+            source,
         });
         effects.push(PlaybackEffect::WriteFact {
             hash: hash.clone(),
@@ -144,7 +144,7 @@ impl PlaybackStateMachine {
     }
 
     /// Skip the current track and optionally start the next.
-    pub fn skip(&mut self, next: Option<(ContentHash, PathBuf)>) -> Vec<PlaybackEffect> {
+    pub fn skip(&mut self, next: Option<(ContentHash, String)>) -> Vec<PlaybackEffect> {
         let mut effects = Vec::new();
 
         match self.state.clone() {
@@ -159,14 +159,14 @@ impl PlaybackStateMachine {
                 }));
 
                 match next {
-                    Some((next_hash, next_path)) => {
+                    Some((next_hash, next_source)) => {
                         self.state = PlaybackState::Playing {
                             hash: next_hash.clone(),
                         };
                         // Session continues — Playing -> Playing, no new session start.
                         effects.push(PlaybackEffect::LoadAndPlay {
                             hash: next_hash.clone(),
-                            path: next_path,
+                            source: next_source,
                         });
                         effects.push(PlaybackEffect::WriteFact {
                             hash: next_hash.clone(),
@@ -183,14 +183,14 @@ impl PlaybackStateMachine {
                 }
             }
             PlaybackState::Idle => {
-                if let Some((next_hash, next_path)) = next {
+                if let Some((next_hash, next_source)) = next {
                     self.state = PlaybackState::Playing {
                         hash: next_hash.clone(),
                     };
                     self.maybe_start_session(&mut effects);
                     effects.push(PlaybackEffect::LoadAndPlay {
                         hash: next_hash.clone(),
-                        path: next_path,
+                        source: next_source,
                     });
                     effects.push(PlaybackEffect::WriteFact {
                         hash: next_hash.clone(),
@@ -213,7 +213,7 @@ impl PlaybackStateMachine {
             PlaybackState::Playing { hash } => {
                 self.state = PlaybackState::Paused { hash: hash.clone() };
                 vec![
-                    PlaybackEffect::StopEngine,
+                    PlaybackEffect::PauseEngine,
                     PlaybackEffect::EmitEvent(PlaybackEvent::TrackPaused { hash: hash.clone() }),
                 ]
             }
@@ -236,7 +236,7 @@ impl PlaybackStateMachine {
     }
 
     /// Called when the engine reports a track has played to completion.
-    pub fn track_ended(&mut self, next: Option<(ContentHash, PathBuf)>) -> Vec<PlaybackEffect> {
+    pub fn track_ended(&mut self, next: Option<(ContentHash, String)>) -> Vec<PlaybackEffect> {
         let mut effects = Vec::new();
 
         match self.state.clone() {
@@ -250,14 +250,14 @@ impl PlaybackStateMachine {
                 }));
 
                 match next {
-                    Some((next_hash, next_path)) => {
+                    Some((next_hash, next_source)) => {
                         self.state = PlaybackState::Playing {
                             hash: next_hash.clone(),
                         };
                         // Session continues — auto-advance does not create a new session.
                         effects.push(PlaybackEffect::LoadAndPlay {
                             hash: next_hash.clone(),
-                            path: next_path,
+                            source: next_source,
                         });
                         effects.push(PlaybackEffect::WriteFact {
                             hash: next_hash.clone(),
@@ -300,12 +300,12 @@ mod tests {
         ContentHash::new("sha256:bbbbbb")
     }
 
-    fn path_a() -> PathBuf {
-        PathBuf::from("/music/track_a.flac")
+    fn source_a() -> String {
+        "audio".to_string()
     }
 
-    fn path_b() -> PathBuf {
-        PathBuf::from("/music/track_b.flac")
+    fn source_b() -> String {
+        "audio".to_string()
     }
 
     // -------------------------------------------------------------------------
@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn play_queue_from_idle_transitions_to_playing() {
         let mut sm = PlaybackStateMachine::new();
-        let effects = sm.play_queue(hash_a(), path_a());
+        let effects = sm.play_queue(hash_a(), source_a());
 
         assert!(matches!(sm.state(), PlaybackState::Playing { hash } if *hash == hash_a()));
         assert_eq!(sm.current_hash(), Some(&hash_a()));
@@ -354,9 +354,9 @@ mod tests {
     #[test]
     fn play_queue_from_playing_stops_current_then_loads_new() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
 
-        let effects = sm.play_queue(hash_b(), path_b());
+        let effects = sm.play_queue(hash_b(), source_b());
 
         assert!(matches!(sm.state(), PlaybackState::Playing { hash } if *hash == hash_b()));
 
@@ -381,12 +381,12 @@ mod tests {
     #[test]
     fn play_queue_from_paused_stops_then_loads_new() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
         sm.pause();
 
         assert!(matches!(sm.state(), PlaybackState::Paused { .. }));
 
-        let effects = sm.play_queue(hash_b(), path_b());
+        let effects = sm.play_queue(hash_b(), source_b());
 
         assert!(matches!(sm.state(), PlaybackState::Playing { hash } if *hash == hash_b()));
         assert!(effects
@@ -404,7 +404,7 @@ mod tests {
     #[test]
     fn stop_from_playing_transitions_to_idle() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
 
         let effects = sm.stop();
 
@@ -428,7 +428,7 @@ mod tests {
     #[test]
     fn stop_from_paused_transitions_to_idle() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
         sm.pause();
 
         let effects = sm.stop();
@@ -458,9 +458,9 @@ mod tests {
     #[test]
     fn skip_from_playing_with_next_transitions_to_playing_next() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
 
-        let effects = sm.skip(Some((hash_b(), path_b())));
+        let effects = sm.skip(Some((hash_b(), source_b())));
 
         assert!(matches!(sm.state(), PlaybackState::Playing { hash } if *hash == hash_b()));
         assert!(effects
@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn skip_from_playing_empty_queue_transitions_to_idle() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
 
         let effects = sm.skip(None);
 
@@ -502,10 +502,10 @@ mod tests {
     #[test]
     fn skip_from_paused_with_next_track() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
         sm.pause();
 
-        let effects = sm.skip(Some((hash_b(), path_b())));
+        let effects = sm.skip(Some((hash_b(), source_b())));
 
         assert!(matches!(sm.state(), PlaybackState::Playing { hash } if *hash == hash_b()));
         assert!(effects
@@ -527,7 +527,7 @@ mod tests {
     #[test]
     fn skip_from_paused_empty_queue() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
         sm.pause();
 
         let effects = sm.skip(None);
@@ -546,7 +546,7 @@ mod tests {
     fn skip_from_idle_with_next_starts_playing() {
         let mut sm = PlaybackStateMachine::new();
 
-        let effects = sm.skip(Some((hash_a(), path_a())));
+        let effects = sm.skip(Some((hash_a(), source_a())));
 
         assert!(matches!(sm.state(), PlaybackState::Playing { hash } if *hash == hash_a()));
         assert!(effects
@@ -571,13 +571,16 @@ mod tests {
     #[test]
     fn pause_from_playing_transitions_to_paused() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
 
         let effects = sm.pause();
 
         assert!(matches!(sm.state(), PlaybackState::Paused { hash } if *hash == hash_a()));
         assert!(!sm.is_playing());
         assert!(effects
+            .iter()
+            .any(|e| matches!(e, PlaybackEffect::PauseEngine)));
+        assert!(!effects
             .iter()
             .any(|e| matches!(e, PlaybackEffect::StopEngine)));
         assert!(effects.iter().any(|e| matches!(e,
@@ -589,7 +592,7 @@ mod tests {
     #[test]
     fn pause_from_paused_is_noop() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
         sm.pause();
 
         let effects = sm.pause();
@@ -615,7 +618,7 @@ mod tests {
     #[test]
     fn resume_from_paused_transitions_to_playing() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
         sm.pause();
 
         let effects = sm.resume();
@@ -634,7 +637,7 @@ mod tests {
     #[test]
     fn resume_from_playing_is_noop() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
 
         let effects = sm.resume();
 
@@ -659,9 +662,9 @@ mod tests {
     #[test]
     fn track_ended_from_playing_with_next_advances_queue() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
 
-        let effects = sm.track_ended(Some((hash_b(), path_b())));
+        let effects = sm.track_ended(Some((hash_b(), source_b())));
 
         assert!(matches!(sm.state(), PlaybackState::Playing { hash } if *hash == hash_b()));
         assert!(effects.iter().any(|e| matches!(e,
@@ -680,7 +683,7 @@ mod tests {
     #[test]
     fn track_ended_from_playing_no_next_transitions_to_idle() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
 
         let effects = sm.track_ended(None);
 
@@ -698,7 +701,7 @@ mod tests {
     #[test]
     fn track_ended_from_paused_is_noop() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
         sm.pause();
 
         let effects = sm.track_ended(None);
@@ -725,7 +728,7 @@ mod tests {
     #[test]
     fn pause_resume_cycle_stays_on_same_track() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
         sm.pause();
         sm.resume();
 
@@ -736,7 +739,7 @@ mod tests {
     #[test]
     fn stop_from_playing_clears_current_hash() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
         sm.stop();
 
         assert_eq!(sm.current_hash(), None);
@@ -745,7 +748,7 @@ mod tests {
     #[test]
     fn skip_from_paused_clears_paused_state() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
         sm.pause();
 
         // After skip with no next, must be Idle — not Paused.
@@ -760,9 +763,9 @@ mod tests {
     #[test]
     fn play_queue_stop_fact_uses_on_request_reason() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
 
-        let effects = sm.play_queue(hash_b(), path_b());
+        let effects = sm.play_queue(hash_b(), source_b());
 
         // The stop fact for track A must use OnRequest (interrupted by new track).
         assert!(effects.iter().any(|e| matches!(e,
@@ -780,7 +783,7 @@ mod tests {
         let mut sm = PlaybackStateMachine::new();
         assert_eq!(sm.session_id(), None);
 
-        let effects = sm.play_queue(hash_a(), path_a());
+        let effects = sm.play_queue(hash_a(), source_a());
 
         // Session is now set.
         assert!(sm.session_id().is_some());
@@ -795,11 +798,11 @@ mod tests {
     #[test]
     fn session_does_not_restart_on_skip_to_next() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
 
         let first_session = sm.session_id().cloned().expect("session must be active");
 
-        let effects = sm.skip(Some((hash_b(), path_b())));
+        let effects = sm.skip(Some((hash_b(), source_b())));
 
         // Same session ID — not restarted.
         assert_eq!(sm.session_id(), Some(&first_session));
@@ -819,7 +822,7 @@ mod tests {
     #[test]
     fn session_ends_on_stop_from_playing() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
 
         assert!(sm.session_id().is_some());
 
@@ -838,7 +841,7 @@ mod tests {
     #[test]
     fn session_ends_when_queue_empties_on_track_ended() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
 
         assert!(sm.session_id().is_some());
 
@@ -858,7 +861,7 @@ mod tests {
     #[test]
     fn session_persists_across_pause_and_resume() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
 
         let session_before = sm.session_id().cloned().expect("session must be active");
 
@@ -872,7 +875,7 @@ mod tests {
     #[test]
     fn session_ends_on_skip_with_empty_queue() {
         let mut sm = PlaybackStateMachine::new();
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
 
         assert!(sm.session_id().is_some());
 
@@ -892,13 +895,13 @@ mod tests {
         let mut sm = PlaybackStateMachine::new();
 
         // First session.
-        sm.play_queue(hash_a(), path_a());
+        sm.play_queue(hash_a(), source_a());
         let first_id = sm.session_id().cloned().expect("session active");
         sm.stop();
         assert_eq!(sm.session_id(), None);
 
         // Second session.
-        let effects = sm.play_queue(hash_b(), path_b());
+        let effects = sm.play_queue(hash_b(), source_b());
         let second_id = sm.session_id().cloned().expect("new session active");
 
         // The IDs must differ (different timestamps).
@@ -913,7 +916,7 @@ mod tests {
     #[test]
     fn session_id_emitted_in_session_started_event_matches_accessor() {
         let mut sm = PlaybackStateMachine::new();
-        let effects = sm.play_queue(hash_a(), path_a());
+        let effects = sm.play_queue(hash_a(), source_a());
 
         let session_id = sm.session_id().expect("session active");
 
