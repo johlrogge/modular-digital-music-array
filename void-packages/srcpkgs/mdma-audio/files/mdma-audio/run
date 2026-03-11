@@ -7,6 +7,7 @@ mkdir -p /run/mdma/streams
 chown mdma:mdma /run/mdma/streams
 rm -f /run/mdma/streams/audio.sock
 export PIPEWIRE_RUNTIME_DIR=/run/pipewire
+export RUST_LOG=info
 exec chpst -u mdma:mdma:audio:video:_pipewire /usr/bin/mdma-audio \
 	--socket ipc:///run/mdma/streams/audio.sock \
 	--library-socket ipc:///run/mdma/library.sock \

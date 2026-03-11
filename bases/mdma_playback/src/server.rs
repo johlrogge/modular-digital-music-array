@@ -442,11 +442,12 @@ async fn execute_effects(
             PlaybackEffect::LoadAndPlay { hash, source: _ } => {
                 // Phase 4: single source, always route to mdma-audio
                 let client = audio.lock().await;
-                if let Err(e) = client.load(hash.clone()) {
-                    warn!("Failed to load {hash}: {e}");
-                } else if let Err(e) = client.play() {
-                    warn!("Failed to play after load: {e}");
-                }
+                client.load(hash.clone()).inspect_err(|e| {
+                    warn!("Failed to load {}: {}", hash, e);
+                })?;
+                client.play().inspect_err(|e| {
+                    warn!("Failed to play after load: {}", e);
+                })?;
             }
             PlaybackEffect::EmitEvent(event) => {
                 publish_event_on_socket(event_pub, &event);

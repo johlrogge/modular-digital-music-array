@@ -1,6 +1,7 @@
 #!/bin/sh
 exec 2>&1
 mkdir -p /metadata /run/mdma
+export RUST_LOG=info
 exec chpst -u mdma /usr/bin/mdma-acid \
     --metadata-dir /metadata \
     --socket ipc:///run/mdma/acid.sock
