@@ -3,42 +3,26 @@ use crate::playback_state::{PlaybackEffect, PlaybackState, PlaybackStateMachine}
 use acid_client::AcidClient;
 use color_eyre::Result;
 use event_protocol::{to_topic_message, PlaybackEvent};
-use media_protocol::{
-    AudioOutputConfig, AudioSinkInfo, Command, ContentHash, Response, ResponseData,
-};
-use music_facts::{FactOrigin, FactSource, MusicValue, StartReason};
+use media_protocol::{Command, Response, ResponseData};
+use music_facts::{FactOrigin, FactSource, MusicValue};
 use nng::Socket;
-use playback_engine::{Deck, PlaybackEngine, PlaybackError};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use stream_source_protocol::StreamPlaybackState;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-fn audio_output_config_to_protocol(c: playback_engine::AudioOutputConfig) -> AudioOutputConfig {
-    AudioOutputConfig {
-        device_name: c.device_name,
-        sample_rate: Some(c.sample_rate),
-        channels: None,
-    }
-}
-
-fn audio_sink_to_protocol(s: playback_engine::AudioSink) -> AudioSinkInfo {
-    AudioSinkInfo {
-        name: s.name,
-        description: Some(s.description),
-        max_sample_rate: Some(s.max_sample_rate),
-    }
-}
+use crate::stream_client::StreamClient;
 
 struct QueueEntry {
-    hash: ContentHash,
+    hash: media_protocol::ContentHash,
     path: PathBuf,
 }
 
-fn write_fact(acid_client: &AcidClient, hash: &ContentHash, value: MusicValue) {
+fn write_fact(acid_client: &AcidClient, hash: &media_protocol::ContentHash, value: MusicValue) {
     let source = FactSource::new(
         "mdma-playback",
         env!("CARGO_PKG_VERSION"),
@@ -57,7 +41,7 @@ struct PersistEntry {
 }
 
 pub struct Server {
-    engine: Arc<Mutex<PlaybackEngine>>,
+    audio: Arc<Mutex<StreamClient>>,
     socket: Socket,
     queue: Arc<Mutex<VecDeque<QueueEntry>>>,
     /// State machine that owns the canonical playback state (replaces the old
@@ -70,14 +54,14 @@ pub struct Server {
 
 impl Server {
     pub fn new(
-        engine: Arc<Mutex<PlaybackEngine>>,
+        audio: Arc<Mutex<StreamClient>>,
         socket: Socket,
         queue_file: PathBuf,
         event_pub: Socket,
         acid_client: Arc<AcidClient>,
     ) -> Self {
         Self {
-            engine,
+            audio,
             socket,
             queue: Arc::new(Mutex::new(VecDeque::new())),
             state: Arc::new(Mutex::new(PlaybackStateMachine::new())),
@@ -123,7 +107,7 @@ impl Server {
             let path = PathBuf::from(&e.path);
             if path.exists() {
                 queue.push_back(QueueEntry {
-                    hash: ContentHash::new(e.hash),
+                    hash: media_protocol::ContentHash::new(e.hash),
                     path,
                 });
             } else {
@@ -143,7 +127,7 @@ impl Server {
 
         // Background task: auto-advance to next queued track when current track finishes.
         tokio::spawn(auto_advance_task(
-            self.engine.clone(),
+            self.audio.clone(),
             self.queue.clone(),
             self.state.clone(),
             self.event_pub.clone(),
@@ -174,29 +158,30 @@ impl Server {
     async fn handle_command(&self, command: Command) -> Response {
         match command {
             // ---------------------------------------------------------------
-            // Low-level deck commands — bypass the state machine.
-            // TODO: deprecate these in favour of queue-based commands once all
-            // callers have been migrated.
+            // Deprecated low-level deck commands — not supported in split-architecture mode.
             // ---------------------------------------------------------------
-            Command::LoadTrack { path, deck } => {
-                info!("Loading track {:?} on deck {:?}", path, deck);
-                let result = self.engine.lock().await.load_track(deck, &path).await;
-                info!("Track loaded");
-                self.create_response(result, None)
-            }
-            Command::Play { deck } => {
-                info!("About to play deck {:?}", deck);
-                let result = self.engine.lock().await.play(deck);
-                info!("Play command completed for deck {:?}: {:?}", deck, result);
-                if result.is_ok() {
-                    if let Some(hash) = self.state.lock().await.current_hash().cloned() {
-                        write_fact(
-                            &self.acid_client,
-                            &hash,
-                            MusicValue::TrackStarted(StartReason::OnRequest),
-                        );
+            Command::LoadTrack { .. }
+            | Command::SetVolume { .. }
+            | Command::Unload { .. }
+            | Command::Seek { .. } => Response::Err {
+                message: "This command is not supported in split-architecture mode".into(),
+            },
+            Command::Play { deck: _ } => {
+                info!("Play command");
+                let effects = {
+                    let mut sm = self.state.lock().await;
+                    match sm.state() {
+                        PlaybackState::Paused { .. } => sm.resume(),
+                        PlaybackState::Playing { .. } => vec![],
+                        PlaybackState::Idle => {
+                            // No track loaded via state machine — treat as no-op
+                            warn!("Play command received while Idle and no queue entry");
+                            vec![]
+                        }
                     }
-                }
+                };
+                let result =
+                    execute_effects(effects, &self.audio, &self.event_pub, &self.acid_client).await;
                 self.create_response(result, None)
             }
             // ---------------------------------------------------------------
@@ -206,49 +191,32 @@ impl Server {
                 info!("Stopping playback");
                 let effects = self.state.lock().await.stop();
                 let result =
-                    execute_effects(effects, &self.engine, &self.event_pub, &self.acid_client)
-                        .await;
+                    execute_effects(effects, &self.audio, &self.event_pub, &self.acid_client).await;
                 self.create_response(result, None)
             }
             Command::Pause { deck: _ } => {
                 info!("Pausing playback");
                 let effects = self.state.lock().await.pause();
                 let result =
-                    execute_effects(effects, &self.engine, &self.event_pub, &self.acid_client)
-                        .await;
+                    execute_effects(effects, &self.audio, &self.event_pub, &self.acid_client).await;
                 self.create_response(result, None)
             }
             Command::Resume { deck: _ } => {
                 info!("Resuming playback");
                 let effects = self.state.lock().await.resume();
                 let result =
-                    execute_effects(effects, &self.engine, &self.event_pub, &self.acid_client)
-                        .await;
+                    execute_effects(effects, &self.audio, &self.event_pub, &self.acid_client).await;
                 self.create_response(result, None)
             }
-            Command::SetVolume { deck, volume } => {
-                info!("Setting volume on deck {:?}", deck);
-                let result = self.engine.lock().await.set_volume(deck, volume);
-                self.create_response(result, None)
-            }
-            Command::Unload { deck } => {
-                info!("Unloading deck {:?}", deck);
-                let result = self.engine.lock().await.unload_track(deck);
-                self.create_response(result, None)
-            }
-            Command::Seek { deck, position } => {
-                info!("Seeking deck {:?} to position {}", deck, position);
-                let result = self.engine.lock().await.seek(deck, position);
-                self.create_response(result, None)
-            }
-            Command::GetLength { deck } => {
-                info!("Getting length for deck {:?}", deck);
-                match self.engine.lock().await.duration_ms(deck) {
-                    Some(ms) => Response::Ok {
-                        data: Some(ResponseData::Length(ms as usize)),
+            Command::GetLength { deck: _ } => {
+                info!("Getting length");
+                match self.audio.lock().await.loaded() {
+                    Ok(Some(info)) => Response::Ok {
+                        data: info.duration_ms.map(|d| ResponseData::Length(d as usize)),
                     },
-                    None => Response::Err {
-                        message: PlaybackError::NoTrackLoaded(deck).to_string(),
+                    Ok(None) => Response::Ok { data: None },
+                    Err(e) => Response::Err {
+                        message: e.to_string(),
                     },
                 }
             }
@@ -273,7 +241,7 @@ impl Server {
                 self.ok_response()
             }
             Command::QueueList => {
-                let hashes: Vec<ContentHash> = self
+                let hashes: Vec<media_protocol::ContentHash> = self
                     .queue
                     .lock()
                     .await
@@ -344,7 +312,7 @@ impl Server {
                             .play_queue(e.hash.clone(), e.path.clone());
                         let result = execute_effects(
                             effects,
-                            &self.engine,
+                            &self.audio,
                             &self.event_pub,
                             &self.acid_client,
                         )
@@ -375,8 +343,7 @@ impl Server {
                 };
                 let effects = self.state.lock().await.skip(next);
                 let result =
-                    execute_effects(effects, &self.engine, &self.event_pub, &self.acid_client)
-                        .await;
+                    execute_effects(effects, &self.audio, &self.event_pub, &self.acid_client).await;
                 self.create_response(result, None)
             }
             Command::GetSession => {
@@ -393,13 +360,10 @@ impl Server {
             }
             Command::ListAudioOutputs => {
                 info!("Listing audio outputs");
-                match self.engine.lock().await.list_outputs() {
-                    Ok(sinks) => {
-                        let sink_infos = sinks.into_iter().map(audio_sink_to_protocol).collect();
-                        Response::Ok {
-                            data: Some(ResponseData::AudioOutputs(sink_infos)),
-                        }
-                    }
+                match self.audio.lock().await.list_outputs() {
+                    Ok(sinks) => Response::Ok {
+                        data: Some(ResponseData::AudioOutputs(sinks)),
+                    },
                     Err(e) => Response::Err {
                         message: e.to_string(),
                     },
@@ -407,11 +371,9 @@ impl Server {
             }
             Command::SetAudioOutput { device_name } => {
                 info!("Setting audio output to {:?}", device_name);
-                match self.engine.lock().await.set_output(device_name) {
+                match self.audio.lock().await.set_output(device_name) {
                     Ok(config) => Response::Ok {
-                        data: Some(ResponseData::AudioOutput(audio_output_config_to_protocol(
-                            config,
-                        ))),
+                        data: Some(ResponseData::AudioOutput(config)),
                     },
                     Err(e) => Response::Err {
                         message: e.to_string(),
@@ -420,11 +382,13 @@ impl Server {
             }
             Command::GetAudioOutput => {
                 info!("Getting current audio output");
-                let config = self.engine.lock().await.get_output().clone();
-                Response::Ok {
-                    data: Some(ResponseData::AudioOutput(audio_output_config_to_protocol(
-                        config,
-                    ))),
+                match self.audio.lock().await.get_output() {
+                    Ok(config) => Response::Ok {
+                        data: Some(ResponseData::AudioOutput(config)),
+                    },
+                    Err(e) => Response::Err {
+                        message: e.to_string(),
+                    },
                 }
             }
         }
@@ -436,7 +400,7 @@ impl Server {
 
     fn create_response(
         &self,
-        result: Result<(), PlaybackError>,
+        result: Result<(), ServerError>,
         data: Option<ResponseData>,
     ) -> Response {
         match result {
@@ -457,25 +421,36 @@ impl Server {
 /// Execute a list of effects produced by the state machine.
 async fn execute_effects(
     effects: Vec<PlaybackEffect>,
-    engine: &Arc<Mutex<PlaybackEngine>>,
+    audio: &Arc<Mutex<StreamClient>>,
     event_pub: &nng::Socket,
     acid_client: &AcidClient,
-) -> Result<(), PlaybackError> {
+) -> Result<(), ServerError> {
     for effect in effects {
         match effect {
             PlaybackEffect::StopEngine => {
-                engine.lock().await.stop(Deck::A)?;
+                let guard = audio.lock().await;
+                if let Err(e) = guard.stop() {
+                    warn!("Failed to stop audio: {e}");
+                }
+            }
+            PlaybackEffect::PauseEngine => {
+                if let Err(e) = audio.lock().await.pause() {
+                    warn!("Failed to pause audio: {e}");
+                }
             }
             PlaybackEffect::PlayEngine => {
-                let mut eng = engine.lock().await;
-                eng.set_stream_active(true);
-                eng.play(Deck::A)?;
+                let guard = audio.lock().await;
+                if let Err(e) = guard.play() {
+                    warn!("Failed to play audio: {e}");
+                }
             }
-            PlaybackEffect::LoadAndPlay { hash: _, path } => {
-                let mut eng = engine.lock().await;
-                eng.set_stream_active(true);
-                eng.load_track(Deck::A, &path).await?;
-                eng.play(Deck::A)?;
+            PlaybackEffect::LoadAndPlay { hash, path: _ } => {
+                let client = audio.lock().await;
+                if let Err(e) = client.load(hash.clone()) {
+                    warn!("Failed to load {hash}: {e}");
+                } else if let Err(e) = client.play() {
+                    warn!("Failed to play after load: {e}");
+                }
             }
             PlaybackEffect::EmitEvent(event) => {
                 publish_event_on_socket(event_pub, &event);
@@ -523,12 +498,12 @@ fn persist_queue_to_file(queue_file: &Path, queue: &VecDeque<QueueEntry>) {
     }
 }
 
-/// Polls deck A every 200 ms. When the track reaches `Finished`, pops the next
+/// Polls the audio source every 200 ms. When the track reaches `Finished`, pops the next
 /// entry from the queue and starts playing it automatically.
 /// Auto-advance is suppressed while playback is paused (state machine handles this).
 /// Every 5th poll iteration (~1 s) broadcasts a `PositionUpdate` event while playing.
 async fn auto_advance_task(
-    engine: Arc<Mutex<PlaybackEngine>>,
+    audio: Arc<Mutex<StreamClient>>,
     queue: Arc<Mutex<VecDeque<QueueEntry>>>,
     state: Arc<Mutex<PlaybackStateMachine>>,
     event_pub: nng::Socket,
@@ -536,7 +511,6 @@ async fn auto_advance_task(
     queue_file: PathBuf,
 ) {
     let mut tick: u8 = 0;
-    let mut idle_since: Option<tokio::time::Instant> = None;
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
         tick = tick.wrapping_add(1);
@@ -547,63 +521,46 @@ async fn auto_advance_task(
             if let PlaybackState::Playing { hash } = current_state.state() {
                 let h = hash.clone();
                 drop(current_state);
-                let eng = engine.lock().await;
-                if let (Some(position_ms), Some(duration_ms)) =
-                    (eng.position_ms(Deck::A), eng.duration_ms(Deck::A))
-                {
-                    drop(eng);
-                    publish_event_on_socket(
-                        &event_pub,
-                        &PlaybackEvent::PositionUpdate {
-                            hash: h.clone(),
-                            position_ms,
-                            duration_ms,
-                        },
-                    );
+                if let Ok(Some(ref info)) = audio.lock().await.loaded() {
+                    if let (Some(position_ms), Some(duration_ms)) =
+                        (info.position_ms, info.duration_ms)
+                    {
+                        publish_event_on_socket(
+                            &event_pub,
+                            &PlaybackEvent::PositionUpdate {
+                                hash: h.clone(),
+                                position_ms,
+                                duration_ms,
+                            },
+                        );
+                    }
                 }
             }
         }
 
-        // Check whether the current state is Playing before checking engine.
+        // Check whether the current state is Playing before checking audio source.
         // If Paused or Idle, do not auto-advance.
         {
             let current_state = state.lock().await;
             match current_state.state() {
-                PlaybackState::Playing { .. } => {
-                    // If the stream was deactivated during idle, reactivate it now.
-                    // The engine is the source of truth for stream active state.
-                    if !engine.lock().await.is_stream_active() {
-                        engine.lock().await.set_stream_active(true);
-                        idle_since = None;
-                        info!("Stream reactivated: playback resumed");
-                    } else {
-                        idle_since = None;
-                    }
-                }
+                PlaybackState::Playing { .. } => {}
                 PlaybackState::Paused { .. } => {
-                    idle_since = None;
                     continue;
                 }
                 PlaybackState::Idle => {
-                    // Track idle start time.
-                    if idle_since.is_none() {
-                        idle_since = Some(tokio::time::Instant::now());
-                    }
-                    // Deactivate stream after 5 seconds of idle.
-                    if let Some(since) = idle_since {
-                        if since.elapsed() >= Duration::from_secs(5)
-                            && engine.lock().await.is_stream_active()
-                        {
-                            engine.lock().await.set_stream_active(false);
-                            info!("Stream deactivated: idle for 5 seconds");
-                        }
-                    }
                     continue;
                 }
             }
         }
 
-        let finished = engine.lock().await.is_track_finished(Deck::A);
+        let finished = match audio.lock().await.loaded() {
+            Ok(Some(ref info)) => matches!(info.state, StreamPlaybackState::Finished),
+            Ok(None) => false,
+            Err(e) => {
+                warn!("Failed to poll audio source: {e}");
+                false
+            }
+        };
         if !finished {
             continue;
         }
@@ -625,7 +582,7 @@ async fn auto_advance_task(
         // Drive the state machine.
         let effects = state.lock().await.track_ended(next);
 
-        if let Err(e) = execute_effects(effects, &engine, &event_pub, &acid_client).await {
+        if let Err(e) = execute_effects(effects, &audio, &event_pub, &acid_client).await {
             warn!("Auto-advance failed: {}", e);
         }
     }
@@ -636,15 +593,12 @@ mod tests {
     use super::*;
     use acid_client::AcidClient;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn make_server() -> Server {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("audio_config.json");
-        let engine = PlaybackEngine::new(config_path).unwrap();
-        let engine = Arc::new(Mutex::new(engine));
         let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
         let event_pub = nng::Socket::new(nng::Protocol::Pub0).unwrap();
         // Create a dummy ACID listener so the client can connect.
@@ -653,8 +607,20 @@ mod tests {
         acid_listen.listen(&acid_addr).unwrap();
         let acid_client = Arc::new(AcidClient::connect(&acid_addr).unwrap());
         std::mem::forget(acid_listen);
+
+        // Create a dummy audio source (Req0 side of a Rep0/Req0 pair).
+        // The StreamClient connects to a stub that we never actually read from in these
+        // state-machine-only tests, so we just create a socket that listens but is never used.
+        let audio_stub = nng::Socket::new(nng::Protocol::Rep0).unwrap();
+        let audio_addr = format!("ipc:///tmp/test_audio_{}_{}.sock", std::process::id(), id);
+        audio_stub.listen(&audio_addr).unwrap();
+        std::mem::forget(audio_stub);
+
+        let audio_client = StreamClient::connect(&audio_addr).unwrap();
+        let audio = Arc::new(tokio::sync::Mutex::new(audio_client));
+
         Server::new(
-            engine,
+            audio,
             socket,
             PathBuf::from("/tmp/test_queue.json"),
             event_pub,
@@ -672,7 +638,7 @@ mod tests {
         // Drive the state machine directly into Paused.
         {
             let mut sm = server.state.lock().await;
-            let hash = ContentHash::new("sha256:test");
+            let hash = media_protocol::ContentHash::new("sha256:test");
             let path = PathBuf::from("/nonexistent/track.flac");
             sm.play_queue(hash, path);
             sm.pause();
@@ -686,17 +652,10 @@ mod tests {
             "Expected Paused state before Skip"
         );
 
-        // Issue Skip via state machine (engine stop may error on no-loaded track,
-        // but state must still transition to Idle).
-        let effects = server.state.lock().await.skip(None);
-        // Ignore engine errors — we only care about the state transition.
-        let _ = execute_effects(
-            effects,
-            &server.engine,
-            &server.event_pub,
-            &server.acid_client,
-        )
-        .await;
+        // Issue Skip directly on the state machine.
+        // We skip effects execution entirely — the audio stub doesn't respond,
+        // and we only care about the state transition here.
+        let _effects = server.state.lock().await.skip(None);
 
         assert!(
             matches!(server.state.lock().await.state(), PlaybackState::Idle),
@@ -704,73 +663,19 @@ mod tests {
         );
     }
 
+    /// Verify state machine transitions work for stop/resume without involving audio.
     #[tokio::test]
-    #[ignore]
-    async fn handle_nonexistent_track() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("audio_config.json");
-        let engine = PlaybackEngine::new(config_path).unwrap();
-        let engine = Arc::new(Mutex::new(engine));
-
-        let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
-        let event_pub = nng::Socket::new(nng::Protocol::Pub0).unwrap();
-        let acid_listen = nng::Socket::new(nng::Protocol::Rep0).unwrap();
-        let acid_addr = format!("ipc:///tmp/test_acid_ignored_{}.sock", std::process::id());
-        acid_listen.listen(&acid_addr).unwrap();
-        let acid_client = Arc::new(AcidClient::connect(&acid_addr).unwrap());
-        std::mem::forget(acid_listen);
-        let server = Server::new(
-            engine,
-            socket,
-            PathBuf::from("/tmp/test_queue.json"),
-            event_pub,
-            acid_client,
-        );
-
-        let nonexistent_path = PathBuf::from("/this/file/does/not/exist.flac");
-        let command = Command::LoadTrack {
-            path: nonexistent_path.clone(),
-            deck: playback_engine::Deck::A,
-        };
-
-        let response = server.handle_command(command).await;
-        match response {
-            Response::Err { message } => {
-                assert!(
-                    message.contains("No such file or directory"),
-                    "Error message '{}' should contain 'No such file or directory'",
-                    message
-                );
-            }
-            Response::Ok { .. } => panic!("Expected Err response for nonexistent track"),
-        }
-    }
-
-    #[tokio::test]
-    async fn get_length_with_no_track_returns_error() {
+    async fn stop_from_idle_is_noop_at_server_level() {
         let server = make_server();
-        let response = server
-            .handle_command(Command::GetLength {
-                deck: playback_engine::Deck::A,
-            })
-            .await;
+        // State starts Idle; stop from Idle should produce no effects and remain Idle.
+        let effects = server.state.lock().await.stop();
         assert!(
-            matches!(response, Response::Err { .. }),
-            "Expected Err when no track is loaded on deck A"
+            effects.is_empty(),
+            "Stop from Idle should produce no effects"
         );
-    }
-
-    #[tokio::test]
-    async fn get_length_with_no_track_returns_error_deck_b() {
-        let server = make_server();
-        let response = server
-            .handle_command(Command::GetLength {
-                deck: playback_engine::Deck::B,
-            })
-            .await;
         assert!(
-            matches!(response, Response::Err { .. }),
-            "Expected Err when no track is loaded on deck B"
+            matches!(server.state.lock().await.state(), PlaybackState::Idle),
+            "Expected Idle after Stop from Idle"
         );
     }
 }

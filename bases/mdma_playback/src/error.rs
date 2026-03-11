@@ -8,8 +8,8 @@ pub enum ServerError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("Playback error: {0}")]
-    Playback(#[from] playback_engine::PlaybackError),
+    #[error("Stream source error: {0}")]
+    Stream(String),
 }
 
 impl From<(nng::Message, nng::Error)> for ServerError {
@@ -21,5 +21,19 @@ impl From<(nng::Message, nng::Error)> for ServerError {
 impl From<nng::Error> for ServerError {
     fn from(err: nng::Error) -> Self {
         ServerError::Nng(err.to_string())
+    }
+}
+
+impl ServerError {
+    pub fn from_nng(e: nng::Error) -> Self {
+        ServerError::Nng(e.to_string())
+    }
+
+    pub fn from_json(e: serde_json::Error) -> Self {
+        ServerError::Json(e)
+    }
+
+    pub fn stream(msg: impl Into<String>) -> Self {
+        ServerError::Stream(msg.into())
     }
 }

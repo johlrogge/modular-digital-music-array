@@ -14,6 +14,7 @@ pub enum PlaybackState {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlaybackEffect {
     StopEngine,
+    PauseEngine,
     PlayEngine,
     LoadAndPlay {
         hash: ContentHash,
@@ -213,7 +214,7 @@ impl PlaybackStateMachine {
             PlaybackState::Playing { hash } => {
                 self.state = PlaybackState::Paused { hash: hash.clone() };
                 vec![
-                    PlaybackEffect::StopEngine,
+                    PlaybackEffect::PauseEngine,
                     PlaybackEffect::EmitEvent(PlaybackEvent::TrackPaused { hash: hash.clone() }),
                 ]
             }
@@ -578,6 +579,9 @@ mod tests {
         assert!(matches!(sm.state(), PlaybackState::Paused { hash } if *hash == hash_a()));
         assert!(!sm.is_playing());
         assert!(effects
+            .iter()
+            .any(|e| matches!(e, PlaybackEffect::PauseEngine)));
+        assert!(!effects
             .iter()
             .any(|e| matches!(e, PlaybackEffect::StopEngine)));
         assert!(effects.iter().any(|e| matches!(e,
