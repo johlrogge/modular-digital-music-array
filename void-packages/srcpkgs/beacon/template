@@ -1,7 +1,7 @@
 # Template file for beacon package
 pkgname=beacon
 version=0.5.4
-revision=1
+revision=2
 archs="aarch64"
 build_style=cargo
 hostmakedepends="cargo"
