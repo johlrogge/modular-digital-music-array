@@ -83,6 +83,7 @@ fn forward_raw(backend: &nng::Socket, request_bytes: &[u8]) -> Result<Vec<u8>, S
 ///
 /// Returns `Ok(response)` on success, or `Err(GatewayResponse::Error { .. })` on any failure
 /// so callers can propagate an error envelope without extra boilerplate.
+#[allow(clippy::result_large_err)]
 fn forward_typed<Req, Resp>(
     backend: &nng::Socket,
     request: &Req,

@@ -40,11 +40,11 @@ pub enum Command {
     // Queue management — queue feeds deck A only
     QueueNext {
         hash: ContentHash,
-        path: PathBuf,
+        source: String,
     },
     QueueAppend {
         hash: ContentHash,
-        path: PathBuf,
+        source: String,
     },
     QueueList,
     QueueClear,
@@ -53,7 +53,7 @@ pub enum Command {
     },
     /// Atomically replace the entire queue with a new ordered list.
     QueueReplace {
-        entries: Vec<(ContentHash, PathBuf)>,
+        entries: Vec<(ContentHash, String)>,
     },
     /// Pop from queue head, load on deck A, and start playing.
     PlayQueue,

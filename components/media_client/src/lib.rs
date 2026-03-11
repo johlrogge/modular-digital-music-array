@@ -94,12 +94,12 @@ impl MediaClient {
         })
     }
 
-    pub fn queue_next(&self, hash: ContentHash, path: PathBuf) -> Result<(), ClientError> {
-        self.send_command(Command::QueueNext { hash, path })
+    pub fn queue_next(&self, hash: ContentHash, source: String) -> Result<(), ClientError> {
+        self.send_command(Command::QueueNext { hash, source })
     }
 
-    pub fn queue_append(&self, hash: ContentHash, path: PathBuf) -> Result<(), ClientError> {
-        self.send_command(Command::QueueAppend { hash, path })
+    pub fn queue_append(&self, hash: ContentHash, source: String) -> Result<(), ClientError> {
+        self.send_command(Command::QueueAppend { hash, source })
     }
 
     pub fn queue_list(&self) -> Result<Vec<ContentHash>, ClientError> {
@@ -116,7 +116,7 @@ impl MediaClient {
         self.send_command(Command::QueueClear)
     }
 
-    pub fn queue_replace(&self, entries: Vec<(ContentHash, PathBuf)>) -> Result<(), ClientError> {
+    pub fn queue_replace(&self, entries: Vec<(ContentHash, String)>) -> Result<(), ClientError> {
         self.send_command(Command::QueueReplace { entries })
     }
 

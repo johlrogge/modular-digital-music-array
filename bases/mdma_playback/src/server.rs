@@ -19,7 +19,7 @@ use crate::stream_client::StreamClient;
 
 struct QueueEntry {
     hash: media_protocol::ContentHash,
-    path: PathBuf,
+    source: String,
 }
 
 fn write_fact(acid_client: &AcidClient, hash: &media_protocol::ContentHash, value: MusicValue) {
@@ -37,7 +37,7 @@ fn write_fact(acid_client: &AcidClient, hash: &media_protocol::ContentHash, valu
 #[derive(Serialize, Deserialize)]
 struct PersistEntry {
     hash: String,
-    path: String,
+    source: String,
 }
 
 pub struct Server {
@@ -104,15 +104,10 @@ impl Server {
 
         let mut queue = VecDeque::new();
         for e in entries {
-            let path = PathBuf::from(&e.path);
-            if path.exists() {
-                queue.push_back(QueueEntry {
-                    hash: media_protocol::ContentHash::new(e.hash),
-                    path,
-                });
-            } else {
-                warn!("Skipping missing queue entry: {}", e.path);
-            }
+            queue.push_back(QueueEntry {
+                hash: media_protocol::ContentHash::new(e.hash),
+                source: e.source,
+            });
         }
         info!("Restored {} track(s) from queue file", queue.len());
         queue
@@ -220,20 +215,20 @@ impl Server {
                     },
                 }
             }
-            Command::QueueNext { hash, path } => {
-                info!("Queue next: {:?}", path);
+            Command::QueueNext { hash, source } => {
+                info!("Queue next: hash={:?} source={:?}", hash, source);
                 let mut queue = self.queue.lock().await;
-                queue.push_front(QueueEntry { hash, path });
+                queue.push_front(QueueEntry { hash, source });
                 self.persist_queue(&queue);
                 self.publish_event(&PlaybackEvent::QueueChanged {
                     length: queue.len(),
                 });
                 self.ok_response()
             }
-            Command::QueueAppend { hash, path } => {
-                info!("Queue append: {:?}", path);
+            Command::QueueAppend { hash, source } => {
+                info!("Queue append: hash={:?} source={:?}", hash, source);
                 let mut queue = self.queue.lock().await;
-                queue.push_back(QueueEntry { hash, path });
+                queue.push_back(QueueEntry { hash, source });
                 self.persist_queue(&queue);
                 self.publish_event(&PlaybackEvent::QueueChanged {
                     length: queue.len(),
@@ -278,8 +273,8 @@ impl Server {
             Command::QueueReplace { entries } => {
                 let mut queue = self.queue.lock().await;
                 queue.clear();
-                for (hash, path) in entries {
-                    queue.push_back(QueueEntry { hash, path });
+                for (hash, source) in entries {
+                    queue.push_back(QueueEntry { hash, source });
                 }
                 let n = queue.len();
                 self.persist_queue(&queue);
@@ -309,7 +304,7 @@ impl Server {
                             .state
                             .lock()
                             .await
-                            .play_queue(e.hash.clone(), e.path.clone());
+                            .play_queue(e.hash.clone(), e.source.clone());
                         let result = execute_effects(
                             effects,
                             &self.audio,
@@ -339,7 +334,7 @@ impl Server {
                             length: queue.len(),
                         });
                     }
-                    e.map(|entry| (entry.hash, entry.path))
+                    e.map(|entry| (entry.hash, entry.source))
                 };
                 let effects = self.state.lock().await.skip(next);
                 let result =
@@ -444,7 +439,8 @@ async fn execute_effects(
                     warn!("Failed to play audio: {e}");
                 }
             }
-            PlaybackEffect::LoadAndPlay { hash, path: _ } => {
+            PlaybackEffect::LoadAndPlay { hash, source: _ } => {
+                // Phase 4: single source, always route to mdma-audio
                 let client = audio.lock().await;
                 if let Err(e) = client.load(hash.clone()) {
                     warn!("Failed to load {hash}: {e}");
@@ -476,7 +472,7 @@ fn persist_queue_to_file(queue_file: &Path, queue: &VecDeque<QueueEntry>) {
         .iter()
         .map(|e| PersistEntry {
             hash: e.hash.as_str().to_owned(),
-            path: e.path.to_string_lossy().into_owned(),
+            source: e.source.clone(),
         })
         .collect();
 
@@ -576,7 +572,7 @@ async fn auto_advance_task(
                     &PlaybackEvent::QueueChanged { length: q.len() },
                 );
             }
-            entry.map(|e| (e.hash, e.path))
+            entry.map(|e| (e.hash, e.source))
         };
 
         // Drive the state machine.
@@ -592,7 +588,6 @@ async fn auto_advance_task(
 mod tests {
     use super::*;
     use acid_client::AcidClient;
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -639,8 +634,7 @@ mod tests {
         {
             let mut sm = server.state.lock().await;
             let hash = media_protocol::ContentHash::new("sha256:test");
-            let path = PathBuf::from("/nonexistent/track.flac");
-            sm.play_queue(hash, path);
+            sm.play_queue(hash, "audio".to_string());
             sm.pause();
         }
 

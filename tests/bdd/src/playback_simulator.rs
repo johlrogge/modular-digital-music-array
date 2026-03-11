@@ -5,13 +5,12 @@
 
 use media_protocol::{Command, ContentHash, Response, ResponseData};
 use std::collections::VecDeque;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// Shared state for the playback simulator.
 #[derive(Debug, Default)]
 pub struct PlaybackState {
-    pub queue: VecDeque<(ContentHash, PathBuf)>,
+    pub queue: VecDeque<(ContentHash, String)>,
     pub now_playing: Option<ContentHash>,
 }
 
@@ -70,12 +69,12 @@ fn handle_command(cmd: Command, state: &Arc<Mutex<PlaybackState>>) -> Response {
     let mut s = state.lock().unwrap();
 
     match cmd {
-        Command::QueueAppend { hash, path } => {
-            s.queue.push_back((hash, path));
+        Command::QueueAppend { hash, source } => {
+            s.queue.push_back((hash, source));
             ok_response()
         }
-        Command::QueueNext { hash, path } => {
-            s.queue.push_front((hash, path));
+        Command::QueueNext { hash, source } => {
+            s.queue.push_front((hash, source));
             ok_response()
         }
         Command::QueueList => {
@@ -101,7 +100,7 @@ fn handle_command(cmd: Command, state: &Arc<Mutex<PlaybackState>>) -> Response {
             ok_response()
         }
         Command::PlayQueue => {
-            if let Some((hash, _path)) = s.queue.pop_front() {
+            if let Some((hash, _source)) = s.queue.pop_front() {
                 s.now_playing = Some(hash);
                 ok_response()
             } else {
