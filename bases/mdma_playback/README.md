@@ -1,6 +1,6 @@
 # mdma-playback
 
-Real-time audio playback server for MDMA. Decodes audio using Symphonia, resamples to 192 kHz with rubato, and outputs via PipeWire to the iFi USB DAC.
+Pure queue manager for MDMA (v0.5.0). Accepts play/stop/queue commands over NNG IPC and drives audio source services via `StreamClient`. Has no direct dependency on `playback_engine` — audio decoding and output is handled by `mdma-audio` and other future sources.
 
 [Back to workspace README](../../README.md)
 
@@ -9,19 +9,23 @@ Real-time audio playback server for MDMA. Decodes audio using Symphonia, resampl
 ## What it does
 
 - Accepts play/stop/queue commands over NNG IPC from the gateway
-- Decodes FLAC, WAV, AIFF, and MP3 via Symphonia
-- Upsamples all sources to 192 kHz using rubato (high-quality sinc resampler)
-- Outputs a fixed-rate 192 kHz PipeWire stream — the DAC always sees full resolution
-- Probes the iFi DAC's maximum supported rate at startup; falls back to 192 kHz if probing fails
+- Drives audio sources (e.g. `mdma-audio`) via `StreamClient` using `stream_source_protocol`
+- Queue entries carry a `source` field (default `"audio"`) identifying which source service handles playback
 - Publishes playback events (TrackStarted, TrackEnded, TrackStopped, QueueChanged) on a Pub0 socket for live clients
 - Writes `Played` and `Skipped` facts to the fact stream on track end and manual stop
-- Persists the queue to `queue.json` on every mutation; restores on restart
+- Persists the queue to `/metadata/queue.json` on every mutation; restores on restart
 
 ## IPC interface
 
 Listens on `ipc:///run/mdma/playback.sock`. Accepts `PlaybackCommand` messages (protobuf via `media_protocol`). Not directly accessible externally — all traffic is routed through the gateway on TCP port 5555.
 
 Event socket: `ipc:///run/mdma/playback-events.sock` (Pub0). The gateway bridges this to TCP port 5556.
+
+Connects to `mdma-audio` at `ipc:///run/mdma/streams/audio.sock` (and any other sources registered under `/run/mdma/streams/`).
+
+## Service startup order
+
+`mdma-audio` must be running before `mdma-playback` starts. Full order: mdma-library → mdma-audio → mdma-playback.
 
 ## Build
 
@@ -42,4 +46,4 @@ just deploy-playback
 cargo run --package mdma-playback
 ```
 
-The service requires PipeWire running on the host. On the Pi, WirePlumber is started via a runit service with a `context.exec` drop-in for headless operation.
+The service requires `mdma-audio` (or another source service) to be running and listening on its IPC socket.
