@@ -1,5 +1,7 @@
 use crate::now_playing::NowPlaying;
 use crate::pane::Pane;
+use mdma_client::LibraryBackend;
+use std::rc::Rc;
 
 /// Which side of the split layout is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,10 +32,16 @@ pub struct App {
     pub command_input: String,
     pub filter_input: String,
     pub should_quit: bool,
+    /// Shared library backend, used for opening new panes (e.g. PlaylistPane).
+    pub library: Rc<LibraryBackend>,
 }
 
 impl App {
-    pub fn new(left_pane: Box<dyn Pane>, right_pane: Box<dyn Pane>) -> Self {
+    pub fn new(
+        left_pane: Box<dyn Pane>,
+        right_pane: Box<dyn Pane>,
+        library: Rc<LibraryBackend>,
+    ) -> Self {
         Self {
             left_pane,
             right_pane,
@@ -44,6 +52,7 @@ impl App {
             command_input: String::new(),
             filter_input: String::new(),
             should_quit: false,
+            library,
         }
     }
 

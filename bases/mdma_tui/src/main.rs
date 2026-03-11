@@ -1,10 +1,15 @@
 mod app;
+mod browse_field;
+mod browser_pane;
 mod error;
 mod events;
 mod input;
 mod now_playing;
 mod pane;
+mod playlist_pane;
+mod playlists_pane;
 mod queue_pane;
+mod search_pane;
 mod selection;
 mod track_list;
 mod ui;
@@ -21,6 +26,7 @@ use events::{spawn_event_subscriber, AppEvent};
 use mdma_client::{LibraryBackend, PlaybackBackend};
 use queue_pane::QueuePane;
 use ratatui::{backend::CrosstermBackend, Terminal};
+use search_pane::SearchPane;
 use std::rc::Rc;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
@@ -81,13 +87,12 @@ fn main() -> Result<()> {
         .map(|node| spawn_event_subscriber(&event_addr_from_node(node)))
         .and_then(|r| r.ok());
 
-    // Build initial panes
-    let left_pane: Box<dyn pane::Pane> =
-        Box::new(QueuePane::new(Rc::clone(&playback), Rc::clone(&library)));
+    // Build initial panes: left = Search, right = Queue.
+    let left_pane: Box<dyn pane::Pane> = Box::new(SearchPane::new(Rc::clone(&library)));
     let right_pane: Box<dyn pane::Pane> =
         Box::new(QueuePane::new(Rc::clone(&playback), Rc::clone(&library)));
 
-    let mut app = App::new(left_pane, right_pane);
+    let mut app = App::new(left_pane, right_pane, Rc::clone(&library));
 
     // Terminal setup
     enable_raw_mode()?;

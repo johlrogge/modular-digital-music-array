@@ -14,6 +14,7 @@ path = "src/main.rs"
 ratatui = "0.29"
 crossterm = "0.28"
 mdma-client = { path = "../../components/mdma_client" }
+library-search = { path = "../../components/library_search" }
 event-protocol = { path = "../../components/event_protocol" }
 nng-transport = { path = "../../components/nng_transport" }
 nng = { workspace = true }

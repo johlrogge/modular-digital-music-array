@@ -2790,6 +2790,7 @@ dependencies = [
  "color-eyre",
  "crossterm",
  "event-protocol",
+ "library-search",
  "mdma-client",
  "nng",
  "nng-transport",
