@@ -1,13 +1,12 @@
 #!/bin/sh
 exec 2>&1
 sv check mdma-acid || exit 1
-sv check pipewire || exit 1
+sv check mdma-audio || exit 1
 sleep 1
 mkdir -p /run/mdma
 chown mdma:mdma /run/mdma
 rm -f /run/mdma/playback.sock
-export PIPEWIRE_RUNTIME_DIR=/run/pipewire
-cd /music
-exec chpst -u mdma:mdma:audio:video:_pipewire /usr/bin/mdma-playback \
-    --socket ipc:///run/mdma/playback.sock \
-    --acid-socket ipc:///run/mdma/acid.sock
+exec chpst -u mdma:mdma /usr/bin/mdma-playback \
+	--socket ipc:///run/mdma/playback.sock \
+	--acid-socket ipc:///run/mdma/acid.sock \
+	--audio-socket ipc:///run/mdma/streams/audio.sock

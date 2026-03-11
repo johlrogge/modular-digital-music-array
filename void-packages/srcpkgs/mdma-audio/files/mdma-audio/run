@@ -1,0 +1,14 @@
+#!/bin/sh
+exec 2>&1
+sv check mdma-library || exit 1
+sv check pipewire || exit 1
+sleep 1
+mkdir -p /run/mdma/streams
+chown mdma:mdma /run/mdma/streams
+rm -f /run/mdma/streams/audio.sock
+export PIPEWIRE_RUNTIME_DIR=/run/pipewire
+exec chpst -u mdma:mdma:audio:video:_pipewire /usr/bin/mdma-audio \
+	--socket ipc:///run/mdma/streams/audio.sock \
+	--library-socket ipc:///run/mdma/library.sock \
+	--music-dir /music \
+	--audio-config /metadata/audio-output.json
