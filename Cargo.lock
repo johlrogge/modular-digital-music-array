@@ -4118,6 +4118,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "stream-source-protocol"
+version = "0.1.0"
+dependencies = [
+ "music-primitives",
+ "playback-primitives",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "strength_reduce"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,13 @@
+[package]
+name = "stream-source-protocol"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+music-primitives = { path = "../music_primitives" }
+playback-primitives = { path = "../playback_primitives" }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+pretty_assertions = { workspace = true }

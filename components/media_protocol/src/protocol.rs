@@ -1,4 +1,4 @@
-use playback_primitives::{ContentHash, Deck, Volume};
+use playback_primitives::{AudioOutputConfig, AudioSinkInfo, ContentHash, Deck, Volume};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -91,19 +91,6 @@ pub enum ResponseData {
     Session(Option<String>),
     AudioOutputs(Vec<AudioSinkInfo>),
     AudioOutput(AudioOutputConfig),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AudioSinkInfo {
-    pub name: String,
-    pub description: String,
-    pub max_sample_rate: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AudioOutputConfig {
-    pub device_name: Option<String>,
-    pub sample_rate: u32,
 }
 
 #[cfg(test)]
@@ -244,8 +231,8 @@ mod tests {
     fn audio_outputs_response_data_serialization() {
         let sinks = vec![AudioSinkInfo {
             name: "alsa_output.pci-0000_00_1f.3.analog-stereo".to_string(),
-            description: "Built-in Audio Analog Stereo".to_string(),
-            max_sample_rate: 48000,
+            description: Some("Built-in Audio Analog Stereo".to_string()),
+            max_sample_rate: Some(48000),
         }];
         let data = ResponseData::AudioOutputs(sinks);
         let json = serde_json::to_string(&data).unwrap();
@@ -254,8 +241,11 @@ mod tests {
         if let ResponseData::AudioOutputs(sinks) = decoded {
             assert_eq!(sinks.len(), 1);
             assert_eq!(sinks[0].name, "alsa_output.pci-0000_00_1f.3.analog-stereo");
-            assert_eq!(sinks[0].description, "Built-in Audio Analog Stereo");
-            assert_eq!(sinks[0].max_sample_rate, 48000);
+            assert_eq!(
+                sinks[0].description.as_deref(),
+                Some("Built-in Audio Analog Stereo")
+            );
+            assert_eq!(sinks[0].max_sample_rate, Some(48000));
         }
     }
 
@@ -263,7 +253,8 @@ mod tests {
     fn audio_output_response_data_serialization() {
         let config = AudioOutputConfig {
             device_name: Some("alsa_output.pci-0000_00_1f.3.analog-stereo".to_string()),
-            sample_rate: 44100,
+            sample_rate: Some(44100),
+            channels: None,
         };
         let data = ResponseData::AudioOutput(config);
         let json = serde_json::to_string(&data).unwrap();
@@ -274,12 +265,13 @@ mod tests {
                 cfg.device_name.as_deref(),
                 Some("alsa_output.pci-0000_00_1f.3.analog-stereo")
             );
-            assert_eq!(cfg.sample_rate, 44100);
+            assert_eq!(cfg.sample_rate, Some(44100));
         }
 
         let none_config = AudioOutputConfig {
             device_name: None,
-            sample_rate: 48000,
+            sample_rate: Some(48000),
+            channels: None,
         };
         let data2 = ResponseData::AudioOutput(none_config);
         let json2 = serde_json::to_string(&data2).unwrap();
@@ -287,7 +279,7 @@ mod tests {
         assert!(matches!(decoded2, ResponseData::AudioOutput(_)));
         if let ResponseData::AudioOutput(cfg) = decoded2 {
             assert!(cfg.device_name.is_none());
-            assert_eq!(cfg.sample_rate, 48000);
+            assert_eq!(cfg.sample_rate, Some(48000));
         }
     }
 

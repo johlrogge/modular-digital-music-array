@@ -2283,7 +2283,11 @@ fn handle_playback_outputs(media_client: &PlaybackBackend) -> Result<()> {
     for sink in &sinks {
         println!(
             "{:<40} {:<40} {}",
-            sink.name, sink.description, sink.max_sample_rate
+            sink.name,
+            sink.description.as_deref().unwrap_or("-"),
+            sink.max_sample_rate
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "-".to_string())
         );
     }
     Ok(())
@@ -2295,7 +2299,11 @@ fn handle_playback_set_output(media_client: &PlaybackBackend, name: &str) -> Res
         Err(e) => handle_playback_error(e),
     };
     let device = cfg.device_name.as_deref().unwrap_or("auto");
-    println!("Audio output set to: {} ({}Hz)", device, cfg.sample_rate);
+    let rate = cfg
+        .sample_rate
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    println!("Audio output set to: {} ({}Hz)", device, rate);
     Ok(())
 }
 
@@ -2305,7 +2313,11 @@ fn handle_playback_get_output(media_client: &PlaybackBackend) -> Result<()> {
         Err(e) => handle_playback_error(e),
     };
     let device = cfg.device_name.as_deref().unwrap_or("auto");
-    println!("{} ({}Hz)", device, cfg.sample_rate);
+    let rate = cfg
+        .sample_rate
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    println!("{} ({}Hz)", device, rate);
     Ok(())
 }
 

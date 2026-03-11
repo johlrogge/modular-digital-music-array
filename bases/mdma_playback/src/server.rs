@@ -20,15 +20,16 @@ use tracing::{info, warn};
 fn audio_output_config_to_protocol(c: playback_engine::AudioOutputConfig) -> AudioOutputConfig {
     AudioOutputConfig {
         device_name: c.device_name,
-        sample_rate: c.sample_rate,
+        sample_rate: Some(c.sample_rate),
+        channels: None,
     }
 }
 
 fn audio_sink_to_protocol(s: playback_engine::AudioSink) -> AudioSinkInfo {
     AudioSinkInfo {
         name: s.name,
-        description: s.description,
-        max_sample_rate: s.max_sample_rate,
+        description: Some(s.description),
+        max_sample_rate: Some(s.max_sample_rate),
     }
 }
 
