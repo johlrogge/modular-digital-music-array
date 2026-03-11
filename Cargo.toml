@@ -51,6 +51,7 @@ default-members = [
     "bases/mdma_gateway",
     "bases/mdma_library",
     "bases/mdma_playback",
+    "bases/mdma_audio",
 ]
 resolver = "2"
 

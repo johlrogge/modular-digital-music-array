@@ -673,6 +673,11 @@ setup-playback-sysroot:
 playback-cross: setup-playback-sysroot
     ./scripts/ci/build-playback.sh
 
+# Cross-compile audio source for aarch64 (needs PipeWire sysroot like playback)
+[group('build')]
+audio-cross: setup-playback-sysroot
+    ./scripts/ci/build-audio.sh
+
 # Cross-compile library service for aarch64
 [group('build')]
 library-cross: (cross "mdma-library" "Library")
@@ -729,6 +734,11 @@ deploy-library: library-cross
 [group('dev')]
 deploy-playback: playback-cross
     @just _deploy-svc mdma-playback mdma-playback
+
+# Deploy audio source to Pi
+[group('dev')]
+deploy-audio: audio-cross
+    @just _deploy-svc mdma-audio mdma-audio
 
 # Cross-compile gateway for aarch64
 [group('build')]
