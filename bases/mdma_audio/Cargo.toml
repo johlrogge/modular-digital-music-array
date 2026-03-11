@@ -1,0 +1,26 @@
+[package]
+name = "mdma-audio"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "mdma-audio"
+path = "src/main.rs"
+
+[dependencies]
+stream-source-protocol = { path = "../../components/stream_source_protocol" }
+playback-engine = { path = "../../components/playback_engine" }
+library-ipc-client = { path = "../../components/library_ipc_client" }
+music-primitives = { path = "../../components/music_primitives" }
+playback-primitives = { path = "../../components/playback_primitives" }
+nng = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+color-eyre = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = "3.8"

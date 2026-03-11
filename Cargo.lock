@@ -2450,6 +2450,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "mdma-audio"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "color-eyre",
+ "library-ipc-client",
+ "music-primitives",
+ "nng",
+ "playback-engine",
+ "playback-primitives",
+ "pretty_assertions",
+ "serde_json",
+ "stream-source-protocol",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mdma-bandcamp"
 version = "0.6.0"
 dependencies = [

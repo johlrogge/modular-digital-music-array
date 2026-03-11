@@ -37,6 +37,7 @@ members = [
     "bases/mdma_bandcamp",
     "bases/mdma_gateway",
     "bases/mdma_acid",
+    "bases/mdma_audio",
     # Tests
     "tests/bdd",
 ]
