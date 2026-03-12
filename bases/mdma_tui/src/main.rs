@@ -58,10 +58,6 @@ struct Cli {
     playback_socket: String,
 }
 
-fn event_addr_from_node(node: &str) -> String {
-    format!("tcp://{}:5556", node)
-}
-
 fn main() -> Result<()> {
     color_eyre::install()?;
     tracing_subscriber::fmt()
@@ -84,13 +80,12 @@ fn main() -> Result<()> {
             .map_err(|e| color_eyre::eyre::eyre!("Playback connect failed: {}", e))?,
     );
 
-    // Attempt to subscribe to playback events. Failure here is non-fatal;
-    // the TUI still works, just without live now-playing updates.
+    // Subscribe to playback events. Derives address from --node (same as CLI).
+    // Non-fatal: TUI still works without live updates if subscription fails.
     let event_rx = cli
         .node
         .as_deref()
-        .map(|node| spawn_event_subscriber(&event_addr_from_node(node)))
-        .and_then(|r| r.ok());
+        .and_then(|n| spawn_event_subscriber(&format!("tcp://{}:5556", n)).ok());
 
     // Build initial panes: left = Browser (Artists), right = Queue.
     let left_pane: Box<dyn pane::Pane> = Box::new(BrowserPane::new(Rc::clone(&library)));
