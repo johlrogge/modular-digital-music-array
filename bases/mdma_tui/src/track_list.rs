@@ -1,26 +1,13 @@
 use crate::selection::SelectionState;
+use crate::theme::{ACCENT2, BG_ELEVATED, TEXT_PRIMARY, TEXT_TERTIARY, WARNING};
 use mdma_client::TrackInfo;
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
-    text::Span,
+    text::{Line, Span},
     widgets::{Block, List, ListItem},
     Frame,
 };
-
-/// Format a `TrackInfo` as a single display line.
-///
-/// Format: `{artist} - {title}  {bpm}bpm  [{duration}]`
-pub fn format_track_line(track: &TrackInfo) -> String {
-    let artist = track.artist.as_deref().unwrap_or("Unknown Artist");
-    let title = track.title.as_deref().unwrap_or("Unknown Title");
-    let bpm_part = track.bpm.map(|b| format!("  {}bpm", b)).unwrap_or_default();
-    let dur_part = track
-        .duration
-        .map(|d| format!("  [{}]", d))
-        .unwrap_or_default();
-    format!("{} - {}{}{}", artist, title, bpm_part, dur_part)
-}
 
 /// Render a list of tracks respecting the SelectionState's visibility and selection.
 ///
@@ -38,29 +25,52 @@ pub fn render_track_list(
         .enumerate()
         .map(|(vis_idx, &data_idx)| {
             let track = &tracks[data_idx];
-            let line = format_track_line(track);
             let is_cursor = selection.cursor_position() == Some(vis_idx);
             let is_selected = selection.selected.contains(&vis_idx);
 
-            let style = if is_cursor && is_selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
+            let artist = track.artist.as_deref().unwrap_or("Unknown Artist");
+            let title = track.title.as_deref().unwrap_or("Unknown Title");
+
+            let (artist_color, title_color, meta_color, bg) = if is_cursor && is_selected {
+                (Color::Black, Color::Black, Color::Black, WARNING)
             } else if is_cursor {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+                (Color::Black, Color::Black, Color::Black, ACCENT2)
             } else if is_selected {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
+                (WARNING, WARNING, TEXT_TERTIARY, Color::Reset)
             } else {
-                Style::default()
+                (ACCENT2, TEXT_PRIMARY, TEXT_TERTIARY, Color::Reset)
             };
 
-            ListItem::new(Span::styled(line, style))
+            let mut spans = vec![
+                Span::styled(artist.to_string(), Style::default().fg(artist_color).bg(bg)),
+                Span::styled("  —  ", Style::default().fg(meta_color).bg(bg)),
+                Span::styled(
+                    title.to_string(),
+                    Style::default()
+                        .fg(title_color)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ];
+
+            if let Some(bpm) = track.bpm {
+                spans.push(Span::styled(
+                    format!("  {}bpm", bpm),
+                    Style::default().fg(meta_color).bg(bg),
+                ));
+            }
+            if let Some(dur) = track.duration {
+                spans.push(Span::styled(
+                    format!("  [{}]", dur),
+                    Style::default().fg(meta_color).bg(bg),
+                ));
+            }
+
+            ListItem::new(Line::from(spans)).style(Style::default().bg(if is_cursor {
+                BG_ELEVATED
+            } else {
+                Color::Reset
+            }))
         })
         .collect();
 

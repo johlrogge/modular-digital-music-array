@@ -12,6 +12,7 @@ mod playlists_pane;
 mod queue_pane;
 mod search_pane;
 mod selection;
+mod theme;
 mod track_list;
 mod ui;
 
@@ -138,6 +139,15 @@ fn main() -> Result<()> {
                             if app.right_pane.pane_kind() == PaneKind::Queue {
                                 app.right_pane.refresh();
                             }
+                        }
+                        // Resolve track metadata when a new track starts.
+                        if let PlaybackEvent::TrackStarted { hash } = &pe {
+                            let meta = library.get_track(hash);
+                            let (title, artist) = match meta {
+                                Ok(t) => (t.title, t.artist),
+                                Err(_) => (None, None),
+                            };
+                            app.now_playing.set_track_metadata(title, artist);
                         }
                         app.now_playing.apply(&pe);
                     }
