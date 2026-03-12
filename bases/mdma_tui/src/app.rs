@@ -25,6 +25,8 @@ pub enum InputMode {
     Palette,
     /// Typing a filter string (`s` prefix).
     FilterInput,
+    /// Help overlay visible; any key returns to Normal.
+    Help,
 }
 
 /// Application state.

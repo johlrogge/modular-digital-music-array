@@ -12,6 +12,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         InputMode::Normal => handle_normal(app, key),
         InputMode::Palette => handle_palette(app, key),
         InputMode::FilterInput => handle_filter(app, key),
+        InputMode::Help => app.mode = InputMode::Normal,
     }
 }
 
@@ -27,7 +28,7 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             app.open_palette();
         }
         KeyCode::Char('?') => {
-            app.open_palette();
+            app.mode = InputMode::Help;
         }
         KeyCode::Char('s') => {
             app.mode = InputMode::FilterInput;

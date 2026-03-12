@@ -43,6 +43,11 @@ pub fn render(f: &mut Frame, app: &App) {
     if app.mode == InputMode::Palette {
         render_palette_overlay(f, app, area);
     }
+
+    // Render the help overlay on top if active.
+    if app.mode == InputMode::Help {
+        render_help_overlay(f, area);
+    }
 }
 
 /// Render one pane side with an active/inactive border highlight.
@@ -105,7 +110,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("filter: ", Style::default().fg(Color::Magenta)),
             Span::raw(app.filter_input.as_str()),
         ]),
-        InputMode::Normal => {
+        InputMode::Normal | InputMode::Help => {
             if let Some(ref msg) = app.status_message {
                 Line::from(Span::styled(
                     msg.as_str(),
@@ -113,7 +118,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 ))
             } else {
                 Line::from(Span::styled(
-                    "q:quit  Tab:switch  a:add  s:filter  ?:cmds",
+                    "q:quit  Tab:switch  a:add  s:filter  ?:help",
                     Style::default().fg(Color::DarkGray),
                 ))
             }
@@ -257,4 +262,127 @@ fn render_palette_overlay(f: &mut Frame, app: &App, area: Rect) {
         list_state.select(Some(app.palette_cursor));
         f.render_stateful_widget(list, chunks[1], &mut list_state);
     }
+}
+
+/// Render a centred floating help overlay listing all key bindings.
+fn render_help_overlay(f: &mut Frame, area: Rect) {
+    // Fixed overlay dimensions.
+    const WIDTH: u16 = 60;
+
+    let key = |s: &'static str| Span::styled(s, Style::default().fg(Color::Cyan));
+    let desc = |s: &'static str| Span::styled(s, Style::default().fg(Color::Gray));
+    let header = |s: &'static str| {
+        Span::styled(
+            s,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let dim = |s: &'static str| Span::styled(s, Style::default().fg(Color::DarkGray));
+    let gap = Line::from("");
+
+    let lines: Vec<Line> = vec![
+        Line::from(header("  Navigation                  Selection")),
+        Line::from(vec![
+            key("  j / ↓ "),
+            desc("  cursor down         "),
+            key("x"),
+            desc("     extend down"),
+        ]),
+        Line::from(vec![
+            key("  k / ↑ "),
+            desc("  cursor up           "),
+            key("X"),
+            desc("     extend up"),
+        ]),
+        Line::from(vec![
+            key("  Tab   "),
+            desc("  switch pane         "),
+            key("%"),
+            desc("     select all"),
+        ]),
+        Line::from(vec![
+            Span::raw("                       "),
+            key("Esc"),
+            desc("   clear / pop filter"),
+        ]),
+        gap.clone(),
+        Line::from(header("  Actions                     Pane switching")),
+        Line::from(vec![
+            key("  a     "),
+            desc("  add to queue        "),
+            key(":search"),
+            desc("   search pane"),
+        ]),
+        Line::from(vec![
+            key("  s     "),
+            desc("  filter              "),
+            key(":browser"),
+            desc("  browser pane"),
+        ]),
+        Line::from(vec![
+            key("  /     "),
+            desc("  search              "),
+            key(":queue"),
+            desc("    queue pane"),
+        ]),
+        Line::from(vec![
+            key("  :     "),
+            desc("  command palette     "),
+            key(":playlists"),
+            desc(" playlist list"),
+        ]),
+        Line::from(vec![key("  ?     "), desc("  this help")]),
+        Line::from(vec![key("  q     "), desc("  quit")]),
+        gap.clone(),
+        Line::from(vec![
+            Span::raw("  "),
+            header("Playback commands: "),
+            key(":play"),
+            Span::raw("  "),
+            key(":pause"),
+            Span::raw("  "),
+            key(":stop"),
+            Span::raw("  "),
+            key(":next"),
+            Span::raw("  "),
+            key(":clear"),
+        ]),
+        gap.clone(),
+        Line::from(vec![
+            Span::raw("                    "),
+            dim("any key to close"),
+        ]),
+    ];
+
+    let height = (lines.len() as u16) + 2; // +2 for block borders
+
+    // Centre the overlay within `area`.
+    let x = area.x + area.width.saturating_sub(WIDTH) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let overlay_area = Rect {
+        x,
+        y,
+        width: WIDTH.min(area.width),
+        height: height.min(area.height),
+    };
+
+    f.render_widget(Clear, overlay_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(
+            " Help ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let inner = block.inner(overlay_area);
+    f.render_widget(block, overlay_area);
+
+    f.render_widget(Paragraph::new(lines), inner);
 }
