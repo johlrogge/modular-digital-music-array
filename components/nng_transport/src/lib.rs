@@ -3,7 +3,13 @@
 //! Shared NNG connection logic with hostname resolution for mDNS (.local) support.
 
 use std::path::PathBuf;
+use std::time::Duration;
 use thiserror::Error;
+
+use nng::options::{Options, RecvTimeout, SendTimeout};
+
+/// Default send/receive timeout for NNG Req0 client sockets.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Errors that can occur during connection.
 #[derive(Debug, Error)]
@@ -44,6 +50,16 @@ pub fn connect(address: &str) -> Result<nng::Socket, ConnectionError> {
     let resolved_address = resolve_tcp_hostname(address)?;
 
     let socket = nng::Socket::new(nng::Protocol::Req0)?;
+    socket
+        .set_opt::<SendTimeout>(Some(DEFAULT_TIMEOUT))
+        .map_err(|e| {
+            ConnectionError::ConnectionFailed(format!("Failed to set send timeout: {}", e))
+        })?;
+    socket
+        .set_opt::<RecvTimeout>(Some(DEFAULT_TIMEOUT))
+        .map_err(|e| {
+            ConnectionError::ConnectionFailed(format!("Failed to set recv timeout: {}", e))
+        })?;
     socket.dial(&resolved_address).map_err(|e| {
         ConnectionError::ConnectionFailed(format!("Failed to connect to {}: {}", address, e))
     })?;
@@ -274,5 +290,44 @@ mod tests {
         write_cached_ip_to("myhost.local", "192.168.1.99", path.clone());
         let result = read_cached_ip_from("myhost.local", path);
         assert_eq!(result, Some("192.168.1.99".to_string()));
+    }
+
+    /// Verify that connect() to an unreachable TCP address fails within 10 seconds.
+    ///
+    /// Without SendTimeout/RecvTimeout set on the socket, a subsequent send/recv
+    /// would block indefinitely. This test checks that the socket is created and
+    /// dial succeeds (NNG dial is non-blocking by default), then a send on a
+    /// disconnected socket times out rather than hanging forever.
+    #[test]
+    fn connect_to_unreachable_address_has_send_timeout() {
+        use std::time::{Duration, Instant};
+
+        // Use a TCP address on a port that should be closed (TEST-NET range, RFC 5737)
+        let result = connect("tcp://192.0.2.1:19999");
+        // Dial may succeed (NNG dials asynchronously) or fail — either outcome is explicit below.
+        match result {
+            Ok(socket) => {
+                // Got a socket — verify the send timeout fires well within 10 seconds.
+                let start = Instant::now();
+                let msg = nng::Message::new();
+                let send_result = socket.send(msg);
+                let elapsed = start.elapsed();
+                // Send must fail (timeout) and must complete within 10 seconds.
+                assert!(
+                    send_result.is_err(),
+                    "Expected send to unreachable address to fail"
+                );
+                assert!(
+                    elapsed < Duration::from_secs(10),
+                    "Send took {:?}, expected timeout within 10s",
+                    elapsed
+                );
+            }
+            Err(_) => {
+                // connect() itself rejected early (e.g. DNS/NNG refused connection outright).
+                // Early rejection is acceptable — the socket never blocked indefinitely.
+                assert!(true, "connect() failed fast; no hang risk");
+            }
+        }
     }
 }

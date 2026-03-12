@@ -1,6 +1,6 @@
 # mdma-playback
 
-Pure queue manager for MDMA (v0.5.0). Accepts play/stop/queue commands over NNG IPC and drives audio source services via `StreamClient`. Has no direct dependency on `playback_engine` — audio decoding and output is handled by `mdma-audio` and other future sources.
+Pure queue manager for MDMA (v0.6.0). Accepts play/stop/queue commands over NNG IPC and drives audio source services via `StreamClient`. Has no direct dependency on `playback_engine` — audio decoding and output is handled by `mdma-audio` and other future sources.
 
 [Back to workspace README](../../README.md)
 
@@ -11,6 +11,7 @@ Pure queue manager for MDMA (v0.5.0). Accepts play/stop/queue commands over NNG 
 - Accepts play/stop/queue commands over NNG IPC from the gateway
 - Drives audio sources (e.g. `mdma-audio`) via `StreamClient` using `stream_source_protocol`
 - Queue entries carry a `source` field (default `"audio"`) identifying which source service handles playback
+- `Play`/`PlayQueue` resumes a paused track rather than popping the next queue entry
 - Publishes playback events (TrackStarted, TrackEnded, TrackStopped, QueueChanged) on a Pub0 socket for live clients
 - Writes `Played` and `Skipped` facts to the fact stream on track end and manual stop
 - Persists the queue to `/metadata/queue.json` on every mutation; restores on restart

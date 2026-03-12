@@ -14,6 +14,9 @@ pub struct AcidClient {
 
 impl AcidClient {
     pub fn connect(address: &str) -> Result<Self, ClientError> {
+        // Uses dial_async (non-blocking dial) rather than nng_transport::connect()
+        // which uses blocking dial. Acid writes are fire-and-forget and benefit
+        // from async dialing to avoid blocking startup if the acid service is slow.
         let socket = nng::Socket::new(nng::Protocol::Req0)?;
         socket.set_opt::<SendTimeout>(Some(Duration::from_secs(5)))?;
         socket.set_opt::<RecvTimeout>(Some(Duration::from_secs(5)))?;

@@ -163,21 +163,17 @@ impl Server {
             },
             Command::Play { deck: _ } => {
                 info!("Play command");
-                let effects = {
-                    let mut sm = self.state.lock().await;
-                    match sm.state() {
-                        PlaybackState::Paused { .. } => sm.resume(),
-                        PlaybackState::Playing { .. } => vec![],
-                        PlaybackState::Idle => {
-                            // No track loaded via state machine — treat as no-op
-                            warn!("Play command received while Idle and no queue entry");
-                            vec![]
-                        }
-                    }
-                };
-                let result =
-                    execute_effects(effects, &self.audio, &self.event_pub, &self.acid_client).await;
-                self.create_response(result, None)
+                if let Some(effects) = self.try_resume().await {
+                    let result =
+                        execute_effects(effects, &self.audio, &self.event_pub, &self.acid_client)
+                            .await;
+                    return self.create_response(result, None);
+                }
+                // Playing or Idle — no-op
+                if matches!(self.state.lock().await.state(), PlaybackState::Idle) {
+                    warn!("Play command received while Idle and no queue entry");
+                }
+                self.create_response(Ok(()), None)
             }
             // ---------------------------------------------------------------
             // State-machine-backed commands
@@ -284,6 +280,17 @@ impl Server {
             }
             Command::PlayQueue => {
                 info!("Play from queue");
+
+                // If currently paused, resume the paused track instead of
+                // popping from the queue.
+                if let Some(effects) = self.try_resume().await {
+                    info!("PlayQueue: state is Paused — resuming instead of popping queue");
+                    let result =
+                        execute_effects(effects, &self.audio, &self.event_pub, &self.acid_client)
+                            .await;
+                    return self.create_response(result, None);
+                }
+
                 let entry = {
                     let mut queue = self.queue.lock().await;
                     let e = queue.pop_front();
@@ -386,6 +393,17 @@ impl Server {
                     },
                 }
             }
+        }
+    }
+
+    /// If the state machine is Paused, resume it and return the effects.
+    /// Returns None if not paused (Idle or Playing).
+    async fn try_resume(&self) -> Option<Vec<PlaybackEffect>> {
+        let mut sm = self.state.lock().await;
+        if matches!(sm.state(), PlaybackState::Paused { .. }) {
+            Some(sm.resume())
+        } else {
+            None
         }
     }
 
@@ -622,6 +640,64 @@ mod tests {
             event_pub,
             acid_client,
         )
+    }
+
+    /// PlayQueue while Paused must resume the paused track, not pop from the queue.
+    #[tokio::test]
+    async fn play_queue_while_paused_resumes_not_pops() {
+        let server = make_server();
+
+        // Put something in the queue so we can verify it is NOT popped.
+        {
+            let mut q = server.queue.lock().await;
+            q.push_back(QueueEntry {
+                hash: media_protocol::ContentHash::new("sha256:queued"),
+                source: "audio".to_string(),
+            });
+        }
+
+        // Drive state machine to Paused.
+        {
+            let mut sm = server.state.lock().await;
+            let hash = media_protocol::ContentHash::new("sha256:paused_track");
+            sm.play_queue(hash, "audio".to_string());
+            sm.pause();
+        }
+
+        assert!(
+            matches!(
+                server.state.lock().await.state(),
+                PlaybackState::Paused { .. }
+            ),
+            "Expected Paused before PlayQueue"
+        );
+
+        // Issue PlayQueue via handle_command.
+        let response = server.handle_command(Command::PlayQueue).await;
+
+        // Must succeed.
+        assert!(
+            matches!(response, Response::Ok { .. }),
+            "Expected Ok response, got {:?}",
+            response
+        );
+
+        // State must be Playing (resumed), not Idle.
+        assert!(
+            matches!(
+                server.state.lock().await.state(),
+                PlaybackState::Playing { .. }
+            ),
+            "Expected Playing after PlayQueue from Paused"
+        );
+
+        // The queued track must still be in the queue (not popped).
+        let queue_len = server.queue.lock().await.len();
+        assert_eq!(
+            queue_len, 1,
+            "Queue should still have 1 entry after resume, got {}",
+            queue_len
+        );
     }
 
     /// After pause -> skip, the state machine must be in Idle (not Paused).

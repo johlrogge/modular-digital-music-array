@@ -313,11 +313,11 @@ Ordered by complexity — simplest ships first.
 
 Status bar module. Shell script + polybar config. First pub/sub consumer — proved the event model works from an external process.
 
-### TUI Client
+### ~~TUI Client~~ — COMPLETE (v0.8.0)
 
 Terminal-based player interface. Real-time display of now playing, queue, search. Runs on the laptop. Talks to the gateway.
 
-Think: `cmus` or `ncmpcpp` but for MDMA. Rust TUI framework (ratatui or similar).
+Think: `cmus` or `ncmpcpp` but for MDMA. Built with ratatui. Dual-pane layout, modal keybindings, command palette, live event sync.
 
 ### mdmamp (Desktop Player)
 
@@ -368,7 +368,7 @@ mdma-playback      = Audio playback service (Symphonia + PipeWire + rubato)
 mdma-bandcamp      = Bandcamp download service (source_protocol)
 mdma-console       = HTTP frontend (web UI player)
 mdma-cli           = CLI frontend (gateway-aware, dual-mode dispatch)
-mdma-tui           = TUI client (ratatui, future)
+mdma-tui           = TUI client (ratatui, v0.2.0)
 mdma-acid          = Fact store service — sole owner of the fact stream (Priority 15)
 mdmamp             = Desktop player (Bevy, future)
 beacon             = Provisioning and service discovery
@@ -677,6 +677,8 @@ Unix pipes.
 ---
 
 ## Update History
+
+- **2026-03-12 (v0.8.0):** mdma-tui v0.2.0: dual-pane terminal UI (browser left, queue right). Modal keybindings — Normal mode for navigation, Playback mode for transport. Command palette (`:`) for play/pause/stop/next/clear/quit and pane switching. `q`/`Q` queue append/next. `?` help overlay. Live queue sync via event bus subscription. mdma-playback v0.6.0: Play/PlayQueue now resumes a paused track instead of popping the queue. nng-transport: 5-second send/recv timeouts on all client sockets.
 
 - **2026-03-09 (v0.6.0):** Album view sorted by DiscNumber + TrackNumber. AddedAt tracking: every ingested track records when it was added, queryable via `--added` CLI flag (date expressions) and sortable with `mdma sort added`. Album art cache: album-level cover art served as fallback when tracks have no embedded art. New `date_expression` crate with relative date syntax (`~`, `^`, `$`, `+/-N`, `/`-separated components) integrated into all date queries. CI: git-hooks input added to devenv.yaml.
 
