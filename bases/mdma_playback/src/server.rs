@@ -622,13 +622,24 @@ mod tests {
         let acid_client = Arc::new(AcidClient::connect(&acid_addr).unwrap());
         std::mem::forget(acid_listen);
 
-        // Create a dummy audio source (Req0 side of a Rep0/Req0 pair).
-        // The StreamClient connects to a stub that we never actually read from in these
-        // state-machine-only tests, so we just create a socket that listens but is never used.
+        // Create a dummy audio source (Rep0 stub) that auto-replies with Ok so that
+        // tests which trigger NNG effects don't block waiting for a timeout.
         let audio_stub = nng::Socket::new(nng::Protocol::Rep0).unwrap();
         let audio_addr = format!("ipc:///tmp/test_audio_{}_{}.sock", std::process::id(), id);
         audio_stub.listen(&audio_addr).unwrap();
-        std::mem::forget(audio_stub);
+
+        std::thread::spawn(move || {
+            use stream_source_protocol::StreamResponse;
+            loop {
+                match audio_stub.recv() {
+                    Ok(_) => {
+                        let reply = serde_json::to_vec(&StreamResponse::Ok).unwrap();
+                        let _ = audio_stub.send(reply.as_slice());
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
 
         let audio_client = StreamClient::connect(&audio_addr).unwrap();
         let audio = Arc::new(tokio::sync::Mutex::new(audio_client));
@@ -636,7 +647,11 @@ mod tests {
         Server::new(
             audio,
             socket,
-            PathBuf::from("/tmp/test_queue.json"),
+            PathBuf::from(format!(
+                "/tmp/test_queue_{}_{}.json",
+                std::process::id(),
+                id
+            )),
             event_pub,
             acid_client,
         )
