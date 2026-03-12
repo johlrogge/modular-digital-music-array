@@ -112,10 +112,10 @@
     "metadev": {
       "flake": false,
       "locked": {
-        "lastModified": 1773247442,
+        "lastModified": 1773342440,
         "owner": "johlrogge",
         "repo": "metadev",
-        "rev": "caec34938e724cea1e03d88c82deda30ceed1028",
+        "rev": "bf2b78078b60a88fdd7037dc75472e42b5628fc0",
         "type": "github"
       },
       "original": {

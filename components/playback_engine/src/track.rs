@@ -131,7 +131,7 @@ async fn decoder_task<S: Source + Send + Sync + 'static>(
                         sample_pos
                     };
                     let ms = frames * 1000 / source_rate as u64;
-                    position_ms.store(ms, Ordering::Relaxed);
+                    position_ms.store(ms, Ordering::Release);
                 }
                 Err(e) => {
                     tracing::error!("Decode error: {e}");
@@ -139,7 +139,7 @@ async fn decoder_task<S: Source + Send + Sync + 'static>(
             }
         }
 
-        match TrackState::from_u8(state.load(Ordering::Relaxed)) {
+        match TrackState::from_u8(state.load(Ordering::Acquire)) {
             TrackState::Stopped => {
                 // Paused: keep decoding ahead for instant resume, but don't write
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -157,7 +157,7 @@ async fn decoder_task<S: Source + Send + Sync + 'static>(
             }
             TrackState::Playing if eof => {
                 // All decoded samples written — track is done
-                state.store(TrackState::Finished as u8, Ordering::Relaxed);
+                state.store(TrackState::Finished as u8, Ordering::Release);
                 tracing::info!("Track finished (EOF + pending drained)");
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
@@ -188,9 +188,9 @@ async fn decoder_task<S: Source + Send + Sync + 'static>(
                         position as u64
                     };
                     let ms = frames * 1000 / source_rate as u64;
-                    position_ms.store(ms, Ordering::Relaxed);
+                    position_ms.store(ms, Ordering::Release);
                     // Seek resets to Stopped — caller must call play() again if desired
-                    state.store(TrackState::Stopped as u8, Ordering::Relaxed);
+                    state.store(TrackState::Stopped as u8, Ordering::Release);
                     // Reset resampler state by recreating it
                     if source_rate != target_rate {
                         resampler = Resampler::new(source_rate, target_rate, channels).ok();
@@ -251,26 +251,26 @@ impl Track {
 
     pub fn play(&mut self) {
         self.state
-            .store(TrackState::Playing as u8, Ordering::Relaxed);
-        tracing::info!("Track set to playing state");
+            .store(TrackState::Playing as u8, Ordering::Release);
+        tracing::debug!("Track set to playing state");
     }
 
     pub fn stop(&mut self) {
         self.state
-            .store(TrackState::Stopped as u8, Ordering::Relaxed);
+            .store(TrackState::Stopped as u8, Ordering::Release);
     }
 
     pub fn is_playing(&self) -> bool {
-        TrackState::from_u8(self.state.load(Ordering::Relaxed)) == TrackState::Playing
+        TrackState::from_u8(self.state.load(Ordering::Acquire)) == TrackState::Playing
     }
 
     pub fn is_finished(&self) -> bool {
-        TrackState::from_u8(self.state.load(Ordering::Relaxed)) == TrackState::Finished
+        TrackState::from_u8(self.state.load(Ordering::Acquire)) == TrackState::Finished
     }
 
     /// Current playback position in milliseconds (from decoder progress).
     pub fn position_ms(&self) -> u64 {
-        self.position_ms.load(Ordering::Relaxed)
+        self.position_ms.load(Ordering::Acquire)
     }
 
     /// Total track duration in milliseconds (0 if unknown).
