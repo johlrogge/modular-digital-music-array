@@ -14,7 +14,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         InputMode::Palette => handle_palette(app, key),
         InputMode::FilterInput => handle_filter(app, key),
         InputMode::Help => app.mode = InputMode::Normal,
-        InputMode::SpaceMenu => handle_space_menu(app, key),
         InputMode::Playback => handle_playback(app, key),
     }
 }
@@ -52,8 +51,8 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
                 }
             }
         }
-        KeyCode::Char(' ') => {
-            app.mode = InputMode::SpaceMenu;
+        KeyCode::Char('p') => {
+            app.mode = InputMode::Playback;
         }
         _ => {
             let action = app.active_pane_mut().handle_key(key);
@@ -130,21 +129,9 @@ fn handle_filter(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn handle_space_menu(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Char('p') => app.mode = InputMode::Playback,
-        KeyCode::Char('n') => app.mode = InputMode::Normal,
-        _ => app.mode = InputMode::Normal, // Esc or anything else cancels
-    }
-}
-
 fn handle_playback(app: &mut App, key: KeyEvent) {
     match key.code {
-        // Space is the leader key — always opens the mode picker.
-        KeyCode::Char(' ') => {
-            app.mode = InputMode::SpaceMenu;
-        }
-        KeyCode::Char('p') => {
+        KeyCode::Char('p') | KeyCode::Char(' ') => {
             // Toggle: if playing → pause, otherwise → play
             let action = match &app.now_playing.status {
                 PlaybackStatus::Playing { .. } => {

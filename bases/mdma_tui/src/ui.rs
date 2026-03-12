@@ -48,11 +48,6 @@ pub fn render(f: &mut Frame, app: &App) {
     if app.mode == InputMode::Help {
         render_help_overlay(f, area);
     }
-
-    // Render the space mode picker overlay on top if active.
-    if app.mode == InputMode::SpaceMenu {
-        render_space_menu(f, area);
-    }
 }
 
 /// Render one pane side with an active/inactive border highlight.
@@ -115,18 +110,6 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("filter: ", Style::default().fg(Color::Magenta)),
             Span::raw(app.filter_input.as_str()),
         ]),
-        InputMode::SpaceMenu => Line::from(vec![
-            Span::styled(
-                "mode  ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "p:playback  Esc:cancel",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
         InputMode::Playback => Line::from(vec![
             Span::styled(
                 "[PLAY] ",
@@ -147,7 +130,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 ))
             } else {
                 Line::from(Span::styled(
-                    "q:quit  Tab:switch  a:add  s:filter  Spc:mode  ?:help",
+                    "q:quit  Tab:switch  a:add  p:playback  s:filter  ?:help",
                     Style::default().fg(Color::DarkGray),
                 ))
             }
@@ -298,54 +281,6 @@ fn render_palette_overlay(f: &mut Frame, app: &App, area: Rect) {
 /// ```text
 /// ┌─ Mode ─────────────────────┐
 /// │  p   Playback              │
-/// │  Esc  cancel               │
-/// └────────────────────────────┘
-/// ```
-fn render_space_menu(f: &mut Frame, area: Rect) {
-    const WIDTH: u16 = 32;
-    const HEIGHT: u16 = 5; // 2 border + 3 rows
-
-    let x = area.x + area.width.saturating_sub(WIDTH) / 2;
-    let y = area.y + area.height.saturating_sub(HEIGHT) / 2;
-    let overlay_area = Rect {
-        x,
-        y,
-        width: WIDTH.min(area.width),
-        height: HEIGHT.min(area.height),
-    };
-
-    f.render_widget(Clear, overlay_area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .title(Span::styled(
-            " Mode ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-
-    let inner = block.inner(overlay_area);
-    f.render_widget(block, overlay_area);
-
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("  p  ", Style::default().fg(Color::Cyan)),
-            Span::styled("Playback", Style::default().fg(Color::Gray)),
-        ]),
-        Line::from(vec![
-            Span::styled("  n  ", Style::default().fg(Color::Cyan)),
-            Span::styled("Normal (browse)", Style::default().fg(Color::Gray)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Esc", Style::default().fg(Color::DarkGray)),
-            Span::styled("  cancel", Style::default().fg(Color::DarkGray)),
-        ]),
-    ];
-    f.render_widget(Paragraph::new(lines), inner);
-}
-
 /// Render a centred floating help overlay listing all key bindings.
 fn render_help_overlay(f: &mut Frame, area: Rect) {
     // Fixed overlay dimensions.

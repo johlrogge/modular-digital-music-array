@@ -27,8 +27,6 @@ pub enum InputMode {
     FilterInput,
     /// Help overlay visible; any key returns to Normal.
     Help,
-    /// Space mode picker overlay — shows available modes.
-    SpaceMenu,
     /// Playback control mode; single-key bindings for transport controls.
     Playback,
 }
