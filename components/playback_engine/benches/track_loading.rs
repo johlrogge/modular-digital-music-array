@@ -1,11 +1,9 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use parking_lot::Mutex;
 use playback_engine::AudioSource;
 use playback_engine::Source;
 use playback_engine::Track;
 use ringbuf::HeapRb;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 
@@ -127,87 +125,5 @@ fn bench_time_to_playable(c: &mut Criterion) {
     group.finish();
 }
 
-// bench_seeking is incomplete (todo! for known file lengths) — suppress dead-code warnings
-#[allow(
-    unused_variables,
-    unused_mut,
-    unreachable_code,
-    clippy::diverging_sub_expression
-)]
-fn bench_seeking(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
-    let group = c.benchmark_group("seeking");
-
-    for name in ["short.flac", "medium.flac", "long.flac"] {
-        let path = test_file_path(name);
-
-        let buffer = HeapRb::new(8 * 1024);
-        let (prod, mut cons) = buffer.split();
-        // Create a track for testing
-        let track = rt.block_on(async {
-            let source = AudioSource::new(&path).unwrap();
-            let rate = source.sample_rate();
-            Track::new(source, prod, rate, rate)
-                .await
-                .expect("Failed to create track")
-        });
-
-        // Create a shared reference that can be cloned for each benchmark
-        let _track = Arc::new(Mutex::new(track));
-        let length: usize = todo!("use known lengths for short, medium and long");
-
-        let positions = [
-            ("start", 0),
-            ("quarter", length / 4),
-            ("middle", length / 2),
-            ("three_quarters", length * 3 / 4),
-            ("end", length.saturating_sub(1024)),
-        ];
-
-        for (label, pos) in positions {
-            // Seek benchmark
-            let track_clone = _track.clone();
-            group.bench_with_input(
-                BenchmarkId::new(format!("seek_to_{}", label), name),
-                &pos,
-                |b, &pos| {
-                    let pos = black_box(pos);
-                    b.iter(|| {
-                        rt.block_on(async {
-                            let mut track = track_clone.lock();
-                            track.seek(pos).unwrap();
-                        });
-                    });
-                },
-            );
-
-            // Seek and read benchmark
-            let track_clone = _track.clone();
-            group.bench_with_input(
-                BenchmarkId::new(format!("seek_and_read_{}", label), name),
-                &pos,
-                |b, &pos| {
-                    let mut buffer = vec![0.0f32; 1024];
-                    let pos = black_box(pos);
-                    b.iter(|| {
-                        rt.block_on(async {
-                            let mut track = track_clone.lock();
-                            track.seek(pos).unwrap();
-                            cons.pop_slice(&mut buffer);
-                        });
-                    });
-                },
-            );
-        }
-    }
-
-    group.finish();
-}
-
-criterion_group!(
-    benches,
-    bench_track_loading,
-    bench_time_to_playable,
-    bench_seeking
-);
+criterion_group!(benches, bench_track_loading, bench_time_to_playable);
 criterion_main!(benches);

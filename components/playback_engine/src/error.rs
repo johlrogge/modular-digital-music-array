@@ -8,22 +8,13 @@ pub enum PlaybackError {
     #[error("Decoder error: {0}")]
     Decoder(String),
 
-    #[error("Track not found: {0}")]
-    TrackNotFound(std::path::PathBuf),
-
-    #[error("Channel {0:?} already in use")]
-    ChannelInUse(crate::Deck),
-
-    #[error("No track loaded on channel {0:?}")]
-    NoTrackLoaded(crate::Deck),
+    #[error("No track loaded")]
+    NoTrackLoaded,
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Task cancelled")]
     TaskCancelled,
-
-    #[error("Track is not ready for playback")]
-    TrackNotReady,
 
     #[error("Resampler error: {0}")]
     Resampler(String),

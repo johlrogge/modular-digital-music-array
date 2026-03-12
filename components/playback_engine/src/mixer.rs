@@ -1,52 +1,44 @@
-// in mixer.rs
 use crate::error::PlaybackError;
-use playback_primitives::{Db, Deck, Volume};
+use playback_primitives::{Db, Volume};
 use ringbuf::{HeapConsumer, HeapProducer};
-use std::collections::HashMap;
 
 pub struct Mixer {
-    volumes: HashMap<Deck, f32>,
-    output_producer: HeapProducer<f32>, // Mixer output
+    volume: f32,
+    output_producer: HeapProducer<f32>,
 }
 
 impl Mixer {
     pub fn new(output_producer: HeapProducer<f32>) -> Self {
         Self {
-            volumes: HashMap::new(),
+            volume: 1.0,
             output_producer,
         }
     }
 
     pub fn mix(
         &mut self,
-        output: &mut [f32], // Temporary buffer for mixing
+        output: &mut [f32],
         samples_per_callback: usize,
-        consumers: &mut HashMap<Deck, HeapConsumer<f32>>,
+        consumer: &mut Option<HeapConsumer<f32>>,
     ) -> Result<(), PlaybackError> {
         // Clear output buffer
         output[..samples_per_callback].fill(0.0);
 
-        // Mix each active track
-
-        for (deck, consumer) in consumers.iter_mut() {
-            // Get volume
-            let volume = *self.volumes.get(deck).unwrap_or(&1.0);
-
-            // Read from consumer and mix with volume
+        // Mix the single track if present
+        if let Some(consumer) = consumer {
             let available = consumer.len();
             let to_mix = std::cmp::min(available, samples_per_callback);
 
             if to_mix > 0 {
-                // Mix samples
                 (0..to_mix).for_each(|i| {
                     if let Some(sample) = consumer.pop() {
-                        output[i] += sample * volume;
+                        output[i] += sample * self.volume;
                     }
                 });
             }
         }
 
-        // Now write the mixed output to the output producer
+        // Write the mixed output to the output producer
         let mut written = 0;
         let to_write = samples_per_callback;
 
@@ -57,7 +49,6 @@ impl Mixer {
 
             written += pushed;
 
-            // If we couldn't write everything, yield and retry
             if pushed < remaining {
                 write_attempts += 1;
                 if write_attempts % 1_000_000 == 0 {
@@ -68,7 +59,7 @@ impl Mixer {
                         remaining
                     );
                 }
-                std::thread::yield_now(); // Standard library yield, not tokio
+                std::thread::yield_now();
             }
         }
         if written < to_write {
@@ -80,7 +71,8 @@ impl Mixer {
 
         Ok(())
     }
-    pub(crate) fn set_volume(&mut self, deck: Deck, volume: Volume) {
-        self.volumes.insert(deck, volume.to_linear());
+
+    pub(crate) fn set_volume(&mut self, volume: Volume) {
+        self.volume = volume.to_linear();
     }
 }

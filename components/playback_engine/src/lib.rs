@@ -8,7 +8,6 @@ mod source;
 mod track;
 
 use std::{
-    collections::HashMap,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -19,10 +18,10 @@ use std::{
 pub use audio_config::{load_audio_config, save_audio_config, AudioOutputConfig};
 pub use error::PlaybackError;
 use mixer::Mixer;
-use parking_lot::RwLock;
 pub use pipewire_devices::AudioSink;
 use pipewire_output::PipewireOutput;
-pub use playback_primitives::{Db, Deck, Volume};
+use playback_primitives::Db;
+pub use playback_primitives::Volume;
 use ringbuf::{HeapConsumer, HeapRb};
 pub use source::{AudioSource, Source};
 use tracing::info;
@@ -30,35 +29,28 @@ pub use track::Track;
 
 use crate::pipewire_devices::list_sinks;
 
-type Decks = Arc<RwLock<HashMap<Deck, Arc<RwLock<Track>>>>>;
-
 pub struct PlaybackEngine {
-    decks: Decks,
+    track: Option<Track>,
     audio_output: Option<PipewireOutput>,
     mixer_consumer: Option<HeapConsumer<f32>>,
     current_sample_rate: Option<u32>,
     command_sender: mpsc::Sender<MixerCommand>,
-    _mix_task: Option<std::thread::JoinHandle<()>>,
+    mix_task: Option<std::thread::JoinHandle<()>>,
     stream_active: bool,
     mix_thread_running: Arc<AtomicBool>,
     config_path: PathBuf,
     audio_config: AudioOutputConfig,
 }
+
 enum MixerCommand {
-    RegisterTrack {
-        deck: Deck,
-        consumer: HeapConsumer<f32>,
-    },
-    SetVolume {
-        deck: Deck,
-        volume: Volume,
-    },
+    RegisterTrack { consumer: HeapConsumer<f32> },
+    SetVolume { volume: Volume },
 }
+
 impl PlaybackEngine {
     pub fn new(config_path: PathBuf) -> Result<Self, PlaybackError> {
         let audio_config = load_audio_config(&config_path)?;
 
-        // Create a channel for mixer commands - std::sync::mpsc doesn't take a capacity
         let (command_sender, command_receiver) = std::sync::mpsc::channel();
 
         // Create ringbuffer for mixer output.
@@ -73,46 +65,45 @@ impl PlaybackEngine {
         // Start the mix thread with command receiver
         let mix_task = std::thread::spawn(move || {
             let mut mixer = Mixer::new(mixer_producer);
-            let mut consumers = HashMap::<Deck, HeapConsumer<f32>>::new();
+            let mut consumer: Option<HeapConsumer<f32>> = None;
             let mut temp_buffer = vec![0.0; 1920 * 2];
 
             tracing::info!("MIX THREAD: Started, will process audio");
 
-            while running.load(Ordering::Relaxed) {
+            while running.load(Ordering::Acquire) {
                 // Process any pending commands
                 while let Ok(cmd) = command_receiver.try_recv() {
                     match cmd {
-                        MixerCommand::RegisterTrack { deck, consumer } => {
-                            tracing::info!("MIX THREAD: Registering track for deck {:?}", deck);
-                            consumers.insert(deck, consumer);
+                        MixerCommand::RegisterTrack {
+                            consumer: new_consumer,
+                        } => {
+                            tracing::info!("MIX THREAD: Registering new track");
+                            consumer = Some(new_consumer);
                         }
-                        MixerCommand::SetVolume { deck, volume } => {
-                            mixer.set_volume(deck, volume);
+                        MixerCommand::SetVolume { volume } => {
+                            mixer.set_volume(volume);
                         }
                     }
                 }
                 let l = temp_buffer.len();
 
-                // Mix audio
-                if let Err(e) = mixer.mix(&mut temp_buffer, l, &mut consumers) {
+                if let Err(e) = mixer.mix(&mut temp_buffer, l, &mut consumer) {
                     tracing::error!("MIX THREAD: Error mixing: {}", e);
                 }
 
-                // Sleep briefly
-                std::thread::sleep(std::time::Duration::from_micros(500)); // 0.5ms instead of 5ms
+                std::thread::sleep(std::time::Duration::from_micros(500));
             }
 
             tracing::info!("MIX THREAD: Exiting cleanly");
         });
 
-        // Return the engine — PipeWire output deferred until first track load
         Ok(Self {
-            decks: Arc::new(RwLock::new(HashMap::new())),
+            track: None,
             audio_output: None,
             mixer_consumer: Some(mixer_consumer),
             current_sample_rate: None,
             command_sender,
-            _mix_task: Some(mix_task),
+            mix_task: Some(mix_task),
             stream_active: true,
             mix_thread_running,
             config_path,
@@ -122,8 +113,8 @@ impl PlaybackEngine {
 
     /// Signal the mix thread to stop and wait for it to join.
     pub fn shutdown(&mut self) {
-        self.mix_thread_running.store(false, Ordering::Relaxed);
-        if let Some(handle) = self._mix_task.take() {
+        self.mix_thread_running.store(false, Ordering::Release);
+        if let Some(handle) = self.mix_task.take() {
             let _ = handle.join();
         }
     }
@@ -171,8 +162,6 @@ impl PlaybackEngine {
 
         save_audio_config(&self.config_path, &new_config)?;
 
-        // If the sample rate is changing, note that existing audio will continue
-        // at the old rate until the next track load.
         if let Some(current_rate) = self.current_sample_rate {
             if current_rate != sink.max_sample_rate {
                 tracing::info!(
@@ -183,14 +172,9 @@ impl PlaybackEngine {
             }
         }
 
-        // Recover the consumer from the old output (if active), then immediately
-        // create a new output on the selected device with the recovered consumer.
         let recovered_consumer = if let Some(old_output) = self.audio_output.take() {
             old_output.shutdown()
         } else {
-            // No active output — consumer is still sitting in self.mixer_consumer
-            // and will be picked up by the next load_track() call when it creates
-            // the PipeWire output for the first time.
             None
         };
 
@@ -211,17 +195,15 @@ impl PlaybackEngine {
         Ok(new_config)
     }
 
-    pub async fn load_track(&mut self, deck: Deck, path: &Path) -> Result<(), PlaybackError> {
-        tracing::info!("Starting track load for deck {:?}", deck);
+    pub async fn load_track(&mut self, path: &Path) -> Result<(), PlaybackError> {
+        tracing::info!("Starting track load");
 
-        // Stop and remove any existing track on this deck
-        {
-            let mut decks = self.decks.write();
-            if let Some(existing) = decks.remove(&deck) {
-                tracing::info!("Unloading existing track from deck {:?}", deck);
-                existing.write().stop();
-            }
+        // Stop and remove any existing track
+        if let Some(ref mut t) = self.track {
+            tracing::info!("Unloading existing track");
+            t.stop();
         }
+        self.track = None;
 
         // Create source and read its native sample rate
         let source = AudioSource::new(path)?;
@@ -231,7 +213,6 @@ impl PlaybackEngine {
         let target_device = self.audio_config.device_name.clone();
 
         // Create PipeWire output on first track load at the configured rate.
-        // All sources are upsampled by the decoder task regardless of their native rate.
         if self.audio_output.is_none() {
             if self.mixer_consumer.is_none() {
                 tracing::error!(
@@ -252,7 +233,7 @@ impl PlaybackEngine {
             }
         }
 
-        // Create ringbuffer for this deck.
+        // Create ringbuffer for this track.
         // Sized for ~0.34 s at 192 kHz stereo.
         const BUFFER_SIZE: usize = 131_072;
         let rb = HeapRb::<f32>::new(BUFFER_SIZE);
@@ -262,101 +243,77 @@ impl PlaybackEngine {
         let track = Track::new(source, producer, source_rate, target_rate).await?;
         tracing::info!("Track is ready for playback");
 
-        // Store the track - no lock conflicts possible with mix thread now
-        let mut decks = self.decks.write();
-        decks.insert(deck, Arc::new(RwLock::new(track)));
-        drop(decks);
-
-        // Send consumer to mix thread via command - using standard send, not try_send
+        // Store the track and register its consumer with the mix thread
+        self.track = Some(track);
         self.command_sender
-            .send(MixerCommand::RegisterTrack { deck, consumer })
+            .send(MixerCommand::RegisterTrack { consumer })
             .map_err(|_| PlaybackError::TaskCancelled)?;
 
-        tracing::info!("Loaded track from {:?} into deck {:?}", path, deck);
+        tracing::info!("Loaded track from {:?}", path);
         Ok(())
     }
 
-    pub fn set_volume(&mut self, deck: Deck, volume: Volume) -> Result<(), PlaybackError> {
-        match self
-            .command_sender
-            .send(MixerCommand::SetVolume { deck, volume })
-        {
+    pub fn set_volume(&mut self, volume: Volume) -> Result<(), PlaybackError> {
+        match self.command_sender.send(MixerCommand::SetVolume { volume }) {
             Ok(_) => {
-                tracing::info!("Setting volume for deck {:?} to {}dB", deck, volume.raw());
+                tracing::debug!("Setting volume to {}dB", volume.raw());
                 Ok(())
             }
             Err(_) => {
-                tracing::error!("Failed to send volume command for deck {:?}", deck);
+                tracing::error!("Failed to send volume command");
                 Err(PlaybackError::TaskCancelled)
             }
         }
     }
 
-    fn find_track(&self, deck: Deck) -> Option<Arc<RwLock<Track>>> {
-        let decks = self.decks.read();
-        decks.get(&deck).cloned()
-    }
-
-    pub fn play(&mut self, deck: Deck) -> Result<(), PlaybackError> {
-        if let Some(track) = self.find_track(deck) {
-            tracing::info!("DEBUG PLAY: About to set track to playing state");
-            track.write().play();
-            tracing::info!("DEBUG PLAY: Track set to playing state");
-
+    pub fn play(&mut self) -> Result<(), PlaybackError> {
+        if let Some(ref mut track) = self.track {
+            tracing::debug!("Setting track to playing state");
+            track.play();
             Ok(())
         } else {
-            tracing::error!("No track loaded in deck {:?}", deck);
-            Err(PlaybackError::NoTrackLoaded(deck))
+            tracing::error!("No track loaded");
+            Err(PlaybackError::NoTrackLoaded)
         }
     }
 
-    pub fn stop(&mut self, deck: Deck) -> Result<(), PlaybackError> {
-        if let Some(track) = self.find_track(deck) {
-            tracing::info!("Stopping deck {:?}", deck);
-            track.write().stop();
+    pub fn stop(&mut self) -> Result<(), PlaybackError> {
+        if let Some(ref mut track) = self.track {
+            tracing::info!("Stopping track");
+            track.stop();
             Ok(())
         } else {
-            tracing::error!("No track loaded in deck {:?}", deck);
-            Err(PlaybackError::NoTrackLoaded(deck))
+            tracing::error!("No track loaded");
+            Err(PlaybackError::NoTrackLoaded)
         }
     }
 
-    pub fn unload_track(&mut self, deck: Deck) -> Result<(), PlaybackError> {
-        let mut decks = self.decks.write();
-
-        // Remove returns the old value if it existed
-        match decks.remove(&deck) {
-            Some(_) => {
-                tracing::info!("Unloaded track from deck {:?}", deck);
-                Ok(())
-            }
-            None => {
-                tracing::info!("No track to unload from deck {:?}", deck);
-                Ok(()) // No track is still a success
-            }
-        }
-    }
-
-    pub fn is_track_finished(&self, deck: Deck) -> bool {
-        if let Some(track) = self.find_track(deck) {
-            track.read().is_finished()
+    pub fn unload_track(&mut self) -> Result<(), PlaybackError> {
+        if self.track.is_some() {
+            self.track = None;
+            tracing::info!("Unloaded track");
         } else {
-            false
+            tracing::info!("No track to unload");
         }
+        Ok(())
     }
 
-    /// Returns the current playback position in milliseconds for the given deck,
-    /// or `None` if no track is loaded.
-    pub fn position_ms(&self, deck: Deck) -> Option<u64> {
-        self.find_track(deck)
-            .map(|track| track.read().position_ms())
+    pub fn is_track_finished(&self) -> bool {
+        self.track
+            .as_ref()
+            .map(|t| t.is_finished())
+            .unwrap_or(false)
     }
 
-    /// Returns the total duration in milliseconds for the track on the given deck,
+    /// Returns the current playback position in milliseconds, or `None` if no track is loaded.
+    pub fn position_ms(&self) -> Option<u64> {
+        self.track.as_ref().map(|t| t.position_ms())
+    }
+
+    /// Returns the total duration in milliseconds for the loaded track,
     /// or `None` if no track is loaded. Returns `Some(0)` if duration is unknown.
-    pub fn duration_ms(&self, deck: Deck) -> Option<u64> {
-        self.find_track(deck)
-            .map(|track| track.read().duration_ms())
+    pub fn duration_ms(&self) -> Option<u64> {
+        self.track.as_ref().map(|t| t.duration_ms())
     }
 
     /// Returns whether the stream is currently active.
@@ -364,22 +321,21 @@ impl PlaybackEngine {
         self.stream_active
     }
 
-    pub fn seek(&mut self, deck: Deck, position: usize) -> Result<(), PlaybackError> {
-        if let Some(track) = self.find_track(deck) {
-            tracing::info!("Seeking deck {:?} to position {}", deck, position);
-            let mut track_guard = track.write();
-            track_guard.seek(position)
+    pub fn seek(&mut self, position: usize) -> Result<(), PlaybackError> {
+        if let Some(ref mut track) = self.track {
+            tracing::info!("Seeking to position {}", position);
+            track.seek(position)
         } else {
-            tracing::error!("No track loaded in deck {:?}", deck);
-            Err(PlaybackError::NoTrackLoaded(deck))
+            tracing::error!("No track loaded");
+            Err(PlaybackError::NoTrackLoaded)
         }
     }
 }
 
 impl Drop for PlaybackEngine {
     fn drop(&mut self) {
-        self.mix_thread_running.store(false, Ordering::Relaxed);
-        if let Some(handle) = self._mix_task.take() {
+        self.mix_thread_running.store(false, Ordering::Release);
+        if let Some(handle) = self.mix_task.take() {
             let _ = handle.join();
         }
     }
@@ -423,9 +379,9 @@ mod tests {
     #[test]
     fn shutdown_stops_mix_thread() {
         let (mut engine, _tmp) = engine_with_tempdir();
-        assert!(engine._mix_task.is_some());
+        assert!(engine.mix_task.is_some());
         engine.shutdown();
-        assert!(engine._mix_task.is_none());
+        assert!(engine.mix_task.is_none());
     }
 
     /// Verify that a missing config file results in the default config being used.
@@ -471,13 +427,64 @@ mod tests {
             "audio_output should be None after new()"
         );
 
-        // Simulate what set_output hot-swap does when there is no active output:
-        // consumer stays put (we only take it when we actually spawn PW).
         // Manually drain it to represent the post-spawn state.
         let _ = engine.mixer_consumer.take();
         assert!(
             engine.mixer_consumer.is_none(),
             "mixer_consumer should be None after take()"
         );
+    }
+
+    /// play() with no track loaded returns NoTrackLoaded error.
+    #[test]
+    fn play_with_no_track_returns_error() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        let result = engine.play();
+        assert!(
+            matches!(result, Err(PlaybackError::NoTrackLoaded)),
+            "expected NoTrackLoaded, got {:?}",
+            result
+        );
+    }
+
+    /// stop() with no track loaded returns NoTrackLoaded error.
+    #[test]
+    fn stop_with_no_track_returns_error() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        let result = engine.stop();
+        assert!(
+            matches!(result, Err(PlaybackError::NoTrackLoaded)),
+            "expected NoTrackLoaded, got {:?}",
+            result
+        );
+    }
+
+    /// unload_track() with no track loaded returns Ok (no-op).
+    #[test]
+    fn unload_track_with_no_track_is_ok() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        let result = engine.unload_track();
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+    }
+
+    /// is_track_finished() returns false when no track is loaded.
+    #[test]
+    fn is_track_finished_no_track() {
+        let (engine, _tmp) = engine_with_tempdir();
+        assert!(!engine.is_track_finished());
+    }
+
+    /// position_ms() returns None when no track is loaded.
+    #[test]
+    fn position_ms_no_track() {
+        let (engine, _tmp) = engine_with_tempdir();
+        assert_eq!(engine.position_ms(), None);
+    }
+
+    /// duration_ms() returns None when no track is loaded.
+    #[test]
+    fn duration_ms_no_track() {
+        let (engine, _tmp) = engine_with_tempdir();
+        assert_eq!(engine.duration_ms(), None);
     }
 }

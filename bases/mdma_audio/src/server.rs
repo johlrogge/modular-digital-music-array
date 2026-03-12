@@ -1,6 +1,6 @@
 use library_ipc_client::LibraryClient;
 use music_primitives::ContentHash;
-use playback_engine::{Deck, PlaybackEngine};
+use playback_engine::PlaybackEngine;
 use playback_primitives::AudioSinkInfo;
 use std::path::PathBuf;
 use stream_source_protocol::{
@@ -118,7 +118,7 @@ impl Server {
         let full_path = self.music_dir.join(&blob_path);
         info!("Loading track from {:?}", full_path);
 
-        if let Err(e) = self.engine.load_track(Deck::A, &full_path).await {
+        if let Err(e) = self.engine.load_track(&full_path).await {
             warn!("Failed to load track: {}", e);
             return StreamResponse::Error {
                 message: format!("Failed to load track: {}", e),
@@ -147,7 +147,7 @@ impl Server {
         };
 
         self.engine.set_stream_active(true);
-        if let Err(e) = self.engine.play(Deck::A) {
+        if let Err(e) = self.engine.play() {
             warn!("Play failed: {}", e);
             return StreamResponse::Error {
                 message: format!("Play failed: {}", e),
@@ -164,7 +164,7 @@ impl Server {
             None => return StreamResponse::Ok,
         };
 
-        if let Err(e) = self.engine.stop(Deck::A) {
+        if let Err(e) = self.engine.stop() {
             warn!("Pause (stop) failed: {}", e);
         }
         loaded.is_playing = false;
@@ -173,10 +173,10 @@ impl Server {
 
     fn handle_stop(&mut self) -> StreamResponse {
         if self.loaded.is_some() {
-            if let Err(e) = self.engine.stop(Deck::A) {
+            if let Err(e) = self.engine.stop() {
                 warn!("Stop failed: {}", e);
             }
-            if let Err(e) = self.engine.unload_track(Deck::A) {
+            if let Err(e) = self.engine.unload_track() {
                 warn!("Unload failed: {}", e);
             }
             self.engine.set_stream_active(false);
@@ -191,7 +191,7 @@ impl Server {
             None => return StreamResponse::Loaded { info: None },
         };
 
-        let state = if self.engine.is_track_finished(Deck::A) {
+        let state = if self.engine.is_track_finished() {
             StreamPlaybackState::Finished
         } else if loaded.is_playing {
             StreamPlaybackState::Playing
@@ -206,8 +206,8 @@ impl Server {
                 title: loaded.title.clone(),
                 artist: loaded.artist.clone(),
                 album: loaded.album.clone(),
-                position_ms: self.engine.position_ms(Deck::A),
-                duration_ms: self.engine.duration_ms(Deck::A),
+                position_ms: self.engine.position_ms(),
+                duration_ms: self.engine.duration_ms(),
             }),
         }
     }
