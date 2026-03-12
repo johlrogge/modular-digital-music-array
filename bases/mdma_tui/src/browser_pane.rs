@@ -312,9 +312,9 @@ impl BrowserPane {
         let current = std::mem::replace(&mut self.level, BrowserLevel::Root { cursor: 0 });
 
         match current {
-            BrowserLevel::Root { .. } => {
+            BrowserLevel::Root { cursor } => {
                 // Already at root, nothing to do
-                self.level = BrowserLevel::Root { cursor: 0 };
+                self.level = BrowserLevel::Root { cursor };
             }
             BrowserLevel::Groups { .. } => {
                 // Go back to root
@@ -543,13 +543,7 @@ impl Pane for BrowserPane {
                         selection.select_all();
                         PaneAction::Consumed
                     }
-                    KeyCode::Esc => {
-                        if !selection.pop_filter() {
-                            selection.clear_selection();
-                        }
-                        PaneAction::Consumed
-                    }
-                    KeyCode::Backspace => {
+                    KeyCode::Esc | KeyCode::Backspace => {
                         if let Some(err) = self.pop_level() {
                             return err;
                         }
@@ -632,13 +626,7 @@ impl Pane for BrowserPane {
                     selection.select_all();
                     PaneAction::Consumed
                 }
-                KeyCode::Esc => {
-                    if !selection.pop_filter() {
-                        selection.clear_selection();
-                    }
-                    PaneAction::Consumed
-                }
-                KeyCode::Backspace => {
+                KeyCode::Esc | KeyCode::Backspace => {
                     if let Some(err) = self.pop_level() {
                         return err;
                     }

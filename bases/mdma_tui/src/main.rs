@@ -24,8 +24,10 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use event_protocol::PlaybackEvent;
 use events::{spawn_event_subscriber, AppEvent};
 use mdma_client::{LibraryBackend, PlaybackBackend};
+use pane::PaneKind;
 use queue_pane::QueuePane;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::rc::Rc;
@@ -133,6 +135,15 @@ fn main() -> Result<()> {
             while let Ok(ev) = rx.try_recv() {
                 match ev {
                     AppEvent::Playback(pe) => {
+                        // Refresh queue panes when the queue changes on the node.
+                        if matches!(pe, PlaybackEvent::QueueChanged { .. }) {
+                            if app.left_pane.pane_kind() == PaneKind::Queue {
+                                app.left_pane.refresh();
+                            }
+                            if app.right_pane.pane_kind() == PaneKind::Queue {
+                                app.right_pane.refresh();
+                            }
+                        }
                         app.now_playing.apply(&pe);
                     }
                     AppEvent::SubscriberError(msg) => {
