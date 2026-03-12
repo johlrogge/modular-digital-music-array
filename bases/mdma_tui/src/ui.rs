@@ -118,7 +118,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "p:play/pause  s:stop  n:next  c:clear  q:append  Q:next  Esc:back",
+                "p:play/pause  s:stop  n:next  c:clear  Esc:back",
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
@@ -130,7 +130,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 ))
             } else {
                 Line::from(Span::styled(
-                    "Tab:switch  a:add  p:playback  s:filter  ?:help  :q:quit",
+                    "Tab:switch  a:add  q:queue  Q:next  p:playback  s:filter  ?:help  :q:quit",
                     Style::default().fg(Color::DarkGray),
                 ))
             }
@@ -333,6 +333,12 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
             desc("   search pane"),
         ]),
         Line::from(vec![
+            key("  q     "),
+            desc("  queue append        "),
+            key("Q"),
+            desc("     queue next"),
+        ]),
+        Line::from(vec![
             key("  s     "),
             desc("  filter              "),
             key(":browser"),
@@ -379,12 +385,6 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
             desc(" next track      "),
             key("c"),
             desc("    clear queue"),
-        ]),
-        Line::from(vec![
-            key("  q      "),
-            desc(" queue append    "),
-            key("Q"),
-            desc("    queue next"),
         ]),
         Line::from(vec![key("  Esc    "), desc(" back to normal")]),
         gap.clone(),

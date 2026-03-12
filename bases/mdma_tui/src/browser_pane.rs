@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use crate::browse_field::{find_first_by_letter, BrowseField};
+use crate::browse_field::BrowseField;
 use crate::pane::{Pane, PaneAction, PaneKind};
 use crate::selection::SelectionState;
 use crate::track_list::render_track_list;
@@ -576,28 +576,6 @@ impl Pane for BrowserPane {
                             }
                         } else if let Some(err) = self.drill_multi_group(field, selected_names) {
                             return err;
-                        }
-                        PaneAction::Consumed
-                    }
-                    KeyCode::Char(ch) if ch.is_ascii_alphabetic() => {
-                        // Letter jump: find first visible group starting with this letter.
-                        // Build the list of visible names from the destructured bindings,
-                        // then drop the shared borrow before mutating selection.
-                        let maybe_vis_idx = {
-                            let visible_names: Vec<&str> = selection
-                                .visible_to_data
-                                .iter()
-                                .map(|&data_idx| groups[data_idx].name.as_str())
-                                .collect();
-                            find_first_by_letter(&visible_names, ch)
-                        };
-                        if let Some(vis_idx) = maybe_vis_idx {
-                            selection.list_state.select(Some(vis_idx));
-                        } else {
-                            return PaneAction::Info(format!(
-                                "No {} entries visible",
-                                ch.to_uppercase()
-                            ));
                         }
                         PaneAction::Consumed
                     }

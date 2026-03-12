@@ -50,6 +50,34 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
                 }
             }
         }
+        KeyCode::Char('q') => {
+            let hashes = app.active_pane().resolve_selection();
+            if hashes.is_empty() {
+                app.set_status("No tracks selected");
+            } else {
+                let count = hashes.len();
+                for hash in &hashes {
+                    let _ = app
+                        .playback
+                        .queue_append(hash.clone(), DEFAULT_SOURCE.to_string());
+                }
+                app.set_status(format!("Queued {} track(s)", count));
+            }
+        }
+        KeyCode::Char('Q') => {
+            let hashes = app.active_pane().resolve_selection();
+            if hashes.is_empty() {
+                app.set_status("No tracks selected");
+            } else {
+                let count = hashes.len();
+                for hash in hashes.iter().rev() {
+                    let _ = app
+                        .playback
+                        .queue_next(hash.clone(), DEFAULT_SOURCE.to_string());
+                }
+                app.set_status(format!("Queued next {} track(s)", count));
+            }
+        }
         KeyCode::Char('p') => {
             app.mode = InputMode::Playback;
         }
@@ -155,35 +183,6 @@ fn handle_playback(app: &mut App, key: KeyEvent) {
         KeyCode::Char('c') => {
             let _ = app.playback.queue_clear();
             app.set_status("Queue cleared");
-        }
-        KeyCode::Char('q') => {
-            let hashes = app.active_pane().resolve_selection();
-            if hashes.is_empty() {
-                app.set_status("No tracks selected");
-            } else {
-                let count = hashes.len();
-                for hash in &hashes {
-                    let _ = app
-                        .playback
-                        .queue_append(hash.clone(), DEFAULT_SOURCE.to_string());
-                }
-                app.set_status(format!("Queued {} track(s)", count));
-            }
-        }
-        KeyCode::Char('Q') => {
-            let hashes = app.active_pane().resolve_selection();
-            if hashes.is_empty() {
-                app.set_status("No tracks selected");
-            } else {
-                let count = hashes.len();
-                // queue_next inserts at front; iterate in reverse to preserve order
-                for hash in hashes.iter().rev() {
-                    let _ = app
-                        .playback
-                        .queue_next(hash.clone(), DEFAULT_SOURCE.to_string());
-                }
-                app.set_status(format!("Queued next {} track(s)", count));
-            }
         }
         KeyCode::Esc => {
             app.mode = InputMode::Normal;
