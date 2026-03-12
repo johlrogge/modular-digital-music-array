@@ -8,7 +8,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::Span,
-    widgets::{Block, BorderType, Borders, List, ListItem},
+    widgets::{Block, Borders, List, ListItem},
     Frame,
 };
 use std::rc::Rc;
@@ -35,18 +35,10 @@ impl PlaylistsPane {
 
 impl Pane for PlaylistsPane {
     fn render(&self, f: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .title("Playlists")
-            .borders(Borders::ALL)
-            .border_type(BorderType::Plain)
-            .border_style(Style::default().fg(Color::White));
-
         if self.names.is_empty() {
-            let inner = block.inner(area);
-            f.render_widget(block, area);
             let placeholder = ratatui::widgets::Paragraph::new("No playlists")
                 .style(Style::default().fg(Color::DarkGray));
-            f.render_widget(placeholder, inner);
+            f.render_widget(placeholder, area);
             return;
         }
 
@@ -85,6 +77,7 @@ impl Pane for PlaylistsPane {
             })
             .collect();
 
+        let block = Block::default().borders(Borders::NONE);
         let list = List::new(items)
             .block(block)
             .highlight_style(Style::default());

@@ -8,14 +8,14 @@ use mdma_client::{ContentHash, LibraryBackend, TrackInfo};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, BorderType, Borders, List, ListItem},
+    text::Span,
+    widgets::{Block, Borders, List, ListItem},
     Frame,
 };
 use std::collections::HashMap;
 use std::rc::Rc;
 
-const ROOT_ITEMS: [&str; 4] = ["Songs", "Artists", "Albums", "Genres"];
+const ROOT_ITEMS: [&str; 4] = ["Tracks", "Artists", "Albums", "Genres"];
 const ROOT_FIELDS: [BrowseField; 4] = [
     BrowseField::Title,
     BrowseField::Artist,
@@ -287,9 +287,9 @@ pub(crate) fn resolve_hashes_from_selection(
     selection: &SelectionState,
 ) -> Vec<ContentHash> {
     selection
-        .selected
-        .iter()
-        .filter_map(|&vis_idx| selection.visible_to_data.get(vis_idx))
+        .effective_selection()
+        .into_iter()
+        .filter_map(|vis_idx| selection.visible_to_data.get(vis_idx))
         .filter_map(|&data_idx| tracks.get(data_idx))
         .map(|t| t.content_hash.clone())
         .collect()
@@ -305,7 +305,7 @@ impl BrowserPane {
                 selection,
             } => {
                 let mut hashes = Vec::new();
-                for &vis_idx in &selection.selected {
+                for vis_idx in selection.effective_selection() {
                     if let Some(&data_idx) = selection.visible_to_data.get(vis_idx) {
                         if let Some(group) = groups.get(data_idx) {
                             if let Some(all) = &self.all_tracks {
@@ -401,17 +401,7 @@ impl BrowserPane {
 
 impl Pane for BrowserPane {
     fn render(&self, f: &mut Frame, area: Rect) {
-        let breadcrumb = self.breadcrumb_line();
-
-        let block = Block::default()
-            .title(Line::from(vec![
-                Span::styled(" ", Style::default()),
-                Span::styled(&breadcrumb, Style::default().fg(Color::Yellow)),
-                Span::styled(" ", Style::default()),
-            ]))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Plain)
-            .border_style(Style::default().fg(Color::White));
+        let block = Block::default().borders(Borders::NONE);
 
         match &self.level {
             BrowserLevel::Root { cursor } => {
@@ -761,7 +751,7 @@ mod tests {
                     selection,
                 } => {
                     let mut hashes = Vec::new();
-                    for &vis_idx in &selection.selected {
+                    for vis_idx in selection.effective_selection() {
                         if let Some(&data_idx) = selection.visible_to_data.get(vis_idx) {
                             if let Some(group) = groups.get(data_idx) {
                                 if let Some(all) = &self.all_tracks {

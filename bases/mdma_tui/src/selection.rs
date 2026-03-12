@@ -138,6 +138,17 @@ impl SelectionState {
         });
     }
 
+    /// Returns the effective selection indices in the visible list.
+    /// If explicit selections exist, returns those. Otherwise falls back
+    /// to the cursor position (helix/kakoune: cursor is always a selection).
+    pub fn effective_selection(&self) -> Vec<usize> {
+        if !self.selected.is_empty() {
+            self.selected.iter().copied().collect()
+        } else {
+            self.cursor_position().map(|c| vec![c]).unwrap_or_default()
+        }
+    }
+
     /// `Escape` key: pop the top filter from the stack.
     ///
     /// Returns `false` if the stack was already empty.
@@ -288,5 +299,20 @@ mod tests {
         assert_eq!(state.visible_index_to_data(1), Some(2));
         assert_eq!(state.visible_index_to_data(2), Some(4));
         assert_eq!(state.visible_index_to_data(3), None);
+    }
+
+    #[test]
+    fn effective_selection_falls_back_to_cursor() {
+        let state = SelectionState::new(3);
+        // No explicit selection — cursor at 0
+        assert_eq!(state.effective_selection(), vec![0]);
+    }
+
+    #[test]
+    fn effective_selection_uses_explicit_when_present() {
+        let mut state = SelectionState::new(5);
+        state.selected.insert(2);
+        state.selected.insert(4);
+        assert_eq!(state.effective_selection(), vec![2, 4]);
     }
 }

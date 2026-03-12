@@ -6,7 +6,7 @@ use mdma_client::{ContentHash, LibraryBackend, PlaybackBackend, PlaylistName, Tr
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
-    widgets::{Block, BorderType, Borders},
+    widgets::{Block, Borders},
     Frame,
 };
 use std::rc::Rc;
@@ -54,21 +54,14 @@ impl QueuePane {
 
 impl Pane for QueuePane {
     fn render(&self, f: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .title(self.title.as_str())
-            .borders(Borders::ALL)
-            .border_type(BorderType::Plain)
-            .border_style(Style::default().fg(Color::White));
-
         if self.tracks.is_empty() {
-            let inner = block.inner(area);
-            f.render_widget(block, area);
             let placeholder = ratatui::widgets::Paragraph::new("Queue is empty")
                 .style(Style::default().fg(Color::DarkGray));
-            f.render_widget(placeholder, inner);
+            f.render_widget(placeholder, area);
             return;
         }
 
+        let block = Block::default().borders(Borders::NONE);
         render_track_list(f, area, &self.tracks, &self.selection, block);
     }
 
@@ -106,9 +99,9 @@ impl Pane for QueuePane {
 
     fn resolve_selection(&self) -> Vec<ContentHash> {
         self.selection
-            .selected
-            .iter()
-            .filter_map(|&vis_idx| self.selection.visible_index_to_data(vis_idx))
+            .effective_selection()
+            .into_iter()
+            .filter_map(|vis_idx| self.selection.visible_index_to_data(vis_idx))
             .map(|data_idx| self.tracks[data_idx].content_hash.clone())
             .collect()
     }
@@ -135,6 +128,24 @@ impl Pane for QueuePane {
 
     fn playlist_name(&self) -> Option<&PlaylistName> {
         None
+    }
+
+    fn accept_tracks(&mut self, hashes: &[ContentHash]) -> PaneAction {
+        let mut errors = Vec::new();
+        for hash in hashes {
+            if let Err(e) = self
+                .playback
+                .queue_append(hash.clone(), "audio".to_string())
+            {
+                errors.push(format!("{e}"));
+            }
+        }
+        if errors.is_empty() {
+            self.refresh();
+            PaneAction::Info(format!("Queued {} track(s)", hashes.len()))
+        } else {
+            PaneAction::Error(errors.join(", "))
+        }
     }
 
     fn refresh(&mut self) -> PaneAction {

@@ -113,7 +113,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 ))
             } else {
                 Line::from(Span::styled(
-                    "q:quit  Tab:switch  s:filter  ::cmd",
+                    "q:quit  Tab:switch  a:add  s:filter  ?:cmds",
                     Style::default().fg(Color::DarkGray),
                 ))
             }

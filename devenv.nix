@@ -192,18 +192,18 @@ in
     echo "  gateway  tcp://$MDMA_NODE:5555"
     echo ""
 
-    # Build mdma-cli and expose it directly as `mdma` on PATH
+    # Build mdma-cli and mdma-tui, expose via target/debug on PATH
     # Skip in CI — the build is wasted work there (~30s)
     if [ -z "''${CI:-}" ]; then
-      cargo build -q --package mdma-cli 2>/dev/null \
+      cargo build -q --package mdma-cli --package mdma-tui 2>/dev/null \
         && export PATH="$MDMA_PROJECT_ROOT/target/debug:$PATH" \
-        && echo "mdma CLI ready (gateway mode)" \
-        || echo "mdma CLI not built — run: cargo build --package mdma-cli"
+        && echo "mdma CLI + TUI ready (gateway mode)" \
+        || echo "mdma CLI/TUI not built — run: cargo build --package mdma-cli --package mdma-tui"
       eval "$(mdma generate-completions bash 2>/dev/null)" || true
     fi
 
     echo ""
-    echo "Commands:  mdma --help"
+    echo "Commands:  mdma --help | mdma-tui"
     echo "           mdma source list|sync|status|downloads"
     echo "           mdma-volume <0-1>  mdma-status"
     echo "           just --list"

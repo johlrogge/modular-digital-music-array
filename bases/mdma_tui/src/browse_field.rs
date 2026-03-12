@@ -16,7 +16,7 @@ impl BrowseField {
             Self::Artist => "Artists",
             Self::Album => "Albums",
             Self::Genre => "Genres",
-            Self::Title => "Songs",
+            Self::Title => "Tracks",
         }
     }
 
@@ -73,7 +73,7 @@ mod tests {
         assert_eq!(BrowseField::Artist.display_name(), "Artists");
         assert_eq!(BrowseField::Album.display_name(), "Albums");
         assert_eq!(BrowseField::Genre.display_name(), "Genres");
-        assert_eq!(BrowseField::Title.display_name(), "Songs");
+        assert_eq!(BrowseField::Title.display_name(), "Tracks");
     }
 
     #[test]

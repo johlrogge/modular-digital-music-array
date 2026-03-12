@@ -26,6 +26,9 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         KeyCode::Char(':') => {
             app.open_palette();
         }
+        KeyCode::Char('?') => {
+            app.open_palette();
+        }
         KeyCode::Char('s') => {
             app.mode = InputMode::FilterInput;
             app.filter_input.clear();
@@ -179,11 +182,11 @@ fn dispatch_pane_action(app: &mut App, action: PaneAction) {
         PaneAction::Error(msg) => app.set_status(format!("Error: {}", msg)),
         PaneAction::Info(msg) => app.set_status(msg),
         PaneAction::OpenPlaylist(name) => {
-            // Open the requested playlist in the INACTIVE pane.
+            // Open the requested playlist in the ACTIVE pane (replaces it).
             let library = Rc::clone(&app.library);
             match PlaylistPane::open(name.clone(), library) {
                 Ok(playlist_pane) => {
-                    *app.inactive_pane_mut() = Box::new(playlist_pane);
+                    app.switch_active_pane(Box::new(playlist_pane));
                     app.set_status(format!("Opened playlist: {}", name));
                 }
                 Err(e) => {

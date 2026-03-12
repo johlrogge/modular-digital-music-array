@@ -158,9 +158,9 @@ impl Pane for SearchPane {
 
     fn resolve_selection(&self) -> Vec<ContentHash> {
         self.selection
-            .selected
-            .iter()
-            .filter_map(|&vis_idx| self.selection.visible_index_to_data(vis_idx))
+            .effective_selection()
+            .into_iter()
+            .filter_map(|vis_idx| self.selection.visible_index_to_data(vis_idx))
             .map(|data_idx| self.tracks[data_idx].content_hash.clone())
             .collect()
     }
@@ -220,9 +220,9 @@ mod tests {
     /// Reproduce the resolve_selection logic for test purposes.
     fn resolve(selection: &SelectionState, tracks: &[TrackInfo]) -> Vec<ContentHash> {
         selection
-            .selected
-            .iter()
-            .filter_map(|&vis_idx| selection.visible_index_to_data(vis_idx))
+            .effective_selection()
+            .into_iter()
+            .filter_map(|vis_idx| selection.visible_index_to_data(vis_idx))
             .map(|data_idx| tracks[data_idx].content_hash.clone())
             .collect()
     }
@@ -267,13 +267,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_selection_empty_when_nothing_selected() {
+    fn resolve_selection_falls_back_to_cursor_when_nothing_explicit() {
+        // With effective_selection, the cursor position is an implicit selection.
         let tracks = vec![make_track("sha256:aaa"), make_track("sha256:bbb")];
         let selection = SelectionState::new(tracks.len());
-
+        // No explicit selection — cursor at 0 → resolves to first track.
         let hashes = resolve(&selection, &tracks);
-
-        assert!(hashes.is_empty());
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0], ContentHash::new("sha256:aaa"));
     }
 
     #[test]

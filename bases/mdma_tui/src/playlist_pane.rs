@@ -8,7 +8,7 @@ use mdma_client::{ContentHash, LibraryBackend, PlaylistName, TrackInfo};
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
-    widgets::{Block, BorderType, Borders},
+    widgets::{Block, Borders},
     Frame,
 };
 use std::rc::Rc;
@@ -65,21 +65,14 @@ impl PlaylistPane {
 
 impl Pane for PlaylistPane {
     fn render(&self, f: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .title(self.title.as_str())
-            .borders(Borders::ALL)
-            .border_type(BorderType::Plain)
-            .border_style(Style::default().fg(Color::White));
-
         if self.tracks.is_empty() {
-            let inner = block.inner(area);
-            f.render_widget(block, area);
             let placeholder = ratatui::widgets::Paragraph::new("Playlist is empty")
                 .style(Style::default().fg(Color::DarkGray));
-            f.render_widget(placeholder, inner);
+            f.render_widget(placeholder, area);
             return;
         }
 
+        let block = Block::default().borders(Borders::NONE);
         render_track_list(f, area, &self.tracks, &self.selection, block);
     }
 
@@ -249,9 +242,9 @@ impl Pane for PlaylistPane {
 
     fn resolve_selection(&self) -> Vec<ContentHash> {
         self.selection
-            .selected
-            .iter()
-            .filter_map(|&vis_idx| self.selection.visible_index_to_data(vis_idx))
+            .effective_selection()
+            .into_iter()
+            .filter_map(|vis_idx| self.selection.visible_index_to_data(vis_idx))
             .map(|data_idx| self.hashes[data_idx].clone())
             .collect()
     }
