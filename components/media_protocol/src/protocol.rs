@@ -2,6 +2,11 @@ use playback_primitives::{AudioOutputConfig, AudioSinkInfo, ContentHash, Deck, V
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[allow(dead_code)] // used by serde via string reference in #[serde(default = "...")]
+fn default_audio_source() -> String {
+    "audio".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Command {
@@ -40,10 +45,12 @@ pub enum Command {
     // Queue management — queue feeds deck A only
     QueueNext {
         hash: ContentHash,
+        #[serde(default = "default_audio_source")]
         source: String,
     },
     QueueAppend {
         hash: ContentHash,
+        #[serde(default = "default_audio_source")]
         source: String,
     },
     QueueList,
@@ -97,6 +104,28 @@ pub enum ResponseData {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn queue_append_without_source_defaults_to_audio() {
+        let json = r#"{"queue_append":{"hash":"abc123def456abc123def456abc123def456abc123def456abc123def456abc1"}}"#;
+        let decoded: Command = serde_json::from_str(json).unwrap();
+        if let Command::QueueAppend { source, .. } = decoded {
+            assert_eq!(source, "audio");
+        } else {
+            panic!("expected QueueAppend variant");
+        }
+    }
+
+    #[test]
+    fn queue_next_without_source_defaults_to_audio() {
+        let json = r#"{"queue_next":{"hash":"abc123def456abc123def456abc123def456abc123def456abc123def456abc1"}}"#;
+        let decoded: Command = serde_json::from_str(json).unwrap();
+        if let Command::QueueNext { source, .. } = decoded {
+            assert_eq!(source, "audio");
+        } else {
+            panic!("expected QueueNext variant");
+        }
+    }
 
     #[test]
     fn response_ok_serialization() {
