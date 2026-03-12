@@ -16,6 +16,7 @@ mod track_list;
 mod ui;
 
 use app::App;
+use browser_pane::BrowserPane;
 use clap::Parser;
 use color_eyre::Result;
 use crossterm::{
@@ -27,7 +28,6 @@ use events::{spawn_event_subscriber, AppEvent};
 use mdma_client::{LibraryBackend, PlaybackBackend};
 use queue_pane::QueuePane;
 use ratatui::{backend::CrosstermBackend, Terminal};
-use search_pane::SearchPane;
 use std::rc::Rc;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
@@ -90,8 +90,8 @@ fn main() -> Result<()> {
         .map(|node| spawn_event_subscriber(&event_addr_from_node(node)))
         .and_then(|r| r.ok());
 
-    // Build initial panes: left = Search, right = Queue.
-    let left_pane: Box<dyn pane::Pane> = Box::new(SearchPane::new(Rc::clone(&library)));
+    // Build initial panes: left = Browser (Artists), right = Queue.
+    let left_pane: Box<dyn pane::Pane> = Box::new(BrowserPane::new(Rc::clone(&library)));
     let right_pane: Box<dyn pane::Pane> =
         Box::new(QueuePane::new(Rc::clone(&playback), Rc::clone(&library)));
 

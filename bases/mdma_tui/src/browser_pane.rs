@@ -61,12 +61,15 @@ pub struct BrowserPane {
 
 impl BrowserPane {
     pub fn new(library: Rc<LibraryBackend>) -> Self {
+        let mut root_selection = SelectionState::new(ROOT_ITEMS.len());
+        // Start with cursor on Artists (index 1).
+        root_selection.list_state.select(Some(1));
         BrowserPane {
-            level: BrowserLevel::Root { cursor: 0 },
+            level: BrowserLevel::Root { cursor: 1 },
             library,
             breadcrumbs: vec!["Browser".to_string()],
             all_tracks: None,
-            root_selection: SelectionState::new(ROOT_ITEMS.len()),
+            root_selection,
         }
     }
 
@@ -150,12 +153,26 @@ impl BrowserPane {
         }
     }
 
-    /// Get tracks for a specific group (filtered by field == group_name).
+    /// Get tracks for a specific group (filtered by field == group_name), sorted by title ascending.
     fn tracks_for_group(all: &[TrackInfo], field: BrowseField, group_name: &str) -> Vec<TrackInfo> {
-        all.iter()
+        let mut tracks: Vec<TrackInfo> = all
+            .iter()
             .filter(|t| field.extract(t).as_deref() == Some(group_name))
             .cloned()
-            .collect()
+            .collect();
+        tracks.sort_by(|a, b| {
+            BrowseField::Title
+                .extract(a)
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .cmp(
+                    &BrowseField::Title
+                        .extract(b)
+                        .unwrap_or_default()
+                        .to_ascii_lowercase(),
+                )
+        });
+        tracks
     }
 
     /// Drill into the root item at the given index.
@@ -171,8 +188,20 @@ impl BrowserPane {
 
         match field {
             BrowseField::Title => {
-                // Songs: show all tracks directly
-                let tracks = self.all_tracks.clone().unwrap_or_default();
+                // Songs: show all tracks directly, sorted by title ascending.
+                let mut tracks = self.all_tracks.clone().unwrap_or_default();
+                tracks.sort_by(|a, b| {
+                    BrowseField::Title
+                        .extract(a)
+                        .unwrap_or_default()
+                        .to_ascii_lowercase()
+                        .cmp(
+                            &BrowseField::Title
+                                .extract(b)
+                                .unwrap_or_default()
+                                .to_ascii_lowercase(),
+                        )
+                });
                 let total = tracks.len();
                 self.breadcrumbs.push(label.to_string());
                 self.level = BrowserLevel::Tracks {
@@ -221,6 +250,50 @@ impl BrowserPane {
         self.level = BrowserLevel::Tracks {
             field,
             group_name: Some(group_name),
+            selection: SelectionState::new(total),
+            tracks,
+        };
+        None
+    }
+
+    /// Drill into multiple selected group entries at once, merging their tracks.
+    fn drill_multi_group(&mut self, field: BrowseField, names: Vec<String>) -> Option<PaneAction> {
+        if let Some(err) = self.ensure_all_tracks() {
+            return Some(err);
+        }
+        let all = self.all_tracks.as_deref().unwrap_or(&[]);
+
+        // Collect tracks from all selected groups, preserving order, deduplicating by hash.
+        let mut seen = std::collections::HashSet::new();
+        let mut tracks: Vec<TrackInfo> = Vec::new();
+        for name in &names {
+            for t in Self::tracks_for_group(all, field, name) {
+                if seen.insert(t.content_hash.clone()) {
+                    tracks.push(t);
+                }
+            }
+        }
+
+        // Sort by track title ascending.
+        tracks.sort_by(|a, b| {
+            BrowseField::Title
+                .extract(a)
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .cmp(
+                    &BrowseField::Title
+                        .extract(b)
+                        .unwrap_or_default()
+                        .to_ascii_lowercase(),
+                )
+        });
+
+        let label = format!("{} {}", names.len(), field.display_name());
+        let total = tracks.len();
+        self.breadcrumbs.push(label.clone());
+        self.level = BrowserLevel::Tracks {
+            field,
+            group_name: Some(label), // non-None so pop_level goes back to Groups
             selection: SelectionState::new(total),
             tracks,
         };
@@ -483,17 +556,32 @@ impl Pane for BrowserPane {
                         PaneAction::Consumed
                     }
                     KeyCode::Enter => {
-                        // Drill into the group under the cursor
-                        let group_name = selection
-                            .cursor_position()
-                            .and_then(|vis| selection.visible_to_data.get(vis).copied())
-                            .and_then(|data_idx| groups.get(data_idx))
-                            .map(|g| g.name.clone());
+                        // Collect names for all effectively-selected entries.
+                        // Extract into a local Vec first so the borrow on `selection`
+                        // and `groups` ends before we call the drill methods on `self`.
+                        let selected_names: Vec<String> = {
+                            selection
+                                .effective_selection()
+                                .into_iter()
+                                .filter_map(|vis| selection.visible_to_data.get(vis).copied())
+                                .filter_map(|data_idx| groups.get(data_idx))
+                                .map(|g| g.name.clone())
+                                .collect()
+                        };
 
-                        if let Some(name) = group_name {
+                        if selected_names.is_empty() {
+                            return PaneAction::Consumed;
+                        }
+
+                        // The Groups level is replaced entirely by the drill methods,
+                        // so there is no need to explicitly clear its selection state.
+                        if selected_names.len() == 1 {
+                            let name = selected_names.into_iter().next().unwrap();
                             if let Some(err) = self.drill_group(field, name) {
                                 return err;
                             }
+                        } else if let Some(err) = self.drill_multi_group(field, selected_names) {
+                            return err;
                         }
                         PaneAction::Consumed
                     }
