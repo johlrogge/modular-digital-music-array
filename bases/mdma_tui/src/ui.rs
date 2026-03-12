@@ -1,4 +1,4 @@
-use crate::app::{App, InputMode, Side};
+use crate::app::{App, InputMode, PaletteEntry, Side};
 use crate::now_playing::PlaybackStatus;
 use crate::theme::{
     ACCENT, ACCENT2, BG_ELEVATED, BG_SURFACE, BORDER_SUBTLE, SUCCESS, TEXT_PRIMARY, TEXT_SECONDARY,
@@ -264,11 +264,25 @@ fn render_palette_overlay(f: &mut Frame, app: &App, area: Rect) {
             .palette_matches
             .iter()
             .take(MAX_MATCHES)
-            .map(|cmd| {
-                ListItem::new(Line::from(vec![
+            .map(|entry| match entry {
+                PaletteEntry::Command(cmd) => ListItem::new(Line::from(vec![
                     Span::styled(format!("{:<10}", cmd.name), Style::default().fg(ACCENT2)),
                     Span::styled(cmd.description, Style::default().fg(TEXT_SECONDARY)),
-                ]))
+                ])),
+                PaletteEntry::OpenPlaylist(name) => ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:<10}", name.as_str()),
+                        Style::default().fg(SUCCESS),
+                    ),
+                    Span::styled("open playlist", Style::default().fg(TEXT_SECONDARY)),
+                ])),
+                PaletteEntry::CreatePlaylist(name) => ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:<10}", format!("create: {}", name)),
+                        Style::default().fg(ACCENT),
+                    ),
+                    Span::styled("new playlist", Style::default().fg(TEXT_SECONDARY)),
+                ])),
             })
             .collect();
 

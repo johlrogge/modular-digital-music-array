@@ -1,4 +1,4 @@
-use crate::app::{App, InputMode};
+use crate::app::{App, InputMode, PaletteEntry};
 use crate::commands::Command;
 use crate::now_playing::PlaybackStatus;
 use crate::pane::{PaneAction, PaneKind};
@@ -122,9 +122,41 @@ fn handle_palette(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             let cursor = app.palette_cursor;
-            if let Some(&cmd) = app.palette_matches.get(cursor) {
-                let playback = Rc::clone(&app.playback);
-                execute_command(cmd, &playback, app);
+            if let Some(entry) = app.palette_matches.get(cursor).cloned() {
+                match entry {
+                    PaletteEntry::Command(cmd) => {
+                        let playback = Rc::clone(&app.playback);
+                        execute_command(cmd, &playback, app);
+                    }
+                    PaletteEntry::OpenPlaylist(name) => {
+                        let library = Rc::clone(&app.library);
+                        match PlaylistPane::open(name.clone(), library) {
+                            Ok(pane) => {
+                                app.switch_active_pane(Box::new(pane));
+                                app.set_status(format!("Opened: {}", name));
+                            }
+                            Err(e) => app.set_status(format!("Open failed: {e}")),
+                        }
+                    }
+                    PaletteEntry::CreatePlaylist(name_str) => match PlaylistName::new(&name_str) {
+                        Ok(name) => match app.library.playlist_new(&name, &[]) {
+                            Ok(()) => {
+                                let library = Rc::clone(&app.library);
+                                match PlaylistPane::open(name.clone(), library) {
+                                    Ok(pane) => {
+                                        app.switch_active_pane(Box::new(pane));
+                                        app.set_status(format!("Created: {}", name_str));
+                                    }
+                                    Err(e) => {
+                                        app.set_status(format!("Created but open failed: {e}"))
+                                    }
+                                }
+                            }
+                            Err(e) => app.set_status(format!("Create failed: {e}")),
+                        },
+                        Err(e) => app.set_status(format!("Invalid name: {e}")),
+                    },
+                }
             }
             app.close_palette();
         }
@@ -279,6 +311,9 @@ fn execute_command(cmd: &Command, playback: &PlaybackBackend, app: &mut App) {
             Ok(p) => app.switch_active_pane(p),
             Err(e) => app.set_status(format!("Playlists: {e}")),
         },
+        "o" => {
+            app.set_status(":o <name>  — open or create a playlist");
+        }
         _ => {
             app.set_status(format!("Unknown command: {}", cmd.name));
         }

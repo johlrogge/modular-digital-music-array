@@ -6,8 +6,16 @@ use crate::pane::Pane;
 use crate::playlists_pane::PlaylistsPane;
 use crate::queue_pane::QueuePane;
 use crate::search_pane::SearchPane;
-use mdma_client::{LibraryBackend, PlaybackBackend};
+use mdma_client::{LibraryBackend, PlaybackBackend, PlaylistName};
 use std::rc::Rc;
+
+/// An entry in the command palette — either a built-in command or a playlist open/create action.
+#[derive(Clone)]
+pub enum PaletteEntry {
+    Command(&'static Command),
+    OpenPlaylist(PlaylistName),
+    CreatePlaylist(String),
+}
 
 /// Which side of the split layout is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +58,7 @@ pub struct App {
     pub playback: Rc<PlaybackBackend>,
     // --- Palette state ---
     pub palette_query: String,
-    pub palette_matches: Vec<&'static Command>,
+    pub palette_matches: Vec<PaletteEntry>,
     pub palette_cursor: usize,
 }
 
@@ -136,7 +144,10 @@ impl App {
     /// Open the command palette, resetting query and computing initial matches.
     pub fn open_palette(&mut self) {
         self.palette_query.clear();
-        self.palette_matches = matching("");
+        self.palette_matches = matching("")
+            .into_iter()
+            .map(PaletteEntry::Command)
+            .collect();
         self.palette_cursor = 0;
         self.mode = InputMode::Palette;
     }
@@ -151,7 +162,28 @@ impl App {
 
     /// Update the palette query and recompute matches, clamping the cursor.
     pub fn palette_update_query(&mut self, query: String) {
-        self.palette_matches = matching(&query);
+        if let Some(arg) = query.strip_prefix("o ") {
+            // Open/create mode: fetch playlists and filter by arg prefix
+            let playlists = self.library.playlist_list().unwrap_or_default();
+            let lower = arg.to_lowercase();
+            let mut entries: Vec<PaletteEntry> = playlists
+                .into_iter()
+                .filter(|p| p.as_str().to_lowercase().starts_with(lower.as_str()))
+                .map(PaletteEntry::OpenPlaylist)
+                .collect();
+            let has_exact = entries.iter().any(|e| {
+                matches!(e, PaletteEntry::OpenPlaylist(p) if p.as_str().eq_ignore_ascii_case(arg))
+            });
+            if !arg.is_empty() && !has_exact {
+                entries.push(PaletteEntry::CreatePlaylist(arg.to_string()));
+            }
+            self.palette_matches = entries;
+        } else {
+            self.palette_matches = matching(&query)
+                .into_iter()
+                .map(PaletteEntry::Command)
+                .collect();
+        }
         self.palette_cursor = self
             .palette_cursor
             .min(self.palette_matches.len().saturating_sub(1));
