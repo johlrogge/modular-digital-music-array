@@ -3,8 +3,8 @@
 use crate::error::map_gw_to_lib_error;
 use library_ipc_client::{
     ClientError, ContentHash, FactType, InboxPath, IngestAllItem, IngestResult, IngestSource,
-    LibraryClient, LibraryRequest, LibraryResponse, ProtocolError, ServiceStatus, TrackInfo,
-    TrackQuery,
+    LibraryClient, LibraryRequest, LibraryResponse, PlaylistName, ProtocolError, ServiceStatus,
+    TrackInfo, TrackQuery,
 };
 
 /// Abstraction for library requests, works in both gateway and direct mode.
@@ -167,5 +167,184 @@ impl LibraryBackend {
                 message: "Unexpected response to IngestAll".to_string(),
             })),
         }
+    }
+
+    // =========================================================================
+    // Playlist Methods
+    // =========================================================================
+
+    pub fn playlist_list(&self) -> Result<Vec<PlaylistName>, ClientError> {
+        match self.request(&LibraryRequest::PlaylistList)? {
+            LibraryResponse::PlaylistNames(names) => Ok(names),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to PlaylistList".to_string(),
+            })),
+        }
+    }
+
+    pub fn playlist_get(&self, name: &PlaylistName) -> Result<Vec<ContentHash>, ClientError> {
+        match self.request(&LibraryRequest::PlaylistGet { name: name.clone() })? {
+            LibraryResponse::PlaylistContent(content) => Ok(content_to_hashes(&content)),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to PlaylistGet".to_string(),
+            })),
+        }
+    }
+
+    pub fn playlist_new(
+        &self,
+        name: &PlaylistName,
+        hashes: &[ContentHash],
+    ) -> Result<(), ClientError> {
+        match self.request(&LibraryRequest::PlaylistNew {
+            name: name.clone(),
+            content: hashes_to_content(hashes),
+        })? {
+            LibraryResponse::PlaylistContent(_) => Ok(()),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to PlaylistNew".to_string(),
+            })),
+        }
+    }
+
+    pub fn playlist_append(
+        &self,
+        name: &PlaylistName,
+        hashes: &[ContentHash],
+    ) -> Result<(), ClientError> {
+        match self.request(&LibraryRequest::PlaylistAppend {
+            name: name.clone(),
+            content: hashes_to_content(hashes),
+        })? {
+            LibraryResponse::PlaylistContent(_) => Ok(()),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to PlaylistAppend".to_string(),
+            })),
+        }
+    }
+
+    pub fn playlist_replace(
+        &self,
+        name: &PlaylistName,
+        hashes: &[ContentHash],
+    ) -> Result<(), ClientError> {
+        match self.request(&LibraryRequest::PlaylistReplace {
+            name: name.clone(),
+            content: hashes_to_content(hashes),
+        })? {
+            LibraryResponse::PlaylistContent(_) => Ok(()),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to PlaylistReplace".to_string(),
+            })),
+        }
+    }
+
+    pub fn playlist_remove(&self, name: &PlaylistName) -> Result<(), ClientError> {
+        match self.request(&LibraryRequest::PlaylistRemove { name: name.clone() })? {
+            LibraryResponse::PlaylistContent(_) => Ok(()),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to PlaylistRemove".to_string(),
+            })),
+        }
+    }
+
+    pub fn playlist_rename(
+        &self,
+        from: &PlaylistName,
+        to: &PlaylistName,
+    ) -> Result<(), ClientError> {
+        match self.request(&LibraryRequest::PlaylistRename {
+            from: from.clone(),
+            to: to.clone(),
+        })? {
+            LibraryResponse::PlaylistContent(_) => Ok(()),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to PlaylistRename".to_string(),
+            })),
+        }
+    }
+}
+
+// =========================================================================
+// Private helpers
+// =========================================================================
+
+/// Serialize a slice of ContentHash to the one-hash-per-line format.
+fn hashes_to_content(hashes: &[ContentHash]) -> String {
+    hashes
+        .iter()
+        .map(|h| h.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Parse hash-per-line playlist content. Skips empty lines and comment lines.
+/// Takes the first whitespace-separated token per line (hash may be followed by display info).
+fn content_to_hashes(content: &str) -> Vec<ContentHash> {
+    content
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.split_whitespace().next())
+        .map(|token| ContentHash::new(token))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hashes_to_content_produces_newline_separated() {
+        let hashes = vec![
+            ContentHash::new("sha256:aaa"),
+            ContentHash::new("sha256:bbb"),
+        ];
+        assert_eq!(hashes_to_content(&hashes), "sha256:aaa\nsha256:bbb");
+    }
+
+    #[test]
+    fn hashes_to_content_empty_produces_empty_string() {
+        assert_eq!(hashes_to_content(&[]), "");
+    }
+
+    #[test]
+    fn content_to_hashes_parses_one_per_line() {
+        let content = "sha256:aaa\nsha256:bbb\n";
+        let result = content_to_hashes(content);
+        assert_eq!(
+            result,
+            vec![
+                ContentHash::new("sha256:aaa"),
+                ContentHash::new("sha256:bbb")
+            ]
+        );
+    }
+
+    #[test]
+    fn content_to_hashes_skips_empty_lines_and_comments() {
+        let content = "sha256:aaa\n\n# comment\nsha256:bbb";
+        let result = content_to_hashes(content);
+        assert_eq!(
+            result,
+            vec![
+                ContentHash::new("sha256:aaa"),
+                ContentHash::new("sha256:bbb")
+            ]
+        );
+    }
+
+    #[test]
+    fn content_to_hashes_takes_first_whitespace_token() {
+        let content = "sha256:abc  Artist - Title  [3:45]";
+        let result = content_to_hashes(content);
+        assert_eq!(result, vec![ContentHash::new("sha256:abc")]);
     }
 }
