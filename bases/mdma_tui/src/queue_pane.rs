@@ -11,6 +11,8 @@ use ratatui::{
 };
 use std::rc::Rc;
 
+const DEFAULT_SOURCE: &str = "audio";
+
 /// Minimal proof-of-life pane that shows the current playback queue.
 #[allow(dead_code)]
 pub struct QueuePane {
@@ -135,7 +137,7 @@ impl Pane for QueuePane {
         for hash in hashes {
             if let Err(e) = self
                 .playback
-                .queue_append(hash.clone(), "audio".to_string())
+                .queue_append(hash.clone(), DEFAULT_SOURCE.to_string())
             {
                 errors.push(format!("{e}"));
             }

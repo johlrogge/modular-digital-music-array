@@ -118,7 +118,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "p:play/pause  s:stop  n:next  c:clear  Spc:modes  Esc:back",
+                "p:play/pause  s:stop  n:next  c:clear  q:append  Q:next  Esc:back",
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
@@ -130,7 +130,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 ))
             } else {
                 Line::from(Span::styled(
-                    "q:quit  Tab:switch  a:add  p:playback  s:filter  ?:help",
+                    "Tab:switch  a:add  p:playback  s:filter  ?:help  :q:quit",
                     Style::default().fg(Color::DarkGray),
                 ))
             }
@@ -351,7 +351,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
             desc(" playlist list"),
         ]),
         Line::from(vec![key("  ?     "), desc("  this help")]),
-        Line::from(vec![key("  q     "), desc("  quit")]),
+        Line::from(vec![key("  :q    "), desc("  quit")]),
         gap.clone(),
         Line::from(vec![
             Span::raw("  "),
@@ -367,7 +367,6 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
             key(":clear"),
         ]),
         gap.clone(),
-        Line::from(vec![key("  Spc   "), desc("  open mode picker")]),
         Line::from(header("  In playback mode:")),
         Line::from(vec![
             key("  p / Spc"),
@@ -380,6 +379,12 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
             desc(" next track      "),
             key("c"),
             desc("    clear queue"),
+        ]),
+        Line::from(vec![
+            key("  q      "),
+            desc(" queue append    "),
+            key("Q"),
+            desc("    queue next"),
         ]),
         Line::from(vec![key("  Esc    "), desc(" back to normal")]),
         gap.clone(),

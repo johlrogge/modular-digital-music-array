@@ -7,6 +7,8 @@ use crossterm::event::{KeyCode, KeyEvent};
 use mdma_client::{Deck, PlaybackBackend};
 use std::rc::Rc;
 
+const DEFAULT_SOURCE: &str = "audio";
+
 /// Dispatch a key event to the application based on the current input mode.
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     match app.mode {
@@ -20,9 +22,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 
 fn handle_normal(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Char('q') => {
-            app.should_quit = true;
-        }
         KeyCode::Tab => {
             app.toggle_active();
         }
@@ -157,6 +156,35 @@ fn handle_playback(app: &mut App, key: KeyEvent) {
             let _ = app.playback.queue_clear();
             app.set_status("Queue cleared");
         }
+        KeyCode::Char('q') => {
+            let hashes = app.active_pane().resolve_selection();
+            if hashes.is_empty() {
+                app.set_status("No tracks selected");
+            } else {
+                let count = hashes.len();
+                for hash in &hashes {
+                    let _ = app
+                        .playback
+                        .queue_append(hash.clone(), DEFAULT_SOURCE.to_string());
+                }
+                app.set_status(format!("Queued {} track(s)", count));
+            }
+        }
+        KeyCode::Char('Q') => {
+            let hashes = app.active_pane().resolve_selection();
+            if hashes.is_empty() {
+                app.set_status("No tracks selected");
+            } else {
+                let count = hashes.len();
+                // queue_next inserts at front; iterate in reverse to preserve order
+                for hash in hashes.iter().rev() {
+                    let _ = app
+                        .playback
+                        .queue_next(hash.clone(), DEFAULT_SOURCE.to_string());
+                }
+                app.set_status(format!("Queued next {} track(s)", count));
+            }
+        }
         KeyCode::Esc => {
             app.mode = InputMode::Normal;
         }
@@ -190,7 +218,7 @@ fn execute_command(cmd: &Command, playback: &PlaybackBackend, app: &mut App) {
         "shuffle" => {
             app.set_status("shuffle not yet implemented");
         }
-        "quit" => {
+        "q" | "quit" => {
             app.should_quit = true;
         }
         "search" => {
