@@ -1,5 +1,6 @@
 use crate::app::{App, InputMode};
 use crate::commands::Command;
+use crate::now_playing::PlaybackStatus;
 use crate::pane::PaneAction;
 use crate::playlist_pane::PlaylistPane;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -13,6 +14,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         InputMode::Palette => handle_palette(app, key),
         InputMode::FilterInput => handle_filter(app, key),
         InputMode::Help => app.mode = InputMode::Normal,
+        InputMode::SpaceMenu => handle_space_menu(app, key),
+        InputMode::Playback => handle_playback(app, key),
     }
 }
 
@@ -48,6 +51,9 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
                     _ => app.set_status(format!("Added {} track(s)", count)),
                 }
             }
+        }
+        KeyCode::Char(' ') => {
+            app.mode = InputMode::SpaceMenu;
         }
         _ => {
             let action = app.active_pane_mut().handle_key(key);
@@ -121,6 +127,48 @@ fn handle_filter(app: &mut App, key: KeyEvent) {
             app.active_pane_mut().selection_state_mut().pop_filter();
         }
         _ => {}
+    }
+}
+
+fn handle_space_menu(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('p') => app.mode = InputMode::Playback,
+        _ => app.mode = InputMode::Normal, // Esc or anything else cancels
+    }
+}
+
+fn handle_playback(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('p') | KeyCode::Char(' ') => {
+            // Toggle: if playing → pause, otherwise → play
+            let action = match &app.now_playing.status {
+                PlaybackStatus::Playing { .. } => {
+                    let _ = app.playback.pause(Deck::A);
+                    "Paused"
+                }
+                _ => {
+                    let _ = app.playback.play_queue();
+                    "Playing"
+                }
+            };
+            app.set_status(action);
+        }
+        KeyCode::Char('s') => {
+            let _ = app.playback.stop(Deck::A);
+            app.set_status("Stopped");
+        }
+        KeyCode::Char('n') => {
+            let _ = app.playback.skip();
+            app.set_status("Skipped");
+        }
+        KeyCode::Char('c') => {
+            let _ = app.playback.queue_clear();
+            app.set_status("Queue cleared");
+        }
+        KeyCode::Esc => {
+            app.mode = InputMode::Normal;
+        }
+        _ => {} // any unrecognised key stays in Playback mode
     }
 }
 
