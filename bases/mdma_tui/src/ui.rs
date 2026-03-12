@@ -135,7 +135,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "p:play/pause  s:stop  n:next  c:clear  Esc:back",
+                "p:play/pause  s:stop  n:next  c:clear  Spc:modes  Esc:back",
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
@@ -303,7 +303,7 @@ fn render_palette_overlay(f: &mut Frame, app: &App, area: Rect) {
 /// ```
 fn render_space_menu(f: &mut Frame, area: Rect) {
     const WIDTH: u16 = 32;
-    const HEIGHT: u16 = 4; // 2 border + 2 rows
+    const HEIGHT: u16 = 5; // 2 border + 3 rows
 
     let x = area.x + area.width.saturating_sub(WIDTH) / 2;
     let y = area.y + area.height.saturating_sub(HEIGHT) / 2;
@@ -333,6 +333,10 @@ fn render_space_menu(f: &mut Frame, area: Rect) {
         Line::from(vec![
             Span::styled("  p  ", Style::default().fg(Color::Cyan)),
             Span::styled("Playback", Style::default().fg(Color::Gray)),
+        ]),
+        Line::from(vec![
+            Span::styled("  n  ", Style::default().fg(Color::Cyan)),
+            Span::styled("Normal (browse)", Style::default().fg(Color::Gray)),
         ]),
         Line::from(vec![
             Span::styled("  Esc", Style::default().fg(Color::DarkGray)),
