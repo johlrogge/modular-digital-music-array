@@ -94,7 +94,7 @@ Audio path: FLAC/MP3 → Symphonia decoder → rubato resampler → 192 kHz Pipe
 |-----------|-------------|
 | `date_expression` | Relative date syntax parser used by all date-based queries (`~`, `^`, `$`, `+/-N`, `/`-separated components) |
 | `library_search` | Composable `TrackQuery` with string, numeric, duration, key, and date filters |
-| `playback_engine` | Real-time audio: Symphonia decoder + rubato resampler + PipeWire output |
+| [`playback_engine`](components/playback_engine/README.md) | Real-time audio: Symphonia decoder + rubato resampler + PipeWire output. Single-track model (`Option<Track>`). |
 | `stream_source_protocol` | `StreamCommand`/`StreamResponse`/`StreamTrackInfo`/`StreamPlaybackState` — protocol between playback and audio source services |
 | `music_primitives` | BPM, Key, Mode types |
 | `storage_primitives` | Type-safe `ByteSize` |
@@ -155,6 +155,13 @@ cp target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.8.1
+
+- **playback_engine** (v0.8.1) — removed multi-deck abstraction. The engine now manages a single `Option<Track>` directly, with no phantom type parameters or deck-indexed state. Atomic orderings corrected for aarch64: `SeqCst` replaced with `Acquire`/`Release` pairs throughout.
+- **mdma-audio** (v0.1.1) — updated to match the simplified `PlaybackEngine` API. No behaviour change; single-track model was already the effective usage.
 
 ---
 

@@ -1,6 +1,6 @@
 # mdma-audio
 
-File playback source service for MDMA (v0.1.0). Wraps `playback_engine` (Symphonia decoder + rubato resampler + PipeWire output) and exposes it as a source service via `stream_source_protocol` over NNG Rep0.
+File playback source service for MDMA (v0.1.1). Wraps `playback_engine` (Symphonia decoder + rubato resampler + PipeWire output) and exposes it as a source service via `stream_source_protocol` over NNG Rep0.
 
 [Back to workspace README](../../README.md)
 
