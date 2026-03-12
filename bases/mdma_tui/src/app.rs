@@ -1,6 +1,11 @@
+use crate::browser_pane::BrowserPane;
 use crate::commands::{matching, Command};
+use crate::error::TuiError;
 use crate::now_playing::NowPlaying;
 use crate::pane::Pane;
+use crate::playlists_pane::PlaylistsPane;
+use crate::queue_pane::QueuePane;
+use crate::search_pane::SearchPane;
 use mdma_client::{LibraryBackend, PlaybackBackend};
 use std::rc::Rc;
 
@@ -143,5 +148,40 @@ impl App {
             .palette_cursor
             .min(self.palette_matches.len().saturating_sub(1));
         self.palette_query = query;
+    }
+
+    /// Replace the currently active pane with `new_pane`.
+    pub fn switch_active_pane(&mut self, new_pane: Box<dyn Pane>) {
+        if self.active_side == Side::Left {
+            self.left_pane = new_pane;
+        } else {
+            self.right_pane = new_pane;
+        }
+    }
+
+    /// Construct a fresh SearchPane backed by this app's library.
+    pub fn make_search_pane(&self) -> Box<dyn Pane> {
+        Box::new(SearchPane::new(Rc::clone(&self.library)))
+    }
+
+    /// Construct a fresh BrowserPane backed by this app's library.
+    pub fn make_browser_pane(&self) -> Box<dyn Pane> {
+        Box::new(BrowserPane::new(Rc::clone(&self.library)))
+    }
+
+    /// Construct a fresh QueuePane backed by this app's playback and library backends.
+    pub fn make_queue_pane(&self) -> Box<dyn Pane> {
+        Box::new(QueuePane::new(
+            Rc::clone(&self.playback),
+            Rc::clone(&self.library),
+        ))
+    }
+
+    /// Construct a fresh PlaylistsPane backed by this app's library.
+    ///
+    /// Returns `Err` if the library backend cannot be reached.
+    pub fn make_playlists_pane(&self) -> Result<Box<dyn Pane>, TuiError> {
+        let pane = PlaylistsPane::new(Rc::clone(&self.library))?;
+        Ok(Box::new(pane))
     }
 }

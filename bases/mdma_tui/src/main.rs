@@ -35,7 +35,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "mdma-tui", about = "MDMA Terminal User Interface")]
 struct Cli {
-    /// MDMA node address (e.g. tcp://mdma-909.local:5555). Overrides direct socket args.
+    /// MDMA node hostname (e.g. mdma-909.local). Derives gateway addresses automatically.
     #[arg(long, env = "MDMA_NODE")]
     node: Option<String>,
 
@@ -69,7 +69,9 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let gateway = cli.node.as_deref();
+    // Derive full NNG gateway address from node hostname (tcp://hostname:5555).
+    let gateway: Option<String> = cli.node.as_deref().map(|n| format!("tcp://{}:5555", n));
+    let gateway = gateway.as_deref();
 
     let library = Rc::new(
         LibraryBackend::connect(gateway, &cli.library_socket)

@@ -149,6 +149,22 @@ fn execute_command(cmd: &Command, playback: &PlaybackBackend, app: &mut App) {
         "quit" => {
             app.should_quit = true;
         }
+        "search" => {
+            let p = app.make_search_pane();
+            app.switch_active_pane(p);
+        }
+        "browser" => {
+            let p = app.make_browser_pane();
+            app.switch_active_pane(p);
+        }
+        "queue" => {
+            let p = app.make_queue_pane();
+            app.switch_active_pane(p);
+        }
+        "playlists" => match app.make_playlists_pane() {
+            Ok(p) => app.switch_active_pane(p),
+            Err(e) => app.set_status(format!("Playlists: {e}")),
+        },
         _ => {
             app.set_status(format!("Unknown command: {}", cmd.name));
         }

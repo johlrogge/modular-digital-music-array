@@ -34,6 +34,22 @@ pub static COMMANDS: &[Command] = &[
         name: "quit",
         description: "Quit mdma-tui",
     },
+    Command {
+        name: "search",
+        description: "Switch active pane to search",
+    },
+    Command {
+        name: "browser",
+        description: "Switch active pane to browser",
+    },
+    Command {
+        name: "queue",
+        description: "Switch active pane to queue",
+    },
+    Command {
+        name: "playlists",
+        description: "Switch active pane to playlists list",
+    },
 ];
 
 /// Return all commands whose name starts with `input` (case-insensitive).
@@ -75,5 +91,33 @@ mod tests {
     fn matching_unknown_returns_empty() {
         let results = matching("xyz");
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn pane_switching_commands_are_registered() {
+        let all_names: Vec<&str> = COMMANDS.iter().map(|c| c.name).collect();
+        assert!(
+            all_names.contains(&"search"),
+            "expected 'search' command in COMMANDS"
+        );
+        assert!(
+            all_names.contains(&"browser"),
+            "expected 'browser' command in COMMANDS"
+        );
+        assert!(
+            all_names.contains(&"queue"),
+            "expected 'queue' command in COMMANDS"
+        );
+        assert!(
+            all_names.contains(&"playlists"),
+            "expected 'playlists' command in COMMANDS"
+        );
+    }
+
+    #[test]
+    fn matching_br_returns_browser() {
+        let results = matching("br");
+        let names: Vec<&str> = results.iter().map(|c| c.name).collect();
+        assert!(names.contains(&"browser"), "expected 'browser' in results");
     }
 }
