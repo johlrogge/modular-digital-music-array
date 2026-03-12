@@ -29,6 +29,8 @@ pub enum InputMode {
     Help,
     /// Playback control mode; single-key bindings for transport controls.
     Playback,
+    /// Typing a new playlist name.
+    NameInput,
 }
 
 /// Application state.
@@ -40,6 +42,7 @@ pub struct App {
     pub now_playing: NowPlaying,
     pub status_message: Option<String>,
     pub filter_input: String,
+    pub name_input: String,
     pub should_quit: bool,
     /// Shared library backend, used for opening new panes (e.g. PlaylistPane).
     pub library: Rc<LibraryBackend>,
@@ -66,6 +69,7 @@ impl App {
             now_playing: NowPlaying::new(),
             status_message: None,
             filter_input: String::new(),
+            name_input: String::new(),
             should_quit: false,
             library,
             playback,

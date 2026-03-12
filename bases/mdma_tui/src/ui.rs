@@ -190,6 +190,11 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(TEXT_TERTIARY),
             ),
         ]),
+        InputMode::NameInput => Line::from(vec![
+            Span::styled("new playlist: ", Style::default().fg(ACCENT)),
+            Span::styled(app.name_input.as_str(), Style::default().fg(TEXT_PRIMARY)),
+            Span::styled("_", Style::default().fg(ACCENT)),
+        ]),
         InputMode::Normal | InputMode::Help => {
             if let Some(ref msg) = app.status_message {
                 Line::from(Span::styled(msg.as_str(), Style::default().fg(SUCCESS)))
@@ -352,6 +357,11 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
             key(":playlists"),
             desc(" playlist list"),
         ]),
+        Line::from(vec![
+            key("  n     "),
+            desc("  new playlist (in playlists pane)"),
+        ]),
+        Line::from(vec![key("  d     "), desc("  remove from queue/playlist")]),
         Line::from(vec![key("  ?     "), desc("  this help")]),
         Line::from(vec![key("  :q    "), desc("  quit")]),
         gap.clone(),

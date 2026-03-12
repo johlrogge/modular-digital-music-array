@@ -91,6 +91,20 @@ impl Pane for QueuePane {
                 self.selection.select_all();
                 PaneAction::Consumed
             }
+            KeyCode::Char('d') => {
+                let hashes = self.resolve_selection();
+                if hashes.is_empty() {
+                    return PaneAction::Consumed;
+                }
+                let count = hashes.len();
+                match self.playback.queue_remove(hashes) {
+                    Ok(_) => {
+                        self.refresh();
+                        PaneAction::Info(format!("Removed {} track(s) from queue", count))
+                    }
+                    Err(e) => PaneAction::Error(format!("Remove failed: {e}")),
+                }
+            }
             KeyCode::Esc => {
                 if !self.selection.pop_filter() {
                     self.selection.clear_selection();

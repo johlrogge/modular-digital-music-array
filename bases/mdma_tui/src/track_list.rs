@@ -9,6 +9,21 @@ use ratatui::{
     Frame,
 };
 
+/// Fit a string into exactly `width` chars: pad right with spaces if shorter, truncate with … if longer.
+fn fit(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let char_count = s.chars().count();
+    if char_count <= width {
+        format!("{:<width$}", s, width = width)
+    } else {
+        // truncate to width-1 and add ellipsis
+        let truncated: String = s.chars().take(width.saturating_sub(1)).collect();
+        format!("{}…", truncated)
+    }
+}
+
 /// Render a list of tracks respecting the SelectionState's visibility and selection.
 ///
 /// The block title and borders are provided by the caller.
@@ -41,30 +56,44 @@ pub fn render_track_list(
                 (ACCENT2, TEXT_PRIMARY, TEXT_TERTIARY, Color::Reset)
             };
 
-            let mut spans = vec![
-                Span::styled(artist.to_string(), Style::default().fg(artist_color).bg(bg)),
-                Span::styled("  —  ", Style::default().fg(meta_color).bg(bg)),
+            // Column widths (chars):
+            //   artist:    22
+            //   separator: 3  (" — ")
+            //   bpm:       8  ("  BBBbpm")
+            //   duration:  9  ("  [MM:SS]")
+            //   title:     remaining
+            const ARTIST_W: usize = 22;
+            const SEP_W: usize = 3;
+            const BPM_W: usize = 8;
+            const DUR_W: usize = 9;
+            let title_width = (area.width as usize)
+                .saturating_sub(ARTIST_W + SEP_W + BPM_W + DUR_W)
+                .max(4);
+
+            let artist_str = fit(artist, ARTIST_W);
+            let title_str = fit(title, title_width);
+            let bpm_str = track
+                .bpm
+                .map(|b| format!("  {:>3}bpm", b))
+                .unwrap_or_else(|| " ".repeat(BPM_W));
+            let dur_str = track
+                .duration
+                .map(|d| format!("  [{}]", d))
+                .unwrap_or_else(|| " ".repeat(DUR_W));
+
+            let spans = vec![
+                Span::styled(artist_str, Style::default().fg(artist_color).bg(bg)),
+                Span::styled(" — ", Style::default().fg(meta_color).bg(bg)),
                 Span::styled(
-                    title.to_string(),
+                    title_str,
                     Style::default()
                         .fg(title_color)
                         .bg(bg)
                         .add_modifier(Modifier::BOLD),
                 ),
+                Span::styled(bpm_str, Style::default().fg(meta_color).bg(bg)),
+                Span::styled(dur_str, Style::default().fg(meta_color).bg(bg)),
             ];
-
-            if let Some(bpm) = track.bpm {
-                spans.push(Span::styled(
-                    format!("  {}bpm", bpm),
-                    Style::default().fg(meta_color).bg(bg),
-                ));
-            }
-            if let Some(dur) = track.duration {
-                spans.push(Span::styled(
-                    format!("  [{}]", dur),
-                    Style::default().fg(meta_color).bg(bg),
-                ));
-            }
 
             ListItem::new(Line::from(spans)).style(Style::default().bg(if is_cursor {
                 BG_ELEVATED
@@ -82,4 +111,55 @@ pub fn render_track_list(
     // ListState so the List widget scrolls to keep the cursor in view.
     let mut ls = selection.list_state.clone();
     f.render_stateful_widget(list, area, &mut ls);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit;
+
+    #[test]
+    fn fit_pads_short_string_to_width() {
+        let result = fit("hello", 10);
+        assert_eq!(result.chars().count(), 10);
+        assert_eq!(result, "hello     ");
+    }
+
+    #[test]
+    fn fit_returns_exact_string_at_width() {
+        let result = fit("hello", 5);
+        assert_eq!(result.chars().count(), 5);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn fit_truncates_long_string_with_ellipsis() {
+        let result = fit("hello world", 8);
+        assert_eq!(result.chars().count(), 8);
+        assert!(result.ends_with('…'));
+        assert_eq!(result, "hello w…");
+    }
+
+    #[test]
+    fn fit_width_zero_returns_empty() {
+        assert_eq!(fit("hello", 0), "");
+    }
+
+    #[test]
+    fn fit_width_one_returns_ellipsis_for_long_string() {
+        let result = fit("hello", 1);
+        assert_eq!(result.chars().count(), 1);
+        assert_eq!(result, "…");
+    }
+
+    #[test]
+    fn fit_handles_multibyte_chars() {
+        // "héllo" is 5 chars but more than 5 bytes
+        let result = fit("héllo", 5);
+        assert_eq!(result.chars().count(), 5);
+        assert_eq!(result, "héllo");
+
+        let result = fit("héllo world", 6);
+        assert_eq!(result.chars().count(), 6);
+        assert!(result.ends_with('…'));
+    }
 }
