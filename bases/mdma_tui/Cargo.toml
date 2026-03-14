@@ -25,3 +25,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 scopeguard = { workspace = true }
 thiserror = { workspace = true }
+corsett = { git = "https://github.com/johlrogge/corsett.git" }
+
+[dev-dependencies]
+library-ipc-protocol = { path = "../../components/library_ipc_protocol" }
+music-primitives = { path = "../../components/music_primitives" }

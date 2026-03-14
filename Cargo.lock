@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "acid-client"
-version = "0.8.1"
+version = "0.8.3"
 dependencies = [
  "acid_protocol",
  "music-facts",
@@ -17,7 +17,7 @@ dependencies = [
 
 [[package]]
 name = "acid_protocol"
-version = "0.8.1"
+version = "0.8.3"
 dependencies = [
  "pretty_assertions",
  "serde",
@@ -265,7 +265,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "audio-metadata"
-version = "0.8.1"
+version = "0.8.3"
 dependencies = [
  "lofty",
  "pretty_assertions",
@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "audio-transcoder"
-version = "0.8.1"
+version = "0.8.3"
 dependencies = [
  "pretty_assertions",
  "rstest",
@@ -1134,7 +1134,7 @@ checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 
 [[package]]
 name = "date-expression"
-version = "0.8.1"
+version = "0.8.3"
 dependencies = [
  "chrono",
  "thiserror 1.0.69",
@@ -1301,7 +1301,7 @@ dependencies = [
 
 [[package]]
 name = "event-protocol"
-version = "0.8.1"
+version = "0.8.3"
 dependencies = [
  "playback-primitives",
  "pretty_assertions",
@@ -1509,7 +1509,7 @@ dependencies = [
 
 [[package]]
 name = "gateway-client"
-version = "0.8.1"
+version = "0.8.3"
 dependencies = [
  "acid_protocol",
  "gateway-protocol",
@@ -1525,7 +1525,7 @@ dependencies = [
 
 [[package]]
 name = "gateway-protocol"
-version = "0.8.1"
+version = "0.8.3"
 dependencies = [
  "acid_protocol",
  "library-ipc-protocol",
@@ -2039,7 +2039,7 @@ dependencies = [
 
 [[package]]
 name = "inbox-utils"
-version = "0.8.1"
+version = "0.8.3"
 dependencies = [
  "pretty_assertions",
  "rstest",
@@ -2303,7 +2303,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "library-ipc-client"
-version = "0.8.1"
+version = "0.8.3"
 dependencies = [
  "library-ipc-protocol",
  "nng",
@@ -2314,7 +2314,7 @@ dependencies = [
 
 [[package]]
 name = "library-ipc-protocol"
-version = "0.8.1"
+version = "0.8.3"
 dependencies = [
  "library-search",
  "music-facts",
@@ -2327,7 +2327,7 @@ dependencies = [
 
 [[package]]
 name = "library-search"
-version = "0.8.1"
+version = "0.8.3"
 dependencies = [
  "chrono",
  "date-expression",
@@ -2766,10 +2766,13 @@ version = "0.2.0"
 dependencies = [
  "clap",
  "color-eyre",
+ "corsett",
  "crossterm",
  "event-protocol",
+ "library-ipc-protocol",
  "library-search",
  "mdma-client",
+ "music-primitives",
  "nng",
  "nng-transport",
  "ratatui",
@@ -2782,7 +2785,7 @@ dependencies = [
 
 [[package]]
 name = "media-client"
-version = "0.8.1"
+version = "0.8.3"
 dependencies = [
  "media-protocol",
  "nng",
@@ -2795,7 +2798,7 @@ dependencies = [
 
 [[package]]
 name = "media-protocol"
-version = "0.8.1"
+version = "0.8.3"
 dependencies = [
  "playback-primitives",
  "pretty_assertions",
@@ -2885,7 +2888,7 @@ dependencies = [
 
 [[package]]
 name = "music-facts"
-version = "0.8.1"
+version = "0.8.3"
 dependencies = [
  "chrono",
  "music-primitives",
@@ -2901,7 +2904,7 @@ dependencies = [
 
 [[package]]
 name = "music-primitives"
-version = "0.8.1"
+version = "0.8.3"
 dependencies = [
  "pretty_assertions",
  "rstest",
@@ -2949,7 +2952,7 @@ dependencies = [
 
 [[package]]
 name = "nng-transport"
-version = "0.8.1"
+version = "0.8.3"
 dependencies = [
  "dirs",
  "nng",
@@ -3333,7 +3336,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "playback-engine"
-version = "0.8.1"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "criterion",
@@ -3357,7 +3360,7 @@ dependencies = [
 
 [[package]]
 name = "playback-primitives"
-version = "0.8.1"
+version = "0.8.3"
 dependencies = [
  "assert_matches",
  "chrono",
@@ -4276,7 +4279,7 @@ dependencies = [
 
 [[package]]
 name = "source-protocol"
-version = "0.8.1"
+version = "0.8.3"
 dependencies = [
  "pretty_assertions",
  "serde",
@@ -4776,7 +4779,7 @@ dependencies = [
 
 [[package]]
 name = "time-primitives"
-version = "0.8.1"
+version = "0.8.3"
 dependencies = [
  "assert_matches",
  "pretty_assertions",
