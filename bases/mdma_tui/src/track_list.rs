@@ -138,9 +138,12 @@ const SEP: &str = " \u{2014} "; // " — " (3 chars: space, em-dash, space)
 /// Size track columns for `available_width` terminal columns using corsett.
 ///
 /// Removal order (first removed → last):
-///   key/duration (cols 3,4) — BelowScore::BASIC  (removed first; corsett picks narrower first)
-///   bpm/artist   (cols 2,0) — BelowScore::MINIMAL (bpm is narrower so goes before artist)
-///   title        (col 1)    — Never
+///   key/duration (cols 3,4) — removed first (key is narrower so removed before duration)
+///   bpm/artist   (cols 2,0) — removed next (bpm is narrower so goes before artist)
+///   title        (col 1)    — never removed
+///
+/// Column removal is decided upfront based on natural content widths and available budget.
+/// Corsett handles fine-grained shrinking of the remaining visible columns.
 pub fn size_track_columns(tracks: &[&TrackInfo], available_width: u16) -> SizedColumns {
     if tracks.is_empty() {
         return SizedColumns {
@@ -151,11 +154,34 @@ pub fn size_track_columns(tracks: &[&TrackInfo], available_width: u16) -> SizedC
 
     let rows: Vec<TrackRow> = tracks.iter().map(|t| TrackRow::from_track(t)).collect();
 
+    // Compute natural max content width per column across all rows.
+    let mut natural_widths = [0usize; 5];
+    for row in &rows {
+        natural_widths[0] = natural_widths[0].max(row.artist.0.chars().count());
+        natural_widths[1] = natural_widths[1].max(row.title.0.chars().count());
+        natural_widths[2] = natural_widths[2].max(row.bpm.0.chars().count());
+        natural_widths[3] = natural_widths[3].max(row.key.0.chars().count());
+        natural_widths[4] = natural_widths[4].max(row.duration.0.chars().count());
+    }
+
     // Subtract gap overhead (4 gaps between 5 columns).
     // The separator (" — ") is rendered conditionally at render time (only when
     // artist col_width > 0) so corsett must NOT reserve space for it.
     let gap_overhead = (5 - 1) * GAP_SIZE;
     let available_content = (available_width as usize).saturating_sub(gap_overhead);
+
+    // Remove columns in priority order until natural total fits in available_content.
+    // Removal order: key(3), duration(4), bpm(2), artist(0); title(1) is never removed.
+    const REMOVAL_ORDER: [usize; 4] = [3, 4, 2, 0];
+    let mut removed = [false; 5];
+    let mut total_natural: usize = natural_widths.iter().sum();
+    for &col in &REMOVAL_ORDER {
+        if total_natural <= available_content {
+            break;
+        }
+        total_natural = total_natural.saturating_sub(natural_widths[col]);
+        removed[col] = true;
+    }
 
     let config = ColumnSizingConfigBuilder::<5>::new()
         .terminal_width(available_content)
@@ -180,6 +206,15 @@ pub fn size_track_columns(tracks: &[&TrackInfo], available_width: u16) -> SizedC
             if w > col_widths[i] {
                 col_widths[i] = w;
             }
+        }
+    }
+
+    // Force col_widths to 0 for any column we decided to remove above.
+    // This ensures that even if corsett shrunk (rather than removed) a column,
+    // it is treated as absent by the render layer.
+    for col in 0..5 {
+        if removed[col] {
+            col_widths[col] = 0;
         }
     }
 
