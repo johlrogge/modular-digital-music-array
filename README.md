@@ -83,7 +83,7 @@ Audio path: FLAC/MP3 → Symphonia decoder → rubato resampler → 192 kHz Pipe
 | [mdma_acid](bases/mdma_acid/) | ACID service — standalone append-only fact stream writer | [README](bases/mdma_acid/README.md) |
 | [mdma_playback](bases/mdma_playback/) | Queue manager — drives audio sources via StreamClient; persists queue to `/metadata/queue.json` | [README](bases/mdma_playback/README.md) |
 | [mdma_audio](bases/mdma_audio/) | Audio playback source — wraps PlaybackEngine (Symphonia + rubato + PipeWire), speaks `stream_source_protocol` over NNG | [README](bases/mdma_audio/README.md) |
-| [mdma_tui](bases/mdma_tui/) | Terminal UI — dual-pane browser/queue, modal keybindings, command palette, live queue sync via events | [README](bases/mdma_tui/README.md) |
+| [mdma_tui](bases/mdma_tui/) | Terminal UI (v0.3.0) — dual-pane browser/queue, modal keybindings, command palette, live queue sync via events, intelligent column compression | [README](bases/mdma_tui/README.md) |
 | [mdma_bandcamp](bases/mdma_bandcamp/) | Bandcamp collection sync — downloads purchases into the library inbox | [README](bases/mdma_bandcamp/README.md) |
 | [mdma_console](bases/mdma_console/) | Web management console — player controls, search, queue, upload, export | [README](bases/mdma_console/README.md) |
 | [mdma_cli](bases/mdma_cli/) | CLI — search, queue, playlists, playback, export, subscribe, shell completions | [README](bases/mdma_cli/README.md) |
@@ -155,6 +155,12 @@ cp target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.9.0
+
+- **mdma-tui** (v0.3.0) — intelligent column compression in track lists. BPM and key columns are dropped first when horizontal space is tight, then duration, then artist. The artist/title separator ` — ` is hidden when the artist column is not shown. Artist compresses before title so the title remains visible as long as possible.
 
 ---
 
