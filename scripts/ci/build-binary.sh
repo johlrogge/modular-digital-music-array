@@ -11,7 +11,7 @@ mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
 echo "Building $BIN for aarch64..."
 
 if command -v cargo-zigbuild &> /dev/null; then
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin "$BIN"
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 --bin "$BIN"
 else
     cargo build --release --target aarch64-unknown-linux-gnu --bin "$BIN"
 fi

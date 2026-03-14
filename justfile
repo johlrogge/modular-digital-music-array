@@ -29,7 +29,7 @@ cross bin label=bin:
     export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     echo "Building {{label}} for aarch64..."
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin {{bin}}
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 --bin {{bin}}
     echo ""
     echo "{{label}} built!"
     file target/aarch64-unknown-linux-gnu/release/{{bin}}
