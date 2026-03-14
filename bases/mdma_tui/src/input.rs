@@ -1,10 +1,10 @@
-use crate::app::{App, InputMode};
+use crate::app::{App, InputMode, PaletteEntry};
 use crate::commands::Command;
 use crate::now_playing::PlaybackStatus;
-use crate::pane::PaneAction;
+use crate::pane::{PaneAction, PaneKind};
 use crate::playlist_pane::PlaylistPane;
 use crossterm::event::{KeyCode, KeyEvent};
-use mdma_client::{Deck, PlaybackBackend};
+use mdma_client::{Deck, PlaybackBackend, PlaylistName};
 use std::rc::Rc;
 
 const DEFAULT_SOURCE: &str = "audio";
@@ -17,6 +17,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         InputMode::FilterInput => handle_filter(app, key),
         InputMode::Help => app.mode = InputMode::Normal,
         InputMode::Playback => handle_playback(app, key),
+        InputMode::NameInput => handle_name_input(app, key),
     }
 }
 
@@ -81,6 +82,10 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         KeyCode::Char('p') => {
             app.mode = InputMode::Playback;
         }
+        KeyCode::Char('n') if app.active_pane().pane_kind() == PaneKind::PlaylistsList => {
+            app.name_input.clear();
+            app.mode = InputMode::NameInput;
+        }
         _ => {
             let action = app.active_pane_mut().handle_key(key);
             dispatch_pane_action(app, action);
@@ -117,9 +122,41 @@ fn handle_palette(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             let cursor = app.palette_cursor;
-            if let Some(&cmd) = app.palette_matches.get(cursor) {
-                let playback = Rc::clone(&app.playback);
-                execute_command(cmd, &playback, app);
+            if let Some(entry) = app.palette_matches.get(cursor).cloned() {
+                match entry {
+                    PaletteEntry::Command(cmd) => {
+                        let playback = Rc::clone(&app.playback);
+                        execute_command(cmd, &playback, app);
+                    }
+                    PaletteEntry::OpenPlaylist(name) => {
+                        let library = Rc::clone(&app.library);
+                        match PlaylistPane::open(name.clone(), library) {
+                            Ok(pane) => {
+                                app.switch_active_pane(Box::new(pane));
+                                app.set_status(format!("Opened: {}", name));
+                            }
+                            Err(e) => app.set_status(format!("Open failed: {e}")),
+                        }
+                    }
+                    PaletteEntry::CreatePlaylist(name_str) => match PlaylistName::new(&name_str) {
+                        Ok(name) => match app.library.playlist_new(&name, &[]) {
+                            Ok(()) => {
+                                let library = Rc::clone(&app.library);
+                                match PlaylistPane::open(name.clone(), library) {
+                                    Ok(pane) => {
+                                        app.switch_active_pane(Box::new(pane));
+                                        app.set_status(format!("Created: {}", name_str));
+                                    }
+                                    Err(e) => {
+                                        app.set_status(format!("Created but open failed: {e}"))
+                                    }
+                                }
+                            }
+                            Err(e) => app.set_status(format!("Create failed: {e}")),
+                        },
+                        Err(e) => app.set_status(format!("Invalid name: {e}")),
+                    },
+                }
             }
             app.close_palette();
         }
@@ -191,6 +228,44 @@ fn handle_playback(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn handle_name_input(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.name_input.clear();
+            app.mode = InputMode::Normal;
+        }
+        KeyCode::Backspace => {
+            app.name_input.pop();
+        }
+        KeyCode::Enter => {
+            let name_str = app.name_input.trim().to_string();
+            app.name_input.clear();
+            app.mode = InputMode::Normal;
+            if name_str.is_empty() {
+                return;
+            }
+            let name = match PlaylistName::new(&name_str) {
+                Ok(n) => n,
+                Err(e) => {
+                    app.set_status(format!("Invalid playlist name: {e}"));
+                    return;
+                }
+            };
+            match app.library.playlist_new(&name, &[]) {
+                Ok(()) => {
+                    app.active_pane_mut().refresh();
+                    app.set_status(format!("Created playlist \"{}\"", name_str));
+                }
+                Err(e) => app.set_status(format!("Error: {e}")),
+            }
+        }
+        KeyCode::Char(c) => {
+            app.name_input.push(c);
+        }
+        _ => {}
+    }
+}
+
 /// Execute a palette command against the playback backend, updating app status.
 fn execute_command(cmd: &Command, playback: &PlaybackBackend, app: &mut App) {
     match cmd.name {
@@ -236,6 +311,9 @@ fn execute_command(cmd: &Command, playback: &PlaybackBackend, app: &mut App) {
             Ok(p) => app.switch_active_pane(p),
             Err(e) => app.set_status(format!("Playlists: {e}")),
         },
+        "o" => {
+            app.set_status(":o <name>  — open or create a playlist");
+        }
         _ => {
             app.set_status(format!("Unknown command: {}", cmd.name));
         }

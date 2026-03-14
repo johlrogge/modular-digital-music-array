@@ -1,6 +1,6 @@
 [package]
 name = "mdma-tui"
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -25,3 +25,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 scopeguard = { workspace = true }
 thiserror = { workspace = true }
+corsett = { git = "https://github.com/johlrogge/corsett.git" }
+
+[dev-dependencies]
+library-ipc-protocol = { path = "../../components/library_ipc_protocol" }
+music-primitives = { path = "../../components/music_primitives" }

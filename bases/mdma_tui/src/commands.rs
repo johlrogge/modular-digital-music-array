@@ -50,6 +50,10 @@ pub static COMMANDS: &[Command] = &[
         name: "playlists",
         description: "Switch active pane to playlists list",
     },
+    Command {
+        name: "o",
+        description: "Open or create a playlist  :o <name>",
+    },
 ];
 
 /// Return all commands whose name starts with `input` (case-insensitive).
@@ -119,5 +123,24 @@ mod tests {
         let results = matching("br");
         let names: Vec<&str> = results.iter().map(|c| c.name).collect();
         assert!(names.contains(&"browser"), "expected 'browser' in results");
+    }
+
+    #[test]
+    fn o_command_is_registered() {
+        let all_names: Vec<&str> = COMMANDS.iter().map(|c| c.name).collect();
+        assert!(
+            all_names.contains(&"o"),
+            "expected 'o' command in COMMANDS for open/create playlist"
+        );
+    }
+
+    #[test]
+    fn matching_o_returns_o_command() {
+        let results = matching("o");
+        let names: Vec<&str> = results.iter().map(|c| c.name).collect();
+        assert!(
+            names.contains(&"o"),
+            "expected 'o' in results for prefix 'o'"
+        );
     }
 }

@@ -25,6 +25,8 @@ pub enum PlaybackStatus {
 pub struct NowPlaying {
     pub status: PlaybackStatus,
     pub queue_length: usize,
+    pub title: Option<String>,
+    pub artist: Option<String>,
 }
 
 impl Default for NowPlaying {
@@ -38,7 +40,14 @@ impl NowPlaying {
         Self {
             status: PlaybackStatus::Stopped,
             queue_length: 0,
+            title: None,
+            artist: None,
         }
+    }
+
+    pub fn set_track_metadata(&mut self, title: Option<String>, artist: Option<String>) {
+        self.title = title;
+        self.artist = artist;
     }
 
     /// Apply a playback event, returning `true` if a redraw is warranted.
@@ -54,6 +63,8 @@ impl NowPlaying {
             }
             PlaybackEvent::TrackEnded { .. } | PlaybackEvent::TrackStopped { .. } => {
                 self.status = PlaybackStatus::Stopped;
+                self.title = None;
+                self.artist = None;
                 true
             }
             PlaybackEvent::TrackPaused { .. } => {
@@ -225,6 +236,34 @@ mod tests {
             }
         ));
         assert!(!redraw);
+    }
+
+    #[test]
+    fn set_track_metadata_stores_fields() {
+        let mut np = NowPlaying::new();
+        np.set_track_metadata(Some("Init".into()), Some("Carbon Based Lifeforms".into()));
+        assert_eq!(np.title.as_deref(), Some("Init"));
+        assert_eq!(np.artist.as_deref(), Some("Carbon Based Lifeforms"));
+    }
+
+    #[test]
+    fn track_ended_clears_metadata() {
+        let mut np = NowPlaying::new();
+        let hash = make_hash("sha256:abc");
+        np.set_track_metadata(Some("Init".into()), Some("CBL".into()));
+        np.apply(&PlaybackEvent::TrackEnded { hash });
+        assert!(np.title.is_none());
+        assert!(np.artist.is_none());
+    }
+
+    #[test]
+    fn track_stopped_clears_metadata() {
+        let mut np = NowPlaying::new();
+        let hash = make_hash("sha256:abc");
+        np.set_track_metadata(Some("Init".into()), Some("CBL".into()));
+        np.apply(&PlaybackEvent::TrackStopped { hash });
+        assert!(np.title.is_none());
+        assert!(np.artist.is_none());
     }
 
     #[test]

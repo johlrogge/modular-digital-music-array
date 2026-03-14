@@ -1,12 +1,13 @@
 use crate::pane::{Pane, PaneAction, PaneKind};
 use crate::selection::SelectionState;
+use crate::theme::TEXT_TERTIARY;
 use crate::track_list::render_track_list;
 use crossterm::event::{KeyCode, KeyEvent};
 use mdma_client::{ContentHash, LibraryBackend, PlaybackBackend, PlaylistName, TrackInfo};
 use ratatui::{
-    layout::Rect,
-    style::{Color, Style},
-    widgets::{Block, Borders},
+    layout::{Alignment, Rect},
+    style::Style,
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 use std::rc::Rc;
@@ -57,8 +58,9 @@ impl QueuePane {
 impl Pane for QueuePane {
     fn render(&self, f: &mut Frame, area: Rect) {
         if self.tracks.is_empty() {
-            let placeholder = ratatui::widgets::Paragraph::new("Queue is empty")
-                .style(Style::default().fg(Color::DarkGray));
+            let placeholder = Paragraph::new("queue is empty")
+                .style(Style::default().fg(TEXT_TERTIARY))
+                .alignment(Alignment::Center);
             f.render_widget(placeholder, area);
             return;
         }
@@ -88,6 +90,20 @@ impl Pane for QueuePane {
             KeyCode::Char('%') => {
                 self.selection.select_all();
                 PaneAction::Consumed
+            }
+            KeyCode::Char('d') => {
+                let hashes = self.resolve_selection();
+                if hashes.is_empty() {
+                    return PaneAction::Consumed;
+                }
+                let count = hashes.len();
+                match self.playback.queue_remove(hashes) {
+                    Ok(_) => {
+                        self.refresh();
+                        PaneAction::Info(format!("Removed {} track(s) from queue", count))
+                    }
+                    Err(e) => PaneAction::Error(format!("Remove failed: {e}")),
+                }
             }
             KeyCode::Esc => {
                 if !self.selection.pop_filter() {
