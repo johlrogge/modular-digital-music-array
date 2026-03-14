@@ -4,10 +4,8 @@ use crate::now_playing::PlaybackStatus;
 use crate::pane::{PaneAction, PaneKind};
 use crate::playlist_pane::PlaylistPane;
 use crossterm::event::{KeyCode, KeyEvent};
-use mdma_client::{Deck, PlaybackBackend, PlaylistName};
+use mdma_client::{Deck, PlaybackBackend, PlaylistName, SourceName};
 use std::rc::Rc;
-
-const DEFAULT_SOURCE: &str = "audio";
 
 /// Dispatch a key event to the application based on the current input mode.
 pub fn handle_key(app: &mut App, key: KeyEvent) {
@@ -58,9 +56,7 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             } else {
                 let count = hashes.len();
                 for hash in &hashes {
-                    let _ = app
-                        .playback
-                        .queue_append(hash.clone(), DEFAULT_SOURCE.to_string());
+                    let _ = app.playback.queue_append(hash.clone(), SourceName::audio());
                 }
                 app.set_status(format!("Queued {} track(s)", count));
             }
@@ -72,9 +68,7 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             } else {
                 let count = hashes.len();
                 for hash in hashes.iter().rev() {
-                    let _ = app
-                        .playback
-                        .queue_next(hash.clone(), DEFAULT_SOURCE.to_string());
+                    let _ = app.playback.queue_next(hash.clone(), SourceName::audio());
                 }
                 app.set_status(format!("Queued next {} track(s)", count));
             }

@@ -11,6 +11,7 @@ acid_protocol = { path = "../acid_protocol" }
 source-protocol = { path = "../source_protocol" }
 library-ipc-protocol = { path = "../library_ipc_protocol" }
 media-protocol = { path = "../media_protocol" }
+playback-primitives = { path = "../playback_primitives" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 

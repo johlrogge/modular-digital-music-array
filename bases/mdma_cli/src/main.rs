@@ -14,6 +14,7 @@ use library_ipc_client::{ClientError, ContentHash, InboxPath, ProtocolError, Tra
 use library_search::{parse_date_query, parse_numeric_query, parse_string_query, TrackQuery};
 use mdma_client::{
     Deck, IngestSource, LibraryBackend, PlaybackBackend, PlaybackClientError, SourceClient,
+    SourceName,
 };
 use nng::options::Options;
 use source_protocol::{SourceRequest, SourceResponse};
@@ -1934,7 +1935,7 @@ fn handle_queue_next(
     // Prepend in reverse so the first hash ends up at the front of the queue.
     for hash in hashes.into_iter().rev() {
         let content_hash = ContentHash::new(hash);
-        if let Err(e) = media_client.queue_next(content_hash, "audio".to_string()) {
+        if let Err(e) = media_client.queue_next(content_hash, SourceName::audio()) {
             handle_playback_error(e);
         }
     }
@@ -1950,7 +1951,7 @@ fn handle_queue_append(
     let count = hashes.len();
     for hash in hashes {
         let content_hash = ContentHash::new(hash);
-        if let Err(e) = media_client.queue_append(content_hash, "audio".to_string()) {
+        if let Err(e) = media_client.queue_append(content_hash, SourceName::audio()) {
             handle_playback_error(e);
         }
     }
@@ -2030,9 +2031,9 @@ fn handle_queue_replace(
     media_client: &PlaybackBackend,
     hashes: Vec<String>,
 ) -> Result<()> {
-    let entries: Vec<(ContentHash, String)> = hashes
+    let entries: Vec<(ContentHash, SourceName)> = hashes
         .into_iter()
-        .map(|hash| (ContentHash::new(hash), "audio".to_string()))
+        .map(|hash| (ContentHash::new(hash), SourceName::audio()))
         .collect();
     let count = entries.len();
     if let Err(e) = media_client.queue_replace(entries) {
@@ -2113,9 +2114,9 @@ fn handle_queue_edit(
     let _ = std::fs::remove_file(&tmp_path);
 
     // 6. Replace queue with reordered hashes.
-    let entries: Vec<(ContentHash, String)> = edited_hashes
+    let entries: Vec<(ContentHash, SourceName)> = edited_hashes
         .into_iter()
-        .map(|hash| (ContentHash::new(hash), "audio".to_string()))
+        .map(|hash| (ContentHash::new(hash), SourceName::audio()))
         .collect();
     let count = entries.len();
     if let Err(e) = media_client.queue_replace(entries) {

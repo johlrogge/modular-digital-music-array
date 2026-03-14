@@ -1530,6 +1530,7 @@ dependencies = [
  "acid_protocol",
  "library-ipc-protocol",
  "media-protocol",
+ "playback-primitives",
  "pretty_assertions",
  "serde",
  "serde_json",

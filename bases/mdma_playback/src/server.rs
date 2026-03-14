@@ -3,7 +3,7 @@ use crate::playback_state::{PlaybackEffect, PlaybackState, PlaybackStateMachine}
 use acid_client::AcidClient;
 use color_eyre::Result;
 use event_protocol::{to_topic_message, PlaybackEvent};
-use media_protocol::{Command, Response, ResponseData};
+use media_protocol::{Command, Response, ResponseData, SourceName};
 use music_facts::{FactOrigin, FactSource, MusicValue};
 use nng::Socket;
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,7 @@ use crate::stream_client::StreamClient;
 
 struct QueueEntry {
     hash: media_protocol::ContentHash,
-    source: String,
+    source: SourceName,
 }
 
 fn write_fact(acid_client: &AcidClient, hash: &media_protocol::ContentHash, value: MusicValue) {
@@ -37,7 +37,7 @@ fn write_fact(acid_client: &AcidClient, hash: &media_protocol::ContentHash, valu
 #[derive(Serialize, Deserialize)]
 struct PersistEntry {
     hash: String,
-    source: String,
+    source: SourceName,
 }
 
 pub struct Server {
@@ -667,7 +667,7 @@ mod tests {
             let mut q = server.queue.lock().await;
             q.push_back(QueueEntry {
                 hash: media_protocol::ContentHash::new("sha256:queued"),
-                source: "audio".to_string(),
+                source: SourceName::audio(),
             });
         }
 
@@ -675,7 +675,7 @@ mod tests {
         {
             let mut sm = server.state.lock().await;
             let hash = media_protocol::ContentHash::new("sha256:paused_track");
-            sm.play_queue(hash, "audio".to_string());
+            sm.play_queue(hash, SourceName::audio());
             sm.pause();
         }
 
@@ -726,7 +726,7 @@ mod tests {
         {
             let mut sm = server.state.lock().await;
             let hash = media_protocol::ContentHash::new("sha256:test");
-            sm.play_queue(hash, "audio".to_string());
+            sm.play_queue(hash, SourceName::audio());
             sm.pause();
         }
 

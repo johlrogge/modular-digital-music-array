@@ -3,14 +3,14 @@
 //! Implements the media_protocol Command/Response contract with an in-memory
 //! queue. No PipeWire, no audio hardware — just queue management and now_playing state.
 
-use media_protocol::{Command, ContentHash, Response, ResponseData};
+use media_protocol::{Command, ContentHash, Response, ResponseData, SourceName};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 /// Shared state for the playback simulator.
 #[derive(Debug, Default)]
 pub struct PlaybackState {
-    pub queue: VecDeque<(ContentHash, String)>,
+    pub queue: VecDeque<(ContentHash, SourceName)>,
     pub now_playing: Option<ContentHash>,
 }
 

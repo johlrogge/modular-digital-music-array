@@ -1,10 +1,12 @@
-use playback_primitives::{AudioOutputConfig, AudioSinkInfo, ContentHash, Deck, Volume};
+use playback_primitives::{
+    AudioOutputConfig, AudioSinkInfo, ContentHash, Deck, SourceName, Volume,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[allow(dead_code)] // used by serde via string reference in #[serde(default = "...")]
-fn default_audio_source() -> String {
-    "audio".to_string()
+fn default_audio_source() -> SourceName {
+    SourceName::audio()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,12 +48,12 @@ pub enum Command {
     QueueNext {
         hash: ContentHash,
         #[serde(default = "default_audio_source")]
-        source: String,
+        source: SourceName,
     },
     QueueAppend {
         hash: ContentHash,
         #[serde(default = "default_audio_source")]
-        source: String,
+        source: SourceName,
     },
     QueueList,
     QueueClear,
@@ -60,7 +62,7 @@ pub enum Command {
     },
     /// Atomically replace the entire queue with a new ordered list.
     QueueReplace {
-        entries: Vec<(ContentHash, String)>,
+        entries: Vec<(ContentHash, SourceName)>,
     },
     /// Pop from queue head, load on deck A, and start playing.
     PlayQueue,
@@ -103,6 +105,7 @@ pub enum ResponseData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use playback_primitives::SourceName;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -110,7 +113,7 @@ mod tests {
         let json = r#"{"queue_append":{"hash":"abc123def456abc123def456abc123def456abc123def456abc123def456abc1"}}"#;
         let decoded: Command = serde_json::from_str(json).unwrap();
         if let Command::QueueAppend { source, .. } = decoded {
-            assert_eq!(source, "audio");
+            assert_eq!(source, SourceName::audio());
         } else {
             panic!("expected QueueAppend variant");
         }
@@ -121,7 +124,7 @@ mod tests {
         let json = r#"{"queue_next":{"hash":"abc123def456abc123def456abc123def456abc123def456abc123def456abc1"}}"#;
         let decoded: Command = serde_json::from_str(json).unwrap();
         if let Command::QueueNext { source, .. } = decoded {
-            assert_eq!(source, "audio");
+            assert_eq!(source, SourceName::audio());
         } else {
             panic!("expected QueueNext variant");
         }

@@ -5,6 +5,7 @@
 
 pub use media_protocol::{
     AudioOutputConfig, AudioSinkInfo, Command, ContentHash, Deck, Response, ResponseData,
+    SourceName,
 };
 pub use playback_primitives::Volume;
 
@@ -94,11 +95,11 @@ impl MediaClient {
         })
     }
 
-    pub fn queue_next(&self, hash: ContentHash, source: String) -> Result<(), ClientError> {
+    pub fn queue_next(&self, hash: ContentHash, source: SourceName) -> Result<(), ClientError> {
         self.send_command(Command::QueueNext { hash, source })
     }
 
-    pub fn queue_append(&self, hash: ContentHash, source: String) -> Result<(), ClientError> {
+    pub fn queue_append(&self, hash: ContentHash, source: SourceName) -> Result<(), ClientError> {
         self.send_command(Command::QueueAppend { hash, source })
     }
 
@@ -116,7 +117,10 @@ impl MediaClient {
         self.send_command(Command::QueueClear)
     }
 
-    pub fn queue_replace(&self, entries: Vec<(ContentHash, String)>) -> Result<(), ClientError> {
+    pub fn queue_replace(
+        &self,
+        entries: Vec<(ContentHash, SourceName)>,
+    ) -> Result<(), ClientError> {
         self.send_command(Command::QueueReplace { entries })
     }
 

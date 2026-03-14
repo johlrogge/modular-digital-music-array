@@ -106,6 +106,41 @@ impl Db for Volume {
     }
 }
 
+/// Identifies a named audio source (e.g. "audio", "bandcamp").
+///
+/// This is a newtype around `String` to prevent confusion with other string fields
+/// and to centralise the canonical "audio" default.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SourceName(String);
+
+impl SourceName {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    /// Returns the canonical audio source name.
+    pub fn audio() -> Self {
+        Self("audio".to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SourceName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<SourceName> for String {
+    fn from(s: SourceName) -> Self {
+        s.0
+    }
+}
+
 /// Identifies a playback channel (deck)
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Deck {
@@ -191,6 +226,45 @@ mod tests {
                 result.is_err(),
                 "expected error for out-of-range dBFS value"
             );
+        }
+    }
+
+    mod source_name {
+        use super::*;
+        use pretty_assertions::assert_eq;
+
+        #[test]
+        fn audio_constructor_returns_audio_string() {
+            let s = SourceName::audio();
+            assert_eq!(s.as_str(), "audio");
+        }
+
+        #[test]
+        fn new_constructor_wraps_string() {
+            let s = SourceName::new("bandcamp");
+            assert_eq!(s.as_str(), "bandcamp");
+        }
+
+        #[test]
+        fn display_shows_inner_string() {
+            let s = SourceName::new("beatport");
+            assert_eq!(s.to_string(), "beatport");
+        }
+
+        #[test]
+        fn serde_round_trip_transparent() {
+            let s = SourceName::audio();
+            let json = serde_json::to_string(&s).unwrap();
+            assert_eq!(json, "\"audio\"");
+            let decoded: SourceName = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, s);
+        }
+
+        #[test]
+        fn from_source_name_into_string() {
+            let s = SourceName::new("audio");
+            let st: String = s.into();
+            assert_eq!(st, "audio");
         }
     }
 

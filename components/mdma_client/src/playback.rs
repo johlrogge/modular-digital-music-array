@@ -2,7 +2,7 @@
 
 use media_client::{
     AudioOutputConfig, AudioSinkInfo, ClientError, Command, ContentHash, Deck, MediaClient,
-    Response, ResponseData,
+    Response, ResponseData, SourceName,
 };
 
 /// Abstraction for playback commands, works in both gateway and direct mode.
@@ -80,14 +80,14 @@ impl PlaybackBackend {
         }
     }
 
-    pub fn queue_next(&self, hash: ContentHash, source: String) -> Result<(), ClientError> {
+    pub fn queue_next(&self, hash: ContentHash, source: SourceName) -> Result<(), ClientError> {
         match self {
             PlaybackBackend::Direct(c) => c.queue_next(hash, source),
             PlaybackBackend::Gateway(gw) => gw_command(gw, Command::QueueNext { hash, source }),
         }
     }
 
-    pub fn queue_append(&self, hash: ContentHash, source: String) -> Result<(), ClientError> {
+    pub fn queue_append(&self, hash: ContentHash, source: SourceName) -> Result<(), ClientError> {
         match self {
             PlaybackBackend::Direct(c) => c.queue_append(hash, source),
             PlaybackBackend::Gateway(gw) => gw_command(gw, Command::QueueAppend { hash, source }),
@@ -114,7 +114,10 @@ impl PlaybackBackend {
         }
     }
 
-    pub fn queue_replace(&self, entries: Vec<(ContentHash, String)>) -> Result<(), ClientError> {
+    pub fn queue_replace(
+        &self,
+        entries: Vec<(ContentHash, SourceName)>,
+    ) -> Result<(), ClientError> {
         match self {
             PlaybackBackend::Direct(c) => c.queue_replace(entries),
             PlaybackBackend::Gateway(gw) => gw_command(gw, Command::QueueReplace { entries }),
