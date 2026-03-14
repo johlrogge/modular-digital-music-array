@@ -6,6 +6,7 @@ pub use acid_protocol::{AcidRequest, AcidResponse, FactEntry, StreamChunk};
 pub use nng_transport::NngClientError as ClientError;
 
 use nng::options::{Options, RecvTimeout, SendTimeout};
+use nng_transport::request_response;
 use std::time::Duration;
 
 pub struct AcidClient {
@@ -25,14 +26,7 @@ impl AcidClient {
     }
 
     fn request(&self, request: &AcidRequest) -> Result<AcidResponse, ClientError> {
-        let data = serde_json::to_vec(request)?;
-        let msg = nng::Message::from(&data[..]);
-        self.socket
-            .send(msg)
-            .map_err(|(_, e)| ClientError::Nng(e))?;
-        let response_msg = self.socket.recv()?;
-        let response: AcidResponse = serde_json::from_slice(&response_msg)?;
-        Ok(response)
+        request_response(&self.socket, request)
     }
 
     pub fn ping(&self) -> Result<(), ClientError> {

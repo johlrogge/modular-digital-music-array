@@ -31,15 +31,7 @@ impl GatewayClient {
 
     /// Send a raw gateway request and receive a response.
     fn request(&self, request: &GatewayRequest) -> Result<GatewayResponse, ClientError> {
-        let data = serde_json::to_vec(request)?;
-        let msg = nng::Message::from(&data[..]);
-        self.socket
-            .send(msg)
-            .map_err(|(_, e)| ClientError::Nng(e))?;
-
-        let response_msg = self.socket.recv()?;
-        let response: GatewayResponse = serde_json::from_slice(&response_msg)?;
-        Ok(response)
+        nng_transport::request_response(&self.socket, request)
     }
 
     // =========================================================================

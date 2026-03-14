@@ -197,6 +197,48 @@ fn resolve_with_std(host: &str) -> Option<String> {
         .map(|addr| addr.ip().to_string())
 }
 
+/// Send a request and receive a response over an existing NNG socket.
+///
+/// This is the shared serialize→send→recv→deserialize pattern used by all NNG clients.
+/// The caller is responsible for connecting the socket with [`connect`].
+///
+/// # Errors
+///
+/// Returns [`NngClientError`] on serialization failure, NNG send/recv error,
+/// or deserialization failure.
+///
+/// # Examples
+///
+/// ```no_run
+/// use nng_transport::{connect, request_response, NngClientError};
+/// use serde::{Deserialize, Serialize};
+///
+/// #[derive(Serialize)]
+/// struct Ping;
+///
+/// #[derive(Deserialize)]
+/// struct Pong;
+///
+/// let socket = connect("ipc:///run/mdma/library.sock")?;
+/// let _pong: Pong = request_response(&socket, &Ping)?;
+/// # Ok::<(), NngClientError>(())
+/// ```
+pub fn request_response<Req, Resp>(
+    socket: &nng::Socket,
+    request: &Req,
+) -> Result<Resp, NngClientError>
+where
+    Req: serde::Serialize,
+    Resp: serde::de::DeserializeOwned,
+{
+    let data = serde_json::to_vec(request)?;
+    let msg = nng::Message::from(&data[..]);
+    socket.send(msg).map_err(|(_, e)| NngClientError::Nng(e))?;
+    let response_msg = socket.recv()?;
+    let response: Resp = serde_json::from_slice(&response_msg)?;
+    Ok(response)
+}
+
 /// Shared NNG client error type for use across all NNG-based clients.
 ///
 /// Covers the common error cases: failed connection, NNG transport errors,

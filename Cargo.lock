@@ -2957,6 +2957,7 @@ dependencies = [
  "dirs",
  "nng",
  "pretty_assertions",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
