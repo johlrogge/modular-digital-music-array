@@ -1107,11 +1107,8 @@ impl LibraryService {
 
     /// Resolve a partial hash to a full hash (like git short refs)
     fn resolve_hash(&self, partial: &ContentHash) -> Result<ContentHash, ProtocolError> {
-        let partial_clean = partial
-            .as_str()
-            .strip_prefix("sha256:")
-            .unwrap_or(partial.as_str())
-            .to_lowercase();
+        let normalize = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
+        let partial_clean = normalize(partial.as_str());
 
         let tracks = self.tracks.lock().unwrap();
         let matches: Vec<_> = tracks
@@ -1136,12 +1133,30 @@ impl LibraryService {
                 // value. If so, they are duplicate index entries for the same
                 // content (e.g. legacy short hashes written more than once) and
                 // resolving to the first one is correct.
-                let first_hash = matches[0].content_hash.as_str();
-                let all_same = matches
+                // Normalize by stripping "sha256:" prefix and lowercasing so that
+                // a legacy short-hash entry ("9fb4105e") and a full-hash entry
+                // ("sha256:9fb4105eXXX...") are recognised as the same content:
+                // both normalize to the same prefix, so one starts_with the other.
+                let normalized: Vec<String> = matches
                     .iter()
-                    .all(|t| t.content_hash.as_str() == first_hash);
+                    .map(|t| normalize(t.content_hash.as_str()))
+                    .collect();
+                // All entries represent the same content if every pair of
+                // normalized hashes has one that is a prefix of the other
+                // (i.e. short legacy hash vs full hash of the same file).
+                let all_same = normalized.iter().all(|a| {
+                    normalized
+                        .iter()
+                        .all(|b| a.starts_with(b.as_str()) || b.starts_with(a.as_str()))
+                });
                 if all_same {
-                    return Ok(matches[0].content_hash.clone());
+                    // Prefer the entry with the longest (most complete) hash,
+                    // so a full "sha256:..." hash wins over a legacy 8-char hash.
+                    let best = matches
+                        .iter()
+                        .max_by_key(|t| t.content_hash.as_str().len())
+                        .unwrap();
+                    return Ok(best.content_hash.clone());
                 }
 
                 // Genuinely different hashes share a prefix — real ambiguity.
@@ -2270,6 +2285,45 @@ mod tests {
             matches!(result, Err(_)),
             "expected Ambiguous error for genuine prefix collision, got: {:?}",
             result
+        );
+    }
+
+    #[test]
+    fn resolve_hash_with_legacy_short_and_full_hash_returns_full_hash() {
+        // One entry has a legacy 8-char short hash ("9fb4105e") and another has
+        // the full sha256 hash ("sha256:9fb4105eXXX...") for the same file.
+        // resolve_hash must recognise them as the same content and return the
+        // full hash (the most complete one), not an Ambiguous error.
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+
+        let service = LibraryService::new(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+            "ipc:///tmp/mdma-test-acid-nonexistent.sock",
+        )
+        .unwrap();
+
+        let legacy_hash = ContentHash::new("9fb4105e");
+        let full_hash = ContentHash::new("sha256:9fb4105eaabbccdd11223344556677889900aabb");
+        {
+            let mut tracks = service.tracks.lock().unwrap();
+            let mut entry_legacy = IndexedTrackInfo::new_empty(legacy_hash.as_str().to_owned());
+            entry_legacy.title = Some("Unknown".to_owned());
+            let mut entry_full = IndexedTrackInfo::new_empty(full_hash.as_str().to_owned());
+            entry_full.title = Some("20 Minutes".to_owned());
+            tracks.push(entry_legacy);
+            tracks.push(entry_full);
+        }
+
+        // Searching by the legacy short hash should resolve to the full hash.
+        let result = service.resolve_hash(&legacy_hash);
+        assert_eq!(
+            result
+                .expect("resolve_hash should return Ok for legacy+full hash pair")
+                .as_str(),
+            full_hash.as_str(),
+            "resolved hash should be the full sha256 hash"
         );
     }
 
