@@ -20,6 +20,6 @@ pub use library_ipc_client::{
 pub use library_search::TrackQuery;
 pub use media_client::{
     AudioOutputConfig, AudioSinkInfo, ClientError as PlaybackClientError, Command, Deck, Response,
-    ResponseData,
+    ResponseData, SourceName,
 };
 pub use source_protocol::{SourceRequest, SourceResponse};

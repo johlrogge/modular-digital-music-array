@@ -3,7 +3,9 @@ use crate::selection::SelectionState;
 use crate::theme::TEXT_TERTIARY;
 use crate::track_list::render_track_list;
 use crossterm::event::{KeyCode, KeyEvent};
-use mdma_client::{ContentHash, LibraryBackend, PlaybackBackend, PlaylistName, TrackInfo};
+use mdma_client::{
+    ContentHash, LibraryBackend, PlaybackBackend, PlaylistName, SourceName, TrackInfo,
+};
 use ratatui::{
     layout::{Alignment, Rect},
     style::Style,
@@ -11,8 +13,6 @@ use ratatui::{
     Frame,
 };
 use std::rc::Rc;
-
-const DEFAULT_SOURCE: &str = "audio";
 
 /// Minimal proof-of-life pane that shows the current playback queue.
 #[allow(dead_code)]
@@ -153,7 +153,7 @@ impl Pane for QueuePane {
         for hash in hashes {
             if let Err(e) = self
                 .playback
-                .queue_append(hash.clone(), DEFAULT_SOURCE.to_string())
+                .queue_append(hash.clone(), SourceName::audio())
             {
                 errors.push(format!("{e}"));
             }

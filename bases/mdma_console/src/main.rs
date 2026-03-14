@@ -14,7 +14,7 @@ use color_eyre::Result;
 use futures::stream::Stream;
 use gateway_client::{Command, GatewayClient};
 use library_ipc_client::{ContentHash, FactType, LibraryClient, TrackInfo, TrackQuery};
-use media_protocol::{AudioSinkInfo, Deck, ResponseData};
+use media_protocol::{AudioSinkInfo, Deck, ResponseData, SourceName};
 use nng::options::Options;
 use source_protocol::{DownloadState, SourceRequest, SourceResponse};
 use std::convert::Infallible;
@@ -989,7 +989,7 @@ async fn player_queue_append(
         &gw,
         &Command::QueueAppend {
             hash,
-            source: "audio".to_string(),
+            source: SourceName::audio(),
         },
     )
 }

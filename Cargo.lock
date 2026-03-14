@@ -374,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "bandcamp-api"
-version = "0.2.0"
+version = "0.9.0"
 dependencies = [
  "async-stream",
  "chrono",
@@ -1530,6 +1530,7 @@ dependencies = [
  "acid_protocol",
  "library-ipc-protocol",
  "media-protocol",
+ "playback-primitives",
  "pretty_assertions",
  "serde",
  "serde_json",
@@ -2957,6 +2958,7 @@ dependencies = [
  "dirs",
  "nng",
  "pretty_assertions",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
@@ -4329,7 +4331,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage_primitives"
-version = "0.2.0"
+version = "0.9.0"
 dependencies = [
  "pretty_assertions",
  "rstest",
@@ -4775,18 +4777,6 @@ checksum = "2e70e4c5a0e0a8a4823ad65dfe1a6930e4f4d756dcd9dd7939022b5e8c501215"
 dependencies = [
  "num-conv",
  "time-core",
-]
-
-[[package]]
-name = "time-primitives"
-version = "0.9.0"
-dependencies = [
- "assert_matches",
- "pretty_assertions",
- "rstest",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
 ]
 
 [[package]]

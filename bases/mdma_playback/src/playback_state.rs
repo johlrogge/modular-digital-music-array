@@ -1,7 +1,7 @@
 use event_protocol::PlaybackEvent;
 use media_protocol::ContentHash;
 use music_facts::{MusicValue, StartReason, StopReason};
-use playback_primitives::SessionId;
+use playback_primitives::{SessionId, SourceName};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlaybackState {
@@ -17,7 +17,7 @@ pub enum PlaybackEffect {
     PlayEngine,
     LoadAndPlay {
         hash: ContentHash,
-        source: String,
+        source: SourceName,
     },
     EmitEvent(PlaybackEvent),
     WriteFact {
@@ -84,7 +84,7 @@ impl PlaybackStateMachine {
 
     /// Pop from queue and start playing. If a track is currently Playing or
     /// Paused, it is stopped first.
-    pub fn play_queue(&mut self, hash: ContentHash, source: String) -> Vec<PlaybackEffect> {
+    pub fn play_queue(&mut self, hash: ContentHash, source: SourceName) -> Vec<PlaybackEffect> {
         let mut effects = Vec::new();
 
         // Stop whatever is currently playing/paused.
@@ -144,7 +144,7 @@ impl PlaybackStateMachine {
     }
 
     /// Skip the current track and optionally start the next.
-    pub fn skip(&mut self, next: Option<(ContentHash, String)>) -> Vec<PlaybackEffect> {
+    pub fn skip(&mut self, next: Option<(ContentHash, SourceName)>) -> Vec<PlaybackEffect> {
         let mut effects = Vec::new();
 
         match self.state.clone() {
@@ -236,7 +236,7 @@ impl PlaybackStateMachine {
     }
 
     /// Called when the engine reports a track has played to completion.
-    pub fn track_ended(&mut self, next: Option<(ContentHash, String)>) -> Vec<PlaybackEffect> {
+    pub fn track_ended(&mut self, next: Option<(ContentHash, SourceName)>) -> Vec<PlaybackEffect> {
         let mut effects = Vec::new();
 
         match self.state.clone() {
@@ -300,12 +300,12 @@ mod tests {
         ContentHash::new("sha256:bbbbbb")
     }
 
-    fn source_a() -> String {
-        "audio".to_string()
+    fn source_a() -> SourceName {
+        SourceName::audio()
     }
 
-    fn source_b() -> String {
-        "audio".to_string()
+    fn source_b() -> SourceName {
+        SourceName::audio()
     }
 
     // -------------------------------------------------------------------------

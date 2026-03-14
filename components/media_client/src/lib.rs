@@ -5,6 +5,7 @@
 
 pub use media_protocol::{
     AudioOutputConfig, AudioSinkInfo, Command, ContentHash, Deck, Response, ResponseData,
+    SourceName,
 };
 pub use playback_primitives::Volume;
 
@@ -94,11 +95,11 @@ impl MediaClient {
         })
     }
 
-    pub fn queue_next(&self, hash: ContentHash, source: String) -> Result<(), ClientError> {
+    pub fn queue_next(&self, hash: ContentHash, source: SourceName) -> Result<(), ClientError> {
         self.send_command(Command::QueueNext { hash, source })
     }
 
-    pub fn queue_append(&self, hash: ContentHash, source: String) -> Result<(), ClientError> {
+    pub fn queue_append(&self, hash: ContentHash, source: SourceName) -> Result<(), ClientError> {
         self.send_command(Command::QueueAppend { hash, source })
     }
 
@@ -116,7 +117,10 @@ impl MediaClient {
         self.send_command(Command::QueueClear)
     }
 
-    pub fn queue_replace(&self, entries: Vec<(ContentHash, String)>) -> Result<(), ClientError> {
+    pub fn queue_replace(
+        &self,
+        entries: Vec<(ContentHash, SourceName)>,
+    ) -> Result<(), ClientError> {
         self.send_command(Command::QueueReplace { entries })
     }
 
@@ -190,19 +194,9 @@ impl MediaClient {
 
     fn send_command(&self, cmd: Command) -> Result<(), ClientError> {
         tracing::debug!("Serializing command: {:?}", cmd);
-        let data = serde_json::to_vec(&cmd)?;
-
-        let msg = nng::Message::from(&data[..]);
-        tracing::debug!("Sending {} bytes to server", data.len());
-        self.socket
-            .send(msg)
-            .map_err(|(_, e)| ClientError::Nng(e))?;
-
-        tracing::debug!("Waiting for response...");
-        let response_msg = self.socket.recv()?;
-        tracing::debug!("Received response of {} bytes", response_msg.len());
-
-        let response: Response = serde_json::from_slice(&response_msg)?;
+        tracing::debug!("Sending command to server");
+        let response: Response = nng_transport::request_response(&self.socket, &cmd)?;
+        tracing::debug!("Received response");
 
         match response {
             Response::Ok { .. } => Ok(()),
@@ -215,15 +209,7 @@ impl MediaClient {
         cmd: Command,
         extract: fn(ResponseData) -> Option<T>,
     ) -> Result<T, ClientError> {
-        let data = serde_json::to_vec(&cmd)?;
-
-        let msg = nng::Message::from(&data[..]);
-        self.socket
-            .send(msg)
-            .map_err(|(_, e)| ClientError::Nng(e))?;
-
-        let response_msg = self.socket.recv()?;
-        let response: Response = serde_json::from_slice(&response_msg)?;
+        let response: Response = nng_transport::request_response(&self.socket, &cmd)?;
 
         match response {
             Response::Err { message } => Err(ClientError::Service(message)),
