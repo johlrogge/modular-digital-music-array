@@ -1131,7 +1131,21 @@ impl LibraryService {
                 hash: partial.as_str().to_owned(),
             }),
             1 => Ok(matches[0].content_hash.clone()),
-            n => {
+            _ => {
+                // Multiple matches: check whether all share the exact same hash
+                // value. If so, they are duplicate index entries for the same
+                // content (e.g. legacy short hashes written more than once) and
+                // resolving to the first one is correct.
+                let first_hash = matches[0].content_hash.as_str();
+                let all_same = matches
+                    .iter()
+                    .all(|t| t.content_hash.as_str() == first_hash);
+                if all_same {
+                    return Ok(matches[0].content_hash.clone());
+                }
+
+                // Genuinely different hashes share a prefix — real ambiguity.
+                let n = matches.len();
                 let examples: Vec<_> = matches
                     .iter()
                     .take(3)
@@ -2179,6 +2193,84 @@ mod tests {
             LibraryResponse::Error(ProtocolError::PlaylistNotFound { .. }) => {}
             other => panic!("Expected PlaylistNotFound error, got {:?}", other),
         }
+    }
+
+    // =========================================================================
+    // Hash resolution tests
+    // =========================================================================
+
+    #[test]
+    fn resolve_hash_with_duplicate_same_hash_returns_first_match() {
+        // Two index entries that share the exact same content_hash (legacy short
+        // hashes can collide in the index). They represent the same content, so
+        // resolve_hash must return that hash rather than an Ambiguous error.
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+
+        let service = LibraryService::new(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+            "ipc:///tmp/mdma-test-acid-nonexistent.sock",
+        )
+        .unwrap();
+
+        // Inject two entries with the exact same content_hash directly.
+        let shared_hash = ContentHash::new("10e95ec1");
+        {
+            let mut tracks = service.tracks.lock().unwrap();
+            let mut entry_a = IndexedTrackInfo::new_empty(shared_hash.as_str().to_owned());
+            entry_a.title = Some("Track A".to_owned());
+            let mut entry_b = IndexedTrackInfo::new_empty(shared_hash.as_str().to_owned());
+            entry_b.title = Some("Track B".to_owned());
+            tracks.push(entry_a);
+            tracks.push(entry_b);
+        }
+
+        // resolve_hash should succeed because both matches have identical hashes.
+        let result = service.resolve_hash(&shared_hash);
+        assert_eq!(
+            result
+                .expect("resolve_hash should return Ok for duplicate entries with the same hash")
+                .as_str(),
+            shared_hash.as_str(),
+            "resolved hash should equal the shared hash"
+        );
+    }
+
+    #[test]
+    fn resolve_hash_with_prefix_collision_different_hashes_returns_ambiguous() {
+        // Two entries whose hashes share a common prefix but are different values.
+        // This is a genuine ambiguity and must still return an error.
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+
+        let service = LibraryService::new(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+            "ipc:///tmp/mdma-test-acid-nonexistent.sock",
+        )
+        .unwrap();
+
+        let hash_a = ContentHash::new("sha256:abcdef0011223344");
+        let hash_b = ContentHash::new("sha256:abcdef0099887766");
+        {
+            let mut tracks = service.tracks.lock().unwrap();
+            let mut entry_a = IndexedTrackInfo::new_empty(hash_a.as_str().to_owned());
+            entry_a.title = Some("Track A".to_owned());
+            let mut entry_b = IndexedTrackInfo::new_empty(hash_b.as_str().to_owned());
+            entry_b.title = Some("Track B".to_owned());
+            tracks.push(entry_a);
+            tracks.push(entry_b);
+        }
+
+        // Use "sha256:abcdef00" as the partial prefix that matches both hashes.
+        let partial = ContentHash::new("sha256:abcdef00");
+        let result = service.resolve_hash(&partial);
+        assert!(
+            matches!(result, Err(_)),
+            "expected Ambiguous error for genuine prefix collision, got: {:?}",
+            result
+        );
     }
 
     // =========================================================================
