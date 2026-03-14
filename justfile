@@ -796,3 +796,28 @@ deploy-bandcamp: bandcamp-cross
 [group('dev')]
 deploy-acid: acid-cross
     @just _deploy-svc mdma-acid mdma-acid
+
+# Cross-compile TUI (mdma-tui) for aarch64
+[group('build')]
+tui-cross: (cross "mdma-tui" "TUI")
+
+# Deploy TUI (mdma-tui) to Pi - installs as /usr/bin/mdma-tui, no service required
+[group('dev')]
+deploy-tui: tui-cross
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    HOST="${PI_HOST:-mdma-909.local}"
+    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-tui"
+    SSH_KEY="$HOME/.ssh/mdma_pi"
+
+    echo "Deploying mdma-tui to $HOST..."
+
+    scp -4 -i "$SSH_KEY" "$BINARY" "admin@${HOST}:/tmp/"
+
+    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo mv /tmp/mdma-tui /usr/bin/mdma-tui
+        sudo chmod +x /usr/bin/mdma-tui
+        mdma-tui --help 2>&1 | head -1 || true'
+
+    echo ""
+    echo "TUI deployed! Run: mdma-tui --help"
