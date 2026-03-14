@@ -40,3 +40,9 @@ Feature: Library search
       | Carbon Based Lifeforms | Interloper  | 120 |
       | Carbon Based Lifeforms | MOS 6581    | 130 |
       | Extrawelt              | Soopertrack | 132 |
+
+  Scenario: Ambiguous hash resolution with legacy short-hash entity does not panic
+    Given the library also contains a legacy track with raw hash "7926386d" and title "LegacyTrack" by "OldArtist"
+    And the library also contains a legacy track with raw hash "79263890" and title "OtherLegacy" by "OldArtist"
+    When I resolve hash "792638"
+    Then the operation should fail with "Ambiguous"

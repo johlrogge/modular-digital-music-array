@@ -3,6 +3,7 @@
 use crate::harness::SeedTrack;
 use crate::world::MdmaWorld;
 use cucumber::{gherkin::Step, given, then, when};
+use mdma_client::ContentHash;
 
 /// Background step: seed the library with tracks from a data table.
 /// Parses the header row dynamically so any column order works, and new columns
@@ -38,6 +39,7 @@ async fn library_contains(world: &mut MdmaWorld, step: &Step) {
                 duration: get(col_duration).and_then(|s| s.parse::<u32>().ok()),
                 year: get(col_year).and_then(|s| s.parse::<u32>().ok()),
                 hash: get(col_hash).map(|s| s.to_string()),
+                raw_hash: None,
             });
         }
     }
@@ -165,4 +167,42 @@ async fn operation_should_fail_with(world: &mut MdmaWorld, expected_msg: String)
         expected_msg,
         err
     );
+}
+
+/// Step: add a legacy track with a raw hash (no sha256: prefix, arbitrary length).
+/// This simulates legacy entities that may be short or lack the standard prefix.
+#[given(
+    regex = r#"^the library also contains a legacy track with raw hash "([^"]*)" and title "([^"]*)" by "([^"]*)"$"#
+)]
+async fn library_also_contains_legacy_track(
+    world: &mut MdmaWorld,
+    raw_hash: String,
+    title: String,
+    artist: String,
+) {
+    world.pending_tracks.push(SeedTrack {
+        artist,
+        title,
+        bpm: None,
+        genre: None,
+        duration: None,
+        year: None,
+        hash: None,
+        raw_hash: Some(raw_hash),
+    });
+}
+
+/// Step: resolve a hash via get_track (exercises the resolve_hash ambiguity path).
+#[when(regex = r#"^I resolve hash "([^"]*)"$"#)]
+async fn resolve_hash(world: &mut MdmaWorld, hash: String) {
+    world.ensure_env();
+    let content_hash = ContentHash::new(hash);
+    match world.library().get_track(&content_hash) {
+        Ok(_) => {
+            world.last_error = None;
+        }
+        Err(e) => {
+            world.last_error = Some(e.to_string());
+        }
+    }
 }

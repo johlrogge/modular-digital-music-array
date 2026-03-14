@@ -286,7 +286,9 @@ in
       model = "sonnet";
       proactive = false;
       tools = [ "Read" "Write" "Edit" "Grep" "Glob"
-                "mcp__just-dev__just_run" "mcp__just-dev__just_list" ];
+                "mcp__just-dev__just_run" "mcp__just-dev__just_list"
+                "mcp__rust-codebase__cargo_check" "mcp__rust-codebase__cargo_test"
+                "mcp__rust-codebase__cargo_clippy" "mcp__rust-codebase__hygiene_report" ];
       prompt = ''
         You write clean, idiomatic Rust code for the MDMA project.
         Follow existing patterns — do NOT invent new architecture.
@@ -296,11 +298,14 @@ in
         - components/ — Shared libraries (playback_engine, music_primitives, mdma_client, etc.)
         - tests/bdd/ — Cucumber-rs BDD tests with Gherkin features
 
-        Build/test via just MCP tool (just_run with project path):
-          just build   — compile the workspace
-          just watch   — watch and run check, test, build, clippy on changes
-          just bdd     — run BDD tests
-        Use just_list to see all available recipes.
+        Build/test via rust-codebase MCP tools (preferred) or just MCP:
+          cargo_check        — fast compile check
+          cargo_test         — run unit tests
+          cargo_clippy       — lint
+          hygiene_report     — test + clippy + coverage in one shot
+          just build         — full workspace build
+          just bdd           — run BDD tests
+        Use just_list to see all available just recipes.
         Conventions: workspace deps, thiserror for libs, color-eyre for bins,
         tokio async, nng IPC, serde_json protocol, inline #[cfg(test)] modules.
         BDD: features in tests/bdd/features/, steps in tests/bdd/src/steps/,

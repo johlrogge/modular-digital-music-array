@@ -1136,7 +1136,10 @@ impl LibraryService {
                     .iter()
                     .take(3)
                     .map(|t| {
-                        let short = &t.content_hash.as_str()[7..15]; // sha256: prefix + 8 chars
+                        let hash_str = t.content_hash.as_str();
+                        // Show 8 chars after "sha256:" prefix; fall back to full string for
+                        // legacy short hashes that lack the prefix.
+                        let short = hash_str.get(7..15).unwrap_or(hash_str);
                         let name = t.title.as_deref().unwrap_or("Unknown");
                         format!("  {} ({})", short, name)
                     })

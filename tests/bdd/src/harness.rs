@@ -20,6 +20,9 @@ pub struct SeedTrack {
     /// Explicit hex hash (e.g. "a1b2c3d4"). Padded to 64 hex chars with trailing zeros.
     /// When None, an index-based hash is auto-generated.
     pub hash: Option<String>,
+    /// Raw content hash string used as-is (no padding, no "sha256:" prefix added).
+    /// Simulates legacy or non-standard hash entries in the facts file.
+    pub raw_hash: Option<String>,
 }
 
 /// Everything the World needs from the harness.
@@ -43,13 +46,15 @@ fn seed_facts(metadata_dir: &std::path::Path, tracks: &[SeedTrack]) {
     let now = chrono::Utc::now();
 
     for (i, track) in tracks.iter().enumerate() {
-        // Use explicit hash if provided (padded to 64 hex chars), else auto-generate from index
-        let hash = match &track.hash {
-            Some(h) => {
+        // Use explicit hash if provided (padded to 64 hex chars), else auto-generate from index.
+        // raw_hash bypasses prefix/padding and is stored exactly as given.
+        let hash = match (&track.raw_hash, &track.hash) {
+            (Some(raw), _) => ContentHash::new(raw.clone()),
+            (None, Some(h)) => {
                 let padded = format!("{:0<64}", h);
                 ContentHash::new(format!("sha256:{}", padded))
             }
-            None => ContentHash::new(format!("sha256:{:064x}", i + 1)),
+            (None, None) => ContentHash::new(format!("sha256:{:064x}", i + 1)),
         };
 
         let mut facts: Vec<Fact<ContentHash, MusicValue, FactSource>> = vec![
