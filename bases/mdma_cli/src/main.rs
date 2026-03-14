@@ -871,31 +871,6 @@ fn print_tracks(tracks: &[TrackInfo], header: &str) {
     }
 }
 
-/// Print queue tracks. Terminal: numbered, colored table. Pipe: canonical lines.
-fn print_queue_tracks(indexed: &[(usize, &TrackInfo)]) {
-    use std::io::IsTerminal;
-    let is_tty = std::io::stdout().is_terminal();
-    if is_tty {
-        let pos_width = indexed
-            .last()
-            .map(|(p, _)| p.to_string().len())
-            .unwrap_or(1);
-        let tracks: Vec<TrackInfo> = indexed.iter().map(|(_, t)| (*t).clone()).collect();
-        // Reserve pos_width + 3 chars for the "N.  " prefix (digit(s) + "." + 2 spaces).
-        let lines = render_track_table(&tracks, pos_width + 3);
-        for ((pos, _), line) in indexed.iter().zip(lines.iter()) {
-            let pos_str = format!("{:>width$}.", pos, width = pos_width)
-                .bright_black()
-                .to_string();
-            println!("{}  {}", pos_str, line);
-        }
-    } else {
-        for (_, track) in indexed {
-            println!("{}", format_track_line(track));
-        }
-    }
-}
-
 /// Handle library client errors uniformly
 fn handle_error(err: ClientError) -> ! {
     match err {
@@ -1910,9 +1885,10 @@ fn handle_playback_now(
         Some(h) => match library_client {
             None => println!("{}", h.as_str()),
             Some(lib) => {
-                let track = lib
-                    .get_track(&h)
-                    .expect("playing hash not found in library — invariant violated");
+                let track = match lib.get_track(&h) {
+                    Ok(t) => t,
+                    Err(e) => handle_error(e),
+                };
                 let artist = track.artist.as_deref().unwrap_or("-");
                 let title = track.title.as_deref().unwrap_or("-");
                 let duration = track
@@ -1976,24 +1952,60 @@ fn handle_queue_list(
         return Ok(());
     }
 
-    let tracks: Vec<TrackInfo> = hashes
+    // Resolve each hash, keeping a Result per slot so positions stay aligned.
+    let resolved: Vec<Result<TrackInfo, String>> = hashes
         .iter()
-        .map(|hash| {
-            library_client
-                .get_track(hash)
-                .expect("queued hash not found in library — invariant violated")
-        })
+        .map(|hash| library_client.get_track(hash).map_err(|e| e.to_string()))
         .collect();
 
-    let indexed: Vec<(usize, &TrackInfo)> =
-        tracks.iter().enumerate().map(|(i, t)| (i + 1, t)).collect();
-
     use std::io::IsTerminal;
-    if std::io::stdout().is_terminal() {
-        println!("{}", format!("Queue ({} tracks)", tracks.len()).bold());
+    let is_tty = std::io::stdout().is_terminal();
+
+    if is_tty {
+        println!("{}", format!("Queue ({} tracks)", hashes.len()).bold());
         println!();
+
+        let pos_width = hashes.len().to_string().len().max(1);
+        // Collect only the resolvable tracks so we can size columns together.
+        let resolvable: Vec<TrackInfo> = resolved
+            .iter()
+            .filter_map(|r| r.as_ref().ok().cloned())
+            .collect();
+        // Pre-render resolvable tracks into lines (indexed by their slot).
+        let mut resolvable_lines = render_track_table(&resolvable, pos_width + 3).into_iter();
+
+        for (i, slot) in resolved.iter().enumerate() {
+            let pos = i + 1;
+            let pos_str = format!("{:>width$}.", pos, width = pos_width)
+                .bright_black()
+                .to_string();
+            match slot {
+                Ok(_) => {
+                    let line = resolvable_lines.next().unwrap_or_default();
+                    println!("{}  {}", pos_str, line);
+                }
+                Err(e) => {
+                    let short = short_hash(&hashes[i]);
+                    println!(
+                        "{}  {}  {}",
+                        pos_str,
+                        short.bright_black(),
+                        format!("[unavailable: {}]", e).bright_red()
+                    );
+                }
+            }
+        }
+    } else {
+        for (i, slot) in resolved.iter().enumerate() {
+            match slot {
+                Ok(track) => println!("{}", format_track_line(track)),
+                Err(e) => {
+                    let short = short_hash(&hashes[i]);
+                    println!("{}  [unavailable: {}]", short, e);
+                }
+            }
+        }
     }
-    print_queue_tracks(&indexed);
     Ok(())
 }
 
@@ -2053,16 +2065,8 @@ fn handle_queue_edit(
         Err(e) => handle_playback_error(e),
     };
 
-    // 2. Look up each track for display info.
-    let tracks: Vec<TrackInfo> = hashes
-        .iter()
-        .map(|hash| {
-            library_client
-                .get_track(hash)
-                .expect("queued hash not found in library — invariant violated")
-        })
-        .collect();
-
+    // 2. Look up each track for display info. Unresolvable entries are written as
+    //    plain-hash comment lines so they survive the edit round-trip unchanged.
     // 3. Write to temp file in playlist format.
     let tmp_path = std::env::temp_dir().join("mdma_queue_edit.plist");
     let mut content = String::from(
@@ -2070,8 +2074,18 @@ fn handle_queue_edit(
          # Lines not starting with an 8-12 character lowercase hash followed by a space are ignored.\n\
          \n",
     );
-    for track in &tracks {
-        content.push_str(&format_track_line(track));
+    for hash in &hashes {
+        match library_client.get_track(hash) {
+            Ok(track) => {
+                content.push_str(&format_track_line(&track));
+            }
+            Err(e) => {
+                // Write the raw hash with an inline comment so the user can keep or remove it.
+                // parse_hash_from_line reads only the first whitespace token, so the comment is ignored
+                // when the file is parsed back — the hash will survive the round-trip.
+                content.push_str(&format!("{}  # [unavailable: {}]", short_hash(hash), e));
+            }
+        }
         content.push('\n');
     }
     std::fs::write(&tmp_path, &content)
@@ -2164,6 +2178,24 @@ fn compare_optional<T: Ord>(a: Option<T>, b: Option<T>, asc: bool) -> std::cmp::
     }
 }
 
+/// Resolve a list of raw hash strings to `TrackInfo`, skipping any that the library
+/// cannot find and printing a warning for each skipped entry.
+fn resolve_tracks_skip_errors(client: &LibraryBackend, hashes: Vec<String>) -> Vec<TrackInfo> {
+    hashes
+        .into_iter()
+        .filter_map(|hash| {
+            let content_hash = ContentHash::new(hash.clone());
+            match client.get_track(&content_hash) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    eprintln!("Warning: skipping track {}: {}", hash, e);
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
 fn handle_sort(
     client: &LibraryBackend,
     field: SortField,
@@ -2180,20 +2212,7 @@ fn handle_sort(
     };
 
     let hashes = hashes_arg_or_stdin(None);
-
-    let mut tracks: Vec<TrackInfo> = hashes
-        .into_iter()
-        .filter_map(|hash| {
-            let content_hash = ContentHash::new(hash);
-            match client.get_track(&content_hash) {
-                Ok(t) => Some(t),
-                Err(e) => {
-                    eprintln!("Warning: could not resolve hash: {}", e);
-                    None
-                }
-            }
-        })
-        .collect();
+    let mut tracks = resolve_tracks_skip_errors(client, hashes);
 
     tracks.sort_by(|a, b| match &field {
         SortField::Bpm => compare_optional(a.bpm, b.bpm, direction_asc),
@@ -2799,19 +2818,7 @@ fn handle_export(
     }
 
     // Resolve each hash (short or full) to a full TrackInfo via the library
-    let mut tracks: Vec<TrackInfo> = Vec::with_capacity(raw_hashes.len());
-    for raw in &raw_hashes {
-        let ch = ContentHash::new(raw.clone());
-        match library.get_track(&ch) {
-            Ok(t) => tracks.push(t),
-            Err(e) => {
-                eprintln!(
-                    "WARNING: could not resolve hash '{}': {} — skipping",
-                    raw, e
-                );
-            }
-        }
-    }
+    let tracks = resolve_tracks_skip_errors(library, raw_hashes);
 
     if tracks.is_empty() {
         eprintln!("No tracks could be resolved. Aborting.");
@@ -3492,6 +3499,14 @@ mod tests {
     #[test]
     fn parse_hash_from_short_token_returns_none() {
         assert!(parse_hash_from_line("abcd12").is_none());
+    }
+
+    #[test]
+    fn parse_hash_from_unavailable_comment_line() {
+        // Queue edit writes unresolvable tracks as: {short_hash}  # [unavailable: error]
+        // The hash must survive the round-trip through parse_hash_from_line.
+        let result = parse_hash_from_line("a1b2c3d4  # [unavailable: track not found]");
+        assert_eq!(result, Some("a1b2c3d4".to_string()));
     }
 
     // ── ExportFormat::Original ────────────────────────────────────────────────
