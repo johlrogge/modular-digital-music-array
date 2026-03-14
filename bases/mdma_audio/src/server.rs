@@ -24,12 +24,18 @@ fn engine_sink_to_protocol(s: playback_engine::AudioSink) -> AudioSinkInfo {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadedState {
+    Playing,
+    Paused,
+}
+
 struct LoadedTrack {
     content_hash: ContentHash,
     title: Option<String>,
     artist: Option<String>,
     album: Option<String>,
-    is_playing: bool,
+    state: LoadedState,
 }
 
 pub struct Server {
@@ -130,7 +136,7 @@ impl Server {
             title: track_info.title,
             artist: track_info.artist,
             album: track_info.album,
-            is_playing: false,
+            state: LoadedState::Paused,
         });
 
         StreamResponse::Ok
@@ -154,7 +160,7 @@ impl Server {
             };
         }
 
-        loaded.is_playing = true;
+        loaded.state = LoadedState::Playing;
         StreamResponse::Ok
     }
 
@@ -167,7 +173,7 @@ impl Server {
         if let Err(e) = self.engine.stop() {
             warn!("Pause (stop) failed: {}", e);
         }
-        loaded.is_playing = false;
+        loaded.state = LoadedState::Paused;
         StreamResponse::Ok
     }
 
@@ -193,7 +199,7 @@ impl Server {
 
         let state = if self.engine.is_track_finished() {
             StreamPlaybackState::Finished
-        } else if loaded.is_playing {
+        } else if loaded.state == LoadedState::Playing {
             StreamPlaybackState::Playing
         } else {
             StreamPlaybackState::Paused
@@ -321,5 +327,43 @@ mod tests {
         let mut server = make_server();
         let response = server.handle_command(StreamCommand::Pause).await;
         assert!(matches!(response, StreamResponse::Ok));
+    }
+
+    /// handle_loaded reports Playing when LoadedState::Playing.
+    #[tokio::test]
+    async fn loaded_state_playing_reports_playing() {
+        let mut server = make_server();
+        server.loaded = Some(LoadedTrack {
+            content_hash: ContentHash::new("test-hash"),
+            title: None,
+            artist: None,
+            album: None,
+            state: LoadedState::Playing,
+        });
+        let response = server.handle_command(StreamCommand::Loaded).await;
+        if let StreamResponse::Loaded { info: Some(info) } = response {
+            assert_eq!(info.state, StreamPlaybackState::Playing);
+        } else {
+            panic!("expected Loaded {{ info: Some(..) }}");
+        }
+    }
+
+    /// handle_loaded reports Paused when LoadedState::Paused.
+    #[tokio::test]
+    async fn loaded_state_paused_reports_paused() {
+        let mut server = make_server();
+        server.loaded = Some(LoadedTrack {
+            content_hash: ContentHash::new("test-hash"),
+            title: None,
+            artist: None,
+            album: None,
+            state: LoadedState::Paused,
+        });
+        let response = server.handle_command(StreamCommand::Loaded).await;
+        if let StreamResponse::Loaded { info: Some(info) } = response {
+            assert_eq!(info.state, StreamPlaybackState::Paused);
+        } else {
+            panic!("expected Loaded {{ info: Some(..) }}");
+        }
     }
 }
