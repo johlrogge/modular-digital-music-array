@@ -1,5 +1,5 @@
 [package]
-name = "acid_protocol"
+name = "acid-protocol"
 version.workspace = true
 edition.workspace = true
 
