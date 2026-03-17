@@ -749,9 +749,21 @@ deploy-audio: audio-cross
 [group('build')]
 gateway-cross: (cross "mdma-gateway" "Gateway")
 
-# Cross-compile acid service for aarch64
+# Cross-compile acid service for aarch64 (project workspace)
 [group('build')]
-acid-cross: (cross "mdma-acid" "Acid")
+acid-cross:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building Acid for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        --manifest-path projects/mdma-acid/Cargo.toml \
+        --bin mdma-acid
+    echo ""
+    echo "Acid built!"
+    file target/aarch64-unknown-linux-gnu/release/mdma-acid
+    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-acid
 
 # Cross-compile bandcamp for aarch64
 [group('build')]

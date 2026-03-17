@@ -2549,25 +2549,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
-name = "mdma-acid"
-version = "0.6.0"
-dependencies = [
- "acid_protocol",
- "chrono",
- "clap",
- "color-eyre",
- "event-protocol",
- "nng",
- "pretty_assertions",
- "serde_json",
- "stainless-facts",
- "tempfile",
- "thiserror 1.0.69",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "mdma-audio"
 version = "0.1.1"
 dependencies = [
@@ -2733,29 +2714,6 @@ dependencies = [
  "clap",
  "color-eyre",
  "library-service",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "mdma-playback"
-version = "0.6.1"
-dependencies = [
- "acid-client",
- "clap",
- "color-eyre",
- "event-protocol",
- "media-protocol",
- "music-facts",
- "nng",
- "playback-primitives",
- "pretty_assertions",
- "serde",
- "serde_json",
- "stream-source-protocol",
- "tempfile",
- "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -4146,6 +4104,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "service"
+version = "0.1.0"
+dependencies = [
+ "nng",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "servo_arc"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4313,7 +4281,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stainless-facts"
 version = "0.2.0"
-source = "git+https://github.com/johlrogge/stainless_facts#2aa820a808fd5345a1bd59c11d90969bfa84b285"
+source = "git+https://github.com/johlrogge/stainless_facts?rev=2aa820a808fd5345a1bd59c11d90969bfa84b285#2aa820a808fd5345a1bd59c11d90969bfa84b285"
 dependencies = [
  "chrono",
  "fs2",

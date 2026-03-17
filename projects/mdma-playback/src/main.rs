@@ -5,12 +5,12 @@ pub(crate) mod stream_client;
 
 use acid_client::AcidClient;
 use server::Server;
+use service::{ServiceConfig, ServiceSockets};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
 use color_eyre::Result;
-use nng::{Protocol, Socket};
 use stream_client::StreamClient;
 use tokio::runtime::Runtime;
 use tracing::info;
@@ -56,13 +56,16 @@ fn main() -> Result<()> {
     let audio_client = StreamClient::connect(&args.audio_socket)?;
     let audio = Arc::new(tokio::sync::Mutex::new(audio_client));
 
-    let socket = Socket::new(Protocol::Rep0)?;
+    let ServiceSockets {
+        rep_socket: socket,
+        event_socket: event_pub_opt,
+    } = service::create_sockets(&ServiceConfig {
+        socket_address: args.socket.clone(),
+        event_address: Some(args.event_socket.clone()),
+    })?;
     info!("Listening on {}", args.socket);
-    socket.listen(&args.socket)?;
-
-    let event_pub = Socket::new(Protocol::Pub0)?;
+    let event_pub = event_pub_opt.expect("event socket configured for mdma-playback");
     info!("Event publishing on {}", args.event_socket);
-    event_pub.listen(&args.event_socket)?;
 
     let acid_client = Arc::new(AcidClient::connect(&args.acid_socket)?);
     let server = Server::new(audio, socket, args.queue_file, event_pub, acid_client);

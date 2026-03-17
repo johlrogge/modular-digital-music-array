@@ -32,7 +32,7 @@ playback-primitives = { path = "../../components/playback_primitives" }
 library-ipc-protocol = { path = "../../components/library_ipc_protocol" }
 
 # For seeding test fact streams
-stainless-facts = { git = "https://github.com/johlrogge/stainless_facts" }
+stainless-facts = { git = "https://github.com/johlrogge/stainless_facts", rev = "2aa820a808fd5345a1bd59c11d90969bfa84b285" }
 music-facts = { path = "../../components/music_facts" }
 
 # Query parsing helpers

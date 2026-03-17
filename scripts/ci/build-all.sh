@@ -41,7 +41,13 @@ export PKG_CONFIG_ALLOW_CROSS=1
 export BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu="--sysroot=$SYSROOT -I$SYSROOT/usr/include/pipewire-0.3 -I$SYSROOT/usr/include/spa-0.2"
 
 # Target glibc 2.38 to match Void Linux's PipeWire build
-cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 --bin mdma-playback --bin mdma-audio
+# mdma-playback from its project workspace (same env vars apply)
+cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+    --manifest-path "$PROJECT_ROOT/projects/mdma-playback/Cargo.toml" \
+    --bin mdma-playback
+
+# mdma-audio from root workspace
+cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 --bin mdma-audio
 
 echo ""
 echo "=== All binaries built ==="

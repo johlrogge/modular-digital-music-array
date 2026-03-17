@@ -24,7 +24,7 @@ acid-client = { path = "../acid_client", features = ["music"] }
 event-protocol = { path = "../event_protocol" }
 
 # Fact stream
-stainless-facts = { git = "https://github.com/johlrogge/stainless_facts" }
+stainless-facts = { git = "https://github.com/johlrogge/stainless_facts", rev = "2aa820a808fd5345a1bd59c11d90969bfa84b285" }
 
 # Hashing
 sha2 = "0.10"

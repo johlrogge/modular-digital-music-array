@@ -8,6 +8,7 @@ use chrono::Utc;
 use clap::Parser;
 use color_eyre::Result;
 use event_protocol::{acid_event_to_topic_message, AcidEvent};
+use service::{ServiceConfig, ServiceSockets};
 use stainless_facts::{Fact, FactStreamWriter, Operation};
 use thiserror::Error;
 
@@ -63,7 +64,6 @@ fn handle_request(request: &AcidRequest, metadata_dir: &Path) -> AcidResponse {
         }
 
         AcidRequest::ReadStream { cursor, limit } => {
-            // Decode opaque cursor to internal line offset (None => start from 0)
             let after_line = cursor.as_deref().and_then(offset_from_cursor).unwrap_or(0);
             match read_stream(after_line, *limit, metadata_dir) {
                 Ok(chunk) => AcidResponse::StreamChunk(chunk),
@@ -138,9 +138,6 @@ fn read_stream(
     })
 }
 
-/// Publish a `FactsWritten` notification on the Pub0 event socket.
-///
-/// Errors are logged but not fatal — the write already succeeded.
 fn publish_facts_written(event_pub: &nng::Socket, entity: &str, count: usize, cursor: &str) {
     let event = AcidEvent::FactsWritten {
         entity: entity.to_string(),
@@ -175,30 +172,18 @@ fn main() -> Result<()> {
 
     std::fs::create_dir_all(&args.metadata_dir)?;
 
-    // Ensure IPC socket directories exist
-    for addr in [&args.socket, &args.event_socket] {
-        if addr.starts_with("ipc://") {
-            if let Some(path) = addr.strip_prefix("ipc://") {
-                if let Some(parent) = Path::new(path).parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-            }
-        }
-    }
-
-    // Rep0 — request/response for reads and writes
-    let socket = nng::Socket::new(nng::Protocol::Rep0)?;
-    socket.listen(&args.socket)?;
+    let ServiceSockets {
+        rep_socket: socket,
+        event_socket: event_pub_opt,
+    } = service::create_sockets(&ServiceConfig {
+        socket_address: args.socket.clone(),
+        event_address: Some(args.event_socket.clone()),
+    })?;
     tracing::info!(address = %args.socket, "ACID service listening");
 
-    // Pub0 — publish lightweight notifications after successful writes
-    let event_pub = nng::Socket::new(nng::Protocol::Pub0)?;
-    event_pub.listen(&args.event_socket)?;
+    let event_pub = event_pub_opt.expect("event socket configured for mdma-acid");
     tracing::info!(address = %args.event_socket, "ACID event socket listening");
 
-    // Track total line count in-memory; initialise once by counting existing lines.
-    // This avoids re-reading the whole file after every write (TOCTOU-safe for our
-    // single-writer model because only this process appends to facts.jsonl).
     let mut line_count = count_facts_lines(&args.metadata_dir);
     tracing::debug!(line_count, "Initial facts line count");
 
@@ -220,7 +205,6 @@ fn main() -> Result<()> {
 
         tracing::debug!(request = ?request, "Received request");
 
-        // Capture write entity before handling so we can publish after
         let write_entity: Option<String> = match &request {
             AcidRequest::WriteFacts { entity, .. } => Some(entity.clone()),
             _ => None,
@@ -228,7 +212,6 @@ fn main() -> Result<()> {
 
         let response = handle_request(&request, &args.metadata_dir);
 
-        // After a successful write, increment the in-memory counter and publish.
         if let (Some(entity), AcidResponse::WriteOk { facts_written }) = (&write_entity, &response)
         {
             line_count += facts_written;
@@ -242,9 +225,6 @@ fn main() -> Result<()> {
     }
 }
 
-/// Count the number of lines currently in the facts file.
-///
-/// Called once at startup to initialise the in-memory line counter.
 fn count_facts_lines(metadata_dir: &Path) -> usize {
     let facts_path = metadata_dir.join("facts.jsonl");
     if !facts_path.exists() {
@@ -326,7 +306,6 @@ mod tests {
         match response {
             AcidResponse::StreamChunk(chunk) => {
                 assert_eq!(chunk.lines, Vec::<String>::new());
-                // cursor should point to offset 0 (beginning)
                 assert_eq!(acid_protocol::offset_from_cursor(&chunk.cursor), Some(0));
             }
             other => panic!("unexpected response: {other:?}"),
@@ -337,7 +316,6 @@ mod tests {
     fn handle_read_stream_returns_written_lines() {
         let dir = temp_metadata();
 
-        // Write some facts first
         let write_req = AcidRequest::WriteFacts {
             entity: "track:test".to_string(),
             facts: vec![FactEntry {
@@ -355,7 +333,6 @@ mod tests {
         match response {
             AcidResponse::StreamChunk(chunk) => {
                 assert!(!chunk.lines.is_empty(), "should have at least one line");
-                // cursor should advance past the returned lines
                 let offset = acid_protocol::offset_from_cursor(&chunk.cursor).unwrap();
                 assert_eq!(offset, chunk.lines.len());
             }
@@ -367,7 +344,6 @@ mod tests {
     fn handle_read_stream_with_cursor_continues_from_offset() {
         let dir = temp_metadata();
 
-        // Write two facts
         let write_req = AcidRequest::WriteFacts {
             entity: "track:test".to_string(),
             facts: vec![
@@ -383,7 +359,6 @@ mod tests {
         };
         handle_request(&write_req, dir.path());
 
-        // Read first line only
         let read1 = AcidRequest::ReadStream {
             cursor: None,
             limit: 1,
@@ -394,7 +369,6 @@ mod tests {
         };
         assert_eq!(chunk1.lines.len(), 1);
 
-        // Continue reading from the returned cursor
         let read2 = AcidRequest::ReadStream {
             cursor: Some(chunk1.cursor.clone()),
             limit: 10,
@@ -431,10 +405,8 @@ mod tests {
     fn count_facts_lines_returns_line_count() {
         let dir = temp_metadata();
 
-        // No file yet -> 0
         assert_eq!(count_facts_lines(dir.path()), 0);
 
-        // Write two facts
         let write_req = AcidRequest::WriteFacts {
             entity: "track:test".to_string(),
             facts: vec![
