@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+
+[package]
+name = "beacon"
+version = "0.5.4"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/johlrogge/modular-digital-music-array"
+license = "MIT"
+
+[[bin]]
+name = "beacon"
+path = "src/main.rs"
+
+[dependencies]
+http-server = { path = "../../bases/http_server" }
+storage-primitives = { path = "../../components/storage_primitives" }
+tokio = { version = "1.36", features = ["full"] }
+color-eyre = "0.6"
+axum = "0.7"
+askama = "0.12"
+tower-http = { version = "0.5", features = ["fs"] }
+thiserror = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+async-stream = "0.3"
+futures = "0.3"
+
+[dev-dependencies]
+pretty_assertions = "1"
+rstest = "0.26"

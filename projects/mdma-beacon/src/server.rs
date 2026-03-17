@@ -75,9 +75,6 @@ pub async fn run(hardware: HardwareInfo, config: Config) -> color_eyre::Result<(
         .nest_service("/static", ServeDir::new("static"))
         .with_state(state);
 
-    let addr = format!("0.0.0.0:{}", config.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-
     if config.is_check_mode() {
         info!(
             "🔍 Beacon server listening on http://localhost:{}",
@@ -92,7 +89,7 @@ pub async fn run(hardware: HardwareInfo, config: Config) -> color_eyre::Result<(
         info!("   Also accessible via http://0.0.0.0:{}", config.port);
     }
 
-    axum::serve(listener, app).await?;
+    http_server::serve(app, &http_server::HttpServerConfig { port: config.port }).await?;
 
     Ok(())
 }
@@ -232,7 +229,7 @@ async fn provision(
                 white-space: pre-wrap;
                 border: 2px solid #333;
             }}
-            .log-line {{ 
+            .log-line {{
                 margin: 4px 0;
                 padding: 2px 0;
             }}
@@ -248,16 +245,16 @@ async fn provision(
     <body>
         <h1 class="success">⏳ Provisioning in Progress</h1>
         {mode_notice}
-        
+
         <div class="status" id="status">Connecting to stream...</div>
-        
+
         <p>Live log:</p>
         <div id="log-container"></div>
-        
+
         <script>
             const logContainer = document.getElementById('log-container');
             const statusDiv = document.getElementById('status');
-            
+
             // Log to both console and container
             function log(msg, isError) {{
                 console.log(msg);
@@ -270,18 +267,18 @@ async fn provision(
                 logContainer.appendChild(line);
                 logContainer.scrollTop = logContainer.scrollHeight;
             }}
-            
+
             log('Initializing EventSource...');
             statusDiv.textContent = 'Connecting...';
-            
+
             const eventSource = new EventSource('/stream');
-            
+
             eventSource.onopen = function() {{
                 console.log('EventSource opened');
                 statusDiv.textContent = '✓ Connected - Starting provisioning...';
                 statusDiv.style.background = '#d4edda';
                 log('✓ Connected to stream');
-                
+
                 // Send start signal to server
                 fetch('/provision/start', {{ method: 'POST' }})
                     .then(response => {{
@@ -299,19 +296,19 @@ async fn provision(
                         log('✗ Error starting provisioning', true);
                     }});
             }};
-            
+
             eventSource.onmessage = function(event) {{
                 console.log('Message:', event.data);
                 log(event.data);
             }};
-            
+
             eventSource.onerror = function(error) {{
                 console.error('EventSource error:', error);
                 console.log('ReadyState:', eventSource.readyState);
                 statusDiv.textContent = '✗ Connection error';
                 statusDiv.style.background = '#f8d7da';
                 log('✗ Connection error (see console)', true);
-                
+
                 if (eventSource.readyState === EventSource.CLOSED) {{
                     log('Stream closed', true);
                 }}

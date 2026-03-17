@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Build all MDMA binaries for ARM64 (Raspberry Pi 5)
 #
-# Phase 1: 3 root-workspace binaries in one cargo zigbuild invocation (shared dep compilation)
+# Phase 1:  mdma-library from root workspace
 # Phase 1b: mdma-gateway from its project workspace
 # Phase 1c: mdma-bandcamp from its project workspace
-# Phase 2: mdma-playback with PipeWire sysroot env vars (separate target suffix)
+# Phase 1d: beacon from its project workspace (projects/mdma-beacon)
+# Phase 1e: mdma-console from its project workspace (projects/mdma-console)
+# Phase 2:  mdma-playback with PipeWire sysroot env vars (separate target suffix)
 #
 # Requires aarch64 PipeWire sysroot at .cross/aarch64-sysroot/ for Phase 2
 # (see scripts/ci/setup-cross-sysroot.sh to create it)
@@ -25,11 +27,9 @@ fi
 export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
 mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
 
-echo "=== Phase 1: Building 3 root-workspace binaries ==="
+echo "=== Phase 1: Building root-workspace binaries ==="
 cargo zigbuild --release --target aarch64-unknown-linux-gnu \
-    --bin beacon \
-    --bin mdma-library \
-    --bin mdma-console
+    --bin mdma-library
 
 echo ""
 echo "=== Phase 1b: Building gateway (project workspace) ==="
@@ -42,6 +42,18 @@ echo "=== Phase 1c: Building bandcamp (project workspace) ==="
 cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
     --manifest-path "$PROJECT_ROOT/projects/mdma-bandcamp/Cargo.toml" \
     --bin mdma-bandcamp
+
+echo ""
+echo "=== Phase 1d: Building beacon (project workspace) ==="
+cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+    --manifest-path "$PROJECT_ROOT/projects/mdma-beacon/Cargo.toml" \
+    --bin beacon
+
+echo ""
+echo "=== Phase 1e: Building console (project workspace) ==="
+cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+    --manifest-path "$PROJECT_ROOT/projects/mdma-console/Cargo.toml" \
+    --bin mdma-console
 
 echo ""
 echo "=== Phase 2: Building playback (with PipeWire sysroot) ==="

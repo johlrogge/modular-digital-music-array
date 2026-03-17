@@ -1,10 +1,15 @@
+[workspace]
+resolver = "2"
+# This is a standalone project workspace (Polylith projects/ layout).
+# Dependencies use explicit versions — no workspace = true inheritance.
+
 [package]
 name = "mdma-cli"
 version = "0.5.2"
-edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-license.workspace = true
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/johlrogge/modular-digital-music-array"
+license = "MIT"
 
 [[bin]]
 name = "mdma"
@@ -12,9 +17,9 @@ path = "src/main.rs"
 
 [dependencies]
 # CLI
-clap = { workspace = true, features = ["derive"] }
-clap_complete = { workspace = true }
-color-eyre = { workspace = true }
+clap = { version = "4.5", features = ["derive", "env"] }
+clap_complete = "4.5"
+color-eyre = "0.6"
 
 # Client abstraction (gateway or direct)
 event-protocol = { path = "../../components/event_protocol" }
@@ -23,9 +28,9 @@ mdma-client = { path = "../../components/mdma_client" }
 tempfile = "3"
 
 # Event subscription
-nng = { workspace = true }
+nng = "1.0"
 nng-transport = { path = "../../components/nng_transport" }
-serde_json = { workspace = true }
+serde_json = "1.0"
 
 # Audio format classification (for smart export)
 audio-transcoder = { path = "../../components/audio_transcoder" }
@@ -40,8 +45,8 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 
 # Output formatting
 colored = "2.0"
-corsett = { git = "https://github.com/johlrogge/corsett.git" }
+corsett = { git = "https://github.com/johlrogge/corsett.git", rev = "bf16c1aa2e8d6ba1f833e33009f2deecadc3ee26" }
 terminal_size = "0.4"
 
 [dev-dependencies]
-pretty_assertions = { workspace = true }
+pretty_assertions = "1"

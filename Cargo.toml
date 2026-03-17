@@ -1,4 +1,4 @@
-# Root Cargo.toml with beacon added
+# Root Cargo.toml — beacon and mdma_console migrated to projects/mdma-beacon and projects/mdma-console
 [workspace]
 members = [
     # Components (bricks)
@@ -29,11 +29,8 @@ members = [
     "components/stream_source_protocol",
     # Bases (entry points)
     "bases/service",
-    "bases/beacon",
-    "bases/mdma_console",
+    "bases/http_server",
     "bases/mdma_library",
-    "bases/mdma_cli",
-    "bases/mdma_tui",
     # Tests
     "tests/bdd",
 ]
@@ -64,11 +61,8 @@ default-members = [
     "components/acid_client",
     "components/stream_source_protocol",
     "bases/service",
-    "bases/beacon",
-    "bases/mdma_cli",
-    "bases/mdma_console",
+    "bases/http_server",
     "bases/mdma_library",
-    "bases/mdma_tui",
 ]
 resolver = "2"
 

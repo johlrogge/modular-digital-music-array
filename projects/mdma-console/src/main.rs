@@ -297,6 +297,7 @@ async fn index(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     });
     let configured_username = read_bandcamp_username(&state.bandcamp_conf_path);
     let cookies_valid = check_cookies_valid(&state.bandcamp_cookies_path);
+
     let bandcamp =
         BandcampView::from_source_response(bandcamp_response, configured_username, cookies_valid);
 
@@ -1541,12 +1542,8 @@ async fn main() -> Result<()> {
         .route("/export/:hash", get(export_track))
         .with_state(state);
 
-    let addr = format!("0.0.0.0:{}", args.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-
     tracing::info!("MDMA Console listening on http://0.0.0.0:{}", args.port);
-
-    axum::serve(listener, app).await?;
+    http_server::serve(app, &http_server::HttpServerConfig { port: args.port }).await?;
 
     Ok(())
 }

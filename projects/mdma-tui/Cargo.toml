@@ -4,34 +4,34 @@ resolver = "2"
 # Dependencies use explicit versions — no workspace = true inheritance.
 
 [package]
-name = "mdma-acid"
-version = "0.6.0"
+name = "mdma-tui"
+version = "0.3.0"
 edition = "2021"
 authors = ["MDMA Development Team"]
 repository = "https://github.com/johlrogge/modular-digital-music-array"
 license = "MIT"
 
 [[bin]]
-name = "mdma-acid"
+name = "mdma-tui"
 path = "src/main.rs"
 
 [dependencies]
-# Local — path references relative to this project
-service = { path = "../../bases/service" }
-acid-protocol = { path = "../../components/acid_protocol" }
+ratatui = "0.29"
+crossterm = "0.28"
+mdma-client = { path = "../../components/mdma_client" }
+library-search = { path = "../../components/library_search" }
 event-protocol = { path = "../../components/event_protocol" }
-
-# External — keep versions in sync with root Cargo.toml [workspace.dependencies]
-stainless-facts = { git = "https://github.com/johlrogge/stainless_facts", rev = "2aa820a808fd5345a1bd59c11d90969bfa84b285" }
+nng-transport = { path = "../../components/nng_transport" }
 nng = "1.0"
 serde_json = "1.0"
 clap = { version = "4.5", features = ["derive", "env"] }
+color-eyre = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-color-eyre = "0.6"
+scopeguard = "1"
 thiserror = "1.0"
-chrono = "0.4"
+corsett = { git = "https://github.com/johlrogge/corsett.git", rev = "bf16c1aa2e8d6ba1f833e33009f2deecadc3ee26" }
 
 [dev-dependencies]
-pretty_assertions = "1"
-tempfile = "3"
+library-ipc-protocol = { path = "../../components/library_ipc_protocol" }
+music-primitives = { path = "../../components/music_primitives" }

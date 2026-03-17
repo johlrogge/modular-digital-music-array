@@ -8,7 +8,7 @@ name = "mdma-playback"
 version = "0.6.1"
 edition = "2021"
 authors = ["MDMA Development Team"]
-repository = "https://github.com/your-org/mdma"
+repository = "https://github.com/johlrogge/modular-digital-music-array"
 license = "MIT"
 
 [[bin]]
