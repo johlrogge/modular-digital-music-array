@@ -1,8 +1,9 @@
 use clap::Parser;
 use color_eyre::Result;
 
-use library_service::service::spawn_fact_subscriber;
-use library_service::{service, LibraryService};
+use library_service::service::{run_ipc_server, spawn_fact_subscriber};
+use library_service::LibraryService;
+use service::ensure_ipc_dir;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -60,13 +61,7 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(args.metadata_dir.join("playlists"))?;
 
     // Create socket directory if needed
-    if args.socket.starts_with("ipc://") {
-        if let Some(path) = args.socket.strip_prefix("ipc://") {
-            if let Some(parent) = std::path::Path::new(path).parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-    }
+    ensure_ipc_dir(&args.socket)?;
 
     // Initialize service
     let library = LibraryService::new_with_events(
@@ -88,7 +83,7 @@ async fn main() -> Result<()> {
     spawn_fact_subscriber(std::sync::Arc::clone(&library));
 
     // Run IPC server (blocking)
-    service::run_ipc_server(library, &args.socket)?;
+    run_ipc_server(library, &args.socket)?;
 
     Ok(())
 }

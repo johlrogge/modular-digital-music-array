@@ -23,6 +23,20 @@ pub struct ServiceSockets {
     pub event_socket: Option<nng::Socket>,
 }
 
+/// Ensures the parent directory for an `ipc://` socket address exists.
+///
+/// If `addr` does not start with `ipc://` or has no parent directory, this is a no-op.
+/// Call this when you need socket directory setup without creating NNG sockets (e.g.,
+/// services that bind their own sockets via a component library).
+pub fn ensure_ipc_dir(addr: &str) -> Result<(), std::io::Error> {
+    if let Some(path) = addr.strip_prefix("ipc://") {
+        if let Some(parent) = Path::new(path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(())
+}
+
 /// Creates the IPC socket directory and binds the NNG sockets described by `config`.
 ///
 /// For each `ipc://` address, the parent directory is created with

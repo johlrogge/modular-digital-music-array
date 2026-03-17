@@ -13,6 +13,9 @@ color-eyre = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
+# Service base for IPC directory setup
+service = { path = "../service" }
+
 # Library service component (extracted)
 library-service = { path = "../../components/library_service" }
 
