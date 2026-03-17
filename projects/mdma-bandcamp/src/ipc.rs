@@ -25,12 +25,9 @@ pub struct IpcServer {
 }
 
 impl IpcServer {
-    /// Create and bind an IPC server
-    pub fn bind(address: &str) -> Result<Self, IpcError> {
-        let socket = nng::Socket::new(nng::Protocol::Rep0)?;
-        socket.listen(address)?;
-        tracing::info!(address = %address, "IPC server listening");
-        Ok(Self { socket })
+    /// Create an IPC server from a pre-built socket (obtained via `service::create_sockets`).
+    pub fn new(socket: nng::Socket) -> Self {
+        Self { socket }
     }
 
     /// Add another listener address (nng supports multiple listeners on one socket)

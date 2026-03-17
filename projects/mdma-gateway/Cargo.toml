@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+# Standalone project workspace (Polylith projects/ layout).
+# Dependencies use explicit versions — no workspace = true inheritance.
+
+[package]
+name = "mdma-gateway"
+version = "0.6.0"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
+
+[[bin]]
+name = "mdma-gateway"
+path = "src/main.rs"
+
+[dependencies]
+# Local — path references relative to this project
+acid-protocol = { path = "../../components/acid_protocol" }
+event-protocol = { path = "../../components/event_protocol" }
+gateway-protocol = { path = "../../components/gateway_protocol" }
+source-protocol = { path = "../../components/source_protocol" }
+library-ipc-protocol = { path = "../../components/library_ipc_protocol" }
+media-protocol = { path = "../../components/media_protocol" }
+
+# External — keep versions in sync with root Cargo.toml [workspace.dependencies]
+nng = "1.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+color-eyre = "0.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

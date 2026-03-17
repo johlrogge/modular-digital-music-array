@@ -2,9 +2,9 @@ mod server;
 
 use clap::Parser;
 use color_eyre::Result;
-use nng::{Protocol, Socket};
 use playback_engine::PlaybackEngine;
 use server::Server;
+use service::{ServiceConfig, ServiceSockets};
 use std::path::PathBuf;
 use tokio::runtime::Runtime;
 use tracing::info;
@@ -35,7 +35,12 @@ struct Args {
 
 fn main() -> Result<()> {
     color_eyre::install()?;
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "mdma_audio=info".into()),
+        )
+        .init();
 
     let args = Args::parse();
 
@@ -43,9 +48,11 @@ fn main() -> Result<()> {
 
     let engine = PlaybackEngine::new(args.audio_config)?;
 
-    let socket = Socket::new(Protocol::Rep0)?;
     info!("Listening on {}", args.socket);
-    socket.listen(&args.socket)?;
+    let ServiceSockets { rep_socket: socket, .. } = service::create_sockets(&ServiceConfig {
+        socket_address: args.socket.clone(),
+        event_address: None,
+    })?;
 
     let mut server = Server::new(engine, socket, args.library_socket, args.music_dir);
 

@@ -6,7 +6,7 @@ version = 4
 name = "acid-client"
 version = "0.9.0"
 dependencies = [
- "acid_protocol",
+ "acid-protocol",
  "music-facts",
  "nng",
  "nng-transport",
@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "acid_protocol"
+name = "acid-protocol"
 version = "0.9.0"
 dependencies = [
  "pretty_assertions",
@@ -1511,7 +1511,7 @@ dependencies = [
 name = "gateway-client"
 version = "0.9.0"
 dependencies = [
- "acid_protocol",
+ "acid-protocol",
  "gateway-protocol",
  "library-ipc-protocol",
  "media-protocol",
@@ -1527,7 +1527,7 @@ dependencies = [
 name = "gateway-protocol"
 version = "0.9.0"
 dependencies = [
- "acid_protocol",
+ "acid-protocol",
  "library-ipc-protocol",
  "media-protocol",
  "playback-primitives",
@@ -2549,50 +2549,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
-name = "mdma-audio"
-version = "0.1.1"
-dependencies = [
- "clap",
- "color-eyre",
- "library-ipc-client",
- "music-primitives",
- "nng",
- "playback-engine",
- "playback-primitives",
- "pretty_assertions",
- "serde_json",
- "stream-source-protocol",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "mdma-bandcamp"
-version = "0.6.0"
-dependencies = [
- "bandcamp-api",
- "clap",
- "color-eyre",
- "inbox-utils",
- "library-ipc-client",
- "nng",
- "parking_lot",
- "pretty_assertions",
- "serde",
- "serde_json",
- "source-protocol",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-stream",
- "tracing",
- "tracing-subscriber",
- "zip",
-]
-
-[[package]]
 name = "mdma-bdd"
 version = "0.1.0"
 dependencies = [
@@ -2684,25 +2640,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tower-http 0.5.2",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "mdma-gateway"
-version = "0.6.0"
-dependencies = [
- "acid_protocol",
- "clap",
- "color-eyre",
- "event-protocol",
- "gateway-protocol",
- "library-ipc-protocol",
- "media-protocol",
- "nng",
- "serde",
- "serde_json",
- "source-protocol",
  "tracing",
  "tracing-subscriber",
 ]

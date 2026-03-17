@@ -306,11 +306,27 @@ ci-build-playback:
 
 # Build mdma-gateway for CI
 [group('ci')]
-ci-build-gateway: (ci-build "mdma-gateway")
+ci-build-gateway:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building mdma-gateway for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        --manifest-path projects/mdma-gateway/Cargo.toml \
+        --bin mdma-gateway
 
 # Build mdma-bandcamp for CI
 [group('ci')]
-ci-build-bandcamp: (ci-build "mdma-bandcamp")
+ci-build-bandcamp:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building mdma-bandcamp for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        --manifest-path projects/mdma-bandcamp/Cargo.toml \
+        --bin mdma-bandcamp
 
 # Build mdma-library Void package
 [group('package')]
@@ -745,9 +761,21 @@ deploy-playback: playback-cross
 deploy-audio: audio-cross
     @just _deploy-svc mdma-audio mdma-audio
 
-# Cross-compile gateway for aarch64
+# Cross-compile gateway for aarch64 (project workspace)
 [group('build')]
-gateway-cross: (cross "mdma-gateway" "Gateway")
+gateway-cross:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building Gateway for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        --manifest-path projects/mdma-gateway/Cargo.toml \
+        --bin mdma-gateway
+    echo ""
+    echo "Gateway built!"
+    file target/aarch64-unknown-linux-gnu/release/mdma-gateway
+    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-gateway
 
 # Cross-compile acid service for aarch64 (project workspace)
 [group('build')]
@@ -765,9 +793,21 @@ acid-cross:
     file target/aarch64-unknown-linux-gnu/release/mdma-acid
     ls -lh target/aarch64-unknown-linux-gnu/release/mdma-acid
 
-# Cross-compile bandcamp for aarch64
+# Cross-compile bandcamp for aarch64 (project workspace)
 [group('build')]
-bandcamp-cross: (cross "mdma-bandcamp" "Bandcamp")
+bandcamp-cross:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building Bandcamp for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        --manifest-path projects/mdma-bandcamp/Cargo.toml \
+        --bin mdma-bandcamp
+    echo ""
+    echo "Bandcamp built!"
+    file target/aarch64-unknown-linux-gnu/release/mdma-bandcamp
+    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-bandcamp
 
 # Deploy gateway to Pi (single external TCP port)
 [group('dev')]

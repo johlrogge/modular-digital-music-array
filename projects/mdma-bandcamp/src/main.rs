@@ -2,8 +2,10 @@ use clap::Parser;
 use color_eyre::Result;
 
 mod cache;
-pub mod ipc;
+mod ipc;
 mod service;
+
+use ::service::{ServiceConfig, ServiceSockets};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -96,15 +98,6 @@ async fn main() -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Create socket directory if needed
-    if args.socket.starts_with("ipc://") {
-        if let Some(path) = args.socket.strip_prefix("ipc://") {
-            if let Some(parent) = std::path::Path::new(path).parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-    }
-
     // Validate cookies before starting the service so failures surface immediately
     // with an actionable message rather than obscure downstream errors.
     if let Err(err) = bandcamp_api::load_cookies(&args.cookies) {
@@ -138,9 +131,15 @@ async fn main() -> Result<()> {
         service::run_download_worker(worker_service).await;
     });
 
+    // Create IPC socket directory and bind the socket
+    let ServiceSockets { rep_socket, .. } = ::service::create_sockets(&ServiceConfig {
+        socket_address: args.socket.clone(),
+        event_address: None,
+    })?;
+
     // Run async IPC server
     // NNG blocking I/O runs in a spawn_blocking task, bridged to async via channels
-    service::run_async_ipc_server(service, args.socket).await?;
+    service::run_async_ipc_server(service, rep_socket).await?;
 
     Ok(())
 }
