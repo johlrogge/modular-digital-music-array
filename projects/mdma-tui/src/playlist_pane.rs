@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-use crate::error::TuiError;
 use crate::pane::{Pane, PaneAction, PaneKind};
 use crate::selection::SelectionState;
 use crate::track_list::render_track_list;
@@ -27,7 +26,7 @@ impl PlaylistPane {
     /// Open a playlist pane by loading the playlist from the library backend.
     ///
     /// Hashes that fail to resolve are skipped (logged at warn level).
-    pub fn open(name: PlaylistName, library: Rc<LibraryBackend>) -> Result<Self, TuiError> {
+    pub fn open(name: PlaylistName, library: Rc<LibraryBackend>) -> color_eyre::Result<Self> {
         let hashes = library.playlist_get(&name)?;
         let tracks: Vec<TrackInfo> = hashes
             .iter()

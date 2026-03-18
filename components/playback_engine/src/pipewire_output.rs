@@ -303,8 +303,7 @@ mod tests {
 
         let (tx, rx) = mpsc::sync_channel::<HeapConsumer<f32>>(1);
 
-        // Simulate what the PW thread does on Shutdown
-        let _cmd = StreamCommand::Shutdown(tx.clone());
+        // Simulate the PW thread sending the consumer back on Shutdown
         tx.send(consumer).expect("send should succeed");
 
         let recovered = rx

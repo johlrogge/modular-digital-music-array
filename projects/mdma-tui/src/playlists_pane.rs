@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-use crate::error::TuiError;
 use crate::pane::{Pane, PaneAction, PaneKind};
 use crate::selection::SelectionState;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -22,7 +21,7 @@ pub struct PlaylistsPane {
 
 impl PlaylistsPane {
     /// Create a new PlaylistsPane, loading all playlist names from the library.
-    pub fn new(library: Rc<LibraryBackend>) -> Result<Self, TuiError> {
+    pub fn new(library: Rc<LibraryBackend>) -> color_eyre::Result<Self> {
         let names = library.playlist_list()?;
         let total = names.len();
         Ok(PlaylistsPane {

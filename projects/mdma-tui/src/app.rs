@@ -1,6 +1,5 @@
 use crate::browser_pane::BrowserPane;
 use crate::commands::{matching, Command};
-use crate::error::TuiError;
 use crate::events::AppEvent;
 use crate::now_playing::NowPlaying;
 use crate::pane::{Pane, PaneKind};
@@ -271,7 +270,7 @@ impl App {
     /// Construct a fresh PlaylistsPane backed by this app's library.
     ///
     /// Returns `Err` if the library backend cannot be reached.
-    pub fn make_playlists_pane(&self) -> Result<Box<dyn Pane>, TuiError> {
+    pub fn make_playlists_pane(&self) -> color_eyre::Result<Box<dyn Pane>> {
         let pane = PlaylistsPane::new(Rc::clone(&self.library))?;
         Ok(Box::new(pane))
     }

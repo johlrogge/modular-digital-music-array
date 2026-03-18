@@ -79,18 +79,6 @@ impl DownloadCache {
         Ok((entries, item_ids))
     }
 
-    /// Build a track key for cache lookup.
-    /// Currently only used in tests; production code builds keys inline in service.rs.
-    #[allow(dead_code)]
-    pub fn make_track_key(
-        artist: &str,
-        album: &str,
-        track_name: &str,
-        duration_secs: u32,
-    ) -> String {
-        format!("{}|{}|{}|{}", artist, album, track_name, duration_secs)
-    }
-
     /// Check if a track has been downloaded (by track key)
     pub fn is_downloaded(&self, key: &str) -> bool {
         self.downloaded.contains(key)
@@ -144,12 +132,6 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn make_track_key() {
-        let key = DownloadCache::make_track_key("Artist", "Album", "Track One", 234);
-        assert_eq!(key, "Artist|Album|Track One|234");
-    }
-
-    #[test]
     fn cache_operations() {
         let dir = tempdir().unwrap();
         let cache_path = dir.path().join("cache.txt");
@@ -157,15 +139,15 @@ mod tests {
         let mut cache = DownloadCache::open(&cache_path).unwrap();
         assert!(cache.is_empty());
 
-        let key = DownloadCache::make_track_key("Artist", "Album", "Track", 180);
-        assert!(!cache.is_downloaded(&key));
+        let key = "Artist|Album|Track|180";
+        assert!(!cache.is_downloaded(key));
 
-        cache.mark_downloaded(&key, "p123456").unwrap();
-        assert!(cache.is_downloaded(&key));
+        cache.mark_downloaded(key, "p123456").unwrap();
+        assert!(cache.is_downloaded(key));
         assert_eq!(cache.len(), 1);
 
         // Marking again should be idempotent
-        cache.mark_downloaded(&key, "p123456").unwrap();
+        cache.mark_downloaded(key, "p123456").unwrap();
         assert_eq!(cache.len(), 1);
     }
 
@@ -178,16 +160,10 @@ mod tests {
         {
             let mut cache = DownloadCache::open(&cache_path).unwrap();
             cache
-                .mark_downloaded(
-                    &DownloadCache::make_track_key("Artist", "Album", "Track 1", 180),
-                    "p123",
-                )
+                .mark_downloaded("Artist|Album|Track 1|180", "p123")
                 .unwrap();
             cache
-                .mark_downloaded(
-                    &DownloadCache::make_track_key("Artist", "Album", "Track 2", 210),
-                    "p123",
-                )
+                .mark_downloaded("Artist|Album|Track 2|210", "p123")
                 .unwrap();
         }
 
@@ -195,15 +171,9 @@ mod tests {
         {
             let cache = DownloadCache::open(&cache_path).unwrap();
             assert_eq!(cache.len(), 2);
-            assert!(cache.is_downloaded(&DownloadCache::make_track_key(
-                "Artist", "Album", "Track 1", 180
-            )));
-            assert!(cache.is_downloaded(&DownloadCache::make_track_key(
-                "Artist", "Album", "Track 2", 210
-            )));
-            assert!(!cache.is_downloaded(&DownloadCache::make_track_key(
-                "Artist", "Album", "Track 3", 240
-            )));
+            assert!(cache.is_downloaded("Artist|Album|Track 1|180"));
+            assert!(cache.is_downloaded("Artist|Album|Track 2|210"));
+            assert!(!cache.is_downloaded("Artist|Album|Track 3|240"));
         }
     }
 }

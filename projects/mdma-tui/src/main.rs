@@ -2,7 +2,6 @@ mod app;
 mod browse_field;
 mod browser_pane;
 mod commands;
-mod error;
 mod events;
 mod input;
 mod now_playing;
