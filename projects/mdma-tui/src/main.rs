@@ -58,8 +58,12 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Derive full NNG gateway address from node hostname (tcp://hostname:5555).
-    let gateway: Option<String> = cli.node.as_deref().map(|n| format!("tcp://{}:5555", n));
+    // Derive full NNG gateway/event addresses from node hostname via ClientConfig.
+    let client_cfg = client::ClientConfig {
+        node: cli.node.clone(),
+        ..Default::default()
+    };
+    let gateway = client_cfg.gateway_addr();
     let gateway = gateway.as_deref();
 
     let library = Rc::new(
@@ -73,10 +77,9 @@ fn main() -> Result<()> {
 
     // Subscribe to playback events. Derives address from --node (same as CLI).
     // Non-fatal: TUI still works without live updates if subscription fails.
-    let event_rx = cli
-        .node
-        .as_deref()
-        .and_then(|n| spawn_event_subscriber(&format!("tcp://{}:5556", n)).ok());
+    let event_rx = client_cfg
+        .event_addr()
+        .and_then(|addr| spawn_event_subscriber(&addr).ok());
 
     // Build initial panes: left = Browser (Artists), right = Queue.
     let left_pane: Box<dyn pane::Pane> = Box::new(BrowserPane::new(Rc::clone(&library)));

@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Local — path references relative to this project
+service = { path = "../../bases/service" }
 acid-protocol = { path = "../../components/acid_protocol" }
 event-protocol = { path = "../../components/event_protocol" }
 gateway-protocol = { path = "../../components/gateway_protocol" }

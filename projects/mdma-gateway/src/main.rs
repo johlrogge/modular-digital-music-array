@@ -1,6 +1,7 @@
 use clap::Parser;
 use color_eyre::Result;
 use gateway_protocol::{GatewayRequest, GatewayResponse, SourceName};
+use service;
 use nng::options::Options;
 use serde::{de::DeserializeOwned, Serialize};
 use source_protocol::{SourceRequest, SourceResponse};
@@ -219,10 +220,15 @@ fn main() -> Result<()> {
     // Create sources directory if it doesn't exist
     std::fs::create_dir_all(&args.sources_dir)?;
 
-    // Create frontend (Rep0) socket
-    let frontend = nng::Socket::new(nng::Protocol::Rep0)?;
-    frontend.listen(&args.listen)?;
+    // Create frontend (Rep0) and event (Pub0) sockets via the service base.
+    let sockets = service::create_sockets(&service::ServiceConfig {
+        socket_address: args.listen.clone(),
+        event_address: Some(args.event_listen.clone()),
+    })?;
+    let frontend = sockets.rep_socket;
+    let event_pub = Arc::new(sockets.event_socket.expect("event socket always created"));
     tracing::info!(address = %args.listen, "Gateway listening");
+    tracing::info!(address = %args.event_listen, "Event publishing on TCP");
 
     // Connect to core backends
     let library_backend = connect_backend(&args.library_socket)
@@ -236,12 +242,6 @@ fn main() -> Result<()> {
     let acid_backend = connect_backend(&args.acid_socket)
         .map_err(|e| color_eyre::eyre::eyre!("Failed to connect to acid: {}", e))?;
     tracing::info!(address = %args.acid_socket, "Connected to acid backend");
-
-    // Event bridge: Sub0 (local) -> Pub0 (TCP)
-    // A single Pub0 socket re-publishes events from all IPC sources to TCP subscribers.
-    let event_pub = Arc::new(nng::Socket::new(nng::Protocol::Pub0)?);
-    event_pub.listen(&args.event_listen)?;
-    tracing::info!(address = %args.event_listen, "Event publishing on TCP");
 
     // Bridge playback events (playback/ topic)
     spawn_event_bridge(Arc::clone(&event_pub), args.event_source.clone());

@@ -1,4 +1,4 @@
-# Root Cargo.toml — beacon and mdma_console migrated to projects/mdma-beacon and projects/mdma-console
+# Root Cargo.toml — beacon, mdma_console, mdma_library migrated to projects/ standalone workspaces
 [workspace]
 members = [
     # Components (bricks)
@@ -31,7 +31,7 @@ members = [
     "bases/service",
     "bases/http_server",
     "bases/tui",
-    "bases/mdma_library",
+    "bases/client",
     # Tests
     "tests/bdd",
 ]
@@ -64,7 +64,7 @@ default-members = [
     "bases/service",
     "bases/http_server",
     "bases/tui",
-    "bases/mdma_library",
+    "bases/client",
 ]
 resolver = "2"
 

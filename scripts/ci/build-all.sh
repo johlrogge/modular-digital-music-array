@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build all MDMA binaries for ARM64 (Raspberry Pi 5)
 #
-# Phase 1:  mdma-library from root workspace
+# Phase 1:  mdma-library from its project workspace (projects/mdma-library)
 # Phase 1b: mdma-gateway from its project workspace
 # Phase 1c: mdma-bandcamp from its project workspace
 # Phase 1d: beacon from its project workspace (projects/mdma-beacon)
@@ -27,8 +27,9 @@ fi
 export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
 mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
 
-echo "=== Phase 1: Building root-workspace binaries ==="
-cargo zigbuild --release --target aarch64-unknown-linux-gnu \
+echo "=== Phase 1: Building mdma-library (project workspace) ==="
+cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+    --manifest-path "$PROJECT_ROOT/projects/mdma-library/Cargo.toml" \
     --bin mdma-library
 
 echo ""

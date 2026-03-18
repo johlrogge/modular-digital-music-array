@@ -559,30 +559,26 @@ enum LibraryCommands {
 // Gateway Resolution Helpers
 // =============================================================================
 
-/// Derive the command gateway address from an MDMA node hostname.
-/// The gateway is always at port 5555.
-fn gateway_from_node(node: &str) -> String {
-    format!("tcp://{}:5555", node)
-}
-
-/// Derive the event gateway address from an MDMA node hostname.
-/// The event gateway is always at port 5556.
-fn event_gateway_from_node(node: &str) -> String {
-    format!("tcp://{}:5556", node)
-}
-
 /// Resolve the effective gateway address.
 /// Derived from `--node` / `MDMA_NODE` (already in `cli.node` via clap): `tcp://<node>:5555`
 /// Returns `None` when `--node` is not set — caller falls back to direct IPC.
 fn resolve_gateway(cli: &Cli) -> Option<String> {
-    cli.node.as_deref().map(gateway_from_node)
+    client::ClientConfig {
+        node: cli.node.clone(),
+        ..Default::default()
+    }
+    .gateway_addr()
 }
 
 /// Resolve the effective event gateway address.
 /// Derived from `--node` / `MDMA_NODE`: `tcp://<node>:5556`
 /// Returns `None` when `--node` is not set.
 fn resolve_event_gateway(cli: &Cli) -> Option<String> {
-    cli.node.as_deref().map(event_gateway_from_node)
+    client::ClientConfig {
+        node: cli.node.clone(),
+        ..Default::default()
+    }
+    .event_addr()
 }
 
 // =============================================================================
@@ -3228,6 +3224,28 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    /// Derive the command gateway address from an MDMA node hostname.
+    /// The gateway is always at port 5555.
+    fn gateway_from_node(node: &str) -> String {
+        client::ClientConfig {
+            node: Some(node.to_string()),
+            ..Default::default()
+        }
+        .gateway_addr()
+        .expect("node is set")
+    }
+
+    /// Derive the event gateway address from an MDMA node hostname.
+    /// The event gateway is always at port 5556.
+    fn event_gateway_from_node(node: &str) -> String {
+        client::ClientConfig {
+            node: Some(node.to_string()),
+            ..Default::default()
+        }
+        .event_addr()
+        .expect("node is set")
+    }
 
     #[test]
     fn resolve_gateway_from_mdma_node() {

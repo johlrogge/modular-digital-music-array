@@ -306,9 +306,17 @@ ci-build-all: setup-playback-sysroot
 pkg-beacon:
     ./scripts/package/create-package.sh
 
-# Build mdma-library for CI
+# Build mdma-library for CI (project workspace)
 [group('ci')]
-ci-build-library: (ci-build "mdma-library")
+ci-build-library:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building mdma-library for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        --manifest-path projects/mdma-library/Cargo.toml \
+        --bin mdma-library
 
 # Build mdma-console for CI
 [group('ci')]
@@ -726,9 +734,21 @@ playback-cross: setup-playback-sysroot
 audio-cross: setup-playback-sysroot
     ./scripts/ci/build-audio.sh
 
-# Cross-compile library service for aarch64
+# Cross-compile library service for aarch64 (project workspace)
 [group('build')]
-library-cross: (cross "mdma-library" "Library")
+library-cross:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building Library for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        --manifest-path projects/mdma-library/Cargo.toml \
+        --bin mdma-library
+    echo ""
+    echo "Library built!"
+    file target/aarch64-unknown-linux-gnu/release/mdma-library
+    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-library
 
 # Internal: deploy a standard MDMA service to the provisioned Pi
 [group('dev')]
