@@ -20,19 +20,10 @@ use app::App;
 use browser_pane::BrowserPane;
 use clap::Parser;
 use color_eyre::Result;
-use crossterm::{
-    event::{poll, Event},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
-use event_protocol::PlaybackEvent;
-use events::{spawn_event_subscriber, AppEvent};
+use events::spawn_event_subscriber;
 use mdma_client::{LibraryBackend, PlaybackBackend};
-use pane::PaneKind;
 use queue_pane::QueuePane;
-use ratatui::{backend::CrosstermBackend, Terminal};
 use std::rc::Rc;
-use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -98,72 +89,10 @@ fn main() -> Result<()> {
         right_pane,
         Rc::clone(&library),
         Rc::clone(&playback),
+        event_rx,
     );
 
-    // Terminal setup
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-
-    // Restore terminal on drop (including panics)
-    scopeguard::defer! {
-        let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
-    }
-
-    let backend = CrosstermBackend::new(std::io::stdout());
-    let mut terminal = Terminal::new(backend)?;
-
-    loop {
-        if poll(Duration::from_millis(100))? {
-            match crossterm::event::read()? {
-                Event::Key(key) => {
-                    input::handle_key(&mut app, key);
-                }
-                Event::Resize(_, _) => {
-                    // Force redraw on next iteration; nothing extra needed.
-                }
-                _ => {}
-            }
-        }
-
-        if let Some(ref rx) = event_rx {
-            while let Ok(ev) = rx.try_recv() {
-                match ev {
-                    AppEvent::Playback(pe) => {
-                        // Refresh queue panes when the queue changes on the node.
-                        if matches!(pe, PlaybackEvent::QueueChanged { .. }) {
-                            if app.left_pane.pane_kind() == PaneKind::Queue {
-                                app.left_pane.refresh();
-                            }
-                            if app.right_pane.pane_kind() == PaneKind::Queue {
-                                app.right_pane.refresh();
-                            }
-                        }
-                        // Resolve track metadata when a new track starts.
-                        if let PlaybackEvent::TrackStarted { hash } = &pe {
-                            let meta = library.get_track(hash);
-                            let (title, artist) = match meta {
-                                Ok(t) => (t.title, t.artist),
-                                Err(_) => (None, None),
-                            };
-                            app.now_playing.set_track_metadata(title, artist);
-                        }
-                        app.now_playing.apply(&pe);
-                    }
-                    AppEvent::SubscriberError(msg) => {
-                        app.set_status(format!("Event error: {msg}"));
-                    }
-                }
-            }
-        }
-
-        terminal.draw(|f| ui::render(f, &app))?;
-
-        if app.should_quit {
-            break;
-        }
-    }
+    tui_base::run(&mut app, &tui_base::TuiConfig::default())?;
 
     Ok(())
 }

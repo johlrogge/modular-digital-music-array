@@ -46,8 +46,12 @@ pub enum ValidationError {
 
     #[error("device path cannot be empty")]
     DevicePathEmpty,
+
     #[error("Drive too small: {0}")]
     DriveToSmall(String),
+
+    #[error("unknown unit type: {0}")]
+    InvalidUnitType(String),
 }
 
 // ============================================================================
@@ -390,6 +394,19 @@ impl UnitType {
 impl fmt::Display for UnitType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+impl std::str::FromStr for UnitType {
+    type Err = ValidationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "mdma-909" => Ok(UnitType::Mdma909),
+            "mdma-101" => Ok(UnitType::Mdma101),
+            "mdma-303" => Ok(UnitType::Mdma303),
+            _ => Err(ValidationError::InvalidUnitType(s.to_owned())),
+        }
     }
 }
 

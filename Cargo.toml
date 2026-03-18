@@ -30,6 +30,7 @@ members = [
     # Bases (entry points)
     "bases/service",
     "bases/http_server",
+    "bases/tui",
     "bases/mdma_library",
     # Tests
     "tests/bdd",
@@ -62,6 +63,7 @@ default-members = [
     "components/stream_source_protocol",
     "bases/service",
     "bases/http_server",
+    "bases/tui",
     "bases/mdma_library",
 ]
 resolver = "2"

@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 ratatui = "0.29"
 crossterm = "0.28"
+tui-base = { path = "../../bases/tui" }
 mdma-client = { path = "../../components/mdma_client" }
 library-search = { path = "../../components/library_search" }
 event-protocol = { path = "../../components/event_protocol" }
@@ -28,7 +29,6 @@ clap = { version = "4.5", features = ["derive", "env"] }
 color-eyre = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-scopeguard = "1"
 thiserror = "1.0"
 corsett = { git = "https://github.com/johlrogge/corsett.git", rev = "bf16c1aa2e8d6ba1f833e33009f2deecadc3ee26" }
 

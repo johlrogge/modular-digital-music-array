@@ -1,13 +1,16 @@
 use crate::browser_pane::BrowserPane;
 use crate::commands::{matching, Command};
 use crate::error::TuiError;
+use crate::events::AppEvent;
 use crate::now_playing::NowPlaying;
-use crate::pane::Pane;
+use crate::pane::{Pane, PaneKind};
 use crate::playlists_pane::PlaylistsPane;
 use crate::queue_pane::QueuePane;
 use crate::search_pane::SearchPane;
+use event_protocol::PlaybackEvent;
 use mdma_client::{LibraryBackend, PlaybackBackend, PlaylistName};
 use std::rc::Rc;
+use std::sync::mpsc::Receiver;
 
 /// An entry in the command palette — either a built-in command or a playlist open/create action.
 #[derive(Clone)]
@@ -60,6 +63,9 @@ pub struct App {
     pub palette_query: String,
     pub palette_matches: Vec<PaletteEntry>,
     pub palette_cursor: usize,
+    /// Background event receiver (NNG playback events from the subscriber thread).
+    /// `None` when no event subscription was established (e.g. no --node flag).
+    pub event_rx: Option<Receiver<AppEvent>>,
 }
 
 impl App {
@@ -68,6 +74,7 @@ impl App {
         right_pane: Box<dyn Pane>,
         library: Rc<LibraryBackend>,
         playback: Rc<PlaybackBackend>,
+        event_rx: Option<Receiver<AppEvent>>,
     ) -> Self {
         Self {
             left_pane,
@@ -84,6 +91,50 @@ impl App {
             palette_query: String::new(),
             palette_matches: Vec::new(),
             palette_cursor: 0,
+            event_rx,
+        }
+    }
+
+    /// Drain the background event channel and apply any pending events to app state.
+    ///
+    /// Called once per tick from the `TuiApp::on_tick` implementation.
+    ///
+    /// Events are collected into a `Vec` first so the borrow on `self.event_rx` is
+    /// released before we mutate other fields (panes, now_playing, status).
+    pub fn drain_events(&mut self) {
+        let events: Vec<AppEvent> = match self.event_rx.as_ref() {
+            Some(rx) => std::iter::from_fn(|| rx.try_recv().ok()).collect(),
+            None => return,
+        };
+
+        let library = Rc::clone(&self.library);
+        for ev in events {
+            match ev {
+                AppEvent::Playback(pe) => {
+                    // Refresh queue panes when the queue changes on the node.
+                    if matches!(pe, PlaybackEvent::QueueChanged { .. }) {
+                        if self.left_pane.pane_kind() == PaneKind::Queue {
+                            self.left_pane.refresh();
+                        }
+                        if self.right_pane.pane_kind() == PaneKind::Queue {
+                            self.right_pane.refresh();
+                        }
+                    }
+                    // Resolve track metadata when a new track starts.
+                    if let PlaybackEvent::TrackStarted { hash } = &pe {
+                        let meta = library.get_track(hash);
+                        let (title, artist) = match meta {
+                            Ok(t) => (t.title, t.artist),
+                            Err(_) => (None, None),
+                        };
+                        self.now_playing.set_track_metadata(title, artist);
+                    }
+                    self.now_playing.apply(&pe);
+                }
+                AppEvent::SubscriberError(msg) => {
+                    self.set_status(format!("Event error: {msg}"));
+                }
+            }
         }
     }
 
@@ -223,5 +274,25 @@ impl App {
     pub fn make_playlists_pane(&self) -> Result<Box<dyn Pane>, TuiError> {
         let pane = PlaylistsPane::new(Rc::clone(&self.library))?;
         Ok(Box::new(pane))
+    }
+}
+
+impl tui_base::TuiApp for App {
+    type Error = color_eyre::Report;
+
+    fn on_key(&mut self, key: crossterm::event::KeyEvent) {
+        crate::input::handle_key(self, key);
+    }
+
+    fn on_tick(&mut self) {
+        self.drain_events();
+    }
+
+    fn render(&self, frame: &mut ratatui::Frame) {
+        crate::ui::render(frame, self);
+    }
+
+    fn should_quit(&self) -> bool {
+        self.should_quit
     }
 }

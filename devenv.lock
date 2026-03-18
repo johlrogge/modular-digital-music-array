@@ -59,10 +59,11 @@
     "devenv": {
       "locked": {
         "dir": "src/modules",
-        "lastModified": 1771419682,
+        "lastModified": 1773767086,
+        "narHash": "sha256-3eKyl4LXswf6P17/u59x8oQXDgCfYX+UX0uh7YHFwJc=",
         "owner": "cachix",
         "repo": "devenv",
-        "rev": "f77fc4de35c184d9ef9a32d5d7e9033351bcdfdc",
+        "rev": "a5e5a7f8b1c9a7f33f9d82192b692768b39ec710",
         "type": "github"
       },
       "original": {
@@ -165,10 +166,11 @@
     "metadev": {
       "flake": false,
       "locked": {
-        "lastModified": 1773473688,
+        "lastModified": 1773775879,
+        "narHash": "sha256-VUAIfUrvhD3mSI16yIhTGkXeMExzHWsVTnPGwBAkmBE=",
         "owner": "johlrogge",
         "repo": "metadev",
-        "rev": "226496a4f725719f97eba5ec93b0a91dde84fe6a",
+        "rev": "250c6cb381d3e8f86d094b3058506c57cb15bd66",
         "type": "github"
       },
       "original": {
@@ -220,9 +222,6 @@
         "git-hooks": "git-hooks",
         "metadev": "metadev",
         "nixpkgs": "nixpkgs",
-        "pre-commit-hooks": [
-          "git-hooks"
-        ],
         "rust-overlay": "rust-overlay"
       }
     },
