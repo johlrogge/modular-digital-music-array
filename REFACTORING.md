@@ -218,15 +218,21 @@ target-dir = "../../target"
 
 ### 4b. Create `components/library_service_stub/`
 
-The stub must present **the same package name** (`library-service`) and the same
-public interface as `library_service`. The BDD tests import `library-service`;
-swapping the path is all that changes.
+The stub must implement **the same public interface** as `library_service`, but with a
+**distinct package name** so it can be a root workspace member without conflicting.
+
+`components/library_service_stub/Cargo.toml`:
+```toml
+[package]
+name = "library-service-stub"
+version = "0.1.0"
+edition = "2021"
+```
 
 **Public surface to implement** (derived from `library_service/src/lib.rs`,
 `ipc.rs`, and `service.rs`):
 
 ```rust
-// Re-export these to match library_service's public API:
 pub use ipc::IpcServer;
 pub use service::{LibraryService, ServiceError};
 ```
@@ -237,18 +243,47 @@ pub use service::{LibraryService, ServiceError};
 - `ServiceError` must have the same variants (or at least be `From`-compatible with
   what BDD steps currently match against)
 - No `fact_generator`, no `fact_writer`, no `pipeline` — those are real-world concerns
-- Stub crate `Cargo.toml` must declare `name = "library-service"` (same package name
-  as the real component)
 
-### 4c. Wire the stub into `projects/bdd/`
+**Add to root workspace members** in the root `Cargo.toml`:
+```toml
+"components/library_service_stub",
+```
 
-In `projects/bdd/Cargo.toml`, under `[dependencies]`, replace the real
-`library-service` path with the stub:
+This resolves the `[not-in-workspace]` warning from `cargo polylith check`.
+
+### 4c. Wire the stub into `projects/bdd/` using `[patch.crates-io]`
+
+The polylith swappable-implementation pattern separates two concerns:
+
+- **`[dependencies]`** — declares *what* interface is needed. This is stable; it never
+  changes when you swap implementations.
+- **`[patch.crates-io]`** — declares *which implementation* to use for this project.
+  Swapping back to the real component is a one-line change here, with no changes to
+  any call-site code.
+
+In `projects/bdd/Cargo.toml`:
 
 ```toml
 [dependencies]
-library-service = { path = "../../components/library_service_stub" }
+# Declare the interface needed — implementation is chosen in [patch] below.
+library-service = "0.1"
+
+[patch.crates-io]
+# Swap the real service for the in-memory stub.
+# Remove this section to use the real component instead.
+library-service = { path = "../../components/library_service_stub",
+                    package = "library-service-stub" }
 ```
+
+**Effect:**
+- Cargo resolves `library-service` by substituting `library-service-stub` from the
+  given path. The `package = "library-service-stub"` key names the crate on disk;
+  `library-service` is the name used inside BDD code (`use library_service::...`).
+- The root workspace and the real `library_service` component are untouched.
+- Any other dep in `projects/bdd` that transitively needs `library-service` (e.g.
+  through `library-ipc-client`) also gets the stub automatically.
+- `cargo polylith check` recognises `[patch.crates-io]` entries and counts the stub
+  as reachable, so it will not be flagged as an orphan.
 
 All other dependencies remain as-is (nng-transport, library-ipc-protocol, etc. still
 resolve from the root workspace via relative paths).
@@ -278,9 +313,66 @@ the harness, not the other way around.
 
 ---
 
-## 5. Verification sequence
+## 5. Polylith violations to expect after refactoring
 
-Run these commands in order after all four tasks are complete.
+Running `cargo polylith check` after the refactoring will surface two categories of
+warning. Neither requires a code fix — they require a decision.
+
+### 5a. `[orphan]` — library_ingestion and library_service
+
+**Root cause.** The consumer chain for both components is:
+```
+bases/service → components/library_service → components/library_ingestion
+```
+`bases/service` IS in the root workspace, so you might expect the chain to be
+satisfied. It is not, because `mdma-library` — the _project_ that wires `service`
+to `library_service` — lives in a **standalone project workspace** outside the root.
+From the root workspace's perspective, `library_service` is never wired into a
+deployable binary, so polylith correctly flags it as orphaned.
+
+**This is a pre-existing condition** — `library_service` was already orphaned before
+the refactoring. Extracting `library_ingestion` added a second orphan but did not
+create a new problem, it revealed the existing boundary.
+
+**Decision: do nothing for now.** The orphan warnings are accurate observations, not
+bugs. The `cargo polylith check` exit code is 0 (warnings, not errors). Accept them
+or, if the noise bothers you, add an exclusion mechanism once `cargo polylith` supports
+one.
+
+**Do NOT bring `mdma-library` into the root workspace** to silence this. It would pull
+its entire standalone dependency set back into the root build, erasing the isolation
+the standalone workspace was created to provide.
+
+### 5b. `[no-base]` — mdma-bdd
+
+**`projects/bdd` stays in `projects/`. The previous advice to move it was wrong.**
+
+In the canonical polylith model the **development project** is a first-class project
+that does not produce a deployable artefact and does not need a base. Its purpose is
+exactly what `mdma-bdd` does: wire together a specific set of component implementations
+(in this case the `library-service-stub`) for testing. Polylith treats testing as a
+first-class architectural concern, not an afterthought — the key distinction is between
+*deliverable* projects and *test/development* projects, not between "projects" and "not
+projects".
+
+Keeping `mdma-bdd` in `projects/` matters for a practical reason too: the stub swap
+via the `package` alias (section 4c) requires a Cargo workspace manifest to declare the
+dependency. That is a project-level configuration. Moving the BDD harness outside
+`projects/` would not remove that requirement — it would just hide the project from the
+polylith tool.
+
+**Decision: accept the `[no-base]` warning. It is a tool limitation, not an
+architectural problem.** The `cargo polylith check` exit code remains 0 (it is a
+warning). The `cargo-polylith` tool should eventually be updated to distinguish
+deliverable projects from test/development projects (perhaps via a
+`[package.metadata.polylith] test-project = true` marker), but that is a future
+tool improvement, not something `rust-architect` needs to act on now.
+
+---
+
+## 6. Verification sequence
+
+Run these commands in order after tasks 1–4 are complete.
 
 ```bash
 # 1. Full workspace build (confirms no broken dependencies)
@@ -296,7 +388,7 @@ cargo build -p library-service-stub
 # 3. Root workspace tests (unit + integration, excluding bdd)
 cargo test --workspace --exclude mdma-bdd
 
-# 4. BDD project (now uses stub)
+# 4. BDD project (now under projects/bdd/, uses stub)
 cd projects/bdd && cargo test -- -vv
 
 # 5. Clippy clean

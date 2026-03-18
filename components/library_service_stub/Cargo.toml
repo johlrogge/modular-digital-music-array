@@ -1,14 +1,20 @@
 [package]
-name = "library-service"
+name = "library-service-stub"
 version = "0.4.0"
-edition = "2021"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[package.metadata.polylith]
+interface = "library-service"
 
 [dependencies]
-thiserror = "1.0"
-tracing = "0.1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1.0"
-nng = "1.0"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+nng = { workspace = true }
 
 # Internal components (path-based)
 library-ipc-protocol = { path = "../library_ipc_protocol" }

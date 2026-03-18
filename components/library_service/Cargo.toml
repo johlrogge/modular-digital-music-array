@@ -6,6 +6,9 @@ authors.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[package.metadata.polylith]
+interface = "library-service"
+
 [dependencies]
 # Workspace dependencies
 tracing = { workspace = true }

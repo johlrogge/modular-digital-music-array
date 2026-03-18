@@ -280,3 +280,140 @@ As violations are resolved, note any gaps in `cargo polylith check` detection:
 - Does `cargo polylith deps` trace cross-workspace path deps?
 
 File issues or improvements against `~/projects/cargo-polylith` as discovered.
+
+---
+
+## Phase 5: cargo-polylith metadata cleanup
+
+**Status: PENDING**
+
+`cargo polylith check` now reports 4 violations — 2 pre-existing orphans (acceptable, see §5a
+of REFACTORING.md) and 2 new ones introduced by the stub work. This phase fixes them and
+adds interface metadata so the tool understands which components are swappable alternatives.
+
+### Current check output
+
+```
+[orphan]           audio-metadata — pre-existing, do not act
+[orphan]           library-ingestion — pre-existing, do not act
+[no-base]          mdma-bdd has no base dependency
+[not-in-workspace] component 'library-service' at components/library_service_stub
+                   not in root workspace members
+```
+
+### 5a. Rename the library-service stub
+
+`components/library_service_stub/Cargo.toml` currently declares `name = "library-service"`,
+which collides with the real component. Change it:
+
+```toml
+[package]
+name = "library-service-stub"   # was "library-service"
+version = "0.1.0"
+edition = "2021"
+```
+
+Leave all `[dependencies]` unchanged.
+
+**Validate:** `cargo build -p library-service-stub`
+
+### 5b. Add the stub to root workspace members
+
+**Root `Cargo.toml`** — add to `members`:
+
+```toml
+"components/library_service_stub",
+```
+
+**Validate:** `cargo build --workspace`
+
+### 5c. Re-wire projects/bdd after the rename
+
+`projects/bdd/Cargo.toml` currently declares:
+
+```toml
+library-service = { path = "../../components/library_service_stub" }
+```
+
+After the rename this no longer resolves (`library-service-stub` ≠ `library-service`).
+Fix with the `package` key:
+
+```toml
+library-service = { path = "../../components/library_service_stub",
+                    package = "library-service-stub" }
+```
+
+Cargo resolves `library-service-stub` from the given path and aliases it as
+`library_service` inside the BDD crate. No change to any BDD test code.
+
+**Validate:** `cd projects/bdd && cargo test -- -vv`
+
+### 5d. Mark mdma-bdd as a test project
+
+Add one table to `projects/bdd/Cargo.toml`:
+
+```toml
+[package.metadata.polylith]
+test-project = true
+```
+
+This suppresses the `[no-base]` warning. `cargo polylith check` recognises it and
+treats `mdma-bdd` as a development/test project rather than a deliverable.
+
+**Validate:**
+
+```bash
+cargo polylith check
+# expect: only the two pre-existing [orphan] warnings remain
+```
+
+### 5e. Add interface metadata to library-service components
+
+**`components/library_service/Cargo.toml`** — add:
+
+```toml
+[package.metadata.polylith]
+interface = "library-service"
+```
+
+**`components/library_service_stub/Cargo.toml`** — add:
+
+```toml
+[package.metadata.polylith]
+interface = "library-service"
+```
+
+Since the real component's `name` matches the interface name, it is the default
+implementation. The stub is registered as an alternative. No `[ambiguous-interface]`
+warning will be emitted.
+
+**Effect on tooling:**
+- `cargo polylith info` will group and display both under the `library-service` interface label
+- `cargo polylith edit` will show `library-service` in the interface column of the grid
+
+**Validate:**
+
+```bash
+cargo polylith info
+# Components section shows:
+#   library-service   library-service
+#                     library-service-stub
+
+cargo polylith check
+# Only the two expected [orphan] warnings — clean otherwise
+```
+
+### Future stubs
+
+When a new stub component is created for any other interface (e.g. `audio-output-stub`),
+apply the same pattern:
+
+1. Give it a distinct package name: `name = "audio-output-stub"`
+2. Add to root workspace members
+3. Add `[package.metadata.polylith] interface = "audio-output"` to **both** the real
+   component and the stub
+4. In any project using the stub, wire via `package` key:
+   ```toml
+   audio-output = { path = "../../components/audio_output_stub",
+                    package = "audio-output-stub" }
+   ```

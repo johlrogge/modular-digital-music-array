@@ -8,6 +8,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[package.metadata.polylith]
+test-project = true
+
 [lib]
 name = "mdma_bdd"
 path = "src/lib.rs"
@@ -28,7 +31,7 @@ mdma-client = { path = "../../components/mdma_client" }
 date-expression = { path = "../../components/date_expression" }
 
 # Service (stub — in-memory implementation)
-library-service = { path = "../../components/library_service_stub" }
+library-service = { path = "../../components/library_service_stub", package = "library-service-stub" }
 
 # Protocol types (for playback simulator)
 media-protocol = { path = "../../components/media_protocol" }
