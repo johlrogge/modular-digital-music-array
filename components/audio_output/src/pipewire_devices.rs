@@ -1,4 +1,4 @@
-use crate::PlaybackError;
+use crate::AudioOutputError;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -25,9 +25,9 @@ struct PwInfo {
 
 /// Parse pw-dump JSON text into a list of AudioSink values.
 /// Exposed for testing so tests do not need PipeWire running.
-pub fn parse_sinks(json: &str) -> Result<Vec<AudioSink>, PlaybackError> {
+pub fn parse_sinks(json: &str) -> Result<Vec<AudioSink>, AudioOutputError> {
     let entries: Vec<PwEntry> = serde_json::from_str(json)
-        .map_err(|e| PlaybackError::AudioDevice(format!("pw-dump parse error: {e}")))?;
+        .map_err(|e| AudioOutputError::AudioDevice(format!("pw-dump parse error: {e}")))?;
 
     let mut sinks = Vec::new();
 
@@ -128,14 +128,14 @@ fn extract_max_rate(params: Option<&Value>) -> u32 {
 }
 
 /// Enumerate audio sinks by running `pw-dump` and parsing its JSON output.
-pub fn list_sinks() -> Result<Vec<AudioSink>, PlaybackError> {
+pub fn list_sinks() -> Result<Vec<AudioSink>, AudioOutputError> {
     let output = std::process::Command::new("pw-dump")
         .output()
-        .map_err(|e| PlaybackError::AudioDevice(format!("failed to run pw-dump: {e}")))?;
+        .map_err(|e| AudioOutputError::AudioDevice(format!("failed to run pw-dump: {e}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(PlaybackError::AudioDevice(format!(
+        return Err(AudioOutputError::AudioDevice(format!(
             "pw-dump exited with status {}: {stderr}",
             output.status
         )));

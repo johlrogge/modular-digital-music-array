@@ -7,23 +7,22 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-symphonia = { version = "0.5", features = ["default", "flac", "mp3"] }
+audio-decoder = { path = "../audio_decoder" }
+audio-types = { path = "../audio_types" }
 tokio = { workspace = true, features = ["full"] }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 playback-primitives = { path = "../playback_primitives" }
+audio-output = { path = "../audio_output" }
 tracing.workspace=true
 ringbuf = "0.3"
-rubato = "0.15"
+audio-resampler = { path = "../audio_resampler" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-pipewire = "0.8"
-spa_sys = { package = "libspa-sys", version = "0.8" }
 
 [build-dependencies]
 hound = "3.5"    # For WAV handling
 anyhow = "1.0"
-symphonia = { version = "0.5", features = ["flac", "mp3"] }
 
 [[bench]]
 name = "track_loading"
@@ -34,7 +33,7 @@ pretty_assertions = { workspace = true }
 criterion = "0.5"
 tempfile = "3.8"
 hound = "3.5"
-tracing-subscriber = "0.3"  # Add this line
+tracing-subscriber = "0.3"
 
 [[example]]
 name = "file_leak_test"

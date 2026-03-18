@@ -3,8 +3,14 @@ use rubato::{
     WindowFunction,
 };
 
-use crate::error::PlaybackError;
-use crate::source::SEGMENT_SIZE;
+use audio_types::SEGMENT_SIZE;
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum ResamplerError {
+    #[error("resampler error: {0}")]
+    Resample(String),
+}
 
 /// Upsamples interleaved stereo audio to a fixed target rate using a sinc resampler.
 ///
@@ -19,7 +25,11 @@ pub struct Resampler {
 }
 
 impl Resampler {
-    pub fn new(source_rate: u32, target_rate: u32, channels: usize) -> Result<Self, PlaybackError> {
+    pub fn new(
+        source_rate: u32,
+        target_rate: u32,
+        channels: usize,
+    ) -> Result<Self, ResamplerError> {
         let chunk_frames = SEGMENT_SIZE / channels;
         let ratio = target_rate as f64 / source_rate as f64;
 
@@ -32,7 +42,7 @@ impl Resampler {
         };
 
         let inner = SincFixedIn::<f32>::new(ratio, 2.0, params, chunk_frames, channels)
-            .map_err(|e| PlaybackError::Resampler(e.to_string()))?;
+            .map_err(|e| ResamplerError::Resample(e.to_string()))?;
 
         tracing::debug!(
             "Resampler created: {}Hz → {}Hz, channels={}, chunk_frames={}",
@@ -54,7 +64,7 @@ impl Resampler {
     ///
     /// Input must be exactly SEGMENT_SIZE samples (chunk_frames * channels).
     /// Returns resampled interleaved samples; length depends on the ratio.
-    pub fn process_segment(&mut self, interleaved: &[f32]) -> Result<Vec<f32>, PlaybackError> {
+    pub fn process_segment(&mut self, interleaved: &[f32]) -> Result<Vec<f32>, ResamplerError> {
         // Deinterleave: LRLRLR... → per-channel buffers
         for (frame_idx, frame) in interleaved
             .chunks(self.channels)
@@ -72,7 +82,7 @@ impl Resampler {
 
         let out = inner
             .process(input_bufs, None)
-            .map_err(|e| PlaybackError::Resampler(e.to_string()))?;
+            .map_err(|e| ResamplerError::Resample(e.to_string()))?;
 
         // Reinterleave: per-channel → LRLRLR...
         let n_out_frames = out[0].len();
@@ -84,5 +94,31 @@ impl Resampler {
         }
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resampler_new_same_rate_succeeds() {
+        let r = Resampler::new(48_000, 48_000, 2);
+        assert!(r.is_ok(), "expected Ok, got {:?}", r.err());
+    }
+
+    #[test]
+    fn resampler_new_upsample_succeeds() {
+        let r = Resampler::new(44_100, 192_000, 2);
+        assert!(r.is_ok(), "expected Ok for upsample, got {:?}", r.err());
+    }
+
+    #[test]
+    fn process_segment_returns_nonempty_output() {
+        let mut r = Resampler::new(48_000, 96_000, 2).expect("resampler");
+        let input = vec![0.0f32; SEGMENT_SIZE];
+        let output = r.process_segment(&input);
+        assert!(output.is_ok(), "expected Ok, got {:?}", output.err());
+        assert!(!output.unwrap().is_empty(), "expected non-empty output");
     }
 }

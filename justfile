@@ -19,7 +19,7 @@ build:
 # Run BDD tests
 [group('test')]
 bdd:
-    cargo test --package mdma-bdd --test cucumber -- -vv
+    cd projects/bdd && cargo test --test cucumber -- -vv
 
 # Cross-compile a standard MDMA binary for aarch64
 [group('build')]

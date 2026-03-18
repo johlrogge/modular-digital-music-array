@@ -1,0 +1,29 @@
+[package]
+name = "library-ingestion"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+
+# Internal components
+music-facts = { path = "../music_facts" }
+music-primitives = { path = "../music_primitives" }
+audio-metadata = { path = "../audio_metadata" }
+
+# Hashing
+sha2 = "0.10"
+hex = "0.4"
+
+# Path utilities
+pathdiff = "0.2"
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+rstest = { workspace = true }
+tempfile = "3"

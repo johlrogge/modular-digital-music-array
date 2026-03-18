@@ -1,8 +1,8 @@
 use crate::error::PlaybackError;
-use crate::resampler::Resampler;
-use crate::source::Source;
+use audio_decoder::Source;
+use audio_resampler::Resampler;
 #[cfg(test)]
-use crate::source::{AudioSegment, DecodedSegment, SegmentIndex, SEGMENT_SIZE};
+use audio_types::{AudioSegment, DecodedSegment, SegmentIndex, SEGMENT_SIZE};
 
 use tokio::sync::mpsc;
 
@@ -458,7 +458,7 @@ impl TestSource {
 
 #[cfg(test)]
 impl Source for TestSource {
-    fn decode_next_frame(&self) -> Result<Vec<DecodedSegment>, PlaybackError> {
+    fn decode_next_frame(&self) -> Result<Vec<DecodedSegment>, audio_decoder::DecoderError> {
         // Get current position
         let pos = self.position.load(Ordering::Relaxed);
 
@@ -487,7 +487,7 @@ impl Source for TestSource {
         Ok(adjusted_segments)
     }
 
-    fn seek(&self, position: usize) -> Result<(), PlaybackError> {
+    fn seek(&self, position: usize) -> Result<(), audio_decoder::DecoderError> {
         // Store the target sample position
         self.current_sample_position
             .store(position, Ordering::Relaxed);

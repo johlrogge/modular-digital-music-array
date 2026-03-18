@@ -16,6 +16,7 @@ thiserror = { workspace = true }
 
 # Internal components
 library-search = { path = "../library_search" }
+library-ingestion = { path = "../library_ingestion" }
 music-facts = { path = "../music_facts" }
 music-primitives = { path = "../music_primitives" }
 audio-metadata = { path = "../audio_metadata" }
@@ -26,18 +27,11 @@ event-protocol = { path = "../event_protocol" }
 # Fact stream
 stainless-facts = { git = "https://github.com/johlrogge/stainless_facts", rev = "2aa820a808fd5345a1bd59c11d90969bfa84b285" }
 
-# Hashing
-sha2 = "0.10"
-hex = "0.4"
-
 # IPC
 nng = { workspace = true }
 
 # File watching
 notify = "6.1"
-
-# Path utilities
-pathdiff = "0.2"
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

@@ -1,0 +1,19 @@
+[package]
+name = "library-service"
+version = "0.4.0"
+edition = "2021"
+
+[dependencies]
+thiserror = "1.0"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+nng = "1.0"
+
+# Internal components (path-based)
+library-ipc-protocol = { path = "../library_ipc_protocol" }
+library-search = { path = "../library_search" }
+music-facts = { path = "../music_facts" }
+
+# Fact stream reading
+stainless-facts = { git = "https://github.com/johlrogge/stainless_facts", rev = "2aa820a808fd5345a1bd59c11d90969bfa84b285" }

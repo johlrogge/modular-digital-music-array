@@ -1,4 +1,5 @@
-use crate::error::PlaybackError;
+pub use audio_types::{AudioSegment, DecodedSegment, SegmentIndex, SEGMENT_SIZE};
+
 use parking_lot::Mutex;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -11,62 +12,23 @@ use symphonia::core::{
     probe::Hint,
     units::Time,
 };
+use thiserror::Error;
 
-pub const SEGMENT_SIZE: usize = 1024;
-
-// Identifies a segment's position in the stream
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SegmentIndex(pub usize);
-
-impl SegmentIndex {
-    // Convert a sample position to a segment index
-    pub fn from_sample_position(position: usize) -> Self {
-        let index = position / SEGMENT_SIZE;
-        tracing::debug!("Segment index {index} for position {position}");
-        Self(index)
-    }
-
-    // Get the sample position at the start of this segment
-    pub fn start_position(&self) -> usize {
-        self.0 * SEGMENT_SIZE
-    }
-
-    // Get the next segment index
-    pub fn next(&self) -> Self {
-        Self(self.0 + 1)
-    }
-}
-
-// An audio segment with exactly SEGMENT_SIZE samples
-// Last segment is zero-padded if needed
-#[derive(Clone, Debug)]
-pub struct AudioSegment {
-    pub samples: [f32; SEGMENT_SIZE],
-}
-
-// A decoded segment with its position information
-#[derive(Debug, Clone)]
-pub struct DecodedSegment {
-    // The segment index
-    pub index: SegmentIndex,
-
-    // The segment data
-    pub segment: AudioSegment,
-}
-
-impl DecodedSegment {
-    pub fn is_empty(&self) -> bool {
-        self.segment.samples.iter().all(|s| *s == 0.0)
-    }
+#[derive(Error, Debug)]
+pub enum DecoderError {
+    #[error("decoder error: {0}")]
+    Decode(String),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 pub trait Source: Send + Sync {
     // Decode the next frame of audio data into segments
     // Returns the segments from the frame, or empty vec at EOF
-    fn decode_next_frame(&self) -> Result<Vec<DecodedSegment>, PlaybackError>;
+    fn decode_next_frame(&self) -> Result<Vec<DecodedSegment>, DecoderError>;
 
     // Seek to a specific sample position
-    fn seek(&self, position: usize) -> Result<(), PlaybackError>;
+    fn seek(&self, position: usize) -> Result<(), DecoderError>;
 
     // Basic metadata
     fn sample_rate(&self) -> u32;
@@ -108,11 +70,11 @@ type DecoderResult = Result<
         u16,
         Option<u64>,
     ),
-    PlaybackError,
+    DecoderError,
 >;
 
 impl AudioSource {
-    pub fn new(path: impl AsRef<Path>) -> Result<Self, PlaybackError> {
+    pub fn new(path: impl AsRef<Path>) -> Result<Self, DecoderError> {
         tracing::debug!("Opening file: {:?}", path.as_ref());
         // Initialize the decoder and format reader
         let (format_reader, decoder, sample_rate, audio_channels, total_duration_ms) =
@@ -155,12 +117,12 @@ impl AudioSource {
                 &FormatOptions::default(),
                 &MetadataOptions::default(),
             )
-            .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
+            .map_err(|e| DecoderError::Decode(e.to_string()))?;
 
         let track = probed
             .format
             .default_track()
-            .ok_or_else(|| PlaybackError::Decoder("No default track found".into()))?;
+            .ok_or_else(|| DecoderError::Decode("No default track found".into()))?;
 
         let audio_channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2) as u16;
         let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
@@ -175,7 +137,7 @@ impl AudioSource {
         // Create decoder
         let decoder = symphonia::default::get_codecs()
             .make(&track.codec_params, &DecoderOptions::default())
-            .map_err(|e| PlaybackError::Decoder(e.to_string()))?;
+            .map_err(|e| DecoderError::Decode(e.to_string()))?;
 
         Ok((
             probed.format,
@@ -204,7 +166,7 @@ impl AudioSource {
     fn extract_segments(
         &self,
         decoded: symphonia::core::audio::AudioBufferRef<'_>,
-    ) -> Result<Vec<DecodedSegment>, PlaybackError> {
+    ) -> Result<Vec<DecodedSegment>, DecoderError> {
         tracing::debug!("extract segments called");
         // Get decoded buffer specification
         let spec = *decoded.spec();
@@ -261,7 +223,7 @@ impl AudioSource {
 }
 
 impl Source for AudioSource {
-    fn decode_next_frame(&self) -> Result<Vec<DecodedSegment>, PlaybackError> {
+    fn decode_next_frame(&self) -> Result<Vec<DecodedSegment>, DecoderError> {
         tracing::debug!("decode_next_frame");
         if self.is_eof.load(Ordering::Relaxed) {
             return Ok(Vec::new());
@@ -276,18 +238,18 @@ impl Source for AudioSource {
                 self.is_eof.store(true, Ordering::Relaxed);
                 return Ok(Vec::new());
             }
-            Err(e) => return Err(PlaybackError::Decoder(e.to_string())),
+            Err(e) => return Err(DecoderError::Decode(e.to_string())),
         };
 
         let decoded = match decoder_state.decoder.decode(&packet) {
             Ok(decoded) => decoded,
-            Err(e) => return Err(PlaybackError::Decoder(e.to_string())),
+            Err(e) => return Err(DecoderError::Decode(e.to_string())),
         };
 
         self.extract_segments(decoded)
     }
 
-    fn seek(&self, position: usize) -> Result<(), PlaybackError> {
+    fn seek(&self, position: usize) -> Result<(), DecoderError> {
         // Calculate the time to seek to
         let seek_time = self.position_to_time(position);
 
@@ -310,7 +272,7 @@ impl Source for AudioSource {
                     track_id: None,
                 },
             )
-            .map_err(|e| PlaybackError::Decoder(format!("Seek error: {}", e)))?;
+            .map_err(|e| DecoderError::Decode(format!("Seek error: {}", e)))?;
 
         Ok(())
     }
