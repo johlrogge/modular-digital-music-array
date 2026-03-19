@@ -24,7 +24,7 @@ jobs:
     - name: Install cmake
       run: brew install cmake
     - name: Build mdma_cli for Apple Silicon
-      run: cargo build --release -p mdma-cli
+      run: cargo build --release --manifest-path projects/mdma-cli/Cargo.toml
     - uses: actions/upload-artifact@v4
       with:
         name: mdma-cli-macos-arm64
