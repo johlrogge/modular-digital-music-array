@@ -1,5 +1,6 @@
 use clap::Parser;
 use color_eyre::Result;
+use service::{ServiceConfig, ServiceSockets};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -31,15 +32,22 @@ fn main() -> Result<()> {
         "Starting MDMA ACID service"
     );
 
-    service::ensure_ipc_dir(&args.socket)
-        .map_err(|e| color_eyre::eyre::eyre!("Failed to create socket directory: {}", e))?;
-    service::ensure_ipc_dir(&args.event_socket)
-        .map_err(|e| color_eyre::eyre::eyre!("Failed to create event socket directory: {}", e))?;
-    let _handle = acid_service::start(&args.socket, &args.event_socket, &args.metadata_dir)
-        .map_err(|e| color_eyre::eyre::eyre!("Failed to start ACID service: {}", e))?;
+    let ServiceSockets {
+        rep_socket,
+        event_socket,
+    } = service::create_sockets(&ServiceConfig {
+        socket_address: args.socket.clone(),
+        event_address: Some(args.event_socket.clone()),
+    })
+    .map_err(|e| color_eyre::eyre::eyre!("Failed to create service sockets: {}", e))?;
+
+    let pub_sock = event_socket.expect("event socket must be configured for mdma-acid");
 
     tracing::info!(address = %args.socket, "ACID service listening");
     tracing::info!(address = %args.event_socket, "ACID event socket listening");
+
+    let _handle = acid_service::start(rep_socket, pub_sock, &args.metadata_dir)
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to start ACID service: {}", e))?;
 
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));

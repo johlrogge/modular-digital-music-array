@@ -30,24 +30,24 @@ pub struct ServerHandle {
 
 /// Start the ACID NNG server in a background thread.
 ///
-/// - `facts_addr`: NNG Rep0 address (e.g. `"ipc:///run/mdma/acid.sock"`)
-/// - `events_addr`: NNG Pub0 address (e.g. `"ipc:///run/mdma/acid-events.sock"`)
+/// The caller is responsible for creating and binding the sockets before calling
+/// this function. `acid_service` owns the socket timeout settings for correct
+/// shutdown and flow control.
+///
+/// - `rep`: bound NNG Rep0 socket (e.g. listening on `"ipc:///run/mdma/acid.sock"`)
+/// - `pub_sock`: bound NNG Pub0 socket (e.g. listening on `"ipc:///run/mdma/acid-events.sock"`)
 /// - `metadata_dir`: passed to `FactStorage::new()` (ignored by memory impl)
 pub fn start(
-    facts_addr: &str,
-    events_addr: &str,
+    rep: nng::Socket,
+    pub_sock: nng::Socket,
     metadata_dir: &Path,
 ) -> Result<ServerHandle, ServiceError> {
+    // acid_service owns these socket settings for correct shutdown and flow control
+    rep.set_opt::<RecvTimeout>(Some(Duration::from_secs(1)))?;
+    rep.set_opt::<SendTimeout>(Some(Duration::from_secs(5)))?;
+
     let storage = FactStorage::new(metadata_dir)?;
     let storage = Arc::new(storage);
-
-    let rep = nng::Socket::new(nng::Protocol::Rep0)?;
-    rep.set_opt::<SendTimeout>(Some(Duration::from_secs(5)))?;
-    rep.set_opt::<RecvTimeout>(Some(Duration::from_secs(1)))?;
-    rep.listen(facts_addr)?;
-
-    let pub_sock = nng::Socket::new(nng::Protocol::Pub0)?;
-    pub_sock.listen(events_addr)?;
 
     let shutdown = Arc::new(());
     let shutdown_clone = Arc::clone(&shutdown);

@@ -1993,7 +1993,14 @@ mod tests {
         let pid = std::process::id();
         let facts_addr = format!("ipc:///tmp/mdma-test-acid-facts-{}-{}.sock", pid, id);
         let events_addr = format!("ipc:///tmp/mdma-test-acid-events-{}-{}.sock", pid, id);
-        let handle = acid_service::start(&facts_addr, &events_addr, std::path::Path::new("/tmp"))
+
+        let rep = nng::Socket::new(nng::Protocol::Rep0).expect("rep socket");
+        rep.listen(&facts_addr).expect("rep listen");
+
+        let pub_sock = nng::Socket::new(nng::Protocol::Pub0).expect("pub socket");
+        pub_sock.listen(&events_addr).expect("pub listen");
+
+        let handle = acid_service::start(rep, pub_sock, std::path::Path::new("/tmp"))
             .expect("failed to start acid server");
         std::thread::sleep(std::time::Duration::from_millis(20));
         (handle, facts_addr, events_addr)
