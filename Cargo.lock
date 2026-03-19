@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "acid-client"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "acid-protocol",
  "music-facts",
@@ -17,7 +17,7 @@ dependencies = [
 
 [[package]]
 name = "acid-protocol"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "pretty_assertions",
  "serde",
@@ -26,7 +26,7 @@ dependencies = [
 
 [[package]]
 name = "acid-service"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "acid-protocol",
  "event-protocol",
@@ -205,7 +205,7 @@ dependencies = [
 
 [[package]]
 name = "audio-metadata"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "lofty",
  "pretty_assertions",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "audio-transcoder"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "pretty_assertions",
  "rstest",
@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "bandcamp-api"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-stream",
  "chrono",
@@ -926,7 +926,7 @@ checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 
 [[package]]
 name = "date-expression"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "thiserror 1.0.69",
@@ -1081,7 +1081,7 @@ dependencies = [
 
 [[package]]
 name = "event-protocol"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "playback-primitives",
  "pretty_assertions",
@@ -1109,7 +1109,7 @@ dependencies = [
 
 [[package]]
 name = "fact-store"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "acid-protocol",
  "chrono",
@@ -1120,7 +1120,7 @@ dependencies = [
 
 [[package]]
 name = "fact-store-file"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "acid-protocol",
  "chrono",
@@ -1312,7 +1312,7 @@ dependencies = [
 
 [[package]]
 name = "gateway-client"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "acid-protocol",
  "gateway-protocol",
@@ -1328,7 +1328,7 @@ dependencies = [
 
 [[package]]
 name = "gateway-protocol"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "acid-protocol",
  "library-ipc-protocol",
@@ -1768,7 +1768,7 @@ dependencies = [
 
 [[package]]
 name = "inbox-utils"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "pretty_assertions",
  "rstest",
@@ -2000,7 +2000,7 @@ dependencies = [
 
 [[package]]
 name = "library-ipc-client"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "library-ipc-protocol",
  "nng",
@@ -2011,7 +2011,7 @@ dependencies = [
 
 [[package]]
 name = "library-ipc-protocol"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "library-search",
  "music-facts",
@@ -2024,7 +2024,7 @@ dependencies = [
 
 [[package]]
 name = "library-search"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "date-expression",
@@ -2262,7 +2262,7 @@ dependencies = [
 
 [[package]]
 name = "media-client"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "media-protocol",
  "nng",
@@ -2275,7 +2275,7 @@ dependencies = [
 
 [[package]]
 name = "media-protocol"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "playback-primitives",
  "pretty_assertions",
@@ -2338,7 +2338,7 @@ dependencies = [
 
 [[package]]
 name = "music-facts"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "music-primitives",
@@ -2354,7 +2354,7 @@ dependencies = [
 
 [[package]]
 name = "music-primitives"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "pretty_assertions",
  "rstest",
@@ -2402,7 +2402,7 @@ dependencies = [
 
 [[package]]
 name = "nng-transport"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "dirs",
  "nng",
@@ -2723,7 +2723,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "playback-engine"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "audio-decoder",
@@ -2747,7 +2747,7 @@ dependencies = [
 
 [[package]]
 name = "playback-primitives"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "assert_matches",
  "chrono",
@@ -3640,7 +3640,7 @@ dependencies = [
 
 [[package]]
 name = "source-protocol"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "pretty_assertions",
  "serde",
@@ -3684,7 +3684,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage_primitives"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "pretty_assertions",
  "rstest",
