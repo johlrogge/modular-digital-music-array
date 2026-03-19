@@ -117,7 +117,12 @@ in
     rm -f /tmp/mdma-dev/run/*.sock
     mkdir -p /tmp/mdma-dev/run/sources /tmp/mdma-dev/music/inbox /tmp/mdma-dev/music/blobs /tmp/mdma-dev/metadata
     echo "Building all services..."
-    cargo build --release --package mdma-acid --package mdma-library --package mdma-playback --package mdma-gateway --package mdma-console
+    cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-acid/Cargo.toml" 2>/dev/null \
+      && cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-library/Cargo.toml" 2>/dev/null \
+      && cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-playback/Cargo.toml" 2>/dev/null \
+      && cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-gateway/Cargo.toml" 2>/dev/null \
+      && cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-console/Cargo.toml" 2>/dev/null \
+      || echo "One or more services failed to build — check individual manifests"
   '';
 
   processes = {
@@ -195,10 +200,11 @@ in
     # Build mdma-cli and mdma-tui, expose via target/debug on PATH
     # Skip in CI — the build is wasted work there (~30s)
     if [ -z "''${CI:-}" ]; then
-      cargo build -q --package mdma-cli --package mdma-tui 2>/dev/null \
+      cargo build -q --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-cli/Cargo.toml" 2>/dev/null \
+        && cargo build -q --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-tui/Cargo.toml" 2>/dev/null \
         && export PATH="$MDMA_PROJECT_ROOT/target/debug:$PATH" \
         && echo "mdma CLI + TUI ready (gateway mode)" \
-        || echo "mdma CLI/TUI not built — run: cargo build --package mdma-cli --package mdma-tui"
+        || echo "mdma CLI/TUI not built — run: cargo build --manifest-path projects/mdma-cli/Cargo.toml && cargo build --manifest-path projects/mdma-tui/Cargo.toml"
       eval "$(mdma generate-completions bash 2>/dev/null)" || true
     fi
 
