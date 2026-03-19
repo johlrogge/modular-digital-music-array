@@ -19,7 +19,7 @@ build:
 # Run BDD tests
 [group('test')]
 bdd:
-    cargo test --package mdma-bdd --test cucumber -- -vv
+    cd projects/bdd && cargo test --test cucumber -- -vv
 
 # Cross-compile a standard MDMA binary for aarch64
 [group('build')]
@@ -29,20 +29,34 @@ cross bin label=bin:
     export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     echo "Building {{label}} for aarch64..."
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin {{bin}}
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 --bin {{bin}}
     echo ""
     echo "{{label}} built!"
     file target/aarch64-unknown-linux-gnu/release/{{bin}}
     ls -lh target/aarch64-unknown-linux-gnu/release/{{bin}}
 
-# Quick cross-compile beacon using cargo-zigbuild (devenv provides zig + target)
+# Quick cross-compile beacon using cargo-zigbuild (project workspace)
 [group('build')]
-beacon-cross: (cross "beacon" "Beacon")
+beacon-cross:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building Beacon for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        --manifest-path projects/mdma-beacon/Cargo.toml \
+        --bin beacon
+    echo ""
+    echo "Beacon built!"
+    file target/aarch64-unknown-linux-gnu/release/beacon
+    ls -lh target/aarch64-unknown-linux-gnu/release/beacon
 
 # Build beacon with native cargo (requires system cross-compiler)
 [group('build')]
 beacon-native:
-    cargo build --release --target aarch64-unknown-linux-gnu --bin beacon
+    cargo build --release --target aarch64-unknown-linux-gnu \
+        --manifest-path projects/mdma-beacon/Cargo.toml \
+        --bin beacon
     @echo ""
     @file target/aarch64-unknown-linux-gnu/release/beacon
     @ls -lh target/aarch64-unknown-linux-gnu/release/beacon
@@ -50,7 +64,8 @@ beacon-native:
 # Check beacon dependencies for cross-compilation compatibility
 [group('build')]
 beacon-deps:
-    cargo tree --target aarch64-unknown-linux-gnu --package mdma-beacon
+    cargo tree --target aarch64-unknown-linux-gnu \
+        --manifest-path projects/mdma-beacon/Cargo.toml
 
 # Set up Cargo config for cross-compilation (native gcc method)
 [group('build')]
@@ -112,17 +127,17 @@ check-toolchain:
 # Watch beacon and rebuild on changes (for development)
 [group('dev')]
 beacon-watch:
-    cargo watch -x 'build --bin beacon'
+    cargo watch --manifest-path projects/mdma-beacon/Cargo.toml -x 'build --bin beacon'
 
 # Run beacon locally (x86_64 - for development/testing)
 [group('dev')]
 beacon-run:
-    cargo run --bin beacon
+    cargo run --manifest-path projects/mdma-beacon/Cargo.toml --bin beacon
 
 # Build beacon for current platform (development)
 [group('dev')]
 beacon-dev:
-    cargo build --bin beacon
+    cargo build --manifest-path projects/mdma-beacon/Cargo.toml --bin beacon
     @ls -lh target/debug/beacon
 
 # Rapid deploy beacon to Pi for development iteration
@@ -291,9 +306,17 @@ ci-build-all: setup-playback-sysroot
 pkg-beacon:
     ./scripts/package/create-package.sh
 
-# Build mdma-library for CI
+# Build mdma-library for CI (project workspace)
 [group('ci')]
-ci-build-library: (ci-build "mdma-library")
+ci-build-library:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building mdma-library for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        --manifest-path projects/mdma-library/Cargo.toml \
+        --bin mdma-library
 
 # Build mdma-console for CI
 [group('ci')]
@@ -306,11 +329,27 @@ ci-build-playback:
 
 # Build mdma-gateway for CI
 [group('ci')]
-ci-build-gateway: (ci-build "mdma-gateway")
+ci-build-gateway:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building mdma-gateway for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        --manifest-path projects/mdma-gateway/Cargo.toml \
+        --bin mdma-gateway
 
 # Build mdma-bandcamp for CI
 [group('ci')]
-ci-build-bandcamp: (ci-build "mdma-bandcamp")
+ci-build-bandcamp:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building mdma-bandcamp for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        --manifest-path projects/mdma-bandcamp/Cargo.toml \
+        --bin mdma-bandcamp
 
 # Build mdma-library Void package
 [group('package')]
@@ -650,16 +689,28 @@ pi-wait:
 # run beacon
 [group("run")]
 run-beacon:
-    cargo run --bin beacon
+    cargo run --manifest-path projects/mdma-beacon/Cargo.toml --bin beacon
 
 # run console locally
 [group("run")]
 run-console:
-    cargo run --bin mdma-console
+    cargo run --manifest-path projects/mdma-console/Cargo.toml --bin mdma-console
 
-# Cross-compile console for aarch64
+# Cross-compile console for aarch64 (project workspace)
 [group('build')]
-console-cross: (cross "mdma-console" "Console")
+console-cross:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building Console for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        --manifest-path projects/mdma-console/Cargo.toml \
+        --bin mdma-console
+    echo ""
+    echo "Console built!"
+    file target/aarch64-unknown-linux-gnu/release/mdma-console
+    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-console
 
 # Set up aarch64 PipeWire sysroot for cross-compiling playback
 [group('build')]
@@ -683,9 +734,21 @@ playback-cross: setup-playback-sysroot
 audio-cross: setup-playback-sysroot
     ./scripts/ci/build-audio.sh
 
-# Cross-compile library service for aarch64
+# Cross-compile library service for aarch64 (project workspace)
 [group('build')]
-library-cross: (cross "mdma-library" "Library")
+library-cross:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building Library for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        --manifest-path projects/mdma-library/Cargo.toml \
+        --bin mdma-library
+    echo ""
+    echo "Library built!"
+    file target/aarch64-unknown-linux-gnu/release/mdma-library
+    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-library
 
 # Internal: deploy a standard MDMA service to the provisioned Pi
 [group('dev')]
@@ -745,26 +808,74 @@ deploy-playback: playback-cross
 deploy-audio: audio-cross
     @just _deploy-svc mdma-audio mdma-audio
 
-# Cross-compile gateway for aarch64
+# Cross-compile gateway for aarch64 (project workspace)
 [group('build')]
-gateway-cross: (cross "mdma-gateway" "Gateway")
+gateway-cross:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building Gateway for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        --manifest-path projects/mdma-gateway/Cargo.toml \
+        --bin mdma-gateway
+    echo ""
+    echo "Gateway built!"
+    file target/aarch64-unknown-linux-gnu/release/mdma-gateway
+    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-gateway
 
-# Cross-compile acid service for aarch64
+# Cross-compile acid service for aarch64 (project workspace)
 [group('build')]
-acid-cross: (cross "mdma-acid" "Acid")
+acid-cross:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building Acid for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        --manifest-path projects/mdma-acid/Cargo.toml \
+        --bin mdma-acid
+    echo ""
+    echo "Acid built!"
+    file target/aarch64-unknown-linux-gnu/release/mdma-acid
+    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-acid
 
-# Cross-compile bandcamp for aarch64
+# Cross-compile bandcamp for aarch64 (project workspace)
 [group('build')]
-bandcamp-cross: (cross "mdma-bandcamp" "Bandcamp")
+bandcamp-cross:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building Bandcamp for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        --manifest-path projects/mdma-bandcamp/Cargo.toml \
+        --bin mdma-bandcamp
+    echo ""
+    echo "Bandcamp built!"
+    file target/aarch64-unknown-linux-gnu/release/mdma-bandcamp
+    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-bandcamp
 
 # Deploy gateway to Pi (single external TCP port)
 [group('dev')]
 deploy-gateway: gateway-cross
     @just _deploy-svc mdma-gateway mdma-gateway
 
-# Cross-compile CLI (mdma) for aarch64
+# Cross-compile CLI for aarch64 (project workspace)
 [group('build')]
-cli-cross: (cross "mdma" "CLI")
+cli-cross:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building CLI for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        --manifest-path projects/mdma-cli/Cargo.toml \
+        --bin mdma
+    echo ""
+    echo "CLI built!"
+    file target/aarch64-unknown-linux-gnu/release/mdma
+    ls -lh target/aarch64-unknown-linux-gnu/release/mdma
 
 # Deploy CLI (mdma) to Pi - installs as /usr/bin/mdma, no service required
 [group('dev')]
@@ -796,3 +907,40 @@ deploy-bandcamp: bandcamp-cross
 [group('dev')]
 deploy-acid: acid-cross
     @just _deploy-svc mdma-acid mdma-acid
+
+# Cross-compile TUI for aarch64 (project workspace)
+[group('build')]
+tui-cross:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building TUI for aarch64..."
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        --manifest-path projects/mdma-tui/Cargo.toml \
+        --bin mdma-tui
+    echo ""
+    echo "TUI built!"
+    file target/aarch64-unknown-linux-gnu/release/mdma-tui
+    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-tui
+
+# Deploy TUI (mdma-tui) to Pi - installs as /usr/bin/mdma-tui, no service required
+[group('dev')]
+deploy-tui: tui-cross
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    HOST="${PI_HOST:-mdma-909.local}"
+    BINARY="target/aarch64-unknown-linux-gnu/release/mdma-tui"
+    SSH_KEY="$HOME/.ssh/mdma_pi"
+
+    echo "Deploying mdma-tui to $HOST..."
+
+    scp -4 -i "$SSH_KEY" "$BINARY" "admin@${HOST}:/tmp/"
+
+    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo mv /tmp/mdma-tui /usr/bin/mdma-tui
+        sudo chmod +x /usr/bin/mdma-tui
+        mdma-tui --help 2>&1 | head -1 || true'
+
+    echo ""
+    echo "TUI deployed! Run: mdma-tui --help"

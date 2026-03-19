@@ -1,10 +1,18 @@
 [package]
 name = "storage_primitives"
-version = "0.2.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "storage-primitives"
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
+serde = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

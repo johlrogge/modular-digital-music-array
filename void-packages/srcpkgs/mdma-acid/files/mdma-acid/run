@@ -4,4 +4,5 @@ mkdir -p /metadata /run/mdma
 export RUST_LOG=info
 exec chpst -u mdma /usr/bin/mdma-acid \
     --metadata-dir /metadata \
-    --socket ipc:///run/mdma/acid.sock
+    --socket ipc:///run/mdma/acid.sock \
+    --event-socket ipc:///run/mdma/acid-events.sock

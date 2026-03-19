@@ -31,7 +31,7 @@ pub enum ServiceError {
     Ingest(#[from] crate::pipeline::IngestError),
 
     #[error("ACID client error: {0}")]
-    AcidClient(#[from] acid_client::ClientError),
+    Acid(#[from] acid_client::ClientError),
 }
 
 /// Library service state
@@ -43,7 +43,7 @@ pub struct LibraryService {
     facts_count: AtomicUsize,
     /// In-memory index of tracks for fast search (rebuilt from facts on startup)
     tracks: Mutex<Vec<IndexedTrackInfo>>,
-    /// ACID client for writing facts
+    /// ACID client for writing and reading facts
     acid_client: AcidClient,
     /// Album name -> cover_art_path for tracks that have cover art.
     /// Used as a fallback when a track on the same album has no cover art of its own.
@@ -226,12 +226,12 @@ impl LibraryService {
         // Try to load from the ACID stream (incremental if cursor exists)
         let cursor_path = metadata_dir.join("facts.cursor");
         let saved_cursor = Self::load_saved_cursor(&cursor_path);
-        let used_full_load = saved_cursor.is_none();
 
         let (loaded, final_cursor) = Self::load_from_acid_stream(&acid_client, saved_cursor);
 
-        // If ACID stream returned nothing and we had no cursor, fall back to local file
-        let (loaded, final_cursor) = if loaded.tracks.is_empty() && used_full_load {
+        // If ACID stream returned nothing, fall back to local file.
+        // This covers both "ACID unavailable" and "cursor at end-of-file with no new facts".
+        let (loaded, final_cursor) = if loaded.tracks.is_empty() {
             tracing::info!("ACID stream empty or unavailable, falling back to local facts file");
             let facts_path = metadata_dir.join("facts.jsonl");
             let file_loaded = Self::load_tracks_from_facts(&facts_path);
@@ -351,17 +351,17 @@ impl LibraryService {
         has_cover_art: &mut HashSet<String>,
         total: &mut usize,
     ) {
-        use music_facts::FactSource;
-
         for line in lines {
-            let fact: stainless_facts::Fact<ContentHash, MusicValue, FactSource> =
-                match serde_json::from_str(line) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::warn!("Failed to parse stream line during load: {:?}", e);
-                        continue;
-                    }
-                };
+            let fact = match serde_json::from_str::<
+                stainless_facts::Fact<ContentHash, MusicValue, music_facts::FactSource>,
+            >(line)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to parse stream line during load");
+                    continue;
+                }
+            };
 
             *total += 1;
             let entity = fact.entity().as_str().to_owned();
@@ -1107,11 +1107,8 @@ impl LibraryService {
 
     /// Resolve a partial hash to a full hash (like git short refs)
     fn resolve_hash(&self, partial: &ContentHash) -> Result<ContentHash, ProtocolError> {
-        let partial_clean = partial
-            .as_str()
-            .strip_prefix("sha256:")
-            .unwrap_or(partial.as_str())
-            .to_lowercase();
+        let normalize = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
+        let partial_clean = normalize(partial.as_str());
 
         let tracks = self.tracks.lock().unwrap();
         let matches: Vec<_> = tracks
@@ -1131,12 +1128,47 @@ impl LibraryService {
                 hash: partial.as_str().to_owned(),
             }),
             1 => Ok(matches[0].content_hash.clone()),
-            n => {
+            _ => {
+                // Multiple matches: check whether all share the exact same hash
+                // value. If so, they are duplicate index entries for the same
+                // content (e.g. legacy short hashes written more than once) and
+                // resolving to the first one is correct.
+                // Normalize by stripping "sha256:" prefix and lowercasing so that
+                // a legacy short-hash entry ("9fb4105e") and a full-hash entry
+                // ("sha256:9fb4105eXXX...") are recognised as the same content:
+                // both normalize to the same prefix, so one starts_with the other.
+                let normalized: Vec<String> = matches
+                    .iter()
+                    .map(|t| normalize(t.content_hash.as_str()))
+                    .collect();
+                // All entries represent the same content if every pair of
+                // normalized hashes has one that is a prefix of the other
+                // (i.e. short legacy hash vs full hash of the same file).
+                let all_same = normalized.iter().all(|a| {
+                    normalized
+                        .iter()
+                        .all(|b| a.starts_with(b.as_str()) || b.starts_with(a.as_str()))
+                });
+                if all_same {
+                    // Prefer the entry with the longest (most complete) hash,
+                    // so a full "sha256:..." hash wins over a legacy 8-char hash.
+                    let best = matches
+                        .iter()
+                        .max_by_key(|t| t.content_hash.as_str().len())
+                        .unwrap();
+                    return Ok(best.content_hash.clone());
+                }
+
+                // Genuinely different hashes share a prefix — real ambiguity.
+                let n = matches.len();
                 let examples: Vec<_> = matches
                     .iter()
                     .take(3)
                     .map(|t| {
-                        let short = &t.content_hash.as_str()[7..15]; // sha256: prefix + 8 chars
+                        let hash_str = t.content_hash.as_str();
+                        // Show 8 chars after "sha256:" prefix; fall back to full string for
+                        // legacy short hashes that lack the prefix.
+                        let short = hash_str.get(7..15).unwrap_or(hash_str);
                         let name = t.title.as_deref().unwrap_or("Unknown");
                         format!("  {} ({})", short, name)
                     })
@@ -1507,7 +1539,7 @@ impl LibraryService {
         let source_facts = Self::source_facts(source, &fact_source);
         facts.extend(source_facts);
 
-        // Write facts via ACID
+        // Write facts via fact store
         self.acid_client.write_music_facts(&content_hash, &facts)?;
 
         // Update in-memory index
@@ -1954,23 +1986,49 @@ mod tests {
     // Playlist handler tests
     // =========================================================================
 
-    fn make_service_with_playlists_dir() -> (LibraryService, tempfile::TempDir) {
+    static ACID_SERVER_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn spawn_acid_server() -> (acid_service::ServerHandle, String, String) {
+        let id = ACID_SERVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id();
+        let facts_addr = format!("ipc:///tmp/mdma-test-acid-facts-{}-{}.sock", pid, id);
+        let events_addr = format!("ipc:///tmp/mdma-test-acid-events-{}-{}.sock", pid, id);
+
+        let rep = nng::Socket::new(nng::Protocol::Rep0).expect("rep socket");
+        rep.listen(&facts_addr).expect("rep listen");
+
+        let pub_sock = nng::Socket::new(nng::Protocol::Pub0).expect("pub socket");
+        pub_sock.listen(&events_addr).expect("pub listen");
+
+        let handle = acid_service::start(rep, pub_sock, std::path::Path::new("/tmp"))
+            .expect("failed to start acid server");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        (handle, facts_addr, events_addr)
+    }
+
+    fn make_service_with_playlists_dir() -> (
+        LibraryService,
+        tempfile::TempDir,
+        acid_service::ServerHandle,
+    ) {
         let music_dir = tempfile::tempdir().unwrap();
         let metadata_dir = tempfile::tempdir().unwrap();
         // create the playlists sub-directory
         std::fs::create_dir_all(metadata_dir.path().join("playlists")).unwrap();
-        let service = LibraryService::new(
+        let (acid_handle, facts_addr, events_addr) = spawn_acid_server();
+        let service = LibraryService::new_with_events(
             music_dir.path().to_path_buf(),
             metadata_dir.path().to_path_buf(),
-            "ipc:///tmp/mdma-test-acid-nonexistent.sock",
+            &facts_addr,
+            &events_addr,
         )
         .unwrap();
-        (service, metadata_dir)
+        (service, metadata_dir, acid_handle)
     }
 
     #[test]
     fn playlist_list_returns_empty_when_no_playlists() {
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let response = service.handle_request(LibraryRequest::PlaylistList);
         match response {
             LibraryResponse::PlaylistNames(names) => {
@@ -1983,7 +2041,7 @@ mod tests {
     #[test]
     fn playlist_new_creates_and_returns_content() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("test-set").unwrap();
         let content = "sha256:abc\nsha256:def\n".to_string();
         let response = service.handle_request(LibraryRequest::PlaylistNew {
@@ -1999,7 +2057,7 @@ mod tests {
     #[test]
     fn playlist_list_returns_created_playlist() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("my-set").unwrap();
         service.handle_request(LibraryRequest::PlaylistNew {
             name,
@@ -2020,7 +2078,7 @@ mod tests {
     #[test]
     fn playlist_new_fails_if_already_exists() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("dupe").unwrap();
         service.handle_request(LibraryRequest::PlaylistNew {
             name: name.clone(),
@@ -2039,7 +2097,7 @@ mod tests {
     #[test]
     fn playlist_get_returns_content() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("get-me").unwrap();
         let content = "sha256:abc\n".to_string();
         service.handle_request(LibraryRequest::PlaylistNew {
@@ -2056,7 +2114,7 @@ mod tests {
     #[test]
     fn playlist_get_returns_not_found_for_missing() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("missing").unwrap();
         let response = service.handle_request(LibraryRequest::PlaylistGet { name });
         match response {
@@ -2068,7 +2126,7 @@ mod tests {
     #[test]
     fn playlist_append_adds_to_existing_content() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("append-me").unwrap();
         service.handle_request(LibraryRequest::PlaylistNew {
             name: name.clone(),
@@ -2090,7 +2148,7 @@ mod tests {
     #[test]
     fn playlist_append_fails_if_not_found() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("no-such-playlist").unwrap();
         let response = service.handle_request(LibraryRequest::PlaylistAppend {
             name,
@@ -2105,7 +2163,7 @@ mod tests {
     #[test]
     fn playlist_replace_overwrites_content() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("replace-me").unwrap();
         service.handle_request(LibraryRequest::PlaylistNew {
             name: name.clone(),
@@ -2125,7 +2183,7 @@ mod tests {
     #[test]
     fn playlist_remove_deletes_playlist() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("remove-me").unwrap();
         service.handle_request(LibraryRequest::PlaylistNew {
             name: name.clone(),
@@ -2141,7 +2199,7 @@ mod tests {
     #[test]
     fn playlist_rename_works() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         // Create
         let name = PlaylistName::new("old-name").unwrap();
         service.handle_request(LibraryRequest::PlaylistNew {
@@ -2169,13 +2227,130 @@ mod tests {
     #[test]
     fn playlist_remove_fails_if_not_found() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("not-there").unwrap();
         let response = service.handle_request(LibraryRequest::PlaylistRemove { name });
         match response {
             LibraryResponse::Error(ProtocolError::PlaylistNotFound { .. }) => {}
             other => panic!("Expected PlaylistNotFound error, got {:?}", other),
         }
+    }
+
+    // =========================================================================
+    // Hash resolution tests
+    // =========================================================================
+
+    #[test]
+    fn resolve_hash_with_duplicate_same_hash_returns_first_match() {
+        // Two index entries that share the exact same content_hash (legacy short
+        // hashes can collide in the index). They represent the same content, so
+        // resolve_hash must return that hash rather than an Ambiguous error.
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+
+        let service = LibraryService::new(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+            "ipc:///tmp/mdma-test-acid-nonexistent.sock",
+        )
+        .unwrap();
+
+        // Inject two entries with the exact same content_hash directly.
+        let shared_hash = ContentHash::new("10e95ec1");
+        {
+            let mut tracks = service.tracks.lock().unwrap();
+            let mut entry_a = IndexedTrackInfo::new_empty(shared_hash.as_str().to_owned());
+            entry_a.title = Some("Track A".to_owned());
+            let mut entry_b = IndexedTrackInfo::new_empty(shared_hash.as_str().to_owned());
+            entry_b.title = Some("Track B".to_owned());
+            tracks.push(entry_a);
+            tracks.push(entry_b);
+        }
+
+        // resolve_hash should succeed because both matches have identical hashes.
+        let result = service.resolve_hash(&shared_hash);
+        assert_eq!(
+            result
+                .expect("resolve_hash should return Ok for duplicate entries with the same hash")
+                .as_str(),
+            shared_hash.as_str(),
+            "resolved hash should equal the shared hash"
+        );
+    }
+
+    #[test]
+    fn resolve_hash_with_prefix_collision_different_hashes_returns_ambiguous() {
+        // Two entries whose hashes share a common prefix but are different values.
+        // This is a genuine ambiguity and must still return an error.
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+
+        let service = LibraryService::new(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+            "ipc:///tmp/mdma-test-acid-nonexistent.sock",
+        )
+        .unwrap();
+
+        let hash_a = ContentHash::new("sha256:abcdef0011223344");
+        let hash_b = ContentHash::new("sha256:abcdef0099887766");
+        {
+            let mut tracks = service.tracks.lock().unwrap();
+            let mut entry_a = IndexedTrackInfo::new_empty(hash_a.as_str().to_owned());
+            entry_a.title = Some("Track A".to_owned());
+            let mut entry_b = IndexedTrackInfo::new_empty(hash_b.as_str().to_owned());
+            entry_b.title = Some("Track B".to_owned());
+            tracks.push(entry_a);
+            tracks.push(entry_b);
+        }
+
+        // Use "sha256:abcdef00" as the partial prefix that matches both hashes.
+        let partial = ContentHash::new("sha256:abcdef00");
+        let result = service.resolve_hash(&partial);
+        assert!(
+            matches!(result, Err(_)),
+            "expected Ambiguous error for genuine prefix collision, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn resolve_hash_with_legacy_short_and_full_hash_returns_full_hash() {
+        // One entry has a legacy 8-char short hash ("9fb4105e") and another has
+        // the full sha256 hash ("sha256:9fb4105eXXX...") for the same file.
+        // resolve_hash must recognise them as the same content and return the
+        // full hash (the most complete one), not an Ambiguous error.
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+
+        let service = LibraryService::new(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+            "ipc:///tmp/mdma-test-acid-nonexistent.sock",
+        )
+        .unwrap();
+
+        let legacy_hash = ContentHash::new("9fb4105e");
+        let full_hash = ContentHash::new("sha256:9fb4105eaabbccdd11223344556677889900aabb");
+        {
+            let mut tracks = service.tracks.lock().unwrap();
+            let mut entry_legacy = IndexedTrackInfo::new_empty(legacy_hash.as_str().to_owned());
+            entry_legacy.title = Some("Unknown".to_owned());
+            let mut entry_full = IndexedTrackInfo::new_empty(full_hash.as_str().to_owned());
+            entry_full.title = Some("20 Minutes".to_owned());
+            tracks.push(entry_legacy);
+            tracks.push(entry_full);
+        }
+
+        // Searching by the legacy short hash should resolve to the full hash.
+        let result = service.resolve_hash(&legacy_hash);
+        assert_eq!(
+            result
+                .expect("resolve_hash should return Ok for legacy+full hash pair")
+                .as_str(),
+            full_hash.as_str(),
+            "resolved hash should be the full sha256 hash"
+        );
     }
 
     // =========================================================================
@@ -2354,6 +2529,94 @@ mod tests {
             track_b_info.cover_art_path.as_deref(),
             Some(cover_path),
             "Track B should inherit album cover art from Track A on the same album"
+        );
+    }
+
+    // =========================================================================
+    // Bug fix tests: apply_lines_to_map and fallback guard
+    // =========================================================================
+
+    /// Verify that facts written to the in-memory ACID service are read back
+    /// correctly by load_from_acid_stream.
+    ///
+    /// Both `fact_store_memory` and `fact_store_file` now produce the same
+    /// array-format JSONL lines, so direct `serde_json::from_str::<Fact<>>()` works
+    /// for both backends without a compatibility shim.
+    #[test]
+    fn load_from_acid_stream_parses_facts_via_memory_storage() {
+        let (acid_handle, facts_addr, _events_addr) = spawn_acid_server();
+
+        let acid_client = AcidClient::connect(&facts_addr).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let hash = ContentHash::new("sha256:acidstreamtest01");
+        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        acid_client
+            .write_music_facts(
+                &hash,
+                &[(MusicValue::Title(Title::new("ACID Track")), source)],
+            )
+            .unwrap();
+
+        let (loaded, _cursor) = LibraryService::load_from_acid_stream(&acid_client, None);
+
+        drop(acid_handle);
+
+        assert_eq!(
+            loaded.tracks.len(),
+            1,
+            "load_from_acid_stream must return the track written to the in-memory ACID store"
+        );
+        assert_eq!(
+            loaded.tracks[0].title.as_deref(),
+            Some("ACID Track"),
+            "track title must be parsed from ACID stream line"
+        );
+    }
+
+    /// Bug 2: fallback to facts.jsonl must trigger whenever tracks.is_empty(),
+    /// regardless of whether a cursor was present.
+    ///
+    /// Before the fix, a saved cursor suppresses the fallback even when ACID
+    /// returns 0 new facts (cursor is already at end-of-file).
+    #[test]
+    fn fallback_to_facts_file_when_acid_returns_empty_with_cursor() {
+        let hash = ContentHash::new("sha256:cursorfallback01");
+
+        let temp = write_facts_file(&[(
+            hash.clone(),
+            MusicValue::Title(Title::new("Fallback Track")),
+        )]);
+
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+
+        // Copy facts file to where the service expects it
+        let facts_dest = metadata_dir.path().join("facts.jsonl");
+        std::fs::copy(temp.path(), &facts_dest).unwrap();
+
+        // Write a cursor file so saved_cursor.is_some() — simulates "already synced"
+        let cursor_path = metadata_dir.path().join("facts.cursor");
+        LibraryService::save_cursor(&cursor_path, "line:1");
+
+        // Use a nonexistent ACID socket so load_from_acid_stream returns 0 lines
+        let service = LibraryService::new(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+            "ipc:///tmp/mdma-test-acid-nonexistent.sock",
+        )
+        .unwrap();
+
+        let tracks = service.tracks.lock().unwrap();
+        assert_eq!(
+            tracks.len(),
+            1,
+            "service must fall back to facts.jsonl when ACID returns 0 tracks even if a cursor was saved"
+        );
+        assert_eq!(
+            tracks[0].title.as_deref(),
+            Some("Fallback Track"),
+            "fallback track title must match the facts file"
         );
     }
 

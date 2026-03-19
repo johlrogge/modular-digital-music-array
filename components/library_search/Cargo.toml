@@ -6,6 +6,11 @@ authors.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "library-search"
+
 [dependencies]
 date-expression = { path = "../date_expression" }
 chrono = { workspace = true, features = ["serde"] }

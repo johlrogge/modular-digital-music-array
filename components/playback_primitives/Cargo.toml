@@ -6,14 +6,19 @@ authors.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "playback-primitives"
+
 [dependencies]
 thiserror.workspace = true
-serde = { version = "1.0", features = ["derive"] }
+serde = { workspace = true }
 chrono = { workspace = true }
 music-primitives = { path = "../music_primitives" }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
 assert_matches.workspace = true
-serde_json = "1.0"
+serde_json = { workspace = true }
 rstest = { workspace = true }

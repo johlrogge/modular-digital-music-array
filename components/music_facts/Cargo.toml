@@ -6,6 +6,11 @@ authors.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "music-facts"
+
 [dependencies]
 music-primitives = { path = "../music_primitives" }
 playback-primitives = { path = "../playback_primitives" }
@@ -18,4 +23,4 @@ chrono = { workspace = true, features = ["serde"] }
 pretty_assertions = { workspace = true }
 rstest = { workspace = true }
 serde_json = { workspace = true }
-stainless-facts = { git = "https://github.com/johlrogge/stainless_facts" }
+stainless-facts = { git = "https://github.com/johlrogge/stainless_facts", rev = "2aa820a808fd5345a1bd59c11d90969bfa84b285" }

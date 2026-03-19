@@ -20,13 +20,50 @@
         "type": "github"
       }
     },
+    "corsett": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1771792543,
+        "owner": "johlrogge",
+        "repo": "corsett",
+        "rev": "bf16c1aa2e8d6ba1f833e33009f2deecadc3ee26",
+        "type": "github"
+      },
+      "original": {
+        "owner": "johlrogge",
+        "repo": "corsett",
+        "type": "github"
+      }
+    },
+    "ctx": {
+      "inputs": {
+        "corsett": "corsett",
+        "flake-utils": "flake-utils_2",
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1773355372,
+        "owner": "johlrogge.rs",
+        "repo": "ctx",
+        "rev": "eedcdda6f27df5d0af853af205335b7a2df9e6d2",
+        "type": "gitlab"
+      },
+      "original": {
+        "owner": "johlrogge.rs",
+        "repo": "ctx",
+        "type": "gitlab"
+      }
+    },
     "devenv": {
       "locked": {
         "dir": "src/modules",
-        "lastModified": 1771419682,
+        "lastModified": 1773767086,
+        "narHash": "sha256-3eKyl4LXswf6P17/u59x8oQXDgCfYX+UX0uh7YHFwJc=",
         "owner": "cachix",
         "repo": "devenv",
-        "rev": "f77fc4de35c184d9ef9a32d5d7e9033351bcdfdc",
+        "rev": "a5e5a7f8b1c9a7f33f9d82192b692768b39ec710",
         "type": "github"
       },
       "original": {
@@ -54,6 +91,23 @@
     "flake-utils": {
       "inputs": {
         "systems": "systems"
+      },
+      "locked": {
+        "lastModified": 1731533236,
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "rev": "11707dc2f618dd54ca8739b309ec4fc024de578b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "type": "github"
+      }
+    },
+    "flake-utils_2": {
+      "inputs": {
+        "systems": "systems_2"
       },
       "locked": {
         "lastModified": 1731533236,
@@ -112,10 +166,11 @@
     "metadev": {
       "flake": false,
       "locked": {
-        "lastModified": 1773342440,
+        "lastModified": 1773950381,
+        "narHash": "sha256-q1tAiOcFqrmlTrbZEeKJISBr6+LiyFpiumIg1RmUR8s=",
         "owner": "johlrogge",
         "repo": "metadev",
-        "rev": "bf2b78078b60a88fdd7037dc75472e42b5628fc0",
+        "rev": "b2b48ed435aa528e72c2e5873ef36ed92a7c6a09",
         "type": "github"
       },
       "original": {
@@ -162,13 +217,11 @@
     "root": {
       "inputs": {
         "claude-code-nix": "claude-code-nix",
+        "ctx": "ctx",
         "devenv": "devenv",
         "git-hooks": "git-hooks",
         "metadev": "metadev",
         "nixpkgs": "nixpkgs",
-        "pre-commit-hooks": [
-          "git-hooks"
-        ],
         "rust-overlay": "rust-overlay"
       }
     },
@@ -192,6 +245,20 @@
       }
     },
     "systems": {
+      "locked": {
+        "lastModified": 1681028828,
+        "owner": "nix-systems",
+        "repo": "default",
+        "rev": "da67096a3b9bf56a91d16901293e51ba5b49a27e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-systems",
+        "repo": "default",
+        "type": "github"
+      }
+    },
+    "systems_2": {
       "locked": {
         "lastModified": 1681028828,
         "owner": "nix-systems",

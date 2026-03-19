@@ -2,11 +2,11 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum PlaybackError {
-    #[error("Audio device error: {0}")]
-    AudioDevice(String),
+    #[error(transparent)]
+    AudioOutput(#[from] audio_output::AudioOutputError),
 
-    #[error("Decoder error: {0}")]
-    Decoder(String),
+    #[error(transparent)]
+    Decoder(#[from] audio_decoder::DecoderError),
 
     #[error("No track loaded")]
     NoTrackLoaded,
@@ -16,6 +16,6 @@ pub enum PlaybackError {
     #[error("Task cancelled")]
     TaskCancelled,
 
-    #[error("Resampler error: {0}")]
-    Resampler(String),
+    #[error(transparent)]
+    Resampler(#[from] audio_resampler::ResamplerError),
 }

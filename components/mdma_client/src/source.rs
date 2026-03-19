@@ -44,14 +44,7 @@ impl SourceClient {
     ) -> Result<SourceResponse, NngClientError> {
         match self {
             SourceClient::Gateway(gw) => gw.source_request(name, req),
-            SourceClient::Direct(socket) => {
-                let data = serde_json::to_vec(req)?;
-                let msg = nng::Message::from(&data[..]);
-                socket.send(msg).map_err(|(_, e)| NngClientError::Nng(e))?;
-                let resp_msg = socket.recv()?;
-                let response = serde_json::from_slice(&resp_msg)?;
-                Ok(response)
-            }
+            SourceClient::Direct(socket) => nng_transport::request_response(socket, req),
         }
     }
 }

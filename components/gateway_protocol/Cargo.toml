@@ -6,11 +6,17 @@ authors.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "gateway-protocol"
+
 [dependencies]
-acid_protocol = { path = "../acid_protocol" }
+acid-protocol = { path = "../acid_protocol" }
 source-protocol = { path = "../source_protocol" }
 library-ipc-protocol = { path = "../library_ipc_protocol" }
 media-protocol = { path = "../media_protocol" }
+playback-primitives = { path = "../playback_primitives" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 

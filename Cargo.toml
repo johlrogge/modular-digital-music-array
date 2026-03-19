@@ -1,4 +1,4 @@
-# Root Cargo.toml with beacon added
+# Root Cargo.toml — beacon, mdma_console, mdma_library migrated to projects/ standalone workspaces
 [workspace]
 members = [
     # Components (bricks)
@@ -11,9 +11,12 @@ members = [
     "components/media_protocol",
     "components/music_facts",
     "components/music_primitives",
+    "components/audio_types",
+    "components/audio_decoder",
+    "components/audio_output",
+    "components/audio_resampler",
     "components/playback_engine",
     "components/playback_primitives",
-    "components/time_primitives",
     "components/storage_primitives",
     "components/event_protocol",
     "components/nng_transport",
@@ -25,40 +28,64 @@ members = [
     "components/audio_transcoder",
     "components/inbox_utils",
     "components/library_service",
+    "components/library_service_stub",
+    "components/library_ingestion",
     "components/acid_protocol",
     "components/acid_client",
+    "components/fact_store_memory",
+    "components/fact_store_file",
+    "components/acid_service",
     "components/stream_source_protocol",
     # Bases (entry points)
-    "bases/mdma_playback",
-    "bases/beacon",
-    "bases/mdma_console",
-    "bases/mdma_library",
-    "bases/mdma_cli",
-    "bases/mdma_bandcamp",
-    "bases/mdma_gateway",
-    "bases/mdma_acid",
-    "bases/mdma_audio",
-    "bases/mdma_tui",
-    # Tests
-    "tests/bdd",
+    "bases/service",
+    "bases/http_server",
+    "bases/tui",
+    "bases/client",
 ]
 default-members = [
-    "components/*",
-    "bases/beacon",
-    "bases/mdma_bandcamp",
-    "bases/mdma_cli",
-    "bases/mdma_console",
-    "bases/mdma_acid",
-    "bases/mdma_gateway",
-    "bases/mdma_library",
-    "bases/mdma_playback",
-    "bases/mdma_audio",
-    "bases/mdma_tui",
+    "components/date_expression",
+    "components/bandcamp_api",
+    "components/audio_metadata",
+    "components/library_ipc_client",
+    "components/library_ipc_protocol",
+    "components/media_client",
+    "components/media_protocol",
+    "components/music_facts",
+    "components/music_primitives",
+    "components/audio_types",
+    "components/audio_decoder",
+    "components/audio_output",
+    "components/audio_resampler",
+    "components/playback_engine",
+    "components/playback_primitives",
+    "components/storage_primitives",
+    "components/event_protocol",
+    "components/nng_transport",
+    "components/library_search",
+    "components/source_protocol",
+    "components/gateway_protocol",
+    "components/gateway_client",
+    "components/mdma_client",
+    "components/audio_transcoder",
+    "components/inbox_utils",
+    "components/library_service",
+    "components/library_service_stub",
+    "components/library_ingestion",
+    "components/acid_protocol",
+    "components/acid_client",
+    "components/fact_store_memory",
+    "components/fact_store_file",
+    "components/acid_service",
+    "components/stream_source_protocol",
+    "bases/service",
+    "bases/http_server",
+    "bases/tui",
+    "bases/client",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 authors = ["MDMA Development Team"]
 repository = "https://github.com/your-org/mdma"
@@ -89,6 +116,8 @@ tokio = { version = "1.36", features = ["full"] }
 tower-http = { version = "0.5", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+fact-store = { path = "components/fact_store_memory" }
+acid-service = { path = "components/acid_service" }
 
 [profile.release]
 strip = true

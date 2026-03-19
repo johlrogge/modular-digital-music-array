@@ -23,8 +23,11 @@ impl Default for AudioOutputConfig {
 pub fn load_audio_config(path: &Path) -> Result<AudioOutputConfig, PlaybackError> {
     match std::fs::read_to_string(path) {
         Ok(contents) => {
-            let config = serde_json::from_str(&contents)
-                .map_err(|e| PlaybackError::AudioDevice(format!("Config parse error: {e}")))?;
+            let config = serde_json::from_str(&contents).map_err(|e| {
+                PlaybackError::AudioOutput(audio_output::AudioOutputError::AudioDevice(format!(
+                    "Config parse error: {e}"
+                )))
+            })?;
             Ok(config)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AudioOutputConfig::default()),
@@ -34,8 +37,11 @@ pub fn load_audio_config(path: &Path) -> Result<AudioOutputConfig, PlaybackError
 
 /// Save audio output config to a JSON file (atomic write via temp file + rename).
 pub fn save_audio_config(path: &Path, config: &AudioOutputConfig) -> Result<(), PlaybackError> {
-    let json = serde_json::to_string_pretty(config)
-        .map_err(|e| PlaybackError::AudioDevice(format!("Config serialize error: {e}")))?;
+    let json = serde_json::to_string_pretty(config).map_err(|e| {
+        PlaybackError::AudioOutput(audio_output::AudioOutputError::AudioDevice(format!(
+            "Config serialize error: {e}"
+        )))
+    })?;
     let tmp_path = path.with_extension("json.tmp");
     std::fs::write(&tmp_path, json)?;
     std::fs::rename(&tmp_path, path)?;

@@ -6,8 +6,13 @@ authors.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "acid-client"
+
 [dependencies]
-acid_protocol = { path = "../acid_protocol" }
+acid-protocol = { path = "../acid_protocol" }
 nng = { workspace = true }
 nng-transport = { path = "../nng_transport" }
 serde_json = { workspace = true }

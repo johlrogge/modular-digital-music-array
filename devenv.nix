@@ -117,7 +117,12 @@ in
     rm -f /tmp/mdma-dev/run/*.sock
     mkdir -p /tmp/mdma-dev/run/sources /tmp/mdma-dev/music/inbox /tmp/mdma-dev/music/blobs /tmp/mdma-dev/metadata
     echo "Building all services..."
-    cargo build --release --package mdma-acid --package mdma-library --package mdma-playback --package mdma-gateway --package mdma-console
+    cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-acid/Cargo.toml" 2>/dev/null \
+      && cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-library/Cargo.toml" 2>/dev/null \
+      && cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-playback/Cargo.toml" 2>/dev/null \
+      && cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-gateway/Cargo.toml" 2>/dev/null \
+      && cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-console/Cargo.toml" 2>/dev/null \
+      || echo "One or more services failed to build — check individual manifests"
   '';
 
   processes = {
@@ -195,10 +200,11 @@ in
     # Build mdma-cli and mdma-tui, expose via target/debug on PATH
     # Skip in CI — the build is wasted work there (~30s)
     if [ -z "''${CI:-}" ]; then
-      cargo build -q --package mdma-cli --package mdma-tui 2>/dev/null \
+      cargo build -q --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-cli/Cargo.toml" 2>/dev/null \
+        && cargo build -q --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-tui/Cargo.toml" 2>/dev/null \
         && export PATH="$MDMA_PROJECT_ROOT/target/debug:$PATH" \
         && echo "mdma CLI + TUI ready (gateway mode)" \
-        || echo "mdma CLI/TUI not built — run: cargo build --package mdma-cli --package mdma-tui"
+        || echo "mdma CLI/TUI not built — run: cargo build --manifest-path projects/mdma-cli/Cargo.toml && cargo build --manifest-path projects/mdma-tui/Cargo.toml"
       eval "$(mdma generate-completions bash 2>/dev/null)" || true
     fi
 
@@ -286,7 +292,9 @@ in
       model = "sonnet";
       proactive = false;
       tools = [ "Read" "Write" "Edit" "Grep" "Glob"
-                "mcp__just-dev__just_run" "mcp__just-dev__just_list" ];
+                "mcp__just-dev__just_run" "mcp__just-dev__just_list"
+                "mcp__rust-codebase__cargo_check" "mcp__rust-codebase__cargo_test"
+                "mcp__rust-codebase__cargo_clippy" "mcp__rust-codebase__hygiene_report" ];
       prompt = ''
         You write clean, idiomatic Rust code for the MDMA project.
         Follow existing patterns — do NOT invent new architecture.
@@ -296,11 +304,14 @@ in
         - components/ — Shared libraries (playback_engine, music_primitives, mdma_client, etc.)
         - tests/bdd/ — Cucumber-rs BDD tests with Gherkin features
 
-        Build/test via just MCP tool (just_run with project path):
-          just build   — compile the workspace
-          just watch   — watch and run check, test, build, clippy on changes
-          just bdd     — run BDD tests
-        Use just_list to see all available recipes.
+        Build/test via rust-codebase MCP tools (preferred) or just MCP:
+          cargo_check        — fast compile check
+          cargo_test         — run unit tests
+          cargo_clippy       — lint
+          hygiene_report     — test + clippy + coverage in one shot
+          just build         — full workspace build
+          just bdd           — run BDD tests
+        Use just_list to see all available just recipes.
         Conventions: workspace deps, thiserror for libs, color-eyre for bins,
         tokio async, nng IPC, serde_json protocol, inline #[cfg(test)] modules.
         BDD: features in tests/bdd/features/, steps in tests/bdd/src/steps/,

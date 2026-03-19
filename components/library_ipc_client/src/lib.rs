@@ -68,15 +68,7 @@ impl LibraryClient {
     /// This is the low-level method that sends any request type.
     /// For convenience, use the typed methods like `ping()`, `status()`, etc.
     pub fn request(&self, request: &LibraryRequest) -> Result<LibraryResponse, ClientError> {
-        let data = serde_json::to_vec(request)?;
-        let msg = nng::Message::from(&data[..]);
-        self.socket
-            .send(msg)
-            .map_err(|(_, e)| ClientError::Transport(nng_transport::NngClientError::Nng(e)))?;
-
-        let response_msg = self.socket.recv()?;
-        let response: LibraryResponse = serde_json::from_slice(&response_msg)?;
-        Ok(response)
+        Ok(nng_transport::request_response(&self.socket, request)?)
     }
 
     // =========================================================================
@@ -261,6 +253,140 @@ impl LibraryClient {
             })),
         }
     }
+
+    // =========================================================================
+    // Playlist Methods
+    // =========================================================================
+
+    /// List all playlists.
+    pub fn playlist_list(&self) -> Result<Vec<PlaylistName>, ClientError> {
+        match self.request(&LibraryRequest::PlaylistList)? {
+            LibraryResponse::PlaylistNames(names) => Ok(names),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to PlaylistList".to_string(),
+            })),
+        }
+    }
+
+    /// Get the contents of a playlist as a list of content hashes.
+    pub fn playlist_get(&self, name: &PlaylistName) -> Result<Vec<ContentHash>, ClientError> {
+        match self.request(&LibraryRequest::PlaylistGet { name: name.clone() })? {
+            LibraryResponse::PlaylistContent(content) => Ok(content_to_hashes(&content)),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to PlaylistGet".to_string(),
+            })),
+        }
+    }
+
+    /// Create a new playlist with the given hashes.
+    pub fn playlist_new(
+        &self,
+        name: &PlaylistName,
+        hashes: &[ContentHash],
+    ) -> Result<(), ClientError> {
+        match self.request(&LibraryRequest::PlaylistNew {
+            name: name.clone(),
+            content: hashes_to_content(hashes),
+        })? {
+            LibraryResponse::PlaylistContent(_) => Ok(()),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to PlaylistNew".to_string(),
+            })),
+        }
+    }
+
+    /// Append hashes to an existing playlist.
+    pub fn playlist_append(
+        &self,
+        name: &PlaylistName,
+        hashes: &[ContentHash],
+    ) -> Result<(), ClientError> {
+        match self.request(&LibraryRequest::PlaylistAppend {
+            name: name.clone(),
+            content: hashes_to_content(hashes),
+        })? {
+            LibraryResponse::PlaylistContent(_) => Ok(()),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to PlaylistAppend".to_string(),
+            })),
+        }
+    }
+
+    /// Replace all hashes in an existing playlist.
+    pub fn playlist_replace(
+        &self,
+        name: &PlaylistName,
+        hashes: &[ContentHash],
+    ) -> Result<(), ClientError> {
+        match self.request(&LibraryRequest::PlaylistReplace {
+            name: name.clone(),
+            content: hashes_to_content(hashes),
+        })? {
+            LibraryResponse::PlaylistContent(_) => Ok(()),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to PlaylistReplace".to_string(),
+            })),
+        }
+    }
+
+    /// Remove a playlist.
+    pub fn playlist_remove(&self, name: &PlaylistName) -> Result<(), ClientError> {
+        match self.request(&LibraryRequest::PlaylistRemove { name: name.clone() })? {
+            LibraryResponse::PlaylistContent(_) => Ok(()),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to PlaylistRemove".to_string(),
+            })),
+        }
+    }
+
+    /// Rename a playlist.
+    pub fn playlist_rename(
+        &self,
+        from: &PlaylistName,
+        to: &PlaylistName,
+    ) -> Result<(), ClientError> {
+        match self.request(&LibraryRequest::PlaylistRename {
+            from: from.clone(),
+            to: to.clone(),
+        })? {
+            LibraryResponse::PlaylistContent(_) => Ok(()),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to PlaylistRename".to_string(),
+            })),
+        }
+    }
+}
+
+// =========================================================================
+// Playlist content helpers
+// =========================================================================
+
+/// Serialize a slice of ContentHash to the one-hash-per-line format.
+pub fn hashes_to_content(hashes: &[ContentHash]) -> String {
+    hashes
+        .iter()
+        .map(|h| h.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Parse hash-per-line playlist content. Skips empty lines and comment lines.
+/// Takes the first whitespace-separated token per line (hash may be followed by display info).
+pub fn content_to_hashes(content: &str) -> Vec<ContentHash> {
+    content
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.split_whitespace().next())
+        .map(|token| ContentHash::new(token))
+        .collect()
 }
 
 #[cfg(test)]
