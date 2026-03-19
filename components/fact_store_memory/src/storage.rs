@@ -1,5 +1,5 @@
 //! In-memory FactStorage for ACID server.
-use acid_protocol::{cursor_from_offset, offset_from_cursor, FactEntry, StreamChunk};
+use acid_protocol::{cursor_from_offset, FactEntry, StreamChunk};
 use chrono::Utc;
 use std::path::Path;
 use std::sync::Mutex;
@@ -68,6 +68,7 @@ impl FactStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use acid_protocol::offset_from_cursor;
 
     #[test]
     fn new_creates_empty_storage() {
