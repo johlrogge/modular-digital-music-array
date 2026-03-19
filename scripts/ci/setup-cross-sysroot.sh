@@ -24,11 +24,17 @@ if [ -z "$LIBPIPEWIRE_PKG" ]; then
   exit 1
 fi
 
-PIPEWIRE_DEVEL_PKG=$(curl -sL "$VOID_REPO/" | grep -oE 'pipewire-devel-[0-9][0-9._]+\.aarch64\.xbps' | sort -V | tail -1)
-if [ -z "$PIPEWIRE_DEVEL_PKG" ]; then
-  echo "ERROR: Could not discover pipewire-devel package from $VOID_REPO/" >&2
+# Extract the version suffix (e.g. "1.6.2_1") from the libpipewire package name
+# and reuse it for pipewire-devel to avoid false positives from independent grepping
+# (e.g. pipewire-devel-6.6.2_1 which is actually a Linux kernel package).
+PIPEWIRE_PKG_VER=$(echo "$LIBPIPEWIRE_PKG" | grep -oE '[0-9][0-9._]+(?=\.aarch64\.xbps)')
+if [ -z "$PIPEWIRE_PKG_VER" ]; then
+  echo "ERROR: Could not extract version suffix from package name: $LIBPIPEWIRE_PKG" >&2
   exit 1
 fi
+
+LIBPIPEWIRE_PKG="libpipewire-${PIPEWIRE_PKG_VER}.aarch64.xbps"
+PIPEWIRE_DEVEL_PKG="pipewire-devel-${PIPEWIRE_PKG_VER}.aarch64.xbps"
 
 # Extract the version string (e.g. "1.4.9_1" → "1.4.9") for use in the .pc file
 # Package name format: libpipewire-<version>_<rev>.aarch64.xbps
