@@ -16,17 +16,42 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 echo "Setting up aarch64 cross-compilation sysroot..."
 
+# Dynamically discover the current PipeWire version in the Void Linux repo
+echo "  Discovering current PipeWire version from Void Linux repo..."
+LIBPIPEWIRE_PKG=$(curl -sL "$VOID_REPO/" | grep -oE 'libpipewire-[0-9][0-9._]+\.aarch64\.xbps' | sort -V | tail -1)
+if [ -z "$LIBPIPEWIRE_PKG" ]; then
+  echo "ERROR: Could not discover libpipewire package from $VOID_REPO/" >&2
+  exit 1
+fi
+
+PIPEWIRE_DEVEL_PKG=$(curl -sL "$VOID_REPO/" | grep -oE 'pipewire-devel-[0-9][0-9._]+\.aarch64\.xbps' | sort -V | tail -1)
+if [ -z "$PIPEWIRE_DEVEL_PKG" ]; then
+  echo "ERROR: Could not discover pipewire-devel package from $VOID_REPO/" >&2
+  exit 1
+fi
+
+# Extract the version string (e.g. "1.4.9_1" → "1.4.9") for use in the .pc file
+# Package name format: libpipewire-<version>_<rev>.aarch64.xbps
+PIPEWIRE_VER=$(echo "$LIBPIPEWIRE_PKG" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+if [ -z "$PIPEWIRE_VER" ]; then
+  echo "ERROR: Could not parse PipeWire version from package name: $LIBPIPEWIRE_PKG" >&2
+  exit 1
+fi
+
+echo "  Found: $LIBPIPEWIRE_PKG (version $PIPEWIRE_VER)"
+echo "  Found: $PIPEWIRE_DEVEL_PKG"
+
 # Download packages
 echo "  Downloading aarch64 PipeWire packages from Void Linux..."
-curl -sL "$VOID_REPO/libpipewire-1.4.9_1.aarch64.xbps" -o "$TMPDIR/libpipewire.xbps"
-curl -sL "$VOID_REPO/pipewire-devel-1.4.9_1.aarch64.xbps" -o "$TMPDIR/pipewire-devel.xbps"
+curl -fsSL "$VOID_REPO/$LIBPIPEWIRE_PKG" -o "$TMPDIR/libpipewire.xbps"
+curl -fsSL "$VOID_REPO/$PIPEWIRE_DEVEL_PKG" -o "$TMPDIR/pipewire-devel.xbps"
 
 # Extract
 echo "  Extracting..."
 mkdir -p "$TMPDIR/extract"
 cd "$TMPDIR/extract"
-tar xf "$TMPDIR/libpipewire.xbps" 2>/dev/null
-tar xf "$TMPDIR/pipewire-devel.xbps" 2>/dev/null
+tar xf "$TMPDIR/libpipewire.xbps"
+tar xf "$TMPDIR/pipewire-devel.xbps"
 
 # Create sysroot structure
 echo "  Creating sysroot at $SYSROOT..."
@@ -48,7 +73,7 @@ moduledir=\${libdir}/pipewire-0.3
 
 Name: libpipewire
 Description: PipeWire Interface
-Version: 1.4.9
+Version: $PIPEWIRE_VER
 Requires: libspa-0.2
 Libs: -L\${libdir} -lpipewire-0.3
 Cflags: -I\${includedir}/pipewire-0.3 -D_REENTRANT
@@ -69,6 +94,7 @@ EOF
 
 echo ""
 echo "Sysroot ready at: $SYSROOT"
+echo "  PipeWire version: $PIPEWIRE_VER"
 echo "  Libraries: $(ls "$SYSROOT/usr/lib/"*.so* | wc -l) files"
 echo "  Headers:   pipewire-0.3, spa-0.2"
 echo ""
