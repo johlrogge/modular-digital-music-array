@@ -263,6 +263,7 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
+    use std::time::Instant;
 
     fn temp_cache_path(dir: &std::path::Path) -> PathBuf {
         dir.join("mdma").join("dns-cache")
@@ -334,42 +335,53 @@ mod tests {
         assert_eq!(result, Some("192.168.1.99".to_string()));
     }
 
-    /// Verify that connect() to an unreachable TCP address fails within 10 seconds.
-    ///
-    /// Without SendTimeout/RecvTimeout set on the socket, a subsequent send/recv
-    /// would block indefinitely. This test checks that the socket is created and
-    /// dial succeeds (NNG dial is non-blocking by default), then a send on a
-    /// disconnected socket times out rather than hanging forever.
     #[test]
-    fn connect_to_unreachable_address_has_send_timeout() {
-        use std::time::{Duration, Instant};
+    fn connect_configures_send_and_recv_timeouts() {
+        // Bind a Rep0 server so connect()'s blocking dial() can succeed.
+        let addr = format!("ipc:///tmp/mdma-test-timeouts-{}.sock", std::process::id());
+        let server = nng::Socket::new(nng::Protocol::Rep0).unwrap();
+        server.listen(&addr).unwrap();
 
-        // Use a TCP address on a port that should be closed (TEST-NET range, RFC 5737)
-        let result = connect("tcp://192.0.2.1:19999");
-        // Dial may succeed (NNG dials asynchronously) or fail — either outcome is explicit below.
-        match result {
-            Ok(socket) => {
-                // Got a socket — verify the send timeout fires well within 10 seconds.
-                let start = Instant::now();
-                let msg = nng::Message::new();
-                let send_result = socket.send(msg);
-                let elapsed = start.elapsed();
-                // Send must fail (timeout) and must complete within 10 seconds.
-                assert!(
-                    send_result.is_err(),
-                    "Expected send to unreachable address to fail"
-                );
-                assert!(
-                    elapsed < Duration::from_secs(10),
-                    "Send took {:?}, expected timeout within 10s",
-                    elapsed
-                );
-            }
-            Err(_) => {
-                // connect() itself rejected early (e.g. DNS/NNG refused connection outright).
-                // Early rejection is acceptable — the socket never blocked indefinitely.
-                assert!(true, "connect() failed fast; no hang risk");
-            }
-        }
+        let client = connect(&addr).expect("should connect to local server");
+
+        // Verify connect() configured both timeout options.
+        let send_timeout = client.get_opt::<SendTimeout>().unwrap();
+        let recv_timeout = client.get_opt::<RecvTimeout>().unwrap();
+        assert_eq!(send_timeout, Some(DEFAULT_TIMEOUT));
+        assert_eq!(recv_timeout, Some(DEFAULT_TIMEOUT));
+    }
+
+    #[test]
+    fn recv_on_unresponsive_server_times_out() {
+        // Server accepts connection but never replies.
+        let addr = format!(
+            "ipc:///tmp/mdma-test-timeout-fires-{}.sock",
+            std::process::id()
+        );
+        let server = nng::Socket::new(nng::Protocol::Rep0).unwrap();
+        server.listen(&addr).unwrap();
+
+        let client = connect(&addr).expect("should connect to local server");
+        // Short timeout so the test doesn't take 5 seconds.
+        client
+            .set_opt::<RecvTimeout>(Some(Duration::from_millis(100)))
+            .unwrap();
+
+        // Send a request — succeeds (goes into IPC buffer).
+        let msg = nng::Message::new();
+        client.send(msg).expect("send should succeed");
+        // Server never reads and never replies.
+
+        // Recv blocks until RecvTimeout fires.
+        let start = Instant::now();
+        let result = client.recv();
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "expected recv to time out");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "timed out in {:?}",
+            elapsed
+        );
     }
 }

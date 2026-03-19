@@ -1,10 +1,6 @@
 pub mod audio_config;
 mod error;
 mod mixer;
-pub mod pipewire_devices;
-mod pipewire_output;
-mod resampler;
-mod source;
 mod track;
 
 use std::{
@@ -16,18 +12,19 @@ use std::{
 };
 
 pub use audio_config::{load_audio_config, save_audio_config, AudioOutputConfig};
+pub use audio_decoder::{AudioSource, DecoderError, Source};
+pub use audio_output::pipewire_devices::{self, AudioSink};
+pub use audio_output::{AudioOutputError, PipewireOutput};
+pub use audio_types::{AudioSegment, DecodedSegment, SegmentIndex, SEGMENT_SIZE};
 pub use error::PlaybackError;
 use mixer::Mixer;
-pub use pipewire_devices::AudioSink;
-use pipewire_output::PipewireOutput;
 use playback_primitives::Db;
 pub use playback_primitives::Volume;
 use ringbuf::{HeapConsumer, HeapRb};
-pub use source::{AudioSource, Source};
 use tracing::info;
 pub use track::Track;
 
-use crate::pipewire_devices::list_sinks;
+use audio_output::pipewire_devices::list_sinks;
 
 pub struct PlaybackEngine {
     track: Option<Track>,
@@ -132,7 +129,7 @@ impl PlaybackEngine {
 
     /// Enumerate available audio output sinks via pw-dump.
     pub fn list_outputs(&self) -> Result<Vec<AudioSink>, PlaybackError> {
-        list_sinks()
+        list_sinks().map_err(PlaybackError::AudioOutput)
     }
 
     /// Return the current audio output configuration.
@@ -152,7 +149,9 @@ impl PlaybackEngine {
             .iter()
             .find(|s| s.name == device_name)
             .ok_or_else(|| {
-                PlaybackError::AudioDevice(format!("Audio device not found: {device_name}"))
+                PlaybackError::AudioOutput(audio_output::AudioOutputError::AudioDevice(format!(
+                    "Audio device not found: {device_name}"
+                )))
             })?;
 
         let new_config = AudioOutputConfig {
@@ -188,7 +187,11 @@ impl PlaybackEngine {
             );
             let audio_output =
                 PipewireOutput::new(consumer, new_config.sample_rate, Some(device_name.as_str()))
-                    .map_err(|e| PlaybackError::AudioDevice(format!("PipeWire error: {}", e)))?;
+                    .map_err(|e| {
+                    PlaybackError::AudioOutput(audio_output::AudioOutputError::AudioDevice(
+                        format!("PipeWire error: {}", e),
+                    ))
+                })?;
             self.audio_output = Some(audio_output);
         }
 
@@ -226,7 +229,11 @@ impl PlaybackEngine {
                 );
                 let audio_output =
                     PipewireOutput::new(consumer, target_rate, target_device.as_deref()).map_err(
-                        |e| PlaybackError::AudioDevice(format!("PipeWire error: {}", e)),
+                        |e| {
+                            PlaybackError::AudioOutput(audio_output::AudioOutputError::AudioDevice(
+                                format!("PipeWire error: {}", e),
+                            ))
+                        },
                     )?;
                 self.audio_output = Some(audio_output);
                 self.current_sample_rate = Some(target_rate);

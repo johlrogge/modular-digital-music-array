@@ -3,6 +3,11 @@ name = "stream-source-protocol"
 version = "0.1.0"
 edition.workspace = true
 
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "stream-source-protocol"
+
 [dependencies]
 serde = { workspace = true }
 music-primitives = { path = "../music_primitives" }

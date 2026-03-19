@@ -6,6 +6,11 @@ authors.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "library-ipc-protocol"
+
 [dependencies]
 library-search = { path = "../library_search" }
 music-facts = { path = "../music_facts" }

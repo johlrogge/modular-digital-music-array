@@ -31,7 +31,7 @@ pub enum ServiceError {
     Ingest(#[from] crate::pipeline::IngestError),
 
     #[error("ACID client error: {0}")]
-    AcidClient(#[from] acid_client::ClientError),
+    Acid(#[from] acid_client::ClientError),
 }
 
 /// Library service state
@@ -43,7 +43,7 @@ pub struct LibraryService {
     facts_count: AtomicUsize,
     /// In-memory index of tracks for fast search (rebuilt from facts on startup)
     tracks: Mutex<Vec<IndexedTrackInfo>>,
-    /// ACID client for writing facts
+    /// ACID client for writing and reading facts
     acid_client: AcidClient,
     /// Album name -> cover_art_path for tracks that have cover art.
     /// Used as a fallback when a track on the same album has no cover art of its own.
@@ -226,12 +226,12 @@ impl LibraryService {
         // Try to load from the ACID stream (incremental if cursor exists)
         let cursor_path = metadata_dir.join("facts.cursor");
         let saved_cursor = Self::load_saved_cursor(&cursor_path);
-        let used_full_load = saved_cursor.is_none();
 
         let (loaded, final_cursor) = Self::load_from_acid_stream(&acid_client, saved_cursor);
 
-        // If ACID stream returned nothing and we had no cursor, fall back to local file
-        let (loaded, final_cursor) = if loaded.tracks.is_empty() && used_full_load {
+        // If ACID stream returned nothing, fall back to local file.
+        // This covers both "ACID unavailable" and "cursor at end-of-file with no new facts".
+        let (loaded, final_cursor) = if loaded.tracks.is_empty() {
             tracing::info!("ACID stream empty or unavailable, falling back to local facts file");
             let facts_path = metadata_dir.join("facts.jsonl");
             let file_loaded = Self::load_tracks_from_facts(&facts_path);
@@ -351,17 +351,17 @@ impl LibraryService {
         has_cover_art: &mut HashSet<String>,
         total: &mut usize,
     ) {
-        use music_facts::FactSource;
-
         for line in lines {
-            let fact: stainless_facts::Fact<ContentHash, MusicValue, FactSource> =
-                match serde_json::from_str(line) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::warn!("Failed to parse stream line during load: {:?}", e);
-                        continue;
-                    }
-                };
+            let fact = match serde_json::from_str::<
+                stainless_facts::Fact<ContentHash, MusicValue, music_facts::FactSource>,
+            >(line)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to parse stream line during load");
+                    continue;
+                }
+            };
 
             *total += 1;
             let entity = fact.entity().as_str().to_owned();
@@ -1539,7 +1539,7 @@ impl LibraryService {
         let source_facts = Self::source_facts(source, &fact_source);
         facts.extend(source_facts);
 
-        // Write facts via ACID
+        // Write facts via fact store
         self.acid_client.write_music_facts(&content_hash, &facts)?;
 
         // Update in-memory index
@@ -1986,23 +1986,49 @@ mod tests {
     // Playlist handler tests
     // =========================================================================
 
-    fn make_service_with_playlists_dir() -> (LibraryService, tempfile::TempDir) {
+    static ACID_SERVER_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn spawn_acid_server() -> (acid_service::ServerHandle, String, String) {
+        let id = ACID_SERVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id();
+        let facts_addr = format!("ipc:///tmp/mdma-test-acid-facts-{}-{}.sock", pid, id);
+        let events_addr = format!("ipc:///tmp/mdma-test-acid-events-{}-{}.sock", pid, id);
+
+        let rep = nng::Socket::new(nng::Protocol::Rep0).expect("rep socket");
+        rep.listen(&facts_addr).expect("rep listen");
+
+        let pub_sock = nng::Socket::new(nng::Protocol::Pub0).expect("pub socket");
+        pub_sock.listen(&events_addr).expect("pub listen");
+
+        let handle = acid_service::start(rep, pub_sock, std::path::Path::new("/tmp"))
+            .expect("failed to start acid server");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        (handle, facts_addr, events_addr)
+    }
+
+    fn make_service_with_playlists_dir() -> (
+        LibraryService,
+        tempfile::TempDir,
+        acid_service::ServerHandle,
+    ) {
         let music_dir = tempfile::tempdir().unwrap();
         let metadata_dir = tempfile::tempdir().unwrap();
         // create the playlists sub-directory
         std::fs::create_dir_all(metadata_dir.path().join("playlists")).unwrap();
-        let service = LibraryService::new(
+        let (acid_handle, facts_addr, events_addr) = spawn_acid_server();
+        let service = LibraryService::new_with_events(
             music_dir.path().to_path_buf(),
             metadata_dir.path().to_path_buf(),
-            "ipc:///tmp/mdma-test-acid-nonexistent.sock",
+            &facts_addr,
+            &events_addr,
         )
         .unwrap();
-        (service, metadata_dir)
+        (service, metadata_dir, acid_handle)
     }
 
     #[test]
     fn playlist_list_returns_empty_when_no_playlists() {
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let response = service.handle_request(LibraryRequest::PlaylistList);
         match response {
             LibraryResponse::PlaylistNames(names) => {
@@ -2015,7 +2041,7 @@ mod tests {
     #[test]
     fn playlist_new_creates_and_returns_content() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("test-set").unwrap();
         let content = "sha256:abc\nsha256:def\n".to_string();
         let response = service.handle_request(LibraryRequest::PlaylistNew {
@@ -2031,7 +2057,7 @@ mod tests {
     #[test]
     fn playlist_list_returns_created_playlist() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("my-set").unwrap();
         service.handle_request(LibraryRequest::PlaylistNew {
             name,
@@ -2052,7 +2078,7 @@ mod tests {
     #[test]
     fn playlist_new_fails_if_already_exists() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("dupe").unwrap();
         service.handle_request(LibraryRequest::PlaylistNew {
             name: name.clone(),
@@ -2071,7 +2097,7 @@ mod tests {
     #[test]
     fn playlist_get_returns_content() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("get-me").unwrap();
         let content = "sha256:abc\n".to_string();
         service.handle_request(LibraryRequest::PlaylistNew {
@@ -2088,7 +2114,7 @@ mod tests {
     #[test]
     fn playlist_get_returns_not_found_for_missing() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("missing").unwrap();
         let response = service.handle_request(LibraryRequest::PlaylistGet { name });
         match response {
@@ -2100,7 +2126,7 @@ mod tests {
     #[test]
     fn playlist_append_adds_to_existing_content() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("append-me").unwrap();
         service.handle_request(LibraryRequest::PlaylistNew {
             name: name.clone(),
@@ -2122,7 +2148,7 @@ mod tests {
     #[test]
     fn playlist_append_fails_if_not_found() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("no-such-playlist").unwrap();
         let response = service.handle_request(LibraryRequest::PlaylistAppend {
             name,
@@ -2137,7 +2163,7 @@ mod tests {
     #[test]
     fn playlist_replace_overwrites_content() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("replace-me").unwrap();
         service.handle_request(LibraryRequest::PlaylistNew {
             name: name.clone(),
@@ -2157,7 +2183,7 @@ mod tests {
     #[test]
     fn playlist_remove_deletes_playlist() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("remove-me").unwrap();
         service.handle_request(LibraryRequest::PlaylistNew {
             name: name.clone(),
@@ -2173,7 +2199,7 @@ mod tests {
     #[test]
     fn playlist_rename_works() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         // Create
         let name = PlaylistName::new("old-name").unwrap();
         service.handle_request(LibraryRequest::PlaylistNew {
@@ -2201,7 +2227,7 @@ mod tests {
     #[test]
     fn playlist_remove_fails_if_not_found() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("not-there").unwrap();
         let response = service.handle_request(LibraryRequest::PlaylistRemove { name });
         match response {
@@ -2503,6 +2529,94 @@ mod tests {
             track_b_info.cover_art_path.as_deref(),
             Some(cover_path),
             "Track B should inherit album cover art from Track A on the same album"
+        );
+    }
+
+    // =========================================================================
+    // Bug fix tests: apply_lines_to_map and fallback guard
+    // =========================================================================
+
+    /// Verify that facts written to the in-memory ACID service are read back
+    /// correctly by load_from_acid_stream.
+    ///
+    /// Both `fact_store_memory` and `fact_store_file` now produce the same
+    /// array-format JSONL lines, so direct `serde_json::from_str::<Fact<>>()` works
+    /// for both backends without a compatibility shim.
+    #[test]
+    fn load_from_acid_stream_parses_facts_via_memory_storage() {
+        let (acid_handle, facts_addr, _events_addr) = spawn_acid_server();
+
+        let acid_client = AcidClient::connect(&facts_addr).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let hash = ContentHash::new("sha256:acidstreamtest01");
+        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        acid_client
+            .write_music_facts(
+                &hash,
+                &[(MusicValue::Title(Title::new("ACID Track")), source)],
+            )
+            .unwrap();
+
+        let (loaded, _cursor) = LibraryService::load_from_acid_stream(&acid_client, None);
+
+        drop(acid_handle);
+
+        assert_eq!(
+            loaded.tracks.len(),
+            1,
+            "load_from_acid_stream must return the track written to the in-memory ACID store"
+        );
+        assert_eq!(
+            loaded.tracks[0].title.as_deref(),
+            Some("ACID Track"),
+            "track title must be parsed from ACID stream line"
+        );
+    }
+
+    /// Bug 2: fallback to facts.jsonl must trigger whenever tracks.is_empty(),
+    /// regardless of whether a cursor was present.
+    ///
+    /// Before the fix, a saved cursor suppresses the fallback even when ACID
+    /// returns 0 new facts (cursor is already at end-of-file).
+    #[test]
+    fn fallback_to_facts_file_when_acid_returns_empty_with_cursor() {
+        let hash = ContentHash::new("sha256:cursorfallback01");
+
+        let temp = write_facts_file(&[(
+            hash.clone(),
+            MusicValue::Title(Title::new("Fallback Track")),
+        )]);
+
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+
+        // Copy facts file to where the service expects it
+        let facts_dest = metadata_dir.path().join("facts.jsonl");
+        std::fs::copy(temp.path(), &facts_dest).unwrap();
+
+        // Write a cursor file so saved_cursor.is_some() — simulates "already synced"
+        let cursor_path = metadata_dir.path().join("facts.cursor");
+        LibraryService::save_cursor(&cursor_path, "line:1");
+
+        // Use a nonexistent ACID socket so load_from_acid_stream returns 0 lines
+        let service = LibraryService::new(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+            "ipc:///tmp/mdma-test-acid-nonexistent.sock",
+        )
+        .unwrap();
+
+        let tracks = service.tracks.lock().unwrap();
+        assert_eq!(
+            tracks.len(),
+            1,
+            "service must fall back to facts.jsonl when ACID returns 0 tracks even if a cursor was saved"
+        );
+        assert_eq!(
+            tracks[0].title.as_deref(),
+            Some("Fallback Track"),
+            "fallback track title must match the facts file"
         );
     }
 

@@ -1,0 +1,51 @@
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "mdma-bdd"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[package.metadata.polylith]
+test-project = true
+
+[lib]
+name = "mdma_bdd"
+path = "src/lib.rs"
+
+[[test]]
+name = "cucumber"
+harness = false
+
+[dependencies]
+cucumber = "0.21"
+tokio = { version = "1.36", features = ["full"] }
+tempfile = "3"
+
+# Client layer (what we're testing through)
+mdma-client = { path = "../../components/mdma_client" }
+
+# Date expression parsing
+date-expression = { path = "../../components/date_expression" }
+
+# Protocol types (for playback simulator)
+media-protocol = { path = "../../components/media_protocol" }
+playback-primitives = { path = "../../components/playback_primitives" }
+library-ipc-protocol = { path = "../../components/library_ipc_protocol" }
+
+# For seeding test fact streams
+stainless-facts = { git = "https://github.com/johlrogge/stainless_facts", rev = "2aa820a808fd5345a1bd59c11d90969bfa84b285" }
+music-facts = { path = "../../components/music_facts" }
+
+# Query parsing helpers
+library-search = { path = "../../components/library_search" }
+
+# Timestamps for fact seeding
+chrono = "0.4"
+
+# NNG (for playback simulator + client connections)
+nng = "1.0"
+serde_json = "1.0"
+library-service = { path = "../../components/library_service_stub", package = "library-service-stub" }

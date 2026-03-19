@@ -1,0 +1,21 @@
+[package]
+name = "audio-output"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "audio-output"
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+ringbuf = "0.3"
+pipewire = "0.8"
+spa_sys = { package = "libspa-sys", version = "0.8" }

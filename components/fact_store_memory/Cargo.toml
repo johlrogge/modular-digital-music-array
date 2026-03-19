@@ -1,0 +1,17 @@
+[package]
+name = "fact-store"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[package.metadata.polylith]
+interface = "fact-store"
+
+[dependencies]
+acid-protocol = { path = "../acid_protocol" }
+stainless-facts = { git = "https://github.com/johlrogge/stainless_facts", rev = "2aa820a808fd5345a1bd59c11d90969bfa84b285" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }

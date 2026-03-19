@@ -6,6 +6,11 @@ authors.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "media-protocol"
+
 [dependencies]
 playback-primitives = { path = "../playback_primitives" }
 thiserror.workspace = true

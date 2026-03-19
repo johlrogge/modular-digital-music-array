@@ -1,7 +1,12 @@
 [package]
-name = "acid_protocol"
+name = "acid-protocol"
 version.workspace = true
 edition.workspace = true
+
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "acid-protocol"
 
 [dependencies]
 serde = { workspace = true }

@@ -1,0 +1,18 @@
+[package]
+name = "audio-resampler"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "audio-resampler"
+
+[dependencies]
+audio-types = { path = "../audio_types" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rubato = "0.15"

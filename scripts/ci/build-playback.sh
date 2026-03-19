@@ -30,9 +30,13 @@ mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
 
 # Target glibc 2.38 to match Void Linux's PipeWire build
 if command -v cargo-zigbuild &> /dev/null; then
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 --bin mdma-playback
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        --manifest-path "$PROJECT_ROOT/projects/mdma-playback/Cargo.toml" \
+        --bin mdma-playback
 else
-    cargo build --release --target aarch64-unknown-linux-gnu --bin mdma-playback
+    cargo build --release --target aarch64-unknown-linux-gnu \
+        --manifest-path "$PROJECT_ROOT/projects/mdma-playback/Cargo.toml" \
+        --bin mdma-playback
 fi
 
 echo ""
