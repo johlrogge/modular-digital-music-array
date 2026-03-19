@@ -31,7 +31,7 @@ pub enum ServiceError {
     Ingest(#[from] crate::pipeline::IngestError),
 
     #[error("ACID client error: {0}")]
-    AcidClient(#[from] acid_client::ClientError),
+    Acid(#[from] acid_client::ClientError),
 }
 
 /// Library service state
@@ -43,7 +43,7 @@ pub struct LibraryService {
     facts_count: AtomicUsize,
     /// In-memory index of tracks for fast search (rebuilt from facts on startup)
     tracks: Mutex<Vec<IndexedTrackInfo>>,
-    /// ACID client for writing facts
+    /// ACID client for writing and reading facts
     acid_client: AcidClient,
     /// Album name -> cover_art_path for tracks that have cover art.
     /// Used as a fallback when a track on the same album has no cover art of its own.
@@ -1539,7 +1539,7 @@ impl LibraryService {
         let source_facts = Self::source_facts(source, &fact_source);
         facts.extend(source_facts);
 
-        // Write facts via ACID
+        // Write facts via fact store
         self.acid_client.write_music_facts(&content_hash, &facts)?;
 
         // Update in-memory index
@@ -1986,23 +1986,42 @@ mod tests {
     // Playlist handler tests
     // =========================================================================
 
-    fn make_service_with_playlists_dir() -> (LibraryService, tempfile::TempDir) {
+    static ACID_SERVER_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn spawn_acid_server() -> (acid_service::ServerHandle, String, String) {
+        let id = ACID_SERVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id();
+        let facts_addr = format!("ipc:///tmp/mdma-test-acid-facts-{}-{}.sock", pid, id);
+        let events_addr = format!("ipc:///tmp/mdma-test-acid-events-{}-{}.sock", pid, id);
+        let handle = acid_service::start(&facts_addr, &events_addr, std::path::Path::new("/tmp"))
+            .expect("failed to start acid server");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        (handle, facts_addr, events_addr)
+    }
+
+    fn make_service_with_playlists_dir() -> (
+        LibraryService,
+        tempfile::TempDir,
+        acid_service::ServerHandle,
+    ) {
         let music_dir = tempfile::tempdir().unwrap();
         let metadata_dir = tempfile::tempdir().unwrap();
         // create the playlists sub-directory
         std::fs::create_dir_all(metadata_dir.path().join("playlists")).unwrap();
-        let service = LibraryService::new(
+        let (acid_handle, facts_addr, events_addr) = spawn_acid_server();
+        let service = LibraryService::new_with_events(
             music_dir.path().to_path_buf(),
             metadata_dir.path().to_path_buf(),
-            "ipc:///tmp/mdma-test-acid-nonexistent.sock",
+            &facts_addr,
+            &events_addr,
         )
         .unwrap();
-        (service, metadata_dir)
+        (service, metadata_dir, acid_handle)
     }
 
     #[test]
     fn playlist_list_returns_empty_when_no_playlists() {
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let response = service.handle_request(LibraryRequest::PlaylistList);
         match response {
             LibraryResponse::PlaylistNames(names) => {
@@ -2015,7 +2034,7 @@ mod tests {
     #[test]
     fn playlist_new_creates_and_returns_content() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("test-set").unwrap();
         let content = "sha256:abc\nsha256:def\n".to_string();
         let response = service.handle_request(LibraryRequest::PlaylistNew {
@@ -2031,7 +2050,7 @@ mod tests {
     #[test]
     fn playlist_list_returns_created_playlist() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("my-set").unwrap();
         service.handle_request(LibraryRequest::PlaylistNew {
             name,
@@ -2052,7 +2071,7 @@ mod tests {
     #[test]
     fn playlist_new_fails_if_already_exists() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("dupe").unwrap();
         service.handle_request(LibraryRequest::PlaylistNew {
             name: name.clone(),
@@ -2071,7 +2090,7 @@ mod tests {
     #[test]
     fn playlist_get_returns_content() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("get-me").unwrap();
         let content = "sha256:abc\n".to_string();
         service.handle_request(LibraryRequest::PlaylistNew {
@@ -2088,7 +2107,7 @@ mod tests {
     #[test]
     fn playlist_get_returns_not_found_for_missing() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("missing").unwrap();
         let response = service.handle_request(LibraryRequest::PlaylistGet { name });
         match response {
@@ -2100,7 +2119,7 @@ mod tests {
     #[test]
     fn playlist_append_adds_to_existing_content() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("append-me").unwrap();
         service.handle_request(LibraryRequest::PlaylistNew {
             name: name.clone(),
@@ -2122,7 +2141,7 @@ mod tests {
     #[test]
     fn playlist_append_fails_if_not_found() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("no-such-playlist").unwrap();
         let response = service.handle_request(LibraryRequest::PlaylistAppend {
             name,
@@ -2137,7 +2156,7 @@ mod tests {
     #[test]
     fn playlist_replace_overwrites_content() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("replace-me").unwrap();
         service.handle_request(LibraryRequest::PlaylistNew {
             name: name.clone(),
@@ -2157,7 +2176,7 @@ mod tests {
     #[test]
     fn playlist_remove_deletes_playlist() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("remove-me").unwrap();
         service.handle_request(LibraryRequest::PlaylistNew {
             name: name.clone(),
@@ -2173,7 +2192,7 @@ mod tests {
     #[test]
     fn playlist_rename_works() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         // Create
         let name = PlaylistName::new("old-name").unwrap();
         service.handle_request(LibraryRequest::PlaylistNew {
@@ -2201,7 +2220,7 @@ mod tests {
     #[test]
     fn playlist_remove_fails_if_not_found() {
         use library_ipc_protocol::PlaylistName;
-        let (service, _dir) = make_service_with_playlists_dir();
+        let (service, _dir, _acid) = make_service_with_playlists_dir();
         let name = PlaylistName::new("not-there").unwrap();
         let response = service.handle_request(LibraryRequest::PlaylistRemove { name });
         match response {

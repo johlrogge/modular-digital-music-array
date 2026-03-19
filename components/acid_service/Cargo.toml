@@ -1,23 +1,19 @@
 [package]
-name = "nng-transport"
+name = "acid-service"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
 
-[package.metadata]
-
 [package.metadata.polylith]
-interface = "nng-transport"
+interface = "acid-service"
 
 [dependencies]
+acid-protocol = { path = "../acid_protocol" }
+event-protocol = { path = "../event_protocol" }
+fact-store = { workspace = true }
 nng = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }
 thiserror = { workspace = true }
-dirs = "6"
-
-[dev-dependencies]
-pretty_assertions = { workspace = true }
-tempfile = "3"

@@ -6,6 +6,11 @@ authors.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "gateway-client"
+
 [dependencies]
 acid-protocol = { path = "../acid_protocol" }
 gateway-protocol = { path = "../gateway_protocol" }

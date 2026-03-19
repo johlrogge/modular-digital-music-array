@@ -6,6 +6,11 @@ authors.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "source-protocol"
+
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

@@ -1,23 +1,16 @@
 [package]
-name = "nng-transport"
+name = "fact-store"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
 
-[package.metadata]
-
 [package.metadata.polylith]
-interface = "nng-transport"
+interface = "fact-store"
 
 [dependencies]
-nng = { workspace = true }
-serde = { workspace = true }
+acid-protocol = { path = "../acid_protocol" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-dirs = "6"
-
-[dev-dependencies]
-pretty_assertions = { workspace = true }
-tempfile = "3"
+chrono = { workspace = true }

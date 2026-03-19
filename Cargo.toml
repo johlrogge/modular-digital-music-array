@@ -32,6 +32,9 @@ members = [
     "components/library_ingestion",
     "components/acid_protocol",
     "components/acid_client",
+    "components/fact_store_memory",
+    "components/fact_store_file",
+    "components/acid_service",
     "components/stream_source_protocol",
     # Bases (entry points)
     "bases/service",
@@ -70,6 +73,9 @@ default-members = [
     "components/library_ingestion",
     "components/acid_protocol",
     "components/acid_client",
+    "components/fact_store_memory",
+    "components/fact_store_file",
+    "components/acid_service",
     "components/stream_source_protocol",
     "bases/service",
     "bases/http_server",
@@ -110,6 +116,8 @@ tokio = { version = "1.36", features = ["full"] }
 tower-http = { version = "0.5", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+fact-store = { path = "components/fact_store_memory" }
+acid-service = { path = "components/acid_service" }
 
 [profile.release]
 strip = true

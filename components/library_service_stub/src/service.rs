@@ -267,11 +267,11 @@ impl LibraryService {
             | LibraryRequest::PlaylistAppend { .. }
             | LibraryRequest::PlaylistReplace { .. }
             | LibraryRequest::PlaylistRemove { .. }
-            | LibraryRequest::PlaylistRename { .. } => LibraryResponse::Error(
-                ProtocolError::Internal {
+            | LibraryRequest::PlaylistRename { .. } => {
+                LibraryResponse::Error(ProtocolError::Internal {
                     message: "playlist operations not supported in stub".to_string(),
-                },
-            ),
+                })
+            }
 
             // Stub no-ops for inbox/ingestion operations
             LibraryRequest::GetInboxQueue => LibraryResponse::InboxQueue(vec![]),
@@ -279,11 +279,9 @@ impl LibraryService {
             LibraryRequest::IngestFile { .. }
             | LibraryRequest::DeleteInboxFile { .. }
             | LibraryRequest::IngestAll
-            | LibraryRequest::ReindexCovers => {
-                LibraryResponse::Error(ProtocolError::Internal {
-                    message: "ingestion not supported in stub".to_string(),
-                })
-            }
+            | LibraryRequest::ReindexCovers => LibraryResponse::Error(ProtocolError::Internal {
+                message: "ingestion not supported in stub".to_string(),
+            }),
         }
     }
 
@@ -322,10 +320,7 @@ impl LibraryService {
                         .all(|b| a.starts_with(b.as_str()) || b.starts_with(a.as_str()))
                 });
                 if all_same {
-                    let best = matches
-                        .iter()
-                        .max_by_key(|t| t.content_hash.len())
-                        .unwrap();
+                    let best = matches.iter().max_by_key(|t| t.content_hash.len()).unwrap();
                     return Ok(ContentHash::new(best.content_hash.clone()));
                 }
 

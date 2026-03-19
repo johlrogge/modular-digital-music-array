@@ -1,23 +1,20 @@
 [package]
-name = "nng-transport"
+name = "fact-store-file"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
 
-[package.metadata]
-
 [package.metadata.polylith]
-interface = "nng-transport"
+interface = "fact-store"
 
 [dependencies]
-nng = { workspace = true }
-serde = { workspace = true }
+acid-protocol = { path = "../acid_protocol" }
+stainless-facts = { git = "https://github.com/johlrogge/stainless_facts", rev = "2aa820a808fd5345a1bd59c11d90969bfa84b285" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-dirs = "6"
+chrono = { workspace = true }
 
 [dev-dependencies]
-pretty_assertions = { workspace = true }
 tempfile = "3"

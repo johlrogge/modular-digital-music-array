@@ -7,6 +7,11 @@ repository.workspace = true
 license.workspace = true
 description = "Bandcamp API client for MDMA"
 
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "bandcamp-api"
+
 [dependencies]
 # Async HTTP client (using rustls to avoid native openssl dependency)
 reqwest = { version = "0.12", default-features = false, features = ["cookies", "stream", "json", "rustls-tls"] }

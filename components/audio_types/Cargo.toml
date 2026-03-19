@@ -6,4 +6,9 @@ authors.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "audio-types"
+
 [dependencies]

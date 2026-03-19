@@ -40,3 +40,4 @@ notify = "6.1"
 pretty_assertions = { workspace = true }
 rstest = { workspace = true }
 tempfile = "3"
+acid-service = { workspace = true }

@@ -6,6 +6,11 @@ authors.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "playback-engine"
+
 [dependencies]
 audio-decoder = { path = "../audio_decoder" }
 audio-types = { path = "../audio_types" }

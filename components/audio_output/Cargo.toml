@@ -6,6 +6,11 @@ authors.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "audio-output"
+
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true }
