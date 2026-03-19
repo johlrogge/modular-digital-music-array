@@ -1114,6 +1114,7 @@ dependencies = [
  "acid-protocol",
  "chrono",
  "serde_json",
+ "stainless-facts",
  "thiserror 1.0.69",
 ]
 

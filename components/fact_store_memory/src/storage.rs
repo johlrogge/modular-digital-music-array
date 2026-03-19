@@ -1,6 +1,7 @@
 //! In-memory FactStorage for ACID server.
 use acid_protocol::{cursor_from_offset, FactEntry, StreamChunk};
 use chrono::Utc;
+use stainless_facts::{Fact, Operation};
 use std::path::Path;
 use std::sync::Mutex;
 use thiserror::Error;
@@ -28,18 +29,14 @@ impl FactStorage {
     /// Append facts for `entity`. Returns the count of facts written.
     pub fn write_facts(&self, entity: &str, facts: &[FactEntry]) -> Result<usize, StorageError> {
         let mut lines = self.lines.lock().unwrap();
+        let now = Utc::now();
         let count = facts.len();
         for fact in facts {
             let value: serde_json::Value = serde_json::from_str(&fact.value_json)?;
             let source: serde_json::Value = serde_json::from_str(&fact.source_json)?;
-            let line = serde_json::json!({
-                "entity": entity,
-                "value": value,
-                "source": source,
-                "timestamp": Utc::now().to_rfc3339(),
-                "operation": "Assert"
-            });
-            lines.push(serde_json::to_string(&line)?);
+            let fact_struct: Fact<String, serde_json::Value, serde_json::Value> =
+                Fact::new(entity.to_string(), value, now, source, Operation::Assert);
+            lines.push(serde_json::to_string(&fact_struct)?);
         }
         Ok(count)
     }
@@ -162,5 +159,41 @@ mod tests {
         }];
         let result = storage.write_facts("entity:1", &facts);
         assert!(result.is_err(), "expected error on bad source_json, got Ok");
+    }
+
+    /// Verify that the memory backend serializes facts in array (tuple) format,
+    /// matching the output of `fact_store_file` via `FactStreamWriter`.
+    ///
+    /// Expected format: `["entity","<timestamp>",<value_obj>,<source_obj>,"Assert"]`
+    /// Wrong format (old):
+    ///   `{"entity":"...","value":{...},"timestamp":"...","source":{...},"operation":"Assert"}`
+    #[test]
+    fn write_facts_produces_array_format() {
+        let storage = FactStorage::new(Path::new("/tmp")).unwrap();
+        let facts = vec![FactEntry {
+            value_json: r#"{"t":"Test Track"}"#.to_string(),
+            source_json: r#"{"name":"analyser"}"#.to_string(),
+        }];
+
+        storage.write_facts("sha256:deadbeef", &facts).unwrap();
+
+        let chunk = storage.read_stream(0, 10).unwrap();
+        assert_eq!(chunk.lines.len(), 1);
+
+        let line = &chunk.lines[0];
+
+        // The line must be a JSON array — if it is an object this is the old broken format
+        let first_char = line.trim_start().chars().next().unwrap_or(' ');
+        assert_eq!(
+            first_char, '[',
+            "memory backend must produce array-format fact lines (matching fact_store_file), \
+             but got: {line}"
+        );
+
+        // It must contain the entity string
+        assert!(
+            line.contains("sha256:deadbeef"),
+            "serialized line must contain the entity, got: {line}"
+        );
     }
 }
