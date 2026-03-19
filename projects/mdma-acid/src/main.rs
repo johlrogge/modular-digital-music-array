@@ -31,6 +31,10 @@ fn main() -> Result<()> {
         "Starting MDMA ACID service"
     );
 
+    service::ensure_ipc_dir(&args.socket)
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to create socket directory: {}", e))?;
+    service::ensure_ipc_dir(&args.event_socket)
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to create event socket directory: {}", e))?;
     let _handle = acid_service::start(&args.socket, &args.event_socket, &args.metadata_dir)
         .map_err(|e| color_eyre::eyre::eyre!("Failed to start ACID service: {}", e))?;
 
