@@ -19,6 +19,7 @@ build:
 # Run BDD tests
 [group('test')]
 bdd:
+    cargo build -q --manifest-path projects/mdma-cli/Cargo.toml
     cd projects/bdd && cargo test --test cucumber -- -vv
 
 # Cross-compile a standard MDMA binary for aarch64
