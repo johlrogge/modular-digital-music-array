@@ -3,7 +3,7 @@ resolver = "2"
 
 [package]
 name = "mdma-beacon"
-version = "0.5.4"
+version = "0.6.0"
 edition = "2021"
 authors = ["MDMA Development Team"]
 repository = "https://github.com/johlrogge/modular-digital-music-array"
