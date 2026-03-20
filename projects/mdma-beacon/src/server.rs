@@ -9,7 +9,7 @@ use tokio::sync::{broadcast, oneshot, Mutex};
 use tower_http::services::ServeDir;
 use tracing::info;
 
-mod routes;
+use crate::routes;
 
 /// Application state shared across handlers
 #[derive(Clone)]
