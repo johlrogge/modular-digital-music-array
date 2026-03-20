@@ -387,7 +387,7 @@ mod tests {
     ) -> NamedTempFile {
         let fixture = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../components/playback_engine/benches/test_data/silence.flac"
+            "/../../components/audio_decoder/benches/test_data/silence.flac"
         );
 
         let mut tmp = NamedTempFile::with_suffix(".flac").expect("tmpfile");
@@ -418,7 +418,7 @@ mod tests {
     fn extract_pictures_returns_empty_for_file_without_pictures() {
         let fixture = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../components/playback_engine/benches/test_data/silence.flac"
+            "/../../components/audio_decoder/benches/test_data/silence.flac"
         );
         let result = extract_pictures(fixture).expect("extract_pictures should not error");
         assert!(
