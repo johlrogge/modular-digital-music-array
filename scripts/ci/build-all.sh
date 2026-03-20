@@ -6,6 +6,7 @@
 # Phase 1c: mdma-bandcamp from its project workspace
 # Phase 1d: beacon from its project workspace (projects/mdma-beacon)
 # Phase 1e: mdma-console from its project workspace (projects/mdma-console)
+# Phase 1f: mdma-acid from its project workspace (projects/mdma-acid)
 # Phase 2:  mdma-playback with PipeWire sysroot env vars (separate target suffix)
 #
 # Requires aarch64 PipeWire sysroot at .cross/aarch64-sysroot/ for Phase 2
@@ -57,6 +58,12 @@ cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
     --bin mdma-console
 
 echo ""
+echo "=== Phase 1f: Building acid (project workspace) ==="
+cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+    --manifest-path "$PROJECT_ROOT/projects/mdma-acid/Cargo.toml" \
+    --bin mdma-acid
+
+echo ""
 echo "=== Phase 2: Building playback (with PipeWire sysroot) ==="
 echo "  Sysroot: $SYSROOT"
 
@@ -78,7 +85,7 @@ cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
 
 echo ""
 echo "=== All binaries built ==="
-for bin in beacon mdma-library mdma-console mdma-gateway mdma-bandcamp mdma-playback mdma-audio; do
+for bin in beacon mdma-library mdma-console mdma-gateway mdma-bandcamp mdma-acid mdma-playback mdma-audio; do
     file "$PROJECT_ROOT/target/aarch64-unknown-linux-gnu/release/$bin"
     ls -lh "$PROJECT_ROOT/target/aarch64-unknown-linux-gnu/release/$bin"
 done

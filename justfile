@@ -382,9 +382,14 @@ pkg-bandcamp:
 pkg-audio:
     ./scripts/package/create-audio-package.sh
 
+# Build mdma-acid Void package
+[group('package')]
+pkg-acid:
+    ./scripts/package/create-acid-package.sh
+
 # Create repository structure and index (all packages)
 [group('package')]
-pkg-repository: ci-build-all pkg-beacon pkg-library pkg-console pkg-playback pkg-audio pkg-gateway pkg-bandcamp
+pkg-repository: ci-build-all pkg-beacon pkg-library pkg-console pkg-playback pkg-audio pkg-acid pkg-gateway pkg-bandcamp
     ./scripts/package/create-repository.sh
 
 # Full package build pipeline (what CI runs!)
@@ -394,7 +399,7 @@ pkg-build-all: check-prereqs pkg-repository
     @echo "🎉 Package build complete!"
     @echo ""
     @echo "Repository ready at: build/repository/"
-    @echo "Packages: beacon, mdma-library, mdma-console, mdma-playback, mdma-audio, mdma-gateway, mdma-bandcamp"
+    @echo "Packages: beacon, mdma-library, mdma-console, mdma-playback, mdma-audio, mdma-acid, mdma-gateway, mdma-bandcamp"
     @echo ""
     @echo "To test locally:"
     @echo "  1. Serve repository: just pkg-serve"

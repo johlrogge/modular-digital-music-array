@@ -1,0 +1,14 @@
+#!/bin/sh
+# INSTALL script for mdma-console
+# Runs on the target system after package installation/upgrade.
+#
+# mdma-console binds to port 80 but runs as the unprivileged 'mdma' user.
+# CAP_NET_BIND_SERVICE allows it to bind to privileged ports without root.
+
+case "${ACTION}" in
+post)
+    if command -v setcap >/dev/null 2>&1; then
+        setcap 'cap_net_bind_service=+ep' /usr/bin/mdma-console
+    fi
+    ;;
+esac
