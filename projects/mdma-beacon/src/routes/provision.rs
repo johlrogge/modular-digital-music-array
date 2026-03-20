@@ -122,7 +122,7 @@ pub async fn provision(
     let log_tx = state.log_tx.clone();
 
     // Spawn provisioning in background, waiting for start signal from JavaScript
-    spawn_with_start_signal(&state.provision_start, log_tx, |log_tx| async move {
+    spawn_with_start_signal(&state.provision_start, log_tx, move |log_tx| async move {
         match provisioning::provision_system(config, hardware, execution_mode, log_tx.clone()).await
         {
             Ok(provisioned) => {
