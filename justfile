@@ -385,7 +385,7 @@ pkg-audio:
 # Build mdma-acid Void package
 [group('package')]
 pkg-acid:
-    ./scripts/package/create-acid-package.sh
+    bash ./scripts/package/create-acid-package.sh
 
 # Create repository structure and index (all packages)
 [group('package')]
