@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 http-server = { path = "../../bases/http_server" }
-storage-primitives = { path = "../../components/storage_primitives" }
+storage_primitives = { path = "../../components/storage_primitives" }
 tokio = { version = "1.36", features = ["full"] }
 color-eyre = "0.6"
 axum = "0.7"

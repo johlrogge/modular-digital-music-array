@@ -7,6 +7,7 @@ mod config;
 mod error;
 mod hardware;
 mod provisioning;
+mod routes;
 mod server;
 mod types;
 mod update;
