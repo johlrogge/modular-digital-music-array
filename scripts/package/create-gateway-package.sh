@@ -4,5 +4,5 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec "$SCRIPT_DIR/create-service-package.sh" \
     --bin mdma-gateway \
     --desc "MDMA API gateway" \
-    --cargo-toml bases/mdma_gateway/Cargo.toml \
+    --cargo-toml projects/mdma-gateway/Cargo.toml \
     --extra-install "$SCRIPT_DIR/install/mdma-gateway.sh"
