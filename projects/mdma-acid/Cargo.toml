@@ -12,7 +12,7 @@ service = { path = "../../bases/service" }
 
 [package]
 name = "mdma-acid"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 authors = ["MDMA Development Team"]
 repository = "https://github.com/johlrogge/modular-digital-music-array"
