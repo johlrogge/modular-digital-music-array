@@ -27,7 +27,7 @@ fi
 # Extract the version suffix (e.g. "1.6.2_1") from the libpipewire package name
 # and reuse it for pipewire-devel to avoid false positives from independent grepping
 # (e.g. pipewire-devel-6.6.2_1 which is actually a Linux kernel package).
-PIPEWIRE_PKG_VER=$(echo "$LIBPIPEWIRE_PKG" | grep -oE '[0-9][0-9._]+(?=\.aarch64\.xbps)')
+PIPEWIRE_PKG_VER=$(echo "$LIBPIPEWIRE_PKG" | sed 's/libpipewire-//;s/\.aarch64\.xbps//')
 if [ -z "$PIPEWIRE_PKG_VER" ]; then
   echo "ERROR: Could not extract version suffix from package name: $LIBPIPEWIRE_PKG" >&2
   exit 1
