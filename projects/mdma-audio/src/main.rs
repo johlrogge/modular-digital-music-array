@@ -49,7 +49,9 @@ fn main() -> Result<()> {
     let engine = PlaybackEngine::new(args.audio_config)?;
 
     info!("Listening on {}", args.socket);
-    let ServiceSockets { rep_socket: socket, .. } = service::create_sockets(&ServiceConfig {
+    let ServiceSockets {
+        rep_socket: socket, ..
+    } = service::create_sockets(&ServiceConfig {
         socket_address: args.socket.clone(),
         event_address: None,
     })?;

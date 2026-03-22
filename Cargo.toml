@@ -1,4 +1,3 @@
-# Root Cargo.toml — beacon, mdma_console, mdma_library migrated to projects/ standalone workspaces
 [workspace]
 members = [
     # Components (bricks)
@@ -41,6 +40,19 @@ members = [
     "bases/http_server",
     "bases/tui",
     "bases/client",
+    "bases/bdd-runner",
+    # Projects
+    "projects/mdma-acid",
+    "projects/mdma-audio",
+    "projects/mdma-bandcamp",
+    "projects/mdma-console",
+    "projects/mdma-gateway",
+    "projects/mdma-library",
+    "projects/mdma-playback",
+    "projects/mdma-beacon",
+    "projects/mdma-cli",
+    "projects/mdma-tui",
+    "projects/bdd",
 ]
 default-members = [
     "components/date_expression",
@@ -81,6 +93,18 @@ default-members = [
     "bases/http_server",
     "bases/tui",
     "bases/client",
+    "bases/bdd-runner",
+    "projects/mdma-acid",
+    "projects/mdma-audio",
+    "projects/mdma-bandcamp",
+    "projects/mdma-console",
+    "projects/mdma-gateway",
+    "projects/mdma-library",
+    "projects/mdma-playback",
+    "projects/mdma-beacon",
+    "projects/mdma-cli",
+    "projects/mdma-tui",
+    "projects/bdd",
 ]
 resolver = "2"
 
@@ -116,6 +140,10 @@ tokio = { version = "1.36", features = ["full"] }
 tower-http = { version = "0.5", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+service = { path = "bases/service" }
+tempfile = "3"
+tokio-stream = "0.1"
+zip = "2"
 fact-store = { path = "components/fact_store_memory" }
 acid-service = { path = "components/acid_service" }
 

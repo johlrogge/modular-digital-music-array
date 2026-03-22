@@ -37,11 +37,17 @@ just pi-connect         # Find and auto-SSH to Pi
 
 ### Workspace Structure
 
-- **bases/** - Binary entry points
-  - `beacon` - Provisioning server with web UI (main focus)
-  - `mdma_playback` - Audio playback server
-  - `mdma_cli` - Command-line interface
-  - `mdma_console` - Web management console
+- **projects/** - Binary entry points (deployable services and tools)
+  - `mdma-beacon` - Provisioning server with web UI (main focus)
+  - `mdma-playback` - Audio playback queue manager
+  - `mdma-audio` - File playback source (wraps PlaybackEngine, speaks stream_source_protocol)
+  - `mdma-cli` - Command-line interface
+  - `mdma-console` - Web management console
+  - `mdma-library` - Library service
+  - `mdma-gateway` - Gateway router
+  - `mdma-bandcamp` - Bandcamp source
+
+- **bases/** - Abstract Polylith base traits (client, service, http_server, tui)
 
 - **components/** - Shared libraries
   - `playback_engine` - Real-time audio (Symphonia + PipeWire)
@@ -62,9 +68,9 @@ stage4_install → stage5_configure → stage6_finalize
 Each stage implements the `Action` trait with `plan()` and `apply()` methods. The compiler enforces correct stage sequencing through the type system.
 
 **Key files:**
-- `bases/beacon/src/provisioning/mod.rs` - Stage orchestration
-- `bases/beacon/src/provisioning/stage*.rs` - Individual stages
-- `bases/beacon/src/routes/` - Axum web handlers
+- `projects/mdma-beacon/src/provisioning/mod.rs` - Stage orchestration
+- `projects/mdma-beacon/src/provisioning/stage*.rs` - Individual stages
+- `projects/mdma-beacon/src/routes/` - Axum web handlers
 
 ### Type-Safe Primitives
 
@@ -153,9 +159,9 @@ Workflow:
    - For large plans: split into independent phases, dispatch one code-minion per phase in parallel
    - Give each code-minion a clear, self-contained prompt with all necessary context
    - Code-minions must run cargo build/test/clippy before reporting back
-3. Code-minion(s) report back → dispatch rust-architect to review all changed files
+3. Code-minion(s) report back → dispatch architect to review all changed files
    for duplication, inconsistencies, missed reuse, and fragility
-4. If rust-architect finds issues → dispatch code-minion to fix, then re-run rust-architect
+4. If architect finds issues → dispatch code-minion to fix, then re-run architect
    until clean
 5. Dispatch commit agent
 6. Dispatch devops to deploy → dispatch test agent for smoke tests
@@ -182,7 +188,7 @@ Workflow:
 8. CI builds and publishes packages
 9. Dispatch **devops** to verify packages install on Pi
 
-See `.claude/skills/mdma-devops/references/releases.md` for detailed procedure.
+See `RELEASING.md` for detailed procedure.
 
 ## Git Commit Guidelines
 

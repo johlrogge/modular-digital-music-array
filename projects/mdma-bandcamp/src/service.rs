@@ -439,9 +439,7 @@ pub async fn run_async_ipc_server(
     let (request_tx, mut request_rx) = mpsc::channel::<IpcMessage>(32);
 
     // Spawn the NNG server in a blocking task
-    let nng_handle = {
-        tokio::task::spawn_blocking(move || run_nng_bridge(socket, request_tx))
-    };
+    let nng_handle = { tokio::task::spawn_blocking(move || run_nng_bridge(socket, request_tx)) };
 
     tracing::info!("Async IPC server running");
 
