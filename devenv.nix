@@ -240,8 +240,19 @@ in
              "ci-build-console" "ci-build-playback" "ci-build-gateway"
              "ci-build-bandcamp" "ci-simulate" "ci-check-deps" "ci-clean"
              "pkg-build-all" "pkg-beacon" "pkg-library" "pkg-console"
-             "pkg-playback" "pkg-gateway" "pkg-bandcamp" "pkg-repository"
+             "pkg-playback" "pkg-gateway" "pkg-bandcamp" "pkg-audio" "pkg-acid"
+             "pkg-cli" "pkg-tui" "pkg-repository"
              "pkg-serve" "pkg-version" "pkg-bump-revision" "pkg-clean" ];
+  };
+
+  claude.code.mcpServers.just-deploy = {
+    type = "stdio";
+    command = "bb";
+    args = [ "${inputs.metadev}/tools/just/server.bb"
+             "--allow"
+             "deploy-library" "deploy-console" "deploy-playback" "deploy-gateway"
+             "deploy-bandcamp" "deploy-audio" "deploy-acid" "deploy-cli" "deploy-tui"
+             "deploy-dev" ];
   };
 
   claude.code.agents = {
@@ -414,7 +425,14 @@ in
       description = "Pi deployment and debugging. Deploys services, debugs on real hardware, administers the Raspberry Pi.";
       model = "sonnet";
       proactive = false;
-      tools = [ "Read" "Write" "Edit" "Bash" "Grep" "Glob" ];
+      tools = [
+        "Read" "Write" "Edit" "Grep" "Glob"
+        "mcp__just-ci__just_run" "mcp__just-ci__just_list"
+        "mcp__just-deploy__just_run" "mcp__just-deploy__just_list"
+        "mcp__ssh__ssh_run" "mcp__ssh__scp_transfer"
+        "mcp__cargo-polylith__polylith_info" "mcp__cargo-polylith__polylith_check"
+        "mcp__git-read__git_status" "mcp__git-read__git_log"
+      ];
       prompt = ''
         You deploy and debug MDMA on the Raspberry Pi 5 running Void Linux.
         Before deploying or debugging, read .claude/skills/mdma-devops/SKILL.md for procedures and reference material.
@@ -431,26 +449,23 @@ in
         Key files to update when fixing things:
         - void-packages/srcpkgs/*/files/*/run — runit run scripts
         - scripts/package/create-*.sh — package creation (INSTALL scripts, file layout)
-        - justfile — deploy-* recipes (scp + ssh commands)
+        - justfile — deploy-* recipes
         - .claude/skills/mdma-devops/ — update runbooks when procedures change
 
-        Pi: mdma-909.local | SSH key: ~/.ssh/mdma_pi
-        SSH: ssh -4 -i ~/.ssh/mdma_pi admin@mdma-909.local
-        MDMA_NODE is already set in the shell — the CLI derives the gateway from it automatically.
+        TOOL USAGE:
+        - Build packages: mcp__just-ci__just_run (pkg-build-all, pkg-acid, pkg-audio, etc.)
+        - Deploy to Pi: mcp__just-deploy__just_run (deploy-library, deploy-gateway, etc.)
+        - SSH to Pi: mcp__ssh__ssh_run (service status, logs, debugging)
+        - SCP files: mcp__ssh__scp_transfer
+        - Workspace info: mcp__cargo-polylith__polylith_info / polylith_check
+        NEVER use raw cargo zigbuild, scp, or ssh commands — use the MCP tools.
 
-        ALWAYS use just recipes for building and deploying. NEVER run cargo zigbuild,
-        cargo build, or scp manually — the just recipes encapsulate the correct
-        cross-compilation flags, target paths, and deploy steps.
+        Pi host alias: "pi" (configured in project SSH config)
+        Service mgmt: sudo sv status|restart|stop <service>
+        Logs: sudo tail -f /var/log/<service>/current
 
-        NO WORKAROUNDS. If a tool, just recipe, or build script fails, report the
-        exact error and stop. Do NOT attempt to work around broken tools by running
-        commands manually or rewriting scripts. Failures are likely upstream bugs —
-        report them clearly so they can be fixed at the source.
-
-        Deploy: just deploy-{library,console,playback,gateway,bandcamp}
-        Service mgmt (runit): sv status|restart|stop <service>
-        Logs: tail -f /var/log/<service>/current
-        Network: just pi-scan | just pi-connect
+        NO WORKAROUNDS. If a just recipe or MCP tool fails, report the exact error
+        and stop. Failures are likely upstream bugs — report them clearly.
 
         NEVER wipe /music on the Pi (contains the music library).
         Releases go through `git flow release` — see .claude/skills/mdma-devops/references/releases.md.
@@ -465,7 +480,7 @@ in
       description = "Post-deploy smoke tester. Verifies all services are running and responding on the Pi.";
       model = "haiku";
       proactive = false;
-      tools = [ "Bash" "Read" "Grep" "Glob" ];
+      tools = [ "Bash" "Read" "Grep" "Glob" "mcp__ssh__ssh_run" ];
       prompt = ''
         You verify that MDMA services are running correctly after deployment.
 
@@ -475,11 +490,14 @@ in
         IMPORTANT: Always use --no-stdin with `mdma search` to prevent it from waiting
         for piped input. Without --no-stdin, search hangs when called from agents.
 
+        TOOL USAGE:
+        - Pi SSH checks (sv status, logs): use mcp__ssh__ssh_run with host "pi"
+        - Local mdma CLI commands (mdma ping, mdma status, etc.): use Bash
+
         Run these checks IN ORDER and report results as a table:
 
-        1. SERVICE STATUS — SSH to Pi and check runit:
-           ssh -4 -i ~/.ssh/mdma_pi admin@mdma-909.local \
-             'sudo sv status mdma-gateway mdma-library mdma-playback mdma-console mdma-bandcamp'
+        1. SERVICE STATUS — use mcp__ssh__ssh_run on host "pi":
+           command: sudo sv status mdma-gateway mdma-library mdma-playback mdma-console mdma-bandcamp
            Expected: all "run:" with PIDs
 
         2. GATEWAY PING — verify gateway responds:
