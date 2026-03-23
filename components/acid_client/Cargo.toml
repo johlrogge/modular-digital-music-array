@@ -12,9 +12,9 @@ license.workspace = true
 interface = "acid-client"
 
 [dependencies]
-acid-protocol = { path = "../acid_protocol" }
+acid-protocol = { workspace = true }
 nng = { workspace = true }
-nng-transport = { path = "../nng_transport" }
+nng-transport = { workspace = true }
 serde_json = { workspace = true }
 
 [features]
@@ -22,7 +22,7 @@ music = ["music-facts", "playback-primitives"]
 
 [dependencies.music-facts]
 package = "music-facts"
-path = "../music_facts"
+workspace = true
 optional = true
 
 [dev-dependencies]
@@ -30,5 +30,5 @@ pretty_assertions = { workspace = true }
 
 [dependencies.playback-primitives]
 package = "playback-primitives"
-path = "../playback_primitives"
+workspace = true
 optional = true

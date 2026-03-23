@@ -1,7 +1,7 @@
 //! ACID service — append-only fact store backed by the `fact-store` interface.
-//! The active implementation is selected via the workspace dependency:
-//! - Root workspace (`Cargo.toml`): `fact_store_memory` (dev/test default)
-//! - Production builds: `fact_store_file` (via `cargo polylith profile build production`)
+//! The active implementation is selected via `[workspace.dependencies]`:
+//! - Root workspace: `fact_store_memory` (dev/test default)
+//! - Production builds: `fact_store_file` via `profiles/production.profile`
 
 use acid_protocol::{offset_from_cursor, AcidRequest, AcidResponse};
 use event_protocol::{acid_event_to_topic_message, AcidEvent};

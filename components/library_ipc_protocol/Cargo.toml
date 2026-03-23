@@ -12,8 +12,8 @@ license.workspace = true
 interface = "library-ipc-protocol"
 
 [dependencies]
-library-search = { path = "../library_search" }
-music-facts = { path = "../music_facts" }
+library-search = { workspace = true }
+music-facts = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

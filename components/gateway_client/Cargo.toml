@@ -12,12 +12,12 @@ license.workspace = true
 interface = "gateway-client"
 
 [dependencies]
-acid-protocol = { path = "../acid_protocol" }
-gateway-protocol = { path = "../gateway_protocol" }
-source-protocol = { path = "../source_protocol" }
-library-ipc-protocol = { path = "../library_ipc_protocol" }
-media-protocol = { path = "../media_protocol" }
-nng-transport = { path = "../nng_transport" }
+acid-protocol = { workspace = true }
+gateway-protocol = { workspace = true }
+source-protocol = { workspace = true }
+library-ipc-protocol = { workspace = true }
+media-protocol = { workspace = true }
+nng-transport = { workspace = true }
 nng = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

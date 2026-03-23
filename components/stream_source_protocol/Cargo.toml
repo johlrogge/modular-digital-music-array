@@ -10,8 +10,8 @@ interface = "stream-source-protocol"
 
 [dependencies]
 serde = { workspace = true }
-music-primitives = { path = "../music_primitives" }
-playback-primitives = { path = "../playback_primitives" }
+music-primitives = { workspace = true }
+playback-primitives = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

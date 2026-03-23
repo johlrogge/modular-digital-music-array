@@ -442,6 +442,11 @@ in
         cargo build, or scp manually — the just recipes encapsulate the correct
         cross-compilation flags, target paths, and deploy steps.
 
+        NO WORKAROUNDS. If a tool, just recipe, or build script fails, report the
+        exact error and stop. Do NOT attempt to work around broken tools by running
+        commands manually or rewriting scripts. Failures are likely upstream bugs —
+        report them clearly so they can be fixed at the source.
+
         Deploy: just deploy-{library,console,playback,gateway,bandcamp}
         Service mgmt (runit): sv status|restart|stop <service>
         Logs: tail -f /var/log/<service>/current

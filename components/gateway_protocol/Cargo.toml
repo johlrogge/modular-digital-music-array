@@ -12,11 +12,11 @@ license.workspace = true
 interface = "gateway-protocol"
 
 [dependencies]
-acid-protocol = { path = "../acid_protocol" }
-source-protocol = { path = "../source_protocol" }
-library-ipc-protocol = { path = "../library_ipc_protocol" }
-media-protocol = { path = "../media_protocol" }
-playback-primitives = { path = "../playback_primitives" }
+acid-protocol = { workspace = true }
+source-protocol = { workspace = true }
+library-ipc-protocol = { workspace = true }
+media-protocol = { workspace = true }
+playback-primitives = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 

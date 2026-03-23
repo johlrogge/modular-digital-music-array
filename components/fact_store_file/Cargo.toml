@@ -10,7 +10,7 @@ license.workspace = true
 interface = "fact-store"
 
 [dependencies]
-acid-protocol = { path = "../acid_protocol" }
+acid-protocol = { workspace = true }
 stainless-facts = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

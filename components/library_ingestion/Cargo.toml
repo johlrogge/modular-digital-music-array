@@ -17,9 +17,9 @@ tracing = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 
 # Internal components
-music-facts = { path = "../music_facts" }
-music-primitives = { path = "../music_primitives" }
-audio-metadata = { path = "../audio_metadata" }
+music-facts = { workspace = true }
+music-primitives = { workspace = true }
+audio-metadata = { workspace = true }
 
 # Hashing
 sha2 = "0.10"

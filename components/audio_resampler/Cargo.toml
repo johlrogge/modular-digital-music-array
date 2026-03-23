@@ -12,7 +12,7 @@ license.workspace = true
 interface = "audio-resampler"
 
 [dependencies]
-audio-types = { path = "../audio_types" }
+audio-types = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 rubato = "0.15"

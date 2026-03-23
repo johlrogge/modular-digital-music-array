@@ -13,14 +13,14 @@ interface = "mdma-client"
 
 [dependencies]
 # IPC clients
-library-ipc-client = { path = "../library_ipc_client" }
-library-ipc-protocol = { path = "../library_ipc_protocol" }
-library-search = { path = "../library_search" }
-media-client = { path = "../media_client" }
-media-protocol = { path = "../media_protocol" }
-gateway-client = { path = "../gateway_client" }
-source-protocol = { path = "../source_protocol" }
-nng-transport = { path = "../nng_transport" }
+library-ipc-client = { workspace = true }
+library-ipc-protocol = { workspace = true }
+library-search = { workspace = true }
+media-client = { workspace = true }
+media-protocol = { workspace = true }
+gateway-client = { workspace = true }
+source-protocol = { workspace = true }
+nng-transport = { workspace = true }
 
 # NNG + serialization
 nng = { workspace = true }

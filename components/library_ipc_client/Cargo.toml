@@ -12,8 +12,8 @@ license.workspace = true
 interface = "library-ipc-client"
 
 [dependencies]
-library-ipc-protocol = { path = "../library_ipc_protocol" }
-nng-transport = { path = "../nng_transport" }
+library-ipc-protocol = { workspace = true }
+nng-transport = { workspace = true }
 nng = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

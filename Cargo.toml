@@ -97,6 +97,38 @@ stainless-facts = { git = "https://github.com/johlrogge/stainless_facts", rev = 
 # Dev/test default. Production builds use fact_store_file via profiles/production.profile.
 fact-store = { path = "components/fact_store_memory" }
 acid-service = { path = "components/acid_service" }
+acid-protocol       = { path = "components/acid_protocol" }
+acid-client         = { path = "components/acid_client" }
+audio-decoder       = { path = "components/audio_decoder" }
+audio-metadata      = { path = "components/audio_metadata" }
+audio-output        = { path = "components/audio_output" }
+audio-resampler     = { path = "components/audio_resampler" }
+audio-types         = { path = "components/audio_types" }
+audio-transcoder    = { path = "components/audio_transcoder" }
+bandcamp-api        = { path = "components/bandcamp_api" }
+date-expression     = { path = "components/date_expression" }
+event-protocol      = { path = "components/event_protocol" }
+fact-store-file     = { path = "components/fact_store_file" }
+gateway-client      = { path = "components/gateway_client" }
+gateway-protocol    = { path = "components/gateway_protocol" }
+inbox-utils         = { path = "components/inbox_utils" }
+library-ipc-client  = { path = "components/library_ipc_client" }
+library-ipc-protocol = { path = "components/library_ipc_protocol" }
+library-ingestion   = { path = "components/library_ingestion" }
+library-search      = { path = "components/library_search" }
+library-service     = { path = "components/library_service" }
+library-service-stub = { path = "components/library_service_stub" }
+mdma-client         = { path = "components/mdma_client" }
+media-client        = { path = "components/media_client" }
+media-protocol      = { path = "components/media_protocol" }
+music-facts         = { path = "components/music_facts" }
+music-primitives    = { path = "components/music_primitives" }
+nng-transport       = { path = "components/nng_transport" }
+playback-engine     = { path = "components/playback_engine" }
+playback-primitives = { path = "components/playback_primitives" }
+source-protocol     = { path = "components/source_protocol" }
+storage_primitives  = { path = "components/storage_primitives" }
+stream-source-protocol = { path = "components/stream_source_protocol" }
 
 [profile.release]
 strip = true

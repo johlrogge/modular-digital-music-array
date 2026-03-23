@@ -15,7 +15,7 @@ interface = "playback-primitives"
 thiserror.workspace = true
 serde = { workspace = true }
 chrono = { workspace = true }
-music-primitives = { path = "../music_primitives" }
+music-primitives = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

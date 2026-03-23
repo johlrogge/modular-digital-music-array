@@ -40,7 +40,7 @@ tokio = { workspace = true }
 zip = "2.1"
 
 # Reuse music primitives
-music-facts = { path = "../music_facts" }
+music-facts = { workspace = true }
 
 # Tracing
 tracing = { workspace = true }

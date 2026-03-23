@@ -10,8 +10,8 @@ license.workspace = true
 interface = "acid-service"
 
 [dependencies]
-acid-protocol = { path = "../acid_protocol" }
-event-protocol = { path = "../event_protocol" }
+acid-protocol = { workspace = true }
+event-protocol = { workspace = true }
 fact-store = { workspace = true }
 nng = { workspace = true }
 serde_json = { workspace = true }

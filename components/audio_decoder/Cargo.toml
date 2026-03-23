@@ -12,7 +12,7 @@ license.workspace = true
 interface = "audio-decoder"
 
 [dependencies]
-audio-types = { path = "../audio_types" }
+audio-types = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }

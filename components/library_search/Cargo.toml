@@ -12,7 +12,7 @@ license.workspace = true
 interface = "library-search"
 
 [dependencies]
-date-expression = { path = "../date_expression" }
+date-expression = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
