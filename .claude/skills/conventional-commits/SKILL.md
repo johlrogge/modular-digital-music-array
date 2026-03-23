@@ -1,6 +1,8 @@
 ---
 name: conventional-commits
 description: Conventional Commits specification adapted for the MDMA project. Defines commit message format, types, scopes, and breaking change conventions.
+# NOTE: This skill is project-owned — it contains MDMA-specific scopes and examples.
+# Do NOT run `metadev install conventional-commits`; it would overwrite this with the generic template.
 ---
 
 # Conventional Commits for MDMA

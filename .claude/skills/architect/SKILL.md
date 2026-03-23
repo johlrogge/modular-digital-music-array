@@ -22,7 +22,7 @@ Load reference files on-demand based on the query topic:
 - **references/tooling.md** - When setting up bacon for background checking or just for task automation
 - **references/testing.md** - When writing tests, setting up test fixtures, creating test doubles, or discussing testing strategies
 
-Note: reference files live at `.claude/skills/rust-architect/references/` — metadev installs them there under the legacy path. Load them using the paths shown above.
+Note: reference files live at `.claude/skills/rust-architect/references/` — metadev installs them there by design. Load them using the paths shown above.
 
 ## Core Capabilities
 
