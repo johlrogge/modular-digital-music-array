@@ -54,58 +54,6 @@ members = [
     "projects/mdma-tui",
     "projects/bdd",
 ]
-default-members = [
-    "components/date_expression",
-    "components/bandcamp_api",
-    "components/audio_metadata",
-    "components/library_ipc_client",
-    "components/library_ipc_protocol",
-    "components/media_client",
-    "components/media_protocol",
-    "components/music_facts",
-    "components/music_primitives",
-    "components/audio_types",
-    "components/audio_decoder",
-    "components/audio_output",
-    "components/audio_resampler",
-    "components/playback_engine",
-    "components/playback_primitives",
-    "components/storage_primitives",
-    "components/event_protocol",
-    "components/nng_transport",
-    "components/library_search",
-    "components/source_protocol",
-    "components/gateway_protocol",
-    "components/gateway_client",
-    "components/mdma_client",
-    "components/audio_transcoder",
-    "components/inbox_utils",
-    "components/library_service",
-    "components/library_service_stub",
-    "components/library_ingestion",
-    "components/acid_protocol",
-    "components/acid_client",
-    "components/fact_store_memory",
-    "components/fact_store_file",
-    "components/acid_service",
-    "components/stream_source_protocol",
-    "bases/service",
-    "bases/http_server",
-    "bases/tui",
-    "bases/client",
-    "bases/bdd-runner",
-    "projects/mdma-acid",
-    "projects/mdma-audio",
-    "projects/mdma-bandcamp",
-    "projects/mdma-console",
-    "projects/mdma-gateway",
-    "projects/mdma-library",
-    "projects/mdma-playback",
-    "projects/mdma-beacon",
-    "projects/mdma-cli",
-    "projects/mdma-tui",
-    "projects/bdd",
-]
 resolver = "2"
 
 [workspace.package]
@@ -144,7 +92,9 @@ service = { path = "bases/service" }
 tempfile = "3"
 tokio-stream = "0.1"
 zip = "2"
-fact-store = { path = "components/fact_store_memory" }
+corsett = { git = "https://github.com/johlrogge/corsett.git", rev = "bf16c1aa2e8d6ba1f833e33009f2deecadc3ee26" }
+stainless-facts = { git = "https://github.com/johlrogge/stainless_facts", rev = "2aa820a808fd5345a1bd59c11d90969bfa84b285" }
+fact-store = { package = "fact-store-file", path = "components/fact_store_file" }
 acid-service = { path = "components/acid_service" }
 
 [profile.release]

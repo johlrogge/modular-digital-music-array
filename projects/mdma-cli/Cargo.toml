@@ -28,7 +28,7 @@ library-search = { path = "../../components/library_search" }
 source-protocol = { path = "../../components/source_protocol" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 colored = "2.0"
-corsett = { git = "https://github.com/johlrogge/corsett.git", rev = "bf16c1aa2e8d6ba1f833e33009f2deecadc3ee26" }
+corsett = { workspace = true }
 terminal_size = "0.4"
 
 [dev-dependencies]
