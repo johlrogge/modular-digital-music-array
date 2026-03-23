@@ -382,9 +382,10 @@ pkg-bandcamp:
 pkg-audio:
     ./scripts/package/create-audio-package.sh
 
-# Build mdma-acid Void package
+# Build mdma-acid Void package (uses production profile for file-backed fact-store)
 [group('package')]
 pkg-acid:
+    cargo polylith profile build production --no-build
     bash ./scripts/package/create-acid-package.sh
 
 # Create repository structure and index (all packages)

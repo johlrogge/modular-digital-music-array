@@ -30,7 +30,7 @@ version = "0.10.1"
 dependencies = [
  "acid-protocol",
  "event-protocol",
- "fact-store-file",
+ "fact-store",
  "nng",
  "serde_json",
  "thiserror 1.0.69",

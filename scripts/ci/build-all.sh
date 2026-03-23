@@ -58,9 +58,10 @@ cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
     --bin mdma-console
 
 echo ""
-echo "=== Phase 1f: Building acid (project workspace) ==="
+echo "=== Phase 1f: Building acid (production profile, file-backed fact-store) ==="
+cargo polylith profile build production --no-build
 cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
-    --manifest-path "$PROJECT_ROOT/projects/mdma-acid/Cargo.toml" \
+    --manifest-path "$PROJECT_ROOT/profiles/production/Cargo.toml" \
     --bin mdma-acid
 
 echo ""

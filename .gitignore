@@ -67,3 +67,6 @@ devenv.local.yaml
 # pre-commit
 .pre-commit-config.yaml
 .cross/
+
+# Generated polylith profile manifests
+profiles/*/
