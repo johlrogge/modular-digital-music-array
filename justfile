@@ -831,16 +831,17 @@ gateway-cross:
     file target/aarch64-unknown-linux-gnu/release/mdma-gateway
     ls -lh target/aarch64-unknown-linux-gnu/release/mdma-gateway
 
-# Cross-compile acid service for aarch64 (project workspace)
+# Cross-compile acid service for aarch64 (production profile, file-backed fact-store)
 [group('build')]
 acid-cross:
     #!/usr/bin/env bash
     set -euo pipefail
     export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
-    echo "Building Acid for aarch64..."
+    echo "Building Acid for aarch64 (production profile, file-backed fact-store)..."
+    cargo polylith profile build production --no-build
     cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
-        --manifest-path projects/mdma-acid/Cargo.toml \
+        --manifest-path profiles/production/Cargo.toml \
         --bin mdma-acid
     echo ""
     echo "Acid built!"
