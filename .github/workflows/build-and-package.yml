@@ -24,7 +24,7 @@ jobs:
     - name: Install cmake
       run: brew install cmake
     - name: Install cargo-polylith
-      run: cargo install cargo-polylith
+      run: cargo install --git https://github.com/johlrogge/metadev cargo-polylith
     - name: Build mdma_cli for Apple Silicon
       run: |
         cargo polylith profile build dev --no-build
@@ -58,8 +58,11 @@ jobs:
         key: cargo-aarch64-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: cargo-aarch64-
 
+    - name: Build mdma binary for BDD tests
+      run: devenv shell -- sh -c 'cargo polylith profile build dev --no-build && cargo build --manifest-path profiles/dev/Cargo.toml --bin mdma'
+
     - name: Unit tests
-      run: devenv shell -- sh -c 'cargo polylith profile build dev --no-build && cargo test --manifest-path profiles/dev/Cargo.toml'
+      run: devenv shell -- sh -c 'cargo test --manifest-path profiles/dev/Cargo.toml'
 
     - name: BDD integration tests
       timeout-minutes: 30
