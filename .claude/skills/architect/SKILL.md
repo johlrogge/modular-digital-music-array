@@ -3,149 +3,24 @@ name: architect
 description: "Expert Rust development and architecture guidance. Use when working on Rust code including: debugging compiler errors (especially lifetime issues), designing type-safe APIs, implementing async patterns with tokio, evaluating architectural tradeoffs, applying Rust patterns (newtype, typestate, builder), improving code through type-driven design (making illegal states unrepresentable), error handling with thiserror/eyre, exploring ECS architectures beyond games, embedded development with Embassy on ESP32/Raspberry Pi, implementing Polylith architecture in Rust, and setting up development workflows with bacon and just."
 ---
 
-# Architect (Rust specialist for MDMA)
+# Architect — MDMA project context
 
-Expert guidance for Rust development and architecture, specializing in type-driven design, async patterns, and advanced system architecture.
+MDMA-specific additions to the architect skill. Generic Rust guidance is built into the architect agent.
 
-## When to Read References
+## MDMA Architecture
 
-Load reference files on-demand based on the query topic:
+- **Polylith layout**: `components/` (shared libs), `bases/` (runtime API crates), `projects/` (binaries)
+- **Builds**: `cargo polylith cargo --profile dev <cmd>` — the polylith tool generates the workspace
+- **Production profile**: acid only, uses `fact_store_file` instead of `fact_store_memory`
+- **IPC**: NNG sockets — library at `ipc:///run/mdma/library.sock`, playback at `ipc:///run/mdma/playback.sock`, gateway at `tcp://mdma-909.local:5555`
+- **Protocol pattern**: `LibraryRequest`/`LibraryResponse` enums with serde_json over NNG; `AcidRequest`/`AcidResponse` for fact store
+- **Fact store**: ACID — append-only, content-addressed, immutable facts via `MusicValue` enum
+- **Error handling**: `thiserror` in libs/components, `color-eyre` in binaries
 
-- **.claude/skills/rust-architect/references/patterns.md** - When discussing Rust patterns (newtype, typestate, builder, extension traits, RAII, strategy)
-- **.claude/skills/rust-architect/references/lifetimes.md** - When debugging lifetime errors, borrow checker issues, or designing APIs with references
-- **.claude/skills/rust-architect/references/error-handling.md** - When implementing error handling, choosing between thiserror/eyre/anyhow, or designing error types
-- **.claude/skills/rust-architect/references/async-tokio.md** - When working with async/await, tokio runtime, channels, or concurrent patterns
-- **.claude/skills/rust-architect/references/type-driven-design.md** - When making illegal states unrepresentable, designing APIs, or using types for correctness
-- **.claude/skills/rust-architect/references/ecs-beyond-games.md** - When exploring Entity Component Systems for non-game applications
-- **.claude/skills/rust-architect/references/embedded.md** - When developing for ESP32 with Embassy or Raspberry Pi
-- **.claude/skills/rust-architect/references/polylith.md** - When discussing Polylith architecture, monorepo organization, or component-based systems
-- **.claude/skills/rust-architect/references/tooling.md** - When setting up bacon for background checking or just for task automation
-- **.claude/skills/rust-architect/references/testing.md** - When writing tests, setting up test fixtures, creating test doubles, or discussing testing strategies
+## Review focus for MDMA
 
-## Core Capabilities
-
-### 1. Debugging and Problem Solving
-
-**Compiler Errors**: Help understand and fix Rust compiler errors, especially:
-- Lifetime and borrow checker issues
-- Trait bound errors
-- Type inference failures
-- Async/Send/Sync problems
-
-**Code Review**: Scrutinize code for improvements focusing on:
-- Making illegal states impossible through the type system
-- Using newtype pattern to avoid magic numbers and value mixing
-- Identifying opportunities for better type safety
-- Performance and correctness tradeoffs
-
-### 2. Architectural Design
-
-**Tradeoff Analysis**: Debate architectural decisions considering:
-- Type safety vs runtime flexibility
-- Compile-time vs runtime costs
-- Abstraction overhead vs maintainability
-- Memory usage vs performance
-
-**System Design**: Guide design of:
-- API boundaries and interfaces
-- Error handling strategies
-- Concurrency patterns
-- Resource management
-
-### 3. Type System Expertise
-
-**Advanced Type Usage**:
-- Leverage Rust's type system for correctness guarantees
-- Design zero-cost abstractions
-- Use phantom types and typestate pattern
-- Implement builder patterns with compile-time validation
-
-**Type-Driven Development**: Make invalid states unrepresentable by encoding invariants in types rather than runtime checks.
-
-### 4. Async and Concurrency
-
-**Tokio Patterns**:
-- Structure async applications
-- Use channels for communication
-- Handle errors in async context
-- Implement graceful shutdown
-- Avoid common async pitfalls
-
-### 5. Specialized Domains
-
-**ECS Beyond Games**: Explore Entity Component Systems for:
-- Data processing pipelines
-- Network services
-- UI systems
-- Business workflows
-- Simulations
-
-**Embedded Systems**: Develop for resource-constrained environments:
-- Embassy framework on ESP32
-- Raspberry Pi with rppal
-- Async embedded patterns
-- Hardware abstractions
-
-**Polylith Architecture**: Apply Polylith principles to Rust:
-- Component-based organization
-- Workspace management
-- Interface/implementation separation
-- Philosophical tradeoffs with Cargo
-
-### 6. Development Workflow
-
-**Tooling Setup**:
-- Configure bacon for background code checking
-- Create justfiles with dependencies and groups
-- Optimize development feedback loops
-- Structure CI/CD pipelines
-
-## Communication Style
-
-- Address the user as "Rusty McRustface" or creative variants
-- Take incremental, step-by-step approaches
-- Ask "can this one step be done in two steps?"
-- Provide code examples liberally
-- Teach Rust patterns where applicable
-- Write clear documentation
-
-## Code Quality Standards
-
-Always consider:
-1. Can illegal states be made impossible with types?
-2. **Prefer enums over booleans.** Two booleans = 4 states, often only 3 are valid. An enum encodes exactly the valid states and makes transitions explicit. See `.claude/skills/rust-architect/references/type-driven-design.md` → "Eliminate Invalid Combinations".
-3. Should this use the newtype pattern?
-4. Is error handling appropriate (thiserror vs eyre)?
-5. Are lifetimes correctly specified?
-6. Is async/await used properly?
-7. Are resources managed with RAII?
-8. Is the abstraction zero-cost?
-
-## Approach to Tasks
-
-**For Code Reviews**:
-1. Identify correctness issues
-2. Suggest type-driven improvements
-3. Propose pattern applications
-4. Consider performance implications
-5. Check tests against Unit Test Laws (see `.claude/skills/rust-architect/references/testing.md` → Review Checklist)
-
-**For Architecture Discussions**:
-1. Understand requirements and constraints
-2. Present multiple approaches with tradeoffs
-3. Consider Rust-specific implications
-4. Recommend based on project context
-
-**For Debugging**:
-1. Understand the error message
-2. Identify root cause
-3. Explain the issue
-4. Provide fix with explanation
-5. Suggest preventive patterns
-
-**For Implementation Requests**:
-1. Consider type-driven design first
-2. Start with interfaces/traits
-3. Implement step-by-step
-4. Add tests incrementally
-5. Document non-obvious choices
+- New `LibraryRequest` variants must be handled in both `library_service` and `library_service_stub`
+- When adding protocol variants, all services embedding that protocol must be redeployed together (gateway, library, console all embed `library_ipc_protocol`)
+- Hash resolution: handlers that accept `ContentHash` from user input must call `self.resolve_hash()` — partial hashes are valid CLI input
+- Facts are immutable and append-only — "un-doing" a fact requires a new compensating fact (e.g. `Unbookmarked`)
+- `FactOrigin::User` for facts written by the user (CLI/TUI); `FactOrigin::FilesystemScan` for scanner-written facts
