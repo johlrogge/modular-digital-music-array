@@ -1,10 +1,10 @@
 [package]
 name = "music-facts"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-license.workspace = true
+version = "0.10.1"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
 
 [package.metadata]
 
@@ -12,15 +12,15 @@ license.workspace = true
 interface = "music-facts"
 
 [dependencies]
-music-primitives = { path = "../music_primitives" }
-playback-primitives = { path = "../playback_primitives" }
-storage_primitives = { path = "../storage_primitives" }
-serde = { workspace = true, features = ["derive"] }
-thiserror = { workspace = true }
-chrono = { workspace = true, features = ["serde"] }
+music-primitives = { workspace = true }
+playback-primitives = { workspace = true }
+storage_primitives = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1.0"
+chrono = "0.4"
 
 [dev-dependencies]
-pretty_assertions = { workspace = true }
-rstest = { workspace = true }
-serde_json = { workspace = true }
+pretty_assertions = "1"
+rstest = "0.26"
+serde_json = "1.0"
 stainless-facts = { git = "https://github.com/johlrogge/stainless_facts", rev = "2aa820a808fd5345a1bd59c11d90969bfa84b285" }

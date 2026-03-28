@@ -1,14 +1,9 @@
-[workspace]
-resolver = "2"
-# This is a standalone project workspace (Polylith projects/ layout).
-# Dependencies use explicit versions — no workspace = true inheritance.
-
 [package]
 name = "mdma-tui"
-version = "0.4.0"
+version = "0.10.1"
 edition = "2021"
 authors = ["MDMA Development Team"]
-repository = "https://github.com/johlrogge/modular-digital-music-array"
+repository = "https://github.com/your-org/mdma"
 license = "MIT"
 
 [[bin]]
@@ -16,9 +11,7 @@ name = "mdma-tui"
 path = "src/main.rs"
 
 [dependencies]
-# Client base (gateway address derivation)
 client = { path = "../../bases/client" }
-
 ratatui = "0.29"
 crossterm = "0.28"
 tui-base = { path = "../../bases/tui" }

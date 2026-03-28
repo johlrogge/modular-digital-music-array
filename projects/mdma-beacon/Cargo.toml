@@ -1,12 +1,9 @@
-[workspace]
-resolver = "2"
-
 [package]
 name = "mdma-beacon"
-version = "0.6.0"
+version = "0.10.1"
 edition = "2021"
 authors = ["MDMA Development Team"]
-repository = "https://github.com/johlrogge/modular-digital-music-array"
+repository = "https://github.com/your-org/mdma"
 license = "MIT"
 
 [[bin]]
@@ -22,7 +19,7 @@ axum = "0.7"
 askama = "0.12"
 tower-http = { version = "0.5", features = ["fs"] }
 thiserror = "1.0"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

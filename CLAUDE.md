@@ -8,14 +8,27 @@ MDMA (Modular Distributed Music Architecture) is a distributed DJ system for Ras
 
 **Target Platform:** Raspberry Pi 5 running Void Linux with NVMe storage via M.2 HAT
 
+## Environment
+
+This project runs in an immutable Nix environment managed by devenv.
+**Do NOT** run `pip install`, `npm install -g`, `cargo install`, `brew install`,
+`apt-get install`, or any other imperative package manager.
+If a tool or package is missing, add it to `devenv.nix` and re-enter the shell.
+All tools, packages, hooks, and services are declared in `devenv.nix`.
+
 ## Build Commands
 
+Agents use the `mcp__rust-codebase__*` MCP tools (polylith-aware):
+```
+cargo_check        # fast compile check
+cargo_test         # run tests
+cargo_clippy       # lint
+hygiene_report     # test + clippy + coverage in one shot
+```
+
+Other tasks via `just` (use `just --list` or `mcp__just-dev__just_list` to see all):
 ```bash
-# Development
 just watch              # Watch mode: check → test → build → clippy
-cargo build             # Build all workspace members
-cargo test              # Run all tests
-cargo clippy            # Lint
 
 # Cross-compile beacon for Raspberry Pi
 just beacon-cross       # Uses cargo-zigbuild (recommended)
@@ -37,11 +50,17 @@ just pi-connect         # Find and auto-SSH to Pi
 
 ### Workspace Structure
 
-- **bases/** - Binary entry points
-  - `beacon` - Provisioning server with web UI (main focus)
-  - `mdma_playback` - Audio playback server
-  - `mdma_cli` - Command-line interface
-  - `mdma_console` - Web management console
+- **projects/** - Binary entry points (deployable services and tools)
+  - `mdma-beacon` - Provisioning server with web UI (main focus)
+  - `mdma-playback` - Audio playback queue manager
+  - `mdma-audio` - File playback source (wraps PlaybackEngine, speaks stream_source_protocol)
+  - `mdma-cli` - Command-line interface
+  - `mdma-console` - Web management console
+  - `mdma-library` - Library service
+  - `mdma-gateway` - Gateway router
+  - `mdma-bandcamp` - Bandcamp source
+
+- **bases/** - Abstract Polylith base traits (client, service, http_server, tui)
 
 - **components/** - Shared libraries
   - `playback_engine` - Real-time audio (Symphonia + PipeWire)
@@ -62,9 +81,9 @@ stage4_install → stage5_configure → stage6_finalize
 Each stage implements the `Action` trait with `plan()` and `apply()` methods. The compiler enforces correct stage sequencing through the type system.
 
 **Key files:**
-- `bases/beacon/src/provisioning/mod.rs` - Stage orchestration
-- `bases/beacon/src/provisioning/stage*.rs` - Individual stages
-- `bases/beacon/src/routes/` - Axum web handlers
+- `projects/mdma-beacon/src/provisioning/mod.rs` - Stage orchestration
+- `projects/mdma-beacon/src/provisioning/stage*.rs` - Individual stages
+- `projects/mdma-beacon/src/routes/` - Axum web handlers
 
 ### Type-Safe Primitives
 
@@ -121,12 +140,7 @@ MDMA_NODE is already set in the devenv shell. The CLI derives the gateway addres
 
 ## Testing
 
-Tests are inline with `#[cfg(test)]` modules:
-```bash
-cargo test                    # All tests
-cargo test --package beacon   # Single package
-cargo test provisioning       # Filter by name
-```
+Tests are inline with `#[cfg(test)]` modules. Use `mcp__rust-codebase__cargo_test` (polylith-aware) to run them.
 
 ## Coordinator Rules
 
@@ -153,9 +167,9 @@ Workflow:
    - For large plans: split into independent phases, dispatch one code-minion per phase in parallel
    - Give each code-minion a clear, self-contained prompt with all necessary context
    - Code-minions must run cargo build/test/clippy before reporting back
-3. Code-minion(s) report back → dispatch rust-architect to review all changed files
+3. Code-minion(s) report back → dispatch architect to review all changed files
    for duplication, inconsistencies, missed reuse, and fragility
-4. If rust-architect finds issues → dispatch code-minion to fix, then re-run rust-architect
+4. If architect finds issues → dispatch code-minion to fix, then re-run architect
    until clean
 5. Dispatch commit agent
 6. Dispatch devops to deploy → dispatch test agent for smoke tests
@@ -167,8 +181,8 @@ Workflow:
 - **Release branches**: `git flow release start <version>` for version bumps
 - **Hotfix branches**: `git flow hotfix start <name>` for urgent fixes
 - All development happens on feature branches off `develop`
-- Only releases and hotfixes merge to `main`
-- CI builds packages only on `main` push; tests run on all branches
+- Only releases and hotfixes merge to `master`
+- CI builds packages only on `master` push; tests run on all branches
 
 ### Release Workflow
 
@@ -178,11 +192,11 @@ Workflow:
 4. Dispatch **documenter** agent to update all READMEs
 5. Dispatch **commit** agent: `chore(release): bump to <version>`
 6. `git flow release finish <version>`
-7. Push main + develop + tags
+7. Push master + develop + tags
 8. CI builds and publishes packages
 9. Dispatch **devops** to verify packages install on Pi
 
-See `.claude/skills/mdma-devops/references/releases.md` for detailed procedure.
+See `RELEASING.md` for detailed procedure.
 
 ## Git Commit Guidelines
 

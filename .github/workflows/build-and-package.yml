@@ -23,8 +23,12 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
     - name: Install cmake
       run: brew install cmake
+    - name: Install cargo-polylith
+      run: cargo install cargo-polylith
     - name: Build mdma_cli for Apple Silicon
-      run: cargo build --release --manifest-path projects/mdma-cli/Cargo.toml
+      run: |
+        cargo polylith profile build dev --no-build
+        cargo build --release --manifest-path profiles/dev/Cargo.toml --bin mdma
     - uses: actions/upload-artifact@v4
       with:
         name: mdma-cli-macos-arm64
@@ -55,7 +59,7 @@ jobs:
         restore-keys: cargo-aarch64-
 
     - name: Unit tests
-      run: devenv shell -- cargo test
+      run: devenv shell -- sh -c 'cargo polylith profile build dev --no-build && cargo test --manifest-path profiles/dev/Cargo.toml'
 
     - name: BDD integration tests
       timeout-minutes: 30

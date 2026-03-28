@@ -1,10 +1,10 @@
 [package]
 name = "library-search"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-license.workspace = true
+version = "0.10.1"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
 
 [package.metadata]
 
@@ -12,12 +12,12 @@ license.workspace = true
 interface = "library-search"
 
 [dependencies]
-date-expression = { path = "../date_expression" }
-chrono = { workspace = true, features = ["serde"] }
-serde = { workspace = true, features = ["derive"] }
-thiserror = { workspace = true }
+date-expression = { workspace = true }
+chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1.0"
 regex = "1"
 
 [dev-dependencies]
-rstest = { workspace = true }
-serde_json = { workspace = true }
+rstest = "0.26"
+serde_json = "1.0"

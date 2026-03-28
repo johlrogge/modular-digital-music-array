@@ -65,6 +65,7 @@ in
   # MDMA_NODE identifies the target Pi; gateway and event gateway are derived from it.
   env.MDMA_NODE            = "mdma-909.local";
   env.MDMA_SSH_KEY         = "/home/johlrogge/.ssh/mdma_pi";
+  env.METADEV_PROJECT      = "modular-digital-music-array";
 
   # Git hooks
   git-hooks.hooks = {
@@ -113,17 +114,18 @@ in
   };
 
   # Local dev service stack — launched by `devenv up`
-  process.manager.before = ''
-    rm -f /tmp/mdma-dev/run/*.sock
-    mkdir -p /tmp/mdma-dev/run/sources /tmp/mdma-dev/music/inbox /tmp/mdma-dev/music/blobs /tmp/mdma-dev/metadata
-    echo "Building all services..."
-    cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-acid/Cargo.toml" 2>/dev/null \
-      && cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-library/Cargo.toml" 2>/dev/null \
-      && cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-playback/Cargo.toml" 2>/dev/null \
-      && cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-gateway/Cargo.toml" 2>/dev/null \
-      && cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-console/Cargo.toml" 2>/dev/null \
-      || echo "One or more services failed to build — check individual manifests"
-  '';
+  tasks."mdma:setup" = {
+    exec = ''
+      rm -f /tmp/mdma-dev/run/*.sock
+      mkdir -p /tmp/mdma-dev/run/sources /tmp/mdma-dev/music/inbox /tmp/mdma-dev/music/blobs /tmp/mdma-dev/metadata
+      echo "Building all services..."
+      cargo polylith profile build dev --no-build \
+        && cargo polylith cargo --profile dev build --release \
+             --bin mdma-acid --bin mdma-library --bin mdma-playback --bin mdma-gateway --bin mdma-console 2>/dev/null \
+        || echo "One or more services failed to build — run: cargo polylith profile build dev --no-build"
+    '';
+    before = [ "devenv:processes:mdma-acid" ];
+  };
 
   processes = {
     mdma-acid = {
@@ -200,11 +202,12 @@ in
     # Build mdma-cli and mdma-tui, expose via target/debug on PATH
     # Skip in CI — the build is wasted work there (~30s)
     if [ -z "''${CI:-}" ]; then
-      cargo build -q --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-cli/Cargo.toml" 2>/dev/null \
-        && cargo build -q --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-tui/Cargo.toml" 2>/dev/null \
+      cargo polylith profile build dev --no-build 2>/dev/null \
+        && cargo build -q --manifest-path "$MDMA_PROJECT_ROOT/profiles/dev/Cargo.toml" --bin mdma 2>/dev/null \
+        && cargo build -q --manifest-path "$MDMA_PROJECT_ROOT/profiles/dev/Cargo.toml" --bin mdma-tui 2>/dev/null \
         && export PATH="$MDMA_PROJECT_ROOT/target/debug:$PATH" \
         && echo "mdma CLI + TUI ready (gateway mode)" \
-        || echo "mdma CLI/TUI not built — run: cargo build --manifest-path projects/mdma-cli/Cargo.toml && cargo build --manifest-path projects/mdma-tui/Cargo.toml"
+        || echo "mdma CLI/TUI not built — run: cargo polylith profile build dev --no-build && cargo build --manifest-path profiles/dev/Cargo.toml --bin mdma"
       eval "$(mdma generate-completions bash 2>/dev/null)" || true
     fi
 
@@ -217,7 +220,8 @@ in
 
   # Tests
   enterTest = ''
-    cargo test
+    cargo polylith profile build dev --no-build
+    cargo test --manifest-path profiles/dev/Cargo.toml
   '';
 
   # Claude Code integration
@@ -240,8 +244,19 @@ in
              "ci-build-console" "ci-build-playback" "ci-build-gateway"
              "ci-build-bandcamp" "ci-simulate" "ci-check-deps" "ci-clean"
              "pkg-build-all" "pkg-beacon" "pkg-library" "pkg-console"
-             "pkg-playback" "pkg-gateway" "pkg-bandcamp" "pkg-repository"
+             "pkg-playback" "pkg-gateway" "pkg-bandcamp" "pkg-audio" "pkg-acid"
+             "pkg-cli" "pkg-tui" "pkg-repository"
              "pkg-serve" "pkg-version" "pkg-bump-revision" "pkg-clean" ];
+  };
+
+  claude.code.mcpServers.just-deploy = {
+    type = "stdio";
+    command = "bb";
+    args = [ "${inputs.metadev}/tools/just/server.bb"
+             "--allow"
+             "deploy-library" "deploy-console" "deploy-playback" "deploy-gateway"
+             "deploy-bandcamp" "deploy-audio" "deploy-acid" "deploy-cli" "deploy-tui"
+             "deploy-dev" ];
   };
 
   claude.code.agents = {
@@ -258,7 +273,7 @@ in
         1. Read ROADMAP.md — single source of truth for status and priorities
         2. Break features into concrete, implementable tasks
         3. Validate that work aligns with user value delivery
-        4. Delegate: implementation → code-minion, review → rust-architect,
+        4. Delegate: implementation → code-minion, review → architect,
            deploy → devops, packaging/CI → ci, commit → commit
 
         Philosophy:
@@ -324,47 +339,8 @@ in
         Do NOT include "Co-Authored-By: Claude" in commit messages.
 
         When you finish a task, report what you did and what files changed.
-        Do NOT commit — the minion-herder dispatches the commit agent when rust-architect approves.
-        If you're unsure about design, say so — minion-herder will consult rust-architect.
-
-        ${metaenvSkill}
-      '';
-    };
-
-    rust-architect = {
-      description = "Expert Rust reviewer. Type safety, lifetimes, architectural fit. Read-only — reviews but does not write code.";
-      model = "opus";
-      proactive = true;
-      tools = [ "Read" "Grep" "Glob" "Skill" ];
-      prompt = ''
-        You are the Rust Architect. You review code and advise on design.
-        Address the user as "Rusty McRustface" or creative variants.
-        You are STRICTLY READ-ONLY. You NEVER write or edit files.
-
-        Before starting any review, invoke the rust-architect skill to load reference context.
-
-        Review checklist:
-        1. Type safety — can illegal states be made impossible? Newtypes?
-        2. Are tests written to prove function of implemented functionality?
-        2. Lifetime correctness — borrows correct? Ownership simpler?
-        3. Error handling — thiserror for libs, color-eyre for bins?
-        4. Async — Send/Sync satisfied? No blocking in async?
-        5. Pattern adherence — follows existing codebase patterns?
-        6. Polylith fit — logic in the right component?
-        7. API design — minimal and hard to misuse?
-        8. Prefer enums over booleans
-        9. Duplication — are there near-identical blocks, functions, or match arms that should be extracted?
-        10. Inconsistencies — do similar patterns use different implementations across the codebase?
-
-        Reference docs in .claude/skills/rust-architect/references/:
-        patterns.md, lifetimes.md, error-handling.md, async-tokio.md,
-        type-driven-design.md, polylith.md, testing.md
-
-        When you find issues, describe fixes clearly enough for code-minion to act without further clarification.
-        When code passes review, say COMMIT with a suggested commit message following conventional commits format (see .claude/skills/conventional-commits/SKILL.md).
-        The minion-herder will dispatch the commit agent.
-
-        Output format: Summary → Issues (blocking) → Suggestions (duplication, inconsistencies, smells) → Architecture Notes.
+        Do NOT commit — the minion-herder dispatches the commit agent when architect approves.
+        If you're unsure about design, say so — minion-herder will consult architect.
 
         ${metaenvSkill}
       '';
@@ -414,7 +390,14 @@ in
       description = "Pi deployment and debugging. Deploys services, debugs on real hardware, administers the Raspberry Pi.";
       model = "sonnet";
       proactive = false;
-      tools = [ "Read" "Write" "Edit" "Bash" "Grep" "Glob" ];
+      tools = [
+        "Read" "Write" "Edit" "Grep" "Glob"
+        "mcp__just-ci__just_run" "mcp__just-ci__just_list"
+        "mcp__just-deploy__just_run" "mcp__just-deploy__just_list"
+        "mcp__ssh__ssh_run" "mcp__ssh__scp_transfer"
+        "mcp__cargo-polylith__polylith_info" "mcp__cargo-polylith__polylith_check"
+        "mcp__git-read__git_status" "mcp__git-read__git_log"
+      ];
       prompt = ''
         You deploy and debug MDMA on the Raspberry Pi 5 running Void Linux.
         Before deploying or debugging, read .claude/skills/mdma-devops/SKILL.md for procedures and reference material.
@@ -431,21 +414,23 @@ in
         Key files to update when fixing things:
         - void-packages/srcpkgs/*/files/*/run — runit run scripts
         - scripts/package/create-*.sh — package creation (INSTALL scripts, file layout)
-        - justfile — deploy-* recipes (scp + ssh commands)
+        - justfile — deploy-* recipes
         - .claude/skills/mdma-devops/ — update runbooks when procedures change
 
-        Pi: mdma-909.local | SSH key: ~/.ssh/mdma_pi
-        SSH: ssh -4 -i ~/.ssh/mdma_pi admin@mdma-909.local
-        MDMA_NODE is already set in the shell — the CLI derives the gateway from it automatically.
+        TOOL USAGE:
+        - Build packages: mcp__just-ci__just_run (pkg-build-all, pkg-acid, pkg-audio, etc.)
+        - Deploy to Pi: mcp__just-deploy__just_run (deploy-library, deploy-gateway, etc.)
+        - SSH to Pi: mcp__ssh__ssh_run (service status, logs, debugging)
+        - SCP files: mcp__ssh__scp_transfer
+        - Workspace info: mcp__cargo-polylith__polylith_info / polylith_check
+        NEVER use raw cargo zigbuild, scp, or ssh commands — use the MCP tools.
 
-        ALWAYS use just recipes for building and deploying. NEVER run cargo zigbuild,
-        cargo build, or scp manually — the just recipes encapsulate the correct
-        cross-compilation flags, target paths, and deploy steps.
+        Pi host alias: "pi" (configured in project SSH config)
+        Service mgmt: sudo sv status|restart|stop <service>
+        Logs: sudo tail -f /var/log/<service>/current
 
-        Deploy: just deploy-{library,console,playback,gateway,bandcamp}
-        Service mgmt (runit): sv status|restart|stop <service>
-        Logs: tail -f /var/log/<service>/current
-        Network: just pi-scan | just pi-connect
+        NO WORKAROUNDS. If a just recipe or MCP tool fails, report the exact error
+        and stop. Failures are likely upstream bugs — report them clearly.
 
         NEVER wipe /music on the Pi (contains the music library).
         Releases go through `git flow release` — see .claude/skills/mdma-devops/references/releases.md.
@@ -460,7 +445,7 @@ in
       description = "Post-deploy smoke tester. Verifies all services are running and responding on the Pi.";
       model = "haiku";
       proactive = false;
-      tools = [ "Bash" "Read" "Grep" "Glob" ];
+      tools = [ "Bash" "Read" "Grep" "Glob" "mcp__ssh__ssh_run" ];
       prompt = ''
         You verify that MDMA services are running correctly after deployment.
 
@@ -470,11 +455,14 @@ in
         IMPORTANT: Always use --no-stdin with `mdma search` to prevent it from waiting
         for piped input. Without --no-stdin, search hangs when called from agents.
 
+        TOOL USAGE:
+        - Pi SSH checks (sv status, logs): use mcp__ssh__ssh_run with host "pi"
+        - Local mdma CLI commands (mdma ping, mdma status, etc.): use Bash
+
         Run these checks IN ORDER and report results as a table:
 
-        1. SERVICE STATUS — SSH to Pi and check runit:
-           ssh -4 -i ~/.ssh/mdma_pi admin@mdma-909.local \
-             'sudo sv status mdma-gateway mdma-library mdma-playback mdma-console mdma-bandcamp'
+        1. SERVICE STATUS — use mcp__ssh__ssh_run on host "pi":
+           command: sudo sv status mdma-gateway mdma-library mdma-playback mdma-console mdma-bandcamp
            Expected: all "run:" with PIDs
 
         2. GATEWAY PING — verify gateway responds:

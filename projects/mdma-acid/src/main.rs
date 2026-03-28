@@ -4,7 +4,11 @@ use service::{ServiceConfig, ServiceSockets};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "MDMA ACID - Append-only fact stream writer service")]
+#[command(
+    author,
+    version,
+    about = "MDMA ACID - Append-only fact stream writer service"
+)]
 struct Args {
     #[arg(long, default_value = "/metadata")]
     metadata_dir: PathBuf,

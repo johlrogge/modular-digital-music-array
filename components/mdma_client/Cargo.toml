@@ -1,10 +1,10 @@
 [package]
 name = "mdma-client"
 version = "0.2.0"
-edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-license.workspace = true
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
 
 [package.metadata]
 
@@ -13,16 +13,16 @@ interface = "mdma-client"
 
 [dependencies]
 # IPC clients
-library-ipc-client = { path = "../library_ipc_client" }
-library-ipc-protocol = { path = "../library_ipc_protocol" }
-library-search = { path = "../library_search" }
-media-client = { path = "../media_client" }
-media-protocol = { path = "../media_protocol" }
-gateway-client = { path = "../gateway_client" }
-source-protocol = { path = "../source_protocol" }
-nng-transport = { path = "../nng_transport" }
+library-ipc-client = { workspace = true }
+library-ipc-protocol = { workspace = true }
+library-search = { workspace = true }
+media-client = { workspace = true }
+media-protocol = { workspace = true }
+gateway-client = { workspace = true }
+source-protocol = { workspace = true }
+nng-transport = { workspace = true }
 
 # NNG + serialization
-nng = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
+nng = "1.0"
+serde_json = "1.0"
+thiserror = "1.0"

@@ -1,440 +1,277 @@
 # Polylith Architecture in Rust
 
-## What is Polylith?
-
-Polylith is a software architecture that aims for:
-- **Maximum code reuse** across projects
-- **Independent development** of components
-- **Incremental testing** - test only what changed
-- **Simplified CI/CD** - build only affected artifacts
-
-Originally from Clojure, adapting to Rust requires thinking through unique tradeoffs.
+Polylith is a monorepo architecture for maximum component reuse across multiple deployable artifacts.
+Originally from Clojure; this document describes the Rust/Cargo mapping.
 
 ## Core Concepts
 
-### Workspace Structure
-```
-polylith-rust/
-├── components/          # Reusable logic
-│   ├── user/
-│   │   ├── interface.rs    # Public API
-│   │   └── core.rs         # Implementation
-│   ├── auth/
-│   └── payment/
-├── bases/              # Entry points (main, handlers)
-│   ├── web-api/
-│   └── cli/
-├── projects/           # Deployable artifacts
-│   ├── backend/
-│   │   ├── Cargo.toml
-│   │   └── src/main.rs
-│   └── admin-cli/
-│       ├── Cargo.toml
-│       └── src/main.rs
-└── development/        # For REPL/testing
-    ├── Cargo.toml
-    └── src/lib.rs
-```
+### Component
+A Cargo library crate under `components/<name>/`. Its **interface is the public surface of `lib.rs`** — the `pub` items re-exported from private submodules. Nothing beyond the crate boundary is accessible to other bricks.
 
-### Component Structure
 ```
 components/user/
-├── interface.rs       # Public trait/types
-└── core.rs           # Implementation
-
-// interface.rs
-pub trait UserService {
-    fn create_user(&self, email: &str) -> Result<User>;
-    fn get_user(&self, id: UserId) -> Result<User>;
-}
-
-pub struct User {
-    pub id: UserId,
-    pub email: String,
-}
-
-// core.rs
-pub struct UserServiceImpl {
-    db: Box<dyn Database>,
-}
-
-impl UserService for UserServiceImpl {
-    fn create_user(&self, email: &str) -> Result<User> {
-        // Implementation
-    }
-}
+  Cargo.toml
+  src/
+    lib.rs        ← ONLY pub use re-exports
+    user.rs       ← private implementation
 ```
 
-## Rust-Specific Considerations
+```rust
+// src/lib.rs — the interface: what other bricks can see
+mod user;
+pub use user::create_user;
+pub use user::get_user;
+pub use user::User;
+```
 
-### Challenge 1: Cargo Workspaces vs Polylith
+```rust
+// src/user.rs — the implementation: private
+pub fn create_user(email: &str) -> Result<User> { ... }
+pub fn get_user(id: UserId) -> Result<User> { ... }
+```
 
-**Polylith ideal**: One namespace, all components available
-**Cargo reality**: Explicit dependencies in Cargo.toml
+**No traits required.** The interface is plain named functions, as Joakim Tengstrand (polylith inventor) intends. The crate's pub surface IS the interface contract.
 
-**Solution**: Workspace with path dependencies
+### Interface metadata
+Cargo-polylith uses an explicit metadata declaration in each component's `Cargo.toml`:
+
 ```toml
-# projects/backend/Cargo.toml
+[package.metadata.polylith]
+interface = "user"
+```
+
+New components get this automatically (`component new` defaults `interface` to the crate name).
+Existing components can be updated with `component update <name> [--interface <NAME>]`.
+`cargo polylith check` warns for any component missing this declaration.
+
+### Base
+A Cargo **library crate** under `bases/<name>/`. Exposes a runtime API (HTTP server, CLI, IPC, gRPC ...) as ordinary Rust functions (`run()`, `serve()`, `create_sockets()`). Bases wire components together but do not hardcode which implementations are used.
+
+**Bases must NOT have `src/main.rs`.** If a base were a binary, two bases could never share one process.
+
+```
+bases/http_api/
+  Cargo.toml
+  src/
+    lib.rs        ← pub fn serve(...) / run(...) / create_sockets(...)
+    handler.rs    ← private implementation
+```
+
+### Project
+A Cargo workspace root under `projects/<name>/`. Owns `src/main.rs` and calls the bases' runtime-API functions. Projects CAN depend on components directly (valid polylith). Projects MUST depend on at least one base.
+
+```
+projects/production/
+  Cargo.toml      ← project workspace root + [package] + [[bin]]
+  src/main.rs     ← entry point: calls base fns, wires components
+```
+
+A project has **no domain logic** — all logic lives in bricks. The `main.rs` is a thin wiring point.
+
+### Development Workspace
+The repo root `Cargo.toml`. Lists ALL components and bases as members. Used for `cargo check`, IDE support, and day-to-day development. Not a deployment artifact.
+
+## Directory Layout
+
+```
+repo-root/
+  Cargo.toml              ← development workspace: members = all components + bases
+  .cargo/config.toml      ← [build] target-dir = "target"  (shared across all workspaces)
+  components/             ← library crates (NOT a workspace root)
+    user/
+      Cargo.toml
+      src/lib.rs          ← pub re-exports only
+      src/user.rs         ← private impl
+    user_inmemory/        ← alternative implementation (same crate name "user")
+      Cargo.toml
+      src/lib.rs
+      src/user.rs
+  bases/                  ← runtime-API library crates (lib only, no main.rs)
+    http_api/
+      Cargo.toml
+      src/lib.rs          ← pub fn serve(...)
+  projects/
+    production/
+      Cargo.toml          ← project workspace root + [package] + [[bin]]
+      src/main.rs         ← entry point: calls base fns
+    test-env/
+      Cargo.toml          ← different implementation choices
+      src/main.rs
+```
+
+## `cargo polylith check` Violations
+
+| Violation                        | Kind    | Exit |
+|----------------------------------|---------|------|
+| Component missing lib.rs         | error   | 1    |
+| Base missing lib.rs              | error   | 1    |
+| Base has main.rs                 | warning | 0    |
+| Base depends on base             | error   | 1    |
+| Project has no base dep          | warning | 0    |
+| Component not reachable          | warning | 0    |
+| Wildcard re-export               | warning | 0    |
+| Missing interface metadata       | warning | 0    |
+| Ambiguous interface              | warning | 0    |
+| Duplicate package name           | warning | 0    |
+| Not in workspace members         | warning | 0    |
+| project_has_own_workspace        | warning | 0    |
+| project_not_in_root_workspace    | warning | 0    |
+| hardwired_dep                    | warning | 0    |
+
+Projects depending directly on components is valid and not flagged.
+
+## Profiles
+
+Polylith profiles let you swap implementations per build without changing the root workspace.
+
+```
+profiles/production.profile   ← declares implementation overrides
+profiles/production/          ← generated by `cargo polylith profile build production`
+  Cargo.toml                  ← full standalone workspace manifest with overrides applied
+```
+
+Example `.profile` file:
+```toml
+[implementations]
+fact-store = "components/fact_store_file"
+```
+
+Build a production artifact against the profile manifest:
+```bash
+cargo polylith profile build production --no-build   # generates profiles/production/Cargo.toml
+cargo build --manifest-path profiles/production/Cargo.toml --bin my-service
+```
+
+The generated `profiles/*/` directories should be gitignored — they are derived from the `.profile` source.
+
+The root workspace keeps the dev/test default implementation. Only production CI and packaging builds use the profile manifest.
+
+## Swappable Implementations
+
+Alternative implementations of the same component share the same Cargo package name:
+
+```toml
+# components/user_inmemory/Cargo.toml
+[package]
+name = "user"             # same name as components/user/
+version = "0.1.0"
+```
+
+The compiler enforces compatibility — if a function is missing or has the wrong signature, it is a compile error everywhere that function is called. This is Rust's type system doing the interface checking, with no traits involved.
+
+### How Projects Select Implementations
+
+Bases declare component dependencies as **workspace-inherited deps** (`workspace = true`). The project workspace defines which path each name resolves to:
+
+```toml
+# bases/http_api/Cargo.toml
 [dependencies]
-user-interface = { path = "../../components/user", package = "user-interface" }
-user-core = { path = "../../components/user", package = "user-core" }
-auth-interface = { path = "../../components/auth", package = "auth-interface" }
+user = { workspace = true }   # resolves to whatever the project workspace says
 ```
 
-**Philosophical tradeoff:**
-- ✅ Explicit dependencies (Rust philosophy)
-- ❌ More ceremony than Clojure
-- ✅ Compiler catches missing deps
-- ❌ Can't easily "try" components without declaring
-
-### Challenge 2: Interface/Implementation Split
-
-**Option A: Traits** (Most Rusty)
-```rust
-// components/user/interface.rs
-pub trait UserService {
-    fn create_user(&self, email: &str) -> Result<User>;
-}
-
-// components/user/core.rs
-pub struct UserServiceImpl { /* ... */ }
-
-impl user_interface::UserService for UserServiceImpl {
-    fn create_user(&self, email: &str) -> Result<User> {
-        // Implementation
-    }
-}
-```
-
-**Pros:**
-- Testable (mock implementations)
-- Multiple implementations possible
-- True abstraction
-
-**Cons:**
-- Dynamic dispatch overhead (can use generics)
-- More ceremony
-- Trait objects can complicate lifetimes
-
-**Option B: Modules** (Simpler)
-```rust
-// components/user/mod.rs
-pub mod interface {
-    pub struct User { /* ... */ }
-    pub fn create_user(email: &str) -> Result<User> {
-        crate::user::core::create_user_impl(email)
-    }
-}
-
-mod core {
-    pub(crate) fn create_user_impl(email: &str) -> Result<User> {
-        // Implementation
-    }
-}
-```
-
-**Pros:**
-- Simpler
-- No trait overhead
-- Direct compilation
-
-**Cons:**
-- Harder to mock
-- Less flexible
-- Tighter coupling
-
-**Recommendation**: Use traits for true boundaries, modules for simple cases
-
-### Challenge 3: Incremental Compilation
-
-**Polylith promise**: Only rebuild what changed
-
-**Rust reality**: Cargo already does incremental compilation
-
-**Question**: Does Polylith add value here?
-
-**Answer**: Yes, but differently:
-- Polylith: Deploy only changed projects
-- Cargo: Rebuild only changed crates
-- Value: Deployment optimization, not build optimization
-
-### Challenge 4: Feature Flags vs Components
-
-**Rust way**: Feature flags
 ```toml
-[features]
-default = ["user", "auth"]
-user = []
-auth = []
-admin = []
+# projects/production/Cargo.toml
+[workspace]
+members = ["../../bases/http_api"]
+
+[workspace.dependencies]
+user = { path = "../../components/user" }           # Postgres implementation
 ```
 
-**Polylith way**: Include/exclude components per project
-
-**Tradeoff discussion:**
-- Features: Compile-time selection, binary size optimization
-- Components: Clearer boundaries, easier to understand dependencies
-- **Hybrid**: Use components, expose as features
-  ```toml
-  [features]
-  default = []
-  full = ["user-component", "auth-component"]
-  
-  [dependencies]
-  user-component = { path = "../components/user", optional = true }
-  ```
-
-### Challenge 5: Testing
-
-**Polylith approach**: Test components in isolation + integration
-
-```rust
-// components/user/tests/integration_test.rs
-#[test]
-fn test_user_creation() {
-    let service = UserServiceImpl::new(MockDb::new());
-    let user = service.create_user("test@example.com").unwrap();
-    assert_eq!(user.email, "test@example.com");
-}
-```
-
-**Rust enhancement**: Use workspace-level tests
 ```toml
-# Workspace Cargo.toml
+# projects/test-env/Cargo.toml
+[workspace]
+members = ["../../bases/http_api"]
+
+[workspace.dependencies]
+user = { path = "../../components/user_inmemory" }  # in-memory implementation
+```
+
+The `cargo-polylith` tool generates and manages these project workspace files. Build a specific project with:
+```bash
+cargo build --manifest-path projects/production/Cargo.toml
+```
+
+## Project Workspace Structure
+
+A project workspace lists bases as `[workspace].members`. Components are not workspace members (they live outside the project directory) — they come in as workspace-level path dependencies resolved transitively.
+
+```toml
+# projects/production/Cargo.toml
 [workspace]
 members = [
-    "components/*",
-    "bases/*",
-    "projects/*",
+  ".",
+  "../../bases/http_api",
+  "../../bases/cli",
 ]
 
-# Run all component tests
-# cargo test -p user-core -p auth-core
-```
-
-## Practical Polylith in Rust
-
-### Component Template
-```rust
-// components/payment/interface.rs
-pub trait PaymentProcessor {
-    async fn charge(&self, amount: Money) -> Result<Transaction>;
-}
-
-pub struct Money {
-    pub amount: i64,
-    pub currency: Currency,
-}
-
-pub struct Transaction {
-    pub id: TransactionId,
-    pub status: TransactionStatus,
-}
-
-// components/payment/core.rs
-use interface::*;
-
-pub struct StripeProcessor {
-    client: StripeClient,
-}
-
-impl PaymentProcessor for StripeProcessor {
-    async fn charge(&self, amount: Money) -> Result<Transaction> {
-        // Stripe implementation
-    }
-}
-
-pub struct MockProcessor;
-
-impl PaymentProcessor for MockProcessor {
-    async fn charge(&self, amount: Money) -> Result<Transaction> {
-        // Mock for testing
-    }
-}
-```
-
-### Base Template
-```rust
-// bases/web-api/src/main.rs
-use axum::{Router, routing::post};
-use user_interface::UserService;
-use auth_interface::AuthService;
-
-struct AppState {
-    user_service: Box<dyn UserService>,
-    auth_service: Box<dyn AuthService>,
-}
-
-#[tokio::main]
-async fn main() {
-    let state = AppState {
-        user_service: Box::new(user_core::UserServiceImpl::new()),
-        auth_service: Box::new(auth_core::AuthServiceImpl::new()),
-    };
-    
-    let app = Router::new()
-        .route("/users", post(create_user))
-        .with_state(state);
-    
-    axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
-}
-```
-
-### Project Composition
-```toml
-# projects/backend/Cargo.toml
 [package]
-name = "backend"
+name = "production"
 version = "0.1.0"
 
+[[bin]]
+name = "production"
+path = "src/main.rs"
+
 [dependencies]
-# Include only what this project needs
-user-interface = { path = "../../components/user/interface" }
-user-core = { path = "../../components/user/core" }
-auth-interface = { path = "../../components/auth/interface" }
-auth-core = { path = "../../components/auth/core" }
-payment-interface = { path = "../../components/payment/interface" }
-payment-core = { path = "../../components/payment/core" }
+http_api = { path = "../../bases/http_api" }
+cli      = { path = "../../bases/cli" }
 
-web-api-base = { path = "../../bases/web-api" }
+[workspace.dependencies]
+user     = { path = "../../components/user" }
+library  = { path = "../../components/library_service" }
 ```
 
-## Tooling for Rust Polylith
+All bases in the same project share the same `[workspace.dependencies]` pool — one implementation choice per interface name per project.
 
-### Potential Cargo Extensions
+## Shared Target Directory
 
-**cargo-poly** (hypothetical tool):
-```bash
-# Create new component
-cargo poly component create user
+Without configuration, each project workspace would have its own `target/` directory and recompile everything. Solve this with a single `.cargo/config.toml` at the repo root:
 
-# Show component dependencies
-cargo poly deps user
-
-# Build affected projects
-cargo poly build --since main
-
-# Test changed components
-cargo poly test --changed
-```
-
-**Implementation ideas**:
-```rust
-// Use cargo metadata to analyze workspace
-let metadata = MetadataCommand::new()
-    .exec()
-    .unwrap();
-
-// Find components that changed
-let changed_components = git_diff()
-    .iter()
-    .filter_map(|file| component_from_path(file))
-    .collect();
-
-// Find projects that depend on changed components
-let affected_projects = metadata.workspace_members
-    .iter()
-    .filter(|pkg| depends_on_any(pkg, &changed_components))
-    .collect();
-```
-
-## Philosophical Considerations
-
-### Where Polylith Fits in Rust
-
-**Strengths in Rust:**
-1. **Monorepo benefits** - Atomic refactoring across components
-2. **Clear boundaries** - Interfaces force good design
-3. **Reuse** - Share components across projects
-4. **Testing** - Component isolation helps testing
-
-**Tensions with Rust:**
-1. **Explicitness** - Cargo wants explicit deps, Polylith wants implicit availability
-2. **Compile times** - More crates = longer builds (though incremental helps)
-3. **Trait objects** - Performance overhead for maximum flexibility
-4. **Async** - Trait async can be tricky
-
-### When to Use Polylith in Rust
-
-**Good fit:**
-- Multiple related applications (web, CLI, mobile backend)
-- Large team needing clear boundaries
-- High component reuse across projects
-- Microservices that share logic
-
-**Poor fit:**
-- Single application
-- Small team (<5 people)
-- Greenfield with uncertain boundaries
-- Performance-critical single deployment
-
-### Alternative: Cargo Workspaces
-
-Standard workspace is often sufficient:
-```
-my-app/
-├── Cargo.toml (workspace)
-├── core/          # Business logic
-├── web/           # Web server
-├── cli/           # CLI tool
-└── shared/        # Common utilities
-```
-
-**Use Polylith when:**
-- Workspace isn't providing enough structure
-- Need stronger component boundaries
-- Want automated affected-project detection
-- Multiple teams working on overlapping concerns
-
-## Migration Strategy
-
-### Step 1: Start with Workspace
 ```toml
+[build]
+target-dir = "target"
+```
+
+Cargo hashes artifacts by (crate + features + profile + target triple), so identical builds across projects share compiled artifacts.
+
+## The Development Workspace
+
+The repo root workspace lists all components and bases:
+
+```toml
+# Cargo.toml (repo root)
 [workspace]
-members = ["app", "cli", "core"]
+members = [
+  "components/*",
+  "bases/*",
+]
 ```
 
-### Step 2: Extract Components
-```
-core/ → components/user/
-        components/auth/
-```
+This gives full IDE support and lets you run `cargo check` across the entire codebase. Component dependencies here can use direct path deps (no `workspace = true` needed since the dev workspace isn't a project).
 
-### Step 3: Add Interface Layers
-```rust
-// components/user/interface.rs
-pub trait UserService { /* ... */ }
+## What the cargo-polylith Tool Does
 
-// components/user/core.rs
-impl UserService for UserServiceImpl { /* ... */ }
-```
+Managing this structure by hand is tedious. `cargo-polylith` handles:
 
-### Step 4: Create Projects
-```
-app/ → projects/web-api/
-cli/ → projects/admin-cli/
-```
+- **Scaffolding**: `cargo polylith component new <name> [--interface <NAME>]` — always creates interface metadata (defaults to crate name)
+- **Interface update**: `cargo polylith component update <name> [--interface <NAME>]` — set/replace interface on an existing component
+- **Base scaffolding**: `cargo polylith base new <name>` creates `bases/<name>/` with `lib.rs` (pub fn run() skeleton) and Cargo.toml
+- **Project management**: `cargo polylith project new <name>` generates the project workspace manifest
+- **Overview**: `cargo polylith deps` shows which components are used by which bases and projects
+- **Interface checking**: `cargo polylith check` verifies structural correctness and reports violations
+- **Interactive editor**: `cargo polylith edit` — TUI to toggle project/component connections, set interface names ('i' key), write all staged changes to disk ('w')
 
-### Step 5: Add Tooling
-- Scripts for affected projects
-- CI/CD optimizations
-- Development environment
+## Polylith in mdma
 
-## Conclusion
+The `modular-digital-music-array` project at `~/projects/modular-digital-music-array` uses Polylith with all 11 service projects as root workspace members.
 
-Polylith in Rust requires balancing:
-- **Polylith philosophy**: Maximum reuse and flexibility
-- **Rust philosophy**: Explicit dependencies and zero-cost abstractions
+Current state (post-migration v0.8.x):
+- All projects are root workspace members — no `project_has_own_workspace` or `project_not_in_root_workspace` violations
+- Bases are correctly lib crates: `http_server` exposes `serve()`, `service` exposes `create_sockets()`
+- `bdd-runner` is a test-base scaffold (empty lib, marked `test_base = true`)
+- Swappable interface: `fact-store` — root workspace uses `fact_store_memory` (dev/test default); production builds use `fact_store_file` via `profiles/production.profile`
+- `hardwired_dep` warnings remain for components that have not yet been lifted to `[workspace.dependencies]`
+- Some projects (`mdma-cli`, `mdma-gateway`, `mdma-tui`) have no explicit base dependency (flagged as warnings — valid for thin CLI/router projects)
 
-**Key insight**: Use Polylith for **architecture**, not fight against Cargo. Let Cargo handle building, use Polylith for organizing.
-
-**Success pattern**:
-1. Clear component boundaries (interface crates)
-2. Cargo workspaces for dependency management
-3. Custom tooling for deployment optimization
-4. Traits for true flexibility, modules for simplicity
-
-The goal isn't pure Polylith—it's **better Rust codebases inspired by Polylith principles**.
+Run `cargo polylith check` to see current violations.

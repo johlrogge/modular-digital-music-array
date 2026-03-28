@@ -1,9 +1,9 @@
 use clap::Parser;
 use color_eyre::Result;
 use gateway_protocol::{GatewayRequest, GatewayResponse, SourceName};
-use service;
 use nng::options::Options;
 use serde::{de::DeserializeOwned, Serialize};
+use service;
 use source_protocol::{SourceRequest, SourceResponse};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
