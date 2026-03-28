@@ -1,6 +1,6 @@
 # Template file for mdma-gateway package
 pkgname=mdma-gateway
-version=0.11.0
+version=0.11.1
 revision=1
 archs="aarch64"
 build_style=cargo
