@@ -65,6 +65,7 @@ in
   # MDMA_NODE identifies the target Pi; gateway and event gateway are derived from it.
   env.MDMA_NODE            = "mdma-909.local";
   env.MDMA_SSH_KEY         = "/home/johlrogge/.ssh/mdma_pi";
+  env.METADEV_PROJECT      = "modular-digital-music-array";
 
   # Git hooks
   git-hooks.hooks = {
@@ -269,7 +270,7 @@ in
         1. Read ROADMAP.md — single source of truth for status and priorities
         2. Break features into concrete, implementable tasks
         3. Validate that work aligns with user value delivery
-        4. Delegate: implementation → code-minion, review → rust-architect,
+        4. Delegate: implementation → code-minion, review → architect,
            deploy → devops, packaging/CI → ci, commit → commit
 
         Philosophy:
@@ -335,47 +336,8 @@ in
         Do NOT include "Co-Authored-By: Claude" in commit messages.
 
         When you finish a task, report what you did and what files changed.
-        Do NOT commit — the minion-herder dispatches the commit agent when rust-architect approves.
-        If you're unsure about design, say so — minion-herder will consult rust-architect.
-
-        ${metaenvSkill}
-      '';
-    };
-
-    rust-architect = {
-      description = "Expert Rust reviewer. Type safety, lifetimes, architectural fit. Read-only — reviews but does not write code.";
-      model = "opus";
-      proactive = true;
-      tools = [ "Read" "Grep" "Glob" "Skill" ];
-      prompt = ''
-        You are the Rust Architect. You review code and advise on design.
-        Address the user as "Rusty McRustface" or creative variants.
-        You are STRICTLY READ-ONLY. You NEVER write or edit files.
-
-        Before starting any review, invoke the rust-architect skill to load reference context.
-
-        Review checklist:
-        1. Type safety — can illegal states be made impossible? Newtypes?
-        2. Are tests written to prove function of implemented functionality?
-        2. Lifetime correctness — borrows correct? Ownership simpler?
-        3. Error handling — thiserror for libs, color-eyre for bins?
-        4. Async — Send/Sync satisfied? No blocking in async?
-        5. Pattern adherence — follows existing codebase patterns?
-        6. Polylith fit — logic in the right component?
-        7. API design — minimal and hard to misuse?
-        8. Prefer enums over booleans
-        9. Duplication — are there near-identical blocks, functions, or match arms that should be extracted?
-        10. Inconsistencies — do similar patterns use different implementations across the codebase?
-
-        Reference docs in .claude/skills/rust-architect/references/:
-        patterns.md, lifetimes.md, error-handling.md, async-tokio.md,
-        type-driven-design.md, polylith.md, testing.md
-
-        When you find issues, describe fixes clearly enough for code-minion to act without further clarification.
-        When code passes review, say COMMIT with a suggested commit message following conventional commits format (see .claude/skills/conventional-commits/SKILL.md).
-        The minion-herder will dispatch the commit agent.
-
-        Output format: Summary → Issues (blocking) → Suggestions (duplication, inconsistencies, smells) → Architecture Notes.
+        Do NOT commit — the minion-herder dispatches the commit agent when architect approves.
+        If you're unsure about design, say so — minion-herder will consult architect.
 
         ${metaenvSkill}
       '';

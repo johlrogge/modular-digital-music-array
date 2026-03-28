@@ -18,12 +18,17 @@ All tools, packages, hooks, and services are declared in `devenv.nix`.
 
 ## Build Commands
 
+Agents use the `mcp__rust-codebase__*` MCP tools (polylith-aware):
+```
+cargo_check        # fast compile check
+cargo_test         # run tests
+cargo_clippy       # lint
+hygiene_report     # test + clippy + coverage in one shot
+```
+
+Other tasks via `just` (use `just --list` or `mcp__just-dev__just_list` to see all):
 ```bash
-# Development
 just watch              # Watch mode: check → test → build → clippy
-cargo build             # Build all workspace members
-cargo test              # Run all tests
-cargo clippy            # Lint
 
 # Cross-compile beacon for Raspberry Pi
 just beacon-cross       # Uses cargo-zigbuild (recommended)
@@ -135,12 +140,7 @@ MDMA_NODE is already set in the devenv shell. The CLI derives the gateway addres
 
 ## Testing
 
-Tests are inline with `#[cfg(test)]` modules:
-```bash
-cargo test                    # All tests
-cargo test --package beacon   # Single package
-cargo test provisioning       # Filter by name
-```
+Tests are inline with `#[cfg(test)]` modules. Use `mcp__rust-codebase__cargo_test` (polylith-aware) to run them.
 
 ## Coordinator Rules
 
@@ -181,8 +181,8 @@ Workflow:
 - **Release branches**: `git flow release start <version>` for version bumps
 - **Hotfix branches**: `git flow hotfix start <name>` for urgent fixes
 - All development happens on feature branches off `develop`
-- Only releases and hotfixes merge to `main`
-- CI builds packages only on `main` push; tests run on all branches
+- Only releases and hotfixes merge to `master`
+- CI builds packages only on `master` push; tests run on all branches
 
 ### Release Workflow
 
@@ -192,7 +192,7 @@ Workflow:
 4. Dispatch **documenter** agent to update all READMEs
 5. Dispatch **commit** agent: `chore(release): bump to <version>`
 6. `git flow release finish <version>`
-7. Push main + develop + tags
+7. Push master + develop + tags
 8. CI builds and publishes packages
 9. Dispatch **devops** to verify packages install on Pi
 
