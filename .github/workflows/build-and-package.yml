@@ -16,24 +16,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-macos:
-    runs-on: macos-latest
-    steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@stable
-    - name: Install cmake
-      run: brew install cmake
-    - name: Install cargo-polylith
-      run: cargo install --git https://github.com/johlrogge/metadev cargo-polylith
-    - name: Build mdma_cli for Apple Silicon
-      run: |
-        cargo polylith profile build dev --no-build
-        cargo build --release --manifest-path profiles/dev/Cargo.toml --bin mdma
-    - uses: actions/upload-artifact@v4
-      with:
-        name: mdma-cli-macos-arm64
-        path: target/release/mdma
-
   test:
     runs-on: ubuntu-latest
 
