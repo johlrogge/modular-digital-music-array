@@ -124,7 +124,7 @@ in
              --bin mdma-acid --bin mdma-library --bin mdma-playback --bin mdma-gateway --bin mdma-console 2>/dev/null \
         || echo "One or more services failed to build — run: cargo polylith profile build dev --no-build"
     '';
-    before = [ "devenv:processes" ];
+    before = [ "devenv:processes:mdma-acid" ];
   };
 
   processes = {
