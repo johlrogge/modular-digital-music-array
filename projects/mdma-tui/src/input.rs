@@ -4,7 +4,7 @@ use crate::now_playing::PlaybackStatus;
 use crate::pane::{PaneAction, PaneKind};
 use crate::playlist_pane::PlaylistPane;
 use crossterm::event::{KeyCode, KeyEvent};
-use mdma_client::{Deck, PlaybackBackend, PlaylistName, SourceName};
+use mdma_client::{ContentHash, Deck, PlaybackBackend, PlaylistName, SourceName};
 use std::rc::Rc;
 
 /// Dispatch a key event to the application based on the current input mode.
@@ -214,6 +214,21 @@ fn handle_playback(app: &mut App, key: KeyEvent) {
         KeyCode::Char('c') => {
             let _ = app.playback.queue_clear();
             app.set_status("Queue cleared");
+        }
+        KeyCode::Char('b') => {
+            let hash: Option<ContentHash> = match &app.now_playing.status {
+                PlaybackStatus::Playing { track, .. } | PlaybackStatus::Paused { track, .. } => {
+                    Some(track.clone())
+                }
+                PlaybackStatus::Stopped => None,
+            };
+            match hash {
+                None => app.set_status("Nothing playing"),
+                Some(h) => match app.library.write_bookmark(&h, None) {
+                    Ok(()) => app.set_status("Bookmarked"),
+                    Err(e) => app.set_status(format!("Bookmark failed: {e}")),
+                },
+            }
         }
         KeyCode::Esc => {
             app.mode = InputMode::Normal;

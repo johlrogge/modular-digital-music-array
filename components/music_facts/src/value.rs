@@ -254,6 +254,15 @@ pub enum MusicValue {
     // ========================================================================
     /// When the track was added to the library
     AddedAt(DateTime<Utc>),
+
+    // ========================================================================
+    // User Annotations
+    // ========================================================================
+    /// Track bookmarked by the user, optionally within a named scope (e.g. a set name)
+    Bookmarked {
+        scope: Option<String>,
+        timestamp: DateTime<Utc>,
+    },
 }
 
 impl MusicValue {
@@ -298,6 +307,7 @@ impl MusicValue {
             MusicValue::TrackStarted(_) => "TrackStarted",
             MusicValue::TrackStopped(_) => "TrackStopped",
             MusicValue::AddedAt(_) => "AddedAt",
+            MusicValue::Bookmarked { .. } => "Bookmarked",
         }
     }
 }
@@ -351,6 +361,10 @@ impl fmt::Display for MusicValue {
             MusicValue::TrackStarted(r) => write!(f, "{}", r),
             MusicValue::TrackStopped(r) => write!(f, "{}", r),
             MusicValue::AddedAt(dt) => write!(f, "{}", dt.to_rfc3339()),
+            MusicValue::Bookmarked { scope, timestamp } => match scope {
+                Some(s) => write!(f, "Bookmarked({s}) at {timestamp}"),
+                None => write!(f, "Bookmarked at {timestamp}"),
+            },
         }
     }
 }
@@ -626,5 +640,18 @@ mod tests {
     fn recording_date_fact_value_format() {
         let date = NaiveDate::from_ymd_opt(2024, 6, 15).unwrap();
         assert_fact_value_format!(MusicValue::RecordingDate(date));
+    }
+
+    #[test]
+    fn bookmarked_fact_roundtrip() {
+        let val = MusicValue::Bookmarked {
+            scope: Some("my-set".to_string()),
+            timestamp: DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let json = serde_json::to_string(&val).unwrap();
+        let decoded: MusicValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(val, decoded);
     }
 }

@@ -1,7 +1,7 @@
-//! ACID service component — NNG server loop backed by swappable fact storage.
-//!
-//! `fact-store` resolves to `fact_store_memory` in the dev workspace and
-//! `fact_store_file` in the `projects/mdma-acid` standalone workspace.
+//! ACID service — append-only fact store backed by the `fact-store` interface.
+//! The active implementation is selected via `[workspace.dependencies]`:
+//! - Root workspace: `fact_store_memory` (dev/test default)
+//! - Production builds: `fact_store_file` via `profiles/production.profile`
 
 use acid_protocol::{offset_from_cursor, AcidRequest, AcidResponse};
 use event_protocol::{acid_event_to_topic_message, AcidEvent};

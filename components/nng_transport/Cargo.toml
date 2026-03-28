@@ -1,10 +1,10 @@
 [package]
 name = "nng-transport"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-license.workspace = true
+version = "0.10.1"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
 
 [package.metadata]
 
@@ -12,12 +12,12 @@ license.workspace = true
 interface = "nng-transport"
 
 [dependencies]
-nng = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
+nng = "1.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
 dirs = "6"
 
 [dev-dependencies]
-pretty_assertions = { workspace = true }
+pretty_assertions = "1"
 tempfile = "3"

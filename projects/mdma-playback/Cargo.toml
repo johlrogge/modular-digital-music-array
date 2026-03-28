@@ -1,14 +1,9 @@
-[workspace]
-resolver = "2"
-# Standalone project workspace (Polylith projects/ layout).
-# Dependencies use explicit versions — no workspace = true inheritance.
-
 [package]
 name = "mdma-playback"
-version = "0.7.0"
+version = "0.10.1"
 edition = "2021"
 authors = ["MDMA Development Team"]
-repository = "https://github.com/johlrogge/modular-digital-music-array"
+repository = "https://github.com/your-org/mdma"
 license = "MIT"
 
 [[bin]]
@@ -16,16 +11,13 @@ name = "mdma-playback"
 path = "src/main.rs"
 
 [dependencies]
-# Local — path references relative to this project
-service = { path = "../../bases/service" }
+service = { workspace = true }
 stream-source-protocol = { path = "../../components/stream_source_protocol" }
 media-protocol = { path = "../../components/media_protocol" }
 event-protocol = { path = "../../components/event_protocol" }
 music-facts = { path = "../../components/music_facts" }
 playback-primitives = { path = "../../components/playback_primitives" }
 acid-client = { path = "../../components/acid_client", features = ["music"] }
-
-# External — keep versions in sync with root Cargo.toml [workspace.dependencies]
 tokio = { version = "1.36", features = ["full"] }
 color-eyre = "0.6"
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -38,4 +30,4 @@ thiserror = "1.0"
 
 [dev-dependencies]
 pretty_assertions = "1"
-tempfile = "3.8"
+tempfile = "3"

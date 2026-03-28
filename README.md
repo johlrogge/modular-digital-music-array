@@ -35,11 +35,18 @@ mdma playlist get friday-night | mdma queue replace
 # Find which playlists contain a track (or a set of tracks from stdin)
 mdma search --artist CBL | mdma playlist contains --all
 
+# Bookmark the currently playing track
+mdma bookmark
+
+# Bookmark a specific track by content hash, associated with a named set
+mdma bookmark sha256:abc123 --scope "friday-night-picks"
+
+# List all bookmarked tracks
+mdma bookmarks
+
 # Subscribe to live events (now playing, queue changes)
 mdma subscribe
 ```
-
-Full CLI documentation: [bases/mdma_cli/README.md](bases/mdma_cli/README.md)
 
 ---
 
@@ -75,18 +82,20 @@ Audio path: FLAC/MP3 → Symphonia decoder → rubato resampler → 192 kHz Pipe
 
 ## Workspace members
 
-| Base | Description | README |
-|------|-------------|--------|
-| [beacon](bases/beacon/) | Provisioning server — installs and configures MDMA on a fresh Raspberry Pi | [README](bases/beacon/README.md) |
-| [mdma_gateway](bases/mdma_gateway/) | Single TCP gateway (port 5555) routing to all internal IPC services | [README](bases/mdma_gateway/README.md) |
-| [mdma_library](bases/mdma_library/) | Library service — content-addressed storage and fact-based metadata | [README](bases/mdma_library/README.md) |
-| [mdma_acid](bases/mdma_acid/) | ACID service — standalone append-only fact stream writer | [README](bases/mdma_acid/README.md) |
-| [mdma_playback](bases/mdma_playback/) | Queue manager — drives audio sources via StreamClient; persists queue to `/metadata/queue.json` | [README](bases/mdma_playback/README.md) |
-| [mdma_audio](bases/mdma_audio/) | Audio playback source — wraps PlaybackEngine (Symphonia + rubato + PipeWire), speaks `stream_source_protocol` over NNG | [README](bases/mdma_audio/README.md) |
-| [mdma_tui](bases/mdma_tui/) | Terminal UI (v0.3.0) — dual-pane browser/queue, modal keybindings, command palette, live queue sync via events, intelligent column compression | [README](bases/mdma_tui/README.md) |
-| [mdma_bandcamp](bases/mdma_bandcamp/) | Bandcamp collection sync — downloads purchases into the library inbox | [README](bases/mdma_bandcamp/README.md) |
-| [mdma_console](bases/mdma_console/) | Web management console — player controls, search, queue, upload, export | [README](bases/mdma_console/README.md) |
-| [mdma_cli](bases/mdma_cli/) | CLI — search, queue, playlists, playback, export, subscribe, shell completions | [README](bases/mdma_cli/README.md) |
+This is a [Polylith](https://polylith.gitbook.io/polylith/) workspace. Deployable services live in `projects/`; shared logic lives in `components/`; abstract base traits live in `bases/`.
+
+| Service (project) | Description |
+|-------------------|-------------|
+| `mdma-beacon` | Provisioning server — installs and configures MDMA on a fresh Raspberry Pi |
+| `mdma-gateway` | Single TCP gateway (port 5555) routing to all internal IPC services |
+| `mdma-library` | Library service — content-addressed storage and fact-based metadata |
+| `mdma-acid` | ACID service — standalone append-only fact stream writer |
+| `mdma-playback` | Queue manager — drives audio sources via StreamClient; persists queue to `/metadata/queue.json` |
+| `mdma-audio` | Audio playback source — wraps PlaybackEngine (Symphonia + rubato + PipeWire), speaks `stream_source_protocol` over NNG |
+| `mdma-tui` | Terminal UI — dual-pane browser/queue, modal keybindings, command palette, live queue sync via events, intelligent column compression, bookmark keybinding (`b` in Playback mode) |
+| `mdma-bandcamp` | Bandcamp collection sync — downloads purchases into the library inbox |
+| `mdma-console` | Web management console — player controls, search, queue, upload, export |
+| `mdma-cli` | CLI — search, queue, playlists, playback, export, subscribe, bookmarks, shell completions |
 
 **Key components** (shared libraries):
 
@@ -108,11 +117,13 @@ Audio path: FLAC/MP3 → Symphonia decoder → rubato resampler → 192 kHz Pipe
 # Enter reproducible dev environment (Nix/devenv)
 devenv shell
 
-# Build everything
-cargo build
+# Build everything (Polylith workspace — generate profile manifest first)
+cargo polylith profile build dev --no-build
+cargo build --manifest-path profiles/dev/Cargo.toml
 
 # Run all tests
-cargo test
+cargo polylith profile build dev --no-build
+cargo test --manifest-path profiles/dev/Cargo.toml
 
 # Watch mode: check → test → build → clippy on save
 just watch
@@ -148,13 +159,23 @@ sudo mv mdma /usr/local/bin/
 Or build from source:
 
 ```bash
-cargo build --release -p mdma-cli
-cp target/release/mdma /usr/local/bin/
+cargo polylith profile build dev --no-build
+cargo build --manifest-path profiles/dev/Cargo.toml --release -p mdma-cli
+cp profiles/dev/target/release/mdma /usr/local/bin/
 ```
 
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.11.0
+
+- **Polylith workspace migration** — root `Cargo.toml` is now a stub. All builds go through `cargo polylith profile build <profile> --no-build` followed by `--manifest-path profiles/<profile>/Cargo.toml`. Dev builds use the `dev` profile; production (mdma-acid) uses the `production` profile.
+- **Bookmarks** — `mdma bookmark [<hash>] [--scope <set-name>]` bookmarks the currently playing track (or a specific track by hash). `mdma bookmarks` lists all bookmarked tracks. Bookmarks are stored as `Bookmarked` facts in the ACID store with `FactOrigin::User` provenance.
+- **TUI bookmark keybinding** — in Playback mode, pressing `b` bookmarks the currently playing track immediately.
+- **`FactOrigin::User`** — new variant in `music_facts::FactOrigin` for facts initiated directly by the user (e.g. bookmarks), distinct from ingestion-time origins.
 
 ---
 

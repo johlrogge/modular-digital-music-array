@@ -1,14 +1,9 @@
-[workspace]
-resolver = "2"
-# This is a standalone project workspace (Polylith projects/ layout).
-# Dependencies use explicit versions — no workspace = true inheritance.
-
 [package]
 name = "mdma-cli"
-version = "0.5.3"
+version = "0.10.1"
 edition = "2021"
 authors = ["MDMA Development Team"]
-repository = "https://github.com/johlrogge/modular-digital-music-array"
+repository = "https://github.com/your-org/mdma"
 license = "MIT"
 
 [[bin]]
@@ -16,37 +11,22 @@ name = "mdma"
 path = "src/main.rs"
 
 [dependencies]
-# Client base (gateway address derivation)
 client = { path = "../../bases/client" }
-
-# CLI
 clap = { version = "4.5", features = ["derive", "env"] }
-clap_complete = "4.5"
+clap_complete = "4"
 color-eyre = "0.6"
-
-# Client abstraction (gateway or direct)
 event-protocol = { path = "../../components/event_protocol" }
 inbox-utils = { path = "../../components/inbox_utils" }
 mdma-client = { path = "../../components/mdma_client" }
 tempfile = "3"
-
-# Event subscription
 nng = "1.0"
 nng-transport = { path = "../../components/nng_transport" }
 serde_json = "1.0"
-
-# Audio format classification (for smart export)
 audio-transcoder = { path = "../../components/audio_transcoder" }
-
-# IPC (still needed for protocol types re-exported by mdma-client)
 library-ipc-client = { path = "../../components/library_ipc_client" }
 library-search = { path = "../../components/library_search" }
 source-protocol = { path = "../../components/source_protocol" }
-
-# HTTP client (for export command, using rustls to avoid native openssl dependency)
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
-
-# Output formatting
 colored = "2.0"
 corsett = { git = "https://github.com/johlrogge/corsett.git", rev = "bf16c1aa2e8d6ba1f833e33009f2deecadc3ee26" }
 terminal_size = "0.4"

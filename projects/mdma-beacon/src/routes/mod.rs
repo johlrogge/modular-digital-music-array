@@ -1,12 +1,12 @@
 pub(crate) mod provision;
 pub(crate) mod update;
 
+use crate::error::BeaconError;
+use crate::types::ValidationError;
 use axum::{
     http::StatusCode,
     response::{Html, IntoResponse, Response},
 };
-use crate::error::BeaconError;
-use crate::types::ValidationError;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::{broadcast, oneshot, Mutex};

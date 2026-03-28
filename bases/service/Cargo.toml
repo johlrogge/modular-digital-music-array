@@ -1,15 +1,15 @@
 [package]
 name = "service"
 version = "0.1.0"
-edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-license.workspace = true
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
 
 [dependencies]
-nng = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
+nng = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

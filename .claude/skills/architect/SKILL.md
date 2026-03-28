@@ -1,9 +1,9 @@
 ---
-name: rust-architect
+name: architect
 description: "Expert Rust development and architecture guidance. Use when working on Rust code including: debugging compiler errors (especially lifetime issues), designing type-safe APIs, implementing async patterns with tokio, evaluating architectural tradeoffs, applying Rust patterns (newtype, typestate, builder), improving code through type-driven design (making illegal states unrepresentable), error handling with thiserror/eyre, exploring ECS architectures beyond games, embedded development with Embassy on ESP32/Raspberry Pi, implementing Polylith architecture in Rust, and setting up development workflows with bacon and just."
 ---
 
-# Rust Architect
+# Architect (Rust specialist for MDMA)
 
 Expert guidance for Rust development and architecture, specializing in type-driven design, async patterns, and advanced system architecture.
 
@@ -11,16 +11,16 @@ Expert guidance for Rust development and architecture, specializing in type-driv
 
 Load reference files on-demand based on the query topic:
 
-- **references/patterns.md** - When discussing Rust patterns (newtype, typestate, builder, extension traits, RAII, strategy)
-- **references/lifetimes.md** - When debugging lifetime errors, borrow checker issues, or designing APIs with references
-- **references/error-handling.md** - When implementing error handling, choosing between thiserror/eyre/anyhow, or designing error types
-- **references/async-tokio.md** - When working with async/await, tokio runtime, channels, or concurrent patterns
-- **references/type-driven-design.md** - When making illegal states unrepresentable, designing APIs, or using types for correctness
-- **references/ecs-beyond-games.md** - When exploring Entity Component Systems for non-game applications
-- **references/embedded.md** - When developing for ESP32 with Embassy or Raspberry Pi
-- **references/polylith.md** - When discussing Polylith architecture, monorepo organization, or component-based systems
-- **references/tooling.md** - When setting up bacon for background checking or just for task automation
-- **references/testing.md** - When writing tests, setting up test fixtures, creating test doubles, or discussing testing strategies
+- **.claude/skills/rust-architect/references/patterns.md** - When discussing Rust patterns (newtype, typestate, builder, extension traits, RAII, strategy)
+- **.claude/skills/rust-architect/references/lifetimes.md** - When debugging lifetime errors, borrow checker issues, or designing APIs with references
+- **.claude/skills/rust-architect/references/error-handling.md** - When implementing error handling, choosing between thiserror/eyre/anyhow, or designing error types
+- **.claude/skills/rust-architect/references/async-tokio.md** - When working with async/await, tokio runtime, channels, or concurrent patterns
+- **.claude/skills/rust-architect/references/type-driven-design.md** - When making illegal states unrepresentable, designing APIs, or using types for correctness
+- **.claude/skills/rust-architect/references/ecs-beyond-games.md** - When exploring Entity Component Systems for non-game applications
+- **.claude/skills/rust-architect/references/embedded.md** - When developing for ESP32 with Embassy or Raspberry Pi
+- **.claude/skills/rust-architect/references/polylith.md** - When discussing Polylith architecture, monorepo organization, or component-based systems
+- **.claude/skills/rust-architect/references/tooling.md** - When setting up bacon for background checking or just for task automation
+- **.claude/skills/rust-architect/references/testing.md** - When writing tests, setting up test fixtures, creating test doubles, or discussing testing strategies
 
 ## Core Capabilities
 
@@ -113,7 +113,7 @@ Load reference files on-demand based on the query topic:
 
 Always consider:
 1. Can illegal states be made impossible with types?
-2. **Prefer enums over booleans.** Two booleans = 4 states, often only 3 are valid. An enum encodes exactly the valid states and makes transitions explicit. See `references/type-driven-design.md` → "Eliminate Invalid Combinations".
+2. **Prefer enums over booleans.** Two booleans = 4 states, often only 3 are valid. An enum encodes exactly the valid states and makes transitions explicit. See `.claude/skills/rust-architect/references/type-driven-design.md` → "Eliminate Invalid Combinations".
 3. Should this use the newtype pattern?
 4. Is error handling appropriate (thiserror vs eyre)?
 5. Are lifetimes correctly specified?
@@ -123,12 +123,12 @@ Always consider:
 
 ## Approach to Tasks
 
-**For Code Reviews**: 
+**For Code Reviews**:
 1. Identify correctness issues
 2. Suggest type-driven improvements
 3. Propose pattern applications
 4. Consider performance implications
-5. Check tests against Unit Test Laws (see references/testing.md → Review Checklist)
+5. Check tests against Unit Test Laws (see `.claude/skills/rust-architect/references/testing.md` → Review Checklist)
 
 **For Architecture Discussions**:
 1. Understand requirements and constraints

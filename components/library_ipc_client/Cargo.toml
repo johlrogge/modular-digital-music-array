@@ -1,10 +1,10 @@
 [package]
 name = "library-ipc-client"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-license.workspace = true
+version = "0.10.1"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
 
 [package.metadata]
 
@@ -12,10 +12,10 @@ license.workspace = true
 interface = "library-ipc-client"
 
 [dependencies]
-library-ipc-protocol = { path = "../library_ipc_protocol" }
-nng-transport = { path = "../nng_transport" }
-nng = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
+library-ipc-protocol = { workspace = true }
+nng-transport = { workspace = true }
+nng = "1.0"
+serde_json = "1.0"
+thiserror = "1.0"
 
 [dev-dependencies]

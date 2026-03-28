@@ -1,14 +1,9 @@
-[workspace]
-resolver = "2"
-# This is a standalone project workspace (Polylith projects/ layout).
-# Dependencies use explicit versions — no workspace = true inheritance.
-
 [package]
 name = "mdma-console"
-version = "0.5.0"
+version = "0.10.1"
 edition = "2021"
 authors = ["MDMA Development Team"]
-repository = "https://github.com/johlrogge/modular-digital-music-array"
+repository = "https://github.com/your-org/mdma"
 license = "MIT"
 
 [[bin]]
@@ -16,7 +11,6 @@ name = "mdma-console"
 path = "src/main.rs"
 
 [dependencies]
-# Local — path references relative to this project
 http-server = { path = "../../bases/http_server" }
 audio-transcoder = { path = "../../components/audio_transcoder" }
 inbox-utils = { path = "../../components/inbox_utils" }
@@ -28,9 +22,7 @@ nng-transport = { path = "../../components/nng_transport" }
 media-protocol = { path = "../../components/media_protocol" }
 library-search = { path = "../../components/library_search" }
 bandcamp-api = { path = "../../components/bandcamp_api" }
-
-# External — keep versions in sync with root Cargo.toml [workspace.dependencies]
-tokio = { version = "1.36", features = ["full", "process"] }
+tokio = { version = "1.36", features = ["full"] }
 color-eyre = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -40,7 +32,7 @@ thiserror = "1.0"
 futures = "0.3"
 nng = "1.0"
 async-stream = "0.3"
-axum = { version = "0.7", features = ["macros", "multipart"] }
+axum = { version = "0.7", features = ["multipart"] }
 askama = "0.12"
 tower-http = { version = "0.5", features = ["fs"] }
 clap = { version = "4.5", features = ["derive", "env"] }

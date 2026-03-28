@@ -1,10 +1,10 @@
 [package]
 name = "library-ingestion"
 version = "0.1.0"
-edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-license.workspace = true
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
 
 [package.metadata]
 
@@ -12,14 +12,14 @@ license.workspace = true
 interface = "library-ingestion"
 
 [dependencies]
-thiserror = { workspace = true }
-tracing = { workspace = true }
-chrono = { workspace = true, features = ["serde"] }
+thiserror = "1.0"
+tracing = "0.1"
+chrono = "0.4"
 
 # Internal components
-music-facts = { path = "../music_facts" }
-music-primitives = { path = "../music_primitives" }
-audio-metadata = { path = "../audio_metadata" }
+music-facts = { workspace = true }
+music-primitives = { workspace = true }
+audio-metadata = { workspace = true }
 
 # Hashing
 sha2 = "0.10"
@@ -29,6 +29,6 @@ hex = "0.4"
 pathdiff = "0.2"
 
 [dev-dependencies]
-pretty_assertions = { workspace = true }
-rstest = { workspace = true }
+pretty_assertions = "1"
+rstest = "0.26"
 tempfile = "3"
