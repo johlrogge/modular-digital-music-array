@@ -12,7 +12,7 @@ repository = "https://github.com/your-org/mdma"
 askama = "0.12"
 assert_matches = "1.5"
 async-stream = "0.3"
-axum = "0.7"
+axum = { version = "0.7", features = ["multipart"] }
 chrono = "0.4"
 clap = { version="4.5", features = ["derive", "env"] }
 clap_complete = "4"
