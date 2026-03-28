@@ -1,10 +1,10 @@
 [package]
 name = "mdma-gateway"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-license.workspace = true
+version = "0.10.1"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
 
 [[bin]]
 name = "mdma-gateway"
@@ -18,10 +18,10 @@ gateway-protocol = { path = "../../components/gateway_protocol" }
 source-protocol = { path = "../../components/source_protocol" }
 library-ipc-protocol = { path = "../../components/library_ipc_protocol" }
 media-protocol = { path = "../../components/media_protocol" }
-nng = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-clap = { workspace = true }
-color-eyre = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+nng = "1.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+color-eyre = "0.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

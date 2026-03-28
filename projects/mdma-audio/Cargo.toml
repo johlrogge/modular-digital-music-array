@@ -1,10 +1,10 @@
 [package]
 name = "mdma-audio"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-license.workspace = true
+version = "0.10.1"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
 
 [[bin]]
 name = "mdma-audio"
@@ -17,14 +17,14 @@ library-ipc-client = { path = "../../components/library_ipc_client" }
 music-primitives = { path = "../../components/music_primitives" }
 playback-primitives = { path = "../../components/playback_primitives" }
 service = { workspace = true }
-nng = { workspace = true }
-serde_json = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-tokio = { workspace = true }
-clap = { workspace = true }
-color-eyre = { workspace = true }
+nng = "1.0"
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1.36", features = ["full"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+color-eyre = "0.6"
 
 [dev-dependencies]
-pretty_assertions = { workspace = true }
-tempfile = { workspace = true }
+pretty_assertions = "1"
+tempfile = "3"

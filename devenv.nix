@@ -117,12 +117,10 @@ in
     rm -f /tmp/mdma-dev/run/*.sock
     mkdir -p /tmp/mdma-dev/run/sources /tmp/mdma-dev/music/inbox /tmp/mdma-dev/music/blobs /tmp/mdma-dev/metadata
     echo "Building all services..."
-    cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-acid/Cargo.toml" 2>/dev/null \
-      && cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-library/Cargo.toml" 2>/dev/null \
-      && cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-playback/Cargo.toml" 2>/dev/null \
-      && cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-gateway/Cargo.toml" 2>/dev/null \
-      && cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-console/Cargo.toml" 2>/dev/null \
-      || echo "One or more services failed to build — check individual manifests"
+    cargo polylith profile build dev --no-build \
+      && cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/profiles/dev/Cargo.toml" \
+           --bin mdma-acid --bin mdma-library --bin mdma-playback --bin mdma-gateway --bin mdma-console 2>/dev/null \
+      || echo "One or more services failed to build — run: cargo polylith profile build dev --no-build"
   '';
 
   processes = {
@@ -200,11 +198,12 @@ in
     # Build mdma-cli and mdma-tui, expose via target/debug on PATH
     # Skip in CI — the build is wasted work there (~30s)
     if [ -z "''${CI:-}" ]; then
-      cargo build -q --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-cli/Cargo.toml" 2>/dev/null \
-        && cargo build -q --manifest-path "$MDMA_PROJECT_ROOT/projects/mdma-tui/Cargo.toml" 2>/dev/null \
+      cargo polylith profile build dev --no-build 2>/dev/null \
+        && cargo build -q --manifest-path "$MDMA_PROJECT_ROOT/profiles/dev/Cargo.toml" --bin mdma 2>/dev/null \
+        && cargo build -q --manifest-path "$MDMA_PROJECT_ROOT/profiles/dev/Cargo.toml" --bin mdma-tui 2>/dev/null \
         && export PATH="$MDMA_PROJECT_ROOT/target/debug:$PATH" \
         && echo "mdma CLI + TUI ready (gateway mode)" \
-        || echo "mdma CLI/TUI not built — run: cargo build --manifest-path projects/mdma-cli/Cargo.toml && cargo build --manifest-path projects/mdma-tui/Cargo.toml"
+        || echo "mdma CLI/TUI not built — run: cargo polylith profile build dev --no-build && cargo build --manifest-path profiles/dev/Cargo.toml --bin mdma"
       eval "$(mdma generate-completions bash 2>/dev/null)" || true
     fi
 
@@ -217,7 +216,8 @@ in
 
   # Tests
   enterTest = ''
-    cargo test
+    cargo polylith profile build dev --no-build
+    cargo test --manifest-path profiles/dev/Cargo.toml
   '';
 
   # Claude Code integration

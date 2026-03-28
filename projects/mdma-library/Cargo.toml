@@ -1,10 +1,10 @@
 [package]
 name = "mdma-library"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-license.workspace = true
+version = "0.10.1"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
 
 [[bin]]
 name = "mdma-library"
@@ -13,8 +13,8 @@ path = "src/main.rs"
 [dependencies]
 service = { workspace = true }
 library-service = { path = "../../components/library_service" }
-clap = { workspace = true }
-tokio = { workspace = true }
-color-eyre = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+clap = { version = "4.5", features = ["derive", "env"] }
+tokio = { version = "1.36", features = ["full"] }
+color-eyre = "0.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

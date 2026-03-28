@@ -1,10 +1,10 @@
 [package]
 name = "mdma-beacon"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-license.workspace = true
+version = "0.10.1"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
 
 [[bin]]
 name = "beacon"
@@ -13,21 +13,21 @@ path = "src/main.rs"
 [dependencies]
 http-server = { path = "../../bases/http_server" }
 storage_primitives = { path = "../../components/storage_primitives" }
-tokio = { workspace = true }
-color-eyre = { workspace = true }
-axum = { workspace = true }
-askama = { workspace = true }
-tower-http = { workspace = true }
-thiserror = { workspace = true }
-clap = { workspace = true }
-tokio-util = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-async-stream = { workspace = true }
-futures = { workspace = true }
+tokio = { version = "1.36", features = ["full"] }
+color-eyre = "0.6"
+axum = "0.7"
+askama = "0.12"
+tower-http = { version = "0.5", features = ["fs"] }
+thiserror = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+async-stream = "0.3"
+futures = "0.3"
 
 [dev-dependencies]
-pretty_assertions = { workspace = true }
-rstest = { workspace = true }
+pretty_assertions = "1"
+rstest = "0.26"

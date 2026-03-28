@@ -1,10 +1,10 @@
 [package]
 name = "acid-client"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-license.workspace = true
+version = "0.10.1"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
 
 [package.metadata]
 
@@ -13,9 +13,9 @@ interface = "acid-client"
 
 [dependencies]
 acid-protocol = { workspace = true }
-nng = { workspace = true }
+nng = "1.0"
 nng-transport = { workspace = true }
-serde_json = { workspace = true }
+serde_json = "1.0"
 
 [features]
 music = ["music-facts", "playback-primitives"]
@@ -26,7 +26,7 @@ workspace = true
 optional = true
 
 [dev-dependencies]
-pretty_assertions = { workspace = true }
+pretty_assertions = "1"
 
 [dependencies.playback-primitives]
 package = "playback-primitives"

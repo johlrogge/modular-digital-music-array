@@ -1,10 +1,10 @@
 [package]
 name = "media-client"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-license.workspace = true
+version = "0.10.1"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
 
 [package.metadata]
 
@@ -15,7 +15,7 @@ interface = "media-client"
 media-protocol = { workspace = true }
 playback-primitives = { workspace = true }
 nng-transport = { workspace = true }
-nng = { workspace = true }
-serde_json.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
+nng = "1.0"
+serde_json = "1.0"
+thiserror = "1.0"
+tracing = "0.1"

@@ -1,10 +1,10 @@
 [package]
 name = "mdma-acid"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-license.workspace = true
+version = "0.10.1"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
 
 [[bin]]
 name = "mdma-acid"
@@ -13,11 +13,11 @@ path = "src/main.rs"
 [dependencies]
 acid-service = { workspace = true }
 service = { workspace = true }
-clap = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-color-eyre = { workspace = true }
+clap = { version = "4.5", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+color-eyre = "0.6"
 
 [dev-dependencies]
-pretty_assertions = { workspace = true }
-tempfile = { workspace = true }
+pretty_assertions = "1"
+tempfile = "3"

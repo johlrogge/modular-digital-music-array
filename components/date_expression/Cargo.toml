@@ -1,10 +1,10 @@
 [package]
 name = "date-expression"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-license.workspace = true
+version = "0.10.1"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
 
 [package.metadata]
 
@@ -12,6 +12,6 @@ license.workspace = true
 interface = "date-expression"
 
 [dependencies]
-chrono = { workspace = true }
-thiserror = { workspace = true }
+chrono = "0.4"
+thiserror = "1.0"
 

@@ -1,12 +1,12 @@
 [package]
 name = "http-server"
 version = "0.1.0"
-edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-license.workspace = true
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
 
 [dependencies]
-axum = { workspace = true }
-tokio = { workspace = true }
-thiserror = { workspace = true }
+axum = "0.7"
+tokio = { version = "1.36", features = ["full"] }
+thiserror = "1.0"

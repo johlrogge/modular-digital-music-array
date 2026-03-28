@@ -1,10 +1,10 @@
 [package]
 name = "acid-service"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-license.workspace = true
+version = "0.10.1"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
 
 [package.metadata.polylith]
 interface = "acid-service"
@@ -13,7 +13,7 @@ interface = "acid-service"
 acid-protocol = { workspace = true }
 event-protocol = { workspace = true }
 fact-store = { workspace = true }
-nng = { workspace = true }
-serde_json = { workspace = true }
-tracing = { workspace = true }
-thiserror = { workspace = true }
+nng = "1.0"
+serde_json = "1.0"
+tracing = "0.1"
+thiserror = "1.0"

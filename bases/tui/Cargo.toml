@@ -1,17 +1,17 @@
 [package]
 name = "tui-base"
 version = "0.1.0"
-edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-license.workspace = true
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
 
 [dependencies]
 ratatui = "0.29"
 crossterm = "0.28"
-thiserror = { workspace = true }
-scopeguard = { workspace = true }
+thiserror = "1.0"
+scopeguard = "1"
 
 [dev-dependencies]
-color-eyre = { workspace = true }
-pretty_assertions = { workspace = true }
+color-eyre = "0.6"
+pretty_assertions = "1"
