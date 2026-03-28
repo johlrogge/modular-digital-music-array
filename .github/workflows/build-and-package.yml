@@ -41,10 +41,10 @@ jobs:
         restore-keys: cargo-aarch64-
 
     - name: Build mdma binary for BDD tests
-      run: devenv shell -- sh -c 'cargo polylith profile build dev --no-build && cargo build --manifest-path profiles/dev/Cargo.toml --bin mdma'
+      run: devenv shell -- cargo polylith cargo --profile dev build --bin mdma
 
     - name: Unit tests
-      run: devenv shell -- sh -c 'cargo test --manifest-path profiles/dev/Cargo.toml'
+      run: devenv shell -- cargo polylith cargo --profile dev test
 
     - name: BDD integration tests
       timeout-minutes: 30

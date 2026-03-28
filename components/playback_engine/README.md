@@ -38,16 +38,13 @@ engine.shutdown()                 // stop mix thread and release resources
 ## Build
 
 ```bash
-# Generate the dev profile manifest first, then build
-cargo polylith profile build dev --no-build
-cargo build --manifest-path profiles/dev/Cargo.toml --package playback-engine
+cargo polylith cargo --profile dev build --package playback-engine
 ```
 
 Cross-compile for Raspberry Pi:
 
 ```bash
-cargo polylith profile build production --no-build
-cargo zigbuild --manifest-path profiles/production/Cargo.toml --package playback-engine --target aarch64-unknown-linux-musl --release
+cargo polylith cargo --profile production zigbuild --package playback-engine --target aarch64-unknown-linux-musl --release
 ```
 
 Building requires PipeWire and libspa development headers. These are provided automatically in the `devenv` shell.

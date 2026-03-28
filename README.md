@@ -117,13 +117,11 @@ This is a [Polylith](https://polylith.gitbook.io/polylith/) workspace. Deployabl
 # Enter reproducible dev environment (Nix/devenv)
 devenv shell
 
-# Build everything (Polylith workspace — generate profile manifest first)
-cargo polylith profile build dev --no-build
-cargo build --manifest-path profiles/dev/Cargo.toml
+# Build everything (Polylith workspace)
+cargo polylith cargo --profile dev build
 
 # Run all tests
-cargo polylith profile build dev --no-build
-cargo test --manifest-path profiles/dev/Cargo.toml
+cargo polylith cargo --profile dev test
 
 # Watch mode: check → test → build → clippy on save
 just watch
@@ -159,8 +157,7 @@ sudo mv mdma /usr/local/bin/
 Or build from source:
 
 ```bash
-cargo polylith profile build dev --no-build
-cargo build --manifest-path profiles/dev/Cargo.toml --release -p mdma-cli
+cargo polylith cargo --profile dev build --release -p mdma-cli
 cp profiles/dev/target/release/mdma /usr/local/bin/
 ```
 
@@ -172,7 +169,7 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ## What's new in 0.11.0
 
-- **Polylith workspace migration** — root `Cargo.toml` is now a stub. All builds go through `cargo polylith profile build <profile> --no-build` followed by `--manifest-path profiles/<profile>/Cargo.toml`. Dev builds use the `dev` profile; production (mdma-acid) uses the `production` profile.
+- **Polylith workspace migration** — root `Cargo.toml` is now a stub. All builds go through `cargo polylith cargo --profile <profile> <cmd>`. Dev builds use the `dev` profile; production (mdma-acid) uses the `production` profile.
 - **Bookmarks** — `mdma bookmark [<hash>] [--scope <set-name>]` bookmarks the currently playing track (or a specific track by hash). `mdma bookmarks` lists all bookmarked tracks. Bookmarks are stored as `Bookmarked` facts in the ACID store with `FactOrigin::User` provenance.
 - **TUI bookmark keybinding** — in Playback mode, pressing `b` bookmarks the currently playing track immediately.
 - **`FactOrigin::User`** — new variant in `music_facts::FactOrigin` for facts initiated directly by the user (e.g. bookmarks), distinct from ingestion-time origins.
