@@ -1010,6 +1010,28 @@ impl LibraryService {
                     message: format!("Cover art reindexed for {} tracks", reindexed),
                 })
             }
+
+            LibraryRequest::WriteBookmark { hash, scope } => {
+                let full_hash = match self.resolve_hash(&hash) {
+                    Ok(h) => h,
+                    Err(e) => return LibraryResponse::Error(e),
+                };
+                let fact = MusicValue::Bookmarked {
+                    scope,
+                    timestamp: chrono::Utc::now(),
+                };
+                let source = music_facts::FactSource::new(
+                    "mdma",
+                    env!("CARGO_PKG_VERSION"),
+                    music_facts::FactOrigin::User,
+                );
+                match self.acid_client.write_music_facts(&full_hash, &[(fact, source)]) {
+                    Ok(_) => LibraryResponse::BookmarkWritten,
+                    Err(e) => LibraryResponse::Error(ProtocolError::Internal {
+                        message: e.to_string(),
+                    }),
+                }
+            }
         }
     }
 

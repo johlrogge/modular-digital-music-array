@@ -282,6 +282,8 @@ impl LibraryService {
             | LibraryRequest::ReindexCovers => LibraryResponse::Error(ProtocolError::Internal {
                 message: "ingestion not supported in stub".to_string(),
             }),
+
+            LibraryRequest::WriteBookmark { .. } => LibraryResponse::BookmarkWritten,
         }
     }
 

@@ -250,6 +250,18 @@ impl LibraryBackend {
             }
         }
     }
+
+    /// Write a bookmark fact for a track.
+    pub fn write_bookmark(
+        &self,
+        hash: &ContentHash,
+        scope: Option<String>,
+    ) -> Result<(), ClientError> {
+        interpret_bookmark_written(self.request(&LibraryRequest::WriteBookmark {
+            hash: hash.clone(),
+            scope,
+        })?)
+    }
 }
 
 // =========================================================================
@@ -368,6 +380,14 @@ fn interpret_playlist_ok(response: LibraryResponse) -> Result<(), ClientError> {
     }
 }
 
+fn interpret_bookmark_written(response: LibraryResponse) -> Result<(), ClientError> {
+    match response {
+        LibraryResponse::BookmarkWritten => Ok(()),
+        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+        _ => Err(unexpected("WriteBookmark")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,5 +453,23 @@ mod tests {
     #[test]
     fn interpret_ping_unexpected_variant_is_err() {
         assert!(interpret_ping(LibraryResponse::Tracks(vec![])).is_err());
+    }
+
+    #[test]
+    fn interpret_bookmark_written_ok() {
+        assert!(interpret_bookmark_written(LibraryResponse::BookmarkWritten).is_ok());
+    }
+
+    #[test]
+    fn interpret_bookmark_written_error_propagates() {
+        let err = LibraryResponse::Error(ProtocolError::Internal {
+            message: "fail".to_string(),
+        });
+        assert!(interpret_bookmark_written(err).is_err());
+    }
+
+    #[test]
+    fn interpret_bookmark_written_unexpected_variant_is_err() {
+        assert!(interpret_bookmark_written(LibraryResponse::Pong).is_err());
     }
 }

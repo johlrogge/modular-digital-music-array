@@ -37,6 +37,9 @@ pub enum FactOrigin {
 
     /// Unknown/other source
     Unknown,
+
+    /// Initiated directly by the user (e.g. a bookmark)
+    User,
 }
 
 impl FactOrigin {

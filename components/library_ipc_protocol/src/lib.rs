@@ -301,6 +301,12 @@ pub enum LibraryRequest {
 
     /// Re-extract cover art for tracks that don't have a CoverArtPath fact yet.
     ReindexCovers,
+
+    /// Write a bookmark fact for a track.
+    WriteBookmark {
+        hash: ContentHash,
+        scope: Option<String>,
+    },
 }
 
 // ============================================================================
@@ -362,6 +368,9 @@ pub enum LibraryResponse {
 
     /// Verbatim playlist content.
     PlaylistContent(String),
+
+    /// Bookmark written successfully.
+    BookmarkWritten,
 
     /// Error response.
     Error(ProtocolError),
