@@ -433,7 +433,7 @@ in
         and stop. Failures are likely upstream bugs — report them clearly.
 
         NEVER wipe /music on the Pi (contains the music library).
-        Releases go through `git flow release` — see .claude/skills/mdma-devops/references/releases.md.
+        Do NOT manage releases — that is the release-manager agent's job.
         Do NOT write application Rust code.
         Do NOT include "Co-Authored-By: Claude" in commit messages.
 
