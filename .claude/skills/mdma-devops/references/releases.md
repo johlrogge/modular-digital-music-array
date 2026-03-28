@@ -18,7 +18,7 @@ git flow release start <version>
 
 ### 2. Bump Versions
 
-**Workspace version** — edit `Cargo.toml` at the workspace root:
+**Workspace version** — edit `Polylith.toml`:
 ```toml
 [workspace.package]
 version = "<new-version>"
@@ -54,18 +54,18 @@ chore(release): bump to <version>
 
 ```bash
 git flow release finish <version>
-# This merges to main and develop, creates a tag v<version>
+# This merges to master and develop, creates a tag v<version>
 ```
 
 ### 7. Push Everything
 
 ```bash
-git push github main develop --tags
+git push github master develop --tags
 ```
 
 ### 8. CI Builds and Publishes
 
-GitHub Actions on the `main` push:
+GitHub Actions on the `master` push:
 1. Runs tests
 2. Cross-compiles all services for aarch64
 3. Creates .xbps packages
@@ -89,7 +89,7 @@ For urgent fixes that can't wait for a normal release:
 git flow hotfix start <version>
 # Make fix, bump patch version
 git flow hotfix finish <version>
-git push github main develop --tags
+git push github master develop --tags
 ```
 
 ## Version Scheme

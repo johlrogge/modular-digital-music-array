@@ -186,15 +186,15 @@ Workflow:
 
 ### Release Workflow
 
-1. `git flow release start <version>`
-2. Bump workspace version in `Cargo.toml`
-3. Bump xbps template versions in `void-packages/srcpkgs/*/template`
-4. Dispatch **documenter** agent to update all READMEs
-5. Dispatch **commit** agent: `chore(release): bump to <version>`
-6. `git flow release finish <version>`
-7. Push master + develop + tags
-8. CI builds and publishes packages
-9. Dispatch **devops** to verify packages install on Pi
+All release steps are owned by the **release-manager** agent. Dispatch it with the version number — it handles everything from branch creation to pushing.
+
+1. Dispatch **release-manager**: `git flow release start <version>`
+2. Dispatch **code-minion**: bump version in `Polylith.toml` and `void-packages/srcpkgs/*/template`
+3. Dispatch **documenter**: update all READMEs
+4. Dispatch **commit** agent: `chore(release): bump to <version>`
+5. Dispatch **release-manager**: `git flow release finish <version>` + push master, develop, tags to `github`
+6. CI builds and publishes packages (triggered by master push)
+7. Dispatch **devops** to deploy updated packages to Pi and verify
 
 See `RELEASING.md` for detailed procedure.
 

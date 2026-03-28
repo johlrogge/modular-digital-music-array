@@ -23,7 +23,7 @@ build:
 bdd:
     cargo polylith profile build dev --no-build
     cargo build -q --manifest-path profiles/dev/Cargo.toml --bin mdma
-    cd projects/bdd && cargo test --test cucumber -- -vv
+    cargo test --manifest-path profiles/dev/Cargo.toml -p mdma-bdd --test cucumber -- -vv
 
 # Cross-compile a standard MDMA binary for aarch64
 [group('build')]
