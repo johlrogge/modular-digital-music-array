@@ -272,6 +272,18 @@ enum Commands {
         command: LibraryCommands,
     },
 
+    /// Bookmark the currently playing track, or a specific track by hash
+    Bookmark {
+        /// Content hash of track to bookmark (defaults to now-playing if omitted)
+        hash: Option<String>,
+        /// Optional scope — associate bookmark with a named set
+        #[arg(long)]
+        scope: Option<String>,
+    },
+
+    /// List all bookmarked tracks
+    Bookmarks,
+
     /// Generate shell completions
     #[command(hide = true)]
     GenerateCompletions {
@@ -1680,6 +1692,76 @@ fn handle_library_reindex_covers(client: &LibraryBackend) -> Result<()> {
             std::process::exit(1);
         }
     }
+    Ok(())
+}
+
+// =============================================================================
+// Bookmark Command Handlers
+// =============================================================================
+
+fn handle_bookmark(
+    library_client: &LibraryBackend,
+    playback_client: Option<&PlaybackBackend>,
+    hash: Option<String>,
+    scope: Option<String>,
+) -> Result<()> {
+    let content_hash = match hash {
+        Some(h) => ContentHash::new(h),
+        None => {
+            let pb = match playback_client {
+                Some(p) => p,
+                None => {
+                    eprintln!("No hash provided and no playback client available");
+                    std::process::exit(1);
+                }
+            };
+            match pb.now_playing() {
+                Ok(Some(h)) => h,
+                Ok(None) => {
+                    eprintln!("Nothing is currently playing");
+                    std::process::exit(1);
+                }
+                Err(e) => handle_playback_error(e),
+            }
+        }
+    };
+
+    match library_client.write_bookmark(&content_hash, scope) {
+        Ok(()) => {
+            println!("Bookmarked.");
+            Ok(())
+        }
+        Err(e) => handle_error(e),
+    }
+}
+
+fn handle_bookmarks(library_client: &LibraryBackend) -> Result<()> {
+    let tracks = match library_client.list_tracks(None) {
+        Ok(t) => t,
+        Err(e) => handle_error(e),
+    };
+
+    let bookmarked: Vec<TrackInfo> = tracks
+        .into_iter()
+        .filter(|track| {
+            match library_client.get_facts(&track.content_hash) {
+                Ok((_hash, facts)) => facts
+                    .iter()
+                    .any(|(fact_type, _value)| fact_type == "Bookmarked"),
+                Err(_) => false,
+            }
+        })
+        .collect();
+
+    if bookmarked.is_empty() {
+        use std::io::IsTerminal;
+        if std::io::stdout().is_terminal() {
+            println!("No bookmarked tracks");
+        }
+        return Ok(());
+    }
+
+    print_tracks(&bookmarked, &format!("Bookmarked tracks ({})", bookmarked.len()));
     Ok(())
 }
 
@@ -3216,6 +3298,17 @@ fn main() -> Result<()> {
             match command {
                 LibraryCommands::ReindexCovers => handle_library_reindex_covers(&lib),
             }
+        }
+
+        Commands::Bookmark { hash, scope } => {
+            let lib = connect_library(&cli);
+            let pb = connect_playback(&cli);
+            handle_bookmark(&lib, Some(&pb), hash.clone(), scope.clone())
+        }
+
+        Commands::Bookmarks => {
+            let lib = connect_library(&cli);
+            handle_bookmarks(&lib)
         }
     }
 }
