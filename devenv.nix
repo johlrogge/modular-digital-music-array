@@ -114,15 +114,18 @@ in
   };
 
   # Local dev service stack — launched by `devenv up`
-  process.manager.before = ''
-    rm -f /tmp/mdma-dev/run/*.sock
-    mkdir -p /tmp/mdma-dev/run/sources /tmp/mdma-dev/music/inbox /tmp/mdma-dev/music/blobs /tmp/mdma-dev/metadata
-    echo "Building all services..."
-    cargo polylith profile build dev --no-build \
-      && cargo build --release --manifest-path "$MDMA_PROJECT_ROOT/profiles/dev/Cargo.toml" \
-           --bin mdma-acid --bin mdma-library --bin mdma-playback --bin mdma-gateway --bin mdma-console 2>/dev/null \
-      || echo "One or more services failed to build — run: cargo polylith profile build dev --no-build"
-  '';
+  tasks."mdma:setup" = {
+    exec = ''
+      rm -f /tmp/mdma-dev/run/*.sock
+      mkdir -p /tmp/mdma-dev/run/sources /tmp/mdma-dev/music/inbox /tmp/mdma-dev/music/blobs /tmp/mdma-dev/metadata
+      echo "Building all services..."
+      cargo polylith profile build dev --no-build \
+        && cargo polylith cargo --profile dev build --release \
+             --bin mdma-acid --bin mdma-library --bin mdma-playback --bin mdma-gateway --bin mdma-console 2>/dev/null \
+        || echo "One or more services failed to build — run: cargo polylith profile build dev --no-build"
+    '';
+    before = [ "devenv:processes" ];
+  };
 
   processes = {
     mdma-acid = {
