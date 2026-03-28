@@ -260,6 +260,19 @@ enum Commands {
         output: std::path::PathBuf,
     },
 
+    /// Export tracks for Pioneer Rekordbox
+    ///
+    /// Downloads audio files and generates rekordbox.xml for import
+    /// via Rekordbox File → Import Library.
+    ///
+    /// Examples:
+    ///   mdma rekordbox export --playlist my-set
+    ///   mdma search --artist CBL | mdma rekordbox export
+    Rekordbox {
+        #[command(subcommand)]
+        command: RekordboxCommands,
+    },
+
     /// Manage playlists
     Playlist {
         #[command(subcommand)]
@@ -292,7 +305,7 @@ enum Commands {
     },
 }
 
-#[derive(clap::ValueEnum, Debug, Clone, PartialEq, Eq)]
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 enum ExportFormat {
     /// Transfer the file without conversion (default)
     Original,
@@ -318,6 +331,22 @@ impl ExportFormat {
             Self::Wav => "wav",
         }
     }
+}
+
+#[derive(Subcommand, Debug)]
+enum RekordboxCommands {
+    /// Export tracks to Rekordbox-compatible XML + audio files.
+    Export {
+        /// Export from a named playlist (mutually exclusive with stdin)
+        #[arg(long)]
+        playlist: Option<String>,
+        /// Output directory
+        #[arg(long, default_value = "./rekordbox-export/")]
+        output: std::path::PathBuf,
+        /// Audio format (defaults to original)
+        #[arg(long, value_enum)]
+        format: Option<ExportFormat>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2811,13 +2840,146 @@ fn parse_hash_from_line(line: &str) -> Option<String> {
     None
 }
 
-/// Result of a single track export attempt.
-struct ExportResult {
+/// Require `--node` / `MDMA_NODE` to be set and return the hostname.
+///
+/// Prints an error and exits if the node is absent or empty.
+fn require_node(cli: &Cli) -> String {
+    match cli.node.as_deref() {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => {
+            eprintln!("MDMA_NODE is not set.");
+            eprintln!(
+                "Set --node or MDMA_NODE to the hostname of your MDMA device (e.g. mdma-909.local)"
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Build the shared blocking HTTP client used by export handlers.
+fn build_http_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to build HTTP client: {}", e))
+}
+
+/// Outcome of a single track download attempt.
+enum DownloadOutcome {
+    Success {
+        dest: std::path::PathBuf,
+        size: u64,
+        ext: String,
+    },
+    Failure {
+        error: String,
+    },
+}
+
+/// Result of a single track download attempt.
+///
+/// Carries enough information for both the plain export summary and the
+/// Rekordbox XML builder.
+struct DownloadAttempt {
+    track: TrackInfo,
     hash: String,
-    filename: String,
-    bytes: u64,
-    success: bool,
-    error: Option<String>,
+    outcome: DownloadOutcome,
+}
+
+/// Download a list of tracks to `output`, resolving each track's format via
+/// `resolve_format`.  Progress is printed to stderr.  Returns one
+/// `DownloadAttempt` per input track, in order.
+fn download_tracks(
+    node: &str,
+    tracks: &[TrackInfo],
+    output: &std::path::Path,
+    http: &reqwest::blocking::Client,
+    resolve_format: impl Fn(&TrackInfo) -> ExportFormat,
+) -> Vec<DownloadAttempt> {
+    use std::io::Write;
+
+    let total = tracks.len();
+    let mut results: Vec<DownloadAttempt> = Vec::with_capacity(total);
+
+    for (idx, track) in tracks.iter().enumerate() {
+        let full_hash = track.content_hash.as_str();
+        let resolved_format = resolve_format(track);
+        let format_param = resolved_format.format_param();
+        let url = export_url_from_node(node, full_hash, format_param);
+
+        eprint!("[{}/{}] Downloading {} ... ", idx + 1, total, full_hash);
+        let _ = std::io::stderr().flush();
+
+        macro_rules! fail {
+            ($msg:expr) => {{
+                eprintln!("FAILED ({})", $msg);
+                results.push(DownloadAttempt {
+                    track: track.clone(),
+                    hash: full_hash.to_string(),
+                    outcome: DownloadOutcome::Failure {
+                        error: $msg.to_string(),
+                    },
+                });
+                continue;
+            }};
+        }
+
+        let response = match http.get(&url).send() {
+            Ok(r) => r,
+            Err(e) => fail!(e.to_string()),
+        };
+
+        if !response.status().is_success() {
+            fail!(format!("HTTP {}", response.status()));
+        }
+
+        // Determine extension: fixed for converted formats, derived from blob_path for Original.
+        let source_ext_owned: String;
+        let ext: &str = match resolved_format.static_extension() {
+            Some(fixed) => fixed,
+            None => {
+                source_ext_owned = track
+                    .blob_path
+                    .as_deref()
+                    .and_then(|p| std::path::Path::new(p).extension())
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("bin")
+                    .to_lowercase();
+                &source_ext_owned
+            }
+        };
+
+        let dest = export_dest_path(output, track, ext);
+
+        if let Some(parent) = dest.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                fail!(format!("mkdir: {}", e));
+            }
+        }
+
+        let body = match response.bytes() {
+            Ok(b) => b,
+            Err(e) => fail!(format!("read error: {}", e)),
+        };
+
+        if let Err(e) = std::fs::write(&dest, &body) {
+            fail!(format!("write error: {}", e));
+        }
+
+        let size = body.len() as u64;
+        eprintln!("OK  {} ({} bytes)", dest.display(), size);
+        results.push(DownloadAttempt {
+            track: track.clone(),
+            hash: full_hash.to_string(),
+            outcome: DownloadOutcome::Success {
+                dest,
+                size,
+                ext: ext.to_string(),
+            },
+        });
+    }
+
+    results
 }
 
 /// Resolve the export format for a track based on its source extension and CLI flags.
@@ -2859,6 +3021,200 @@ fn resolve_export_format(
     }
 }
 
+// =============================================================================
+// Rekordbox Export
+// =============================================================================
+
+fn handle_rekordbox_export(
+    cli: &Cli,
+    library: &LibraryBackend,
+    playlist: Option<&str>,
+    output: &std::path::Path,
+    format: Option<&ExportFormat>,
+) -> Result<()> {
+    use std::io::BufRead;
+
+    let node = require_node(cli);
+
+    // Collect hashes: from playlist or stdin
+    let raw_hashes: Vec<String> = if let Some(pname) = playlist {
+        let name = parse_playlist_name(pname);
+        match library.playlist_get(&name) {
+            Ok(hashes) => hashes.into_iter().map(|h| h.as_str().to_string()).collect(),
+            Err(e) => {
+                eprintln!("Failed to get playlist '{}': {}", pname, e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        std::io::stdin()
+            .lock()
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|line| parse_hash_from_line(&line))
+            .collect()
+    };
+
+    if raw_hashes.is_empty() {
+        if playlist.is_some() {
+            eprintln!("Playlist is empty.");
+        } else {
+            eprintln!("No hashes provided on stdin.");
+            eprintln!("Usage: mdma search --artist CBL | mdma rekordbox export");
+            eprintln!("       mdma rekordbox export --playlist my-set");
+        }
+        std::process::exit(1);
+    }
+
+    // Resolve each hash to full TrackInfo
+    let tracks = resolve_tracks_skip_errors(library, raw_hashes);
+    if tracks.is_empty() {
+        eprintln!("No tracks could be resolved. Aborting.");
+        std::process::exit(1);
+    }
+
+    let http = build_http_client()?;
+
+    // Create output directory early
+    if let Err(e) = std::fs::create_dir_all(output) {
+        return Err(color_eyre::eyre::eyre!(
+            "Failed to create output directory: {}",
+            e
+        ));
+    }
+
+    // Resolve format: only --format (no lossless/lossy split for rekordbox export)
+    let format_owned = format.cloned().unwrap_or(ExportFormat::Original);
+    let results = download_tracks(&node, &tracks, output, &http, |_track| format_owned.clone());
+
+    let downloaded: Vec<(&DownloadAttempt, &std::path::PathBuf, &String, u64)> = results
+        .iter()
+        .filter_map(|r| {
+            if let DownloadOutcome::Success { dest, ext, size } = &r.outcome {
+                Some((r, dest, ext, *size))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let fail_count = results
+        .iter()
+        .filter(|r| matches!(r.outcome, DownloadOutcome::Failure { .. }))
+        .count();
+
+    if downloaded.is_empty() {
+        eprintln!("No tracks downloaded. Aborting XML generation.");
+        std::process::exit(1);
+    }
+
+    // Build RekordboxTrack list
+    let mut rb_tracks: Vec<rekordbox_xml::RekordboxTrack> = Vec::with_capacity(downloaded.len());
+
+    for (idx, (attempt, dest, ext, size)) in downloaded.iter().enumerate() {
+        let track = &attempt.track;
+        let track_id = (idx + 1) as u32;
+
+        // Fetch facts for additional metadata
+        let facts: Vec<(String, String)> = library
+            .get_facts(&track.content_hash)
+            .map(|(_hash, facts)| facts)
+            .unwrap_or_default();
+
+        let find_fact = |name: &str| -> Option<String> {
+            facts
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+
+        let bitrate = find_fact("Bitrate")
+            .and_then(|v| v.parse::<u32>().ok());
+        let sample_rate = find_fact("SampleRate")
+            .and_then(|v| v.parse::<u32>().ok());
+        let year = find_fact("Year").or_else(|| find_fact("RecordingYear"));
+        let label = find_fact("Label");
+        let comment = find_fact("Comment");
+        let genre = find_fact("MainGenre")
+            .or_else(|| find_fact("FullGenre"))
+            .unwrap_or_default();
+
+        let date_added = track
+            .added
+            .as_deref()
+            .and_then(|s| s.split('T').next())
+            .map(String::from);
+
+        let tonality = track
+            .key
+            .as_ref()
+            .map(rekordbox_xml::key_to_tonality);
+
+        let average_bpm = track.bpm.map(|b| b.as_f32());
+
+        let location = rekordbox_xml::path_to_file_uri(
+            &dest.canonicalize().unwrap_or_else(|_| dest.to_path_buf()),
+        );
+
+        rb_tracks.push(rekordbox_xml::RekordboxTrack {
+            track_id,
+            name: track.title.clone().unwrap_or_else(|| "Unknown".to_string()),
+            artist: track.artist.clone().unwrap_or_default(),
+            album: track.album.clone().unwrap_or_default(),
+            genre,
+            kind: rekordbox_xml::ext_to_kind(ext).to_string(),
+            size: *size,
+            total_time: track.duration.map(|d| d.value()).unwrap_or(0),
+            average_bpm,
+            tonality,
+            track_number: track.track_number,
+            disc_number: track.disc_number,
+            year,
+            label,
+            comment,
+            date_added,
+            bitrate,
+            sample_rate,
+            location,
+        });
+    }
+
+    // Build playlists section
+    let playlists = if let Some(pname) = playlist {
+        let all_ids: Vec<u32> = rb_tracks.iter().map(|t| t.track_id).collect();
+        vec![rekordbox_xml::RekordboxPlaylist {
+            name: pname.to_string(),
+            track_ids: all_ids,
+        }]
+    } else {
+        vec![]
+    };
+
+    // Generate and write XML
+    let xml = rekordbox_xml::RekordboxLibrary {
+        tracks: rb_tracks,
+        playlists,
+    }
+    .to_xml();
+
+    let xml_path = output.join("rekordbox.xml");
+    std::fs::write(&xml_path, xml.as_bytes())
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to write rekordbox.xml: {}", e))?;
+
+    eprintln!();
+    eprintln!(
+        "Done: {} tracks exported, {} failed",
+        downloaded.len(),
+        fail_count
+    );
+    eprintln!("XML written to: {}", xml_path.display());
+
+    if fail_count > 0 {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
 fn handle_export(
     cli: &Cli,
     library: &LibraryBackend,
@@ -2867,19 +3223,9 @@ fn handle_export(
     lossy_format: &Option<ExportFormat>,
     output: &std::path::Path,
 ) -> Result<()> {
-    use std::io::{BufRead, Write};
+    use std::io::BufRead;
 
-    // Resolve node from --node / MDMA_NODE (already in cli.node via clap)
-    let node = match cli.node.as_deref() {
-        Some(n) if !n.is_empty() => n.to_string(),
-        _ => {
-            eprintln!("MDMA_NODE is not set.");
-            eprintln!(
-                "Set --node or MDMA_NODE to the hostname of your MDMA device (e.g. mdma-909.local)"
-            );
-            std::process::exit(1);
-        }
-    };
+    let node = require_node(cli);
 
     // Read hashes from stdin
     let raw_hashes: Vec<String> = std::io::stdin()
@@ -2903,134 +3249,31 @@ fn handle_export(
         std::process::exit(1);
     }
 
-    let http = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|e| color_eyre::eyre::eyre!("Failed to build HTTP client: {}", e))?;
+    let http = build_http_client()?;
 
-    let total = tracks.len();
-    let mut results: Vec<ExportResult> = Vec::with_capacity(total);
-
-    for (idx, track) in tracks.iter().enumerate() {
-        let resolved_format = resolve_export_format(
-            track.blob_path.as_deref(),
-            format,
-            lossless_format,
-            lossy_format,
-        );
-        let format_param = resolved_format.format_param();
-        let full_hash = track.content_hash.as_str();
-        let url = export_url_from_node(&node, full_hash, format_param);
-        eprint!("[{}/{}] Downloading {} ... ", idx + 1, total, full_hash);
-        let _ = std::io::stderr().flush();
-
-        let response = match http.get(&url).send() {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("FAILED ({})", e);
-                results.push(ExportResult {
-                    hash: full_hash.to_string(),
-                    filename: String::new(),
-                    bytes: 0,
-                    success: false,
-                    error: Some(e.to_string()),
-                });
-                continue;
-            }
-        };
-
-        if !response.status().is_success() {
-            let status = response.status();
-            eprintln!("FAILED (HTTP {})", status);
-            results.push(ExportResult {
-                hash: full_hash.to_string(),
-                filename: String::new(),
-                bytes: 0,
-                success: false,
-                error: Some(format!("HTTP {}", status)),
-            });
-            continue;
-        }
-
-        // Determine the file extension: fixed for converted formats, derived from
-        // blob_path for Original.
-        let source_ext_owned: String;
-        let ext: &str = match resolved_format.static_extension() {
-            Some(fixed) => fixed,
-            None => {
-                // Original: derive from blob_path
-                source_ext_owned = track
-                    .blob_path
-                    .as_deref()
-                    .and_then(|p| std::path::Path::new(p).extension())
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("bin")
-                    .to_lowercase();
-                &source_ext_owned
-            }
-        };
-
-        // Build the structured destination path: output/artist/album/title.ext
-        let dest = export_dest_path(output, track, ext);
-
-        // Create intermediate directories
-        if let Some(parent) = dest.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!("FAILED (mkdir: {})", e);
-                results.push(ExportResult {
-                    hash: full_hash.to_string(),
-                    filename: dest.display().to_string(),
-                    bytes: 0,
-                    success: false,
-                    error: Some(e.to_string()),
-                });
-                continue;
-            }
-        }
-
-        let body = match response.bytes() {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("FAILED (read error: {})", e);
-                results.push(ExportResult {
-                    hash: full_hash.to_string(),
-                    filename: dest.display().to_string(),
-                    bytes: 0,
-                    success: false,
-                    error: Some(e.to_string()),
-                });
-                continue;
-            }
-        };
-
-        if let Err(e) = std::fs::write(&dest, &body) {
-            eprintln!("FAILED (write error: {})", e);
-            results.push(ExportResult {
-                hash: full_hash.to_string(),
-                filename: dest.display().to_string(),
-                bytes: 0,
-                success: false,
-                error: Some(e.to_string()),
-            });
-            continue;
-        }
-
-        let bytes = body.len() as u64;
-        let display = dest.display().to_string();
-        eprintln!("OK  {} ({} bytes)", display, bytes);
-        results.push(ExportResult {
-            hash: full_hash.to_string(),
-            filename: display,
-            bytes,
-            success: true,
-            error: None,
-        });
-    }
+    let results = download_tracks(&node, &tracks, output, &http, |track| {
+        resolve_export_format(track.blob_path.as_deref(), format, lossless_format, lossy_format)
+    });
 
     // Summary
-    let success_count = results.iter().filter(|r| r.success).count();
-    let total_bytes: u64 = results.iter().filter(|r| r.success).map(|r| r.bytes).sum();
-    let fail_count = results.iter().filter(|r| !r.success).count();
+    let success_count = results
+        .iter()
+        .filter(|r| matches!(r.outcome, DownloadOutcome::Success { .. }))
+        .count();
+    let total_bytes: u64 = results
+        .iter()
+        .filter_map(|r| {
+            if let DownloadOutcome::Success { size, .. } = &r.outcome {
+                Some(*size)
+            } else {
+                None
+            }
+        })
+        .sum();
+    let fail_count = results
+        .iter()
+        .filter(|r| matches!(r.outcome, DownloadOutcome::Failure { .. }))
+        .count();
     eprintln!();
     eprintln!(
         "Done: {} exported ({} bytes), {} failed",
@@ -3040,17 +3283,14 @@ fn handle_export(
     if fail_count > 0 {
         eprintln!();
         eprintln!("Failed tracks:");
-        for r in results.iter().filter(|r| !r.success) {
-            let target = if r.filename.is_empty() {
-                r.hash.clone()
+        for (r, error) in results.iter().filter_map(|r| {
+            if let DownloadOutcome::Failure { error } = &r.outcome {
+                Some((r, error.as_str()))
             } else {
-                format!("{} ({})", r.hash, r.filename)
-            };
-            eprintln!(
-                "  {} — {}",
-                target,
-                r.error.as_deref().unwrap_or("unknown error")
-            );
+                None
+            }
+        }) {
+            eprintln!("  {} — {}", r.hash, error);
         }
         std::process::exit(1);
     }
@@ -3287,6 +3527,22 @@ fn main() -> Result<()> {
         } => {
             let lib = connect_library(&cli);
             handle_export(&cli, &lib, format, lossless_format, lossy_format, output)
+        }
+        Commands::Rekordbox { command } => {
+            let lib = connect_library(&cli);
+            match command {
+                RekordboxCommands::Export {
+                    playlist,
+                    output,
+                    format,
+                } => handle_rekordbox_export(
+                    &cli,
+                    &lib,
+                    playlist.as_deref(),
+                    output,
+                    format.as_ref(),
+                ),
+            }
         }
         Commands::GenerateCompletions { shell } => {
             generate_completions(*shell, &mut std::io::stdout());
