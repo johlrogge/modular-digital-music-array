@@ -1,6 +1,6 @@
 # playback_engine
 
-Real-time audio playback component for MDMA (v0.8.1). Decodes audio files via Symphonia, resamples to the configured output rate via rubato, and writes to a PipeWire stream. Manages a single track at a time (`Option<Track>`).
+Real-time audio playback component for MDMA. Decodes audio files via Symphonia, resamples to the configured output rate via rubato, and writes to a PipeWire stream. Manages a single track at a time (`Option<Track>`).
 
 [Back to workspace README](../../README.md)
 
@@ -38,13 +38,16 @@ engine.shutdown()                 // stop mix thread and release resources
 ## Build
 
 ```bash
-cargo build --package playback-engine
+# Generate the dev profile manifest first, then build
+cargo polylith profile build dev --no-build
+cargo build --manifest-path profiles/dev/Cargo.toml --package playback-engine
 ```
 
 Cross-compile for Raspberry Pi:
 
 ```bash
-cargo zigbuild --package playback-engine --target aarch64-unknown-linux-musl --release
+cargo polylith profile build production --no-build
+cargo zigbuild --manifest-path profiles/production/Cargo.toml --package playback-engine --target aarch64-unknown-linux-musl --release
 ```
 
 Building requires PipeWire and libspa development headers. These are provided automatically in the `devenv` shell.
