@@ -38,8 +38,6 @@ in
 
     # Audio development
     pkg-config
-    alsa-lib
-    pipewire
 
     # Network tools
     nmap
@@ -47,15 +45,18 @@ in
     gh
     gitflow               # Git-flow branching workflow
 
-    xbps              # Void Linux package tools (xbps-create, xbps-rindex)
     ffmpeg
+  ] ++ lib.optionals pkgs.stdenv.isLinux [
+    alsa-lib
+    pipewire
+    xbps              # Void Linux package tools (xbps-create, xbps-rindex)
   ];
 
   # Rust language support
   languages.rust = {
     enable = true;
     channel = "stable";
-    targets = [ "aarch64-unknown-linux-gnu" ];
+    targets = lib.optionals pkgs.stdenv.isLinux [ "aarch64-unknown-linux-gnu" ];
   };
 
   # Environment variables for bindgen
@@ -119,10 +120,9 @@ in
       rm -f /tmp/mdma-dev/run/*.sock
       mkdir -p /tmp/mdma-dev/run/sources /tmp/mdma-dev/music/inbox /tmp/mdma-dev/music/blobs /tmp/mdma-dev/metadata
       echo "Building all services..."
-      cargo polylith profile build dev --no-build \
-        && cargo polylith cargo --profile dev build --release \
-             --bin mdma-acid --bin mdma-library --bin mdma-playback --bin mdma-gateway --bin mdma-console 2>/dev/null \
-        || echo "One or more services failed to build — run: cargo polylith profile build dev --no-build"
+      cargo polylith cargo --profile dev build --release \
+           --bin mdma-acid --bin mdma-library --bin mdma-playback --bin mdma-gateway --bin mdma-console 2>/dev/null \
+        || echo "One or more services failed to build — run: cargo polylith cargo --profile dev build --bin <name>"
     '';
     before = [ "devenv:processes:mdma-acid" ];
   };
@@ -202,12 +202,11 @@ in
     # Build mdma-cli and mdma-tui, expose via target/debug on PATH
     # Skip in CI — the build is wasted work there (~30s)
     if [ -z "''${CI:-}" ]; then
-      cargo polylith profile build dev --no-build 2>/dev/null \
-        && cargo build -q --manifest-path "$MDMA_PROJECT_ROOT/profiles/dev/Cargo.toml" --bin mdma 2>/dev/null \
-        && cargo build -q --manifest-path "$MDMA_PROJECT_ROOT/profiles/dev/Cargo.toml" --bin mdma-tui 2>/dev/null \
+      cargo polylith cargo --profile dev build -q --bin mdma 2>/dev/null \
+        && cargo polylith cargo --profile dev build -q --bin mdma-tui 2>/dev/null \
         && export PATH="$MDMA_PROJECT_ROOT/target/debug:$PATH" \
         && echo "mdma CLI + TUI ready (gateway mode)" \
-        || echo "mdma CLI/TUI not built — run: cargo polylith profile build dev --no-build && cargo build --manifest-path profiles/dev/Cargo.toml --bin mdma"
+        || echo "mdma CLI/TUI not built — run: cargo polylith cargo --profile dev build --bin mdma"
       eval "$(mdma generate-completions bash 2>/dev/null)" || true
     fi
 
@@ -220,8 +219,7 @@ in
 
   # Tests
   enterTest = ''
-    cargo polylith profile build dev --no-build
-    cargo test --manifest-path profiles/dev/Cargo.toml
+    cargo polylith cargo --profile dev test
   '';
 
   # Claude Code integration

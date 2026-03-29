@@ -284,6 +284,8 @@ impl LibraryService {
             }),
 
             LibraryRequest::WriteBookmark { .. } => LibraryResponse::BookmarkWritten,
+
+            LibraryRequest::WriteFact { .. } => LibraryResponse::FactWritten,
         }
     }
 

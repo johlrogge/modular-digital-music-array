@@ -1032,6 +1032,24 @@ impl LibraryService {
                     }),
                 }
             }
+
+            LibraryRequest::WriteFact { hash, fact } => {
+                let full_hash = match self.resolve_hash(&hash) {
+                    Ok(h) => h,
+                    Err(e) => return LibraryResponse::Error(e),
+                };
+                let source = music_facts::FactSource::new(
+                    "mdma",
+                    env!("CARGO_PKG_VERSION"),
+                    music_facts::FactOrigin::User,
+                );
+                match self.acid_client.write_music_facts(&full_hash, &[(fact, source)]) {
+                    Ok(_) => LibraryResponse::FactWritten,
+                    Err(e) => LibraryResponse::Error(ProtocolError::Internal {
+                        message: e.to_string(),
+                    }),
+                }
+            }
         }
     }
 

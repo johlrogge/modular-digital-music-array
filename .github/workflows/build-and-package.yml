@@ -16,6 +16,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: cachix/install-nix-action@v31
+    - uses: cachix/cachix-action@v16
+      with:
+        name: devenv
+    - run: nix profile install nixpkgs#devenv
+
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: cargo-macos-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: cargo-macos-
+
+    - name: Build mdma CLI for Apple Silicon
+      run: devenv shell -- cargo polylith cargo --profile dev build --bin mdma
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: mdma-cli-macos-arm64
+        path: target/release/mdma
+
   test:
     runs-on: ubuntu-latest
 
@@ -41,10 +69,10 @@ jobs:
         restore-keys: cargo-aarch64-
 
     - name: Build mdma binary for BDD tests
-      run: devenv shell -- sh -c 'cargo polylith profile build dev --no-build && cargo build --manifest-path profiles/dev/Cargo.toml --bin mdma'
+      run: devenv shell -- cargo polylith cargo --profile dev build --bin mdma
 
     - name: Unit tests
-      run: devenv shell -- sh -c 'cargo test --manifest-path profiles/dev/Cargo.toml'
+      run: devenv shell -- cargo polylith cargo --profile dev test
 
     - name: BDD integration tests
       timeout-minutes: 30

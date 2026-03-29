@@ -263,6 +263,71 @@ impl Key {
         format!("{}{}", open_key_num, letter)
     }
 
+    /// Parse from Camelot notation (e.g. "8B" = C Major, "8A" = A Minor).
+    ///
+    /// The letter suffix determines the mode:
+    /// - `B` = Major
+    /// - `A` = Minor
+    ///
+    /// # Examples
+    /// ```
+    /// # use music_primitives::{Key, KeyError};
+    /// let key = Key::from_camelot("8B")?;
+    /// assert_eq!(key.to_traditional_sharp(), "C Major");
+    ///
+    /// let key = Key::from_camelot("8A")?;
+    /// assert_eq!(key.to_traditional_sharp(), "A Minor");
+    /// # Ok::<(), KeyError>(())
+    /// ```
+    pub fn from_camelot(s: &str) -> Result<Self, KeyError> {
+        let s = s.trim();
+        if s.len() < 2 {
+            return Err(KeyError::InvalidNotation(s.to_string()));
+        }
+
+        let (num_part, letter) = s.split_at(s.len() - 1);
+        let number: u8 = num_part
+            .parse()
+            .map_err(|_| KeyError::InvalidNotation(s.to_string()))?;
+
+        let mode = match letter {
+            "B" | "b" => Mode::Major,
+            "A" | "a" => Mode::Minor,
+            _ => return Err(KeyError::InvalidNotation(s.to_string())),
+        };
+
+        // Camelot wheel reverse lookup
+        let pitch = match (number, mode) {
+            (8, Mode::Major) => PitchClass::C,
+            (5, Mode::Minor) => PitchClass::C,
+            (3, Mode::Major) => PitchClass::CSharp,
+            (12, Mode::Minor) => PitchClass::CSharp,
+            (10, Mode::Major) => PitchClass::D,
+            (7, Mode::Minor) => PitchClass::D,
+            (5, Mode::Major) => PitchClass::DSharp,
+            (2, Mode::Minor) => PitchClass::DSharp,
+            (12, Mode::Major) => PitchClass::E,
+            (9, Mode::Minor) => PitchClass::E,
+            (7, Mode::Major) => PitchClass::F,
+            (4, Mode::Minor) => PitchClass::F,
+            (2, Mode::Major) => PitchClass::FSharp,
+            (11, Mode::Minor) => PitchClass::FSharp,
+            (9, Mode::Major) => PitchClass::G,
+            (6, Mode::Minor) => PitchClass::G,
+            (4, Mode::Major) => PitchClass::GSharp,
+            (1, Mode::Minor) => PitchClass::GSharp,
+            (11, Mode::Major) => PitchClass::A,
+            (8, Mode::Minor) => PitchClass::A,
+            (6, Mode::Major) => PitchClass::ASharp,
+            (3, Mode::Minor) => PitchClass::ASharp,
+            (1, Mode::Major) => PitchClass::B,
+            (10, Mode::Minor) => PitchClass::B,
+            _ => return Err(KeyError::InvalidNotation(s.to_string())),
+        };
+
+        Ok(Self { pitch, mode })
+    }
+
     pub fn pitch(&self) -> PitchClass {
         self.pitch
     }
@@ -376,5 +441,36 @@ mod tests {
 
         let deserialized: Key = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, key);
+    }
+
+    #[rstest]
+    #[case("8B", "C Major")]
+    #[case("8A", "A Minor")]
+    #[case("9B", "G Major")]
+    #[case("9A", "E Minor")]
+    #[case("1B", "B Major")]
+    #[case("1A", "G# Minor")]
+    #[case("3B", "C# Major")]
+    #[case("12A", "C# Minor")]
+    fn from_camelot_roundtrip(#[case] camelot: &str, #[case] traditional: &str) {
+        let key = Key::from_camelot(camelot).unwrap();
+        assert_eq!(key.to_camelot(), camelot);
+        // Also check traditional (sharp notation)
+        assert_eq!(key.to_traditional_sharp(), traditional);
+    }
+
+    #[test]
+    fn from_camelot_invalid_letter_errors() {
+        assert!(Key::from_camelot("8C").is_err());
+        assert!(Key::from_camelot("13B").is_err());
+        assert!(Key::from_camelot("0A").is_err());
+        assert!(Key::from_camelot("B").is_err());
+    }
+
+    #[test]
+    fn from_camelot_case_insensitive() {
+        let key_upper = Key::from_camelot("8B").unwrap();
+        let key_lower = Key::from_camelot("8b").unwrap();
+        assert_eq!(key_upper, key_lower);
     }
 }

@@ -1,0 +1,19 @@
+[package]
+name = "rekordbox-xml"
+version = "0.11.1"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
+
+[package.metadata.polylith]
+interface = "rekordbox-xml"
+
+[dependencies]
+music-primitives = { workspace = true }
+quick-xml = { version = "0.37", features = ["serialize"] }
+thiserror = "1.0"
+
+[dev-dependencies]
+pretty_assertions = "1"
+rstest = "0.26"

@@ -362,6 +362,20 @@ impl LibraryClient {
             })),
         }
     }
+
+    /// Write a single fact for a track. Used for importing metadata from external sources.
+    pub fn write_fact(&self, hash: &ContentHash, fact: MusicValue) -> Result<(), ClientError> {
+        match self.request(&LibraryRequest::WriteFact {
+            hash: hash.clone(),
+            fact,
+        })? {
+            LibraryResponse::FactWritten => Ok(()),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to WriteFact".to_string(),
+            })),
+        }
+    }
 }
 
 // =========================================================================

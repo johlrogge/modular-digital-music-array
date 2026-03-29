@@ -28,17 +28,12 @@ export BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu="--sysroot=$SYSROOT -I
 export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
 mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
 
-# Generate the polylith dev profile workspace manifest
-cargo polylith profile build dev --no-build
-
 # Target glibc 2.38 to match Void Linux's PipeWire build
 if command -v cargo-zigbuild &> /dev/null; then
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
-        --manifest-path "$PROJECT_ROOT/profiles/dev/Cargo.toml" \
+    cargo polylith cargo --profile dev zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
         --bin mdma-playback
 else
-    cargo build --release --target aarch64-unknown-linux-gnu \
-        --manifest-path "$PROJECT_ROOT/profiles/dev/Cargo.toml" \
+    cargo polylith cargo --profile dev build --release --target aarch64-unknown-linux-gnu \
         --bin mdma-playback
 fi
 

@@ -9,21 +9,18 @@ check-prereqs:
 # watch and run check, test, build and clippy when files change
 [group('build')]
 watch:
-    cargo polylith profile build dev --no-build
-    cargo watch --manifest-path profiles/dev/Cargo.toml -x check -x test -x build -x clippy
+    cargo polylith cargo --profile dev watch -x check -x test -x build -x clippy
 
 # just build
 [group('build')]
 build:
-    cargo polylith profile build dev --no-build
-    cargo build --manifest-path profiles/dev/Cargo.toml
+    cargo polylith cargo --profile dev build
 
 # Run BDD tests
 [group('test')]
 bdd:
-    cargo polylith profile build dev --no-build
-    cargo build -q --manifest-path profiles/dev/Cargo.toml --bin mdma
-    cargo test --manifest-path profiles/dev/Cargo.toml -p mdma-bdd --test cucumber -- -vv
+    cargo polylith cargo --profile dev build -q --bin mdma
+    cargo polylith cargo --profile dev test -p mdma-bdd --test cucumber -- -vv
 
 # Cross-compile a standard MDMA binary for aarch64
 [group('build')]
@@ -33,8 +30,7 @@ cross bin label=bin:
     export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     echo "Building {{label}} for aarch64..."
-    cargo polylith profile build dev --no-build
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 --manifest-path profiles/dev/Cargo.toml --bin {{bin}}
+    cargo polylith cargo --profile dev zigbuild --release --target aarch64-unknown-linux-gnu.2.38 --bin {{bin}}
     echo ""
     echo "{{label}} built!"
     file target/aarch64-unknown-linux-gnu/release/{{bin}}
@@ -48,9 +44,7 @@ beacon-cross:
     export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     echo "Building Beacon for aarch64..."
-    cargo polylith profile build dev --no-build
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
-        --manifest-path profiles/dev/Cargo.toml \
+    cargo polylith cargo --profile dev zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
         --bin beacon
     echo ""
     echo "Beacon built!"
@@ -60,9 +54,7 @@ beacon-cross:
 # Build beacon with native cargo (requires system cross-compiler)
 [group('build')]
 beacon-native:
-    cargo polylith profile build dev --no-build
-    cargo build --release --target aarch64-unknown-linux-gnu \
-        --manifest-path profiles/dev/Cargo.toml \
+    cargo polylith cargo --profile dev build --release --target aarch64-unknown-linux-gnu \
         --bin beacon
     @echo ""
     @file target/aarch64-unknown-linux-gnu/release/beacon
@@ -71,9 +63,7 @@ beacon-native:
 # Check beacon dependencies for cross-compilation compatibility
 [group('build')]
 beacon-deps:
-    cargo polylith profile build dev --no-build
-    cargo tree --target aarch64-unknown-linux-gnu \
-        --manifest-path profiles/dev/Cargo.toml
+    cargo polylith cargo --profile dev tree --target aarch64-unknown-linux-gnu
 
 # Set up Cargo config for cross-compilation (native gcc method)
 [group('build')]
@@ -135,20 +125,17 @@ check-toolchain:
 # Watch beacon and rebuild on changes (for development)
 [group('dev')]
 beacon-watch:
-    cargo polylith profile build dev --no-build
-    cargo watch --manifest-path profiles/dev/Cargo.toml -x 'build --bin beacon'
+    cargo polylith cargo --profile dev watch -x 'build --bin beacon'
 
 # Run beacon locally (x86_64 - for development/testing)
 [group('dev')]
 beacon-run:
-    cargo polylith profile build dev --no-build
-    cargo run --manifest-path profiles/dev/Cargo.toml --bin beacon
+    cargo polylith cargo --profile dev run --bin beacon
 
 # Build beacon for current platform (development)
 [group('dev')]
 beacon-dev:
-    cargo polylith profile build dev --no-build
-    cargo build --manifest-path profiles/dev/Cargo.toml --bin beacon
+    cargo polylith cargo --profile dev build --bin beacon
     @ls -lh target/debug/beacon
 
 # Rapid deploy beacon to Pi for development iteration
@@ -325,9 +312,7 @@ ci-build-library:
     export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     echo "Building mdma-library for aarch64..."
-    cargo polylith profile build dev --no-build
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
-        --manifest-path profiles/dev/Cargo.toml \
+    cargo polylith cargo --profile dev zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
         --bin mdma-library
 
 # Build mdma-console for CI
@@ -347,9 +332,7 @@ ci-build-gateway:
     export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     echo "Building mdma-gateway for aarch64..."
-    cargo polylith profile build dev --no-build
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
-        --manifest-path profiles/dev/Cargo.toml \
+    cargo polylith cargo --profile dev zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
         --bin mdma-gateway
 
 # Build mdma-bandcamp for CI
@@ -360,9 +343,7 @@ ci-build-bandcamp:
     export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     echo "Building mdma-bandcamp for aarch64..."
-    cargo polylith profile build dev --no-build
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
-        --manifest-path profiles/dev/Cargo.toml \
+    cargo polylith cargo --profile dev zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
         --bin mdma-bandcamp
 
 # Build mdma-library Void package
@@ -398,7 +379,6 @@ pkg-audio:
 # Build mdma-acid Void package (uses production profile for file-backed fact-store)
 [group('package')]
 pkg-acid:
-    cargo polylith profile build production --no-build
     bash ./scripts/package/create-acid-package.sh
 
 # Create repository structure and index (all packages)
@@ -709,14 +689,12 @@ pi-wait:
 # run beacon
 [group("run")]
 run-beacon:
-    cargo polylith profile build dev --no-build
-    cargo run --manifest-path profiles/dev/Cargo.toml --bin beacon
+    cargo polylith cargo --profile dev run --bin beacon
 
 # run console locally
 [group("run")]
 run-console:
-    cargo polylith profile build dev --no-build
-    cargo run --manifest-path profiles/dev/Cargo.toml --bin mdma-console
+    cargo polylith cargo --profile dev run --bin mdma-console
 
 # Cross-compile console for aarch64 (dev profile workspace)
 [group('build')]
@@ -726,9 +704,7 @@ console-cross:
     export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     echo "Building Console for aarch64..."
-    cargo polylith profile build dev --no-build
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
-        --manifest-path profiles/dev/Cargo.toml \
+    cargo polylith cargo --profile dev zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
         --bin mdma-console
     echo ""
     echo "Console built!"
@@ -765,9 +741,7 @@ library-cross:
     export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     echo "Building Library for aarch64..."
-    cargo polylith profile build dev --no-build
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
-        --manifest-path profiles/dev/Cargo.toml \
+    cargo polylith cargo --profile dev zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
         --bin mdma-library
     echo ""
     echo "Library built!"
@@ -840,9 +814,7 @@ gateway-cross:
     export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     echo "Building Gateway for aarch64..."
-    cargo polylith profile build dev --no-build
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
-        --manifest-path profiles/dev/Cargo.toml \
+    cargo polylith cargo --profile dev zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
         --bin mdma-gateway
     echo ""
     echo "Gateway built!"
@@ -857,9 +829,7 @@ acid-cross:
     export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     echo "Building Acid for aarch64 (production profile, file-backed fact-store)..."
-    cargo polylith profile build production --no-build
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
-        --manifest-path profiles/production/Cargo.toml \
+    cargo polylith cargo --profile production zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
         --bin mdma-acid
     echo ""
     echo "Acid built!"
@@ -874,9 +844,7 @@ bandcamp-cross:
     export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     echo "Building Bandcamp for aarch64..."
-    cargo polylith profile build dev --no-build
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
-        --manifest-path profiles/dev/Cargo.toml \
+    cargo polylith cargo --profile dev zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
         --bin mdma-bandcamp
     echo ""
     echo "Bandcamp built!"
@@ -896,9 +864,7 @@ cli-cross:
     export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     echo "Building CLI for aarch64..."
-    cargo polylith profile build dev --no-build
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
-        --manifest-path profiles/dev/Cargo.toml \
+    cargo polylith cargo --profile dev zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
         --bin mdma
     echo ""
     echo "CLI built!"
@@ -944,9 +910,7 @@ tui-cross:
     export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     echo "Building TUI for aarch64..."
-    cargo polylith profile build dev --no-build
-    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
-        --manifest-path profiles/dev/Cargo.toml \
+    cargo polylith cargo --profile dev zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
         --bin mdma-tui
     echo ""
     echo "TUI built!"
