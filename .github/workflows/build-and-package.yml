@@ -16,6 +16,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Install cmake
+      run: brew install cmake
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: cargo-macos-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: cargo-macos-
+    - name: Build mdma CLI for Apple Silicon
+      run: cargo build --release --manifest-path profiles/dev/Cargo.toml --bin mdma
+    - uses: actions/upload-artifact@v4
+      with:
+        name: mdma-cli-macos-arm64
+        path: target/release/mdma
+
   test:
     runs-on: ubuntu-latest
 
