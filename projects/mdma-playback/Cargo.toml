@@ -1,6 +1,6 @@
 [package]
 name = "mdma-playback"
-version = "0.10.1"
+version.workspace = true
 edition = "2021"
 authors = ["MDMA Development Team"]
 repository = "https://github.com/your-org/mdma"
