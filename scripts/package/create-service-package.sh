@@ -200,7 +200,7 @@ fi
 
 RAW=$(grep '^version[. =]' "$CARGO_TOML" | head -1)
 if echo "$RAW" | grep -q 'workspace = true'; then
-    VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+    VERSION=$(grep '^version = ' Polylith.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
 else
     VERSION=$(echo "$RAW" | sed 's/version = "\(.*\)"/\1/')
 fi
