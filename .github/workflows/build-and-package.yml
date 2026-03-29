@@ -37,12 +37,12 @@ jobs:
         restore-keys: cargo-macos-
 
     - name: Build mdma CLI for Apple Silicon
-      run: devenv shell -- cargo polylith cargo --profile dev build --bin mdma
+      run: devenv shell -- cargo polylith cargo --profile dev build --release --bin mdma
 
     - uses: actions/upload-artifact@v4
       with:
         name: mdma-cli-macos-arm64
-        path: target/release/mdma
+        path: profiles/dev/target/release/mdma
 
   test:
     runs-on: ubuntu-latest
