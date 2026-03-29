@@ -3522,20 +3522,31 @@ fn handle_rekordbox_import(
     // 8. Enrich BPM/Key facts
     if enrich {
         let mut enriched = 0usize;
+        let mut skipped = 0usize;
         let mut errors = 0usize;
 
         for (rb_track, hash) in &matched {
+            // Fetch current track facts; on failure fall back to writing (safe default).
+            let existing = library.get_track(hash).ok();
+
             // Write BPM if available
             if let Some(bpm_f32) = rb_track.average_bpm {
                 if let Ok(bpm) = Bpm::from_f32(bpm_f32) {
-                    let fact = MusicValue::Bpm(bpm);
-                    if dry_run {
+                    let already_current = existing
+                        .as_ref()
+                        .and_then(|t| t.bpm)
+                        .map(|existing_bpm| existing_bpm == bpm)
+                        .unwrap_or(false);
+
+                    if already_current {
+                        skipped += 1;
+                    } else if dry_run {
                         println!(
                             "[dry-run] Would write BPM {} for {} - {}",
                             bpm_f32, rb_track.artist, rb_track.name
                         );
                     } else {
-                        match library.write_fact(hash, fact) {
+                        match library.write_fact(hash, MusicValue::Bpm(bpm)) {
                             Ok(()) => enriched += 1,
                             Err(e) => {
                                 eprintln!(
@@ -3552,14 +3563,21 @@ fn handle_rekordbox_import(
             // Write Key (Tonality) if available
             if let Some(ref tonality) = rb_track.tonality {
                 if let Ok(key) = Key::from_camelot(tonality) {
-                    let fact = MusicValue::Key(key);
-                    if dry_run {
+                    let already_current = existing
+                        .as_ref()
+                        .and_then(|t| t.key)
+                        .map(|existing_key| existing_key == key)
+                        .unwrap_or(false);
+
+                    if already_current {
+                        skipped += 1;
+                    } else if dry_run {
                         println!(
                             "[dry-run] Would write Key {} for {} - {}",
                             tonality, rb_track.artist, rb_track.name
                         );
                     } else {
-                        match library.write_fact(hash, fact) {
+                        match library.write_fact(hash, MusicValue::Key(key)) {
                             Ok(()) => enriched += 1,
                             Err(e) => {
                                 eprintln!(
@@ -3575,7 +3593,10 @@ fn handle_rekordbox_import(
         }
 
         if !dry_run {
-            println!("Enriched {} fact(s), {} error(s)", enriched, errors);
+            println!(
+                "Enriched {} fact(s), skipped {} (already up to date), {} error(s)",
+                enriched, skipped, errors
+            );
         }
     }
 
