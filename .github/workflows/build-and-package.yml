@@ -39,6 +39,14 @@ jobs:
     - name: Build mdma CLI for Apple Silicon
       run: devenv shell -- cargo polylith cargo --profile dev build --release --bin mdma
 
+    - name: Fix dylib paths for distribution
+      run: |
+        LIBICONV_NIX=$(otool -L target/release/mdma | awk '/libiconv/{print $1}' | head -1)
+        if [ -n "$LIBICONV_NIX" ] && [[ "$LIBICONV_NIX" == /nix/* ]]; then
+          echo "Rewriting $LIBICONV_NIX -> /usr/lib/libiconv.2.dylib"
+          install_name_tool -change "$LIBICONV_NIX" /usr/lib/libiconv.2.dylib target/release/mdma
+        fi
+
     - uses: actions/upload-artifact@v4
       with:
         name: mdma-cli-macos-arm64
