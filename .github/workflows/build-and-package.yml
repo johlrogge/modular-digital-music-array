@@ -28,9 +28,14 @@ jobs:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
+          ~/.cargo/bin/cargo-polylith
           target
         key: cargo-macos-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: cargo-macos-
+    - name: Install cargo-polylith
+      run: cargo install --git https://github.com/johlrogge/metadev --bin cargo-polylith
+    - name: Generate profile manifest
+      run: cargo polylith profile build dev --no-build
     - name: Build mdma CLI for Apple Silicon
       run: cargo build --release --manifest-path profiles/dev/Cargo.toml --bin mdma
     - uses: actions/upload-artifact@v4
