@@ -20,24 +20,25 @@ jobs:
     runs-on: macos-latest
     steps:
     - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@stable
-    - name: Install cmake
-      run: brew install cmake
+
+    - uses: cachix/install-nix-action@v31
+    - uses: cachix/cachix-action@v16
+      with:
+        name: devenv
+    - run: nix profile install nixpkgs#devenv
+
     - uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
-          ~/.cargo/bin/cargo-polylith
           target
         key: cargo-macos-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: cargo-macos-
-    - name: Install cargo-polylith
-      run: cargo install --git https://github.com/johlrogge/metadev --bin cargo-polylith
-    - name: Generate profile manifest
-      run: cargo polylith profile build dev --no-build
+
     - name: Build mdma CLI for Apple Silicon
-      run: cargo build --release --manifest-path profiles/dev/Cargo.toml --bin mdma
+      run: devenv shell -- cargo polylith cargo --profile dev build --bin mdma
+
     - uses: actions/upload-artifact@v4
       with:
         name: mdma-cli-macos-arm64

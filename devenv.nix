@@ -38,8 +38,6 @@ in
 
     # Audio development
     pkg-config
-    alsa-lib
-    pipewire
 
     # Network tools
     nmap
@@ -47,15 +45,18 @@ in
     gh
     gitflow               # Git-flow branching workflow
 
-    xbps              # Void Linux package tools (xbps-create, xbps-rindex)
     ffmpeg
+  ] ++ lib.optionals pkgs.stdenv.isLinux [
+    alsa-lib
+    pipewire
+    xbps              # Void Linux package tools (xbps-create, xbps-rindex)
   ];
 
   # Rust language support
   languages.rust = {
     enable = true;
     channel = "stable";
-    targets = [ "aarch64-unknown-linux-gnu" ];
+    targets = lib.optionals pkgs.stdenv.isLinux [ "aarch64-unknown-linux-gnu" ];
   };
 
   # Environment variables for bindgen
