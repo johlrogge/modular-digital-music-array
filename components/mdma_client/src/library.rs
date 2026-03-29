@@ -4,7 +4,7 @@ use crate::error::map_gw_to_lib_error;
 use library_ipc_client::{
     content_to_hashes, hashes_to_content, ClientError, ContentHash, FactType, InboxPath,
     IngestAllItem, IngestResult, IngestSource, LibraryClient, LibraryRequest, LibraryResponse,
-    PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
+    MusicValue, PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
 };
 
 /// Abstraction for library requests, works in both gateway and direct mode.
@@ -262,6 +262,14 @@ impl LibraryBackend {
             scope,
         })?)
     }
+
+    /// Write a single fact for a track. Used for importing metadata from external sources.
+    pub fn write_fact(&self, hash: &ContentHash, fact: MusicValue) -> Result<(), ClientError> {
+        interpret_fact_written(self.request(&LibraryRequest::WriteFact {
+            hash: hash.clone(),
+            fact,
+        })?)
+    }
 }
 
 // =========================================================================
@@ -388,6 +396,14 @@ fn interpret_bookmark_written(response: LibraryResponse) -> Result<(), ClientErr
     }
 }
 
+fn interpret_fact_written(response: LibraryResponse) -> Result<(), ClientError> {
+    match response {
+        LibraryResponse::FactWritten => Ok(()),
+        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+        _ => Err(unexpected("WriteFact")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,5 +487,23 @@ mod tests {
     #[test]
     fn interpret_bookmark_written_unexpected_variant_is_err() {
         assert!(interpret_bookmark_written(LibraryResponse::Pong).is_err());
+    }
+
+    #[test]
+    fn interpret_fact_written_ok() {
+        assert!(interpret_fact_written(LibraryResponse::FactWritten).is_ok());
+    }
+
+    #[test]
+    fn interpret_fact_written_error_propagates() {
+        let err = LibraryResponse::Error(ProtocolError::Internal {
+            message: "fail".to_string(),
+        });
+        assert!(interpret_fact_written(err).is_err());
+    }
+
+    #[test]
+    fn interpret_fact_written_unexpected_variant_is_err() {
+        assert!(interpret_fact_written(LibraryResponse::Pong).is_err());
     }
 }

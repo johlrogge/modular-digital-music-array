@@ -568,10 +568,418 @@ pub mod xml {
 }
 
 // =============================================================================
+// parse module — parse Rekordbox XML into RekordboxLibrary
+// =============================================================================
+
+pub mod parse {
+    use super::xml::{RekordboxLibrary, RekordboxPlaylist, RekordboxTrack};
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+    use thiserror::Error;
+
+    #[derive(Debug, Error)]
+    pub enum ParseError {
+        #[error("XML parse error: {0}")]
+        Xml(#[from] quick_xml::Error),
+
+        #[error("UTF-8 error: {0}")]
+        Utf8(#[from] std::str::Utf8Error),
+    }
+
+    /// Strip `file://localhost` prefix and percent-decode a Rekordbox location URI.
+    ///
+    /// Reverse of `path_uri::path_to_file_uri`.
+    pub fn parse_location(location: &str) -> Option<String> {
+        let path = location
+            .strip_prefix("file://localhost")
+            .or_else(|| location.strip_prefix("file://"))?;
+        Some(percent_decode(path))
+    }
+
+    fn percent_decode(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                if let (Some(h), Some(l)) = (
+                    char_to_hex(bytes[i + 1]),
+                    char_to_hex(bytes[i + 2]),
+                ) {
+                    out.push((h * 16 + l) as char);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+        out
+    }
+
+    fn char_to_hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    fn attr_str<'a>(
+        attrs: &'a quick_xml::events::attributes::Attributes,
+        name: &[u8],
+    ) -> Option<String> {
+        // We need to iterate — clone isn't available, so collect first
+        let mut result = None;
+        for attr in attrs.clone() {
+            if let Ok(a) = attr {
+                if a.key.as_ref() == name {
+                    if let Ok(val) = std::str::from_utf8(a.value.as_ref()) {
+                        result = Some(val.to_string());
+                    }
+                    break;
+                }
+            }
+        }
+        result
+    }
+
+    fn attr_u32(attrs: &quick_xml::events::attributes::Attributes, name: &[u8]) -> Option<u32> {
+        attr_str(attrs, name).and_then(|s| s.parse().ok())
+    }
+
+    fn attr_f32(attrs: &quick_xml::events::attributes::Attributes, name: &[u8]) -> Option<f32> {
+        attr_str(attrs, name).and_then(|s| s.parse().ok())
+    }
+
+    /// Parse a Rekordbox XML export into a `RekordboxLibrary`.
+    ///
+    /// Parse tolerantly — skips unknown elements, uses defaults for missing optional attributes.
+    pub fn parse_xml(xml: &str) -> Result<RekordboxLibrary, ParseError> {
+        let mut reader = Reader::from_str(xml);
+        reader.config_mut().trim_text(true);
+
+        let mut tracks: Vec<RekordboxTrack> = Vec::new();
+        let mut playlists: Vec<RekordboxPlaylist> = Vec::new();
+
+        #[derive(PartialEq, Clone, Copy)]
+        enum Section {
+            Other,
+            Collection,
+            Playlists,
+        }
+
+        let mut section = Section::Other;
+
+        // Stack of (playlist_name, track_ids) for nested NODE parsing.
+        // Empty name = folder/root placeholder (not emitted as a playlist).
+        let mut playlist_stack: Vec<(String, Vec<u32>)> = Vec::new();
+        let mut node_depth: u32 = 0;
+
+        loop {
+            match reader.read_event()? {
+                Event::Eof => break,
+
+                // Empty elements are self-closing: <TAG ... />
+                // They never get an End event, so handle them separately
+                Event::Empty(e) => {
+                    let name_bytes = e.name().into_inner().to_vec();
+                    let tag_name = std::str::from_utf8(&name_bytes)?;
+                    match tag_name {
+                        "TRACK" if section == Section::Collection => {
+                            process_collection_track(&e, &mut tracks)?;
+                        }
+                        "TRACK" if section == Section::Playlists => {
+                            let attrs = e.attributes();
+                            let key = attr_u32(&attrs, b"Key").unwrap_or(0);
+                            if let Some(top) = playlist_stack.last_mut() {
+                                top.1.push(key);
+                            }
+                        }
+                        "NODE" if section == Section::Playlists => {
+                            // Self-closing NODE (empty folder or empty playlist)
+                            let attrs = e.attributes();
+                            let node_type = attr_str(&attrs, b"Type").unwrap_or_default();
+                            let node_name = attr_str(&attrs, b"Name").unwrap_or_default();
+                            if node_type == "1" && !node_name.is_empty() {
+                                playlists.push(RekordboxPlaylist {
+                                    name: node_name,
+                                    track_ids: Vec::new(),
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                Event::Start(e) => {
+                    let name_bytes = e.name().into_inner().to_vec();
+                    let tag_name = std::str::from_utf8(&name_bytes)?;
+                    match tag_name {
+                        "COLLECTION" => {
+                            section = Section::Collection;
+                        }
+                        "PLAYLISTS" => {
+                            section = Section::Playlists;
+                        }
+                        "TRACK" if section == Section::Collection => {
+                            // TRACK with TEMPO child — process it as a collection track
+                            process_collection_track(&e, &mut tracks)?;
+                        }
+                        "NODE" if section == Section::Playlists => {
+                            let attrs = e.attributes();
+                            let node_type = attr_str(&attrs, b"Type").unwrap_or_default();
+                            let node_name = attr_str(&attrs, b"Name").unwrap_or_default();
+                            node_depth += 1;
+                            if node_type == "1" {
+                                playlist_stack.push((node_name, Vec::new()));
+                            } else {
+                                // Folder or ROOT — placeholder
+                                playlist_stack.push((String::new(), Vec::new()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                Event::End(e) => {
+                    let name_bytes = e.name().into_inner().to_vec();
+                    let tag_name = std::str::from_utf8(&name_bytes)?;
+                    match tag_name {
+                        "COLLECTION" => {
+                            section = Section::Other;
+                        }
+                        "PLAYLISTS" => {
+                            section = Section::Other;
+                        }
+                        "NODE" if section == Section::Playlists && node_depth > 0 => {
+                            node_depth -= 1;
+                            if let Some((name, track_ids)) = playlist_stack.pop() {
+                                if !name.is_empty() {
+                                    playlists.push(RekordboxPlaylist { name, track_ids });
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(RekordboxLibrary { tracks, playlists })
+    }
+
+    fn process_collection_track(
+        e: &quick_xml::events::BytesStart,
+        tracks: &mut Vec<RekordboxTrack>,
+    ) -> Result<(), ParseError> {
+        let attrs = e.attributes();
+        let track_id = attr_u32(&attrs, b"TrackID").unwrap_or(0);
+        let name = attr_str(&attrs, b"Name").unwrap_or_default();
+        let artist = attr_str(&attrs, b"Artist").unwrap_or_default();
+        let album = attr_str(&attrs, b"Album").unwrap_or_default();
+        let genre = attr_str(&attrs, b"Genre").unwrap_or_default();
+        let kind = attr_str(&attrs, b"Kind").unwrap_or_default();
+        let size = attr_str(&attrs, b"Size")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let total_time = attr_u32(&attrs, b"TotalTime").unwrap_or(0);
+        let average_bpm = attr_f32(&attrs, b"AverageBpm");
+        let tonality = attr_str(&attrs, b"Tonality");
+        let track_number = attr_u32(&attrs, b"TrackNumber");
+        let disc_number = attr_u32(&attrs, b"DiscNumber");
+        let year = attr_str(&attrs, b"Year");
+        let label = attr_str(&attrs, b"Label");
+        let comment = attr_str(&attrs, b"Comments");
+        let date_added = attr_str(&attrs, b"DateAdded");
+        let bitrate = attr_u32(&attrs, b"BitRate");
+        let sample_rate = attr_u32(&attrs, b"SampleRate");
+        let location = attr_str(&attrs, b"Location").unwrap_or_default();
+
+        tracks.push(RekordboxTrack {
+            track_id,
+            name,
+            artist,
+            album,
+            genre,
+            kind,
+            size,
+            total_time,
+            average_bpm,
+            tonality,
+            track_number,
+            disc_number,
+            year: year.filter(|s| !s.is_empty()),
+            label: label.filter(|s| !s.is_empty()),
+            comment: comment.filter(|s| !s.is_empty()),
+            date_added: date_added.filter(|s| !s.is_empty()),
+            bitrate,
+            sample_rate,
+            location,
+        });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use pretty_assertions::assert_eq;
+
+        const SAMPLE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<DJ_PLAYLISTS Version="1.0.0">
+  <PRODUCT Name="rekordbox" Version="6.0.0" Company="AlphaTheta"/>
+  <COLLECTION Entries="2">
+    <TRACK TrackID="1" Name="Test Track" Artist="Test Artist" Album="Test Album"
+           Genre="Techno" Kind="AIFF File" Size="12345678" TotalTime="423"
+           AverageBpm="128.00" Tonality="8A" TrackNumber="1" DiscNumber="1"
+           Year="2023" Label="Fabric" Comments="great track" Rating="0"
+           DateAdded="2024-06-15" BitRate="1411" SampleRate="44100"
+           Location="file://localhost/music/Test%20Track.aiff">
+      <TEMPO Inizio="0.000" Bpm="128.00" Metro="4/4" Battito="1"/>
+    </TRACK>
+    <TRACK TrackID="2" Name="Another Track" Artist="Another Artist" Album=""
+           Genre="" Kind="WAV File" Size="9000000" TotalTime="360"
+           Location="file://localhost/music/another.wav"/>
+  </COLLECTION>
+  <PLAYLISTS>
+    <NODE Type="0" Name="ROOT" Count="1">
+      <NODE Name="My Set" Type="1" KeyType="0" Entries="2">
+        <TRACK Key="1"/>
+        <TRACK Key="2"/>
+      </NODE>
+    </NODE>
+  </PLAYLISTS>
+</DJ_PLAYLISTS>"#;
+
+        #[test]
+        fn parse_xml_collection_tracks() {
+            let lib = parse_xml(SAMPLE_XML).unwrap();
+            assert_eq!(lib.tracks.len(), 2);
+            let t = &lib.tracks[0];
+            assert_eq!(t.track_id, 1);
+            assert_eq!(t.name, "Test Track");
+            assert_eq!(t.artist, "Test Artist");
+            assert_eq!(t.album, "Test Album");
+            assert_eq!(t.genre, "Techno");
+            assert_eq!(t.kind, "AIFF File");
+            assert_eq!(t.size, 12345678);
+            assert_eq!(t.total_time, 423);
+            assert!((t.average_bpm.unwrap() - 128.0).abs() < 0.01);
+            assert_eq!(t.tonality.as_deref(), Some("8A"));
+            assert_eq!(t.track_number, Some(1));
+            assert_eq!(t.disc_number, Some(1));
+            assert_eq!(t.year.as_deref(), Some("2023"));
+            assert_eq!(t.label.as_deref(), Some("Fabric"));
+            assert_eq!(t.comment.as_deref(), Some("great track"));
+            assert_eq!(t.date_added.as_deref(), Some("2024-06-15"));
+            assert_eq!(t.bitrate, Some(1411));
+            assert_eq!(t.sample_rate, Some(44100));
+            assert_eq!(t.location, "file://localhost/music/Test%20Track.aiff");
+        }
+
+        #[test]
+        fn parse_xml_track_with_minimal_attributes() {
+            let lib = parse_xml(SAMPLE_XML).unwrap();
+            let t = &lib.tracks[1];
+            assert_eq!(t.track_id, 2);
+            assert_eq!(t.name, "Another Track");
+            assert!(t.average_bpm.is_none());
+            assert!(t.tonality.is_none());
+            assert!(t.year.is_none());
+            assert!(t.label.is_none());
+        }
+
+        #[test]
+        fn parse_xml_playlist() {
+            let lib = parse_xml(SAMPLE_XML).unwrap();
+            assert_eq!(lib.playlists.len(), 1);
+            let p = &lib.playlists[0];
+            assert_eq!(p.name, "My Set");
+            assert_eq!(p.track_ids, vec![1, 2]);
+        }
+
+        #[test]
+        fn parse_location_strips_prefix_and_decodes() {
+            assert_eq!(
+                parse_location("file://localhost/music/Test%20Track.aiff"),
+                Some("/music/Test Track.aiff".to_string())
+            );
+        }
+
+        #[test]
+        fn parse_location_handles_percent_encoded_chars() {
+            assert_eq!(
+                parse_location("file://localhost/music/Simon%20%26%20Garfunkel/track.mp3"),
+                Some("/music/Simon & Garfunkel/track.mp3".to_string())
+            );
+        }
+
+        #[test]
+        fn parse_location_rejects_non_file_uri() {
+            assert_eq!(parse_location("http://example.com/track.mp3"), None);
+        }
+
+        #[test]
+        fn roundtrip_parse_and_generate() {
+            use super::super::xml::{RekordboxLibrary, RekordboxPlaylist, RekordboxTrack};
+
+            let original = RekordboxLibrary {
+                tracks: vec![RekordboxTrack {
+                    track_id: 42,
+                    name: "Round Trip".to_string(),
+                    artist: "Some Artist".to_string(),
+                    album: "An Album".to_string(),
+                    genre: "Techno".to_string(),
+                    kind: "FLAC File".to_string(),
+                    size: 50000000,
+                    total_time: 300,
+                    average_bpm: Some(130.5),
+                    tonality: Some("5B".to_string()),
+                    track_number: Some(3),
+                    disc_number: None,
+                    year: Some("2022".to_string()),
+                    label: Some("Some Label".to_string()),
+                    comment: None,
+                    date_added: Some("2023-01-01".to_string()),
+                    bitrate: Some(1411),
+                    sample_rate: Some(44100),
+                    location: "file://localhost/music/Round%20Trip.flac".to_string(),
+                }],
+                playlists: vec![RekordboxPlaylist {
+                    name: "My Playlist".to_string(),
+                    track_ids: vec![42],
+                }],
+            };
+
+            let xml = original.to_xml();
+            let parsed = parse_xml(&xml).unwrap();
+
+            assert_eq!(parsed.tracks.len(), 1);
+            let t = &parsed.tracks[0];
+            assert_eq!(t.track_id, 42);
+            assert_eq!(t.name, "Round Trip");
+            assert_eq!(t.artist, "Some Artist");
+            assert!((t.average_bpm.unwrap() - 130.5).abs() < 0.01);
+            assert_eq!(t.tonality.as_deref(), Some("5B"));
+            assert_eq!(t.total_time, 300);
+            assert_eq!(t.year.as_deref(), Some("2022"));
+            assert_eq!(t.label.as_deref(), Some("Some Label"));
+
+            assert_eq!(parsed.playlists.len(), 1);
+            assert_eq!(parsed.playlists[0].name, "My Playlist");
+            assert_eq!(parsed.playlists[0].track_ids, vec![42]);
+        }
+    }
+}
+
+// =============================================================================
 // Re-exports for convenient top-level use
 // =============================================================================
 
 pub use kind::ext_to_kind;
+pub use parse::{parse_location, parse_xml, ParseError};
 pub use path_uri::path_to_file_uri;
 pub use tonality::key_to_tonality;
 pub use xml::{RekordboxLibrary, RekordboxPlaylist, RekordboxTrack};

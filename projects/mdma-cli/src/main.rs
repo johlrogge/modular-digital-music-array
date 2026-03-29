@@ -16,9 +16,12 @@ use mdma_client::{
     Deck, IngestSource, LibraryBackend, PlaybackBackend, PlaybackClientError, SourceClient,
     SourceName,
 };
+use music_facts::MusicValue;
 use nng::options::Options;
+use rekordbox_xml::{parse_xml, RekordboxTrack};
 use source_protocol::{SourceRequest, SourceResponse};
 use std::path::Path;
+use track_matcher::{CandidateTrack, MatchResult, TrackLookup};
 
 // =============================================================================
 // CLI Definition
@@ -346,6 +349,37 @@ enum RekordboxCommands {
         /// Audio format (defaults to original)
         #[arg(long, value_enum)]
         format: Option<ExportFormat>,
+    },
+
+    /// Import tracks and playlists from a Rekordbox XML file.
+    ///
+    /// Matches Rekordbox tracks to MDMA library tracks by metadata,
+    /// creates playlists, and optionally enriches BPM/Key facts.
+    ///
+    /// Examples:
+    ///   mdma rekordbox import rekordbox.xml
+    ///   mdma rekordbox import rekordbox.xml --playlist imported-set
+    ///   mdma rekordbox import rekordbox.xml --enrich --dry-run
+    Import {
+        /// Path to rekordbox.xml file
+        path: std::path::PathBuf,
+
+        /// Create an MDMA playlist with matched tracks.
+        /// Invalid characters (spaces, special chars) are replaced with `-`.
+        #[arg(long)]
+        playlist: Option<String>,
+
+        /// Import all playlists found in the XML as MDMA playlists
+        #[arg(long)]
+        all_playlists: bool,
+
+        /// Update BPM and Key facts from Rekordbox data for matched tracks
+        #[arg(long)]
+        enrich: bool,
+
+        /// Show what would happen without making changes
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -3215,6 +3249,339 @@ fn handle_rekordbox_export(
     Ok(())
 }
 
+// =============================================================================
+// Rekordbox Import
+// =============================================================================
+
+struct LibraryTrackLookup<'a> {
+    library: &'a LibraryBackend,
+}
+
+impl TrackLookup for LibraryTrackLookup<'_> {
+    fn find_by_isrc(&self, _isrc: &str) -> Vec<ContentHash> {
+        // TODO: ISRC search is not available via TrackQuery — no ISRC field in library_search.
+        // HasFact could be used but returns bool, not ContentHash.
+        // For now, return empty and rely on artist+title matching.
+        vec![]
+    }
+
+    fn find_by_artist_title(&self, artist: &str, title: &str) -> Vec<(ContentHash, Option<u32>)> {
+        use library_search::StringQuery;
+
+        let query = TrackQuery {
+            artist: Some(StringQuery::Contains(artist.to_string())),
+            title: Some(StringQuery::Contains(title.to_string())),
+            ..Default::default()
+        };
+
+        match self.library.search(&query) {
+            Ok(tracks) => tracks
+                .into_iter()
+                .map(|t| {
+                    let duration = t.duration.map(|d| d.value());
+                    (t.content_hash, duration)
+                })
+                .collect(),
+            Err(_) => vec![],
+        }
+    }
+}
+
+fn handle_rekordbox_import(
+    _cli: &Cli,
+    library: &LibraryBackend,
+    path: &std::path::Path,
+    playlist: &Option<String>,
+    all_playlists: bool,
+    enrich: bool,
+    dry_run: bool,
+) -> Result<()> {
+    use library_ipc_client::{Bpm, Key};
+    use std::collections::HashMap;
+
+    // 1. Read and parse XML file
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to read {}: {}", path.display(), e))?;
+
+    let parsed = parse_xml(&content)
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to parse rekordbox XML: {}", e))?;
+
+    if parsed.tracks.is_empty() {
+        eprintln!("No tracks found in {}", path.display());
+        return Ok(());
+    }
+
+    // 2. Create lookup and match tracks
+    let lookup = LibraryTrackLookup { library };
+
+    let mut matched: Vec<(&RekordboxTrack, ContentHash)> = Vec::new();
+    let mut ambiguous: Vec<(&RekordboxTrack, Vec<ContentHash>)> = Vec::new();
+    let mut unmatched: Vec<&RekordboxTrack> = Vec::new();
+
+    for track in &parsed.tracks {
+        let candidate = CandidateTrack {
+            isrc: None,
+            artist: if track.artist.is_empty() {
+                None
+            } else {
+                Some(track.artist.clone())
+            },
+            title: if track.name.is_empty() {
+                None
+            } else {
+                Some(track.name.clone())
+            },
+            duration_secs: if track.total_time > 0 {
+                Some(track.total_time)
+            } else {
+                None
+            },
+        };
+
+        match track_matcher::match_track(&candidate, &lookup) {
+            MatchResult::Definitive(hash, _) => {
+                matched.push((track, hash));
+            }
+            MatchResult::Ambiguous(hashes, _) => {
+                ambiguous.push((track, hashes));
+            }
+            MatchResult::NoMatch => {
+                unmatched.push(track);
+            }
+        }
+    }
+
+    // 3. Print summary
+    println!(
+        "Matched:   {:3} tracks",
+        matched.len()
+    );
+    println!(
+        "Ambiguous: {:3} tracks (need manual resolution)",
+        ambiguous.len()
+    );
+    println!(
+        "Unmatched: {:3} tracks",
+        unmatched.len()
+    );
+
+    // 4. Print unmatched tracks to stderr
+    if !unmatched.is_empty() {
+        eprintln!();
+        eprintln!("Unmatched tracks:");
+        for t in &unmatched {
+            let filename = rekordbox_xml::parse_location(&t.location)
+                .map(|p| {
+                    std::path::Path::new(&p)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&p)
+                        .to_string()
+                })
+                .unwrap_or_else(|| t.location.clone());
+            eprintln!("  {} - {} ({})", t.artist, t.name, filename);
+        }
+    }
+
+    // 5. Print ambiguous tracks to stderr
+    if !ambiguous.is_empty() {
+        eprintln!();
+        eprintln!("Ambiguous tracks (multiple candidates):");
+        for (t, hashes) in &ambiguous {
+            eprintln!("  {} - {}", t.artist, t.name);
+            for h in hashes.iter().take(3) {
+                eprintln!("    candidate: {}", &h.as_str()[..h.as_str().len().min(16)]);
+            }
+        }
+    }
+
+    // Build track_id → ContentHash map for playlist resolution
+    let track_id_to_hash: HashMap<u32, ContentHash> = matched
+        .iter()
+        .map(|(rb_track, hash)| (rb_track.track_id, hash.clone()))
+        .collect();
+
+    // 6. Create --playlist if requested
+    if let Some(pname) = playlist {
+        let sanitized: String = pname
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let sanitized = sanitized.trim_matches('-').to_string();
+        if sanitized.is_empty() {
+            eprintln!("Invalid --playlist '{}': name sanitizes to empty", pname);
+            std::process::exit(1);
+        }
+        if sanitized != *pname {
+            eprintln!("Note: playlist name sanitized from '{}' to '{}'", pname, sanitized);
+        }
+        let name = parse_playlist_name(&sanitized);
+        let hashes: Vec<ContentHash> = matched.iter().map(|(_, h)| h.clone()).collect();
+
+        if dry_run {
+            println!(
+                "[dry-run] Would create playlist '{}' with {} tracks",
+                sanitized,
+                hashes.len()
+            );
+        } else {
+            match library.playlist_new(&name, &hashes) {
+                Ok(()) => println!("Created playlist '{}' with {} tracks", sanitized, hashes.len()),
+                Err(e) => {
+                    eprintln!("Failed to create playlist '{}': {}", sanitized, e);
+                    eprintln!("Trying to replace existing playlist...");
+                    library
+                        .playlist_replace(&name, &hashes)
+                        .map_err(|e2| color_eyre::eyre::eyre!("Failed to replace playlist: {}", e2))?;
+                    println!("Replaced playlist '{}' with {} tracks", sanitized, hashes.len());
+                }
+            }
+        }
+    }
+
+    // 7. Create --all-playlists
+    if all_playlists {
+        for rb_playlist in &parsed.playlists {
+            let resolved: Vec<ContentHash> = rb_playlist
+                .track_ids
+                .iter()
+                .filter_map(|id| track_id_to_hash.get(id).cloned())
+                .collect();
+
+            if resolved.is_empty() {
+                eprintln!(
+                    "Skipping playlist '{}': no matched tracks",
+                    rb_playlist.name
+                );
+                continue;
+            }
+
+            // Sanitize playlist name: replace non-alphanumeric chars with '-'
+            let sanitized: String = rb_playlist
+                .name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+            // Trim leading/trailing dashes
+            let sanitized = sanitized.trim_matches('-').to_string();
+
+            if sanitized.is_empty() {
+                eprintln!("Skipping playlist '{}': name sanitizes to empty", rb_playlist.name);
+                continue;
+            }
+
+            if dry_run {
+                println!(
+                    "[dry-run] Would create playlist '{}' (from '{}') with {} tracks",
+                    sanitized,
+                    rb_playlist.name,
+                    resolved.len()
+                );
+            } else {
+                let name = parse_playlist_name(&sanitized);
+                match library.playlist_new(&name, &resolved) {
+                    Ok(()) => println!(
+                        "Created playlist '{}' with {} tracks",
+                        sanitized,
+                        resolved.len()
+                    ),
+                    Err(e) => {
+                        eprintln!(
+                            "Failed to create playlist '{}': {} — trying replace",
+                            sanitized, e
+                        );
+                        match library.playlist_replace(&name, &resolved) {
+                            Ok(()) => println!(
+                                "Replaced playlist '{}' with {} tracks",
+                                sanitized,
+                                resolved.len()
+                            ),
+                            Err(e2) => eprintln!(
+                                "Failed to replace playlist '{}': {}",
+                                sanitized, e2
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 8. Enrich BPM/Key facts
+    if enrich {
+        let mut enriched = 0usize;
+        let mut errors = 0usize;
+
+        for (rb_track, hash) in &matched {
+            // Write BPM if available
+            if let Some(bpm_f32) = rb_track.average_bpm {
+                if let Ok(bpm) = Bpm::from_f32(bpm_f32) {
+                    let fact = MusicValue::Bpm(bpm);
+                    if dry_run {
+                        println!(
+                            "[dry-run] Would write BPM {} for {} - {}",
+                            bpm_f32, rb_track.artist, rb_track.name
+                        );
+                    } else {
+                        match library.write_fact(hash, fact) {
+                            Ok(()) => enriched += 1,
+                            Err(e) => {
+                                eprintln!(
+                                    "Failed to write BPM for {} - {}: {}",
+                                    rb_track.artist, rb_track.name, e
+                                );
+                                errors += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Write Key (Tonality) if available
+            if let Some(ref tonality) = rb_track.tonality {
+                if let Ok(key) = Key::from_camelot(tonality) {
+                    let fact = MusicValue::Key(key);
+                    if dry_run {
+                        println!(
+                            "[dry-run] Would write Key {} for {} - {}",
+                            tonality, rb_track.artist, rb_track.name
+                        );
+                    } else {
+                        match library.write_fact(hash, fact) {
+                            Ok(()) => enriched += 1,
+                            Err(e) => {
+                                eprintln!(
+                                    "Failed to write Key for {} - {}: {}",
+                                    rb_track.artist, rb_track.name, e
+                                );
+                                errors += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !dry_run {
+            println!("Enriched {} fact(s), {} error(s)", enriched, errors);
+        }
+    }
+
+    Ok(())
+}
+
 fn handle_export(
     cli: &Cli,
     library: &LibraryBackend,
@@ -3541,6 +3908,21 @@ fn main() -> Result<()> {
                     playlist.as_deref(),
                     output,
                     format.as_ref(),
+                ),
+                RekordboxCommands::Import {
+                    path,
+                    playlist,
+                    all_playlists,
+                    enrich,
+                    dry_run,
+                } => handle_rekordbox_import(
+                    &cli,
+                    &lib,
+                    path,
+                    playlist,
+                    *all_playlists,
+                    *enrich,
+                    *dry_run,
                 ),
             }
         }

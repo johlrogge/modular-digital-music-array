@@ -5,7 +5,7 @@
 //! - library-ipc-client (used by CLI and console)
 
 // Re-export types used in the protocol so clients don't need to depend on music-facts
-pub use music_facts::{Bpm, ContentHash, DurationSeconds, Key};
+pub use music_facts::{Bpm, ContentHash, DurationSeconds, Key, MusicValue};
 // Re-export query types so clients can use them without depending on library-search directly
 pub use library_search::{
     CamelotLetter, DurationQuery, DurationUnit, KeyQuery, NumericQuery, StringQuery, TrackQuery,
@@ -307,6 +307,9 @@ pub enum LibraryRequest {
         hash: ContentHash,
         scope: Option<String>,
     },
+
+    /// Write a single fact for a track. Used for importing metadata from external sources.
+    WriteFact { hash: ContentHash, fact: MusicValue },
 }
 
 // ============================================================================
@@ -371,6 +374,9 @@ pub enum LibraryResponse {
 
     /// Bookmark written successfully.
     BookmarkWritten,
+
+    /// Fact written successfully.
+    FactWritten,
 
     /// Error response.
     Error(ProtocolError),
@@ -532,6 +538,33 @@ mod tests {
     fn playlist_name_serde_rejects_invalid() {
         let result: Result<PlaylistName, _> = serde_json::from_str("\"../../../etc\"");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn write_fact_request_roundtrip() {
+        use music_facts::{Bpm, MusicValue};
+        let hash = ContentHash::new("sha256:abc");
+        let fact = MusicValue::Bpm(Bpm::from_u32(128).unwrap());
+        let req = LibraryRequest::WriteFact {
+            hash: hash.clone(),
+            fact: fact.clone(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: LibraryRequest = serde_json::from_str(&json).unwrap();
+        if let LibraryRequest::WriteFact { hash: h, fact: f } = decoded {
+            assert_eq!(h.as_str(), hash.as_str());
+            assert_eq!(f, fact);
+        } else {
+            panic!("unexpected variant");
+        }
+    }
+
+    #[test]
+    fn fact_written_response_roundtrip() {
+        let resp = LibraryResponse::FactWritten;
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: LibraryResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, LibraryResponse::FactWritten));
     }
 
     #[test]
