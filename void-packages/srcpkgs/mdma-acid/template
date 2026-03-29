@@ -1,6 +1,6 @@
 # Template file for mdma-acid package
 pkgname=mdma-acid
-version=0.12.1
+version=0.12.2
 revision=1
 archs="aarch64"
 build_style=cargo
