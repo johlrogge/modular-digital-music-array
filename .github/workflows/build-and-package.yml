@@ -39,13 +39,10 @@ jobs:
     - name: Build mdma CLI for Apple Silicon
       run: devenv shell -- cargo polylith cargo --profile dev build --release --bin mdma
 
-    - name: Find built binary
-      run: find . -name mdma -type f 2>/dev/null | grep -v ".git"
-
     - uses: actions/upload-artifact@v4
       with:
         name: mdma-cli-macos-arm64
-        path: profiles/dev/target/release/mdma
+        path: target/release/mdma
 
   test:
     runs-on: ubuntu-latest
