@@ -635,8 +635,8 @@ pub mod parse {
         for attr in attrs.clone() {
             if let Ok(a) = attr {
                 if a.key.as_ref() == name {
-                    if let Ok(val) = std::str::from_utf8(a.value.as_ref()) {
-                        result = Some(val.to_string());
+                    if let Ok(val) = a.unescape_value() {
+                        result = Some(val.into_owned());
                     }
                     break;
                 }
@@ -970,6 +970,30 @@ pub mod parse {
             assert_eq!(parsed.playlists.len(), 1);
             assert_eq!(parsed.playlists[0].name, "My Playlist");
             assert_eq!(parsed.playlists[0].track_ids, vec![42]);
+        }
+
+        #[test]
+        fn attr_str_unescapes_xml_entities() {
+            // Titles containing XML entities must be unescaped when parsed so that
+            // track matching works correctly (e.g. &apos; → ' and &amp; → &).
+            let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<DJ_PLAYLISTS Version="1.0.0">
+  <PRODUCT Name="rekordbox" Version="6.0.0" Company="AlphaTheta"/>
+  <COLLECTION Entries="1">
+    <TRACK TrackID="1" Name="Love Dove (Back to 90&apos;s)" Artist="DJ &amp; Friends"
+           Album="" Genre="" Kind="MP3 File" Size="1000000" TotalTime="300"
+           Location="file://localhost/music/track.mp3"/>
+  </COLLECTION>
+  <PLAYLISTS>
+    <NODE Type="0" Name="ROOT" Count="0"/>
+  </PLAYLISTS>
+</DJ_PLAYLISTS>"#;
+
+            let lib = parse_xml(xml).unwrap();
+            assert_eq!(lib.tracks.len(), 1);
+            let t = &lib.tracks[0];
+            assert_eq!(t.name, "Love Dove (Back to 90's)");
+            assert_eq!(t.artist, "DJ & Friends");
         }
     }
 }
