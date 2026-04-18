@@ -116,6 +116,40 @@ pub struct BandcampService {
     username: Option<String>,
 }
 
+/// Pure helper: given a slice of collection items, the set of library-known IDs,
+/// and a pre-fetched list of `(item_id, stored_album_title)` pairs, return the
+/// set of item IDs that are stale (stored title differs from collection title).
+///
+/// Extracted from `detect_stale_items` so the comparison logic can be unit-tested
+/// without a live NNG connection.
+fn compute_stale_ids(
+    collection: &[CollectionItem],
+    library_known: &HashSet<String>,
+    stored_titles: &[(String, Option<String>)],
+) -> HashSet<String> {
+    let mut stale = HashSet::new();
+
+    // Build a lookup: item_id -> stored_title
+    let stored_map: std::collections::HashMap<&str, Option<&str>> = stored_titles
+        .iter()
+        .map(|(id, title)| (id.as_str(), title.as_deref()))
+        .collect();
+
+    for item in collection {
+        if !library_known.contains(item.id.as_str()) {
+            continue;
+        }
+
+        if let Some(Some(stored_title)) = stored_map.get(item.id.as_str()) {
+            if *stored_title != item.title.as_str() {
+                stale.insert(item.id.0.clone());
+            }
+        }
+    }
+
+    stale
+}
+
 impl BandcampService {
     /// Create a new service
     pub fn new(
@@ -232,7 +266,127 @@ impl BandcampService {
                 tracing::info!("Downloads resumed");
                 SourceResponse::Resumed
             }
+
+            SourceRequest::ResyncItem { identifier } => self.handle_resync(identifier).await,
         }
+    }
+
+    /// Force-queue an item, bypassing library and cache dedup.
+    ///
+    /// Retracts existing library facts and evicts the cache entry (best-effort),
+    /// then pushes the item onto the download queue unconditionally.
+    async fn queue_item_forcibly(&self, item: CollectionItem) -> Result<(), ServiceError> {
+        // Best-effort: retract library facts
+        if let Some(lib_client) = self.try_library_client() {
+            match lib_client.retract_source_facts(item.id.as_str(), "bandcamp") {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        item_id = %item.id.as_str(),
+                        "Failed to retract library facts — continuing anyway"
+                    );
+                }
+            }
+        }
+
+        // Best-effort: evict cache entry
+        match self.cache.lock().forget_item(item.id.as_str()) {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    item_id = %item.id.as_str(),
+                    "Failed to evict cache entry — continuing anyway"
+                );
+            }
+        }
+
+        // Push onto download queue unconditionally
+        let queued = QueuedDownload {
+            item,
+            state: InternalDownloadState::Queued,
+            downloaded_bytes: 0,
+            total_bytes: None,
+            error: None,
+        };
+        self.download_queue.lock().push_back(queued);
+        Ok(())
+    }
+
+    /// Handle a forced resync of a specific item by identifier.
+    async fn handle_resync(&self, identifier: String) -> SourceResponse {
+        let client = match self.try_load_client() {
+            Some(c) => c,
+            None => {
+                return SourceResponse::Error(SourceError::NotAuthenticated {
+                    message: "Cookies not loaded. Upload cookies first.".to_string(),
+                });
+            }
+        };
+
+        let username = match &self.username {
+            Some(u) => u.clone(),
+            None => {
+                return SourceResponse::Error(SourceError::NotAuthenticated {
+                    message: "No username configured. Set --username or MDMA_BANDCAMP_USERNAME."
+                        .to_string(),
+                });
+            }
+        };
+
+        let collection = match client.get_collection(&username).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to fetch collection for resync");
+                return SourceResponse::Error(SourceError::SyncFailed {
+                    message: e.to_string(),
+                });
+            }
+        };
+
+        let item = match collection.into_iter().find(|i| i.id.as_str() == identifier) {
+            Some(i) => i,
+            None => {
+                return SourceResponse::Error(SourceError::ItemNotFound { identifier });
+            }
+        };
+
+        if let Err(e) = self.queue_item_forcibly(item).await {
+            return SourceResponse::Error(SourceError::Internal {
+                message: e.to_string(),
+            });
+        }
+
+        SourceResponse::ResyncQueued {
+            identifier,
+            tracks_queued: 1,
+        }
+    }
+
+    /// Detect stale items: library-known items whose stored album title differs
+    /// from the current collection metadata.
+    async fn detect_stale_items(
+        &self,
+        collection: &[CollectionItem],
+        lib_client: &LibraryClient,
+        library_known: &HashSet<String>,
+    ) -> HashSet<String> {
+        let stored_titles: Vec<(String, Option<String>)> = collection
+            .iter()
+            .filter(|item| library_known.contains(item.id.as_str()))
+            .map(|item| {
+                let stored = lib_client
+                    .get_album_title_by_item_id(item.id.as_str())
+                    .ok()
+                    .flatten();
+                (item.id.0.clone(), stored)
+            })
+            .collect();
+
+        let stale = compute_stale_ids(collection, library_known, &stored_titles);
+        tracing::info!("detected stale bandcamp items: {:?}", stale);
+        stale
     }
 
     /// Handle sync request - fetches collection and queues new downloads.
@@ -279,7 +433,8 @@ impl BandcampService {
         tracing::info!(total = total_items, "Fetched collection");
 
         // Check library for already-ingested items (primary dedup)
-        let library_known: HashSet<String> = match self.try_library_client() {
+        let maybe_lib_client = self.try_library_client();
+        let library_known: HashSet<String> = match &maybe_lib_client {
             Some(lib_client) => {
                 let all_item_ids: Vec<String> = collection
                     .iter()
@@ -305,36 +460,71 @@ impl BandcampService {
             }
         };
 
-        // Filter out already downloaded items using library + cache
-        let cache = self.cache.lock();
-        let mut new_items = 0;
+        // Detect stale items (library-known but metadata changed)
+        let stale_ids = if let Some(ref lib_client) = maybe_lib_client {
+            self.detect_stale_items(&collection, lib_client, &library_known)
+                .await
+        } else {
+            HashSet::new()
+        };
+
+        // Separate items into stale-requeue vs. new vs. skip buckets before
+        // acquiring any locks (avoids holding the cache lock across awaits).
+        let mut stale_items = Vec::new();
+        let mut fresh_items = Vec::new();
 
         for item in collection {
             let item_id_str = item.id.as_str().to_string();
 
-            // Primary dedup: library knows this item ID
+            if stale_ids.contains(&item_id_str) {
+                // Known to library but metadata changed — force re-queue
+                stale_items.push(item);
+                continue;
+            }
+
             if library_known.contains(&item_id_str) {
+                // Up-to-date in library, skip
                 continue;
             }
 
-            // Fallback dedup: local cache
-            let cache_key = format!("{}|{}|{}|0", item.artist, item.title, item.id.as_str());
-            if cache.is_downloaded(&cache_key) || cache.is_item_downloaded(item.id.as_str()) {
-                continue;
+            // Not in library — check fallback cache
+            {
+                let cache = self.cache.lock();
+                let cache_key = format!("{}|{}|{}|0", item.artist, item.title, item.id.as_str());
+                if cache.is_downloaded(&cache_key) || cache.is_item_downloaded(item.id.as_str()) {
+                    continue;
+                }
             }
 
-            new_items += 1;
+            fresh_items.push(item);
+        }
 
-            // Add to download queue
-            let queued = QueuedDownload {
-                item,
-                state: InternalDownloadState::Queued,
-                downloaded_bytes: 0,
-                total_bytes: None,
-                error: None,
-            };
+        let mut new_items = 0;
 
-            self.download_queue.lock().push_back(queued);
+        // Re-queue stale items (async — needs await)
+        for item in stale_items {
+            let item_id_str = item.id.as_str().to_string();
+            match self.queue_item_forcibly(item).await {
+                Ok(()) => new_items += 1,
+                Err(e) => {
+                    tracing::warn!(error = %e, item_id = %item_id_str, "Failed to forcibly queue stale item");
+                }
+            }
+        }
+
+        // Queue fresh (new) items
+        {
+            let mut queue = self.download_queue.lock();
+            for item in fresh_items {
+                new_items += 1;
+                queue.push_back(QueuedDownload {
+                    item,
+                    state: InternalDownloadState::Queued,
+                    downloaded_bytes: 0,
+                    total_bytes: None,
+                    error: None,
+                });
+            }
         }
 
         tracing::info!(
@@ -784,5 +974,102 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
 
         // Small delay between downloads for rate limiting
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bandcamp_api::{Artist, ItemId, ItemType, Title};
+
+    fn make_item(id: &str, title: &str) -> CollectionItem {
+        CollectionItem {
+            id: ItemId::new(id),
+            artist: Artist::new("Test Artist"),
+            title: Title::new(title),
+            item_type: ItemType::Album,
+            purchased: None,
+            download_url: "https://example.com/download".to_string(),
+        }
+    }
+
+    #[test]
+    fn compute_stale_ids_flags_items_with_changed_title() {
+        let collection = vec![
+            make_item("p001", "New Title"),
+            make_item("p002", "Unchanged Title"),
+            make_item("p003", "Another New Title"),
+        ];
+
+        let library_known: HashSet<String> =
+            ["p001".to_string(), "p002".to_string(), "p003".to_string()]
+                .into_iter()
+                .collect();
+
+        // Stored titles: p001 changed, p002 unchanged, p003 changed
+        let stored_titles = vec![
+            ("p001".to_string(), Some("Old Title".to_string())),
+            ("p002".to_string(), Some("Unchanged Title".to_string())),
+            ("p003".to_string(), Some("Different Old Title".to_string())),
+        ];
+
+        let stale = compute_stale_ids(&collection, &library_known, &stored_titles);
+
+        assert!(
+            stale.contains("p001"),
+            "p001 should be stale (title changed)"
+        );
+        assert!(
+            !stale.contains("p002"),
+            "p002 should not be stale (title unchanged)"
+        );
+        assert!(
+            stale.contains("p003"),
+            "p003 should be stale (title changed)"
+        );
+    }
+
+    #[test]
+    fn compute_stale_ids_skips_items_not_in_library() {
+        let collection = vec![make_item("p001", "Some Title")];
+
+        // p001 is NOT in library_known
+        let library_known: HashSet<String> = HashSet::new();
+
+        let stored_titles = vec![("p001".to_string(), Some("Some Title".to_string()))];
+
+        let stale = compute_stale_ids(&collection, &library_known, &stored_titles);
+
+        assert!(
+            stale.is_empty(),
+            "items not in library should not be flagged as stale"
+        );
+    }
+
+    #[test]
+    fn compute_stale_ids_skips_items_with_no_stored_title() {
+        let collection = vec![make_item("p001", "Current Title")];
+
+        let library_known: HashSet<String> = ["p001".to_string()].into_iter().collect();
+
+        // No stored title (None) — don't flag as stale
+        let stored_titles = vec![("p001".to_string(), None)];
+
+        let stale = compute_stale_ids(&collection, &library_known, &stored_titles);
+
+        assert!(
+            stale.is_empty(),
+            "items with no stored title should not be flagged as stale"
+        );
+    }
+
+    #[test]
+    fn compute_stale_ids_empty_collection() {
+        let collection: Vec<CollectionItem> = vec![];
+        let library_known: HashSet<String> = HashSet::new();
+        let stored_titles: Vec<(String, Option<String>)> = vec![];
+
+        let stale = compute_stale_ids(&collection, &library_known, &stored_titles);
+        assert!(stale.is_empty());
     }
 }

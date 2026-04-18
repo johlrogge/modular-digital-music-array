@@ -17,7 +17,7 @@ playback-primitives = { workspace = true }
 storage_primitives = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 thiserror = "1.0"
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 pretty_assertions = "1"

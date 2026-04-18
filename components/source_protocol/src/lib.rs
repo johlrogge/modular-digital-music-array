@@ -61,6 +61,9 @@ pub enum SourceRequest {
 
     /// Resume downloads.
     ResumeAll,
+
+    /// Force re-sync of a specific source item by identifier.
+    ResyncItem { identifier: String },
 }
 
 // ============================================================================
@@ -94,6 +97,12 @@ pub enum SourceResponse {
 
     /// Downloads resumed.
     Resumed,
+
+    /// Resync queued for a specific source item.
+    ResyncQueued {
+        identifier: String,
+        tracks_queued: usize,
+    },
 
     /// Error response.
     Error(SourceError),
@@ -193,6 +202,9 @@ pub enum SourceError {
 
     #[error("internal error: {message}")]
     Internal { message: String },
+
+    #[error("item not found: {identifier}")]
+    ItemNotFound { identifier: String },
 }
 
 #[cfg(test)]
@@ -344,6 +356,52 @@ mod tests {
             SourceResponse::Error(SourceError::RateLimited { retry_after_secs }) => {
                 assert_eq!(retry_after_secs, 60);
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn request_resync_item_roundtrip() {
+        let req = SourceRequest::ResyncItem {
+            identifier: "p123456".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: SourceRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SourceRequest::ResyncItem { identifier } => assert_eq!(identifier, "p123456"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn response_resync_queued_roundtrip() {
+        let resp = SourceResponse::ResyncQueued {
+            identifier: "p123456".to_string(),
+            tracks_queued: 7,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: SourceResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SourceResponse::ResyncQueued {
+                identifier,
+                tracks_queued,
+            } => {
+                assert_eq!(identifier, "p123456");
+                assert_eq!(tracks_queued, 7);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn source_error_item_not_found_roundtrip() {
+        let err = SourceError::ItemNotFound {
+            identifier: "p999".to_string(),
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        let parsed: SourceError = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SourceError::ItemNotFound { identifier } => assert_eq!(identifier, "p999"),
             _ => panic!("wrong variant"),
         }
     }

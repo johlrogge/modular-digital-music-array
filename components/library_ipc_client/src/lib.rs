@@ -376,6 +376,46 @@ impl LibraryClient {
             })),
         }
     }
+
+    /// Retract all facts whose `FactSource.tool` matches `source_name` for every
+    /// content hash that has an `ItemId` fact equal to `item_id`.
+    ///
+    /// Retracted attributes: Album, Title, Artist, TrackNumber, Year.
+    /// ItemId itself is intentionally NOT retracted.
+    pub fn retract_source_facts(
+        &self,
+        item_id: &str,
+        source_name: &str,
+    ) -> Result<(), ClientError> {
+        match self.request(&LibraryRequest::RetractSourceFacts {
+            item_id: item_id.to_string(),
+            source_name: source_name.to_string(),
+        })? {
+            LibraryResponse::SourceFactsRetracted => Ok(()),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to RetractSourceFacts".to_string(),
+            })),
+        }
+    }
+
+    /// Look up the album title for any track tagged with `item_id`.
+    ///
+    /// Returns `Some(title)` if any track for that ItemId has an Album fact,
+    /// otherwise `None`. If multiple tracks share the same ItemId but have
+    /// different album titles (rare, should only occur mid-rename), any one
+    /// value may be returned.
+    pub fn get_album_title_by_item_id(&self, item_id: &str) -> Result<Option<String>, ClientError> {
+        match self.request(&LibraryRequest::GetAlbumTitleByItemId {
+            item_id: item_id.to_string(),
+        })? {
+            LibraryResponse::AlbumTitleByItemId(title) => Ok(title),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to GetAlbumTitleByItemId".to_string(),
+            })),
+        }
+    }
 }
 
 // =========================================================================

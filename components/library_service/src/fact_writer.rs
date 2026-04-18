@@ -70,6 +70,37 @@ impl FactWriter {
         Ok(())
     }
 
+    /// Write retraction facts for a track
+    ///
+    /// Identical to `write_track_facts` but uses `Operation::Retract` instead of
+    /// `Operation::Assert`. Use this to signal that previously asserted facts
+    /// from a given source should no longer be considered current.
+    pub fn write_track_retractions(
+        &mut self,
+        content_hash: &ContentHash,
+        facts: &[(MusicValue, FactSource)],
+    ) -> Result<(), FactWriteError> {
+        let now = Utc::now();
+
+        let fact_structs: Vec<Fact<ContentHash, MusicValue, FactSource>> = facts
+            .iter()
+            .map(|(value, source)| {
+                Fact::new(
+                    content_hash.clone(),
+                    value.clone(),
+                    now,
+                    source.clone(),
+                    Operation::Retract,
+                )
+            })
+            .collect();
+
+        self.writer.write_batch(&fact_structs)?;
+
+        self.facts_written += fact_structs.len();
+        Ok(())
+    }
+
     /// Get count of facts written
     pub fn facts_written(&self) -> usize {
         self.facts_written
@@ -99,6 +130,32 @@ mod tests {
 
         let mut writer = FactWriter::open(temp.path()).unwrap();
         writer.write_track_facts(&content_hash, &facts).unwrap();
+
+        assert_eq!(writer.facts_written(), 2);
+
+        // Verify file has content
+        let metadata = std::fs::metadata(temp.path()).unwrap();
+        assert!(metadata.len() > 0);
+    }
+
+    #[test]
+    fn write_track_retractions() {
+        let temp = NamedTempFile::new().unwrap();
+        let content_hash = ContentHash::new("sha256:abc123");
+        let source = FactSource::new("bandcamp", "1.0.0", FactOrigin::Unknown);
+
+        let facts = vec![
+            (MusicValue::Title(Title::new("Old Title")), source.clone()),
+            (
+                MusicValue::Artist(Artist::new("Old Artist")),
+                source.clone(),
+            ),
+        ];
+
+        let mut writer = FactWriter::open(temp.path()).unwrap();
+        writer
+            .write_track_retractions(&content_hash, &facts)
+            .unwrap();
 
         assert_eq!(writer.facts_written(), 2);
 
