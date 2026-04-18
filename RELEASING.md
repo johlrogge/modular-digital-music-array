@@ -17,8 +17,9 @@ MDMA uses [Semantic Versioning](https://semver.org/):
 
 ### Where versions live
 
-- **Workspace version** — `[workspace.package] version` in `Polylith.toml`. Applies to all
-  packages that use `version.workspace = true`. Bump this on every release.
+- **Workspace version** — `[package] version` in root `Cargo.toml` (since cargo-polylith 0.10.0,
+  workspace package metadata lives here, not in `Polylith.toml [workspace.package]`). Applies to
+  all packages that use `version.workspace = true`. Bump this on every release.
 - **Independently versioned packages** — `bases/*/Cargo.toml` entries that have a hardcoded
   `version = "x.y.z"` (not `version.workspace = true`) must be bumped individually based on
   what changed in that package.
@@ -28,8 +29,6 @@ MDMA uses [Semantic Versioning](https://semver.org/):
   (e.g., `_2`) when the template changes but the code version does not (e.g., fixing a run
   script or INSTALL hook).
 
-> The root `Cargo.toml` is a Polylith stub package (`workspace-root`, version `0.0.0`).
-> It is NOT the workspace version. Do not edit it for releases.
 
 ---
 
@@ -62,10 +61,10 @@ Use `mcp__git-flow-release__gitflow_release_start` with the target version.
 
 ### 2. Bump the workspace version
 
-Edit `Polylith.toml`:
+Edit root `Cargo.toml` (since cargo-polylith 0.10.0, workspace package metadata lives here, not in `Polylith.toml`):
 
 ```toml
-[workspace.package]
+[package]
 version = "<new-version>"
 ```
 
@@ -177,7 +176,7 @@ Dispatch **code-minion** with a focused, minimal fix. Then dispatch **architect*
 
 ### 3. Bump versions
 
-Same as release checklist steps 2–4: bump `Polylith.toml`, any independently versioned
+Same as release checklist steps 2–4: bump root `Cargo.toml` (`[package] version`), any independently versioned
 packages that changed, and the corresponding xbps templates.
 
 ### 4. Commit
