@@ -8,7 +8,7 @@ use crate::ipc::{
     DownloadId, DownloadState, DownloadStatus, IpcServer, SourceError, SourceRequest,
     SourceResponse, SourceStatus,
 };
-use bandcamp_api::{AudioFormat, BandcampClient, CollectionItem};
+use bandcamp_api::{AudioFormat, BandcampClient, CollectionItem, ItemType};
 use library_ipc_client::{InboxPath, IngestSource, LibraryClient};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -117,31 +117,28 @@ pub struct BandcampService {
 }
 
 /// Pure helper: given a slice of collection items, the set of library-known IDs,
-/// and a pre-fetched list of `(item_id, stored_album_title)` pairs, return the
-/// set of item IDs that are stale (stored title differs from collection title).
+/// and a pre-fetched map of `item_id -> stored_album_title`, return the set of
+/// item IDs that are stale (stored title differs from collection title).
+///
+/// Absent key in `stored_titles` means no album title was found for that item
+/// (either unknown or no Album fact yet); such items are not flagged as stale.
 ///
 /// Extracted from `detect_stale_items` so the comparison logic can be unit-tested
 /// without a live NNG connection.
 fn compute_stale_ids(
     collection: &[CollectionItem],
     library_known: &HashSet<String>,
-    stored_titles: &[(String, Option<String>)],
+    stored_titles: &HashMap<String, String>,
 ) -> HashSet<String> {
     let mut stale = HashSet::new();
-
-    // Build a lookup: item_id -> stored_title
-    let stored_map: std::collections::HashMap<&str, Option<&str>> = stored_titles
-        .iter()
-        .map(|(id, title)| (id.as_str(), title.as_deref()))
-        .collect();
 
     for item in collection {
         if !library_known.contains(item.id.as_str()) {
             continue;
         }
 
-        if let Some(Some(stored_title)) = stored_map.get(item.id.as_str()) {
-            if *stored_title != item.title.as_str() {
+        if let Some(stored_title) = stored_titles.get(item.id.as_str()) {
+            if stored_title != item.title.as_str() {
                 stale.insert(item.id.0.clone());
             }
         }
@@ -364,27 +361,45 @@ impl BandcampService {
         }
     }
 
-    /// Detect stale items: library-known items whose stored album title differs
+    /// Detect stale items: library-known album items whose stored album title differs
     /// from the current collection metadata.
+    ///
+    /// Track purchases are skipped entirely — their `CollectionItem.title` is the
+    /// track title, not the album title, so comparing it against the stored Album
+    /// fact would produce spurious mismatches and unnecessary re-downloads.
+    ///
+    /// Uses a single batched IPC query instead of one call per item.
     async fn detect_stale_items(
         &self,
         collection: &[CollectionItem],
         lib_client: &LibraryClient,
         library_known: &HashSet<String>,
     ) -> HashSet<String> {
-        let stored_titles: Vec<(String, Option<String>)> = collection
+        // Only album purchases have a title that can be meaningfully compared
+        // against the stored Album fact; skip Track items entirely.
+        let albums_only: Vec<&CollectionItem> = collection
             .iter()
-            .filter(|item| library_known.contains(item.id.as_str()))
-            .map(|item| {
-                let stored = lib_client
-                    .get_album_title_by_item_id(item.id.as_str())
-                    .ok()
-                    .flatten();
-                (item.id.0.clone(), stored)
-            })
+            .filter(|item| matches!(item.item_type, ItemType::Album))
             .collect();
 
-        let stale = compute_stale_ids(collection, library_known, &stored_titles);
+        // Collect library-known album IDs for the batched IPC query
+        let ids: Vec<String> = albums_only
+            .iter()
+            .filter(|item| library_known.contains(item.id.as_str()))
+            .map(|item| item.id.as_str().to_string())
+            .collect();
+
+        if ids.is_empty() {
+            return HashSet::new();
+        }
+
+        // Single batched IPC round-trip
+        let stored_titles = lib_client
+            .get_album_titles_by_item_ids(&ids)
+            .unwrap_or_default();
+
+        let album_items: Vec<CollectionItem> = albums_only.into_iter().cloned().collect();
+        let stale = compute_stale_ids(&album_items, library_known, &stored_titles);
         tracing::info!("detected stale bandcamp items: {:?}", stale);
         stale
     }
@@ -1007,11 +1022,13 @@ mod tests {
                 .collect();
 
         // Stored titles: p001 changed, p002 unchanged, p003 changed
-        let stored_titles = vec![
-            ("p001".to_string(), Some("Old Title".to_string())),
-            ("p002".to_string(), Some("Unchanged Title".to_string())),
-            ("p003".to_string(), Some("Different Old Title".to_string())),
-        ];
+        let stored_titles: HashMap<String, String> = [
+            ("p001".to_string(), "Old Title".to_string()),
+            ("p002".to_string(), "Unchanged Title".to_string()),
+            ("p003".to_string(), "Different Old Title".to_string()),
+        ]
+        .into_iter()
+        .collect();
 
         let stale = compute_stale_ids(&collection, &library_known, &stored_titles);
 
@@ -1036,7 +1053,10 @@ mod tests {
         // p001 is NOT in library_known
         let library_known: HashSet<String> = HashSet::new();
 
-        let stored_titles = vec![("p001".to_string(), Some("Some Title".to_string()))];
+        let stored_titles: HashMap<String, String> =
+            [("p001".to_string(), "Some Title".to_string())]
+                .into_iter()
+                .collect();
 
         let stale = compute_stale_ids(&collection, &library_known, &stored_titles);
 
@@ -1052,8 +1072,8 @@ mod tests {
 
         let library_known: HashSet<String> = ["p001".to_string()].into_iter().collect();
 
-        // No stored title (None) — don't flag as stale
-        let stored_titles = vec![("p001".to_string(), None)];
+        // Absent key means no stored title — don't flag as stale
+        let stored_titles: HashMap<String, String> = HashMap::new();
 
         let stale = compute_stale_ids(&collection, &library_known, &stored_titles);
 
@@ -1067,9 +1087,85 @@ mod tests {
     fn compute_stale_ids_empty_collection() {
         let collection: Vec<CollectionItem> = vec![];
         let library_known: HashSet<String> = HashSet::new();
-        let stored_titles: Vec<(String, Option<String>)> = vec![];
+        let stored_titles: HashMap<String, String> = HashMap::new();
 
         let stale = compute_stale_ids(&collection, &library_known, &stored_titles);
         assert!(stale.is_empty());
+    }
+
+    fn make_track_item(id: &str, title: &str) -> CollectionItem {
+        CollectionItem {
+            id: ItemId::new(id),
+            artist: Artist::new("Test Artist"),
+            title: Title::new(title),
+            item_type: ItemType::Track,
+            purchased: None,
+            download_url: "https://example.com/download".to_string(),
+        }
+    }
+
+    #[test]
+    fn detect_stale_items_never_flags_track_purchases() {
+        // A Track item with a mismatched stored title must NOT be flagged stale.
+        // compute_stale_ids is called only for Album items; Track items bypass it.
+        let track = make_track_item("t001", "Track Title On Bandcamp");
+
+        // Simulate: it's library-known
+        let library_known: HashSet<String> = ["t001".to_string()].into_iter().collect();
+
+        // Stored title is completely different (as happens when the library stores
+        // the album title and the CollectionItem carries the track title)
+        let stored_titles: HashMap<String, String> = [(
+            "t001".to_string(),
+            "Completely Different Album Name".to_string(),
+        )]
+        .into_iter()
+        .collect();
+
+        // Filter to albums only — Track items should be excluded before reaching compute_stale_ids
+        let album_only: Vec<&CollectionItem> = std::slice::from_ref(&track)
+            .iter()
+            .filter(|i| matches!(i.item_type, ItemType::Album))
+            .collect();
+
+        let stale = compute_stale_ids(
+            &album_only.iter().map(|i| (*i).clone()).collect::<Vec<_>>(),
+            &library_known,
+            &stored_titles,
+        );
+
+        assert!(
+            !stale.contains("t001"),
+            "Track purchase should never be flagged as stale"
+        );
+    }
+
+    #[test]
+    fn detect_stale_items_still_flags_stale_albums() {
+        // An Album item with a mismatched stored title must still be flagged stale.
+        let album = make_item("a001", "New Album Title");
+
+        let library_known: HashSet<String> = ["a001".to_string()].into_iter().collect();
+        let stored_titles: HashMap<String, String> =
+            [("a001".to_string(), "Old Album Title".to_string())]
+                .into_iter()
+                .collect();
+
+        // Album items pass through the filter
+        let album_only: Vec<&CollectionItem> = std::slice::from_ref(&album)
+            .iter()
+            .filter(|i| matches!(i.item_type, ItemType::Album))
+            .collect();
+
+        let stale = compute_stale_ids(
+            &album_only.iter().map(|i| (*i).clone()).collect::<Vec<_>>(),
+            &library_known,
+            &stored_titles,
+        );
+
+        assert!(
+            stale.contains("a001"),
+            "Album with changed title should be flagged as stale"
+        );
     }
 }
