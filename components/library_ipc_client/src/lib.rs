@@ -416,6 +416,28 @@ impl LibraryClient {
             })),
         }
     }
+
+    /// Batch lookup: for many ItemIds at once, return a map of ItemId → album title.
+    ///
+    /// Absent key in the result means no album title was found for that ItemId
+    /// (either unknown ID or its tracks have no Album fact yet).
+    ///
+    /// Prefer this over calling `get_album_title_by_item_id` in a loop — it
+    /// replaces N sequential IPC round-trips with a single batched query.
+    pub fn get_album_titles_by_item_ids(
+        &self,
+        item_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>, ClientError> {
+        match self.request(&LibraryRequest::GetAlbumTitlesByItemIds {
+            item_ids: item_ids.to_vec(),
+        })? {
+            LibraryResponse::AlbumTitlesByItemIds(map) => Ok(map),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to GetAlbumTitlesByItemIds".to_string(),
+            })),
+        }
+    }
 }
 
 // =========================================================================

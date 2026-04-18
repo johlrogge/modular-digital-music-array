@@ -292,6 +292,10 @@ impl LibraryService {
             LibraryRequest::GetAlbumTitleByItemId { .. } => {
                 LibraryResponse::AlbumTitleByItemId(None)
             }
+
+            LibraryRequest::GetAlbumTitlesByItemIds { .. } => {
+                LibraryResponse::AlbumTitlesByItemIds(HashMap::new())
+            }
         }
     }
 

@@ -322,6 +322,13 @@ pub enum LibraryRequest {
     /// If multiple tracks have different album titles for the same ItemId, returns
     /// one value (the first encountered during iteration).
     GetAlbumTitleByItemId { item_id: String },
+
+    /// Batch version: look up the album title for many ItemIds at once.
+    ///
+    /// Returns a `HashMap<item_id, album_title>`. ItemIds with no matching tracks,
+    /// or whose tracks have no Album fact, are absent from the map ("absent means
+    /// unknown" semantics — simpler than wrapping each value in `Option`).
+    GetAlbumTitlesByItemIds { item_ids: Vec<String> },
 }
 
 // ============================================================================
@@ -395,6 +402,12 @@ pub enum LibraryResponse {
 
     /// Album title for a given ItemId (None if no tracks with that ItemId have an album title).
     AlbumTitleByItemId(Option<String>),
+
+    /// Batch album title lookup result.
+    ///
+    /// Keys are ItemIds; values are album titles. Absent key means no album title
+    /// was found for that ItemId (either unknown ItemId or no Album fact on its tracks).
+    AlbumTitlesByItemIds(std::collections::HashMap<String, String>),
 
     /// Error response.
     Error(ProtocolError),
@@ -647,6 +660,50 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let decoded: LibraryResponse = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, LibraryResponse::AlbumTitleByItemId(None)));
+    }
+
+    #[test]
+    fn get_album_titles_by_item_ids_request_roundtrip() {
+        let req = LibraryRequest::GetAlbumTitlesByItemIds {
+            item_ids: vec!["p111".to_string(), "p222".to_string()],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: LibraryRequest = serde_json::from_str(&json).unwrap();
+        match decoded {
+            LibraryRequest::GetAlbumTitlesByItemIds { item_ids } => {
+                assert_eq!(item_ids, vec!["p111", "p222"]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn album_titles_by_item_ids_response_roundtrip() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("p111".to_string(), "Album One".to_string());
+        map.insert("p222".to_string(), "Album Two".to_string());
+        let resp = LibraryResponse::AlbumTitlesByItemIds(map.clone());
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: LibraryResponse = serde_json::from_str(&json).unwrap();
+        match decoded {
+            LibraryResponse::AlbumTitlesByItemIds(decoded_map) => {
+                assert_eq!(decoded_map, map);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn album_titles_by_item_ids_response_empty_roundtrip() {
+        let resp = LibraryResponse::AlbumTitlesByItemIds(std::collections::HashMap::new());
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: LibraryResponse = serde_json::from_str(&json).unwrap();
+        match decoded {
+            LibraryResponse::AlbumTitlesByItemIds(map) => {
+                assert!(map.is_empty());
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]
