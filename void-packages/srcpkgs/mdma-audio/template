@@ -1,6 +1,6 @@
 # Template file for mdma-audio package
 pkgname=mdma-audio
-version=0.12.3
+version=0.13.0
 revision=1
 archs="aarch64"
 build_style=cargo

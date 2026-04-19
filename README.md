@@ -76,7 +76,7 @@ Service startup order: mdma-library → mdma-audio → mdma-playback
 
 The library is a content-addressed blob store with an immutable fact stream (`stainless_facts`). Every track attribute — artist, BPM, key, play history — is a typed fact appended to `facts.jsonl`. Nothing is ever overwritten. Fact writes go through `mdma-acid`, a dedicated service that owns the `facts.jsonl` file and accepts batched writes from any other service via IPC.
 
-Audio path: FLAC/MP3 → Symphonia decoder → rubato resampler → 192 kHz PipeWire stream → iFi USB DAC
+Audio path: FLAC/MP3 → Symphonia decoder (std::thread) → rubato resampler → PipeWire stream at source native rate → iFi USB DAC
 
 ---
 
@@ -92,7 +92,7 @@ This is a [Polylith](https://polylith.gitbook.io/polylith/) workspace. Deployabl
 | `mdma-acid` | ACID service — standalone append-only fact stream writer |
 | `mdma-playback` | Queue manager — drives audio sources via StreamClient; persists queue to `/metadata/queue.json` |
 | `mdma-audio` | Audio playback source — wraps PlaybackEngine (Symphonia + rubato + PipeWire), speaks `stream_source_protocol` over NNG |
-| `mdma-tui` | Terminal UI — dual-pane browser/queue, modal keybindings, command palette, live queue sync via events, intelligent column compression, bookmark keybinding (`b` in Playback mode) |
+| `mdma-tui` | Terminal UI — multi-pane tabs (nnn-style, `1`–`5`/`6`–`0`), field-aware search grammar (`:artist`, `:bpm`, `:added`, …), DJ shortcuts (`A`, `P`, `d`/`p`, `u`), modal keybindings, command palette, live queue sync, intelligent column compression |
 | `mdma-bandcamp` | Bandcamp collection sync — downloads purchases into the library inbox |
 | `mdma-console` | Web management console — player controls, search, queue, upload, export |
 | `mdma-cli` | CLI — search, queue, playlists, playback, export, subscribe, bookmarks, shell completions |
@@ -164,6 +164,65 @@ cp profiles/dev/target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.13.0
+
+### Search and filters
+
+- **Field-aware search grammar** in SearchPane: `:artist 'bonobo'`, `:bpm 120`, `:title 'foo bar'`, `:added -7`, etc. Bare words search `any_text` (title/artist/album/label/genre).
+- **Live search** — results update on every keystroke.
+- `s` and `/` filter the current list live (pane display-string match). `,` clears selection.
+- Genre counts show real track numbers.
+- `:history [days]` opens a SearchPane preset with `:started '-N..~'`. Default 7 days.
+- CLI: `mdma search --added -7` now accepts hyphen-prefixed date expressions.
+
+### Multi-pane tabs (nnn-style)
+
+- **5 tab slots per side.** Keys `1`–`5` = left side; `6`–`9`, `0` = right side.
+- Pressing a key for an empty slot clones the currently-focused pane into it.
+- No explicit close — tabs overwrite by navigation or by being cloned into.
+- Tab bar with LRU-priority shrinking of inactive titles.
+
+### DJ-workflow shortcuts
+
+| Key | Action |
+|-----|--------|
+| `A` | Add currently-playing track to focused playlist or queue |
+| `P` | Play selected track(s) immediately (queue_next + skip, queue preserved) |
+| `x` / `X` | Select for cut |
+| `d` | Cut selection to clipboard |
+| `p` | Paste after cursor |
+| `Shift+J` / `Shift+K` | Move selected block up/down (Kakoune/Helix semantics) |
+| `u` | Undo last mutation on the active pane (playlist-only in v1) |
+
+### UX fixes
+
+- Panes with text input capture all keys until `Esc` — no more `a`/`s`/`P` hijacking during search typing.
+- Palette no longer eats `h`/`l` in `:help` etc.
+- Album drill-down default sort: disc asc, track asc.
+- Inbox scanner ignores macOS AppleDouble sidecar files (`._*`).
+
+### Playback engine
+
+- MP3 decoder no longer strips zero-padding from decoded segments — fixes scratchy/roboty MP3 playback.
+- Decoder moved from tokio task to `std::thread` to avoid IPC contention.
+- Mixer no longer busy-spins on a full output ring.
+- Mixer no longer silence-pads when the track buffer briefly underruns.
+- Output uses the source's **native sample rate** — 44.1 kHz MP3 is no longer resampled to 192 kHz unnecessarily.
+- Flush on track change — skip latency ~50 ms instead of seconds.
+- `allowed-rates` PipeWire config added so the graph can switch rate natively.
+
+### Library
+
+- `mdma-library` creates `playlists/` on startup and before each write — fresh installs can reorder playlists immediately.
+- Retract-aware fact fold.
+
+### Bandcamp
+
+- `mdma source check-item <source> <id>` and `mdma source check-updates <source> [--apply]` — on-demand stale-item detection via track-count comparison.
+- `mdma source resync <source> <id>` — force-resync for manual override.
 
 ---
 
