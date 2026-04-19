@@ -8,9 +8,10 @@ Real-time audio playback component for MDMA. Decodes audio files via Symphonia, 
 
 ## What it does
 
-- Decodes FLAC, WAV, AIFF, and MP3 via Symphonia
-- Resamples decoded PCM to the configured output sample rate (default 192 kHz) using rubato's high-quality sinc resampler
-- Outputs a fixed-rate PipeWire stream — the DAC always sees a consistent rate
+- Decodes FLAC, WAV, AIFF, and MP3 via Symphonia (runs in a dedicated `std::thread` to avoid IPC contention)
+- Resamples decoded PCM with rubato's high-quality sinc resampler only when the source rate differs from the output rate
+- Outputs a PipeWire stream at the source's native sample rate — 44.1 kHz files no longer forced to 192 kHz; PipeWire `allowed-rates` config enables graph-level rate switching
+- Flushes the pipeline on track change — skip latency ~50 ms
 - Manages a single loaded track (`Option<Track>`); loading a new track stops and replaces any existing one
 - Exposes volume control in dBFS via the `Volume` type
 - Supports hot-swap of the PipeWire output device without restarting the process
@@ -51,5 +52,6 @@ Building requires PipeWire and libspa development headers. These are provided au
 
 ## Notes
 
+- The decoder runs in a `std::thread` (not a tokio task) to avoid blocking the async runtime during IPC calls.
 - The mix thread runs independently of the async runtime and uses an `Arc<AtomicBool>` with `Acquire`/`Release` ordering (correct on aarch64) to signal shutdown.
 - The `Deck` type from `playback_primitives` is not used here. It is retained in that crate for future DJ-mode features.
