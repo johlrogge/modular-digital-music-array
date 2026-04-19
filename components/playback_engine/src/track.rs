@@ -148,8 +148,9 @@ fn decoder_thread_fn<S: Source + Send + Sync + 'static>(
                 }
                 Ok(segments) => {
                     for seg in segments {
+                        let valid = &seg.segment.samples[..seg.valid_samples];
                         let samples = if let Some(ref mut r) = resampler {
-                            match r.process_segment(&seg.segment.samples) {
+                            match r.process_segment(valid) {
                                 Ok(s) => s,
                                 Err(e) => {
                                     tracing::error!("Resampler error: {e}");
@@ -157,7 +158,7 @@ fn decoder_thread_fn<S: Source + Send + Sync + 'static>(
                                 }
                             }
                         } else {
-                            seg.segment.samples.to_vec()
+                            valid.to_vec()
                         };
                         pending.extend(samples);
                     }
@@ -352,6 +353,7 @@ impl TestSource {
                 segment: AudioSegment {
                     samples: segment_samples,
                 },
+                valid_samples: SEGMENT_SIZE,
             });
 
             start_pos += SEGMENT_SIZE;
@@ -375,6 +377,7 @@ impl TestSource {
                 segment: AudioSegment {
                     samples: segment_samples,
                 },
+                valid_samples: remaining,
             });
         }
 
