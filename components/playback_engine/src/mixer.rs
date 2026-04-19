@@ -59,7 +59,7 @@ impl Mixer {
                         remaining
                     );
                 }
-                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_micros(500));
             }
         }
         if written < to_write {
