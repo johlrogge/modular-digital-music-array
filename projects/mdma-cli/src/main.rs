@@ -142,15 +142,15 @@ enum Commands {
         no_stdin: bool,
 
         /// Filter by last started date. Format: N/A, >2026-02, <2026, 2026-01..2026-06
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         started: Option<String>,
 
         /// Filter by last stopped date. Same format as --started.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         stopped: Option<String>,
 
         /// Filter by date added to library. Uses date expression syntax: ~/+1/15 (15th next month), -7 (7 days ago), ^ (1st of month), $ (end of month). Ranges: -7..~ (last 7 days to today).
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         added: Option<String>,
 
         /// Invert the search results — return tracks that do NOT match the filters.
@@ -4793,5 +4793,38 @@ mod tests {
     #[test]
     fn contains_threshold_no_flag_inverts() {
         assert_eq!(resolve_contains_threshold(false, None, true, 4), (1, true));
+    }
+
+    // ── Date arg hyphen-value parsing ────────────────────────────────────────
+
+    #[test]
+    fn search_added_hyphen_value_parses() {
+        // `mdma search --added -7` must not be rejected by clap as an unknown flag.
+        let result = Cli::try_parse_from(["mdma", "search", "--added", "-7"]);
+        assert!(
+            result.is_ok(),
+            "clap rejected --added -7: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn search_started_hyphen_value_parses() {
+        let result = Cli::try_parse_from(["mdma", "search", "--started", "-7"]);
+        assert!(
+            result.is_ok(),
+            "clap rejected --started -7: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn search_stopped_tilde_parses() {
+        let result = Cli::try_parse_from(["mdma", "search", "--stopped", "~"]);
+        assert!(
+            result.is_ok(),
+            "clap rejected --stopped ~: {}",
+            result.unwrap_err()
+        );
     }
 }
