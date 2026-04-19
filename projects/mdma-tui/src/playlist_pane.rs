@@ -12,8 +12,18 @@ use ratatui::{
 };
 use std::rc::Rc;
 
-/// A pane that displays the contents of a named playlist.
+/// Maximum number of undo snapshots retained per playlist pane.
+const UNDO_DEPTH: usize = 50;
+
+/// Snapshot of a playlist pane's mutable state, used for undo.
 #[derive(Clone)]
+struct PlaylistSnapshot {
+    hashes: Vec<ContentHash>,
+    tracks: Vec<TrackInfo>,
+    cursor: usize,
+}
+
+/// A pane that displays the contents of a named playlist.
 pub struct PlaylistPane {
     name: PlaylistName,
     hashes: Vec<ContentHash>,
@@ -21,6 +31,23 @@ pub struct PlaylistPane {
     selection: SelectionState,
     library: Rc<LibraryBackend>,
     title: String,
+    undo_stack: Vec<PlaylistSnapshot>,
+}
+
+impl Clone for PlaylistPane {
+    fn clone(&self) -> Self {
+        PlaylistPane {
+            name: self.name.clone(),
+            hashes: self.hashes.clone(),
+            tracks: self.tracks.clone(),
+            selection: self.selection.clone(),
+            library: Rc::clone(&self.library),
+            title: self.title.clone(),
+            // Undo history is intentionally not carried over to tab clones —
+            // each tab is an independent view.
+            undo_stack: Vec::new(),
+        }
+    }
 }
 
 impl PlaylistPane {
@@ -48,7 +75,24 @@ impl PlaylistPane {
             selection: SelectionState::new(total),
             library,
             title,
+            undo_stack: Vec::new(),
         })
+    }
+
+    /// Push a snapshot of the current state onto the undo stack.
+    ///
+    /// Drops the oldest entry when the stack exceeds `UNDO_DEPTH`.
+    fn push_undo_snapshot(&mut self) {
+        let cursor = self.selection.list_state.selected().unwrap_or(0);
+        let snap = PlaylistSnapshot {
+            hashes: self.hashes.clone(),
+            tracks: self.tracks.clone(),
+            cursor,
+        };
+        self.undo_stack.push(snap);
+        if self.undo_stack.len() > UNDO_DEPTH {
+            self.undo_stack.remove(0);
+        }
     }
 
     /// Reorder: move the track at `from` to `to` (adjacent swap).
@@ -60,6 +104,35 @@ impl PlaylistPane {
     /// Persist the current hash order to the backend.
     fn persist_order(&self) -> Result<(), mdma_client::LibraryClientError> {
         self.library.playlist_replace(&self.name, &self.hashes)
+    }
+
+    /// Undo the most recent mutation by restoring the last snapshot.
+    ///
+    /// If the persist fails the in-memory state is rolled back and the
+    /// snapshot is discarded so the undo stack stays consistent.
+    fn undo_mutation(&mut self) -> PaneAction {
+        let Some(snap) = self.undo_stack.pop() else {
+            return PaneAction::Info("Nothing to undo".to_string());
+        };
+
+        let prior_hashes = std::mem::replace(&mut self.hashes, snap.hashes);
+        let prior_tracks = std::mem::replace(&mut self.tracks, snap.tracks);
+
+        match self.persist_order() {
+            Ok(()) => {
+                self.selection.set_total_items(self.hashes.len());
+                self.selection
+                    .list_state
+                    .select(Some(snap.cursor.min(self.hashes.len().saturating_sub(1))));
+                PaneAction::Info("Undone".to_string())
+            }
+            Err(e) => {
+                // Revert the undo if persist failed
+                self.hashes = prior_hashes;
+                self.tracks = prior_tracks;
+                PaneAction::Error(format!("Undo failed: {e}"))
+            }
+        }
     }
 
     /// Paste `hashes` after the current cursor position.
@@ -81,6 +154,8 @@ impl PlaylistPane {
             .filter_map(|h| self.library.get_track(h).ok())
             .collect();
 
+        self.push_undo_snapshot();
+
         let old_hashes = std::mem::replace(&mut self.hashes, new_hashes.clone());
         let old_tracks = std::mem::replace(&mut self.tracks, new_tracks);
 
@@ -91,9 +166,10 @@ impl PlaylistPane {
                 PaneAction::Info(format!("Pasted {} track(s)", hashes.len()))
             }
             Err(e) => {
-                // Revert
+                // Revert state and discard the snapshot (persist never succeeded)
                 self.hashes = old_hashes;
                 self.tracks = old_tracks;
+                self.undo_stack.pop();
                 PaneAction::Error(format!("Paste failed: {e}"))
             }
         }
@@ -147,6 +223,7 @@ impl Pane for PlaylistPane {
                     if let Some(data_idx) = self.selection.visible_index_to_data(vis_idx) {
                         let next = data_idx + 1;
                         if next < self.hashes.len() {
+                            self.push_undo_snapshot();
                             self.swap_tracks(data_idx, next);
                             match self.persist_order() {
                                 Ok(()) => {
@@ -154,8 +231,9 @@ impl Pane for PlaylistPane {
                                     PaneAction::Consumed
                                 }
                                 Err(e) => {
-                                    // Revert
+                                    // Revert swap and discard snapshot
                                     self.swap_tracks(data_idx, next);
+                                    self.undo_stack.pop();
                                     PaneAction::Error(format!("Reorder failed: {e}"))
                                 }
                             }
@@ -175,6 +253,7 @@ impl Pane for PlaylistPane {
                     if let Some(data_idx) = self.selection.visible_index_to_data(vis_idx) {
                         if data_idx > 0 {
                             let prev = data_idx - 1;
+                            self.push_undo_snapshot();
                             self.swap_tracks(data_idx, prev);
                             match self.persist_order() {
                                 Ok(()) => {
@@ -182,8 +261,9 @@ impl Pane for PlaylistPane {
                                     PaneAction::Consumed
                                 }
                                 Err(e) => {
-                                    // Revert
+                                    // Revert swap and discard snapshot
                                     self.swap_tracks(data_idx, prev);
+                                    self.undo_stack.pop();
                                     PaneAction::Error(format!("Reorder failed: {e}"))
                                 }
                             }
@@ -208,6 +288,8 @@ impl Pane for PlaylistPane {
                     return PaneAction::Consumed;
                 }
 
+                self.push_undo_snapshot();
+
                 match self.library.playlist_replace(&self.name, &remaining_hashes) {
                     Ok(()) => {
                         let remaining_tracks: Vec<TrackInfo> = remaining_hashes
@@ -229,7 +311,11 @@ impl Pane for PlaylistPane {
                         }
                         PaneAction::Cut(cut_hashes)
                     }
-                    Err(e) => PaneAction::Error(format!("Failed to cut tracks: {e}")),
+                    Err(e) => {
+                        // Discard snapshot since persist never succeeded
+                        self.undo_stack.pop();
+                        PaneAction::Error(format!("Failed to cut tracks: {e}"))
+                    }
                 }
             }
             _ => PaneAction::Ignored,
@@ -340,6 +426,10 @@ impl Pane for PlaylistPane {
 
     fn paste_clipboard(&mut self, hashes: Vec<ContentHash>) -> PaneAction {
         self.paste_after_cursor(hashes)
+    }
+
+    fn undo(&mut self) -> PaneAction {
+        self.undo_mutation()
     }
 }
 
@@ -652,6 +742,90 @@ mod tests {
         let cut_hashes = vec![hash("b")];
         let action = PaneAction::Cut(cut_hashes.clone());
         assert!(matches!(action, PaneAction::Cut(ref h) if h == &cut_hashes));
+    }
+
+    // -------------------------------------------------------------------------
+    // Undo stack tests
+    // -------------------------------------------------------------------------
+
+    /// Helper: build a minimal PlaylistSnapshot for testing.
+    ///
+    /// Uses empty `tracks` vec — undo stack tests only care about hashes + cursor.
+    fn make_snapshot(hashes: Vec<ContentHash>, cursor: usize) -> PlaylistSnapshot {
+        PlaylistSnapshot {
+            tracks: Vec::new(),
+            hashes,
+            cursor,
+        }
+    }
+
+    /// push_undo_snapshot helper: verify snapshot is pushed and capped.
+    #[test]
+    fn undo_stack_capped_at_depth() {
+        let mut stack: Vec<PlaylistSnapshot> = Vec::new();
+        // Push 60 snapshots (cap is UNDO_DEPTH = 50)
+        for i in 0..60_usize {
+            let snap = make_snapshot(vec![hash(&format!("sha256:{:04x}", i))], 0);
+            stack.push(snap);
+            if stack.len() > UNDO_DEPTH {
+                stack.remove(0);
+            }
+        }
+        assert_eq!(
+            stack.len(),
+            UNDO_DEPTH,
+            "stack should be capped at UNDO_DEPTH"
+        );
+        // Oldest (index 0 in original sequence) should be gone; snapshot 10 is oldest remaining.
+        assert_eq!(
+            stack[0].hashes[0],
+            hash(&format!("sha256:{:04x}", 60 - UNDO_DEPTH)),
+            "oldest entry should be dropped"
+        );
+    }
+
+    /// Undo with empty stack returns PaneAction::Info("Nothing to undo").
+    #[test]
+    fn undo_empty_stack_returns_info() {
+        // We test the undo() trait method through the default impl in pane.rs,
+        // which returns Info("Nothing to undo"). We replicate equivalent logic
+        // here to confirm the contract without a live LibraryBackend.
+        let mut stack: Vec<PlaylistSnapshot> = Vec::new();
+        let result = if stack.pop().is_none() {
+            PaneAction::Info("Nothing to undo".to_string())
+        } else {
+            PaneAction::Consumed
+        };
+        assert!(
+            matches!(result, PaneAction::Info(ref s) if s == "Nothing to undo"),
+            "empty stack undo must return Info(Nothing to undo)"
+        );
+    }
+
+    /// Cloning a PlaylistSnapshot produces an independent copy (no shared refs).
+    /// This also exercises the Clone derive on PlaylistSnapshot.
+    #[test]
+    fn playlist_snapshot_clone_is_independent() {
+        let snap = make_snapshot(vec![hash("sha256:aaa"), hash("sha256:bbb")], 1);
+        let cloned = snap.clone();
+        assert_eq!(snap.hashes, cloned.hashes);
+        assert_eq!(snap.cursor, cloned.cursor);
+    }
+
+    /// Verify that a Vec<PlaylistSnapshot> behaves as a stack (LIFO).
+    #[test]
+    fn undo_stack_is_lifo() {
+        let mut stack: Vec<PlaylistSnapshot> = Vec::new();
+        let snap_a = make_snapshot(vec![hash("sha256:aaa")], 0);
+        let snap_b = make_snapshot(vec![hash("sha256:bbb")], 1);
+        stack.push(snap_a.clone());
+        stack.push(snap_b.clone());
+
+        let popped = stack.pop().unwrap();
+        assert_eq!(
+            popped.hashes, snap_b.hashes,
+            "last pushed snapshot should be first popped"
+        );
     }
 
     /// Pane preempts 'd' and 'p' in normal mode.

@@ -147,6 +147,14 @@ pub trait Pane {
         false
     }
 
+    /// Undo the last mutation on this pane.
+    ///
+    /// Default: no-op — returns `Info("Nothing to undo")`.
+    /// Only `PlaylistPane` overrides this for now.
+    fn undo(&mut self) -> PaneAction {
+        PaneAction::Info("Nothing to undo".to_string())
+    }
+
     /// Clone this pane into a new `Box<dyn Pane>`.
     ///
     /// Required — each pane implements this by calling `Box::new(self.clone())`.

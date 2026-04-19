@@ -183,6 +183,10 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             app.name_input.clear();
             app.mode = InputMode::NameInput;
         }
+        KeyCode::Char('u') => {
+            let action = app.active_pane_mut().undo();
+            dispatch_pane_action(app, action);
+        }
         _ => {
             let action = app.active_pane_mut().handle_key(key);
             dispatch_pane_action(app, action);
