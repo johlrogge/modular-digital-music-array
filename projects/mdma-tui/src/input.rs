@@ -30,9 +30,10 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         KeyCode::Char('?') => {
             app.mode = InputMode::Help;
         }
-        KeyCode::Char('s') => {
+        KeyCode::Char('s') | KeyCode::Char('/') => {
             app.mode = InputMode::FilterInput;
             app.filter_input.clear();
+            app.live_filter_active = false;
         }
         KeyCode::Char('a') => {
             // Add selection from active pane to inactive pane.
@@ -200,36 +201,27 @@ fn handle_filter(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char(c) => {
             app.filter_input.push(c);
+            apply_live_filter(app);
         }
         KeyCode::Backspace => {
             app.filter_input.pop();
+            apply_live_filter(app);
         }
         KeyCode::Enter => {
-            let pattern = app.filter_input.clone();
-            app.filter_input.clear();
+            // Commit: exit FilterInput mode and stay in Normal.
+            // The live filter (if any) remains applied; reset tracking flag so
+            // the next FilterInput session pushes a fresh layer.
             app.mode = InputMode::Normal;
-
-            let pattern_lc = pattern.to_ascii_lowercase();
-            // Collect display strings for all data indices before calling push_filter,
-            // so the closure does not borrow `app` while `push_filter` mutably borrows it.
-            let total = app.active_pane().item_count();
-            let display_strings: Vec<Option<String>> = (0..total)
-                .map(|i| app.active_pane().display_string(i))
-                .collect();
-            app.active_pane_mut()
-                .selection_state_mut()
-                .push_filter(move |data_idx| {
-                    match display_strings.get(data_idx) {
-                        Some(Some(text)) => text.to_ascii_lowercase().contains(&pattern_lc),
-                        // No display string available: keep the item (defensive).
-                        _ => true,
-                    }
-                });
+            app.live_filter_active = false;
         }
         KeyCode::Esc => {
+            // Cancel: remove the live filter and return to Normal.
             app.filter_input.clear();
             app.mode = InputMode::Normal;
-            app.active_pane_mut().selection_state_mut().pop_filter();
+            if app.live_filter_active {
+                app.active_pane_mut().selection_state_mut().pop_filter();
+                app.live_filter_active = false;
+            }
         }
         _ => {}
     }
@@ -374,6 +366,209 @@ fn execute_command(cmd: &Command, playback: &PlaybackBackend, app: &mut App) {
         _ => {
             app.set_status(format!("Unknown command: {}", cmd.name));
         }
+    }
+}
+
+/// Apply (or replace) the live filter on the active pane.
+///
+/// If a live filter is already active (`app.live_filter_active == true`), the
+/// top of the filter stack is replaced. Otherwise a new filter is pushed and
+/// `live_filter_active` is set to `true`.
+///
+/// If `pattern` is empty the live filter is removed (pop) and
+/// `live_filter_active` is reset to `false`.
+fn apply_live_filter(app: &mut App) {
+    let pattern = app.filter_input.clone();
+
+    if pattern.is_empty() {
+        if app.live_filter_active {
+            app.active_pane_mut().selection_state_mut().pop_filter();
+            app.live_filter_active = false;
+        }
+        return;
+    }
+
+    let pattern_lc = pattern.to_ascii_lowercase();
+    let total = app.active_pane().item_count();
+    let display_strings: Vec<Option<String>> = (0..total)
+        .map(|i| app.active_pane().display_string(i))
+        .collect();
+
+    let predicate = move |data_idx: usize| match display_strings.get(data_idx) {
+        Some(Some(text)) => text.to_ascii_lowercase().contains(&pattern_lc),
+        _ => true,
+    };
+
+    if app.live_filter_active {
+        app.active_pane_mut()
+            .selection_state_mut()
+            .replace_top_filter(predicate);
+    } else {
+        app.active_pane_mut()
+            .selection_state_mut()
+            .push_filter(predicate);
+        app.live_filter_active = true;
+    }
+}
+
+// =========================================================================
+// Tests
+// =========================================================================
+//
+// `App` requires live IPC backends, so these tests exercise the filter logic
+// directly via `SelectionState` + display-string slices — the same path that
+// `apply_live_filter` takes internally.  The `SelectionState` tests in
+// `selection.rs` cover `push_filter` / `replace_top_filter` correctness; here
+// we verify the higher-level "keystroke-by-keystroke narrowing" invariant.
+
+#[cfg(test)]
+mod tests {
+    use crate::selection::SelectionState;
+
+    /// Simulate `apply_live_filter` for a given pattern against a fixed set of
+    /// display strings.  Returns the visible data indices after applying the filter.
+    ///
+    /// `live_active` indicates whether a live filter is already pushed (i.e. this
+    /// is not the first keystroke in the session).
+    fn apply_filter_sim(
+        state: &mut SelectionState,
+        display: &[&str],
+        pattern: &str,
+        live_active: &mut bool,
+    ) {
+        if pattern.is_empty() {
+            if *live_active {
+                state.pop_filter();
+                *live_active = false;
+            }
+            return;
+        }
+        let pattern_lc = pattern.to_ascii_lowercase();
+        let display_owned: Vec<String> = display.iter().map(|s| s.to_string()).collect();
+        let predicate = move |data_idx: usize| {
+            display_owned
+                .get(data_idx)
+                .map(|t| t.to_ascii_lowercase().contains(&pattern_lc))
+                .unwrap_or(true)
+        };
+        if *live_active {
+            state.replace_top_filter(predicate);
+        } else {
+            state.push_filter(predicate);
+            *live_active = true;
+        }
+    }
+
+    const ITEMS: &[&str] = &["Destination Calabria", "Destroyed", "Daft Punk", "Moby"];
+
+    #[test]
+    fn live_filter_narrows_on_each_char() {
+        let mut state = SelectionState::new(ITEMS.len());
+        let mut live_active = false;
+
+        // Type 'd' → "Destination Calabria", "Destroyed", "Daft Punk" match (case-insensitive)
+        apply_filter_sim(&mut state, ITEMS, "d", &mut live_active);
+        assert!(live_active, "live filter should be active after first char");
+        assert_eq!(state.visible_count(), 3, "d: 3 matches");
+
+        // Type 'e' → pattern "de" → "Destination Calabria", "Destroyed"
+        apply_filter_sim(&mut state, ITEMS, "de", &mut live_active);
+        assert_eq!(state.visible_count(), 2, "de: 2 matches");
+
+        // Type 's' → pattern "des" → "Destination Calabria", "Destroyed"
+        apply_filter_sim(&mut state, ITEMS, "des", &mut live_active);
+        assert_eq!(state.visible_count(), 2, "des: 2 matches");
+
+        // Type 't' → pattern "dest" → "Destination Calabria", "Destroyed"
+        apply_filter_sim(&mut state, ITEMS, "dest", &mut live_active);
+        assert_eq!(state.visible_count(), 2, "dest: 2 matches");
+
+        // Only one filter layer on the stack (no stacking on each keystroke)
+        assert_eq!(state.filter_depth(), 1);
+    }
+
+    #[test]
+    fn live_filter_backspace_widens_results() {
+        let mut state = SelectionState::new(ITEMS.len());
+        let mut live_active = false;
+
+        apply_filter_sim(&mut state, ITEMS, "dest", &mut live_active);
+        assert_eq!(state.visible_count(), 2);
+
+        // Backspace: "des" — still 2
+        apply_filter_sim(&mut state, ITEMS, "des", &mut live_active);
+        assert_eq!(state.visible_count(), 2);
+
+        // Backspace to "d" — 3 matches
+        apply_filter_sim(&mut state, ITEMS, "d", &mut live_active);
+        assert_eq!(state.visible_count(), 3);
+    }
+
+    #[test]
+    fn live_filter_cleared_on_empty_pattern() {
+        let mut state = SelectionState::new(ITEMS.len());
+        let mut live_active = false;
+
+        apply_filter_sim(&mut state, ITEMS, "dest", &mut live_active);
+        assert!(live_active);
+        assert_eq!(state.visible_count(), 2);
+
+        // Backspace all the way to empty
+        apply_filter_sim(&mut state, ITEMS, "", &mut live_active);
+        assert!(
+            !live_active,
+            "live filter should be inactive after empty pattern"
+        );
+        assert_eq!(
+            state.visible_count(),
+            ITEMS.len(),
+            "all items visible after clearing"
+        );
+    }
+
+    #[test]
+    fn enter_commits_filter_leaving_it_applied() {
+        // Enter key in handle_filter sets live_filter_active = false and exits mode.
+        // The filter stays on the stack. Simulate: push a filter, then commit.
+        let mut state = SelectionState::new(ITEMS.len());
+        let mut live_active = false;
+
+        apply_filter_sim(&mut state, ITEMS, "dest", &mut live_active);
+        assert_eq!(state.visible_count(), 2);
+
+        // Commit: reset live_filter_active (Enter behaviour)
+        live_active = false;
+
+        // Filter is still applied
+        assert_eq!(state.visible_count(), 2, "filter remains after commit");
+
+        // A subsequent filter session pushes on top (not replaces)
+        apply_filter_sim(&mut state, ITEMS, "destination", &mut live_active);
+        // "destination calabria" contains "destination" — 1 match
+        assert_eq!(state.visible_count(), 1);
+        // Two layers: committed + new live
+        assert_eq!(state.filter_depth(), 2);
+    }
+
+    #[test]
+    fn esc_removes_live_filter() {
+        let mut state = SelectionState::new(ITEMS.len());
+        let mut live_active = false;
+
+        apply_filter_sim(&mut state, ITEMS, "dest", &mut live_active);
+        assert_eq!(state.visible_count(), 2);
+
+        // Esc behaviour: pop if live_active
+        if live_active {
+            state.pop_filter();
+            live_active = false;
+        }
+        assert!(!live_active);
+        assert_eq!(
+            state.visible_count(),
+            ITEMS.len(),
+            "all items restored after Esc"
+        );
     }
 }
 

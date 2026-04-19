@@ -52,6 +52,10 @@ pub struct App {
     pub now_playing: NowPlaying,
     pub status_message: Option<String>,
     pub filter_input: String,
+    /// Tracks whether a live (in-progress) filter has been pushed onto the active
+    /// pane's filter stack. Used by `apply_live_filter` to decide between
+    /// `push_filter` (first keystroke) and `replace_top_filter` (subsequent).
+    pub live_filter_active: bool,
     pub name_input: String,
     pub should_quit: bool,
     /// Shared library backend, used for opening new panes (e.g. PlaylistPane).
@@ -83,6 +87,7 @@ impl App {
             now_playing: NowPlaying::new(),
             status_message: None,
             filter_input: String::new(),
+            live_filter_active: false,
             name_input: String::new(),
             should_quit: false,
             library,
