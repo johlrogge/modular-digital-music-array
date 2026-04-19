@@ -283,6 +283,13 @@ fn render_palette_overlay(f: &mut Frame, app: &App, area: Rect) {
                     ),
                     Span::styled("new playlist", Style::default().fg(TEXT_SECONDARY)),
                 ])),
+                PaletteEntry::History(arg) => ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:<10}", format!("history {}", arg)),
+                        Style::default().fg(ACCENT2),
+                    ),
+                    Span::styled("history search", Style::default().fg(TEXT_SECONDARY)),
+                ])),
             })
             .collect();
 

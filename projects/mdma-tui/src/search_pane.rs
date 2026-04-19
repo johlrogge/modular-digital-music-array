@@ -36,6 +36,22 @@ impl SearchPane {
         }
     }
 
+    /// Construct a `SearchPane` with a pre-filled query and immediately execute it.
+    ///
+    /// The pane starts in non-editing mode so the user can browse results right away.
+    pub fn with_query(library: Rc<LibraryBackend>, query: String) -> (Self, PaneAction) {
+        let mut pane = Self {
+            query_text: query,
+            editing: false,
+            tracks: Vec::new(),
+            selection: SelectionState::new(0),
+            library,
+            last_executed_query: String::new(),
+        };
+        let action = pane.execute_search();
+        (pane, action)
+    }
+
     /// Execute the current `query_text` against the library backend.
     ///
     /// On success updates `tracks` and resets selection.

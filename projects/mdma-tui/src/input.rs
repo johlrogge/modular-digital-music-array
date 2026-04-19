@@ -189,6 +189,12 @@ fn handle_palette(app: &mut App, key: KeyEvent) {
                         },
                         Err(e) => app.set_status(format!("Invalid name: {e}")),
                     },
+                    PaletteEntry::History(arg) => match parse_history_days(&arg) {
+                        Ok(days) => open_history_pane(app, days),
+                        Err(_) => {
+                            app.set_status("history: number of days required (e.g., :history 7)")
+                        }
+                    },
                 }
             }
             app.close_palette();
@@ -348,6 +354,10 @@ fn execute_command(cmd: &Command, playback: &PlaybackBackend, app: &mut App) {
             let p = app.make_search_pane();
             app.switch_active_pane(p);
         }
+        "history" => {
+            // Default: 7 days (no argument)
+            open_history_pane(app, 7);
+        }
         "browser" => {
             let p = app.make_browser_pane();
             app.switch_active_pane(p);
@@ -408,6 +418,44 @@ fn apply_live_filter(app: &mut App) {
             .selection_state_mut()
             .push_filter(predicate);
         app.live_filter_active = true;
+    }
+}
+
+// =========================================================================
+// History helpers
+// =========================================================================
+
+/// Parse the optional argument to the `:history` palette command.
+///
+/// - `""` → `Ok(7)` (default: last 7 days)
+/// - `"N"` where N is a non-negative integer → `Ok(N)`
+/// - anything else → `Err(())`
+pub fn parse_history_days(arg: &str) -> Result<u32, ()> {
+    if arg.is_empty() {
+        return Ok(7);
+    }
+    arg.parse::<u32>().map_err(|_| ())
+}
+
+/// Build the search query string for a history search of `days` days.
+///
+/// - `0` → `started '~'`  (today only)
+/// - N → `started '-N'`
+fn history_query(days: u32) -> String {
+    if days == 0 {
+        "started '~'".to_string()
+    } else {
+        format!("started '-{}'", days)
+    }
+}
+
+/// Switch the active pane to a SearchPane pre-filled with a history query.
+fn open_history_pane(app: &mut App, days: u32) {
+    let query = history_query(days);
+    let (pane, action) = app.make_search_pane_with_query(query);
+    app.switch_active_pane(pane);
+    if let PaneAction::Error(msg) = action {
+        app.set_status(msg);
     }
 }
 
@@ -569,6 +617,44 @@ mod tests {
             ITEMS.len(),
             "all items restored after Esc"
         );
+    }
+
+    // ---- parse_history_days ----
+
+    #[test]
+    fn parse_history_days_empty_defaults_to_7() {
+        assert_eq!(super::parse_history_days(""), Ok(7));
+    }
+
+    #[test]
+    fn parse_history_days_numeric_string() {
+        assert_eq!(super::parse_history_days("7"), Ok(7));
+        assert_eq!(super::parse_history_days("30"), Ok(30));
+        assert_eq!(super::parse_history_days("0"), Ok(0));
+    }
+
+    #[test]
+    fn parse_history_days_non_integer_is_err() {
+        assert!(super::parse_history_days("abc").is_err());
+        assert!(super::parse_history_days("7days").is_err());
+        assert!(super::parse_history_days("-7").is_err());
+    }
+
+    // ---- history_query ----
+
+    #[test]
+    fn history_query_default_7_days() {
+        assert_eq!(super::history_query(7), "started '-7'");
+    }
+
+    #[test]
+    fn history_query_30_days() {
+        assert_eq!(super::history_query(30), "started '-30'");
+    }
+
+    #[test]
+    fn history_query_zero_is_today() {
+        assert_eq!(super::history_query(0), "started '~'");
     }
 }
 

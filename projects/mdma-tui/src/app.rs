@@ -17,6 +17,8 @@ pub enum PaletteEntry {
     Command(&'static Command),
     OpenPlaylist(PlaylistName),
     CreatePlaylist(String),
+    /// Open a history search. The string is the raw argument from `:history [arg]`.
+    History(String),
 }
 
 /// Which side of the split layout is active.
@@ -233,6 +235,10 @@ impl App {
                 entries.push(PaletteEntry::CreatePlaylist(arg.to_string()));
             }
             self.palette_matches = entries;
+        } else if let Some(arg) = query.strip_prefix("history ") {
+            // History mode: show a single entry so the user can confirm with Enter.
+            // Argument validation (and error display) happens on Enter.
+            self.palette_matches = vec![PaletteEntry::History(arg.trim().to_string())];
         } else {
             self.palette_matches = matching(&query)
                 .into_iter()
@@ -257,6 +263,18 @@ impl App {
     /// Construct a fresh SearchPane backed by this app's library.
     pub fn make_search_pane(&self) -> Box<dyn Pane> {
         Box::new(SearchPane::new(Rc::clone(&self.library)))
+    }
+
+    /// Construct a SearchPane with a pre-filled query and immediately run the search.
+    ///
+    /// Returns the pane and any `PaneAction` from the initial search (e.g. an error
+    /// message if the library backend could not be reached).
+    pub fn make_search_pane_with_query(
+        &self,
+        query: String,
+    ) -> (Box<dyn Pane>, crate::pane::PaneAction) {
+        let (pane, action) = SearchPane::with_query(Rc::clone(&self.library), query);
+        (Box::new(pane), action)
     }
 
     /// Construct a fresh BrowserPane backed by this app's library.
