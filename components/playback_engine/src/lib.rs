@@ -44,6 +44,21 @@ enum MixerCommand {
     SetVolume { volume: Volume },
 }
 
+/// Compute the PipeWire output rate for a track.
+///
+/// Passes the source's native sample rate through directly so no resampling
+/// is required. Falls back to `fallback_rate` only when `source_rate` is 0
+/// (defensive; Symphonia should never produce this, but we guard against it).
+/// If PipeWire rejects an unusual rate that is a real error surfaced upward —
+/// we do not silently mask it with a clamp.
+pub fn select_target_rate(source_rate: u32, fallback_rate: u32) -> u32 {
+    if source_rate == 0 {
+        fallback_rate
+    } else {
+        source_rate
+    }
+}
+
 impl PlaybackEngine {
     pub fn new(config_path: PathBuf) -> Result<Self, PlaybackError> {
         let audio_config = load_audio_config(&config_path)?;
@@ -212,11 +227,33 @@ impl PlaybackEngine {
         let source = AudioSource::new(path)?;
         let source_rate = source.sample_rate();
 
-        let target_rate = self.audio_config.sample_rate;
+        let max_rate = self.audio_config.sample_rate;
+        let target_rate = select_target_rate(source_rate, max_rate);
         let target_device = self.audio_config.device_name.clone();
 
-        // Create PipeWire output on first track load at the configured rate.
-        if self.audio_output.is_none() {
+        // (Re-)create the PipeWire output when needed:
+        //   • no output yet (first track load), OR
+        //   • the new track's native rate differs from the current output rate.
+        // When the rate changes, shut down the existing output, recover its
+        // ring-buffer consumer, then spin up a new output at the track's rate.
+        let need_new_output = match self.current_sample_rate {
+            None => true,
+            Some(current) => current != target_rate,
+        };
+
+        if need_new_output {
+            // Recover the consumer from the old output (if any) so we can
+            // hand it to the new one without touching the mix thread.
+            if let Some(old_output) = self.audio_output.take() {
+                if let Some(consumer) = old_output.shutdown() {
+                    self.mixer_consumer = Some(consumer);
+                } else {
+                    tracing::warn!(
+                        "load_track: failed to recover consumer from old PipeWire output"
+                    );
+                }
+            }
+
             if self.mixer_consumer.is_none() {
                 tracing::error!(
                     "load_track: no mixer consumer available and no audio output — audio will be silent"
@@ -493,5 +530,35 @@ mod tests {
     fn duration_ms_no_track() {
         let (engine, _tmp) = engine_with_tempdir();
         assert_eq!(engine.duration_ms(), None);
+    }
+
+    /// select_target_rate passes source rate through without clamping (no 192 kHz ceiling).
+    #[test]
+    fn select_target_rate_passes_through_high_rate() {
+        assert_eq!(select_target_rate(384_000, 192_000), 384_000);
+    }
+
+    /// select_target_rate passes through source rate when below default.
+    #[test]
+    fn select_target_rate_passes_through_44100() {
+        assert_eq!(select_target_rate(44_100, 192_000), 44_100);
+    }
+
+    /// select_target_rate passes through 96 kHz (common hi-res rate).
+    #[test]
+    fn select_target_rate_passes_through_96000() {
+        assert_eq!(select_target_rate(96_000, 192_000), 96_000);
+    }
+
+    /// select_target_rate falls back to default when source rate is zero.
+    #[test]
+    fn select_target_rate_zero_source_falls_back_to_max() {
+        assert_eq!(select_target_rate(0, 192_000), 192_000);
+    }
+
+    /// select_target_rate passes through exact default rate.
+    #[test]
+    fn select_target_rate_at_ceiling_is_unchanged() {
+        assert_eq!(select_target_rate(192_000, 192_000), 192_000);
     }
 }
