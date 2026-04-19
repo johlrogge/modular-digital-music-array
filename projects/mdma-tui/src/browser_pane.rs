@@ -24,12 +24,14 @@ const ROOT_FIELDS: [BrowseField; 4] = [
 ];
 
 /// An entry in a group list (artists, albums, genres).
+#[derive(Clone)]
 struct GroupEntry {
     name: String,
     count: usize,
 }
 
 /// The hierarchical drill-down level in the browser.
+#[derive(Clone)]
 enum BrowserLevel {
     /// Top level showing the four browse categories.
     Root { cursor: usize },
@@ -49,6 +51,7 @@ enum BrowserLevel {
 }
 
 /// Browser pane that allows hierarchical navigation: Root → Groups → Tracks.
+#[derive(Clone)]
 pub struct BrowserPane {
     level: BrowserLevel,
     library: Rc<LibraryBackend>,
@@ -699,6 +702,10 @@ impl Pane for BrowserPane {
                 Some(format!("{} {} {}", artist, title, album))
             }
         }
+    }
+
+    fn clone_box(&self) -> Box<dyn Pane> {
+        Box::new(self.clone())
     }
 }
 

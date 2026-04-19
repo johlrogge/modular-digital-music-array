@@ -16,6 +16,7 @@ use std::rc::Rc;
 
 /// Minimal proof-of-life pane that shows the current playback queue.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct QueuePane {
     tracks: Vec<TrackInfo>,
     selection: SelectionState,
@@ -182,5 +183,9 @@ impl Pane for QueuePane {
 
     fn add_playing_target(&self) -> AddPlayingTarget {
         AddPlayingTarget::Queue
+    }
+
+    fn clone_box(&self) -> Box<dyn Pane> {
+        Box::new(self.clone())
     }
 }

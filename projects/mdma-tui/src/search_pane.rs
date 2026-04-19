@@ -14,6 +14,7 @@ use ratatui::{
 use std::rc::Rc;
 
 /// Search pane — lets the user type a query and browse the results.
+#[derive(Clone)]
 pub struct SearchPane {
     query_text: String,
     editing: bool,
@@ -226,6 +227,10 @@ impl Pane for SearchPane {
         let title = track.title.as_deref().unwrap_or("");
         let album = track.album.as_deref().unwrap_or("");
         Some(format!("{} {} {}", artist, title, album))
+    }
+
+    fn clone_box(&self) -> Box<dyn Pane> {
+        Box::new(self.clone())
     }
 }
 

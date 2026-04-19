@@ -1,4 +1,4 @@
-use crate::app::{App, InputMode, PaletteEntry};
+use crate::app::{App, InputMode, PaletteEntry, Side};
 use crate::commands::Command;
 use crate::now_playing::PlaybackStatus;
 use crate::pane::{AddPlayingTarget, PaneAction, PaneKind};
@@ -21,6 +21,18 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 
 fn handle_normal(app: &mut App, key: KeyEvent) {
     match key.code {
+        // Tab slot keys: 1-5 = left side, 6-9,0 = right side.
+        KeyCode::Char(c @ '1'..='5') => {
+            let idx = (c as u8 - b'1') as usize;
+            app.activate_tab(Side::Left, idx);
+        }
+        KeyCode::Char(c @ '6'..='9') => {
+            let idx = (c as u8 - b'6') as usize;
+            app.activate_tab(Side::Right, idx);
+        }
+        KeyCode::Char('0') => {
+            app.activate_tab(Side::Right, 4);
+        }
         KeyCode::Tab => {
             app.toggle_active();
         }

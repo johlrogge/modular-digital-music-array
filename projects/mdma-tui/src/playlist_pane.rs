@@ -13,6 +13,7 @@ use ratatui::{
 use std::rc::Rc;
 
 /// A pane that displays the contents of a named playlist.
+#[derive(Clone)]
 pub struct PlaylistPane {
     name: PlaylistName,
     hashes: Vec<ContentHash>,
@@ -304,6 +305,10 @@ impl Pane for PlaylistPane {
             }
             Err(e) => PaneAction::Error(format!("Failed to refresh playlist: {e}")),
         }
+    }
+
+    fn clone_box(&self) -> Box<dyn Pane> {
+        Box::new(self.clone())
     }
 }
 

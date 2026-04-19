@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 /// Each `push_filter` narrows visibility; `pop_filter` restores the previous
 /// visibility level. Selected indices always refer to positions in the
 /// *currently visible* item list.
+#[derive(Clone)]
 pub struct SelectionState {
     pub list_state: ListState,
     /// Indices into the *visible* list that are selected.

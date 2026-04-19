@@ -108,6 +108,13 @@ pub trait Pane {
     fn add_playing_target(&self) -> AddPlayingTarget {
         AddPlayingTarget::None
     }
+
+    /// Clone this pane into a new `Box<dyn Pane>`.
+    ///
+    /// Required — each pane implements this by calling `Box::new(self.clone())`.
+    /// This method exists so that `Box<dyn Pane>` can be cloned even though
+    /// the trait is object-safe (sized-Clone is not object-safe).
+    fn clone_box(&self) -> Box<dyn Pane>;
 }
 
 #[cfg(test)]
@@ -119,6 +126,7 @@ mod tests {
     use ratatui::Frame;
 
     /// Stub pane that uses the trait defaults (search, browser, playlists-list behaviour).
+    #[derive(Clone)]
     struct DefaultPane;
     impl Pane for DefaultPane {
         fn render(&self, _f: &mut Frame, _area: Rect) {}
@@ -142,6 +150,9 @@ mod tests {
         }
         fn pane_kind(&self) -> PaneKind {
             PaneKind::Search
+        }
+        fn clone_box(&self) -> Box<dyn Pane> {
+            Box::new(self.clone())
         }
     }
 
