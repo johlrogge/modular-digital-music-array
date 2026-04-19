@@ -26,6 +26,15 @@ pub use track::Track;
 
 use audio_output::pipewire_devices::list_sinks;
 
+/// Track ring buffer size in f32 samples. Stereo: divide by 2 for frames;
+/// divide by sample_rate for seconds of pre-decoded audio.
+/// 524_288 = ~5.9 s at 44.1 kHz stereo, ~1.36 s at 192 kHz stereo.
+const TRACK_BUFFER_SAMPLES: usize = 524_288;
+
+/// Mixer ring buffer size in f32 samples.
+/// 1_048_576 = ~11.9 s at 44.1 kHz stereo, ~2.72 s at 192 kHz stereo.
+const MIXER_BUFFER_SAMPLES: usize = 1_048_576;
+
 pub struct PlaybackEngine {
     track: Option<Track>,
     audio_output: Option<PipewireOutput>,
@@ -66,9 +75,7 @@ impl PlaybackEngine {
         let (command_sender, command_receiver) = std::sync::mpsc::channel();
 
         // Create ringbuffer for mixer output.
-        // Sized for ~0.7 s at 192 kHz stereo.
-        const MIXER_BUFFER_SIZE: usize = 262_144;
-        let mixer_rb = HeapRb::<f32>::new(MIXER_BUFFER_SIZE);
+        let mixer_rb = HeapRb::<f32>::new(MIXER_BUFFER_SAMPLES);
         let (mixer_producer, mixer_consumer) = mixer_rb.split();
 
         let mix_thread_running = Arc::new(AtomicBool::new(true));
@@ -278,9 +285,7 @@ impl PlaybackEngine {
         }
 
         // Create ringbuffer for this track.
-        // Sized for ~0.34 s at 192 kHz stereo.
-        const BUFFER_SIZE: usize = 131_072;
-        let rb = HeapRb::<f32>::new(BUFFER_SIZE);
+        let rb = HeapRb::<f32>::new(TRACK_BUFFER_SAMPLES);
         let (producer, consumer) = rb.split();
 
         // Create new track — decoder task will resample source_rate → target_rate

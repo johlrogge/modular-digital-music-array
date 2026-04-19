@@ -7,7 +7,7 @@ use pipewire as pw;
 use pw::{properties::properties, spa};
 use ringbuf::HeapConsumer;
 use spa::pod::Pod;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub const DEFAULT_CHANNELS: u32 = 2;
 pub const CHAN_SIZE: usize = std::mem::size_of::<f32>();
@@ -60,11 +60,18 @@ impl PipewireOutput {
             struct UserData {
                 consumer: Rc<RefCell<Option<HeapConsumer<f32>>>>,
                 frame_count: usize, // For debugging
+                /// Counts consecutive callbacks that ended with a partial fill
+                /// (i.e. the ring buffer ran dry mid-callback). Reset to 0 on
+                /// a fully-supplied callback. We log only on the *first* underrun
+                /// after a clean run, then every 100th thereafter, to stay readable
+                /// during a sustained dropout without flooding the log.
+                underrun_streak: u32,
             }
 
             let user_data = UserData {
                 consumer: shared_consumer.clone(),
                 frame_count: 0,
+                underrun_streak: 0,
             };
 
             let stream = if let Some(ref name) = target_device {
@@ -146,6 +153,27 @@ impl PipewireOutput {
                                     let chan = &mut slice[start..end];
                                     chan.copy_from_slice(&f32_sample.to_le_bytes());
                                 }
+                            }
+
+                            let silence_samples =
+                                (n_frames * DEFAULT_CHANNELS as usize).saturating_sub(samples_read);
+                            if silence_samples > 0 {
+                                user_data.underrun_streak += 1;
+                                // Log on the first underrun after a clean run, then every 100th.
+                                // Avoids flooding at ~1000 callbacks/s during a sustained dropout.
+                                if user_data.underrun_streak == 1
+                                    || user_data.underrun_streak % 100 == 0
+                                {
+                                    warn!(
+                                        n_frames,
+                                        samples_provided = samples_read,
+                                        silence_samples,
+                                        underrun_streak = user_data.underrun_streak,
+                                        "pw underrun: ring buffer starved"
+                                    );
+                                }
+                            } else {
+                                user_data.underrun_streak = 0;
                             }
 
                             n_frames
