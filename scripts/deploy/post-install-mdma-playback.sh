@@ -21,3 +21,22 @@ wireplumber.settings = {
   device.routes.default-sink-volume = 1.0
 }
 WPCFG
+
+# Allow PipeWire graph to switch between common sample rates natively.
+# Without this, the graph is locked to 48000 and every 44.1 kHz source
+# (MP3, much of the Bandcamp library) is resampled, causing choppy playback.
+sudo mkdir -p /etc/pipewire/pipewire.conf.d
+sudo tee /etc/pipewire/pipewire.conf.d/10-mdma-rates.conf > /dev/null << 'PWCFG'
+# MDMA: allow PipeWire to switch to common audio sample rates natively.
+# Without this override, the graph is locked to 48000 and every 44.1 kHz
+# source (MP3, much of the bandcamp library) gets resampled. Include
+# 44.1 kHz and its 2x/4x relatives plus the standard 48/96 kHz.
+context.properties = {
+    default.clock.allowed-rates = [ 44100 48000 88200 96000 ]
+}
+PWCFG
+
+# Restart PipeWire and WirePlumber so the new configs take effect.
+# (The volume drop-in also requires a restart to apply on reinstall.)
+sudo sv restart pipewire 2>/dev/null || true
+sudo sv restart wireplumber 2>/dev/null || true
