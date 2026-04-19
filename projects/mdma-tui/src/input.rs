@@ -508,12 +508,12 @@ pub fn parse_history_days(arg: &str) -> Result<u32, ()> {
 /// Build the search query string for a history search of `days` days.
 ///
 /// - `0` → `:started '~'`  (today only)
-/// - N → `:started '-N'`
+/// - N → `:started '-N..~'`  (range: N days ago → today)
 fn history_query(days: u32) -> String {
     if days == 0 {
         ":started '~'".to_string()
     } else {
-        format!(":started '-{}'", days)
+        format!(":started '-{}..~'", days)
     }
 }
 
@@ -750,12 +750,12 @@ mod tests {
 
     #[test]
     fn history_query_default_7_days() {
-        assert_eq!(super::history_query(7), ":started '-7'");
+        assert_eq!(super::history_query(7), ":started '-7..~'");
     }
 
     #[test]
     fn history_query_30_days() {
-        assert_eq!(super::history_query(30), ":started '-30'");
+        assert_eq!(super::history_query(30), ":started '-30..~'");
     }
 
     #[test]
