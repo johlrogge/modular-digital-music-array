@@ -378,6 +378,9 @@ impl LibraryService {
         // Backfill cover art for tracks that don't have CoverArtPath yet
         service.backfill_cover_art(&loaded.has_cover_art);
 
+        // Ensure playlists directory exists so writes never fail on a fresh install
+        std::fs::create_dir_all(service.metadata_dir.join("playlists"))?;
+
         Ok(service)
     }
 
@@ -1094,6 +1097,13 @@ impl LibraryService {
                         name: name.to_string(),
                     })
                 } else {
+                    if let Some(parent) = path.parent() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            return LibraryResponse::Error(ProtocolError::Internal {
+                                message: format!("Failed to create playlist directory: {}", e),
+                            });
+                        }
+                    }
                     match std::fs::write(&path, &content) {
                         Ok(()) => LibraryResponse::PlaylistContent(content),
                         Err(e) => LibraryResponse::Error(ProtocolError::Internal {
@@ -1117,6 +1127,13 @@ impl LibraryService {
                             new_content.push('\n');
                         }
                         new_content.push_str(&content);
+                        if let Some(parent) = path.parent() {
+                            if let Err(e) = std::fs::create_dir_all(parent) {
+                                return LibraryResponse::Error(ProtocolError::Internal {
+                                    message: format!("Failed to create playlist directory: {}", e),
+                                });
+                            }
+                        }
                         match std::fs::write(&path, &new_content) {
                             Ok(()) => LibraryResponse::PlaylistContent(new_content),
                             Err(e) => LibraryResponse::Error(ProtocolError::Internal {
@@ -1132,6 +1149,13 @@ impl LibraryService {
 
             LibraryRequest::PlaylistReplace { name, content } => {
                 let path = self.resolve_playlist_path(&name);
+                if let Some(parent) = path.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        return LibraryResponse::Error(ProtocolError::Internal {
+                            message: format!("Failed to create playlist directory: {}", e),
+                        });
+                    }
+                }
                 match std::fs::write(&path, &content) {
                     Ok(()) => LibraryResponse::PlaylistContent(content),
                     Err(e) => LibraryResponse::Error(ProtocolError::Internal {
@@ -2593,6 +2617,45 @@ mod tests {
         });
         match response {
             LibraryResponse::PlaylistContent(c) => assert_eq!(c, new_content),
+            other => panic!("Expected PlaylistContent, got {:?}", other),
+        }
+    }
+
+    /// Regression test: PlaylistReplace must succeed on a bare tempdir with no
+    /// pre-existing `playlists/` subdirectory. This would have caught the original
+    /// bug where the directory was never created automatically.
+    #[test]
+    fn playlist_replace_succeeds_without_preexisting_playlists_dir() {
+        use library_ipc_protocol::PlaylistName;
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+        // Deliberately do NOT create metadata_dir/playlists — that is the regression scenario.
+        let (acid_handle, facts_addr, events_addr) = spawn_acid_server();
+        let service = LibraryService::new_with_events(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+            &facts_addr,
+            &events_addr,
+        )
+        .expect("service construction must succeed even without playlists dir");
+        let _acid_handle = acid_handle; // keep alive
+
+        let name = PlaylistName::new("bare-dir-test").unwrap();
+        let content = "sha256:aaa\nsha256:bbb\n".to_string();
+        let response = service.handle_request(LibraryRequest::PlaylistReplace {
+            name,
+            content: content.clone(),
+        });
+        match response {
+            LibraryResponse::PlaylistContent(c) => {
+                assert_eq!(c, content);
+                // Also verify the file actually landed on disk
+                let file_path = metadata_dir
+                    .path()
+                    .join("playlists")
+                    .join("bare-dir-test.plist");
+                assert!(file_path.exists(), "playlist file must exist on disk");
+            }
             other => panic!("Expected PlaylistContent, got {:?}", other),
         }
     }
