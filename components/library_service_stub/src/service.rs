@@ -293,10 +293,6 @@ impl LibraryService {
                 LibraryResponse::AlbumTitleByItemId(None)
             }
 
-            LibraryRequest::GetAlbumTitlesByItemIds { .. } => {
-                LibraryResponse::AlbumTitlesByItemIds(HashMap::new())
-            }
-
             LibraryRequest::GetTrackCountForItemId { .. } => {
                 // Stub: always returns 0 (no real facts file scanning)
                 LibraryResponse::TrackCountForItemId(0)

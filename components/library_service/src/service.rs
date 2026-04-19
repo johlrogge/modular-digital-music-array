@@ -1239,10 +1239,6 @@ impl LibraryService {
                 LibraryResponse::AlbumTitleByItemId(self.get_album_title_by_item_id(&item_id))
             }
 
-            LibraryRequest::GetAlbumTitlesByItemIds { item_ids } => {
-                LibraryResponse::AlbumTitlesByItemIds(self.get_album_titles_by_item_ids(&item_ids))
-            }
-
             LibraryRequest::GetTrackCountForItemId { item_id } => {
                 let count = self.content_hashes_for_item_id(&item_id).len();
                 LibraryResponse::TrackCountForItemId(count)
@@ -1425,80 +1421,6 @@ impl LibraryService {
             }
         }
         None
-    }
-
-    /// Batch lookup: for each ItemId in `item_ids`, find the album title of any
-    /// track tagged with that ItemId.
-    ///
-    /// Performs a single pass over the fact stream, building a
-    /// `content_hash -> item_id` map for only the requested IDs, then resolves
-    /// album titles from the in-memory index. This is O(facts + tracks) rather
-    /// than O(N × facts) for N item IDs.
-    ///
-    /// Absent key in the result means no album title was found for that ItemId
-    /// (either unknown ID or its tracks have no Album fact yet).
-    fn get_album_titles_by_item_ids(
-        &self,
-        item_ids: &[String],
-    ) -> std::collections::HashMap<String, String> {
-        use music_facts::FactSource;
-        use stainless_facts::FactStreamReader;
-
-        if item_ids.is_empty() {
-            return std::collections::HashMap::new();
-        }
-
-        let requested: std::collections::HashSet<&str> =
-            item_ids.iter().map(String::as_str).collect();
-
-        let facts_path = self.metadata_dir.join("facts.jsonl");
-        let reader: FactStreamReader<ContentHash, MusicValue, FactSource> =
-            match FactStreamReader::open(&facts_path) {
-                Ok(r) => r,
-                Err(_) => return std::collections::HashMap::new(),
-            };
-
-        // Single pass: build hash -> item_id for requested ids only
-        let mut hash_to_item_id: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-
-        for fact_result in reader {
-            let fact = match fact_result {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            if fact.operation() != stainless_facts::Operation::Assert {
-                continue;
-            }
-            if let MusicValue::ItemId(id) = fact.value() {
-                if requested.contains(id.as_str()) {
-                    hash_to_item_id
-                        .entry(fact.entity().as_str().to_owned())
-                        .or_insert_with(|| id.clone());
-                }
-            }
-        }
-
-        if hash_to_item_id.is_empty() {
-            return std::collections::HashMap::new();
-        }
-
-        // Resolve album titles from in-memory index
-        let mut result: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        let tracks = self.tracks.lock().unwrap();
-        for (hash_str, item_id) in &hash_to_item_id {
-            if result.contains_key(item_id) {
-                continue; // already found an album for this item_id
-            }
-            if let Some(track) = tracks.iter().find(|t| t.content_hash.as_str() == hash_str) {
-                if let Some(album) = &track.album {
-                    result.insert(item_id.clone(), album.clone());
-                }
-            }
-        }
-
-        result
     }
 
     /// Resolve a PlaylistName to an absolute filesystem path
@@ -3468,103 +3390,6 @@ mod tests {
                 "expected AlbumTitleByItemId(Some({:?})), got {:?}",
                 album_name, other
             ),
-        }
-    }
-
-    // =========================================================================
-    // GetAlbumTitlesByItemIds (batch) tests
-    // =========================================================================
-
-    #[test]
-    fn get_album_titles_by_item_ids_returns_map_for_two_ids() {
-        let hash_a = ContentHash::new("sha256:batchalbum01");
-        let hash_b = ContentHash::new("sha256:batchalbum02");
-        let source = FactSource::new("mdma-library", "0.0.0", FactOrigin::Unknown);
-
-        let temp = {
-            let t = NamedTempFile::new().unwrap();
-            let mut writer = FactWriter::open(t.path()).unwrap();
-            writer
-                .write_track_facts(
-                    &hash_a,
-                    &[
-                        (MusicValue::ItemId("p_batch_01".to_string()), source.clone()),
-                        (
-                            MusicValue::Album(music_facts::Album::new("Batch Album One")),
-                            source.clone(),
-                        ),
-                    ],
-                )
-                .unwrap();
-            writer
-                .write_track_facts(
-                    &hash_b,
-                    &[
-                        (MusicValue::ItemId("p_batch_02".to_string()), source.clone()),
-                        (
-                            MusicValue::Album(music_facts::Album::new("Batch Album Two")),
-                            source.clone(),
-                        ),
-                    ],
-                )
-                .unwrap();
-            t
-        };
-
-        let (service, _metadata_dir) = make_service_with_facts(temp.path());
-
-        let response = service.handle_request(LibraryRequest::GetAlbumTitlesByItemIds {
-            item_ids: vec!["p_batch_01".to_string(), "p_batch_02".to_string()],
-        });
-
-        match response {
-            LibraryResponse::AlbumTitlesByItemIds(map) => {
-                assert_eq!(
-                    map.get("p_batch_01").map(String::as_str),
-                    Some("Batch Album One")
-                );
-                assert_eq!(
-                    map.get("p_batch_02").map(String::as_str),
-                    Some("Batch Album Two")
-                );
-                assert_eq!(map.len(), 2);
-            }
-            other => panic!("expected AlbumTitlesByItemIds, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn get_album_titles_by_item_ids_omits_ids_with_no_album() {
-        let hash_a = ContentHash::new("sha256:batchnoalbum01");
-        let source = FactSource::new("mdma-library", "0.0.0", FactOrigin::Unknown);
-
-        let temp = {
-            let t = NamedTempFile::new().unwrap();
-            let mut writer = FactWriter::open(t.path()).unwrap();
-            // p_noalbum_01 has only ItemId, no Album fact
-            writer
-                .write_track_facts(
-                    &hash_a,
-                    &[(
-                        MusicValue::ItemId("p_noalbum_01".to_string()),
-                        source.clone(),
-                    )],
-                )
-                .unwrap();
-            t
-        };
-
-        let (service, _metadata_dir) = make_service_with_facts(temp.path());
-
-        let response = service.handle_request(LibraryRequest::GetAlbumTitlesByItemIds {
-            item_ids: vec!["p_noalbum_01".to_string(), "p_noalbum_unknown".to_string()],
-        });
-
-        match response {
-            LibraryResponse::AlbumTitlesByItemIds(map) => {
-                assert!(map.is_empty(), "expected empty map, got: {:?}", map);
-            }
-            other => panic!("expected AlbumTitlesByItemIds, got {:?}", other),
         }
     }
 
