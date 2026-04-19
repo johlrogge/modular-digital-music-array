@@ -36,3 +36,6 @@ storage_primitives = "components/storage_primitives"
 stream-source-protocol = "components/stream_source_protocol"
 rekordbox-xml = "components/rekordbox_xml"
 track-matcher = "components/track_matcher"
+
+[profile.release]
+strip = true
