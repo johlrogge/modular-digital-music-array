@@ -1,4 +1,4 @@
-use crate::pane::{Pane, PaneAction, PaneKind};
+use crate::pane::{AddPlayingTarget, Pane, PaneAction, PaneKind};
 use crate::selection::SelectionState;
 use crate::theme::TEXT_TERTIARY;
 use crate::track_list::render_track_list;
@@ -178,5 +178,9 @@ impl Pane for QueuePane {
         let title = track.title.as_deref().unwrap_or("");
         let album = track.album.as_deref().unwrap_or("");
         Some(format!("{} {} {}", artist, title, album))
+    }
+
+    fn add_playing_target(&self) -> AddPlayingTarget {
+        AddPlayingTarget::Queue
     }
 }

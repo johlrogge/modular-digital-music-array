@@ -1,7 +1,7 @@
 use crate::app::{App, InputMode, PaletteEntry};
 use crate::commands::Command;
 use crate::now_playing::PlaybackStatus;
-use crate::pane::{PaneAction, PaneKind};
+use crate::pane::{AddPlayingTarget, PaneAction, PaneKind};
 use crate::playlist_pane::PlaylistPane;
 use crossterm::event::{KeyCode, KeyEvent};
 use mdma_client::{ContentHash, Deck, PlaybackBackend, PlaylistName, SourceName};
@@ -71,6 +71,44 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
                     let _ = app.playback.queue_next(hash.clone(), SourceName::audio());
                 }
                 app.set_status(format!("Queued next {} track(s)", count));
+            }
+        }
+        KeyCode::Char('A') => {
+            // Add the currently-playing track to the focused pane (queue or playlist).
+            let hash: Option<ContentHash> = match &app.now_playing.status {
+                PlaybackStatus::Playing { track, .. } | PlaybackStatus::Paused { track, .. } => {
+                    Some(track.clone())
+                }
+                PlaybackStatus::Stopped => None,
+            };
+            match hash {
+                None => app.set_status("Nothing playing"),
+                Some(h) => {
+                    let target = app.active_pane().add_playing_target();
+                    match target {
+                        AddPlayingTarget::Queue => {
+                            match app.playback.queue_append(h, SourceName::audio()) {
+                                Ok(_) => {
+                                    app.active_pane_mut().refresh();
+                                    app.set_status("Added playing track to queue");
+                                }
+                                Err(e) => app.set_status(format!("Queue append failed: {e}")),
+                            }
+                        }
+                        AddPlayingTarget::Playlist(name) => {
+                            match app.library.playlist_append(&name, &[h]) {
+                                Ok(()) => {
+                                    app.active_pane_mut().refresh();
+                                    app.set_status(format!("Added playing track to {}", name));
+                                }
+                                Err(e) => app.set_status(format!("Playlist append failed: {e}")),
+                            }
+                        }
+                        AddPlayingTarget::None => {
+                            app.set_status("No playlist/queue focused");
+                        }
+                    }
+                }
             }
         }
         KeyCode::Char('p') => {

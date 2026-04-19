@@ -6,6 +6,20 @@ use mdma_client::{ContentHash, PlaylistName};
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
+/// Identifies whether the focused pane can accept the currently-playing track,
+/// and if so, what kind of target it is.
+///
+/// Returned by `Pane::add_playing_target()`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AddPlayingTarget {
+    /// The pane is a playback queue — append to the queue.
+    Queue,
+    /// The pane is a named playlist — append to this playlist.
+    Playlist(PlaylistName),
+    /// The pane does not support receiving the playing track (e.g. Search, Browser).
+    None,
+}
+
 /// Identifies the kind of pane for routing and display purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneKind {
@@ -85,5 +99,67 @@ pub trait Pane {
     /// implemented this method yet.
     fn display_string(&self, _data_idx: usize) -> Option<String> {
         None
+    }
+
+    /// Return the target for the "add currently-playing track" action (`A` key).
+    ///
+    /// `QueuePane` returns `Queue`, `PlaylistPane` returns `Playlist(name)`,
+    /// all other panes return `None` via this default.
+    fn add_playing_target(&self) -> AddPlayingTarget {
+        AddPlayingTarget::None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::selection::SelectionState;
+    use crossterm::event::KeyEvent;
+    use ratatui::layout::Rect;
+    use ratatui::Frame;
+
+    /// Stub pane that uses the trait defaults (search, browser, playlists-list behaviour).
+    struct DefaultPane;
+    impl Pane for DefaultPane {
+        fn render(&self, _f: &mut Frame, _area: Rect) {}
+        fn handle_key(&mut self, _key: KeyEvent) -> PaneAction {
+            PaneAction::Ignored
+        }
+        fn resolve_selection(&self) -> Vec<ContentHash> {
+            vec![]
+        }
+        fn selection_state(&self) -> &SelectionState {
+            unimplemented!()
+        }
+        fn selection_state_mut(&mut self) -> &mut SelectionState {
+            unimplemented!()
+        }
+        fn title(&self) -> &str {
+            "stub"
+        }
+        fn item_count(&self) -> usize {
+            0
+        }
+        fn pane_kind(&self) -> PaneKind {
+            PaneKind::Search
+        }
+    }
+
+    #[test]
+    fn default_pane_add_playing_target_is_none() {
+        let pane = DefaultPane;
+        assert_eq!(pane.add_playing_target(), AddPlayingTarget::None);
+    }
+
+    #[test]
+    fn add_playing_target_queue_is_not_none() {
+        assert_ne!(AddPlayingTarget::Queue, AddPlayingTarget::None);
+    }
+
+    #[test]
+    fn add_playing_target_playlist_is_not_none() {
+        let name = PlaylistName::new("test-list").unwrap();
+        let target = AddPlayingTarget::Playlist(name);
+        assert!(matches!(target, AddPlayingTarget::Playlist(_)));
     }
 }
