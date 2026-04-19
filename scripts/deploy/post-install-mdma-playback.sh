@@ -36,7 +36,15 @@ context.properties = {
 }
 PWCFG
 
-# Restart PipeWire and WirePlumber so the new configs take effect.
-# (The volume drop-in also requires a restart to apply on reinstall.)
-sudo sv restart pipewire 2>/dev/null || true
-sudo sv restart wireplumber 2>/dev/null || true
+# Restart PipeWire so the new configs take effect.
+# WirePlumber is launched as a child of PipeWire (via context.exec drop-in),
+# not as a separate runit service — do NOT call 'sv restart wireplumber'.
+# Use kill -TERM on the PipeWire process directly; runit will restart it.
+# 'sv restart pipewire' can fail if runit's tracking state is stale.
+PIPEWIRE_PID=$(pgrep -x pipewire | head -1)
+if [ -n "$PIPEWIRE_PID" ]; then
+    sudo kill -TERM "$PIPEWIRE_PID" 2>/dev/null || true
+    sleep 3
+else
+    sudo sv restart pipewire 2>/dev/null || true
+fi
