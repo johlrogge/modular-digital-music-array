@@ -289,7 +289,7 @@ impl PlaybackEngine {
         let (producer, consumer) = rb.split();
 
         // Create new track — decoder task will resample source_rate → target_rate
-        let track = Track::new(source, producer, source_rate, target_rate).await?;
+        let track = Track::new(source, producer, source_rate, target_rate)?;
         tracing::info!("Track is ready for playback");
 
         // Store the track and register its consumer with the mix thread

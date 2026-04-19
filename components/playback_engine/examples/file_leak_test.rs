@@ -4,17 +4,7 @@ use ringbuf::HeapRb;
 use std::path::PathBuf;
 use std::time::Duration;
 
-async fn force_cleanup() {
-    // Yield to allow task cancellation to be processed
-    tokio::task::yield_now().await;
-    // Wait a short time to allow shutdown logic to complete
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    // Yield again to ensure runtime processes all pending tasks
-    tokio::task::yield_now().await;
-}
-
-#[tokio::main]
-async fn main() {
+fn main() {
     // Initialize tracing
     tracing_subscriber::fmt::init();
 
@@ -32,18 +22,17 @@ async fn main() {
         let (prod, _cons) = buffer.split();
         let source = AudioSource::new(&path).expect("Failed to create source");
         let source_rate = source.sample_rate();
-        let mut track = Track::new(source, prod, source_rate, source_rate)
-            .await
-            .expect("Failed to create track");
+        let mut track =
+            Track::new(source, prod, source_rate, source_rate).expect("Failed to create track");
 
-        // Play the track to ensure background task is active
+        // Play the track to ensure background thread is active
         track.play();
 
         println!("Dropping track {}...", i);
         drop(track);
 
-        // Wait and force cleanup
-        force_cleanup().await;
+        // Wait for decoder thread to join (handled by Drop)
+        std::thread::sleep(Duration::from_millis(50));
 
         println!("Track {} should be fully cleaned up", i);
     }
