@@ -6,15 +6,24 @@ use library_search::{
 /// Parse a simple query language into a `TrackQuery`.
 ///
 /// Grammar:
-/// - `field 'quoted value'`  — single-quoted value (may contain spaces)
-/// - `field "quoted value"`  — double-quoted value (may contain spaces)
-/// - `field value`           — unquoted single word
-/// - `bareword`              — no recognised field prefix → added to `any_text`
+/// - `:field 'quoted value'`  — single-quoted value (may contain spaces)
+/// - `:field "quoted value"`  — double-quoted value (may contain spaces)
+/// - `:field value`           — unquoted single word
+/// - `bareword`               — any token NOT starting with `:` → added to `any_text`
 ///
-/// Recognised field names: artist, title, album, label, genre, style, bpm,
-/// key, duration, year, source, added, started, stopped.
+/// Field names must be prefixed with `:`. A bare word like `artist` is treated
+/// as plain text, not a field selector. This avoids false matches in titles
+/// containing words like "artist", "bpm", or "added".
 ///
-/// Unknown field names fall back to bareword handling (value added to any_text).
+/// Recognised field names (always with `:` prefix):
+///   `:artist`, `:title`, `:album`, `:label`, `:genre`, `:style`, `:bpm`,
+///   `:key`, `:duration`, `:year`, `:source`, `:added`, `:started`, `:stopped`.
+///
+/// Unknown `:field` names (e.g. `:fizz`) fall back to bareword handling: both
+/// the `:fizz` token and the following value token are added to `any_text`.
+///
+/// A lone `:` (no field name after the colon) is treated as a bareword.
+///
 /// Unparseable field values also fall back to bareword handling.
 /// Never panics, never returns Err — always produces *some* query.
 pub fn parse_query(input: &str) -> TrackQuery {
@@ -24,57 +33,62 @@ pub fn parse_query(input: &str) -> TrackQuery {
     let mut remaining = input.trim();
 
     while !remaining.is_empty() {
-        // Extract the next field name token (up to whitespace).
-        let (field_token, after_field) = split_next_token(remaining);
-        if field_token.is_empty() {
+        // Extract the next token (up to whitespace).
+        let (token, after_token) = split_next_token(remaining);
+        if token.is_empty() {
             break;
         }
 
-        let after_field_trimmed = after_field.trim_start();
+        let after_token_trimmed = after_token.trim_start();
 
-        // Check whether the next character starts a value (quoted or unquoted).
-        // If there is no more input after the field token, treat field as bareword.
-        if after_field_trimmed.is_empty() {
-            // No value follows — treat field_token as a bareword.
-            any_text_parts.push(field_token.to_string());
-            remaining = after_field_trimmed;
-            continue;
-        }
+        // Only tokens starting with `:` can be field selectors.
+        // A lone `:` (nothing after the colon) is a bareword.
+        let maybe_field = if token.starts_with(':') && token.len() > 1 {
+            Some(&token[1..])
+        } else {
+            None
+        };
 
-        // Peek at whether this looks like a known field followed by a value.
-        let is_known = is_known_field(field_token);
-
-        if !is_known {
-            // Unknown field: treat the whole "field value" pair as barewords.
-            // We read the value too so we don't lose it.
-            let (value_token, after_value) = split_next_value(after_field_trimmed);
-            any_text_parts.push(field_token.to_string());
-            if !value_token.is_empty() {
-                any_text_parts.push(value_token.to_string());
+        match maybe_field {
+            None => {
+                // Plain bareword — goes directly into any_text.
+                any_text_parts.push(token.to_string());
+                remaining = after_token_trimmed;
             }
-            remaining = after_value.trim_start();
-            continue;
+            Some(field_name) => {
+                if !is_known_field(field_name) {
+                    // Unknown field prefix — treat `:foo` and its value as barewords.
+                    let (value_token, after_value) = split_next_value(after_token_trimmed);
+                    any_text_parts.push(token.to_string());
+                    if !value_token.is_empty() {
+                        any_text_parts.push(value_token);
+                    }
+                    remaining = after_value.trim_start();
+                } else if after_token_trimmed.is_empty() {
+                    // Known field but no value follows — treat `:field` as a bareword.
+                    any_text_parts.push(token.to_string());
+                    remaining = after_token_trimmed;
+                } else {
+                    // Known field — extract the value.
+                    let (value, after_value) = split_next_value(after_token_trimmed);
+
+                    if value.is_empty() {
+                        // Value was empty — treat the field token as a bareword.
+                        any_text_parts.push(token.to_string());
+                        remaining = after_token_trimmed;
+                    } else {
+                        // Apply the value to the appropriate query field.
+                        let applied = apply_field(&mut query, field_name, &value);
+                        if !applied {
+                            // Parsing failed for a known field — fall back both tokens to any_text.
+                            any_text_parts.push(token.to_string());
+                            any_text_parts.push(value);
+                        }
+                        remaining = after_value.trim_start();
+                    }
+                }
+            }
         }
-
-        // Known field — extract the value.
-        let (value, after_value) = split_next_value(after_field_trimmed);
-
-        if value.is_empty() {
-            // Value was empty (e.g. field at end of string) — treat field as bareword.
-            any_text_parts.push(field_token.to_string());
-            remaining = after_field_trimmed;
-            continue;
-        }
-
-        // Apply the value to the appropriate query field.
-        let applied = apply_field(&mut query, field_token, &value);
-        if !applied {
-            // Parsing failed for a known field — fall back both tokens to any_text.
-            any_text_parts.push(field_token.to_string());
-            any_text_parts.push(value.clone());
-        }
-
-        remaining = after_value.trim_start();
     }
 
     if !any_text_parts.is_empty() {
@@ -85,7 +99,7 @@ pub fn parse_query(input: &str) -> TrackQuery {
     query
 }
 
-/// Returns true if `name` is a recognised field keyword.
+/// Returns true if `name` is a recognised field keyword (without the `:` prefix).
 fn is_known_field(name: &str) -> bool {
     matches!(
         name,
@@ -107,6 +121,7 @@ fn is_known_field(name: &str) -> bool {
 }
 
 /// Apply a (field, value) pair to the query.
+/// `field` is the name without the `:` prefix.
 /// Returns false if the value could not be parsed for the field.
 fn apply_field(query: &mut TrackQuery, field: &str, value: &str) -> bool {
     match field {
@@ -268,9 +283,42 @@ mod tests {
         assert!(q.artist.is_none());
     }
 
+    // --- New: bare field names are no longer treated as fields ---
+
+    #[test]
+    fn bare_artist_word_goes_to_any_text() {
+        // Without `:` prefix, "artist" is just a bareword.
+        let q = parse_query("artist bonobo");
+        assert!(
+            q.artist.is_none(),
+            "bare 'artist' must not set the artist field"
+        );
+        let text = contains_str(&q.any_text).expect("any_text should contain both tokens");
+        assert!(text.contains("artist") && text.contains("bonobo"));
+    }
+
+    #[test]
+    fn bare_bpm_word_goes_to_any_text() {
+        let q = parse_query("bpm 120");
+        assert!(q.bpm.is_none(), "bare 'bpm' must not set the bpm field");
+        let text = contains_str(&q.any_text).expect("any_text should be set");
+        assert!(text.contains("bpm"));
+    }
+
+    #[test]
+    fn bare_added_word_goes_to_any_text() {
+        let q = parse_query("added -7");
+        assert!(
+            q.added.is_none(),
+            "bare 'added' must not set the added field"
+        );
+    }
+
+    // --- Colon-prefixed fields work correctly ---
+
     #[test]
     fn artist_single_quoted() {
-        let q = parse_query("artist 'bonobo'");
+        let q = parse_query(":artist 'bonobo'");
         assert!(matches!(
             &q.artist,
             Some(StringQuery::Contains(s)) if s == "bonobo"
@@ -280,7 +328,7 @@ mod tests {
 
     #[test]
     fn artist_double_quoted() {
-        let q = parse_query(r#"artist "bonobo""#);
+        let q = parse_query(r#":artist "bonobo""#);
         assert!(matches!(
             &q.artist,
             Some(StringQuery::Contains(s)) if s == "bonobo"
@@ -289,16 +337,17 @@ mod tests {
 
     #[test]
     fn artist_unquoted_single_word() {
-        let q = parse_query("artist bonobo");
+        let q = parse_query(":artist bonobo");
         assert!(matches!(
             &q.artist,
             Some(StringQuery::Contains(s)) if s == "bonobo"
         ));
+        assert!(q.any_text.is_none());
     }
 
     #[test]
     fn artist_with_spaces_in_quotes() {
-        let q = parse_query("artist 'carbon based lifeforms'");
+        let q = parse_query(":artist 'carbon based lifeforms'");
         assert!(matches!(
             &q.artist,
             Some(StringQuery::Contains(s)) if s == "carbon based lifeforms"
@@ -308,7 +357,7 @@ mod tests {
     #[test]
     fn added_date_expression() {
         // "-7" is a date expression meaning "7 days ago"
-        let q = parse_query("added '-7'");
+        let q = parse_query(":added '-7'");
         assert!(q.added.is_some(), "added should be set");
         assert!(q.any_text.is_none());
         // Verify it parsed as a date range (date_expression resolves -7 to a specific day)
@@ -316,8 +365,16 @@ mod tests {
     }
 
     #[test]
+    fn added_unquoted_negative_offset() {
+        let q = parse_query(":added -7");
+        assert!(q.added.is_some(), "added should be set");
+        assert!(q.any_text.is_none());
+        assert!(matches!(q.added.unwrap(), DateQuery::Range(..)));
+    }
+
+    #[test]
     fn bpm_exact() {
-        let q = parse_query("bpm '120'");
+        let q = parse_query(":bpm '120'");
         assert!(matches!(
             q.bpm,
             Some(NumericQuery::Exact(v)) if (v - 120.0).abs() < 0.01
@@ -327,7 +384,7 @@ mod tests {
 
     #[test]
     fn bpm_range() {
-        let q = parse_query("bpm '120..130'");
+        let q = parse_query(":bpm '120..130'");
         assert!(matches!(
             q.bpm,
             Some(NumericQuery::Range(lo, hi)) if lo == 120.0 && hi == 130.0
@@ -336,7 +393,7 @@ mod tests {
 
     #[test]
     fn genre_field() {
-        let q = parse_query("genre 'ambient'");
+        let q = parse_query(":genre 'ambient'");
         assert!(matches!(
             &q.genre,
             Some(StringQuery::Contains(s)) if s == "ambient"
@@ -346,7 +403,7 @@ mod tests {
 
     #[test]
     fn artist_and_bpm_combined() {
-        let q = parse_query("artist 'bonobo' bpm '120'");
+        let q = parse_query(":artist 'bonobo' :bpm '120'");
         assert!(q.artist.is_some());
         assert!(q.bpm.is_some());
         assert!(q.any_text.is_none());
@@ -354,33 +411,45 @@ mod tests {
 
     #[test]
     fn artist_and_bareword() {
-        let q = parse_query("artist 'bonobo' dest");
+        let q = parse_query(":artist 'bonobo' dest");
         assert!(q.artist.is_some());
         assert_eq!(contains_str(&q.any_text), Some("dest"));
     }
 
     #[test]
     fn unknown_field_falls_back_to_any_text() {
-        // "typo" is not a known field — both tokens go to any_text
-        let q = parse_query("unknown 'foo'");
-        // The implementation joins "unknown" and "foo" into any_text
+        // ":unknown" is not a known field — both tokens go to any_text
+        let q = parse_query(":unknown 'foo'");
         let text = contains_str(&q.any_text).expect("any_text should be set");
-        // Both the field name and value should be captured somehow
-        assert!(text.contains("unknown") || text.contains("foo"));
+        assert!(text.contains(":unknown") || text.contains("unknown"));
+        assert!(text.contains("foo"));
+    }
+
+    #[test]
+    fn unknown_field_fizz_falls_back() {
+        // ":fizz bar" — both tokens should land in any_text, nothing silently set
+        let q = parse_query(":fizz 'bar'");
+        assert!(q.artist.is_none());
+        assert!(q.title.is_none());
+        assert!(q.bpm.is_none());
+        let text = contains_str(&q.any_text).expect("any_text should be set");
+        assert!(
+            text.contains("bar"),
+            "value should appear in any_text, got: {text}"
+        );
     }
 
     #[test]
     fn unterminated_quote_no_panic() {
         // Should not panic; falls back gracefully
-        let q = parse_query("artist 'unterminated");
-        // The value is whatever remains after the quote — could be artist or any_text
+        let q = parse_query(":artist 'unterminated");
         // Either way the function must not panic and must return something.
         let _ = q; // just verify no panic
     }
 
     #[test]
     fn unterminated_quote_artist_set_with_remainder() {
-        let q = parse_query("artist 'unterminated");
+        let q = parse_query(":artist 'unterminated");
         // The unterminated string is treated as the value "unterminated"
         assert!(matches!(
             &q.artist,
@@ -391,22 +460,21 @@ mod tests {
     #[test]
     fn multiple_barewords_joined() {
         let q = parse_query("hello world");
-        // "world" is unquoted after "hello" — "hello" is unknown field, "world" is its value
-        // Both fall into any_text
+        // Both "hello" and "world" are bare tokens (no `:` prefix) → any_text
         let text = contains_str(&q.any_text).expect("any_text should be set");
-        assert!(text.contains("hello") || text.contains("world"));
+        assert!(text.contains("hello") && text.contains("world"));
     }
 
     #[test]
     fn source_field() {
-        let q = parse_query("source bandcamp");
+        let q = parse_query(":source bandcamp");
         assert_eq!(q.source.as_deref(), Some("bandcamp"));
         assert!(q.any_text.is_none());
     }
 
     #[test]
     fn title_field() {
-        let q = parse_query("title 'Kong'");
+        let q = parse_query(":title 'Kong'");
         assert!(matches!(
             &q.title,
             Some(StringQuery::Contains(s)) if s == "Kong"
@@ -415,7 +483,7 @@ mod tests {
 
     #[test]
     fn year_field() {
-        let q = parse_query("year '2024'");
+        let q = parse_query(":year '2024'");
         assert!(matches!(
             q.year,
             Some(NumericQuery::Exact(v)) if (v - 2024.0).abs() < 0.01
@@ -424,8 +492,8 @@ mod tests {
 
     #[test]
     fn invalid_bpm_value_falls_back_to_any_text() {
-        // "bpm" is a known field but "notanumber" can't be parsed as numeric.
-        let q = parse_query("bpm 'notanumber'");
+        // ":bpm" is a known field but "notanumber" can't be parsed as numeric.
+        let q = parse_query(":bpm 'notanumber'");
         assert!(q.bpm.is_none());
         // Both tokens should be in any_text
         let text = contains_str(&q.any_text).expect("any_text should be set for fallback");
@@ -434,17 +502,81 @@ mod tests {
 
     #[test]
     fn added_na() {
-        let q = parse_query("added 'N/A'");
+        let q = parse_query(":added 'N/A'");
         assert!(matches!(q.added, Some(DateQuery::NA)));
     }
 
     #[test]
     fn all_known_fields_no_any_text() {
         // Each known field with a valid value should not pollute any_text
-        let q = parse_query("artist 'bonobo' genre 'jazz' bpm '120'");
+        let q = parse_query(":artist 'bonobo' :genre 'jazz' :bpm '120'");
         assert!(q.artist.is_some());
         assert!(q.genre.is_some());
         assert!(q.bpm.is_some());
         assert!(q.any_text.is_none());
+    }
+
+    // --- New grammar-specific tests ---
+
+    #[test]
+    fn bareword_before_colon_field() {
+        // Bare token before a colon field → bareword in any_text, field still parsed
+        let q = parse_query("artist :title 'foo'");
+        assert!(q.title.is_some(), "title should be set by :title");
+        let text = contains_str(&q.any_text).expect("'artist' should be in any_text");
+        assert_eq!(text, "artist");
+    }
+
+    #[test]
+    fn artist_with_quoted_value_and_trailing_bareword() {
+        // `:artist 'the prodigy' live` → artist set, any_text = "live"
+        let q = parse_query(":artist 'the prodigy' live");
+        assert!(matches!(
+            &q.artist,
+            Some(StringQuery::Contains(s)) if s == "the prodigy"
+        ));
+        assert_eq!(contains_str(&q.any_text), Some("live"));
+    }
+
+    #[test]
+    fn lone_colon_is_bareword() {
+        // A bare `:` with nothing after it → treated as a bareword
+        let q = parse_query(":");
+        // Must not panic; should appear in any_text
+        let text = contains_str(&q.any_text).expect("':' should go into any_text");
+        assert_eq!(text, ":");
+    }
+
+    #[test]
+    fn title_containing_field_word_is_any_text() {
+        // Tracks with "bpm", "artist", "added" in their name search correctly
+        let q = parse_query("120bpm artist track added yesterday");
+        assert!(q.bpm.is_none());
+        assert!(q.artist.is_none());
+        assert!(q.added.is_none());
+        let text = contains_str(&q.any_text).expect("all tokens should be in any_text");
+        assert!(text.contains("artist") && text.contains("bpm") && text.contains("added"));
+    }
+
+    #[test]
+    fn unknown_field_does_not_silently_set_any_struct_field() {
+        let q = parse_query(":fizz 'bar'");
+        // Exhaustively verify nothing was set on the query except any_text
+        assert!(q.artist.is_none());
+        assert!(q.title.is_none());
+        assert!(q.album.is_none());
+        assert!(q.label.is_none());
+        assert!(q.genre.is_none());
+        assert!(q.style.is_none());
+        assert!(q.bpm.is_none());
+        assert!(q.key.is_none());
+        assert!(q.duration.is_none());
+        assert!(q.year.is_none());
+        assert!(q.source.is_none());
+        assert!(q.added.is_none());
+        assert!(q.started.is_none());
+        assert!(q.stopped.is_none());
+        // any_text should have something
+        assert!(q.any_text.is_some());
     }
 }
