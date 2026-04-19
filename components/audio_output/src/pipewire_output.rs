@@ -15,6 +15,9 @@ pub const CHAN_SIZE: usize = std::mem::size_of::<f32>();
 pub enum StreamCommand {
     SetActive(bool),
     Shutdown(mpsc::SyncSender<HeapConsumer<f32>>),
+    /// Drain the mixer output ring buffer (pop-and-discard) and flush
+    /// PipeWire's own in-flight buffers.
+    Flush,
 }
 
 impl std::fmt::Debug for StreamCommand {
@@ -22,6 +25,7 @@ impl std::fmt::Debug for StreamCommand {
         match self {
             StreamCommand::SetActive(v) => write!(f, "SetActive({v})"),
             StreamCommand::Shutdown(_) => write!(f, "Shutdown(..)"),
+            StreamCommand::Flush => write!(f, "Flush"),
         }
     }
 }
@@ -244,6 +248,20 @@ impl PipewireOutput {
                     }
                     mainloop_for_cmd.quit();
                 }
+                StreamCommand::Flush => {
+                    // Drain the mixer output ring buffer: discard all pending samples
+                    // so old-track audio does not reach PipeWire after a skip.
+                    if let Some(ref mut consumer) = *consumer_for_cmd.borrow_mut() {
+                        let pending = consumer.len();
+                        let mut scratch = vec![0.0f32; pending];
+                        consumer.pop_slice(&mut scratch);
+                        tracing::info!("Flush: drained {} samples from mixer ring", pending);
+                    }
+                    // Tell PipeWire to drop its own in-flight buffers (drain=false = discard).
+                    if let Err(e) = stream_for_cmd.flush(false) {
+                        tracing::warn!("Flush: stream.flush(false) failed: {}", e);
+                    }
+                }
             });
 
             mainloop.run();
@@ -254,6 +272,17 @@ impl PipewireOutput {
             pw_thread: Some(pw_thread),
             command_sender: cmd_sender,
         })
+    }
+
+    /// Drain the mixer output ring buffer and flush PipeWire's in-flight buffers.
+    ///
+    /// Should be called after `MixerCommand::ClearTrack` and before registering the
+    /// next track's consumer so that no old-track audio leaks into the new track's
+    /// playback window.
+    pub fn flush(&self) {
+        if let Err(e) = self.command_sender.send(StreamCommand::Flush) {
+            tracing::warn!("Failed to send Flush to PW thread: {:?}", e);
+        }
     }
 
     /// Activate or deactivate the PipeWire stream.

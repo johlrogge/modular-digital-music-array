@@ -133,4 +133,41 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(output_consumer.len(), 0, "expected 0 samples in output");
     }
+
+    /// Simulate the ClearTrack effect: after consumer is set to None,
+    /// subsequent mix() calls produce no samples into the output ring.
+    #[test]
+    fn consumer_none_after_clear_produces_no_output() {
+        let output_rb = HeapRb::<f32>::new(4096);
+        let (output_producer, mut output_consumer) = output_rb.split();
+        let mut mixer = Mixer::new(output_producer);
+
+        // Seed a track consumer with samples
+        let track_rb = HeapRb::<f32>::new(64);
+        let (mut track_producer, track_consumer) = track_rb.split();
+        for _ in 0..32 {
+            track_producer.push(1.0f32).ok();
+        }
+        let mut consumer_opt: Option<HeapConsumer<f32>> = Some(track_consumer);
+
+        // Pre-clear: mix produces output
+        let mut buf = vec![0.0f32; 64];
+        mixer.mix(&mut buf, 64, &mut consumer_opt).unwrap();
+        assert!(output_consumer.len() > 0, "expected samples before clear");
+
+        // Simulate MixerCommand::ClearTrack — consumer becomes None
+        consumer_opt = None;
+
+        // Drain the ring so we start clean
+        let mut drain = vec![0.0f32; 4096];
+        output_consumer.pop_slice(&mut drain);
+
+        // Post-clear: mix should produce nothing
+        mixer.mix(&mut buf, 64, &mut consumer_opt).unwrap();
+        assert_eq!(
+            output_consumer.len(),
+            0,
+            "after ClearTrack consumer=None, mix must produce 0 samples"
+        );
+    }
 }

@@ -28,12 +28,12 @@ use audio_output::pipewire_devices::list_sinks;
 
 /// Track ring buffer size in f32 samples. Stereo: divide by 2 for frames;
 /// divide by sample_rate for seconds of pre-decoded audio.
-/// 524_288 = ~5.9 s at 44.1 kHz stereo, ~1.36 s at 192 kHz stereo.
-const TRACK_BUFFER_SAMPLES: usize = 524_288;
+/// 131_072 = ~1.49 s at 44.1 kHz stereo, ~0.34 s at 192 kHz stereo.
+const TRACK_BUFFER_SAMPLES: usize = 131_072;
 
 /// Mixer ring buffer size in f32 samples.
-/// 1_048_576 = ~11.9 s at 44.1 kHz stereo, ~2.72 s at 192 kHz stereo.
-const MIXER_BUFFER_SAMPLES: usize = 1_048_576;
+/// 262_144 = ~2.97 s at 44.1 kHz stereo, ~0.68 s at 192 kHz stereo.
+const MIXER_BUFFER_SAMPLES: usize = 262_144;
 
 pub struct PlaybackEngine {
     track: Option<Track>,
@@ -49,8 +49,15 @@ pub struct PlaybackEngine {
 }
 
 enum MixerCommand {
-    RegisterTrack { consumer: HeapConsumer<f32> },
-    SetVolume { volume: Volume },
+    RegisterTrack {
+        consumer: HeapConsumer<f32>,
+    },
+    SetVolume {
+        volume: Volume,
+    },
+    /// Drop the current track consumer without replacing it.
+    /// After this, the mixer stops pulling samples until a RegisterTrack arrives.
+    ClearTrack,
 }
 
 /// Compute the PipeWire output rate for a track.
@@ -101,6 +108,10 @@ impl PlaybackEngine {
                         }
                         MixerCommand::SetVolume { volume } => {
                             mixer.set_volume(volume);
+                        }
+                        MixerCommand::ClearTrack => {
+                            tracing::info!("MIX THREAD: Clearing track consumer");
+                            consumer = None;
                         }
                     }
                 }
@@ -229,6 +240,18 @@ impl PlaybackEngine {
             t.stop();
         }
         self.track = None;
+
+        // If audio was flowing, clear the mixer consumer so no old samples are produced,
+        // then flush the mixer output ring and PipeWire's in-flight buffers.
+        // This reduces skip latency from ~3 s (full ring drain) to ~50 ms.
+        if self.audio_output.is_some() {
+            self.command_sender
+                .send(MixerCommand::ClearTrack)
+                .map_err(|_| PlaybackError::TaskCancelled)?;
+            if let Some(ref output) = self.audio_output {
+                output.flush();
+            }
+        }
 
         // Create source and read its native sample rate
         let source = AudioSource::new(path)?;
@@ -565,5 +588,85 @@ mod tests {
     #[test]
     fn select_target_rate_at_ceiling_is_unchanged() {
         assert_eq!(select_target_rate(192_000, 192_000), 192_000);
+    }
+
+    /// After sending ClearTrack, the mix thread stops producing samples.
+    /// We verify by registering a consumer with data, sending ClearTrack,
+    /// letting the mix thread run briefly, then checking the mixer output ring
+    /// is still empty (because the consumer was cleared before the mixer ran).
+    #[test]
+    fn clear_track_command_stops_mix_thread_producing_samples() {
+        use ringbuf::HeapRb;
+        use std::time::Duration;
+
+        // Build a standalone mix thread replicating the engine's mix loop
+        // so we can inspect the mixer output consumer directly.
+        let mixer_rb = HeapRb::<f32>::new(262_144);
+        let (mixer_producer, mut mixer_output) = mixer_rb.split();
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<MixerCommand>();
+        let running = Arc::new(AtomicBool::new(true));
+        let running_clone = Arc::clone(&running);
+
+        let thread = std::thread::spawn(move || {
+            let mut mixer = mixer::Mixer::new(mixer_producer);
+            let mut consumer: Option<HeapConsumer<f32>> = None;
+            let mut temp_buffer = vec![0.0f32; 1920 * 2];
+
+            while running_clone.load(Ordering::Acquire) {
+                while let Ok(cmd) = cmd_rx.try_recv() {
+                    match cmd {
+                        MixerCommand::RegisterTrack { consumer: new } => {
+                            consumer = Some(new);
+                        }
+                        MixerCommand::ClearTrack => {
+                            consumer = None;
+                        }
+                        MixerCommand::SetVolume { .. } => {}
+                    }
+                }
+                let l = temp_buffer.len();
+                let _ = mixer.mix(&mut temp_buffer, l, &mut consumer);
+                std::thread::sleep(Duration::from_micros(500));
+            }
+        });
+
+        // Push samples into a track ring buffer and register it
+        let track_rb = HeapRb::<f32>::new(131_072);
+        let (mut track_producer, track_consumer) = track_rb.split();
+        for _ in 0..1024 {
+            track_producer.push(1.0f32).ok();
+        }
+        cmd_tx
+            .send(MixerCommand::RegisterTrack {
+                consumer: track_consumer,
+            })
+            .unwrap();
+
+        // Let the mix thread run a few cycles so it starts consuming
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Now send ClearTrack and drain any samples that already landed
+        cmd_tx.send(MixerCommand::ClearTrack).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+
+        let before_len = mixer_output.len();
+        // Drain whatever was produced before/during the clear
+        let mut drain = vec![0.0f32; 262_144];
+        mixer_output.pop_slice(&mut drain);
+
+        // Wait another round — mix thread should not produce any more samples
+        std::thread::sleep(Duration::from_millis(5));
+
+        let after_len = mixer_output.len();
+
+        running.store(false, Ordering::Release);
+        thread.join().unwrap();
+
+        assert_eq!(
+            after_len, 0,
+            "after ClearTrack, mix thread must produce 0 new samples (had {} before drain)",
+            before_len
+        );
     }
 }
