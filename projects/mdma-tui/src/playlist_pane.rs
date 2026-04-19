@@ -218,64 +218,82 @@ impl Pane for PlaylistPane {
                 PaneAction::Consumed
             }
             KeyCode::Char('J') => {
-                // Move cursor track DOWN (swap with next)
-                if let Some(vis_idx) = self.selection.cursor_position() {
-                    if let Some(data_idx) = self.selection.visible_index_to_data(vis_idx) {
-                        let next = data_idx + 1;
-                        if next < self.hashes.len() {
-                            self.push_undo_snapshot();
-                            self.swap_tracks(data_idx, next);
-                            match self.persist_order() {
-                                Ok(()) => {
-                                    self.selection.move_cursor_down();
-                                    PaneAction::Consumed
-                                }
-                                Err(e) => {
-                                    // Revert swap and discard snapshot
-                                    self.swap_tracks(data_idx, next);
-                                    self.undo_stack.pop();
-                                    PaneAction::Error(format!("Reorder failed: {e}"))
+                // Move selected block DOWN by one position.
+                // If no explicit selection, falls back to cursor track.
+                match effective_data_indices_for_move(&self.selection) {
+                    Err(msg) => PaneAction::Info(msg),
+                    Ok(selected) if selected.is_empty() => PaneAction::Consumed,
+                    Ok(selected) => {
+                        match move_block_down(&self.hashes, &self.tracks, &selected) {
+                            None => PaneAction::Consumed, // at bottom, no-op
+                            Some((new_hashes, new_tracks, new_selected)) => {
+                                self.push_undo_snapshot();
+                                let old_hashes = std::mem::replace(&mut self.hashes, new_hashes);
+                                let old_tracks = std::mem::replace(&mut self.tracks, new_tracks);
+                                match self.persist_order() {
+                                    Ok(()) => {
+                                        let new_cursor = *new_selected.last().unwrap_or(&0);
+                                        // Only update selection state if there was an explicit multi-selection
+                                        if !self.selection.selected.is_empty() {
+                                            self.selection
+                                                .set_selected_visible_indices(new_selected);
+                                        }
+                                        self.selection.list_state.select(Some(new_cursor));
+                                        PaneAction::Consumed
+                                    }
+                                    Err(e) => {
+                                        // Revert and discard snapshot
+                                        self.hashes = old_hashes;
+                                        self.tracks = old_tracks;
+                                        self.undo_stack.pop();
+                                        PaneAction::Error(format!("Reorder failed: {e}"))
+                                    }
                                 }
                             }
-                        } else {
-                            PaneAction::Consumed
                         }
-                    } else {
-                        PaneAction::Consumed
                     }
-                } else {
-                    PaneAction::Consumed
                 }
             }
             KeyCode::Char('K') => {
-                // Move cursor track UP (swap with previous)
-                if let Some(vis_idx) = self.selection.cursor_position() {
-                    if let Some(data_idx) = self.selection.visible_index_to_data(vis_idx) {
-                        if data_idx > 0 {
-                            let prev = data_idx - 1;
-                            self.push_undo_snapshot();
-                            self.swap_tracks(data_idx, prev);
-                            match self.persist_order() {
-                                Ok(()) => {
-                                    self.selection.move_cursor_up();
-                                    PaneAction::Consumed
-                                }
-                                Err(e) => {
-                                    // Revert swap and discard snapshot
-                                    self.swap_tracks(data_idx, prev);
-                                    self.undo_stack.pop();
-                                    PaneAction::Error(format!("Reorder failed: {e}"))
+                // Move selected block UP by one position.
+                // If no explicit selection, falls back to cursor track.
+                match effective_data_indices_for_move(&self.selection) {
+                    Err(msg) => PaneAction::Info(msg),
+                    Ok(selected) if selected.is_empty() => PaneAction::Consumed,
+                    Ok(selected) => {
+                        match move_block_up(&self.hashes, &self.tracks, &selected) {
+                            None => PaneAction::Consumed, // at top, no-op
+                            Some((new_hashes, new_tracks, new_selected)) => {
+                                self.push_undo_snapshot();
+                                let old_hashes = std::mem::replace(&mut self.hashes, new_hashes);
+                                let old_tracks = std::mem::replace(&mut self.tracks, new_tracks);
+                                match self.persist_order() {
+                                    Ok(()) => {
+                                        let new_cursor = *new_selected.first().unwrap_or(&0);
+                                        // Only update selection state if there was an explicit multi-selection
+                                        if !self.selection.selected.is_empty() {
+                                            self.selection
+                                                .set_selected_visible_indices(new_selected);
+                                        }
+                                        self.selection.list_state.select(Some(new_cursor));
+                                        PaneAction::Consumed
+                                    }
+                                    Err(e) => {
+                                        // Revert and discard snapshot
+                                        self.hashes = old_hashes;
+                                        self.tracks = old_tracks;
+                                        self.undo_stack.pop();
+                                        PaneAction::Error(format!("Reorder failed: {e}"))
+                                    }
                                 }
                             }
-                        } else {
-                            PaneAction::Consumed
                         }
-                    } else {
-                        PaneAction::Consumed
                     }
-                } else {
-                    PaneAction::Consumed
                 }
+            }
+            KeyCode::Char(',') => {
+                self.selection.clear_selection();
+                PaneAction::Consumed
             }
             KeyCode::Char('d') => {
                 // Cut selected tracks (or cursor track if nothing selected) into
@@ -552,6 +570,107 @@ pub(crate) fn paste_after_cursor_into(
 /// `PlaylistPane` (which requires a LibraryBackend).
 pub(crate) fn playlist_pane_preempts_key(key: &KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('d') | KeyCode::Char('p'))
+}
+
+/// Compute the effective sorted data indices for a move operation.
+///
+/// Returns `Some(sorted_indices)` when the selection (or cursor fallback)
+/// maps to a non-empty, contiguous set of data indices.
+/// Returns `None` with an error message when the selection is non-contiguous.
+///
+/// The "cursor is always in the selection" semantic is implemented here:
+/// if `selection.selected` is empty, the cursor's data index is used as
+/// a single-element selection.
+pub(crate) fn effective_data_indices_for_move(
+    selection: &SelectionState,
+) -> Result<Vec<usize>, String> {
+    let vis_indices = selection.effective_selection();
+    if vis_indices.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut data_indices: Vec<usize> = vis_indices
+        .iter()
+        .filter_map(|&vis| selection.visible_index_to_data(vis))
+        .collect();
+    data_indices.sort_unstable();
+    data_indices.dedup();
+
+    // Contiguity check
+    for window in data_indices.windows(2) {
+        if window[1] != window[0] + 1 {
+            return Err("Non-contiguous selection; Shift+J/K requires contiguous".to_string());
+        }
+    }
+
+    Ok(data_indices)
+}
+
+/// Move a contiguous block of items in `hashes` (and parallel `tracks`) down
+/// by one position. `selected` must be sorted and contiguous.
+///
+/// Returns `(new_hashes, new_tracks, new_selection_indices)` where
+/// `new_selection_indices` are the data indices the block now occupies.
+/// Returns `None` when the block is already at the bottom.
+pub(crate) fn move_block_down<T: Clone>(
+    hashes: &[ContentHash],
+    tracks: &[T],
+    selected: &[usize],
+) -> Option<(Vec<ContentHash>, Vec<T>, Vec<usize>)> {
+    if selected.is_empty() {
+        return None;
+    }
+    let top = selected[0];
+    let bottom = *selected.last().unwrap();
+    if bottom + 1 >= hashes.len() {
+        return None; // already at bottom
+    }
+
+    let mut new_hashes = hashes.to_vec();
+    let mut new_tracks = tracks.to_vec();
+
+    // Rotate: remove item at bottom+1 and insert at top
+    let moved_hash = new_hashes.remove(bottom + 1);
+    new_hashes.insert(top, moved_hash);
+    let moved_track = new_tracks.remove(bottom + 1);
+    new_tracks.insert(top, moved_track);
+
+    // Selection shifts +1
+    let new_selection: Vec<usize> = selected.iter().map(|&i| i + 1).collect();
+    Some((new_hashes, new_tracks, new_selection))
+}
+
+/// Move a contiguous block of items in `hashes` (and parallel `tracks`) up
+/// by one position. `selected` must be sorted and contiguous.
+///
+/// Returns `(new_hashes, new_tracks, new_selection_indices)`.
+/// Returns `None` when the block is already at the top.
+pub(crate) fn move_block_up<T: Clone>(
+    hashes: &[ContentHash],
+    tracks: &[T],
+    selected: &[usize],
+) -> Option<(Vec<ContentHash>, Vec<T>, Vec<usize>)> {
+    if selected.is_empty() {
+        return None;
+    }
+    let top = selected[0];
+    let bottom = *selected.last().unwrap();
+    if top == 0 {
+        return None; // already at top
+    }
+
+    let mut new_hashes = hashes.to_vec();
+    let mut new_tracks = tracks.to_vec();
+
+    // Rotate: remove item at top-1 and insert at bottom+1
+    let moved_hash = new_hashes.remove(top - 1);
+    new_hashes.insert(bottom, moved_hash); // insert at bottom (old bottom, after removal offset)
+    let moved_track = new_tracks.remove(top - 1);
+    new_tracks.insert(bottom, moved_track);
+
+    // Selection shifts -1
+    let new_selection: Vec<usize> = selected.iter().map(|&i| i - 1).collect();
+    Some((new_hashes, new_tracks, new_selection))
 }
 
 #[cfg(test)]
@@ -850,5 +969,162 @@ mod tests {
             !playlist_pane_preempts_key(&key_j),
             "j should not be preempted"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Shift+J / Shift+K block-move tests
+    // -------------------------------------------------------------------------
+
+    /// Shift+J on cursor at index 1 in [a, b, c, d] → [a, c, b, d]; cursor at 2.
+    #[test]
+    fn shift_j_moves_single_cursor_track_down() {
+        let hashes = vec![hash("a"), hash("b"), hash("c"), hash("d")];
+        let mut sel = SelectionState::new(hashes.len());
+        sel.list_state.select(Some(1)); // cursor at b
+
+        // effective_data_indices_for_move: no explicit selection → [1]
+        let indices = effective_data_indices_for_move(&sel).unwrap();
+        assert_eq!(indices, vec![1]);
+
+        let (new_hashes, new_tracks, new_sel) =
+            move_block_down(&hashes, &hashes, &indices).unwrap();
+
+        assert_eq!(new_hashes, vec![hash("a"), hash("c"), hash("b"), hash("d")]);
+        assert_eq!(new_sel, vec![2]);
+        // tracks parallel
+        assert_eq!(new_tracks, new_hashes);
+    }
+
+    /// Shift+J on selection block 1..=2 in [a,b,c,d,e] → [a,d,b,c,e]; selection 2..=3.
+    #[test]
+    fn shift_j_moves_selection_block_down() {
+        let hashes = vec![hash("a"), hash("b"), hash("c"), hash("d"), hash("e")];
+        let mut sel = SelectionState::new(hashes.len());
+        // Select visible indices 1 and 2 (b and c)
+        sel.selected.insert(1);
+        sel.selected.insert(2);
+        sel.list_state.select(Some(2)); // cursor at c
+
+        let indices = effective_data_indices_for_move(&sel).unwrap();
+        assert_eq!(indices, vec![1, 2]);
+
+        let (new_hashes, _, new_sel) = move_block_down(&hashes, &hashes, &indices).unwrap();
+
+        assert_eq!(
+            new_hashes,
+            vec![hash("a"), hash("d"), hash("b"), hash("c"), hash("e")]
+        );
+        assert_eq!(new_sel, vec![2, 3]);
+    }
+
+    /// Shift+J at the last index is a no-op.
+    #[test]
+    fn shift_j_at_bottom_is_noop() {
+        let hashes = vec![hash("a"), hash("b"), hash("c")];
+        let mut sel = SelectionState::new(hashes.len());
+        sel.list_state.select(Some(2)); // cursor at last
+
+        let indices = effective_data_indices_for_move(&sel).unwrap();
+        let result = move_block_down(&hashes, &hashes, &indices);
+        assert!(
+            result.is_none(),
+            "move_block_down at bottom should return None"
+        );
+    }
+
+    /// Shift+K on cursor at index 2 in [a,b,c,d] → [a,b,d... wait:
+    /// cursor at 2 (c), move up: [a,c,b,d]? No: block [2] moves up → [a,b,d,c]... wait.
+    ///
+    /// [a, b, c, d], selected=[2] (c), move up:
+    /// remove item at top-1=1 (b), insert at bottom=2: [a, c, b, d]. cursor at 1.
+    #[test]
+    fn shift_k_moves_selection_block_up() {
+        let hashes = vec![hash("a"), hash("b"), hash("c"), hash("d")];
+        let mut sel = SelectionState::new(hashes.len());
+        sel.list_state.select(Some(2)); // cursor at c
+
+        let indices = effective_data_indices_for_move(&sel).unwrap();
+        let (new_hashes, _, new_sel) = move_block_up(&hashes, &hashes, &indices).unwrap();
+
+        assert_eq!(new_hashes, vec![hash("a"), hash("c"), hash("b"), hash("d")]);
+        assert_eq!(new_sel, vec![1]);
+    }
+
+    /// Shift+K at index 0 is a no-op.
+    #[test]
+    fn shift_k_at_top_is_noop() {
+        let hashes = vec![hash("a"), hash("b"), hash("c")];
+        let mut sel = SelectionState::new(hashes.len());
+        sel.list_state.select(Some(0)); // cursor at first
+
+        let indices = effective_data_indices_for_move(&sel).unwrap();
+        let result = move_block_up(&hashes, &hashes, &indices);
+        assert!(result.is_none(), "move_block_up at top should return None");
+    }
+
+    /// Non-contiguous selection (indices 0 and 2) → error, no movement.
+    #[test]
+    fn shift_j_noncontiguous_selection_noop_with_status() {
+        let hashes = vec![hash("a"), hash("b"), hash("c"), hash("d")];
+        let mut sel = SelectionState::new(hashes.len());
+        sel.selected.insert(0);
+        sel.selected.insert(2); // gap at 1
+
+        let result = effective_data_indices_for_move(&sel);
+        assert!(
+            result.is_err(),
+            "non-contiguous selection should return Err"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("Non-contiguous"),
+            "error message should mention non-contiguous: {msg}"
+        );
+    }
+
+    /// Comma key clears selection via SelectionState.
+    #[test]
+    fn comma_clears_selection() {
+        let mut sel = SelectionState::new(5);
+        sel.selected.insert(1);
+        sel.selected.insert(2);
+        sel.list_state.select(Some(2));
+
+        sel.clear_selection();
+
+        assert!(sel.selected.is_empty(), "selection should be cleared");
+        assert_eq!(
+            sel.cursor_position(),
+            Some(2),
+            "cursor should remain after clear"
+        );
+    }
+
+    /// move_block_up on a 2-item block in [a,b,c,d,e] at indices 2..=3
+    /// → [a,c,d,b,e]; new selection 1..=2.
+    ///
+    /// Wait, let me trace: top=2, bottom=3, remove at top-1=1 (b), insert at bottom=3:
+    /// start: [a,b,c,d,e]
+    /// remove index 1 (b): [a,c,d,e]
+    /// insert at index 3 (bottom=3 in original, but after removal that's index 3 in [a,c,d,e]):
+    /// → [a,c,d,b,e]; selection shifts -1: [1,2]. Correct.
+    #[test]
+    fn shift_k_moves_two_item_block_up() {
+        let hashes = vec![hash("a"), hash("b"), hash("c"), hash("d"), hash("e")];
+        let mut sel = SelectionState::new(hashes.len());
+        sel.selected.insert(2);
+        sel.selected.insert(3);
+        sel.list_state.select(Some(3));
+
+        let indices = effective_data_indices_for_move(&sel).unwrap();
+        assert_eq!(indices, vec![2, 3]);
+
+        let (new_hashes, _, new_sel) = move_block_up(&hashes, &hashes, &indices).unwrap();
+
+        assert_eq!(
+            new_hashes,
+            vec![hash("a"), hash("c"), hash("d"), hash("b"), hash("e")]
+        );
+        assert_eq!(new_sel, vec![1, 2]);
     }
 }

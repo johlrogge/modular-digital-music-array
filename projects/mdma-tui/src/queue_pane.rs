@@ -112,6 +112,10 @@ impl Pane for QueuePane {
                 }
                 PaneAction::Consumed
             }
+            KeyCode::Char(',') => {
+                self.selection.clear_selection();
+                PaneAction::Consumed
+            }
             _ => PaneAction::Ignored,
         }
     }

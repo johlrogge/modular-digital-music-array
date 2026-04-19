@@ -584,6 +584,10 @@ impl Pane for BrowserPane {
                         }
                         PaneAction::Consumed
                     }
+                    KeyCode::Char(',') => {
+                        selection.clear_selection();
+                        PaneAction::Consumed
+                    }
                     KeyCode::Enter => {
                         // Collect names for all effectively-selected entries.
                         // Extract into a local Vec first so the borrow on `selection`
@@ -643,6 +647,10 @@ impl Pane for BrowserPane {
                     if let Some(err) = self.pop_level() {
                         return err;
                     }
+                    PaneAction::Consumed
+                }
+                KeyCode::Char(',') => {
+                    selection.clear_selection();
                     PaneAction::Consumed
                 }
                 _ => PaneAction::Ignored,

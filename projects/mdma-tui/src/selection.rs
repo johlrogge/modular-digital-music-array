@@ -122,6 +122,16 @@ impl SelectionState {
         self.selected.clear();
     }
 
+    /// Set the explicit selection to a given set of *visible* indices,
+    /// replacing any prior selection. Used after block-move operations to
+    /// keep the selection tracking the moved items.
+    pub fn set_selected_visible_indices(&mut self, vis_indices: impl IntoIterator<Item = usize>) {
+        self.selected.clear();
+        for idx in vis_indices {
+            self.selected.insert(idx);
+        }
+    }
+
     /// `s` key: push a new filter onto the stack.
     ///
     /// `match_fn` receives the *data* index and returns `true` if the item
