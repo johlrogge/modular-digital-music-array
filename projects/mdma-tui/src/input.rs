@@ -129,12 +129,16 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             if hashes.is_empty() {
                 app.set_status("No track selected");
             } else {
-                let entries = build_quick_play_entries(hashes);
-                match app.playback.queue_replace(entries) {
-                    Ok(_) => match app.playback.play_queue() {
-                        Ok(_) => app.set_status("Playing selected"),
-                        Err(e) => app.set_status(format!("Play failed: {e}")),
-                    },
+                let count = hashes.len();
+                let result = (|| -> Result<(), mdma_client::PlaybackClientError> {
+                    for hash in queue_next_order(hashes) {
+                        app.playback.queue_next(hash, SourceName::audio())?;
+                    }
+                    app.playback.skip()?;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => app.set_status(format!("Playing {} track(s)", count)),
                     Err(e) => app.set_status(format!("Play failed: {e}")),
                 }
             }
@@ -646,30 +650,43 @@ mod tests {
         );
     }
 
-    // ---- build_quick_play_entries ----
+    // ---- quick_play_insert_order ----
 
+    /// Verify that `queue_next_order` returns hashes in reverse input order,
+    /// so that inserting each in sequence leaves the original order as "next up".
     #[test]
-    fn quick_play_entries_empty_input_gives_empty_vec() {
-        let entries = super::build_quick_play_entries(vec![]);
-        assert!(entries.is_empty());
-    }
-
-    #[test]
-    fn quick_play_entries_preserves_hash_order_and_uses_audio_source() {
-        use mdma_client::{ContentHash, SourceName};
+    fn quick_play_insert_order_is_reversed() {
+        use mdma_client::ContentHash;
 
         let hashes = vec![
             ContentHash::new("aabbcc001122"),
             ContentHash::new("ddeeff334455"),
+            ContentHash::new("112233aabbcc"),
         ];
-        let entries = super::build_quick_play_entries(hashes.clone());
+        let order = super::queue_next_order(hashes.clone());
 
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].0, hashes[0]);
-        assert_eq!(entries[1].0, hashes[1]);
-        // Both entries must use the audio source name.
-        assert_eq!(entries[0].1, SourceName::audio());
-        assert_eq!(entries[1].1, SourceName::audio());
+        // Reverse: C, B, A — so after inserting each as "next", A ends up first.
+        assert_eq!(order.len(), 3);
+        assert_eq!(order[0], hashes[2]);
+        assert_eq!(order[1], hashes[1]);
+        assert_eq!(order[2], hashes[0]);
+    }
+
+    #[test]
+    fn quick_play_insert_order_single_element() {
+        use mdma_client::ContentHash;
+
+        let hashes = vec![ContentHash::new("aabbcc001122")];
+        let order = super::queue_next_order(hashes.clone());
+        assert_eq!(order.len(), 1);
+        assert_eq!(order[0], hashes[0]);
+    }
+
+    #[test]
+    fn quick_play_insert_order_empty() {
+        use mdma_client::ContentHash;
+        let order = super::queue_next_order(vec![]);
+        assert!(order.is_empty());
     }
 
     // ---- parse_history_days ----
@@ -711,13 +728,15 @@ mod tests {
     }
 }
 
-/// Build a `queue_replace`-compatible entry list from a set of content hashes,
-/// pairing each with the standard audio source name.
-fn build_quick_play_entries(hashes: Vec<ContentHash>) -> Vec<(ContentHash, SourceName)> {
-    hashes
-        .into_iter()
-        .map(|h| (h, SourceName::audio()))
-        .collect()
+/// Return hashes in the order they should be passed to successive `queue_next`
+/// calls so that the final "next up" sequence preserves the original selection
+/// order.
+///
+/// `queue_next` inserts immediately after the currently-playing track, so
+/// inserting [C, B, A] in that order leaves the queue as `[current, A, B, C,
+/// rest…]`.  Reversing the caller's selection achieves this.
+fn queue_next_order(hashes: Vec<ContentHash>) -> Vec<ContentHash> {
+    hashes.into_iter().rev().collect()
 }
 
 /// Route a PaneAction returned from a pane's key handler to the App.
