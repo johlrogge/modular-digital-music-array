@@ -30,6 +30,29 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Pane-level preemption: some panes claim specific keys before the
+    // App-level match below can handle them (e.g. PlaylistPane claims 'd'
+    // and 'p' so they act as cut/paste rather than global bindings).
+    if app.active_pane().preempts_normal_key(&key) {
+        // 'p' (paste) requires the clipboard from App — inject it here so the
+        // pane stays unaware of App.  We route through the `paste_clipboard`
+        // trait method rather than PaneAction to avoid an extra round-trip.
+        if key.code == KeyCode::Char('p') {
+            let clipboard = app.clipboard.clone();
+            if clipboard.is_empty() {
+                app.set_status("Clipboard is empty");
+            } else {
+                let action = app.active_pane_mut().paste_clipboard(clipboard);
+                dispatch_pane_action(app, action);
+            }
+            return;
+        }
+
+        let action = app.active_pane_mut().handle_key(key);
+        dispatch_pane_action(app, action);
+        return;
+    }
+
     match key.code {
         // Tab slot keys: 1-5 = left side, 6-9,0 = right side.
         KeyCode::Char(c @ '1'..='5') => {
@@ -755,6 +778,11 @@ fn dispatch_pane_action(app: &mut App, action: PaneAction) {
         PaneAction::Ignored => {}
         PaneAction::Error(msg) => app.set_status(format!("Error: {}", msg)),
         PaneAction::Info(msg) => app.set_status(msg),
+        PaneAction::Cut(hashes) => {
+            let count = hashes.len();
+            app.clipboard = hashes;
+            app.set_status(format!("Cut {} track(s) — press p to paste", count));
+        }
         PaneAction::OpenPlaylist(name) => {
             // Open the requested playlist in the ACTIVE pane (replaces it).
             let library = Rc::clone(&app.library);

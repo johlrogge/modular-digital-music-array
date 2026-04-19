@@ -7,7 +7,7 @@ use crate::playlists_pane::PlaylistsPane;
 use crate::queue_pane::QueuePane;
 use crate::search_pane::SearchPane;
 use event_protocol::PlaybackEvent;
-use mdma_client::{LibraryBackend, PlaybackBackend, PlaylistName};
+use mdma_client::{ContentHash, LibraryBackend, PlaybackBackend, PlaylistName};
 use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 
@@ -86,6 +86,9 @@ pub struct App {
     /// Background event receiver (NNG playback events from the subscriber thread).
     /// `None` when no event subscription was established (e.g. no --node flag).
     pub event_rx: Option<Receiver<AppEvent>>,
+    /// Cut/yank clipboard: hashes placed here by `d` (cut) in PlaylistPane.
+    /// Paste (`p`) reads from here non-destructively, allowing multi-paste.
+    pub clipboard: Vec<ContentHash>,
 }
 
 impl App {
@@ -125,6 +128,7 @@ impl App {
             palette_matches: Vec::new(),
             palette_cursor: 0,
             event_rx,
+            clipboard: Vec::new(),
         }
     }
 

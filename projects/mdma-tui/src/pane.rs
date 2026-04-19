@@ -42,6 +42,8 @@ pub enum PaneAction {
     Info(String),
     /// Request to open a playlist pane.
     OpenPlaylist(PlaylistName),
+    /// Tracks were cut from this pane; store these hashes in the App clipboard.
+    Cut(Vec<ContentHash>),
 }
 
 /// The core pane abstraction.
@@ -77,6 +79,17 @@ pub trait Pane {
     /// Default: returns an error indicating this pane does not accept tracks.
     fn accept_tracks(&mut self, _hashes: &[ContentHash]) -> PaneAction {
         PaneAction::Error("Cannot add tracks to this pane type".to_string())
+    }
+
+    /// Paste clipboard hashes after the cursor (cut-and-paste reorder flow).
+    ///
+    /// Called by `input.rs` when `p` is pressed in a pane that has preempted
+    /// that key. The App passes its clipboard contents here so the pane can
+    /// remain unaware of `App`.
+    ///
+    /// Default: no-op (`Consumed`). Only `PlaylistPane` overrides this.
+    fn paste_clipboard(&mut self, _hashes: Vec<ContentHash>) -> PaneAction {
+        PaneAction::Consumed
     }
 
     /// For playlist panes: the playlist name.
@@ -119,6 +132,18 @@ pub trait Pane {
     ///
     /// Default: `false`.  Override in panes that contain a text-input widget.
     fn capturing_text_input(&self) -> bool {
+        false
+    }
+
+    /// Keys the pane wants to intercept in Normal mode before App-level
+    /// bindings fire.
+    ///
+    /// When `true` is returned for a given key, `handle_normal` in `input.rs`
+    /// calls `handle_key` on this pane and skips the App-level binding — even
+    /// if the App has a global handler for that key.
+    ///
+    /// Default: none (always `false`).
+    fn preempts_normal_key(&self, _key: &KeyEvent) -> bool {
         false
     }
 
