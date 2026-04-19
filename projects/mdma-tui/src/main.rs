@@ -10,6 +10,7 @@ mod playlist_pane;
 mod playlists_pane;
 mod queue_pane;
 mod search_pane;
+mod search_parse;
 mod selection;
 mod theme;
 mod track_list;
