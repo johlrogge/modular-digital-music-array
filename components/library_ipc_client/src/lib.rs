@@ -417,6 +417,21 @@ impl LibraryClient {
         }
     }
 
+    /// Count the number of tracks in the library whose facts include `ItemId = item_id`.
+    ///
+    /// Returns `0` for an unknown ItemId.
+    pub fn get_track_count_for_item_id(&self, item_id: &str) -> Result<usize, ClientError> {
+        match self.request(&LibraryRequest::GetTrackCountForItemId {
+            item_id: item_id.to_string(),
+        })? {
+            LibraryResponse::TrackCountForItemId(count) => Ok(count),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to GetTrackCountForItemId".to_string(),
+            })),
+        }
+    }
+
     /// Batch lookup: for many ItemIds at once, return a map of ItemId → album title.
     ///
     /// Absent key in the result means no album title was found for that ItemId

@@ -8,7 +8,7 @@ use crate::ipc::{
     DownloadId, DownloadState, DownloadStatus, IpcServer, SourceError, SourceRequest,
     SourceResponse, SourceStatus,
 };
-use bandcamp_api::{AudioFormat, BandcampClient, CollectionItem, ItemType};
+use bandcamp_api::{AudioFormat, BandcampClient, CollectionItem};
 use library_ipc_client::{InboxPath, IngestSource, LibraryClient};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -123,8 +123,8 @@ pub struct BandcampService {
 /// Absent key in `stored_titles` means no album title was found for that item
 /// (either unknown or no Album fact yet); such items are not flagged as stale.
 ///
-/// Extracted from `detect_stale_items` so the comparison logic can be unit-tested
-/// without a live NNG connection.
+/// Only referenced from unit tests; kept for test coverage of the comparison logic.
+#[cfg_attr(not(test), allow(dead_code))]
 fn compute_stale_ids(
     collection: &[CollectionItem],
     library_known: &HashSet<String>,
@@ -145,6 +145,15 @@ fn compute_stale_ids(
     }
 
     stale
+}
+
+/// Pure helper: determine whether a bandcamp item is stale based on track counts.
+///
+/// `stale` means `live_count > stored_count` — bandcamp has more tracks than we have.
+/// Same count is fine. Fewer live tracks than stored is unusual (bandcamp removed tracks)
+/// and is NOT flagged as stale here — the caller may wish to log a warning separately.
+fn classify_check_result(live_count: usize, stored_count: usize) -> bool {
+    live_count > stored_count
 }
 
 impl BandcampService {
@@ -265,6 +274,8 @@ impl BandcampService {
             }
 
             SourceRequest::ResyncItem { identifier } => self.handle_resync(identifier).await,
+
+            SourceRequest::CheckItem { identifier } => self.handle_check_item(identifier).await,
         }
     }
 
@@ -361,47 +372,99 @@ impl BandcampService {
         }
     }
 
-    /// Detect stale items: library-known album items whose stored album title differs
-    /// from the current collection metadata.
-    ///
-    /// Track purchases are skipped entirely — their `CollectionItem.title` is the
-    /// track title, not the album title, so comparing it against the stored Album
-    /// fact would produce spurious mismatches and unnecessary re-downloads.
-    ///
-    /// Uses a single batched IPC query instead of one call per item.
-    async fn detect_stale_items(
-        &self,
-        collection: &[CollectionItem],
-        lib_client: &LibraryClient,
-        library_known: &HashSet<String>,
-    ) -> HashSet<String> {
-        // Only album purchases have a title that can be meaningfully compared
-        // against the stored Album fact; skip Track items entirely.
-        let albums_only: Vec<&CollectionItem> = collection
-            .iter()
-            .filter(|item| matches!(item.item_type, ItemType::Album))
-            .collect();
+    /// Handle a check-item request: fetch live track count from bandcamp and compare
+    /// against the library's stored count for the given item identifier.
+    async fn handle_check_item(&self, identifier: String) -> SourceResponse {
+        let client = match self.try_load_client() {
+            Some(c) => c,
+            None => {
+                return SourceResponse::Error(SourceError::NotAuthenticated {
+                    message: "Cookies not loaded. Upload cookies first.".to_string(),
+                });
+            }
+        };
 
-        // Collect library-known album IDs for the batched IPC query
-        let ids: Vec<String> = albums_only
-            .iter()
-            .filter(|item| library_known.contains(item.id.as_str()))
-            .map(|item| item.id.as_str().to_string())
-            .collect();
+        let username = match &self.username {
+            Some(u) => u.clone(),
+            None => {
+                return SourceResponse::Error(SourceError::NotAuthenticated {
+                    message: "No username configured. Set --username or MDMA_BANDCAMP_USERNAME."
+                        .to_string(),
+                });
+            }
+        };
 
-        if ids.is_empty() {
-            return HashSet::new();
+        // Fetch the collection to find the item's download URL
+        let collection = match client.get_collection(&username).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "CheckItem: failed to fetch collection");
+                return SourceResponse::Error(SourceError::CheckFailed {
+                    identifier,
+                    reason: e.to_string(),
+                });
+            }
+        };
+
+        let item = match collection.into_iter().find(|i| i.id.as_str() == identifier) {
+            Some(i) => i,
+            None => {
+                return SourceResponse::Error(SourceError::ItemNotFound { identifier });
+            }
+        };
+
+        // Fetch item details to get the live track count
+        let details = match client.get_item_details(&item.download_url).await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!(error = %e, item_id = %identifier, "CheckItem: failed to fetch item details");
+                return SourceResponse::Error(SourceError::CheckFailed {
+                    identifier,
+                    reason: e.to_string(),
+                });
+            }
+        };
+
+        let live_track_count = details.tracks.len();
+
+        // Query library for stored track count
+        let stored_track_count = if let Some(lib_client) = self.try_library_client() {
+            match lib_client.get_track_count_for_item_id(&identifier) {
+                Ok(count) => count,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        item_id = %identifier,
+                        "CheckItem: failed to query library track count, defaulting to 0"
+                    );
+                    0
+                }
+            }
+        } else {
+            tracing::warn!(
+                item_id = %identifier,
+                "CheckItem: library not available, defaulting stored_track_count to 0"
+            );
+            0
+        };
+
+        let stale = classify_check_result(live_track_count, stored_track_count);
+
+        if stored_track_count > live_track_count {
+            tracing::warn!(
+                item_id = %identifier,
+                live = live_track_count,
+                stored = stored_track_count,
+                "CheckItem: stored track count exceeds live count — bandcamp may have removed tracks"
+            );
         }
 
-        // Single batched IPC round-trip
-        let stored_titles = lib_client
-            .get_album_titles_by_item_ids(&ids)
-            .unwrap_or_default();
-
-        let album_items: Vec<CollectionItem> = albums_only.into_iter().cloned().collect();
-        let stale = compute_stale_ids(&album_items, library_known, &stored_titles);
-        tracing::info!("detected stale bandcamp items: {:?}", stale);
-        stale
+        SourceResponse::ItemChecked {
+            identifier,
+            live_track_count,
+            stored_track_count,
+            stale,
+        }
     }
 
     /// Handle sync request - fetches collection and queues new downloads.
@@ -475,62 +538,29 @@ impl BandcampService {
             }
         };
 
-        // Detect stale items (library-known but metadata changed)
-        let stale_ids = if let Some(ref lib_client) = maybe_lib_client {
-            self.detect_stale_items(&collection, lib_client, &library_known)
-                .await
-        } else {
-            HashSet::new()
-        };
-
-        // Separate items into stale-requeue vs. new vs. skip buckets before
-        // acquiring any locks (avoids holding the cache lock across awaits).
-        let mut stale_items = Vec::new();
-        let mut fresh_items = Vec::new();
-
-        for item in collection {
-            let item_id_str = item.id.as_str().to_string();
-
-            if stale_ids.contains(&item_id_str) {
-                // Known to library but metadata changed — force re-queue
-                stale_items.push(item);
-                continue;
-            }
-
-            if library_known.contains(&item_id_str) {
-                // Up-to-date in library, skip
-                continue;
-            }
-
-            // Not in library — check fallback cache
-            {
-                let cache = self.cache.lock();
-                let cache_key = format!("{}|{}|{}|0", item.artist, item.title, item.id.as_str());
-                if cache.is_downloaded(&cache_key) || cache.is_item_downloaded(item.id.as_str()) {
-                    continue;
-                }
-            }
-
-            fresh_items.push(item);
-        }
-
+        // Queue new items (not in library and not in fallback cache).
         let mut new_items = 0;
-
-        // Re-queue stale items (async — needs await)
-        for item in stale_items {
-            let item_id_str = item.id.as_str().to_string();
-            match self.queue_item_forcibly(item).await {
-                Ok(()) => new_items += 1,
-                Err(e) => {
-                    tracing::warn!(error = %e, item_id = %item_id_str, "Failed to forcibly queue stale item");
-                }
-            }
-        }
-
-        // Queue fresh (new) items
         {
             let mut queue = self.download_queue.lock();
-            for item in fresh_items {
+            for item in collection {
+                let item_id_str = item.id.as_str().to_string();
+
+                if library_known.contains(&item_id_str) {
+                    // Already in library, skip
+                    continue;
+                }
+
+                // Not in library — check fallback cache
+                {
+                    let cache = self.cache.lock();
+                    let cache_key =
+                        format!("{}|{}|{}|0", item.artist, item.title, item.id.as_str());
+                    if cache.is_downloaded(&cache_key) || cache.is_item_downloaded(item.id.as_str())
+                    {
+                        continue;
+                    }
+                }
+
                 new_items += 1;
                 queue.push_back(QueuedDownload {
                     item,
@@ -1167,5 +1197,39 @@ mod tests {
             stale.contains("a001"),
             "Album with changed title should be flagged as stale"
         );
+    }
+
+    // =========================================================================
+    // classify_check_result tests
+    // =========================================================================
+
+    #[test]
+    fn classify_check_result_flags_stale_when_live_exceeds_stored() {
+        assert!(
+            classify_check_result(7, 2),
+            "live=7, stored=2 should be stale"
+        );
+    }
+
+    #[test]
+    fn classify_check_result_not_stale_when_counts_equal() {
+        assert!(
+            !classify_check_result(5, 5),
+            "live=5, stored=5 should not be stale"
+        );
+    }
+
+    #[test]
+    fn classify_check_result_not_stale_when_live_fewer_than_stored() {
+        // Bandcamp removed tracks — unusual, not flagged as stale by this helper
+        assert!(
+            !classify_check_result(2, 5),
+            "live=2, stored=5 should not be flagged stale (bandcamp removed tracks)"
+        );
+    }
+
+    #[test]
+    fn classify_check_result_not_stale_when_both_zero() {
+        assert!(!classify_check_result(0, 0));
     }
 }

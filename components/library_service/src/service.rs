@@ -1242,6 +1242,11 @@ impl LibraryService {
             LibraryRequest::GetAlbumTitlesByItemIds { item_ids } => {
                 LibraryResponse::AlbumTitlesByItemIds(self.get_album_titles_by_item_ids(&item_ids))
             }
+
+            LibraryRequest::GetTrackCountForItemId { item_id } => {
+                let count = self.content_hashes_for_item_id(&item_id).len();
+                LibraryResponse::TrackCountForItemId(count)
+            }
         }
     }
 
@@ -3875,6 +3880,64 @@ mod tests {
             gone,
             "fact_index must not contain 'techno' after all asserters retracted"
         );
+    }
+
+    // =========================================================================
+    // GetTrackCountForItemId tests
+    // =========================================================================
+
+    #[test]
+    fn get_track_count_for_item_id_returns_correct_count() {
+        // Three tracks all tagged with the same ItemId
+        let hash_a = ContentHash::new("sha256:trackcount01");
+        let hash_b = ContentHash::new("sha256:trackcount02");
+        let hash_c = ContentHash::new("sha256:trackcount03");
+        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let item_id = "p_trackcount";
+
+        let temp = {
+            let t = NamedTempFile::new().unwrap();
+            let mut writer = FactWriter::open(t.path()).unwrap();
+            for hash in &[hash_a.clone(), hash_b.clone(), hash_c.clone()] {
+                writer
+                    .write_track_facts(
+                        hash,
+                        &[(MusicValue::ItemId(item_id.to_string()), source.clone())],
+                    )
+                    .unwrap();
+            }
+            t
+        };
+
+        let (service, _metadata_dir) = make_service_with_facts(temp.path());
+
+        let response = service.handle_request(LibraryRequest::GetTrackCountForItemId {
+            item_id: item_id.to_string(),
+        });
+
+        match response {
+            LibraryResponse::TrackCountForItemId(count) => {
+                assert_eq!(count, 3, "expected 3 tracks for item_id={}", item_id);
+            }
+            other => panic!("expected TrackCountForItemId, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn get_track_count_for_item_id_returns_zero_for_unknown_id() {
+        let empty_facts = NamedTempFile::new().unwrap();
+        let (service, _metadata_dir) = make_service_with_facts(empty_facts.path());
+
+        let response = service.handle_request(LibraryRequest::GetTrackCountForItemId {
+            item_id: "p_unknown_xyz".to_string(),
+        });
+
+        match response {
+            LibraryResponse::TrackCountForItemId(count) => {
+                assert_eq!(count, 0, "unknown ItemId should return 0");
+            }
+            other => panic!("expected TrackCountForItemId(0), got {:?}", other),
+        }
     }
 
     /// Assert(Album="A"), Retract(Album="A"), Assert(Album="B") ->

@@ -329,6 +329,9 @@ pub enum LibraryRequest {
     /// or whose tracks have no Album fact, are absent from the map ("absent means
     /// unknown" semantics — simpler than wrapping each value in `Option`).
     GetAlbumTitlesByItemIds { item_ids: Vec<String> },
+
+    /// Count the number of tracks in the library whose facts include `ItemId = item_id`.
+    GetTrackCountForItemId { item_id: String },
 }
 
 // ============================================================================
@@ -408,6 +411,9 @@ pub enum LibraryResponse {
     /// Keys are ItemIds; values are album titles. Absent key means no album title
     /// was found for that ItemId (either unknown ItemId or no Album fact on its tracks).
     AlbumTitlesByItemIds(std::collections::HashMap<String, String>),
+
+    /// Number of tracks in the library whose facts include a given ItemId.
+    TrackCountForItemId(usize),
 
     /// Error response.
     Error(ProtocolError),
@@ -702,6 +708,43 @@ mod tests {
             LibraryResponse::AlbumTitlesByItemIds(map) => {
                 assert!(map.is_empty());
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn get_track_count_for_item_id_request_roundtrip() {
+        let req = LibraryRequest::GetTrackCountForItemId {
+            item_id: "p123456".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: LibraryRequest = serde_json::from_str(&json).unwrap();
+        match decoded {
+            LibraryRequest::GetTrackCountForItemId { item_id } => {
+                assert_eq!(item_id, "p123456");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn track_count_for_item_id_response_roundtrip() {
+        let resp = LibraryResponse::TrackCountForItemId(3);
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: LibraryResponse = serde_json::from_str(&json).unwrap();
+        match decoded {
+            LibraryResponse::TrackCountForItemId(count) => assert_eq!(count, 3),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn track_count_for_item_id_zero_roundtrip() {
+        let resp = LibraryResponse::TrackCountForItemId(0);
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: LibraryResponse = serde_json::from_str(&json).unwrap();
+        match decoded {
+            LibraryResponse::TrackCountForItemId(count) => assert_eq!(count, 0),
             _ => panic!("wrong variant"),
         }
     }

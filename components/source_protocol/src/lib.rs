@@ -64,6 +64,10 @@ pub enum SourceRequest {
 
     /// Force re-sync of a specific source item by identifier.
     ResyncItem { identifier: String },
+
+    /// Check if a single item is stale by fetching current details and
+    /// comparing track count against the library.
+    CheckItem { identifier: String },
 }
 
 // ============================================================================
@@ -102,6 +106,14 @@ pub enum SourceResponse {
     ResyncQueued {
         identifier: String,
         tracks_queued: usize,
+    },
+
+    /// Result of a CheckItem request.
+    ItemChecked {
+        identifier: String,
+        live_track_count: usize,
+        stored_track_count: usize,
+        stale: bool,
     },
 
     /// Error response.
@@ -205,6 +217,9 @@ pub enum SourceError {
 
     #[error("item not found: {identifier}")]
     ItemNotFound { identifier: String },
+
+    #[error("check failed for {identifier}: {reason}")]
+    CheckFailed { identifier: String, reason: String },
 }
 
 #[cfg(test)]
@@ -402,6 +417,78 @@ mod tests {
         let parsed: SourceError = serde_json::from_str(&json).unwrap();
         match parsed {
             SourceError::ItemNotFound { identifier } => assert_eq!(identifier, "p999"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn request_check_item_roundtrip() {
+        let req = SourceRequest::CheckItem {
+            identifier: "p123456".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: SourceRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SourceRequest::CheckItem { identifier } => assert_eq!(identifier, "p123456"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn response_item_checked_stale_roundtrip() {
+        let resp = SourceResponse::ItemChecked {
+            identifier: "p123456".to_string(),
+            live_track_count: 7,
+            stored_track_count: 2,
+            stale: true,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: SourceResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SourceResponse::ItemChecked {
+                identifier,
+                live_track_count,
+                stored_track_count,
+                stale,
+            } => {
+                assert_eq!(identifier, "p123456");
+                assert_eq!(live_track_count, 7);
+                assert_eq!(stored_track_count, 2);
+                assert!(stale);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn response_item_checked_fresh_roundtrip() {
+        let resp = SourceResponse::ItemChecked {
+            identifier: "p999".to_string(),
+            live_track_count: 5,
+            stored_track_count: 5,
+            stale: false,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: SourceResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SourceResponse::ItemChecked { stale, .. } => assert!(!stale),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn source_error_check_failed_roundtrip() {
+        let err = SourceError::CheckFailed {
+            identifier: "p111".to_string(),
+            reason: "HTTP 403 Forbidden".to_string(),
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        let parsed: SourceError = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SourceError::CheckFailed { identifier, reason } => {
+                assert_eq!(identifier, "p111");
+                assert_eq!(reason, "HTTP 403 Forbidden");
+            }
             _ => panic!("wrong variant"),
         }
     }
