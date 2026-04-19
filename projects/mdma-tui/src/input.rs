@@ -124,6 +124,21 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
                 }
             }
         }
+        KeyCode::Char('P') => {
+            let hashes = app.active_pane().resolve_selection();
+            if hashes.is_empty() {
+                app.set_status("No track selected");
+            } else {
+                let entries = build_quick_play_entries(hashes);
+                match app.playback.queue_replace(entries) {
+                    Ok(_) => match app.playback.play_queue() {
+                        Ok(_) => app.set_status("Playing selected"),
+                        Err(e) => app.set_status(format!("Play failed: {e}")),
+                    },
+                    Err(e) => app.set_status(format!("Play failed: {e}")),
+                }
+            }
+        }
         KeyCode::Char('p') => {
             app.mode = InputMode::Playback;
         }
@@ -631,6 +646,32 @@ mod tests {
         );
     }
 
+    // ---- build_quick_play_entries ----
+
+    #[test]
+    fn quick_play_entries_empty_input_gives_empty_vec() {
+        let entries = super::build_quick_play_entries(vec![]);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn quick_play_entries_preserves_hash_order_and_uses_audio_source() {
+        use mdma_client::{ContentHash, SourceName};
+
+        let hashes = vec![
+            ContentHash::new("aabbcc001122"),
+            ContentHash::new("ddeeff334455"),
+        ];
+        let entries = super::build_quick_play_entries(hashes.clone());
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, hashes[0]);
+        assert_eq!(entries[1].0, hashes[1]);
+        // Both entries must use the audio source name.
+        assert_eq!(entries[0].1, SourceName::audio());
+        assert_eq!(entries[1].1, SourceName::audio());
+    }
+
     // ---- parse_history_days ----
 
     #[test]
@@ -668,6 +709,15 @@ mod tests {
     fn history_query_zero_is_today() {
         assert_eq!(super::history_query(0), "started '~'");
     }
+}
+
+/// Build a `queue_replace`-compatible entry list from a set of content hashes,
+/// pairing each with the standard audio source name.
+fn build_quick_play_entries(hashes: Vec<ContentHash>) -> Vec<(ContentHash, SourceName)> {
+    hashes
+        .into_iter()
+        .map(|h| (h, SourceName::audio()))
+        .collect()
 }
 
 /// Route a PaneAction returned from a pane's key handler to the App.
