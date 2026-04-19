@@ -1444,6 +1444,13 @@ impl LibraryService {
                     .filter_map(|e| e.ok())
                     .map(|e| e.path())
                     .filter(|p| p.is_file())
+                    .filter(|p| {
+                        // Exclude AppleDouble sidecar files created by macOS Finder/SMB.
+                        // These are named ._<filename> and contain HFS+ metadata, not audio.
+                        !p.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.starts_with("._"))
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -3803,6 +3810,51 @@ mod tests {
             track.album.as_deref(),
             Some("B"),
             "album should be Some('B') after Assert(A), Retract(A), Assert(B)"
+        );
+    }
+
+    // =========================================================================
+    // Inbox scanner tests
+    // =========================================================================
+
+    /// AppleDouble sidecar files (._<name>) created by macOS Finder/SMB must be
+    /// excluded from the inbox queue so the ingest pipeline never tries to parse
+    /// them as audio.
+    #[test]
+    fn inbox_scanner_ignores_appledouble_files() {
+        let music_dir = tempfile::tempdir().unwrap();
+        let inbox_dir = music_dir.path().join("inbox");
+        std::fs::create_dir_all(&inbox_dir).unwrap();
+
+        // Real audio file (placeholder content — scanner only reads filenames)
+        std::fs::write(inbox_dir.join("track.mp3"), b"fake mp3").unwrap();
+        // AppleDouble sidecar created by macOS
+        std::fs::write(inbox_dir.join("._track.mp3"), b"AppleDouble metadata").unwrap();
+
+        let metadata_dir = tempfile::tempdir().unwrap();
+        let service = LibraryService::new(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+            "ipc:///tmp/mdma-test-acid-nonexistent.sock",
+        )
+        .unwrap();
+
+        let queue = service.get_inbox_queue_internal();
+
+        let filenames: Vec<_> = queue
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+
+        assert!(
+            !filenames.iter().any(|n| n.starts_with("._")),
+            "inbox scanner must exclude AppleDouble sidecar files, got: {:?}",
+            filenames
+        );
+        assert!(
+            filenames.contains(&"track.mp3"),
+            "real audio file must be present in inbox queue, got: {:?}",
+            filenames
         );
     }
 }
