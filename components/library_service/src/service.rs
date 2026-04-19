@@ -115,60 +115,108 @@ impl IndexedTrackInfo {
 ///
 /// The fact timestamp is needed only for `TrackStarted` / `TrackStopped` to
 /// preserve the most-recent-wins ordering; callers must supply it.
+///
+/// When `operation` is `Retract`, single-valued fields are cleared to `None`
+/// and multi-valued fields (e.g. `StyleDescriptor`) remove the retracted value.
 fn apply_fact_to_track(
     entry: &mut IndexedTrackInfo,
     value: &MusicValue,
     timestamp: chrono::DateTime<chrono::Utc>,
+    operation: stainless_facts::Operation,
     has_format: Option<&mut HashSet<String>>,
     has_cover_art: Option<&mut HashSet<String>>,
 ) {
-    match value {
-        MusicValue::Title(v) => entry.title = Some(v.as_str().to_string()),
-        MusicValue::Artist(v) => entry.artist = Some(v.as_str().to_string()),
-        MusicValue::Album(v) => entry.album = Some(v.as_str().to_string()),
-        MusicValue::Label(v) => entry.label = Some(v.clone()),
-        MusicValue::MainGenre(v) => entry.genre = Some(v.clone()),
-        MusicValue::StyleDescriptor(v) => entry.styles.push(v.clone()),
-        MusicValue::DurationSeconds(v) => entry.duration_seconds = Some(v.value()),
-        MusicValue::Bpm(v) => entry.bpm = Some(v.as_f32()),
-        MusicValue::Key(v) => entry.key = Some(v.to_string()),
-        MusicValue::Year(v) => entry.year = Some(v.value()),
-        MusicValue::TrackNumber(v) => entry.track_number = Some(v.value()),
-        MusicValue::DiscNumber(v) => entry.disc_number = Some(v.value()),
-        MusicValue::Source(v) => entry.source = Some(v.clone()),
-        MusicValue::TrackStarted(_) => {
-            update_if_more_recent(&mut entry.last_started, timestamp);
-        }
-        MusicValue::TrackStopped(_) => {
-            update_if_more_recent(&mut entry.last_stopped, timestamp);
-        }
-        MusicValue::FilePath(p) => {
-            let hash = entry.content_hash.as_str();
-            let hash_clean = hash.strip_prefix("sha256:").unwrap_or(hash);
-            if hash_clean.len() >= 2 {
-                if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                    entry.blob_path =
-                        PathBuf::from(format!("blobs/{}/{}.{}", &hash_clean[..2], hash_clean, ext));
+    use stainless_facts::Operation;
+
+    match operation {
+        Operation::Assert => match value {
+            MusicValue::Title(v) => entry.title = Some(v.as_str().to_string()),
+            MusicValue::Artist(v) => entry.artist = Some(v.as_str().to_string()),
+            MusicValue::Album(v) => entry.album = Some(v.as_str().to_string()),
+            MusicValue::Label(v) => entry.label = Some(v.clone()),
+            MusicValue::MainGenre(v) => entry.genre = Some(v.clone()),
+            MusicValue::StyleDescriptor(v) => entry.styles.push(v.clone()),
+            MusicValue::DurationSeconds(v) => entry.duration_seconds = Some(v.value()),
+            MusicValue::Bpm(v) => entry.bpm = Some(v.as_f32()),
+            MusicValue::Key(v) => entry.key = Some(v.to_string()),
+            MusicValue::Year(v) => entry.year = Some(v.value()),
+            MusicValue::TrackNumber(v) => entry.track_number = Some(v.value()),
+            MusicValue::DiscNumber(v) => entry.disc_number = Some(v.value()),
+            MusicValue::Source(v) => entry.source = Some(v.clone()),
+            MusicValue::TrackStarted(_) => {
+                update_if_more_recent(&mut entry.last_started, timestamp);
+            }
+            MusicValue::TrackStopped(_) => {
+                update_if_more_recent(&mut entry.last_stopped, timestamp);
+            }
+            MusicValue::FilePath(p) => {
+                let hash = entry.content_hash.as_str();
+                let hash_clean = hash.strip_prefix("sha256:").unwrap_or(hash);
+                if hash_clean.len() >= 2 {
+                    if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                        entry.blob_path = PathBuf::from(format!(
+                            "blobs/{}/{}.{}",
+                            &hash_clean[..2],
+                            hash_clean,
+                            ext
+                        ));
+                    }
                 }
             }
-        }
-        MusicValue::Format(_) => {
-            if let Some(set) = has_format {
-                set.insert(entry.content_hash.as_str().to_owned());
+            MusicValue::Format(_) => {
+                if let Some(set) = has_format {
+                    set.insert(entry.content_hash.as_str().to_owned());
+                }
+            }
+            MusicValue::CoverArtPath(p) => {
+                entry.cover_art_path = Some(PathBuf::from(p));
+                if let Some(set) = has_cover_art {
+                    set.insert(entry.content_hash.as_str().to_owned());
+                }
+            }
+            MusicValue::AddedAt(dt) => {
+                if entry.added_at.is_none() {
+                    entry.added_at = Some(*dt);
+                }
+            }
+            _ => {}
+        },
+        Operation::Retract => {
+            // TODO: multi-source correctness — if two sources both asserted the same
+            // attribute and only one retracts, the other source's value should survive.
+            // Currently we use simple last-writer-wins across sources, so a retraction
+            // clears the field regardless of other sources. Full per-source tracking
+            // is left as a follow-up.
+            match value {
+                MusicValue::Title(_) => entry.title = None,
+                MusicValue::Artist(_) => entry.artist = None,
+                MusicValue::Album(_) => entry.album = None,
+                MusicValue::Label(_) => entry.label = None,
+                MusicValue::MainGenre(_) => entry.genre = None,
+                MusicValue::StyleDescriptor(v) => entry.styles.retain(|s| s != v),
+                MusicValue::DurationSeconds(_) => entry.duration_seconds = None,
+                MusicValue::Bpm(_) => entry.bpm = None,
+                MusicValue::Key(_) => entry.key = None,
+                MusicValue::Year(_) => entry.year = None,
+                MusicValue::TrackNumber(_) => entry.track_number = None,
+                MusicValue::DiscNumber(_) => entry.disc_number = None,
+                MusicValue::Source(_) => entry.source = None,
+                MusicValue::CoverArtPath(_) => {
+                    entry.cover_art_path = None;
+                    if let Some(set) = has_cover_art {
+                        set.remove(entry.content_hash.as_str());
+                    }
+                }
+                MusicValue::Format(_) => {
+                    if let Some(set) = has_format {
+                        set.remove(entry.content_hash.as_str());
+                    }
+                }
+                // TrackStarted/TrackStopped/FilePath/AddedAt retractions are not
+                // emitted in the current codebase; ignore silently.
+                _ => {}
             }
         }
-        MusicValue::CoverArtPath(p) => {
-            entry.cover_art_path = Some(PathBuf::from(p));
-            if let Some(set) = has_cover_art {
-                set.insert(entry.content_hash.as_str().to_owned());
-            }
-        }
-        MusicValue::AddedAt(dt) => {
-            if entry.added_at.is_none() {
-                entry.added_at = Some(*dt);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -196,6 +244,66 @@ fn update_if_more_recent(
 /// Format a MusicValue for display (returns type name and string value)
 fn format_fact_for_display(value: &MusicValue) -> (String, String) {
     (value.display_name().to_string(), value.to_string())
+}
+
+/// Returns true for the metadata attributes that a Bandcamp ingest writes and
+/// that are safe to retract during a resync.  ItemId and Source are identifiers
+/// and intentionally excluded.
+fn is_retractable_bandcamp_attribute(value: &MusicValue) -> bool {
+    matches!(
+        value,
+        MusicValue::Album(_)
+            | MusicValue::Title(_)
+            | MusicValue::Artist(_)
+            | MusicValue::TrackNumber(_)
+            | MusicValue::Year(_)
+    )
+}
+
+/// Map a `FactOrigin` variant to its canonical source-name string.
+///
+/// This is the single source of truth for the `source_name` → `FactOrigin`
+/// mapping used in `retract_source_facts`. If a new origin is added to
+/// `FactOrigin`, add an arm here.
+fn origin_matches_source_name(origin: &music_facts::FactOrigin, source_name: &str) -> bool {
+    use music_facts::FactOrigin;
+    match origin {
+        FactOrigin::Bandcamp { .. } => source_name == "bandcamp",
+        FactOrigin::Beatport { .. } => source_name == "beatport",
+        FactOrigin::FilesystemScan { .. } => source_name == "filesystem",
+        FactOrigin::User => source_name == "user",
+        FactOrigin::Unknown => source_name == "unknown",
+    }
+}
+
+/// Returns `true` if the given track still asserts a particular (fact_type, value) pair.
+///
+/// Used during `Retract` processing to decide whether the fact_index entry
+/// should be removed or kept (because another entity still asserts it).
+///
+/// Only covers the fact types stored as named fields on `IndexedTrackInfo`.
+/// For fact types not tracked there (e.g. `ItemId`, `BandcampUrl`), returns
+/// `true` conservatively (value stays in the index).
+fn is_value_still_asserted_for_fact_type(
+    track: &IndexedTrackInfo,
+    fact_type: &FactType,
+    value: &str,
+) -> bool {
+    match fact_type.as_str() {
+        "Title" => track.title.as_deref() == Some(value),
+        "Artist" => track.artist.as_deref() == Some(value),
+        "Album" => track.album.as_deref() == Some(value),
+        "Label" => track.label.as_deref() == Some(value),
+        "MainGenre" => track.genre.as_deref() == Some(value),
+        "StyleDescriptor" => track.styles.iter().any(|s| s == value),
+        "Key" => track.key.as_deref() == Some(value),
+        _ => {
+            // Conservative: cannot determine from IndexedTrackInfo fields alone.
+            // Returning true means we never remove — safe but slightly imprecise
+            // for less-common fact types.
+            true
+        }
+    }
 }
 
 impl LibraryService {
@@ -269,6 +377,9 @@ impl LibraryService {
 
         // Backfill cover art for tracks that don't have CoverArtPath yet
         service.backfill_cover_art(&loaded.has_cover_art);
+
+        // Ensure playlists directory exists so writes never fail on a fresh install
+        std::fs::create_dir_all(service.metadata_dir.join("playlists"))?;
 
         Ok(service)
     }
@@ -364,23 +475,44 @@ impl LibraryService {
             };
 
             *total += 1;
-            let entity = fact.entity().as_str().to_owned();
+            let entity_key = fact.entity().as_str().to_owned();
 
-            let entry = tracks_map
-                .entry(entity.clone())
-                .or_insert_with(|| IndexedTrackInfo::new_empty(entity));
+            // Ensure the entry exists before we need to scan the map
+            tracks_map
+                .entry(entity_key.clone())
+                .or_insert_with(|| IndexedTrackInfo::new_empty(entity_key.clone()));
 
             let variant_name = fact.value().display_name();
             let value_str = fact.value().to_string();
-            fact_index
-                .entry(FactType::new(variant_name))
-                .or_default()
-                .insert(value_str);
+            let fact_type = FactType::new(variant_name);
+            match fact.operation() {
+                stainless_facts::Operation::Assert => {
+                    fact_index.entry(fact_type).or_default().insert(value_str);
+                }
+                stainless_facts::Operation::Retract => {
+                    // Only remove from fact_index when no OTHER entity still
+                    // asserts this value. We exclude the current entity because
+                    // apply_fact_to_track (called below) will clear it.
+                    let still_asserted = tracks_map.iter().any(|(k, t)| {
+                        k != &entity_key
+                            && is_value_still_asserted_for_fact_type(t, &fact_type, &value_str)
+                    });
+                    if !still_asserted {
+                        if let Some(set) = fact_index.get_mut(&fact_type) {
+                            set.remove(&value_str);
+                        }
+                    }
+                }
+            }
 
+            let entry = tracks_map
+                .get_mut(&entity_key)
+                .expect("entry was just inserted");
             apply_fact_to_track(
                 entry,
                 fact.value(),
                 *fact.timestamp(),
+                fact.operation(),
                 Some(has_format),
                 Some(has_cover_art),
             );
@@ -429,26 +561,47 @@ impl LibraryService {
                 }
             };
 
-            let entity = fact.entity().as_str().to_owned();
+            let entity_key = fact.entity().as_str().to_owned();
 
-            // Build track summary
-            let entry = tracks_map
-                .entry(entity.clone())
-                .or_insert_with(|| IndexedTrackInfo::new_empty(entity));
+            // Ensure the entry exists before we scan the map
+            tracks_map
+                .entry(entity_key.clone())
+                .or_insert_with(|| IndexedTrackInfo::new_empty(entity_key.clone()));
 
-            // Index fact values for HasFact/HasFacts lookups
+            // Index fact values for HasFact/HasFacts lookups; honour Retract
             let variant_name = fact.value().display_name();
             let value_str = fact.value().to_string();
-            fact_index
-                .entry(FactType::new(variant_name))
-                .or_default()
-                .insert(value_str);
+            let fact_type = FactType::new(variant_name);
+            match fact.operation() {
+                stainless_facts::Operation::Assert => {
+                    fact_index.entry(fact_type).or_default().insert(value_str);
+                }
+                stainless_facts::Operation::Retract => {
+                    // Only remove from fact_index when no OTHER entity still
+                    // asserts this value. The current entity's entry still has
+                    // the old value (apply_fact_to_track below will clear it),
+                    // so we exclude it from the scan.
+                    let still_asserted = tracks_map.iter().any(|(k, t)| {
+                        k != &entity_key
+                            && is_value_still_asserted_for_fact_type(t, &fact_type, &value_str)
+                    });
+                    if !still_asserted {
+                        if let Some(set) = fact_index.get_mut(&fact_type) {
+                            set.remove(&value_str);
+                        }
+                    }
+                }
+            }
 
-            // Extract key fields for search
+            // Extract key fields for search; honour Retract
+            let entry = tracks_map
+                .get_mut(&entity_key)
+                .expect("entry was just inserted");
             apply_fact_to_track(
                 entry,
                 fact.value(),
                 *fact.timestamp(),
+                fact.operation(),
                 Some(&mut has_format),
                 Some(&mut has_cover_art),
             );
@@ -752,18 +905,41 @@ impl LibraryService {
                 index.insert(entity.clone(), pos);
                 pos
             };
-            let entry = &mut tracks[pos];
 
-            // Index the fact value
+            // Index the fact value; honour Retract
             let variant_name = fact.value().display_name();
             let value_str = fact.value().to_string();
-            fact_index
-                .entry(FactType::new(variant_name))
-                .or_default()
-                .insert(value_str);
+            let fact_type = FactType::new(variant_name);
+            match fact.operation() {
+                stainless_facts::Operation::Assert => {
+                    fact_index.entry(fact_type).or_default().insert(value_str);
+                }
+                stainless_facts::Operation::Retract => {
+                    // Only remove from fact_index when no OTHER entity still
+                    // asserts this value. The current entry (at pos) still has
+                    // the old value; apply_fact_to_track below will clear it,
+                    // so we exclude pos from the scan.
+                    let still_asserted = tracks.iter().enumerate().any(|(i, t)| {
+                        i != pos && is_value_still_asserted_for_fact_type(t, &fact_type, &value_str)
+                    });
+                    if !still_asserted {
+                        if let Some(set) = fact_index.get_mut(&fact_type) {
+                            set.remove(&value_str);
+                        }
+                    }
+                }
+            }
 
-            // Apply to track fields
-            apply_fact_to_track(entry, fact.value(), *fact.timestamp(), None, None);
+            // Apply to track fields (borrow tracks[pos] after the scan above)
+            let entry = &mut tracks[pos];
+            apply_fact_to_track(
+                entry,
+                fact.value(),
+                *fact.timestamp(),
+                fact.operation(),
+                None,
+                None,
+            );
         }
 
         // Update tracks_indexed counter for any new entries
@@ -921,6 +1097,13 @@ impl LibraryService {
                         name: name.to_string(),
                     })
                 } else {
+                    if let Some(parent) = path.parent() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            return LibraryResponse::Error(ProtocolError::Internal {
+                                message: format!("Failed to create playlist directory: {}", e),
+                            });
+                        }
+                    }
                     match std::fs::write(&path, &content) {
                         Ok(()) => LibraryResponse::PlaylistContent(content),
                         Err(e) => LibraryResponse::Error(ProtocolError::Internal {
@@ -944,6 +1127,13 @@ impl LibraryService {
                             new_content.push('\n');
                         }
                         new_content.push_str(&content);
+                        if let Some(parent) = path.parent() {
+                            if let Err(e) = std::fs::create_dir_all(parent) {
+                                return LibraryResponse::Error(ProtocolError::Internal {
+                                    message: format!("Failed to create playlist directory: {}", e),
+                                });
+                            }
+                        }
                         match std::fs::write(&path, &new_content) {
                             Ok(()) => LibraryResponse::PlaylistContent(new_content),
                             Err(e) => LibraryResponse::Error(ProtocolError::Internal {
@@ -959,6 +1149,13 @@ impl LibraryService {
 
             LibraryRequest::PlaylistReplace { name, content } => {
                 let path = self.resolve_playlist_path(&name);
+                if let Some(parent) = path.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        return LibraryResponse::Error(ProtocolError::Internal {
+                            message: format!("Failed to create playlist directory: {}", e),
+                        });
+                    }
+                }
                 match std::fs::write(&path, &content) {
                     Ok(()) => LibraryResponse::PlaylistContent(content),
                     Err(e) => LibraryResponse::Error(ProtocolError::Internal {
@@ -1025,7 +1222,10 @@ impl LibraryService {
                     env!("CARGO_PKG_VERSION"),
                     music_facts::FactOrigin::User,
                 );
-                match self.acid_client.write_music_facts(&full_hash, &[(fact, source)]) {
+                match self
+                    .acid_client
+                    .write_music_facts(&full_hash, &[(fact, source)])
+                {
                     Ok(_) => LibraryResponse::BookmarkWritten,
                     Err(e) => LibraryResponse::Error(ProtocolError::Internal {
                         message: e.to_string(),
@@ -1043,14 +1243,208 @@ impl LibraryService {
                     env!("CARGO_PKG_VERSION"),
                     music_facts::FactOrigin::User,
                 );
-                match self.acid_client.write_music_facts(&full_hash, &[(fact, source)]) {
+                match self
+                    .acid_client
+                    .write_music_facts(&full_hash, &[(fact, source)])
+                {
                     Ok(_) => LibraryResponse::FactWritten,
                     Err(e) => LibraryResponse::Error(ProtocolError::Internal {
                         message: e.to_string(),
                     }),
                 }
             }
+
+            LibraryRequest::RetractSourceFacts {
+                item_id,
+                source_name,
+            } => self.retract_source_facts(&item_id, &source_name),
+
+            LibraryRequest::GetAlbumTitleByItemId { item_id } => {
+                LibraryResponse::AlbumTitleByItemId(self.get_album_title_by_item_id(&item_id))
+            }
+
+            LibraryRequest::GetTrackCountForItemId { item_id } => {
+                let count = self.content_hashes_for_item_id(&item_id).len();
+                LibraryResponse::TrackCountForItemId(count)
+            }
         }
+    }
+
+    /// Scan the local facts file and return every ContentHash that has an
+    /// asserted `ItemId` fact equal to `item_id`.
+    ///
+    /// Linear scan — acceptable at current library scale.
+    fn content_hashes_for_item_id(&self, item_id: &str) -> Vec<ContentHash> {
+        use music_facts::FactSource;
+        use stainless_facts::FactStreamReader;
+
+        let facts_path = self.metadata_dir.join("facts.jsonl");
+        let reader: FactStreamReader<ContentHash, MusicValue, FactSource> =
+            match FactStreamReader::open(&facts_path) {
+                Ok(r) => r,
+                Err(_) => return vec![],
+            };
+
+        let mut result: Vec<ContentHash> = reader
+            .filter_map(|r| r.ok())
+            .filter(|f| {
+                f.operation() == stainless_facts::Operation::Assert
+                    && matches!(f.value(), MusicValue::ItemId(v) if v == item_id)
+            })
+            .map(|f| f.entity().clone())
+            .collect();
+
+        // De-duplicate (a track may have duplicate ItemId facts)
+        result.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        result.dedup_by(|a, b| a.as_str() == b.as_str());
+        result
+    }
+
+    /// Retract bandcamp-sourced metadata facts for all tracks belonging to
+    /// `item_id`, where the fact was written by `source_name` (matches
+    /// `FactSource.tool`).
+    ///
+    /// Retracted attributes: Album, Title, Artist, TrackNumber, Year.
+    /// ItemId itself is intentionally NOT retracted — it is the stable identifier
+    /// used to correlate tracks across resyncs.
+    ///
+    /// Retractions are appended to the local facts.jsonl file and the in-memory
+    /// index is updated immediately.  Note: because the ACID service always writes
+    /// facts with `Operation::Assert`, the on-disk retraction will be re-applied on
+    /// next service restart only if the load path is updated to honour Retract.
+    /// The in-memory update is authoritative for the lifetime of this process.
+    fn retract_source_facts(&self, item_id: &str, source_name: &str) -> LibraryResponse {
+        use crate::fact_writer::FactWriter;
+        use music_facts::FactSource;
+        use stainless_facts::FactStreamReader;
+
+        let hashes = self.content_hashes_for_item_id(item_id);
+
+        if hashes.is_empty() {
+            return LibraryResponse::SourceFactsRetracted;
+        }
+
+        let facts_path = self.metadata_dir.join("facts.jsonl");
+
+        // For each hash, collect (MusicValue, FactSource) pairs to retract.
+        // We only retract the attributes that bandcamp writes during ingest:
+        // Album, Title, Artist, TrackNumber, Year.
+        // (Label, Genre, etc. from audio tags are written by mdma-library and may
+        // be shared with other sources; retract them only if source_name matches.)
+        let mut all_retractions: Vec<(ContentHash, Vec<(MusicValue, FactSource)>)> = vec![];
+
+        for hash in &hashes {
+            // Scan facts for this hash to find the currently asserted values
+            // from the given source.
+            let reader: FactStreamReader<ContentHash, MusicValue, FactSource> =
+                match FactStreamReader::open(&facts_path) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "RetractSourceFacts: failed to open facts file");
+                        return LibraryResponse::Error(ProtocolError::Internal {
+                            message: format!("Failed to open facts file: {}", e),
+                        });
+                    }
+                };
+
+            let retractable: Vec<(MusicValue, FactSource)> = reader
+                .filter_map(|r| r.ok())
+                .filter(|f| {
+                    f.entity().as_str() == hash.as_str()
+                        && f.operation() == stainless_facts::Operation::Assert
+                        && origin_matches_source_name(&f.source().origin, source_name)
+                        && is_retractable_bandcamp_attribute(f.value())
+                })
+                .map(|f| (f.value().clone(), f.source().clone()))
+                .collect();
+
+            if !retractable.is_empty() {
+                all_retractions.push((hash.clone(), retractable));
+            }
+        }
+
+        if all_retractions.is_empty() {
+            return LibraryResponse::SourceFactsRetracted;
+        }
+
+        // Write retraction facts to the local facts file
+        let mut writer = match FactWriter::open(&facts_path) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!(error = %e, "RetractSourceFacts: failed to open fact writer");
+                return LibraryResponse::Error(ProtocolError::Internal {
+                    message: format!("Failed to open fact writer: {}", e),
+                });
+            }
+        };
+
+        let mut total_retracted = 0usize;
+        for (hash, facts) in &all_retractions {
+            if let Err(e) = writer.write_track_retractions(hash, facts) {
+                tracing::warn!(error = %e, hash = %hash.as_str(), "Failed to write retractions");
+                return LibraryResponse::Error(ProtocolError::Internal {
+                    message: format!("Failed to write retractions: {}", e),
+                });
+            }
+            total_retracted += facts.len();
+        }
+
+        tracing::info!(
+            item_id,
+            source_name,
+            facts_retracted = total_retracted,
+            "Retracted source facts"
+        );
+
+        // Update in-memory state: clear only the fields that were actually retracted
+        let mut tracks = self.tracks.lock().unwrap();
+        for (hash, retracted_facts) in &all_retractions {
+            if let Some(track) = tracks
+                .iter_mut()
+                .find(|t| t.content_hash.as_str() == hash.as_str())
+            {
+                for (value, _source) in retracted_facts {
+                    match value {
+                        MusicValue::Title(_) => track.title = None,
+                        MusicValue::Artist(_) => track.artist = None,
+                        MusicValue::Album(_) => track.album = None,
+                        MusicValue::TrackNumber(_) => track.track_number = None,
+                        MusicValue::Year(_) => track.year = None,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        LibraryResponse::SourceFactsRetracted
+    }
+
+    /// Look up the album title for any track tagged with `item_id`.
+    ///
+    /// Scans the fact stream to identify which ContentHashes have the given
+    /// ItemId, then looks up their current Album in the in-memory index.
+    ///
+    /// Returns the first album found. If multiple tracks share the same ItemId
+    /// but have different Album values (rare, should only occur mid-rename),
+    /// any one value may be returned.
+    fn get_album_title_by_item_id(&self, item_id: &str) -> Option<String> {
+        let hashes = self.content_hashes_for_item_id(item_id);
+        if hashes.is_empty() {
+            return None;
+        }
+
+        let tracks = self.tracks.lock().unwrap();
+        for hash in &hashes {
+            if let Some(track) = tracks
+                .iter()
+                .find(|t| t.content_hash.as_str() == hash.as_str())
+            {
+                if track.album.is_some() {
+                    return track.album.clone();
+                }
+            }
+        }
+        None
     }
 
     /// Resolve a PlaylistName to an absolute filesystem path
@@ -1074,6 +1468,13 @@ impl LibraryService {
                     .filter_map(|e| e.ok())
                     .map(|e| e.path())
                     .filter(|p| p.is_file())
+                    .filter(|p| {
+                        // Exclude AppleDouble sidecar files created by macOS Finder/SMB.
+                        // These are named ._<filename> and contain HFS+ metadata, not audio.
+                        !p.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.starts_with("._"))
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -2220,6 +2621,45 @@ mod tests {
         }
     }
 
+    /// Regression test: PlaylistReplace must succeed on a bare tempdir with no
+    /// pre-existing `playlists/` subdirectory. This would have caught the original
+    /// bug where the directory was never created automatically.
+    #[test]
+    fn playlist_replace_succeeds_without_preexisting_playlists_dir() {
+        use library_ipc_protocol::PlaylistName;
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+        // Deliberately do NOT create metadata_dir/playlists — that is the regression scenario.
+        let (acid_handle, facts_addr, events_addr) = spawn_acid_server();
+        let service = LibraryService::new_with_events(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+            &facts_addr,
+            &events_addr,
+        )
+        .expect("service construction must succeed even without playlists dir");
+        let _acid_handle = acid_handle; // keep alive
+
+        let name = PlaylistName::new("bare-dir-test").unwrap();
+        let content = "sha256:aaa\nsha256:bbb\n".to_string();
+        let response = service.handle_request(LibraryRequest::PlaylistReplace {
+            name,
+            content: content.clone(),
+        });
+        match response {
+            LibraryResponse::PlaylistContent(c) => {
+                assert_eq!(c, content);
+                // Also verify the file actually landed on disk
+                let file_path = metadata_dir
+                    .path()
+                    .join("playlists")
+                    .join("bare-dir-test.plist");
+                assert!(file_path.exists(), "playlist file must exist on disk");
+            }
+            other => panic!("Expected PlaylistContent, got {:?}", other),
+        }
+    }
+
     #[test]
     fn playlist_remove_deletes_playlist() {
         use library_ipc_protocol::PlaylistName;
@@ -2714,6 +3154,770 @@ mod tests {
             track_b_info.cover_art_path.as_deref(),
             Some(cover_b),
             "Track B should keep its own cover art, not be replaced by Track A's"
+        );
+    }
+
+    // =========================================================================
+    // RetractSourceFacts tests
+    // =========================================================================
+
+    /// Helper: build a minimal service backed by a real (in-process) ACID server
+    /// and pre-load it with a given facts file.
+    fn make_service_with_facts(
+        facts_file: &std::path::Path,
+    ) -> (LibraryService, tempfile::TempDir) {
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+        let facts_dest = metadata_dir.path().join("facts.jsonl");
+        std::fs::copy(facts_file, &facts_dest).unwrap();
+        let service = LibraryService::new(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+            "ipc:///tmp/mdma-test-acid-nonexistent.sock",
+        )
+        .unwrap();
+        (service, metadata_dir)
+    }
+
+    #[test]
+    fn retract_source_facts_removes_album_and_title_from_in_memory_track() {
+        // Arrange: a track with ItemId, Album and Title written by "mdma-library"
+        // with FactOrigin::Bandcamp — exactly as production sets it.
+        let hash = ContentHash::new("sha256:retracttest01");
+        let source = FactSource::new(
+            "mdma-library",
+            "0.0.0",
+            FactOrigin::bandcamp(Some("https://artist.bandcamp.com".to_string())),
+        );
+        let item_id = "p12345";
+
+        let temp = {
+            let t = NamedTempFile::new().unwrap();
+            let mut writer = FactWriter::open(t.path()).unwrap();
+            writer
+                .write_track_facts(
+                    &hash,
+                    &[
+                        (MusicValue::ItemId(item_id.to_string()), source.clone()),
+                        (
+                            MusicValue::Album(music_facts::Album::new("Old Album")),
+                            source.clone(),
+                        ),
+                        (MusicValue::Title(Title::new("Old Title")), source.clone()),
+                        (
+                            MusicValue::Artist(music_facts::Artist::new("Old Artist")),
+                            source.clone(),
+                        ),
+                    ],
+                )
+                .unwrap();
+            t
+        };
+
+        let (service, _metadata_dir) = make_service_with_facts(temp.path());
+
+        // Pre-condition: album and title visible in memory
+        {
+            let tracks = service.tracks.lock().unwrap();
+            let t = tracks
+                .iter()
+                .find(|t| t.content_hash.as_str() == hash.as_str())
+                .expect("track must be indexed before retraction");
+            assert_eq!(t.album.as_deref(), Some("Old Album"));
+            assert_eq!(t.title.as_deref(), Some("Old Title"));
+        }
+
+        // Act: retract with "bandcamp" source_name — matches FactOrigin::Bandcamp
+        let response = service.handle_request(LibraryRequest::RetractSourceFacts {
+            item_id: item_id.to_string(),
+            source_name: "bandcamp".to_string(),
+        });
+
+        // Assert response
+        assert!(
+            matches!(response, LibraryResponse::SourceFactsRetracted),
+            "expected SourceFactsRetracted, got {:?}",
+            response
+        );
+
+        // Assert in-memory state cleared
+        let tracks = service.tracks.lock().unwrap();
+        let t = tracks
+            .iter()
+            .find(|t| t.content_hash.as_str() == hash.as_str())
+            .expect("track must still be indexed after retraction");
+        assert_eq!(
+            t.album, None,
+            "album should be cleared after RetractSourceFacts"
+        );
+        assert_eq!(
+            t.title, None,
+            "title should be cleared after RetractSourceFacts"
+        );
+        assert_eq!(
+            t.artist, None,
+            "artist should be cleared after RetractSourceFacts"
+        );
+    }
+
+    #[test]
+    fn retract_source_facts_writes_retract_entries_to_facts_file() {
+        use stainless_facts::FactStreamReader;
+
+        let hash = ContentHash::new("sha256:retractfile01");
+        // Use Bandcamp origin + "bandcamp" source_name — matches production usage
+        let source = FactSource::new("mdma-library", "0.0.0", FactOrigin::bandcamp(None));
+        let item_id = "p54321";
+
+        let temp = {
+            let t = NamedTempFile::new().unwrap();
+            let mut writer = FactWriter::open(t.path()).unwrap();
+            writer
+                .write_track_facts(
+                    &hash,
+                    &[
+                        (MusicValue::ItemId(item_id.to_string()), source.clone()),
+                        (
+                            MusicValue::Album(music_facts::Album::new("Retract Album")),
+                            source.clone(),
+                        ),
+                        (
+                            MusicValue::Title(Title::new("Retract Title")),
+                            source.clone(),
+                        ),
+                    ],
+                )
+                .unwrap();
+            t
+        };
+
+        let (service, metadata_dir) = make_service_with_facts(temp.path());
+
+        service.handle_request(LibraryRequest::RetractSourceFacts {
+            item_id: item_id.to_string(),
+            source_name: "bandcamp".to_string(),
+        });
+
+        // Verify Retract entries appear in facts.jsonl
+        let facts_path = metadata_dir.path().join("facts.jsonl");
+        let reader: FactStreamReader<ContentHash, MusicValue, FactSource> =
+            FactStreamReader::open(&facts_path).unwrap();
+
+        let retract_count = reader
+            .filter_map(|r| r.ok())
+            .filter(|f| {
+                f.entity().as_str() == hash.as_str()
+                    && f.operation() == stainless_facts::Operation::Retract
+            })
+            .count();
+
+        assert!(
+            retract_count > 0,
+            "at least one Retract entry should be written to facts.jsonl after RetractSourceFacts"
+        );
+    }
+
+    #[test]
+    fn retract_source_facts_noop_for_unknown_item_id() {
+        let hash = ContentHash::new("sha256:retractnoop01");
+        let source = FactSource::new("mdma-library", "0.0.0", FactOrigin::bandcamp(None));
+
+        let temp = {
+            let t = NamedTempFile::new().unwrap();
+            let mut writer = FactWriter::open(t.path()).unwrap();
+            writer
+                .write_track_facts(
+                    &hash,
+                    &[(MusicValue::ItemId("p99999".to_string()), source.clone())],
+                )
+                .unwrap();
+            t
+        };
+
+        let (service, _metadata_dir) = make_service_with_facts(temp.path());
+
+        // Requesting retraction for an unknown item_id should still succeed (no-op)
+        let response = service.handle_request(LibraryRequest::RetractSourceFacts {
+            item_id: "p00000_does_not_exist".to_string(),
+            source_name: "bandcamp".to_string(),
+        });
+
+        assert!(
+            matches!(response, LibraryResponse::SourceFactsRetracted),
+            "expected SourceFactsRetracted even for unknown item_id, got {:?}",
+            response
+        );
+    }
+
+    // =========================================================================
+    // GetAlbumTitleByItemId tests
+    // =========================================================================
+
+    #[test]
+    fn get_album_title_by_item_id_returns_album_when_present() {
+        let hash = ContentHash::new("sha256:albumbyitemid01");
+        let source = FactSource::new("mdma-library", "0.0.0", FactOrigin::Unknown);
+        let item_id = "p77777";
+
+        let temp = {
+            let t = NamedTempFile::new().unwrap();
+            let mut writer = FactWriter::open(t.path()).unwrap();
+            writer
+                .write_track_facts(
+                    &hash,
+                    &[
+                        (MusicValue::ItemId(item_id.to_string()), source.clone()),
+                        (
+                            MusicValue::Album(music_facts::Album::new("Expected Album")),
+                            source.clone(),
+                        ),
+                    ],
+                )
+                .unwrap();
+            t
+        };
+
+        let (service, _metadata_dir) = make_service_with_facts(temp.path());
+
+        let response = service.handle_request(LibraryRequest::GetAlbumTitleByItemId {
+            item_id: item_id.to_string(),
+        });
+
+        match response {
+            LibraryResponse::AlbumTitleByItemId(Some(title)) => {
+                assert_eq!(title, "Expected Album");
+            }
+            other => panic!("expected AlbumTitleByItemId(Some(_)), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn get_album_title_by_item_id_returns_none_for_unknown_id() {
+        let empty_facts = NamedTempFile::new().unwrap();
+        let (service, _metadata_dir) = make_service_with_facts(empty_facts.path());
+
+        let response = service.handle_request(LibraryRequest::GetAlbumTitleByItemId {
+            item_id: "p_unknown_000".to_string(),
+        });
+
+        assert!(
+            matches!(response, LibraryResponse::AlbumTitleByItemId(None)),
+            "expected AlbumTitleByItemId(None) for unknown item_id, got {:?}",
+            response
+        );
+    }
+
+    #[test]
+    fn get_album_title_by_item_id_with_two_tracks_same_album() {
+        // Two tracks share the same ItemId and album — should return Some(album)
+        let hash_a = ContentHash::new("sha256:twotrackalbum01");
+        let hash_b = ContentHash::new("sha256:twotrackalbum02");
+        let source = FactSource::new("mdma-library", "0.0.0", FactOrigin::Unknown);
+        let item_id = "p88888";
+        let album_name = "Shared Album Name";
+
+        let temp = {
+            let t = NamedTempFile::new().unwrap();
+            let mut writer = FactWriter::open(t.path()).unwrap();
+            writer
+                .write_track_facts(
+                    &hash_a,
+                    &[
+                        (MusicValue::ItemId(item_id.to_string()), source.clone()),
+                        (
+                            MusicValue::Album(music_facts::Album::new(album_name)),
+                            source.clone(),
+                        ),
+                    ],
+                )
+                .unwrap();
+            writer
+                .write_track_facts(
+                    &hash_b,
+                    &[
+                        (MusicValue::ItemId(item_id.to_string()), source.clone()),
+                        (
+                            MusicValue::Album(music_facts::Album::new(album_name)),
+                            source.clone(),
+                        ),
+                    ],
+                )
+                .unwrap();
+            t
+        };
+
+        let (service, _metadata_dir) = make_service_with_facts(temp.path());
+
+        let response = service.handle_request(LibraryRequest::GetAlbumTitleByItemId {
+            item_id: item_id.to_string(),
+        });
+
+        match response {
+            LibraryResponse::AlbumTitleByItemId(Some(title)) => {
+                assert_eq!(title, album_name);
+            }
+            other => panic!(
+                "expected AlbumTitleByItemId(Some({:?})), got {:?}",
+                album_name, other
+            ),
+        }
+    }
+
+    // =========================================================================
+    // Retract semantics in load path
+    // =========================================================================
+
+    /// Helper: write a sequence of (ContentHash, MusicValue, timestamp, Operation) facts
+    /// directly into a temp file so we can test Retract handling.
+    fn write_facts_file_with_operations(
+        facts: &[(ContentHash, MusicValue, chrono::DateTime<Utc>, Operation)],
+    ) -> NamedTempFile {
+        let temp = NamedTempFile::new().unwrap();
+        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let mut writer = FactStreamWriter::open(temp.path()).unwrap();
+
+        let fact_structs: Vec<Fact<ContentHash, MusicValue, FactSource>> = facts
+            .iter()
+            .map(|(hash, value, ts, op)| {
+                Fact::new(hash.clone(), value.clone(), *ts, source.clone(), *op)
+            })
+            .collect();
+        writer.write_batch(&fact_structs).unwrap();
+        temp
+    }
+
+    /// Assert(Album="Old"), Assert(Title="T"), Retract(Album="Old") ->
+    /// album should be None, title should be Some("T").
+    #[test]
+    fn load_tracks_retract_clears_field() {
+        let hash = ContentHash::new("sha256:retract_clears_01");
+        let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+
+        let temp = write_facts_file_with_operations(&[
+            (
+                hash.clone(),
+                MusicValue::Album(music_facts::Album::new("Old")),
+                ts,
+                Operation::Assert,
+            ),
+            (
+                hash.clone(),
+                MusicValue::Title(Title::new("T")),
+                ts,
+                Operation::Assert,
+            ),
+            (
+                hash.clone(),
+                MusicValue::Album(music_facts::Album::new("Old")),
+                ts,
+                Operation::Retract,
+            ),
+        ]);
+
+        let result = LibraryService::load_tracks_from_facts(&temp.path().to_path_buf());
+
+        assert_eq!(result.tracks.len(), 1);
+        let track = &result.tracks[0];
+        assert_eq!(
+            track.album, None,
+            "album should be None after Retract(Album)"
+        );
+        assert_eq!(
+            track.title.as_deref(),
+            Some("T"),
+            "title should remain after only Album was retracted"
+        );
+    }
+
+    // =========================================================================
+    // Blocker 1: retract_source_facts filters by FactOrigin, not tool name
+    // =========================================================================
+
+    /// retract_source_facts with source_name="bandcamp" MUST retract facts whose
+    /// origin is FactOrigin::Bandcamp, even though tool="mdma-library".
+    #[test]
+    fn retract_source_facts_bandcamp_origin_is_retracted() {
+        let hash = ContentHash::new("sha256:bc_retract_01");
+        // tool is "mdma-library" — this is what production sets; origin carries bandcamp-ness
+        let source = FactSource::new(
+            "mdma-library",
+            "0.0.0",
+            FactOrigin::bandcamp(Some("https://artist.bandcamp.com".to_string())),
+        );
+        let item_id = "p_bc_01";
+
+        let temp = {
+            let t = NamedTempFile::new().unwrap();
+            let mut writer = FactWriter::open(t.path()).unwrap();
+            writer
+                .write_track_facts(
+                    &hash,
+                    &[
+                        (MusicValue::ItemId(item_id.to_string()), source.clone()),
+                        (
+                            MusicValue::Album(music_facts::Album::new("Bandcamp Album")),
+                            source.clone(),
+                        ),
+                        (
+                            MusicValue::Title(Title::new("Bandcamp Track")),
+                            source.clone(),
+                        ),
+                        (
+                            MusicValue::Artist(music_facts::Artist::new("Bandcamp Artist")),
+                            source.clone(),
+                        ),
+                    ],
+                )
+                .unwrap();
+            t
+        };
+
+        let (service, _metadata_dir) = make_service_with_facts(temp.path());
+
+        // Pre-condition: track is indexed with values
+        {
+            let tracks = service.tracks.lock().unwrap();
+            let t = tracks
+                .iter()
+                .find(|t| t.content_hash.as_str() == hash.as_str())
+                .expect("track must be indexed before retraction");
+            assert_eq!(t.album.as_deref(), Some("Bandcamp Album"));
+        }
+
+        // Act: retract with source_name="bandcamp" (matches FactOrigin::Bandcamp)
+        let response = service.handle_request(LibraryRequest::RetractSourceFacts {
+            item_id: item_id.to_string(),
+            source_name: "bandcamp".to_string(),
+        });
+
+        assert!(
+            matches!(response, LibraryResponse::SourceFactsRetracted),
+            "expected SourceFactsRetracted, got {:?}",
+            response
+        );
+
+        // Assert in-memory state cleared
+        let tracks = service.tracks.lock().unwrap();
+        let t = tracks
+            .iter()
+            .find(|t| t.content_hash.as_str() == hash.as_str())
+            .expect("track must still be indexed after retraction");
+        assert_eq!(
+            t.album, None,
+            "album should be cleared when retracted by bandcamp origin"
+        );
+        assert_eq!(
+            t.title, None,
+            "title should be cleared when retracted by bandcamp origin"
+        );
+        assert_eq!(
+            t.artist, None,
+            "artist should be cleared when retracted by bandcamp origin"
+        );
+    }
+
+    /// Facts with a NON-bandcamp origin (FactOrigin::User) for the same ItemId
+    /// must NOT be retracted when source_name="bandcamp".
+    #[test]
+    fn retract_source_facts_non_bandcamp_origin_is_not_retracted() {
+        let hash = ContentHash::new("sha256:non_bc_retract_01");
+        let bandcamp_source = FactSource::new("mdma-library", "0.0.0", FactOrigin::bandcamp(None));
+        let user_source = FactSource::new("mdma-library", "0.0.0", FactOrigin::User);
+        let item_id = "p_non_bc_01";
+
+        let temp = {
+            let t = NamedTempFile::new().unwrap();
+            let mut writer = FactWriter::open(t.path()).unwrap();
+            writer
+                .write_track_facts(
+                    &hash,
+                    &[
+                        (
+                            MusicValue::ItemId(item_id.to_string()),
+                            bandcamp_source.clone(),
+                        ),
+                        // bandcamp-origin fact — should be retracted
+                        (
+                            MusicValue::Album(music_facts::Album::new("BC Album")),
+                            bandcamp_source.clone(),
+                        ),
+                        // user-origin fact — must NOT be retracted
+                        (
+                            MusicValue::Title(Title::new("User Title")),
+                            user_source.clone(),
+                        ),
+                    ],
+                )
+                .unwrap();
+            t
+        };
+
+        let (service, _metadata_dir) = make_service_with_facts(temp.path());
+
+        let response = service.handle_request(LibraryRequest::RetractSourceFacts {
+            item_id: item_id.to_string(),
+            source_name: "bandcamp".to_string(),
+        });
+
+        assert!(
+            matches!(response, LibraryResponse::SourceFactsRetracted),
+            "expected SourceFactsRetracted, got {:?}",
+            response
+        );
+
+        // User-origin title must survive
+        let tracks = service.tracks.lock().unwrap();
+        let t = tracks
+            .iter()
+            .find(|t| t.content_hash.as_str() == hash.as_str())
+            .expect("track must still be indexed after retraction");
+        assert_eq!(
+            t.title.as_deref(),
+            Some("User Title"),
+            "title from User origin must not be retracted by source_name=bandcamp"
+        );
+    }
+
+    // =========================================================================
+    // Blocker 2: fact_index retract is entity-aware (shared-value safety)
+    // =========================================================================
+
+    /// When two tracks both assert MainGenre("techno") and track 1 retracts,
+    /// fact_index must still contain "techno" because track 2 still asserts it.
+    #[test]
+    fn fact_index_retract_keeps_value_when_other_asserter_exists() {
+        let hash_a = ContentHash::new("sha256:shared_genre_01");
+        let hash_b = ContentHash::new("sha256:shared_genre_02");
+        let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let ts2 = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+
+        let temp = write_facts_file_with_operations(&[
+            // Both tracks assert techno
+            (
+                hash_a.clone(),
+                MusicValue::MainGenre("techno".to_string()),
+                ts,
+                Operation::Assert,
+            ),
+            (
+                hash_b.clone(),
+                MusicValue::MainGenre("techno".to_string()),
+                ts,
+                Operation::Assert,
+            ),
+            // Track A retracts — track B still has it
+            (
+                hash_a.clone(),
+                MusicValue::MainGenre("techno".to_string()),
+                ts2,
+                Operation::Retract,
+            ),
+        ]);
+
+        let result = LibraryService::load_tracks_from_facts(&temp.path().to_path_buf());
+
+        let main_genre_type = FactType::new("MainGenre");
+        let still_there = result
+            .fact_index
+            .get(&main_genre_type)
+            .is_some_and(|s| s.contains("techno"));
+        assert!(
+            still_there,
+            "fact_index must still contain 'techno' because track B still asserts it"
+        );
+    }
+
+    /// When the last asserter retracts, fact_index must drop the value.
+    #[test]
+    fn fact_index_retract_removes_value_when_last_asserter_retracts() {
+        let hash_a = ContentHash::new("sha256:shared_genre_03");
+        let hash_b = ContentHash::new("sha256:shared_genre_04");
+        let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let ts2 = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+        let ts3 = Utc.with_ymd_and_hms(2026, 1, 3, 0, 0, 0).unwrap();
+
+        let temp = write_facts_file_with_operations(&[
+            (
+                hash_a.clone(),
+                MusicValue::MainGenre("techno".to_string()),
+                ts,
+                Operation::Assert,
+            ),
+            (
+                hash_b.clone(),
+                MusicValue::MainGenre("techno".to_string()),
+                ts,
+                Operation::Assert,
+            ),
+            // Both retract
+            (
+                hash_a.clone(),
+                MusicValue::MainGenre("techno".to_string()),
+                ts2,
+                Operation::Retract,
+            ),
+            (
+                hash_b.clone(),
+                MusicValue::MainGenre("techno".to_string()),
+                ts3,
+                Operation::Retract,
+            ),
+        ]);
+
+        let result = LibraryService::load_tracks_from_facts(&temp.path().to_path_buf());
+
+        let main_genre_type = FactType::new("MainGenre");
+        let gone = result
+            .fact_index
+            .get(&main_genre_type)
+            .is_none_or(|s| !s.contains("techno"));
+        assert!(
+            gone,
+            "fact_index must not contain 'techno' after all asserters retracted"
+        );
+    }
+
+    // =========================================================================
+    // GetTrackCountForItemId tests
+    // =========================================================================
+
+    #[test]
+    fn get_track_count_for_item_id_returns_correct_count() {
+        // Three tracks all tagged with the same ItemId
+        let hash_a = ContentHash::new("sha256:trackcount01");
+        let hash_b = ContentHash::new("sha256:trackcount02");
+        let hash_c = ContentHash::new("sha256:trackcount03");
+        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let item_id = "p_trackcount";
+
+        let temp = {
+            let t = NamedTempFile::new().unwrap();
+            let mut writer = FactWriter::open(t.path()).unwrap();
+            for hash in &[hash_a.clone(), hash_b.clone(), hash_c.clone()] {
+                writer
+                    .write_track_facts(
+                        hash,
+                        &[(MusicValue::ItemId(item_id.to_string()), source.clone())],
+                    )
+                    .unwrap();
+            }
+            t
+        };
+
+        let (service, _metadata_dir) = make_service_with_facts(temp.path());
+
+        let response = service.handle_request(LibraryRequest::GetTrackCountForItemId {
+            item_id: item_id.to_string(),
+        });
+
+        match response {
+            LibraryResponse::TrackCountForItemId(count) => {
+                assert_eq!(count, 3, "expected 3 tracks for item_id={}", item_id);
+            }
+            other => panic!("expected TrackCountForItemId, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn get_track_count_for_item_id_returns_zero_for_unknown_id() {
+        let empty_facts = NamedTempFile::new().unwrap();
+        let (service, _metadata_dir) = make_service_with_facts(empty_facts.path());
+
+        let response = service.handle_request(LibraryRequest::GetTrackCountForItemId {
+            item_id: "p_unknown_xyz".to_string(),
+        });
+
+        match response {
+            LibraryResponse::TrackCountForItemId(count) => {
+                assert_eq!(count, 0, "unknown ItemId should return 0");
+            }
+            other => panic!("expected TrackCountForItemId(0), got {:?}", other),
+        }
+    }
+
+    /// Assert(Album="A"), Retract(Album="A"), Assert(Album="B") ->
+    /// final album should be Some("B").
+    #[test]
+    fn load_tracks_retract_then_reassert() {
+        let hash = ContentHash::new("sha256:retract_reassert_01");
+        let t1 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+        let t3 = Utc.with_ymd_and_hms(2026, 1, 3, 0, 0, 0).unwrap();
+
+        let temp = write_facts_file_with_operations(&[
+            (
+                hash.clone(),
+                MusicValue::Album(music_facts::Album::new("A")),
+                t1,
+                Operation::Assert,
+            ),
+            (
+                hash.clone(),
+                MusicValue::Album(music_facts::Album::new("A")),
+                t2,
+                Operation::Retract,
+            ),
+            (
+                hash.clone(),
+                MusicValue::Album(music_facts::Album::new("B")),
+                t3,
+                Operation::Assert,
+            ),
+        ]);
+
+        let result = LibraryService::load_tracks_from_facts(&temp.path().to_path_buf());
+
+        assert_eq!(result.tracks.len(), 1);
+        let track = &result.tracks[0];
+        assert_eq!(
+            track.album.as_deref(),
+            Some("B"),
+            "album should be Some('B') after Assert(A), Retract(A), Assert(B)"
+        );
+    }
+
+    // =========================================================================
+    // Inbox scanner tests
+    // =========================================================================
+
+    /// AppleDouble sidecar files (._<name>) created by macOS Finder/SMB must be
+    /// excluded from the inbox queue so the ingest pipeline never tries to parse
+    /// them as audio.
+    #[test]
+    fn inbox_scanner_ignores_appledouble_files() {
+        let music_dir = tempfile::tempdir().unwrap();
+        let inbox_dir = music_dir.path().join("inbox");
+        std::fs::create_dir_all(&inbox_dir).unwrap();
+
+        // Real audio file (placeholder content — scanner only reads filenames)
+        std::fs::write(inbox_dir.join("track.mp3"), b"fake mp3").unwrap();
+        // AppleDouble sidecar created by macOS
+        std::fs::write(inbox_dir.join("._track.mp3"), b"AppleDouble metadata").unwrap();
+
+        let metadata_dir = tempfile::tempdir().unwrap();
+        let service = LibraryService::new(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+            "ipc:///tmp/mdma-test-acid-nonexistent.sock",
+        )
+        .unwrap();
+
+        let queue = service.get_inbox_queue_internal();
+
+        let filenames: Vec<_> = queue
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+
+        assert!(
+            !filenames.iter().any(|n| n.starts_with("._")),
+            "inbox scanner must exclude AppleDouble sidecar files, got: {:?}",
+            filenames
+        );
+        assert!(
+            filenames.contains(&"track.mp3"),
+            "real audio file must be present in inbox queue, got: {:?}",
+            filenames
         );
     }
 }

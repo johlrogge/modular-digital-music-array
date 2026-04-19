@@ -13,6 +13,7 @@ use ratatui::{
 use std::rc::Rc;
 
 /// A pane that lists all available playlists by name.
+#[derive(Clone)]
 pub struct PlaylistsPane {
     names: Vec<PlaylistName>,
     selection: SelectionState,
@@ -207,6 +208,14 @@ impl Pane for PlaylistsPane {
             }
             Err(e) => PaneAction::Error(format!("Failed to refresh playlists: {e}")),
         }
+    }
+
+    fn display_string(&self, data_idx: usize) -> Option<String> {
+        self.names.get(data_idx).map(|n| n.to_string())
+    }
+
+    fn clone_box(&self) -> Box<dyn Pane> {
+        Box::new(self.clone())
     }
 }
 

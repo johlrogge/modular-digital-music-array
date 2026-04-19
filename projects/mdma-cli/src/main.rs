@@ -19,7 +19,7 @@ use mdma_client::{
 use music_facts::MusicValue;
 use nng::options::Options;
 use rekordbox_xml::{parse_xml, RekordboxTrack};
-use source_protocol::{SourceRequest, SourceResponse};
+use source_protocol::{SourceError, SourceRequest, SourceResponse};
 use std::path::Path;
 use track_matcher::{CandidateTrack, MatchResult, TrackLookup};
 
@@ -142,15 +142,15 @@ enum Commands {
         no_stdin: bool,
 
         /// Filter by last started date. Format: N/A, >2026-02, <2026, 2026-01..2026-06
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         started: Option<String>,
 
         /// Filter by last stopped date. Same format as --started.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         stopped: Option<String>,
 
         /// Filter by date added to library. Uses date expression syntax: ~/+1/15 (15th next month), -7 (7 days ago), ^ (1st of month), $ (end of month). Ranges: -7..~ (last 7 days to today).
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         added: Option<String>,
 
         /// Invert the search results — return tracks that do NOT match the filters.
@@ -445,6 +445,31 @@ enum SourceCommands {
     Resume {
         /// Source name
         name: String,
+    },
+
+    /// Force re-sync of a specific item (bypasses dedup)
+    Resync {
+        /// Source name (e.g. bandcamp)
+        name: String,
+        /// Source-specific item identifier (e.g. "p123456" for bandcamp)
+        identifier: String,
+    },
+
+    /// Check if a specific item has changed upstream
+    CheckItem {
+        /// Source name (e.g. bandcamp)
+        name: String,
+        /// Source-specific item identifier
+        identifier: String,
+    },
+
+    /// Check the whole source collection for stale items
+    CheckUpdates {
+        /// Source name
+        name: String,
+        /// Auto-apply resync for any stale items found
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -1806,14 +1831,14 @@ fn handle_bookmarks(library_client: &LibraryBackend) -> Result<()> {
 
     let bookmarked: Vec<TrackInfo> = tracks
         .into_iter()
-        .filter(|track| {
-            match library_client.get_facts(&track.content_hash) {
+        .filter(
+            |track| match library_client.get_facts(&track.content_hash) {
                 Ok((_hash, facts)) => facts
                     .iter()
                     .any(|(fact_type, _value)| fact_type == "Bookmarked"),
                 Err(_) => false,
-            }
-        })
+            },
+        )
         .collect();
 
     if bookmarked.is_empty() {
@@ -1824,7 +1849,10 @@ fn handle_bookmarks(library_client: &LibraryBackend) -> Result<()> {
         return Ok(());
     }
 
-    print_tracks(&bookmarked, &format!("Bookmarked tracks ({})", bookmarked.len()));
+    print_tracks(
+        &bookmarked,
+        &format!("Bookmarked tracks ({})", bookmarked.len()),
+    );
     Ok(())
 }
 
@@ -1861,6 +1889,34 @@ fn handle_source_sync(client: &SourceClient, name: &str) -> Result<()> {
             println!("Sync started for {}", name);
             println!("Total items: {}, New items: {}", total_items, new_items);
             Ok(())
+        }
+        Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
+        Ok(_) => handle_source_error(&"Unexpected response"),
+        Err(e) => handle_source_error(&e),
+    }
+}
+
+fn handle_source_resync(client: &SourceClient, name: &str, identifier: &str) -> Result<()> {
+    println!("Requesting resync of {} from {}...", identifier, name);
+    match client.request(
+        name,
+        &SourceRequest::ResyncItem {
+            identifier: identifier.to_string(),
+        },
+    ) {
+        Ok(SourceResponse::ResyncQueued {
+            identifier,
+            tracks_queued,
+        }) => {
+            println!(
+                "Queued resync for {} ({} item queued)",
+                identifier, tracks_queued
+            );
+            Ok(())
+        }
+        Ok(SourceResponse::Error(SourceError::ItemNotFound { identifier: ref id })) => {
+            eprintln!("Item {} not found in your {} collection", id, name);
+            std::process::exit(1);
         }
         Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
         Ok(_) => handle_source_error(&"Unexpected response"),
@@ -1983,6 +2039,173 @@ fn handle_source_resume(client: &SourceClient, name: &str) -> Result<()> {
         Ok(_) => handle_source_error(&"Unexpected response"),
         Err(e) => handle_source_error(&e),
     }
+}
+
+fn handle_source_check_item(client: &SourceClient, name: &str, identifier: &str) -> Result<()> {
+    match client.request(
+        name,
+        &SourceRequest::CheckItem {
+            identifier: identifier.to_string(),
+        },
+    ) {
+        Ok(SourceResponse::ItemChecked {
+            identifier,
+            live_track_count,
+            stored_track_count,
+            stale,
+        }) => {
+            if stale {
+                println!(
+                    "STALE {}: live={} stored={}",
+                    identifier, live_track_count, stored_track_count
+                );
+            } else {
+                println!("OK {}: {} tracks", identifier, stored_track_count);
+            }
+            Ok(())
+        }
+        Ok(SourceResponse::Error(SourceError::ItemNotFound { identifier: ref id })) => {
+            eprintln!("Item {} not found in your {} collection", id, name);
+            std::process::exit(1);
+        }
+        Ok(SourceResponse::Error(e)) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        Ok(_) => handle_source_error(&"Unexpected response"),
+        Err(e) => handle_source_error(&e),
+    }
+}
+
+fn handle_source_check_updates(
+    cli: &Cli,
+    source_client: &SourceClient,
+    name: &str,
+    apply: bool,
+) -> Result<()> {
+    // Fetch all ItemId values from the library for this source.
+    // We use GetFactValues("ItemId") — returns all ItemId values the library knows about.
+    let lib = connect_library(cli);
+    let all_item_ids = match lib.request(&library_ipc_client::LibraryRequest::GetFactValues {
+        fact_type: library_ipc_client::FactType::new("ItemId"),
+    }) {
+        Ok(library_ipc_client::LibraryResponse::FactValues(values)) => values,
+        Ok(library_ipc_client::LibraryResponse::Error(e)) => {
+            eprintln!("Library error: {}", e);
+            std::process::exit(1);
+        }
+        Ok(_) => {
+            eprintln!("Unexpected response from library");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Failed to connect to library: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if all_item_ids.is_empty() {
+        println!("No items in library.");
+        return Ok(());
+    }
+
+    let total = all_item_ids.len();
+    let mut stale_ids: Vec<String> = Vec::new();
+    let mut fresh_count = 0usize;
+    let mut error_count = 0usize;
+
+    for (idx, item_id) in all_item_ids.iter().enumerate() {
+        eprint!("[{}/{}] checking {} ... ", idx + 1, total, item_id);
+
+        match source_client.request(
+            name,
+            &SourceRequest::CheckItem {
+                identifier: item_id.clone(),
+            },
+        ) {
+            Ok(SourceResponse::ItemChecked {
+                live_track_count,
+                stored_track_count,
+                stale,
+                ..
+            }) => {
+                if stale {
+                    eprintln!(
+                        "STALE (live={}, stored={})",
+                        live_track_count, stored_track_count
+                    );
+                    stale_ids.push(item_id.clone());
+                } else {
+                    eprintln!("ok");
+                    fresh_count += 1;
+                }
+            }
+            Ok(SourceResponse::Error(SourceError::ItemNotFound { .. })) => {
+                // Not in this source's collection — skip silently
+                eprintln!("not in collection (skipping)");
+                fresh_count += 1;
+            }
+            Ok(SourceResponse::Error(e)) => {
+                eprintln!("ERROR: {}", e);
+                error_count += 1;
+            }
+            Ok(_) => {
+                eprintln!("unexpected response");
+                error_count += 1;
+            }
+            Err(e) => {
+                eprintln!("transport error: {}", e);
+                error_count += 1;
+            }
+        }
+
+        // Rate-limit: be polite to bandcamp
+        if idx + 1 < total {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+
+    println!(
+        "\n{} items stale, {} items up-to-date, {} items errored",
+        stale_ids.len(),
+        fresh_count,
+        error_count
+    );
+
+    if stale_ids.is_empty() {
+        return Ok(());
+    }
+
+    if apply {
+        for id in &stale_ids {
+            match source_client.request(
+                name,
+                &SourceRequest::ResyncItem {
+                    identifier: id.clone(),
+                },
+            ) {
+                Ok(SourceResponse::ResyncQueued { identifier, .. }) => {
+                    println!("Queued resync for {}", identifier);
+                }
+                Ok(SourceResponse::Error(e)) => {
+                    eprintln!("Failed to queue resync for {}: {}", id, e);
+                }
+                Ok(_) => {
+                    eprintln!("Unexpected response queueing resync for {}", id);
+                }
+                Err(e) => {
+                    eprintln!("Transport error queueing resync for {}: {}", id, e);
+                }
+            }
+        }
+    } else {
+        println!("Run with --apply to resync stale items, or resync individually with:");
+        for id in &stale_ids {
+            println!("  mdma source resync {} {}", name, id);
+        }
+    }
+
+    Ok(())
 }
 
 // =============================================================================
@@ -3161,10 +3384,8 @@ fn handle_rekordbox_export(
                 .map(|(_, v)| v.clone())
         };
 
-        let bitrate = find_fact("Bitrate")
-            .and_then(|v| v.parse::<u32>().ok());
-        let sample_rate = find_fact("SampleRate")
-            .and_then(|v| v.parse::<u32>().ok());
+        let bitrate = find_fact("Bitrate").and_then(|v| v.parse::<u32>().ok());
+        let sample_rate = find_fact("SampleRate").and_then(|v| v.parse::<u32>().ok());
         let year = find_fact("Year").or_else(|| find_fact("RecordingYear"));
         let label = find_fact("Label");
         let comment = find_fact("Comment");
@@ -3178,10 +3399,7 @@ fn handle_rekordbox_export(
             .and_then(|s| s.split('T').next())
             .map(String::from);
 
-        let tonality = track
-            .key
-            .as_ref()
-            .map(rekordbox_xml::key_to_tonality);
+        let tonality = track.key.as_ref().map(rekordbox_xml::key_to_tonality);
 
         let average_bpm = track.bpm.map(|b| b.as_f32());
 
@@ -3352,18 +3570,12 @@ fn handle_rekordbox_import(
     }
 
     // 3. Print summary
-    println!(
-        "Matched:   {:3} tracks",
-        matched.len()
-    );
+    println!("Matched:   {:3} tracks", matched.len());
     println!(
         "Ambiguous: {:3} tracks (need manual resolution)",
         ambiguous.len()
     );
-    println!(
-        "Unmatched: {:3} tracks",
-        unmatched.len()
-    );
+    println!("Unmatched: {:3} tracks", unmatched.len());
 
     // 4. Print unmatched tracks to stderr
     if !unmatched.is_empty() {
@@ -3419,7 +3631,10 @@ fn handle_rekordbox_import(
             std::process::exit(1);
         }
         if sanitized != *pname {
-            eprintln!("Note: playlist name sanitized from '{}' to '{}'", pname, sanitized);
+            eprintln!(
+                "Note: playlist name sanitized from '{}' to '{}'",
+                pname, sanitized
+            );
         }
         let name = parse_playlist_name(&sanitized);
         let hashes: Vec<ContentHash> = matched.iter().map(|(_, h)| h.clone()).collect();
@@ -3432,14 +3647,22 @@ fn handle_rekordbox_import(
             );
         } else {
             match library.playlist_new(&name, &hashes) {
-                Ok(()) => println!("Created playlist '{}' with {} tracks", sanitized, hashes.len()),
+                Ok(()) => println!(
+                    "Created playlist '{}' with {} tracks",
+                    sanitized,
+                    hashes.len()
+                ),
                 Err(e) => {
                     eprintln!("Failed to create playlist '{}': {}", sanitized, e);
                     eprintln!("Trying to replace existing playlist...");
-                    library
-                        .playlist_replace(&name, &hashes)
-                        .map_err(|e2| color_eyre::eyre::eyre!("Failed to replace playlist: {}", e2))?;
-                    println!("Replaced playlist '{}' with {} tracks", sanitized, hashes.len());
+                    library.playlist_replace(&name, &hashes).map_err(|e2| {
+                        color_eyre::eyre::eyre!("Failed to replace playlist: {}", e2)
+                    })?;
+                    println!(
+                        "Replaced playlist '{}' with {} tracks",
+                        sanitized,
+                        hashes.len()
+                    );
                 }
             }
         }
@@ -3478,7 +3701,10 @@ fn handle_rekordbox_import(
             let sanitized = sanitized.trim_matches('-').to_string();
 
             if sanitized.is_empty() {
-                eprintln!("Skipping playlist '{}': name sanitizes to empty", rb_playlist.name);
+                eprintln!(
+                    "Skipping playlist '{}': name sanitizes to empty",
+                    rb_playlist.name
+                );
                 continue;
             }
 
@@ -3508,10 +3734,9 @@ fn handle_rekordbox_import(
                                 sanitized,
                                 resolved.len()
                             ),
-                            Err(e2) => eprintln!(
-                                "Failed to replace playlist '{}': {}",
-                                sanitized, e2
-                            ),
+                            Err(e2) => {
+                                eprintln!("Failed to replace playlist '{}': {}", sanitized, e2)
+                            }
                         }
                     }
                 }
@@ -3640,7 +3865,12 @@ fn handle_export(
     let http = build_http_client()?;
 
     let results = download_tracks(&node, &tracks, output, &http, |track| {
-        resolve_export_format(track.blob_path.as_deref(), format, lossless_format, lossy_format)
+        resolve_export_format(
+            track.blob_path.as_deref(),
+            format,
+            lossless_format,
+            lossy_format,
+        )
     });
 
     // Summary
@@ -3777,6 +4007,18 @@ fn main() -> Result<()> {
             SourceCommands::Resume { name } => {
                 let client = connect_source(&cli, name);
                 handle_source_resume(&client, name)
+            }
+            SourceCommands::Resync { name, identifier } => {
+                let client = connect_source(&cli, name);
+                handle_source_resync(&client, name, identifier)
+            }
+            SourceCommands::CheckItem { name, identifier } => {
+                let client = connect_source(&cli, name);
+                handle_source_check_item(&client, name, identifier)
+            }
+            SourceCommands::CheckUpdates { name, apply } => {
+                let client = connect_source(&cli, name);
+                handle_source_check_updates(&cli, &client, name, *apply)
             }
         },
 
@@ -4551,5 +4793,38 @@ mod tests {
     #[test]
     fn contains_threshold_no_flag_inverts() {
         assert_eq!(resolve_contains_threshold(false, None, true, 4), (1, true));
+    }
+
+    // ── Date arg hyphen-value parsing ────────────────────────────────────────
+
+    #[test]
+    fn search_added_hyphen_value_parses() {
+        // `mdma search --added -7` must not be rejected by clap as an unknown flag.
+        let result = Cli::try_parse_from(["mdma", "search", "--added", "-7"]);
+        assert!(
+            result.is_ok(),
+            "clap rejected --added -7: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn search_started_hyphen_value_parses() {
+        let result = Cli::try_parse_from(["mdma", "search", "--started", "-7"]);
+        assert!(
+            result.is_ok(),
+            "clap rejected --started -7: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn search_stopped_tilde_parses() {
+        let result = Cli::try_parse_from(["mdma", "search", "--stopped", "~"]);
+        assert!(
+            result.is_ok(),
+            "clap rejected --stopped ~: {}",
+            result.unwrap_err()
+        );
     }
 }

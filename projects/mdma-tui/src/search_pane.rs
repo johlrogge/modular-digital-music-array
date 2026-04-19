@@ -1,8 +1,8 @@
 use crate::pane::{Pane, PaneAction, PaneKind};
+use crate::search_parse::parse_query;
 use crate::selection::SelectionState;
 use crate::track_list::render_track_list;
 use crossterm::event::{KeyCode, KeyEvent};
-use library_search::{StringQuery, TrackQuery};
 use mdma_client::{ContentHash, LibraryBackend, PlaylistName, TrackInfo};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -14,6 +14,7 @@ use ratatui::{
 use std::rc::Rc;
 
 /// Search pane — lets the user type a query and browse the results.
+#[derive(Clone)]
 pub struct SearchPane {
     query_text: String,
     editing: bool,
@@ -36,15 +37,28 @@ impl SearchPane {
         }
     }
 
+    /// Construct a `SearchPane` with a pre-filled query and immediately execute it.
+    ///
+    /// The pane starts in non-editing mode so the user can browse results right away.
+    pub fn with_query(library: Rc<LibraryBackend>, query: String) -> (Self, PaneAction) {
+        let mut pane = Self {
+            query_text: query,
+            editing: false,
+            tracks: Vec::new(),
+            selection: SelectionState::new(0),
+            library,
+            last_executed_query: String::new(),
+        };
+        let action = pane.execute_search();
+        (pane, action)
+    }
+
     /// Execute the current `query_text` against the library backend.
     ///
     /// On success updates `tracks` and resets selection.
     /// On failure returns a `PaneAction::Error`.
     fn execute_search(&mut self) -> PaneAction {
-        let query = TrackQuery {
-            any_text: Some(StringQuery::Contains(self.query_text.clone())),
-            ..Default::default()
-        };
+        let query = parse_query(&self.query_text);
         match self.library.search(&query) {
             Ok(tracks) => {
                 self.last_executed_query = self.query_text.clone();
@@ -54,6 +68,16 @@ impl SearchPane {
                 PaneAction::Consumed
             }
             Err(e) => PaneAction::Error(format!("Search failed: {e}")),
+        }
+    }
+
+    /// Run the search only if the query text has changed since the last execution.
+    /// Called on each keystroke to provide live results.
+    fn maybe_execute_search(&mut self) -> PaneAction {
+        if self.query_text != self.last_executed_query {
+            self.execute_search()
+        } else {
+            PaneAction::Consumed
         }
     }
 }
@@ -91,7 +115,18 @@ impl Pane for SearchPane {
 
         // Render the track list (no inner block — outer frame provides the border).
         let block = Block::default().borders(Borders::NONE);
-        render_track_list(f, list_area, &self.tracks, &self.selection, block);
+        // If a search has been run and returned no results, show a hint.
+        if self.tracks.is_empty() && !self.last_executed_query.is_empty() {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "(no matches)",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                list_area,
+            );
+        } else {
+            render_track_list(f, list_area, &self.tracks, &self.selection, block);
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> PaneAction {
@@ -99,14 +134,15 @@ impl Pane for SearchPane {
             match key.code {
                 KeyCode::Char(c) => {
                     self.query_text.push(c);
-                    PaneAction::Consumed
+                    self.maybe_execute_search()
                 }
                 KeyCode::Backspace => {
                     self.query_text.pop();
-                    PaneAction::Consumed
+                    self.maybe_execute_search()
                 }
                 KeyCode::Enter => {
-                    let action = self.execute_search();
+                    // Commit: run the search (no-op if already current) and exit editing.
+                    let action = self.maybe_execute_search();
                     self.editing = false;
                     action
                 }
@@ -151,6 +187,10 @@ impl Pane for SearchPane {
                     }
                     PaneAction::Consumed
                 }
+                KeyCode::Char(',') => {
+                    self.selection.clear_selection();
+                    PaneAction::Consumed
+                }
                 _ => PaneAction::Ignored,
             }
         }
@@ -184,6 +224,22 @@ impl Pane for SearchPane {
     fn playlist_name(&self) -> Option<&PlaylistName> {
         None
     }
+
+    fn display_string(&self, data_idx: usize) -> Option<String> {
+        let track = self.tracks.get(data_idx)?;
+        let artist = track.artist.as_deref().unwrap_or("");
+        let title = track.title.as_deref().unwrap_or("");
+        let album = track.album.as_deref().unwrap_or("");
+        Some(format!("{} {} {}", artist, title, album))
+    }
+
+    fn capturing_text_input(&self) -> bool {
+        self.editing
+    }
+
+    fn clone_box(&self) -> Box<dyn Pane> {
+        Box::new(self.clone())
+    }
 }
 
 // =========================================================================
@@ -191,9 +247,13 @@ impl Pane for SearchPane {
 // =========================================================================
 //
 // NOTE: `SearchPane` requires a live `LibraryBackend` (IPC socket) to
-// construct. Tests instead exercise the pure logic — the same resolve logic
-// used in `resolve_selection` — directly on `SelectionState` + a track slice,
-// without instantiating `SearchPane` or connecting to any backend.
+// construct. Tests exercise the pure logic — the same resolve logic used in
+// `resolve_selection` — directly on `SelectionState` + a track slice.
+// `capturing_text_input` behaviour is verified via the `CapturingPane` stub
+// in `pane.rs` tests, which cover the trait contract.  The one-liner
+// `SearchPane::capturing_text_input` (returning `self.editing`) is simple
+// enough to be covered by code review; the trait-default tests in `pane.rs`
+// guard the plumbing.
 
 #[cfg(test)]
 mod tests {

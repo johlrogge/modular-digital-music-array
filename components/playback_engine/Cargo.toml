@@ -14,7 +14,6 @@ interface = "playback-engine"
 [dependencies]
 audio-decoder = { workspace = true }
 audio-types = { workspace = true }
-tokio = { version = "1.36", features = ["full"] }
 thiserror = "1.0"
 parking_lot = "0.12"
 playback-primitives = { workspace = true }

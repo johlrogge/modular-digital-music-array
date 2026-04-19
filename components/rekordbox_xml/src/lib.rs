@@ -168,10 +168,7 @@ pub mod path_uri {
         #[test]
         fn percent_is_double_encoded() {
             let path = Path::new("/music/100%.flac");
-            assert_eq!(
-                path_to_file_uri(path),
-                "file://localhost/music/100%25.flac"
-            );
+            assert_eq!(path_to_file_uri(path), "file://localhost/music/100%25.flac");
         }
 
         #[test]
@@ -271,10 +268,7 @@ pub mod xml {
 
             // COLLECTION
             let entry_count = self.tracks.len();
-            out.push_str(&format!(
-                "  <COLLECTION Entries=\"{}\">\n",
-                entry_count
-            ));
+            out.push_str(&format!("  <COLLECTION Entries=\"{}\">\n", entry_count));
 
             for track in &self.tracks {
                 write_track(&mut out, track);
@@ -362,10 +356,7 @@ pub mod xml {
             " DateAdded=\"{}\"",
             xml_escape(track.date_added.as_deref().unwrap_or(""))
         ));
-        out.push_str(&format!(
-            " BitRate=\"{}\"",
-            track.bitrate.unwrap_or(0)
-        ));
+        out.push_str(&format!(" BitRate=\"{}\"", track.bitrate.unwrap_or(0)));
         out.push_str(&format!(
             " SampleRate=\"{}\"",
             track.sample_rate.unwrap_or(0)
@@ -428,7 +419,10 @@ pub mod xml {
         #[test]
         fn xml_has_dj_playlists_root() {
             let xml = make_test_library().to_xml();
-            assert!(xml.contains("<DJ_PLAYLISTS Version=\"1.0.0\">"), "missing root");
+            assert!(
+                xml.contains("<DJ_PLAYLISTS Version=\"1.0.0\">"),
+                "missing root"
+            );
             assert!(xml.contains("</DJ_PLAYLISTS>"), "missing closing root");
         }
 
@@ -454,7 +448,10 @@ pub mod xml {
             assert!(xml.contains("TotalTime=\"423\""), "TotalTime missing");
             assert!(xml.contains("BitRate=\"1411\""), "BitRate missing");
             assert!(xml.contains("SampleRate=\"44100\""), "SampleRate missing");
-            assert!(xml.contains("DateAdded=\"2024-06-15\""), "DateAdded missing");
+            assert!(
+                xml.contains("DateAdded=\"2024-06-15\""),
+                "DateAdded missing"
+            );
         }
 
         #[test]
@@ -493,16 +490,28 @@ pub mod xml {
                 playlists: vec![],
             };
             let xml = lib.to_xml();
-            assert!(!xml.contains("<TEMPO"), "TEMPO should not appear when BPM is None");
+            assert!(
+                !xml.contains("<TEMPO"),
+                "TEMPO should not appear when BPM is None"
+            );
             // Self-closing track tag
-            assert!(xml.contains("/>"), "track should be self-closing when no BPM");
+            assert!(
+                xml.contains("/>"),
+                "track should be self-closing when no BPM"
+            );
         }
 
         #[test]
         fn xml_playlist_structure() {
             let xml = make_test_library().to_xml();
-            assert!(xml.contains("NODE Name=\"My Set\""), "playlist name missing");
-            assert!(xml.contains("TRACK Key=\"1\""), "playlist track ref missing");
+            assert!(
+                xml.contains("NODE Name=\"My Set\""),
+                "playlist name missing"
+            );
+            assert!(
+                xml.contains("TRACK Key=\"1\""),
+                "playlist track ref missing"
+            );
         }
 
         #[test]
@@ -602,10 +611,7 @@ pub mod parse {
         let mut i = 0;
         while i < bytes.len() {
             if bytes[i] == b'%' && i + 2 < bytes.len() {
-                if let (Some(h), Some(l)) = (
-                    char_to_hex(bytes[i + 1]),
-                    char_to_hex(bytes[i + 2]),
-                ) {
+                if let (Some(h), Some(l)) = (char_to_hex(bytes[i + 1]), char_to_hex(bytes[i + 2])) {
                     out.push((h * 16 + l) as char);
                     i += 3;
                     continue;

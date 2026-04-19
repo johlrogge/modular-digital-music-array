@@ -37,6 +37,10 @@ pub struct DecodedSegment {
 
     // The segment data
     pub segment: AudioSegment,
+
+    // How many samples in `segment.samples` are real audio (not zero-padding).
+    // Callers must only read `segment.samples[..valid_samples]`.
+    pub valid_samples: usize,
 }
 
 impl DecodedSegment {
@@ -86,6 +90,7 @@ mod tests {
             segment: AudioSegment {
                 samples: [0.0; SEGMENT_SIZE],
             },
+            valid_samples: SEGMENT_SIZE,
         };
         assert!(segment.is_empty());
     }
@@ -97,6 +102,7 @@ mod tests {
         let segment = DecodedSegment {
             index: SegmentIndex(0),
             segment: AudioSegment { samples },
+            valid_samples: SEGMENT_SIZE,
         };
         assert!(!segment.is_empty());
     }

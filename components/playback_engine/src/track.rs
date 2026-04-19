@@ -4,12 +4,11 @@ use audio_resampler::Resampler;
 #[cfg(test)]
 use audio_types::{AudioSegment, DecodedSegment, SegmentIndex, SEGMENT_SIZE};
 
-use tokio::sync::mpsc;
-
 use std::collections::VecDeque;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::mpsc;
 
 use std::sync::Arc;
 
@@ -42,9 +41,10 @@ impl TrackState {
 
 pub struct Track {
     state: Arc<AtomicU8>,
-    command_tx: mpsc::Sender<TrackCommand>,
-    decoder_task: Option<tokio::task::JoinHandle<()>>,
-    /// Current playback position in milliseconds (updated by decoder task).
+    command_tx: mpsc::SyncSender<TrackCommand>,
+    decoder_thread: Option<std::thread::JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+    /// Current playback position in milliseconds (updated by decoder thread).
     position_ms: Arc<AtomicU64>,
     /// Total track duration in milliseconds (0 if unknown).
     duration_ms: u64,
@@ -59,14 +59,15 @@ pub enum TrackCommand {
 /// At 192 kHz stereo this is ~170 ms of audio.
 const DECODE_AHEAD: usize = 65_536;
 
-async fn decoder_task<S: Source + Send + Sync + 'static>(
+fn decoder_thread_fn<S: Source + Send + Sync + 'static>(
     source: S,
     mut output: HeapProducer<f32>,
-    mut command_rx: mpsc::Receiver<TrackCommand>,
+    command_rx: mpsc::Receiver<TrackCommand>,
     state: Arc<AtomicU8>,
     source_rate: u32,
     target_rate: u32,
     position_ms: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
 ) {
     let channels = source.audio_channels() as usize;
 
@@ -99,78 +100,13 @@ async fn decoder_task<S: Source + Send + Sync + 'static>(
     let mut eof = false;
 
     loop {
-        // Decode more audio when the pending buffer runs low
-        if !eof && pending.len() < DECODE_AHEAD {
-            match source.decode_next_frame() {
-                Ok(segments) if segments.is_empty() => {
-                    tracing::debug!("Decoder reached EOF");
-                    eof = true;
-                }
-                Ok(segments) => {
-                    for seg in segments {
-                        let samples = if let Some(ref mut r) = resampler {
-                            match r.process_segment(&seg.segment.samples) {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    tracing::error!("Resampler error: {e}");
-                                    continue;
-                                }
-                            }
-                        } else {
-                            seg.segment.samples.to_vec()
-                        };
-                        pending.extend(samples);
-                    }
-                    // Update position_ms from the source's current sample position.
-                    // current_position() counts all interleaved samples; divide by channels to get frames.
-                    let channels = source.audio_channels() as u64;
-                    let sample_pos = source.current_position() as u64;
-                    let frames = if channels > 0 {
-                        sample_pos / channels
-                    } else {
-                        sample_pos
-                    };
-                    let ms = frames * 1000 / source_rate as u64;
-                    position_ms.store(ms, Ordering::Release);
-                }
-                Err(e) => {
-                    tracing::error!("Decode error: {e}");
-                }
-            }
+        // Check stop flag first — set by Drop before join
+        if stop.load(Ordering::Acquire) {
+            tracing::info!("Decoder thread stopping (stop flag set)");
+            return;
         }
 
-        match TrackState::from_u8(state.load(Ordering::Acquire)) {
-            TrackState::Stopped => {
-                // Paused: keep decoding ahead for instant resume, but don't write
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            TrackState::Playing if !pending.is_empty() => {
-                // Write as much as the ring buffer will accept
-                let (front, _) = pending.as_slices();
-                let written = output.push_slice(front);
-                pending.drain(..written);
-
-                if written == 0 {
-                    // Ring buffer full — yield so the mixer can consume
-                    tokio::task::yield_now().await;
-                }
-            }
-            TrackState::Playing if eof => {
-                // All decoded samples written — track is done
-                state.store(TrackState::Finished as u8, Ordering::Release);
-                tracing::info!("Track finished (EOF + pending drained)");
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            TrackState::Playing => {
-                tokio::task::yield_now().await;
-            }
-            TrackState::Finished => {
-                // Nothing to do — wait for a seek command to reset or shutdown
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        }
-
-        // Handle commands (seek, shutdown)
+        // Handle commands (seek, shutdown) — checked every iteration
         while let Ok(command) = command_rx.try_recv() {
             match command {
                 TrackCommand::FillFrom(position) => {
@@ -197,16 +133,88 @@ async fn decoder_task<S: Source + Send + Sync + 'static>(
                     }
                 }
                 TrackCommand::Shutdown => {
-                    tracing::info!("Decoder task shutting down");
+                    tracing::info!("Decoder thread shutting down");
                     return;
                 }
+            }
+        }
+
+        // Decode more audio when the pending buffer runs low
+        if !eof && pending.len() < DECODE_AHEAD {
+            match source.decode_next_frame() {
+                Ok(segments) if segments.is_empty() => {
+                    tracing::debug!("Decoder reached EOF");
+                    eof = true;
+                }
+                Ok(segments) => {
+                    for seg in segments {
+                        let valid = &seg.segment.samples[..seg.valid_samples];
+                        let samples = if let Some(ref mut r) = resampler {
+                            match r.process_segment(valid) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    tracing::error!("Resampler error: {e}");
+                                    continue;
+                                }
+                            }
+                        } else {
+                            valid.to_vec()
+                        };
+                        pending.extend(samples);
+                    }
+                    // Update position_ms from the source's current sample position.
+                    // current_position() counts all interleaved samples; divide by channels to get frames.
+                    let channels = source.audio_channels() as u64;
+                    let sample_pos = source.current_position() as u64;
+                    let frames = if channels > 0 {
+                        sample_pos / channels
+                    } else {
+                        sample_pos
+                    };
+                    let ms = frames * 1000 / source_rate as u64;
+                    position_ms.store(ms, Ordering::Release);
+                }
+                Err(e) => {
+                    tracing::error!("Decode error: {e}");
+                }
+            }
+        }
+
+        match TrackState::from_u8(state.load(Ordering::Acquire)) {
+            TrackState::Stopped => {
+                // Paused: keep decoding ahead for instant resume, but don't write
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            TrackState::Playing if !pending.is_empty() => {
+                // Write as much as the ring buffer will accept
+                let (front, _) = pending.as_slices();
+                let written = output.push_slice(front);
+                pending.drain(..written);
+
+                if written == 0 {
+                    // Ring buffer full — yield so the mixer can consume
+                    std::thread::sleep(std::time::Duration::from_micros(500));
+                }
+            }
+            TrackState::Playing if eof => {
+                // All decoded samples written — track is done
+                state.store(TrackState::Finished as u8, Ordering::Release);
+                tracing::info!("Track finished (EOF + pending drained)");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            TrackState::Playing => {
+                std::thread::sleep(std::time::Duration::from_micros(500));
+            }
+            TrackState::Finished => {
+                // Nothing to do — wait for a seek command to reset or shutdown
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
     }
 }
 
 impl Track {
-    pub async fn new<S: Source + Send + Sync + 'static>(
+    pub fn new<S: Source + Send + Sync + 'static>(
         source: S,
         output_producer: HeapProducer<f32>,
         source_rate: u32,
@@ -214,14 +222,16 @@ impl Track {
     ) -> Result<Self, PlaybackError> {
         let state = Arc::new(AtomicU8::new(TrackState::Stopped as u8));
         let position_ms = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
         let duration_ms = source.duration_ms().unwrap_or(0);
 
-        let (command_tx, command_rx) = mpsc::channel(32);
+        let (command_tx, command_rx) = mpsc::sync_channel(32);
 
         let state_clone = state.clone();
         let position_ms_clone = position_ms.clone();
-        let decoder_task = tokio::spawn(async move {
-            decoder_task(
+        let stop_clone = stop.clone();
+        let decoder_thread = std::thread::spawn(move || {
+            decoder_thread_fn(
                 source,
                 output_producer,
                 command_rx,
@@ -229,14 +239,15 @@ impl Track {
                 source_rate,
                 target_rate,
                 position_ms_clone,
-            )
-            .await;
+                stop_clone,
+            );
         });
 
         Ok(Self {
             state,
             command_tx,
-            decoder_task: Some(decoder_task),
+            decoder_thread: Some(decoder_thread),
+            stop,
             position_ms,
             duration_ms,
         })
@@ -283,20 +294,17 @@ impl Drop for Track {
     fn drop(&mut self) {
         tracing::info!("Track drop beginning");
 
-        // 1. Send shutdown command first
+        // 1. Set stop flag so the loop exits even if the command channel is full
+        self.stop.store(true, Ordering::Release);
+
+        // 2. Best-effort shutdown command — ignore channel-full errors
         let _ = self.command_tx.try_send(TrackCommand::Shutdown);
-        tracing::info!("Shutdown command sent (or attempted)");
+        tracing::info!("Stop flag set and shutdown command attempted");
 
-        // 2. Close the command channel
-        // Create dummy sender - this safely drops the original
-        let dummy_tx = mpsc::channel::<TrackCommand>(1).0;
-        let _ = std::mem::replace(&mut self.command_tx, dummy_tx);
-        tracing::info!("Command channel closed");
-
-        // 3. Abort the decoder task
-        if let Some(task) = self.decoder_task.take() {
-            tracing::info!("Aborting decoder task");
-            task.abort();
+        // 3. Join the decoder thread — deterministic shutdown
+        if let Some(handle) = self.decoder_thread.take() {
+            tracing::info!("Joining decoder thread");
+            handle.join().ok();
         }
 
         tracing::info!("Track drop completed");
@@ -345,6 +353,7 @@ impl TestSource {
                 segment: AudioSegment {
                     samples: segment_samples,
                 },
+                valid_samples: SEGMENT_SIZE,
             });
 
             start_pos += SEGMENT_SIZE;
@@ -368,6 +377,7 @@ impl TestSource {
                 segment: AudioSegment {
                     samples: segment_samples,
                 },
+                valid_samples: remaining,
             });
         }
 
@@ -519,7 +529,7 @@ impl Source for TestSource {
 #[cfg(test)]
 #[allow(dead_code)]
 impl Track {
-    pub(crate) async fn new_test() -> Result<Self, PlaybackError> {
+    pub(crate) fn new_test() -> Result<Self, PlaybackError> {
         // Generate 1 second of 440Hz test tone
         let sample_rate = 48000;
         let frequency = 440.0; // A4 note
@@ -533,11 +543,47 @@ impl Track {
         let buffer = HeapRb::new(1024 * 8);
         let (prod, _cons) = buffer.split();
         // Tests use same source and target rate to skip resampling
-        Self::new(TestSource::new_from_samples(samples), prod, 48_000, 48_000).await
+        Self::new(TestSource::new_from_samples(samples), prod, 48_000, 48_000)
     }
 
     // Add this method for tests
-    pub(crate) async fn ensure_ready_for_test(&mut self) -> Result<(), PlaybackError> {
+    pub(crate) fn ensure_ready_for_test(&mut self) -> Result<(), PlaybackError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ringbuf::HeapRb;
+
+    /// Verify that Track::new does not require a tokio runtime.
+    /// The decoder must run on a dedicated std::thread, not a tokio task.
+    #[test]
+    fn track_new_does_not_require_tokio_runtime() {
+        let sample_rate = 48_000u32;
+        let samples: Vec<f32> = (0..sample_rate as usize)
+            .map(|i| (i as f32 / sample_rate as f32).sin() * 0.1)
+            .collect();
+        let source = TestSource::new_from_samples(samples);
+        let buffer = HeapRb::new(1024 * 8);
+        let (prod, _cons) = buffer.split();
+        // This must compile and succeed without a tokio runtime on the current thread
+        let _track = Track::new(source, prod, sample_rate, sample_rate)
+            .expect("Track::new should succeed without tokio runtime");
+    }
+
+    /// Verify that dropping a Track joins the decoder thread deterministically.
+    #[test]
+    fn track_drop_joins_decoder_thread() {
+        let sample_rate = 48_000u32;
+        let samples: Vec<f32> = vec![0.0f32; 1024];
+        let source = TestSource::new_from_samples(samples);
+        let buffer = HeapRb::new(1024 * 8);
+        let (prod, _cons) = buffer.split();
+        let track =
+            Track::new(source, prod, sample_rate, sample_rate).expect("Track::new should succeed");
+        // Dropping the track should not panic or deadlock
+        drop(track);
     }
 }

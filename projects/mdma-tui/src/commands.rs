@@ -54,6 +54,10 @@ pub static COMMANDS: &[Command] = &[
         name: "o",
         description: "Open or create a playlist  :o <name>",
     },
+    Command {
+        name: "history",
+        description: "Show recent play history  :history [days]",
+    },
 ];
 
 /// Return all commands whose name starts with `input` (case-insensitive).

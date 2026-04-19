@@ -48,10 +48,7 @@ pub fn normalize(s: &str) -> String {
     let lowered = s.to_lowercase();
     let trimmed = lowered.trim();
     // Collapse internal whitespace runs to single space
-    trimmed
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    trimmed.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn duration_matches(a: u32, b: u32, tolerance: u32) -> bool {
@@ -313,8 +310,7 @@ mod tests {
 
     #[test]
     fn artist_title_duration_exact_match() {
-        let lookup =
-            MockLookup::new().with_artist_title_duration("artist", "title", "hash1", 300);
+        let lookup = MockLookup::new().with_artist_title_duration("artist", "title", "hash1", 300);
         let candidate = CandidateTrack {
             isrc: None,
             artist: Some("artist".to_string()),
@@ -330,8 +326,7 @@ mod tests {
 
     #[test]
     fn artist_title_duration_within_tolerance() {
-        let lookup =
-            MockLookup::new().with_artist_title_duration("artist", "title", "hash1", 300);
+        let lookup = MockLookup::new().with_artist_title_duration("artist", "title", "hash1", 300);
         let candidate = CandidateTrack {
             isrc: None,
             artist: Some("artist".to_string()),
@@ -347,8 +342,7 @@ mod tests {
 
     #[test]
     fn artist_title_duration_outside_tolerance_falls_to_title_only() {
-        let lookup =
-            MockLookup::new().with_artist_title_duration("artist", "title", "hash1", 300);
+        let lookup = MockLookup::new().with_artist_title_duration("artist", "title", "hash1", 300);
         let candidate = CandidateTrack {
             isrc: None,
             artist: Some("artist".to_string()),
@@ -383,8 +377,7 @@ mod tests {
 
     #[test]
     fn artist_title_duration_includes_entries_with_no_duration() {
-        let lookup = MockLookup::new()
-            .with_artist_title("artist", "title", "hash_no_dur"); // no duration
+        let lookup = MockLookup::new().with_artist_title("artist", "title", "hash_no_dur"); // no duration
         let candidate = CandidateTrack {
             isrc: None,
             artist: Some("artist".to_string()),
@@ -518,8 +511,7 @@ mod tests {
 
     #[test]
     fn all_duration_filtered_falls_through_to_title_only() {
-        let lookup = MockLookup::new()
-            .with_artist_title_duration("artist", "title", "hash1", 400); // outside tolerance
+        let lookup = MockLookup::new().with_artist_title_duration("artist", "title", "hash1", 400); // outside tolerance
         let candidate = CandidateTrack {
             isrc: None,
             artist: Some("artist".to_string()),

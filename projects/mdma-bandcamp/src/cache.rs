@@ -112,6 +112,68 @@ impl DownloadCache {
         Ok(())
     }
 
+    /// Remove all cache entries whose source item ID matches `item_id`.
+    ///
+    /// Rewrites the cache file atomically (write to temp + rename) excluding any
+    /// line whose 5th `|`-separated field equals `item_id`. Also evicts matching
+    /// entries from the in-memory `downloaded` and `downloaded_item_ids` sets.
+    ///
+    /// Calling this with an `item_id` that is not present in the cache is a no-op
+    /// and does not return an error.
+    pub fn forget_item(&mut self, item_id: &str) -> Result<(), CacheError> {
+        if !self.downloaded_item_ids.contains(item_id) {
+            return Ok(());
+        }
+
+        // Read current file and rebuild without the target item_id
+        let mut kept_lines: Vec<String> = Vec::new();
+        let mut removed_track_keys: Vec<String> = Vec::new();
+
+        if self.path.exists() {
+            let file = File::open(&self.path)?;
+            let reader = BufReader::new(file);
+
+            for line in reader.lines() {
+                let line = line?;
+                let trimmed = line.trim();
+
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    kept_lines.push(line);
+                    continue;
+                }
+
+                let parts: Vec<&str> = trimmed.splitn(5, '|').collect();
+                if parts.len() >= 5 && parts[4] == item_id {
+                    // Record the track key so we can evict it from memory
+                    let track_key = format!("{}|{}|{}|{}", parts[0], parts[1], parts[2], parts[3]);
+                    removed_track_keys.push(track_key);
+                    // Skip this line — it belongs to the forgotten item
+                } else {
+                    kept_lines.push(line);
+                }
+            }
+        }
+
+        // Write atomically: write to a sibling temp file then rename over the original
+        let tmp_path = self.path.with_extension("tmp");
+        {
+            let mut tmp_file = File::create(&tmp_path)?;
+            for line in &kept_lines {
+                writeln!(tmp_file, "{}", line)?;
+            }
+            tmp_file.flush()?;
+        }
+        std::fs::rename(&tmp_path, &self.path)?;
+
+        // Evict from in-memory state
+        for key in &removed_track_keys {
+            self.downloaded.remove(key);
+        }
+        self.downloaded_item_ids.remove(item_id);
+
+        Ok(())
+    }
+
     /// Get the number of cached entries
     #[allow(dead_code)] // Used in tests; production code checks keys directly
     pub fn len(&self) -> usize {
@@ -149,6 +211,64 @@ mod tests {
         // Marking again should be idempotent
         cache.mark_downloaded(key, "p123456").unwrap();
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn forget_item_removes_entries_and_updates_memory() {
+        let dir = tempdir().unwrap();
+        let cache_path = dir.path().join("cache.txt");
+
+        let mut cache = DownloadCache::open(&cache_path).unwrap();
+
+        // Two tracks for item-A, one track for item-B
+        cache
+            .mark_downloaded("Artist A|Album A|Track 1|180", "item-A")
+            .unwrap();
+        cache
+            .mark_downloaded("Artist A|Album A|Track 2|210", "item-A")
+            .unwrap();
+        cache
+            .mark_downloaded("Artist B|Album B|Track 1|200", "item-B")
+            .unwrap();
+        assert_eq!(cache.len(), 3);
+        assert!(cache.is_item_downloaded("item-A"));
+        assert!(cache.is_item_downloaded("item-B"));
+
+        cache.forget_item("item-A").unwrap();
+
+        // In-memory state should only contain item-B's track
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.is_downloaded("Artist A|Album A|Track 1|180"));
+        assert!(!cache.is_downloaded("Artist A|Album A|Track 2|210"));
+        assert!(cache.is_downloaded("Artist B|Album B|Track 1|200"));
+        assert!(!cache.is_item_downloaded("item-A"));
+        assert!(cache.is_item_downloaded("item-B"));
+
+        // Reload from disk and verify persistence
+        let reloaded = DownloadCache::open(&cache_path).unwrap();
+        assert_eq!(reloaded.len(), 1);
+        assert!(!reloaded.is_downloaded("Artist A|Album A|Track 1|180"));
+        assert!(reloaded.is_downloaded("Artist B|Album B|Track 1|200"));
+        assert!(!reloaded.is_item_downloaded("item-A"));
+        assert!(reloaded.is_item_downloaded("item-B"));
+    }
+
+    #[test]
+    fn forget_item_noop_for_unknown_id() {
+        let dir = tempdir().unwrap();
+        let cache_path = dir.path().join("cache.txt");
+
+        let mut cache = DownloadCache::open(&cache_path).unwrap();
+        cache
+            .mark_downloaded("Artist A|Album A|Track 1|180", "item-A")
+            .unwrap();
+
+        // Forgetting a non-existent ID should not error and should leave state intact
+        cache.forget_item("item-unknown").unwrap();
+
+        assert_eq!(cache.len(), 1);
+        assert!(cache.is_downloaded("Artist A|Album A|Track 1|180"));
+        assert!(cache.is_item_downloaded("item-A"));
     }
 
     #[test]

@@ -5,7 +5,6 @@ use playback_engine::Track;
 use ringbuf::HeapRb;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use tokio::runtime::Runtime;
 
 fn test_file_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -14,7 +13,6 @@ fn test_file_path(name: &str) -> PathBuf {
 }
 
 fn bench_track_loading(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("track_loading");
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(5));
@@ -26,28 +24,16 @@ fn bench_track_loading(c: &mut Criterion) {
             b.iter(|| {
                 let buffer = HeapRb::new(1024 * 8);
                 let (prod, _cons) = buffer.split();
-                // Create Track in a block to ensure it's dropped right after use
-                let track = rt.block_on(async {
-                    // Create a AudioSource
-                    let source = AudioSource::new(&path).expect("Could not create source");
-                    let source_rate = source.sample_rate();
+                // Create a AudioSource
+                let source = AudioSource::new(&path).expect("Could not create source");
+                let source_rate = source.sample_rate();
 
-                    // Create a Track with the source (no resampling in benchmarks)
-                    Track::new(source, prod, source_rate, source_rate)
-                        .await
-                        .expect("Could not create track")
-                });
+                // Create a Track with the source (no resampling in benchmarks)
+                let track = Track::new(source, prod, source_rate, source_rate)
+                    .expect("Could not create track");
 
-                // Explicitly drop the track
+                // Explicitly drop the track — Drop joins the decoder thread
                 drop(track);
-
-                // Give runtime a chance to clean up
-                rt.block_on(async {
-                    tokio::task::yield_now().await;
-                });
-
-                // Force GC-like cleanup
-                std::thread::sleep(std::time::Duration::from_millis(1));
             });
         });
     }
@@ -56,7 +42,6 @@ fn bench_track_loading(c: &mut Criterion) {
 }
 
 fn bench_time_to_playable(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("time_to_playable");
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(5));
@@ -67,13 +52,9 @@ fn bench_time_to_playable(c: &mut Criterion) {
         let (prod, mut cons) = buffer.split();
         // Print metrics once before benchmarking
         let start = Instant::now();
-        let mut track = rt.block_on(async {
-            let source = AudioSource::new(&path).unwrap();
-            let rate = source.sample_rate();
-            Track::new(source, prod, rate, rate)
-                .await
-                .expect("Failed to create track")
-        });
+        let source = AudioSource::new(&path).unwrap();
+        let rate = source.sample_rate();
+        let mut track = Track::new(source, prod, rate, rate).expect("Failed to create track");
         let load_time = start.elapsed();
 
         let start = Instant::now();
@@ -102,13 +83,10 @@ fn bench_time_to_playable(c: &mut Criterion) {
                 let buffer = HeapRb::new(8 * 1024);
                 let (prod, _cons) = buffer.split();
                 // Load track
-                let mut track = rt.block_on(async {
-                    let source = AudioSource::new(&path).unwrap();
-                    let rate = source.sample_rate();
-                    Track::new(source, prod, rate, rate)
-                        .await
-                        .expect("Failed to create track")
-                });
+                let source = AudioSource::new(&path).unwrap();
+                let rate = source.sample_rate();
+                let mut track =
+                    Track::new(source, prod, rate, rate).expect("Failed to create track");
 
                 // Start playback
                 track.play();

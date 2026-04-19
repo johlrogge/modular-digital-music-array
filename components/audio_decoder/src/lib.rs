@@ -203,6 +203,7 @@ impl AudioSource {
             let decoded_segment = DecodedSegment {
                 index: current_segment_index,
                 segment,
+                valid_samples: samples_to_copy,
             };
             tracing::debug!(
                 "Decoded segment at {:?}, was empty: {}",
@@ -739,6 +740,89 @@ mod tests {
             samples[last_quarter_idx] > samples[first_quarter_idx],
             "Samples should follow ascending pattern after seeking"
         );
+    }
+
+    mod valid_samples {
+        use audio_types::{AudioSegment, DecodedSegment, SegmentIndex, SEGMENT_SIZE};
+
+        /// Helper: build a DecodedSegment as extract_segments would produce one,
+        /// given a slice of interleaved samples (length need not be a multiple of SEGMENT_SIZE).
+        /// This exercises the same arithmetic used in extract_segments.
+        fn make_segment_from_slice(all_samples: &[f32], segment_idx: usize) -> DecodedSegment {
+            let start = segment_idx * SEGMENT_SIZE;
+            let samples_to_copy = std::cmp::min(SEGMENT_SIZE, all_samples.len() - start);
+            let mut segment = AudioSegment {
+                samples: [0.0; SEGMENT_SIZE],
+            };
+            segment.samples[..samples_to_copy]
+                .copy_from_slice(&all_samples[start..start + samples_to_copy]);
+            DecodedSegment {
+                index: SegmentIndex::from_sample_position(start),
+                segment,
+                valid_samples: samples_to_copy,
+            }
+        }
+
+        /// 2304 interleaved stereo samples (one MP3 Symphonia packet) → 3 segments.
+        /// First two: valid_samples = 1024, last: valid_samples = 256.
+        #[test]
+        fn partial_last_segment_reports_correct_valid_samples() {
+            let total = 2304_usize;
+            let samples: Vec<f32> = (0..total).map(|i| i as f32).collect();
+
+            let seg0 = make_segment_from_slice(&samples, 0);
+            let seg1 = make_segment_from_slice(&samples, 1);
+            let seg2 = make_segment_from_slice(&samples, 2);
+
+            assert_eq!(seg0.valid_samples, SEGMENT_SIZE, "segment 0 should be full");
+            assert_eq!(seg1.valid_samples, SEGMENT_SIZE, "segment 1 should be full");
+            assert_eq!(
+                seg2.valid_samples,
+                total - 2 * SEGMENT_SIZE,
+                "last segment valid_samples should equal remainder"
+            );
+            // No spurious segments
+            let fourth_start = 3 * SEGMENT_SIZE;
+            assert!(
+                fourth_start >= total,
+                "there should only be 3 segments for 2304 samples"
+            );
+        }
+
+        /// Samples within [..valid_samples] must match the input exactly — no zero-padding inside.
+        #[test]
+        fn valid_range_matches_input_exactly() {
+            let total = 2304_usize;
+            let samples: Vec<f32> = (0..total).map(|i| i as f32 * 0.001).collect();
+
+            let seg2 = make_segment_from_slice(&samples, 2);
+            let remainder = total - 2 * SEGMENT_SIZE; // 256
+
+            for i in 0..remainder {
+                assert_eq!(
+                    seg2.segment.samples[i],
+                    samples[2 * SEGMENT_SIZE + i],
+                    "sample {i} in valid range must match input"
+                );
+            }
+        }
+
+        /// Samples beyond valid_samples should be zero (current implementation) —
+        /// callers must not read them as audio.
+        #[test]
+        fn padding_beyond_valid_samples_is_zero() {
+            let total = 2304_usize;
+            let non_zero_samples: Vec<f32> = (0..total).map(|i| i as f32 + 1.0).collect();
+            let seg2 = make_segment_from_slice(&non_zero_samples, 2);
+            let remainder = total - 2 * SEGMENT_SIZE; // 256
+
+            for i in remainder..SEGMENT_SIZE {
+                assert_eq!(
+                    seg2.segment.samples[i], 0.0,
+                    "padding sample {i} should be zero"
+                );
+            }
+        }
     }
 
     mod audio_source_position {

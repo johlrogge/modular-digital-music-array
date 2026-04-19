@@ -26,7 +26,7 @@ cargo_clippy       # lint
 hygiene_report     # test + clippy + coverage in one shot
 ```
 
-Other tasks via `just` (use `just --list` or `mcp__just-dev__just_list` to see all):
+Other tasks via `just` (use `just --list` or `mcp__just__just_list` to see all):
 ```bash
 just watch              # Watch mode: check → test → build → clippy
 
@@ -184,12 +184,31 @@ Workflow:
 - Only releases and hotfixes merge to `master`
 - CI builds packages only on `master` push; tests run on all branches
 
+## Tool Usage Policy
+
+**Always prefer MCP tools over Bash.** This project inherits MCP servers
+from metadev (`git-read`, `git-write`, `gh-issues`, `gh-ci`, `gh-repo`,
+`rust-codebase`, `just`, `devenv`, `cargo-polylith`, `adr`, `ssh`,
+`mcp-test`) — plus project-scoped servers (`just-dev`, `just-ci`,
+`just-deploy`). Use them first.
+
+When no MCP covers the operation:
+1. State in one sentence why you're using Bash (e.g. "no MCP tool for
+   `git ls-remote`").
+2. Consider whether the gap is worth a feature request against metadev
+   (`gh_issue_create` with `repo: "johlrogge/metadev"`,
+   `label: "enhancement"`) or the project's own MCP server.
+
+When an MCP tool exists but misbehaves:
+- **Do not fall back to Bash as a workaround.** File a bug and/or fix
+  the root cause. A silent fallback hides the defect.
+
 ### Release Workflow
 
 All release steps are owned by the **release-manager** agent. Dispatch it with the version number — it handles everything from branch creation to pushing.
 
 1. Dispatch **release-manager**: `git flow release start <version>`
-2. Dispatch **code-minion**: bump version in `Polylith.toml` and `void-packages/srcpkgs/*/template`
+2. Dispatch **code-minion**: bump version in root `Cargo.toml` (`[package] version`) and `void-packages/srcpkgs/*/template`
 3. Dispatch **documenter**: update all READMEs
 4. Dispatch **commit** agent: `chore(release): bump to <version>`
 5. Dispatch **release-manager**: `git flow release finish <version>` + push master, develop, tags to `github`

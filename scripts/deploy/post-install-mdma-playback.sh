@@ -21,3 +21,30 @@ wireplumber.settings = {
   device.routes.default-sink-volume = 1.0
 }
 WPCFG
+
+# Allow PipeWire graph to switch between common sample rates natively.
+# Without this, the graph is locked to 48000 and every 44.1 kHz source
+# (MP3, much of the Bandcamp library) is resampled, causing choppy playback.
+sudo mkdir -p /etc/pipewire/pipewire.conf.d
+sudo tee /etc/pipewire/pipewire.conf.d/10-mdma-rates.conf > /dev/null << 'PWCFG'
+# MDMA: allow PipeWire to switch to common audio sample rates natively.
+# Without this override, the graph is locked to 48000 and every 44.1 kHz
+# source (MP3, much of the bandcamp library) gets resampled. Include
+# 44.1 kHz and its 2x/4x relatives plus the standard 48/96 kHz.
+context.properties = {
+    default.clock.allowed-rates = [ 44100 48000 88200 96000 ]
+}
+PWCFG
+
+# Restart PipeWire so the new configs take effect.
+# WirePlumber is launched as a child of PipeWire (via context.exec drop-in),
+# not as a separate runit service — do NOT call 'sv restart wireplumber'.
+# Use kill -TERM on the PipeWire process directly; runit will restart it.
+# 'sv restart pipewire' can fail if runit's tracking state is stale.
+PIPEWIRE_PID=$(pgrep -x pipewire | head -1)
+if [ -n "$PIPEWIRE_PID" ]; then
+    sudo kill -TERM "$PIPEWIRE_PID" 2>/dev/null || true
+    sleep 3
+else
+    sudo sv restart pipewire 2>/dev/null || true
+fi

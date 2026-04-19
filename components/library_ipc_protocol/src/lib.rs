@@ -310,6 +310,21 @@ pub enum LibraryRequest {
 
     /// Write a single fact for a track. Used for importing metadata from external sources.
     WriteFact { hash: ContentHash, fact: MusicValue },
+
+    /// Retract all facts whose FactSource.source_name matches `source_name` for every
+    /// ContentHash that has an ItemId fact equal to `item_id`.
+    RetractSourceFacts {
+        item_id: String,
+        source_name: String,
+    },
+
+    /// Look up the album title(s) stored for any track tagged with this ItemId.
+    /// If multiple tracks have different album titles for the same ItemId, returns
+    /// one value (the first encountered during iteration).
+    GetAlbumTitleByItemId { item_id: String },
+
+    /// Count the number of tracks in the library whose facts include `ItemId = item_id`.
+    GetTrackCountForItemId { item_id: String },
 }
 
 // ============================================================================
@@ -377,6 +392,15 @@ pub enum LibraryResponse {
 
     /// Fact written successfully.
     FactWritten,
+
+    /// Source facts retracted successfully.
+    SourceFactsRetracted,
+
+    /// Album title for a given ItemId (None if no tracks with that ItemId have an album title).
+    AlbumTitleByItemId(Option<String>),
+
+    /// Number of tracks in the library whose facts include a given ItemId.
+    TrackCountForItemId(usize),
 
     /// Error response.
     Error(ProtocolError),
@@ -565,6 +589,107 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let decoded: LibraryResponse = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, LibraryResponse::FactWritten));
+    }
+
+    #[test]
+    fn retract_source_facts_request_roundtrip() {
+        let req = LibraryRequest::RetractSourceFacts {
+            item_id: "p123456".to_string(),
+            source_name: "bandcamp".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: LibraryRequest = serde_json::from_str(&json).unwrap();
+        match decoded {
+            LibraryRequest::RetractSourceFacts {
+                item_id,
+                source_name,
+            } => {
+                assert_eq!(item_id, "p123456");
+                assert_eq!(source_name, "bandcamp");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn get_album_title_by_item_id_request_roundtrip() {
+        let req = LibraryRequest::GetAlbumTitleByItemId {
+            item_id: "p123456".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: LibraryRequest = serde_json::from_str(&json).unwrap();
+        match decoded {
+            LibraryRequest::GetAlbumTitleByItemId { item_id } => {
+                assert_eq!(item_id, "p123456");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn source_facts_retracted_response_roundtrip() {
+        let resp = LibraryResponse::SourceFactsRetracted;
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: LibraryResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, LibraryResponse::SourceFactsRetracted));
+    }
+
+    #[test]
+    fn album_title_by_item_id_response_some_roundtrip() {
+        let resp = LibraryResponse::AlbumTitleByItemId(Some("My Album".to_string()));
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: LibraryResponse = serde_json::from_str(&json).unwrap();
+        match decoded {
+            LibraryResponse::AlbumTitleByItemId(Some(title)) => {
+                assert_eq!(title, "My Album");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn album_title_by_item_id_response_none_roundtrip() {
+        let resp = LibraryResponse::AlbumTitleByItemId(None);
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: LibraryResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, LibraryResponse::AlbumTitleByItemId(None)));
+    }
+
+    #[test]
+    fn get_track_count_for_item_id_request_roundtrip() {
+        let req = LibraryRequest::GetTrackCountForItemId {
+            item_id: "p123456".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: LibraryRequest = serde_json::from_str(&json).unwrap();
+        match decoded {
+            LibraryRequest::GetTrackCountForItemId { item_id } => {
+                assert_eq!(item_id, "p123456");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn track_count_for_item_id_response_roundtrip() {
+        let resp = LibraryResponse::TrackCountForItemId(3);
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: LibraryResponse = serde_json::from_str(&json).unwrap();
+        match decoded {
+            LibraryResponse::TrackCountForItemId(count) => assert_eq!(count, 3),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn track_count_for_item_id_zero_roundtrip() {
+        let resp = LibraryResponse::TrackCountForItemId(0);
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: LibraryResponse = serde_json::from_str(&json).unwrap();
+        match decoded {
+            LibraryResponse::TrackCountForItemId(count) => assert_eq!(count, 0),
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]

@@ -286,6 +286,17 @@ impl LibraryService {
             LibraryRequest::WriteBookmark { .. } => LibraryResponse::BookmarkWritten,
 
             LibraryRequest::WriteFact { .. } => LibraryResponse::FactWritten,
+
+            LibraryRequest::RetractSourceFacts { .. } => LibraryResponse::SourceFactsRetracted,
+
+            LibraryRequest::GetAlbumTitleByItemId { .. } => {
+                LibraryResponse::AlbumTitleByItemId(None)
+            }
+
+            LibraryRequest::GetTrackCountForItemId { .. } => {
+                // Stub: always returns 0 (no real facts file scanning)
+                LibraryResponse::TrackCountForItemId(0)
+            }
         }
     }
 

@@ -24,12 +24,14 @@ const ROOT_FIELDS: [BrowseField; 4] = [
 ];
 
 /// An entry in a group list (artists, albums, genres).
+#[derive(Clone)]
 struct GroupEntry {
     name: String,
     count: usize,
 }
 
 /// The hierarchical drill-down level in the browser.
+#[derive(Clone)]
 enum BrowserLevel {
     /// Top level showing the four browse categories.
     Root { cursor: usize },
@@ -49,6 +51,7 @@ enum BrowserLevel {
 }
 
 /// Browser pane that allows hierarchical navigation: Root → Groups → Tracks.
+#[derive(Clone)]
 pub struct BrowserPane {
     level: BrowserLevel,
     library: Rc<LibraryBackend>,
@@ -129,14 +132,25 @@ impl BrowserPane {
                         .collect();
                 };
 
-                // Count tracks per genre
+                // Count tracks per genre by looking up each track's MainGenre fact.
                 let mut map: HashMap<String, usize> = HashMap::new();
                 for genre in &genre_values {
                     map.insert(genre.clone(), 0);
                 }
 
-                // TODO: count tracks per genre when genre metadata is available
-                let _ = all;
+                for track in all {
+                    if let Ok((_, facts)) = self.library.get_facts(&track.content_hash) {
+                        if let Some(genre) = facts
+                            .into_iter()
+                            .find(|(k, _)| k == "MainGenre")
+                            .map(|(_, v)| v)
+                        {
+                            if let Some(count) = map.get_mut(&genre) {
+                                *count += 1;
+                            }
+                        }
+                    }
+                }
 
                 let mut groups: Vec<GroupEntry> = map
                     .into_iter()
@@ -153,25 +167,46 @@ impl BrowserPane {
         }
     }
 
-    /// Get tracks for a specific group (filtered by field == group_name), sorted by title ascending.
+    /// Sort tracks by (disc_number asc, track_number asc) for album views.
+    ///
+    /// Tracks with no disc_number are treated as disc 1. Tracks with no
+    /// track_number sort to the end (represented as `u32::MAX`).
+    pub(crate) fn sort_album_tracks(tracks: &mut Vec<TrackInfo>) {
+        tracks.sort_by_key(|t| {
+            (
+                t.disc_number.unwrap_or(1),
+                t.track_number.unwrap_or(u32::MAX),
+            )
+        });
+    }
+
+    /// Get tracks for a specific group (filtered by field == group_name).
+    ///
+    /// When the field is `Album`, tracks are sorted by (disc, track number).
+    /// For all other fields, tracks are sorted by title ascending.
     fn tracks_for_group(all: &[TrackInfo], field: BrowseField, group_name: &str) -> Vec<TrackInfo> {
         let mut tracks: Vec<TrackInfo> = all
             .iter()
             .filter(|t| field.extract(t).as_deref() == Some(group_name))
             .cloned()
             .collect();
-        tracks.sort_by(|a, b| {
-            BrowseField::Title
-                .extract(a)
-                .unwrap_or_default()
-                .to_ascii_lowercase()
-                .cmp(
-                    &BrowseField::Title
-                        .extract(b)
-                        .unwrap_or_default()
-                        .to_ascii_lowercase(),
-                )
-        });
+
+        if field == BrowseField::Album {
+            Self::sort_album_tracks(&mut tracks);
+        } else {
+            tracks.sort_by(|a, b| {
+                BrowseField::Title
+                    .extract(a)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .cmp(
+                        &BrowseField::Title
+                            .extract(b)
+                            .unwrap_or_default()
+                            .to_ascii_lowercase(),
+                    )
+            });
+        }
         tracks
     }
 
@@ -549,6 +584,10 @@ impl Pane for BrowserPane {
                         }
                         PaneAction::Consumed
                     }
+                    KeyCode::Char(',') => {
+                        selection.clear_selection();
+                        PaneAction::Consumed
+                    }
                     KeyCode::Enter => {
                         // Collect names for all effectively-selected entries.
                         // Extract into a local Vec first so the borrow on `selection`
@@ -610,6 +649,10 @@ impl Pane for BrowserPane {
                     }
                     PaneAction::Consumed
                 }
+                KeyCode::Char(',') => {
+                    selection.clear_selection();
+                    PaneAction::Consumed
+                }
                 _ => PaneAction::Ignored,
             },
         }
@@ -654,6 +697,24 @@ impl Pane for BrowserPane {
     fn pane_kind(&self) -> PaneKind {
         PaneKind::Browser
     }
+
+    fn display_string(&self, data_idx: usize) -> Option<String> {
+        match &self.level {
+            BrowserLevel::Root { .. } => ROOT_ITEMS.get(data_idx).map(|s| s.to_string()),
+            BrowserLevel::Groups { groups, .. } => groups.get(data_idx).map(|g| g.name.clone()),
+            BrowserLevel::Tracks { tracks, .. } => {
+                let track = tracks.get(data_idx)?;
+                let artist = track.artist.as_deref().unwrap_or("");
+                let title = track.title.as_deref().unwrap_or("");
+                let album = track.album.as_deref().unwrap_or("");
+                Some(format!("{} {} {}", artist, title, album))
+            }
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn Pane> {
+        Box::new(self.clone())
+    }
 }
 
 #[cfg(test)]
@@ -681,6 +742,44 @@ mod tests {
             disc_number: None,
             added: None,
         }
+    }
+
+    fn make_track_with_disc_track(hash: &str, disc: Option<u32>, track: Option<u32>) -> TrackInfo {
+        TrackInfo {
+            content_hash: ContentHash::new(hash),
+            title: None,
+            artist: None,
+            album: None,
+            duration: None,
+            bpm: None,
+            key: None,
+            blob_path: None,
+            cover_art_path: None,
+            track_number: track,
+            disc_number: disc,
+            added: None,
+        }
+    }
+
+    #[test]
+    fn sort_album_tracks_orders_by_disc_then_track_number() {
+        // (disc, track) input order: (2,1), (1,3), (1,1), (None→1, 2)
+        let mut tracks = vec![
+            make_track_with_disc_track("sha256:d21", Some(2), Some(1)),
+            make_track_with_disc_track("sha256:d13", Some(1), Some(3)),
+            make_track_with_disc_track("sha256:d11", Some(1), Some(1)),
+            make_track_with_disc_track("sha256:dno", None, Some(2)), // no disc → treated as disc 1
+        ];
+
+        BrowserPane::sort_album_tracks(&mut tracks);
+
+        let hashes: Vec<&str> = tracks.iter().map(|t| t.content_hash.as_str()).collect();
+
+        // Expected order: disc1/track1, disc1/track2(nodisk), disc1/track3, disc2/track1
+        assert_eq!(
+            hashes,
+            vec!["sha256:d11", "sha256:dno", "sha256:d13", "sha256:d21"]
+        );
     }
 
     #[test]
