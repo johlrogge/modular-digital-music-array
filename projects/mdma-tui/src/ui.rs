@@ -1,4 +1,4 @@
-use crate::app::{App, InputMode, PaletteEntry, Side};
+use crate::app::{App, InputMode, PaletteEntry, Side, TABS_PER_SIDE};
 use crate::now_playing::PlaybackStatus;
 use crate::theme::{
     ACCENT, ACCENT2, BG_ELEVATED, BG_SURFACE, BORDER_SUBTLE, SUCCESS, TEXT_PRIMARY, TEXT_SECONDARY,
@@ -136,13 +136,19 @@ fn render_now_playing_bar(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// Render one pane side with an active/inactive border highlight.
+/// Render one pane side with an active/inactive border highlight and a tab strip.
 fn render_pane_area(f: &mut Frame, app: &App, side: Side, area: Rect) {
     let is_active = app.active_side == side;
-    let pane = match side {
-        Side::Left => app.left_pane.as_ref(),
-        Side::Right => app.right_pane.as_ref(),
+
+    let (tabs, tab_idx, recency) = match side {
+        Side::Left => (&app.left_tabs, app.left_tab_idx, &app.left_recency),
+        Side::Right => (&app.right_tabs, app.right_tab_idx, &app.right_recency),
     };
+
+    let pane = tabs[tab_idx]
+        .as_ref()
+        .expect("active tab must be Some")
+        .as_ref();
 
     let border_style = if is_active {
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
@@ -164,7 +170,194 @@ fn render_pane_area(f: &mut Frame, app: &App, side: Side, area: Rect) {
 
     let inner_area = outer_block.inner(area);
     f.render_widget(outer_block, area);
-    pane.render(f, inner_area);
+
+    if inner_area.height < 2 {
+        // Too small for a tab strip — just render the pane.
+        pane.render(f, inner_area);
+        return;
+    }
+
+    // Split inner_area: 1 row for tab strip + rest for pane content.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner_area);
+
+    let tab_strip_area = chunks[0];
+    let pane_area = chunks[1];
+
+    render_tab_strip(
+        f,
+        app,
+        side,
+        tabs,
+        tab_idx,
+        recency,
+        is_active,
+        tab_strip_area,
+    );
+    pane.render(f, pane_area);
+}
+
+/// Render the tab strip for one side.
+///
+/// Each slot is labelled with its display key (left: 1-5, right: 6,7,8,9,0).
+/// Populated slots show "N:title"; empty slots show "N" in a muted style.
+/// Active slot is highlighted. Titles shrink under space pressure in LRU order
+/// (least-recently-visited title drops first; active tab's title is last to go).
+fn render_tab_strip(
+    f: &mut Frame,
+    _app: &App,
+    side: Side,
+    tabs: &[Option<Box<dyn crate::pane::Pane>>; TABS_PER_SIDE],
+    active_idx: usize,
+    recency: &[usize],
+    _is_active_side: bool,
+    area: Rect,
+) {
+    // Display key for each slot (0-based index → key char displayed to user).
+    let display_key = |idx: usize| -> char {
+        match side {
+            Side::Left => (b'1' + idx as u8) as char, // '1'..'5'
+            Side::Right => {
+                if idx == 4 {
+                    '0'
+                } else {
+                    (b'6' + idx as u8) as char
+                } // '6'..'9','0'
+            }
+        }
+    };
+
+    // Build full label for each slot.
+    let labels: Vec<String> = (0..TABS_PER_SIDE)
+        .map(|i| {
+            let k = display_key(i);
+            match &tabs[i] {
+                Some(pane) => format!("{}:{}", k, pane.title()),
+                None => format!("{}", k),
+            }
+        })
+        .collect();
+
+    // Determine shrink priority: lower number = shrink first.
+    // Active tab: highest priority (never shrink). Others: by LRU position (oldest first).
+    // Empty slots: lowest priority.
+    let priority_of = |idx: usize| -> usize {
+        if idx == active_idx {
+            return usize::MAX; // never shrink
+        }
+        if tabs[idx].is_none() {
+            return 0; // shrink first
+        }
+        // Find position in recency vec: position 0 = most recent.
+        // Convert: most recent → high priority, least recent → low priority.
+        let pos = recency
+            .iter()
+            .position(|&r| r == idx)
+            .unwrap_or(TABS_PER_SIDE);
+        // Invert: pos 0 (most recent) → TABS_PER_SIDE priority; pos N-1 → 1 priority.
+        TABS_PER_SIDE - pos
+    };
+
+    // Available width for the strip (minus separators between tabs).
+    // Separators: TABS_PER_SIDE - 1 spaces between cells.
+    let available_width = area.width as usize;
+    let sep_width = TABS_PER_SIDE - 1; // one space between each pair
+    let content_width = available_width.saturating_sub(sep_width);
+
+    // Natural widths (each label as-is).
+    let mut widths: Vec<usize> = labels.iter().map(|l| l.chars().count()).collect();
+    let total_natural: usize = widths.iter().sum();
+
+    if total_natural > content_width {
+        // Need to shrink. Build priority order: sort indices by priority ascending
+        // (lowest priority first = shrink first).
+        let mut shrink_order: Vec<usize> = (0..TABS_PER_SIDE).collect();
+        shrink_order.sort_by_key(|&i| priority_of(i));
+
+        let budget = content_width;
+        // First pass: assign minimum widths (just the key char, e.g. "1").
+        let min_widths: Vec<usize> = (0..TABS_PER_SIDE)
+            .map(|i| {
+                let k = display_key(i);
+                if tabs[i].is_some() {
+                    // minimum: "N:" (2 chars) — key + colon
+                    format!("{}:", k).chars().count()
+                } else {
+                    // minimum: "N" (1 char)
+                    format!("{}", k).chars().count()
+                }
+            })
+            .collect();
+
+        // Distribute budget: give each slot at least its minimum.
+        let total_min: usize = min_widths.iter().sum();
+        if total_min >= budget {
+            // Very tight: give everyone just their minimum.
+            widths = min_widths;
+        } else {
+            // Give everyone their minimum first, then distribute remainder to higher-priority slots.
+            let mut remaining = budget - total_min;
+            widths = min_widths.clone();
+
+            // Distribute from highest priority down (reverse shrink_order).
+            for &idx in shrink_order.iter().rev() {
+                let natural = labels[idx].chars().count();
+                let current = widths[idx];
+                let can_add = natural - current;
+                let give = can_add.min(remaining);
+                widths[idx] += give;
+                remaining = remaining.saturating_sub(give);
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Build the line spans.
+    let mut spans: Vec<Span> = Vec::new();
+    for i in 0..TABS_PER_SIDE {
+        if i > 0 {
+            spans.push(Span::styled(" ", Style::default().fg(TEXT_TERTIARY)));
+        }
+
+        let label = &labels[i];
+        let w = widths[i];
+        let text = truncate_to(label, w);
+
+        let is_active_tab = i == active_idx;
+        let style = if is_active_tab {
+            Style::default()
+                .fg(ACCENT)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else if tabs[i].is_some() {
+            Style::default().fg(TEXT_SECONDARY)
+        } else {
+            Style::default().fg(TEXT_TERTIARY)
+        };
+
+        spans.push(Span::styled(text, style));
+    }
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Truncate a string to at most `width` visible characters, appending `…` if truncated.
+fn truncate_to(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let len = s.chars().count();
+    if len <= width {
+        s.to_string()
+    } else if width == 1 {
+        s.chars().take(1).collect()
+    } else {
+        let truncated: String = s.chars().take(width - 1).collect();
+        format!("{}…", truncated)
+    }
 }
 
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
@@ -282,6 +475,13 @@ fn render_palette_overlay(f: &mut Frame, app: &App, area: Rect) {
                         Style::default().fg(ACCENT),
                     ),
                     Span::styled("new playlist", Style::default().fg(TEXT_SECONDARY)),
+                ])),
+                PaletteEntry::History(arg) => ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:<10}", format!("history {}", arg)),
+                        Style::default().fg(ACCENT2),
+                    ),
+                    Span::styled("history search", Style::default().fg(TEXT_SECONDARY)),
                 ])),
             })
             .collect();

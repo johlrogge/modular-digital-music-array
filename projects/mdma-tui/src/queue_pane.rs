@@ -1,4 +1,4 @@
-use crate::pane::{Pane, PaneAction, PaneKind};
+use crate::pane::{AddPlayingTarget, Pane, PaneAction, PaneKind};
 use crate::selection::SelectionState;
 use crate::theme::TEXT_TERTIARY;
 use crate::track_list::render_track_list;
@@ -16,6 +16,7 @@ use std::rc::Rc;
 
 /// Minimal proof-of-life pane that shows the current playback queue.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct QueuePane {
     tracks: Vec<TrackInfo>,
     selection: SelectionState,
@@ -111,6 +112,10 @@ impl Pane for QueuePane {
                 }
                 PaneAction::Consumed
             }
+            KeyCode::Char(',') => {
+                self.selection.clear_selection();
+                PaneAction::Consumed
+            }
             _ => PaneAction::Ignored,
         }
     }
@@ -170,5 +175,21 @@ impl Pane for QueuePane {
         self.tracks = Self::load_queue(&self.playback, &self.library);
         self.selection.set_total_items(self.tracks.len());
         PaneAction::Consumed
+    }
+
+    fn display_string(&self, data_idx: usize) -> Option<String> {
+        let track = self.tracks.get(data_idx)?;
+        let artist = track.artist.as_deref().unwrap_or("");
+        let title = track.title.as_deref().unwrap_or("");
+        let album = track.album.as_deref().unwrap_or("");
+        Some(format!("{} {} {}", artist, title, album))
+    }
+
+    fn add_playing_target(&self) -> AddPlayingTarget {
+        AddPlayingTarget::Queue
+    }
+
+    fn clone_box(&self) -> Box<dyn Pane> {
+        Box::new(self.clone())
     }
 }

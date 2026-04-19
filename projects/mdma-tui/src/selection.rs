@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 /// Each `push_filter` narrows visibility; `pop_filter` restores the previous
 /// visibility level. Selected indices always refer to positions in the
 /// *currently visible* item list.
+#[derive(Clone)]
 pub struct SelectionState {
     pub list_state: ListState,
     /// Indices into the *visible* list that are selected.
@@ -52,6 +53,14 @@ impl SelectionState {
     /// Number of currently visible items.
     pub fn visible_count(&self) -> usize {
         self.visible_to_data.len()
+    }
+
+    /// Number of filter layers currently on the stack.
+    ///
+    /// Exposed for testing purposes; not required for normal operation.
+    #[cfg(test)]
+    pub fn filter_depth(&self) -> usize {
+        self.filter_stack.len()
     }
 
     /// Map a visible index to its underlying data index.
@@ -113,6 +122,16 @@ impl SelectionState {
         self.selected.clear();
     }
 
+    /// Set the explicit selection to a given set of *visible* indices,
+    /// replacing any prior selection. Used after block-move operations to
+    /// keep the selection tracking the moved items.
+    pub fn set_selected_visible_indices(&mut self, vis_indices: impl IntoIterator<Item = usize>) {
+        self.selected.clear();
+        for idx in vis_indices {
+            self.selected.insert(idx);
+        }
+    }
+
     /// `s` key: push a new filter onto the stack.
     ///
     /// `match_fn` receives the *data* index and returns `true` if the item
@@ -147,6 +166,38 @@ impl SelectionState {
         } else {
             self.cursor_position().map(|c| vec![c]).unwrap_or_default()
         }
+    }
+
+    /// Replace the top filter on the stack.
+    ///
+    /// Panics in debug mode if the stack is empty; callers must ensure a
+    /// filter was previously pushed (tracked by `App::live_filter_active`).
+    ///
+    /// Used for live-filter updates so that each keystroke narrows from the
+    /// *pre-live-filter* item set rather than stacking a new layer on each char.
+    pub fn replace_top_filter(&mut self, match_fn: impl Fn(usize) -> bool) {
+        debug_assert!(
+            !self.filter_stack.is_empty(),
+            "replace_top_filter called on empty filter stack"
+        );
+        self.filter_stack.pop();
+        // Recompute visible_to_data from the remaining stack (committed filters only)
+        // so the new live filter is applied on top of the committed base.
+        self.recompute_visible();
+        let mut mask = vec![false; self.total_items];
+        for &data_idx in &self.visible_to_data {
+            if match_fn(data_idx) {
+                mask[data_idx] = true;
+            }
+        }
+        self.filter_stack.push(mask);
+        self.selected.clear();
+        self.recompute_visible();
+        self.list_state.select(if self.visible_count() > 0 {
+            Some(0)
+        } else {
+            None
+        });
     }
 
     /// `Escape` key: pop the top filter from the stack.
@@ -314,5 +365,63 @@ mod tests {
         state.selected.insert(2);
         state.selected.insert(4);
         assert_eq!(state.effective_selection(), vec![2, 4]);
+    }
+
+    #[test]
+    fn replace_top_filter_swaps_the_top_layer() {
+        let mut state = SelectionState::new(5);
+        // Push the initial live filter.
+        state.push_filter(|i| i % 2 == 0); // visible: 0, 2, 4
+                                           // Replace with a broader predicate — all items visible.
+        state.replace_top_filter(|_| true);
+        assert_eq!(state.visible_count(), 5);
+        assert_eq!(state.filter_stack.len(), 1);
+    }
+
+    #[test]
+    fn replace_top_filter_replaces_not_stacks() {
+        let mut state = SelectionState::new(5);
+        // Push a first live filter (no committed ones below).
+        state.push_filter(|i| i % 2 == 0); // visible: 0, 2, 4
+                                           // Replace it — visible should reflect the new predicate against all 5 items.
+        state.replace_top_filter(|i| i < 4); // replaces: visible from all 5 where i < 4 → 0, 1, 2, 3
+        assert_eq!(state.visible_count(), 4);
+        assert_eq!(state.visible_to_data, vec![0, 1, 2, 3]);
+        // Only one layer on stack
+        assert_eq!(state.filter_stack.len(), 1);
+    }
+
+    #[test]
+    fn replace_top_filter_preserves_lower_committed_filters() {
+        let mut state = SelectionState::new(6);
+        // Committed filter: even indices → 0, 2, 4
+        state.push_filter(|i| i % 2 == 0);
+        assert_eq!(state.visible_count(), 3);
+        // First live filter pushed on top of committed via push_filter (not replace).
+        // This is what App does on the first keystroke (live_filter_active=false → push_filter).
+        state.push_filter(|i| i < 4); // within {0,2,4}, keep <4 → 0, 2
+        assert_eq!(state.visible_count(), 2);
+        assert_eq!(state.visible_to_data, vec![0, 2]);
+        // Two layers: 1 committed + 1 live
+        assert_eq!(state.filter_stack.len(), 2);
+        // Replace the live (top) filter: items < 5 → within {0,2,4}, keep <5 → 0, 2, 4
+        state.replace_top_filter(|i| i < 5);
+        assert_eq!(state.visible_count(), 3);
+        assert_eq!(state.visible_to_data, vec![0, 2, 4]);
+        // Still two layers
+        assert_eq!(state.filter_stack.len(), 2);
+    }
+
+    #[test]
+    fn pop_after_replace_top_filter_restores_unfiltered() {
+        let mut state = SelectionState::new(5);
+        state.push_filter(|i| i % 2 == 0);
+        state.replace_top_filter(|i| i < 3); // replaces: 0, 2 visible (even AND < 3... wait)
+                                             // After push(even): visible=[0,2,4]. replace_top_filter pops, recomputes from empty=all,
+                                             // then applies i<3 → mask true at 0,1,2 → visible=[0,1,2].
+        assert_eq!(state.visible_count(), 3);
+        let popped = state.pop_filter();
+        assert!(popped);
+        assert_eq!(state.visible_count(), 5);
     }
 }
