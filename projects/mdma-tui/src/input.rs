@@ -20,6 +20,16 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_normal(app: &mut App, key: KeyEvent) {
+    // If the active pane has an internal text-input field active, it owns ALL
+    // keys — including characters that would normally trigger App-level bindings
+    // ('a', 's', 'A', ':', '/', digits, etc.).  The pane handles Esc itself to
+    // exit editing mode.
+    if app.active_pane().capturing_text_input() {
+        let action = app.active_pane_mut().handle_key(key);
+        dispatch_pane_action(app, action);
+        return;
+    }
+
     match key.code {
         // Tab slot keys: 1-5 = left side, 6-9,0 = right side.
         KeyCode::Char(c @ '1'..='5') => {
@@ -684,7 +694,6 @@ mod tests {
 
     #[test]
     fn quick_play_insert_order_empty() {
-        use mdma_client::ContentHash;
         let order = super::queue_next_order(vec![]);
         assert!(order.is_empty());
     }

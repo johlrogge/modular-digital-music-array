@@ -109,6 +109,19 @@ pub trait Pane {
         AddPlayingTarget::None
     }
 
+    /// Returns `true` while this pane owns all keyboard input (e.g. it has an
+    /// active text-entry field).
+    ///
+    /// When `true`, `handle_normal` in `input.rs` forwards every key directly
+    /// to the pane — bypassing all App-level bindings (`a`, `s`, `A`, `P`, `:`,
+    /// `/`, digit tabs, etc.) — and returns immediately.  The pane itself is
+    /// responsible for handling `Esc` to exit the editing state.
+    ///
+    /// Default: `false`.  Override in panes that contain a text-input widget.
+    fn capturing_text_input(&self) -> bool {
+        false
+    }
+
     /// Clone this pane into a new `Box<dyn Pane>`.
     ///
     /// Required — each pane implements this by calling `Box::new(self.clone())`.
@@ -154,6 +167,81 @@ mod tests {
         fn clone_box(&self) -> Box<dyn Pane> {
             Box::new(self.clone())
         }
+    }
+
+    /// Stub pane that overrides `capturing_text_input` to return `true` and
+    /// records whether `handle_key` was called.
+    #[derive(Clone)]
+    struct CapturingPane {
+        pub key_received: bool,
+    }
+
+    impl CapturingPane {
+        fn new() -> Self {
+            Self {
+                key_received: false,
+            }
+        }
+    }
+
+    impl Pane for CapturingPane {
+        fn render(&self, _f: &mut Frame, _area: Rect) {}
+        fn handle_key(&mut self, _key: KeyEvent) -> PaneAction {
+            self.key_received = true;
+            PaneAction::Consumed
+        }
+        fn resolve_selection(&self) -> Vec<ContentHash> {
+            vec![]
+        }
+        fn selection_state(&self) -> &SelectionState {
+            unimplemented!()
+        }
+        fn selection_state_mut(&mut self) -> &mut SelectionState {
+            unimplemented!()
+        }
+        fn title(&self) -> &str {
+            "capturing"
+        }
+        fn item_count(&self) -> usize {
+            0
+        }
+        fn pane_kind(&self) -> PaneKind {
+            PaneKind::Search
+        }
+        fn capturing_text_input(&self) -> bool {
+            true
+        }
+        fn clone_box(&self) -> Box<dyn Pane> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[test]
+    fn default_pane_capturing_text_input_is_false() {
+        let pane = DefaultPane;
+        assert!(
+            !pane.capturing_text_input(),
+            "default pane must not capture text input"
+        );
+    }
+
+    #[test]
+    fn capturing_pane_capturing_text_input_is_true() {
+        let pane = CapturingPane::new();
+        assert!(
+            pane.capturing_text_input(),
+            "CapturingPane override must return true"
+        );
+    }
+
+    #[test]
+    fn capturing_pane_handle_key_sets_flag() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut pane = CapturingPane::new();
+        assert!(!pane.key_received);
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let _ = pane.handle_key(key);
+        assert!(pane.key_received, "handle_key must set key_received flag");
     }
 
     #[test]

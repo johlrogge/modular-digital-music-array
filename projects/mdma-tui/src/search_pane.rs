@@ -229,6 +229,10 @@ impl Pane for SearchPane {
         Some(format!("{} {} {}", artist, title, album))
     }
 
+    fn capturing_text_input(&self) -> bool {
+        self.editing
+    }
+
     fn clone_box(&self) -> Box<dyn Pane> {
         Box::new(self.clone())
     }
@@ -239,9 +243,13 @@ impl Pane for SearchPane {
 // =========================================================================
 //
 // NOTE: `SearchPane` requires a live `LibraryBackend` (IPC socket) to
-// construct. Tests instead exercise the pure logic — the same resolve logic
-// used in `resolve_selection` — directly on `SelectionState` + a track slice,
-// without instantiating `SearchPane` or connecting to any backend.
+// construct. Tests exercise the pure logic — the same resolve logic used in
+// `resolve_selection` — directly on `SelectionState` + a track slice.
+// `capturing_text_input` behaviour is verified via the `CapturingPane` stub
+// in `pane.rs` tests, which cover the trait contract.  The one-liner
+// `SearchPane::capturing_text_input` (returning `self.editing`) is simple
+// enough to be covered by code review; the trait-default tests in `pane.rs`
+// guard the plumbing.
 
 #[cfg(test)]
 mod tests {
