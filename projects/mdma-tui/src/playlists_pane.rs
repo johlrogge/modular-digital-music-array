@@ -208,6 +208,10 @@ impl Pane for PlaylistsPane {
             Err(e) => PaneAction::Error(format!("Failed to refresh playlists: {e}")),
         }
     }
+
+    fn display_string(&self, data_idx: usize) -> Option<String> {
+        self.names.get(data_idx).map(|n| n.to_string())
+    }
 }
 
 #[cfg(test)]

@@ -272,6 +272,14 @@ impl Pane for PlaylistPane {
         Some(&self.name)
     }
 
+    fn display_string(&self, data_idx: usize) -> Option<String> {
+        let track = self.tracks.get(data_idx)?;
+        let artist = track.artist.as_deref().unwrap_or("");
+        let title = track.title.as_deref().unwrap_or("");
+        let album = track.album.as_deref().unwrap_or("");
+        Some(format!("{} {} {}", artist, title, album))
+    }
+
     fn refresh(&mut self) -> PaneAction {
         match self.library.playlist_get(&self.name) {
             Ok(hashes) => {

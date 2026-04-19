@@ -129,14 +129,25 @@ impl BrowserPane {
                         .collect();
                 };
 
-                // Count tracks per genre
+                // Count tracks per genre by looking up each track's MainGenre fact.
                 let mut map: HashMap<String, usize> = HashMap::new();
                 for genre in &genre_values {
                     map.insert(genre.clone(), 0);
                 }
 
-                // TODO: count tracks per genre when genre metadata is available
-                let _ = all;
+                for track in all {
+                    if let Ok((_, facts)) = self.library.get_facts(&track.content_hash) {
+                        if let Some(genre) = facts
+                            .into_iter()
+                            .find(|(k, _)| k == "MainGenre")
+                            .map(|(_, v)| v)
+                        {
+                            if let Some(count) = map.get_mut(&genre) {
+                                *count += 1;
+                            }
+                        }
+                    }
+                }
 
                 let mut groups: Vec<GroupEntry> = map
                     .into_iter()
@@ -653,6 +664,20 @@ impl Pane for BrowserPane {
 
     fn pane_kind(&self) -> PaneKind {
         PaneKind::Browser
+    }
+
+    fn display_string(&self, data_idx: usize) -> Option<String> {
+        match &self.level {
+            BrowserLevel::Root { .. } => ROOT_ITEMS.get(data_idx).map(|s| s.to_string()),
+            BrowserLevel::Groups { groups, .. } => groups.get(data_idx).map(|g| g.name.clone()),
+            BrowserLevel::Tracks { tracks, .. } => {
+                let track = tracks.get(data_idx)?;
+                let artist = track.artist.as_deref().unwrap_or("");
+                let title = track.title.as_deref().unwrap_or("");
+                let album = track.album.as_deref().unwrap_or("");
+                Some(format!("{} {} {}", artist, title, album))
+            }
+        }
     }
 }
 

@@ -92,13 +92,13 @@ fn handle_palette(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => {
             app.close_palette();
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down => {
             let len = app.palette_matches.len();
             if len > 0 {
                 app.palette_cursor = (app.palette_cursor + 1) % len;
             }
         }
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up => {
             let len = app.palette_matches.len();
             if len > 0 {
                 app.palette_cursor = app.palette_cursor.checked_sub(1).unwrap_or(len - 1);
@@ -171,12 +171,22 @@ fn handle_filter(app: &mut App, key: KeyEvent) {
             app.filter_input.clear();
             app.mode = InputMode::Normal;
 
-            // Stub: accept everything — full text matching is wired in Task #3
-            // when panes expose their display strings.
-            let _ = pattern;
+            let pattern_lc = pattern.to_ascii_lowercase();
+            // Collect display strings for all data indices before calling push_filter,
+            // so the closure does not borrow `app` while `push_filter` mutably borrows it.
+            let total = app.active_pane().item_count();
+            let display_strings: Vec<Option<String>> = (0..total)
+                .map(|i| app.active_pane().display_string(i))
+                .collect();
             app.active_pane_mut()
                 .selection_state_mut()
-                .push_filter(|_data_idx| true);
+                .push_filter(move |data_idx| {
+                    match display_strings.get(data_idx) {
+                        Some(Some(text)) => text.to_ascii_lowercase().contains(&pattern_lc),
+                        // No display string available: keep the item (defensive).
+                        _ => true,
+                    }
+                });
         }
         KeyCode::Esc => {
             app.filter_input.clear();

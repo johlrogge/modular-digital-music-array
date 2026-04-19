@@ -74,4 +74,16 @@ pub trait Pane {
     fn refresh(&mut self) -> PaneAction {
         PaneAction::Consumed
     }
+
+    /// Return the display string for the item at the given *data* index.
+    ///
+    /// Used by the filter predicate to match text the user sees on screen.
+    /// Returns `None` if the index is out of range.
+    ///
+    /// Default implementation returns `None` (no text available), which the filter
+    /// treats as "keep" to avoid accidentally hiding items from panes that have not
+    /// implemented this method yet.
+    fn display_string(&self, _data_idx: usize) -> Option<String> {
+        None
+    }
 }
