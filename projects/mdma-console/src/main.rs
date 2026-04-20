@@ -13,7 +13,9 @@ use clap::Parser;
 use color_eyre::Result;
 use futures::stream::Stream;
 use gateway_client::{Command, GatewayClient};
-use library_ipc_client::{ContentHash, FactType, LibraryClient, TrackInfo, TrackQuery};
+use library_ipc_client::{
+    ContentHash, FactType, LibraryClient, PlaylistName, TrackInfo, TrackQuery,
+};
 use media_protocol::{AudioSinkInfo, Deck, ResponseData, SourceName};
 use nng::options::Options;
 use source_protocol::{DownloadState, SourceRequest, SourceResponse};
@@ -1014,6 +1016,29 @@ async fn player_queue_remove(
     playback_success_or_error(&client, &Command::QueueRemove { hashes })
 }
 
+#[derive(serde::Deserialize)]
+struct QueueReplaceRequest {
+    hashes: Vec<String>,
+}
+
+async fn player_queue_replace(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<QueueReplaceRequest>,
+) -> impl IntoResponse {
+    let entries: Vec<(ContentHash, SourceName)> = req
+        .hashes
+        .into_iter()
+        .map(|h| (ContentHash::new(h), SourceName::audio()))
+        .collect();
+
+    let client = match require_gateway(&state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+
+    playback_success_or_error(&client, &Command::QueueReplace { entries })
+}
+
 async fn player_queue_clear(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let client = match require_gateway(&state) {
         Ok(c) => c,
@@ -1297,6 +1322,177 @@ async fn library_album_tracks_handler(
 }
 
 // =============================================================================
+// Playlist Handlers
+// =============================================================================
+
+async fn library_playlists_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
+    use gateway_client::{LibraryRequest, LibraryResponse};
+    let client = match require_gateway(&state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    match client.library_request(&LibraryRequest::PlaylistList) {
+        Ok(LibraryResponse::PlaylistNames(names)) => {
+            let json: Vec<serde_json::Value> = names
+                .iter()
+                .map(|n| serde_json::json!({"name": n.as_str()}))
+                .collect();
+            Json(json).into_response()
+        }
+        Ok(LibraryResponse::Error(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Unexpected library response"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn library_playlist_tracks_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    use gateway_client::{LibraryRequest, LibraryResponse};
+    let playlist_name = match PlaylistName::new(&name) {
+        Ok(n) => n,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let client = match require_gateway(&state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    match client.library_request(&LibraryRequest::PlaylistGet {
+        name: playlist_name,
+    }) {
+        Ok(LibraryResponse::PlaylistContent(content)) => {
+            // Parse hashes from playlist content (one hash per line, first token)
+            let hashes: Vec<ContentHash> = content
+                .lines()
+                .filter_map(|line| {
+                    let token = line.split_whitespace().next()?;
+                    if token.is_empty() {
+                        None
+                    } else {
+                        Some(ContentHash::new(token.to_string()))
+                    }
+                })
+                .collect();
+            let lib = match state.library_client() {
+                Some(c) => c,
+                None => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({"error": "Library service not available"})),
+                    )
+                        .into_response()
+                }
+            };
+            let tracks: Vec<serde_json::Value> = hashes
+                .iter()
+                .filter_map(|hash| lib.get_track(hash).ok())
+                .map(|t| {
+                    serde_json::to_value(TrackInfoJson::from_track_info(&t))
+                        .unwrap_or(serde_json::json!({}))
+                })
+                .collect();
+            Json(tracks).into_response()
+        }
+        Ok(LibraryResponse::Error(e)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Unexpected library response"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn library_playlist_queue_replace_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    use gateway_client::{LibraryRequest, LibraryResponse};
+    let playlist_name = match PlaylistName::new(&name) {
+        Ok(n) => n,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let client = match require_gateway(&state) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let hashes = match client.library_request(&LibraryRequest::PlaylistGet {
+        name: playlist_name,
+    }) {
+        Ok(LibraryResponse::PlaylistContent(content)) => content
+            .lines()
+            .filter_map(|line| {
+                let token = line.split_whitespace().next()?;
+                if token.is_empty() {
+                    None
+                } else {
+                    Some(ContentHash::new(token.to_string()))
+                }
+            })
+            .collect::<Vec<_>>(),
+        Ok(LibraryResponse::Error(e)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+        Ok(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Unexpected library response"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let entries: Vec<(ContentHash, SourceName)> = hashes
+        .into_iter()
+        .map(|h| (h, SourceName::audio()))
+        .collect();
+    playback_success_or_error(&client, &Command::QueueReplace { entries })
+}
+
+// =============================================================================
 // Library Search Handler
 // =============================================================================
 
@@ -1512,6 +1708,7 @@ async fn main() -> Result<()> {
         .route("/player/queue", get(player_queue))
         .route("/player/queue/append", post(player_queue_append))
         .route("/player/queue/remove", post(player_queue_remove))
+        .route("/player/queue/replace", post(player_queue_replace))
         .route("/player/queue/clear", post(player_queue_clear))
         .route("/player/play-queue", post(player_play_queue))
         .route("/player/stop", post(player_stop))
@@ -1535,6 +1732,15 @@ async fn main() -> Result<()> {
         .route(
             "/library/albums/:name/tracks",
             get(library_album_tracks_handler),
+        )
+        .route("/library/playlists", get(library_playlists_handler))
+        .route(
+            "/library/playlists/:name/tracks",
+            get(library_playlist_tracks_handler),
+        )
+        .route(
+            "/library/playlists/:name/queue-replace",
+            post(library_playlist_queue_replace_handler),
         )
         // Cover art
         .route("/cover/:hash", get(cover_art))
@@ -1965,6 +2171,8 @@ mod tests {
             track_number: None,
             disc_number: None,
             added: None,
+            started: None,
+            stopped: None,
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.content_hash, "sha256:abc123");
@@ -1993,6 +2201,8 @@ mod tests {
             track_number: None,
             disc_number: None,
             added: None,
+            started: None,
+            stopped: None,
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.content_hash, "sha256:deadbeef");
@@ -2021,6 +2231,8 @@ mod tests {
             track_number: None,
             disc_number: Some(2),
             added: Some("2024-01-15T12:00:00Z".to_string()),
+            started: None,
+            stopped: None,
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.disc_number, Some(2));
