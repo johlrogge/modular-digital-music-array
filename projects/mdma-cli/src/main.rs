@@ -153,6 +153,11 @@ enum Commands {
         #[arg(long, allow_hyphen_values = true)]
         added: Option<String>,
 
+        /// Filter by playback history. `never` matches tracks with no started fact (never played).
+        /// When combined with --started, --played=never takes precedence.
+        #[arg(long)]
+        played: Option<PlayedFilter>,
+
         /// Invert the search results — return tracks that do NOT match the filters.
         #[arg(long)]
         not: bool,
@@ -533,6 +538,19 @@ enum SortField {
     TrackNumber,
     DiscNumber,
     Added,
+    /// Last started (played) datetime. None treated as -∞: ascending puts never-played first,
+    /// descending puts never-played last.
+    Started,
+    /// Last stopped datetime. None treated as -∞: ascending puts never-stopped first,
+    /// descending puts never-stopped last.
+    Stopped,
+}
+
+/// Filter by playback history.
+#[derive(clap::ValueEnum, Debug, Clone)]
+enum PlayedFilter {
+    /// Tracks that have never been played (started fact is absent).
+    Never,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1098,6 +1116,8 @@ fn handle_facts(client: &LibraryBackend, hash: String) -> Result<()> {
 }
 
 /// Build a TrackQuery from individual CLI arguments.
+///
+/// Precedence: `--played=never` overrides any explicit `--started` value.
 #[allow(clippy::too_many_arguments)]
 fn build_track_query(
     any_text: Option<String>,
@@ -1115,8 +1135,12 @@ fn build_track_query(
     started_str: Option<String>,
     stopped_str: Option<String>,
     added_str: Option<String>,
+    played: Option<PlayedFilter>,
 ) -> TrackQuery {
-    let started = if let Some(s) = started_str {
+    let started = if matches!(played, Some(PlayedFilter::Never)) {
+        // --played=never is a shortcut for started=N/A and overrides any --started value.
+        Some(library_search::DateQuery::NA)
+    } else if let Some(s) = started_str {
         match parse_date_query(&s) {
             Ok(q) => Some(q),
             Err(e) => {
@@ -1169,6 +1193,49 @@ fn build_track_query(
     }
 }
 
+/// Returns true if a track's content hash matches any token in the set.
+///
+/// Both the track hash and the token are stripped of the "sha256:" prefix before
+/// comparison, and a prefix match is used (like `git log <short-hash>`).
+fn hash_matches(track_hash: &str, set: &std::collections::HashSet<String>) -> bool {
+    let clean = track_hash.strip_prefix("sha256:").unwrap_or(track_hash);
+    set.iter().any(|token| {
+        let token_clean = token.strip_prefix("sha256:").unwrap_or(token.as_str());
+        clean.starts_with(token_clean)
+    })
+}
+
+/// Apply a stdin hash filter to a list of tracks.
+///
+/// - `stdin`: `None` means no filter was piped — return `tracks` unchanged.
+/// - `stdin`: `Some(set)` with `not == false` — keep only tracks whose hash is in `set`
+///   (intersection).
+/// - `stdin`: `Some(set)` with `not == true` — keep only tracks whose hash is NOT in `set`
+///   (exclusion). In this case the caller must ensure the query was sent to the library
+///   with `.not = false` so that the library returns a candidate set (not nothing).
+fn apply_stdin_filter(
+    tracks: Vec<TrackInfo>,
+    stdin: Option<&std::collections::HashSet<String>>,
+    not: bool,
+) -> Vec<TrackInfo> {
+    match stdin {
+        None => tracks,
+        Some(set) => {
+            if not {
+                tracks
+                    .into_iter()
+                    .filter(|t| !hash_matches(t.content_hash.as_str(), set))
+                    .collect()
+            } else {
+                tracks
+                    .into_iter()
+                    .filter(|t| hash_matches(t.content_hash.as_str(), set))
+                    .collect()
+            }
+        }
+    }
+}
+
 fn handle_search(client: &LibraryBackend, query: &TrackQuery, no_stdin: bool) -> Result<()> {
     use std::collections::HashSet;
     use std::io::{BufRead, IsTerminal};
@@ -1186,28 +1253,19 @@ fn handle_search(client: &LibraryBackend, query: &TrackQuery, no_stdin: bool) ->
         None
     };
 
-    match client.search(query) {
+    // When stdin hashes are present and --not is set, we invert the intersection rather
+    // than the library query: send the query without `.not` (so the library returns a
+    // candidate set), then exclude any track whose hash is in the piped set.
+    // Without stdin, `.not` flows through to the library as usual.
+    let effective_not = query.not && stdin_filter.is_some();
+    let mut effective_query = query.clone();
+    if effective_not {
+        effective_query.not = false;
+    }
+
+    match client.search(&effective_query) {
         Ok(tracks) => {
-            // Apply stdin intersection filter if hashes were piped in.
-            let tracks: Vec<_> = if let Some(ref filter) = stdin_filter {
-                tracks
-                    .into_iter()
-                    .filter(|t| {
-                        let clean = t
-                            .content_hash
-                            .as_str()
-                            .strip_prefix("sha256:")
-                            .unwrap_or(t.content_hash.as_str());
-                        filter.iter().any(|token| {
-                            let token_clean =
-                                token.strip_prefix("sha256:").unwrap_or(token.as_str());
-                            clean.starts_with(token_clean)
-                        })
-                    })
-                    .collect()
-            } else {
-                tracks
-            };
+            let tracks = apply_stdin_filter(tracks, stdin_filter.as_ref(), effective_not);
 
             if tracks.is_empty() && std::io::stdout().is_terminal() {
                 println!("No tracks found");
@@ -2526,19 +2584,26 @@ fn hashes_arg_or_stdin(hash: Option<String>) -> Vec<String> {
     }
 }
 
+/// Compare two optional values treating `None` as negative-infinity (-∞).
+///
+/// Semantics:
+/// - Ascending  (`asc=true`):  None first, then real values oldest→newest.
+/// - Descending (`asc=false`): real values newest→oldest, None last.
+///
+/// This applies uniformly to Started, Stopped, and Added so that
+/// `mdma sort started -d` yields "most recently played first, never-played last".
 fn compare_optional<T: Ord>(a: Option<T>, b: Option<T>, asc: bool) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    match (a, b) {
+    let ord = match (a, b) {
         (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Greater,
-        (Some(_), None) => Ordering::Less,
-        (Some(av), Some(bv)) => {
-            if asc {
-                av.cmp(&bv)
-            } else {
-                bv.cmp(&av)
-            }
-        }
+        (None, Some(_)) => Ordering::Less, // None is -∞, smaller than any Some
+        (Some(_), None) => Ordering::Greater, // Some is larger than -∞
+        (Some(av), Some(bv)) => av.cmp(&bv),
+    };
+    if asc {
+        ord
+    } else {
+        ord.reverse()
     }
 }
 
@@ -2605,6 +2670,16 @@ fn handle_sort(
         SortField::Added => compare_optional(
             a.added.as_deref().map(str::to_string),
             b.added.as_deref().map(str::to_string),
+            direction_asc,
+        ),
+        SortField::Started => compare_optional(
+            a.started.as_deref().map(str::to_string),
+            b.started.as_deref().map(str::to_string),
+            direction_asc,
+        ),
+        SortField::Stopped => compare_optional(
+            a.stopped.as_deref().map(str::to_string),
+            b.stopped.as_deref().map(str::to_string),
             direction_asc,
         ),
     });
@@ -4060,6 +4135,7 @@ fn main() -> Result<()> {
             started,
             stopped,
             added,
+            played,
             not,
             subcommand,
         } => {
@@ -4087,6 +4163,7 @@ fn main() -> Result<()> {
                     started.clone(),
                     stopped.clone(),
                     added.clone(),
+                    played.clone(),
                 );
                 track_query.not = *not;
                 handle_search(&client, &track_query, *no_stdin)
@@ -4298,6 +4375,8 @@ mod tests {
             track_number: None,
             disc_number: None,
             added: None,
+            started: None,
+            stopped: None,
         }
     }
 
@@ -4573,6 +4652,8 @@ mod tests {
             track_number: None,
             disc_number: None,
             added: None,
+            started: None,
+            stopped: None,
         }
     }
 
@@ -4621,6 +4702,8 @@ mod tests {
             track_number: None,
             disc_number: None,
             added: None,
+            started: None,
+            stopped: None,
         };
         let output = std::path::Path::new("/tmp/export");
         let path = export_dest_path(output, &track, "flac");
@@ -4825,6 +4908,309 @@ mod tests {
             result.is_ok(),
             "clap rejected --stopped ~: {}",
             result.unwrap_err()
+        );
+    }
+
+    // ── apply_stdin_filter tests ─────────────────────────────────────────────
+
+    fn make_track_with_hash(hash: &str) -> TrackInfo {
+        use library_ipc_client::ContentHash;
+        TrackInfo {
+            content_hash: ContentHash::new(hash.to_string()),
+            title: None,
+            artist: None,
+            album: None,
+            duration: None,
+            bpm: None,
+            key: None,
+            blob_path: None,
+            cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
+            started: None,
+            stopped: None,
+        }
+    }
+
+    fn hash_set(hashes: &[&str]) -> std::collections::HashSet<String> {
+        hashes.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn search_not_with_stdin_excludes_piped_hashes() {
+        // stdin = {h1, h2}, library returns {h1, h2, h3, h4}, --not returns [h3, h4]
+        let tracks = vec![
+            make_track_with_hash("sha256:h1aaaaaa"),
+            make_track_with_hash("sha256:h2aaaaaa"),
+            make_track_with_hash("sha256:h3aaaaaa"),
+            make_track_with_hash("sha256:h4aaaaaa"),
+        ];
+        let stdin = hash_set(&["sha256:h1aaaaaa", "sha256:h2aaaaaa"]);
+        let result = apply_stdin_filter(tracks, Some(&stdin), true);
+        let hashes: Vec<_> = result.iter().map(|t| t.content_hash.as_str()).collect();
+        assert_eq!(hashes, vec!["sha256:h3aaaaaa", "sha256:h4aaaaaa"]);
+    }
+
+    #[test]
+    fn search_not_with_stdin_prefix_match_excludes() {
+        // stdin token is a short prefix (no sha256: prefix on token)
+        let tracks = vec![
+            make_track_with_hash("sha256:abcdef1234"),
+            make_track_with_hash("sha256:deadbeef56"),
+            make_track_with_hash("sha256:cafebabe78"),
+        ];
+        let stdin = hash_set(&["abcdef", "deadbe"]);
+        let result = apply_stdin_filter(tracks, Some(&stdin), true);
+        let hashes: Vec<_> = result.iter().map(|t| t.content_hash.as_str()).collect();
+        assert_eq!(hashes, vec!["sha256:cafebabe78"]);
+    }
+
+    #[test]
+    fn search_stdin_without_not_intersects() {
+        // Sanity: stdin + no --not still intersects
+        let tracks = vec![
+            make_track_with_hash("sha256:h1aaaaaa"),
+            make_track_with_hash("sha256:h2aaaaaa"),
+            make_track_with_hash("sha256:h3aaaaaa"),
+        ];
+        let stdin = hash_set(&["sha256:h1aaaaaa", "sha256:h2aaaaaa"]);
+        let result = apply_stdin_filter(tracks, Some(&stdin), false);
+        let hashes: Vec<_> = result.iter().map(|t| t.content_hash.as_str()).collect();
+        assert_eq!(hashes, vec!["sha256:h1aaaaaa", "sha256:h2aaaaaa"]);
+    }
+
+    #[test]
+    fn search_no_stdin_preserves_not_behavior() {
+        // Without stdin, apply_stdin_filter returns tracks unchanged regardless of `not`
+        let tracks = vec![
+            make_track_with_hash("sha256:h1aaaaaa"),
+            make_track_with_hash("sha256:h2aaaaaa"),
+        ];
+        let result = apply_stdin_filter(tracks.clone(), None, true);
+        assert_eq!(result.len(), 2, "pass-through when no stdin, not=true");
+        let result2 = apply_stdin_filter(tracks, None, false);
+        assert_eq!(result2.len(), 2, "pass-through when no stdin, not=false");
+    }
+
+    // ── sort by started / stopped ─────────────────────────────────────────────
+
+    fn make_track_with_started(hash: &str, started: Option<&str>) -> TrackInfo {
+        use library_ipc_client::ContentHash;
+        TrackInfo {
+            content_hash: ContentHash::new(hash.to_string()),
+            title: None,
+            artist: None,
+            album: None,
+            duration: None,
+            bpm: None,
+            key: None,
+            blob_path: None,
+            cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
+            started: started.map(str::to_string),
+            stopped: None,
+        }
+    }
+
+    fn make_track_with_stopped(hash: &str, stopped: Option<&str>) -> TrackInfo {
+        use library_ipc_client::ContentHash;
+        TrackInfo {
+            content_hash: ContentHash::new(hash.to_string()),
+            title: None,
+            artist: None,
+            album: None,
+            duration: None,
+            bpm: None,
+            key: None,
+            blob_path: None,
+            cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
+            started: None,
+            stopped: stopped.map(str::to_string),
+        }
+    }
+
+    // ── --played=never filter ─────────────────────────────────────────────────
+
+    #[test]
+    fn search_played_never_maps_to_started_na() {
+        use library_search::DateQuery;
+        let result = Cli::try_parse_from(["mdma", "search", "--played", "never"]);
+        assert!(
+            result.is_ok(),
+            "clap rejected --played never: {}",
+            result.unwrap_err()
+        );
+        // Build the query with played=never and no explicit --started
+        let query = build_track_query(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(PlayedFilter::Never),
+        );
+        assert!(
+            matches!(query.started, Some(DateQuery::NA)),
+            "expected started == Some(DateQuery::NA), got {:?}",
+            query.started
+        );
+    }
+
+    #[test]
+    fn search_played_never_overrides_started() {
+        use library_search::DateQuery;
+        // When --played=never and --started are both given, --played=never wins.
+        let query = build_track_query(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("-7".to_string()),
+            None,
+            None,
+            Some(PlayedFilter::Never),
+        );
+        assert!(
+            matches!(query.started, Some(DateQuery::NA)),
+            "expected --played=never to override --started, got {:?}",
+            query.started
+        );
+    }
+
+    // ── sort None = -∞ semantics ──────────────────────────────────────────────
+
+    #[test]
+    fn sort_started_ascending_puts_none_first() {
+        let mut tracks = vec![
+            make_track_with_started("sha256:never", None),
+            make_track_with_started("sha256:old", Some("2024-01-01T00:00:00Z")),
+            make_track_with_started("sha256:recent", Some("2025-06-15T12:00:00Z")),
+        ];
+        // ascending: None (-∞) first, then oldest → newest
+        tracks.sort_by(|a, b| {
+            compare_optional(
+                a.started.as_deref().map(str::to_string),
+                b.started.as_deref().map(str::to_string),
+                true,
+            )
+        });
+        let hashes: Vec<_> = tracks.iter().map(|t| t.content_hash.as_str()).collect();
+        assert_eq!(
+            hashes,
+            vec!["sha256:never", "sha256:old", "sha256:recent"],
+            "ascending: never-played first (None = -∞), then oldest→newest"
+        );
+    }
+
+    #[test]
+    fn sort_started_descending_puts_none_last() {
+        let mut tracks = vec![
+            make_track_with_started("sha256:never", None),
+            make_track_with_started("sha256:old", Some("2024-01-01T00:00:00Z")),
+            make_track_with_started("sha256:recent", Some("2025-06-15T12:00:00Z")),
+        ];
+        // descending: newest first, None last
+        tracks.sort_by(|a, b| {
+            compare_optional(
+                a.started.as_deref().map(str::to_string),
+                b.started.as_deref().map(str::to_string),
+                false,
+            )
+        });
+        let hashes: Vec<_> = tracks.iter().map(|t| t.content_hash.as_str()).collect();
+        assert_eq!(
+            hashes,
+            vec!["sha256:recent", "sha256:old", "sha256:never"],
+            "descending: newest first, never-played last (None = -∞)"
+        );
+    }
+
+    #[test]
+    fn sort_by_stopped_descending_newest_first() {
+        let mut tracks = vec![
+            make_track_with_stopped("sha256:never", None),
+            make_track_with_stopped("sha256:old", Some("2024-03-01T00:00:00Z")),
+            make_track_with_stopped("sha256:recent", Some("2025-11-20T08:00:00Z")),
+        ];
+        // descending: newest first, None last (None = -∞, reversed → last)
+        tracks.sort_by(|a, b| {
+            compare_optional(
+                a.stopped.as_deref().map(str::to_string),
+                b.stopped.as_deref().map(str::to_string),
+                false,
+            )
+        });
+        let hashes: Vec<_> = tracks.iter().map(|t| t.content_hash.as_str()).collect();
+        assert_eq!(
+            hashes,
+            vec!["sha256:recent", "sha256:old", "sha256:never"],
+            "descending: newest first, never-stopped last"
+        );
+    }
+
+    #[test]
+    fn sort_added_respects_none_as_beginning_of_time() {
+        use library_ipc_client::ContentHash;
+        let make = |hash: &str, added: Option<&str>| -> TrackInfo {
+            TrackInfo {
+                content_hash: ContentHash::new(hash.to_string()),
+                title: None,
+                artist: None,
+                album: None,
+                duration: None,
+                bpm: None,
+                key: None,
+                blob_path: None,
+                cover_art_path: None,
+                track_number: None,
+                disc_number: None,
+                added: added.map(str::to_string),
+                started: None,
+                stopped: None,
+            }
+        };
+        let mut tracks = vec![
+            make("sha256:unknown", None),
+            make("sha256:new", Some("2025-12-01T00:00:00Z")),
+            make("sha256:early", Some("2020-01-01T00:00:00Z")),
+        ];
+        // ascending: None first (beginning of time), then oldest→newest
+        tracks.sort_by(|a, b| {
+            compare_optional(
+                a.added.as_deref().map(str::to_string),
+                b.added.as_deref().map(str::to_string),
+                true,
+            )
+        });
+        let hashes: Vec<_> = tracks.iter().map(|t| t.content_hash.as_str()).collect();
+        assert_eq!(
+            hashes,
+            vec!["sha256:unknown", "sha256:early", "sha256:new"],
+            "ascending added: None first, then oldest→newest"
         );
     }
 }
