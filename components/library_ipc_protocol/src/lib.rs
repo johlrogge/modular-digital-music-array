@@ -430,6 +430,12 @@ pub struct TrackInfo {
     pub disc_number: Option<u32>,
     /// ISO 8601 datetime when track was added to the library.
     pub added: Option<String>,
+    /// ISO 8601 datetime when the track was last started (played). None if never played.
+    #[serde(default)]
+    pub started: Option<String>,
+    /// ISO 8601 datetime when the track was last stopped. None if never played.
+    #[serde(default)]
+    pub stopped: Option<String>,
 }
 
 /// Service status information.
@@ -754,6 +760,8 @@ mod tests {
             track_number: None,
             disc_number: None,
             added: None,
+            started: None,
+            stopped: None,
         };
 
         let json = serde_json::to_string(&track).unwrap();

@@ -741,6 +741,8 @@ mod tests {
             track_number: None,
             disc_number: None,
             added: None,
+            started: None,
+            stopped: None,
         }
     }
 
@@ -758,6 +760,8 @@ mod tests {
             track_number: track,
             disc_number: disc,
             added: None,
+            started: None,
+            stopped: None,
         }
     }
 

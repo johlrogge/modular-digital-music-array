@@ -66,6 +66,8 @@ impl IndexedTrack {
             track_number: self.track_number,
             disc_number: self.disc_number,
             added: None,
+            started: None,
+            stopped: None,
         }
     }
 
