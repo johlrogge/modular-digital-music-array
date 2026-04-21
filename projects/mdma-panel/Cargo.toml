@@ -1,0 +1,20 @@
+[package]
+name = "mdma-panel"
+version.workspace = true
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
+
+[[bin]]
+name = "mdma-panel"
+path = "src/main.rs"
+
+[dependencies]
+panel-host = { path = "../../bases/panel-host" }
+panel-transport-fake = { path = "../../components/panel-transport-fake" }
+panel-protocol = { path = "../../components/panel-protocol" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+color-eyre = { workspace = true }

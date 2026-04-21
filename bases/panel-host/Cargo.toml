@@ -1,0 +1,19 @@
+[package]
+name = "panel-host"
+version.workspace = true
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
+
+[dependencies]
+panel-protocol = { workspace = true }
+panel-transport = { workspace = true }
+panel-ui = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+panel-transport-fake = { workspace = true }
+panel-protocol = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+pretty_assertions = "1"

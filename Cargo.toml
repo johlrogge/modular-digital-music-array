@@ -54,7 +54,7 @@ members = [
     "projects/mdma-library",
     "projects/mdma-playback",
     "projects/mdma-tui"
-]
+, "components/panel-protocol", "components/panel-ui", "components/panel-transport", "components/panel-transport-fake", "bases/panel-host", "projects/mdma-panel"]
 resolver = "2"
 
 [workspace.package]
@@ -102,6 +102,11 @@ source-protocol = { path = "components/source_protocol" }
 storage_primitives = { path = "components/storage_primitives" }
 stream-source-protocol = { path = "components/stream_source_protocol" }
 track-matcher = { path = "components/track_matcher" }
+panel-protocol = { path = "components/panel-protocol" }
+panel-transport = { path = "components/panel-transport" }
+panel-transport-fake = { path = "components/panel-transport-fake" }
+panel-ui = { path = "components/panel-ui" }
+panel-host = { path = "bases/panel-host" }
 askama = "0.12"
 assert_matches = "1.5"
 async-stream = "0.3"

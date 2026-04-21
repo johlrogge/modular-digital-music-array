@@ -1,0 +1,14 @@
+[package]
+name = "panel-transport"
+version.workspace = true
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
+
+[package.metadata.polylith]
+interface = "panel-transport"
+
+[dependencies]
+panel-protocol = { workspace = true }
+thiserror = { workspace = true }

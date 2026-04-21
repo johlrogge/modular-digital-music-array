@@ -1,0 +1,17 @@
+[package]
+name = "panel-ui"
+version.workspace = true
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
+
+[package.metadata.polylith]
+interface = "panel-ui"
+
+[dependencies]
+panel-protocol = { workspace = true }
+heapless = { version = "0.8" }
+
+[dev-dependencies]
+pretty_assertions = "1"
