@@ -678,6 +678,8 @@ Unix pipes.
 
 ## Update History
 
+- **2026-04-21 (v0.14.0):** Console: queue playlists; reorder queue with ↑/↓. CLI: `--not` with stdin excludes, `--played never` filter, sort by `start`/`stop`. Library: `TrackInfo` exposes `last_started` and `last_stopped`.
+
 - **2026-04-19 (v0.13.0):** TUI: field-aware search grammar (`:artist`, `:bpm`, `:title`, `:added`, `:history`), live search on every keystroke, multi-pane tabs (`1`–`5` left / `6`–`0` right, nnn-style clone-on-empty), DJ shortcuts (`A` add-playing, `P` play-immediate, `d`/`p` cut-paste, `Shift+J`/`K` block move, `u` undo). Input-capturing panes no longer leak keys. Album drill-down sorts disc/track asc. Inbox ignores `._*` sidecar files. CLI: `mdma search --added -7` hyphen-prefix date. Playback engine: MP3 zero-padding bug fixed (no more roboty MP3), decoder moved to `std::thread`, mixer busy-spin and silence-pad both eliminated, output uses source native sample rate (44.1 kHz MP3 no longer upsampled), flush-on-track-change (~50 ms skip latency), `allowed-rates` PipeWire config. Library: `playlists/` auto-created on startup and before writes, retract-aware fact fold. Bandcamp: `mdma source check-item`, `check-updates [--apply]`, `resync` for on-demand stale detection.
 
 - **2026-03-12 (v0.8.0):** mdma-tui v0.2.0: dual-pane terminal UI (browser left, queue right). Modal keybindings — Normal mode for navigation, Playback mode for transport. Command palette (`:`) for play/pause/stop/next/clear/quit and pane switching. `q`/`Q` queue append/next. `?` help overlay. Live queue sync via event bus subscription. mdma-playback v0.6.0: Play/PlayQueue now resumes a paused track instead of popping the queue. nng-transport: 5-second send/recv timeouts on all client sockets.

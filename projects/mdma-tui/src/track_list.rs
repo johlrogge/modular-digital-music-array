@@ -390,6 +390,8 @@ mod tests {
             track_number: None,
             disc_number: None,
             added: None,
+            started: None,
+            stopped: None,
         }
     }
 

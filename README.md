@@ -167,6 +167,25 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ---
 
+## What's new in 0.14.0
+
+### Console
+
+- **Queue playlists** — send a whole playlist to the queue directly from the web console.
+- **Reorder queue** — move entries up/down with ↑/↓ buttons.
+
+### CLI
+
+- **`--not` with stdin excludes** — pipe track IDs into `mdma search --not` to exclude them from results.
+- **`--played never`** — filter for tracks that have never been played.
+- **Sort by `start`/`stop`** — `mdma sort start` and `mdma sort stop` order by last-started / last-stopped timestamps.
+
+### Library
+
+- `TrackInfo` now exposes `last_started` and `last_stopped` fields.
+
+---
+
 ## What's new in 0.13.0
 
 ### Search and filters

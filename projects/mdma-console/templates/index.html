@@ -1186,8 +1186,9 @@
                 <div style="display:flex;gap:8px;margin-bottom:16px">
                     <button class="btn btn-accent btn-sm browse-mode-btn active" data-mode="artists" onclick="switchBrowseMode('artists')">Artists</button>
                     <button class="btn btn-sm browse-mode-btn" data-mode="albums" onclick="switchBrowseMode('albums')">Albums</button>
+                    <button class="btn btn-sm browse-mode-btn" data-mode="playlists" onclick="switchBrowseMode('playlists')">Playlists</button>
                 </div>
-                <div id="browse-content" class="empty-state">Select Artists or Albums to browse</div>
+                <div id="browse-content" class="empty-state">Select Artists, Albums or Playlists to browse</div>
             </div>
 
         </div>
@@ -1574,6 +1575,7 @@
                         list.innerHTML = '<li><span class="empty-state">Queue is empty</span></li>';
                         return;
                     }
+                    var len = tracks.length;
                     list.innerHTML = tracks.map(function(t, i) {
                         var title = escapeHtml(t.title || t.content_hash || 'Unknown');
                         var artist = escapeHtml(t.artist || '');
@@ -1588,6 +1590,8 @@
                                 '<div class="queue-title">' + title + '</div>' +
                                 (artist ? '<div class="queue-artist">' + artist + '</div>' : '') +
                             '</div>' +
+                            (i > 0 ? '<button class="btn btn-sm" onclick="moveQueueItem(' + i + ', -1)" title="Move up">\u2191</button>' : '<button class="btn btn-sm" style="visibility:hidden">\u2191</button>') +
+                            (i < len - 1 ? '<button class="btn btn-sm" onclick="moveQueueItem(' + i + ', 1)" title="Move down">\u2193</button>' : '<button class="btn btn-sm" style="visibility:hidden">\u2193</button>') +
                             '<button class="btn btn-danger btn-sm queue-remove" onclick="removeFromQueue(\'' + hash + '\')">Remove</button>' +
                             '</li>';
                     }).join('');
@@ -1656,6 +1660,37 @@
         function clearQueue() {
             fetch('/player/queue/clear', { method: 'POST' })
                 .then(function() { refreshQueue(); })
+                .catch(function(e) { showStatus('Error: ' + e.message, true); });
+        }
+
+        function moveQueueItem(index, direction) {
+            fetch('/player/queue')
+                .then(function(r) { return r.json(); })
+                .then(function(tracks) {
+                    if (!Array.isArray(tracks) || tracks.length === 0) { return; }
+                    var target = index + direction;
+                    if (target < 0) { showStatus('Already at top', false); return; }
+                    if (target >= tracks.length) { showStatus('Already at bottom', false); return; }
+                    var hashes = tracks.map(function(t) { return t.content_hash; });
+                    var tmp = hashes[index];
+                    hashes[index] = hashes[target];
+                    hashes[target] = tmp;
+                    fetch('/player/queue/replace', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ hashes: hashes })
+                    })
+                    .then(function(r) { return r.json(); })
+                    .then(function(data) {
+                        if (data.success) {
+                            refreshQueue();
+                        } else {
+                            showStatus('Reorder failed: ' + (data.error || 'unknown'), true);
+                            refreshQueue();
+                        }
+                    })
+                    .catch(function(e) { showStatus('Reorder failed: ' + e.message, true); refreshQueue(); });
+                })
                 .catch(function(e) { showStatus('Error: ' + e.message, true); });
         }
 
@@ -2053,6 +2088,14 @@
         function loadBrowseContent() {
             var area = document.getElementById('browse-content');
             area.innerHTML = '<div class="empty-state">Loading...</div>';
+            if (currentBrowseMode === 'playlists') {
+                fetch('/library/playlists').then(function(r) { return r.json(); }).then(function(items) {
+                    if (!items.length) { area.innerHTML = '<div class="empty-state">No playlists found</div>'; return; }
+                    var names = items.map(function(item) { return item.name; });
+                    renderNameList(names, area, 'loadPlaylistTracks');
+                }).catch(function(e) { area.innerHTML = '<div class="empty-state">Error: ' + e.message + '</div>'; });
+                return;
+            }
             var url = currentBrowseMode === 'artists' ? '/library/artists' : '/library/albums';
             fetch(url).then(function(r) { return r.json(); }).then(function(items) {
                 if (!items.length) { area.innerHTML = '<div class="empty-state">No ' + currentBrowseMode + ' found</div>'; return; }
@@ -2118,6 +2161,34 @@
                     area.innerHTML = html;
                 })
                 .catch(function(e) { area.innerHTML = '<div class="empty-state">Error: ' + e.message + '</div>'; });
+        }
+
+        function loadPlaylistTracks(playlistName) {
+            var area = document.getElementById('browse-content');
+            area.innerHTML = '<div class="empty-state">Loading tracks...</div>';
+            fetch('/library/playlists/' + encodeURIComponent(playlistName) + '/tracks')
+                .then(function(r) { return r.json(); })
+                .then(function(tracks) {
+                    var html = '<div style="margin-bottom:12px"><button class="btn btn-sm btn-ghost" onclick="loadBrowseContent()">&larr; Back</button> <span style="font-family:\'DM Mono\',monospace;color:var(--accent)">' + escapeHtml(playlistName) + '</span></div>';
+                    html += '<div style="margin-bottom:12px"><button class="btn btn-accent btn-sm" onclick="queuePlaylist(\'' + escapeHtml(playlistName).replace(/'/g, "\\'") + '\')">Queue This Playlist</button></div>';
+                    html += renderBrowseTrackTable(tracks);
+                    area.innerHTML = html;
+                })
+                .catch(function(e) { area.innerHTML = '<div class="empty-state">Error: ' + e.message + '</div>'; });
+        }
+
+        function queuePlaylist(name) {
+            fetch('/library/playlists/' + encodeURIComponent(name) + '/queue-replace', { method: 'POST' })
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (data.success) {
+                        showStatus('Queued playlist: ' + name, false);
+                        refreshQueue();
+                    } else {
+                        showStatus('Queue failed: ' + (data.error || 'unknown'), true);
+                    }
+                })
+                .catch(function(e) { showStatus('Error: ' + e.message, true); });
         }
 
         function renderBrowseTrackTable(tracks) {
