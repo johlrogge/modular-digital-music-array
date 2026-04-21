@@ -4,6 +4,25 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.14.0] — 2026-04-21
+
+### Console
+
+- Queue playlists directly from the web console.
+- Reorder queue entries with ↑/↓ buttons.
+
+### CLI
+
+- `--not` with stdin excludes: pipe track IDs to exclude from search results.
+- `--played never` filter: list tracks that have never been played.
+- Sort by `start` and `stop` (last started / last stopped timestamps).
+
+### Library
+
+- `TrackInfo` now exposes `last_started` and `last_stopped` fields.
+
+---
+
 ## [0.13.0] — 2026-04-19
 
 ### TUI — Search and filters
