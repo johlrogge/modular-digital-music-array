@@ -1515,6 +1515,8 @@ impl LibraryService {
             track_number: t.track_number,
             disc_number: t.disc_number,
             added: t.added_at.map(|dt| dt.to_rfc3339()),
+            started: t.last_started.map(|dt| dt.to_rfc3339()),
+            stopped: t.last_stopped.map(|dt| dt.to_rfc3339()),
         }
     }
 
