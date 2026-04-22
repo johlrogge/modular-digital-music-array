@@ -1,7 +1,6 @@
-/// Rekordbox XML export utilities.
-///
-/// Generates Pioneer Rekordbox-compatible XML library files for import
-/// via Rekordbox File → Import Library.
+// Rekordbox XML export utilities.
+// Generates Pioneer Rekordbox-compatible XML library files for import
+// via Rekordbox File → Import Library.
 
 // =============================================================================
 // tonality module — converts MDMA Key to Camelot notation
@@ -206,6 +205,7 @@ pub mod path_uri {
 
 pub mod xml {
     /// A single track entry for the Rekordbox XML collection.
+    #[derive(Clone)]
     pub struct RekordboxTrack {
         pub track_id: u32,
         pub name: String,
@@ -229,12 +229,14 @@ pub mod xml {
     }
 
     /// A playlist entry referencing tracks by ID.
+    #[derive(Clone)]
     pub struct RekordboxPlaylist {
         pub name: String,
         pub track_ids: Vec<u32>,
     }
 
     /// A full Rekordbox library with tracks and playlists.
+    #[derive(Clone)]
     pub struct RekordboxLibrary {
         pub tracks: Vec<RekordboxTrack>,
         pub playlists: Vec<RekordboxPlaylist>,
@@ -384,7 +386,6 @@ pub mod xml {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use pretty_assertions::assert_eq;
 
         fn make_test_library() -> RekordboxLibrary {
             RekordboxLibrary {
@@ -632,20 +633,14 @@ pub mod parse {
         }
     }
 
-    fn attr_str<'a>(
-        attrs: &'a quick_xml::events::attributes::Attributes,
-        name: &[u8],
-    ) -> Option<String> {
-        // We need to iterate — clone isn't available, so collect first
+    fn attr_str(attrs: &quick_xml::events::attributes::Attributes, name: &[u8]) -> Option<String> {
         let mut result = None;
-        for attr in attrs.clone() {
-            if let Ok(a) = attr {
-                if a.key.as_ref() == name {
-                    if let Ok(val) = a.unescape_value() {
-                        result = Some(val.into_owned());
-                    }
-                    break;
+        for a in attrs.clone().flatten() {
+            if a.key.as_ref() == name {
+                if let Ok(val) = a.unescape_value() {
+                    result = Some(val.into_owned());
                 }
+                break;
             }
         }
         result
@@ -1005,10 +1000,617 @@ pub mod parse {
 }
 
 // =============================================================================
+// merge module — incremental export planning and library merging
+// =============================================================================
+
+pub mod merge {
+    use std::collections::{HashMap, HashSet};
+    use std::path::{Path, PathBuf};
+
+    use super::path_uri::path_to_file_uri;
+    use super::xml::{RekordboxLibrary, RekordboxPlaylist, RekordboxTrack};
+
+    #[derive(Debug, Clone)]
+    pub struct DesiredTrack {
+        pub dest_path: PathBuf,
+        pub source_id: String,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct PlannedTrack {
+        pub dest_path: PathBuf,
+        pub source_id: String,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct DestPathCollision {
+        pub dest_path: PathBuf,
+        pub source_ids: Vec<String>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct FormatChange {
+        pub existing_location: String,
+        pub new_dest_path: PathBuf,
+        pub source_id: String,
+    }
+
+    #[derive(Debug, Default, Clone)]
+    pub struct ExportPlan {
+        pub to_download: Vec<PlannedTrack>,
+        pub to_skip: Vec<String>,
+        pub collisions: Vec<DestPathCollision>,
+        pub format_changes: Vec<FormatChange>,
+    }
+
+    /// A track ready to be merged — every field except `track_id`, which
+    /// `merge_export` assigns based on final ordering. Callers cannot
+    /// supply a track_id, making the unassigned-id state unrepresentable.
+    #[derive(Debug, Clone)]
+    pub struct RefreshedTrack {
+        pub name: String,
+        pub artist: String,
+        pub album: String,
+        pub genre: String,
+        pub kind: String,
+        pub size: u64,
+        pub total_time: u32,
+        pub average_bpm: Option<f32>,
+        pub tonality: Option<String>,
+        pub track_number: Option<u32>,
+        pub disc_number: Option<u32>,
+        pub year: Option<String>,
+        pub label: Option<String>,
+        pub comment: Option<String>,
+        pub date_added: Option<String>,
+        pub bitrate: Option<u32>,
+        pub sample_rate: Option<u32>,
+        pub location: String,
+    }
+
+    pub fn plan_export(
+        existing: Option<&RekordboxLibrary>,
+        desired: &[DesiredTrack],
+        disk_check: impl Fn(&Path) -> bool,
+    ) -> ExportPlan {
+        let existing_locations: HashSet<String> = existing
+            .map(|lib| lib.tracks.iter().map(|t| t.location.clone()).collect())
+            .unwrap_or_default();
+
+        // Build (stem_without_ext, parent) → (location, ext) map for format-change detection.
+        // We use the existing location's decoded path for comparison.
+        let existing_by_stem: Vec<(PathBuf, String, String)> = existing
+            .map(|lib| {
+                lib.tracks
+                    .iter()
+                    .filter_map(|t| {
+                        let decoded = super::parse::parse_location(&t.location)?;
+                        let p = PathBuf::from(&decoded);
+                        let stem = p.with_extension("");
+                        let ext = p
+                            .extension()
+                            .map(|e| e.to_string_lossy().to_lowercase())
+                            .unwrap_or_default();
+                        Some((stem, t.location.clone(), ext))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Collision detection: group by dest_path.
+        let mut by_dest: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        for dt in desired {
+            by_dest
+                .entry(dt.dest_path.clone())
+                .or_default()
+                .push(dt.source_id.clone());
+        }
+        let collisions: Vec<DestPathCollision> = by_dest
+            .iter()
+            .filter(|(_, ids)| ids.len() >= 2)
+            .map(|(path, ids)| DestPathCollision {
+                dest_path: path.clone(),
+                source_ids: ids.clone(),
+            })
+            .collect();
+
+        let mut to_skip = Vec::new();
+        let mut to_download = Vec::new();
+        let mut format_changes = Vec::new();
+
+        for dt in desired {
+            let location = path_to_file_uri(&dt.dest_path);
+
+            if existing_locations.contains(&location) && disk_check(&dt.dest_path) {
+                to_skip.push(location);
+            } else {
+                // Check for format change: same parent+stem, different extension.
+                let desired_stem = dt.dest_path.with_extension("");
+                let desired_ext = dt
+                    .dest_path
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+
+                for (existing_stem, existing_loc, existing_ext) in &existing_by_stem {
+                    if existing_stem == &desired_stem && existing_ext != &desired_ext {
+                        format_changes.push(FormatChange {
+                            existing_location: existing_loc.clone(),
+                            new_dest_path: dt.dest_path.clone(),
+                            source_id: dt.source_id.clone(),
+                        });
+                    }
+                }
+
+                to_download.push(PlannedTrack {
+                    dest_path: dt.dest_path.clone(),
+                    source_id: dt.source_id.clone(),
+                });
+            }
+        }
+
+        ExportPlan {
+            to_download,
+            to_skip,
+            collisions,
+            format_changes,
+        }
+    }
+
+    pub fn merge_export(
+        existing: Option<RekordboxLibrary>,
+        refreshed: Vec<RefreshedTrack>,
+        playlist_name: &str,
+        playlist_locations: &[String],
+    ) -> RekordboxLibrary {
+        let mut refreshed_by_location: HashMap<String, RefreshedTrack> = refreshed
+            .into_iter()
+            .map(|t| (t.location.clone(), t))
+            .collect();
+
+        // Destructure existing upfront so we can use both tracks and playlists.
+        let (existing_tracks, existing_playlists) = existing
+            .map(|lib| (lib.tracks, lib.playlists))
+            .unwrap_or_default();
+
+        let existing_locations_ordered: Vec<String> =
+            existing_tracks.iter().map(|t| t.location.clone()).collect();
+        let existing_locations_set: HashSet<String> =
+            existing_locations_ordered.iter().cloned().collect();
+
+        // Old-id → location for playlist remapping.
+        let old_id_to_location: HashMap<u32, String> = existing_tracks
+            .iter()
+            .map(|t| (t.track_id, t.location.clone()))
+            .collect();
+
+        let mut existing_tracks_by_location: HashMap<String, RekordboxTrack> = existing_tracks
+            .into_iter()
+            .map(|t| (t.location.clone(), t))
+            .collect();
+
+        // Ordered locations: existing first, then new from refreshed.
+        let mut ordered_locations = existing_locations_ordered;
+        for loc in refreshed_by_location.keys() {
+            if !existing_locations_set.contains(loc) {
+                ordered_locations.push(loc.clone());
+            }
+        }
+
+        // Assign sequential ids (1-based). Each location appears exactly once,
+        // so .remove is safe and avoids a clone.
+        let mut merged: Vec<RekordboxTrack> = Vec::with_capacity(ordered_locations.len());
+        for (idx, loc) in ordered_locations.iter().enumerate() {
+            let track_id = (idx + 1) as u32;
+            let track: RekordboxTrack = if let Some(r) = refreshed_by_location.remove(loc) {
+                RekordboxTrack {
+                    track_id,
+                    name: r.name,
+                    artist: r.artist,
+                    album: r.album,
+                    genre: r.genre,
+                    kind: r.kind,
+                    size: r.size,
+                    total_time: r.total_time,
+                    average_bpm: r.average_bpm,
+                    tonality: r.tonality,
+                    track_number: r.track_number,
+                    disc_number: r.disc_number,
+                    year: r.year,
+                    label: r.label,
+                    comment: r.comment,
+                    date_added: r.date_added,
+                    bitrate: r.bitrate,
+                    sample_rate: r.sample_rate,
+                    location: r.location,
+                }
+            } else if let Some(mut existing_track) = existing_tracks_by_location.remove(loc) {
+                existing_track.track_id = track_id;
+                existing_track
+            } else {
+                continue;
+            };
+            merged.push(track);
+        }
+
+        let location_to_new_id: HashMap<String, u32> = merged
+            .iter()
+            .map(|t| (t.location.clone(), t.track_id))
+            .collect();
+
+        // Carry over existing playlists (except the named one), remapping track ids.
+        let mut rebuilt_playlists: Vec<RekordboxPlaylist> = existing_playlists
+            .into_iter()
+            .filter(|p| p.name != playlist_name)
+            .map(|p| {
+                let remapped_ids: Vec<u32> = p
+                    .track_ids
+                    .iter()
+                    .filter_map(|old_id| {
+                        let loc = old_id_to_location.get(old_id)?;
+                        location_to_new_id.get(loc).copied()
+                    })
+                    .collect();
+                RekordboxPlaylist {
+                    name: p.name,
+                    track_ids: remapped_ids,
+                }
+            })
+            .collect();
+
+        // Build (or replace) the named playlist.
+        // Skip appending when name is empty and locations is empty — stdin mode produces no playlist.
+        if !playlist_name.is_empty() || !playlist_locations.is_empty() {
+            let named_track_ids: Vec<u32> = playlist_locations
+                .iter()
+                .filter_map(|loc| {
+                    let id = location_to_new_id.get(loc).copied();
+                    debug_assert!(
+                        id.is_some(),
+                        "playlist_locations entry not found in merged: {}",
+                        loc
+                    );
+                    id
+                })
+                .collect();
+
+            rebuilt_playlists.push(RekordboxPlaylist {
+                name: playlist_name.to_string(),
+                track_ids: named_track_ids,
+            });
+        }
+
+        RekordboxLibrary {
+            tracks: merged,
+            playlists: rebuilt_playlists,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::xml::{RekordboxLibrary, RekordboxPlaylist, RekordboxTrack};
+        use super::*;
+
+        fn make_track(id: u32, location: &str) -> RekordboxTrack {
+            RekordboxTrack {
+                track_id: id,
+                name: format!("Track {}", id),
+                artist: "Artist".to_string(),
+                album: "Album".to_string(),
+                genre: "Techno".to_string(),
+                kind: "AIFF File".to_string(),
+                size: 1000,
+                total_time: 300,
+                average_bpm: None,
+                tonality: None,
+                track_number: None,
+                disc_number: None,
+                year: None,
+                label: None,
+                comment: None,
+                date_added: None,
+                bitrate: None,
+                sample_rate: None,
+                location: location.to_string(),
+            }
+        }
+
+        fn make_refreshed(name: &str, location: &str) -> RefreshedTrack {
+            RefreshedTrack {
+                name: name.to_string(),
+                artist: "Artist".to_string(),
+                album: "Album".to_string(),
+                genre: "Techno".to_string(),
+                kind: "AIFF File".to_string(),
+                size: 1000,
+                total_time: 300,
+                average_bpm: None,
+                tonality: None,
+                track_number: None,
+                disc_number: None,
+                year: None,
+                label: None,
+                comment: None,
+                date_added: None,
+                bitrate: None,
+                sample_rate: None,
+                location: location.to_string(),
+            }
+        }
+
+        fn make_library(
+            tracks: Vec<RekordboxTrack>,
+            playlists: Vec<RekordboxPlaylist>,
+        ) -> RekordboxLibrary {
+            RekordboxLibrary { tracks, playlists }
+        }
+
+        const LOC_A: &str = "file://localhost/music/a.aiff";
+        const LOC_B: &str = "file://localhost/music/b.aiff";
+        const LOC_C: &str = "file://localhost/music/c.aiff";
+
+        #[test]
+        fn merge_empty_existing_matches_fresh_export() {
+            let refreshed = vec![
+                make_refreshed("Track A", LOC_A),
+                make_refreshed("Track B", LOC_B),
+            ];
+            let playlist_locs = vec![LOC_A.to_string(), LOC_B.to_string()];
+            let lib = merge_export(None, refreshed, "My Set", &playlist_locs);
+            assert_eq!(lib.tracks.len(), 2);
+            assert_eq!(lib.playlists.len(), 1);
+            assert_eq!(lib.playlists[0].track_ids.len(), 2);
+        }
+
+        #[test]
+        fn merge_preserves_untouched_tracks() {
+            let existing = make_library(vec![make_track(1, LOC_A), make_track(2, LOC_B)], vec![]);
+            // Only refresh LOC_A; LOC_B stays untouched.
+            let refreshed_a = make_refreshed("Updated A", LOC_A);
+            let lib = merge_export(Some(existing), vec![refreshed_a], "My Set", &[]);
+            assert_eq!(lib.tracks.len(), 2);
+            let b = lib.tracks.iter().find(|t| t.location == LOC_B).unwrap();
+            assert_eq!(b.name, "Track 2");
+        }
+
+        #[test]
+        fn merge_refreshes_metadata_on_reexport() {
+            let existing = make_library(vec![make_track(1, LOC_A)], vec![]);
+            let mut refreshed = make_refreshed("Fresh Name", LOC_A);
+            refreshed.artist = "Fresh Artist".to_string();
+            let lib = merge_export(Some(existing), vec![refreshed], "My Set", &[]);
+            let t = &lib.tracks[0];
+            assert_eq!(t.name, "Fresh Name");
+            assert_eq!(t.artist, "Fresh Artist");
+        }
+
+        #[test]
+        fn merge_adds_new_tracks_to_collection() {
+            let existing = make_library(vec![make_track(1, LOC_A)], vec![]);
+            let new_track = make_refreshed("Track B", LOC_B);
+            let lib = merge_export(Some(existing), vec![new_track], "My Set", &[]);
+            assert_eq!(lib.tracks.len(), 2);
+            assert!(lib.tracks.iter().any(|t| t.location == LOC_B));
+        }
+
+        #[test]
+        fn merge_assigns_sequential_ids() {
+            let existing = make_library(vec![make_track(5, LOC_A), make_track(10, LOC_B)], vec![]);
+            let refreshed = vec![make_refreshed("Track C", LOC_C)];
+            let lib = merge_export(Some(existing), refreshed, "My Set", &[]);
+            assert_eq!(lib.tracks.len(), 3);
+            let mut ids: Vec<u32> = lib.tracks.iter().map(|t| t.track_id).collect();
+            ids.sort();
+            assert_eq!(ids, vec![1, 2, 3]);
+        }
+
+        #[test]
+        fn merge_replaces_named_playlist() {
+            let existing = make_library(
+                vec![make_track(1, LOC_A), make_track(2, LOC_B)],
+                vec![RekordboxPlaylist {
+                    name: "My Set".to_string(),
+                    track_ids: vec![1, 2],
+                }],
+            );
+            // Refresh LOC_C and make it the only entry in the named playlist.
+            let refreshed = vec![make_refreshed("Track C", LOC_C)];
+            let playlist_locs = vec![LOC_C.to_string()];
+            let lib = merge_export(Some(existing), refreshed, "My Set", &playlist_locs);
+            let named = lib.playlists.iter().find(|p| p.name == "My Set").unwrap();
+            assert_eq!(named.track_ids.len(), 1);
+            let c_id = lib
+                .tracks
+                .iter()
+                .find(|t| t.location == LOC_C)
+                .unwrap()
+                .track_id;
+            assert_eq!(named.track_ids[0], c_id);
+        }
+
+        #[test]
+        fn merge_preserves_other_playlists_with_remapped_ids() {
+            let existing = make_library(
+                vec![make_track(1, LOC_A), make_track(2, LOC_B)],
+                vec![
+                    RekordboxPlaylist {
+                        name: "Other".to_string(),
+                        track_ids: vec![1, 2],
+                    },
+                    RekordboxPlaylist {
+                        name: "My Set".to_string(),
+                        track_ids: vec![1],
+                    },
+                ],
+            );
+            // Add a new track so IDs shift.
+            let refreshed = vec![make_refreshed("Track C", LOC_C)];
+            let lib = merge_export(Some(existing), refreshed, "My Set", &[]);
+            // "Other" playlist should survive.
+            let other = lib.playlists.iter().find(|p| p.name == "Other").unwrap();
+            // Both LOC_A and LOC_B should be resolvable.
+            let a_id = lib
+                .tracks
+                .iter()
+                .find(|t| t.location == LOC_A)
+                .unwrap()
+                .track_id;
+            let b_id = lib
+                .tracks
+                .iter()
+                .find(|t| t.location == LOC_B)
+                .unwrap()
+                .track_id;
+            assert!(other.track_ids.contains(&a_id));
+            assert!(other.track_ids.contains(&b_id));
+        }
+
+        #[test]
+        fn merge_named_playlist_creates_if_absent() {
+            let existing = make_library(vec![make_track(1, LOC_A)], vec![]);
+            let playlist_locs = vec![LOC_A.to_string()];
+            let lib = merge_export(Some(existing), vec![], "New Playlist", &playlist_locs);
+            assert!(lib.playlists.iter().any(|p| p.name == "New Playlist"));
+        }
+
+        #[test]
+        fn merge_skips_empty_playlist_name() {
+            // stdin mode passes ("", &[]) — no playlist should be appended.
+            let existing = make_library(vec![make_track(1, LOC_A)], vec![]);
+            let lib = merge_export(Some(existing), vec![], "", &[]);
+            assert!(
+                lib.playlists.is_empty(),
+                "empty playlist_name + empty locations must not append a playlist"
+            );
+        }
+
+        #[test]
+        fn merge_export_assigns_ids_to_refreshed_tracks() {
+            // Caller cannot supply a track_id (RefreshedTrack has none).
+            // Verify merge_export assigns sequential 1-based ids regardless of insertion order.
+            let refreshed = vec![
+                make_refreshed("Track B", LOC_B),
+                make_refreshed("Track A", LOC_A),
+            ];
+            let lib = merge_export(None, refreshed, "My Set", &[]);
+            let ids: HashSet<u32> = lib.tracks.iter().map(|t| t.track_id).collect();
+            assert_eq!(ids, HashSet::from([1, 2]));
+            // Every id must be positive — the sentinel zero is unreachable.
+            assert!(lib.tracks.iter().all(|t| t.track_id > 0));
+        }
+
+        // --- plan_export tests ---
+
+        #[test]
+        fn plan_export_skips_when_location_and_file_exist() {
+            let path = PathBuf::from("/music/a.aiff");
+            let loc = path_to_file_uri(&path);
+            let existing = make_library(
+                vec![{
+                    let mut t = make_track(1, &loc);
+                    t.location = loc.clone();
+                    t
+                }],
+                vec![],
+            );
+            let desired = vec![DesiredTrack {
+                dest_path: path.clone(),
+                source_id: "id1".to_string(),
+            }];
+            let plan = plan_export(Some(&existing), &desired, |_| true);
+            assert_eq!(plan.to_skip.len(), 1);
+            assert!(plan.to_download.is_empty());
+        }
+
+        #[test]
+        fn plan_export_redownloads_when_file_missing_but_xml_has_location() {
+            let path = PathBuf::from("/music/a.aiff");
+            let loc = path_to_file_uri(&path);
+            let existing = make_library(
+                vec![{
+                    let mut t = make_track(1, &loc);
+                    t.location = loc.clone();
+                    t
+                }],
+                vec![],
+            );
+            let desired = vec![DesiredTrack {
+                dest_path: path.clone(),
+                source_id: "id1".to_string(),
+            }];
+            // disk_check returns false — file not on disk.
+            let plan = plan_export(Some(&existing), &desired, |_| false);
+            assert!(plan.to_skip.is_empty());
+            assert_eq!(plan.to_download.len(), 1);
+        }
+
+        #[test]
+        fn plan_export_downloads_new_track() {
+            let path = PathBuf::from("/music/new.aiff");
+            let desired = vec![DesiredTrack {
+                dest_path: path.clone(),
+                source_id: "id1".to_string(),
+            }];
+            let plan = plan_export(None, &desired, |_| false);
+            assert!(plan.to_skip.is_empty());
+            assert_eq!(plan.to_download.len(), 1);
+            assert_eq!(plan.to_download[0].source_id, "id1");
+        }
+
+        #[test]
+        fn plan_export_flags_dest_path_collision() {
+            let path = PathBuf::from("/music/a.aiff");
+            let desired = vec![
+                DesiredTrack {
+                    dest_path: path.clone(),
+                    source_id: "id1".to_string(),
+                },
+                DesiredTrack {
+                    dest_path: path.clone(),
+                    source_id: "id2".to_string(),
+                },
+            ];
+            let plan = plan_export(None, &desired, |_| false);
+            assert_eq!(plan.collisions.len(), 1);
+            assert_eq!(plan.collisions[0].source_ids.len(), 2);
+        }
+
+        #[test]
+        fn plan_export_flags_format_extension_change() {
+            // Existing XML has /x/y.aiff; desired has /x/y.wav.
+            let existing_path = PathBuf::from("/music/y.aiff");
+            let existing_loc = path_to_file_uri(&existing_path);
+            let existing = make_library(
+                vec![{
+                    let mut t = make_track(1, &existing_loc);
+                    t.location = existing_loc.clone();
+                    t
+                }],
+                vec![],
+            );
+
+            let new_path = PathBuf::from("/music/y.wav");
+            let desired = vec![DesiredTrack {
+                dest_path: new_path.clone(),
+                source_id: "id1".to_string(),
+            }];
+            let plan = plan_export(Some(&existing), &desired, |_| false);
+            assert_eq!(plan.format_changes.len(), 1);
+            assert_eq!(plan.format_changes[0].existing_location, existing_loc);
+            assert_eq!(plan.format_changes[0].new_dest_path, new_path);
+        }
+    }
+}
+
+// =============================================================================
 // Re-exports for convenient top-level use
 // =============================================================================
 
 pub use kind::ext_to_kind;
+pub use merge::{
+    merge_export, plan_export, DesiredTrack, DestPathCollision, ExportPlan, FormatChange,
+    PlannedTrack, RefreshedTrack,
+};
 pub use parse::{parse_location, parse_xml, ParseError};
 pub use path_uri::path_to_file_uri;
 pub use tonality::key_to_tonality;

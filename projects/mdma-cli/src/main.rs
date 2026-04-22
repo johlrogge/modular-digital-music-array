@@ -354,6 +354,9 @@ enum RekordboxCommands {
         /// Audio format (defaults to original)
         #[arg(long, value_enum)]
         format: Option<ExportFormat>,
+        /// Force a fresh XML and re-download everything (discards incremental sync).
+        #[arg(long)]
+        replace: bool,
     },
 
     /// Import tracks and playlists from a Rekordbox XML file.
@@ -3357,13 +3360,74 @@ fn resolve_export_format(
 // Rekordbox Export
 // =============================================================================
 
+/// Build a single `RekordboxTrack` from MDMA metadata and file facts.
+///
+/// `dest_path` must be the already-canonicalised destination used for planning —
+/// do not re-canonicalise here so the Location URI stays stable.
+fn build_rekordbox_track(
+    track: &TrackInfo,
+    dest_path: &std::path::Path,
+    ext: &str,
+    size: u64,
+    facts: &[(String, String)],
+) -> rekordbox_xml::RefreshedTrack {
+    let find_fact = |name: &str| -> Option<String> {
+        facts
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+    };
+
+    let bitrate = find_fact("Bitrate").and_then(|v| v.parse::<u32>().ok());
+    let sample_rate = find_fact("SampleRate").and_then(|v| v.parse::<u32>().ok());
+    let year = find_fact("Year").or_else(|| find_fact("RecordingYear"));
+    let label = find_fact("Label");
+    let comment = find_fact("Comment");
+    let genre = find_fact("MainGenre")
+        .or_else(|| find_fact("FullGenre"))
+        .unwrap_or_default();
+
+    let date_added = track
+        .added
+        .as_deref()
+        .and_then(|s| s.split('T').next())
+        .map(String::from);
+
+    let tonality = track.key.as_ref().map(rekordbox_xml::key_to_tonality);
+    let average_bpm = track.bpm.map(|b| b.as_f32());
+    let location = rekordbox_xml::path_to_file_uri(dest_path);
+
+    rekordbox_xml::RefreshedTrack {
+        name: track.title.clone().unwrap_or_else(|| "Unknown".to_string()),
+        artist: track.artist.clone().unwrap_or_default(),
+        album: track.album.clone().unwrap_or_default(),
+        genre,
+        kind: rekordbox_xml::ext_to_kind(ext).to_string(),
+        size,
+        total_time: track.duration.map(|d| d.value()).unwrap_or(0),
+        average_bpm,
+        tonality,
+        track_number: track.track_number,
+        disc_number: track.disc_number,
+        year,
+        label,
+        comment,
+        date_added,
+        bitrate,
+        sample_rate,
+        location,
+    }
+}
+
 fn handle_rekordbox_export(
     cli: &Cli,
     library: &LibraryBackend,
     playlist: Option<&str>,
     output: &std::path::Path,
     format: Option<&ExportFormat>,
+    replace: bool,
 ) -> Result<()> {
+    use std::collections::HashSet;
     use std::io::BufRead;
 
     let node = require_node(cli);
@@ -3407,135 +3471,245 @@ fn handle_rekordbox_export(
 
     let http = build_http_client()?;
 
-    // Create output directory early
+    // Create output directory early so we can canonicalise it for stable paths
     if let Err(e) = std::fs::create_dir_all(output) {
         return Err(color_eyre::eyre::eyre!(
             "Failed to create output directory: {}",
             e
         ));
     }
+    let output_canon = output
+        .canonicalize()
+        .unwrap_or_else(|_| output.to_path_buf());
 
     // Resolve format: only --format (no lossless/lossy split for rekordbox export)
     let format_owned = format.cloned().unwrap_or(ExportFormat::Original);
-    let results = download_tracks(&node, &tracks, output, &http, |_track| format_owned.clone());
 
-    let downloaded: Vec<(&DownloadAttempt, &std::path::PathBuf, &String, u64)> = results
-        .iter()
-        .filter_map(|r| {
-            if let DownloadOutcome::Success { dest, ext, size } = &r.outcome {
-                Some((r, dest, ext, *size))
-            } else {
-                None
-            }
+    // Build (TrackInfo, canonical_dest_path, ext) for every desired track.
+    // dest_path is canonicalised so the Location URI is stable pre- and post-download.
+    let desired: Vec<(TrackInfo, std::path::PathBuf, String)> = tracks
+        .into_iter()
+        .map(|track| {
+            let ext: String = match format_owned.static_extension() {
+                Some(fixed) => fixed.to_string(),
+                None => track
+                    .blob_path
+                    .as_deref()
+                    .and_then(|p| std::path::Path::new(p).extension())
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("bin")
+                    .to_lowercase(),
+            };
+            let raw_dest = export_dest_path(&output_canon, &track, &ext);
+            // Canonicalise if the file already exists; fall back to the absolute path otherwise.
+            let dest = raw_dest.canonicalize().unwrap_or_else(|_| raw_dest.clone());
+            (track, dest, ext)
         })
         .collect();
+
+    // Load existing XML for incremental sync (skip when --replace)
+    let xml_path = output_canon.join("rekordbox.xml");
+    let existing: Option<rekordbox_xml::RekordboxLibrary> = if !replace && xml_path.exists() {
+        match std::fs::read_to_string(&xml_path) {
+            Ok(bytes) => match rekordbox_xml::parse_xml(&bytes) {
+                Ok(lib) => Some(lib),
+                Err(err) => {
+                    return Err(color_eyre::eyre::eyre!(
+                        "failed to parse existing rekordbox.xml: {}. Inspect the file or re-run with --replace to regenerate.",
+                        err
+                    ));
+                }
+            },
+            Err(e) => {
+                eprintln!("Warning: could not read existing rekordbox.xml ({}); treating as fresh export.", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Build DesiredTrack list for the planner
+    let desired_for_plan: Vec<rekordbox_xml::DesiredTrack> = desired
+        .iter()
+        .map(|(track, dest, _ext)| rekordbox_xml::DesiredTrack {
+            dest_path: dest.clone(),
+            source_id: track.content_hash.as_str().to_string(),
+        })
+        .collect();
+
+    let plan = rekordbox_xml::plan_export(existing.as_ref(), &desired_for_plan, |p| p.exists());
+
+    // Warn about planning anomalies
+    for collision in &plan.collisions {
+        eprintln!(
+            "warning: destination path {} shared by {} tracks: {}",
+            collision.dest_path.display(),
+            collision.source_ids.len(),
+            collision.source_ids.join(", ")
+        );
+    }
+    for fc in &plan.format_changes {
+        let old_ext = std::path::Path::new(&fc.existing_location)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("?");
+        let new_ext = fc
+            .new_dest_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("?");
+        eprintln!(
+            "warning: {} already exported as .{}; new --format produces .{} — treating as a new track. Use --replace to reset the XML.",
+            fc.existing_location, old_ext, new_ext
+        );
+    }
+
+    // Filter download list to only tracks not already on disk
+    let to_download_set: HashSet<std::path::PathBuf> = plan
+        .to_download
+        .iter()
+        .map(|p| p.dest_path.clone())
+        .collect();
+
+    let download_tracks_only: Vec<TrackInfo> = desired
+        .iter()
+        .filter(|(_, dest, _)| to_download_set.contains(dest))
+        .map(|(track, _, _)| track.clone())
+        .collect();
+
+    let new_count = plan.to_download.len();
+    let unchanged_count = plan.to_skip.len();
+
+    let results = download_tracks(
+        &node,
+        &download_tracks_only,
+        &output_canon,
+        &http,
+        |_track| format_owned.clone(),
+    );
+
     let fail_count = results
         .iter()
         .filter(|r| matches!(r.outcome, DownloadOutcome::Failure { .. }))
         .count();
 
-    if downloaded.is_empty() {
-        eprintln!("No tracks downloaded. Aborting XML generation.");
+    // Build a map of downloaded track hash → (dest, ext, size) for the refreshed set
+    let mut downloaded_map: std::collections::HashMap<String, (std::path::PathBuf, String, u64)> =
+        std::collections::HashMap::new();
+    for attempt in &results {
+        if let DownloadOutcome::Success { dest, ext, size } = &attempt.outcome {
+            downloaded_map.insert(
+                attempt.track.content_hash.as_str().to_string(),
+                (dest.clone(), ext.clone(), *size),
+            );
+        }
+    }
+
+    // Build the skipped-location set for quick membership checks.
+    let skipped_locations: HashSet<String> = plan.to_skip.into_iter().collect();
+
+    // Only include tracks that are either freshly downloaded or already on disk.
+    // Failed downloads are logged and dropped — a partial XML is worse than the
+    // last-good XML, so we abort before writing if any download failed.
+    let mut refreshed: Vec<rekordbox_xml::RefreshedTrack> = Vec::with_capacity(desired.len());
+    for (track, dest, ext) in &desired {
+        let hash_str = track.content_hash.as_str().to_string();
+        let location = rekordbox_xml::path_to_file_uri(dest);
+
+        let resolved = if let Some((dl_dest, dl_ext, dl_size)) = downloaded_map.get(&hash_str) {
+            // Freshly downloaded.
+            Some((dl_dest.clone(), dl_ext.clone(), *dl_size))
+        } else if skipped_locations.contains(&location) {
+            // Already on disk — get size from filesystem.
+            let size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+            Some((dest.clone(), ext.clone(), size))
+        } else {
+            // Download failed — skip this track.
+            None
+        };
+
+        if let Some((actual_dest, actual_ext, size)) = resolved {
+            let facts: Vec<(String, String)> = library
+                .get_facts(&track.content_hash)
+                .map(|(_hash, facts)| facts)
+                .unwrap_or_default();
+            refreshed.push(build_rekordbox_track(
+                track,
+                &actual_dest,
+                &actual_ext,
+                size,
+                &facts,
+            ));
+        }
+    }
+
+    // Abort before touching the XML if any download failed; leave the last-good
+    // XML in place so the user can re-run after fixing the problem.
+    if fail_count > 0 {
+        eprintln!(
+            "error: {} download(s) failed — XML not written. Re-run to retry.",
+            fail_count
+        );
         std::process::exit(1);
     }
 
-    // Build RekordboxTrack list
-    let mut rb_tracks: Vec<rekordbox_xml::RekordboxTrack> = Vec::with_capacity(downloaded.len());
-
-    for (idx, (attempt, dest, ext, size)) in downloaded.iter().enumerate() {
-        let track = &attempt.track;
-        let track_id = (idx + 1) as u32;
-
-        // Fetch facts for additional metadata
-        let facts: Vec<(String, String)> = library
-            .get_facts(&track.content_hash)
-            .map(|(_hash, facts)| facts)
-            .unwrap_or_default();
-
-        let find_fact = |name: &str| -> Option<String> {
-            facts
-                .iter()
-                .find(|(k, _)| k == name)
-                .map(|(_, v)| v.clone())
-        };
-
-        let bitrate = find_fact("Bitrate").and_then(|v| v.parse::<u32>().ok());
-        let sample_rate = find_fact("SampleRate").and_then(|v| v.parse::<u32>().ok());
-        let year = find_fact("Year").or_else(|| find_fact("RecordingYear"));
-        let label = find_fact("Label");
-        let comment = find_fact("Comment");
-        let genre = find_fact("MainGenre")
-            .or_else(|| find_fact("FullGenre"))
-            .unwrap_or_default();
-
-        let date_added = track
-            .added
-            .as_deref()
-            .and_then(|s| s.split('T').next())
-            .map(String::from);
-
-        let tonality = track.key.as_ref().map(rekordbox_xml::key_to_tonality);
-
-        let average_bpm = track.bpm.map(|b| b.as_f32());
-
-        let location = rekordbox_xml::path_to_file_uri(
-            &dest.canonicalize().unwrap_or_else(|_| dest.to_path_buf()),
-        );
-
-        rb_tracks.push(rekordbox_xml::RekordboxTrack {
-            track_id,
-            name: track.title.clone().unwrap_or_else(|| "Unknown".to_string()),
-            artist: track.artist.clone().unwrap_or_default(),
-            album: track.album.clone().unwrap_or_default(),
-            genre,
-            kind: rekordbox_xml::ext_to_kind(ext).to_string(),
-            size: *size,
-            total_time: track.duration.map(|d| d.value()).unwrap_or(0),
-            average_bpm,
-            tonality,
-            track_number: track.track_number,
-            disc_number: track.disc_number,
-            year,
-            label,
-            comment,
-            date_added,
-            bitrate,
-            sample_rate,
-            location,
-        });
+    if refreshed.is_empty() {
+        eprintln!("No tracks available. Aborting XML generation.");
+        std::process::exit(1);
     }
 
-    // Build playlists section
-    let playlists = if let Some(pname) = playlist {
-        let all_ids: Vec<u32> = rb_tracks.iter().map(|t| t.track_id).collect();
-        vec![rekordbox_xml::RekordboxPlaylist {
-            name: pname.to_string(),
-            track_ids: all_ids,
-        }]
-    } else {
-        vec![]
-    };
+    // Build ordered playlist locations from tracks that actually made it into refreshed.
+    // This preserves MDMA playlist order while excluding any that were dropped (failed downloads).
+    let refreshed_locations: HashSet<&str> =
+        refreshed.iter().map(|r| r.location.as_str()).collect();
+    let playlist_locations: Vec<String> = desired
+        .iter()
+        .map(|(_, dest, _)| rekordbox_xml::path_to_file_uri(dest))
+        .filter(|loc| refreshed_locations.contains(loc.as_str()))
+        .collect();
 
-    // Generate and write XML
-    let xml = rekordbox_xml::RekordboxLibrary {
-        tracks: rb_tracks,
-        playlists,
-    }
-    .to_xml();
+    let playlist_name = playlist.unwrap_or("");
+    let merged = rekordbox_xml::merge_export(
+        existing,
+        refreshed,
+        playlist_name,
+        if playlist.is_some() {
+            &playlist_locations
+        } else {
+            &[]
+        },
+    );
 
-    let xml_path = output.join("rekordbox.xml");
+    let total_tracks = merged.tracks.len();
+    let total_playlists = merged.playlists.len();
+
+    let xml = merged.to_xml();
     std::fs::write(&xml_path, xml.as_bytes())
         .map_err(|e| color_eyre::eyre::eyre!("Failed to write rekordbox.xml: {}", e))?;
 
     eprintln!();
+    let mode_prefix = if replace { "Replace" } else { "Sync" };
+    let desired_count = desired.len();
+    if let Some(pname) = playlist {
+        eprintln!(
+            "{}: {} tracks in playlist '{}' ({} new, {} already on disk).",
+            mode_prefix, desired_count, pname, new_count, unchanged_count
+        );
+    } else {
+        eprintln!(
+            "{}: {} tracks ({} new, {} already on disk).",
+            mode_prefix, desired_count, new_count, unchanged_count
+        );
+    }
     eprintln!(
-        "Done: {} tracks exported, {} failed",
-        downloaded.len(),
-        fail_count
+        "Library now: {} tracks across {} playlists.",
+        total_tracks, total_playlists
     );
     eprintln!("XML written to: {}", xml_path.display());
 
     if fail_count > 0 {
+        eprintln!("{} download(s) failed.", fail_count);
         std::process::exit(1);
     }
 
@@ -4242,12 +4416,14 @@ fn main() -> Result<()> {
                     playlist,
                     output,
                     format,
+                    replace,
                 } => handle_rekordbox_export(
                     &cli,
                     &lib,
                     playlist.as_deref(),
                     output,
                     format.as_ref(),
+                    *replace,
                 ),
                 RekordboxCommands::Import {
                     path,
