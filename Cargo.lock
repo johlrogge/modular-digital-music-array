@@ -2746,6 +2746,7 @@ dependencies = [
  "color-eyre",
  "colored",
  "corsett",
+ "dirs",
  "event-protocol",
  "inbox-utils",
  "library-ipc-client",

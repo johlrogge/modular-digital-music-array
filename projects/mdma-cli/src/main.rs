@@ -344,13 +344,18 @@ impl ExportFormat {
 #[derive(Subcommand, Debug)]
 enum RekordboxCommands {
     /// Export tracks to Rekordbox-compatible XML + audio files.
+    ///
+    /// Pass one or more --playlist flags to export named playlists.
+    /// When no --playlist is given, hashes are read from stdin instead.
+    /// Stdin input is ignored when --playlist is provided.
     Export {
-        /// Export from a named playlist (mutually exclusive with stdin)
+        /// MDMA playlist(s) to export. Repeat for multiple: --playlist A --playlist B.
+        /// If none given, falls back to stdin input (existing behaviour).
         #[arg(long)]
-        playlist: Option<String>,
-        /// Output directory
-        #[arg(long, default_value = "./rekordbox-export/")]
-        output: std::path::PathBuf,
+        playlist: Vec<String>,
+        /// Output directory. Defaults to ~/Music/mdma_rekordbox.
+        #[arg(long)]
+        output: Option<std::path::PathBuf>,
         /// Audio format (defaults to original)
         #[arg(long, value_enum)]
         format: Option<ExportFormat>,
@@ -3422,7 +3427,7 @@ fn build_rekordbox_track(
 fn handle_rekordbox_export(
     cli: &Cli,
     library: &LibraryBackend,
-    playlist: Option<&str>,
+    playlists: &[String],
     output: &std::path::Path,
     format: Option<&ExportFormat>,
     replace: bool,
@@ -3432,28 +3437,52 @@ fn handle_rekordbox_export(
 
     let node = require_node(cli);
 
-    // Collect hashes: from playlist or stdin
-    let raw_hashes: Vec<String> = if let Some(pname) = playlist {
-        let name = parse_playlist_name(pname);
-        match library.playlist_get(&name) {
-            Ok(hashes) => hashes.into_iter().map(|h| h.as_str().to_string()).collect(),
-            Err(e) => {
-                eprintln!("Failed to get playlist '{}': {}", pname, e);
-                std::process::exit(1);
+    // Collect hashes per playlist, or from stdin when no playlists given.
+    //
+    // hashes_per_playlist: ordered list of (playlist_name, ordered_hashes).
+    // When stdin mode, one entry with empty name.
+    let hashes_per_playlist: Vec<(String, Vec<String>)> = if !playlists.is_empty() {
+        let mut result = Vec::with_capacity(playlists.len());
+        for pname in playlists {
+            let name = parse_playlist_name(pname);
+            match library.playlist_get(&name) {
+                Ok(hashes) => {
+                    result.push((
+                        pname.clone(),
+                        hashes.into_iter().map(|h| h.as_str().to_string()).collect(),
+                    ));
+                }
+                Err(e) => {
+                    eprintln!("error: playlist '{}' not found: {}", pname, e);
+                    std::process::exit(1);
+                }
             }
         }
+        result
     } else {
-        std::io::stdin()
+        let hashes: Vec<String> = std::io::stdin()
             .lock()
             .lines()
             .map_while(Result::ok)
             .filter_map(|line| parse_hash_from_line(&line))
-            .collect()
+            .collect();
+        vec![("".to_string(), hashes)]
     };
 
-    if raw_hashes.is_empty() {
-        if playlist.is_some() {
-            eprintln!("Playlist is empty.");
+    // Union of all hashes, deduped while preserving first-occurrence order.
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut all_hashes: Vec<String> = Vec::new();
+    for (_, hs) in &hashes_per_playlist {
+        for h in hs {
+            if seen.insert(h.clone()) {
+                all_hashes.push(h.clone());
+            }
+        }
+    }
+
+    if all_hashes.is_empty() {
+        if !playlists.is_empty() {
+            eprintln!("All specified playlists are empty.");
         } else {
             eprintln!("No hashes provided on stdin.");
             eprintln!("Usage: mdma search --artist CBL | mdma rekordbox export");
@@ -3462,8 +3491,8 @@ fn handle_rekordbox_export(
         std::process::exit(1);
     }
 
-    // Resolve each hash to full TrackInfo
-    let tracks = resolve_tracks_skip_errors(library, raw_hashes);
+    // Resolve each unique hash to full TrackInfo
+    let tracks = resolve_tracks_skip_errors(library, all_hashes);
     if tracks.is_empty() {
         eprintln!("No tracks could be resolved. Aborting.");
         std::process::exit(1);
@@ -3485,7 +3514,7 @@ fn handle_rekordbox_export(
     // Resolve format: only --format (no lossless/lossy split for rekordbox export)
     let format_owned = format.cloned().unwrap_or(ExportFormat::Original);
 
-    // Build (TrackInfo, canonical_dest_path, ext) for every desired track.
+    // Build (TrackInfo, canonical_dest_path, ext) for every unique desired track.
     // dest_path is canonicalised so the Location URI is stable pre- and post-download.
     let desired: Vec<(TrackInfo, std::path::PathBuf, String)> = tracks
         .into_iter()
@@ -3504,6 +3533,17 @@ fn handle_rekordbox_export(
             // Canonicalise if the file already exists; fall back to the absolute path otherwise.
             let dest = raw_dest.canonicalize().unwrap_or_else(|_| raw_dest.clone());
             (track, dest, ext)
+        })
+        .collect();
+
+    // hash → canonical dest location URI, for playlist location building.
+    let hash_to_location: std::collections::HashMap<String, String> = desired
+        .iter()
+        .map(|(track, dest, _)| {
+            (
+                track.content_hash.as_str().to_string(),
+                rekordbox_xml::path_to_file_uri(dest),
+            )
         })
         .collect();
 
@@ -3659,27 +3699,35 @@ fn handle_rekordbox_export(
         std::process::exit(1);
     }
 
-    // Build ordered playlist locations from tracks that actually made it into refreshed.
-    // This preserves MDMA playlist order while excluding any that were dropped (failed downloads).
+    // Build a set of locations that actually made it into refreshed.
     let refreshed_locations: HashSet<&str> =
         refreshed.iter().map(|r| r.location.as_str()).collect();
-    let playlist_locations: Vec<String> = desired
+
+    // Build PlaylistUpdate per playlist. Each playlist references its own full track list
+    // (not the deduplicated union), so overlapping tracks appear in both playlists.
+    // Unresolved hashes (failed downloads) are dropped.
+    let playlist_updates: Vec<rekordbox_xml::PlaylistUpdate> = hashes_per_playlist
         .iter()
-        .map(|(_, dest, _)| rekordbox_xml::path_to_file_uri(dest))
-        .filter(|loc| refreshed_locations.contains(loc.as_str()))
+        .map(|(pname, hs)| {
+            let locations: Vec<String> = hs
+                .iter()
+                .filter_map(|h| {
+                    let loc = hash_to_location.get(h)?;
+                    if refreshed_locations.contains(loc.as_str()) {
+                        Some(loc.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            rekordbox_xml::PlaylistUpdate {
+                name: pname.clone(),
+                locations,
+            }
+        })
         .collect();
 
-    let playlist_name = playlist.unwrap_or("");
-    let merged = rekordbox_xml::merge_export(
-        existing,
-        refreshed,
-        playlist_name,
-        if playlist.is_some() {
-            &playlist_locations
-        } else {
-            &[]
-        },
-    );
+    let merged = rekordbox_xml::merge_export(existing, refreshed, &playlist_updates);
 
     let total_tracks = merged.tracks.len();
     let total_playlists = merged.playlists.len();
@@ -3690,18 +3738,36 @@ fn handle_rekordbox_export(
 
     eprintln!();
     let mode_prefix = if replace { "Replace" } else { "Sync" };
-    let desired_count = desired.len();
-    if let Some(pname) = playlist {
-        eprintln!(
-            "{}: {} tracks in playlist '{}' ({} new, {} already on disk).",
-            mode_prefix, desired_count, pname, new_count, unchanged_count
-        );
-    } else {
+    let total_desired = desired.len();
+
+    if playlists.is_empty() {
+        // stdin mode
         eprintln!(
             "{}: {} tracks ({} new, {} already on disk).",
-            mode_prefix, desired_count, new_count, unchanged_count
+            mode_prefix, total_desired, new_count, unchanged_count
+        );
+    } else if playlists.len() == 1 {
+        eprintln!(
+            "{}: {} tracks in playlist '{}' ({} new, {} already on disk).",
+            mode_prefix, total_desired, playlists[0], new_count, unchanged_count
+        );
+    } else {
+        // Multi-playlist summary: show per-playlist track counts.
+        let per_playlist: Vec<String> = hashes_per_playlist
+            .iter()
+            .map(|(name, hs)| format!("{}: {}", name, hs.len()))
+            .collect();
+        eprintln!(
+            "{}: {} tracks across {} playlists ({}) ({} new, {} already on disk).",
+            mode_prefix,
+            total_desired,
+            playlists.len(),
+            per_playlist.join(", "),
+            new_count,
+            unchanged_count
         );
     }
+
     eprintln!(
         "Library now: {} tracks across {} playlists.",
         total_tracks, total_playlists
@@ -4417,14 +4483,21 @@ fn main() -> Result<()> {
                     output,
                     format,
                     replace,
-                } => handle_rekordbox_export(
-                    &cli,
-                    &lib,
-                    playlist.as_deref(),
-                    output,
-                    format.as_ref(),
-                    *replace,
-                ),
+                } => {
+                    let resolved_output = output.clone().unwrap_or_else(|| {
+                        dirs::audio_dir()
+                            .map(|p| p.join("mdma_rekordbox"))
+                            .unwrap_or_else(|| std::path::PathBuf::from("./rekordbox-export/"))
+                    });
+                    handle_rekordbox_export(
+                        &cli,
+                        &lib,
+                        playlist,
+                        &resolved_output,
+                        format.as_ref(),
+                        *replace,
+                    )
+                }
                 RekordboxCommands::Import {
                     path,
                     playlist,

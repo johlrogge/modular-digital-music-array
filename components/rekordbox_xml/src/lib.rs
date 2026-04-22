@@ -1010,6 +1010,16 @@ pub mod merge {
     use super::path_uri::path_to_file_uri;
     use super::xml::{RekordboxLibrary, RekordboxPlaylist, RekordboxTrack};
 
+    /// A playlist to create or replace in the export.
+    ///
+    /// Passed as a slice to `merge_export`. An entry with both `name` and `locations`
+    /// empty is silently skipped (stdin mode passes exactly that).
+    #[derive(Debug, Clone)]
+    pub struct PlaylistUpdate {
+        pub name: String,
+        pub locations: Vec<String>,
+    }
+
     #[derive(Debug, Clone)]
     pub struct DesiredTrack {
         pub dest_path: PathBuf,
@@ -1160,8 +1170,7 @@ pub mod merge {
     pub fn merge_export(
         existing: Option<RekordboxLibrary>,
         refreshed: Vec<RefreshedTrack>,
-        playlist_name: &str,
-        playlist_locations: &[String],
+        playlist_updates: &[PlaylistUpdate],
     ) -> RekordboxLibrary {
         let mut refreshed_by_location: HashMap<String, RefreshedTrack> = refreshed
             .into_iter()
@@ -1238,10 +1247,14 @@ pub mod merge {
             .map(|t| (t.location.clone(), t.track_id))
             .collect();
 
-        // Carry over existing playlists (except the named one), remapping track ids.
+        // Names of playlists being replaced, for fast lookup.
+        let replaced_names: HashSet<&str> =
+            playlist_updates.iter().map(|u| u.name.as_str()).collect();
+
+        // Carry over existing playlists not being replaced, remapping track ids.
         let mut rebuilt_playlists: Vec<RekordboxPlaylist> = existing_playlists
             .into_iter()
-            .filter(|p| p.name != playlist_name)
+            .filter(|p| !replaced_names.contains(p.name.as_str()))
             .map(|p| {
                 let remapped_ids: Vec<u32> = p
                     .track_ids
@@ -1258,25 +1271,28 @@ pub mod merge {
             })
             .collect();
 
-        // Build (or replace) the named playlist.
-        // Skip appending when name is empty and locations is empty — stdin mode produces no playlist.
-        if !playlist_name.is_empty() || !playlist_locations.is_empty() {
-            let named_track_ids: Vec<u32> = playlist_locations
+        // Append one new playlist per update, in input order.
+        // Skip any update whose name and locations are both empty (stdin mode).
+        for update in playlist_updates {
+            if update.name.is_empty() && update.locations.is_empty() {
+                continue;
+            }
+            let track_ids: Vec<u32> = update
+                .locations
                 .iter()
                 .filter_map(|loc| {
                     let id = location_to_new_id.get(loc).copied();
                     debug_assert!(
                         id.is_some(),
-                        "playlist_locations entry not found in merged: {}",
+                        "playlist_updates location not found in merged: {}",
                         loc
                     );
                     id
                 })
                 .collect();
-
             rebuilt_playlists.push(RekordboxPlaylist {
-                name: playlist_name.to_string(),
-                track_ids: named_track_ids,
+                name: update.name.clone(),
+                track_ids,
             });
         }
 
@@ -1349,14 +1365,20 @@ pub mod merge {
         const LOC_B: &str = "file://localhost/music/b.aiff";
         const LOC_C: &str = "file://localhost/music/c.aiff";
 
+        fn pl(name: &str, locations: &[&str]) -> PlaylistUpdate {
+            PlaylistUpdate {
+                name: name.to_string(),
+                locations: locations.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+
         #[test]
         fn merge_empty_existing_matches_fresh_export() {
             let refreshed = vec![
                 make_refreshed("Track A", LOC_A),
                 make_refreshed("Track B", LOC_B),
             ];
-            let playlist_locs = vec![LOC_A.to_string(), LOC_B.to_string()];
-            let lib = merge_export(None, refreshed, "My Set", &playlist_locs);
+            let lib = merge_export(None, refreshed, &[pl("My Set", &[LOC_A, LOC_B])]);
             assert_eq!(lib.tracks.len(), 2);
             assert_eq!(lib.playlists.len(), 1);
             assert_eq!(lib.playlists[0].track_ids.len(), 2);
@@ -1367,7 +1389,7 @@ pub mod merge {
             let existing = make_library(vec![make_track(1, LOC_A), make_track(2, LOC_B)], vec![]);
             // Only refresh LOC_A; LOC_B stays untouched.
             let refreshed_a = make_refreshed("Updated A", LOC_A);
-            let lib = merge_export(Some(existing), vec![refreshed_a], "My Set", &[]);
+            let lib = merge_export(Some(existing), vec![refreshed_a], &[pl("My Set", &[])]);
             assert_eq!(lib.tracks.len(), 2);
             let b = lib.tracks.iter().find(|t| t.location == LOC_B).unwrap();
             assert_eq!(b.name, "Track 2");
@@ -1378,7 +1400,7 @@ pub mod merge {
             let existing = make_library(vec![make_track(1, LOC_A)], vec![]);
             let mut refreshed = make_refreshed("Fresh Name", LOC_A);
             refreshed.artist = "Fresh Artist".to_string();
-            let lib = merge_export(Some(existing), vec![refreshed], "My Set", &[]);
+            let lib = merge_export(Some(existing), vec![refreshed], &[pl("My Set", &[])]);
             let t = &lib.tracks[0];
             assert_eq!(t.name, "Fresh Name");
             assert_eq!(t.artist, "Fresh Artist");
@@ -1388,7 +1410,7 @@ pub mod merge {
         fn merge_adds_new_tracks_to_collection() {
             let existing = make_library(vec![make_track(1, LOC_A)], vec![]);
             let new_track = make_refreshed("Track B", LOC_B);
-            let lib = merge_export(Some(existing), vec![new_track], "My Set", &[]);
+            let lib = merge_export(Some(existing), vec![new_track], &[pl("My Set", &[])]);
             assert_eq!(lib.tracks.len(), 2);
             assert!(lib.tracks.iter().any(|t| t.location == LOC_B));
         }
@@ -1397,7 +1419,7 @@ pub mod merge {
         fn merge_assigns_sequential_ids() {
             let existing = make_library(vec![make_track(5, LOC_A), make_track(10, LOC_B)], vec![]);
             let refreshed = vec![make_refreshed("Track C", LOC_C)];
-            let lib = merge_export(Some(existing), refreshed, "My Set", &[]);
+            let lib = merge_export(Some(existing), refreshed, &[pl("My Set", &[])]);
             assert_eq!(lib.tracks.len(), 3);
             let mut ids: Vec<u32> = lib.tracks.iter().map(|t| t.track_id).collect();
             ids.sort();
@@ -1415,8 +1437,7 @@ pub mod merge {
             );
             // Refresh LOC_C and make it the only entry in the named playlist.
             let refreshed = vec![make_refreshed("Track C", LOC_C)];
-            let playlist_locs = vec![LOC_C.to_string()];
-            let lib = merge_export(Some(existing), refreshed, "My Set", &playlist_locs);
+            let lib = merge_export(Some(existing), refreshed, &[pl("My Set", &[LOC_C])]);
             let named = lib.playlists.iter().find(|p| p.name == "My Set").unwrap();
             assert_eq!(named.track_ids.len(), 1);
             let c_id = lib
@@ -1445,7 +1466,7 @@ pub mod merge {
             );
             // Add a new track so IDs shift.
             let refreshed = vec![make_refreshed("Track C", LOC_C)];
-            let lib = merge_export(Some(existing), refreshed, "My Set", &[]);
+            let lib = merge_export(Some(existing), refreshed, &[pl("My Set", &[])]);
             // "Other" playlist should survive.
             let other = lib.playlists.iter().find(|p| p.name == "Other").unwrap();
             // Both LOC_A and LOC_B should be resolvable.
@@ -1468,19 +1489,18 @@ pub mod merge {
         #[test]
         fn merge_named_playlist_creates_if_absent() {
             let existing = make_library(vec![make_track(1, LOC_A)], vec![]);
-            let playlist_locs = vec![LOC_A.to_string()];
-            let lib = merge_export(Some(existing), vec![], "New Playlist", &playlist_locs);
+            let lib = merge_export(Some(existing), vec![], &[pl("New Playlist", &[LOC_A])]);
             assert!(lib.playlists.iter().any(|p| p.name == "New Playlist"));
         }
 
         #[test]
         fn merge_skips_empty_playlist_name() {
-            // stdin mode passes ("", &[]) — no playlist should be appended.
+            // stdin mode passes an empty slice — no playlist should be appended.
             let existing = make_library(vec![make_track(1, LOC_A)], vec![]);
-            let lib = merge_export(Some(existing), vec![], "", &[]);
+            let lib = merge_export(Some(existing), vec![], &[pl("", &[])]);
             assert!(
                 lib.playlists.is_empty(),
-                "empty playlist_name + empty locations must not append a playlist"
+                "empty name + empty locations must not append a playlist"
             );
         }
 
@@ -1492,11 +1512,145 @@ pub mod merge {
                 make_refreshed("Track B", LOC_B),
                 make_refreshed("Track A", LOC_A),
             ];
-            let lib = merge_export(None, refreshed, "My Set", &[]);
+            let lib = merge_export(None, refreshed, &[pl("My Set", &[])]);
             let ids: HashSet<u32> = lib.tracks.iter().map(|t| t.track_id).collect();
             assert_eq!(ids, HashSet::from([1, 2]));
             // Every id must be positive — the sentinel zero is unreachable.
             assert!(lib.tracks.iter().all(|t| t.track_id > 0));
+        }
+
+        #[test]
+        fn merge_export_updates_multiple_playlists() {
+            let refreshed = vec![
+                make_refreshed("Track A", LOC_A),
+                make_refreshed("Track B", LOC_B),
+                make_refreshed("Track C", LOC_C),
+            ];
+            let lib = merge_export(
+                None,
+                refreshed,
+                &[
+                    pl("Set Alpha", &[LOC_A, LOC_B]),
+                    pl("Set Beta", &[LOC_B, LOC_C]),
+                ],
+            );
+            assert_eq!(lib.playlists.len(), 2);
+            let alpha = lib
+                .playlists
+                .iter()
+                .find(|p| p.name == "Set Alpha")
+                .unwrap();
+            let beta = lib.playlists.iter().find(|p| p.name == "Set Beta").unwrap();
+
+            let a_id = lib
+                .tracks
+                .iter()
+                .find(|t| t.location == LOC_A)
+                .unwrap()
+                .track_id;
+            let b_id = lib
+                .tracks
+                .iter()
+                .find(|t| t.location == LOC_B)
+                .unwrap()
+                .track_id;
+            let c_id = lib
+                .tracks
+                .iter()
+                .find(|t| t.location == LOC_C)
+                .unwrap()
+                .track_id;
+
+            assert_eq!(alpha.track_ids, vec![a_id, b_id]);
+            assert_eq!(beta.track_ids, vec![b_id, c_id]);
+        }
+
+        #[test]
+        fn merge_export_replaces_each_named_playlist_independently() {
+            const LOC_D: &str = "file://localhost/music/d.aiff";
+            let existing = make_library(
+                vec![
+                    make_track(1, LOC_A),
+                    make_track(2, LOC_B),
+                    make_track(3, LOC_C),
+                ],
+                vec![
+                    RekordboxPlaylist {
+                        name: "A".to_string(),
+                        track_ids: vec![1],
+                    },
+                    RekordboxPlaylist {
+                        name: "B".to_string(),
+                        track_ids: vec![2],
+                    },
+                    RekordboxPlaylist {
+                        name: "C".to_string(),
+                        track_ids: vec![3],
+                    },
+                ],
+            );
+            let refreshed = vec![make_refreshed("Track D", LOC_D)];
+            let lib = merge_export(
+                Some(existing),
+                refreshed,
+                &[pl("A", &[LOC_D]), pl("B", &[LOC_A, LOC_D])],
+            );
+            // C must be preserved
+            let c_pl = lib.playlists.iter().find(|p| p.name == "C").unwrap();
+            let c_id = lib
+                .tracks
+                .iter()
+                .find(|t| t.location == LOC_C)
+                .unwrap()
+                .track_id;
+            assert_eq!(c_pl.track_ids, vec![c_id]);
+
+            // A and B replaced
+            let a_pl = lib.playlists.iter().find(|p| p.name == "A").unwrap();
+            let d_id = lib
+                .tracks
+                .iter()
+                .find(|t| t.location == LOC_D)
+                .unwrap()
+                .track_id;
+            assert_eq!(a_pl.track_ids, vec![d_id]);
+
+            let b_pl = lib.playlists.iter().find(|p| p.name == "B").unwrap();
+            let a_id = lib
+                .tracks
+                .iter()
+                .find(|t| t.location == LOC_A)
+                .unwrap()
+                .track_id;
+            assert_eq!(b_pl.track_ids, vec![a_id, d_id]);
+        }
+
+        #[test]
+        fn merge_export_preserves_playlist_update_order() {
+            let refreshed = vec![
+                make_refreshed("Track A", LOC_A),
+                make_refreshed("Track B", LOC_B),
+                make_refreshed("Track C", LOC_C),
+            ];
+            let lib = merge_export(
+                None,
+                refreshed,
+                &[
+                    pl("First", &[LOC_A]),
+                    pl("Second", &[LOC_B]),
+                    pl("Third", &[LOC_C]),
+                ],
+            );
+            let names: Vec<&str> = lib.playlists.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, vec!["First", "Second", "Third"]);
+        }
+
+        #[test]
+        fn merge_export_skips_empty_playlist_update_alongside_real_ones() {
+            let refreshed = vec![make_refreshed("Track A", LOC_A)];
+            let lib = merge_export(None, refreshed, &[pl("", &[]), pl("Real", &[LOC_A])]);
+            assert_eq!(lib.playlists.len(), 1);
+            assert_eq!(lib.playlists[0].name, "Real");
         }
 
         // --- plan_export tests ---
@@ -1609,7 +1763,7 @@ pub mod merge {
 pub use kind::ext_to_kind;
 pub use merge::{
     merge_export, plan_export, DesiredTrack, DestPathCollision, ExportPlan, FormatChange,
-    PlannedTrack, RefreshedTrack,
+    PlannedTrack, PlaylistUpdate, RefreshedTrack,
 };
 pub use parse::{parse_location, parse_xml, ParseError};
 pub use path_uri::path_to_file_uri;
