@@ -200,9 +200,10 @@ fi
 
 RAW=$(grep '^version[. =]' "$CARGO_TOML" | head -1)
 if echo "$RAW" | grep -q 'workspace = true'; then
-    VERSION=$(grep '^version = ' Polylith.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+    REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+    VERSION=$(awk '/^\[workspace\.package\]/{flag=1; next} /^\[/{flag=0} flag && /^version/{gsub(/[" ]/,""); split($0,a,"="); print a[2]; exit}' "${REPO_ROOT}/Cargo.toml")
 else
-    VERSION=$(echo "$RAW" | sed 's/version = "\(.*\)"/\1/')
+    VERSION=$(echo "$RAW" | sed 's/version *= *"\(.*\)"/\1/')
 fi
 echo "  Version from ${CARGO_TOML}: ${VERSION}"
 if [[ -z "$VERSION" ]]; then
