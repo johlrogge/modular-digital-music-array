@@ -235,6 +235,7 @@ XBPS_ARGS=(
     -H "https://github.com/johlrogge/modular-digital-music-array"
     -l MIT
     -m "Joakim Ohlrogge <joakim.ohlrogge@agical.se>"
+    -i "$PACKAGE_DIR_ABS/INSTALL"
 )
 
 if [[ -n "$DEPS" ]]; then
