@@ -10,3 +10,4 @@ license = "MIT"
 axum = "0.7"
 tokio = { version = "1.36", features = ["full"] }
 thiserror = "1.0"
+socket2 = "0.5"
