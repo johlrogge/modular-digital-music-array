@@ -1748,7 +1748,10 @@ async fn main() -> Result<()> {
         .route("/export/:hash", get(export_track))
         .with_state(state);
 
-    tracing::info!("MDMA Console listening on http://0.0.0.0:{}", args.port);
+    tracing::info!(
+        "MDMA Console listening on http://[::]:{} (dual-stack)",
+        args.port
+    );
     http_server::serve(app, &http_server::HttpServerConfig { port: args.port }).await?;
 
     Ok(())
