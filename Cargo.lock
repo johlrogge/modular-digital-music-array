@@ -3277,7 +3277,6 @@ name = "panel-host"
 version = "0.14.0"
 dependencies = [
  "panel-protocol",
- "panel-transport",
  "panel-transport-fake",
  "panel-ui",
  "pretty_assertions",
@@ -3308,8 +3307,8 @@ name = "panel-transport-fake"
 version = "0.14.0"
 dependencies = [
  "panel-protocol",
- "panel-transport",
  "pretty_assertions",
+ "thiserror 1.0.69",
  "tokio",
 ]
 

@@ -1,10 +1,21 @@
 use panel_protocol::{InputEvent, RenderCommand};
-use panel_transport::{PanelTransport, TransportError};
+use thiserror::Error;
 use tokio::sync::mpsc;
 
+/// Errors that the transport may surface.
+#[derive(Debug, Error)]
+pub enum TransportError {
+    #[error("send failed: {0}")]
+    Send(String),
+    #[error("channel closed")]
+    Closed,
+    #[error("not implemented")]
+    NotImplemented,
+}
+
 /// The transport end held by the 909 service / panel-host.
-/// Implements [`PanelTransport`]: send commands, receive events.
-pub struct FakeTransport {
+/// Send commands, receive events.
+pub struct Transport {
     event_rx: mpsc::Receiver<InputEvent>,
     cmd_tx: mpsc::Sender<RenderCommand>,
 }
@@ -13,29 +24,25 @@ pub struct FakeTransport {
 ///
 /// Use this to push synthetic [`InputEvent`]s into the transport and
 /// inspect the [`RenderCommand`]s that come out.
-pub struct FakeHandle {
+pub struct Handle {
     event_tx: mpsc::Sender<InputEvent>,
     cmd_rx: mpsc::Receiver<RenderCommand>,
 }
 
-/// Create a linked `(FakeTransport, FakeHandle)` pair backed by tokio channels.
-///
-/// ```rust
-/// let (transport, handle) = panel_transport_fake::fake_pair(32);
-/// ```
-pub fn fake_pair(buffer: usize) -> (FakeTransport, FakeHandle) {
+/// Create a linked `(Transport, Handle)` pair backed by tokio channels.
+pub fn pair(buffer: usize) -> (Transport, Handle) {
     let (event_tx, event_rx) = mpsc::channel(buffer);
     let (cmd_tx, cmd_rx) = mpsc::channel(buffer);
-    (
-        FakeTransport { event_rx, cmd_tx },
-        FakeHandle { event_tx, cmd_rx },
-    )
+    (Transport { event_rx, cmd_tx }, Handle { event_tx, cmd_rx })
 }
 
-impl FakeHandle {
+impl Handle {
     /// Push a synthetic input event into the transport.
-    pub async fn push_event(&self, ev: InputEvent) {
-        self.event_tx.send(ev).await.expect("transport closed");
+    pub async fn push_event(&self, ev: InputEvent) -> Result<(), TransportError> {
+        self.event_tx
+            .send(ev)
+            .await
+            .map_err(|e| TransportError::Send(e.to_string()))
     }
 
     /// Receive the next render command that came out of the transport.
@@ -45,15 +52,18 @@ impl FakeHandle {
     }
 }
 
-impl PanelTransport for FakeTransport {
-    async fn send(&mut self, cmd: RenderCommand) -> Result<(), TransportError> {
+impl Transport {
+    /// Send a render command to the panel.
+    pub async fn send(&mut self, cmd: RenderCommand) -> Result<(), TransportError> {
         self.cmd_tx
             .send(cmd)
             .await
             .map_err(|e| TransportError::Send(e.to_string()))
     }
 
-    async fn recv(&mut self) -> Option<InputEvent> {
+    /// Receive the next input event from the panel.
+    /// Returns `None` when the transport is closed / exhausted.
+    pub async fn recv(&mut self) -> Option<InputEvent> {
         self.event_rx.recv().await
     }
 }
@@ -66,16 +76,16 @@ mod tests {
 
     #[tokio::test]
     async fn push_event_received_by_transport() {
-        let (mut transport, handle) = fake_pair(8);
+        let (mut transport, handle) = pair(8);
         let ev = InputEvent::EncoderDelta(3);
-        handle.push_event(ev.clone()).await;
+        handle.push_event(ev.clone()).await.expect("push failed");
         let received = transport.recv().await.expect("expected event");
         assert_eq!(received, ev);
     }
 
     #[tokio::test]
     async fn send_command_received_by_handle() {
-        let (mut transport, mut handle) = fake_pair(8);
+        let (mut transport, mut handle) = pair(8);
         let cmd = RenderCommand::Flip;
         transport.send(cmd.clone()).await.expect("send failed");
         let received = handle.next_command().await.expect("expected command");
@@ -84,7 +94,7 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_events_in_order() {
-        let (mut transport, handle) = fake_pair(8);
+        let (mut transport, handle) = pair(8);
         let events = vec![
             InputEvent::EncoderDelta(1),
             InputEvent::EncoderTilt {
@@ -98,7 +108,7 @@ mod tests {
             },
         ];
         for ev in &events {
-            handle.push_event(ev.clone()).await;
+            handle.push_event(ev.clone()).await.expect("push failed");
         }
         for expected in &events {
             let got = transport.recv().await.expect("expected event");
@@ -108,7 +118,7 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_commands_in_order() {
-        let (mut transport, mut handle) = fake_pair(8);
+        let (mut transport, mut handle) = pair(8);
         let cmds = vec![RenderCommand::Clear, RenderCommand::Flip];
         for cmd in &cmds {
             transport.send(cmd.clone()).await.expect("send failed");
@@ -121,7 +131,7 @@ mod tests {
 
     #[tokio::test]
     async fn recv_returns_none_when_handle_dropped() {
-        let (mut transport, handle) = fake_pair(8);
+        let (mut transport, handle) = pair(8);
         drop(handle);
         assert!(transport.recv().await.is_none());
     }

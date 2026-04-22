@@ -1,4 +1,4 @@
-use panel_transport::PanelTransport;
+use panel_transport::Transport;
 use panel_ui::UiState;
 use tracing::debug;
 
@@ -7,7 +7,7 @@ use tracing::debug;
 /// Receives [`InputEvent`]s from the transport, feeds them through [`UiState`],
 /// and sends the resulting [`RenderCommand`]s back.
 /// Returns when the transport signals end-of-stream (recv returns None).
-pub async fn run(transport: &mut impl PanelTransport) {
+pub async fn run(transport: &mut Transport) {
     let mut ui = UiState::new();
 
     while let Some(ev) = transport.recv().await {
@@ -27,11 +27,11 @@ pub async fn run(transport: &mut impl PanelTransport) {
 mod tests {
     use super::*;
     use panel_protocol::{Direction, Edge, InputEvent};
-    use panel_transport_fake::fake_pair;
+    use panel_transport::pair;
 
     #[tokio::test]
     async fn tilt_up_produces_main_menu_commands() {
-        let (mut transport, handle) = fake_pair(32);
+        let (mut transport, handle) = pair(32);
 
         // Push a tilt-up event then drop handle to end the loop
         handle
@@ -39,7 +39,8 @@ mod tests {
                 dir: Direction::Up,
                 edge: Edge::Press,
             })
-            .await;
+            .await
+            .expect("push failed");
 
         // Drop the sender side to close the event channel so run() exits
         drop(handle);
@@ -49,7 +50,7 @@ mod tests {
 
     #[tokio::test]
     async fn rotate_and_select_sends_render_commands() {
-        let (mut transport, handle) = fake_pair(64);
+        let (mut transport, handle) = pair(64);
 
         // Navigate to main menu
         handle
@@ -57,9 +58,13 @@ mod tests {
                 dir: Direction::Up,
                 edge: Edge::Press,
             })
-            .await;
+            .await
+            .expect("push failed");
         // Scroll to second item (Library)
-        handle.push_event(InputEvent::EncoderDelta(1)).await;
+        handle
+            .push_event(InputEvent::EncoderDelta(1))
+            .await
+            .expect("push failed");
         // Select Library
         handle
             .push_event(InputEvent::Button {
@@ -67,7 +72,8 @@ mod tests {
                 col: 0,
                 edge: Edge::Press,
             })
-            .await;
+            .await
+            .expect("push failed");
 
         drop(handle);
         run(&mut transport).await;
@@ -75,21 +81,22 @@ mod tests {
 
     #[tokio::test]
     async fn host_exits_cleanly_when_transport_closed() {
-        let (mut transport, handle) = fake_pair(8);
+        let (mut transport, handle) = pair(8);
         drop(handle); // immediately close
         run(&mut transport).await; // should return without panic
     }
 
     #[tokio::test]
     async fn tilt_up_renders_clear_and_flip() {
-        let (mut transport, handle) = fake_pair(32);
+        let (mut transport, handle) = pair(32);
 
         handle
             .push_event(InputEvent::EncoderTilt {
                 dir: Direction::Up,
                 edge: Edge::Press,
             })
-            .await;
+            .await
+            .expect("push failed");
         drop(handle);
 
         // Run in a task so we can collect commands concurrently

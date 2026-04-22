@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 panel-host = { path = "../../bases/panel-host" }
-panel-transport-fake = { path = "../../components/panel-transport-fake" }
+panel-transport = { workspace = true }
 panel-protocol = { path = "../../components/panel-protocol" }
 tokio = { workspace = true }
 tracing = { workspace = true }

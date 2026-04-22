@@ -11,7 +11,7 @@ interface = "panel-transport"
 
 [dependencies]
 panel-protocol = { workspace = true }
-panel-transport = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]

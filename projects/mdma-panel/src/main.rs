@@ -1,6 +1,6 @@
 use color_eyre::eyre::Result;
 use panel_protocol::{Direction, Edge, InputEvent};
-use panel_transport_fake::fake_pair;
+use panel_transport::pair;
 use std::time::Duration;
 use tracing::info;
 
@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
 
     info!("mdma-panel starting (fake transport)");
 
-    let (mut transport, mut handle) = fake_pair(64);
+    let (mut transport, mut handle) = pair(64);
 
     // Spawn the panel-host loop
     let host_task = tokio::spawn(async move {
@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
     // Fire events with 500ms pauses, logging render commands as they arrive
     for ev in canned_events {
         info!(?ev, "sending input event");
-        handle.push_event(ev.clone()).await;
+        handle.push_event(ev.clone()).await.expect("push failed");
         tokio::time::sleep(Duration::from_millis(500)).await;
         // Drain any pending render commands
         while let Ok(cmd) =

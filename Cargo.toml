@@ -103,8 +103,7 @@ storage_primitives = { path = "components/storage_primitives" }
 stream-source-protocol = { path = "components/stream_source_protocol" }
 track-matcher = { path = "components/track_matcher" }
 panel-protocol = { path = "components/panel-protocol" }
-panel-transport = { path = "components/panel-transport" }
-panel-transport-fake = { path = "components/panel-transport-fake" }
+panel-transport = { path = "components/panel-transport-fake", package = "panel-transport-fake" }
 panel-ui = { path = "components/panel-ui" }
 panel-host = { path = "bases/panel-host" }
 askama = "0.12"

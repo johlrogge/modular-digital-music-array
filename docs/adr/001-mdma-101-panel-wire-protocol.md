@@ -56,16 +56,21 @@ outside the polylith workspace.
   `heapless` for no_std-compatible collections where relevant). Does
   not depend on the gateway or media_protocol.
 
-- **`components/panel-transport`** — host-side trait. Abstracts "send
-  a `RenderCommand`, receive an `InputEvent`" over whatever concrete
-  transport we end up with. `std`-only; the firmware does not implement
-  this trait (it has its own direct IO tasks).
-
-- **`components/panel-transport-fake`** — mpsc-channel fake
-  implementing `PanelTransport`. Lets the whole stack run and be tested
-  without any hardware. Not just a test fixture — it's the default
-  transport for `projects/mdma-panel` until the real USB-CDC impl
-  lands.
+- **`components/panel-transport`** and **`components/panel-transport-fake`** —
+  two components sharing polylith interface `panel-transport`. Both
+  expose the **same concrete public surface** — `pub struct Transport`,
+  `pub struct Handle`, `pub fn pair(buffer) -> (Transport, Handle)`,
+  `Transport::{send, recv}`, `Handle::{push_event, next_command}` — and
+  are **swapped at build time** via `[workspace.dependencies]`: the
+  workspace-dep `panel-transport` points at whichever concrete
+  component should ship. Today it points at `panel-transport-fake`
+  (mpsc-channel-backed, no hardware needed) so `projects/mdma-panel`
+  runs and the full stack is testable without a panel. When the real
+  USB-CDC impl lands, we point the workspace dep at
+  `components/panel-transport` (currently a stub) and nothing else
+  changes. **No Rust trait** abstracts across them — polylith's
+  interface-swap is the polymorphism. `std`-only; the firmware does
+  not go through this layer (it has its own direct IO tasks).
 
 - **`bases/panel-host`** — wires `panel-ui` + `panel-transport` into
   a `run()` loop. Knows nothing about the gateway yet; that binding is
@@ -92,12 +97,15 @@ dependency on `gateway_client` or `media_protocol`.
 - **One type definition, two targets.** Keeping `InputEvent` and
   `RenderCommand` in a shared crate avoids wire drift between firmware
   and host. This is worth a `no_std` feature gate.
-- **Host-side trait, not firmware-side.** The firmware is a pure IO
-  bridge; it does not benefit from a trait abstraction over its own
-  peripherals at this stage. The host-side trait, on the other hand,
-  is what makes the fake transport possible — and therefore what makes
-  the whole UI testable without hardware, which is Joakim's explicit
-  goal for this spike.
+- **Polylith interface swap, not a Rust trait.** Two components sharing
+  the same polylith `interface` are already swappable at build time.
+  Adding a Rust trait on top would be redundant polymorphism — the
+  interface swap is how we get the fake vs real distinction. Each
+  concrete component simply exposes the same public surface; the
+  workspace-dep resolves one of them. This also keeps the surface small
+  (no generic bounds propagating through `panel-host`, no
+  `dyn Trait` questions) and matches the idiom for the rest of the
+  workspace.
 - **Fake as first-class.** `panel-transport-fake` isn't a test mock
   smuggled into production code. It's the transport the demo binary
   uses until the real one is written. Fake-first matches the
@@ -145,10 +153,15 @@ dependency on `gateway_client` or `media_protocol`.
   track/artist names. UI layer is responsible for truncation with
   ellipsis. Revisit if the cap proves too tight once real metadata is
   wired in.
-- `PanelTransport` uses `async fn` in trait (`#[allow(async_fn_in_trait)]`).
-  Acceptable while the trait is sealed and single-impl-per-binary. If we
-  ever need `dyn PanelTransport`, switch to `async_trait` or
-  `impl Future + '_`.
+- The transport has no Rust trait, so there is no `dyn Trait` question
+  and no generic bound propagation. If we ever need the panel-host to
+  speak to multiple transports at runtime (not currently planned),
+  that's the moment to introduce a trait — not before.
+- Both concrete components own a copy of `TransportError`. This is not
+  duplication-to-be-refactored — it's a consequence of the polylith
+  swap: only one of the two components is ever compiled into a given
+  binary, so the types are structurally identical but belong to
+  whichever component ships.
 - The base is currently called `panel-host`. Once the firmware side
   arrives, the name "host" becomes ambiguous (host = mdma-909 side, but
   also could mean "runs the UI"). Accept the ambiguity for now; rename
