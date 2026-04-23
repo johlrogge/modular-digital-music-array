@@ -3196,12 +3196,167 @@ fn require_node(cli: &Cli) -> String {
     }
 }
 
+/// Resolve `node` to IPv4 SocketAddrs on port 80.
+///
+/// `.local` hostnames route through a hickory resolver pointed at the
+/// mDNS multicast address (224.0.0.251:5353). This isn't full RFC 6762
+/// mDNS — it's a unicast DNS query to the multicast group, which avahi
+/// responders answer. It's enough for point-and-click resolution and
+/// bypasses the OS NSS layer, which matters because Nix-built binaries
+/// can't load libnss_mdns_minimal.so on Linux.
+///
+/// Everything else falls back to the standard resolver.
+fn resolve_node_ipv4(node: &str) -> Result<Vec<std::net::SocketAddr>> {
+    let node_lower = node.to_ascii_lowercase();
+    if node_lower.ends_with(".local") || node_lower.ends_with(".local.") {
+        resolve_mdns_ipv4(node)
+    } else {
+        resolve_std_ipv4(node)
+    }
+}
+
+/// Resolve a non-`.local` hostname via the OS resolver, keeping only IPv4 addresses.
+fn resolve_std_ipv4(node: &str) -> Result<Vec<std::net::SocketAddr>> {
+    use std::net::{IpAddr, ToSocketAddrs};
+    let addrs: Vec<std::net::SocketAddr> = (node, 80u16)
+        .to_socket_addrs()
+        .map_err(|e| color_eyre::eyre::eyre!("DNS lookup for '{}' failed: {}", node, e))?
+        .filter(|a| matches!(a.ip(), IpAddr::V4(_)))
+        .collect();
+    if addrs.is_empty() {
+        color_eyre::eyre::bail!(
+            "could not resolve '{}' to an IPv4 address \
+             (the OS resolver returned only IPv6 addresses). \
+             Pass --node <ip> to work around this.",
+            node
+        );
+    }
+    Ok(addrs)
+}
+
+/// Resolve a `.local` hostname via multicast DNS (avahi / mDNS), keeping only IPv4 addresses.
+///
+/// Configures hickory-resolver to query the mDNS multicast address
+/// (`224.0.0.251:5353`) directly, bypassing the OS NSS layer that breaks in
+/// Nix-glibc environments (where `libnss_mdns_minimal.so` is not found and
+/// `std::net::ToSocketAddrs` returns "Name or service not known" for `.local`).
+///
+/// Uses the sync `Resolver` wrapper (feature `tokio-runtime`), which manages
+/// its own internal tokio runtime — no outer runtime is required.
+fn resolve_mdns_ipv4(node: &str) -> Result<Vec<std::net::SocketAddr>> {
+    use hickory_resolver::{
+        config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts},
+        proto::rr::{rdata::A, RData, RecordType},
+        Resolver,
+    };
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    // mDNS multicast group and port (RFC 6762).
+    let mdns_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)), 5353);
+
+    let ns = NameServerConfig {
+        socket_addr: mdns_addr,
+        protocol: Protocol::Udp,
+        tls_dns_name: None,
+        trust_negative_responses: false,
+        bind_addr: None,
+    };
+    let mut config = ResolverConfig::new();
+    config.add_name_server(ns);
+
+    let mut opts = ResolverOpts::default();
+    // Allow up to 5 s for a multicast response.
+    opts.timeout = std::time::Duration::from_secs(5);
+    opts.attempts = 2;
+
+    let resolver = Resolver::new(config, opts)
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to create mDNS resolver: {}", e))?;
+
+    let response = resolver.lookup(node, RecordType::A).map_err(|e| {
+        color_eyre::eyre::eyre!(
+            "mDNS lookup for {} failed: {}. \
+             Check that the target is reachable on the LAN and responding to mDNS, \
+             or use --node <ip> to bypass mDNS resolution.",
+            node,
+            e
+        )
+    })?;
+
+    let addrs: Vec<SocketAddr> = response
+        .iter()
+        .filter_map(|rdata| {
+            if let RData::A(A(ipv4)) = rdata {
+                Some(SocketAddr::new(IpAddr::V4(*ipv4), 80))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if addrs.is_empty() {
+        color_eyre::eyre::bail!(
+            "mDNS lookup for {} failed: no A records returned. \
+             Check that the target is reachable on the LAN and responding to mDNS, \
+             or use --node <ip> to bypass mDNS resolution.",
+            node
+        );
+    }
+    Ok(addrs)
+}
+
 /// Build the shared blocking HTTP client used by export handlers.
-fn build_http_client() -> Result<reqwest::blocking::Client> {
+///
+/// Pins the client to the IPv4 address(es) of `node` so that mDNS `.local`
+/// hostnames that resolve to IPv6 link-local addresses work correctly.
+fn build_http_client(node: &str) -> Result<reqwest::blocking::Client> {
+    let resolved = resolve_node_ipv4(node)?;
     reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
+        .resolve_to_addrs(node, &resolved)
         .build()
         .map_err(|e| color_eyre::eyre::eyre!("Failed to build HTTP client: {}", e))
+}
+
+#[cfg(test)]
+mod http_client_tests {
+    use super::{resolve_node_ipv4, resolve_std_ipv4};
+    use std::net::IpAddr;
+
+    #[test]
+    fn resolve_non_local_hostname_uses_std() {
+        // IP literal goes through the std branch — no mDNS involved.
+        let addrs = resolve_std_ipv4("127.0.0.1").expect("should resolve IP literal");
+        assert!(!addrs.is_empty());
+        assert!(addrs.iter().all(|a| matches!(a.ip(), IpAddr::V4(_))));
+        assert!(addrs.iter().any(|a| a.ip().to_string() == "127.0.0.1"));
+    }
+
+    #[test]
+    fn resolve_rejects_unresolvable_non_local() {
+        // An unresolvable non-.local name should return an error from the std branch.
+        let result = resolve_node_ipv4("definitely-not-a-host.invalid");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("DNS lookup") || msg.contains("IPv4"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    /// Smoke test that mDNS resolution is attempted for .local names.
+    /// Requires a live network with avahi-daemon; skip in CI with `cargo test -- --skip mdns`.
+    #[test]
+    #[ignore]
+    fn resolve_local_hostname_via_mdns_smoke() {
+        // This exercises the mDNS branch end-to-end.  Run manually with:
+        //   cargo test resolve_local_hostname_via_mdns_smoke -- --ignored
+        // Only works if mdma-909.local is reachable via avahi-daemon.
+        let result = resolve_node_ipv4("mdma-909.local");
+        assert!(result.is_ok(), "mDNS failed: {:?}", result.unwrap_err());
+        let addrs = result.unwrap();
+        assert!(!addrs.is_empty());
+        assert!(addrs.iter().all(|a| matches!(a.ip(), IpAddr::V4(_))));
+    }
 }
 
 /// Outcome of a single track download attempt.
@@ -3498,7 +3653,7 @@ fn handle_rekordbox_export(
         std::process::exit(1);
     }
 
-    let http = build_http_client()?;
+    let http = build_http_client(&node)?;
 
     // Create output directory early so we can canonicalise it for stable paths
     if let Err(e) = std::fs::create_dir_all(output) {
@@ -4177,7 +4332,7 @@ fn handle_export(
         std::process::exit(1);
     }
 
-    let http = build_http_client()?;
+    let http = build_http_client(&node)?;
 
     let results = download_tracks(&node, &tracks, output, &http, |track| {
         resolve_export_format(
