@@ -7,8 +7,10 @@
 
 case "${ACTION}" in
 post)
-    if command -v setcap >/dev/null 2>&1; then
-        setcap 'cap_net_bind_service=+ep' /usr/bin/mdma-console
+    # Use absolute path: xbps runs INSTALL scripts with a minimal PATH that
+    # may not include /usr/sbin where setcap lives on Void Linux.
+    if [ -x /usr/sbin/setcap ]; then
+        /usr/sbin/setcap 'cap_net_bind_service=+ep' /usr/bin/mdma-console
     fi
     ;;
 esac
