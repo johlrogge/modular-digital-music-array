@@ -1,6 +1,13 @@
 #!/bin/sh
 exec 2>&1
 export RUST_LOG=info
+
+# Apply CAP_NET_BIND_SERVICE so the unprivileged 'mdma' user can bind port 80.
+# xbps INSTALL scripts run without CAP_SETFCAP, so the capability cannot be
+# applied at install time; doing it here in the run script (which runs as root
+# before chpst drops privs) is reliable and idempotent.
+/usr/sbin/setcap 'cap_net_bind_service=+ep' /usr/bin/mdma-console
+
 exec chpst -u mdma /usr/bin/mdma-console \
     --port 80 \
     --gateway tcp://127.0.0.1:5555 \
