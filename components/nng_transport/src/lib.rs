@@ -66,6 +66,47 @@ pub fn connect(address: &str) -> Result<nng::Socket, ConnectionError> {
     Ok(socket)
 }
 
+/// Resolve `host` to an IPv4 address string using the project's resolution
+/// order: avahi-resolve subprocess for `.local` hostnames, std resolver
+/// otherwise, with disk-backed cache.
+///
+/// If `host` already looks like an IPv4 address (digits and dots only), it is
+/// returned unchanged.
+///
+/// # Errors
+///
+/// Returns [`ConnectionError::DnsResolution`] when neither avahi nor std
+/// resolver can find the host and there is no cached result.
+pub fn resolve_hostname_to_ipv4(host: &str) -> Result<String, ConnectionError> {
+    // If host already looks like an IP address, pass through
+    if host.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return Ok(host.to_string());
+    }
+
+    // For .local hostnames, use avahi-resolve for mDNS
+    let resolved = if host.ends_with(".local") {
+        resolve_with_avahi(host).or_else(|| resolve_with_std(host))
+    } else {
+        resolve_with_std(host)
+    };
+
+    match resolved {
+        Some(ip) => {
+            write_cached_ip(host, &ip);
+            Ok(ip)
+        }
+        None => {
+            if let Some(cached_ip) = read_cached_ip(host) {
+                return Ok(cached_ip);
+            }
+            Err(ConnectionError::DnsResolution(format!(
+                "No IPv4 address found for {}",
+                host
+            )))
+        }
+    }
+}
+
 /// Resolve hostname in TCP addresses to IPv4.
 ///
 /// NNG doesn't handle DNS resolution, so we need to resolve hostnames
@@ -84,33 +125,8 @@ pub fn resolve_tcp_hostname(address: &str) -> Result<String, ConnectionError> {
         None => return Ok(address.to_string()),
     };
 
-    // If host looks like an IP address, pass through
-    if host.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        return Ok(address.to_string());
-    }
-
-    // For .local hostnames, use avahi-resolve for mDNS
-    let resolved = if host.ends_with(".local") {
-        resolve_with_avahi(host).or_else(|| resolve_with_std(host))
-    } else {
-        resolve_with_std(host)
-    };
-
-    match resolved {
-        Some(ip) => {
-            write_cached_ip(host, &ip);
-            Ok(format!("tcp://{}:{}", ip, port))
-        }
-        None => {
-            if let Some(cached_ip) = read_cached_ip(host) {
-                return Ok(format!("tcp://{}:{}", cached_ip, port));
-            }
-            Err(ConnectionError::DnsResolution(format!(
-                "No IPv4 address found for {}",
-                host
-            )))
-        }
-    }
+    let ip = resolve_hostname_to_ipv4(host)?;
+    Ok(format!("tcp://{}:{}", ip, port))
 }
 
 fn cache_path() -> Option<PathBuf> {
@@ -280,6 +296,22 @@ mod tests {
     fn nng_client_error_service_variant() {
         let err = NngClientError::Service("rejected".to_string());
         assert!(err.to_string().contains("rejected"));
+    }
+
+    #[test]
+    fn resolve_ipv4_address_passes_through() {
+        let ip = "192.168.0.1";
+        assert_eq!(resolve_hostname_to_ipv4(ip).unwrap(), ip);
+    }
+
+    #[test]
+    fn resolve_localhost_returns_loopback() {
+        let result = resolve_hostname_to_ipv4("localhost").unwrap();
+        assert!(
+            result.starts_with("127."),
+            "expected loopback, got {}",
+            result
+        );
     }
 
     #[test]
