@@ -9,7 +9,7 @@ use axum::{
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
-        Html, IntoResponse,
+        Html,
     },
     Form,
 };

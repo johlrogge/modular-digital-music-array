@@ -28,7 +28,7 @@ pub enum ConnectionError {
 ///
 /// Supports both IPC (`ipc:///path/to/socket`) and TCP (`tcp://host:port`).
 /// For TCP addresses with hostnames, resolves to IPv4 using:
-/// - `avahi-resolve` for mDNS (.local) hostnames
+/// - avahi D-Bus (`org.freedesktop.Avahi.Server.ResolveHostName`) for mDNS (.local) hostnames
 /// - Standard DNS for other hostnames
 ///
 /// # Examples
@@ -83,9 +83,9 @@ pub fn resolve_hostname_to_ipv4(host: &str) -> Result<String, ConnectionError> {
         return Ok(host.to_string());
     }
 
-    // For .local hostnames, use avahi-resolve for mDNS
+    // For .local hostnames, use avahi D-Bus for mDNS (Linux) or fall through to std (macOS)
     let resolved = if host.ends_with(".local") {
-        resolve_with_avahi(host).or_else(|| resolve_with_std(host))
+        avahi_platform::resolve(host).or_else(|| resolve_with_std(host))
     } else {
         resolve_with_std(host)
     };
@@ -179,26 +179,67 @@ fn write_cached_ip_to(host: &str, ip: &str, path: PathBuf) {
     }
 }
 
-/// Resolve using `avahi-resolve` (mDNS for .local hostnames)
-fn resolve_with_avahi(host: &str) -> Option<String> {
-    use std::process::Command;
+/// Platform-specific avahi resolution via D-Bus (Linux) or no-op stub (other).
+#[cfg(target_os = "linux")]
+mod avahi_platform {
+    use zbus::blocking::Connection;
+    use zbus::proxy;
 
-    let output = Command::new("avahi-resolve")
-        .args(["-4", "-n", host])
-        .output()
-        .ok()?;
+    /// Avahi D-Bus interface constants.
+    /// AVAHI_IF_UNSPEC = -1, AVAHI_PROTO_UNSPEC = -1, AVAHI_PROTO_INET = 0
+    const IF_UNSPEC: i32 = -1;
+    const PROTO_UNSPEC: i32 = -1;
+    const PROTO_INET: i32 = 0;
+    const FLAGS_NONE: u32 = 0;
 
-    if !output.status.success() {
-        return None;
+    #[proxy(
+        interface = "org.freedesktop.Avahi.Server",
+        default_service = "org.freedesktop.Avahi",
+        default_path = "/"
+    )]
+    trait AvahiServer {
+        /// ResolveHostName(interface i, protocol i, name s, aprotocol i, flags u)
+        /// Returns: (interface i, protocol i, name s, aprotocol i, address s, flags u)
+        ///
+        /// Signature confirmed from avahi D-Bus specification:
+        /// https://avahi.org/doxygen/html/
+        /// and `dbus-send --system --print-reply --dest=org.freedesktop.Avahi /
+        ///   org.freedesktop.DBus.Introspectable.Introspect`
+        fn resolve_host_name(
+            &self,
+            interface: i32,
+            protocol: i32,
+            name: &str,
+            aprotocol: i32,
+            flags: u32,
+        ) -> zbus::Result<(i32, i32, String, i32, String, u32)>;
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // avahi-resolve output: "mdma-909.local\t192.168.0.171"
-    stdout
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .map(|ip| ip.to_string())
+    /// Resolve a `.local` hostname via the avahi-daemon D-Bus service.
+    ///
+    /// Returns the IPv4 address string on success, or `None` if:
+    /// - avahi-daemon is not running
+    /// - the hostname cannot be resolved
+    /// - any D-Bus error occurs
+    pub fn resolve(host: &str) -> Option<String> {
+        let conn = Connection::system().ok()?;
+        let proxy = AvahiServerProxyBlocking::new(&conn).ok()?;
+        let resp = proxy
+            .resolve_host_name(IF_UNSPEC, PROTO_UNSPEC, host, PROTO_INET, FLAGS_NONE)
+            .ok()?;
+        // The 5th field (index 4) of the returned tuple is the resolved address.
+        Some(resp.4)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod avahi_platform {
+    /// On non-Linux platforms (macOS, etc.), avahi is not available.
+    /// `.local` resolution falls through to the standard library, which
+    /// works natively via mDNSResponder on macOS.
+    pub fn resolve(_host: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Resolve using standard library (for regular DNS)
@@ -381,6 +422,38 @@ mod tests {
         let recv_timeout = client.get_opt::<RecvTimeout>().unwrap();
         assert_eq!(send_timeout, Some(DEFAULT_TIMEOUT));
         assert_eq!(recv_timeout, Some(DEFAULT_TIMEOUT));
+    }
+
+    /// Integration test: requires avahi-daemon running and mdma-909.local reachable.
+    /// Run manually with: cargo test -p nng-transport -- --ignored
+    #[test]
+    #[ignore]
+    fn resolve_via_avahi_returns_some_for_known_local_host() {
+        let result = avahi_platform::resolve("mdma-909.local");
+        assert!(
+            result.is_some(),
+            "expected avahi to resolve mdma-909.local, got None"
+        );
+        let ip = result.unwrap();
+        // Should look like an IPv4 address
+        assert!(
+            ip.split('.').count() == 4 && ip.chars().all(|c| c.is_ascii_digit() || c == '.'),
+            "expected IPv4 address, got: {}",
+            ip
+        );
+    }
+
+    /// Integration test: requires avahi-daemon running.
+    /// Run manually with: cargo test -p nng-transport -- --ignored
+    #[test]
+    #[ignore]
+    fn resolve_via_avahi_returns_none_for_nonexistent() {
+        let result = avahi_platform::resolve("nonexistent-mdma-host.local");
+        assert!(
+            result.is_none(),
+            "expected None for nonexistent host, got: {:?}",
+            result
+        );
     }
 
     #[test]

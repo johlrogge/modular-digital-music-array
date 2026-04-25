@@ -205,6 +205,7 @@ fn render_pane_area(f: &mut Frame, app: &App, side: Side, area: Rect) {
 /// Populated slots show "N:title"; empty slots show "N" in a muted style.
 /// Active slot is highlighted. Titles shrink under space pressure in LRU order
 /// (least-recently-visited title drops first; active tab's title is last to go).
+#[allow(clippy::too_many_arguments)]
 fn render_tab_strip(
     f: &mut Frame,
     _app: &App,

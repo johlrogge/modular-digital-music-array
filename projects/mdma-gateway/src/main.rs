@@ -3,6 +3,11 @@ use color_eyre::Result;
 use gateway_protocol::{GatewayRequest, GatewayResponse, SourceName};
 use nng::options::Options;
 use serde::{de::DeserializeOwned, Serialize};
+// Polylith: explicitly names the `service` base crate selected for this binary.
+// In Rust 2018+ the `service::` path prefix already works without this statement,
+// but the bare `use` makes the polylith base selection visible at a glance and
+// is the project convention for documenting which base backs this project.
+#[allow(clippy::single_component_path_imports)]
 use service;
 use source_protocol::{SourceRequest, SourceResponse};
 use std::collections::HashMap;

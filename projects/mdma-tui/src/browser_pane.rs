@@ -171,7 +171,7 @@ impl BrowserPane {
     ///
     /// Tracks with no disc_number are treated as disc 1. Tracks with no
     /// track_number sort to the end (represented as `u32::MAX`).
-    pub(crate) fn sort_album_tracks(tracks: &mut Vec<TrackInfo>) {
+    pub(crate) fn sort_album_tracks(tracks: &mut [TrackInfo]) {
         tracks.sort_by_key(|t| {
             (
                 t.disc_number.unwrap_or(1),

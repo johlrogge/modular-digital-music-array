@@ -18,7 +18,7 @@ use crate::hardware::HardwareInfo;
 
 pub use crate::types::{
     ByteSize, DevicePath, FilesystemType, MountPoint, PartitionLabel, PartitionSize,
-    ProvisionConfig, UnitType, ValidationError,
+    ProvisionConfig, UnitType,
 };
 
 // ============================================================================
