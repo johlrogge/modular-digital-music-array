@@ -59,6 +59,7 @@ pub enum TrackCommand {
 /// At 192 kHz stereo this is ~170 ms of audio.
 const DECODE_AHEAD: usize = 65_536;
 
+#[allow(clippy::too_many_arguments)]
 fn decoder_thread_fn<S: Source + Send + Sync + 'static>(
     source: S,
     mut output: HeapProducer<f32>,
@@ -116,13 +117,11 @@ fn decoder_thread_fn<S: Source + Send + Sync + 'static>(
                     }
                     pending.clear();
                     eof = false;
-                    // Update position_ms after seek
-                    let ch = source.audio_channels() as u64;
-                    let frames = if ch > 0 {
-                        position as u64 / ch
-                    } else {
-                        position as u64
-                    };
+                    // Update position_ms after seek.
+                    // .max(1) upholds the invariant that audio_channels() >= 1, avoiding
+                    // division by zero if a malformed stream reports 0 channels.
+                    let ch = source.audio_channels().max(1) as u64;
+                    let frames = position as u64 / ch;
                     let ms = frames * 1000 / source_rate as u64;
                     position_ms.store(ms, Ordering::Release);
                     // Seek resets to Stopped — caller must call play() again if desired
@@ -164,13 +163,11 @@ fn decoder_thread_fn<S: Source + Send + Sync + 'static>(
                     }
                     // Update position_ms from the source's current sample position.
                     // current_position() counts all interleaved samples; divide by channels to get frames.
-                    let channels = source.audio_channels() as u64;
+                    // .max(1) upholds the invariant that audio_channels() >= 1, avoiding
+                    // division by zero if a malformed stream reports 0 channels.
+                    let ch = source.audio_channels().max(1) as u64;
                     let sample_pos = source.current_position() as u64;
-                    let frames = if channels > 0 {
-                        sample_pos / channels
-                    } else {
-                        sample_pos
-                    };
+                    let frames = sample_pos / ch;
                     let ms = frames * 1000 / source_rate as u64;
                     position_ms.store(ms, Ordering::Release);
                 }

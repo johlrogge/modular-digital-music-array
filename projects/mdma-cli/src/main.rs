@@ -3358,7 +3358,7 @@ fn resolve_export_format(
 ) -> ExportFormat {
     // If --format is given, use it for everything.
     if let Some(fmt) = format {
-        return fmt.clone();
+        return *fmt;
     }
 
     // If neither category flag is given, default to Original.
@@ -3374,10 +3374,10 @@ fn resolve_export_format(
 
     match audio_transcoder::FormatCategory::from_extension(ext) {
         Some(audio_transcoder::FormatCategory::Lossless) => {
-            lossless_format.clone().unwrap_or(ExportFormat::Original)
+            lossless_format.unwrap_or(ExportFormat::Original)
         }
         Some(audio_transcoder::FormatCategory::Lossy) => {
-            lossy_format.clone().unwrap_or(ExportFormat::Original)
+            lossy_format.unwrap_or(ExportFormat::Original)
         }
         None => ExportFormat::Original,
     }

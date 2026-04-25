@@ -1,7 +1,7 @@
-// Rekordbox XML export utilities.
-// Generates Pioneer Rekordbox-compatible XML library files for import
-// via Rekordbox File → Import Library.
-
+//! Rekordbox XML export utilities.
+//!
+//! Generates Pioneer Rekordbox-compatible XML library files for import
+//! via Rekordbox File → Import Library.
 // =============================================================================
 // tonality module — converts MDMA Key to Camelot notation
 // =============================================================================

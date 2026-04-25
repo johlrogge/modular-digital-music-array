@@ -8,6 +8,7 @@ pub use source_protocol::*;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[allow(dead_code)]
 pub enum IpcError {
     #[error("NNG error: {0}")]
     Nng(#[from] nng::Error),
@@ -31,6 +32,7 @@ impl IpcServer {
     }
 
     /// Add another listener address (nng supports multiple listeners on one socket)
+    #[allow(dead_code)]
     pub fn listen_also(&self, address: &str) -> Result<(), IpcError> {
         self.socket.listen(address)?;
         tracing::info!(address = %address, "IPC server also listening");

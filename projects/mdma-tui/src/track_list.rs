@@ -282,7 +282,7 @@ pub fn render_track_list(
         .visible_to_data
         .iter()
         .enumerate()
-        .zip(sized.cells.into_iter())
+        .zip(sized.cells)
         .map(
             |((vis_idx, &_data_idx), [artist_str, title_str, bpm_str, key_str, dur_str])| {
                 let is_cursor = selection.cursor_position() == Some(vis_idx);
