@@ -3197,9 +3197,31 @@ fn require_node(cli: &Cli) -> String {
 }
 
 /// Build the shared blocking HTTP client used by export handlers.
-fn build_http_client() -> Result<reqwest::blocking::Client> {
+///
+/// Resolves `node` to an IPv4 address (using avahi for `.local` hostnames) and
+/// pins that address via `resolve_to_addrs` so the request succeeds even in
+/// environments where mDNS is not wired into the system resolver (e.g.
+/// Nix-glibc).  HTTP on port 80 is used; the URL hostname is kept as-is so
+/// virtual-host routing on the server side is unaffected.
+fn build_http_client(node: &str) -> Result<reqwest::blocking::Client> {
+    use std::net::{IpAddr, SocketAddr};
+
+    let ip_str = nng_transport::resolve_hostname_to_ipv4(node).map_err(|e| {
+        color_eyre::eyre::eyre!(
+            "Failed to resolve '{}' to an IP address: {}. \
+             Try passing an explicit IP with --node <ip>.",
+            node,
+            e
+        )
+    })?;
+    let ip: IpAddr = ip_str.parse().map_err(|e| {
+        color_eyre::eyre::eyre!("Resolved address '{}' is not a valid IP: {}", ip_str, e)
+    })?;
+    let addr = SocketAddr::new(ip, 80);
+
     reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
+        .resolve_to_addrs(node, &[addr])
         .build()
         .map_err(|e| color_eyre::eyre::eyre!("Failed to build HTTP client: {}", e))
 }
@@ -3498,7 +3520,7 @@ fn handle_rekordbox_export(
         std::process::exit(1);
     }
 
-    let http = build_http_client()?;
+    let http = build_http_client(&node)?;
 
     // Create output directory early so we can canonicalise it for stable paths
     if let Err(e) = std::fs::create_dir_all(output) {
@@ -4177,7 +4199,7 @@ fn handle_export(
         std::process::exit(1);
     }
 
-    let http = build_http_client()?;
+    let http = build_http_client(&node)?;
 
     let results = download_tracks(&node, &tracks, output, &http, |track| {
         resolve_export_format(
