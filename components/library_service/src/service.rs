@@ -174,10 +174,8 @@ fn apply_fact_to_track(
                     set.insert(entry.content_hash.as_str().to_owned());
                 }
             }
-            MusicValue::AddedAt(dt) => {
-                if entry.added_at.is_none() {
-                    entry.added_at = Some(*dt);
-                }
+            MusicValue::AddedAt(dt) if entry.added_at.is_none() => {
+                entry.added_at = Some(*dt);
             }
             _ => {}
         },

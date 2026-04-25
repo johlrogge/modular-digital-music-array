@@ -454,7 +454,7 @@ pub fn content_to_hashes(content: &str) -> Vec<ContentHash> {
         .map(|line| line.trim())
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .filter_map(|line| line.split_whitespace().next())
-        .map(|token| ContentHash::new(token))
+        .map(ContentHash::new)
         .collect()
 }
 

@@ -427,9 +427,8 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
 
             // Collect partitions that need to be created
             let mut planned_partitions = Vec::new();
-            let mut partition_num = 1;
 
-            for partition_state in partitions {
+            for (partition_num, partition_state) in (1..).zip(partitions.iter()) {
                 match partition_state {
                     PartitionState::Planned(partition) => {
                         planned_partitions.push((partition_num, partition.clone()));
@@ -454,7 +453,6 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                         tracing::info!("{}", log_msg);
                     }
                 }
-                partition_num += 1;
             }
 
             // If no partitions to create, we're done
