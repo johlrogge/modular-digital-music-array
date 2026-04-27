@@ -3,7 +3,7 @@ schema_version = 1
 
 [versioning]
 policy = "relaxed"
-version = "0.15.3"
+version = "0.15.4"
 
 [libraries]
 askama = "0.12"
