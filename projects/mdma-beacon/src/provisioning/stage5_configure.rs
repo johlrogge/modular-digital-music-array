@@ -15,6 +15,7 @@
 use crate::actions::{Action, ActionId, PlannedAction};
 use crate::error::{BeaconError, Result};
 use crate::provisioning::types::{ConfiguredFstab, ConfiguredSystem};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tokio::process::Command;
 
@@ -90,8 +91,17 @@ impl Action<ConfiguredFstab, ConfiguredSystem, ConfiguredSystem> for ConfigureSy
         // (kept as safety measure even though both should have matching versions)
         sync_kernel_to_sd_boot(mount_root).await?;
 
-        // 12. Configure boot to use NVMe root
-        configure_boot().await?;
+        // 12. Write NVMe-side boot/cmdline.txt (#55)
+        configure_nvme_boot_cmdline(mount_root, "/dev/nvme0n1p1").await?;
+
+        // 13. Configure SD card boot to use NVMe root (#54)
+        configure_boot("/dev/nvme0n1p1").await?;
+
+        // 14. Set up /music directory ownership for mdma user (#60)
+        setup_music_directory(mount_root).await?;
+
+        // 15. Seed bandcamp.conf if not already present (#61)
+        seed_bandcamp_config(mount_root).await?;
 
         tracing::info!("✅ Stage 5: System configuration complete");
         Ok(planned_output.clone())
@@ -290,6 +300,20 @@ async fn setup_ssh_for_admin(mount_root: &Path, ssh_key: &str) -> Result<()> {
         BeaconError::Provisioning(format!("Failed to create {}: {}", ssh_dir.display(), e))
     })?;
 
+    // Fix #62: set .ssh directory to 0o700 immediately after creation, before any
+    // chroot operations. tokio::fs::create_dir_all inherits the process umask, which
+    // on beacon (umask 0o002) would leave the directory world-writable (0o775).
+    // OpenSSH rejects keys when .ssh or authorized_keys are group/world-writable.
+    tokio::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700))
+        .await
+        .map_err(|e| {
+            BeaconError::Provisioning(format!(
+                "Failed to set permissions on {}: {}",
+                ssh_dir.display(),
+                e
+            ))
+        })?;
+
     // Write authorized_keys
     let auth_keys_path = ssh_dir.join("authorized_keys");
     tokio::fs::write(&auth_keys_path, format!("{}\n", ssh_key))
@@ -297,6 +321,19 @@ async fn setup_ssh_for_admin(mount_root: &Path, ssh_key: &str) -> Result<()> {
         .map_err(|e| {
             BeaconError::Provisioning(format!(
                 "Failed to write {}: {}",
+                auth_keys_path.display(),
+                e
+            ))
+        })?;
+
+    // Fix #62: set authorized_keys to 0o600 immediately after write.
+    // tokio::fs::write creates with umask-affected mode (0o664 at umask 0o002).
+    // We set it explicitly here on the host path so OpenSSH will accept it.
+    tokio::fs::set_permissions(&auth_keys_path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .map_err(|e| {
+            BeaconError::Provisioning(format!(
+                "Failed to set permissions on {}: {}",
                 auth_keys_path.display(),
                 e
             ))
@@ -318,7 +355,7 @@ async fn setup_ssh_for_admin(mount_root: &Path, ssh_key: &str) -> Result<()> {
         )));
     }
 
-    // Set permissions (chmod 700 .ssh, chmod 600 authorized_keys)
+    // Confirm permissions via chroot chmod as belt-and-suspenders
     let output = Command::new("chroot")
         .arg(mount_root)
         .args(["chmod", "700", "/home/admin/.ssh"])
@@ -777,9 +814,126 @@ async fn sync_kernel_to_sd_boot(nvme_mount_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Configure SD card boot to use NVMe root
-async fn configure_boot() -> Result<()> {
-    tracing::info!("Configuring boot to use NVMe root");
+/// Look up the PARTUUID for a block device using blkid.
+///
+/// Returns the PARTUUID string (e.g. `"abc123ef-02"`) or an error if blkid
+/// fails or the device has no PARTUUID.
+async fn get_partuuid(device: &str) -> Result<String> {
+    let output = Command::new("blkid")
+        .args(["-s", "PARTUUID", "-o", "value", device])
+        .output()
+        .await
+        .map_err(|e| BeaconError::command_failed("blkid", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(BeaconError::Provisioning(format!(
+            "blkid failed for {}: {}",
+            device, stderr
+        )));
+    }
+
+    let partuuid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if partuuid.is_empty() {
+        return Err(BeaconError::Provisioning(format!(
+            "No PARTUUID found for {} — partition may not have a GPT/MBR UUID",
+            device
+        )));
+    }
+
+    Ok(partuuid)
+}
+
+/// Build a cmdline.txt that boots from `root_partuuid`.
+///
+/// Replaces the `root=` token in `current_cmdline` with the PARTUUID form.
+/// All other kernel parameters are preserved. A trailing newline is always
+/// appended.
+///
+/// If `current_cmdline` is empty or contains no `root=` token, a safe
+/// default is produced from scratch.
+fn rewrite_cmdline(current_cmdline: &str, root_partuuid: &str) -> String {
+    let new_root = format!("root=PARTUUID={}", root_partuuid);
+
+    let trimmed = current_cmdline.trim();
+    if trimmed.is_empty() {
+        // No existing cmdline — generate a minimal one.
+        return format!(
+            "console=serial0,115200 console=tty1 {} rootfstype=ext4 rootwait\n",
+            new_root
+        );
+    }
+
+    // Replace any existing `root=...` token, preserving all other parameters.
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let rewritten: Vec<String> = tokens
+        .iter()
+        .map(|tok| {
+            if tok.starts_with("root=") {
+                new_root.clone()
+            } else {
+                tok.to_string()
+            }
+        })
+        .collect();
+
+    // If there was no root= token at all, append one.
+    if !tokens.iter().any(|t| t.starts_with("root=")) {
+        format!("{} {}\n", rewritten.join(" "), new_root)
+    } else {
+        format!("{}\n", rewritten.join(" "))
+    }
+}
+
+/// Write `cmdline.txt` at `dest` using `root_partuuid` as the root device.
+///
+/// Reads the existing file (if any) to preserve non-root kernel parameters,
+/// then rewrites only the `root=` token. Creates a `.bak` backup on first
+/// write.
+async fn write_cmdline(root_partuuid: &str, dest: &Path) -> Result<()> {
+    let current = if dest.exists() {
+        tokio::fs::read_to_string(dest).await.map_err(|e| {
+            BeaconError::Provisioning(format!("Failed to read {}: {}", dest.display(), e))
+        })?
+    } else {
+        String::new()
+    };
+
+    let new_content = rewrite_cmdline(&current, root_partuuid);
+
+    if current.trim() == new_content.trim() {
+        tracing::info!("  {} already has correct root= — no change", dest.display());
+        return Ok(());
+    }
+
+    // Backup original on first write
+    let backup = dest.with_extension("txt.bak");
+    if !backup.exists() && !current.is_empty() {
+        tokio::fs::write(&backup, &current).await.map_err(|e| {
+            BeaconError::Provisioning(format!("Failed to backup {}: {}", dest.display(), e))
+        })?;
+        tracing::info!("  Backed up original to {}", backup.display());
+    }
+
+    tokio::fs::write(dest, &new_content).await.map_err(|e| {
+        BeaconError::Provisioning(format!("Failed to write {}: {}", dest.display(), e))
+    })?;
+
+    tracing::info!("  Wrote {}: {}", dest.display(), new_content.trim());
+    Ok(())
+}
+
+/// Configure SD card boot to use NVMe root (#54).
+///
+/// Reads the SD card's `cmdline.txt`, substitutes the `root=` token with
+/// `root=PARTUUID=<nvme-root-partuuid>`, and writes it back. This ensures the
+/// Pi boots into the provisioned NVMe on the next restart.
+async fn configure_boot(nvme_root_device: &str) -> Result<()> {
+    tracing::info!("Configuring SD card boot to use NVMe root");
+
+    // Resolve the NVMe root partition PARTUUID at apply time (not plan time).
+    let partuuid = get_partuuid(nvme_root_device).await?;
+    tracing::info!("  NVMe root PARTUUID: {}", partuuid);
 
     // The cmdline.txt is on the SD card (current boot device)
     // Location varies by distro:
@@ -790,64 +944,131 @@ async fn configure_boot() -> Result<()> {
     } else if Path::new("/boot/firmware/cmdline.txt").exists() {
         Path::new("/boot/firmware/cmdline.txt")
     } else {
-        tracing::warn!("cmdline.txt not found - boot configuration skipped");
-        tracing::warn!("You may need to manually configure boot parameters");
-        return Ok(());
+        tracing::error!(
+            "SD card cmdline.txt not found — checked /boot/cmdline.txt and /boot/firmware/cmdline.txt — boot configuration cannot proceed"
+        );
+        return Err(BeaconError::Provisioning(
+            "SD card cmdline.txt not found — checked /boot/cmdline.txt and /boot/firmware/cmdline.txt".to_string(),
+        ));
     };
 
-    // Read current cmdline
-    let current = if cmdline_path.exists() {
-        tokio::fs::read_to_string(cmdline_path).await.map_err(|e| {
-            BeaconError::Provisioning(format!("Failed to read {}: {}", cmdline_path.display(), e))
-        })?
-    } else {
-        String::new()
-    };
+    tracing::info!("  Updating SD card cmdline at {}", cmdline_path.display());
+    write_cmdline(&partuuid, cmdline_path).await?;
 
-    tracing::info!("  Current cmdline: {}", current.trim());
+    tracing::info!("✅ SD card boot configured for NVMe root");
+    Ok(())
+}
 
-    // Build new cmdline with NVMe root
-    // Keep console settings, update root= to NVMe
-    let new_cmdline =
-        "console=serial0,115200 console=tty1 root=/dev/nvme0n1p1 rootfstype=ext4 rootwait\n";
+/// Write NVMe-side `boot/cmdline.txt` so it boots from its own root partition (#55).
+///
+/// Without this, the NVMe's `/boot/cmdline.txt` still contains whatever the
+/// tarball default was (e.g. `root=/dev/mmcblk0p2`), which would cause a boot
+/// loop if the Pi ever loads the NVMe's boot partition directly.
+async fn configure_nvme_boot_cmdline(mount_root: &Path, nvme_root_device: &str) -> Result<()> {
+    tracing::info!("Writing NVMe-side boot/cmdline.txt");
 
-    if current.trim() != new_cmdline.trim() {
-        // Backup original
-        let backup_path = cmdline_path.with_extension("txt.bak");
-        if !backup_path.exists() {
-            tokio::fs::write(backup_path, &current).await.map_err(|e| {
-                BeaconError::Provisioning(format!(
-                    "Failed to backup {}: {}",
-                    cmdline_path.display(),
-                    e
-                ))
-            })?;
-            tracing::info!("  Backed up original cmdline.txt");
-        }
+    let partuuid = get_partuuid(nvme_root_device).await?;
+    tracing::info!("  NVMe root PARTUUID: {}", partuuid);
 
-        // Write new cmdline
-        tokio::fs::write(cmdline_path, new_cmdline)
-            .await
-            .map_err(|e| {
-                BeaconError::Provisioning(format!(
-                    "Failed to write {}: {}",
-                    cmdline_path.display(),
-                    e
-                ))
-            })?;
-
-        tracing::info!("  New cmdline: {}", new_cmdline.trim());
-    } else {
-        tracing::info!("  cmdline.txt already configured for NVMe boot");
+    let nvme_cmdline = mount_root.join("boot/cmdline.txt");
+    // Ensure the boot directory exists on the NVMe target
+    if let Some(parent) = nvme_cmdline.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            BeaconError::Provisioning(format!("Failed to create {}: {}", parent.display(), e))
+        })?;
     }
 
-    tracing::info!("✅ Boot configured for NVMe root");
+    write_cmdline(&partuuid, &nvme_cmdline).await?;
+
+    tracing::info!("✅ NVMe-side boot/cmdline.txt written");
+    Ok(())
+}
+
+/// Set up /music directory and required subdirectories for the mdma user (#60).
+///
+/// mdma-library crashes on startup if `/music/by-artist` doesn't exist and the
+/// mdma user can't create it (because `/music` is root-owned). This function
+/// creates the expected layout and sets ownership to `mdma:mdma`.
+async fn setup_music_directory(mount_root: &Path) -> Result<()> {
+    tracing::info!("Setting up /music directory ownership for mdma user");
+
+    let subdirs = ["music/downloads", "music/inbox", "music/by-artist"];
+    for subdir in &subdirs {
+        let path = mount_root.join(subdir);
+        tokio::fs::create_dir_all(&path).await.map_err(|e| {
+            BeaconError::Provisioning(format!("Failed to create {}: {}", path.display(), e))
+        })?;
+        tracing::info!("  Created {}", path.display());
+    }
+
+    // chown -R mdma:mdma /music (inside the target)
+    let output = Command::new("chroot")
+        .arg(mount_root)
+        .args(["chown", "-R", "mdma:mdma", "/music"])
+        .output()
+        .await
+        .map_err(|e| BeaconError::command_failed("chroot chown /music", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(BeaconError::Provisioning(format!(
+            "Failed to chown /music: {}",
+            stderr
+        )));
+    }
+
+    tracing::info!("✅ /music directory configured for mdma user");
+    Ok(())
+}
+
+/// Seed `/etc/mdma/bandcamp.conf` from the example file if not already present (#61).
+///
+/// The mdma-bandcamp package ships `bandcamp.conf.example`; the package's own
+/// INSTALL script (option b) copies it on `xbps-install`. However, when packages
+/// are installed with `-r <root>` the INSTALL script runs inside the chroot and
+/// may not be triggered correctly. This belt-and-suspenders copy ensures the conf
+/// always exists after provisioning, regardless of INSTALL hook execution.
+async fn seed_bandcamp_config(mount_root: &Path) -> Result<()> {
+    let conf_path = mount_root.join("etc/mdma/bandcamp.conf");
+    let example_path = mount_root.join("etc/mdma/bandcamp.conf.example");
+
+    if conf_path.exists() {
+        tracing::info!("  /etc/mdma/bandcamp.conf already exists — skipping seed");
+        return Ok(());
+    }
+
+    if !example_path.exists() {
+        tracing::error!(
+            "  /etc/mdma/bandcamp.conf.example not found — mdma-bandcamp package is missing or broken; bandcamp will not work"
+        );
+        return Err(BeaconError::Provisioning(
+            "/etc/mdma/bandcamp.conf.example not found — mdma-bandcamp package is missing or broken; bandcamp will not work".to_string(),
+        ));
+    }
+
+    // Ensure directory exists
+    let conf_dir = mount_root.join("etc/mdma");
+    tokio::fs::create_dir_all(&conf_dir).await.map_err(|e| {
+        BeaconError::Provisioning(format!("Failed to create {}: {}", conf_dir.display(), e))
+    })?;
+
+    tokio::fs::copy(&example_path, &conf_path)
+        .await
+        .map_err(|e| {
+            BeaconError::Provisioning(format!(
+                "Failed to copy bandcamp.conf.example to bandcamp.conf: {}",
+                e
+            ))
+        })?;
+
+    tracing::info!("✅ Seeded /etc/mdma/bandcamp.conf from example");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::TARGET_PACKAGES;
+    use super::{rewrite_cmdline, TARGET_PACKAGES};
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn target_packages_does_not_include_beacon() {
@@ -856,6 +1077,132 @@ mod tests {
         assert!(
             !TARGET_PACKAGES.contains(&"beacon"),
             "beacon should not be installed on the provisioned target"
+        );
+    }
+
+    // ── #54 / #55: cmdline rewrite helper ────────────────────────────────────
+
+    #[test]
+    fn rewrite_cmdline_replaces_root_partuuid() {
+        let input =
+            "console=serial0,115200 console=tty1 root=PARTUUID=77668be1-02 rootfstype=ext4 rootwait\n";
+        let out = rewrite_cmdline(input, "aabbccdd-01");
+        assert!(
+            out.contains("root=PARTUUID=aabbccdd-01"),
+            "expected new PARTUUID in output, got: {}",
+            out
+        );
+        // Old PARTUUID must be gone
+        assert!(
+            !out.contains("77668be1-02"),
+            "old PARTUUID should be removed, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn rewrite_cmdline_replaces_dev_path_root() {
+        // #55: NVMe-side cmdline had root=/dev/mmcblk0p2
+        let input =
+            "console=serial0,115200 console=tty1 root=/dev/mmcblk0p2 rootfstype=ext4 rootwait\n";
+        let out = rewrite_cmdline(input, "deadbeef-01");
+        assert!(
+            out.contains("root=PARTUUID=deadbeef-01"),
+            "expected PARTUUID root in output, got: {}",
+            out
+        );
+        assert!(
+            !out.contains("/dev/mmcblk0p2"),
+            "old root path should be removed, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn rewrite_cmdline_preserves_other_parameters() {
+        let input = "console=serial0,115200 console=tty1 root=PARTUUID=old-uuid rootfstype=ext4 rootwait quiet splash\n";
+        let out = rewrite_cmdline(input, "new-uuid");
+        for param in &[
+            "console=serial0,115200",
+            "console=tty1",
+            "rootfstype=ext4",
+            "rootwait",
+            "quiet",
+            "splash",
+        ] {
+            assert!(
+                out.contains(param),
+                "parameter '{}' missing from rewritten cmdline: {}",
+                param,
+                out
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_cmdline_empty_input_generates_default() {
+        let out = rewrite_cmdline("", "cafebabe-02");
+        assert!(
+            out.contains("root=PARTUUID=cafebabe-02"),
+            "expected PARTUUID in generated cmdline, got: {}",
+            out
+        );
+        assert!(out.ends_with('\n'), "cmdline should end with newline");
+    }
+
+    #[test]
+    fn rewrite_cmdline_always_ends_with_newline() {
+        let out = rewrite_cmdline("console=tty1 root=PARTUUID=x rootfstype=ext4 rootwait", "y");
+        assert!(out.ends_with('\n'));
+    }
+
+    // ── #62: authorized_keys permissions ─────────────────────────────────────
+
+    #[test]
+    fn authorized_keys_written_with_mode_0600() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ssh_dir = dir.path().join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).expect("create .ssh");
+
+        // Simulate umask 0o002 by writing with default OpenOptions (no explicit mode)
+        let auth_keys = ssh_dir.join("authorized_keys");
+        std::fs::write(&auth_keys, "ssh-ed25519 AAAA test\n").expect("write");
+
+        // Apply the same explicit permission set that setup_ssh_for_admin now does
+        std::fs::set_permissions(&auth_keys, std::fs::Permissions::from_mode(0o600))
+            .expect("set perms");
+
+        let mode = std::fs::metadata(&auth_keys)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        // Mask off file-type bits — we only care about the permission bits
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "authorized_keys should be 0o600, got {:o}",
+            mode & 0o777
+        );
+    }
+
+    #[test]
+    fn ssh_dir_written_with_mode_0700() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ssh_dir = dir.path().join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).expect("create .ssh");
+
+        std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("set perms");
+
+        let mode = std::fs::metadata(&ssh_dir)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            ".ssh should be 0o700, got {:o}",
+            mode & 0o777
         );
     }
 }
