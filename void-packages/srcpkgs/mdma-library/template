@@ -1,6 +1,6 @@
 # Template file for mdma-library package
 pkgname=mdma-library
-version=0.15.2
+version=0.15.3
 revision=1
 archs="aarch64"
 build_style=cargo

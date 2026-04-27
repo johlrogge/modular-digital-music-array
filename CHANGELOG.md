@@ -4,6 +4,22 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.15.3] — 2026-04-27
+
+### Beacon / Provisioning
+
+- Stage 3 false-skip after `wipefs` fixed — partition detection now uses `blkid` instead of `lsblk` (#53).
+- SD and NVMe `cmdline.txt` both now reference the NVMe partition by PARTUUID (#54, #55).
+- `/music` subdirectories created and chowned during provisioning (#60).
+- `bandcamp.conf` seeded from `.example` on first boot (#61).
+- `authorized_keys` written with 0600 permissions — was silently rejected by OpenSSH at 0664 (#62).
+
+### Logging
+
+- Services write logs to disk via `svlogd`. Beacon UI tails the on-disk log rather than the process stream. New `/logs` page lists rotated log files.
+
+---
+
 ## [0.14.0] — 2026-04-21
 
 ### Console
