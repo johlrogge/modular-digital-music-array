@@ -1,18 +1,9 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Welcome to MDMA</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+{% extends "base.html" %}
 
+{% block title %}Welcome to MDMA{% endblock %}
+
+{% block style %}
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
             display: flex;
@@ -166,9 +157,9 @@
             font-size: 0.85em;
             margin-top: 8px;
         }
-    </style>
-</head>
-<body>
+{% endblock %}
+
+{% block content %}
     <div class="container">
         <h1>Welcome to MDMA</h1>
         <p class="subtitle">Modular Distributed Music Architecture</p>
@@ -213,6 +204,9 @@
                 Version: <strong>{{ version }}</strong><br>
                 <span style="font-size: 0.9em; color: #6c757d;">Built: {{ build_time }}</span>
             </p>
+            <p class="dev-hint" style="margin-top: 8px;">
+                <a href="/logs" style="color: #856404;">📋 View beacon logs</a>
+            </p>
         </div>
 
         <form action="/provision" method="post">
@@ -252,5 +246,4 @@
             <button type="submit">Provision System</button>
         </form>
     </div>
-</body>
-</html>
+{% endblock %}

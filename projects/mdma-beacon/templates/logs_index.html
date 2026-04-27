@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+
+{% block title %}Beacon Logs{% endblock %}
+
+{% block style %}
+        body {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: flex-start;
+            justify-content: center;
+            padding: 40px 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 700px;
+            width: 100%;
+            padding: 40px;
+        }
+        h1 { color: #2c3e50; margin-bottom: 8px; font-size: 2em; }
+        .subtitle { color: #7f8c8d; margin-bottom: 30px; font-size: 0.9em; }
+        .back-link { display: inline-block; color: #667eea; text-decoration: none; margin-bottom: 20px; font-size: 0.9em; }
+        .back-link:hover { text-decoration: underline; }
+        table { width: 100%; border-collapse: collapse; }
+        thead tr { background: #f8f9fa; }
+        th {
+            text-align: left;
+            padding: 10px 12px;
+            color: #34495e;
+            font-size: 0.9em;
+            font-weight: 600;
+            border-bottom: 2px solid #e0e0e0;
+        }
+        td { padding: 10px 12px; color: #2c3e50; border-bottom: 1px solid #f0f0f0; font-size: 0.9em; }
+        tr:last-child td { border-bottom: none; }
+        tr:hover td { background: #f8f9fa; }
+        a.file-link { color: #667eea; text-decoration: none; font-family: 'Courier New', monospace; }
+        a.file-link:hover { text-decoration: underline; }
+        .empty { color: #7f8c8d; font-style: italic; padding: 20px 0; }
+{% endblock %}
+
+{% block content %}
+    <div class="container">
+        <a class="back-link" href="/">&larr; Back to home</a>
+        <h1>Beacon Logs</h1>
+        <p class="subtitle">Log files written by svlogd in the beacon log directory</p>
+
+        {% if files.is_empty() %}
+        <p class="empty">No log files found.</p>
+        {% else %}
+        <table>
+            <thead>
+                <tr>
+                    <th>File</th>
+                    <th>Size</th>
+                    <th>Modified</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for file in files %}
+                <tr>
+                    <td><a class="file-link" href="/logs/{{ file.name }}">{{ file.name }}</a></td>
+                    <td>{{ file.size_bytes }} bytes</td>
+                    <td>{{ file.modified_display }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+    </div>
+{% endblock %}
