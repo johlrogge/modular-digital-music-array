@@ -1,6 +1,7 @@
 // bases/beacon/src/config.rs
 use crate::actions::ExecutionMode;
 use clap::Parser;
+use std::path::PathBuf;
 
 /// Beacon configuration
 #[derive(Debug, Clone)]
@@ -10,6 +11,9 @@ pub struct Config {
 
     /// Execution mode (DryRun or Apply)
     pub execution_mode: ExecutionMode,
+
+    /// Path to the live log file tailed by the SSE /stream endpoint
+    pub log_file: PathBuf,
 }
 
 /// MDMA Beacon - System Provisioning Tool
@@ -32,6 +36,13 @@ pub struct CliArgs {
     /// This is the DEFAULT mode. Only use --apply when you're ready to modify the system.
     #[arg(long, conflicts_with = "apply")]
     pub check: bool,
+
+    /// Path to the log file to tail for the /stream SSE endpoint.
+    ///
+    /// Defaults to /var/log/beacon/current (svlogd managed by runit).
+    /// Override in development with e.g. --log-file /tmp/beacon.log
+    #[arg(long, default_value = "/var/log/beacon/current")]
+    pub log_file: PathBuf,
 }
 
 impl Config {
@@ -56,6 +67,7 @@ impl Config {
         Self {
             port,
             execution_mode,
+            log_file: args.log_file,
         }
     }
 
@@ -70,14 +82,18 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
-    #[test]
-    fn default_is_check_mode() {
-        let args = CliArgs {
+    fn default_args() -> CliArgs {
+        CliArgs {
             port: None,
             apply: false,
             check: false,
-        };
-        let config = Config::from_args(args);
+            log_file: PathBuf::from("/var/log/beacon/current"),
+        }
+    }
+
+    #[test]
+    fn default_is_check_mode() {
+        let config = Config::from_args(default_args());
         assert_eq!(config.execution_mode, ExecutionMode::DryRun);
         assert_eq!(config.port, 8080);
         assert!(config.is_check_mode());
@@ -86,9 +102,8 @@ mod tests {
     #[test]
     fn apply_flag_enables_changes() {
         let args = CliArgs {
-            port: None,
             apply: true,
-            check: false,
+            ..default_args()
         };
         let config = Config::from_args(args);
         assert_eq!(config.execution_mode, ExecutionMode::Apply);
@@ -98,9 +113,8 @@ mod tests {
     #[test]
     fn explicit_check_flag() {
         let args = CliArgs {
-            port: None,
-            apply: false,
             check: true,
+            ..default_args()
         };
         let config = Config::from_args(args);
         assert_eq!(config.execution_mode, ExecutionMode::DryRun);
@@ -111,10 +125,25 @@ mod tests {
     fn custom_port_overrides_default() {
         let args = CliArgs {
             port: Some(3000),
-            apply: false,
-            check: false,
+            ..default_args()
         };
         let config = Config::from_args(args);
         assert_eq!(config.port, 3000);
+    }
+
+    #[test]
+    fn custom_log_file() {
+        let args = CliArgs {
+            log_file: PathBuf::from("/tmp/test.log"),
+            ..default_args()
+        };
+        let config = Config::from_args(args);
+        assert_eq!(config.log_file, PathBuf::from("/tmp/test.log"));
+    }
+
+    #[test]
+    fn default_log_file_is_svlogd_path() {
+        let config = Config::from_args(default_args());
+        assert_eq!(config.log_file, PathBuf::from("/var/log/beacon/current"));
     }
 }

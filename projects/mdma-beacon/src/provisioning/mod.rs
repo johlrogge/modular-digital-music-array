@@ -78,32 +78,32 @@ pub async fn build_provisioning_plan(
     Ok(plan)
 }
 
-/// Legacy API wrapper for server.rs compatibility
+/// Execute the provisioning pipeline, emitting progress via `tracing`.
 ///
-/// This function wraps the new plan-then-execute API to match the old
-/// `provision_system` signature that server.rs expects.
+/// The `log_tx` broadcast channel is intentionally absent — all progress is
+/// now emitted via `tracing::info!` / `tracing::error!` so it lands on disk
+/// through svlogd. Step 3 of the logging redesign will wire the UI's `/stream`
+/// endpoint to tail that file instead.
 pub async fn provision_system(
     config: ProvisionConfig,
     hardware: HardwareInfo,
     execution_mode: crate::actions::ExecutionMode,
-    log_tx: tokio::sync::broadcast::Sender<String>,
 ) -> Result<ProvisionedSystem> {
     use crate::actions::ExecutionProgress;
 
     // Build the plan
     let plan = build_provisioning_plan(config.clone(), hardware.clone(), execution_mode).await?;
 
-    // Show plan summary via logs (broadcast::send is sync, no .await)
-    let _ = log_tx.send("📋 Provisioning Plan:".to_string());
+    // Show plan summary
+    tracing::info!("📋 Provisioning Plan:");
     for summary in plan.summary() {
-        let _ = log_tx.send(format!("  {} - {}", summary.id, summary.description));
-        let _ = log_tx.send(format!("    {}", summary.details));
+        tracing::info!("  {} - {}", summary.id, summary.description);
+        tracing::info!("    {}", summary.details);
     }
-    let _ = log_tx.send("".to_string());
 
     // Check execution mode
     if execution_mode == crate::actions::ExecutionMode::DryRun {
-        let _ = log_tx.send("✅ Dry-run complete - no changes made".to_string());
+        tracing::info!("✅ Dry-run complete - no changes made");
 
         // In dry-run mode, build a mock ProvisionedSystem representing what WOULD be created
         return build_provisioned_system_from_hardware(&config, &hardware);
@@ -115,24 +115,24 @@ pub async fn provision_system(
     // Spawn execution task
     let execution_handle = tokio::spawn(async move { plan.execute(progress_tx).await });
 
-    // Forward progress to logs
+    // Forward progress to tracing
     while let Some(progress) = progress_rx.recv().await {
         match progress {
             ExecutionProgress::Started { id: _, description } => {
-                let _ = log_tx.send(format!("🚀 Starting: {}", description));
+                tracing::info!("🚀 Starting: {}", description);
             }
             ExecutionProgress::Progress { id: _, message } => {
-                let _ = log_tx.send(format!("   {}", message));
+                tracing::info!("   {}", message);
             }
             ExecutionProgress::Complete { id, summary } => {
                 if let Some(summary) = summary {
-                    let _ = log_tx.send(format!("✅ Complete: {}", summary));
+                    tracing::info!("✅ Complete: {}", summary);
                 } else {
-                    let _ = log_tx.send(format!("✅ Complete: {}", id));
+                    tracing::info!("✅ Complete: {}", id);
                 }
             }
             ExecutionProgress::Failed { id, error } => {
-                let _ = log_tx.send(format!("❌ Failed: {} - {}", id, error));
+                tracing::error!("❌ Failed: {} - {}", id, error);
             }
         }
     }
@@ -145,7 +145,7 @@ pub async fn provision_system(
         })?
         .map_err(|e| crate::error::BeaconError::Provisioning(format!("Execution failed: {}", e)))?;
 
-    let _ = log_tx.send("✅ Provisioning complete!".to_string());
+    tracing::info!("✅ Provisioning complete!");
 
     // TODO: In real implementation, need to return actual ProvisionedSystem
     // For now, since stages are stubs, build a mock result
