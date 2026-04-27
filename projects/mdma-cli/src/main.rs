@@ -3648,7 +3648,7 @@ fn handle_rekordbox_export(
         &download_tracks_only,
         &output_canon,
         &http,
-        |_track| format_owned.clone(),
+        |_track| format_owned,
     );
 
     let fail_count = results

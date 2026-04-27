@@ -171,52 +171,95 @@ impl Action<CompletedPartitionedDrives, FormattedSystem, FormattedSystem>
     }
 }
 
+/// Check whether a partition has a live filesystem signature using `blkid`.
+///
+/// Unlike `lsblk`, `blkid` reads the on-disk superblock directly and is not
+/// fooled by kernel caches that may still show a filesystem type after
+/// `wipefs -a` erased the signature. Returns `true` only when blkid reports
+/// a non-empty FSTYPE that matches the expected type AND the label matches.
+///
+/// Fix #53: the old lsblk-based check could return stale cached data
+/// immediately after `wipefs -a`, causing stage 3 to skip formatting a
+/// partition that was just wiped.
+async fn partition_is_formatted_correctly(partition: &super::types::Partition) -> bool {
+    use super::types::FilesystemType;
+    use tokio::process::Command;
+
+    let device = partition.device.as_str();
+    let expected_fs = match partition.filesystem_type() {
+        FilesystemType::Fat32 => "vfat",
+        FilesystemType::Ext4 => "ext4",
+    };
+    let expected_label = partition.label();
+    let expected_label = expected_label.as_str();
+
+    // --- Check filesystem type via blkid (reads on-disk superblock) ----------
+    let fs_output = Command::new("blkid")
+        .args(["-s", "TYPE", "-o", "value", device])
+        .output()
+        .await;
+
+    let actual_fs = match fs_output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => return false, // blkid failed or device absent — must format
+    };
+
+    if actual_fs != expected_fs {
+        tracing::debug!(
+            "{}: filesystem mismatch (expected {}, found '{}')",
+            device,
+            expected_fs,
+            actual_fs
+        );
+        return false;
+    }
+
+    // --- Check label via blkid -----------------------------------------------
+    let label_output = Command::new("blkid")
+        .args(["-s", "LABEL", "-o", "value", device])
+        .output()
+        .await;
+
+    let actual_label = match label_output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => return false,
+    };
+
+    if actual_label != expected_label {
+        tracing::debug!(
+            "{}: label mismatch (expected '{}', found '{}')",
+            device,
+            expected_label,
+            actual_label
+        );
+        return false;
+    }
+
+    true
+}
+
 async fn check_partitions_formatting_status(
     partitions: &[super::types::Partition],
 ) -> Result<Vec<super::types::PartitionFormatAction>> {
     use super::types::PartitionFormatAction;
-    use tokio::process::Command;
 
     let mut actions = Vec::new();
 
-    // Get current lsblk data once
-    let output = Command::new("lsblk")
-        .arg("-o")
-        .arg("NAME,FSTYPE,LABEL,SIZE")
-        .arg("--json")
-        .output()
-        .await
-        .map_err(|e| crate::error::BeaconError::command_failed("lsblk", e))?;
-
-    if !output.status.success() {
-        // Can't read lsblk - assume all need formatting
-        for partition in partitions {
-            actions.push(PartitionFormatAction::WillFormat {
-                device: partition.device.clone(),
-                label: partition.label(),
-                fs_type: partition.filesystem_type(),
-            });
-        }
-        return Ok(actions);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let lsblk_data: serde_json::Value =
-        serde_json::from_str(&stdout).map_err(|e| crate::error::BeaconError::Formatting {
-            partition: "planning".to_string(),
-            reason: format!("Failed to parse lsblk JSON: {}", e),
-        })?;
-
-    // Check each partition - use existing verify_partition function
     for partition in partitions {
         let device = partition.device.clone();
         let label = partition.label();
         let fs_type = partition.filesystem_type();
 
-        // Try to verify this specific partition
-        let is_formatted_correctly = verify_partition(&lsblk_data, partition).is_ok();
-
-        if is_formatted_correctly {
+        // Fix #53: use blkid to read the live on-disk superblock rather than
+        // lsblk, which may return kernel-cached state that doesn't reflect a
+        // recent `wipefs -a`.
+        if partition_is_formatted_correctly(partition).await {
+            tracing::info!(
+                "  {} already formatted as {} with label '{}' — skipping",
+                device,
+                fs_type,
+                label
+            );
             actions.push(PartitionFormatAction::AlreadyFormatted {
                 device,
                 label,
@@ -614,5 +657,57 @@ mod tests {
 
         let err = result.unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    // ── #53: wiped partition must not be classified as already-formatted ──────
+
+    /// Regression test for #53.
+    ///
+    /// `verify_partition_fields` is the leaf function that decides whether a
+    /// partition is correctly formatted. When `wipefs -a` erases the filesystem
+    /// signature, `blkid` returns an empty TYPE. Simulate that by passing JSON
+    /// with `"fstype": null` (what lsblk reported before the fix) and confirm
+    /// the function returns an error — meaning stage 3 would proceed to format.
+    #[test]
+    fn verify_partition_fields_null_fstype_triggers_format() {
+        // Simulate what lsblk reported for a wiped partition (fstype == null)
+        let partition_data = serde_json::json!({
+            "name": "nvme0n1p1",
+            "fstype": null,
+            "label": null,
+            "size": "400G"
+        });
+
+        let result = verify_partition_fields(&partition_data, "nvme0n1p1", "ext4", "music");
+
+        assert!(
+            result.is_err(),
+            "A wiped partition (null fstype) should NOT be classified as already-formatted"
+        );
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Filesystem type mismatch"),
+            "Expected fstype mismatch error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn verify_partition_fields_empty_fstype_triggers_format() {
+        // blkid returns empty string when partition has no FS signature
+        let partition_data = serde_json::json!({
+            "name": "nvme0n1p1",
+            "fstype": "",
+            "label": "",
+            "size": "400G"
+        });
+
+        let result = verify_partition_fields(&partition_data, "nvme0n1p1", "ext4", "music");
+
+        assert!(
+            result.is_err(),
+            "A partition with empty fstype should NOT be classified as already-formatted"
+        );
     }
 }

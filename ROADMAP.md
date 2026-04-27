@@ -678,6 +678,8 @@ Unix pipes.
 
 ## Update History
 
+- **2026-04-27 (v0.15.3):** Beacon provisioning fixes: stage 3 false-skip resolved (`blkid` replaces `lsblk`), `cmdline.txt` on both SD and NVMe references NVMe PARTUUID, `/music` subdirs created and chowned, `bandcamp.conf` seeded from `.example`, `authorized_keys` set to 0600 (was 0664, silently rejected by OpenSSH). Logging redesign: services log to disk via `svlogd`; beacon UI tails on-disk log; `/logs` page lists rotated logs.
+
 - **2026-04-21 (v0.14.0):** Console: queue playlists; reorder queue with ↑/↓. CLI: `--not` with stdin excludes, `--played never` filter, sort by `start`/`stop`. Library: `TrackInfo` exposes `last_started` and `last_stopped`.
 
 - **2026-04-19 (v0.13.0):** TUI: field-aware search grammar (`:artist`, `:bpm`, `:title`, `:added`, `:history`), live search on every keystroke, multi-pane tabs (`1`–`5` left / `6`–`0` right, nnn-style clone-on-empty), DJ shortcuts (`A` add-playing, `P` play-immediate, `d`/`p` cut-paste, `Shift+J`/`K` block move, `u` undo). Input-capturing panes no longer leak keys. Album drill-down sorts disc/track asc. Inbox ignores `._*` sidecar files. CLI: `mdma search --added -7` hyphen-prefix date. Playback engine: MP3 zero-padding bug fixed (no more roboty MP3), decoder moved to `std::thread`, mixer busy-spin and silence-pad both eliminated, output uses source native sample rate (44.1 kHz MP3 no longer upsampled), flush-on-track-change (~50 ms skip latency), `allowed-rates` PipeWire config. Library: `playlists/` auto-created on startup and before writes, retract-aware fact fold. Bandcamp: `mdma source check-item`, `check-updates [--apply]`, `resync` for on-demand stale detection.

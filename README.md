@@ -167,6 +167,24 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ---
 
+## What's new in 0.15.3
+
+Patch release — bug fixes only.
+
+### Beacon / Provisioning
+
+- Stage 3 no longer false-skips after `wipefs` — partition detection switched from `lsblk` to `blkid` (#53).
+- Both SD and NVMe `cmdline.txt` files now reference the NVMe root partition by PARTUUID (#54, #55).
+- `/music` subdirectories are created and chowned during provisioning so the library service starts cleanly (#60).
+- `bandcamp.conf` is seeded from `.example` on a fresh install (#61).
+- `authorized_keys` is written with 0600 permissions; the previous 0664 caused OpenSSH to silently reject it (#62).
+
+### Logging
+
+- Services write structured logs to disk via `svlogd`. The beacon web UI now tails the on-disk log. A new `/logs` page lists all rotated log files.
+
+---
+
 ## What's new in 0.14.0
 
 ### Console

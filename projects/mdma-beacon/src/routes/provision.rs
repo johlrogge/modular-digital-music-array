@@ -14,10 +14,10 @@ use axum::{
     Form,
 };
 use futures::stream::Stream;
+use futures::StreamExt;
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::time::Duration;
-use tokio::sync::broadcast;
 use tracing::info;
 
 use super::{spawn_with_start_signal, AppError};
@@ -29,6 +29,13 @@ struct IndexTemplate {
     hardware: HardwareInfo,
     version: String,
     build_time: &'static str,
+}
+
+/// Template for the provisioning progress page
+#[derive(Template)]
+#[template(path = "provision.html")]
+struct ProvisionPageTemplate {
+    is_dry_run: bool,
 }
 
 /// Provisioning form submission
@@ -68,33 +75,12 @@ pub async fn test_stream() -> Sse<impl Stream<Item = Result<Event, Infallible>>>
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-/// SSE endpoint for streaming provisioning logs
+/// SSE endpoint for streaming provisioning logs — tails the on-disk log file.
 pub async fn stream_events(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let mut rx = state.log_tx.subscribe();
-
-    let stream = async_stream::stream! {
-        // Send initial connection message
-        yield Ok(Event::default().data("Connected to provisioning stream"));
-
-        loop {
-            match rx.recv().await {
-                Ok(msg) => {
-                    yield Ok(Event::default().data(msg));
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    // Client fell behind, inform them
-                    yield Ok(Event::default().data(format!("⚠️  Skipped {} messages (too slow)", n)));
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    // Channel closed, end stream
-                    yield Ok(Event::default().data("Stream closed"));
-                    break;
-                }
-            }
-        }
-    };
+    let stream = crate::log_tail::follow(state.log_path.clone(), 5000)
+        .map(|line| Ok::<Event, Infallible>(Event::default().data(line)));
 
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
@@ -119,142 +105,24 @@ pub async fn provision(
 
     let hardware = state.hardware.lock().await.clone();
     let execution_mode = state.config.execution_mode;
-    let log_tx = state.log_tx.clone();
 
     // Spawn provisioning in background, waiting for start signal from JavaScript
-    spawn_with_start_signal(&state.provision_start, log_tx, move |log_tx| async move {
-        match provisioning::provision_system(config, hardware, execution_mode, log_tx.clone()).await
-        {
+    spawn_with_start_signal(&state.provision_start, move || async move {
+        match provisioning::provision_system(config, hardware, execution_mode).await {
             Ok(provisioned) => {
                 info!("Provisioning completed successfully {provisioned:?}");
             }
             Err(e) => {
                 tracing::error!("Provisioning failed: {}", e);
-                let _ = log_tx.send(format!("❌ Provisioning failed: {}", e));
             }
         }
     })
     .await;
 
-    let mode_notice = if execution_mode == crate::actions::ExecutionMode::DryRun {
-        r#"<div class='dev-notice'><strong>🔍 CHECK MODE:</strong> No changes were made to your system. Watch the log below. Run with <code>--apply</code> flag to actually provision.</div>"#
-    } else {
-        ""
-    };
-
-    let html = format!(
-        r#"
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Provisioning in Progress</title>
-        <meta charset="utf-8">
-        <style>
-            body {{ font-family: sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }}
-            .success {{ color: #27ae60; }}
-            .dev-notice {{ background: #fff3cd; border: 2px solid #ffc107; padding: 15px; margin: 20px 0; border-radius: 6px; }}
-            #log-container {{
-                background: #1e1e1e;
-                color: #d4d4d4;
-                font-family: 'Courier New', monospace;
-                padding: 20px;
-                border-radius: 6px;
-                margin: 20px 0;
-                height: 400px;
-                overflow-y: auto;
-                white-space: pre-wrap;
-                border: 2px solid #333;
-            }}
-            .log-line {{
-                margin: 4px 0;
-                padding: 2px 0;
-            }}
-            .status {{
-                margin: 10px 0;
-                padding: 10px;
-                background: #f0f0f0;
-                border-radius: 4px;
-                font-size: 0.9em;
-            }}
-        </style>
-    </head>
-    <body>
-        <h1 class="success">⏳ Provisioning in Progress</h1>
-        {mode_notice}
-
-        <div class="status" id="status">Connecting to stream...</div>
-
-        <p>Live log:</p>
-        <div id="log-container"></div>
-
-        <script>
-            const logContainer = document.getElementById('log-container');
-            const statusDiv = document.getElementById('status');
-
-            // Log to both console and container
-            function log(msg, isError) {{
-                console.log(msg);
-                const line = document.createElement('div');
-                line.className = 'log-line';
-                if (isError) {{
-                    line.style.color = '#ff6b6b';
-                }}
-                line.textContent = msg;
-                logContainer.appendChild(line);
-                logContainer.scrollTop = logContainer.scrollHeight;
-            }}
-
-            log('Initializing EventSource...');
-            statusDiv.textContent = 'Connecting...';
-
-            const eventSource = new EventSource('/stream');
-
-            eventSource.onopen = function() {{
-                console.log('EventSource opened');
-                statusDiv.textContent = '✓ Connected - Starting provisioning...';
-                statusDiv.style.background = '#d4edda';
-                log('✓ Connected to stream');
-
-                // Send start signal to server
-                fetch('/provision/start', {{ method: 'POST' }})
-                    .then(response => {{
-                        if (response.ok) {{
-                            console.log('Provisioning start signal sent');
-                            statusDiv.textContent = '✓ Provisioning started';
-                        }} else {{
-                            console.error('Failed to start provisioning');
-                            statusDiv.textContent = '✗ Failed to start';
-                            statusDiv.style.background = '#f8d7da';
-                        }}
-                    }})
-                    .catch(err => {{
-                        console.error('Error sending start signal:', err);
-                        log('✗ Error starting provisioning', true);
-                    }});
-            }};
-
-            eventSource.onmessage = function(event) {{
-                console.log('Message:', event.data);
-                log(event.data);
-            }};
-
-            eventSource.onerror = function(error) {{
-                console.error('EventSource error:', error);
-                console.log('ReadyState:', eventSource.readyState);
-                statusDiv.textContent = '✗ Connection error';
-                statusDiv.style.background = '#f8d7da';
-                log('✗ Connection error (see console)', true);
-
-                if (eventSource.readyState === EventSource.CLOSED) {{
-                    log('Stream closed', true);
-                }}
-            }};
-        </script>
-    </body>
-    </html>
-    "#,
-        mode_notice = mode_notice
-    );
+    let is_dry_run = execution_mode == crate::actions::ExecutionMode::DryRun;
+    let html = ProvisionPageTemplate { is_dry_run }
+        .render()
+        .map_err(|e| AppError::Template(e.to_string()))?;
 
     Ok(Html(html))
 }
