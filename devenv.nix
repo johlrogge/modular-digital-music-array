@@ -64,7 +64,7 @@ in
 
   # Pi service sockets — available in every devenv shell automatically
   # MDMA_NODE identifies the target Pi; gateway and event gateway are derived from it.
-  env.MDMA_NODE            = "mdma-909.local";
+  env.MDMA_NODE            = "mdma-johlyroger.local";
   env.MDMA_SSH_KEY         = "/home/johlrogge/.ssh/mdma_pi";
   env.METADEV_PROJECT      = "modular-digital-music-array";
 
