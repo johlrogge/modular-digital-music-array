@@ -1,6 +1,6 @@
 # Template file for mdma-acid package
 pkgname=mdma-acid
-version=0.15.3
+version=0.15.4
 revision=1
 archs="aarch64"
 build_style=cargo
@@ -15,7 +15,7 @@ distfiles="https://github.com/johlrogge/modular-digital-music-array/archive/v${v
 checksum="SKIP"
 
 do_build() {
-    cargo build --release --bin mdma-acid --target aarch64-unknown-linux-gnu
+    cargo polylith cargo --profile production build --release --bin mdma-acid --target aarch64-unknown-linux-gnu
 }
 
 do_install() {
