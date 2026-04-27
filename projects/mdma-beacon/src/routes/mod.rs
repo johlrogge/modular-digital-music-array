@@ -1,3 +1,4 @@
+pub(crate) mod logs;
 pub(crate) mod provision;
 pub(crate) mod update;
 
@@ -9,7 +10,7 @@ use axum::{
 };
 use std::future::Future;
 use std::sync::Arc;
-use tokio::sync::{broadcast, oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex};
 
 /// Application-level errors for HTTP handlers
 #[derive(Debug)]
@@ -63,14 +64,13 @@ impl IntoResponse for AppError {
 /// 2. Store the sender so the `/provision/start` endpoint can fire it.
 /// 3. Spawn a task that blocks until the signal arrives, then calls `f`.
 ///
-/// `f` receives the broadcast sender and is responsible for logging any
-/// errors it encounters (it returns `()`).
+/// All progress is emitted via `tracing::info!` / `error!` — the SSE endpoint
+/// tails the on-disk log file rather than a broadcast channel.
 pub(crate) async fn spawn_with_start_signal<F, Fut>(
     provision_start: &Arc<Mutex<Option<oneshot::Sender<()>>>>,
-    log_tx: broadcast::Sender<String>,
     f: F,
 ) where
-    F: FnOnce(broadcast::Sender<String>) -> Fut + Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     let (start_tx, start_rx) = oneshot::channel::<()>();
@@ -80,6 +80,6 @@ pub(crate) async fn spawn_with_start_signal<F, Fut>(
             tracing::error!("Start signal channel closed unexpectedly");
             return;
         }
-        f(log_tx).await;
+        f().await;
     });
 }

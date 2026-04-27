@@ -6,17 +6,7 @@
 
 use crate::error::{BeaconError, Result};
 use tokio::process::Command;
-use tokio::sync::broadcast;
 use tracing::{error, info};
-
-/// Send a log message to both tracing and the broadcast channel
-macro_rules! send_log {
-    ($tx:expr, $($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        tracing::info!("{}", msg);
-        let _ = $tx.send(msg);
-    }};
-}
 
 /// Update beacon from the package repository
 ///
@@ -25,14 +15,13 @@ macro_rules! send_log {
 /// 2. Updates the beacon package
 /// 3. Restarts the beacon service
 ///
-/// All output is streamed to the provided broadcast channel for real-time
-/// display in the web UI.
-pub async fn update_beacon_from_repo(log_tx: broadcast::Sender<String>) -> Result<()> {
-    send_log!(log_tx, "🔄 Starting beacon update...");
-    send_log!(log_tx, "");
+/// All output is emitted via tracing; svlogd writes it to disk and the SSE
+/// `/stream` endpoint tails the file.
+pub async fn update_beacon_from_repo() -> Result<()> {
+    info!("Starting beacon update...");
 
     // Step 1: Sync repository
-    send_log!(log_tx, "📦 Syncing package repository...");
+    info!("Syncing package repository...");
 
     let sync = Command::new("xbps-install")
         .arg("-S")
@@ -47,19 +36,18 @@ pub async fn update_beacon_from_repo(log_tx: broadcast::Sender<String>) -> Resul
             "Repository sync failed. stdout: {}, stderr: {}",
             stdout, stderr
         );
-        send_log!(log_tx, "❌ Repository sync failed!");
-        send_log!(log_tx, "   {}", stderr);
+        error!("Repository sync failed!");
+        error!("   {}", stderr);
         return Err(BeaconError::Installation(format!(
             "Repo sync failed: {}",
             stderr
         )));
     }
 
-    send_log!(log_tx, "✅ Repository synced");
-    send_log!(log_tx, "");
+    info!("Repository synced");
 
     // Step 2: Update xbps itself first (required before other updates)
-    send_log!(log_tx, "📦 Updating xbps package manager...");
+    info!("Updating xbps package manager...");
 
     let xbps_update = Command::new("xbps-install")
         .args(["-uy", "xbps"])
@@ -70,18 +58,16 @@ pub async fn update_beacon_from_repo(log_tx: broadcast::Sender<String>) -> Resul
     let xbps_stdout = String::from_utf8_lossy(&xbps_update.stdout);
     let xbps_stderr = String::from_utf8_lossy(&xbps_update.stderr);
 
-    if !xbps_update.status.success() && !xbps_stderr.contains("up to date") {
-        // Only fail if it's not already up to date
-        if !xbps_stdout.contains("up to date") {
-            error!("xbps update failed: {}", xbps_stderr);
-            send_log!(log_tx, "⚠️  xbps update issue: {}", xbps_stderr);
-        }
+    if !xbps_update.status.success()
+        && !xbps_stderr.contains("up to date")
+        && !xbps_stdout.contains("up to date")
+    {
+        error!("xbps update issue: {}", xbps_stderr);
     }
-    send_log!(log_tx, "✅ xbps updated");
-    send_log!(log_tx, "");
+    info!("xbps updated");
 
     // Step 3: Check what would be updated (dry run)
-    send_log!(log_tx, "🔍 Checking for beacon updates...");
+    info!("Checking for beacon updates...");
 
     let check = Command::new("xbps-install")
         .args(["-n", "beacon"])
@@ -93,14 +79,13 @@ pub async fn update_beacon_from_repo(log_tx: broadcast::Sender<String>) -> Resul
     info!("Update check output: {}", check_output);
 
     if check_output.contains("beacon") {
-        send_log!(log_tx, "   Update available!");
+        info!("Update available!");
     } else {
-        send_log!(log_tx, "   Already at latest version");
+        info!("Already at latest version");
     }
-    send_log!(log_tx, "");
 
     // Step 4: Update beacon package
-    send_log!(log_tx, "⬇️  Updating beacon package...");
+    info!("Updating beacon package...");
 
     let update = Command::new("xbps-install")
         .args(["-uy", "beacon"])
@@ -118,19 +103,17 @@ pub async fn update_beacon_from_repo(log_tx: broadcast::Sender<String>) -> Resul
 
     if !update.status.success() {
         error!("Beacon update failed");
-        send_log!(log_tx, "❌ Update failed!");
-        send_log!(log_tx, "   {}", update_stderr);
+        error!("Update failed: {}", update_stderr);
         return Err(BeaconError::Installation(format!(
             "Update failed: {}",
             update_stderr
         )));
     }
 
-    send_log!(log_tx, "✅ Beacon package updated");
-    send_log!(log_tx, "");
+    info!("Beacon package updated");
 
     // Step 5: Restart beacon service
-    send_log!(log_tx, "🔄 Restarting beacon service...");
+    info!("Restarting beacon service...");
 
     // Note: This will kill our own process, so we might not see the response
     let restart = Command::new("sv")
@@ -143,19 +126,16 @@ pub async fn update_beacon_from_repo(log_tx: broadcast::Sender<String>) -> Resul
     let restart_stderr = String::from_utf8_lossy(&restart.stderr);
 
     if !restart.status.success() {
-        // sv restart might return non-zero even on success, check output
         info!(
             "Restart command returned non-zero: stdout: {}, stderr: {}",
             restart_stdout, restart_stderr
         );
-        send_log!(log_tx, "⚠️  Restart command output: {}", restart_stderr);
+        info!("Restart command output: {}", restart_stderr);
     }
 
-    send_log!(log_tx, "");
-    send_log!(log_tx, "✅ Beacon updated successfully!");
-    send_log!(log_tx, "🔄 Service is restarting...");
-    send_log!(log_tx, "");
-    send_log!(log_tx, "🌟 Page will reload automatically in 3 seconds");
+    info!("Beacon updated successfully!");
+    info!("Service is restarting...");
+    info!("Page will reload automatically in 3 seconds");
 
     info!("Beacon update completed successfully");
 
