@@ -2,6 +2,7 @@
 use acid_protocol::{cursor_from_offset, FactEntry, StreamChunk};
 use chrono::Utc;
 use stainless_facts::{Fact, Operation};
+use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 use std::sync::Mutex;
 use thiserror::Error;
@@ -54,6 +55,28 @@ impl FactStorage {
             lines: chunk_lines,
             cursor: cursor_from_offset(new_offset),
         })
+    }
+
+    /// Pre-populate in-memory storage from an existing `facts.jsonl` file.
+    ///
+    /// Call once at startup, before serving any requests and before any `write_facts` call.
+    /// Pushes raw lines without re-parsing; the file format must match what `write_facts`
+    /// produces (array-format JSON).  Missing file is not an error — returns `Ok(0)`.
+    /// Returns the number of lines replayed.
+    pub fn replay_from_file(&self, path: &Path) -> io::Result<usize> {
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        let reader = BufReader::new(file);
+        let mut lines = self.lines.lock().unwrap();
+        let mut count = 0usize;
+        for line in reader.lines() {
+            lines.push(line?);
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Return the total number of stored lines (for cursor initialisation).
@@ -159,6 +182,35 @@ mod tests {
         }];
         let result = storage.write_facts("entity:1", &facts);
         assert!(result.is_err(), "expected error on bad source_json, got Ok");
+    }
+
+    #[test]
+    fn replay_from_file_loads_lines() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("facts.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for i in 0..100 {
+            writeln!(
+                f,
+                r#"["entity:{}","2024-01-01T00:00:00Z","val","src","Assert"]"#,
+                i
+            )
+            .unwrap();
+        }
+        drop(f);
+
+        let storage = FactStorage::new(dir.path()).unwrap();
+        let replayed = storage.replay_from_file(&path).unwrap();
+        assert_eq!(replayed, 100);
+        assert_eq!(storage.line_count(), 100);
+    }
+
+    #[test]
+    fn replay_from_file_missing_file_returns_ok_zero() {
+        let storage = FactStorage::new(Path::new("/tmp")).unwrap();
+        let result = storage.replay_from_file(Path::new("/tmp/nonexistent_facts_xyz.jsonl"));
+        assert_eq!(result.unwrap(), 0);
     }
 
     /// Verify that the memory backend serializes facts in array (tuple) format,

@@ -2,7 +2,7 @@
 use acid_protocol::{cursor_from_offset, FactEntry, StreamChunk};
 use chrono::Utc;
 use stainless_facts::{Fact, FactStreamWriter, Operation};
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -76,6 +76,13 @@ impl FactStorage {
             lines,
             cursor: cursor_from_offset(next_offset),
         })
+    }
+
+    /// No-op for the file-backed implementation — this backend reads directly
+    /// from disk on every `read_stream` call so there is nothing to replay.
+    /// Exists for API symmetry with `fact_store_memory`.
+    pub fn replay_from_file(&self, _path: &Path) -> io::Result<usize> {
+        Ok(0)
     }
 
     pub fn line_count(&self) -> usize {
@@ -154,6 +161,14 @@ mod tests {
 
         let chunk = storage.read_stream(1, 10).unwrap();
         assert_eq!(chunk.lines.len(), 2);
+    }
+
+    #[test]
+    fn replay_from_file_is_noop_returns_zero() {
+        let dir = temp_dir();
+        let storage = FactStorage::new(dir.path()).unwrap();
+        let result = storage.replay_from_file(&dir.path().join("facts.jsonl"));
+        assert_eq!(result.unwrap(), 0);
     }
 
     #[test]

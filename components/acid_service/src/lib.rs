@@ -7,6 +7,7 @@ use acid_protocol::{offset_from_cursor, AcidRequest, AcidResponse};
 use event_protocol::{acid_event_to_topic_message, AcidEvent};
 use fact_store::FactStorage;
 use nng::options::{Options, RecvTimeout, SendTimeout};
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
@@ -17,6 +18,8 @@ use thiserror::Error;
 pub enum ServiceError {
     #[error("NNG error: {0}")]
     Nng(#[from] nng::Error),
+    #[error("IO error: {0}")]
+    Io(#[from] io::Error),
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("storage error: {0}")]
@@ -47,6 +50,10 @@ pub fn start(
     rep.set_opt::<SendTimeout>(Some(Duration::from_secs(5)))?;
 
     let storage = FactStorage::new(metadata_dir)?;
+    let replayed = storage.replay_from_file(&metadata_dir.join("facts.jsonl"))?;
+    if replayed > 0 {
+        tracing::info!("ACID startup: replayed {replayed} facts");
+    }
     let storage = Arc::new(storage);
 
     let shutdown = Arc::new(());

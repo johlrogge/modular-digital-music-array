@@ -15,3 +15,6 @@ stainless-facts = { git = "https://github.com/johlrogge/stainless_facts", rev = 
 serde_json = "1.0"
 thiserror = "1.0"
 chrono = "0.4"
+
+[dev-dependencies]
+tempfile = { workspace = true }
