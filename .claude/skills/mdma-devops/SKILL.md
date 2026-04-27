@@ -863,6 +863,9 @@ For alternative configurations, adapt accordingly.
 6. **Real hardware wins** - 5 minutes on real Pi > hours debugging chroot
 7. **Image creation fragile** - Many ways for it to fail, always test on spare card
 8. **PiShrink essential** - 10x smaller images, 3x faster flashing
+9. **PipeWire needs session D-Bus for ALSA enumeration** - WirePlumber requires a D-Bus session bus to enumerate ALSA devices. Using the system bus (`unix:path=/run/dbus/system_bus_socket`) does NOT work. The `dbus-run-session` approach from Void's example forks, causing runit to lose PID tracking. Solution: `dbus-daemon --session --print-address --fork` starts a private session bus as a daemon, captures the address, then `exec chpst ... pipewire` so runit tracks pipewire directly.
+10. **Void's pipewire package doesn't install a system service** - `/usr/share/examples/sv/pipewire/` exists but is not installed to `/etc/sv/`. Stage 5 provisioning must create `/etc/sv/pipewire/run` with the corrected script (see `setup_pipewire_service` in `stage5_configure.rs`).
+11. **WirePlumber is launched by PipeWire** - via `context.exec` drop-in at `/etc/pipewire/pipewire.conf.d/10-wireplumber.conf` (symlinked from `/usr/share/examples/wireplumber/10-wireplumber.conf`). Not a separate runit service.
 
 ### What Works Reliably
 

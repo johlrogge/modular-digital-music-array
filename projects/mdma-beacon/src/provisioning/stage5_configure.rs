@@ -80,14 +80,17 @@ impl Action<ConfiguredFstab, ConfiguredSystem, ConfiguredSystem> for ConfigureSy
         // 8. Install MDMA packages (beacon, mdma-console, mdma-library)
         install_mdma_packages(mount_root).await?;
 
-        // 9. Enable services
+        // 9. Set up pipewire system service (copy example, fix run script for runit)
+        setup_pipewire_service(mount_root).await?;
+
+        // 10. Enable services
         enable_services(mount_root).await?;
 
-        // 10. Sync kernel from NVMe to SD card boot partition
+        // 11. Sync kernel from NVMe to SD card boot partition
         // (kept as safety measure even though both should have matching versions)
         sync_kernel_to_sd_boot(mount_root).await?;
 
-        // 11. Configure boot to use NVMe root
+        // 12. Configure boot to use NVMe root
         configure_boot().await?;
 
         tracing::info!("✅ Stage 5: System configuration complete");
@@ -479,20 +482,27 @@ async fn install_packages(mount_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// MDMA packages to install on the provisioned target.
+///
+/// `beacon` is intentionally excluded — it is the SD-card bootstrap and
+/// must not be installed as a runtime service on the provisioned NVMe target.
+const TARGET_PACKAGES: &[&str] = &[
+    "mdma-acid",
+    "mdma-audio",
+    "mdma-bandcamp",
+    "mdma-console",
+    "mdma-gateway",
+    "mdma-library",
+    "mdma-playback",
+];
+
 /// Install MDMA packages from MDMA repository
 ///
-/// Installs beacon, mdma-console, and mdma-library services.
+/// Installs all MDMA target services (excludes beacon, which is SD-card only).
 async fn install_mdma_packages(mount_root: &Path) -> Result<()> {
     tracing::info!("Installing MDMA packages from MDMA repository");
 
-    let packages = [
-        "beacon",
-        "mdma-console",
-        "mdma-library",
-        "mdma-playback",
-        "mdma-gateway",
-        "mdma-bandcamp",
-    ];
+    let packages = TARGET_PACKAGES;
 
     tracing::info!("  Packages: {}", packages.join(", "));
 
@@ -519,11 +529,114 @@ async fn install_mdma_packages(mount_root: &Path) -> Result<()> {
             "MDMA packages not installed (may not be published yet): {}",
             stderr
         );
-        tracing::warn!("You can install them manually later with: xbps-install beacon mdma-console mdma-library mdma-playback mdma-gateway mdma-bandcamp");
+        tracing::warn!(
+            "You can install them manually later with: xbps-install {}",
+            TARGET_PACKAGES.join(" ")
+        );
         return Ok(());
     }
 
     tracing::info!("✅ MDMA packages installed");
+    Ok(())
+}
+
+/// Set up pipewire as a system runit service.
+///
+/// Void's pipewire package ships a service example under
+/// `/usr/share/examples/sv/pipewire/` but does NOT install it to `/etc/sv/`.
+/// The example run script uses `dbus-run-session` which forks — the child
+/// pipewire ends up adopted by init (PID 1), so runit cannot track it.
+///
+/// Our run script instead:
+/// 1. Starts a private session D-Bus via `dbus-daemon --session --print-address --fork`
+/// 2. Exports DBUS_SESSION_BUS_ADDRESS so WirePlumber can connect to D-Bus
+///    (required for ALSA device enumeration)
+/// 3. `exec chpst ... pipewire` — runit tracks the pipewire PID directly
+///
+/// We also drop in the WirePlumber context.exec config so PipeWire launches
+/// WirePlumber automatically (the Void handbook way).
+async fn setup_pipewire_service(mount_root: &Path) -> Result<()> {
+    tracing::info!("Setting up pipewire system runit service");
+
+    let sv_pipewire = mount_root.join("etc/sv/pipewire");
+
+    // Create service directory
+    tokio::fs::create_dir_all(&sv_pipewire).await.map_err(|e| {
+        BeaconError::Provisioning(format!("Failed to create {}: {}", sv_pipewire.display(), e))
+    })?;
+
+    // Write fixed run script: private session D-Bus + direct exec (runit-trackable)
+    let run_script = r#"#!/bin/sh
+exec 2>&1
+! [ -d /run/pipewire ] && install -m 755 -g _pipewire -o _pipewire -d /run/pipewire
+umask 002
+export PIPEWIRE_RUNTIME_DIR=/run/pipewire
+export XDG_STATE_HOME=/var/lib
+# Start private session D-Bus so WirePlumber can enumerate ALSA devices.
+# --fork means dbus-daemon daemonizes; pipewire is exec'd directly so runit
+# tracks the pipewire PID (not a dbus-run-session wrapper that would fork it).
+export DBUS_SESSION_BUS_ADDRESS=$(dbus-daemon --session --print-address --fork 2>/dev/null)
+exec chpst -P -u _pipewire:_pipewire:audio:video pipewire
+"#;
+
+    let run_path = sv_pipewire.join("run");
+    tokio::fs::write(&run_path, run_script).await.map_err(|e| {
+        BeaconError::Provisioning(format!("Failed to write {}: {}", run_path.display(), e))
+    })?;
+
+    // Make run executable
+    let output = Command::new("chmod")
+        .args(["755", run_path.to_str().unwrap()])
+        .output()
+        .await
+        .map_err(|e| BeaconError::command_failed("chmod pipewire/run", e))?;
+
+    if !output.status.success() {
+        return Err(BeaconError::Provisioning(
+            "Failed to chmod pipewire run script".to_string(),
+        ));
+    }
+
+    // Set up WirePlumber drop-in: PipeWire launches WirePlumber via context.exec
+    let pipewire_conf_d = mount_root.join("etc/pipewire/pipewire.conf.d");
+    tokio::fs::create_dir_all(&pipewire_conf_d)
+        .await
+        .map_err(|e| {
+            BeaconError::Provisioning(format!(
+                "Failed to create {}: {}",
+                pipewire_conf_d.display(),
+                e
+            ))
+        })?;
+
+    // Symlink the wireplumber drop-in (Void handbook approach)
+    let dropin_link = pipewire_conf_d.join("10-wireplumber.conf");
+    let dropin_target = "/usr/share/examples/wireplumber/10-wireplumber.conf";
+
+    // Remove existing symlink/file if present
+    let _ = tokio::fs::remove_file(&dropin_link).await;
+
+    let output = Command::new("chroot")
+        .arg(mount_root)
+        .args([
+            "ln",
+            "-sf",
+            dropin_target,
+            "/etc/pipewire/pipewire.conf.d/10-wireplumber.conf",
+        ])
+        .output()
+        .await
+        .map_err(|e| BeaconError::command_failed("ln wireplumber dropin", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(BeaconError::Provisioning(format!(
+            "Failed to symlink wireplumber drop-in: {}",
+            stderr
+        )));
+    }
+
+    tracing::info!("✅ pipewire system service configured");
     Ok(())
 }
 
@@ -536,20 +649,25 @@ async fn enable_services(mount_root: &Path) -> Result<()> {
         "dhcpcd",
         "dbus",
         "avahi-daemon",
+        "pipewire",
+        "mdma-acid",
+        "mdma-audio",
+        "mdma-bandcamp",
         "mdma-console",
+        "mdma-gateway",
         "mdma-library",
         "mdma-playback",
-        "mdma-gateway",
-        "mdma-bandcamp",
     ];
 
     // Create log directories for MDMA services
     for log_dir in [
+        "mdma-acid",
+        "mdma-audio",
+        "mdma-bandcamp",
         "mdma-console",
+        "mdma-gateway",
         "mdma-library",
         "mdma-playback",
-        "mdma-gateway",
-        "mdma-bandcamp",
     ] {
         let log_path = mount_root.join(format!("var/log/{}", log_dir));
         tokio::fs::create_dir_all(&log_path).await.map_err(|e| {
@@ -725,4 +843,19 @@ async fn configure_boot() -> Result<()> {
 
     tracing::info!("✅ Boot configured for NVMe root");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TARGET_PACKAGES;
+
+    #[test]
+    fn target_packages_does_not_include_beacon() {
+        // beacon is the SD-card bootstrap, not a runtime target service.
+        // If this fails, someone re-added beacon to the install list.
+        assert!(
+            !TARGET_PACKAGES.contains(&"beacon"),
+            "beacon should not be installed on the provisioned target"
+        );
+    }
 }

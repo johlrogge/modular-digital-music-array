@@ -25,6 +25,12 @@ WORK_DIR="${WORK_DIR:-${INVOKING_HOME}/mdma-images}"
 MKLIVE_DIR="${WORK_DIR}/void-mklive"
 OUTPUT_DIR="${WORK_DIR}/output"
 
+# Local package repository (built by pkg-build-all / create-repository.sh).
+# Must be an absolute path because we cd into MKLIVE_DIR before calling mkplatformfs.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+LOCAL_REPO="${PROJECT_ROOT}/build/repository/aarch64"
+
 # Step 0: Clone/update void-mklive
 if [ ! -d "$MKLIVE_DIR" ]; then
     echo "Cloning void-mklive..."
@@ -92,10 +98,24 @@ echo "MDMA beacon configured for first boot"
 HOOKEOF
 chmod +x "$HOOK_SCRIPT"
 
+# Verify the local repo exists and is indexed before proceeding.
+if [ ! -f "${LOCAL_REPO}/aarch64-repodata" ]; then
+    echo "Error: local repo not found or not indexed at ${LOCAL_REPO}"
+    echo "Run 'just pkg-build-all' first (or 'just create-image' which does it automatically)."
+    exit 1
+fi
+
+# Clear any stale beacon binary from the void-mklive xbps cache so the local
+# freshly-built package is used instead of whatever was cached from a previous run.
+rm -f "${MKLIVE_DIR}/xbps-cache/aarch64/beacon-"*.xbps
+
 if [ -z "$PLATFORMFS_TAR" ]; then
     echo "Step 2/3: Building platform rootfs with beacon..."
+    echo "  Local repo : ${LOCAL_REPO}"
+    echo "  Remote repo: ${MDMA_REPO}"
     ./mkplatformfs.sh \
         -p "beacon dbus avahi cloud-guest-utils rpi5-kernel dracut uboot-mkimage" \
+        -r "$LOCAL_REPO" \
         -r "$MDMA_REPO" \
         -k "$HOOK_SCRIPT" \
         rpi-aarch64 \
