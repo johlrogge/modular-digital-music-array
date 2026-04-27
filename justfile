@@ -482,6 +482,22 @@ confirm-sudo:
 create-image: confirm-sudo pkg-build-all
     sudo ./scripts/image/create-sd-card-simple.sh
 
+# Clean cached image artifacts so the next create-image pulls fresh packages.
+# void-mklive caches the platformfs tarball and xbps packages, which can mask
+# updated beacon/MDMA packages from the local repo. Run this when you've
+# rebuilt packages but `beacon --version` on a freshly-flashed Pi still shows
+# the old hash.
+[group('image')]
+clean-image: confirm-sudo
+    @echo "Removing cached platformfs tarballs..."
+    sudo rm -fv ~/mdma-images/void-mklive/void-rpi-aarch64-PLATFORMFS-*.tar.xz
+    @echo "Removing cached MDMA packages from xbps cache..."
+    sudo rm -fv ~/mdma-images/void-mklive/xbps-cache/aarch64/beacon-*.xbps \
+                ~/mdma-images/void-mklive/xbps-cache/aarch64/beacon-*.xbps.sig2 \
+                ~/mdma-images/void-mklive/xbps-cache/aarch64/mdma-*.xbps \
+                ~/mdma-images/void-mklive/xbps-cache/aarch64/mdma-*.xbps.sig2
+    @echo "Image cache cleaned. Next 'just create-image' will rebuild platformfs."
+
 # Network scanning recipes for finding Raspberry Pi
 
 # Scan network for Raspberry Pi devices
@@ -565,6 +581,27 @@ pi-ssh:
 # SSH into the unprovisioned beacon Pi (welcome-to-mdma.local)
 pi-ssh-beacon:
     ssh -4 root@welcome-to-mdma.local
+
+# Authorize the mdma_pi SSH key on the beacon Pi (welcome-to-mdma.local)
+# Enables passwordless SSH access for MCP tools and scripts after first-time setup
+beacon-authorize-key:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    HOST="welcome-to-mdma.local"
+    PASS="${PI_PASSWORD:-voidlinux}"
+    PUBKEY="$HOME/.ssh/mdma_pi.pub"
+    if [ ! -f "$PUBKEY" ]; then
+        echo "ERROR: $PUBKEY not found" >&2
+        exit 1
+    fi
+    echo "Authorizing $PUBKEY on $HOST..."
+    sshpass -p "$PASS" ssh -4 -o StrictHostKeyChecking=no "root@${HOST}" \
+        "mkdir -p /root/.ssh && chmod 700 /root/.ssh"
+    sshpass -p "$PASS" scp -4 -o StrictHostKeyChecking=no "$PUBKEY" "root@${HOST}:/tmp/mdma_pi.pub"
+    sshpass -p "$PASS" ssh -4 -o StrictHostKeyChecking=no "root@${HOST}" \
+        "cat /tmp/mdma_pi.pub >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && rm /tmp/mdma_pi.pub"
+    echo "Key authorized. Testing connection..."
+    ssh -4 -i "$HOME/.ssh/mdma_pi" -o StrictHostKeyChecking=no "root@${HOST}" echo "Key auth works!"
 
 # Scan and auto-connect to first found Pi
 pi-connect:
