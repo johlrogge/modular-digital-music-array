@@ -27,6 +27,7 @@ optional = true
 
 [dev-dependencies]
 pretty_assertions = "1"
+acid-service = { workspace = true }
 
 [dependencies.playback-primitives]
 package = "playback-primitives"

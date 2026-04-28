@@ -16,6 +16,19 @@ pub enum StorageError {
     FactWrite(#[from] stainless_facts::WriteError),
 }
 
+/// Return true if the JSONL line belongs to `entity`.
+///
+/// Facts are stored in array format `[entity, ...]`. Parse just the first element.
+fn is_entity_match(line: &str, entity: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    v.get(0)
+        .and_then(|e| e.as_str())
+        .map(|e| e == entity)
+        .unwrap_or(false)
+}
+
 /// File-backed storage for the ACID service. Writes JSONL to `metadata_dir/facts.jsonl`.
 pub struct FactStorage {
     metadata_dir: PathBuf,
@@ -76,6 +89,52 @@ impl FactStorage {
             lines,
             cursor: cursor_from_offset(next_offset),
         })
+    }
+
+    /// Append retraction facts for `entity`. Returns the count of retractions written.
+    pub fn retract_facts(
+        &self,
+        entity: &str,
+        facts: &[FactEntry],
+    ) -> Result<usize, StorageError> {
+        let facts_path = self.metadata_dir.join("facts.jsonl");
+        let now = Utc::now();
+        let fact_structs: Vec<Fact<String, serde_json::Value, serde_json::Value>> = facts
+            .iter()
+            .map(|entry| {
+                let value: serde_json::Value = serde_json::from_str(&entry.value_json)?;
+                let source: serde_json::Value = serde_json::from_str(&entry.source_json)?;
+                Ok(Fact::new(
+                    entity.to_string(),
+                    value,
+                    now,
+                    source,
+                    Operation::Retract,
+                ))
+            })
+            .collect::<Result<_, serde_json::Error>>()?;
+        let count = fact_structs.len();
+        let mut writer = FactStreamWriter::open(&facts_path)?;
+        writer.write_batch(&fact_structs)?;
+        Ok(count)
+    }
+
+    /// Read all stored facts for a single entity. Returns matching JSONL lines.
+    pub fn read_entity(&self, entity: &str) -> Result<Vec<String>, StorageError> {
+        let facts_path = self.metadata_dir.join("facts.jsonl");
+        if !facts_path.exists() {
+            return Ok(vec![]);
+        }
+        let file = std::fs::File::open(&facts_path)?;
+        let reader = BufReader::new(file);
+        let mut matches = Vec::new();
+        for line_result in reader.lines() {
+            let line = line_result?;
+            if is_entity_match(&line, entity) {
+                matches.push(line);
+            }
+        }
+        Ok(matches)
     }
 
     /// No-op for the file-backed implementation — this backend reads directly
@@ -181,6 +240,103 @@ mod tests {
         let storage = FactStorage::new(dir.path()).unwrap();
         let result = storage.replay_from_file(&dir.path().join("facts.jsonl"));
         assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn retract_facts_appends_retract_operation() {
+        let dir = temp_dir();
+        let storage = FactStorage::new(dir.path()).unwrap();
+
+        let facts = vec![FactEntry {
+            value_json: r#"{"bpm": 128}"#.to_string(),
+            source_json: r#"{"source": "test"}"#.to_string(),
+        }];
+
+        let count = storage.retract_facts("track:test", &facts).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(storage.line_count(), 1);
+
+        // The stored line must carry "Retract" operation
+        let chunk = storage.read_stream(0, 100).unwrap();
+        assert_eq!(chunk.lines.len(), 1);
+        assert!(
+            chunk.lines[0].contains("Retract"),
+            "expected Retract in line, got: {}",
+            chunk.lines[0]
+        );
+    }
+
+    #[test]
+    fn read_entity_returns_matching_lines() {
+        let dir = temp_dir();
+        let storage = FactStorage::new(dir.path()).unwrap();
+
+        storage
+            .write_facts(
+                "entity:alpha",
+                &[FactEntry {
+                    value_json: r#""v1""#.to_string(),
+                    source_json: r#""s""#.to_string(),
+                }],
+            )
+            .unwrap();
+        storage
+            .write_facts(
+                "entity:beta",
+                &[FactEntry {
+                    value_json: r#""v2""#.to_string(),
+                    source_json: r#""s""#.to_string(),
+                }],
+            )
+            .unwrap();
+        storage
+            .write_facts(
+                "entity:alpha",
+                &[FactEntry {
+                    value_json: r#""v3""#.to_string(),
+                    source_json: r#""s""#.to_string(),
+                }],
+            )
+            .unwrap();
+
+        let lines = storage.read_entity("entity:alpha").unwrap();
+        assert_eq!(lines.len(), 2, "expected 2 lines for entity:alpha");
+        for line in &lines {
+            assert!(
+                line.contains("entity:alpha"),
+                "line should contain entity:alpha, got: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_entity_mixed_entities_filtered_correctly() {
+        let dir = temp_dir();
+        let storage = FactStorage::new(dir.path()).unwrap();
+
+        for i in 0..5 {
+            storage
+                .write_facts(
+                    &format!("entity:{i}"),
+                    &[FactEntry {
+                        value_json: format!("\"fact_{i}\""),
+                        source_json: r#""src""#.to_string(),
+                    }],
+                )
+                .unwrap();
+        }
+
+        let lines = storage.read_entity("entity:3").unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("entity:3"));
+    }
+
+    #[test]
+    fn read_entity_missing_file_returns_empty() {
+        let dir = temp_dir();
+        let storage = FactStorage::new(dir.path()).unwrap();
+        let lines = storage.read_entity("entity:none").unwrap();
+        assert!(lines.is_empty());
     }
 
     #[test]

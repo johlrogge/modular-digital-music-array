@@ -13,6 +13,19 @@ pub enum StorageError {
     Serialization(#[from] serde_json::Error),
 }
 
+/// Return true if the JSONL line belongs to `entity`.
+///
+/// Facts are stored in array format `[entity, ...]`. Parse just the first element.
+fn is_entity_match(line: &str, entity: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    v.get(0)
+        .and_then(|e| e.as_str())
+        .map(|e| e == entity)
+        .unwrap_or(false)
+}
+
 /// In-memory storage for the ACID service. Thread-safe.
 pub struct FactStorage {
     lines: Mutex<Vec<String>>,
@@ -40,6 +53,32 @@ impl FactStorage {
             lines.push(serde_json::to_string(&fact_struct)?);
         }
         Ok(count)
+    }
+
+    /// Append retraction facts for `entity`. Returns the count of retractions written.
+    pub fn retract_facts(&self, entity: &str, facts: &[FactEntry]) -> Result<usize, StorageError> {
+        let mut lines = self.lines.lock().unwrap();
+        let now = Utc::now();
+        let count = facts.len();
+        for fact in facts {
+            let value: serde_json::Value = serde_json::from_str(&fact.value_json)?;
+            let source: serde_json::Value = serde_json::from_str(&fact.source_json)?;
+            let fact_struct: Fact<String, serde_json::Value, serde_json::Value> =
+                Fact::new(entity.to_string(), value, now, source, Operation::Retract);
+            lines.push(serde_json::to_string(&fact_struct)?);
+        }
+        Ok(count)
+    }
+
+    /// Read all stored facts for a single entity. Returns matching JSONL lines.
+    pub fn read_entity(&self, entity: &str) -> Result<Vec<String>, StorageError> {
+        let lines = self.lines.lock().unwrap();
+        let matches = lines
+            .iter()
+            .filter(|line| is_entity_match(line, entity))
+            .cloned()
+            .collect();
+        Ok(matches)
     }
 
     /// Read a paginated chunk. `after_line` is a 0-based offset; `limit` is max lines.
@@ -222,6 +261,98 @@ mod tests {
         let storage = FactStorage::new(Path::new("/tmp")).unwrap();
         let result = storage.replay_from_file(Path::new("/tmp/nonexistent_facts_xyz.jsonl"));
         assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn retract_facts_appends_retract_operation() {
+        let storage = FactStorage::new(Path::new("/tmp")).unwrap();
+
+        let facts = vec![FactEntry {
+            value_json: r#"{"bpm": 128}"#.to_string(),
+            source_json: r#"{"source": "test"}"#.to_string(),
+        }];
+
+        let count = storage.retract_facts("entity:alpha", &facts).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(storage.line_count(), 1);
+
+        let chunk = storage.read_stream(0, 100).unwrap();
+        assert_eq!(chunk.lines.len(), 1);
+        assert!(
+            chunk.lines[0].contains("Retract"),
+            "expected Retract in line, got: {}",
+            chunk.lines[0]
+        );
+    }
+
+    #[test]
+    fn read_entity_returns_matching_lines() {
+        let storage = FactStorage::new(Path::new("/tmp")).unwrap();
+
+        storage
+            .write_facts(
+                "entity:alpha",
+                &[FactEntry {
+                    value_json: r#""v1""#.to_string(),
+                    source_json: r#""s""#.to_string(),
+                }],
+            )
+            .unwrap();
+        storage
+            .write_facts(
+                "entity:beta",
+                &[FactEntry {
+                    value_json: r#""v2""#.to_string(),
+                    source_json: r#""s""#.to_string(),
+                }],
+            )
+            .unwrap();
+        storage
+            .write_facts(
+                "entity:alpha",
+                &[FactEntry {
+                    value_json: r#""v3""#.to_string(),
+                    source_json: r#""s""#.to_string(),
+                }],
+            )
+            .unwrap();
+
+        let lines = storage.read_entity("entity:alpha").unwrap();
+        assert_eq!(lines.len(), 2, "expected 2 lines for entity:alpha");
+        for line in &lines {
+            assert!(
+                line.contains("entity:alpha"),
+                "line should contain entity:alpha, got: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_entity_mixed_entities_filtered_correctly() {
+        let storage = FactStorage::new(Path::new("/tmp")).unwrap();
+
+        for i in 0..5 {
+            storage
+                .write_facts(
+                    &format!("entity:{i}"),
+                    &[FactEntry {
+                        value_json: format!("\"fact_{i}\""),
+                        source_json: r#""src""#.to_string(),
+                    }],
+                )
+                .unwrap();
+        }
+
+        let lines = storage.read_entity("entity:3").unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("entity:3"));
+    }
+
+    #[test]
+    fn read_entity_empty_storage_returns_empty() {
+        let storage = FactStorage::new(Path::new("/tmp")).unwrap();
+        let lines = storage.read_entity("entity:none").unwrap();
+        assert!(lines.is_empty());
     }
 
     /// Verify that the memory backend serializes facts in array (tuple) format,
