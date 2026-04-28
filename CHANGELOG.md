@@ -4,6 +4,53 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.16.0] — 2026-04-27
+
+### Library — ACID is now sole reader and writer for all facts (#71)
+
+- All library fact reads and writes now go through ACID over IPC. The six direct `facts.jsonl` read sites and two direct write sites in `service.rs` are gone.
+- New ACID protocol operations: `RetractFacts` request, `ReadEntity` request, `RetractOk` response, `EntityFacts` response.
+- Library refactored at all call sites to use the new protocol operations — no more direct file access from the library service.
+- `IndexedTrackInfo` gained an `item_id` field for round-trip entity identity.
+- New `event_cursor` for incremental `TrackStarted`/`TrackStopped` reads — services can ask for facts since a known position without re-reading the full stream.
+- ADR-001 (`docs/adr/001-acid-sole-writer-of-facts-jsonl.md`) promoted to **Accepted**. The north star is locked.
+
+### Packaging
+
+- INSTALL scripts for all 8 services now create `/var/log/<svc>` at install time. Previously `mdma-audio` and `mdma-acid` were missing this step, causing log directory errors on first install.
+
+### Polylith
+
+- `dirs` and `socket2` added to `Polylith.toml`. Profile drift fix: `cargo polylith change-profile` no longer drops these dependencies.
+
+---
+
+## [0.15.5] — 2026-04-27
+
+### Library
+
+- Bootstrap reads every fact from ACID on startup — no file fallback. If ACID is unreachable or returns nothing, the service fails loudly instead of silently falling back to `facts.jsonl`.
+- Removed the cursor-on-disk dance: the library no longer persists a restart cursor to disk and no longer asks ACID for facts after a stale cursor.
+- ACID fails loudly on errors — no silent partial state on startup.
+
+### ACID
+
+- Logs its backend (`fact_store_memory` or `fact_store_file`) at startup so the active profile is visible in the service log.
+
+---
+
+## [0.15.4] — 2026-04-27
+
+### ACID
+
+- `replay_from_file` added to the in-memory ACID backend — enables seeding the in-memory store from an existing `facts.jsonl` for development and testing.
+
+### CI
+
+- Production profile wired into the CI build pipeline.
+
+---
+
 ## [0.15.3] — 2026-04-27
 
 ### Beacon / Provisioning

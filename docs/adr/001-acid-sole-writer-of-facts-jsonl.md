@@ -1,7 +1,7 @@
 # ADR-001: ACID is the sole writer and source of truth for facts.jsonl
 
 ## Status
-Proposed
+Accepted — v0.16.0
 
 ## Decision
 
@@ -93,17 +93,13 @@ not drift back into bypass territory.
   persist a dense local view and ask ACID only for the tail since a cursor.
   This ADR is what makes that mitigation safe: the cursor is meaningful
   only because no one else writes the file.
-- **Library writes need an ACID write API.** Today the library writes
-  retractions directly to `facts.jsonl`. Until #71 routes those writes
-  through ACID, the system is in violation of this ADR. This is known and
-  scheduled.
 
 ## Implementation Plan
 
-- **Task #71** — route all library writes (retractions, etc.) through an
-  ACID write API. Remove the six direct read sites in `service.rs` and the
-  two direct write sites. After #71, `facts.jsonl` is opened by exactly
-  one process: ACID.
+- **~~Task #71~~** — COMPLETE (v0.16.0). All six direct read sites and two
+  direct write sites in `service.rs` removed. New ACID protocol operations
+  (`RetractFacts`, `ReadEntity`, `RetractOk`, `EntityFacts`) added.
+  `facts.jsonl` is now opened by exactly one process: ACID.
 - **Follow-up: aggregate persistence per service.** Each service persists
   its own aggregate plus the cursor of the last fact it consumed. On
   restart, the service loads its aggregate locally and asks ACID for facts
