@@ -83,12 +83,23 @@ impl FactStorage {
     pub fn line_count(&self) -> usize {
         self.lines.lock().unwrap().len()
     }
+
+    /// Returns the name of this storage backend for logging purposes.
+    pub fn backend_name(&self) -> &'static str {
+        "memory"
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use acid_protocol::offset_from_cursor;
+
+    #[test]
+    fn backend_name_returns_memory() {
+        let storage = FactStorage::new(Path::new("/tmp")).unwrap();
+        assert_eq!(storage.backend_name(), "memory");
+    }
 
     #[test]
     fn new_creates_empty_storage() {

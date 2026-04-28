@@ -95,6 +95,11 @@ impl FactStorage {
             Err(_) => 0,
         }
     }
+
+    /// Returns the name of this storage backend for logging purposes.
+    pub fn backend_name(&self) -> &'static str {
+        "file"
+    }
 }
 
 #[cfg(test)]
@@ -104,6 +109,13 @@ mod tests {
 
     fn temp_dir() -> TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn backend_name_returns_file() {
+        let dir = temp_dir();
+        let storage = FactStorage::new(dir.path()).unwrap();
+        assert_eq!(storage.backend_name(), "file");
     }
 
     #[test]
