@@ -3,7 +3,7 @@
 //! - Root workspace: `fact_store_memory` (dev/test default)
 //! - Production builds: `fact_store_file` via `profiles/production.profile`
 
-use acid_protocol::{offset_from_cursor, AcidRequest, AcidResponse};
+use acid_protocol::{offset_from_cursor, AcidRequest, AcidResponse, EntityFacts};
 use event_protocol::{acid_event_to_topic_message, AcidEvent};
 use fact_store::FactStorage;
 use nng::options::{Options, RecvTimeout, SendTimeout};
@@ -89,17 +89,24 @@ pub fn start(
 
             let write_entity: Option<String> = match &request {
                 AcidRequest::WriteFacts { entity, .. } => Some(entity.clone()),
+                AcidRequest::RetractFacts { entity, .. } => Some(entity.clone()),
                 _ => None,
             };
 
             let response = handle_request(&request, &storage);
 
-            if let (Some(entity), AcidResponse::WriteOk { facts_written }) =
-                (&write_entity, &response)
-            {
-                line_count += facts_written;
-                let cursor = acid_protocol::cursor_from_offset(line_count);
-                publish_facts_written(&pub_sock, entity, *facts_written, &cursor);
+            match (&write_entity, &response) {
+                (Some(entity), AcidResponse::WriteOk { facts_written }) => {
+                    line_count += facts_written;
+                    let cursor = acid_protocol::cursor_from_offset(line_count);
+                    publish_facts_written(&pub_sock, entity, *facts_written, &cursor);
+                }
+                (Some(entity), AcidResponse::RetractOk { facts_retracted }) => {
+                    line_count += facts_retracted;
+                    let cursor = acid_protocol::cursor_from_offset(line_count);
+                    publish_facts_written(&pub_sock, entity, *facts_retracted, &cursor);
+                }
+                _ => {}
             }
 
             if let Ok(data) = serde_json::to_vec(&response) {
@@ -139,6 +146,26 @@ fn handle_request(request: &AcidRequest, storage: &FactStorage) -> AcidResponse 
                 }
             }
         }
+
+        AcidRequest::RetractFacts { entity, facts } => match storage.retract_facts(entity, facts) {
+            Ok(facts_retracted) => AcidResponse::RetractOk { facts_retracted },
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to retract facts");
+                AcidResponse::Error {
+                    message: e.to_string(),
+                }
+            }
+        },
+
+        AcidRequest::ReadEntity { entity } => match storage.read_entity(entity) {
+            Ok(lines) => AcidResponse::EntityFacts(EntityFacts { lines }),
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to read entity");
+                AcidResponse::Error {
+                    message: e.to_string(),
+                }
+            }
+        },
     }
 }
 

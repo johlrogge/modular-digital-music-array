@@ -55,6 +55,16 @@ pub struct LibraryService {
     content_hashes: Mutex<HashSet<String>>,
     /// Current position in the ACID fact stream (opaque cursor string).
     cursor: Mutex<Option<String>>,
+    /// Cursor for incremental reads in refresh_event_timestamps.
+    ///
+    /// Separate from `cursor` (used by spawn_fact_subscriber) so the two readers
+    /// don't fight over the same position.  Starts at None (full scan on first
+    /// call) and advances with each successful refresh.
+    ///
+    /// NOTE: retractions of TrackStarted/TrackStopped facts are not handled here.
+    /// The assumption is that such retractions never occur in production.  If they
+    /// become meaningful, a full scan from None would be required.
+    event_cursor: Mutex<Option<String>>,
     /// Address of the ACID request socket (used by background subscriber thread).
     acid_socket: String,
     /// Address of the ACID events pub/sub socket.
@@ -83,6 +93,7 @@ struct IndexedTrackInfo {
     last_started: Option<chrono::DateTime<chrono::Utc>>,
     last_stopped: Option<chrono::DateTime<chrono::Utc>>,
     added_at: Option<chrono::DateTime<chrono::Utc>>,
+    item_id: Option<String>,
 }
 
 impl IndexedTrackInfo {
@@ -107,6 +118,7 @@ impl IndexedTrackInfo {
             last_started: None,
             last_stopped: None,
             added_at: None,
+            item_id: None,
         }
     }
 }
@@ -177,6 +189,7 @@ fn apply_fact_to_track(
             MusicValue::AddedAt(dt) if entry.added_at.is_none() => {
                 entry.added_at = Some(*dt);
             }
+            MusicValue::ItemId(v) => entry.item_id = Some(v.clone()),
             _ => {}
         },
         Operation::Retract => {
@@ -210,6 +223,7 @@ fn apply_fact_to_track(
                         set.remove(entry.content_hash.as_str());
                     }
                 }
+                MusicValue::ItemId(_) => entry.item_id = None,
                 // TrackStarted/TrackStopped/FilePath/AddedAt retractions are not
                 // emitted in the current codebase; ignore silently.
                 _ => {}
@@ -295,6 +309,7 @@ fn is_value_still_asserted_for_fact_type(
         "MainGenre" => track.genre.as_deref() == Some(value),
         "StyleDescriptor" => track.styles.iter().any(|s| s == value),
         "Key" => track.key.as_deref() == Some(value),
+        "ItemId" => track.item_id.as_deref() == Some(value),
         _ => {
             // Conservative: cannot determine from IndexedTrackInfo fields alone.
             // Returning true means we never remove — safe but slightly imprecise
@@ -348,6 +363,7 @@ impl LibraryService {
             fact_index: Mutex::new(loaded.fact_index),
             content_hashes: Mutex::new(loaded.content_hashes),
             cursor: Mutex::new(final_cursor),
+            event_cursor: Mutex::new(None),
             acid_socket: acid_socket.to_string(),
             acid_events_socket: acid_events_socket.to_string(),
         };
@@ -1226,34 +1242,18 @@ impl LibraryService {
         }
     }
 
-    /// Scan the local facts file and return every ContentHash that has an
-    /// asserted `ItemId` fact equal to `item_id`.
+    /// Scan the in-memory track index and return every ContentHash whose
+    /// `item_id` field matches `item_id`.
     ///
-    /// Linear scan — acceptable at current library scale.
+    /// Linear scan over the in-memory index — acceptable at current library scale.
     fn content_hashes_for_item_id(&self, item_id: &str) -> Vec<ContentHash> {
-        use music_facts::FactSource;
-        use stainless_facts::FactStreamReader;
-
-        let facts_path = self.metadata_dir.join("facts.jsonl");
-        let reader: FactStreamReader<ContentHash, MusicValue, FactSource> =
-            match FactStreamReader::open(&facts_path) {
-                Ok(r) => r,
-                Err(_) => return vec![],
-            };
-
-        let mut result: Vec<ContentHash> = reader
-            .filter_map(|r| r.ok())
-            .filter(|f| {
-                f.operation() == stainless_facts::Operation::Assert
-                    && matches!(f.value(), MusicValue::ItemId(v) if v == item_id)
-            })
-            .map(|f| f.entity().clone())
-            .collect();
-
-        // De-duplicate (a track may have duplicate ItemId facts)
-        result.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
-        result.dedup_by(|a, b| a.as_str() == b.as_str());
-        result
+        self.tracks
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.item_id.as_deref() == Some(item_id))
+            .map(|t| t.content_hash.clone())
+            .collect()
     }
 
     /// Retract bandcamp-sourced metadata facts for all tracks belonging to
@@ -1264,23 +1264,17 @@ impl LibraryService {
     /// ItemId itself is intentionally NOT retracted — it is the stable identifier
     /// used to correlate tracks across resyncs.
     ///
-    /// Retractions are appended to the local facts.jsonl file and the in-memory
-    /// index is updated immediately.  Note: because the ACID service always writes
-    /// facts with `Operation::Assert`, the on-disk retraction will be re-applied on
-    /// next service restart only if the load path is updated to honour Retract.
-    /// The in-memory update is authoritative for the lifetime of this process.
+    /// Per-hash facts are read from ACID via `read_entity`, and retractions are
+    /// sent to ACID via `retract_music_facts`. The in-memory index is updated
+    /// immediately after a successful ACID write.
     fn retract_source_facts(&self, item_id: &str, source_name: &str) -> LibraryResponse {
-        use crate::fact_writer::FactWriter;
         use music_facts::FactSource;
-        use stainless_facts::FactStreamReader;
 
         let hashes = self.content_hashes_for_item_id(item_id);
 
         if hashes.is_empty() {
             return LibraryResponse::SourceFactsRetracted;
         }
-
-        let facts_path = self.metadata_dir.join("facts.jsonl");
 
         // For each hash, collect (MusicValue, FactSource) pairs to retract.
         // We only retract the attributes that bandcamp writes during ingest:
@@ -1290,24 +1284,28 @@ impl LibraryService {
         let mut all_retractions: Vec<(ContentHash, Vec<(MusicValue, FactSource)>)> = vec![];
 
         for hash in &hashes {
-            // Scan facts for this hash to find the currently asserted values
+            // Read facts for this hash from ACID to find currently asserted values
             // from the given source.
-            let reader: FactStreamReader<ContentHash, MusicValue, FactSource> =
-                match FactStreamReader::open(&facts_path) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "RetractSourceFacts: failed to open facts file");
-                        return LibraryResponse::Error(ProtocolError::Internal {
-                            message: format!("Failed to open facts file: {}", e),
-                        });
-                    }
-                };
+            let lines = match self.acid_client.read_entity(hash.as_str()) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!(error = %e, "RetractSourceFacts: failed to read entity from ACID");
+                    return LibraryResponse::Error(ProtocolError::Internal {
+                        message: format!("Failed to read entity from ACID: {}", e),
+                    });
+                }
+            };
 
-            let retractable: Vec<(MusicValue, FactSource)> = reader
-                .filter_map(|r| r.ok())
+            let retractable: Vec<(MusicValue, FactSource)> = lines
+                .iter()
+                .filter_map(|line| {
+                    serde_json::from_str::<
+                        stainless_facts::Fact<ContentHash, MusicValue, FactSource>,
+                    >(line)
+                    .ok()
+                })
                 .filter(|f| {
-                    f.entity().as_str() == hash.as_str()
-                        && f.operation() == stainless_facts::Operation::Assert
+                    f.operation() == stainless_facts::Operation::Assert
                         && origin_matches_source_name(&f.source().origin, source_name)
                         && is_retractable_bandcamp_attribute(f.value())
                 })
@@ -1323,26 +1321,18 @@ impl LibraryService {
             return LibraryResponse::SourceFactsRetracted;
         }
 
-        // Write retraction facts to the local facts file
-        let mut writer = match FactWriter::open(&facts_path) {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::warn!(error = %e, "RetractSourceFacts: failed to open fact writer");
-                return LibraryResponse::Error(ProtocolError::Internal {
-                    message: format!("Failed to open fact writer: {}", e),
-                });
-            }
-        };
-
+        // Send retraction facts to ACID
         let mut total_retracted = 0usize;
         for (hash, facts) in &all_retractions {
-            if let Err(e) = writer.write_track_retractions(hash, facts) {
-                tracing::warn!(error = %e, hash = %hash.as_str(), "Failed to write retractions");
-                return LibraryResponse::Error(ProtocolError::Internal {
-                    message: format!("Failed to write retractions: {}", e),
-                });
+            match self.acid_client.retract_music_facts(hash, facts) {
+                Ok(count) => total_retracted += count,
+                Err(e) => {
+                    tracing::warn!(error = %e, hash = %hash.as_str(), "Failed to retract facts via ACID");
+                    return LibraryResponse::Error(ProtocolError::Internal {
+                        message: format!("Failed to retract facts via ACID: {}", e),
+                    });
+                }
             }
-            total_retracted += facts.len();
         }
 
         tracing::info!(
@@ -1604,19 +1594,24 @@ impl LibraryService {
         hash: &ContentHash,
     ) -> Result<(ContentHash, Vec<(String, String)>), ProtocolError> {
         use music_facts::FactSource;
-        use stainless_facts::FactStreamReader;
 
         let full_hash = self.resolve_hash(hash)?;
-        let facts_path = self.metadata_dir.join("facts.jsonl");
 
-        let reader: FactStreamReader<ContentHash, MusicValue, FactSource> =
-            FactStreamReader::open(&facts_path).map_err(|e| ProtocolError::Internal {
-                message: format!("Failed to open facts file: {}", e),
+        let lines = self
+            .acid_client
+            .read_entity(full_hash.as_str())
+            .map_err(|e| ProtocolError::Internal {
+                message: format!("Failed to read entity from ACID: {}", e),
             })?;
 
-        let facts: Vec<_> = reader
-            .filter_map(|r| r.ok())
-            .filter(|f| f.entity().as_str() == full_hash.as_str())
+        let facts: Vec<_> = lines
+            .iter()
+            .filter_map(|line| {
+                serde_json::from_str::<stainless_facts::Fact<ContentHash, MusicValue, FactSource>>(
+                    line,
+                )
+                .ok()
+            })
             .map(|f| format_fact_for_display(f.value()))
             .collect();
 
@@ -1629,59 +1624,87 @@ impl LibraryService {
         }
     }
 
-    /// Re-read the facts file and update only `last_started` / `last_stopped` in the
-    /// in-memory index.  Called before any search that filters on started/stopped so
-    /// that facts written by external services (e.g. mdma-playback) after startup
-    /// are picked up without a full reload.
+    /// Read new TrackStarted/TrackStopped facts from the ACID stream (since the last
+    /// call) and update `last_started` / `last_stopped` in the in-memory index.
+    ///
+    /// Uses `event_cursor` (a separate cursor from the subscriber's `cursor`) so that
+    /// the background fact subscriber and this refresh path don't interfere with each
+    /// other's read position.
+    ///
+    /// On the first call after a service restart, `event_cursor` is None so the full
+    /// stream is scanned.  Subsequent calls only read new facts appended since the
+    /// previous refresh (incremental / delta reads).
+    ///
+    /// NOTE: retractions of TrackStarted/TrackStopped are not handled.  The assumption
+    /// is that such retractions never occur in production.  If they become meaningful a
+    /// full scan from cursor=None would be required instead of the incremental approach.
     fn refresh_event_timestamps(&self) {
-        use music_facts::FactSource;
-        use stainless_facts::FactStreamReader;
+        const PAGE_SIZE: usize = 10_000;
 
-        let facts_path = self.metadata_dir.join("facts.jsonl");
+        // Take the current cursor position before we start reading.
+        let start_cursor = self.event_cursor.lock().unwrap().clone();
+        let mut current_cursor = start_cursor;
 
-        let reader: FactStreamReader<ContentHash, MusicValue, FactSource> =
-            match FactStreamReader::open(&facts_path) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(
-                        "refresh_event_timestamps: failed to open facts file: {:?}",
-                        e
-                    );
-                    return;
-                }
-            };
-
-        // Collect the most-recent TrackStarted/TrackStopped timestamp per content hash
+        // Collect the most-recent TrackStarted/TrackStopped timestamp per content hash.
+        // We build an intermediate map so the tracks lock is held only at the end.
         let mut last_started: HashMap<String, Option<chrono::DateTime<chrono::Utc>>> =
             HashMap::new();
         let mut last_stopped: HashMap<String, Option<chrono::DateTime<chrono::Utc>>> =
             HashMap::new();
 
-        for fact_result in reader {
-            let fact = match fact_result {
-                Ok(f) => f,
-                Err(_) => continue,
+        loop {
+            let chunk = match self
+                .acid_client
+                .read_stream(current_cursor.clone(), PAGE_SIZE)
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "refresh_event_timestamps: ACID read failed, skipping refresh"
+                    );
+                    return;
+                }
             };
 
-            let entity = fact.entity().as_str().to_owned();
-            match fact.value() {
-                MusicValue::TrackStarted(_) => {
-                    update_if_more_recent(
-                        last_started.entry(entity).or_insert(None),
-                        *fact.timestamp(),
-                    );
+            for line in &chunk.lines {
+                let fact = match serde_json::from_str::<
+                    stainless_facts::Fact<ContentHash, MusicValue, music_facts::FactSource>,
+                >(line)
+                {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+
+                let entity = fact.entity().as_str().to_owned();
+                match fact.value() {
+                    MusicValue::TrackStarted(_) => {
+                        update_if_more_recent(
+                            last_started.entry(entity).or_insert(None),
+                            *fact.timestamp(),
+                        );
+                    }
+                    MusicValue::TrackStopped(_) => {
+                        update_if_more_recent(
+                            last_stopped.entry(entity).or_insert(None),
+                            *fact.timestamp(),
+                        );
+                    }
+                    _ => {}
                 }
-                MusicValue::TrackStopped(_) => {
-                    update_if_more_recent(
-                        last_stopped.entry(entity).or_insert(None),
-                        *fact.timestamp(),
-                    );
-                }
-                _ => {}
+            }
+
+            let is_last_page = chunk.lines.len() < PAGE_SIZE;
+            current_cursor = Some(chunk.cursor);
+            if is_last_page {
+                break;
             }
         }
 
-        // Acquire the lock only after reading the file to avoid deadlock
+        // Advance the stored cursor so the next call only reads new facts.
+        *self.event_cursor.lock().unwrap() = current_cursor;
+
+        // Apply collected timestamps to the in-memory index.
         let mut tracks = self.tracks.lock().unwrap();
         for track in tracks.iter_mut() {
             let hash = track.content_hash.as_str();
@@ -1959,6 +1982,7 @@ impl LibraryService {
             let mut source_str = None;
             let mut track_number = None;
             let mut disc_number = None;
+            let mut item_id_str = None;
 
             for (value, _source) in &facts {
                 match value {
@@ -1975,6 +1999,7 @@ impl LibraryService {
                     MusicValue::Source(s) => source_str = Some(s.clone()),
                     MusicValue::TrackNumber(n) => track_number = Some(n.value()),
                     MusicValue::DiscNumber(n) => disc_number = Some(n.value()),
+                    MusicValue::ItemId(id) => item_id_str = Some(id.clone()),
                     _ => {}
                 }
             }
@@ -1999,6 +2024,7 @@ impl LibraryService {
                 last_started: None,
                 last_stopped: None,
                 added_at: None,
+                item_id: item_id_str,
             });
         }
 
@@ -2215,8 +2241,7 @@ mod tests {
             MusicValue::Title(Title::new("External Append Track")),
         )]);
 
-        let (service, metadata_dir) = make_service_with_facts(temp.path());
-        let facts_dest = metadata_dir.path().join("facts.jsonl");
+        let (service, _metadata_dir, facts_addr) = make_service_with_facts_and_addr(temp.path());
 
         let na_query = TrackQuery {
             started: Some(DateQuery::NA),
@@ -2227,28 +2252,27 @@ mod tests {
         let before = service.search_tracks(&na_query);
         assert_eq!(before.len(), 1, "track should appear before play event");
 
-        // Simulate playback service appending a TrackStarted fact after startup
-        // refresh_event_timestamps() reads from facts.jsonl directly, so this
-        // external append will be picked up at next search_tracks call.
+        // Simulate playback service writing a TrackStarted fact via ACID after startup.
+        // refresh_event_timestamps() now reads from the ACID stream incrementally, so
+        // this write will be picked up on the next search_tracks call.
         let source = music_facts::FactSource::new(
             "test-playback",
             "1.0.0",
             music_facts::FactOrigin::Unknown,
         );
-        let mut writer = FactWriter::open(&facts_dest).unwrap();
-        writer
-            .write_track_facts(
+        let external_client = AcidClient::connect(&facts_addr).unwrap();
+        external_client
+            .write_music_facts(
                 &hash,
                 &[(MusicValue::TrackStarted(StartReason::OnRequest), source)],
             )
             .unwrap();
-        drop(writer);
 
         // After: track now has play history → NA query should return 0
         let after = service.search_tracks(&na_query);
         assert!(
             after.is_empty(),
-            "DateQuery::NA should exclude track after TrackStarted fact appended externally"
+            "DateQuery::NA should exclude track after TrackStarted fact written to ACID"
         );
     }
 
@@ -3021,6 +3045,135 @@ mod tests {
         (service, metadata_dir)
     }
 
+    /// Like `make_service_with_facts` but also returns the ACID request socket address
+    /// so the caller can connect an external AcidClient and write additional facts.
+    fn make_service_with_facts_and_addr(
+        facts_file: &std::path::Path,
+    ) -> (LibraryService, tempfile::TempDir, String) {
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+        let facts_dest = metadata_dir.path().join("facts.jsonl");
+        std::fs::copy(facts_file, &facts_dest).unwrap();
+
+        let id = ACID_SERVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id();
+        let facts_addr = format!("ipc:///tmp/mdma-test-acid-facts-{}-{}.sock", pid, id);
+        let events_addr = format!("ipc:///tmp/mdma-test-acid-events-{}-{}.sock", pid, id);
+        let rep = nng::Socket::new(nng::Protocol::Rep0).expect("rep socket");
+        rep.listen(&facts_addr).expect("rep listen");
+        let pub_sock = nng::Socket::new(nng::Protocol::Pub0).expect("pub socket");
+        pub_sock.listen(&events_addr).expect("pub listen");
+        let handle = acid_service::start(rep, pub_sock, metadata_dir.path())
+            .expect("failed to start acid server");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let service = LibraryService::new_with_events(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+            &facts_addr,
+            &events_addr,
+        )
+        .unwrap();
+        Box::leak(Box::new(handle));
+        (service, metadata_dir, facts_addr)
+    }
+
+    /// Verify that refresh_event_timestamps advances the event_cursor so that a
+    /// second call does not double-process already-seen facts.
+    ///
+    /// Step 1: Write TrackStarted for hash_a, call search (triggers refresh).
+    ///         hash_a should appear with last_started set.
+    /// Step 2: Write TrackStarted for hash_b, call search again.
+    ///         hash_b should now appear with last_started set.
+    ///         hash_a's last_started must remain unchanged (cursor didn't go back).
+    #[test]
+    fn refresh_event_timestamps_incremental_cursor() {
+        use library_search::{query::DateQuery, TrackQuery};
+
+        let hash_a = ContentHash::new("sha256:cursor_test_a");
+        let hash_b = ContentHash::new("sha256:cursor_test_b");
+
+        // Bootstrap with two tracks, neither played
+        let temp = write_facts_file(&[
+            (hash_a.clone(), MusicValue::Title(Title::new("Track A"))),
+            (hash_b.clone(), MusicValue::Title(Title::new("Track B"))),
+        ]);
+
+        let (service, _metadata_dir, facts_addr) = make_service_with_facts_and_addr(temp.path());
+
+        let not_played_query = TrackQuery {
+            started: Some(DateQuery::NA),
+            ..Default::default()
+        };
+
+        // Both tracks are unplayed
+        let before = service.search_tracks(&not_played_query);
+        assert_eq!(before.len(), 2, "both tracks should be unplayed initially");
+
+        let source = FactSource::new("test-playback", "1.0.0", FactOrigin::Unknown);
+        let external_client = AcidClient::connect(&facts_addr).unwrap();
+
+        // Step 1: play hash_a
+        external_client
+            .write_music_facts(
+                &hash_a,
+                &[(
+                    MusicValue::TrackStarted(StartReason::OnRequest),
+                    source.clone(),
+                )],
+            )
+            .unwrap();
+
+        let after_a = service.search_tracks(&not_played_query);
+        assert_eq!(
+            after_a.len(),
+            1,
+            "only hash_b should remain unplayed after hash_a is played"
+        );
+        assert_eq!(
+            after_a[0].content_hash, hash_b,
+            "the remaining unplayed track should be hash_b"
+        );
+
+        // Verify hash_a has last_started set
+        let tracks = service.tracks.lock().unwrap();
+        let a = tracks
+            .iter()
+            .find(|t| t.content_hash.as_str() == hash_a.as_str())
+            .unwrap();
+        let a_started = a.last_started;
+        drop(tracks);
+        assert!(
+            a_started.is_some(),
+            "hash_a must have last_started set after play"
+        );
+
+        // Step 2: play hash_b — cursor should have advanced, so hash_a is not re-processed
+        external_client
+            .write_music_facts(
+                &hash_b,
+                &[(MusicValue::TrackStarted(StartReason::OnRequest), source)],
+            )
+            .unwrap();
+
+        let after_b = service.search_tracks(&not_played_query);
+        assert!(
+            after_b.is_empty(),
+            "no unplayed tracks should remain after both are played"
+        );
+
+        // hash_a's last_started must be unchanged (cursor did not go back to re-read it)
+        let tracks = service.tracks.lock().unwrap();
+        let a_after = tracks
+            .iter()
+            .find(|t| t.content_hash.as_str() == hash_a.as_str())
+            .unwrap();
+        assert_eq!(
+            a_after.last_started, a_started,
+            "hash_a last_started must be identical after second refresh (cursor advanced)"
+        );
+    }
+
     #[test]
     fn retract_source_facts_removes_album_and_title_from_in_memory_track() {
         // Arrange: a track with ItemId, Album and Title written by "mdma-library"
@@ -3103,9 +3256,7 @@ mod tests {
     }
 
     #[test]
-    fn retract_source_facts_writes_retract_entries_to_facts_file() {
-        use stainless_facts::FactStreamReader;
-
+    fn retract_source_facts_writes_retract_entries_to_acid() {
         let hash = ContentHash::new("sha256:retractfile01");
         // Use Bandcamp origin + "bandcamp" source_name — matches production usage
         let source = FactSource::new("mdma-library", "0.0.0", FactOrigin::bandcamp(None));
@@ -3133,29 +3284,32 @@ mod tests {
             t
         };
 
-        let (service, metadata_dir) = make_service_with_facts(temp.path());
+        let (service, _metadata_dir, facts_addr) = make_service_with_facts_and_addr(temp.path());
 
         service.handle_request(LibraryRequest::RetractSourceFacts {
             item_id: item_id.to_string(),
             source_name: "bandcamp".to_string(),
         });
 
-        // Verify Retract entries appear in facts.jsonl
-        let facts_path = metadata_dir.path().join("facts.jsonl");
-        let reader: FactStreamReader<ContentHash, MusicValue, FactSource> =
-            FactStreamReader::open(&facts_path).unwrap();
+        // Verify Retract entries appear in ACID via read_entity
+        let verifier = AcidClient::connect(&facts_addr).unwrap();
+        let lines = verifier.read_entity(hash.as_str()).unwrap();
 
-        let retract_count = reader
-            .filter_map(|r| r.ok())
-            .filter(|f| {
-                f.entity().as_str() == hash.as_str()
-                    && f.operation() == stainless_facts::Operation::Retract
+        let retract_count = lines
+            .iter()
+            .filter(|line| {
+                serde_json::from_str::<stainless_facts::Fact<ContentHash, MusicValue, FactSource>>(
+                    line,
+                )
+                .ok()
+                .map(|f| f.operation() == stainless_facts::Operation::Retract)
+                .unwrap_or(false)
             })
             .count();
 
         assert!(
             retract_count > 0,
-            "at least one Retract entry should be written to facts.jsonl after RetractSourceFacts"
+            "at least one Retract entry should be in ACID after RetractSourceFacts"
         );
     }
 
@@ -3189,6 +3343,56 @@ mod tests {
             "expected SourceFactsRetracted even for unknown item_id, got {:?}",
             response
         );
+    }
+
+    // =========================================================================
+    // GetFacts tests
+    // =========================================================================
+
+    /// GetFacts must read from ACID, not the local facts file.
+    ///
+    /// Proof: write a fact directly into ACID (after service startup, bypassing the
+    /// file) then verify that GetFacts returns it.  The file-based reader would miss
+    /// this fact because it was never written to disk.
+    #[test]
+    fn get_facts_reads_from_acid_not_file() {
+        // Start service with an empty facts file (no tracks known)
+        let empty = NamedTempFile::new().unwrap();
+        let (service, _metadata_dir, facts_addr) = make_service_with_facts_and_addr(empty.path());
+
+        // Inject a fact directly into ACID (not via the file)
+        let hash = ContentHash::new("sha256:getfacts_acid_only");
+        let source = FactSource::new("test-injector", "0.0.0", FactOrigin::Unknown);
+        let external = AcidClient::connect(&facts_addr).unwrap();
+        external
+            .write_music_facts(
+                &hash,
+                &[(MusicValue::Title(Title::new("ACID Only Track")), source)],
+            )
+            .unwrap();
+
+        // Seed the in-memory tracks index so resolve_hash succeeds (it searches
+        // self.tracks, not content_hashes).  A minimal empty entry is sufficient.
+        service
+            .tracks
+            .lock()
+            .unwrap()
+            .push(IndexedTrackInfo::new_empty(hash.as_str().to_owned()));
+
+        // Now call GetFacts — implementation MUST read from ACID to find this fact
+        let response = service.handle_request(LibraryRequest::GetFacts { hash: hash.clone() });
+
+        match response {
+            LibraryResponse::Facts { hash: h, facts } => {
+                assert_eq!(h.as_str(), hash.as_str());
+                assert!(
+                    facts.iter().any(|(k, _)| k == "Title"),
+                    "expected a Title fact, got: {:?}",
+                    facts
+                );
+            }
+            other => panic!("expected LibraryResponse::Facts, got {:?}", other),
+        }
     }
 
     // =========================================================================
@@ -3675,6 +3879,113 @@ mod tests {
             }
             other => panic!("expected TrackCountForItemId(0), got {:?}", other),
         }
+    }
+
+    // =========================================================================
+    // content_hashes_for_item_id in-memory scan tests
+    // =========================================================================
+
+    /// content_hashes_for_item_id returns hashes of tracks with matching ItemId,
+    /// and does not return hashes whose ItemId differs.
+    #[test]
+    fn content_hashes_for_item_id_returns_matching_hashes() {
+        let hash_a = ContentHash::new("sha256:itemid_test_aaa");
+        let hash_b = ContentHash::new("sha256:itemid_test_bbb");
+        let hash_c = ContentHash::new("sha256:itemid_test_ccc");
+        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let target_item_id = "p_target_001";
+        let other_item_id = "p_other_002";
+
+        let temp = {
+            let t = NamedTempFile::new().unwrap();
+            let mut writer = FactWriter::open(t.path()).unwrap();
+            // hash_a and hash_b have target ItemId
+            writer
+                .write_track_facts(
+                    &hash_a,
+                    &[(
+                        MusicValue::ItemId(target_item_id.to_string()),
+                        source.clone(),
+                    )],
+                )
+                .unwrap();
+            writer
+                .write_track_facts(
+                    &hash_b,
+                    &[(
+                        MusicValue::ItemId(target_item_id.to_string()),
+                        source.clone(),
+                    )],
+                )
+                .unwrap();
+            // hash_c has a different ItemId
+            writer
+                .write_track_facts(
+                    &hash_c,
+                    &[(
+                        MusicValue::ItemId(other_item_id.to_string()),
+                        source.clone(),
+                    )],
+                )
+                .unwrap();
+            t
+        };
+
+        let (service, _metadata_dir) = make_service_with_facts(temp.path());
+
+        let mut result = service.content_hashes_for_item_id(target_item_id);
+        result.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        let mut result_strs: Vec<&str> = result.iter().map(|h| h.as_str()).collect();
+        result_strs.sort_unstable();
+
+        assert!(
+            result_strs.contains(&hash_a.as_str()),
+            "hash_a should be in result, got: {:?}",
+            result_strs
+        );
+        assert!(
+            result_strs.contains(&hash_b.as_str()),
+            "hash_b should be in result, got: {:?}",
+            result_strs
+        );
+        assert_eq!(
+            result_strs.len(),
+            2,
+            "only 2 tracks should match target_item_id"
+        );
+    }
+
+    /// Retracting an ItemId fact means content_hashes_for_item_id no longer
+    /// returns that hash.
+    #[test]
+    fn content_hashes_for_item_id_excludes_retracted_item_id() {
+        let hash = ContentHash::new("sha256:itemid_retract_tst");
+        let t1 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+        let item_id = "p_retract_me";
+
+        let temp = write_facts_file_with_operations(&[
+            (
+                hash.clone(),
+                MusicValue::ItemId(item_id.to_string()),
+                t1,
+                Operation::Assert,
+            ),
+            (
+                hash.clone(),
+                MusicValue::ItemId(item_id.to_string()),
+                t2,
+                Operation::Retract,
+            ),
+        ]);
+
+        let result = LibraryService::load_tracks_from_facts(&temp.path().to_path_buf());
+        // After retraction the track should still exist but have item_id=None
+        assert_eq!(result.tracks.len(), 1);
+        assert_eq!(
+            result.tracks[0].item_id, None,
+            "item_id should be None after Retract"
+        );
     }
 
     /// Assert(Album="A"), Retract(Album="A"), Assert(Album="B") ->
