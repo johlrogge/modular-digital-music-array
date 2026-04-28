@@ -1,0 +1,23 @@
+#!/bin/sh
+# INSTALL script for beacon package
+case "${ACTION}" in
+post)
+    # Create log directory for svlogd
+    mkdir -p /var/log/beacon
+
+    # Enable service
+    if [ ! -d /var/service ]; then
+        mkdir -p /var/service
+    fi
+    if [ ! -e /var/service/beacon ]; then
+        ln -sf /etc/sv/beacon /var/service/beacon
+        echo "beacon service enabled"
+    fi
+
+    # Restart if running
+    if sv status beacon >/dev/null 2>&1; then
+        sv restart beacon
+        echo "beacon service restarted"
+    fi
+    ;;
+esac

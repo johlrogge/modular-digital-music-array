@@ -1,0 +1,23 @@
+#!/bin/sh
+# INSTALL script for mdma-gateway package
+case "${ACTION}" in
+post)
+    # Create log directory for svlogd
+    mkdir -p /var/log/mdma-gateway
+
+    # Enable service
+    if [ ! -d /var/service ]; then
+        mkdir -p /var/service
+    fi
+    if [ ! -e /var/service/mdma-gateway ]; then
+        ln -sf /etc/sv/mdma-gateway /var/service/mdma-gateway
+        echo "mdma-gateway service enabled"
+    fi
+
+    # Restart if running
+    if sv status mdma-gateway >/dev/null 2>&1; then
+        sv restart mdma-gateway
+        echo "mdma-gateway service restarted"
+    fi
+    ;;
+esac

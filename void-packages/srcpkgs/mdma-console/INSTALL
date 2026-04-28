@@ -1,0 +1,23 @@
+#!/bin/sh
+# INSTALL script for mdma-console package
+case "${ACTION}" in
+post)
+    # Create log directory for svlogd
+    mkdir -p /var/log/mdma-console
+
+    # Enable service
+    if [ ! -d /var/service ]; then
+        mkdir -p /var/service
+    fi
+    if [ ! -e /var/service/mdma-console ]; then
+        ln -sf /etc/sv/mdma-console /var/service/mdma-console
+        echo "mdma-console service enabled"
+    fi
+
+    # Restart if running
+    if sv status mdma-console >/dev/null 2>&1; then
+        sv restart mdma-console
+        echo "mdma-console service restarted"
+    fi
+    ;;
+esac
