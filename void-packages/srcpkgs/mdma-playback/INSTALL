@@ -1,0 +1,23 @@
+#!/bin/sh
+# INSTALL script for mdma-playback package
+case "${ACTION}" in
+post)
+    # Create log directory for svlogd
+    mkdir -p /var/log/mdma-playback
+
+    # Enable service
+    if [ ! -d /var/service ]; then
+        mkdir -p /var/service
+    fi
+    if [ ! -e /var/service/mdma-playback ]; then
+        ln -sf /etc/sv/mdma-playback /var/service/mdma-playback
+        echo "mdma-playback service enabled"
+    fi
+
+    # Restart if running
+    if sv status mdma-playback >/dev/null 2>&1; then
+        sv restart mdma-playback
+        echo "mdma-playback service restarted"
+    fi
+    ;;
+esac
