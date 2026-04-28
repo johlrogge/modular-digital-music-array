@@ -30,7 +30,7 @@ version = "0.10.1"
 dependencies = [
  "acid-protocol",
  "event-protocol",
- "fact-store",
+ "fact-store-file",
  "nng",
  "serde_json",
  "thiserror 1.0.69",
@@ -1546,7 +1546,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fact-store"
+name = "fact-store-file"
 version = "0.10.1"
 dependencies = [
  "acid-protocol",
