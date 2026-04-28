@@ -3,11 +3,12 @@ schema_version = 1
 
 [versioning]
 policy = "relaxed"
-version = "0.15.5"
+version = "0.16.0"
 
 [libraries]
 askama = "0.12"
 assert_matches = "1.5"
+dirs = "6"
 async-stream = "0.3"
 axum = { version = "0.7", features = ["multipart"] }
 chrono = "0.4"
@@ -25,6 +26,7 @@ rstest = "0.26"
 scopeguard = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
+socket2 = "0.5"
 stainless-facts = { git = "https://github.com/johlrogge/stainless_facts", rev = "2aa820a808fd5345a1bd59c11d90969bfa84b285" }
 tempfile = "3"
 thiserror = "1.0"

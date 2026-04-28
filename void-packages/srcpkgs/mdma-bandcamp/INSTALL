@@ -1,0 +1,23 @@
+#!/bin/sh
+# INSTALL script for mdma-bandcamp package
+case "${ACTION}" in
+post)
+    # Create log directory for svlogd
+    mkdir -p /var/log/mdma-bandcamp
+
+    # Enable service
+    if [ ! -d /var/service ]; then
+        mkdir -p /var/service
+    fi
+    if [ ! -e /var/service/mdma-bandcamp ]; then
+        ln -sf /etc/sv/mdma-bandcamp /var/service/mdma-bandcamp
+        echo "mdma-bandcamp service enabled"
+    fi
+
+    # Restart if running
+    if sv status mdma-bandcamp >/dev/null 2>&1; then
+        sv restart mdma-bandcamp
+        echo "mdma-bandcamp service restarted"
+    fi
+    ;;
+esac

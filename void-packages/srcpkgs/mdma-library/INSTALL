@@ -1,0 +1,23 @@
+#!/bin/sh
+# INSTALL script for mdma-library package
+case "${ACTION}" in
+post)
+    # Create log directory for svlogd
+    mkdir -p /var/log/mdma-library
+
+    # Enable service
+    if [ ! -d /var/service ]; then
+        mkdir -p /var/service
+    fi
+    if [ ! -e /var/service/mdma-library ]; then
+        ln -sf /etc/sv/mdma-library /var/service/mdma-library
+        echo "mdma-library service enabled"
+    fi
+
+    # Restart if running
+    if sv status mdma-library >/dev/null 2>&1; then
+        sv restart mdma-library
+        echo "mdma-library service restarted"
+    fi
+    ;;
+esac

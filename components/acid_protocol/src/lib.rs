@@ -64,6 +64,18 @@ pub enum AcidRequest {
         cursor: Option<String>,
         limit: usize,
     },
+
+    /// Retract a batch of facts for an entity.
+    ///
+    /// Appends retraction records to the log. Semantically the inverse of
+    /// `WriteFacts` (Assert); uses `Operation::Retract` in the stored fact.
+    RetractFacts {
+        entity: String,
+        facts: Vec<FactEntry>,
+    },
+
+    /// Read all stored facts for a single entity.
+    ReadEntity { entity: String },
 }
 
 // ============================================================================
@@ -79,6 +91,12 @@ pub struct StreamChunk {
     pub cursor: String,
 }
 
+/// All facts for a single entity, returned by `ReadEntity`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityFacts {
+    pub lines: Vec<String>,
+}
+
 /// Responses from the ACID service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -89,8 +107,14 @@ pub enum AcidResponse {
     /// Confirmation that facts were written successfully.
     WriteOk { facts_written: usize },
 
+    /// Confirmation that facts were retracted successfully.
+    RetractOk { facts_retracted: usize },
+
     /// A chunk of stream lines.
     StreamChunk(StreamChunk),
+
+    /// All facts for a requested entity.
+    EntityFacts(EntityFacts),
 
     /// Error response.
     Error { message: String },
@@ -249,6 +273,78 @@ mod tests {
             AcidResponse::StreamChunk(c) => {
                 assert_eq!(c.lines, vec!["line1", "line2"]);
                 assert_eq!(c.cursor, "line:2");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn acid_request_retract_facts_roundtrip() {
+        let req = AcidRequest::RetractFacts {
+            entity: "track:sha256:abc123".to_string(),
+            facts: vec![FactEntry {
+                value_json: r#""techno""#.to_string(),
+                source_json: r#"{"source":"tagger"}"#.to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("\"type\":\"RetractFacts\""),
+            "json was: {json}"
+        );
+        let parsed: AcidRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            AcidRequest::RetractFacts { entity, facts } => {
+                assert_eq!(entity, "track:sha256:abc123");
+                assert_eq!(facts.len(), 1);
+                assert_eq!(facts[0].value_json, r#""techno""#);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn acid_request_read_entity_roundtrip() {
+        let req = AcidRequest::ReadEntity {
+            entity: "track:sha256:abc123".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"type\":\"ReadEntity\""), "json was: {json}");
+        let parsed: AcidRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            AcidRequest::ReadEntity { entity } => {
+                assert_eq!(entity, "track:sha256:abc123");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn acid_response_retract_ok_roundtrip() {
+        let resp = AcidResponse::RetractOk { facts_retracted: 3 };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"RetractOk\""), "json was: {json}");
+        let parsed: AcidResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            AcidResponse::RetractOk { facts_retracted } => assert_eq!(facts_retracted, 3),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn acid_response_entity_facts_roundtrip() {
+        let resp = AcidResponse::EntityFacts(EntityFacts {
+            lines: vec!["line1".to_string(), "line2".to_string()],
+        });
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            json.contains("\"type\":\"EntityFacts\""),
+            "json was: {json}"
+        );
+        let parsed: AcidResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            AcidResponse::EntityFacts(ef) => {
+                assert_eq!(ef.lines, vec!["line1", "line2"]);
             }
             other => panic!("unexpected variant: {other:?}"),
         }

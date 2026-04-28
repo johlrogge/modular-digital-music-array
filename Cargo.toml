@@ -58,7 +58,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.15.5"
+version = "0.16.0"
 edition = "2021"
 authors = ["MDMA Development Team"]
 license = "MIT"
@@ -102,7 +102,6 @@ source-protocol = { path = "components/source_protocol" }
 storage_primitives = { path = "components/storage_primitives" }
 stream-source-protocol = { path = "components/stream_source_protocol" }
 track-matcher = { path = "components/track_matcher" }
-dirs = "6"
 askama = "0.12"
 assert_matches = "1.5"
 async-stream = "0.3"
@@ -111,6 +110,7 @@ chrono = "0.4"
 clap = { version = "4.5", features = ["derive", "env"] }
 clap_complete = "4"
 color-eyre = "0.6"
+dirs = "6"
 futures = "0.3"
 lofty = "0.18"
 nng = "1.0"
@@ -120,8 +120,8 @@ proptest = "1"
 rstest = "0.26"
 scopeguard = "1"
 serde = { version = "1", features = ["derive"] }
-socket2 = "0.5"
 serde_json = "1.0"
+socket2 = "0.5"
 tempfile = "3"
 thiserror = "1.0"
 tokio = { version = "1.36", features = ["full"] }

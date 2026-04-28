@@ -2,7 +2,7 @@
 //!
 //! NNG client for connecting to the ACID fact store service.
 
-pub use acid_protocol::{AcidRequest, AcidResponse, FactEntry, StreamChunk};
+pub use acid_protocol::{AcidRequest, AcidResponse, EntityFacts, FactEntry, StreamChunk};
 pub use nng_transport::NngClientError as ClientError;
 
 use nng::options::{Options, RecvTimeout, SendTimeout};
@@ -70,6 +70,37 @@ impl AcidClient {
             ))),
         }
     }
+
+    /// Retract a batch of facts for `entity`. Returns the number of retractions appended.
+    pub fn retract_facts(&self, entity: &str, facts: &[FactEntry]) -> Result<usize, ClientError> {
+        let req = AcidRequest::RetractFacts {
+            entity: entity.to_string(),
+            facts: facts.to_vec(),
+        };
+        match self.request(&req)? {
+            AcidResponse::RetractOk { facts_retracted } => Ok(facts_retracted),
+            AcidResponse::Error { message } => Err(ClientError::Service(message)),
+            other => Err(ClientError::Service(format!(
+                "unexpected response: {:?}",
+                other
+            ))),
+        }
+    }
+
+    /// Read all stored facts for a single entity. Returns JSONL lines.
+    pub fn read_entity(&self, entity: &str) -> Result<Vec<String>, ClientError> {
+        let req = AcidRequest::ReadEntity {
+            entity: entity.to_string(),
+        };
+        match self.request(&req)? {
+            AcidResponse::EntityFacts(ef) => Ok(ef.lines),
+            AcidResponse::Error { message } => Err(ClientError::Service(message)),
+            other => Err(ClientError::Service(format!(
+                "unexpected response: {:?}",
+                other
+            ))),
+        }
+    }
 }
 
 // Music-domain helpers behind feature flag
@@ -95,6 +126,24 @@ mod music {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             self.write_facts(hash.as_str(), &entries)
+        }
+
+        /// Retract music facts through ACID, serializing MusicValue and FactSource to JSON strings.
+        pub fn retract_music_facts(
+            &self,
+            hash: &ContentHash,
+            facts: &[(MusicValue, FactSource)],
+        ) -> Result<usize, ClientError> {
+            let entries: Vec<FactEntry> = facts
+                .iter()
+                .map(|(value, source)| -> Result<FactEntry, ClientError> {
+                    Ok(FactEntry {
+                        value_json: serde_json::to_string(value)?,
+                        source_json: serde_json::to_string(source)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.retract_facts(hash.as_str(), &entries)
         }
     }
 }
@@ -139,5 +188,88 @@ mod tests {
             cursor: "line:1".to_string(),
         };
         assert_eq!(chunk.cursor, "line:1");
+    }
+
+    // ---- Integration tests (spin up real in-process ACID server) ---------------
+
+    static ACID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn spawn_acid() -> (acid_service::ServerHandle, String) {
+        let id = ACID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id();
+        let addr = format!("ipc:///tmp/mdma-test-acidclient-{pid}-{id}.sock");
+        let events_addr = format!("ipc:///tmp/mdma-test-acidclient-ev-{pid}-{id}.sock");
+
+        let rep = nng::Socket::new(nng::Protocol::Rep0).expect("rep socket");
+        rep.listen(&addr).expect("rep listen");
+        let pub_sock = nng::Socket::new(nng::Protocol::Pub0).expect("pub socket");
+        pub_sock.listen(&events_addr).expect("pub listen");
+
+        let handle = acid_service::start(rep, pub_sock, std::path::Path::new("/tmp"))
+            .expect("start acid service");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        (handle, addr)
+    }
+
+    #[test]
+    fn retract_facts_returns_count() {
+        let (_handle, addr) = spawn_acid();
+        let client = AcidClient::connect(&addr).unwrap();
+
+        let facts = vec![FactEntry {
+            value_json: r#"{"genre":"techno"}"#.to_string(),
+            source_json: r#"{"source":"tagger"}"#.to_string(),
+        }];
+
+        let count = client.retract_facts("entity:retract-test", &facts).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn read_entity_returns_only_matching_entity() {
+        let (_handle, addr) = spawn_acid();
+        let client = AcidClient::connect(&addr).unwrap();
+
+        let alpha_fact = vec![FactEntry {
+            value_json: r#"{"key":"Am"}"#.to_string(),
+            source_json: r#"{"source":"analyser"}"#.to_string(),
+        }];
+        let beta_fact = vec![FactEntry {
+            value_json: r#"{"key":"Cm"}"#.to_string(),
+            source_json: r#"{"source":"analyser"}"#.to_string(),
+        }];
+
+        client.write_facts("entity:alpha", &alpha_fact).unwrap();
+        client.write_facts("entity:beta", &beta_fact).unwrap();
+
+        let lines = client.read_entity("entity:alpha").unwrap();
+        assert_eq!(lines.len(), 1, "expected only alpha's fact");
+        assert!(
+            lines[0].contains("entity:alpha"),
+            "line should reference entity:alpha"
+        );
+    }
+
+    #[test]
+    fn retract_facts_appear_in_stream_with_retract_operation() {
+        let (_handle, addr) = spawn_acid();
+        let client = AcidClient::connect(&addr).unwrap();
+
+        let facts = vec![FactEntry {
+            value_json: r#""bad-tag""#.to_string(),
+            source_json: r#"{"source":"test"}"#.to_string(),
+        }];
+
+        client
+            .retract_facts("entity:retract-stream", &facts)
+            .unwrap();
+
+        let chunk = client.read_stream(None, 100).unwrap();
+        assert_eq!(chunk.lines.len(), 1);
+        assert!(
+            chunk.lines[0].contains("Retract"),
+            "stream line should contain Retract, got: {}",
+            chunk.lines[0]
+        );
     }
 }
