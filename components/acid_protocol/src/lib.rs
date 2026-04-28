@@ -7,6 +7,23 @@
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
+// JSONL line helpers
+// ============================================================================
+
+/// Return true if the JSONL line belongs to `entity`.
+///
+/// Facts are stored in array format `[entity, ...]`. Parse just the first element.
+pub fn is_entity_match(line: &str, entity: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    v.get(0)
+        .and_then(|e| e.as_str())
+        .map(|e| e == entity)
+        .unwrap_or(false)
+}
+
+// ============================================================================
 // Cursor helpers
 // ============================================================================
 

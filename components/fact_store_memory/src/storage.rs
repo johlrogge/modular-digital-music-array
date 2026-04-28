@@ -1,5 +1,5 @@
 //! In-memory FactStorage for ACID server.
-use acid_protocol::{cursor_from_offset, FactEntry, StreamChunk};
+use acid_protocol::{cursor_from_offset, is_entity_match, FactEntry, StreamChunk};
 use chrono::Utc;
 use stainless_facts::{Fact, Operation};
 use std::io::{self, BufRead, BufReader};
@@ -11,19 +11,6 @@ use thiserror::Error;
 pub enum StorageError {
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
-}
-
-/// Return true if the JSONL line belongs to `entity`.
-///
-/// Facts are stored in array format `[entity, ...]`. Parse just the first element.
-fn is_entity_match(line: &str, entity: &str) -> bool {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-        return false;
-    };
-    v.get(0)
-        .and_then(|e| e.as_str())
-        .map(|e| e == entity)
-        .unwrap_or(false)
 }
 
 /// In-memory storage for the ACID service. Thread-safe.

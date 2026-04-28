@@ -1,5 +1,5 @@
 //! File-backed FactStorage for the ACID service (production).
-use acid_protocol::{cursor_from_offset, FactEntry, StreamChunk};
+use acid_protocol::{cursor_from_offset, is_entity_match, FactEntry, StreamChunk};
 use chrono::Utc;
 use stainless_facts::{Fact, FactStreamWriter, Operation};
 use std::io::{self, BufRead, BufReader};
@@ -16,18 +16,6 @@ pub enum StorageError {
     FactWrite(#[from] stainless_facts::WriteError),
 }
 
-/// Return true if the JSONL line belongs to `entity`.
-///
-/// Facts are stored in array format `[entity, ...]`. Parse just the first element.
-fn is_entity_match(line: &str, entity: &str) -> bool {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-        return false;
-    };
-    v.get(0)
-        .and_then(|e| e.as_str())
-        .map(|e| e == entity)
-        .unwrap_or(false)
-}
 
 /// File-backed storage for the ACID service. Writes JSONL to `metadata_dir/facts.jsonl`.
 pub struct FactStorage {
