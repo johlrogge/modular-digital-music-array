@@ -50,6 +50,7 @@ pub fn start(
     rep.set_opt::<SendTimeout>(Some(Duration::from_secs(5)))?;
 
     let storage = FactStorage::new(metadata_dir)?;
+    tracing::info!("ACID backend: {}", storage.backend_name());
     let replayed = storage.replay_from_file(&metadata_dir.join("facts.jsonl"))?;
     if replayed > 0 {
         tracing::info!("ACID startup: replayed {replayed} facts");
