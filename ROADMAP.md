@@ -1,6 +1,6 @@
 # MDMA Roadmap
 
-**Last updated:** April 19, 2026
+**Last updated:** April 27, 2026
 
 ## Where We Are
 
@@ -12,7 +12,7 @@ NVMe boot working. mdma-console stub deployed. `just deploy-dev` working.
 
 mdma-library running with nng IPC. 347 tracks indexed. Bandcamp sync operational. mdma-cli for search/list/facts from laptop.
 
-> **Note:** The library service currently embeds what will become the ACID service (Audio Collection Indexing Database) — see `documents/acid-summary.md` and Priority 15. The fact stream, content-hash identity, and in-memory indexes will be extracted into `mdma-acid` as a standalone service. The library will become a client that builds music-domain projections from ACID's fact stream.
+> **Note (updated v0.16.0):** `mdma-acid` is a running standalone service. All library fact reads and writes now go through ACID over IPC — the last direct file accesses were removed in #71. ADR-001 is Accepted. Priority 15 Phase A is complete; Phases B–D (EAVT indexes, filtered subscriptions, derived facts) are the remaining work.
 
 **Milestone 1 Part 3 (Audio Playback): COMPLETE — Feb 20, 2026**
 
@@ -189,10 +189,9 @@ serves it via NFSv3. The CDJ sees the NFS share as equivalent to a USB stick.
 
 ### 15. ACID — The Fact Store Service
 
-> **Ordering rationale:** ACID is architecturally foundational but placed after Rekordbox/CDJ
-> priorities because the current library service already provides a working fact store. The
-> extraction is a refactoring — it improves the architecture without adding user-facing
-> features. It can be pulled forward if the single-process constraint becomes a bottleneck.
+> **Phase A complete as of v0.16.0.** ACID is running as a standalone service and is the
+> sole reader and writer for `facts.jsonl`. The library holds no direct file handles to
+> the fact stream. ADR-001 is Accepted. Phases B–D remain.
 
 **Why:** Every service that produces or consumes facts currently does so through the
 library service, which both owns the fact stream AND implements music-domain logic.
@@ -237,11 +236,12 @@ form (for storage/queries).
 
 **Phases:**
 
-**Phase A — Extract and Stand Alone:**
-- New binary `bases/mdma_acid/` with nng IPC socket
-- Move fact writing from library service into ACID
-- Library service becomes a fact stream subscriber, builds projections locally
-- Existing functionality preserved — just separated into two processes
+**~~Phase A — Extract and Stand Alone~~ — COMPLETE (v0.16.0):**
+- `mdma-acid` runs as a standalone service with nng IPC socket
+- All fact writes and reads go through ACID — library holds no direct file access
+- `RetractFacts`, `ReadEntity`, `RetractOk`, `EntityFacts` protocol operations added
+- `IndexedTrackInfo` carries `item_id`; `event_cursor` enables incremental reads
+- ADR-001 accepted: `facts.jsonl` is opened by exactly one process
 
 **Phase B — EAVT Indexes and Queries:**
 - Implement Datomic-style Entity-Attribute-Value-Time indexes
@@ -677,6 +677,8 @@ Unix pipes.
 ---
 
 ## Update History
+
+- **2026-04-27 (v0.16.0):** ACID is now sole reader and writer for all facts (#71). All six direct `facts.jsonl` read sites and two write sites in the library removed. New ACID protocol operations: `RetractFacts`, `ReadEntity`, `RetractOk`, `EntityFacts`. `IndexedTrackInfo` gets `item_id`. `event_cursor` for incremental `TrackStarted`/`TrackStopped` reads. ADR-001 accepted. INSTALL scripts for all 8 services now create `/var/log/<svc>` at install time. `dirs` and `socket2` added to `Polylith.toml` (profile drift fix). Folded hotfixes: v0.15.5 — library bootstraps from ACID fully, no file fallback, fail-loud on ACID errors, ACID logs its backend; v0.15.4 — `replay_from_file` for in-memory backend, CI production profile wired.
 
 - **2026-04-27 (v0.15.3):** Beacon provisioning fixes: stage 3 false-skip resolved (`blkid` replaces `lsblk`), `cmdline.txt` on both SD and NVMe references NVMe PARTUUID, `/music` subdirs created and chowned, `bandcamp.conf` seeded from `.example`, `authorized_keys` set to 0600 (was 0664, silently rejected by OpenSSH). Logging redesign: services log to disk via `svlogd`; beacon UI tails on-disk log; `/logs` page lists rotated logs.
 

@@ -167,21 +167,29 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ---
 
-## What's new in 0.15.3
+## What's new in 0.16.0
 
-Patch release — bug fixes only.
+Minor release — ACID is now the sole reader and writer for all library facts.
 
-### Beacon / Provisioning
+### Library — ACID sole source of truth (#71)
 
-- Stage 3 no longer false-skips after `wipefs` — partition detection switched from `lsblk` to `blkid` (#53).
-- Both SD and NVMe `cmdline.txt` files now reference the NVMe root partition by PARTUUID (#54, #55).
-- `/music` subdirectories are created and chowned during provisioning so the library service starts cleanly (#60).
-- `bandcamp.conf` is seeded from `.example` on a fresh install (#61).
-- `authorized_keys` is written with 0600 permissions; the previous 0664 caused OpenSSH to silently reject it (#62).
+All library fact reads and writes now go through ACID over IPC. Previously, the library read `facts.jsonl` directly from disk in five places and wrote retractions directly in two more. Those bypasses are gone.
 
-### Logging
+New ACID protocol operations added to support the migration: `RetractFacts`, `ReadEntity`, `RetractOk`, and `EntityFacts`. `IndexedTrackInfo` gained an `item_id` field. A new `event_cursor` enables incremental `TrackStarted`/`TrackStopped` reads so services can ask for facts since a known position rather than replaying the full stream.
 
-- Services write structured logs to disk via `svlogd`. The beacon web UI now tails the on-disk log. A new `/logs` page lists all rotated log files.
+ADR-001 (`docs/adr/001-acid-sole-writer-of-facts-jsonl.md`) is now **Accepted**.
+
+### Packaging
+
+INSTALL scripts for all 8 services now create `/var/log/<svc>` at install time. This was previously missing for `mdma-audio` and `mdma-acid`.
+
+### Earlier in this series (0.15.4 – 0.15.5)
+
+- Library bootstraps fully from ACID on startup; no file fallback; fails loud if ACID is unreachable.
+- Cursor-on-disk removed — no more silent restart drift.
+- ACID logs its active backend at startup.
+- `replay_from_file` added to the in-memory ACID backend for dev/test seeding.
+- Production profile wired into CI.
 
 ---
 
