@@ -167,7 +167,11 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ---
 
-## What's new in 0.16.0
+## What's new in 0.16.1
+
+Hotfix — bandcamp sync failed after service restart due to `/music/inbox` and `/music/blobs` being left owned by `root` on each `mdma-library` startup. The runit run script now chowns those directories to `mdma:mdma` before dropping privileges.
+
+### Earlier in 0.16.0
 
 Minor release — ACID is now the sole reader and writer for all library facts.
 
