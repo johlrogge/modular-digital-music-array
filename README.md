@@ -167,7 +167,11 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ---
 
-## What's new in 0.16.1
+## What's new in 0.16.2
+
+Hotfix — cover-art directory creation failed after service restart with the same root-ownership issue that affected `/music/inbox` in 0.16.1. `/music/cover-art` is now included in the `chown mdma:mdma` line in the `mdma-library` runit run script.
+
+### Earlier in 0.16.1
 
 Hotfix — bandcamp sync failed after service restart due to `/music/inbox` and `/music/blobs` being left owned by `root` on each `mdma-library` startup. The runit run script now chowns those directories to `mdma:mdma` before dropping privileges.
 
