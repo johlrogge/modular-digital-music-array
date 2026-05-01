@@ -4,6 +4,14 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.16.2] — 2026-05-01
+
+### Library
+
+Cover-art directory creation failed with `Permission denied` after any `mdma-library` service restart — the same root-ownership issue that affected `/music/inbox` in 0.16.1. The runit run script created `/music/cover-art` before `chpst` dropped privileges, leaving the directory owned by `root:root` and unwritable for the `mdma` user. Fix: `/music/cover-art` added to the existing `chown mdma:mdma` line alongside `/music/inbox`, `/music/blobs`, and `/run/mdma`.
+
+---
+
 ## [0.16.1] — 2026-05-01
 
 ### Library
