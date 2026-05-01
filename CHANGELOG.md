@@ -4,6 +4,14 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.16.1] — 2026-05-01
+
+### Library
+
+Bandcamp track extraction failed with `Permission denied` after any `mdma-library` service restart. The runit run script created `/music/inbox` and `/music/blobs` during startup but left them owned by `root:root 755`. Because bandcamp runs as the `mdma` user, it could not write extracted tracks to those directories until the service happened to be started as the correct user. Fix: the run script now calls `chown mdma:mdma` on `/music/inbox`, `/music/blobs`, and `/run/mdma` immediately after the `mkdir` calls, before `chpst` drops privileges.
+
+---
+
 ## [0.16.0] — 2026-04-27
 
 ### Library — ACID is now sole reader and writer for all facts (#71)
