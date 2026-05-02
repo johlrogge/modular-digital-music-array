@@ -76,6 +76,7 @@ pub enum MusicFormat {
     Mp3,
     Aiff,
     Wav,
+    M4a,
 }
 
 impl fmt::Display for MusicFormat {
@@ -85,6 +86,7 @@ impl fmt::Display for MusicFormat {
             MusicFormat::Mp3 => write!(f, "MP3"),
             MusicFormat::Aiff => write!(f, "AIFF"),
             MusicFormat::Wav => write!(f, "WAV"),
+            MusicFormat::M4a => write!(f, "M4A"),
         }
     }
 }
@@ -499,6 +501,7 @@ mod tests {
     #[case(MusicFormat::Mp3)]
     #[case(MusicFormat::Aiff)]
     #[case(MusicFormat::Wav)]
+    #[case(MusicFormat::M4a)]
     fn music_format_serde_roundtrip(#[case] format: MusicFormat) {
         let json = serde_json::to_string(&format).unwrap();
         let back: MusicFormat = serde_json::from_str(&json).unwrap();
@@ -510,6 +513,7 @@ mod tests {
     #[case(MusicFormat::Mp3, "MP3")]
     #[case(MusicFormat::Aiff, "AIFF")]
     #[case(MusicFormat::Wav, "WAV")]
+    #[case(MusicFormat::M4a, "M4A")]
     fn music_format_display(#[case] format: MusicFormat, #[case] expected: &str) {
         assert_eq!(format.to_string(), expected);
     }

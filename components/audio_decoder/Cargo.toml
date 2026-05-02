@@ -17,12 +17,12 @@ thiserror = "1.0"
 tracing = "0.1"
 parking_lot = "0.12"
 
-symphonia = { version = "0.5", features = ["default", "flac", "mp3"] }
+symphonia = { version = "0.5", features = ["default", "flac", "mp3", "isomp4", "aac", "alac"] }
 
 [build-dependencies]
 hound = "3.5"
 anyhow = "1.0"
-symphonia = { version = "0.5", features = ["flac", "mp3"] }
+symphonia = { version = "0.5", features = ["flac", "mp3", "isomp4", "aac", "alac"] }
 
 [[bench]]
 name = "track_loading"

@@ -3,19 +3,21 @@
 use std::path::{Path, PathBuf};
 
 /// All recognized audio file extensions (used for ZIP extraction filtering).
-pub const AUDIO_EXTENSIONS: &[&str] = &["flac", "mp3", "wav", "aif", "aiff"];
+pub const AUDIO_EXTENSIONS: &[&str] = &["flac", "mp3", "wav", "aif", "aiff", "m4a"];
 
-/// Ingestible audio file extensions — FLAC, MP3, and WAV are accepted for library ingest.
+/// Ingestible audio file extensions — FLAC, MP3, WAV, and M4A are accepted for library ingest.
 ///
 /// WAV is ingestible (no embedded tags expected; metadata derived from filename if absent).
+/// M4A (MPEG-4 Audio, wrapping AAC or ALAC) is ingestible; metadata is read by lofty.
+/// AIFF is still export-only and must not be ingested.
 /// This is derived from the same policy as `AudioFormat::is_ingestible()` in `library_service`.
 /// When adding a new ingestible format, update both this list and that method.
-pub const INGEST_EXTENSIONS: &[&str] = &["flac", "mp3", "wav"];
+pub const INGEST_EXTENSIONS: &[&str] = &["flac", "mp3", "wav", "m4a"];
 
 /// Human-readable error message for non-ingestible audio files (used in HTTP responses).
 ///
 /// Centralised here so the console and any other HTTP layer show consistent messaging.
-pub const NON_INGESTIBLE_ERROR: &str = "Unsupported format: only FLAC, MP3, and WAV accepted";
+pub const NON_INGESTIBLE_ERROR: &str = "Unsupported format: only FLAC, MP3, WAV, and M4A accepted";
 
 /// Check if a file has any recognized audio extension.
 pub fn is_audio_file(path: &Path) -> bool {
@@ -25,10 +27,11 @@ pub fn is_audio_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Check if a file has an ingestible audio extension (FLAC, MP3, or WAV).
+/// Check if a file has an ingestible audio extension (FLAC, MP3, WAV, or M4A).
 ///
 /// AIFF is recognized as audio but is an export-only format and must not be ingested.
 /// WAV is ingestible (no embedded tags expected; metadata derived from filename if absent).
+/// M4A (MPEG-4 Audio, wrapping AAC or ALAC) is ingestible.
 pub fn is_ingestible_audio(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -115,9 +118,9 @@ pub fn extract_zip(zip_path: &Path, output_dir: &Path) -> Result<Vec<PathBuf>, s
             None => continue, // Skip entries with invalid paths
         };
 
-        // Only extract ingestible audio files (FLAC and MP3)
+        // Only extract ingestible audio files (FLAC, MP3, WAV, and M4A)
         if !is_ingestible_audio(&entry_path) {
-            tracing::debug!(path = %entry_path.display(), "Skipping non-ingestible file (only FLAC, MP3, and WAV accepted)");
+            tracing::debug!(path = %entry_path.display(), "Skipping non-ingestible file (only FLAC, MP3, WAV, and M4A accepted)");
             continue;
         }
 
@@ -158,6 +161,8 @@ mod tests {
     #[case("track.wav", true)]
     #[case("track.aif", true)]
     #[case("track.aiff", true)]
+    #[case("track.m4a", true)]
+    #[case("track.M4A", true)]
     #[case("cover.jpg", false)]
     #[case("notes.txt", false)]
     #[case("noext", false)]
@@ -172,11 +177,13 @@ mod tests {
     #[case("track.MP3", true)]
     #[case("track.wav", true)]
     #[case("track.WAV", true)]
+    #[case("track.m4a", true)]
+    #[case("track.M4A", true)]
     #[case("track.aif", false)]
     #[case("track.aiff", false)]
     #[case("cover.jpg", false)]
     #[case("noext", false)]
-    fn ingestible_audio_flac_mp3_and_wav(#[case] filename: &str, #[case] expected: bool) {
+    fn ingestible_audio_flac_mp3_wav_and_m4a(#[case] filename: &str, #[case] expected: bool) {
         assert_eq!(is_ingestible_audio(Path::new(filename)), expected);
     }
 
@@ -272,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_zip_extracts_wav_skips_aiff() {
+    fn extract_zip_extracts_wav_and_m4a_skips_aiff() {
         let dir = tempfile::tempdir().unwrap();
         let zip_path = dir.path().join("test.zip");
         let output_dir = dir.path().join("output");
@@ -289,14 +296,19 @@ mod tests {
         zip_writer.start_file("track.wav", options).unwrap();
         zip_writer.write_all(b"RIFF fake wav data").unwrap();
 
+        zip_writer.start_file("track.m4a", options).unwrap();
+        zip_writer
+            .write_all(b"\x00\x00\x00\x20ftyp fake m4a data")
+            .unwrap();
+
         zip_writer.start_file("track.aiff", options).unwrap();
         zip_writer.write_all(b"FORM fake aiff data").unwrap();
 
         zip_writer.finish().unwrap();
 
         let extracted = extract_zip(&zip_path, &output_dir).unwrap();
-        // FLAC and WAV should be extracted; AIFF is still export-only
-        assert_eq!(extracted.len(), 2);
+        // FLAC, WAV, and M4A should be extracted; AIFF is still export-only
+        assert_eq!(extracted.len(), 3);
         let names: Vec<String> = extracted
             .iter()
             .filter_map(|p| {
@@ -307,5 +319,6 @@ mod tests {
             .collect();
         assert!(names.contains(&"track.flac".to_string()));
         assert!(names.contains(&"track.wav".to_string()));
+        assert!(names.contains(&"track.m4a".to_string()));
     }
 }
