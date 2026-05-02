@@ -439,7 +439,7 @@ async fn upload_file(
         } else if inbox_utils::is_ingestible_audio(&dest) {
             results.push(serde_json::json!({"file": file_name, "success": true}));
         } else if inbox_utils::is_audio_file(&dest) {
-            // Recognized audio format but not accepted for ingest (WAV/AIFF are export-only)
+            // Recognized audio format but not accepted for ingest (AIFF is export-only)
             let _ = std::fs::remove_file(&dest);
             results.push(
                 serde_json::json!({"file": file_name, "error": inbox_utils::NON_INGESTIBLE_ERROR}),

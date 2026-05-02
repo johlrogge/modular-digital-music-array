@@ -5,16 +5,17 @@ use std::path::{Path, PathBuf};
 /// All recognized audio file extensions (used for ZIP extraction filtering).
 pub const AUDIO_EXTENSIONS: &[&str] = &["flac", "mp3", "wav", "aif", "aiff"];
 
-/// Ingestible audio file extensions — only FLAC and MP3 are accepted for library ingest.
+/// Ingestible audio file extensions — FLAC, MP3, and WAV are accepted for library ingest.
 ///
+/// WAV is ingestible (no embedded tags expected; metadata derived from filename if absent).
 /// This is derived from the same policy as `AudioFormat::is_ingestible()` in `library_service`.
 /// When adding a new ingestible format, update both this list and that method.
-pub const INGEST_EXTENSIONS: &[&str] = &["flac", "mp3"];
+pub const INGEST_EXTENSIONS: &[&str] = &["flac", "mp3", "wav"];
 
 /// Human-readable error message for non-ingestible audio files (used in HTTP responses).
 ///
 /// Centralised here so the console and any other HTTP layer show consistent messaging.
-pub const NON_INGESTIBLE_ERROR: &str = "Unsupported format: only FLAC and MP3 accepted";
+pub const NON_INGESTIBLE_ERROR: &str = "Unsupported format: only FLAC, MP3, and WAV accepted";
 
 /// Check if a file has any recognized audio extension.
 pub fn is_audio_file(path: &Path) -> bool {
@@ -24,9 +25,10 @@ pub fn is_audio_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Check if a file has an ingestible audio extension (FLAC or MP3 only).
+/// Check if a file has an ingestible audio extension (FLAC, MP3, or WAV).
 ///
-/// WAV and AIFF are recognized as audio but are export-only formats and must not be ingested.
+/// AIFF is recognized as audio but is an export-only format and must not be ingested.
+/// WAV is ingestible (no embedded tags expected; metadata derived from filename if absent).
 pub fn is_ingestible_audio(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -115,7 +117,7 @@ pub fn extract_zip(zip_path: &Path, output_dir: &Path) -> Result<Vec<PathBuf>, s
 
         // Only extract ingestible audio files (FLAC and MP3)
         if !is_ingestible_audio(&entry_path) {
-            tracing::debug!(path = %entry_path.display(), "Skipping non-ingestible file (only FLAC and MP3 accepted)");
+            tracing::debug!(path = %entry_path.display(), "Skipping non-ingestible file (only FLAC, MP3, and WAV accepted)");
             continue;
         }
 
@@ -168,12 +170,13 @@ mod tests {
     #[case("track.FLAC", true)]
     #[case("track.mp3", true)]
     #[case("track.MP3", true)]
-    #[case("track.wav", false)]
+    #[case("track.wav", true)]
+    #[case("track.WAV", true)]
     #[case("track.aif", false)]
     #[case("track.aiff", false)]
     #[case("cover.jpg", false)]
     #[case("noext", false)]
-    fn ingestible_audio_only_flac_and_mp3(#[case] filename: &str, #[case] expected: bool) {
+    fn ingestible_audio_flac_mp3_and_wav(#[case] filename: &str, #[case] expected: bool) {
         assert_eq!(is_ingestible_audio(Path::new(filename)), expected);
     }
 
@@ -269,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_zip_skips_wav_and_aiff() {
+    fn extract_zip_extracts_wav_skips_aiff() {
         let dir = tempfile::tempdir().unwrap();
         let zip_path = dir.path().join("test.zip");
         let output_dir = dir.path().join("output");
@@ -292,12 +295,17 @@ mod tests {
         zip_writer.finish().unwrap();
 
         let extracted = extract_zip(&zip_path, &output_dir).unwrap();
-        // Only FLAC should be extracted; WAV and AIFF are skipped
-        assert_eq!(extracted.len(), 1);
-        let name = extracted[0]
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or("");
-        assert_eq!(name, "track.flac");
+        // FLAC and WAV should be extracted; AIFF is still export-only
+        assert_eq!(extracted.len(), 2);
+        let names: Vec<String> = extracted
+            .iter()
+            .filter_map(|p| {
+                p.file_name()
+                    .and_then(|f| f.to_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        assert!(names.contains(&"track.flac".to_string()));
+        assert!(names.contains(&"track.wav".to_string()));
     }
 }
