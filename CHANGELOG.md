@@ -4,6 +4,14 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.16.6] — 2026-05-01
+
+### Library — M4A ingestion
+
+M4A files (MPEG-4 audio container carrying AAC or ALAC) are now ingestible alongside FLAC, MP3, and WAV. The filename-derived metadata fallback introduced in 0.16.5 applies to M4A as well — when no embedded title or artist tags are present, both are derived from the filename stem using a `" - "` split. AIFF remains export-only. DRM-protected M4A files (Apple FairPlay) are not decoded; they surface as decode errors rather than silently producing empty tracks.
+
+---
+
 ## [0.16.5] — 2026-05-01
 
 ### Library — WAV ingestion with filename-derived metadata fallback

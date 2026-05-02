@@ -20,7 +20,7 @@ pub enum IngestError {
     #[error("Unsupported audio format: {0}")]
     UnsupportedFormat(String),
 
-    #[error("Unsupported format: only FLAC, MP3, and WAV accepted")]
+    #[error("Unsupported format: only FLAC, MP3, WAV, and M4A accepted")]
     NonIngestibleFormat,
 
     #[error("Failed to compute hash: {0}")]
@@ -56,6 +56,7 @@ pub enum AudioFormat {
     Mp3,
     Aiff,
     Wav,
+    M4a,
 }
 
 impl AudioFormat {
@@ -66,6 +67,7 @@ impl AudioFormat {
             "mp3" => Some(Self::Mp3),
             "aiff" | "aif" => Some(Self::Aiff),
             "wav" => Some(Self::Wav),
+            "m4a" => Some(Self::M4a),
             _ => None,
         }
     }
@@ -77,17 +79,19 @@ impl AudioFormat {
             Self::Mp3 => "mp3",
             Self::Aiff => "aiff",
             Self::Wav => "wav",
+            Self::M4a => "m4a",
         }
     }
 
     /// Returns true if this format is accepted for library ingest.
     ///
     /// WAV is ingestible (no embedded tags expected; metadata derived from filename if absent).
+    /// M4A (MPEG-4 Audio, wrapping AAC or ALAC) is ingestible; lofty reads its metadata.
     /// AIFF is still export-only and must not be ingested.
     /// This is the single source of truth for "which formats are ingestible".
     /// Add new ingestible formats here — all guards derive from this method.
     pub fn is_ingestible(&self) -> bool {
-        matches!(self, Self::Flac | Self::Mp3 | Self::Wav)
+        matches!(self, Self::Flac | Self::Mp3 | Self::Wav | Self::M4a)
     }
 }
 
@@ -331,6 +335,7 @@ mod tests {
     #[case(AudioFormat::Flac, true)]
     #[case(AudioFormat::Mp3, true)]
     #[case(AudioFormat::Wav, true)]
+    #[case(AudioFormat::M4a, true)]
     #[case(AudioFormat::Aiff, false)]
     fn audio_format_is_ingestible(#[case] format: AudioFormat, #[case] expected: bool) {
         assert_eq!(format.is_ingestible(), expected);
@@ -343,6 +348,8 @@ mod tests {
     #[case("aiff", Some(AudioFormat::Aiff))]
     #[case("aif", Some(AudioFormat::Aiff))]
     #[case("wav", Some(AudioFormat::Wav))]
+    #[case("m4a", Some(AudioFormat::M4a))]
+    #[case("M4A", Some(AudioFormat::M4a))]
     #[case("ogg", None)]
     fn audio_format_from_extension(#[case] ext: &str, #[case] expected: Option<AudioFormat>) {
         assert_eq!(AudioFormat::from_extension(ext), expected);
@@ -365,6 +372,22 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_m4a() {
+        let dir = tempfile::tempdir().unwrap();
+        let m4a_path = dir.path().join("track.m4a");
+        std::fs::write(&m4a_path, b"\x00\x00\x00\x20ftyp fake m4a data").unwrap();
+
+        let inbox = InboxFile::new(m4a_path, UploadSource::HttpUpload);
+        let result = inbox.validate();
+
+        // M4A is ingestible; validate should NOT return NonIngestibleFormat
+        assert!(
+            !matches!(result, Err(IngestError::NonIngestibleFormat)),
+            "M4A files should be accepted and not rejected with NonIngestibleFormat"
+        );
+    }
+
+    #[test]
     fn validate_rejects_aiff_with_non_ingestible_format_error() {
         let dir = tempfile::tempdir().unwrap();
         let aiff_path = dir.path().join("track.aiff");
@@ -378,7 +401,7 @@ mod tests {
                 let err = IngestError::NonIngestibleFormat;
                 assert_eq!(
                     err.to_string(),
-                    "Unsupported format: only FLAC, MP3, and WAV accepted"
+                    "Unsupported format: only FLAC, MP3, WAV, and M4A accepted"
                 );
             }
             other => panic!("expected NonIngestibleFormat, got: {:?}", other.is_ok()),
