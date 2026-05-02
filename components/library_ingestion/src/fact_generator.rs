@@ -19,6 +19,7 @@ impl From<AudioFormat> for MusicFormat {
             AudioFormat::Mp3 => MusicFormat::Mp3,
             AudioFormat::Aiff => MusicFormat::Aiff,
             AudioFormat::Wav => MusicFormat::Wav,
+            AudioFormat::M4a => MusicFormat::M4a,
         }
     }
 }
@@ -305,6 +306,7 @@ mod tests {
     #[case(AudioFormat::Mp3, "MP3")]
     #[case(AudioFormat::Aiff, "AIFF")]
     #[case(AudioFormat::Wav, "WAV")]
+    #[case(AudioFormat::M4a, "M4A")]
     fn format_fact_generated_for_audio_formats(
         #[case] audio_fmt: AudioFormat,
         #[case] expected_display: &str,
