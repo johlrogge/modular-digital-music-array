@@ -167,7 +167,11 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ---
 
-## What's new in 0.16.3
+## What's new in 0.16.4
+
+Hotfix — systematic audit of all runit run scripts (#85) found the same root-owned-directory pattern from the 0.16.1–0.16.3 hotfixes in three more services; `mdma-acid`, `mdma-bandcamp`, and `mdma-library` now all `chown` their working directories to `mdma:mdma` before dropping privileges.
+
+### Earlier in 0.16.3
 
 Hotfix — 0.16.2 added `/music/cover-art` to the `chown` line in the `mdma-library` runit run script but missed the matching `mkdir -p`, so the directory was never created and the chown silently no-op'd; 0.16.3 adds the missing `mkdir -p` entry.
 

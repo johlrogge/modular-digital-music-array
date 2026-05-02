@@ -4,6 +4,20 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.16.4] — 2026-05-01
+
+### Runit chown audit — all remaining services fixed (#85)
+
+A systematic audit of all runit run scripts found the same root-owned-directory pattern that drove the 0.16.1–0.16.3 hotfixes in three more services; all three are fixed in one sweep.
+
+- `mdma-acid`: `/metadata` and `/run/mdma` added to `chown mdma:mdma` — ACID writes `facts.jsonl` to `/metadata` but the directory was never chowned, so a fresh provision would fail on first write.
+- `mdma-bandcamp`: `/run/mdma/sources` and `/var/lib/mdma` added to `chown mdma:mdma` — socket directory and cache location were `mkdir`'d but left owned by root.
+- `mdma-library`: `/metadata` added to the existing `chown` line — the directory was created by `mkdir -p` but ownership was never set, leaving ACID-routed writes broken on a fresh install.
+
+All three are latent bugs currently masked by directories being mode 0755 on existing provisioned systems.
+
+---
+
 ## [0.16.3] — 2026-05-01
 
 ### Library
