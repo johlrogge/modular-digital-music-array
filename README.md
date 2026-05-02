@@ -167,7 +167,11 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ---
 
-## What's new in 0.16.5
+## What's new in 0.16.6
+
+M4A files (MPEG-4 audio — AAC or ALAC) are now ingestible alongside FLAC, MP3, and WAV. DRM-protected files surface as decode errors; filename-derived metadata fallback applies as with WAV.
+
+### Earlier in 0.16.5
 
 WAV files are now ingestible. When no embedded tags are present, title and artist are derived from the filename stem using a `" - "` split; a later manual edit overrides the derived facts naturally.
 
