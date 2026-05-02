@@ -167,7 +167,11 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ---
 
-## What's new in 0.16.2
+## What's new in 0.16.3
+
+Hotfix — 0.16.2 added `/music/cover-art` to the `chown` line in the `mdma-library` runit run script but missed the matching `mkdir -p`, so the directory was never created and the chown silently no-op'd; 0.16.3 adds the missing `mkdir -p` entry.
+
+### Earlier in 0.16.2
 
 Hotfix — cover-art directory creation failed after service restart with the same root-ownership issue that affected `/music/inbox` in 0.16.1. `/music/cover-art` is now included in the `chown mdma:mdma` line in the `mdma-library` runit run script.
 
