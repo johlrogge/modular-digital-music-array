@@ -108,6 +108,24 @@ fn generate_facts_from_metadata(
         ));
     }
 
+    // Filename-derived fallback: when no embedded title or artist, parse from stem.
+    // Applies to WAV files (and any future format without embedded tags).
+    // A later manual edit will override these via stainless-facts replace semantics.
+    if metadata.title.is_none() && metadata.artist.is_none() {
+        if let Some(stem) = metadata.file_path.file_stem().and_then(|s| s.to_str()) {
+            let parsed = crate::filename_parser::parse(stem);
+            facts.push((MusicValue::Title(Title::new(&parsed.title)), source.clone()));
+            if let Some(artist) = parsed.artist {
+                facts.push((MusicValue::Artist(Artist::new(&artist)), source.clone()));
+            }
+            if metadata.track_number.is_none() {
+                if let Some(n) = parsed.track_number {
+                    facts.push((MusicValue::TrackNumber(TrackNumber::new(n)), source.clone()));
+                }
+            }
+        }
+    }
+
     if let Some(year) = metadata.year {
         facts.push((MusicValue::Year(Year::new(year)), source.clone()));
     }
@@ -310,5 +328,174 @@ mod tests {
         assert_eq!(main, "Progressive House");
         assert_eq!(descriptors.len(), 0);
         assert_eq!(full, "Progressive House");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Filename-derived metadata fallback tests
+    // ---------------------------------------------------------------------------
+
+    fn make_metadata(
+        title: Option<&str>,
+        artist: Option<&str>,
+        track_number: Option<u32>,
+        file_path: &str,
+    ) -> TrackMetadata {
+        audio_metadata::TrackMetadata {
+            title: title.map(|s| s.to_string()),
+            artist: artist.map(|s| s.to_string()),
+            album: None,
+            album_artist: None,
+            track_number,
+            disc_number: None,
+            duration: None,
+            sample_rate: None,
+            channels: None,
+            bit_depth: None,
+            bitrate: None,
+            bpm: None,
+            key: None,
+            genre: None,
+            year: None,
+            comment: None,
+            file_path: std::path::PathBuf::from(file_path),
+            file_size_bytes: None,
+            has_picture: false,
+        }
+    }
+
+    fn has_title(facts: &[(MusicValue, FactSource)], expected: &str) -> bool {
+        facts
+            .iter()
+            .any(|(v, _)| matches!(v, MusicValue::Title(t) if t.as_str() == expected))
+    }
+
+    fn has_artist(facts: &[(MusicValue, FactSource)], expected: &str) -> bool {
+        facts
+            .iter()
+            .any(|(v, _)| matches!(v, MusicValue::Artist(a) if a.as_str() == expected))
+    }
+
+    fn has_track_number(facts: &[(MusicValue, FactSource)], expected: u32) -> bool {
+        facts
+            .iter()
+            .any(|(v, _)| matches!(v, MusicValue::TrackNumber(n) if n.value() == expected))
+    }
+
+    fn title_count(facts: &[(MusicValue, FactSource)]) -> usize {
+        facts
+            .iter()
+            .filter(|(v, _)| matches!(v, MusicValue::Title(_)))
+            .count()
+    }
+
+    fn artist_count(facts: &[(MusicValue, FactSource)]) -> usize {
+        facts
+            .iter()
+            .filter(|(v, _)| matches!(v, MusicValue::Artist(_)))
+            .count()
+    }
+
+    #[test]
+    fn fallback_emits_title_artist_track_for_three_part_stem() {
+        let metadata = make_metadata(
+            None,
+            None,
+            None,
+            "/music/inbox/01 - Yagya - Empty Streets.flac",
+        );
+        let hash = ContentHash::new("sha256:abc".to_string());
+        let facts =
+            generate_facts_from_metadata(&hash, &metadata, &std::collections::HashMap::new())
+                .unwrap();
+        assert!(
+            has_title(&facts, "Empty Streets"),
+            "expected title 'Empty Streets'"
+        );
+        assert!(has_artist(&facts, "Yagya"), "expected artist 'Yagya'");
+        assert!(has_track_number(&facts, 1), "expected track number 1");
+    }
+
+    #[test]
+    fn fallback_preserves_title_with_dashes() {
+        let metadata = make_metadata(
+            None,
+            None,
+            None,
+            "/music/inbox/Yagya - Don't Call - Reprise.flac",
+        );
+        let hash = ContentHash::new("sha256:abc".to_string());
+        let facts =
+            generate_facts_from_metadata(&hash, &metadata, &std::collections::HashMap::new())
+                .unwrap();
+        assert!(
+            has_title(&facts, "Don't Call - Reprise"),
+            "expected title with internal dash"
+        );
+        assert!(has_artist(&facts, "Yagya"), "expected artist 'Yagya'");
+    }
+
+    #[test]
+    fn fallback_emits_only_title_when_no_dash() {
+        let metadata = make_metadata(None, None, None, "/music/inbox/Empty Streets.wav");
+        let hash = ContentHash::new("sha256:abc".to_string());
+        let facts =
+            generate_facts_from_metadata(&hash, &metadata, &std::collections::HashMap::new())
+                .unwrap();
+        assert!(
+            has_title(&facts, "Empty Streets"),
+            "expected title 'Empty Streets'"
+        );
+        assert_eq!(
+            artist_count(&facts),
+            0,
+            "no artist fact expected for single-segment stem"
+        );
+    }
+
+    #[test]
+    fn fallback_skipped_when_embedded_title_present() {
+        let metadata = make_metadata(
+            Some("Real Title"),
+            None,
+            None,
+            "/music/inbox/Yagya - Empty Streets.wav",
+        );
+        let hash = ContentHash::new("sha256:abc".to_string());
+        let facts =
+            generate_facts_from_metadata(&hash, &metadata, &std::collections::HashMap::new())
+                .unwrap();
+        // Embedded title should be used, filename fallback should not fire
+        assert!(
+            has_title(&facts, "Real Title"),
+            "embedded title should be present"
+        );
+        assert_eq!(title_count(&facts), 1, "only one title fact expected");
+        // No artist from filename either (condition requires both to be None)
+        assert_eq!(artist_count(&facts), 0, "no artist fact expected");
+    }
+
+    #[test]
+    fn fallback_skipped_when_embedded_artist_present() {
+        let metadata = make_metadata(
+            None,
+            Some("Real Artist"),
+            None,
+            "/music/inbox/Yagya - Empty Streets.wav",
+        );
+        let hash = ContentHash::new("sha256:abc".to_string());
+        let facts =
+            generate_facts_from_metadata(&hash, &metadata, &std::collections::HashMap::new())
+                .unwrap();
+        // Artist is present, so fallback must not fire — no Title or extra Artist from filename
+        assert!(
+            has_artist(&facts, "Real Artist"),
+            "embedded artist should be present"
+        );
+        assert_eq!(
+            title_count(&facts),
+            0,
+            "no title fact when only artist is embedded"
+        );
+        assert_eq!(artist_count(&facts), 1, "only the embedded artist fact");
     }
 }
