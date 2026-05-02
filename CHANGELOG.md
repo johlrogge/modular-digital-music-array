@@ -4,6 +4,14 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.16.3] — 2026-05-01
+
+### Library
+
+The 0.16.2 hotfix added `/music/cover-art` to the `chown mdma:mdma` line in the runit run script but omitted it from the preceding `mkdir -p`. The directory was never created, so the `chown` silently no-op'd and the library still could not write cover-art files in a root-owned `/music`. Fix: `/music/cover-art` added to the `mkdir -p` call so the directory is created before ownership is set.
+
+---
+
 ## [0.16.2] — 2026-05-01
 
 ### Library
