@@ -3,7 +3,7 @@ exec 2>&1
 sv check mdma-acid || exit 1
 sleep 1
 mkdir -p /music/inbox /music/blobs /music/cover-art /metadata /run/mdma
-chown mdma:mdma /music/inbox /music/blobs /music/cover-art /run/mdma 2>/dev/null || true
+chown mdma:mdma /music/inbox /music/blobs /music/cover-art /metadata /run/mdma 2>/dev/null || true
 export RUST_LOG=info
 exec chpst -u mdma /usr/bin/mdma-library \
     --music-dir /music \
