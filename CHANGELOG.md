@@ -4,6 +4,14 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.16.5] — 2026-05-01
+
+### Library — WAV ingestion with filename-derived metadata fallback
+
+WAV files are now ingestible. When no embedded title or artist tags are present, the library derives them from the filename stem using a `" - "` split (preserving titles that contain dashes). AIFF remains export-only. Because stainless-facts use replace semantics, a later manual edit naturally overrides any filename-derived fact.
+
+---
+
 ## [0.16.4] — 2026-05-01
 
 ### Runit chown audit — all remaining services fixed (#85)

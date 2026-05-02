@@ -1,6 +1,6 @@
 # Template file for mdma-playback package
 pkgname=mdma-playback
-version=0.16.4
+version=0.16.5
 revision=1
 archs="aarch64"
 build_style=cargo

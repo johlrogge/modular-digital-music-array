@@ -167,7 +167,11 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ---
 
-## What's new in 0.16.4
+## What's new in 0.16.5
+
+WAV files are now ingestible. When no embedded tags are present, title and artist are derived from the filename stem using a `" - "` split; a later manual edit overrides the derived facts naturally.
+
+### Earlier in 0.16.4
 
 Hotfix — systematic audit of all runit run scripts (#85) found the same root-owned-directory pattern from the 0.16.1–0.16.3 hotfixes in three more services; `mdma-acid`, `mdma-bandcamp`, and `mdma-library` now all `chown` their working directories to `mdma:mdma` before dropping privileges.
 
