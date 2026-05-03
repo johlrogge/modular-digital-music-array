@@ -4,6 +4,18 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.17.0] — 2026-05-01
+
+### Breaking Changes
+
+**`AcidEvent::FactsWritten` removed.** The single event variant is replaced by two distinct variants — `FactsAsserted` and `FactsRetracted` — so subscribers can react to assertions and retractions independently. The corresponding pub/sub topics split from a single topic to `acid/facts/asserted` and `acid/facts/retracted`. External consumers must subscribe to the `acid/` prefix and match both new variants.
+
+### Fixed
+
+- **ACID cursor drift after retractions** — the ACID cursor (and `line_count`) was only advanced on `WriteOk`, never on `RetractOk`, so cursors drifted after every retraction batch. The cursor now advances correctly on both `WriteOk` and `RetractOk`.
+
+---
+
 ## [0.16.7] — 2026-05-01
 
 ### Console — M4A upload picker fix
