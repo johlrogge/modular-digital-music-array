@@ -4,6 +4,14 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.16.7] — 2026-05-01
+
+### Console — M4A upload picker fix
+
+The upload dialog's file input `accept=` list and help text now include `.m4a`. The 0.16.6 release added server-side M4A ingest support, but the HTML file picker was still restricted to `.flac/.mp3/.wav/.aif/.aiff/.zip`, which caused phones and most desktop browsers to hide M4A files in the chooser even though the server would have accepted them. The `.aif` and `.aiff` entries have also been removed from the picker — AIFF is export-only and listing it was misleading.
+
+---
+
 ## [0.16.6] — 2026-05-01
 
 ### Library — M4A ingestion
