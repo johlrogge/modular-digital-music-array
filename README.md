@@ -167,7 +167,11 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ---
 
-## What's new in 0.16.7
+## What's new in 0.17.0
+
+**Breaking change** — `AcidEvent::FactsWritten` is replaced by `FactsAsserted` and `FactsRetracted`. External subscribers must update to the `acid/` prefix and match both new event variants. Also fixes a latent cursor-drift bug where the ACID cursor never advanced on `RetractOk`.
+
+### Earlier in 0.16.7
 
 The upload dialog's file picker now includes `.m4a`. The 0.16.6 server-side M4A ingest support was gated by a missing `accept=` entry — phones and desktop browsers hid M4A files in the chooser. The misleading `.aif`/`.aiff` entries (export-only) are also removed.
 
