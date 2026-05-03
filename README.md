@@ -167,7 +167,11 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ---
 
-## What's new in 0.16.6
+## What's new in 0.16.7
+
+The upload dialog's file picker now includes `.m4a`. The 0.16.6 server-side M4A ingest support was gated by a missing `accept=` entry — phones and desktop browsers hid M4A files in the chooser. The misleading `.aif`/`.aiff` entries (export-only) are also removed.
+
+### Earlier in 0.16.6
 
 M4A files (MPEG-4 audio — AAC or ALAC) are now ingestible alongside FLAC, MP3, and WAV. DRM-protected files surface as decode errors; filename-derived metadata fallback applies as with WAV.
 
