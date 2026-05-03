@@ -99,12 +99,26 @@ pub fn start(
                 (Some(entity), AcidResponse::WriteOk { facts_written }) => {
                     line_count += facts_written;
                     let cursor = acid_protocol::cursor_from_offset(line_count);
-                    publish_facts_written(&pub_sock, entity, *facts_written, &cursor);
+                    publish_acid_event(
+                        &pub_sock,
+                        AcidEvent::FactsAsserted {
+                            entity: entity.clone(),
+                            count: *facts_written,
+                            cursor,
+                        },
+                    );
                 }
                 (Some(entity), AcidResponse::RetractOk { facts_retracted }) => {
                     line_count += facts_retracted;
                     let cursor = acid_protocol::cursor_from_offset(line_count);
-                    publish_facts_written(&pub_sock, entity, *facts_retracted, &cursor);
+                    publish_acid_event(
+                        &pub_sock,
+                        AcidEvent::FactsRetracted {
+                            entity: entity.clone(),
+                            count: *facts_retracted,
+                            cursor,
+                        },
+                    );
                 }
                 _ => {}
             }
@@ -169,14 +183,9 @@ fn handle_request(request: &AcidRequest, storage: &FactStorage) -> AcidResponse 
     }
 }
 
-fn publish_facts_written(pub_sock: &nng::Socket, entity: &str, count: usize, cursor: &str) {
-    let event = AcidEvent::FactsWritten {
-        entity: entity.to_string(),
-        count,
-        cursor: cursor.to_string(),
-    };
+fn publish_acid_event(pub_sock: &nng::Socket, event: AcidEvent) {
     let bytes = acid_event_to_topic_message(&event);
     if let Err((_, e)) = pub_sock.send(nng::Message::from(&bytes[..])) {
-        tracing::warn!(error = %e, "Failed to publish acid/facts event");
+        tracing::warn!(error = %e, "Failed to publish ACID event");
     }
 }
