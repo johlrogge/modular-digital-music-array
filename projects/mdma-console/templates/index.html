@@ -1472,7 +1472,7 @@
                     refreshQueue();
                 } else if (ev.type === 'PositionUpdate') {
                     updateProgressBar(ev.position_ms, ev.duration_ms);
-                } else if (ev.type === 'FactsWritten') {
+                } else if (ev.type === 'FactsAsserted' || ev.type === 'FactsRetracted') {
                     // New facts written — re-run any active search to pick up updated metadata
                     var hasSearch = (document.getElementById('search-q').value.trim() ||
                                      document.getElementById('search-artist').value.trim() ||

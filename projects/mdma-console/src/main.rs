@@ -1582,7 +1582,7 @@ async fn library_search_handler(
 
 fn spawn_event_bridge(event_socket: String, event_tx: broadcast::Sender<String>) {
     use event_protocol::{
-        acid_event_from_topic_message, from_topic_message, TOPIC_ACID_FACTS_WRITTEN, TOPIC_PLAYBACK,
+        acid_event_from_topic_message, from_topic_message, TOPIC_ACID, TOPIC_PLAYBACK,
     };
     std::thread::spawn(move || {
         let sub = match nng::Socket::new(nng::Protocol::Sub0) {
@@ -1598,10 +1598,10 @@ fn spawn_event_bridge(event_socket: String, event_tx: broadcast::Sender<String>)
             tracing::error!(error = %e, "SSE: subscribe (playback) failed");
             return;
         }
-        if let Err(e) = sub.set_opt::<nng::options::protocol::pubsub::Subscribe>(
-            TOPIC_ACID_FACTS_WRITTEN.as_bytes().to_vec(),
-        ) {
-            tracing::error!(error = %e, "SSE: subscribe (acid/facts) failed");
+        if let Err(e) =
+            sub.set_opt::<nng::options::protocol::pubsub::Subscribe>(TOPIC_ACID.as_bytes().to_vec())
+        {
+            tracing::error!(error = %e, "SSE: subscribe (acid/) failed");
             return;
         }
         loop {

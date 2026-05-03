@@ -9,7 +9,7 @@ use crate::ipc::{
 };
 use crate::pipeline::{InboxFile, UploadSource};
 use acid_client::AcidClient;
-use event_protocol::{acid_event_from_topic_message, AcidEvent, TOPIC_ACID_FACTS_WRITTEN};
+use event_protocol::{acid_event_from_topic_message, AcidEvent, TOPIC_ACID};
 use library_search::{matches_query, TrackFields};
 use music_facts::MusicValue;
 use std::collections::{HashMap, HashSet};
@@ -4188,7 +4188,7 @@ pub fn run_ipc_server(service: Arc<LibraryService>, address: &str) -> Result<(),
 /// Spawn a background thread that subscribes to ACID fact notifications and
 /// applies incremental updates to the library index.
 ///
-/// On receiving an `acid/facts` event, fetches new facts from the ACID stream
+/// On receiving an `acid/facts/asserted` or `acid/facts/retracted` event, fetches new facts from the ACID stream
 /// starting at the in-memory cursor, applies them to the in-memory index, and
 /// updates the in-memory cursor. The cursor is never persisted to disk.
 ///
@@ -4208,10 +4208,10 @@ pub fn spawn_fact_subscriber(service: Arc<LibraryService>) {
             }
         };
 
-        if let Err(e) = sub.set_opt::<nng::options::protocol::pubsub::Subscribe>(
-            TOPIC_ACID_FACTS_WRITTEN.as_bytes().to_vec(),
-        ) {
-            tracing::error!(error = %e, "Failed to subscribe to ACID facts topic");
+        if let Err(e) =
+            sub.set_opt::<nng::options::protocol::pubsub::Subscribe>(TOPIC_ACID.as_bytes().to_vec())
+        {
+            tracing::error!(error = %e, "Failed to subscribe to ACID events topic");
             return;
         }
 
@@ -4264,8 +4264,14 @@ pub fn spawn_fact_subscriber(service: Arc<LibraryService>) {
                     }
                 };
 
-                let AcidEvent::FactsWritten { cursor, .. } = event;
-                tracing::debug!(cursor = %cursor, "Received ACID facts-written notification");
+                match &event {
+                    AcidEvent::FactsAsserted { cursor, .. } => {
+                        tracing::debug!(cursor = %cursor, "Received ACID facts-asserted notification");
+                    }
+                    AcidEvent::FactsRetracted { cursor, .. } => {
+                        tracing::debug!(cursor = %cursor, "Received ACID facts-retracted notification");
+                    }
+                };
 
                 // Fetch new facts starting from our in-memory cursor
                 let current_cursor = service.cursor.lock().unwrap().clone();

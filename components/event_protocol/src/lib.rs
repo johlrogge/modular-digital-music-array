@@ -8,8 +8,11 @@ pub const TOPIC_PLAYBACK: &str = "playback/";
 /// Topic prefix for all ACID events.
 pub const TOPIC_ACID: &str = "acid/";
 
-/// Topic for facts-written notifications.
-pub const TOPIC_ACID_FACTS_WRITTEN: &str = "acid/facts";
+/// Topic for facts-asserted notifications.
+pub const TOPIC_ACID_FACTS_ASSERTED: &str = "acid/facts/asserted";
+
+/// Topic for facts-retracted notifications.
+pub const TOPIC_ACID_FACTS_RETRACTED: &str = "acid/facts/retracted";
 
 /// Topic for track started events.
 pub const TOPIC_TRACK_STARTED: &str = "playback/track_started";
@@ -98,12 +101,22 @@ impl PlaybackEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum AcidEvent {
-    /// New facts have been appended for an entity.
+    /// New facts have been asserted for an entity (via `WriteFacts`).
     ///
     /// This is a lightweight notification — it does NOT contain the fact data.
     /// Subscribers should issue a `ReadStream` request with the provided cursor
     /// to fetch the new facts.
-    FactsWritten {
+    FactsAsserted {
+        entity: String,
+        count: usize,
+        cursor: String,
+    },
+    /// Facts have been retracted for an entity (via `RetractFacts`).
+    ///
+    /// Same lightweight notification pattern as `FactsAsserted`.
+    /// Subscribers should issue a `ReadStream` request with the provided cursor
+    /// to fetch the retraction records.
+    FactsRetracted {
         entity: String,
         count: usize,
         cursor: String,
@@ -114,7 +127,8 @@ impl AcidEvent {
     /// Returns the topic string for this event.
     fn topic(&self) -> &'static str {
         match self {
-            AcidEvent::FactsWritten { .. } => TOPIC_ACID_FACTS_WRITTEN,
+            AcidEvent::FactsAsserted { .. } => TOPIC_ACID_FACTS_ASSERTED,
+            AcidEvent::FactsRetracted { .. } => TOPIC_ACID_FACTS_RETRACTED,
         }
     }
 }
@@ -309,28 +323,64 @@ mod tests {
 
     // ---- AcidEvent ----------------------------------------------------------
 
-    #[test]
-    fn acid_facts_written_roundtrip() {
-        let event = AcidEvent::FactsWritten {
+    #[rstest]
+    #[case(
+        AcidEvent::FactsAsserted {
             entity: "sha256:abc123".to_string(),
             count: 5,
             cursor: "line:42".to_string(),
-        };
+        },
+        TOPIC_ACID_FACTS_ASSERTED
+    )]
+    #[case(
+        AcidEvent::FactsRetracted {
+            entity: "sha256:def456".to_string(),
+            count: 2,
+            cursor: "line:44".to_string(),
+        },
+        TOPIC_ACID_FACTS_RETRACTED
+    )]
+    fn acid_event_roundtrip(#[case] event: AcidEvent, #[case] expected_topic: &str) {
         let bytes = acid_event_to_topic_message(&event);
         let (topic, decoded) = acid_event_from_topic_message(&bytes).unwrap();
-        assert_eq!(topic, TOPIC_ACID_FACTS_WRITTEN);
+        assert_eq!(topic, expected_topic);
         assert_eq!(decoded, event);
     }
 
-    #[test]
-    fn acid_event_wire_format_has_null_separator() {
-        let event = AcidEvent::FactsWritten {
+    #[rstest]
+    #[case(
+        AcidEvent::FactsAsserted {
             entity: "sha256:abc".to_string(),
             count: 1,
             cursor: "line:0".to_string(),
-        };
+        },
+        TOPIC_ACID_FACTS_ASSERTED
+    )]
+    #[case(
+        AcidEvent::FactsRetracted {
+            entity: "sha256:abc".to_string(),
+            count: 1,
+            cursor: "line:0".to_string(),
+        },
+        TOPIC_ACID_FACTS_RETRACTED
+    )]
+    fn acid_event_wire_format_has_null_separator(#[case] event: AcidEvent, #[case] topic: &str) {
         let bytes = acid_event_to_topic_message(&event);
-        assert!(bytes.starts_with(TOPIC_ACID_FACTS_WRITTEN.as_bytes()));
-        assert_eq!(bytes[TOPIC_ACID_FACTS_WRITTEN.len()], 0);
+        assert!(bytes.starts_with(topic.as_bytes()));
+        assert_eq!(bytes[topic.len()], 0);
+    }
+
+    #[test]
+    fn acid_prefix_matches_both_variants() {
+        let asserted_topic = TOPIC_ACID_FACTS_ASSERTED;
+        let retracted_topic = TOPIC_ACID_FACTS_RETRACTED;
+        assert!(
+            asserted_topic.starts_with(TOPIC_ACID),
+            "FactsAsserted topic must start with TOPIC_ACID prefix"
+        );
+        assert!(
+            retracted_topic.starts_with(TOPIC_ACID),
+            "FactsRetracted topic must start with TOPIC_ACID prefix"
+        );
     }
 }
