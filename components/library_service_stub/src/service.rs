@@ -289,6 +289,8 @@ impl LibraryService {
 
             LibraryRequest::WriteFact { .. } => LibraryResponse::FactWritten,
 
+            LibraryRequest::RetractFact { .. } => LibraryResponse::FactRetracted,
+
             LibraryRequest::RetractSourceFacts { .. } => LibraryResponse::SourceFactsRetracted,
 
             LibraryRequest::GetAlbumTitleByItemId { .. } => {

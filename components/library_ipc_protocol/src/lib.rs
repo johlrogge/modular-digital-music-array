@@ -311,6 +311,9 @@ pub enum LibraryRequest {
     /// Write a single fact for a track. Used for importing metadata from external sources.
     WriteFact { hash: ContentHash, fact: MusicValue },
 
+    /// Retract a single fact for a track. Used for removing manually-added metadata.
+    RetractFact { hash: ContentHash, fact: MusicValue },
+
     /// Retract all facts whose FactSource.source_name matches `source_name` for every
     /// ContentHash that has an ItemId fact equal to `item_id`.
     RetractSourceFacts {
@@ -392,6 +395,9 @@ pub enum LibraryResponse {
 
     /// Fact written successfully.
     FactWritten,
+
+    /// Fact retracted successfully.
+    FactRetracted,
 
     /// Source facts retracted successfully.
     SourceFactsRetracted,
@@ -595,6 +601,33 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let decoded: LibraryResponse = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, LibraryResponse::FactWritten));
+    }
+
+    #[test]
+    fn retract_fact_request_roundtrip() {
+        use music_facts::{Bpm, MusicValue};
+        let hash = ContentHash::new("sha256:abc");
+        let fact = MusicValue::Bpm(Bpm::from_u32(128).unwrap());
+        let req = LibraryRequest::RetractFact {
+            hash: hash.clone(),
+            fact: fact.clone(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: LibraryRequest = serde_json::from_str(&json).unwrap();
+        if let LibraryRequest::RetractFact { hash: h, fact: f } = decoded {
+            assert_eq!(h.as_str(), hash.as_str());
+            assert_eq!(f, fact);
+        } else {
+            panic!("unexpected variant");
+        }
+    }
+
+    #[test]
+    fn fact_retracted_response_roundtrip() {
+        let resp = LibraryResponse::FactRetracted;
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: LibraryResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, LibraryResponse::FactRetracted));
     }
 
     #[test]

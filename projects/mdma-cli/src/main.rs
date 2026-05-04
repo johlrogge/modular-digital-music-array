@@ -2,6 +2,7 @@
 //!
 //! Connects to services via gateway (single address) or direct IPC.
 
+use chrono::NaiveDate;
 use clap::{CommandFactory, Parser, Subcommand};
 use color_eyre::Result;
 use colored::Colorize;
@@ -16,7 +17,9 @@ use mdma_client::{
     Deck, IngestSource, LibraryBackend, PlaybackBackend, PlaybackClientError, SourceClient,
     SourceName,
 };
-use music_facts::MusicValue;
+use music_facts::{
+    Album, Artist, Bpm, DiscNumber, Isrc, Key, MusicValue, Title, TrackNumber, Year,
+};
 use nng::options::Options;
 use rekordbox_xml::{parse_xml, RekordboxTrack};
 use source_protocol::{SourceError, SourceRequest, SourceResponse};
@@ -305,6 +308,12 @@ enum Commands {
     /// List all bookmarked tracks
     Bookmarks,
 
+    /// Add or retract metadata facts on a track.
+    Fact {
+        #[command(subcommand)]
+        command: FactCommands,
+    },
+
     /// Generate shell completions
     #[command(hide = true)]
     GenerateCompletions {
@@ -536,6 +545,34 @@ enum SearchSubcommands {
     },
 }
 
+/// Metadata fields that can be added or retracted by the user.
+///
+/// Internal/derived fields (FilePath, Source, ItemId, audio properties, play events,
+/// AddedAt, cover art) are intentionally excluded — they are managed automatically.
+#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+enum FactField {
+    Title,
+    Artist,
+    Album,
+    AlbumArtist,
+    TrackNumber,
+    DiscNumber,
+    Year,
+    Bpm,
+    Key,
+    MainGenre,
+    StyleDescriptor,
+    FullGenre,
+    Isrc,
+    Label,
+    RecordingYear,
+    RecordingDate,
+    Comment,
+    BeatportLabelUrl,
+    BeatportTrackUrl,
+    BandcampUrl,
+}
+
 #[derive(clap::ValueEnum, Debug, Clone)]
 enum SortField {
     Bpm,
@@ -679,6 +716,39 @@ enum LibraryCommands {
     /// `/music/cover-art/<hash>.<ext>`. Only tracks without an existing CoverArtPath
     /// fact are processed.
     ReindexCovers,
+}
+
+#[derive(Subcommand, Debug)]
+enum FactCommands {
+    /// Add or update a fact on a track.
+    ///
+    /// Stainless-facts replace semantics: the most recent fact for a given field wins
+    /// for non-collection types. Note this does NOT auto-retract the previous value;
+    /// retract explicitly first if you want to clean history.
+    Add {
+        /// Track content hash (prefix accepted, git-style).
+        hash: String,
+        /// Field name to add. Tab-completion shows supported fields.
+        #[arg(long, value_enum)]
+        field: FactField,
+        /// Value for the field.
+        #[arg(long)]
+        value: String,
+    },
+    /// Retract an existing fact from a track.
+    ///
+    /// Required for collection-type fields (each value is independent).
+    /// For scalar fields, retract removes that value from history.
+    Retract {
+        /// Track content hash (prefix accepted, git-style).
+        hash: String,
+        /// Field name to retract.
+        #[arg(long, value_enum)]
+        field: FactField,
+        /// Value to retract (must match the existing fact's value).
+        #[arg(long)]
+        value: String,
+    },
 }
 
 // =============================================================================
@@ -1117,6 +1187,116 @@ fn handle_facts(client: &LibraryBackend, hash: String) -> Result<()> {
             for (fact_type, fact_value) in facts {
                 println!("{:20} | {}", fact_type, fact_value);
             }
+            Ok(())
+        }
+        Err(e) => handle_error(e),
+    }
+}
+
+/// Parse a raw string value into a `MusicValue` for the given `FactField`.
+///
+/// Returns `Err(String)` with an actionable diagnostic if the value cannot be parsed.
+fn parse_field_value(field: FactField, raw: &str) -> Result<MusicValue, String> {
+    match field {
+        FactField::Title => Ok(MusicValue::Title(Title::new(raw))),
+        FactField::Artist => Ok(MusicValue::Artist(Artist::new(raw))),
+        FactField::Album => Ok(MusicValue::Album(Album::new(raw))),
+        FactField::AlbumArtist => Ok(MusicValue::AlbumArtist(Artist::new(raw))),
+        FactField::TrackNumber => {
+            let n = raw
+                .parse::<u32>()
+                .map_err(|e| format!("invalid integer for TrackNumber '{raw}': {e}"))?;
+            Ok(MusicValue::TrackNumber(TrackNumber::new(n)))
+        }
+        FactField::DiscNumber => {
+            let n = raw
+                .parse::<u32>()
+                .map_err(|e| format!("invalid integer for DiscNumber '{raw}': {e}"))?;
+            Ok(MusicValue::DiscNumber(DiscNumber::new(n)))
+        }
+        FactField::Year => {
+            let n = raw
+                .parse::<u32>()
+                .map_err(|e| format!("invalid integer for Year '{raw}': {e}"))?;
+            Ok(MusicValue::Year(Year::new(n)))
+        }
+        FactField::Bpm => {
+            let b = raw
+                .parse::<f32>()
+                .map_err(|e| format!("invalid float for Bpm '{raw}': {e}"))?;
+            let bpm = Bpm::from_f32(b)
+                .map_err(|e| format!("BPM out of range for '{raw}': {e}"))?;
+            Ok(MusicValue::Bpm(bpm))
+        }
+        FactField::Key => Key::from_camelot(raw)
+            .or_else(|_| Key::from_traditional(raw))
+            .map(MusicValue::Key)
+            .map_err(|_| {
+                format!("invalid key '{raw}': use Camelot notation (1A-12B) or traditional (e.g. 'C Major', 'A Minor')")
+            }),
+        FactField::MainGenre => Ok(MusicValue::MainGenre(raw.to_string())),
+        FactField::StyleDescriptor => Ok(MusicValue::StyleDescriptor(raw.to_string())),
+        FactField::FullGenre => Ok(MusicValue::FullGenre(raw.to_string())),
+        FactField::Isrc => Ok(MusicValue::Isrc(Isrc::new(raw))),
+        FactField::Label => Ok(MusicValue::Label(raw.to_string())),
+        FactField::RecordingYear => {
+            let n = raw
+                .parse::<u32>()
+                .map_err(|e| format!("invalid integer for RecordingYear '{raw}': {e}"))?;
+            Ok(MusicValue::RecordingYear(Year::new(n)))
+        }
+        FactField::RecordingDate => {
+            let date = NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+                .map_err(|e| format!("invalid date for RecordingDate '{raw}' (use YYYY-MM-DD): {e}"))?;
+            Ok(MusicValue::RecordingDate(date))
+        }
+        FactField::Comment => Ok(MusicValue::Comment(raw.to_string())),
+        FactField::BeatportLabelUrl => Ok(MusicValue::BeatportLabelUrl(raw.to_string())),
+        FactField::BeatportTrackUrl => Ok(MusicValue::BeatportTrackUrl(raw.to_string())),
+        FactField::BandcampUrl => Ok(MusicValue::BandcampUrl(raw.to_string())),
+    }
+}
+
+fn handle_fact_add(
+    client: &LibraryBackend,
+    hash: String,
+    field: FactField,
+    value: String,
+) -> Result<()> {
+    let music_value = match parse_field_value(field, &value) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("Error: {msg}");
+            std::process::exit(1);
+        }
+    };
+    let content_hash = ContentHash::new(hash.clone());
+    match client.write_fact(&content_hash, music_value) {
+        Ok(()) => {
+            println!("Added fact for {}: {:?} = {}", &hash, field, value);
+            Ok(())
+        }
+        Err(e) => handle_error(e),
+    }
+}
+
+fn handle_fact_retract(
+    client: &LibraryBackend,
+    hash: String,
+    field: FactField,
+    value: String,
+) -> Result<()> {
+    let music_value = match parse_field_value(field, &value) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("Error: {msg}");
+            std::process::exit(1);
+        }
+    };
+    let content_hash = ContentHash::new(hash.clone());
+    match client.retract_fact(&content_hash, music_value) {
+        Ok(()) => {
+            println!("Retracted fact for {}: {:?} = {}", &hash, field, value);
             Ok(())
         }
         Err(e) => handle_error(e),
@@ -4559,6 +4739,18 @@ fn main() -> Result<()> {
             let lib = connect_library(&cli);
             handle_bookmarks(&lib)
         }
+
+        Commands::Fact { command } => {
+            let lib = connect_library(&cli);
+            match command {
+                FactCommands::Add { hash, field, value } => {
+                    handle_fact_add(&lib, hash.clone(), *field, value.clone())
+                }
+                FactCommands::Retract { hash, field, value } => {
+                    handle_fact_retract(&lib, hash.clone(), *field, value.clone())
+                }
+            }
+        }
     }
 }
 
@@ -5483,5 +5675,82 @@ mod tests {
             vec!["sha256:unknown", "sha256:early", "sha256:new"],
             "ascending added: None first, then oldest→newest"
         );
+    }
+
+    // ── parse_field_value ─────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_field_value_title_valid() {
+        let result = parse_field_value(FactField::Title, "Spacewalk");
+        assert!(
+            matches!(result, Ok(MusicValue::Title(_))),
+            "expected MusicValue::Title, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn parse_field_value_year_valid() {
+        let result = parse_field_value(FactField::Year, "2024");
+        assert!(
+            matches!(result, Ok(MusicValue::Year(_))),
+            "expected MusicValue::Year, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn parse_field_value_year_invalid() {
+        let result = parse_field_value(FactField::Year, "twenty-four");
+        assert!(result.is_err(), "expected Err for non-integer year");
+    }
+
+    #[test]
+    fn parse_field_value_bpm_valid() {
+        let result = parse_field_value(FactField::Bpm, "128.0");
+        assert!(
+            matches!(result, Ok(MusicValue::Bpm(_))),
+            "expected MusicValue::Bpm, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn parse_field_value_bpm_out_of_range() {
+        // 5.0 BPM is below the valid range
+        let result = parse_field_value(FactField::Bpm, "5.0");
+        assert!(result.is_err(), "expected Err for out-of-range BPM");
+    }
+
+    #[test]
+    fn parse_field_value_key_camelot_valid() {
+        let result = parse_field_value(FactField::Key, "8B");
+        assert!(
+            matches!(result, Ok(MusicValue::Key(_))),
+            "expected MusicValue::Key, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn parse_field_value_key_invalid() {
+        let result = parse_field_value(FactField::Key, "NotAKey");
+        assert!(result.is_err(), "expected Err for invalid key");
+    }
+
+    #[test]
+    fn parse_field_value_recording_date_valid() {
+        let result = parse_field_value(FactField::RecordingDate, "2024-06-15");
+        assert!(
+            matches!(result, Ok(MusicValue::RecordingDate(_))),
+            "expected MusicValue::RecordingDate, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn parse_field_value_recording_date_bad_format() {
+        let result = parse_field_value(FactField::RecordingDate, "2024/06/15");
+        assert!(result.is_err(), "expected Err for bad date format");
     }
 }
