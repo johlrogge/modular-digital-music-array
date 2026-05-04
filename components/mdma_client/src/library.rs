@@ -270,6 +270,14 @@ impl LibraryBackend {
             fact,
         })?)
     }
+
+    /// Retract a single fact for a track. Used for removing manually-added metadata.
+    pub fn retract_fact(&self, hash: &ContentHash, fact: MusicValue) -> Result<(), ClientError> {
+        interpret_fact_retracted(self.request(&LibraryRequest::RetractFact {
+            hash: hash.clone(),
+            fact,
+        })?)
+    }
 }
 
 // =========================================================================
@@ -404,6 +412,14 @@ fn interpret_fact_written(response: LibraryResponse) -> Result<(), ClientError> 
     }
 }
 
+fn interpret_fact_retracted(response: LibraryResponse) -> Result<(), ClientError> {
+    match response {
+        LibraryResponse::FactRetracted => Ok(()),
+        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+        _ => Err(unexpected("RetractFact")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,5 +521,23 @@ mod tests {
     #[test]
     fn interpret_fact_written_unexpected_variant_is_err() {
         assert!(interpret_fact_written(LibraryResponse::Pong).is_err());
+    }
+
+    #[test]
+    fn interpret_fact_retracted_ok() {
+        assert!(interpret_fact_retracted(LibraryResponse::FactRetracted).is_ok());
+    }
+
+    #[test]
+    fn interpret_fact_retracted_error_propagates() {
+        let err = LibraryResponse::Error(ProtocolError::Internal {
+            message: "fail".to_string(),
+        });
+        assert!(interpret_fact_retracted(err).is_err());
+    }
+
+    #[test]
+    fn interpret_fact_retracted_unexpected_variant_is_err() {
+        assert!(interpret_fact_retracted(LibraryResponse::Pong).is_err());
     }
 }

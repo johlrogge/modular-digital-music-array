@@ -1226,6 +1226,27 @@ impl LibraryService {
                 }
             }
 
+            LibraryRequest::RetractFact { hash, fact } => {
+                let full_hash = match self.resolve_hash(&hash) {
+                    Ok(h) => h,
+                    Err(e) => return LibraryResponse::Error(e),
+                };
+                let source = music_facts::FactSource::new(
+                    "mdma",
+                    env!("CARGO_PKG_VERSION"),
+                    music_facts::FactOrigin::User,
+                );
+                match self
+                    .acid_client
+                    .retract_music_facts(&full_hash, &[(fact, source)])
+                {
+                    Ok(_) => LibraryResponse::FactRetracted,
+                    Err(e) => LibraryResponse::Error(ProtocolError::Internal {
+                        message: e.to_string(),
+                    }),
+                }
+            }
+
             LibraryRequest::RetractSourceFacts {
                 item_id,
                 source_name,
@@ -4155,6 +4176,92 @@ mod tests {
             ServiceError::Acid(_) => {} // correct: propagated ACID IPC error
             other => panic!("expected ServiceError::Acid(_), got {:?}", other),
         }
+    }
+
+    /// RetractFact handler writes a Retract entry to ACID after a prior Assert.
+    ///
+    /// Injects the hash into the in-memory index (required for resolve_hash), then
+    /// seeds via WriteFact (Assert), and sends RetractFact.
+    /// Verifies that ACID contains one Assert record and one Retract record.
+    #[test]
+    fn retract_fact_handler_writes_retract_entry_to_acid() {
+        use acid_client::AcidClient;
+
+        let music_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+        let (acid_handle, facts_addr, events_addr) = spawn_acid_server();
+
+        let service = LibraryService::new_with_events(
+            music_dir.path().to_path_buf(),
+            metadata_dir.path().to_path_buf(),
+            &facts_addr,
+            &events_addr,
+        )
+        .unwrap();
+
+        let hash = ContentHash::new("sha256:retractfact01");
+
+        // Inject the hash into the in-memory track index so resolve_hash can find it.
+        {
+            let mut tracks = service.tracks.lock().unwrap();
+            let mut entry = IndexedTrackInfo::new_empty(hash.as_str().to_owned());
+            entry.title = Some("Retractable Title".to_owned());
+            tracks.push(entry);
+        }
+
+        // Seed: assert a fact via WriteFact
+        let write_resp = service.handle_request(LibraryRequest::WriteFact {
+            hash: hash.clone(),
+            fact: MusicValue::Title(Title::new("Retractable Title")),
+        });
+        assert!(
+            matches!(write_resp, LibraryResponse::FactWritten),
+            "expected FactWritten, got {:?}",
+            write_resp
+        );
+
+        // Retract the same fact
+        let retract_resp = service.handle_request(LibraryRequest::RetractFact {
+            hash: hash.clone(),
+            fact: MusicValue::Title(Title::new("Retractable Title")),
+        });
+        assert!(
+            matches!(retract_resp, LibraryResponse::FactRetracted),
+            "expected FactRetracted, got {:?}",
+            retract_resp
+        );
+
+        // Verify ACID contains one Assert and one Retract record
+        let verifier = AcidClient::connect(&facts_addr).unwrap();
+        let lines = verifier.read_entity(hash.as_str()).unwrap();
+        drop(acid_handle);
+
+        let assert_count = lines
+            .iter()
+            .filter(|line| {
+                serde_json::from_str::<stainless_facts::Fact<ContentHash, MusicValue, FactSource>>(
+                    line,
+                )
+                .ok()
+                .map(|f| f.operation() == stainless_facts::Operation::Assert)
+                .unwrap_or(false)
+            })
+            .count();
+
+        let retract_count = lines
+            .iter()
+            .filter(|line| {
+                serde_json::from_str::<stainless_facts::Fact<ContentHash, MusicValue, FactSource>>(
+                    line,
+                )
+                .ok()
+                .map(|f| f.operation() == stainless_facts::Operation::Retract)
+                .unwrap_or(false)
+            })
+            .count();
+
+        assert_eq!(assert_count, 1, "expected one Assert record in ACID");
+        assert_eq!(retract_count, 1, "expected one Retract record in ACID");
     }
 }
 

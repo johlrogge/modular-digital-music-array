@@ -4,6 +4,32 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [Unreleased]
+
+### CLI — Manual fact editing (`mdma fact add` / `mdma fact retract`)
+
+Users can now add or retract individual metadata facts on tracks directly from the CLI, without going through a re-import or rekordbox sync.
+
+```
+# Add a corrected BPM:
+mdma fact add sha256:abc123 --field bpm --value 128.5
+
+# Add a key in Camelot or traditional notation:
+mdma fact add sha256:abc123 --field key --value 8B
+mdma fact add sha256:abc123 --field key --value "C Major"
+
+# Retract an incorrect genre tag:
+mdma fact retract sha256:abc123 --field main-genre --value "Electronic"
+```
+
+Supported fields: `title`, `artist`, `album`, `album-artist`, `track-number`, `disc-number`, `year`, `bpm`, `key`, `main-genre`, `style-descriptor`, `full-genre`, `isrc`, `label`, `recording-year`, `recording-date` (YYYY-MM-DD), `comment`, `beatport-track-url`, `beatport-label-url`, `bandcamp-url`.
+
+Facts are written with `FactOrigin::User` attribution, identical to bookmarks. Partial hashes are accepted (git-style prefix matching). Tab-completion on `--field` is supported via shell completion scripts.
+
+**Note:** `mdma fact retract` writes a value-specific Retract record to ACID, but the library's in-memory materialization currently clears the scalar field regardless of the retracted value. If you retract a value that doesn't match the currently-displayed value, the field will briefly appear cleared in memory until the next library restart re-derives it from the fact stream. (Tracked as a follow-up.)
+
+---
+
 ## [0.17.0] — 2026-05-01
 
 ### Breaking Changes

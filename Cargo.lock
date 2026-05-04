@@ -2948,6 +2948,7 @@ name = "mdma-cli"
 version = "0.17.0"
 dependencies = [
  "audio-transcoder",
+ "chrono",
  "clap",
  "clap_complete",
  "client",
