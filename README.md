@@ -167,7 +167,11 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ---
 
-## What's new in 0.17.0
+## What's new in 0.18.0
+
+`mdma fact add` and `mdma fact retract` — edit track metadata directly from the CLI without re-importing or running a rekordbox sync. Covers 20 user-facing fields; built on the `FactsAsserted`/`FactsRetracted` protocol split from 0.17.0.
+
+### Earlier in 0.17.0
 
 **Breaking change** — `AcidEvent::FactsWritten` is replaced by `FactsAsserted` and `FactsRetracted`. External subscribers must update to the `acid/` prefix and match both new event variants. Also fixes a latent cursor-drift bug where the ACID cursor never advanced on `RetractOk`.
 
