@@ -4,7 +4,7 @@ All notable changes to MDMA are documented here.
 
 ---
 
-## [Unreleased]
+## [0.18.0] — 2026-05-04
 
 ### CLI — Manual fact editing (`mdma fact add` / `mdma fact retract`)
 
