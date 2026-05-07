@@ -1,11 +1,12 @@
 #!/bin/sh
 # INSTALL script for mdma-playback package
-case "${ACTION}" in
+# $1 = action (pre/post), $2 = pkgname, $3 = version, $4 = "yes" if upgrade
+case "$1" in
 post)
     # Create log directory for svlogd
     mkdir -p /var/log/mdma-playback
 
-    # Enable service
+    # Enable service on first install
     if [ ! -d /var/service ]; then
         mkdir -p /var/service
     fi
@@ -14,10 +15,12 @@ post)
         echo "mdma-playback service enabled"
     fi
 
-    # Restart if running
-    if sv status mdma-playback >/dev/null 2>&1; then
-        sv restart mdma-playback
-        echo "mdma-playback service restarted"
+    # On upgrade, restart only if the service is currently running
+    if [ "$4" = "yes" ]; then
+        if sv check mdma-playback >/dev/null 2>&1; then
+            sv restart mdma-playback
+            echo "mdma-playback service restarted"
+        fi
     fi
     ;;
 esac
