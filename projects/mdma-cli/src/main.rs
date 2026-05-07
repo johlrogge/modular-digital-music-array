@@ -3280,6 +3280,60 @@ fn export_dest_path(output: &std::path::Path, track: &TrackInfo, ext: &str) -> s
         .join(format!("{}.{}", title, ext))
 }
 
+/// Build a `hash → location-URI` map that resolves all three hash forms a playlist
+/// may use to look up a track:
+///
+/// - Full `sha256:<64hex>` form (what the resolver always returns)
+/// - 12-char short hex (canonical 0.18.1+ playlist format)
+/// - 8-char short hex (legacy 0.18.x playlist format)
+///
+/// The `location_fn` closure produces the location URI for each `(track, dest, ext)` tuple.
+/// Passing it as a closure keeps this helper pure and testable without filesystem I/O.
+fn build_hash_to_location<F>(
+    desired: &[(TrackInfo, std::path::PathBuf, String)],
+    location_fn: F,
+) -> std::collections::HashMap<String, String>
+where
+    F: Fn(&TrackInfo, &std::path::Path, &str) -> String,
+{
+    use std::collections::hash_map::Entry;
+    let mut map = std::collections::HashMap::new();
+    for (track, dest, ext) in desired {
+        let location = location_fn(track, dest, ext);
+        let full = track.content_hash.as_str().to_string();
+        let hex = full.strip_prefix("sha256:").unwrap_or(&full);
+
+        // Full hash: collision is impossible by construction — always insert.
+        map.insert(full.clone(), location.clone());
+
+        // Short prefixes: detect conflicts; first writer wins, warn on divergence.
+        let short_keys: &[usize] = &[12, 8];
+        for &len in short_keys {
+            if hex.len() >= len {
+                let short = hex[..len].to_string();
+                match map.entry(short) {
+                    Entry::Vacant(e) => {
+                        e.insert(location.clone());
+                    }
+                    Entry::Occupied(e) if e.get() == &location => {
+                        // Same location — no-op.
+                    }
+                    Entry::Occupied(e) => {
+                        eprintln!(
+                            "warning: short hash prefix {} maps to multiple tracks; \
+                             playlists referring to this prefix will resolve to {}",
+                            e.key(),
+                            e.get()
+                        );
+                        // Do not overwrite — first writer wins.
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
 /// Extract a content hash from a line of text.
 ///
 /// Handles multiple formats:
@@ -3698,15 +3752,11 @@ fn handle_rekordbox_export(
         .collect();
 
     // hash → canonical dest location URI, for playlist location building.
-    let hash_to_location: std::collections::HashMap<String, String> = desired
-        .iter()
-        .map(|(track, dest, _)| {
-            (
-                track.content_hash.as_str().to_string(),
-                rekordbox_xml::path_to_file_uri(dest),
-            )
-        })
-        .collect();
+    // Insert all three hash forms (full, 12-char short, 8-char short) so that
+    // playlists stored in any format on disk resolve correctly.
+    let hash_to_location = build_hash_to_location(&desired, |_track, dest, _ext| {
+        rekordbox_xml::path_to_file_uri(dest)
+    });
 
     // Load existing XML for incremental sync (skip when --replace)
     let xml_path = output_canon.join("rekordbox.xml");
@@ -6311,6 +6361,200 @@ mod tests {
         let view_matches = matches.subcommand_matches("view").unwrap();
         let cols = view_columns_from_matches(view_matches);
         assert!(cols.is_empty(), "no flags → empty columns list");
+    }
+
+    // ── build_hash_to_location: hash-format mixing ───────────────────────────
+
+    fn make_export_track(full_hash: &str, artist: &str, title: &str) -> TrackInfo {
+        use library_ipc_client::ContentHash;
+        TrackInfo {
+            content_hash: ContentHash::new(full_hash),
+            title: Some(title.to_string()),
+            artist: Some(artist.to_string()),
+            album: None,
+            duration: None,
+            bpm: None,
+            key: None,
+            blob_path: None,
+            cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
+            started: None,
+            stopped: None,
+        }
+    }
+
+    /// Playlist hashes stored as full `sha256:...` strings should resolve in the map.
+    #[test]
+    fn rekordbox_export_associates_tracks_when_playlist_has_full_hashes() {
+        let track = make_export_track(
+            "sha256:abcdef1234567890aabbccddeeff00112233445566778899aabbccddeeff0011",
+            "Carbon Based Lifeforms",
+            "Polyrytmi",
+        );
+        let location = "file://localhost/tmp/export/polyrytmi.aiff".to_string();
+        let desired: Vec<(TrackInfo, std::path::PathBuf, String)> = vec![(
+            track.clone(),
+            std::path::PathBuf::from("/tmp/export/polyrytmi.aiff"),
+            "aiff".to_string(),
+        )];
+        let map = build_hash_to_location(&desired, |_t, dest, _ext| {
+            rekordbox_xml::path_to_file_uri(dest)
+        });
+
+        // Full hash key must resolve.
+        let full_key = track.content_hash.as_str().to_string();
+        assert_eq!(
+            map.get(&full_key),
+            Some(&location),
+            "full hash key must resolve in map"
+        );
+    }
+
+    /// Playlist hashes stored as 12-char short hex (0.18.1+ canonical) should resolve.
+    #[test]
+    fn rekordbox_export_associates_tracks_when_playlist_has_short_hashes() {
+        let track = make_export_track(
+            "sha256:abcdef1234567890aabbccddeeff00112233445566778899aabbccddeeff0011",
+            "Sunju Hargun",
+            "Silverhaze",
+        );
+        let location = "file://localhost/tmp/export/silverhaze.aiff".to_string();
+        let desired: Vec<(TrackInfo, std::path::PathBuf, String)> = vec![(
+            track.clone(),
+            std::path::PathBuf::from("/tmp/export/silverhaze.aiff"),
+            "aiff".to_string(),
+        )];
+        let map = build_hash_to_location(&desired, |_t, dest, _ext| {
+            rekordbox_xml::path_to_file_uri(dest)
+        });
+
+        // 12-char short hash key (format stored by playlist_get in 0.18.1+) must resolve.
+        let short12_key = "abcdef123456".to_string();
+        assert_eq!(
+            map.get(&short12_key),
+            Some(&location),
+            "12-char short hash key must resolve in map"
+        );
+    }
+
+    /// Two playlists, one full-hash one 12-char short-hash — both must populate (Joakim's exact bug).
+    #[test]
+    fn rekordbox_export_associates_tracks_when_playlists_mix_formats() {
+        let track_a = make_export_track(
+            "sha256:abcdef1234567890aabbccddeeff00112233445566778899aabbccddeeff0011",
+            "Carbon Based Lifeforms",
+            "Polyrytmi",
+        );
+        let track_b = make_export_track(
+            "sha256:fedcba9876543210aabbccddeeff00112233445566778899aabbccddeeff0022",
+            "Sunju Hargun",
+            "Silverhaze",
+        );
+        let location_a = "file://localhost/tmp/export/polyrytmi.aiff".to_string();
+        let location_b = "file://localhost/tmp/export/silverhaze.aiff".to_string();
+        let desired: Vec<(TrackInfo, std::path::PathBuf, String)> = vec![
+            (
+                track_a.clone(),
+                std::path::PathBuf::from("/tmp/export/polyrytmi.aiff"),
+                "aiff".to_string(),
+            ),
+            (
+                track_b.clone(),
+                std::path::PathBuf::from("/tmp/export/silverhaze.aiff"),
+                "aiff".to_string(),
+            ),
+        ];
+        let map = build_hash_to_location(&desired, |_t, dest, _ext| {
+            rekordbox_xml::path_to_file_uri(dest)
+        });
+
+        // Playlist A uses full hash format.
+        let full_key_a = track_a.content_hash.as_str().to_string();
+        assert_eq!(
+            map.get(&full_key_a),
+            Some(&location_a),
+            "playlist A (full hash) must resolve"
+        );
+
+        // Playlist B uses 12-char short hash format.
+        let short12_key_b = "fedcba987654".to_string();
+        assert_eq!(
+            map.get(&short12_key_b),
+            Some(&location_b),
+            "playlist B (12-char short hash) must resolve"
+        );
+
+        // Also verify the 8-char legacy key works for both.
+        let short8_key_a = "abcdef12".to_string();
+        assert_eq!(
+            map.get(&short8_key_a),
+            Some(&location_a),
+            "playlist A (8-char legacy hash) must resolve"
+        );
+        let short8_key_b = "fedcba98".to_string();
+        assert_eq!(
+            map.get(&short8_key_b),
+            Some(&location_b),
+            "playlist B (8-char legacy hash) must resolve"
+        );
+    }
+
+    /// Two tracks share the same 8-char prefix but differ in full hash.
+    /// The 8-char short key must map to the FIRST track inserted; the second
+    /// must NOT silently overwrite it.  Both full-hash keys must still be present.
+    #[test]
+    fn build_hash_to_location_warns_on_short_hash_collision() {
+        // These two hashes share the first 8 hex chars ("aabbccdd") but diverge at char 9.
+        let track_a = make_export_track(
+            "sha256:aabbccdd11111111aabbccddeeff00112233445566778899aabbccddeeff0011",
+            "Artist A",
+            "Track A",
+        );
+        let track_b = make_export_track(
+            "sha256:aabbccdd22222222aabbccddeeff00112233445566778899aabbccddeeff0022",
+            "Artist B",
+            "Track B",
+        );
+        let location_a = "file://localhost/tmp/export/track_a.aiff".to_string();
+        let location_b = "file://localhost/tmp/export/track_b.aiff".to_string();
+        let desired: Vec<(TrackInfo, std::path::PathBuf, String)> = vec![
+            (
+                track_a.clone(),
+                std::path::PathBuf::from("/tmp/export/track_a.aiff"),
+                "aiff".to_string(),
+            ),
+            (
+                track_b.clone(),
+                std::path::PathBuf::from("/tmp/export/track_b.aiff"),
+                "aiff".to_string(),
+            ),
+        ];
+        let map = build_hash_to_location(&desired, |_t, dest, _ext| {
+            rekordbox_xml::path_to_file_uri(dest)
+        });
+
+        // Both full-hash keys must be present and point to their own locations.
+        assert_eq!(
+            map.get(track_a.content_hash.as_str()),
+            Some(&location_a),
+            "full hash for track_a must resolve"
+        );
+        assert_eq!(
+            map.get(track_b.content_hash.as_str()),
+            Some(&location_b),
+            "full hash for track_b must resolve"
+        );
+
+        // The two tracks have the same 8-char prefix "aabbccdd".
+        // The first-inserted track (track_a) must win; track_b must NOT overwrite it.
+        let short8_key = "aabbccdd".to_string();
+        assert_eq!(
+            map.get(&short8_key),
+            Some(&location_a),
+            "8-char collision: first-inserted track must win"
+        );
     }
 
     // ── mdma search output stability: render_track_table_inner unchanged ────────
