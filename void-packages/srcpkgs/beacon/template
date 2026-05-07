@@ -1,6 +1,6 @@
 # Template file for beacon package
 pkgname=beacon
-version=0.19.0
+version=0.19.1
 revision=1
 archs="aarch64"
 build_style=cargo
