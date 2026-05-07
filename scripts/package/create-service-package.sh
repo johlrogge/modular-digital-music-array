@@ -159,10 +159,12 @@ if [[ -n "$EXTRA_INSTALL" ]]; then
 fi
 
 # Write the INSTALL script using printf to avoid heredoc quoting surprises
+# xbps calls INSTALL with positional args: $1=action $2=pkgname $3=version $4="yes" if upgrade
 {
     printf '#!/bin/sh\n'
     printf '# INSTALL script for %s package\n' "$SVC"
-    printf 'case "${ACTION}" in\n'
+    printf '# $1=action  $2=pkgname  $3=version  $4="yes" if upgrade\n'
+    printf 'case "$1" in\n'
     printf 'post)\n'
     printf '    # Create log directory for svlogd\n'
     printf '    mkdir -p /var/log/%s\n' "$SVC"
@@ -171,7 +173,7 @@ fi
         printf '%s\n' "$EXTRA_INSTALL_CONTENT"
         printf '\n'
     fi
-    printf '    # Enable service\n'
+    printf '    # Enable service on first install\n'
     printf '    if [ ! -d /var/service ]; then\n'
     printf '        mkdir -p /var/service\n'
     printf '    fi\n'
@@ -180,10 +182,12 @@ fi
     printf '        echo "%s service enabled"\n' "$SVC"
     printf '    fi\n'
     printf '\n'
-    printf '    # Restart if running\n'
-    printf '    if sv status %s >/dev/null 2>&1; then\n' "$SVC"
-    printf '        sv restart %s\n' "$SVC"
-    printf '        echo "%s service restarted"\n' "$SVC"
+    printf '    # On upgrade, restart only if the service is currently up\n'
+    printf '    if [ "$4" = "yes" ]; then\n'
+    printf '        if sv check %s >/dev/null 2>&1; then\n' "$SVC"
+    printf '            sv restart %s\n' "$SVC"
+    printf '            echo "%s service restarted"\n' "$SVC"
+    printf '        fi\n'
     printf '    fi\n'
     printf '    ;;\n'
     printf 'esac\n'
