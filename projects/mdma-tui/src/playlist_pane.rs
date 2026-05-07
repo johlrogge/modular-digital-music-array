@@ -1156,11 +1156,11 @@ mod tests {
 
         // Verify lines match canonical format, NOT bare hashes
         assert_eq!(
-            lines[0], "8d4e7b2c  Artist Name - Track Title  [3:45]",
+            lines[0], "8d4e7b2cabc1  Artist Name - Track Title  [3:45]",
             "line 0 must be canonical formatted, not a bare hash"
         );
         assert_eq!(
-            lines[1], "a3f91e0d  Other Artist - Other Title  [4:12]",
+            lines[1], "a3f91e0dabc1  Other Artist - Other Title  [4:12]",
             "line 1 must be canonical formatted, not a bare hash"
         );
 
