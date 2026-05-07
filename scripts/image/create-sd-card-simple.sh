@@ -114,7 +114,7 @@ if [ -z "$PLATFORMFS_TAR" ]; then
     echo "  Local repo : ${LOCAL_REPO}"
     echo "  Remote repo: ${MDMA_REPO}"
     ./mkplatformfs.sh \
-        -p "beacon dbus avahi cloud-guest-utils rpi5-kernel dracut uboot-mkimage" \
+        -p "beacon dbus avahi cloud-guest-utils rpi5-kernel dracut uboot-mkimage rpi-eeprom" \
         -r "$LOCAL_REPO" \
         -r "$MDMA_REPO" \
         -k "$HOOK_SCRIPT" \

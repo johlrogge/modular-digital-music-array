@@ -230,7 +230,11 @@ impl Action<MountedPartitions, InstallPlan, InstalledPackages> for InstallPackag
         input: &MountedPartitions,
     ) -> Result<PlannedAction<MountedPartitions, InstallPlan, InstalledPackages, Self>> {
         // Install both base-system (userland) and rpi-base (RPi kernel + firmware)
-        let packages = vec!["base-system".to_string(), "rpi-base".to_string()];
+        let packages = vec![
+            "base-system".to_string(),
+            "rpi-base".to_string(),
+            "rpi-eeprom".to_string(),
+        ];
 
         // Check if base-system is already installed by looking for a key binary
         let install_state = check_if_base_system_installed(&input.mount_root).await;
