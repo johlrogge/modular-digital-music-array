@@ -1,69 +1,88 @@
-# ADR-002: Redundant NVMe boot partition for SD-failure resilience
+# ADR-002: NVMe as primary boot device with SD as self-contained rescue beacon
 
 ## Status
-Accepted — 2026-05-07
+Accepted — 2026-05-07 (revised 2026-05-07)
 
 ## Context
 
-The MDMA provisioning pipeline currently boots the Pi 5 exclusively from the SD
-card. The SD holds the kernel, device trees, `cmdline.txt`, and `config.txt`;
-the rootfs and `/lib/modules` live on the NVMe. This couples two physical
-devices into a single boot path with no fallback.
+The MDMA provisioning pipeline originally booted the Pi 5 exclusively from the SD
+card. The SD held the kernel, device trees, `cmdline.txt`, and `config.txt`;
+the rootfs and `/lib/modules` lived on the NVMe. This coupled two physical
+devices into a single boot path.
 
 Today (2026-05-07) the SD card kernel went out of sync with the NVMe rootfs
 `/lib/modules`. The kernel loaded but could not find matching modules, and the
 unit failed to boot. Recovery required out-of-band intervention.
 
-The failure mode this eliminates: any divergence or hardware failure that
-takes the SD out — bit rot, wear-out, corruption from an interrupted write,
-or kernel/module drift between SD and NVMe — bricks the unit. SD cards are
-the least reliable component in the stack and the one we depend on most.
+The root cause was SD/NVMe coupling: the bootloader lived on one device and the
+rootfs (including `/lib/modules`) lived on another. Any divergence between them
+— kernel update applied to one but not both, bit rot, hardware failure — produces
+an unbootable unit. The original design framed this as "drift mitigation." The
+corrected design eliminates the coupling structurally by making NVMe the
+production boot device, end to end.
+
+Pi 5 `BOOT_ORDER` fallthrough is firmware-level only. Once the firmware hands
+off to a kernel, a subsequent kernel panic cannot trigger firmware fallthrough to
+the next device. This means SD/NVMe drift cannot self-recover via firmware
+fallthrough — the fallthrough only helps if the device is unreadable at the
+firmware level, not if the kernel loads but then panics due to missing modules.
 
 ## Decision
 
-Add a redundant boot path on the NVMe so the firmware can fall through when
-the SD fails.
+Restructure the boot path so NVMe is the production boot device. SD reverts to a
+self-contained beacon image used only for rescue scenarios.
 
 1. **Partition layout.** New NVMe layout includes a ~512 MB FAT32 boot
    partition ahead of the rootfs. 512 MB is sufficient for current and
    plausible future kernel/dtb/initramfs payloads with comfortable headroom.
 2. **Population.** Provisioning copies the kernel, device trees,
    `cmdline.txt`, and `config.txt` to the NVMe boot partition during
-   `stage4_install` / `stage5_configure`. Every kernel update must write to
-   both the SD boot partition and the NVMe boot partition; this is a hard
-   invariant of the update path, not a best-effort step.
-3. **Boot order.** Pi 5 firmware `BOOT_ORDER` is set to USB → SD → NVMe.
-   The exact encoded value is **TBD** pending empirical verification on
-   hardware. USB remains first to preserve recovery via USB stick. SD
-   remains primary so the existing boot path is unchanged on healthy units.
-   NVMe is the fallback.
+   `stage4_install` / `stage5_configure`. `config.txt` is sourced from the
+   rootfs `/boot/config.txt` (installed by the `rpi-firmware` package —
+   verified via `xbps-query --files rpi-firmware`; it does NOT come from
+   `rpi-base`). Kernel updates write to the NVMe boot partition and the NVMe
+   rootfs `/lib/modules` together — same disk, handled natively by xbps's
+   `rpi5-kernel` post-install hook. No cross-device sync invariant required.
+3. **Boot order.** Pi 5 firmware `BOOT_ORDER` is set to **USB → NVMe → SD**.
+   The encoded value is **`0xf164`** (right-to-left encoding: 4 = USB first,
+   6 = NVMe second, 1 = SD third, f = loop). USB remains first to preserve
+   recovery via USB stick. NVMe is primary production boot. SD is last.
+
+   This is a structural fix: after provisioning, the Pi boots entirely from
+   NVMe — the kernel comes from the NVMe boot partition, modules come from the
+   NVMe rootfs, both on the same physical device. There is no cross-device
+   coupling and no cross-device drift possible.
 4. **Scope.** New installs only. Already-provisioned Pis do not gain the
-   fallback retroactively; they pick it up on re-provision.
+   new boot order retroactively; they pick it up on re-provision.
+5. **SD card post-provisioning.** SD remains a self-contained beacon image
+   after provisioning. Stage 5 does NOT modify the SD's `cmdline.txt` to
+   redirect to NVMe rootfs, and does NOT sync NVMe's kernel/dtbs back to the
+   SD `/boot`. If firmware falls through to SD (NVMe physically unreadable),
+   the user lands in the beacon's rescue UI — not a half-coupled production
+   attempt. The SD stays clean and independently bootable as a recovery tool.
 
 ## Consequences
 
 ### Positive
-- SD failure or SD/NVMe kernel drift no longer bricks the unit. Firmware
-  falls through to NVMe boot automatically.
-- Recovery path is in-band: the unit boots itself instead of needing a
-  human with a card reader.
+- SD/NVMe kernel drift is structurally eliminated, not mitigated. Kernel and
+  modules live on the same disk; xbps post-install hooks keep them in sync
+  without any cross-device orchestration.
+- NVMe failure falls through to SD, which lands in a rescue UI rather than a
+  broken half-state.
+- Recovery path is in-band: the unit boots itself into beacon rescue mode
+  instead of needing a human with a card reader.
 
 ### Negative
-- **Kernel-drift hazard moves, it does not vanish.** The NVMe boot
-  partition can now go out of sync with `/lib/modules` in exactly the way
-  the SD did. Every kernel update must atomically update both boot
-  partitions. This is mandatory sync logic on the update path, owned by
-  the package post-install hooks.
-- **Boot time cost.** A few seconds of additional firmware probe time per
-  boot when SD is healthy (firmware tries SD first, succeeds, never reaches
+- **Boot time cost.** A few seconds of additional firmware probe time at every
+  boot when USB is empty (firmware checks USB first, finds nothing, moves to
   NVMe). Negligible.
 - **Misconfigured `BOOT_ORDER` could brick the unit unrecoverably** if the
   firmware refuses to fall through. Mitigated by read-back verification of
   the written `BOOT_ORDER` and idempotent skip when already correct;
   provisioning aborts if read-back disagrees.
 - **No migration path for already-provisioned Pis.** They keep the
-  single-point-of-failure boot path until re-provisioned. Deliberate: an
-  online repartition of a live rootfs is the riskier option (see B below).
+  old SD-primary boot path until re-provisioned. Deliberate: an online
+  repartition of a live rootfs is the riskier option (see B below).
 
 ## Alternatives considered
 
@@ -78,17 +97,22 @@ the SD fails.
   music/metadata via rsync** from the existing unit. This is the actual
   recovery path for `mdma-johlyroger`. Not a beacon feature; it is how the
   project moves the existing fleet onto the new layout operationally.
+- **USB → SD → NVMe (original design intent).** Reconsidered when boot-flow
+  analysis showed it preserved the SD/NVMe coupling that caused the
+  precipitating incident. SD-primary means the kernel and modules still live
+  on different devices, leaving the drift class intact. Switching to
+  USB → NVMe → SD eliminates the coupling architecturally.
 
 ## Related
 
 - Issue #22 — redundant boot partition
 - Project task #74 — implement NVMe boot partition in provisioning
 - Project task #57, #56 — provisioning pipeline groundwork
-- Project task #91 — kernel/module sync invariant on updates
 - Lessons from the 2026-05-07 boot incident: SD/NVMe coupling is the
-  fragility, not the kernel update mechanism itself.
+  fragility, not the kernel update mechanism itself. The fix is structural
+  elimination, not mitigation.
 
 ## Follow-up
 
-Update this ADR with the verified `BOOT_ORDER` value once devops confirms
-on hardware.
+`BOOT_ORDER = 0xf164` is empirically verified. No outstanding verification
+needed. The follow-up note from the original ADR is resolved.
