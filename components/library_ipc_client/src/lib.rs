@@ -280,15 +280,14 @@ impl LibraryClient {
         }
     }
 
-    /// Create a new playlist with the given hashes.
-    pub fn playlist_new(
-        &self,
-        name: &PlaylistName,
-        hashes: &[ContentHash],
-    ) -> Result<(), ClientError> {
+    /// Create a new playlist with pre-formatted content.
+    ///
+    /// `content` must be in the canonical `{8hash}  {Artist} - {Title}  [{duration}]`
+    /// format produced by `track_formatter::format_playlist_content`.
+    pub fn playlist_new(&self, name: &PlaylistName, content: String) -> Result<(), ClientError> {
         match self.request(&LibraryRequest::PlaylistNew {
             name: name.clone(),
-            content: hashes_to_content(hashes),
+            content,
         })? {
             LibraryResponse::PlaylistContent(_) => Ok(()),
             LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
@@ -298,15 +297,14 @@ impl LibraryClient {
         }
     }
 
-    /// Append hashes to an existing playlist.
-    pub fn playlist_append(
-        &self,
-        name: &PlaylistName,
-        hashes: &[ContentHash],
-    ) -> Result<(), ClientError> {
+    /// Append pre-formatted content lines to an existing playlist.
+    ///
+    /// `content` must be in the canonical `{8hash}  {Artist} - {Title}  [{duration}]`
+    /// format produced by `track_formatter::format_playlist_content`.
+    pub fn playlist_append(&self, name: &PlaylistName, content: String) -> Result<(), ClientError> {
         match self.request(&LibraryRequest::PlaylistAppend {
             name: name.clone(),
-            content: hashes_to_content(hashes),
+            content,
         })? {
             LibraryResponse::PlaylistContent(_) => Ok(()),
             LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
@@ -316,15 +314,18 @@ impl LibraryClient {
         }
     }
 
-    /// Replace all hashes in an existing playlist.
+    /// Replace a playlist with pre-formatted content.
+    ///
+    /// `content` must be in the canonical `{8hash}  {Artist} - {Title}  [{duration}]`
+    /// format produced by `track_formatter::format_playlist_content`.
     pub fn playlist_replace(
         &self,
         name: &PlaylistName,
-        hashes: &[ContentHash],
+        content: String,
     ) -> Result<(), ClientError> {
         match self.request(&LibraryRequest::PlaylistReplace {
             name: name.clone(),
-            content: hashes_to_content(hashes),
+            content,
         })? {
             LibraryResponse::PlaylistContent(_) => Ok(()),
             LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
@@ -436,15 +437,6 @@ impl LibraryClient {
 // =========================================================================
 // Playlist content helpers
 // =========================================================================
-
-/// Serialize a slice of ContentHash to the one-hash-per-line format.
-pub fn hashes_to_content(hashes: &[ContentHash]) -> String {
-    hashes
-        .iter()
-        .map(|h| h.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
 
 /// Parse hash-per-line playlist content. Skips empty lines and comment lines.
 /// Takes the first whitespace-separated token per line (hash may be followed by display info).

@@ -11,6 +11,15 @@ use ratatui::{
     Frame,
 };
 use std::rc::Rc;
+use track_formatter::format_playlist_content;
+
+/// Build formatted playlist content from a slice of track info.
+///
+/// Produces the canonical `{8hash}  {Artist} - {Title}  [{duration}]` format
+/// used by all playlist write paths in the TUI.
+pub(crate) fn playlist_content_for_write(tracks: &[TrackInfo]) -> String {
+    format_playlist_content(tracks)
+}
 
 /// Maximum number of undo snapshots retained per playlist pane.
 const UNDO_DEPTH: usize = 50;
@@ -101,9 +110,13 @@ impl PlaylistPane {
         self.tracks.swap(from, to);
     }
 
-    /// Persist the current hash order to the backend.
+    /// Persist the current hash order to the backend with canonical formatting.
+    ///
+    /// Writes `{8hash}  {Artist} - {Title}  [{duration}]` lines so the on-disk
+    /// playlist file is human-readable and matches `mdma search` output.
     fn persist_order(&self) -> Result<(), mdma_client::LibraryClientError> {
-        self.library.playlist_replace(&self.name, &self.hashes)
+        let content = playlist_content_for_write(&self.tracks);
+        self.library.playlist_replace(&self.name, content)
     }
 
     /// Undo the most recent mutation by restoring the last snapshot.
@@ -308,12 +321,15 @@ impl Pane for PlaylistPane {
 
                 self.push_undo_snapshot();
 
-                match self.library.playlist_replace(&self.name, &remaining_hashes) {
+                // Compute remaining tracks before writing so we can format the content.
+                let remaining_tracks: Vec<TrackInfo> = remaining_hashes
+                    .iter()
+                    .filter_map(|h| self.library.get_track(h).ok())
+                    .collect();
+                let content = playlist_content_for_write(&remaining_tracks);
+
+                match self.library.playlist_replace(&self.name, content) {
                     Ok(()) => {
-                        let remaining_tracks: Vec<TrackInfo> = remaining_hashes
-                            .iter()
-                            .filter_map(|h| self.library.get_track(h).ok())
-                            .collect();
                         self.hashes = remaining_hashes;
                         self.tracks = remaining_tracks;
                         // Clamp cursor to new length
@@ -355,7 +371,8 @@ impl Pane for PlaylistPane {
             .filter_map(|h| self.library.get_track(h).ok())
             .collect();
 
-        match self.library.playlist_append(&self.name, &new_hashes) {
+        let content = playlist_content_for_write(&new_tracks);
+        match self.library.playlist_append(&self.name, content) {
             Ok(()) => {
                 let added = new_hashes.len();
                 self.hashes.extend(new_hashes);
@@ -1079,6 +1096,83 @@ mod tests {
         assert!(
             msg.contains("Non-contiguous"),
             "error message should mention non-contiguous: {msg}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Regression lock: playlist write format
+    //
+    // Verify that the TUI write path produces the canonical formatted lines
+    // (`{8hash}  {Artist} - {Title}  [{duration}]`) and NOT bare sha256 hashes.
+    // This test MUST fail before the fix and pass after it.
+    // -------------------------------------------------------------------------
+
+    fn make_track_info(hash: &str, artist: &str, title: &str, duration_secs: u32) -> TrackInfo {
+        use library_ipc_protocol::DurationSeconds;
+        TrackInfo {
+            content_hash: ContentHash::new(hash),
+            title: Some(title.to_string()),
+            artist: Some(artist.to_string()),
+            album: None,
+            duration: Some(DurationSeconds::new(duration_secs)),
+            bpm: None,
+            key: None,
+            blob_path: None,
+            cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
+            started: None,
+            stopped: None,
+        }
+    }
+
+    /// The TUI playlist write path must produce canonical formatted lines, not bare hashes.
+    ///
+    /// Regression lock: if this test fails, the TUI is writing raw hashes to disk.
+    #[test]
+    fn playlist_write_produces_canonical_formatted_lines() {
+        let tracks = vec![
+            make_track_info(
+                "sha256:8d4e7b2cabc12345",
+                "Artist Name",
+                "Track Title",
+                225, // 3:45
+            ),
+            make_track_info(
+                "sha256:a3f91e0dabc12345",
+                "Other Artist",
+                "Other Title",
+                252, // 4:12
+            ),
+        ];
+        // This calls the function that the TUI must use when persisting playlists.
+        // Before the fix this function does not exist — the test fails to compile.
+        // After the fix it exists and produces formatted lines.
+        let content = playlist_content_for_write(&tracks);
+
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "expected 2 lines, one per track");
+
+        // Verify lines match canonical format, NOT bare hashes
+        assert_eq!(
+            lines[0], "8d4e7b2c  Artist Name - Track Title  [3:45]",
+            "line 0 must be canonical formatted, not a bare hash"
+        );
+        assert_eq!(
+            lines[1], "a3f91e0d  Other Artist - Other Title  [4:12]",
+            "line 1 must be canonical formatted, not a bare hash"
+        );
+
+        // Extra: assert that bare hash format is NOT present
+        assert!(
+            !lines[0].starts_with("sha256:"),
+            "line must not start with 'sha256:' prefix"
+        );
+        // A bare hash would be pure hex with no spaces; formatted lines always contain spaces.
+        assert!(
+            lines[0].contains("  "),
+            "line must contain double-space separator (canonical format), not a bare hash"
         );
     }
 

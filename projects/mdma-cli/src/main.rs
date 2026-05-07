@@ -24,6 +24,7 @@ use nng::options::Options;
 use rekordbox_xml::{parse_xml, RekordboxTrack};
 use source_protocol::{SourceError, SourceRequest, SourceResponse};
 use std::path::Path;
+use track_formatter::format_track_line as format_track_line_shared;
 use track_matcher::{CandidateTrack, MatchResult, TrackLookup};
 
 // =============================================================================
@@ -845,19 +846,11 @@ fn short_hash(hash: &ContentHash) -> &str {
 
 /// Canonical playlist line format: `{short_hash}  {Artist} - {Title}  [{duration}]`
 /// Used for pipe mode output and temp files (no colors, no alignment).
+///
+/// Delegates to `track_formatter::format_track_line` — the shared implementation
+/// used by both CLI and TUI to guarantee format consistency.
 fn format_track_line(track: &TrackInfo) -> String {
-    let title = track.title.as_deref().unwrap_or("Unknown");
-    let artist = track.artist.as_deref().unwrap_or("Unknown");
-    let duration = track
-        .duration
-        .map(|d| format!("[{}]", d))
-        .unwrap_or_default();
-    let hash = short_hash(&track.content_hash);
-    if duration.is_empty() {
-        format!("{}  {} - {}", hash, artist, title)
-    } else {
-        format!("{}  {} - {}  {}", hash, artist, title, duration)
-    }
+    format_track_line_shared(track)
 }
 
 // =============================================================================
@@ -4022,6 +4015,69 @@ impl TrackLookup for LibraryTrackLookup<'_> {
     }
 }
 
+/// Minimal seam for the rekordbox playlist-write path.
+///
+/// Only the three operations used by `write_rekordbox_playlist` are required;
+/// this keeps the test fake minimal while locking the canonical-format invariant.
+trait PlaylistWriteOps {
+    /// Resolve content hashes to canonical playlist content.
+    fn resolve_and_format_playlist(&self, hashes: &[ContentHash]) -> String;
+    /// Create a new playlist with pre-formatted content. Fails if already exists.
+    fn playlist_new(
+        &self,
+        name: &library_ipc_client::PlaylistName,
+        content: String,
+    ) -> Result<(), library_ipc_client::ClientError>;
+    /// Replace an existing playlist with pre-formatted content.
+    fn playlist_replace(
+        &self,
+        name: &library_ipc_client::PlaylistName,
+        content: String,
+    ) -> Result<(), library_ipc_client::ClientError>;
+}
+
+impl PlaylistWriteOps for LibraryBackend {
+    fn resolve_and_format_playlist(&self, hashes: &[ContentHash]) -> String {
+        self.resolve_and_format_playlist(hashes)
+    }
+
+    fn playlist_new(
+        &self,
+        name: &library_ipc_client::PlaylistName,
+        content: String,
+    ) -> Result<(), library_ipc_client::ClientError> {
+        self.playlist_new(name, content)
+    }
+
+    fn playlist_replace(
+        &self,
+        name: &library_ipc_client::PlaylistName,
+        content: String,
+    ) -> Result<(), library_ipc_client::ClientError> {
+        self.playlist_replace(name, content)
+    }
+}
+
+/// Write a single named playlist via the [`PlaylistWriteOps`] seam.
+///
+/// Formats the hashes as canonical content, then calls `playlist_new`.
+/// Falls back to `playlist_replace` if the playlist already exists.
+/// Returns `Ok(true)` when created, `Ok(false)` when replaced.
+fn write_rekordbox_playlist(
+    backend: &dyn PlaylistWriteOps,
+    name: &library_ipc_client::PlaylistName,
+    hashes: &[ContentHash],
+) -> Result<bool, library_ipc_client::ClientError> {
+    let content = backend.resolve_and_format_playlist(hashes);
+    match backend.playlist_new(name, content.clone()) {
+        Ok(()) => Ok(true),
+        Err(_) => {
+            backend.playlist_replace(name, content)?;
+            Ok(false)
+        }
+    }
+}
+
 fn handle_rekordbox_import(
     _cli: &Cli,
     library: &LibraryBackend,
@@ -4163,24 +4219,19 @@ fn handle_rekordbox_import(
                 hashes.len()
             );
         } else {
-            match library.playlist_new(&name, &hashes) {
-                Ok(()) => println!(
+            match write_rekordbox_playlist(library, &name, &hashes)
+                .map_err(|e| color_eyre::eyre::eyre!("Failed to write playlist: {}", e))?
+            {
+                true => println!(
                     "Created playlist '{}' with {} tracks",
                     sanitized,
                     hashes.len()
                 ),
-                Err(e) => {
-                    eprintln!("Failed to create playlist '{}': {}", sanitized, e);
-                    eprintln!("Trying to replace existing playlist...");
-                    library.playlist_replace(&name, &hashes).map_err(|e2| {
-                        color_eyre::eyre::eyre!("Failed to replace playlist: {}", e2)
-                    })?;
-                    println!(
-                        "Replaced playlist '{}' with {} tracks",
-                        sanitized,
-                        hashes.len()
-                    );
-                }
+                false => println!(
+                    "Replaced playlist '{}' with {} tracks",
+                    sanitized,
+                    hashes.len()
+                ),
             }
         }
     }
@@ -4234,27 +4285,19 @@ fn handle_rekordbox_import(
                 );
             } else {
                 let name = parse_playlist_name(&sanitized);
-                match library.playlist_new(&name, &resolved) {
-                    Ok(()) => println!(
+                match write_rekordbox_playlist(library, &name, &resolved) {
+                    Ok(true) => println!(
                         "Created playlist '{}' with {} tracks",
                         sanitized,
                         resolved.len()
                     ),
+                    Ok(false) => println!(
+                        "Replaced playlist '{}' with {} tracks",
+                        sanitized,
+                        resolved.len()
+                    ),
                     Err(e) => {
-                        eprintln!(
-                            "Failed to create playlist '{}': {} — trying replace",
-                            sanitized, e
-                        );
-                        match library.playlist_replace(&name, &resolved) {
-                            Ok(()) => println!(
-                                "Replaced playlist '{}' with {} tracks",
-                                sanitized,
-                                resolved.len()
-                            ),
-                            Err(e2) => {
-                                eprintln!("Failed to replace playlist '{}': {}", sanitized, e2)
-                            }
-                        }
+                        eprintln!("Failed to write playlist '{}': {}", sanitized, e)
                     }
                 }
             }
@@ -5752,5 +5795,212 @@ mod tests {
     fn parse_field_value_recording_date_bad_format() {
         let result = parse_field_value(FactField::RecordingDate, "2024/06/15");
         assert!(result.is_err(), "expected Err for bad date format");
+    }
+
+    // ── rekordbox import playlist format regression ───────────────────────────
+    //
+    // These tests pin the on-disk format produced by the rekordbox import path.
+    // The critical invariant: playlist content must be in the canonical
+    // `{8hash}  {Artist} - {Title}  [{duration}]` format, never a bare hash.
+
+    fn make_rekordbox_track(
+        hash: &str,
+        artist: &str,
+        title: &str,
+        duration_secs: u32,
+    ) -> TrackInfo {
+        use library_ipc_client::{ContentHash, DurationSeconds};
+        TrackInfo {
+            content_hash: ContentHash::new(hash),
+            title: Some(title.to_string()),
+            artist: Some(artist.to_string()),
+            album: None,
+            duration: Some(DurationSeconds::new(duration_secs)),
+            bpm: None,
+            key: None,
+            blob_path: None,
+            cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
+            started: None,
+            stopped: None,
+        }
+    }
+
+    // ── write_rekordbox_playlist real regression tests ───────────────────────
+    //
+    // These tests drive the actual `write_rekordbox_playlist` code path through a
+    // `RecordingFake` that captures the `String` arguments passed to `playlist_new`
+    // and `playlist_replace`.  The canonical-format assertion would fail if anyone
+    // reverted the import code to pass raw `&[ContentHash]` instead of the
+    // formatted content string.
+
+    use std::cell::RefCell;
+
+    struct RecordingFake {
+        /// Pre-canned TrackInfo entries the fake will "resolve" for any hash.
+        tracks: Vec<TrackInfo>,
+        /// `playlist_new` content arguments, in call order.
+        new_calls: RefCell<Vec<String>>,
+        /// `playlist_replace` content arguments, in call order.
+        replace_calls: RefCell<Vec<String>>,
+        /// When `true`, `playlist_new` returns `PlaylistAlreadyExists` so the
+        /// code falls through to `playlist_replace`.
+        force_conflict: bool,
+    }
+
+    impl RecordingFake {
+        fn new(tracks: Vec<TrackInfo>) -> Self {
+            Self {
+                tracks,
+                new_calls: RefCell::new(Vec::new()),
+                replace_calls: RefCell::new(Vec::new()),
+                force_conflict: false,
+            }
+        }
+
+        fn with_conflict(tracks: Vec<TrackInfo>) -> Self {
+            Self {
+                force_conflict: true,
+                ..Self::new(tracks)
+            }
+        }
+    }
+
+    impl PlaylistWriteOps for RecordingFake {
+        fn resolve_and_format_playlist(&self, _hashes: &[ContentHash]) -> String {
+            // Produce canonical content from the pre-canned tracks (ignoring hashes
+            // so no actual IPC is needed).
+            track_formatter::format_playlist_content(&self.tracks)
+        }
+
+        fn playlist_new(
+            &self,
+            _name: &library_ipc_client::PlaylistName,
+            content: String,
+        ) -> Result<(), library_ipc_client::ClientError> {
+            if self.force_conflict {
+                return Err(library_ipc_client::ClientError::Protocol(
+                    library_ipc_client::ProtocolError::PlaylistAlreadyExists {
+                        name: "test".to_string(),
+                    },
+                ));
+            }
+            self.new_calls.borrow_mut().push(content);
+            Ok(())
+        }
+
+        fn playlist_replace(
+            &self,
+            _name: &library_ipc_client::PlaylistName,
+            content: String,
+        ) -> Result<(), library_ipc_client::ClientError> {
+            self.replace_calls.borrow_mut().push(content);
+            Ok(())
+        }
+    }
+
+    /// Assert every line of `content` is in canonical `{8hash}  {text}` form.
+    fn assert_all_lines_canonical(content: &str, context: &str) {
+        assert!(!content.is_empty(), "{context}: content must not be empty");
+        for line in content.lines() {
+            // Must not be a bare hash
+            assert!(
+                !line.starts_with("sha256:"),
+                "{context}: line must not be a bare sha256: hash; got: {line:?}"
+            );
+            // Must start with exactly 8 lowercase hex chars followed by two spaces
+            let prefix: String = line.chars().take(8).collect();
+            assert!(
+                prefix.chars().all(|c| c.is_ascii_hexdigit()),
+                "{context}: line must start with 8 hex chars; got: {line:?}"
+            );
+            assert!(
+                line.len() > 10 && &line[8..10] == "  ",
+                "{context}: line must have two spaces after hash; got: {line:?}"
+            );
+        }
+    }
+
+    /// Happy path: `playlist_new` receives canonical content on the first import.
+    #[test]
+    fn rekordbox_import_playlist_new_produces_canonical_format() {
+        use library_ipc_client::ContentHash;
+
+        let tracks = vec![
+            make_rekordbox_track(
+                "sha256:8d4e7b2cabc12345",
+                "Carbon Based Lifeforms",
+                "Polyrytmi",
+                367,
+            ),
+            make_rekordbox_track("sha256:a3f91e0dabc12345", "Sunju Hargun", "Silverhaze", 421),
+        ];
+        let hashes: Vec<ContentHash> = tracks.iter().map(|t| t.content_hash.clone()).collect();
+
+        let fake = RecordingFake::new(tracks);
+        let name = library_ipc_client::PlaylistName::new("my-set").unwrap();
+
+        let created = write_rekordbox_playlist(&fake, &name, &hashes).unwrap();
+        assert!(created, "expected playlist_new to succeed (created=true)");
+
+        let new_calls = fake.new_calls.borrow();
+        assert_eq!(new_calls.len(), 1, "playlist_new called exactly once");
+        assert_all_lines_canonical(&new_calls[0], "playlist_new content");
+
+        // Verify exact canonical format for both tracks
+        let lines: Vec<&str> = new_calls[0].lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0],
+            "8d4e7b2c  Carbon Based Lifeforms - Polyrytmi  [6:07]"
+        );
+        assert_eq!(lines[1], "a3f91e0d  Sunju Hargun - Silverhaze  [7:01]");
+    }
+
+    /// Conflict path: `playlist_replace` receives canonical content when the
+    /// playlist already exists (`playlist_new` returns `PlaylistAlreadyExists`).
+    #[test]
+    fn rekordbox_import_playlist_replace_conflict_produces_canonical_format() {
+        use library_ipc_client::ContentHash;
+
+        let tracks = vec![make_rekordbox_track(
+            "sha256:8d4e7b2cabc12345",
+            "Carbon Based Lifeforms",
+            "Polyrytmi",
+            367,
+        )];
+        let hashes: Vec<ContentHash> = tracks.iter().map(|t| t.content_hash.clone()).collect();
+
+        let fake = RecordingFake::with_conflict(tracks);
+        let name = library_ipc_client::PlaylistName::new("my-set").unwrap();
+
+        let created = write_rekordbox_playlist(&fake, &name, &hashes).unwrap();
+        assert!(
+            !created,
+            "expected playlist_replace fallback (created=false)"
+        );
+
+        // playlist_new was NOT recorded (it returned an error before we pushed)
+        assert!(
+            fake.new_calls.borrow().is_empty(),
+            "playlist_new should not record content when it returns an error"
+        );
+
+        let replace_calls = fake.replace_calls.borrow();
+        assert_eq!(
+            replace_calls.len(),
+            1,
+            "playlist_replace called exactly once"
+        );
+        assert_all_lines_canonical(&replace_calls[0], "playlist_replace content");
+
+        let lines: Vec<&str> = replace_calls[0].lines().collect();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0],
+            "8d4e7b2c  Carbon Based Lifeforms - Polyrytmi  [6:07]"
+        );
     }
 }
