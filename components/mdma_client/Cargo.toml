@@ -21,8 +21,10 @@ media-protocol = { workspace = true }
 gateway-client = { workspace = true }
 source-protocol = { workspace = true }
 nng-transport = { workspace = true }
+track-formatter = { workspace = true }
 
 # NNG + serialization
 nng = "1.0"
 serde_json = "1.0"
 thiserror = "1.0"
+tracing = "0.1"

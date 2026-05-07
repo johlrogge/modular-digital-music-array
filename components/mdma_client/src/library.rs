@@ -2,10 +2,11 @@
 
 use crate::error::map_gw_to_lib_error;
 use library_ipc_client::{
-    content_to_hashes, hashes_to_content, ClientError, ContentHash, FactType, InboxPath,
-    IngestAllItem, IngestResult, IngestSource, LibraryClient, LibraryRequest, LibraryResponse,
-    MusicValue, PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
+    content_to_hashes, ClientError, ContentHash, FactType, InboxPath, IngestAllItem, IngestResult,
+    IngestSource, LibraryClient, LibraryRequest, LibraryResponse, MusicValue, PlaylistName,
+    ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
 };
+use track_formatter::format_playlist_content;
 
 /// Abstraction for library requests, works in both gateway and direct mode.
 pub enum LibraryBackend {
@@ -178,52 +179,75 @@ impl LibraryBackend {
         }
     }
 
-    pub fn playlist_new(
-        &self,
-        name: &PlaylistName,
-        hashes: &[ContentHash],
-    ) -> Result<(), ClientError> {
+    /// Create a new playlist with pre-formatted content.
+    ///
+    /// `content` must be in the canonical `{8hash}  {Artist} - {Title}  [{duration}]`
+    /// format produced by `track_formatter::format_playlist_content`.
+    pub fn playlist_new(&self, name: &PlaylistName, content: String) -> Result<(), ClientError> {
         match self {
-            LibraryBackend::Direct(c) => c.playlist_new(name, hashes),
+            LibraryBackend::Direct(c) => c.playlist_new(name, content.clone()),
             LibraryBackend::Gateway(_) => {
                 interpret_playlist_ok(self.request(&LibraryRequest::PlaylistNew {
                     name: name.clone(),
-                    content: hashes_to_content(hashes),
+                    content,
                 })?)
             }
         }
     }
 
-    pub fn playlist_append(
-        &self,
-        name: &PlaylistName,
-        hashes: &[ContentHash],
-    ) -> Result<(), ClientError> {
+    /// Append pre-formatted content lines to an existing playlist.
+    ///
+    /// `content` must be in the canonical `{8hash}  {Artist} - {Title}  [{duration}]`
+    /// format produced by `track_formatter::format_playlist_content`.
+    pub fn playlist_append(&self, name: &PlaylistName, content: String) -> Result<(), ClientError> {
         match self {
-            LibraryBackend::Direct(c) => c.playlist_append(name, hashes),
+            LibraryBackend::Direct(c) => c.playlist_append(name, content),
             LibraryBackend::Gateway(_) => {
                 interpret_playlist_ok(self.request(&LibraryRequest::PlaylistAppend {
                     name: name.clone(),
-                    content: hashes_to_content(hashes),
+                    content,
                 })?)
             }
         }
     }
 
+    /// Replace a playlist with pre-formatted content.
+    ///
+    /// `content` must be in the canonical `{8hash}  {Artist} - {Title}  [{duration}]`
+    /// format produced by `track_formatter::format_playlist_content`.
     pub fn playlist_replace(
         &self,
         name: &PlaylistName,
-        hashes: &[ContentHash],
+        content: String,
     ) -> Result<(), ClientError> {
         match self {
-            LibraryBackend::Direct(c) => c.playlist_replace(name, hashes),
+            LibraryBackend::Direct(c) => c.playlist_replace(name, content),
             LibraryBackend::Gateway(_) => {
                 interpret_playlist_ok(self.request(&LibraryRequest::PlaylistReplace {
                     name: name.clone(),
-                    content: hashes_to_content(hashes),
+                    content,
                 })?)
             }
         }
+    }
+
+    /// Resolve a slice of content hashes to `TrackInfo` records and format them
+    /// as canonical playlist content.
+    ///
+    /// Hashes that fail to resolve are skipped with a warning. Returns the
+    /// formatted string ready to pass to `playlist_replace` or `playlist_append`.
+    pub fn resolve_and_format_playlist(&self, hashes: &[ContentHash]) -> String {
+        let tracks: Vec<TrackInfo> = hashes
+            .iter()
+            .filter_map(|h| match self.get_track(h) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    tracing::warn!("Failed to resolve hash {}: {}", h.as_str(), e);
+                    None
+                }
+            })
+            .collect();
+        format_playlist_content(&tracks)
     }
 
     pub fn playlist_remove(&self, name: &PlaylistName) -> Result<(), ClientError> {
@@ -423,20 +447,6 @@ fn interpret_fact_retracted(response: LibraryResponse) -> Result<(), ClientError
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn hashes_to_content_produces_newline_separated() {
-        let hashes = vec![
-            ContentHash::new("sha256:aaa"),
-            ContentHash::new("sha256:bbb"),
-        ];
-        assert_eq!(hashes_to_content(&hashes), "sha256:aaa\nsha256:bbb");
-    }
-
-    #[test]
-    fn hashes_to_content_empty_produces_empty_string() {
-        assert_eq!(hashes_to_content(&[]), "");
-    }
 
     #[test]
     fn content_to_hashes_parses_one_per_line() {

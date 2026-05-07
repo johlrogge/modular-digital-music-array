@@ -27,6 +27,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1.0"
 corsett = { git = "https://github.com/johlrogge/corsett.git", rev = "bf16c1aa2e8d6ba1f833e33009f2deecadc3ee26" }
+track-formatter = { path = "../../components/track_formatter" }
 
 [dev-dependencies]
 library-ipc-protocol = { path = "../../components/library_ipc_protocol" }

@@ -1,0 +1,15 @@
+[package]
+name = "track-formatter"
+version = "0.1.0"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/johlrogge/modular-digital-music-array"
+license = "MIT"
+
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "track-formatter"
+
+[dependencies]
+library-ipc-protocol = { workspace = true }

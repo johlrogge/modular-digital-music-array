@@ -28,6 +28,7 @@ library-search = { path = "../../components/library_search" }
 source-protocol = { path = "../../components/source_protocol" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rekordbox-xml = { path = "../../components/rekordbox_xml" }
+track-formatter = { path = "../../components/track_formatter" }
 track-matcher = { path = "../../components/track_matcher" }
 music-facts = { workspace = true }
 chrono = { workspace = true }
