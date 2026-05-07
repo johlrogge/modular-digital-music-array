@@ -115,7 +115,7 @@ async fn line_n_should_contain(world: &mut MdmaWorld, line_num: usize, expected:
     );
 }
 
-#[then(regex = r"^line (\d+) should start with hash ([0-9a-f]{8})$")]
+#[then(regex = r"^line (\d+) should start with hash ([0-9a-f]{12})$")]
 async fn line_n_should_start_with_hash(world: &mut MdmaWorld, line_num: usize, hash: String) {
     let lines: Vec<&str> = world
         .last_cli_stdout
@@ -422,11 +422,11 @@ async fn every_line_should_fit(world: &mut MdmaWorld, max_width: usize) {
 // Helpers
 // =============================================================================
 
-/// Check if a line is a data line (starts with an 8-char hex hash).
+/// Check if a line is a data line (starts with a 12-char hex hash).
 /// Filters out header lines like "Search results (N matches)".
 fn is_data_line(line: &str) -> bool {
     let token = line.split_whitespace().next().unwrap_or("");
-    token.len() == 8 && token.chars().all(|c| c.is_ascii_hexdigit())
+    token.len() == 12 && token.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Strip ANSI escape sequences (CSI sequences like `\x1b[...X` where X is a letter).
