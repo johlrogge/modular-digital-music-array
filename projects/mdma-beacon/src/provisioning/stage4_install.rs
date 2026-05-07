@@ -42,8 +42,10 @@ impl Action<FormattedSystem, MountPlan, MountedPartitions> for MountPartitionsAc
     ) -> Result<PlannedAction<FormattedSystem, MountPlan, MountedPartitions, Self>> {
         let mount_root = PathBuf::from("/mnt/mdma-install");
 
-        // Collect all partitions from the partition plan
-        let partitions: Vec<Partition> = match &input.partitioned.plan {
+        // Collect all partitions from the partition plan, sorted by mount path length
+        // so that parent mounts are always established before child mounts
+        // (e.g. "/" before "/boot/firmware").
+        let mut partitions: Vec<Partition> = match &input.partitioned.plan {
             crate::provisioning::types::CompletedPartitionPlan::SingleDrive {
                 partitions, ..
             } => partitions.clone(),
@@ -57,6 +59,7 @@ impl Action<FormattedSystem, MountPlan, MountedPartitions> for MountPartitionsAc
                 all
             }
         };
+        partitions.sort_by_key(|p| p.mount_point.as_str().len());
 
         // Check which partitions are already mounted
         let mut mount_states = Vec::new();
