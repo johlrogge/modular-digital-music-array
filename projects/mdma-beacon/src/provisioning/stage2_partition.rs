@@ -85,6 +85,52 @@ async fn read_existing_partitions(device_path: &str) -> Result<Vec<(String, u64)
     Ok(partitions)
 }
 
+/// Check that the existing on-disk partition layout is compatible with the
+/// planned layout. Aborts with a clear error if any new partition (`boot`) is
+/// being added at a position that would shift existing labeled partitions.
+///
+/// The check detects the old 4-partition layout (root/var/metadata/music at
+/// p1-p4) vs the new 5-partition layout (boot/root/var/metadata/music at
+/// p1-p5). Adding `boot` as p1 shifts every other partition by one slot,
+/// changing byte offsets and corrupting data.
+///
+/// If the planned layout adds a NEW partition label that is NOT in `existing`
+/// and there are also existing partitions present, the layouts are incompatible
+/// — a fresh disk is required.
+pub(crate) fn check_layout_compatibility(
+    planned: &[crate::provisioning::types::PartitionState],
+    existing: &[(String, u64)],
+) -> crate::error::Result<()> {
+    if existing.is_empty() {
+        // No existing partitions — fresh disk, always compatible.
+        return Ok(());
+    }
+
+    let existing_labels: std::collections::HashSet<String> =
+        existing.iter().map(|(l, _)| l.clone()).collect();
+
+    // Find any planned label that is absent from the existing layout.
+    let new_labels: Vec<String> = planned
+        .iter()
+        .map(|ps| ps.partition().label().as_str().to_string())
+        .filter(|l| !existing_labels.contains(l))
+        .collect();
+
+    if !new_labels.is_empty() {
+        return Err(crate::error::BeaconError::Provisioning(format!(
+            "Existing partition layout is incompatible with the new layout \
+             (NVMe boot partition was added in this version). \
+             Re-provisioning would shift partition byte ranges and corrupt data. \
+             To migrate: provision a fresh disk with this version, then copy \
+             /music and /metadata via rsync from the old unit. \
+             New partition(s) not present on disk: [{}]",
+            new_labels.join(", ")
+        )));
+    }
+
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct PartitionDrivesAction;
 
@@ -109,7 +155,8 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
         let primary_device = input.drives.primary().device.clone();
         let primary_size_bytes = input.drives.primary().size_bytes;
 
-        // Constants (in GB)
+        // Constants
+        const BOOT_SIZE_MB: u64 = 512;
         const ROOT_SIZE_GB: u64 = 16;
         const VAR_SIZE_GB: u64 = 8;
         const METADATA_SIZE_GB: u64 = 12; // ACID fact streams for music library metadata
@@ -148,21 +195,26 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                         vec![
                             PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p1", primary_device))?,
+                                mount_point: MountPoint::Boot,
+                                size: PartitionSize::from_mb(BOOT_SIZE_MB),
+                            }),
+                            PartitionState::Planned(Partition {
+                                device: DevicePath::new(format!("{}p2", primary_device))?,
                                 mount_point: MountPoint::Root,
                                 size: PartitionSize::from_gb(ROOT_SIZE_GB),
                             }),
                             PartitionState::Planned(Partition {
-                                device: DevicePath::new(format!("{}p2", primary_device))?,
+                                device: DevicePath::new(format!("{}p3", primary_device))?,
                                 mount_point: MountPoint::Var,
                                 size: PartitionSize::from_gb(VAR_SIZE_GB),
                             }),
                             PartitionState::Planned(Partition {
-                                device: DevicePath::new(format!("{}p3", primary_device))?,
+                                device: DevicePath::new(format!("{}p4", primary_device))?,
                                 mount_point: MountPoint::Metadata,
                                 size: PartitionSize::from_gb(METADATA_SIZE_GB),
                             }),
                             PartitionState::Planned(Partition {
-                                device: DevicePath::new(format!("{}p4", primary_device))?,
+                                device: DevicePath::new(format!("{}p5", primary_device))?,
                                 mount_point: MountPoint::Music,
                                 size: remaining_bytes, // ALL remaining on primary
                             }),
@@ -178,16 +230,21 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                         vec![
                             PartitionState::Planned(Partition {
                                 device: DevicePath::new(format!("{}p1", primary_device))?,
+                                mount_point: MountPoint::Boot,
+                                size: PartitionSize::from_mb(BOOT_SIZE_MB),
+                            }),
+                            PartitionState::Planned(Partition {
+                                device: DevicePath::new(format!("{}p2", primary_device))?,
                                 mount_point: MountPoint::Root,
                                 size: PartitionSize::from_gb(ROOT_SIZE_GB),
                             }),
                             PartitionState::Planned(Partition {
-                                device: DevicePath::new(format!("{}p2", primary_device))?,
+                                device: DevicePath::new(format!("{}p3", primary_device))?,
                                 mount_point: MountPoint::Var,
                                 size: PartitionSize::from_gb(VAR_SIZE_GB),
                             }),
                             PartitionState::Planned(Partition {
-                                device: DevicePath::new(format!("{}p3", primary_device))?,
+                                device: DevicePath::new(format!("{}p4", primary_device))?,
                                 mount_point: MountPoint::Metadata,
                                 size: PartitionSize::from_gb(METADATA_SIZE_GB),
                             }),
@@ -222,21 +279,26 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                     vec![
                         PartitionState::Planned(Partition {
                             device: DevicePath::new(format!("{}p1", primary_device))?,
+                            mount_point: MountPoint::Boot,
+                            size: PartitionSize::from_mb(BOOT_SIZE_MB),
+                        }),
+                        PartitionState::Planned(Partition {
+                            device: DevicePath::new(format!("{}p2", primary_device))?,
                             mount_point: MountPoint::Root,
                             size: PartitionSize::from_gb(ROOT_SIZE_GB),
                         }),
                         PartitionState::Planned(Partition {
-                            device: DevicePath::new(format!("{}p2", primary_device))?,
+                            device: DevicePath::new(format!("{}p3", primary_device))?,
                             mount_point: MountPoint::Var,
                             size: PartitionSize::from_gb(VAR_SIZE_GB),
                         }),
                         PartitionState::Planned(Partition {
-                            device: DevicePath::new(format!("{}p3", primary_device))?,
+                            device: DevicePath::new(format!("{}p4", primary_device))?,
                             mount_point: MountPoint::Metadata,
                             size: PartitionSize::from_gb(METADATA_SIZE_GB),
                         }),
                         PartitionState::Planned(Partition {
-                            device: DevicePath::new(format!("{}p4", primary_device))?,
+                            device: DevicePath::new(format!("{}p5", primary_device))?,
                             mount_point: MountPoint::Music,
                             size: remaining_bytes, // ALL remaining space!
                         }),
@@ -268,6 +330,29 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                 ]
             }
         };
+
+        // Read existing partitions to mark which ones already exist (idempotency)
+        let existing = read_existing_partitions(primary_device.as_path().to_str().unwrap())
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to read existing partitions, will create all: {}", e);
+                Vec::new()
+            });
+
+        tracing::info!(
+            "Found {} existing partitions on {}",
+            existing.len(),
+            primary_device
+        );
+        for (label, size) in &existing {
+            tracing::info!("  - {} ({} bytes)", label, size);
+        }
+
+        // Abort if existing layout is incompatible with the new planned layout.
+        // This must happen BEFORE partitions is moved into the plan.
+        // This prevents sfdisk from silently renumbering partitions and shifting
+        // byte offsets, which would corrupt data on partitions that moved.
+        check_layout_compatibility(&partitions, &existing)?;
 
         // Check for secondary drive and assign based on size comparison
         let plan = if let Some(secondary) = input.drives.secondary() {
@@ -303,23 +388,6 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
                 partitions,
             }
         };
-
-        // Read existing partitions to mark which ones already exist (idempotency)
-        let existing = read_existing_partitions(primary_device.as_path().to_str().unwrap())
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!("Failed to read existing partitions, will create all: {}", e);
-                Vec::new()
-            });
-
-        tracing::info!(
-            "Found {} existing partitions on {}",
-            existing.len(),
-            primary_device
-        );
-        for (label, size) in &existing {
-            tracing::info!("  - {} ({} bytes)", label, size);
-        }
 
         fn mark_existing_partitions(
             partitions: &mut [PartitionState],
@@ -690,43 +758,43 @@ mod tests {
     #[case::equal_drives_512gb(
         512, 512,
         "Equal drives → dedicated music on secondary (full drive)",
-        vec![("/", 16), ("/var", 8), ("/metadata", 12)],
+        vec![("/boot/firmware", 0), ("/", 16), ("/var", 8), ("/metadata", 12)],
         Some(vec![("/music", 512)])
     )]
     #[case::slightly_larger_primary_640gb(
         640, 512,
         "Primary 1.25× (640/512) → dedicated music on secondary (below 1.5× threshold)",
-        vec![("/", 16), ("/var", 8), ("/metadata", 12)],
+        vec![("/boot/firmware", 0), ("/", 16), ("/var", 8), ("/metadata", 12)],
         Some(vec![("/music", 512)])
     )]
     #[case::threshold_case_768gb(
         768, 512,
         "Primary 1.5× (768/512) → music on primary (exactly at threshold), secondary unpartitioned",
-        vec![("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 732)],
+        vec![("/boot/firmware", 0), ("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 732)],
         Some(Vec::new())  // Secondary left unpartitioned
     )]
     #[case::large_primary_1tb(
         1024, 512,
         "Primary 2.0× (1024/512) → music on primary (well above threshold), secondary unpartitioned",
-        vec![("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 988)],
+        vec![("/boot/firmware", 0), ("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 988)],
         Some(Vec::new())  // Secondary left unpartitioned
     )]
     #[case::huge_primary_2tb(
         2048, 512,
         "Primary 4.0× (2048/512) → music on primary (massive difference), secondary unpartitioned",
-        vec![("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 2012)],
+        vec![("/boot/firmware", 0), ("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 2012)],
         Some(Vec::new())  // Secondary left unpartitioned
     )]
     #[case::just_below_threshold(
         730, 512,
         "Primary 1.43× (730/512) → dedicated music on secondary (just below 1.5×)",
-        vec![("/", 16), ("/var", 8), ("/metadata", 12)],
+        vec![("/boot/firmware", 0), ("/", 16), ("/var", 8), ("/metadata", 12)],
         Some(vec![("/music", 512)])
     )]
     #[case::just_above_threshold(
         800, 512,
         "Primary 1.56× (800/512) → music on primary (just above 1.5×), secondary unpartitioned",
-        vec![("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 764)],
+        vec![("/boot/firmware", 0), ("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 764)],
         Some(Vec::new())  // Secondary left unpartitioned
     )]
     #[tokio::test]
@@ -798,12 +866,12 @@ mod tests {
     #[case::standard_512gb(
         512,
         "Single 512GB drive - Music gets all remaining space",
-        vec![("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 476)]
+        vec![("/boot/firmware", 0), ("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 476)]
     )]
     #[case::large_1tb(
         1024,
         "Single 1TB drive - Music gets all remaining space",
-        vec![("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 988)]
+        vec![("/boot/firmware", 0), ("/", 16), ("/var", 8), ("/metadata", 12), ("/music", 988)]
     )]
     #[tokio::test]
     async fn single_drive_partitioning(
@@ -924,11 +992,160 @@ mod tests {
         let music = binding.iter().find(|(m, _)| m == "/music").unwrap();
         assert_eq!(music.1, 512, "Music should get full 512GB dedicated");
 
-        // Primary should have OS partitions only
+        // Primary should have OS partitions only (boot, root, var, metadata)
         assert_eq!(
             primary_info.len(),
-            3,
-            "Primary should have 3 partitions (root, var, metadata)"
+            4,
+            "Primary should have 4 partitions (boot, root, var, metadata)"
+        );
+    }
+
+    // ── Layout compatibility checks ───────────────────────────────────────────
+
+    /// Old 4-partition layout (root/var/metadata/music at p1-p4) vs new
+    /// 5-partition layout (boot/root/var/metadata/music) must abort.
+    /// The `boot` label is new — adding it at p1 shifts all other partitions,
+    /// corrupting data at their current byte offsets.
+    #[test]
+    fn layout_incompatible_old_four_partition_vs_new_five_aborts() {
+        use crate::provisioning::types::{DevicePath, MountPoint, Partition, PartitionSize};
+
+        // Existing 4-partition layout: mdma-johlyroger style (no boot partition)
+        let existing: Vec<(String, u64)> = vec![
+            ("root".to_string(), 16 * 1024 * 1024 * 1024),
+            ("var".to_string(), 8 * 1024 * 1024 * 1024),
+            ("metadata".to_string(), 12 * 1024 * 1024 * 1024),
+            ("music".to_string(), 476 * 1024 * 1024 * 1024),
+        ];
+
+        // New 5-partition plan with boot at p1
+        let planned = vec![
+            PartitionState::Planned(Partition {
+                device: DevicePath::new("/dev/nvme0n1p1").unwrap(),
+                mount_point: MountPoint::Boot,
+                size: PartitionSize::from_mb(512),
+            }),
+            PartitionState::Planned(Partition {
+                device: DevicePath::new("/dev/nvme0n1p2").unwrap(),
+                mount_point: MountPoint::Root,
+                size: PartitionSize::from_gb(16),
+            }),
+            PartitionState::Planned(Partition {
+                device: DevicePath::new("/dev/nvme0n1p3").unwrap(),
+                mount_point: MountPoint::Var,
+                size: PartitionSize::from_gb(8),
+            }),
+            PartitionState::Planned(Partition {
+                device: DevicePath::new("/dev/nvme0n1p4").unwrap(),
+                mount_point: MountPoint::Metadata,
+                size: PartitionSize::from_gb(12),
+            }),
+            PartitionState::Planned(Partition {
+                device: DevicePath::new("/dev/nvme0n1p5").unwrap(),
+                mount_point: MountPoint::Music,
+                size: PartitionSize::from_gb(476),
+            }),
+        ];
+
+        let result = check_layout_compatibility(&planned, &existing);
+        assert!(
+            result.is_err(),
+            "should abort when adding new 'boot' partition to existing 4-partition layout"
+        );
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("incompatible"),
+            "error should say 'incompatible', got: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("boot"),
+            "error should mention 'boot' as the new partition, got: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("rsync"),
+            "error should mention rsync migration path, got: {}",
+            err_msg
+        );
+    }
+
+    /// When existing layout exactly matches the planned layout (all labels present),
+    /// no abort — idempotent re-provisioning of same-version disk.
+    #[test]
+    fn layout_compatible_matching_five_partition_no_abort() {
+        use crate::provisioning::types::{DevicePath, MountPoint, Partition, PartitionSize};
+
+        // Existing layout already has boot (provisioned with this version)
+        let existing: Vec<(String, u64)> = vec![
+            ("boot".to_string(), 512 * 1024 * 1024),
+            ("root".to_string(), 16 * 1024 * 1024 * 1024),
+            ("var".to_string(), 8 * 1024 * 1024 * 1024),
+            ("metadata".to_string(), 12 * 1024 * 1024 * 1024),
+            ("music".to_string(), 476 * 1024 * 1024 * 1024),
+        ];
+
+        let planned = vec![
+            PartitionState::Planned(Partition {
+                device: DevicePath::new("/dev/nvme0n1p1").unwrap(),
+                mount_point: MountPoint::Boot,
+                size: PartitionSize::from_mb(512),
+            }),
+            PartitionState::Planned(Partition {
+                device: DevicePath::new("/dev/nvme0n1p2").unwrap(),
+                mount_point: MountPoint::Root,
+                size: PartitionSize::from_gb(16),
+            }),
+            PartitionState::Planned(Partition {
+                device: DevicePath::new("/dev/nvme0n1p3").unwrap(),
+                mount_point: MountPoint::Var,
+                size: PartitionSize::from_gb(8),
+            }),
+            PartitionState::Planned(Partition {
+                device: DevicePath::new("/dev/nvme0n1p4").unwrap(),
+                mount_point: MountPoint::Metadata,
+                size: PartitionSize::from_gb(12),
+            }),
+            PartitionState::Planned(Partition {
+                device: DevicePath::new("/dev/nvme0n1p5").unwrap(),
+                mount_point: MountPoint::Music,
+                size: PartitionSize::from_gb(476),
+            }),
+        ];
+
+        let result = check_layout_compatibility(&planned, &existing);
+        assert!(
+            result.is_ok(),
+            "should not abort when all planned labels are present on disk, got: {:?}",
+            result
+        );
+    }
+
+    /// Fresh disk (no existing partitions) must never abort.
+    #[test]
+    fn layout_compatible_fresh_disk_no_abort() {
+        use crate::provisioning::types::{DevicePath, MountPoint, Partition, PartitionSize};
+
+        let existing: Vec<(String, u64)> = vec![];
+
+        let planned = vec![
+            PartitionState::Planned(Partition {
+                device: DevicePath::new("/dev/nvme0n1p1").unwrap(),
+                mount_point: MountPoint::Boot,
+                size: PartitionSize::from_mb(512),
+            }),
+            PartitionState::Planned(Partition {
+                device: DevicePath::new("/dev/nvme0n1p2").unwrap(),
+                mount_point: MountPoint::Root,
+                size: PartitionSize::from_gb(16),
+            }),
+        ];
+
+        let result = check_layout_compatibility(&planned, &existing);
+        assert!(
+            result.is_ok(),
+            "fresh disk should always pass compatibility check"
         );
     }
 }

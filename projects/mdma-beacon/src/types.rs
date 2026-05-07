@@ -230,6 +230,8 @@ impl From<&str> for DevicePath {
 /// Adding a new mount point requires explicitly deciding its filesystem type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MountPoint {
+    /// Boot partition (/boot/firmware) - FAT32, holds Pi firmware and bootloader files
+    Boot,
     /// Root filesystem (/)
     Root,
     /// Variable data (/var) - logs, journals
@@ -246,6 +248,7 @@ impl MountPoint {
     /// Get the mount point as a string slice
     pub const fn as_str(&self) -> &'static str {
         match self {
+            MountPoint::Boot => "/boot/firmware",
             MountPoint::Root => "/",
             MountPoint::Var => "/var",
             MountPoint::Music => "/music",
@@ -267,6 +270,7 @@ impl MountPoint {
     /// will cause a compile error until filesystem_type is updated.
     pub const fn filesystem_type(&self) -> FilesystemType {
         match self {
+            MountPoint::Boot => FilesystemType::Fat32,
             MountPoint::Root
             | MountPoint::Var
             | MountPoint::Music
@@ -283,6 +287,7 @@ impl MountPoint {
     /// lsblk output instantly recognizable.
     pub fn label(&self) -> PartitionLabel {
         let label = match self {
+            MountPoint::Boot => "boot",
             MountPoint::Root => "root",
             MountPoint::Var => "var",
             MountPoint::Music => "music",
@@ -463,6 +468,7 @@ mod tests {
     }
 
     #[rstest]
+    #[case(MountPoint::Boot, "/boot/firmware", FilesystemType::Fat32, "boot")]
     #[case(MountPoint::Root, "/", FilesystemType::Ext4, "root")]
     #[case(MountPoint::Var, "/var", FilesystemType::Ext4, "var")]
     #[case(MountPoint::Music, "/music", FilesystemType::Ext4, "music")]
