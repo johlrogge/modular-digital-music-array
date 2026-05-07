@@ -6,10 +6,6 @@ use chrono::NaiveDate;
 use clap::{CommandFactory, Parser, Subcommand};
 use color_eyre::Result;
 use colored::Colorize;
-use corsett::{
-    shortener::{FreeText, RightEllipsis},
-    ColumnSizingConfigBuilder, RemovalPolicy, Row, Score, Shorten, ShortenAny,
-};
 use event_protocol::{from_topic_message, PlaybackEvent, TOPIC_PLAYBACK};
 use library_ipc_client::{ClientError, ContentHash, InboxPath, ProtocolError, TrackInfo};
 use library_search::{parse_date_query, parse_numeric_query, parse_string_query, TrackQuery};
@@ -24,7 +20,10 @@ use nng::options::Options;
 use rekordbox_xml::{parse_xml, RekordboxTrack};
 use source_protocol::{SourceError, SourceRequest, SourceResponse};
 use std::path::Path;
-use track_formatter::format_track_line as format_track_line_shared;
+use track_formatter::{
+    format_track_line as format_track_line_shared, render_for_user, short_hash, ViewColumn,
+    ALL_COLUMNS,
+};
 use track_matcher::{CandidateTrack, MatchResult, TrackLookup};
 
 // =============================================================================
@@ -313,6 +312,37 @@ enum Commands {
     Fact {
         #[command(subcommand)]
         command: FactCommands,
+    },
+
+    /// Display selected fields for tracks read from stdin.
+    ///
+    /// Reads hashes from stdin (one per line), looks up TrackInfo for each hash,
+    /// and renders a colored, columnized table with the selected fields.
+    ///
+    /// Field order in the output matches the order the flags appear on the command line.
+    /// Field-order is detected via clap's indices_of: the position at which each flag
+    /// was specified in the argv determines the column order.
+    ///
+    /// Examples:
+    ///   mdma search --artist CBL | mdma view --hash --artist --title
+    ///   mdma search --genre Techno | mdma view --title --duration
+    ///   cat friday.plist | mdma view --hash --artist --title --duration
+    View {
+        /// Show the 12-character content hash
+        #[arg(long)]
+        hash: bool,
+
+        /// Show the artist name
+        #[arg(long)]
+        artist: bool,
+
+        /// Show the track title
+        #[arg(long)]
+        title: bool,
+
+        /// Show the track duration
+        #[arg(long)]
+        duration: bool,
     },
 
     /// Generate shell completions
@@ -831,19 +861,6 @@ fn connect_source(cli: &Cli, name: &str) -> SourceClient {
 // Display Helpers
 // =============================================================================
 
-/// Get a short hash for display (8 chars after sha256: prefix)
-fn short_hash(hash: &ContentHash) -> &str {
-    let clean = hash
-        .as_str()
-        .strip_prefix("sha256:")
-        .unwrap_or(hash.as_str());
-    if clean.len() >= 8 {
-        &clean[..8]
-    } else {
-        clean
-    }
-}
-
 /// Canonical playlist line format: `{short_hash}  {Artist} - {Title}  [{duration}]`
 /// Used for pipe mode output and temp files (no colors, no alignment).
 ///
@@ -854,78 +871,8 @@ fn format_track_line(track: &TrackInfo) -> String {
 }
 
 // =============================================================================
-// Track Table Rendering (corsett + colored)
+// Track Table Rendering (colored)
 // =============================================================================
-
-// Column types — each maps to a corsett shortening algorithm.
-struct ColHash(String);
-struct ColArtist(String);
-struct ColTitle(String);
-struct ColDuration(String);
-
-impl AsRef<str> for ColHash {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-impl AsRef<str> for ColArtist {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-impl AsRef<str> for ColTitle {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-impl AsRef<str> for ColDuration {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Shorten for ColHash {
-    type Algorithm = FreeText; // always 8 chars, never needs shortening
-}
-impl Shorten for ColArtist {
-    type Algorithm = RightEllipsis<'…', FreeText>;
-}
-impl Shorten for ColTitle {
-    type Algorithm = RightEllipsis<'…', FreeText>;
-}
-impl Shorten for ColDuration {
-    type Algorithm = FreeText; // naturally short, never needs shortening
-}
-
-struct TrackRow {
-    hash: ColHash,
-    artist: ColArtist,
-    title: ColTitle,
-    duration: ColDuration,
-}
-
-impl Row<4> for TrackRow {
-    fn get_cell(&self, index: usize) -> &dyn ShortenAny {
-        match index {
-            0 => &self.hash,
-            1 => &self.artist,
-            2 => &self.title,
-            3 => &self.duration,
-            _ => panic!("TrackRow only has 4 columns"),
-        }
-    }
-}
-
-impl TrackRow {
-    fn from_track(track: &TrackInfo) -> Self {
-        Self {
-            hash: ColHash(short_hash(&track.content_hash).to_string()),
-            artist: ColArtist(track.artist.as_deref().unwrap_or("Unknown").to_string()),
-            title: ColTitle(track.title.as_deref().unwrap_or("Unknown").to_string()),
-            duration: ColDuration(track.duration.map(|d| d.to_string()).unwrap_or_default()),
-        }
-    }
-}
 
 /// Detect terminal width.
 ///
@@ -944,27 +891,11 @@ fn terminal_width() -> usize {
         .unwrap_or(80)
 }
 
-/// Fit a string to exactly `width` visible chars: truncate with trailing `…` if too long, pad with
-/// spaces if too short. Returns an empty string when `width == 0`.
-fn fit_cell(s: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let len = s.chars().count();
-    if len > width {
-        // Truncate, appending an ellipsis if there's room.
-        if width > 1 {
-            let truncated: String = s.chars().take(width - 1).collect();
-            format!("{}…", truncated)
-        } else {
-            s.chars().take(width).collect()
-        }
-    } else if len < width {
-        format!("{}{}", s, " ".repeat(width - len))
-    } else {
-        s.to_string()
-    }
-}
+/// Virtual terminal width used when stdout is not a TTY (pipe, file redirection).
+///
+/// Wide enough to guarantee that corsett never shrinks the 8-char hash column,
+/// and that typical artist/title content is not truncated (Joakim's uniqueness hypothesis).
+const PIPE_TERM_WIDTH: usize = 200;
 
 /// Render tracks as a colored, aligned table for terminal display.
 /// Returns one formatted string per track row.
@@ -978,66 +909,13 @@ fn render_track_table(tracks: &[TrackInfo], reserved_prefix: usize) -> Vec<Strin
 /// Inner implementation of `render_track_table` that accepts an explicit `term_width`,
 /// allowing tests to inject a known width without relying on `$COLUMNS`.
 ///
-/// Corsett's `terminal_width` is compared to the sum of column widths only (no gaps), so we
-/// subtract the gap overhead — `(N-1) * gap_size = 3 * 2 = 6` — to keep the full rendered
-/// line (columns + gaps + prefix) within the terminal width.
+/// Delegates to `track_formatter::render_for_user` with the full default column set.
 fn render_track_table_inner(
     tracks: &[TrackInfo],
     reserved_prefix: usize,
     term_width: usize,
 ) -> Vec<String> {
-    if tracks.is_empty() {
-        return vec![];
-    }
-
-    const GAP_SIZE: usize = 2;
-    const NUM_COLUMNS: usize = 4;
-    const GAP_OVERHEAD: usize = (NUM_COLUMNS - 1) * GAP_SIZE; // 6
-
-    let available_content = term_width
-        .saturating_sub(reserved_prefix)
-        .saturating_sub(GAP_OVERHEAD);
-
-    let rows: Vec<TrackRow> = tracks.iter().map(TrackRow::from_track).collect();
-    let config = ColumnSizingConfigBuilder::<4>::new()
-        .terminal_width(available_content)
-        .gap_size(GAP_SIZE)
-        .max_depth(200)
-        .removal_policies([
-            RemovalPolicy::Never,                      // hash — always visible
-            RemovalPolicy::BelowScore(Score::MINIMAL), // artist — removed only when very cramped
-            RemovalPolicy::Never,                      // title — always visible
-            RemovalPolicy::BelowScore(Score::BASIC), // duration — removed first on narrow terminals
-        ])
-        .build();
-
-    let resized = corsett::resize_columns(config, &rows);
-
-    // Max visual width per column across all rows — for alignment.
-    let mut col_widths = [0usize; 4];
-    for row in &resized {
-        for (i, cell) in row.iter().enumerate() {
-            col_widths[i] = col_widths[i].max(cell.chars().count());
-        }
-    }
-
-    // Render rows: fit_cell truncates-or-pads each cell to the column width.
-    resized
-        .into_iter()
-        .map(|[hash, artist, title, duration]| {
-            let h = fit_cell(&hash, col_widths[0]).bright_black().to_string();
-            let a = fit_cell(&artist, col_widths[1]).green().to_string();
-            let t = fit_cell(&title, col_widths[2]).bold().to_string();
-            if col_widths[3] == 0 || duration.is_empty() {
-                format!("{}  {}  {}", h, a, t)
-            } else {
-                let d = fit_cell(&duration, col_widths[3])
-                    .bright_black()
-                    .to_string();
-                format!("{}  {}  {}  {}", h, a, t, d)
-            }
-        })
-        .collect()
+    render_for_user(tracks, ALL_COLUMNS, term_width, reserved_prefix)
 }
 
 /// Print tracks with a bold header in terminal mode; canonical lines in pipe mode.
@@ -1460,6 +1338,94 @@ fn handle_search(client: &LibraryBackend, query: &TrackQuery, no_stdin: bool) ->
         }
         Err(e) => handle_error(e),
     }
+}
+
+/// Resolve the ordered set of `ViewColumn`s from the raw `clap::ArgMatches` for the `view`
+/// subcommand.
+///
+/// Clap boolean flags (`--hash`, `--artist`, `--title`, `--duration`) don't preserve
+/// insertion order in the derive API. We use `ArgMatches::indices_of` to recover the argv
+/// position of each flag that was actually set, then sort by position to honour the order the
+/// user typed them in. This implements `mdma view --title --hash` → title-first, hash-second.
+fn view_columns_from_matches(matches: &clap::ArgMatches) -> Vec<ViewColumn> {
+    // Collect (argv_index, column) pairs for every flag that was set.
+    let mut indexed: Vec<(usize, ViewColumn)> = Vec::new();
+    for (flag, col) in &[
+        ("hash", ViewColumn::Hash),
+        ("artist", ViewColumn::Artist),
+        ("title", ViewColumn::Title),
+        ("duration", ViewColumn::Duration),
+    ] {
+        if matches.get_flag(flag) {
+            // indices_of returns the positions at which the flag appeared in argv.
+            // Take the first (and only) position for a boolean flag.
+            if let Some(mut idxs) = matches.indices_of(flag) {
+                if let Some(idx) = idxs.next() {
+                    indexed.push((idx, *col));
+                }
+            }
+        }
+    }
+    indexed.sort_by_key(|(idx, _)| *idx);
+    indexed.into_iter().map(|(_, col)| col).collect()
+}
+
+fn handle_view(client: &LibraryBackend, columns: Vec<ViewColumn>) -> Result<()> {
+    use std::io::{BufRead, IsTerminal};
+
+    if columns.is_empty() {
+        eprintln!("No fields selected. Use --hash, --artist, --title, and/or --duration.");
+        std::process::exit(1);
+    }
+
+    // Read hashes from stdin (same format as `mdma playlist append` / `mdma search` output).
+    let hashes: Vec<String> = std::io::stdin()
+        .lock()
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| parse_hash_from_line(&line))
+        .collect();
+
+    if hashes.is_empty() {
+        if std::io::stdout().is_terminal() {
+            eprintln!("No hashes on stdin. Pipe `mdma search` output or a playlist.");
+        }
+        return Ok(());
+    }
+
+    // Look up TrackInfo for each hash, preserving order.
+    let mut tracks: Vec<TrackInfo> = Vec::with_capacity(hashes.len());
+    for hash in &hashes {
+        let content_hash = ContentHash::new(hash.clone());
+        match client.get_track(&content_hash) {
+            Ok(track) => tracks.push(track),
+            Err(e) => {
+                eprintln!("Warning: could not resolve {}: {}", hash, e);
+            }
+        }
+    }
+
+    if tracks.is_empty() {
+        if std::io::stdout().is_terminal() {
+            println!("No tracks found");
+        }
+        return Ok(());
+    }
+
+    // Always use the parameterized corsett renderer.
+    // TTY → real terminal width (corsett truncates as needed via RightEllipsis).
+    // Pipe/file → virtual fixed-large width so the 8-char hash stays intact and
+    //             content is not truncated (Joakim's uniqueness hypothesis).
+    let term_width = if std::io::stdout().is_terminal() {
+        terminal_width()
+    } else {
+        PIPE_TERM_WIDTH
+    };
+    for line in render_for_user(&tracks, &columns, term_width, 0) {
+        println!("{}", line);
+    }
+
+    Ok(())
 }
 
 fn handle_fact_values_for(client: &LibraryBackend, fact_type: String) -> Result<()> {
@@ -4794,6 +4760,21 @@ fn main() -> Result<()> {
                 }
             }
         }
+
+        Commands::View { .. } => {
+            // Re-parse argv via ArgMatches to recover the order the flags appeared.
+            // This implements Option A from the field-order spec: use indices_of on
+            // the raw matches for the `view` subcommand to sort boolean flags by
+            // their argv position.
+            let matches = Cli::command().get_matches();
+            let view_matches = matches.subcommand_matches("view").unwrap_or_else(|| {
+                eprintln!("internal error: expected 'view' subcommand matches");
+                std::process::exit(1);
+            });
+            let columns = view_columns_from_matches(view_matches);
+            let lib = connect_library(&cli);
+            handle_view(&lib, columns)
+        }
     }
 }
 
@@ -5901,7 +5882,7 @@ mod tests {
         }
     }
 
-    /// Assert every line of `content` is in canonical `{8hash}  {text}` form.
+    /// Assert every line of `content` is in canonical `{12hash}  {text}` form.
     fn assert_all_lines_canonical(content: &str, context: &str) {
         assert!(!content.is_empty(), "{context}: content must not be empty");
         for line in content.lines() {
@@ -5910,14 +5891,14 @@ mod tests {
                 !line.starts_with("sha256:"),
                 "{context}: line must not be a bare sha256: hash; got: {line:?}"
             );
-            // Must start with exactly 8 lowercase hex chars followed by two spaces
-            let prefix: String = line.chars().take(8).collect();
+            // Must start with exactly 12 lowercase hex chars followed by two spaces
+            let prefix: String = line.chars().take(12).collect();
             assert!(
                 prefix.chars().all(|c| c.is_ascii_hexdigit()),
-                "{context}: line must start with 8 hex chars; got: {line:?}"
+                "{context}: line must start with 12 hex chars; got: {line:?}"
             );
             assert!(
-                line.len() > 10 && &line[8..10] == "  ",
+                line.len() > 14 && &line[12..14] == "  ",
                 "{context}: line must have two spaces after hash; got: {line:?}"
             );
         }
@@ -5954,9 +5935,9 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(
             lines[0],
-            "8d4e7b2c  Carbon Based Lifeforms - Polyrytmi  [6:07]"
+            "8d4e7b2cabc1  Carbon Based Lifeforms - Polyrytmi  [6:07]"
         );
-        assert_eq!(lines[1], "a3f91e0d  Sunju Hargun - Silverhaze  [7:01]");
+        assert_eq!(lines[1], "a3f91e0dabc1  Sunju Hargun - Silverhaze  [7:01]");
     }
 
     /// Conflict path: `playlist_replace` receives canonical content when the
@@ -6000,7 +5981,448 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(
             lines[0],
-            "8d4e7b2c  Carbon Based Lifeforms - Polyrytmi  [6:07]"
+            "8d4e7b2cabc1  Carbon Based Lifeforms - Polyrytmi  [6:07]"
+        );
+    }
+
+    // ── mdma view: ViewColumn / render_for_user ───────────
+
+    fn make_view_track(
+        hash: &str,
+        artist: Option<&str>,
+        title: Option<&str>,
+        duration_secs: Option<u32>,
+    ) -> TrackInfo {
+        use library_ipc_client::{ContentHash, DurationSeconds};
+        TrackInfo {
+            content_hash: ContentHash::new(hash),
+            title: title.map(str::to_string),
+            artist: artist.map(str::to_string),
+            album: None,
+            duration: duration_secs.map(DurationSeconds::new),
+            bpm: None,
+            key: None,
+            blob_path: None,
+            cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
+            started: None,
+            stopped: None,
+        }
+    }
+
+    #[test]
+    fn view_clap_parses_hash_artist_title_duration() {
+        let result = Cli::try_parse_from([
+            "mdma",
+            "view",
+            "--hash",
+            "--artist",
+            "--title",
+            "--duration",
+        ]);
+        assert!(
+            result.is_ok(),
+            "clap rejected view --hash --artist --title --duration: {}",
+            result.unwrap_err()
+        );
+        if let Commands::View {
+            hash,
+            artist,
+            title,
+            duration,
+        } = result.unwrap().command
+        {
+            assert!(hash);
+            assert!(artist);
+            assert!(title);
+            assert!(duration);
+        } else {
+            panic!("expected Commands::View");
+        }
+    }
+
+    #[test]
+    fn view_clap_parses_subset_of_flags() {
+        let result = Cli::try_parse_from(["mdma", "view", "--title", "--hash"]);
+        assert!(
+            result.is_ok(),
+            "clap rejected view --title --hash: {}",
+            result.unwrap_err()
+        );
+        if let Commands::View {
+            hash,
+            artist,
+            title,
+            duration,
+        } = result.unwrap().command
+        {
+            assert!(title);
+            assert!(hash);
+            assert!(!artist);
+            assert!(!duration);
+        } else {
+            panic!("expected Commands::View");
+        }
+    }
+
+    #[test]
+    fn view_clap_no_flags_parses_ok() {
+        // All flags are optional; no flags is valid (handle_view will reject at runtime).
+        let result = Cli::try_parse_from(["mdma", "view"]);
+        assert!(
+            result.is_ok(),
+            "clap rejected view with no flags: {}",
+            result.unwrap_err()
+        );
+    }
+
+    // ── render_for_user: single-column ────────────────────
+
+    #[test]
+    fn view_render_hash_only_shows_only_hash() {
+        let tracks = vec![make_view_track(
+            "sha256:abcdef1234567890",
+            Some("Artist"),
+            Some("Title"),
+            Some(180),
+        )];
+        let lines = render_for_user(&tracks, &[ViewColumn::Hash], 120, 0);
+        assert_eq!(lines.len(), 1);
+        let stripped = strip_ansi(&lines[0]);
+        assert!(
+            stripped.starts_with("abcdef123456"),
+            "hash-only should start with 12-char hash, got: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("Artist"),
+            "hash-only should not contain artist, got: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("Title"),
+            "hash-only should not contain title, got: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn view_render_artist_only_shows_only_artist() {
+        let tracks = vec![make_view_track(
+            "sha256:abcdef1234567890",
+            Some("Carbon Based Lifeforms"),
+            Some("Init"),
+            Some(508),
+        )];
+        let lines = render_for_user(&tracks, &[ViewColumn::Artist], 120, 0);
+        assert_eq!(lines.len(), 1);
+        let stripped = strip_ansi(&lines[0]);
+        assert!(
+            stripped.contains("Carbon Based Lifeforms"),
+            "artist-only should contain artist, got: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("abcdef123456"),
+            "artist-only should not contain hash, got: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("Init"),
+            "artist-only should not contain title, got: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn view_render_title_only_shows_only_title() {
+        let tracks = vec![make_view_track(
+            "sha256:abcdef1234567890",
+            Some("Carbon Based Lifeforms"),
+            Some("Polyrytmi"),
+            Some(367),
+        )];
+        let lines = render_for_user(&tracks, &[ViewColumn::Title], 120, 0);
+        assert_eq!(lines.len(), 1);
+        let stripped = strip_ansi(&lines[0]);
+        assert!(
+            stripped.contains("Polyrytmi"),
+            "title-only should contain title, got: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("Carbon"),
+            "title-only should not contain artist, got: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn view_render_duration_only_shows_only_duration() {
+        let tracks = vec![make_view_track(
+            "sha256:abcdef1234567890",
+            Some("Artist"),
+            Some("Title"),
+            Some(225), // 3:45
+        )];
+        let lines = render_for_user(&tracks, &[ViewColumn::Duration], 120, 0);
+        assert_eq!(lines.len(), 1);
+        let stripped = strip_ansi(&lines[0]);
+        assert!(
+            stripped.contains("3:45"),
+            "duration-only should contain formatted duration, got: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("Artist"),
+            "duration-only should not contain artist, got: {stripped:?}"
+        );
+    }
+
+    // ── render_for_user: multi-column combinations ─────────
+
+    #[test]
+    fn view_render_hash_and_title() {
+        let tracks = vec![make_view_track(
+            "sha256:abcdef1234567890",
+            Some("Artist"),
+            Some("Init"),
+            Some(508),
+        )];
+        let lines = render_for_user(&tracks, &[ViewColumn::Hash, ViewColumn::Title], 120, 0);
+        assert_eq!(lines.len(), 1);
+        let stripped = strip_ansi(&lines[0]);
+        assert!(stripped.contains("abcdef123456"), "should contain hash");
+        assert!(stripped.contains("Init"), "should contain title");
+        assert!(!stripped.contains("Artist"), "should not contain artist");
+    }
+
+    #[test]
+    fn view_render_all_four_columns() {
+        let tracks = vec![make_view_track(
+            "sha256:abcdef1234567890",
+            Some("Carbon Based Lifeforms"),
+            Some("Polyrytmi"),
+            Some(367),
+        )];
+        let lines = render_for_user(&tracks, ALL_COLUMNS, 120, 0);
+        assert_eq!(lines.len(), 1);
+        let stripped = strip_ansi(&lines[0]);
+        assert!(stripped.contains("abcdef123456"), "should contain hash");
+        assert!(
+            stripped.contains("Carbon Based Lifeforms"),
+            "should contain artist"
+        );
+        assert!(stripped.contains("Polyrytmi"), "should contain title");
+        assert!(stripped.contains("6:07"), "should contain duration");
+    }
+
+    // ── Field-order preservation ─────────────────────────────────────────────────
+
+    #[test]
+    fn view_render_title_before_hash_when_columns_ordered_title_hash() {
+        // When columns = [Title, Hash], title must appear left of hash in the output.
+        let tracks = vec![make_view_track(
+            "sha256:abcdef1234567890",
+            Some("Artist"),
+            Some("TheTitle"),
+            None,
+        )];
+        let lines = render_for_user(&tracks, &[ViewColumn::Title, ViewColumn::Hash], 120, 0);
+        assert_eq!(lines.len(), 1);
+        let stripped = strip_ansi(&lines[0]);
+        let title_pos = stripped.find("TheTitle").expect("title not in output");
+        let hash_pos = stripped.find("abcdef123456").expect("hash not in output");
+        assert!(
+            title_pos < hash_pos,
+            "title ({title_pos}) should appear before hash ({hash_pos}) when columns=[Title, Hash]; got: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn view_render_hash_before_title_when_columns_ordered_hash_title() {
+        // When columns = [Hash, Title], hash must appear left of title.
+        let tracks = vec![make_view_track(
+            "sha256:abcdef1234567890",
+            Some("Artist"),
+            Some("TheTitle"),
+            None,
+        )];
+        let lines = render_for_user(&tracks, &[ViewColumn::Hash, ViewColumn::Title], 120, 0);
+        assert_eq!(lines.len(), 1);
+        let stripped = strip_ansi(&lines[0]);
+        let hash_pos = stripped.find("abcdef123456").expect("hash not in output");
+        let title_pos = stripped.find("TheTitle").expect("title not in output");
+        assert!(
+            hash_pos < title_pos,
+            "hash ({hash_pos}) should appear before title ({title_pos}) when columns=[Hash, Title]; got: {stripped:?}"
+        );
+    }
+
+    // ── view_columns_from_matches ────────────────────────────────────────────────
+
+    #[test]
+    fn view_columns_from_matches_hash_artist_order() {
+        // Simulate `mdma view --hash --artist` → Hash before Artist.
+        let matches = Cli::command().get_matches_from(["mdma", "view", "--hash", "--artist"]);
+        let view_matches = matches.subcommand_matches("view").unwrap();
+        let cols = view_columns_from_matches(view_matches);
+        assert_eq!(cols, vec![ViewColumn::Hash, ViewColumn::Artist]);
+    }
+
+    #[test]
+    fn view_columns_from_matches_title_hash_order() {
+        // Simulate `mdma view --title --hash` → Title before Hash.
+        let matches = Cli::command().get_matches_from(["mdma", "view", "--title", "--hash"]);
+        let view_matches = matches.subcommand_matches("view").unwrap();
+        let cols = view_columns_from_matches(view_matches);
+        assert_eq!(cols, vec![ViewColumn::Title, ViewColumn::Hash]);
+    }
+
+    #[test]
+    fn view_columns_from_matches_all_four_preserves_order() {
+        // Simulate `mdma view --hash --artist --title --duration` → canonical order.
+        let matches = Cli::command().get_matches_from([
+            "mdma",
+            "view",
+            "--hash",
+            "--artist",
+            "--title",
+            "--duration",
+        ]);
+        let view_matches = matches.subcommand_matches("view").unwrap();
+        let cols = view_columns_from_matches(view_matches);
+        assert_eq!(
+            cols,
+            vec![
+                ViewColumn::Hash,
+                ViewColumn::Artist,
+                ViewColumn::Title,
+                ViewColumn::Duration
+            ]
+        );
+    }
+
+    #[test]
+    fn view_columns_from_matches_duration_first() {
+        // Simulate `mdma view --duration --title` → Duration before Title.
+        let matches = Cli::command().get_matches_from(["mdma", "view", "--duration", "--title"]);
+        let view_matches = matches.subcommand_matches("view").unwrap();
+        let cols = view_columns_from_matches(view_matches);
+        assert_eq!(cols, vec![ViewColumn::Duration, ViewColumn::Title]);
+    }
+
+    #[test]
+    fn view_columns_from_matches_no_flags_empty() {
+        let matches = Cli::command().get_matches_from(["mdma", "view"]);
+        let view_matches = matches.subcommand_matches("view").unwrap();
+        let cols = view_columns_from_matches(view_matches);
+        assert!(cols.is_empty(), "no flags → empty columns list");
+    }
+
+    // ── mdma search output stability: render_track_table_inner unchanged ────────
+
+    #[test]
+    fn search_render_unchanged_from_all_columns() {
+        // render_track_table_inner must produce identical output to
+        // render_for_user with ALL_COLUMNS.
+        // This locks the promise that mdma search output is byte-identical after the refactor.
+        let tracks = queue_display_tracks();
+        let term_width = 120;
+
+        let via_inner = render_track_table_inner(&tracks, 0, term_width);
+        let via_parameterized = render_for_user(&tracks, ALL_COLUMNS, term_width, 0);
+
+        assert_eq!(
+            via_inner,
+            via_parameterized,
+            "render_track_table_inner and render_for_user(ALL_COLUMNS) must produce identical output"
+        );
+    }
+
+    // ── Non-TTY (pipe) rendering: hash is always exactly 12 chars ────────────────
+
+    /// The PIPE_TERM_WIDTH constant in the component must be wide enough that
+    /// corsett never shrinks the 12-char hash column.
+    #[test]
+    fn pipe_mode_hash_is_exactly_12_chars_on_every_line() {
+        // Use a very long artist/title to stress-test that the virtual width is
+        // wide enough to keep hash at full 12 chars even under content pressure.
+        use library_ipc_client::{ContentHash, DurationSeconds};
+        let tracks: Vec<TrackInfo> = (0..5)
+            .map(|i| {
+                TrackInfo {
+                    content_hash: ContentHash::new(format!("sha256:abcdef{:02}deadbeef", i)),
+                    title: Some("A Very Long Title That Could Put Pressure On Column Sizing Algorithms And Cause Issues".to_string()),
+                    artist: Some("An Equally Very Long Artist Name That Stresses The Layout Engine Significantly".to_string()),
+                    album: None,
+                    duration: Some(DurationSeconds::new(300)),
+                    bpm: None,
+                    key: None,
+                    blob_path: None,
+                    cover_art_path: None,
+                    track_number: None,
+                    disc_number: None,
+                    added: None,
+                    started: None,
+                    stopped: None,
+                }
+            })
+            .collect();
+
+        // PIPE_TERM_WIDTH is a large virtual width used when rendering to non-TTY.
+        // We simulate it by passing a large explicit width here.
+        const PIPE_TERM_WIDTH: usize = 200;
+        let lines = render_for_user(&tracks, ALL_COLUMNS, PIPE_TERM_WIDTH, 0);
+
+        for (i, line) in lines.iter().enumerate() {
+            let stripped = strip_ansi(line);
+            // First whitespace-separated token is the hash
+            let hash_token = stripped
+                .split_whitespace()
+                .next()
+                .expect("line should have at least one token");
+            assert_eq!(
+                hash_token.len(),
+                12,
+                "Line {}: hash token {:?} should be exactly 12 chars (uniqueness invariant). Full line: {:?}",
+                i + 1,
+                hash_token,
+                stripped,
+            );
+        }
+    }
+
+    /// Pipe mode with virtual large width must not truncate artist or title.
+    #[test]
+    fn pipe_mode_large_virtual_width_does_not_truncate_content() {
+        use library_ipc_client::{ContentHash, DurationSeconds};
+        let long_artist = "An Equally Very Long Artist Name That Stresses The Layout Engine";
+        let long_title = "A Very Long Title That Could Put Pressure On Column Sizing Algorithms";
+        let track = TrackInfo {
+            content_hash: ContentHash::new("sha256:abcdef1234567890"),
+            title: Some(long_title.to_string()),
+            artist: Some(long_artist.to_string()),
+            album: None,
+            duration: Some(DurationSeconds::new(300)),
+            bpm: None,
+            key: None,
+            blob_path: None,
+            cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
+            started: None,
+            stopped: None,
+        };
+
+        const PIPE_TERM_WIDTH: usize = 200;
+        let lines = render_for_user(&[track], ALL_COLUMNS, PIPE_TERM_WIDTH, 0);
+
+        assert_eq!(lines.len(), 1);
+        let stripped = strip_ansi(&lines[0]);
+        assert!(
+            stripped.contains(long_artist),
+            "pipe mode output should not truncate long artist; got: {:?}",
+            stripped
+        );
+        assert!(
+            stripped.contains(long_title),
+            "pipe mode output should not truncate long title; got: {:?}",
+            stripped
         );
     }
 }
