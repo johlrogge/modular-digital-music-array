@@ -481,6 +481,8 @@ confirm-sudo:
 [group('image')]
 create-image: confirm-sudo pkg-build-all
     sudo ./scripts/image/create-sd-card-simple.sh
+    @echo "Returning ownership of ~/mdma-images to $USER..."
+    sudo chown -R "$USER":"$USER" ~/mdma-images
 
 # Clean cached image artifacts so the next create-image pulls fresh packages.
 # void-mklive caches the platformfs tarball and xbps packages, which can mask
@@ -496,7 +498,16 @@ clean-image: confirm-sudo
                 ~/mdma-images/void-mklive/xbps-cache/aarch64/beacon-*.xbps.sig2 \
                 ~/mdma-images/void-mklive/xbps-cache/aarch64/mdma-*.xbps \
                 ~/mdma-images/void-mklive/xbps-cache/aarch64/mdma-*.xbps.sig2
-    @echo "Image cache cleaned. Next 'just create-image' will rebuild platformfs."
+    @echo "Removing cached system packages (kernel, base, firmware) to prevent boot drift..."
+    sudo rm -fv ~/mdma-images/void-mklive/xbps-cache/aarch64/rpi-kernel-*.xbps \
+                ~/mdma-images/void-mklive/xbps-cache/aarch64/rpi-kernel-*.xbps.sig2 \
+                ~/mdma-images/void-mklive/xbps-cache/aarch64/rpi5-kernel-*.xbps \
+                ~/mdma-images/void-mklive/xbps-cache/aarch64/rpi5-kernel-*.xbps.sig2 \
+                ~/mdma-images/void-mklive/xbps-cache/aarch64/rpi-base-*.xbps \
+                ~/mdma-images/void-mklive/xbps-cache/aarch64/rpi-base-*.xbps.sig2 \
+                ~/mdma-images/void-mklive/xbps-cache/aarch64/rpi-firmware-*.xbps \
+                ~/mdma-images/void-mklive/xbps-cache/aarch64/rpi-firmware-*.xbps.sig2
+    @echo "Image cache cleaned. Next 'just create-image' will rebuild platformfs with fresh packages."
 
 # Network scanning recipes for finding Raspberry Pi
 
