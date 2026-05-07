@@ -13,3 +13,5 @@ interface = "track-formatter"
 
 [dependencies]
 library-ipc-protocol = { workspace = true }
+colored = "2.0"
+corsett = { git = "https://github.com/johlrogge/corsett.git", rev = "bf16c1aa2e8d6ba1f833e33009f2deecadc3ee26" }
