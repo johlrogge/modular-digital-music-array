@@ -142,12 +142,27 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
                             }
                         }
                         AddPlayingTarget::Playlist(name) => {
-                            match app.library.playlist_append(&name, &[h]) {
-                                Ok(()) => {
-                                    app.active_pane_mut().refresh();
-                                    app.set_status(format!("Added playing track to {}", name));
+                            use crate::playlist_pane::playlist_content_for_write;
+                            match app.library.get_track(&h) {
+                                Ok(track) => {
+                                    let content =
+                                        playlist_content_for_write(std::slice::from_ref(&track));
+                                    match app.library.playlist_append(&name, content) {
+                                        Ok(()) => {
+                                            app.active_pane_mut().refresh();
+                                            app.set_status(format!(
+                                                "Added playing track to {}",
+                                                name
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            app.set_status(format!("Playlist append failed: {e}"))
+                                        }
+                                    }
                                 }
-                                Err(e) => app.set_status(format!("Playlist append failed: {e}")),
+                                Err(e) => {
+                                    app.set_status(format!("Could not add to playlist: {e}"));
+                                }
                             }
                         }
                         AddPlayingTarget::None => {
@@ -240,7 +255,7 @@ fn handle_palette(app: &mut App, key: KeyEvent) {
                         }
                     }
                     PaletteEntry::CreatePlaylist(name_str) => match PlaylistName::new(&name_str) {
-                        Ok(name) => match app.library.playlist_new(&name, &[]) {
+                        Ok(name) => match app.library.playlist_new(&name, String::new()) {
                             Ok(()) => {
                                 let library = Rc::clone(&app.library);
                                 match PlaylistPane::open(name.clone(), library) {
@@ -374,7 +389,7 @@ fn handle_name_input(app: &mut App, key: KeyEvent) {
                     return;
                 }
             };
-            match app.library.playlist_new(&name, &[]) {
+            match app.library.playlist_new(&name, String::new()) {
                 Ok(()) => {
                     app.active_pane_mut().refresh();
                     app.set_status(format!("Created playlist \"{}\"", name_str));

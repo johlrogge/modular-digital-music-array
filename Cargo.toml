@@ -37,6 +37,7 @@ members = [
     "components/source_protocol",
     "components/storage_primitives",
     "components/stream_source_protocol",
+    "components/track_formatter",
     "components/track_matcher",
     "bases/bdd-runner",
     "bases/client",
@@ -58,7 +59,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.18.0"
+version = "0.18.1"
 edition = "2021"
 authors = ["MDMA Development Team"]
 license = "MIT"
@@ -101,6 +102,7 @@ service = { path = "bases/service" }
 source-protocol = { path = "components/source_protocol" }
 storage_primitives = { path = "components/storage_primitives" }
 stream-source-protocol = { path = "components/stream_source_protocol" }
+track-formatter = { path = "components/track_formatter" }
 track-matcher = { path = "components/track_matcher" }
 askama = "0.12"
 assert_matches = "1.5"

@@ -39,7 +39,7 @@ jobs:
     - name: Build mdma CLI for Apple Silicon
       run: devenv shell -- cargo polylith cargo --profile dev build --release --bin mdma
 
-    - name: Fix dylib paths for distribution
+    - name: Fix dylib paths for distribution (CLI)
       run: |
         LIBICONV_NIX=$(otool -L target/release/mdma | awk '/libiconv/{print $1}' | head -1)
         if [ -n "$LIBICONV_NIX" ] && [[ "$LIBICONV_NIX" == /nix/* ]]; then
@@ -51,6 +51,22 @@ jobs:
       with:
         name: mdma-cli-macos-arm64
         path: target/release/mdma
+
+    - name: Build mdma TUI for Apple Silicon
+      run: devenv shell -- cargo polylith cargo --profile dev build --release --bin mdma-tui
+
+    - name: Fix dylib paths for distribution (TUI)
+      run: |
+        LIBICONV_NIX=$(otool -L target/release/mdma-tui | awk '/libiconv/{print $1}' | head -1)
+        if [ -n "$LIBICONV_NIX" ] && [[ "$LIBICONV_NIX" == /nix/* ]]; then
+          echo "Rewriting $LIBICONV_NIX -> /usr/lib/libiconv.2.dylib"
+          install_name_tool -change "$LIBICONV_NIX" /usr/lib/libiconv.2.dylib target/release/mdma-tui
+        fi
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: mdma-tui-macos-arm64
+        path: target/release/mdma-tui
 
   test:
     runs-on: ubuntu-latest
