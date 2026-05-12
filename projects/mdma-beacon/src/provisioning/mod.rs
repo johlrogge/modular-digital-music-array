@@ -283,6 +283,7 @@ mod tests {
             hostname: Hostname::new("test-909".to_string()).unwrap(),
             unit_type: UnitType::Mdma909,
             ssh_key: SshPublicKey::new("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA96k1y1Y1326DtI4csBGXSqu57wjNuBYEkyjUQ3uS7x mdma-pi-access".to_string()).unwrap(),
+            force_wipe_partitions: false,
         }
     }
 

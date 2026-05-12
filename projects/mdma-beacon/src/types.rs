@@ -427,6 +427,10 @@ pub struct ProvisionConfig {
     pub unit_type: UnitType,
     pub hostname: Hostname,
     pub ssh_key: SshPublicKey,
+    /// When true, skip the incompatible-layout abort and wipe all existing
+    /// partitions. Defaults to false (safe). Requires explicit user opt-in.
+    #[serde(default)]
+    pub force_wipe_partitions: bool,
 }
 
 #[cfg(test)]

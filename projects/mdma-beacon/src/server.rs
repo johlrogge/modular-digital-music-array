@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 use tower_http::services::ServeDir;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::routes;
 
@@ -61,6 +61,29 @@ pub async fn run(
         info!("Beacon server listening on http://welcome-to-mdma.local");
         info!("   APPLY mode - changes WILL be made!");
         info!("   Also accessible via http://0.0.0.0:{}", config.port);
+    }
+
+    // Wait for system clock to sync — TLS cert verification requires a sane
+    // date before stage 4 can fetch repodata over HTTPS. chronyd is enabled
+    // by the SD's runit setup; wait up to 30 tries (~60s) for it to sync.
+    info!("Waiting for system clock to sync (chronyc waitsync)...");
+    let sync_result = tokio::task::spawn_blocking(|| {
+        std::process::Command::new("chronyc")
+            .args(["waitsync", "30", "0", "0", "0"])
+            .status()
+    })
+    .await;
+    match sync_result {
+        Ok(Ok(s)) if s.success() => info!("Clock synced via chronyc"),
+        Ok(Ok(s)) => warn!(
+            "chronyc waitsync exited {} — proceeding anyway; provisioning may fail on TLS",
+            s
+        ),
+        Ok(Err(e)) => warn!(
+            "chronyc not available ({}); proceeding without sync — TLS may fail in stage 4",
+            e
+        ),
+        Err(e) => warn!("spawn_blocking for chronyc failed ({}); continuing", e),
     }
 
     http_server::serve(app, &http_server::HttpServerConfig { port: config.port }).await?;

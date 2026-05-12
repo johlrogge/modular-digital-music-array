@@ -20,6 +20,7 @@ fi
 
 # Configuration
 MDMA_REPO="https://johlrogge.github.io/modular-digital-music-array/aarch64"
+VOID_NONFREE_REPO="https://repo-default.voidlinux.org/current/aarch64/nonfree"
 INVOKING_HOME=$(eval echo "~${SUDO_USER:-$(whoami)}")
 WORK_DIR="${WORK_DIR:-${INVOKING_HOME}/mdma-images}"
 MKLIVE_DIR="${WORK_DIR}/void-mklive"
@@ -93,6 +94,7 @@ mkdir -p "${ROOTFS}/etc/runit/runsvdir/default"
 ln -sf /etc/sv/beacon "${ROOTFS}/etc/runit/runsvdir/default/beacon"
 ln -sf /etc/sv/dbus "${ROOTFS}/etc/runit/runsvdir/default/dbus"
 ln -sf /etc/sv/avahi-daemon "${ROOTFS}/etc/runit/runsvdir/default/avahi-daemon"
+ln -sf /etc/sv/chronyd "${ROOTFS}/etc/runit/runsvdir/default/chronyd"
 
 echo "MDMA beacon configured for first boot"
 HOOKEOF
@@ -113,10 +115,18 @@ if [ -z "$PLATFORMFS_TAR" ]; then
     echo "Step 2/3: Building platform rootfs with beacon..."
     echo "  Local repo : ${LOCAL_REPO}"
     echo "  Remote repo: ${MDMA_REPO}"
+    # NOTE: -r flags are PREPENDED inside mkplatformfs.sh (see line 87:
+    # `XBPS_REPOSITORY="--repository=$OPTARG $XBPS_REPOSITORY"`), so the
+    # FIRST -r passed becomes the LAST in the resulting xbps-install
+    # command, and vice versa. We want xbps to prefer LOCAL_REPO over
+    # MDMA_REPO (CI's published packages) when both have the same version
+    # — local builds with in-flight fixes must win over the published ones.
+    # So we pass them in REVERSE of desired final order:
     ./mkplatformfs.sh \
-        -p "beacon dbus avahi cloud-guest-utils rpi5-kernel dracut uboot-mkimage rpi-eeprom" \
-        -r "$LOCAL_REPO" \
+        -p "beacon dbus avahi cloud-guest-utils rpi5-kernel dracut uboot-mkimage rpi-eeprom void-repo-nonfree chrony" \
+        -r "$VOID_NONFREE_REPO" \
         -r "$MDMA_REPO" \
+        -r "$LOCAL_REPO" \
         -k "$HOOK_SCRIPT" \
         rpi-aarch64 \
         "$ROOTFS_TAR"
@@ -126,8 +136,12 @@ else
 fi
 
 # Step 3: Create bootable disk image
+# IMGSIZE bumped from upstream default 900MiB. The MDMA beacon image's package
+# set (rpi-eeprom + its toolchain deps: binutils, python3, perl, dtc, rpi-utils,
+# void-repo-nonfree) exceeds the 643MiB rootfs partition that 900MiB allocates.
+# 2GiB gives ~1.7GiB rootfs after the 256MiB boot partition — plenty of headroom.
 echo "Step 3/3: Creating bootable SD card image..."
-./mkimage.sh "$PLATFORMFS_TAR"
+./mkimage.sh -s 2G "$PLATFORMFS_TAR"
 
 # Move and rename output
 MKLIVE_OUTPUT=$(ls -t void-rpi-aarch64-*.img.xz 2>/dev/null | head -1 || true)

@@ -100,6 +100,7 @@ async fn read_existing_partitions(device_path: &str) -> Result<Vec<(String, u64)
 pub(crate) fn check_layout_compatibility(
     planned: &[crate::provisioning::types::PartitionState],
     existing: &[(String, u64)],
+    force_wipe: bool,
 ) -> crate::error::Result<()> {
     if existing.is_empty() {
         // No existing partitions — fresh disk, always compatible.
@@ -117,6 +118,14 @@ pub(crate) fn check_layout_compatibility(
         .collect();
 
     if !new_labels.is_empty() {
+        if force_wipe {
+            tracing::warn!(
+                "force_wipe_partitions=true — proceeding with destructive re-provision; \
+                 data will be lost (new partitions not on disk: [{}])",
+                new_labels.join(", ")
+            );
+            return Ok(());
+        }
         return Err(crate::error::BeaconError::Provisioning(format!(
             "Existing partition layout is incompatible with the new layout \
              (NVMe boot partition was added in this version). \
@@ -352,7 +361,7 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
         // This must happen BEFORE partitions is moved into the plan.
         // This prevents sfdisk from silently renumbering partitions and shifting
         // byte offsets, which would corrupt data on partitions that moved.
-        check_layout_compatibility(&partitions, &existing)?;
+        check_layout_compatibility(&partitions, &existing, input.config.force_wipe_partitions)?;
 
         // Check for secondary drive and assign based on size comparison
         let plan = if let Some(secondary) = input.drives.secondary() {
@@ -708,6 +717,7 @@ mod tests {
                 hostname: Hostname::new("mdma-909".to_owned()).expect("works"),
                 unit_type: UnitType::Mdma909,
                 ssh_key: SshPublicKey::new("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA96k1y1Y1326DtI4csBGXSqu57wjNuBYEkyjUQ3uS7x mdma-pi-access".to_owned()).expect("works"),
+                force_wipe_partitions: false,
             },
             drives: secondary
                 .map(|s| ValidatedDrives::TwoDrives(primary.clone(), s))
@@ -1003,9 +1013,8 @@ mod tests {
     // ── Layout compatibility checks ───────────────────────────────────────────
 
     /// Old 4-partition layout (root/var/metadata/music at p1-p4) vs new
-    /// 5-partition layout (boot/root/var/metadata/music) must abort.
-    /// The `boot` label is new — adding it at p1 shifts all other partitions,
-    /// corrupting data at their current byte offsets.
+    /// 5-partition layout (boot/root/var/metadata/music) must abort when
+    /// force_wipe is false, and succeed when force_wipe is true.
     #[test]
     fn layout_incompatible_old_four_partition_vs_new_five_aborts() {
         use crate::provisioning::types::{DevicePath, MountPoint, Partition, PartitionSize};
@@ -1047,7 +1056,8 @@ mod tests {
             }),
         ];
 
-        let result = check_layout_compatibility(&planned, &existing);
+        // force_wipe=false → must abort
+        let result = check_layout_compatibility(&planned, &existing, false);
         assert!(
             result.is_err(),
             "should abort when adding new 'boot' partition to existing 4-partition layout"
@@ -1068,6 +1078,14 @@ mod tests {
             err_msg.contains("rsync"),
             "error should mention rsync migration path, got: {}",
             err_msg
+        );
+
+        // force_wipe=true → must succeed (user has explicitly opted in to destructive wipe)
+        let result = check_layout_compatibility(&planned, &existing, true);
+        assert!(
+            result.is_ok(),
+            "should proceed when force_wipe_partitions=true, got: {:?}",
+            result
         );
     }
 
@@ -1114,7 +1132,7 @@ mod tests {
             }),
         ];
 
-        let result = check_layout_compatibility(&planned, &existing);
+        let result = check_layout_compatibility(&planned, &existing, false);
         assert!(
             result.is_ok(),
             "should not abort when all planned labels are present on disk, got: {:?}",
@@ -1142,7 +1160,7 @@ mod tests {
             }),
         ];
 
-        let result = check_layout_compatibility(&planned, &existing);
+        let result = check_layout_compatibility(&planned, &existing, false);
         assert!(
             result.is_ok(),
             "fresh disk should always pass compatibility check"

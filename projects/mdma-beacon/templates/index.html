@@ -143,6 +143,46 @@
             font-weight: 600;
         }
 
+        .error-panel {
+            background: #fdecea;
+            border: 2px solid #e74c3c;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 25px;
+        }
+
+        .error-panel h3 {
+            color: #c0392b;
+            margin-top: 0;
+            margin-bottom: 10px;
+        }
+
+        .error-panel p {
+            color: #2c3e50;
+            margin: 8px 0;
+        }
+
+        .error-detail {
+            background: #fff5f5;
+            border-left: 4px solid #e74c3c;
+            padding: 10px 14px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.82em;
+            color: #7f1a1a;
+            margin: 12px 0;
+            border-radius: 0 4px 4px 0;
+            word-break: break-word;
+        }
+
+        .wipe-button {
+            background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%);
+            margin-top: 12px;
+        }
+
+        .wipe-button:hover {
+            box-shadow: 0 5px 15px rgba(231, 76, 60, 0.4);
+        }
+
         .update-button {
             background: linear-gradient(135deg, #f39c12 0%, #e67e22 100%);
             margin-top: 10px;
@@ -208,6 +248,49 @@
                 <a href="/logs" style="color: #856404;">📋 View beacon logs</a>
             </p>
         </div>
+
+        {% match layout_error %}
+        {% when Some with (err) %}
+        <div class="error-panel">
+            <h3>Incompatible Existing Partition Layout</h3>
+            <p>The NVMe drive was provisioned with a different partition scheme.
+               Re-provisioning with the current layout would shift partition byte offsets
+               and corrupt data.</p>
+            <div class="error-detail">{{ err.message }}</div>
+            <p>Force-provisioning will <strong>permanently erase</strong> all existing
+               partitions, including <strong>/music</strong> (your music library) and
+               <strong>/metadata</strong> (track metadata). There is <strong>no undo</strong>.</p>
+            <form action="/provision" method="post" id="force-wipe-form">
+                <input type="hidden" name="unit_type" value="{{ err.unit_type }}">
+                <input type="hidden" name="hostname" value="{{ err.hostname }}">
+                <input type="hidden" name="ssh_key" value="{{ err.ssh_key }}">
+                <input type="hidden" name="force_wipe_partitions" value="true">
+                <button type="button" class="wipe-button" id="confirm-force-wipe">
+                    Force Wipe and Re-provision
+                </button>
+            </form>
+            <script>
+                document.getElementById('confirm-force-wipe').addEventListener('click', function() {
+                    var hostname = document.querySelector('#force-wipe-form input[name="hostname"]').value;
+                    var confirmed = confirm(
+                        "WARNING: This will PERMANENTLY ERASE all data on the NVMe drive,\n" +
+                        "including /music (your music library) and /metadata (track metadata).\n\n" +
+                        "There is NO undo.\n\n" +
+                        "Type the unit hostname to confirm: " + hostname + "\n\n" +
+                        "(Click OK only if you typed the hostname above)"
+                    );
+                    if (!confirmed) return;
+                    var typed = prompt("Type the hostname \"" + hostname + "\" to confirm:");
+                    if (typed !== hostname) {
+                        alert("Hostname did not match. Wipe cancelled.");
+                        return;
+                    }
+                    document.getElementById('force-wipe-form').submit();
+                });
+            </script>
+        </div>
+        {% when None %}
+        {% endmatch %}
 
         <form action="/provision" method="post">
             <div class="section">
