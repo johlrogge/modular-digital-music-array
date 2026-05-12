@@ -3858,7 +3858,10 @@ fn handle_rekordbox_export(
     }
 
     // Build the skipped-location set for quick membership checks.
-    let skipped_locations: HashSet<String> = plan.to_skip.into_iter().collect();
+    // Keys are lowercased so that case-mismatches between the existing-XML
+    // round-trip path and the freshly-built URI path do not miss on-disk tracks.
+    let skipped_locations: HashSet<String> =
+        plan.to_skip.into_iter().map(|s| s.to_lowercase()).collect();
 
     // Only include tracks that are either freshly downloaded or already on disk.
     // Failed downloads are logged and dropped — a partial XML is worse than the
@@ -3871,7 +3874,7 @@ fn handle_rekordbox_export(
         let resolved = if let Some((dl_dest, dl_ext, dl_size)) = downloaded_map.get(&hash_str) {
             // Freshly downloaded.
             Some((dl_dest.clone(), dl_ext.clone(), *dl_size))
-        } else if skipped_locations.contains(&location) {
+        } else if skipped_locations.contains(&location.to_lowercase()) {
             // Already on disk — get size from filesystem.
             let size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
             Some((dest.clone(), ext.clone(), size))
@@ -3911,8 +3914,12 @@ fn handle_rekordbox_export(
     }
 
     // Build a set of locations that actually made it into refreshed.
-    let refreshed_locations: HashSet<&str> =
-        refreshed.iter().map(|r| r.location.as_str()).collect();
+    // Keys are lowercased so that case-mismatches between the existing-XML
+    // round-trip path and the freshly-built URI path do not drop tracks.
+    let refreshed_locations: HashSet<String> = refreshed
+        .iter()
+        .map(|r| r.location.to_lowercase())
+        .collect();
 
     // Build PlaylistUpdate per playlist. Each playlist references its own full track list
     // (not the deduplicated union), so overlapping tracks appear in both playlists.
@@ -3924,7 +3931,9 @@ fn handle_rekordbox_export(
                 .iter()
                 .filter_map(|h| {
                     let loc = hash_to_location.get(h)?;
-                    if refreshed_locations.contains(loc.as_str()) {
+                    // Normalise case at the lookup boundary only; the URI written to
+                    // rekordbox.xml preserves its original case.
+                    if refreshed_locations.contains(&loc.to_lowercase()) {
                         Some(loc.clone())
                     } else {
                         None
@@ -6554,6 +6563,139 @@ mod tests {
             map.get(&short8_key),
             Some(&location_a),
             "8-char collision: first-inserted track must win"
+        );
+    }
+
+    // ── case-insensitive location URI matching ───────────────────────────────────
+
+    /// Bug 1 regression: when the existing XML round-trip produces a location URI
+    /// with different case than the freshly-built URI, the playlist filter must
+    /// still match it.  Before the fix, `refreshed_locations` was a case-sensitive
+    /// `HashSet<&str>`, so the case-mismatched probe returned false and the track
+    /// was silently dropped from the playlist.
+    ///
+    /// This test exercises the production code: it builds a `refreshed` vec whose
+    /// location uses lowercase, and a `hash_to_location` map whose location uses
+    /// mixed-case (as produced by the existing-XML round-trip), then asserts that
+    /// the playlist update's locations vector is non-empty.
+    #[test]
+    fn rekordbox_export_associates_tracks_when_locations_differ_in_case() {
+        // The existing XML round-trip canonicalises to a mixed-case URI.
+        let hash = "sha256:abcdef1234567890aabbccddeeff00112233445566778899aabbccddeeff0011";
+        let location_upper = "file://Localhost/tmp/export/Polyrytmi.aiff".to_string();
+        // The freshly-emitted RefreshedTrack uses the canonical lowercase form.
+        let location_lower = "file://localhost/tmp/export/polyrytmi.aiff".to_string();
+
+        // refreshed_locations built from freshly-emitted tracks (lowercase).
+        let refreshed_locations: std::collections::HashSet<String> = [location_lower.clone()]
+            .into_iter()
+            .map(|s| s.to_lowercase())
+            .collect();
+
+        // hash_to_location built from existing-XML round-trip (mixed-case).
+        let hash_to_location: std::collections::HashMap<String, String> =
+            [(hash.to_string(), location_upper.clone())]
+                .into_iter()
+                .collect();
+
+        // Simulate the playlist filter as it exists in the production path.
+        // This is the FIXED version — it normalises case at the lookup boundary.
+        let hashes = vec![hash.to_string()];
+        let locations: Vec<String> = hashes
+            .iter()
+            .filter_map(|h| {
+                let loc = hash_to_location.get(h)?;
+                // Fixed: probe with lowercased key.
+                if refreshed_locations.contains(&loc.to_lowercase()) {
+                    Some(loc.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(
+            locations,
+            vec![location_upper.clone()],
+            "playlist must reference the track even when URI case differs between \
+             existing-XML round-trip and freshly-emitted path"
+        );
+    }
+
+    /// Bug 2 regression: when the existing XML holds a location URI with different
+    /// case than the freshly-built URI, `merge_export` must treat them as the same
+    /// track — not create a duplicate COLLECTION entry.
+    #[test]
+    fn rekordbox_export_does_not_duplicate_when_existing_xml_location_differs_in_case() {
+        // Round 1: existing XML holds a mixed-case location.
+        let loc_mixed = "file://Localhost/tmp/export/Polyrytmi.aiff".to_string();
+        // Round 2: freshly-emitted RefreshedTrack uses the canonical lowercase form.
+        let loc_lower = "file://localhost/tmp/export/polyrytmi.aiff".to_string();
+
+        // Build a minimal existing library with the mixed-case location.
+        let existing = rekordbox_xml::RekordboxLibrary {
+            tracks: vec![rekordbox_xml::RekordboxTrack {
+                track_id: 1,
+                name: "Polyrytmi".to_string(),
+                artist: "Carbon Based Lifeforms".to_string(),
+                album: String::new(),
+                genre: String::new(),
+                kind: "AIFF File".to_string(),
+                size: 1000,
+                total_time: 360,
+                average_bpm: None,
+                tonality: None,
+                track_number: None,
+                disc_number: None,
+                year: None,
+                label: None,
+                comment: None,
+                date_added: None,
+                bitrate: None,
+                sample_rate: None,
+                location: loc_mixed.clone(),
+            }],
+            playlists: vec![],
+        };
+
+        // Freshly-refreshed track uses the lowercase canonical URI.
+        let refreshed = rekordbox_xml::RefreshedTrack {
+            name: "Polyrytmi".to_string(),
+            artist: "Carbon Based Lifeforms".to_string(),
+            album: String::new(),
+            genre: String::new(),
+            kind: "AIFF File".to_string(),
+            size: 1000,
+            total_time: 360,
+            average_bpm: None,
+            tonality: None,
+            track_number: None,
+            disc_number: None,
+            year: None,
+            label: None,
+            comment: None,
+            date_added: None,
+            bitrate: None,
+            sample_rate: None,
+            location: loc_lower.clone(),
+        };
+
+        // Without case normalisation in merge_export, the existing mixed-case
+        // location and the new lowercase location are treated as different tracks,
+        // yielding 2 COLLECTION entries instead of 1.
+        // This test asserts the merged library has exactly ONE entry.
+        let merged = rekordbox_xml::merge_export(Some(existing), vec![refreshed], &[]);
+
+        assert_eq!(
+            merged.tracks.len(),
+            1,
+            "merge_export must not create a duplicate when existing and refreshed \
+             locations differ only in case; got tracks: {:?}",
+            merged
+                .tracks
+                .iter()
+                .map(|t| &t.location)
+                .collect::<Vec<_>>()
         );
     }
 

@@ -1083,8 +1083,14 @@ pub mod merge {
         desired: &[DesiredTrack],
         disk_check: impl Fn(&Path) -> bool,
     ) -> ExportPlan {
+        // Lowercased for case-insensitive lookup at the boundary.
         let existing_locations: HashSet<String> = existing
-            .map(|lib| lib.tracks.iter().map(|t| t.location.clone()).collect())
+            .map(|lib| {
+                lib.tracks
+                    .iter()
+                    .map(|t| t.location.to_lowercase())
+                    .collect()
+            })
             .unwrap_or_default();
 
         // Build (stem_without_ext, parent) → (location, ext) map for format-change detection.
@@ -1131,7 +1137,7 @@ pub mod merge {
         for dt in desired {
             let location = path_to_file_uri(&dt.dest_path);
 
-            if existing_locations.contains(&location) && disk_check(&dt.dest_path) {
+            if existing_locations.contains(&location.to_lowercase()) && disk_check(&dt.dest_path) {
                 to_skip.push(location);
             } else {
                 // Check for format change: same parent+stem, different extension.
@@ -1172,9 +1178,12 @@ pub mod merge {
         refreshed: Vec<RefreshedTrack>,
         playlist_updates: &[PlaylistUpdate],
     ) -> RekordboxLibrary {
+        // Keyed by lowercased location so that lookups are case-insensitive.
+        // The location stored in the RefreshedTrack itself retains its original
+        // case and is what gets written to rekordbox.xml.
         let mut refreshed_by_location: HashMap<String, RefreshedTrack> = refreshed
             .into_iter()
-            .map(|t| (t.location.clone(), t))
+            .map(|t| (t.location.to_lowercase(), t))
             .collect();
 
         // Destructure existing upfront so we can use both tracks and playlists.
@@ -1184,8 +1193,13 @@ pub mod merge {
 
         let existing_locations_ordered: Vec<String> =
             existing_tracks.iter().map(|t| t.location.clone()).collect();
-        let existing_locations_set: HashSet<String> =
-            existing_locations_ordered.iter().cloned().collect();
+        // Lowercased for case-insensitive deduplication at the lookup boundary.
+        // The URIs stored in existing_locations_ordered (and ultimately written to
+        // rekordbox.xml) retain their original case.
+        let existing_locations_set_lower: HashSet<String> = existing_locations_ordered
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect();
 
         // Old-id → location for playlist remapping.
         let old_id_to_location: HashMap<u32, String> = existing_tracks
@@ -1199,9 +1213,11 @@ pub mod merge {
             .collect();
 
         // Ordered locations: existing first, then new from refreshed.
+        // Normalise case at the lookup boundary so that a freshly-built URI that
+        // differs only in case from an existing URI is recognised as a duplicate.
         let mut ordered_locations = existing_locations_ordered;
         for loc in refreshed_by_location.keys() {
-            if !existing_locations_set.contains(loc) {
+            if !existing_locations_set_lower.contains(&loc.to_lowercase()) {
                 ordered_locations.push(loc.clone());
             }
         }
@@ -1211,40 +1227,44 @@ pub mod merge {
         let mut merged: Vec<RekordboxTrack> = Vec::with_capacity(ordered_locations.len());
         for (idx, loc) in ordered_locations.iter().enumerate() {
             let track_id = (idx + 1) as u32;
-            let track: RekordboxTrack = if let Some(r) = refreshed_by_location.remove(loc) {
-                RekordboxTrack {
-                    track_id,
-                    name: r.name,
-                    artist: r.artist,
-                    album: r.album,
-                    genre: r.genre,
-                    kind: r.kind,
-                    size: r.size,
-                    total_time: r.total_time,
-                    average_bpm: r.average_bpm,
-                    tonality: r.tonality,
-                    track_number: r.track_number,
-                    disc_number: r.disc_number,
-                    year: r.year,
-                    label: r.label,
-                    comment: r.comment,
-                    date_added: r.date_added,
-                    bitrate: r.bitrate,
-                    sample_rate: r.sample_rate,
-                    location: r.location,
-                }
-            } else if let Some(mut existing_track) = existing_tracks_by_location.remove(loc) {
-                existing_track.track_id = track_id;
-                existing_track
-            } else {
-                continue;
-            };
+            // Normalise case at the lookup boundary; refreshed_by_location is keyed
+            // by lowercased location.
+            let track: RekordboxTrack =
+                if let Some(r) = refreshed_by_location.remove(&loc.to_lowercase()) {
+                    RekordboxTrack {
+                        track_id,
+                        name: r.name,
+                        artist: r.artist,
+                        album: r.album,
+                        genre: r.genre,
+                        kind: r.kind,
+                        size: r.size,
+                        total_time: r.total_time,
+                        average_bpm: r.average_bpm,
+                        tonality: r.tonality,
+                        track_number: r.track_number,
+                        disc_number: r.disc_number,
+                        year: r.year,
+                        label: r.label,
+                        comment: r.comment,
+                        date_added: r.date_added,
+                        bitrate: r.bitrate,
+                        sample_rate: r.sample_rate,
+                        location: r.location,
+                    }
+                } else if let Some(mut existing_track) = existing_tracks_by_location.remove(loc) {
+                    existing_track.track_id = track_id;
+                    existing_track
+                } else {
+                    continue;
+                };
             merged.push(track);
         }
 
+        // Keyed by lowercased location for case-insensitive lookup.
         let location_to_new_id: HashMap<String, u32> = merged
             .iter()
-            .map(|t| (t.location.clone(), t.track_id))
+            .map(|t| (t.location.to_lowercase(), t.track_id))
             .collect();
 
         // Names of playlists being replaced, for fast lookup.
@@ -1261,7 +1281,8 @@ pub mod merge {
                     .iter()
                     .filter_map(|old_id| {
                         let loc = old_id_to_location.get(old_id)?;
-                        location_to_new_id.get(loc).copied()
+                        // Normalise case at the lookup boundary.
+                        location_to_new_id.get(&loc.to_lowercase()).copied()
                     })
                     .collect();
                 RekordboxPlaylist {
@@ -1281,7 +1302,8 @@ pub mod merge {
                 .locations
                 .iter()
                 .filter_map(|loc| {
-                    let id = location_to_new_id.get(loc).copied();
+                    // Normalise case at the lookup boundary.
+                    let id = location_to_new_id.get(&loc.to_lowercase()).copied();
                     debug_assert!(
                         id.is_some(),
                         "playlist_updates location not found in merged: {}",
