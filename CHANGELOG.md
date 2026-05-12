@@ -4,6 +4,22 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.20.1] — 2026-05-12
+
+### Fixed
+
+- **`mdma rekordbox export` — missing playlist tracks and duplicate collection entries** — tracks would appear in `<COLLECTION>` but be absent from one or more `<PLAYLIST>` entries in the exported `rekordbox.xml`. On repeated export runs, duplicate `<COLLECTION>` entries for the same source track accumulated because the existing-XML matcher failed to recognise tracks it had already written. Root cause: `file://` URIs produced by two different code paths differed in case, and the URI comparison was case-sensitive. URIs are now normalised to lowercase at every lookup boundary before comparison.
+
+---
+
+## [0.20.0] — 2026-05-09
+
+### CLI — Rekordbox XML export (`mdma rekordbox export`)
+
+Exports the library (or a piped set of track IDs) as a `rekordbox.xml` file that Rekordbox can import directly. Tracks are transcoded to AIFF and laid out under an artist/album directory tree. Playlist structure is preserved. Subsequent export runs update the XML in-place — tracks already present in the file are not re-transcoded.
+
+---
+
 ## [0.18.0] — 2026-05-04
 
 ### CLI — Manual fact editing (`mdma fact add` / `mdma fact retract`)

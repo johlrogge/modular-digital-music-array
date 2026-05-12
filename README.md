@@ -167,7 +167,15 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ---
 
-## What's new in 0.18.0
+## What's new in 0.20.1
+
+Hotfix for `mdma rekordbox export`. Tracks that were present in `<COLLECTION>` were sometimes missing from `<PLAYLIST>` entries, and re-running export accumulated duplicate `<COLLECTION>` entries for tracks already written. Both symptoms were caused by a case mismatch in `file://` URI comparison; URIs are now normalised before lookup.
+
+### Earlier in 0.20.0
+
+`mdma rekordbox export` — export the library (or a piped set of tracks) as a `rekordbox.xml` file for direct Rekordbox import. Tracks are transcoded to AIFF and arranged in an artist/album directory tree. Playlist structure is preserved. Subsequent runs update the XML in-place without re-transcoding existing tracks.
+
+### Earlier in 0.18.0
 
 `mdma fact add` and `mdma fact retract` — edit track metadata directly from the CLI without re-importing or running a rekordbox sync. Covers 20 user-facing fields; built on the `FactsAsserted`/`FactsRetracted` protocol split from 0.17.0.
 
