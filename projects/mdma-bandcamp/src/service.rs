@@ -937,40 +937,49 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
                                         .and_then(|f| f.to_str())
                                         .unwrap_or("unknown");
 
-                                    if let Ok(inbox_path) = InboxPath::new(filename) {
-                                        let source = IngestSource::Bandcamp {
-                                            item_id: item_id.clone(),
-                                            artist_url: None,
-                                        };
-                                        match lib_client
-                                            .ingest_file_with_source(&inbox_path, Some(source))
-                                        {
-                                            Ok(library_ipc_client::IngestResult::Success {
-                                                hash,
-                                                ..
-                                            }) => {
-                                                tracing::info!(
-                                                    file = %filename,
-                                                    hash = ?hash,
-                                                    "Auto-ingested into library"
-                                                );
+                                    match InboxPath::new(filename) {
+                                        Ok(inbox_path) => {
+                                            let source = IngestSource::Bandcamp {
+                                                item_id: item_id.clone(),
+                                                artist_url: None,
+                                            };
+                                            match lib_client
+                                                .ingest_file_with_source(&inbox_path, Some(source))
+                                            {
+                                                Ok(library_ipc_client::IngestResult::Success {
+                                                    hash,
+                                                    ..
+                                                }) => {
+                                                    tracing::info!(
+                                                        file = %filename,
+                                                        hash = ?hash,
+                                                        "Auto-ingested into library"
+                                                    );
+                                                }
+                                                Ok(library_ipc_client::IngestResult::Failure {
+                                                    message,
+                                                }) => {
+                                                    tracing::warn!(
+                                                        file = %filename,
+                                                        msg = %message,
+                                                        "Library ingest returned failure"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        error = %e,
+                                                        file = %filename,
+                                                        "Failed to auto-ingest into library"
+                                                    );
+                                                }
                                             }
-                                            Ok(library_ipc_client::IngestResult::Failure {
-                                                message,
-                                            }) => {
-                                                tracing::warn!(
-                                                    file = %filename,
-                                                    msg = %message,
-                                                    "Library ingest returned failure"
-                                                );
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    error = %e,
-                                                    file = %filename,
-                                                    "Failed to auto-ingest into library"
-                                                );
-                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                file = %filename,
+                                                error = %e,
+                                                "Skipping extracted file — inbox path validation failed"
+                                            );
                                         }
                                     }
                                 }
