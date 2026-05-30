@@ -9,7 +9,10 @@ use crate::ipc::{
     SourceResponse, SourceStatus,
 };
 use bandcamp_api::{AudioFormat, BandcampClient, CollectionItem};
-use library_ipc_client::{InboxPath, IngestSource, LibraryClient};
+use library_ipc_client::{
+    InboxPath, IngestSource, LibraryClient, MusicValue, TrackInfo, TrackQuery,
+};
+use library_search::StringQuery;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -18,6 +21,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
+use track_matcher::normalize;
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -114,6 +118,25 @@ pub struct BandcampService {
     library_socket: String,
     /// Bandcamp username (read from cookies/config)
     username: Option<String>,
+}
+
+/// Pure helper: decide whether a collection item should be skipped based on library search results.
+///
+/// Returns `true` IFF at least one `TrackInfo` in `search_results` has a normalized-equal
+/// artist AND a normalized-equal album to the collection item. The probe uses `Contains` to
+/// narrow the candidate set, but this predicate enforces exact normalized equality at the
+/// decision boundary to prevent substring-only false positives.
+pub(crate) fn should_skip_by_work_identity(
+    item: &CollectionItem,
+    search_results: &[TrackInfo],
+) -> bool {
+    let item_artist = normalize(item.artist.as_str());
+    let item_album = normalize(item.title.as_str());
+    search_results.iter().any(|track| {
+        let track_artist = normalize(track.artist.as_deref().unwrap_or(""));
+        let track_album = normalize(track.album.as_deref().unwrap_or(""));
+        track_artist == item_artist && track_album == item_album
+    })
 }
 
 /// Pure helper: determine whether a bandcamp item is stale based on track counts.
@@ -515,8 +538,56 @@ impl BandcampService {
                 let item_id_str = item.id.as_str().to_string();
 
                 if library_known.contains(&item_id_str) {
-                    // Already in library, skip
+                    // Already in library via ItemId fast path, skip
                     continue;
+                }
+
+                // Not found by ItemId — try work-identity dedup (artist + album).
+                // This catches duplicate purchases (e.g. vinyl + digital) that share the
+                // same work but carry different ItemIds.
+                if let Some(lib_client) = &maybe_lib_client {
+                    let query = TrackQuery {
+                        artist: Some(StringQuery::Contains(normalize(item.artist.as_str()))),
+                        album: Some(StringQuery::Contains(normalize(item.title.as_str()))),
+                        ..Default::default()
+                    };
+                    match lib_client.search(&query) {
+                        Ok(results) if should_skip_by_work_identity(&item, &results) => {
+                            let matched = results.first().expect("non-empty checked above");
+                            let matched_hash = matched.content_hash.clone();
+                            tracing::info!(
+                                artist = %item.artist,
+                                album = %item.title,
+                                live_item_id = %item_id_str,
+                                matched_hash = %matched_hash.as_str(),
+                                "Work already in library under different ItemId — skipping download"
+                            );
+
+                            // Backfill: record the new ItemId so future syncs short-circuit via
+                            // the cheap has_facts("ItemId", ...) path.
+                            if let Err(e) = lib_client
+                                .write_fact(&matched_hash, MusicValue::ItemId(item_id_str.clone()))
+                            {
+                                tracing::warn!(
+                                    error = %e,
+                                    item_id = %item_id_str,
+                                    "Failed to backfill ItemId fact — skip still applies"
+                                );
+                            }
+
+                            continue;
+                        }
+                        Ok(_) => {
+                            // No match — fall through to cache check and queue
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                item_id = %item_id_str,
+                                "Work-identity search failed — falling through to download"
+                            );
+                        }
+                    }
                 }
 
                 // Not in library — check fallback cache
@@ -866,40 +937,49 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
                                         .and_then(|f| f.to_str())
                                         .unwrap_or("unknown");
 
-                                    if let Ok(inbox_path) = InboxPath::new(filename) {
-                                        let source = IngestSource::Bandcamp {
-                                            item_id: item_id.clone(),
-                                            artist_url: None,
-                                        };
-                                        match lib_client
-                                            .ingest_file_with_source(&inbox_path, Some(source))
-                                        {
-                                            Ok(library_ipc_client::IngestResult::Success {
-                                                hash,
-                                                ..
-                                            }) => {
-                                                tracing::info!(
-                                                    file = %filename,
-                                                    hash = ?hash,
-                                                    "Auto-ingested into library"
-                                                );
+                                    match InboxPath::new(filename) {
+                                        Ok(inbox_path) => {
+                                            let source = IngestSource::Bandcamp {
+                                                item_id: item_id.clone(),
+                                                artist_url: None,
+                                            };
+                                            match lib_client
+                                                .ingest_file_with_source(&inbox_path, Some(source))
+                                            {
+                                                Ok(library_ipc_client::IngestResult::Success {
+                                                    hash,
+                                                    ..
+                                                }) => {
+                                                    tracing::info!(
+                                                        file = %filename,
+                                                        hash = ?hash,
+                                                        "Auto-ingested into library"
+                                                    );
+                                                }
+                                                Ok(library_ipc_client::IngestResult::Failure {
+                                                    message,
+                                                }) => {
+                                                    tracing::warn!(
+                                                        file = %filename,
+                                                        msg = %message,
+                                                        "Library ingest returned failure"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        error = %e,
+                                                        file = %filename,
+                                                        "Failed to auto-ingest into library"
+                                                    );
+                                                }
                                             }
-                                            Ok(library_ipc_client::IngestResult::Failure {
-                                                message,
-                                            }) => {
-                                                tracing::warn!(
-                                                    file = %filename,
-                                                    msg = %message,
-                                                    "Library ingest returned failure"
-                                                );
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    error = %e,
-                                                    file = %filename,
-                                                    "Failed to auto-ingest into library"
-                                                );
-                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                file = %filename,
+                                                error = %e,
+                                                "Skipping extracted file — inbox path validation failed"
+                                            );
                                         }
                                     }
                                 }
@@ -994,6 +1074,7 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use library_ipc_protocol::{ContentHash, TrackInfo};
 
     // =========================================================================
     // classify_check_result tests
@@ -1027,5 +1108,342 @@ mod tests {
     #[test]
     fn classify_check_result_not_stale_when_both_zero() {
         assert!(!classify_check_result(0, 0));
+    }
+
+    // =========================================================================
+    // should_skip_by_work_identity tests
+    // =========================================================================
+
+    fn make_collection_item(id: &str, artist: &str, title: &str) -> CollectionItem {
+        use bandcamp_api::{ItemId, ItemType};
+        use music_facts::{Artist, Title};
+        CollectionItem {
+            id: ItemId::new(id),
+            artist: Artist::new(artist),
+            title: Title::new(title),
+            item_type: ItemType::Album,
+            purchased: None,
+            download_url: "https://bandcamp.com/download/test".to_string(),
+        }
+    }
+
+    fn make_track_info(hash: &str, artist: &str, album: &str) -> TrackInfo {
+        TrackInfo {
+            content_hash: ContentHash::new(hash),
+            title: Some("some track".to_string()),
+            artist: Some(artist.to_string()),
+            album: Some(album.to_string()),
+            duration: None,
+            bpm: None,
+            key: None,
+            blob_path: None,
+            cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
+            started: None,
+            stopped: None,
+        }
+    }
+
+    #[test]
+    fn should_skip_by_work_identity_empty_results_returns_false() {
+        let item = make_collection_item("p_vinyl_111", "Carbon Based Lifeforms", "Interloper");
+        assert!(
+            !should_skip_by_work_identity(&item, &[]),
+            "empty search results → do NOT skip (work not yet in library)"
+        );
+    }
+
+    #[test]
+    fn should_skip_by_work_identity_matching_artist_and_album_returns_true() {
+        let item = make_collection_item("p_digital_222", "Carbon Based Lifeforms", "Interloper");
+        let existing = make_track_info("sha256:aabbcc", "Carbon Based Lifeforms", "Interloper");
+        assert!(
+            should_skip_by_work_identity(&item, &[existing]),
+            "matching artist+album → skip download"
+        );
+    }
+
+    #[test]
+    fn should_skip_by_work_identity_matching_artist_wrong_album_returns_false() {
+        let item = make_collection_item("p_digital_222", "Carbon Based Lifeforms", "Interloper");
+        let existing = make_track_info("sha256:aabbcc", "Carbon Based Lifeforms", "Twentythree");
+        assert!(
+            !should_skip_by_work_identity(&item, &[existing]),
+            "matching artist but different album → do NOT skip"
+        );
+    }
+
+    #[test]
+    fn should_skip_by_work_identity_wrong_artist_matching_album_returns_false() {
+        let item = make_collection_item("p_digital_222", "Carbon Based Lifeforms", "Interloper");
+        let existing = make_track_info("sha256:aabbcc", "Someone Else", "Interloper");
+        assert!(
+            !should_skip_by_work_identity(&item, &[existing]),
+            "matching album but different artist → do NOT skip"
+        );
+    }
+
+    #[test]
+    fn should_skip_by_work_identity_second_of_two_matches_returns_true() {
+        let item = make_collection_item("p_digital_222", "Carbon Based Lifeforms", "Interloper");
+        let no_match = make_track_info("sha256:aabbcc", "Carbon Based Lifeforms", "Twentythree");
+        let matching = make_track_info("sha256:ddeeff", "Carbon Based Lifeforms", "Interloper");
+        assert!(
+            should_skip_by_work_identity(&item, &[no_match, matching]),
+            "second result matches → skip download"
+        );
+    }
+
+    #[test]
+    fn should_skip_by_work_identity_case_and_whitespace_normalize() {
+        let item = make_collection_item("p_digital_222", "carbon based lifeforms", "interloper");
+        let existing = make_track_info(
+            "sha256:aabbcc",
+            "  Carbon Based Lifeforms  ",
+            "  Interloper  ",
+        );
+        assert!(
+            should_skip_by_work_identity(&item, &[existing]),
+            "strings differing only in case/whitespace should still match via normalize"
+        );
+    }
+
+    // =========================================================================
+    // Integration test: work-identity dedup via IPC stub
+    // =========================================================================
+
+    #[cfg(test)]
+    mod integration {
+        use super::*;
+        use library_service_stub::service::{run_ipc_server, LibraryService};
+        use music_facts::{
+            Album, Artist, ContentHash as MusicContentHash, FactOrigin, FactSource,
+            MusicValue as MV, Title,
+        };
+        use stainless_facts::{Fact, FactStreamWriter, Operation};
+        use std::sync::Arc;
+
+        /// Seed a single track with artist, album, and ItemId facts into a facts.jsonl file.
+        fn seed_track_with_item_id(
+            metadata_dir: &std::path::Path,
+            hash_hex: &str,
+            artist: &str,
+            album: &str,
+            item_id: &str,
+        ) {
+            let facts_path = metadata_dir.join("facts.jsonl");
+            let mut writer =
+                FactStreamWriter::open(&facts_path).expect("failed to open fact stream");
+
+            let hash = MusicContentHash::new(format!("sha256:{}", hash_hex));
+            let source = FactSource::new("test-seed", "0.0.0", FactOrigin::Unknown);
+            let now = chrono::Utc::now();
+
+            let facts: Vec<Fact<MusicContentHash, MV, FactSource>> = vec![
+                Fact::new(
+                    hash.clone(),
+                    MV::Title(Title::new(album)),
+                    now,
+                    source.clone(),
+                    Operation::Assert,
+                ),
+                Fact::new(
+                    hash.clone(),
+                    MV::Artist(Artist::new(artist)),
+                    now,
+                    source.clone(),
+                    Operation::Assert,
+                ),
+                Fact::new(
+                    hash.clone(),
+                    MV::Album(Album::new(album)),
+                    now,
+                    source.clone(),
+                    Operation::Assert,
+                ),
+                Fact::new(
+                    hash.clone(),
+                    MV::ItemId(item_id.to_string()),
+                    now,
+                    source.clone(),
+                    Operation::Assert,
+                ),
+            ];
+            writer.write_batch(&facts).expect("failed to write facts");
+        }
+
+        /// Spin up a stub library IPC server on a temp socket and return the address.
+        fn start_stub_library(
+            metadata_dir: &std::path::Path,
+            socket_path: &std::path::Path,
+        ) -> std::thread::JoinHandle<()> {
+            let svc = Arc::new(
+                LibraryService::new(
+                    metadata_dir.to_path_buf(),
+                    metadata_dir.to_path_buf(),
+                    "ipc:///dev/null",
+                )
+                .expect("failed to create stub library"),
+            );
+            let addr = format!("ipc://{}", socket_path.display());
+            std::thread::spawn(move || {
+                run_ipc_server(svc, &addr).ok();
+            })
+        }
+
+        #[test]
+        fn work_identity_dedup_skips_duplicate_purchase_and_backfills_item_id() {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let metadata_dir = temp.path().to_path_buf();
+            let socket_path = temp.path().join("library.sock");
+
+            // Seed: track with ItemId="p_vinyl_111"
+            seed_track_with_item_id(
+                &metadata_dir,
+                &format!("{:0<64}", "deadbeef"),
+                "Carbon Based Lifeforms",
+                "Interloper",
+                "p_vinyl_111",
+            );
+
+            // Start stub server
+            let _srv = start_stub_library(&metadata_dir, &socket_path);
+            // Give the thread time to bind
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            let lib_socket = format!("ipc://{}", socket_path.display());
+
+            // Verify the stub has the seeded track via ItemId
+            let client = LibraryClient::connect(&lib_socket).expect("connect");
+            let known = client
+                .has_facts("ItemId", vec!["p_vinyl_111".to_string()])
+                .expect("has_facts");
+            assert!(
+                known.contains(&"p_vinyl_111".to_string()),
+                "seed sanity check"
+            );
+
+            // Build collection: p_vinyl_111 (already known by ItemId) + p_digital_222 (same work)
+            let vinyl_item =
+                make_collection_item("p_vinyl_111", "Carbon Based Lifeforms", "Interloper");
+            let digital_item =
+                make_collection_item("p_digital_222", "Carbon Based Lifeforms", "Interloper");
+            let collection = vec![vinyl_item, digital_item];
+
+            // Collect all ItemIds from collection for has_facts call (mirrors handle_sync logic)
+            let all_ids: Vec<String> = collection
+                .iter()
+                .map(|i| i.id.as_str().to_string())
+                .collect();
+            let library_known: std::collections::HashSet<String> = client
+                .has_facts("ItemId", all_ids)
+                .expect("has_facts batch")
+                .into_iter()
+                .collect();
+
+            // p_vinyl_111 is in library_known; p_digital_222 is not
+            assert!(
+                library_known.contains("p_vinyl_111"),
+                "vinyl known via ItemId"
+            );
+            assert!(
+                !library_known.contains("p_digital_222"),
+                "digital NOT known by ItemId yet"
+            );
+
+            // For p_digital_222: perform the work-identity search
+            let digital_item2 =
+                make_collection_item("p_digital_222", "Carbon Based Lifeforms", "Interloper");
+            let query = TrackQuery {
+                artist: Some(StringQuery::Contains(normalize(
+                    digital_item2.artist.as_str(),
+                ))),
+                album: Some(StringQuery::Contains(normalize(
+                    digital_item2.title.as_str(),
+                ))),
+                ..Default::default()
+            };
+            let results = client.search(&query).expect("search");
+            assert!(
+                should_skip_by_work_identity(&digital_item2, &results),
+                "work-identity check should fire: Interloper already in library"
+            );
+
+            // Backfill: write ItemId="p_digital_222" onto the matched track
+            let matched_hash = results.first().unwrap().content_hash.clone();
+            client
+                .write_fact(
+                    &matched_hash,
+                    MusicValue::ItemId("p_digital_222".to_string()),
+                )
+                .expect("write_fact");
+
+            // Verify backfill: now p_digital_222 is known by ItemId
+            let after_backfill = client
+                .has_facts("ItemId", vec!["p_digital_222".to_string()])
+                .expect("has_facts after backfill");
+            assert!(
+                after_backfill.contains(&"p_digital_222".to_string()),
+                "after backfill, p_digital_222 should be found by ItemId"
+            );
+        }
+
+        /// Adversarial test: a Contains-only probe returns a result whose artist/album only
+        /// substring-match the query. The tightened predicate must reject it and NOT skip.
+        ///
+        /// Seeded track: artist="The Flashbulb", album="Arboreal"
+        /// Collection item: artist="The", album="Arbor"
+        ///
+        /// Contains("the") matches stored artist "The Flashbulb" (word present).
+        /// Contains("arbor") matches stored album "Arboreal" (substring present).
+        /// So the Contains probe returns the seeded track.
+        /// But normalize("the") != normalize("the flashbulb") and
+        /// normalize("arbor") != normalize("arboreal"), so `should_skip_by_work_identity`
+        /// must return false.
+        #[test]
+        fn work_identity_dedup_does_not_skip_when_only_contains_match() {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let metadata_dir = temp.path().to_path_buf();
+            let socket_path = temp.path().join("library2.sock");
+
+            // Seed: "The Flashbulb" / "Arboreal"
+            seed_track_with_item_id(
+                &metadata_dir,
+                &format!("{:0<64}", "badf00d"),
+                "The Flashbulb",
+                "Arboreal",
+                "p_flashbulb_111",
+            );
+
+            let _srv = start_stub_library(&metadata_dir, &socket_path);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            let lib_socket = format!("ipc://{}", socket_path.display());
+            let client = LibraryClient::connect(&lib_socket).expect("connect");
+
+            // Collection item: "The" / "Arbor" — substring match only
+            // Contains("the") matches "The Flashbulb"; Contains("arbor") matches "Arboreal"
+            let item = make_collection_item("p_flashbulb_222", "The", "Arbor");
+            let query = TrackQuery {
+                artist: Some(StringQuery::Contains(normalize(item.artist.as_str()))),
+                album: Some(StringQuery::Contains(normalize(item.title.as_str()))),
+                ..Default::default()
+            };
+            let results = client.search(&query).expect("search");
+
+            // Sanity: the Contains probe should return the seeded track
+            assert!(
+                !results.is_empty(),
+                "Contains probe should return the seeded track (test setup check)"
+            );
+
+            // The tightened predicate must reject it: no exact normalized match
+            assert!(
+                !should_skip_by_work_identity(&item, &results),
+                "substring-only match must NOT trigger skip"
+            );
+        }
     }
 }

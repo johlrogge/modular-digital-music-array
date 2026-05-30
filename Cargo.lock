@@ -2875,10 +2875,15 @@ name = "mdma-bandcamp"
 version = "0.20.1"
 dependencies = [
  "bandcamp-api",
+ "chrono",
  "clap",
  "color-eyre",
  "inbox-utils",
  "library-ipc-client",
+ "library-ipc-protocol",
+ "library-search",
+ "library-service-stub",
+ "music-facts",
  "nng",
  "parking_lot",
  "pretty_assertions",
@@ -2886,12 +2891,14 @@ dependencies = [
  "serde_json",
  "service",
  "source-protocol",
+ "stainless-facts",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
+ "track-matcher",
  "zip",
 ]
 

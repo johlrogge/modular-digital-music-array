@@ -103,7 +103,7 @@ Provides: Rust, Zig, cargo-zigbuild, PipeWire libs, nmap, sshpass, just
 
 ### Raspberry Pi
 
-The provisioned Pi is at **mdma-909.local**.
+The provisioned Pi is at **mdma-johlyroger.local**.
 
 **IMPORTANT: Never wipe or delete `/music` on the Pi unless explicitly instructed. It contains the music library and downloaded tracks.**
 
@@ -118,14 +118,14 @@ ssh root@welcome-to-mdma.local  # password: voidlinux
 
 **Provisioned Pi:**
 ```bash
-ssh -4 -i ~/.ssh/mdma_pi admin@mdma-909.local  # key-based auth, -4 forces IPv4
+ssh -4 -i ~/.ssh/mdma_pi admin@mdma-johlyroger.local  # key-based auth, -4 forces IPv4
 ```
 
 ### Service Access
 
 All services are behind the gateway. Only port 5555 is exposed externally.
 
-- **Gateway TCP (remote):** `tcp://mdma-909.local:5555` — routes to all services
+- **Gateway TCP (remote):** `tcp://mdma-johlyroger.local:5555` — routes to all services
 - **Library IPC (local):** `ipc:///run/mdma/library.sock`
 - **Playback IPC (local):** `ipc:///run/mdma/playback.sock`
 - **Source sockets (local):** `/run/mdma/sources/*.sock` (auto-discovered by gateway)
@@ -134,7 +134,7 @@ MDMA_NODE is already set in the devenv shell. The CLI derives the gateway addres
 
 **Bandcamp username:** `johlyroger`
 
-**Web UI:** `http://welcome-to-mdma.local` (beacon) or `http://mdma-909.local` (provisioned)
+**Web UI:** `http://welcome-to-mdma.local` (beacon) or `http://mdma-johlyroger.local` (provisioned)
 
 **Package repo:** GitHub Pages at `https://johlrogge.github.io/modular-digital-music-array/`
 

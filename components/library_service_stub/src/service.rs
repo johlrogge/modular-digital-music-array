@@ -287,7 +287,19 @@ impl LibraryService {
 
             LibraryRequest::WriteBookmark { .. } => LibraryResponse::BookmarkWritten,
 
-            LibraryRequest::WriteFact { .. } => LibraryResponse::FactWritten,
+            LibraryRequest::WriteFact { hash, fact } => {
+                // Store the fact in the fact_index so has_facts probes work in tests.
+                let variant_name = fact.display_name();
+                let value_str = fact.to_string();
+                self.fact_index
+                    .lock()
+                    .unwrap()
+                    .entry(FactType::new(variant_name))
+                    .or_default()
+                    .insert(value_str);
+                tracing::debug!(hash = %hash.as_str(), "Stub: WriteFact stored");
+                LibraryResponse::FactWritten
+            }
 
             LibraryRequest::RetractFact { .. } => LibraryResponse::FactRetracted,
 

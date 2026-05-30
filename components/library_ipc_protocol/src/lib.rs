@@ -76,7 +76,10 @@ impl InboxPath {
         if name.starts_with('/') {
             return Err(InboxPathError::AbsolutePath);
         }
-        if name.contains("..") {
+        let has_parent_dir = std::path::Path::new(name)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir));
+        if has_parent_dir {
             return Err(InboxPathError::PathTraversal);
         }
         if name.contains('\0') {
@@ -484,6 +487,9 @@ mod tests {
     #[case("track.flac")]
     #[case("subdir/track.flac")]
     #[case("a/b/c/track.flac")]
+    #[case("Paramnésie I..flac")] // regression: adjacent dots in stem, not a .. component
+    #[case("foo..flac")] // regression: simpler form of same
+    #[case("a..b/c..d")] // multiple double-dots in filenames, no actual .. component
     fn inbox_path_valid(#[case] path: &str) {
         assert!(InboxPath::new(path).is_ok());
     }
@@ -504,6 +510,7 @@ mod tests {
     #[rstest]
     #[case("../../../etc/passwd")]
     #[case("foo/../bar")]
+    #[case("..")]
     fn inbox_path_rejects_traversal(#[case] path: &str) {
         assert!(matches!(
             InboxPath::new(path),
