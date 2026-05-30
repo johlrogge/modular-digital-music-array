@@ -2837,7 +2837,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "mdma-acid"
-version = "0.20.1"
+version = "0.20.2"
 dependencies = [
  "acid-service",
  "clap",
@@ -2851,7 +2851,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-audio"
-version = "0.20.1"
+version = "0.20.2"
 dependencies = [
  "clap",
  "color-eyre",
@@ -2872,7 +2872,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-bandcamp"
-version = "0.20.1"
+version = "0.20.2"
 dependencies = [
  "bandcamp-api",
  "chrono",
@@ -2926,7 +2926,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-beacon"
-version = "0.20.1"
+version = "0.20.2"
 dependencies = [
  "askama",
  "async-stream",
@@ -2952,7 +2952,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-cli"
-version = "0.20.1"
+version = "0.20.2"
 dependencies = [
  "audio-transcoder",
  "chrono",
@@ -3002,7 +3002,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-console"
-version = "0.20.1"
+version = "0.20.2"
 dependencies = [
  "askama",
  "async-stream",
@@ -3036,7 +3036,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-gateway"
-version = "0.20.1"
+version = "0.20.2"
 dependencies = [
  "acid-protocol",
  "clap",
@@ -3056,7 +3056,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-library"
-version = "0.20.1"
+version = "0.20.2"
 dependencies = [
  "clap",
  "color-eyre",
@@ -3069,7 +3069,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-playback"
-version = "0.20.1"
+version = "0.20.2"
 dependencies = [
  "acid-client",
  "clap",
@@ -3093,7 +3093,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-tui"
-version = "0.20.1"
+version = "0.20.2"
 dependencies = [
  "clap",
  "client",
