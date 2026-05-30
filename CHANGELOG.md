@@ -4,6 +4,15 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.20.2] — 2026-05-30
+
+### Fixed
+
+- **`mdma source sync bandcamp` — duplicate re-downloads when Bandcamp lists multiple purchase entries for the same album** — if you bought an album more than once (e.g. vinyl and digital), MDMA would re-download it on every sync. A pre-download identity probe now checks for an exact normalized artist + album match among tracks already in the library; when a match is found the new item ID is backfilled so future syncs short-circuit via the cheaper ID path.
+- **Bandcamp tracks with filenames containing adjacent dots silently dropped** — tracks whose title ends in a period (e.g. `Paramnésie I..flac`, where the period is part of the title before the extension) were rejected by an overly broad `..` substring guard. The check now rejects only genuine `..` path components. Dropped files now emit a warning instead of disappearing without a trace.
+
+---
+
 ## [0.20.1] — 2026-05-12
 
 ### Fixed

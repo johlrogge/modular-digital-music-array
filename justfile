@@ -476,6 +476,7 @@ archive:
 confirm-sudo:
     @echo "Image creation requires root. Requesting sudo now..."
     @sudo -v
+    @sudo chown -R "$USER":"$USER" ~/mdma-images 2>/dev/null || true
 
 # Create SD card image with beacon installed via xbps
 [group('image')]

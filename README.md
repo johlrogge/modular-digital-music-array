@@ -167,7 +167,11 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ---
 
-## What's new in 0.20.1
+## What's new in 0.20.2
+
+`mdma source sync bandcamp` no longer re-downloads albums you already own when Bandcamp lists multiple purchase entries for the same release (e.g. vinyl + digital). Bandcamp tracks with filenames that contain adjacent dots as part of the title (e.g. `Paramnésie I..flac`) are also no longer silently dropped — they now ingest correctly.
+
+### Earlier in 0.20.1
 
 Hotfix for `mdma rekordbox export`. Tracks that were present in `<COLLECTION>` were sometimes missing from `<PLAYLIST>` entries, and re-running export accumulated duplicate `<COLLECTION>` entries for tracks already written. Both symptoms were caused by a case mismatch in `file://` URI comparison; URIs are now normalised before lookup.
 
