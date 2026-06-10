@@ -17,6 +17,7 @@ clap_complete = "4"
 color-eyre = "0.6"
 corsett = { git = "https://github.com/johlrogge/corsett.git", rev = "bf16c1aa2e8d6ba1f833e33009f2deecadc3ee26" }
 futures = "0.3"
+libc = "0.2"
 lofty = "0.18"
 nng = "1.0"
 parking_lot = "0.12"

@@ -5,6 +5,8 @@
 members = [
     "components/acid_client",
     "components/acid_protocol",
+    "components/admin_ipc_client",
+    "components/admin_ipc_protocol",
     "components/acid_service",
     "components/audio_decoder",
     "components/audio_metadata",
@@ -34,6 +36,7 @@ members = [
     "components/playback_engine",
     "components/playback_primitives",
     "components/rekordbox_xml",
+    "components/rpi_eeprom",
     "components/source_protocol",
     "components/storage_primitives",
     "components/stream_source_protocol",
@@ -45,6 +48,7 @@ members = [
     "bases/service",
     "bases/tui",
     "projects/mdma-acid",
+    "projects/mdma-admin",
     "projects/mdma-audio",
     "projects/mdma-bandcamp",
     "projects/bdd",
@@ -68,6 +72,8 @@ repository = "https://github.com/johlrogge/modular-digital-music-array"
 [workspace.dependencies]
 acid-client = { path = "components/acid_client" }
 acid-protocol = { path = "components/acid_protocol" }
+admin-ipc-client = { path = "components/admin_ipc_client" }
+admin-ipc-protocol = { path = "components/admin_ipc_protocol" }
 acid-service = { path = "components/acid_service" }
 audio-decoder = { path = "components/audio_decoder" }
 audio-metadata = { path = "components/audio_metadata" }
@@ -98,12 +104,14 @@ nng-transport = { path = "components/nng_transport" }
 playback-engine = { path = "components/playback_engine" }
 playback-primitives = { path = "components/playback_primitives" }
 rekordbox-xml = { path = "components/rekordbox_xml" }
+rpi-eeprom = { path = "components/rpi_eeprom" }
 service = { path = "bases/service" }
 source-protocol = { path = "components/source_protocol" }
 storage_primitives = { path = "components/storage_primitives" }
 stream-source-protocol = { path = "components/stream_source_protocol" }
 track-formatter = { path = "components/track_formatter" }
 track-matcher = { path = "components/track_matcher" }
+libc = "0.2"
 askama = "0.12"
 assert_matches = "1.5"
 async-stream = "0.3"

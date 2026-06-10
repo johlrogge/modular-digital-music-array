@@ -38,6 +38,10 @@ struct Args {
     #[arg(long, default_value = "ipc:///run/mdma/acid.sock")]
     acid_socket: String,
 
+    /// Admin service IPC socket
+    #[arg(long, default_value = "ipc:///run/mdma/admin.sock")]
+    admin_socket: String,
+
     /// Directory containing source service sockets
     #[arg(long, default_value = "/run/mdma/sources")]
     sources_dir: PathBuf,
@@ -248,6 +252,10 @@ fn main() -> Result<()> {
         .map_err(|e| color_eyre::eyre::eyre!("Failed to connect to acid: {}", e))?;
     tracing::info!(address = %args.acid_socket, "Connected to acid backend");
 
+    let admin_backend = connect_backend(&args.admin_socket)
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to connect to admin: {}", e))?;
+    tracing::info!(address = %args.admin_socket, "Connected to admin backend");
+
     // Bridge playback events (playback/ topic)
     spawn_event_bridge(Arc::clone(&event_pub), args.event_source.clone());
 
@@ -320,6 +328,13 @@ fn main() -> Result<()> {
             GatewayRequest::Acid { request } => {
                 match forward_typed(&acid_backend, &request, "acid") {
                     Ok(resp) => GatewayResponse::Acid { response: resp },
+                    Err(e) => e,
+                }
+            }
+
+            GatewayRequest::Admin { request } => {
+                match forward_typed(&admin_backend, &request, "admin") {
+                    Ok(resp) => GatewayResponse::Admin { response: resp },
                     Err(e) => e,
                 }
             }

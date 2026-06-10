@@ -7,6 +7,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use color_eyre::Result;
 use colored::Colorize;
 use event_protocol::{from_topic_message, PlaybackEvent, TOPIC_PLAYBACK};
+use gateway_client::{AdminRequest, AdminResponse, GatewayClient};
 use library_ipc_client::{ClientError, ContentHash, InboxPath, ProtocolError, TrackInfo};
 use library_search::{parse_date_query, parse_numeric_query, parse_string_query, TrackQuery};
 use mdma_client::{
@@ -350,6 +351,12 @@ enum Commands {
     GenerateCompletions {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
+    },
+
+    /// Admin commands (service mode, reboot)
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommands,
     },
 }
 
@@ -750,6 +757,27 @@ enum LibraryCommands {
 }
 
 #[derive(Subcommand, Debug)]
+enum AdminCommands {
+    /// Service mode subcommands (EEPROM boot order)
+    ServiceMode {
+        #[command(subcommand)]
+        command: ServiceModeCommands,
+    },
+    /// Reboot the host
+    Reboot,
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceModeCommands {
+    /// Show current EEPROM boot order, armed state, and PCIE_PROBE
+    Status,
+    /// Arm service mode: next reboot will boot from SD (beacon)
+    Enable,
+    /// Disarm service mode: restore NVMe-first boot order
+    Disable,
+}
+
+#[derive(Subcommand, Debug)]
 enum FactCommands {
     /// Add or update a fact on a track.
     ///
@@ -852,6 +880,23 @@ fn connect_source(cli: &Cli, name: &str) -> SourceClient {
             if gateway.is_none() {
                 eprintln!("Is mdma-{} running?", name);
             }
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Connect to the admin service via gateway.
+///
+/// Exits with a message when the gateway address cannot be derived (--node not set).
+fn connect_admin(cli: &Cli) -> GatewayClient {
+    let gateway = resolve_gateway(cli).unwrap_or_else(|| {
+        eprintln!("error: --node (or MDMA_NODE) is required for admin commands");
+        std::process::exit(1);
+    });
+    match GatewayClient::connect(&gateway) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to connect to gateway: {}", e);
             std::process::exit(1);
         }
     }
@@ -4502,6 +4547,112 @@ fn handle_export(
 }
 
 // =============================================================================
+// Admin Handlers
+// =============================================================================
+
+fn handle_admin_service_mode_status(client: &GatewayClient) -> Result<()> {
+    match client.admin_request(&AdminRequest::ServiceModeStatus) {
+        Ok(AdminResponse::Status {
+            boot_order,
+            service_mode_armed,
+            pcie_probe,
+        }) => {
+            let boot_label = if service_mode_armed {
+                "SD-first"
+            } else {
+                "NVMe-first"
+            };
+            println!("Boot order:        {} ({})", boot_order, boot_label);
+            if service_mode_armed {
+                println!("Service mode:      ARMED — next reboot will land on the beacon SD");
+            } else {
+                println!("Service mode:      not armed");
+            }
+            println!("PCIE_PROBE:        {}", pcie_probe);
+            Ok(())
+        }
+        Ok(AdminResponse::Error { message }) => {
+            eprintln!("error: {}", message);
+            std::process::exit(1);
+        }
+        Ok(other) => {
+            eprintln!("unexpected response: {:?}", other);
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("request failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_admin_service_mode_enable(client: &GatewayClient) -> Result<()> {
+    match client.admin_request(&AdminRequest::ServiceModeEnable) {
+        Ok(AdminResponse::Ok) => {
+            println!("Service mode armed.");
+            println!(
+                "Reboot the device with `mdma admin reboot` (or `sudo reboot`) to enter service mode."
+            );
+            Ok(())
+        }
+        Ok(AdminResponse::Error { message }) => {
+            eprintln!("error: {}", message);
+            std::process::exit(1);
+        }
+        Ok(other) => {
+            eprintln!("unexpected response: {:?}", other);
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("request failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_admin_service_mode_disable(client: &GatewayClient) -> Result<()> {
+    match client.admin_request(&AdminRequest::ServiceModeDisable) {
+        Ok(AdminResponse::Ok) => {
+            println!("Service mode disarmed. NVMe-first boot order restored.");
+            Ok(())
+        }
+        Ok(AdminResponse::Error { message }) => {
+            eprintln!("error: {}", message);
+            std::process::exit(1);
+        }
+        Ok(other) => {
+            eprintln!("unexpected response: {:?}", other);
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("request failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_admin_reboot(client: &GatewayClient) -> Result<()> {
+    match client.admin_request(&AdminRequest::Reboot) {
+        Ok(AdminResponse::Ok) => {
+            println!("Reboot initiated.");
+            Ok(())
+        }
+        Ok(AdminResponse::Error { message }) => {
+            eprintln!("error: {}", message);
+            std::process::exit(1);
+        }
+        Ok(other) => {
+            eprintln!("unexpected response: {:?}", other);
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("request failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+// =============================================================================
 // Shell Completions
 // =============================================================================
 
@@ -4833,6 +4984,18 @@ fn main() -> Result<()> {
             let columns = view_columns_from_matches(view_matches);
             let lib = connect_library(&cli);
             handle_view(&lib, columns)
+        }
+
+        Commands::Admin { command } => {
+            let admin = connect_admin(&cli);
+            match command {
+                AdminCommands::ServiceMode { command } => match command {
+                    ServiceModeCommands::Status => handle_admin_service_mode_status(&admin),
+                    ServiceModeCommands::Enable => handle_admin_service_mode_enable(&admin),
+                    ServiceModeCommands::Disable => handle_admin_service_mode_disable(&admin),
+                },
+                AdminCommands::Reboot => handle_admin_reboot(&admin),
+            }
         }
     }
 }
@@ -6810,5 +6973,84 @@ mod tests {
             "pipe mode output should not truncate long title; got: {:?}",
             stripped
         );
+    }
+
+    // ── admin service-mode clap parsing ──────────────────────────────────────
+
+    #[test]
+    fn admin_service_mode_enable_parses_correctly() {
+        let result = Cli::try_parse_from(["mdma", "admin", "service-mode", "enable"]);
+        assert!(
+            result.is_ok(),
+            "clap rejected admin service-mode enable: {}",
+            result.unwrap_err()
+        );
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Admin {
+                command:
+                    AdminCommands::ServiceMode {
+                        command: ServiceModeCommands::Enable,
+                    },
+            } => {}
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn admin_service_mode_status_parses_correctly() {
+        let result = Cli::try_parse_from(["mdma", "admin", "service-mode", "status"]);
+        assert!(
+            result.is_ok(),
+            "clap rejected admin service-mode status: {}",
+            result.unwrap_err()
+        );
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Admin {
+                command:
+                    AdminCommands::ServiceMode {
+                        command: ServiceModeCommands::Status,
+                    },
+            } => {}
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn admin_service_mode_disable_parses_correctly() {
+        let result = Cli::try_parse_from(["mdma", "admin", "service-mode", "disable"]);
+        assert!(
+            result.is_ok(),
+            "clap rejected admin service-mode disable: {}",
+            result.unwrap_err()
+        );
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Admin {
+                command:
+                    AdminCommands::ServiceMode {
+                        command: ServiceModeCommands::Disable,
+                    },
+            } => {}
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn admin_reboot_parses_correctly() {
+        let result = Cli::try_parse_from(["mdma", "admin", "reboot"]);
+        assert!(
+            result.is_ok(),
+            "clap rejected admin reboot: {}",
+            result.unwrap_err()
+        );
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Admin {
+                command: AdminCommands::Reboot,
+            } => {}
+            other => panic!("unexpected command: {:?}", other),
+        }
     }
 }
