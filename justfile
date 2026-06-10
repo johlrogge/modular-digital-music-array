@@ -951,6 +951,26 @@ deploy-bandcamp: bandcamp-cross
 deploy-acid: acid-cross
     @just _deploy-svc mdma-acid mdma-acid
 
+# Cross-compile admin service for aarch64 (dev profile workspace)
+[group('build')]
+admin-cross:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building Admin for aarch64..."
+    cargo polylith cargo --profile dev zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        --bin mdma-admin
+    echo ""
+    echo "Admin built!"
+    file target/aarch64-unknown-linux-gnu/release/mdma-admin
+    ls -lh target/aarch64-unknown-linux-gnu/release/mdma-admin
+
+# Deploy admin service to Pi
+[group('dev')]
+deploy-admin: admin-cross
+    @just _deploy-svc mdma-admin mdma-admin
+
 # Cross-compile TUI for aarch64 (dev profile workspace)
 [group('build')]
 tui-cross:

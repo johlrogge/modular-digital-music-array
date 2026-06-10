@@ -4,6 +4,7 @@
 //! Provides typed facades for library, playback, and source services.
 
 pub use acid_protocol::{AcidRequest, AcidResponse};
+pub use admin_ipc_protocol::{AdminRequest, AdminResponse};
 pub use gateway_protocol::{GatewayRequest, GatewayResponse, SourceName};
 pub use library_ipc_protocol::{LibraryRequest, LibraryResponse};
 pub use media_protocol::{Command, Response};
@@ -107,6 +108,24 @@ impl GatewayClient {
             GatewayResponse::Error { message } => Err(ClientError::Service(message)),
             _ => Err(ClientError::Service(
                 "Unexpected response type for acid request".to_string(),
+            )),
+        }
+    }
+
+    // =========================================================================
+    // Admin facade
+    // =========================================================================
+
+    /// Send an admin request through the gateway.
+    pub fn admin_request(&self, req: &AdminRequest) -> Result<AdminResponse, ClientError> {
+        let envelope = GatewayRequest::Admin {
+            request: req.clone(),
+        };
+        match self.request(&envelope)? {
+            GatewayResponse::Admin { response } => Ok(response),
+            GatewayResponse::Error { message } => Err(ClientError::Service(message)),
+            _ => Err(ClientError::Service(
+                "Unexpected response type for admin request".to_string(),
             )),
         }
     }

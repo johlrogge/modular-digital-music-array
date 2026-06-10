@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MDMA Admin</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Outfit:wght@200;300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-base: #141420;
+            --bg-surface: #1c1c2a;
+            --bg-elevated: #252534;
+            --bg-hover: #2e2e40;
+            --border-subtle: #38384e;
+            --border-strong: #48485e;
+            --text-primary: #f0f0f8;
+            --text-secondary: #b8b8d0;
+            --text-tertiary: #9898b8;
+            --accent: #ec88f4;
+            --accent-dim: rgba(236, 136, 244, 0.16);
+            --accent-glow: rgba(236, 136, 244, 0.45);
+            --accent-bright: #f4a8ff;
+            --accent2: #68e8ff;
+            --accent2-dim: rgba(104, 232, 255, 0.16);
+            --accent2-glow: rgba(104, 232, 255, 0.40);
+            --success: #60e8b8;
+            --success-dim: rgba(96, 232, 184, 0.16);
+            --warning: #f0c060;
+            --warning-dim: rgba(240, 192, 96, 0.16);
+            --error: #f88898;
+            --error-dim: rgba(248, 136, 152, 0.16);
+            --radius-sm: 4px;
+            --radius-md: 8px;
+            --radius-lg: 12px;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: 'Outfit', sans-serif;
+            background: var(--bg-base);
+            color: var(--text-primary);
+            min-height: 100vh;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        .shell {
+            max-width: 860px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+
+        .masthead {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 24px 0 20px;
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        .brand {
+            display: flex;
+            align-items: baseline;
+            gap: 10px;
+        }
+
+        .brand-name {
+            font-family: 'DM Mono', monospace;
+            font-weight: 500;
+            font-size: 1.15rem;
+            letter-spacing: 0.12em;
+            color: var(--text-primary);
+            text-transform: uppercase;
+            text-shadow: 0 0 20px var(--accent2-glow);
+        }
+
+        .brand-version {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.7rem;
+            color: var(--text-tertiary);
+            letter-spacing: 0.06em;
+        }
+
+        .back-link {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.75rem;
+            color: var(--text-tertiary);
+            text-decoration: none;
+            letter-spacing: 0.04em;
+        }
+        .back-link:hover { color: var(--accent2); }
+
+        .page-content {
+            padding: 32px 0 40px;
+        }
+
+        .page-title {
+            font-size: 1.4rem;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 8px;
+        }
+
+        .page-subtitle {
+            font-size: 0.85rem;
+            color: var(--text-tertiary);
+            margin-bottom: 32px;
+        }
+
+        .section {
+            background: var(--bg-surface);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-lg);
+            padding: 20px 24px;
+            margin-bottom: 20px;
+        }
+
+        .section-header {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.7rem;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            color: var(--text-tertiary);
+            margin-bottom: 16px;
+        }
+
+        .kv-grid {
+            display: grid;
+            grid-template-columns: 160px 1fr;
+            gap: 10px 16px;
+            align-items: baseline;
+        }
+
+        .kv-label {
+            font-size: 0.8rem;
+            color: var(--text-tertiary);
+        }
+
+        .kv-value {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: var(--radius-sm);
+            font-family: 'DM Mono', monospace;
+            font-size: 0.7rem;
+            letter-spacing: 0.04em;
+        }
+        .badge.ok  { background: var(--success-dim); color: var(--success); }
+        .badge.warn { background: var(--warning-dim); color: var(--warning); }
+        .badge.err { background: var(--error-dim); color: var(--error); }
+
+        .error-banner {
+            background: var(--error-dim);
+            border: 1px solid var(--error);
+            border-radius: var(--radius-md);
+            color: var(--error);
+            padding: 14px 18px;
+            font-size: 0.85rem;
+            margin-bottom: 20px;
+        }
+
+        .actions {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            display: inline-block;
+            padding: 10px 20px;
+            border-radius: var(--radius-md);
+            font-family: 'Outfit', sans-serif;
+            font-size: 0.85rem;
+            font-weight: 500;
+            border: none;
+            cursor: pointer;
+            text-decoration: none;
+            transition: opacity 0.15s;
+        }
+        .btn:hover { opacity: 0.85; }
+
+        .btn-primary {
+            background: var(--accent);
+            color: #fff;
+        }
+
+        .btn-secondary {
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-strong);
+            color: var(--text-secondary);
+        }
+
+        .btn-danger {
+            background: var(--error-dim);
+            border: 1px solid var(--error);
+            color: var(--error);
+        }
+    </style>
+</head>
+<body>
+<div class="shell">
+    <header class="masthead">
+        <div class="brand">
+            <span class="brand-name">MDMA</span>
+            <span class="brand-version">v{{ version }}</span>
+        </div>
+        <a class="back-link" href="/">← console</a>
+    </header>
+
+    <div class="page-content">
+        <div class="page-title">Admin</div>
+        <div class="page-subtitle">Service-mode and reboot controls</div>
+
+        {% if let Some(err) = error %}
+        <div class="error-banner">{{ err }}</div>
+        {% endif %}
+
+        {% if error.is_none() %}
+        <div class="section">
+            <div class="section-header">Boot Configuration</div>
+            <div class="kv-grid">
+                <div class="kv-label">Boot order</div>
+                <div class="kv-value">{% if boot_order.is_empty() %}(not set){% else %}{{ boot_order }}{% endif %}</div>
+                <div class="kv-label">Service mode</div>
+                <div class="kv-value">
+                    {% if service_mode_armed %}
+                    <span class="badge warn">armed</span>
+                    {% else %}
+                    <span class="badge ok">normal</span>
+                    {% endif %}
+                </div>
+                <div class="kv-label">PCIE_PROBE</div>
+                <div class="kv-value">{{ pcie_probe }}</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-header">Actions</div>
+            <div class="actions">
+                {% if !service_mode_armed %}
+                <form method="post" action="/admin/service-mode/enable"
+                      onsubmit="return confirm('Enable service mode? The Pi will boot from SD on next reboot.');">
+                    <button type="submit" class="btn btn-primary">Enable service mode</button>
+                </form>
+                {% else %}
+                <form method="post" action="/admin/service-mode/disable"
+                      onsubmit="return confirm('Disable service mode? NVMe-first boot order will be restored.');">
+                    <button type="submit" class="btn btn-secondary">Disable service mode</button>
+                </form>
+                {% endif %}
+                <form method="post" action="/admin/reboot"
+                      onsubmit="return confirm('Reboot the Pi now?');">
+                    <button type="submit" class="btn btn-danger">Reboot</button>
+                </form>
+            </div>
+        </div>
+        {% endif %}
+    </div>
+</div>
+</body>
+</html>

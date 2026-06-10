@@ -1577,6 +1577,167 @@ async fn library_search_handler(
 }
 
 // =============================================================================
+// Admin Handlers
+// =============================================================================
+
+#[derive(Template)]
+#[template(path = "admin.html")]
+struct AdminTemplate {
+    version: String,
+    boot_order: String,
+    service_mode_armed: bool,
+    pcie_probe: String,
+    error: Option<String>,
+}
+
+async fn admin_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    use gateway_client::{AdminRequest, AdminResponse};
+
+    let (boot_order, service_mode_armed, pcie_probe, error) = match state.gateway_client() {
+        None => (
+            String::new(),
+            false,
+            String::new(),
+            Some("Admin service not available".to_string()),
+        ),
+        Some(client) => match client.admin_request(&AdminRequest::ServiceModeStatus) {
+            Ok(AdminResponse::Status {
+                boot_order,
+                service_mode_armed,
+                pcie_probe,
+            }) => (boot_order, service_mode_armed, pcie_probe, None),
+            Ok(AdminResponse::Error { message }) => {
+                (String::new(), false, String::new(), Some(message))
+            }
+            Ok(_) => (
+                String::new(),
+                false,
+                String::new(),
+                Some("Unexpected response from admin service".to_string()),
+            ),
+            Err(e) => (String::new(), false, String::new(), Some(e.to_string())),
+        },
+    };
+
+    let template = AdminTemplate {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        boot_order,
+        service_mode_armed,
+        pcie_probe,
+        error,
+    };
+    match template.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "Admin template render failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Template error").into_response()
+        }
+    }
+}
+
+async fn admin_service_mode_enable(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    use axum::response::Redirect;
+    use gateway_client::{AdminRequest, AdminResponse};
+
+    let result = state
+        .gateway_client()
+        .ok_or_else(|| "Admin service not available".to_string())
+        .and_then(|client| {
+            client
+                .admin_request(&AdminRequest::ServiceModeEnable)
+                .map_err(|e| e.to_string())
+        });
+
+    match result {
+        Ok(AdminResponse::Ok) => Redirect::to("/admin").into_response(),
+        Ok(AdminResponse::Error { message }) => {
+            tracing::warn!(message, "service-mode enable refused");
+            Redirect::to("/admin?error=enable_refused").into_response()
+        }
+        Ok(_) => Redirect::to("/admin").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "service-mode enable failed");
+            Redirect::to("/admin").into_response()
+        }
+    }
+}
+
+async fn admin_service_mode_disable(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    use axum::response::Redirect;
+    use gateway_client::{AdminRequest, AdminResponse};
+
+    let result = state
+        .gateway_client()
+        .ok_or_else(|| "Admin service not available".to_string())
+        .and_then(|client| {
+            client
+                .admin_request(&AdminRequest::ServiceModeDisable)
+                .map_err(|e| e.to_string())
+        });
+
+    match result {
+        Ok(AdminResponse::Ok) => Redirect::to("/admin").into_response(),
+        Ok(AdminResponse::Error { message }) => {
+            tracing::warn!(message, "service-mode disable refused");
+            Redirect::to("/admin").into_response()
+        }
+        Ok(_) => Redirect::to("/admin").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "service-mode disable failed");
+            Redirect::to("/admin").into_response()
+        }
+    }
+}
+
+async fn admin_reboot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    use gateway_client::{AdminRequest, AdminResponse};
+
+    let result = state
+        .gateway_client()
+        .ok_or_else(|| "Admin service not available".to_string())
+        .and_then(|client| {
+            client
+                .admin_request(&AdminRequest::Reboot)
+                .map_err(|e| e.to_string())
+        });
+
+    match result {
+        Ok(AdminResponse::Ok) => {
+            let template = AdminRebootingTemplate {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            };
+            match template.render() {
+                Ok(html) => Html(html).into_response(),
+                Err(_) => Html("<p>Rebooting…</p>").into_response(),
+            }
+        }
+        Ok(AdminResponse::Error { message }) => {
+            tracing::warn!(message, "reboot refused");
+            (
+                StatusCode::BAD_GATEWAY,
+                Html(format!("<p>Reboot refused: {message}</p>")),
+            )
+                .into_response()
+        }
+        Ok(_) => Html("<p>Rebooting…</p>").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "reboot failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Html(format!("<p>Error: {e}</p>")),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "admin_rebooting.html")]
+struct AdminRebootingTemplate {
+    version: String,
+}
+
+// =============================================================================
 // Event Bridge
 // =============================================================================
 
@@ -1746,6 +1907,17 @@ async fn main() -> Result<()> {
         .route("/cover/:hash", get(cover_art))
         // Export
         .route("/export/:hash", get(export_track))
+        // Admin routes
+        .route("/admin", get(admin_page))
+        .route(
+            "/admin/service-mode/enable",
+            post(admin_service_mode_enable),
+        )
+        .route(
+            "/admin/service-mode/disable",
+            post(admin_service_mode_disable),
+        )
+        .route("/admin/reboot", post(admin_reboot))
         .with_state(state);
 
     tracing::info!(

@@ -982,9 +982,12 @@
                 <span class="brand-name">MDMA</span>
                 <span class="brand-version">v{{ version }}</span>
             </div>
-            <div class="connection-indicator">
-                <span class="conn-dot" id="sse-dot"></span>
-                <span id="conn-label">connecting</span>
+            <div style="display:flex;align-items:center;gap:20px;">
+                <a href="/admin" style="font-family:'DM Mono',monospace;font-size:0.7rem;color:var(--text-tertiary);text-decoration:none;letter-spacing:0.04em;">admin</a>
+                <div class="connection-indicator">
+                    <span class="conn-dot" id="sse-dot"></span>
+                    <span id="conn-label">connecting</span>
+                </div>
             </div>
         </header>
 

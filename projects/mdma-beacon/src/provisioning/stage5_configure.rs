@@ -16,6 +16,10 @@
 use crate::actions::{Action, ActionId, PlannedAction};
 use crate::error::{BeaconError, Result};
 use crate::provisioning::types::{ConfiguredFstab, ConfiguredSystem};
+use rpi_eeprom::{
+    apply_eeprom_config, find_staged_eeprom_file, read_current_eeprom_config,
+    verify_staged_eeprom_boot_order, BOOT_ORDER_NVME_FIRST,
+};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tokio::process::Command;
@@ -525,6 +529,7 @@ async fn install_packages(mount_root: &Path) -> Result<()> {
 /// must not be installed as a runtime service on the provisioned NVMe target.
 const TARGET_PACKAGES: &[&str] = &[
     "mdma-acid",
+    "mdma-admin",
     "mdma-audio",
     "mdma-bandcamp",
     "mdma-console",
@@ -688,6 +693,7 @@ async fn enable_services(mount_root: &Path) -> Result<()> {
         "avahi-daemon",
         "pipewire",
         "mdma-acid",
+        "mdma-admin",
         "mdma-audio",
         "mdma-bandcamp",
         "mdma-console",
@@ -699,6 +705,7 @@ async fn enable_services(mount_root: &Path) -> Result<()> {
     // Create log directories for MDMA services
     for log_dir in [
         "mdma-acid",
+        "mdma-admin",
         "mdma-audio",
         "mdma-bandcamp",
         "mdma-console",
@@ -1040,143 +1047,9 @@ async fn configure_nvme_boot_cmdline(mount_root: &Path, nvme_root_device: &str) 
     Ok(())
 }
 
-/// Target BOOT_ORDER for Pi 5: USB (1) → NVMe (6) → SD (4) → restart (f)
-/// See https://www.raspberrypi.com/documentation/computers/raspberry-pi.html#BOOT_ORDER
-const TARGET_BOOT_ORDER: &str = "0xf164";
-
-/// Parsed representation of rpi-eeprom-config output.
+/// Set the Pi 5 EEPROM BOOT_ORDER to USB→NVMe→SD ([`BOOT_ORDER_NVME_FIRST`]) via rpi-eeprom-config.
 ///
-/// Provides idempotency check and rewrite logic, separated from command
-/// invocation so tests can exercise the logic without executing system commands.
-pub(crate) struct EepromConfig {
-    raw: String,
-}
-
-impl EepromConfig {
-    /// Parse the raw text output of `rpi-eeprom-config`.
-    pub(crate) fn parse(raw: &str) -> Self {
-        Self {
-            raw: raw.to_string(),
-        }
-    }
-
-    /// Returns `true` if both BOOT_ORDER and PCIE_PROBE are already set to
-    /// their required values.
-    pub(crate) fn is_already_correct(&self) -> bool {
-        let target_boot_order = format!("BOOT_ORDER={}", TARGET_BOOT_ORDER);
-        let has_boot_order = self
-            .raw
-            .lines()
-            .any(|line| line.trim() == target_boot_order);
-        let has_pcie_probe = self.raw.lines().any(|line| line.trim() == "PCIE_PROBE=1");
-        has_boot_order && has_pcie_probe
-    }
-
-    /// Return a new config string with both BOOT_ORDER and PCIE_PROBE set to
-    /// their required values.
-    ///
-    /// For each key: substitutes an existing `KEY=` line if present; appends
-    /// one if the key is missing entirely.  All other fields are preserved.
-    ///
-    /// `PCIE_PROBE=1` is required in addition to BOOT_ORDER because without it
-    /// the Pi 5 bootloader does not probe PCIe at all, making the NVMe nibble
-    /// in BOOT_ORDER a no-op on freshly provisioned hardware.
-    pub(crate) fn with_correct_eeprom_config(&self) -> String {
-        let boot_order_line = format!("BOOT_ORDER={}", TARGET_BOOT_ORDER);
-        const PCIE_PROBE_LINE: &str = "PCIE_PROBE=1";
-
-        let mut found_boot_order = false;
-        let mut found_pcie_probe = false;
-
-        let mut lines: Vec<String> = self
-            .raw
-            .lines()
-            .map(|line| {
-                if line.trim().starts_with("BOOT_ORDER=") {
-                    found_boot_order = true;
-                    boot_order_line.clone()
-                } else if line.trim().starts_with("PCIE_PROBE=") {
-                    found_pcie_probe = true;
-                    PCIE_PROBE_LINE.to_string()
-                } else {
-                    line.to_string()
-                }
-            })
-            .collect();
-
-        if !found_boot_order {
-            lines.push(boot_order_line);
-        }
-        if !found_pcie_probe {
-            lines.push(PCIE_PROBE_LINE.to_string());
-        }
-
-        // Ensure trailing newline
-        let mut result = lines.join("\n");
-        if !result.ends_with('\n') {
-            result.push('\n');
-        }
-        result
-    }
-}
-
-/// Locate the staged EEPROM update file written by `rpi-eeprom-config --apply`.
-///
-/// `--apply` writes `pieeprom.upd` to the bootfs (typically `/boot/firmware/`
-/// or `/boot/`). Returns the path of the first candidate that exists, or `None`
-/// if neither exists (apply did not produce a staged file).
-pub(crate) fn find_staged_eeprom_file() -> Option<std::path::PathBuf> {
-    let candidates = [
-        std::path::PathBuf::from("/boot/firmware/pieeprom.upd"),
-        std::path::PathBuf::from("/boot/pieeprom.upd"),
-    ];
-    candidates.into_iter().find(|p| p.exists())
-}
-
-/// Verify the staged EEPROM config at `staged_path` by extracting its embedded
-/// config with `rpi-eeprom-config <file>` and checking BOOT_ORDER.
-///
-/// This is the correct post-apply verification: the live EEPROM is not yet
-/// re-flashed, so `rpi-eeprom-config` (no args) still returns the OLD value.
-/// Only reading the staged file shows what will be applied after next reboot.
-pub(crate) async fn verify_staged_eeprom_boot_order(staged_path: &Path) -> Result<()> {
-    let extract_output = Command::new("rpi-eeprom-config")
-        .arg(staged_path)
-        .output()
-        .await
-        .map_err(|e| BeaconError::command_failed("rpi-eeprom-config <staged>", e))?;
-
-    if !extract_output.status.success() {
-        let stderr = String::from_utf8_lossy(&extract_output.stderr);
-        return Err(BeaconError::Provisioning(format!(
-            "rpi-eeprom-config {} failed: {}",
-            staged_path.display(),
-            stderr
-        )));
-    }
-
-    let staged_raw = String::from_utf8_lossy(&extract_output.stdout).to_string();
-    let staged = EepromConfig::parse(&staged_raw);
-    if !staged.is_already_correct() {
-        return Err(BeaconError::Provisioning(format!(
-            "EEPROM BOOT_ORDER verification failed: staged file {} has config:\n{}\nExpected BOOT_ORDER={}",
-            staged_path.display(),
-            staged_raw,
-            TARGET_BOOT_ORDER
-        )));
-    }
-
-    tracing::info!(
-        "  Staged EEPROM file {} verified: BOOT_ORDER={}",
-        staged_path.display(),
-        TARGET_BOOT_ORDER
-    );
-    Ok(())
-}
-
-/// Set the Pi 5 EEPROM BOOT_ORDER to USB→NVMe→SD (0xf164) via rpi-eeprom-config.
-///
-/// Idempotent: if BOOT_ORDER is already 0xf164, the apply step is skipped.
+/// Idempotent: if BOOT_ORDER is already correct, the apply step is skipped.
 /// After `--apply`, reads the staged `pieeprom.upd` file (NOT the live EEPROM —
 /// live EEPROM is only updated on next reboot) and verifies BOOT_ORDER matches.
 /// A Pi with misconfigured BOOT_ORDER must not be rebooted silently.
@@ -1186,30 +1059,17 @@ pub(crate) async fn verify_staged_eeprom_boot_order(staged_path: &Path) -> Resul
 async fn configure_pi_eeprom_boot_order() -> Result<()> {
     tracing::info!(
         "Configuring Pi 5 EEPROM BOOT_ORDER to {} (USB→NVMe→SD)",
-        TARGET_BOOT_ORDER
+        BOOT_ORDER_NVME_FIRST
     );
 
-    // Read current EEPROM config
-    let read_output = Command::new("rpi-eeprom-config")
-        .output()
+    let current = read_current_eeprom_config()
         .await
-        .map_err(|e| BeaconError::command_failed("rpi-eeprom-config", e))?;
+        .map_err(|e| BeaconError::Provisioning(e.to_string()))?;
 
-    if !read_output.status.success() {
-        let stderr = String::from_utf8_lossy(&read_output.stderr);
-        return Err(BeaconError::Provisioning(format!(
-            "rpi-eeprom-config read failed: {}",
-            stderr
-        )));
-    }
-
-    let current_raw = String::from_utf8_lossy(&read_output.stdout).to_string();
-    let current = EepromConfig::parse(&current_raw);
-
-    if current.is_already_correct() {
+    if current.is_correct_for_nvme_first() {
         tracing::info!(
             "  BOOT_ORDER already {} — skipping EEPROM update",
-            TARGET_BOOT_ORDER
+            BOOT_ORDER_NVME_FIRST
         );
         return Ok(());
     }
@@ -1217,31 +1077,12 @@ async fn configure_pi_eeprom_boot_order() -> Result<()> {
     let new_config = current.with_correct_eeprom_config();
     tracing::info!(
         "  BOOT_ORDER diff: old config had different value → setting {}",
-        TARGET_BOOT_ORDER
+        BOOT_ORDER_NVME_FIRST
     );
 
-    // Write new config to a temp file and apply it
-    let tmp_path = "/tmp/mdma-eeprom-config.txt";
-    tokio::fs::write(tmp_path, &new_config).await.map_err(|e| {
-        BeaconError::Provisioning(format!(
-            "Failed to write EEPROM config to {}: {}",
-            tmp_path, e
-        ))
-    })?;
-
-    let apply_output = Command::new("rpi-eeprom-config")
-        .args(["--apply", tmp_path])
-        .output()
+    apply_eeprom_config(&new_config)
         .await
-        .map_err(|e| BeaconError::command_failed("rpi-eeprom-config --apply", e))?;
-
-    if !apply_output.status.success() {
-        let stderr = String::from_utf8_lossy(&apply_output.stderr);
-        return Err(BeaconError::Provisioning(format!(
-            "rpi-eeprom-config --apply failed: {}",
-            stderr
-        )));
-    }
+        .map_err(|e| BeaconError::Provisioning(e.to_string()))?;
 
     // Verify by reading the STAGED file — NOT the live EEPROM.
     // `rpi-eeprom-config --apply` writes pieeprom.upd to the bootfs;
@@ -1256,11 +1097,13 @@ async fn configure_pi_eeprom_boot_order() -> Result<()> {
     })?;
     tracing::info!("  Found staged EEPROM file: {}", staged_path.display());
 
-    verify_staged_eeprom_boot_order(&staged_path).await?;
+    verify_staged_eeprom_boot_order(&staged_path)
+        .await
+        .map_err(|e| BeaconError::Provisioning(e.to_string()))?;
 
     tracing::info!(
         "Pi 5 EEPROM BOOT_ORDER staged to {} (USB→NVMe→SD) — will take effect after reboot",
-        TARGET_BOOT_ORDER
+        BOOT_ORDER_NVME_FIRST
     );
     Ok(())
 }
@@ -1348,7 +1191,7 @@ async fn seed_bandcamp_config(mount_root: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{rewrite_cmdline, sync_kernel_to_nvme_boot, EepromConfig, TARGET_PACKAGES};
+    use super::{rewrite_cmdline, sync_kernel_to_nvme_boot, TARGET_PACKAGES};
     use crate::error::BeaconError;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1359,6 +1202,14 @@ mod tests {
         assert!(
             !TARGET_PACKAGES.contains(&"beacon"),
             "beacon should not be installed on the provisioned target"
+        );
+    }
+
+    #[test]
+    fn target_packages_includes_mdma_admin() {
+        assert!(
+            TARGET_PACKAGES.contains(&"mdma-admin"),
+            "mdma-admin must be in TARGET_PACKAGES so it is installed on the provisioned target"
         );
     }
 
@@ -1607,142 +1458,5 @@ mod tests {
             }
             other => panic!("expected Provisioning error, got: {:?}", other),
         }
-    }
-
-    // ── #22 Phase 2: EEPROM boot order ───────────────────────────────────────
-
-    /// EepromConfig::parse + is_already_correct is the pure logic extracted so
-    /// verify_staged_eeprom_boot_order (which calls rpi-eeprom-config) can be
-    /// unit-tested at the config-parsing level. The staged-file path finding and
-    /// command invocation are integration concerns tested manually on the Pi.
-
-    #[test]
-    fn eeprom_config_parse_detects_correct_when_both_keys_present() {
-        let config = "BOOT_ORDER=0xf164\nPCIE_PROBE=1\nBOOT_UART=1\nNET_INSTALL_AT_POWER_ON=1\n";
-        let parsed = EepromConfig::parse(config);
-        assert!(
-            parsed.is_already_correct(),
-            "should detect config with correct BOOT_ORDER and PCIE_PROBE=1 as already correct"
-        );
-    }
-
-    #[test]
-    fn eeprom_config_parse_not_correct_when_pcie_probe_missing() {
-        let config = "BOOT_ORDER=0xf164\nBOOT_UART=1\nNET_INSTALL_AT_POWER_ON=1\n";
-        let parsed = EepromConfig::parse(config);
-        assert!(
-            !parsed.is_already_correct(),
-            "should not be correct when PCIE_PROBE=1 is missing"
-        );
-    }
-
-    #[test]
-    fn eeprom_config_parse_detects_wrong_boot_order() {
-        let config = "BOOT_ORDER=0xf461\nPCIE_PROBE=1\nBOOT_UART=1\n";
-        let parsed = EepromConfig::parse(config);
-        assert!(
-            !parsed.is_already_correct(),
-            "0xf461 should not be detected as correct"
-        );
-    }
-
-    #[test]
-    fn eeprom_config_rewrite_substitutes_boot_order() {
-        let config = "BOOT_ORDER=0xf461\nBOOT_UART=1\nNET_INSTALL_AT_POWER_ON=1\n";
-        let parsed = EepromConfig::parse(config);
-        let new_config = parsed.with_correct_eeprom_config();
-        assert!(
-            new_config.contains("BOOT_ORDER=0xf164"),
-            "expected 0xf164 in rewritten config, got: {}",
-            new_config
-        );
-        assert!(
-            new_config.contains("BOOT_UART=1"),
-            "BOOT_UART=1 should be preserved"
-        );
-        assert!(
-            !new_config.contains("BOOT_ORDER=0xf461"),
-            "old BOOT_ORDER should be gone"
-        );
-    }
-
-    #[test]
-    fn eeprom_config_appends_boot_order_when_missing() {
-        let config = "BOOT_UART=1\nNET_INSTALL_AT_POWER_ON=1\n";
-        let parsed = EepromConfig::parse(config);
-        let new_config = parsed.with_correct_eeprom_config();
-        assert!(
-            new_config.contains("BOOT_ORDER=0xf164"),
-            "expected BOOT_ORDER=0xf164 appended, got: {}",
-            new_config
-        );
-        assert!(
-            new_config.contains("BOOT_UART=1"),
-            "BOOT_UART=1 should be preserved"
-        );
-    }
-
-    #[test]
-    fn eeprom_config_sets_pcie_probe_when_missing() {
-        let config = "BOOT_ORDER=0xf164\nBOOT_UART=1\n";
-        let parsed = EepromConfig::parse(config);
-        let new_config = parsed.with_correct_eeprom_config();
-        assert!(
-            new_config.contains("PCIE_PROBE=1"),
-            "expected PCIE_PROBE=1 appended when missing, got: {}",
-            new_config
-        );
-    }
-
-    #[test]
-    fn eeprom_config_replaces_pcie_probe_wrong_value() {
-        let config = "BOOT_ORDER=0xf164\nPCIE_PROBE=0\nBOOT_UART=1\n";
-        let parsed = EepromConfig::parse(config);
-        let new_config = parsed.with_correct_eeprom_config();
-        assert!(
-            new_config.contains("PCIE_PROBE=1"),
-            "expected PCIE_PROBE=0 replaced with PCIE_PROBE=1, got: {}",
-            new_config
-        );
-        assert!(
-            !new_config.contains("PCIE_PROBE=0"),
-            "old PCIE_PROBE=0 should be gone, got: {}",
-            new_config
-        );
-    }
-
-    #[test]
-    fn eeprom_config_preserves_pcie_probe_already_correct() {
-        let config = "BOOT_ORDER=0xf164\nPCIE_PROBE=1\nBOOT_UART=1\n";
-        let parsed = EepromConfig::parse(config);
-        let new_config = parsed.with_correct_eeprom_config();
-        let pcie_count = new_config.matches("PCIE_PROBE=1").count();
-        assert_eq!(
-            pcie_count, 1,
-            "PCIE_PROBE=1 should appear exactly once, got: {}",
-            new_config
-        );
-    }
-
-    #[test]
-    fn eeprom_config_sets_both_boot_order_and_pcie_probe_when_both_missing() {
-        let config = "BOOT_UART=1\n";
-        let parsed = EepromConfig::parse(config);
-        let new_config = parsed.with_correct_eeprom_config();
-        assert!(
-            new_config.contains("BOOT_ORDER=0xf164"),
-            "expected BOOT_ORDER=0xf164 appended, got: {}",
-            new_config
-        );
-        assert!(
-            new_config.contains("PCIE_PROBE=1"),
-            "expected PCIE_PROBE=1 appended, got: {}",
-            new_config
-        );
-        assert!(
-            new_config.contains("BOOT_UART=1"),
-            "BOOT_UART=1 should be preserved, got: {}",
-            new_config
-        );
     }
 }

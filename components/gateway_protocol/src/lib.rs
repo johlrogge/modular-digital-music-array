@@ -4,6 +4,7 @@
 //! Three routing domains: library (core), playback (core), source (generic).
 
 use acid_protocol::{AcidRequest, AcidResponse};
+use admin_ipc_protocol::{AdminRequest, AdminResponse};
 use library_ipc_protocol::{LibraryRequest, LibraryResponse};
 use media_protocol::{Command, Response};
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,10 @@ pub enum GatewayRequest {
     /// Route to the ACID fact store service.
     #[serde(rename = "acid")]
     Acid { request: AcidRequest },
+
+    /// Route to the admin service.
+    #[serde(rename = "admin")]
+    Admin { request: AdminRequest },
 }
 
 // ============================================================================
@@ -79,6 +84,10 @@ pub enum GatewayResponse {
     /// Response from the ACID fact store service.
     #[serde(rename = "acid")]
     Acid { response: AcidResponse },
+
+    /// Response from the admin service.
+    #[serde(rename = "admin")]
+    Admin { response: AdminResponse },
 
     /// Gateway-level error (routing failure, service unreachable, etc.).
     #[serde(rename = "error")]
@@ -188,6 +197,38 @@ mod tests {
             parsed,
             GatewayResponse::Acid {
                 response: AcidResponse::Pong
+            }
+        ));
+    }
+
+    #[test]
+    fn admin_request_roundtrip() {
+        let req = GatewayRequest::Admin {
+            request: AdminRequest::Ping,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"service\":\"admin\""));
+        let parsed: GatewayRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            GatewayRequest::Admin {
+                request: AdminRequest::Ping
+            }
+        ));
+    }
+
+    #[test]
+    fn admin_response_roundtrip() {
+        let resp = GatewayResponse::Admin {
+            response: AdminResponse::Pong,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"service\":\"admin\""));
+        let parsed: GatewayResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            GatewayResponse::Admin {
+                response: AdminResponse::Pong
             }
         ));
     }

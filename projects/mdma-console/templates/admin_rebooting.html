@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MDMA — Rebooting</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Outfit:wght@200;300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-base: #141420;
+            --text-primary: #f0f0f8;
+            --text-tertiary: #9898b8;
+            --accent2: #68e8ff;
+            --accent2-glow: rgba(104, 232, 255, 0.40);
+            --warning: #f0c060;
+            --warning-dim: rgba(240, 192, 96, 0.16);
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Outfit', sans-serif;
+            background: var(--bg-base);
+            color: var(--text-primary);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            -webkit-font-smoothing: antialiased;
+        }
+        .card {
+            text-align: center;
+            padding: 40px 48px;
+        }
+        .brand-name {
+            font-family: 'DM Mono', monospace;
+            font-weight: 500;
+            font-size: 1.1rem;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            text-shadow: 0 0 20px var(--accent2-glow);
+            color: var(--text-primary);
+            margin-bottom: 24px;
+        }
+        .brand-version {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.7rem;
+            color: var(--text-tertiary);
+        }
+        .status {
+            font-size: 1.1rem;
+            font-weight: 500;
+            color: var(--warning);
+            margin-bottom: 8px;
+        }
+        .hint {
+            font-size: 0.8rem;
+            color: var(--text-tertiary);
+        }
+        .retry-link {
+            display: inline-block;
+            margin-top: 28px;
+            font-family: 'DM Mono', monospace;
+            font-size: 0.75rem;
+            color: var(--text-tertiary);
+            text-decoration: none;
+        }
+        .retry-link:hover { color: var(--accent2); }
+    </style>
+</head>
+<body>
+<div class="card">
+    <div class="brand-name">MDMA <span class="brand-version">v{{ version }}</span></div>
+    <div class="status">Rebooting…</div>
+    <div class="hint">The Pi is restarting. This page will not auto-refresh.</div>
+    <a class="retry-link" href="/">Return to console</a>
+</div>
+</body>
+</html>

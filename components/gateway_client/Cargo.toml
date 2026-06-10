@@ -13,6 +13,7 @@ interface = "gateway-client"
 
 [dependencies]
 acid-protocol = { workspace = true }
+admin-ipc-protocol = { workspace = true }
 gateway-protocol = { workspace = true }
 source-protocol = { workspace = true }
 library-ipc-protocol = { workspace = true }

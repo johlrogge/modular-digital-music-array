@@ -54,6 +54,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "admin-ipc-protocol"
+version = "0.21.0"
+dependencies = [
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aes"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1756,6 +1765,7 @@ name = "gateway-client"
 version = "0.10.1"
 dependencies = [
  "acid-protocol",
+ "admin-ipc-protocol",
  "gateway-protocol",
  "library-ipc-protocol",
  "media-protocol",
@@ -1772,6 +1782,7 @@ name = "gateway-protocol"
 version = "0.10.1"
 dependencies = [
  "acid-protocol",
+ "admin-ipc-protocol",
  "library-ipc-protocol",
  "media-protocol",
  "playback-primitives",
@@ -2850,6 +2861,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "mdma-admin"
+version = "0.21.0"
+dependencies = [
+ "admin-ipc-protocol",
+ "clap",
+ "color-eyre",
+ "libc",
+ "nng",
+ "pretty_assertions",
+ "rpi-eeprom",
+ "serde_json",
+ "service",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mdma-audio"
 version = "0.21.0"
 dependencies = [
@@ -2936,6 +2965,7 @@ dependencies = [
  "futures",
  "http-server",
  "pretty_assertions",
+ "rpi-eeprom",
  "rstest",
  "serde",
  "serde_json",
@@ -2963,6 +2993,7 @@ dependencies = [
  "colored",
  "dirs",
  "event-protocol",
+ "gateway-client",
  "inbox-utils",
  "library-ipc-client",
  "library-search",
@@ -3004,6 +3035,7 @@ dependencies = [
 name = "mdma-console"
 version = "0.21.0"
 dependencies = [
+ "admin-ipc-protocol",
  "askama",
  "async-stream",
  "audio-transcoder",
@@ -4242,6 +4274,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "79abed428d1fd2a128201cec72c5f6938e2da607c6f3745f769fabea399d950a"
 dependencies = [
  "crossbeam-utils",
+]
+
+[[package]]
+name = "rpi-eeprom"
+version = "0.21.0"
+dependencies = [
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
