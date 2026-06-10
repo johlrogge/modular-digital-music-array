@@ -4,6 +4,25 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.21.0] — 2026-06-10
+
+### Added
+
+- **"Force Wipe and Re-provision" button on the beacon main form** — always-visible destructive reprovision option with a hostname-typing confirmation gate. Previously the option only appeared in an error panel when a partition layout incompatibility was detected.
+- **Nonfree repo support for Pi firmware tools** — Void Linux's nonfree repository is now added to both image build and provisioning so `rpi-eeprom` is available on the provisioned Pi.
+- **Clock-sync wait before beacon HTTP serve** — the beacon waits for chrony to synchronise the system clock before accepting connections, avoiding TLS certificate verification failures on a fresh boot.
+
+### Fixed
+
+- **Pi 5 wouldn't boot from NVMe — GPT partition type GUID** — Pi 5 firmware refused to treat a "Linux filesystem" GPT partition type as an NVMe boot candidate even when its content was FAT32. The boot partition now receives the Microsoft Basic Data GUID.
+- **Pi 5 wouldn't boot from NVMe — missing `PCIE_PROBE=1`** — without this flag written to EEPROM alongside `BOOT_ORDER=0xf164`, the bootloader does not probe PCIe at all, making the NVMe slot in `BOOT_ORDER` a no-op. Fresh Pis now get this written explicitly during provisioning.
+
+### Changed
+
+- **Beacon SD image size bumped to 2GiB** — required to fit the rpi-eeprom toolchain.
+
+---
+
 ## [0.20.2] — 2026-05-30
 
 ### Fixed

@@ -167,11 +167,11 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ---
 
-## What's new in 0.20.2
+## What's new in 0.21.0
 
-`mdma source sync bandcamp` no longer re-downloads albums you already own when Bandcamp lists multiple purchase entries for the same release (e.g. vinyl + digital). Bandcamp tracks with filenames that contain adjacent dots as part of the title (e.g. `Paramnésie I..flac`) are also no longer silently dropped — they now ingest correctly.
+Pi 5 NVMe boot is now reliable out of the box: the provisioner sets the correct GPT partition type GUID (Microsoft Basic Data) and writes `PCIE_PROBE=1` to EEPROM — without both, fresh Pi 5 units ignore the NVMe slot entirely. The beacon form also gains an always-available "Force Wipe and Re-provision" button (hostname-typing confirmation required) so destructive reprovisioning no longer requires hitting an error state first.
 
-### Earlier in 0.20.1
+### Earlier in 0.20.2
 
 Hotfix for `mdma rekordbox export`. Tracks that were present in `<COLLECTION>` were sometimes missing from `<PLAYLIST>` entries, and re-running export accumulated duplicate `<COLLECTION>` entries for tracks already written. Both symptoms were caused by a case mismatch in `file://` URI comparison; URIs are now normalised before lookup.
 
