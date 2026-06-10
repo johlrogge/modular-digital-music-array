@@ -1,6 +1,8 @@
 [implementations]
 acid-client = "components/acid_client"
 acid-protocol = "components/acid_protocol"
+admin-ipc-client = "components/admin_ipc_client"
+admin-ipc-protocol = "components/admin_ipc_protocol"
 acid-service = "components/acid_service"
 audio-decoder = "components/audio_decoder"
 audio-metadata = "components/audio_metadata"

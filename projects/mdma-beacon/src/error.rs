@@ -5,6 +5,7 @@
 //! - Preserve source errors
 //! - Provide actionable messages
 
+use rpi_eeprom::EepromError;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -51,6 +52,9 @@ pub enum BeaconError {
 
     #[error("command returned non-zero exit code: {command}\nStderr: {stderr}")]
     CommandExitCode { command: String, stderr: String },
+
+    #[error("EEPROM error")]
+    Eeprom(#[from] EepromError),
 }
 
 /// Helper to create IO error with operation context

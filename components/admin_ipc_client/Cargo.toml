@@ -1,0 +1,21 @@
+[package]
+name = "admin-ipc-client"
+version = "0.21.0"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/johlrogge/modular-digital-music-array"
+license = "MIT"
+
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "admin-ipc-client"
+
+[dependencies]
+admin-ipc-protocol = { workspace = true }
+nng-transport = { workspace = true }
+nng = "1.0"
+serde_json = "1.0"
+thiserror = "1.0"
+
+[dev-dependencies]

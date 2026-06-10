@@ -1,0 +1,27 @@
+[package]
+name = "mdma-admin"
+version.workspace = true
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/johlrogge/modular-digital-music-array"
+license = "MIT"
+
+[[bin]]
+name = "mdma-admin"
+path = "src/main.rs"
+
+[dependencies]
+admin-ipc-protocol = { workspace = true }
+rpi-eeprom = { workspace = true }
+service = { workspace = true }
+nng = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+libc = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+color-eyre = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

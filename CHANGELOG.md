@@ -4,6 +4,25 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.22.0] — 2026-06-10
+
+### Added
+
+- **Service mode** — boot-to-beacon recovery path accessible from the web console (`/admin`) and CLI (`mdma admin service-mode status|enable|disable`). Flips EEPROM `BOOT_ORDER` to SD-first so the next reboot lands on the beacon SD card; beacon auto-reverts to NVMe-first after provisioning completes. Closes #37.
+- **`mdma-admin` service** — new root-owned service that owns system-level operations (EEPROM writes, reboot). Exposed at `/run/mdma/admin.sock` (`0660 root:mdma`) so only the gateway can dispatch privileged operations.
+- **`mdma admin reboot`** — graceful system reboot via CLI.
+- **Web console `/admin` page** — status, enable, disable, and reboot buttons; destructive actions are confirm-gated.
+
+### Changed
+
+- **EEPROM helpers extracted to shared `rpi_eeprom` component** — consumed by both `mdma-beacon` stage5 and `mdma-admin`. No user-visible change.
+
+### Security
+
+- **Admin IPC socket restricted to `root:mdma` (`0660`)** — the `/run/mdma/admin.sock` socket is only accessible to `root` and the `mdma` group, preventing unprivileged processes from issuing EEPROM or reboot commands.
+
+---
+
 ## [0.21.0] — 2026-06-10
 
 ### Added

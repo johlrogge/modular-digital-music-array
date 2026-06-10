@@ -1,0 +1,6 @@
+#!/bin/sh
+exec 2>&1
+mkdir -p /run/mdma
+export RUST_LOG=info
+exec chpst -u root /usr/bin/mdma-admin \
+    --socket ipc:///run/mdma/admin.sock
