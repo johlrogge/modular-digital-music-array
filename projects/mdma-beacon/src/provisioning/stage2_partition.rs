@@ -539,24 +539,7 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
             }
 
             // Build sfdisk input - complete partition table
-            let mut sfdisk_input = String::from("label: gpt\n");
-            let mut start_mb = 1u64; // Start at 1MB for alignment
-
-            // Include ALL partitions (existing and planned) in proper order
-            for partition_state in partitions {
-                let partition = partition_state.partition();
-                let size_mb = partition.size.megabytes();
-
-                // sfdisk format: start=X, size=Y, type=linux, name=label
-                sfdisk_input.push_str(&format!(
-                    "start={}M, size={}M, type=linux, name={}\n",
-                    start_mb,
-                    size_mb,
-                    partition.label()
-                ));
-
-                start_mb += size_mb;
-            }
+            let sfdisk_input = build_sfdisk_input(partitions);
 
             // Log what we're creating
             for (num, partition) in &planned_partitions {
@@ -683,6 +666,47 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
         tracing::info!("Partition stage complete");
         Ok(planned_output.clone().into_completed())
     }
+}
+
+/// GPT type GUID for the boot partition (Microsoft Basic Data).
+///
+/// Pi 5 firmware refuses to consider a partition with the generic Linux
+/// filesystem GUID (`0FC63DAF-...`) as a NVMe boot candidate, even if its
+/// content is FAT32.  The Microsoft Basic Data GUID is required.
+const BOOT_PARTITION_GPT_TYPE: &str = "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7";
+
+/// Build the sfdisk input string for the given ordered list of partition states.
+///
+/// The boot partition receives the Microsoft Basic Data GPT type GUID so that
+/// Pi 5 firmware will consider it as a NVMe boot candidate.  All other
+/// partitions use the generic `linux` type alias.
+pub(crate) fn build_sfdisk_input(partitions: &[PartitionState]) -> String {
+    use crate::provisioning::types::MountPoint;
+    let mut sfdisk_input = String::from("label: gpt\n");
+    let mut start_mb = 1u64; // Start at 1MB for alignment
+
+    for partition_state in partitions {
+        let partition = partition_state.partition();
+        let size_mb = partition.size.megabytes();
+
+        let part_type = if partition.mount_point == MountPoint::Boot {
+            BOOT_PARTITION_GPT_TYPE
+        } else {
+            "linux"
+        };
+
+        sfdisk_input.push_str(&format!(
+            "start={}M, size={}M, type={}, name={}\n",
+            start_mb,
+            size_mb,
+            part_type,
+            partition.label()
+        ));
+
+        start_mb += size_mb;
+    }
+
+    sfdisk_input
 }
 
 #[cfg(test)]
@@ -1164,6 +1188,83 @@ mod tests {
         assert!(
             result.is_ok(),
             "fresh disk should always pass compatibility check"
+        );
+    }
+
+    // ── sfdisk GPT type GUID tests ────────────────────────────────────────────
+
+    /// Boot partition must use the Microsoft Basic Data GUID so Pi 5 firmware
+    /// treats it as a NVMe boot candidate.
+    #[test]
+    fn sfdisk_boot_partition_uses_microsoft_basic_data_guid() {
+        use crate::provisioning::types::{DevicePath, MountPoint, Partition, PartitionSize};
+
+        let partitions = vec![
+            PartitionState::Planned(Partition {
+                device: DevicePath::new("/dev/nvme0n1p1").unwrap(),
+                mount_point: MountPoint::Boot,
+                size: PartitionSize::from_mb(512),
+            }),
+            PartitionState::Planned(Partition {
+                device: DevicePath::new("/dev/nvme0n1p2").unwrap(),
+                mount_point: MountPoint::Root,
+                size: PartitionSize::from_gb(16),
+            }),
+            PartitionState::Planned(Partition {
+                device: DevicePath::new("/dev/nvme0n1p3").unwrap(),
+                mount_point: MountPoint::Var,
+                size: PartitionSize::from_gb(8),
+            }),
+        ];
+
+        let output = build_sfdisk_input(&partitions);
+
+        // Boot partition must carry the Microsoft Basic Data GUID
+        assert!(
+            output.contains("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"),
+            "boot partition must use Microsoft Basic Data GUID, got:\n{}",
+            output
+        );
+
+        // Non-boot partitions must use plain linux type
+        let non_boot_lines: Vec<&str> = output
+            .lines()
+            .filter(|l| l.contains("name=root") || l.contains("name=var"))
+            .collect();
+        assert!(
+            !non_boot_lines.is_empty(),
+            "expected root/var lines in sfdisk output"
+        );
+        for line in &non_boot_lines {
+            assert!(
+                line.contains("type=linux"),
+                "non-boot partition should have type=linux, got: {}",
+                line
+            );
+        }
+    }
+
+    /// The boot partition line must NOT contain the generic linux type.
+    #[test]
+    fn sfdisk_boot_partition_does_not_use_linux_type() {
+        use crate::provisioning::types::{DevicePath, MountPoint, Partition, PartitionSize};
+
+        let partitions = vec![PartitionState::Planned(Partition {
+            device: DevicePath::new("/dev/nvme0n1p1").unwrap(),
+            mount_point: MountPoint::Boot,
+            size: PartitionSize::from_mb(512),
+        })];
+
+        let output = build_sfdisk_input(&partitions);
+
+        let boot_line = output
+            .lines()
+            .find(|l| l.contains("name=boot"))
+            .expect("expected a boot line");
+        assert!(
+            !boot_line.contains("type=linux"),
+            "boot partition must not have type=linux, got: {}",
+            boot_line
         );
     }
 }
