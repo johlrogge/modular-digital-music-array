@@ -326,7 +326,50 @@
                 <div class="help-text">Paste your public key from ~/.ssh/id_ed25519.pub or ~/.ssh/id_rsa.pub</div>
             </div>
 
+            <input type="hidden" name="force_wipe_partitions" id="main-force-wipe-hidden" value="false">
             <button type="submit">Provision System</button>
         </form>
+
+        <form action="/provision" method="post" id="main-force-wipe-form" style="margin-top: 12px;">
+            <input type="hidden" name="unit_type" id="fw-unit-type">
+            <input type="hidden" name="hostname" id="fw-hostname">
+            <input type="hidden" name="ssh_key" id="fw-ssh-key">
+            <input type="hidden" name="force_wipe_partitions" value="true">
+            <button type="button" class="wipe-button" id="main-confirm-force-wipe">
+                Force Wipe and Re-provision
+            </button>
+        </form>
+        <script>
+            document.getElementById('main-confirm-force-wipe').addEventListener('click', function() {
+                var mainForm = document.querySelector('form[action="/provision"]:not(#main-force-wipe-form)');
+                var unitType = mainForm.querySelector('select[name="unit_type"]').value;
+                var hostname = mainForm.querySelector('input[name="hostname"]').value;
+                var sshKey = mainForm.querySelector('textarea[name="ssh_key"]').value;
+
+                if (!hostname) {
+                    alert("Please fill in the Hostname field first.");
+                    return;
+                }
+
+                var confirmed = confirm(
+                    "WARNING: This will PERMANENTLY ERASE all data on the NVMe drive,\n" +
+                    "including /music (your music library) and /metadata (track metadata).\n\n" +
+                    "There is NO undo.\n\n" +
+                    "Type the unit hostname to confirm: " + hostname + "\n\n" +
+                    "(Click OK only if you typed the hostname above)"
+                );
+                if (!confirmed) return;
+                var typed = prompt("Type the hostname \"" + hostname + "\" to confirm:");
+                if (typed !== hostname) {
+                    alert("Hostname did not match. Wipe cancelled.");
+                    return;
+                }
+
+                document.getElementById('fw-unit-type').value = unitType;
+                document.getElementById('fw-hostname').value = hostname;
+                document.getElementById('fw-ssh-key').value = sshKey;
+                document.getElementById('main-force-wipe-form').submit();
+            });
+        </script>
     </div>
 {% endblock %}
