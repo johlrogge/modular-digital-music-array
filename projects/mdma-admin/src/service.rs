@@ -1,18 +1,11 @@
 use admin_ipc_protocol::{AdminRequest, AdminResponse};
 use nng::options::{Options, RecvTimeout, SendTimeout};
 use rpi_eeprom::{
-    apply_eeprom_config, read_current_eeprom_config, BOOT_ORDER_NVME_FIRST, BOOT_ORDER_SD_FIRST,
+    apply_eeprom_config, read_current_eeprom_config, EepromConfig, BOOT_ORDER_NVME_FIRST,
+    BOOT_ORDER_SD_FIRST,
 };
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
-
-/// Extract the value of a key from raw EEPROM config text (e.g. `BOOT_ORDER=0xf164`).
-fn parse_eeprom_key<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
-    let prefix = format!("{key}=");
-    raw.lines()
-        .find(|line| line.trim().starts_with(&prefix))
-        .map(|line| line.trim().trim_start_matches(&prefix))
-}
 
 /// Dispatch a single `AdminRequest` to produce an `AdminResponse`.
 ///
@@ -25,7 +18,7 @@ pub async fn dispatch(req: AdminRequest) -> AdminResponse {
             Err(e) => AdminResponse::Error {
                 message: format!("failed to read EEPROM config: {e}"),
             },
-            Ok(config) => build_status_response_from_raw(config.raw()),
+            Ok(config) => build_status_response(&config),
         },
 
         AdminRequest::ServiceModeEnable => {
@@ -37,8 +30,7 @@ pub async fn dispatch(req: AdminRequest) -> AdminResponse {
                 }
                 Ok(c) => c,
             };
-            let raw = config.raw();
-            let pcie_probe = parse_eeprom_key(raw, "PCIE_PROBE").unwrap_or("0");
+            let pcie_probe = config.get("PCIE_PROBE").unwrap_or("0");
             if pcie_probe != "1" {
                 return AdminResponse::Error {
                     message: "PCIE_PROBE must be 1 before enabling service mode \
@@ -76,22 +68,25 @@ pub async fn dispatch(req: AdminRequest) -> AdminResponse {
         AdminRequest::Reboot => {
             tokio::spawn(async {
                 tokio::time::sleep(Duration::from_secs(2)).await;
-                let _ = std::process::Command::new("reboot").spawn();
+                match std::process::Command::new("reboot").spawn() {
+                    Ok(_) => tracing::info!("Reboot command spawned, system going down"),
+                    Err(e) => tracing::error!(error=?e, "Failed to spawn reboot command"),
+                }
             });
             AdminResponse::Ok
         }
     }
 }
 
-/// Build a `Status` response from raw EEPROM config text.
-fn build_status_response_from_raw(raw: &str) -> AdminResponse {
-    let boot_order = parse_eeprom_key(raw, "BOOT_ORDER")
-        .unwrap_or(BOOT_ORDER_NVME_FIRST)
-        .to_string();
-    let pcie_probe = parse_eeprom_key(raw, "PCIE_PROBE")
-        .unwrap_or("0")
-        .to_string();
-    let service_mode_armed = boot_order != BOOT_ORDER_NVME_FIRST;
+/// Build a `Status` response from an [`EepromConfig`].
+///
+/// `boot_order` is left empty when the key is absent from the EEPROM config
+/// (rather than silently defaulting to NVMe-first), so callers can distinguish
+/// "definitely NVMe-first" from "key not present / unknown".
+fn build_status_response(config: &EepromConfig) -> AdminResponse {
+    let boot_order = config.get("BOOT_ORDER").unwrap_or("").to_string();
+    let pcie_probe = config.get("PCIE_PROBE").unwrap_or("0").to_string();
+    let service_mode_armed = !boot_order.is_empty() && boot_order != BOOT_ORDER_NVME_FIRST;
     AdminResponse::Status {
         boot_order,
         service_mode_armed,
@@ -240,7 +235,8 @@ mod tests {
     #[test]
     fn service_mode_armed_false_when_boot_order_is_nvme_first() {
         let raw = format!("BOOT_ORDER={BOOT_ORDER_NVME_FIRST}\nPCIE_PROBE=1\n");
-        let resp = build_status_response_from_raw(&raw);
+        let config = rpi_eeprom::EepromConfig::parse(&raw);
+        let resp = build_status_response(&config);
         match resp {
             AdminResponse::Status {
                 service_mode_armed, ..
@@ -252,7 +248,8 @@ mod tests {
     #[test]
     fn service_mode_armed_true_when_boot_order_is_sd_first() {
         let raw = format!("BOOT_ORDER={BOOT_ORDER_SD_FIRST}\nPCIE_PROBE=1\n");
-        let resp = build_status_response_from_raw(&raw);
+        let config = rpi_eeprom::EepromConfig::parse(&raw);
+        let resp = build_status_response(&config);
         match resp {
             AdminResponse::Status {
                 service_mode_armed, ..
@@ -262,20 +259,24 @@ mod tests {
     }
 
     #[test]
-    fn service_mode_armed_false_when_boot_order_missing_defaults_to_nvme() {
-        // When BOOT_ORDER is absent, default is NVME_FIRST → not armed
+    fn service_mode_armed_false_when_boot_order_missing() {
+        // When BOOT_ORDER is absent, boot_order is empty and service mode is not armed.
         let raw = "PCIE_PROBE=1\nBOOT_UART=1\n";
-        let resp = build_status_response_from_raw(raw);
+        let config = rpi_eeprom::EepromConfig::parse(raw);
+        let resp = build_status_response(&config);
         match resp {
             AdminResponse::Status {
                 service_mode_armed,
                 boot_order,
                 ..
             } => {
-                assert_eq!(boot_order, BOOT_ORDER_NVME_FIRST);
+                assert!(
+                    boot_order.is_empty(),
+                    "absent BOOT_ORDER should yield empty string"
+                );
                 assert!(
                     !service_mode_armed,
-                    "missing BOOT_ORDER defaults to NVMe-first"
+                    "unknown BOOT_ORDER should not be armed"
                 );
             }
             other => panic!("expected Status, got {other:?}"),
@@ -287,7 +288,8 @@ mod tests {
     #[test]
     fn enable_guard_fires_when_pcie_probe_is_0() {
         let raw = format!("BOOT_ORDER={BOOT_ORDER_NVME_FIRST}\nPCIE_PROBE=0\n");
-        let pcie_probe = parse_eeprom_key(&raw, "PCIE_PROBE").unwrap_or("0");
+        let config = rpi_eeprom::EepromConfig::parse(&raw);
+        let pcie_probe = config.get("PCIE_PROBE").unwrap_or("0");
         assert_eq!(pcie_probe, "0");
         assert_ne!(pcie_probe, "1", "guard should fire: pcie_probe is not 1");
     }
@@ -295,14 +297,16 @@ mod tests {
     #[test]
     fn enable_guard_passes_when_pcie_probe_is_1() {
         let raw = format!("BOOT_ORDER={BOOT_ORDER_NVME_FIRST}\nPCIE_PROBE=1\n");
-        let pcie_probe = parse_eeprom_key(&raw, "PCIE_PROBE").unwrap_or("0");
+        let config = rpi_eeprom::EepromConfig::parse(&raw);
+        let pcie_probe = config.get("PCIE_PROBE").unwrap_or("0");
         assert_eq!(pcie_probe, "1", "guard should pass when PCIE_PROBE=1");
     }
 
     #[test]
     fn enable_guard_fires_when_pcie_probe_missing() {
         let raw = format!("BOOT_ORDER={BOOT_ORDER_NVME_FIRST}\n");
-        let pcie_probe = parse_eeprom_key(&raw, "PCIE_PROBE").unwrap_or("0");
+        let config = rpi_eeprom::EepromConfig::parse(&raw);
+        let pcie_probe = config.get("PCIE_PROBE").unwrap_or("0");
         assert_ne!(
             pcie_probe, "1",
             "guard should fire when PCIE_PROBE is absent"

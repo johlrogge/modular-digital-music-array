@@ -87,6 +87,27 @@ impl EepromConfig {
         has_boot_order && has_pcie_probe
     }
 
+    /// Return the trimmed value for `key` if it is present in the config.
+    ///
+    /// Looks for a line of the form `KEY=value` (leading/trailing whitespace on
+    /// the line is ignored).  Returns `None` if no such line exists.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rpi_eeprom::EepromConfig;
+    /// let cfg = EepromConfig::parse("BOOT_ORDER=0xf164\nPCIE_PROBE=1\n");
+    /// assert_eq!(cfg.get("BOOT_ORDER"), Some("0xf164"));
+    /// assert_eq!(cfg.get("MISSING"), None);
+    /// ```
+    pub fn get<'a>(&'a self, key: &str) -> Option<&'a str> {
+        let prefix = format!("{key}=");
+        self.raw
+            .lines()
+            .find(|line| line.trim().starts_with(&prefix))
+            .map(|line| line.trim().trim_start_matches(&prefix).trim_end())
+    }
+
     /// Return a new config string with `BOOT_ORDER` set to `value`.
     ///
     /// Substitutes an existing `BOOT_ORDER=` line if present; appends one
@@ -333,6 +354,36 @@ unsafe fn libc_geteuid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- EepromConfig::get ---------------------------------------------------
+
+    #[test]
+    fn get_returns_value_for_present_key() {
+        let cfg = EepromConfig::parse("BOOT_ORDER=0xf164\nPCIE_PROBE=1\n");
+        assert_eq!(cfg.get("BOOT_ORDER"), Some("0xf164"));
+    }
+
+    #[test]
+    fn get_returns_none_for_missing_key() {
+        let cfg = EepromConfig::parse("BOOT_ORDER=0xf164\nPCIE_PROBE=1\n");
+        assert_eq!(cfg.get("MISSING_KEY"), None);
+    }
+
+    #[test]
+    fn get_trims_trailing_whitespace_from_value() {
+        let cfg = EepromConfig::parse("BOOT_ORDER=0xf164   \nPCIE_PROBE=1\n");
+        assert_eq!(cfg.get("BOOT_ORDER"), Some("0xf164"));
+    }
+
+    #[test]
+    fn get_works_in_multiline_config() {
+        let cfg = EepromConfig::parse(
+            "BOOT_UART=0\nPOWER_OFF_ON_HALT=0\nBOOT_ORDER=0xf164\nPCIE_PROBE=1\nNET_INSTALL_AT_POWER_ON=1\n",
+        );
+        assert_eq!(cfg.get("BOOT_ORDER"), Some("0xf164"));
+        assert_eq!(cfg.get("PCIE_PROBE"), Some("1"));
+        assert_eq!(cfg.get("BOOT_UART"), Some("0"));
+    }
 
     #[test]
     fn eeprom_config_parse_detects_correct_when_both_keys_present() {

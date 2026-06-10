@@ -227,7 +227,7 @@
             <div class="section-header">Boot Configuration</div>
             <div class="kv-grid">
                 <div class="kv-label">Boot order</div>
-                <div class="kv-value">{{ boot_order }}</div>
+                <div class="kv-value">{% if boot_order.is_empty() %}(not set){% else %}{{ boot_order }}{% endif %}</div>
                 <div class="kv-label">Service mode</div>
                 <div class="kv-value">
                     {% if service_mode_armed %}

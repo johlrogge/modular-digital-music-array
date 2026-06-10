@@ -4559,14 +4559,22 @@ fn handle_admin_service_mode_status(client: &GatewayClient) -> Result<()> {
         }) => {
             let boot_label = if service_mode_armed {
                 "SD-first"
+            } else if boot_order.is_empty() {
+                "unknown"
             } else {
                 "NVMe-first"
             };
-            println!("Boot order:        {} ({})", boot_order, boot_label);
+            if boot_order.is_empty() {
+                println!("Boot order:        (not set) ({})", boot_label);
+            } else {
+                println!("Boot order:        {} ({})", boot_order, boot_label);
+            }
             if service_mode_armed {
                 println!("Service mode:      ARMED — next reboot will land on the beacon SD");
             } else {
-                println!("Service mode:      not armed");
+                println!(
+                    "Service mode:      not armed. Use `mdma admin service-mode enable` to arm it."
+                );
             }
             println!("PCIE_PROBE:        {}", pcie_probe);
             Ok(())
@@ -4634,7 +4642,7 @@ fn handle_admin_service_mode_disable(client: &GatewayClient) -> Result<()> {
 fn handle_admin_reboot(client: &GatewayClient) -> Result<()> {
     match client.admin_request(&AdminRequest::Reboot) {
         Ok(AdminResponse::Ok) => {
-            println!("Reboot initiated.");
+            println!("Reboot initiated. Connection will drop within ~2 seconds.");
             Ok(())
         }
         Ok(AdminResponse::Error { message }) => {
