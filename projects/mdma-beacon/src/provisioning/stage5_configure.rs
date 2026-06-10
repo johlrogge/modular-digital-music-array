@@ -1060,36 +1060,55 @@ impl EepromConfig {
         }
     }
 
-    /// Returns `true` if BOOT_ORDER is already set to the target value.
+    /// Returns `true` if both BOOT_ORDER and PCIE_PROBE are already set to
+    /// their required values.
     pub(crate) fn is_already_correct(&self) -> bool {
-        self.raw.lines().any(|line| {
-            let trimmed = line.trim();
-            trimmed == format!("BOOT_ORDER={}", TARGET_BOOT_ORDER)
-        })
+        let target_boot_order = format!("BOOT_ORDER={}", TARGET_BOOT_ORDER);
+        let has_boot_order = self
+            .raw
+            .lines()
+            .any(|line| line.trim() == target_boot_order);
+        let has_pcie_probe = self.raw.lines().any(|line| line.trim() == "PCIE_PROBE=1");
+        has_boot_order && has_pcie_probe
     }
 
-    /// Return a new config string with BOOT_ORDER set to the target value.
+    /// Return a new config string with both BOOT_ORDER and PCIE_PROBE set to
+    /// their required values.
     ///
-    /// Substitutes an existing `BOOT_ORDER=` line if present; appends one
-    /// if the key is missing entirely. All other fields are preserved.
-    pub(crate) fn with_correct_boot_order(&self) -> String {
-        let new_line = format!("BOOT_ORDER={}", TARGET_BOOT_ORDER);
-        let mut found = false;
+    /// For each key: substitutes an existing `KEY=` line if present; appends
+    /// one if the key is missing entirely.  All other fields are preserved.
+    ///
+    /// `PCIE_PROBE=1` is required in addition to BOOT_ORDER because without it
+    /// the Pi 5 bootloader does not probe PCIe at all, making the NVMe nibble
+    /// in BOOT_ORDER a no-op on freshly provisioned hardware.
+    pub(crate) fn with_correct_eeprom_config(&self) -> String {
+        let boot_order_line = format!("BOOT_ORDER={}", TARGET_BOOT_ORDER);
+        const PCIE_PROBE_LINE: &str = "PCIE_PROBE=1";
+
+        let mut found_boot_order = false;
+        let mut found_pcie_probe = false;
+
         let mut lines: Vec<String> = self
             .raw
             .lines()
             .map(|line| {
                 if line.trim().starts_with("BOOT_ORDER=") {
-                    found = true;
-                    new_line.clone()
+                    found_boot_order = true;
+                    boot_order_line.clone()
+                } else if line.trim().starts_with("PCIE_PROBE=") {
+                    found_pcie_probe = true;
+                    PCIE_PROBE_LINE.to_string()
                 } else {
                     line.to_string()
                 }
             })
             .collect();
 
-        if !found {
-            lines.push(new_line);
+        if !found_boot_order {
+            lines.push(boot_order_line);
+        }
+        if !found_pcie_probe {
+            lines.push(PCIE_PROBE_LINE.to_string());
         }
 
         // Ensure trailing newline
@@ -1195,7 +1214,7 @@ async fn configure_pi_eeprom_boot_order() -> Result<()> {
         return Ok(());
     }
 
-    let new_config = current.with_correct_boot_order();
+    let new_config = current.with_correct_eeprom_config();
     tracing::info!(
         "  BOOT_ORDER diff: old config had different value → setting {}",
         TARGET_BOOT_ORDER
@@ -1598,18 +1617,28 @@ mod tests {
     /// command invocation are integration concerns tested manually on the Pi.
 
     #[test]
-    fn eeprom_config_parse_detects_correct_boot_order() {
-        let config = "BOOT_ORDER=0xf164\nBOOT_UART=1\nNET_INSTALL_AT_POWER_ON=1\n";
+    fn eeprom_config_parse_detects_correct_when_both_keys_present() {
+        let config = "BOOT_ORDER=0xf164\nPCIE_PROBE=1\nBOOT_UART=1\nNET_INSTALL_AT_POWER_ON=1\n";
         let parsed = EepromConfig::parse(config);
         assert!(
             parsed.is_already_correct(),
-            "should detect 0xf164 as already correct"
+            "should detect config with correct BOOT_ORDER and PCIE_PROBE=1 as already correct"
+        );
+    }
+
+    #[test]
+    fn eeprom_config_parse_not_correct_when_pcie_probe_missing() {
+        let config = "BOOT_ORDER=0xf164\nBOOT_UART=1\nNET_INSTALL_AT_POWER_ON=1\n";
+        let parsed = EepromConfig::parse(config);
+        assert!(
+            !parsed.is_already_correct(),
+            "should not be correct when PCIE_PROBE=1 is missing"
         );
     }
 
     #[test]
     fn eeprom_config_parse_detects_wrong_boot_order() {
-        let config = "BOOT_ORDER=0xf461\nBOOT_UART=1\n";
+        let config = "BOOT_ORDER=0xf461\nPCIE_PROBE=1\nBOOT_UART=1\n";
         let parsed = EepromConfig::parse(config);
         assert!(
             !parsed.is_already_correct(),
@@ -1621,7 +1650,7 @@ mod tests {
     fn eeprom_config_rewrite_substitutes_boot_order() {
         let config = "BOOT_ORDER=0xf461\nBOOT_UART=1\nNET_INSTALL_AT_POWER_ON=1\n";
         let parsed = EepromConfig::parse(config);
-        let new_config = parsed.with_correct_boot_order();
+        let new_config = parsed.with_correct_eeprom_config();
         assert!(
             new_config.contains("BOOT_ORDER=0xf164"),
             "expected 0xf164 in rewritten config, got: {}",
@@ -1641,7 +1670,7 @@ mod tests {
     fn eeprom_config_appends_boot_order_when_missing() {
         let config = "BOOT_UART=1\nNET_INSTALL_AT_POWER_ON=1\n";
         let parsed = EepromConfig::parse(config);
-        let new_config = parsed.with_correct_boot_order();
+        let new_config = parsed.with_correct_eeprom_config();
         assert!(
             new_config.contains("BOOT_ORDER=0xf164"),
             "expected BOOT_ORDER=0xf164 appended, got: {}",
@@ -1650,6 +1679,70 @@ mod tests {
         assert!(
             new_config.contains("BOOT_UART=1"),
             "BOOT_UART=1 should be preserved"
+        );
+    }
+
+    #[test]
+    fn eeprom_config_sets_pcie_probe_when_missing() {
+        let config = "BOOT_ORDER=0xf164\nBOOT_UART=1\n";
+        let parsed = EepromConfig::parse(config);
+        let new_config = parsed.with_correct_eeprom_config();
+        assert!(
+            new_config.contains("PCIE_PROBE=1"),
+            "expected PCIE_PROBE=1 appended when missing, got: {}",
+            new_config
+        );
+    }
+
+    #[test]
+    fn eeprom_config_replaces_pcie_probe_wrong_value() {
+        let config = "BOOT_ORDER=0xf164\nPCIE_PROBE=0\nBOOT_UART=1\n";
+        let parsed = EepromConfig::parse(config);
+        let new_config = parsed.with_correct_eeprom_config();
+        assert!(
+            new_config.contains("PCIE_PROBE=1"),
+            "expected PCIE_PROBE=0 replaced with PCIE_PROBE=1, got: {}",
+            new_config
+        );
+        assert!(
+            !new_config.contains("PCIE_PROBE=0"),
+            "old PCIE_PROBE=0 should be gone, got: {}",
+            new_config
+        );
+    }
+
+    #[test]
+    fn eeprom_config_preserves_pcie_probe_already_correct() {
+        let config = "BOOT_ORDER=0xf164\nPCIE_PROBE=1\nBOOT_UART=1\n";
+        let parsed = EepromConfig::parse(config);
+        let new_config = parsed.with_correct_eeprom_config();
+        let pcie_count = new_config.matches("PCIE_PROBE=1").count();
+        assert_eq!(
+            pcie_count, 1,
+            "PCIE_PROBE=1 should appear exactly once, got: {}",
+            new_config
+        );
+    }
+
+    #[test]
+    fn eeprom_config_sets_both_boot_order_and_pcie_probe_when_both_missing() {
+        let config = "BOOT_UART=1\n";
+        let parsed = EepromConfig::parse(config);
+        let new_config = parsed.with_correct_eeprom_config();
+        assert!(
+            new_config.contains("BOOT_ORDER=0xf164"),
+            "expected BOOT_ORDER=0xf164 appended, got: {}",
+            new_config
+        );
+        assert!(
+            new_config.contains("PCIE_PROBE=1"),
+            "expected PCIE_PROBE=1 appended, got: {}",
+            new_config
+        );
+        assert!(
+            new_config.contains("BOOT_UART=1"),
+            "BOOT_UART=1 should be preserved, got: {}",
+            new_config
         );
     }
 }

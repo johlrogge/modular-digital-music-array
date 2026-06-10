@@ -384,37 +384,42 @@ async fn copy_xbps_keys(mount_root: &Path) -> Result<()> {
 
 /// Install base system packages using xbps-install
 async fn install_base_system(mount_root: &PathBuf, packages: &[String]) -> Result<()> {
-    // Void Linux repo URL for aarch64 (Raspberry Pi 5)
+    // Void Linux repo URLs for aarch64 (Raspberry Pi 5).
+    // `nonfree` is required for `rpi-eeprom` (Pi firmware tools live there).
     let repo_url = "https://repo-default.voidlinux.org/current/aarch64";
+    let nonfree_repo_url = "https://repo-default.voidlinux.org/current/aarch64/nonfree";
 
     tracing::info!(
         "Installing packages to {}: {}",
         mount_root.display(),
         packages.join(", ")
     );
-    tracing::info!("Using repository: {}", repo_url);
+    tracing::info!("Using repositories: {}, {}", repo_url, nonfree_repo_url);
 
     // Copy xbps repository keys to target root first
     // This prevents the interactive key import prompt
     copy_xbps_keys(mount_root).await?;
 
     // Build the command
-    // xbps-install -Sy -R <repo> -r <root> <packages>
+    // xbps-install -Sy -R <repo> -R <nonfree-repo> -r <root> <packages>
     // -S: sync repository index
     // -y: assume yes to all questions
-    // -R: repository URL
+    // -R: repository URL (may be specified multiple times)
     // -r: target root directory
     let mut cmd = Command::new("xbps-install");
     cmd.arg("-Sy")
         .arg("-R")
         .arg(repo_url)
+        .arg("-R")
+        .arg(nonfree_repo_url)
         .arg("-r")
         .arg(mount_root)
         .args(packages);
 
     tracing::info!(
-        "Executing: xbps-install -Sy -R {} -r {} {}",
+        "Executing: xbps-install -Sy -R {} -R {} -r {} {}",
         repo_url,
+        nonfree_repo_url,
         mount_root.display(),
         packages.join(" ")
     );
