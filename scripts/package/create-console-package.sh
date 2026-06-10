@@ -5,4 +5,5 @@ exec "$SCRIPT_DIR/create-service-package.sh" \
     --bin mdma-console \
     --desc "MDMA web console" \
     --cargo-toml projects/mdma-console/Cargo.toml \
+    --deps "ffmpeg>=0" \
     --extra-install "$SCRIPT_DIR/install/mdma-console.sh"
