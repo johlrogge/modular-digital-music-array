@@ -5,5 +5,5 @@ exec "$SCRIPT_DIR/create-service-package.sh" \
     --bin mdma-playback \
     --desc "MDMA audio playback server" \
     --cargo-toml projects/mdma-playback/Cargo.toml \
-    --deps "pipewire>=0 wireplumber>=0 libspa-alsa>=0 alsa-pipewire>=0" \
+    --deps "pipewire>=0 wireplumber>=0 libspa-alsa>=0 alsa-pipewire>=0 mdma-audio>=0" \
     --extra-install "$SCRIPT_DIR/install/mdma-playback.sh"

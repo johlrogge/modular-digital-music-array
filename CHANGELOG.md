@@ -4,6 +4,17 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.22.1] — 2026-06-10
+
+### Fixed
+
+- **Package build pipeline silently dropped `depends=` from void-packages templates** — `xbps-create` was invoked without `--deps`, so runtime dependencies declared in void-packages `template` files were never embedded in the built `.xbps` packages. mdma-console, mdma-audio, mdma-playback, and beacon now declare correct runtime dependencies in the built packages. Affected all releases since v0.3.0.
+- **Rekordbox AIFF export no longer fails on fresh installs** — ffmpeg is now pulled automatically as a transitive dependency of mdma-console; manual `xbps-install -y ffmpeg` is no longer required after provisioning.
+- **mdma-playback correctly depends on mdma-audio** — the dependency was declared in the void-packages template but was silently dropped by the build pipeline; it is now embedded in the built package.
+- **beacon depends on `avahi-daemon`** — was `avahi`, which is a different package name and broke transitive dependency resolution.
+
+---
+
 ## [0.22.0] — 2026-06-10
 
 ### Added

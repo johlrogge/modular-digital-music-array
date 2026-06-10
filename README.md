@@ -168,7 +168,11 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ---
 
-## What's new in 0.22.0
+## What's new in 0.22.1
+
+Packaging hotfix: runtime dependencies are now correctly embedded in all built `.xbps` packages. Fresh provisions no longer require a manual `xbps-install -y ffmpeg` to get rekordbox AIFF export working.
+
+### Earlier in 0.22.0
 
 Service mode gives you a button on the web console (and `mdma admin service-mode enable`) to flip the Pi's EEPROM `BOOT_ORDER` to SD-first, so the next reboot drops straight onto the beacon SD for reprovisioning — no SSH, no physical hardware removal required. After provisioning completes, the beacon auto-reverts `BOOT_ORDER` to NVMe-first. A new root-owned `mdma-admin` service owns all system-level operations; its IPC socket is `0660 root:mdma` so only the gateway can dispatch privileged commands.
 
