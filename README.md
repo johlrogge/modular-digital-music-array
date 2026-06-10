@@ -87,6 +87,7 @@ This is a [Polylith](https://polylith.gitbook.io/polylith/) workspace. Deployabl
 | Service (project) | Description |
 |-------------------|-------------|
 | `mdma-beacon` | Provisioning server — installs and configures MDMA on a fresh Raspberry Pi |
+| `mdma-admin` | System-level operations service (EEPROM, reboot) — root-owned, IPC socket `0660 root:mdma` |
 | `mdma-gateway` | Single TCP gateway (port 5555) routing to all internal IPC services |
 | `mdma-library` | Library service — content-addressed storage and fact-based metadata |
 | `mdma-acid` | ACID service — standalone append-only fact stream writer |
@@ -167,7 +168,11 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ---
 
-## What's new in 0.21.0
+## What's new in 0.22.0
+
+Service mode gives you a button on the web console (and `mdma admin service-mode enable`) to flip the Pi's EEPROM `BOOT_ORDER` to SD-first, so the next reboot drops straight onto the beacon SD for reprovisioning — no SSH, no physical hardware removal required. After provisioning completes, the beacon auto-reverts `BOOT_ORDER` to NVMe-first. A new root-owned `mdma-admin` service owns all system-level operations; its IPC socket is `0660 root:mdma` so only the gateway can dispatch privileged commands.
+
+### Earlier in 0.21.0
 
 Pi 5 NVMe boot is now reliable out of the box: the provisioner sets the correct GPT partition type GUID (Microsoft Basic Data) and writes `PCIE_PROBE=1` to EEPROM — without both, fresh Pi 5 units ignore the NVMe slot entirely. The beacon form also gains an always-available "Force Wipe and Re-provision" button (hostname-typing confirmation required) so destructive reprovisioning no longer requires hitting an error state first.
 
