@@ -1,6 +1,11 @@
 { pkgs, lib, config, inputs, ... }:
 
 let
+  # When CI=true is set (GitHub Actions does this automatically),
+  # the dev-only packages below are excluded from the shell closure.
+  # CI then gets exactly what nix/ci-base.nix declares — see that file.
+  isCI = (builtins.getEnv "CI") != "";
+
   metaenvSkill = ''
     ## Capability Boundaries (metaenv)
 
@@ -19,48 +24,24 @@ let
   '';
 in
 {
-  # Development packages
-  packages = with pkgs; [
-    git
+  # The CI base (build/test/package toolchain) is the foundation; the
+  # developer shell is "CI base + extras". CI runs with CI=true and gets
+  # only the base.
+  imports = [ ./nix/ci-base.nix ];
+
+  # Dev-only packages — interactive editor, Pi admin, UX tooling.
+  # Excluded in CI to shrink the Nix closure (see `isCI` above).
+  packages = with pkgs; lib.optionals (!isCI) [
     helix
-    just
     bacon
     socat              # For Claude Code sandboxing
     inputs.claude-code-nix.packages.${pkgs.stdenv.hostPlatform.system}.default  # Claude Code from sadjow/claude-code-nix flake
-
-    # Rust build dependencies
-    clang
-    llvmPackages.libclang
-
-    # Cross-compilation (zig-based, simpler than gcc cross toolchain)
-    zig
-    cargo-zigbuild
-
-    # Audio development
-    pkg-config
-
-    # Network tools
     nmap
     sshpass
     gh
     gitflow               # Git-flow branching workflow
-
-    ffmpeg
-  ] ++ lib.optionals pkgs.stdenv.isLinux [
-    alsa-lib
-    pipewire
-    xbps              # Void Linux package tools (xbps-create, xbps-rindex)
+    ffmpeg                # Runtime dep for the audio transcoder (Pi-side), not build-time
   ];
-
-  # Rust language support
-  languages.rust = {
-    enable = true;
-    channel = "stable";
-    targets = lib.optionals pkgs.stdenv.isLinux [ "aarch64-unknown-linux-gnu" ];
-  };
-
-  # Environment variables for bindgen
-  env.LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
   # Pi service sockets — available in every devenv shell automatically
   # MDMA_NODE identifies the target Pi; gateway and event gateway are derived from it.
@@ -215,11 +196,6 @@ in
     echo "           mdma source list|sync|status|downloads"
     echo "           mdma-volume <0-1>  mdma-status"
     echo "           just --list"
-  '';
-
-  # Tests
-  enterTest = ''
-    cargo polylith cargo --profile dev test
   '';
 
   # Claude Code integration
