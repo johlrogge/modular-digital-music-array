@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 http-server = { path = "../../bases/http_server" }
 admin-ipc-protocol = { workspace = true }
+audio-metadata = { path = "../../components/audio_metadata" }
 audio-transcoder = { path = "../../components/audio_transcoder" }
 inbox-utils = { path = "../../components/inbox_utils" }
 library-ipc-client = { path = "../../components/library_ipc_client" }
