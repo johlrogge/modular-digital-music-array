@@ -358,6 +358,12 @@ enum Commands {
         #[command(subcommand)]
         command: AdminCommands,
     },
+
+    /// Track lifecycle commands (soft-delete, replace, restore, orphans)
+    Track {
+        #[command(subcommand)]
+        command: TrackCommands,
+    },
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -765,6 +771,40 @@ enum AdminCommands {
     },
     /// Reboot the host
     Reboot,
+}
+
+#[derive(Subcommand, Debug)]
+enum TrackCommands {
+    /// Soft-delete a track (hidden from default views; file retained; recoverable).
+    ///
+    /// The track is hidden from list/search results. To undo, use `mdma track restore <hash>`.
+    Delete {
+        /// Content hash of the track (prefix accepted, git-style).
+        hash: String,
+    },
+
+    /// Restore a soft-deleted track (retracts the Deleted fact).
+    Restore {
+        /// Content hash of the track (prefix accepted, git-style).
+        hash: String,
+    },
+
+    /// Replace an old track with a new file.
+    ///
+    /// Ingests the new file (path must be on the device running the library service),
+    /// marks the old track as superseded, and rewrites all playlists containing it.
+    ///
+    /// Note: <new-file> must be a path accessible by the library service on the device.
+    /// Place the new file in the inbox directory or another device-local path first.
+    Replace {
+        /// Content hash of the old track (prefix accepted, git-style).
+        old_hash: String,
+        /// Path to the new audio file on the device running the library service.
+        new_file: String,
+    },
+
+    /// List hidden tracks (deleted or superseded).
+    Orphans,
 }
 
 #[derive(Subcommand, Debug)]
@@ -4547,6 +4587,87 @@ fn handle_export(
 }
 
 // =============================================================================
+// Track Lifecycle Handlers
+// =============================================================================
+
+fn handle_track_delete(lib: &LibraryBackend, hash: &str) -> Result<()> {
+    let ch = ContentHash::new(hash);
+    match lib.track_delete(&ch) {
+        Ok(()) => {
+            println!("soft-deleted; recover with `mdma track restore {}`", hash);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_track_restore(lib: &LibraryBackend, hash: &str) -> Result<()> {
+    let ch = ContentHash::new(hash);
+    match lib.track_restore(&ch) {
+        Ok(()) => {
+            println!("track restored");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_track_replace(lib: &LibraryBackend, old_hash: &str, new_file: &str) -> Result<()> {
+    let ch = ContentHash::new(old_hash);
+    match lib.track_replace(&ch, new_file) {
+        Ok((new_hash, playlists)) => {
+            println!("{} -> {}", old_hash, new_hash.as_str());
+            println!("{} playlist(s) rewritten", playlists);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_track_orphans(lib: &LibraryBackend) -> Result<()> {
+    use library_ipc_client::OrphanReason;
+
+    match lib.track_orphans() {
+        Ok(orphans) => {
+            if orphans.is_empty() {
+                println!("no hidden tracks");
+                return Ok(());
+            }
+            for o in &orphans {
+                let hash_short = o
+                    .content_hash
+                    .as_str()
+                    .get(7..15)
+                    .unwrap_or(o.content_hash.as_str());
+                let artist = o.artist.as_deref().unwrap_or("Unknown");
+                let title = o.title.as_deref().unwrap_or("Unknown");
+                let reason = match &o.reason {
+                    OrphanReason::Deleted { timestamp } => format!("deleted at {}", timestamp),
+                    OrphanReason::SupersededBy { replacement } => {
+                        format!("superseded by {}", replacement.as_str())
+                    }
+                };
+                println!("{}  {} - {}  [{}]", hash_short, artist, title, reason);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+// =============================================================================
 // Admin Handlers
 // =============================================================================
 
@@ -5003,6 +5124,18 @@ fn main() -> Result<()> {
                     ServiceModeCommands::Disable => handle_admin_service_mode_disable(&admin),
                 },
                 AdminCommands::Reboot => handle_admin_reboot(&admin),
+            }
+        }
+
+        Commands::Track { command } => {
+            let lib = connect_library(&cli);
+            match command {
+                TrackCommands::Delete { hash } => handle_track_delete(&lib, hash),
+                TrackCommands::Restore { hash } => handle_track_restore(&lib, hash),
+                TrackCommands::Replace { old_hash, new_file } => {
+                    handle_track_replace(&lib, old_hash, new_file)
+                }
+                TrackCommands::Orphans => handle_track_orphans(&lib),
             }
         }
     }
@@ -7057,6 +7190,89 @@ mod tests {
         match cli.command {
             Commands::Admin {
                 command: AdminCommands::Reboot,
+            } => {}
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    // ── track lifecycle clap parsing ──────────────────────────────────────────
+
+    #[test]
+    fn track_delete_parses_correctly() {
+        let result = Cli::try_parse_from(["mdma", "track", "delete", "abc123"]);
+        assert!(
+            result.is_ok(),
+            "clap rejected track delete: {}",
+            result.unwrap_err()
+        );
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Track {
+                command: TrackCommands::Delete { hash },
+            } => {
+                assert_eq!(hash, "abc123");
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn track_restore_parses_correctly() {
+        let result = Cli::try_parse_from(["mdma", "track", "restore", "abc123"]);
+        assert!(
+            result.is_ok(),
+            "clap rejected track restore: {}",
+            result.unwrap_err()
+        );
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Track {
+                command: TrackCommands::Restore { hash },
+            } => {
+                assert_eq!(hash, "abc123");
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn track_replace_parses_correctly() {
+        let result = Cli::try_parse_from([
+            "mdma",
+            "track",
+            "replace",
+            "abc123",
+            "/music/inbox/new.flac",
+        ]);
+        assert!(
+            result.is_ok(),
+            "clap rejected track replace: {}",
+            result.unwrap_err()
+        );
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Track {
+                command: TrackCommands::Replace { old_hash, new_file },
+            } => {
+                assert_eq!(old_hash, "abc123");
+                assert_eq!(new_file, "/music/inbox/new.flac");
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn track_orphans_parses_correctly() {
+        let result = Cli::try_parse_from(["mdma", "track", "orphans"]);
+        assert!(
+            result.is_ok(),
+            "clap rejected track orphans: {}",
+            result.unwrap_err()
+        );
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Track {
+                command: TrackCommands::Orphans,
             } => {}
             other => panic!("unexpected command: {:?}", other),
         }

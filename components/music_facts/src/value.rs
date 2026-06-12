@@ -265,6 +265,18 @@ pub enum MusicValue {
         scope: Option<String>,
         timestamp: DateTime<Utc>,
     },
+
+    // ========================================================================
+    // Track Lifecycle
+    // ========================================================================
+    /// This track was superseded by a better version (same work). Asserted on the OLD track.
+    SupersededBy {
+        replacement: crate::primitives::ContentHash,
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Track soft-deleted: hidden from default views, file/blob retained, recoverable.
+    Deleted { timestamp: DateTime<Utc> },
 }
 
 impl MusicValue {
@@ -310,6 +322,8 @@ impl MusicValue {
             MusicValue::TrackStopped(_) => "TrackStopped",
             MusicValue::AddedAt(_) => "AddedAt",
             MusicValue::Bookmarked { .. } => "Bookmarked",
+            MusicValue::SupersededBy { .. } => "SupersededBy",
+            MusicValue::Deleted { .. } => "Deleted",
         }
     }
 }
@@ -367,6 +381,11 @@ impl fmt::Display for MusicValue {
                 Some(s) => write!(f, "Bookmarked({s}) at {timestamp}"),
                 None => write!(f, "Bookmarked at {timestamp}"),
             },
+            MusicValue::SupersededBy {
+                replacement,
+                timestamp,
+            } => write!(f, "SupersededBy({}) at {}", replacement.as_str(), timestamp),
+            MusicValue::Deleted { timestamp } => write!(f, "Deleted at {}", timestamp),
         }
     }
 }
@@ -644,6 +663,100 @@ mod tests {
     fn recording_date_fact_value_format() {
         let date = NaiveDate::from_ymd_opt(2024, 6, 15).unwrap();
         assert_fact_value_format!(MusicValue::RecordingDate(date));
+    }
+
+    #[test]
+    fn superseded_by_fact_roundtrip() {
+        use crate::primitives::ContentHash;
+        let replacement = ContentHash::new("sha256:abcdef1234567890");
+        let val = MusicValue::SupersededBy {
+            replacement: replacement.clone(),
+            timestamp: DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let json = serde_json::to_string(&val).unwrap();
+        let decoded: MusicValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(val, decoded);
+    }
+
+    #[test]
+    fn superseded_by_display_name() {
+        use crate::primitives::ContentHash;
+        let val = MusicValue::SupersededBy {
+            replacement: ContentHash::new("sha256:abc"),
+            timestamp: DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        assert_eq!(val.display_name(), "SupersededBy");
+    }
+
+    #[test]
+    fn superseded_by_display() {
+        use crate::primitives::ContentHash;
+        let val = MusicValue::SupersededBy {
+            replacement: ContentHash::new("sha256:abc123"),
+            timestamp: DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let s = val.to_string();
+        assert!(s.contains("sha256:abc123"), "got: {}", s);
+        assert!(s.contains("SupersededBy"), "got: {}", s);
+    }
+
+    #[test]
+    fn deleted_fact_roundtrip() {
+        let val = MusicValue::Deleted {
+            timestamp: DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let json = serde_json::to_string(&val).unwrap();
+        let decoded: MusicValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(val, decoded);
+    }
+
+    #[test]
+    fn deleted_display_name() {
+        let val = MusicValue::Deleted {
+            timestamp: DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        assert_eq!(val.display_name(), "Deleted");
+    }
+
+    #[test]
+    fn deleted_display() {
+        let val = MusicValue::Deleted {
+            timestamp: DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let s = val.to_string();
+        assert!(s.contains("Deleted"), "got: {}", s);
+    }
+
+    #[test]
+    fn superseded_by_fact_value_format() {
+        use crate::primitives::ContentHash;
+        assert_fact_value_format!(MusicValue::SupersededBy {
+            replacement: ContentHash::new("sha256:abc"),
+            timestamp: DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        });
+    }
+
+    #[test]
+    fn deleted_fact_value_format() {
+        assert_fact_value_format!(MusicValue::Deleted {
+            timestamp: DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        });
     }
 
     #[test]

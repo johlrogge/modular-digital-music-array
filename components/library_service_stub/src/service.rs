@@ -6,7 +6,7 @@
 
 use crate::ipc::{
     Bpm, ContentHash, DurationSeconds, FactType, IpcServer, LibraryRequest, LibraryResponse,
-    ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
+    OrphanInfo, OrphanReason, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
 };
 use library_search::{matches_query, TrackFields};
 use music_facts::MusicValue;
@@ -42,6 +42,14 @@ struct IndexedTrack {
     source: Option<String>,
     track_number: Option<u32>,
     disc_number: Option<u32>,
+    superseded_by: Option<ContentHash>,
+    deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl IndexedTrack {
+    fn is_hidden(&self) -> bool {
+        self.deleted_at.is_some() || self.superseded_by.is_some()
+    }
 }
 
 impl IndexedTrack {
@@ -194,7 +202,10 @@ impl LibraryService {
 
             LibraryRequest::ListTracks { limit } => {
                 let tracks = self.tracks.lock().unwrap();
-                let iter = tracks.iter().map(|t| t.to_track_info());
+                let iter = tracks
+                    .iter()
+                    .filter(|t| !t.is_hidden())
+                    .map(|t| t.to_track_info());
                 let results: Vec<TrackInfo> = match limit {
                     Some(n) => iter.take(n).collect(),
                     None => iter.collect(),
@@ -313,6 +324,69 @@ impl LibraryService {
                 // Stub: always returns 0 (no real facts file scanning)
                 LibraryResponse::TrackCountForItemId(0)
             }
+
+            // Track lifecycle — stub implementations
+            LibraryRequest::TrackDelete { hash } => {
+                let mut tracks = self.tracks.lock().unwrap();
+                match tracks.iter_mut().find(|t| t.content_hash == hash.as_str()) {
+                    Some(t) => {
+                        t.deleted_at = Some(chrono::Utc::now());
+                        LibraryResponse::TrackDeleted
+                    }
+                    None => LibraryResponse::Error(ProtocolError::TrackNotFound {
+                        hash: hash.as_str().to_owned(),
+                    }),
+                }
+            }
+
+            LibraryRequest::TrackRestore { hash } => {
+                let mut tracks = self.tracks.lock().unwrap();
+                match tracks.iter_mut().find(|t| t.content_hash == hash.as_str()) {
+                    Some(t) => {
+                        t.deleted_at = None;
+                        LibraryResponse::TrackRestored
+                    }
+                    None => LibraryResponse::Error(ProtocolError::TrackNotFound {
+                        hash: hash.as_str().to_owned(),
+                    }),
+                }
+            }
+
+            LibraryRequest::TrackReplace { .. } => {
+                LibraryResponse::Error(ProtocolError::Internal {
+                    message: "TrackReplace not supported in stub".to_string(),
+                })
+            }
+
+            LibraryRequest::TrackOrphans => {
+                let tracks = self.tracks.lock().unwrap();
+                let orphans: Vec<OrphanInfo> = tracks
+                    .iter()
+                    .filter(|t| t.is_hidden())
+                    .map(|t| {
+                        let reason = if let Some(ref replacement) = t.superseded_by {
+                            OrphanReason::SupersededBy {
+                                replacement: replacement.clone(),
+                            }
+                        } else if let Some(dt) = t.deleted_at {
+                            OrphanReason::Deleted {
+                                timestamp: dt.to_rfc3339(),
+                            }
+                        } else {
+                            OrphanReason::Deleted {
+                                timestamp: "unknown".to_string(),
+                            }
+                        };
+                        OrphanInfo {
+                            content_hash: ContentHash::new(t.content_hash.clone()),
+                            artist: t.artist.clone(),
+                            title: t.title.clone(),
+                            reason,
+                        }
+                    })
+                    .collect();
+                LibraryResponse::OrphansList(orphans)
+            }
         }
     }
 
@@ -380,24 +454,30 @@ impl LibraryService {
     }
 
     /// Look up a track by content hash (supports partial hashes).
+    /// Returns TrackNotFound for hidden (deleted/superseded) tracks.
     fn get_track(&self, hash: &ContentHash) -> Result<TrackInfo, ProtocolError> {
         let full_hash = self.resolve_hash(hash)?;
 
         let tracks = self.tracks.lock().unwrap();
-        tracks
-            .iter()
-            .find(|t| t.content_hash == full_hash.as_str())
-            .map(|t| t.to_track_info())
-            .ok_or_else(|| ProtocolError::TrackNotFound {
+        let track = tracks.iter().find(|t| t.content_hash == full_hash.as_str());
+
+        match track {
+            Some(t) if t.is_hidden() => Err(ProtocolError::TrackNotFound {
                 hash: hash.as_str().to_owned(),
-            })
+            }),
+            Some(t) => Ok(t.to_track_info()),
+            None => Err(ProtocolError::TrackNotFound {
+                hash: hash.as_str().to_owned(),
+            }),
+        }
     }
 
-    /// Search tracks against a `TrackQuery`.
+    /// Search tracks against a `TrackQuery` (hidden tracks excluded).
     fn search_tracks(&self, query: &TrackQuery) -> Vec<TrackInfo> {
         let tracks = self.tracks.lock().unwrap();
         tracks
             .iter()
+            .filter(|t| !t.is_hidden())
             .filter(|t| matches_query(query, &t.as_fields()))
             .map(|t| t.to_track_info())
             .collect()
@@ -419,6 +499,12 @@ fn apply_fact(entry: &mut IndexedTrack, value: &MusicValue) {
         MusicValue::TrackNumber(v) => entry.track_number = Some(v.value()),
         MusicValue::DiscNumber(v) => entry.disc_number = Some(v.value()),
         MusicValue::Source(v) => entry.source = Some(v.clone()),
+        MusicValue::SupersededBy { replacement, .. } => {
+            entry.superseded_by = Some(replacement.clone());
+        }
+        MusicValue::Deleted { timestamp } => {
+            entry.deleted_at = Some(*timestamp);
+        }
         _ => {} // ignore all other facts (key, format, cover art, timestamps, etc.)
     }
 }
