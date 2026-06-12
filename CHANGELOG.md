@@ -4,6 +4,24 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.23.0] — 2026-06-12
+
+### Added
+
+- **Track lifecycle commands** — manage track identity over time without rewriting history.
+  - `mdma track replace <old-hash> <new-file>` — ingest a better-quality version of a track; the old track is marked `SupersededBy` and every playlist referencing it is rewritten in place with position preserved. The file path must be on the device running the library service.
+  - `mdma track delete <hash>` — soft-delete: track is hidden from search, lists, and exports; the file remains on disk and is fully recoverable.
+  - `mdma track restore <hash>` — un-hide a soft-deleted or superseded track.
+  - `mdma track orphans` — list hidden tracks (deleted or superseded) as garbage-collection candidates.
+  - Design: pure-assert facts (`SupersededBy`, `Deleted`) per ADR-003; content hash remains the library's identity key. Closes #25.
+- **CDJ-safe AIFF/WAV export** — `mdma rekordbox export` now downsamples sources above 48 kHz (96→48 and 88.2→44.1 using musical-ratio halving via the soxr resampler) so Pioneer CDJs no longer reject exported files as an illegal format. Sources at ≤48 kHz pass through untouched. Every resample is logged. Closes #28.
+
+### Fixed
+
+- **CI stability** — switched to stable nixpkgs (nixos-25.11) and a slim CI shell, eliminating the recurring Nix cache-eviction failures (CVE-2025-5244).
+
+---
+
 ## [0.22.1] — 2026-06-10
 
 ### Fixed

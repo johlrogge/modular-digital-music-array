@@ -2113,6 +2113,12 @@ async fn export_track(
     // This is blocking CPU/IO work so we run it in spawn_blocking.
     let transcode_format = req_format.to_transcoder_format();
 
+    // Read the source sample rate so the transcoder can downsample to
+    // ≤ 48 kHz when exporting AIFF/WAV for CDJ playback.
+    let source_sample_rate = audio_metadata::extract_metadata(&blob_path)
+        .ok()
+        .and_then(|m| m.sample_rate);
+
     let metadata = audio_transcoder::ExportMetadata {
         title: track.title.clone(),
         artist: track.artist.clone(),
@@ -2127,8 +2133,14 @@ async fn export_track(
             .suffix(ext_suffix)
             .tempfile()
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-        audio_transcoder::transcode(&blob_path, tmp.path(), &transcode_format, &metadata)
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+        audio_transcoder::transcode(
+            &blob_path,
+            tmp.path(),
+            &transcode_format,
+            &metadata,
+            source_sample_rate,
+        )
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
         std::fs::read(tmp.path())
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
     })

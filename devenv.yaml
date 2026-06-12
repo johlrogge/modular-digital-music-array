@@ -2,7 +2,7 @@ allowUnfree: true
 
 inputs:
   nixpkgs:
-    url: github:cachix/devenv-nixpkgs/rolling
+    url: github:NixOS/nixpkgs/nixos-25.11
   rust-overlay:
     url: github:oxalica/rust-overlay
     inputs:

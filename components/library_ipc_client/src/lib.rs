@@ -432,6 +432,67 @@ impl LibraryClient {
             })),
         }
     }
+
+    // =========================================================================
+    // Track lifecycle methods
+    // =========================================================================
+
+    /// Soft-delete a track. The file/blob is retained and the track is recoverable.
+    pub fn track_delete(&self, hash: &ContentHash) -> Result<(), ClientError> {
+        match self.request(&LibraryRequest::TrackDelete { hash: hash.clone() })? {
+            LibraryResponse::TrackDeleted => Ok(()),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to TrackDelete".to_string(),
+            })),
+        }
+    }
+
+    /// Restore a soft-deleted track (retracts the Deleted fact).
+    pub fn track_restore(&self, hash: &ContentHash) -> Result<(), ClientError> {
+        match self.request(&LibraryRequest::TrackRestore { hash: hash.clone() })? {
+            LibraryResponse::TrackRestored => Ok(()),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to TrackRestore".to_string(),
+            })),
+        }
+    }
+
+    /// Replace an old track with a new file. The new file path must be accessible
+    /// by the library service on the device.
+    ///
+    /// Returns the new content hash and how many playlist lines were rewritten.
+    pub fn track_replace(
+        &self,
+        old_hash: &ContentHash,
+        new_file_path: &str,
+    ) -> Result<(ContentHash, usize), ClientError> {
+        match self.request(&LibraryRequest::TrackReplace {
+            old_hash: old_hash.clone(),
+            new_file_path: new_file_path.to_string(),
+        })? {
+            LibraryResponse::TrackReplaced {
+                new_hash,
+                playlists_rewritten,
+            } => Ok((new_hash, playlists_rewritten)),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to TrackReplace".to_string(),
+            })),
+        }
+    }
+
+    /// List hidden (deleted or superseded) tracks.
+    pub fn track_orphans(&self) -> Result<Vec<OrphanInfo>, ClientError> {
+        match self.request(&LibraryRequest::TrackOrphans)? {
+            LibraryResponse::OrphansList(items) => Ok(items),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to TrackOrphans".to_string(),
+            })),
+        }
+    }
 }
 
 // =========================================================================

@@ -152,6 +152,15 @@ mod tests {
 /// Transcode `source` audio to `output` in the given `format`, embedding `meta`
 /// tags and passing through cover art from the source via ffmpeg.
 ///
+/// `source_sample_rate` — pass the known sample rate of the source file so that
+/// AIFF/WAV exports can be downsampled to ≤ 48 kHz when required by CDJ
+/// hardware.  Pass `None` if the rate is unknown; the file will be exported
+/// as-is (risk of "illegal format" on CDJs for high-rate sources).
+///
+/// When a downsample is applied this function logs at `info!` level with the
+/// source rate, target rate, and source file path so the user can audit which
+/// tracks were resampled.
+///
 /// ffmpeg must be available on `$PATH`. Cover art is preserved automatically
 /// via `-map_metadata 0`.
 pub fn transcode(
@@ -159,6 +168,20 @@ pub fn transcode(
     output: &Path,
     format: &ExportFormat,
     meta: &ExportMetadata,
+    source_sample_rate: Option<u32>,
 ) -> Result<(), TranscoderError> {
-    ffmpeg::run_ffmpeg(source, output, format, meta)
+    // Log when a CDJ-required downsample will be applied.
+    if matches!(format, ExportFormat::Aiff | ExportFormat::Wav) {
+        if let Some(src_hz) = source_sample_rate {
+            if let Some(target_hz) = ffmpeg::cdj_target_rate(src_hz) {
+                tracing::info!(
+                    source = %source.display(),
+                    src_hz,
+                    target_hz,
+                    "downsampling to CDJ-safe rate"
+                );
+            }
+        }
+    }
+    ffmpeg::run_ffmpeg(source, output, format, meta, source_sample_rate)
 }

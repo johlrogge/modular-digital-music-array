@@ -168,7 +168,11 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ---
 
-## What's new in 0.22.1
+## What's new in 0.23.0
+
+Track lifecycle: `mdma track replace` swaps in a better-quality version of a track and rewrites every playlist that references the old one in place. `mdma track delete`/`restore` give you soft-delete with full recovery, and `mdma track orphans` surfaces hidden tracks for future garbage collection. CDJ-safe exports: `mdma rekordbox export` now downsamples sources above 48 kHz via soxr so Pioneer CDJs never reject the output as illegal format.
+
+### Earlier in 0.22.1
 
 Packaging hotfix: runtime dependencies are now correctly embedded in all built `.xbps` packages. Fresh provisions no longer require a manual `xbps-install -y ffmpeg` to get rekordbox AIFF export working.
 

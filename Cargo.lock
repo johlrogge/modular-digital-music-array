@@ -462,6 +462,7 @@ dependencies = [
  "pretty_assertions",
  "rstest",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
@@ -2653,6 +2654,7 @@ dependencies = [
 name = "library-service-stub"
 version = "0.4.0"
 dependencies = [
+ "chrono",
  "library-ipc-protocol",
  "library-search",
  "music-facts",
@@ -2848,7 +2850,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "mdma-acid"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "acid-service",
  "clap",
@@ -2862,7 +2864,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-admin"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "admin-ipc-protocol",
  "clap",
@@ -2880,7 +2882,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-audio"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "clap",
  "color-eyre",
@@ -2901,7 +2903,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-bandcamp"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "bandcamp-api",
  "chrono",
@@ -2955,7 +2957,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-beacon"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "askama",
  "async-stream",
@@ -2982,7 +2984,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-cli"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "audio-transcoder",
  "chrono",
@@ -3033,11 +3035,12 @@ dependencies = [
 
 [[package]]
 name = "mdma-console"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "admin-ipc-protocol",
  "askama",
  "async-stream",
+ "audio-metadata",
  "audio-transcoder",
  "axum",
  "bandcamp-api",
@@ -3068,7 +3071,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-gateway"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "acid-protocol",
  "clap",
@@ -3088,7 +3091,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-library"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "clap",
  "color-eyre",
@@ -3101,7 +3104,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-playback"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "acid-client",
  "clap",
@@ -3125,7 +3128,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-tui"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "clap",
  "client",
@@ -4278,7 +4281,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-eeprom"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "thiserror 1.0.69",
  "tokio",
