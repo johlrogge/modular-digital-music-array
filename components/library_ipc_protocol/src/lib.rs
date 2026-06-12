@@ -331,6 +331,31 @@ pub enum LibraryRequest {
 
     /// Count the number of tracks in the library whose facts include `ItemId = item_id`.
     GetTrackCountForItemId { item_id: String },
+
+    // -------------------------------------------------------------------------
+    // Track lifecycle
+    // -------------------------------------------------------------------------
+    /// Soft-delete a track: assert Deleted fact, hide from default views.
+    /// File/blob is retained and the track is recoverable via TrackRestore.
+    TrackDelete { hash: ContentHash },
+
+    /// Restore a soft-deleted track: retract the Deleted fact.
+    TrackRestore { hash: ContentHash },
+
+    /// Replace an old track with a new one: ingest new file (path must be on the
+    /// device, accessible by the library service), assert SupersededBy on the old
+    /// track, rewrite playlists.
+    ///
+    /// Note: `new_file_path` must be a path on the device running the library
+    /// service. CLI users should place the file in the inbox and pass its path,
+    /// or copy the file to the device first.
+    TrackReplace {
+        old_hash: ContentHash,
+        new_file_path: String,
+    },
+
+    /// List hidden tracks (deleted or superseded).
+    TrackOrphans,
 }
 
 // ============================================================================
@@ -411,6 +436,21 @@ pub enum LibraryResponse {
     /// Number of tracks in the library whose facts include a given ItemId.
     TrackCountForItemId(usize),
 
+    /// Track soft-deleted successfully.
+    TrackDeleted,
+
+    /// Track restored (Deleted fact retracted) successfully.
+    TrackRestored,
+
+    /// Track replaced: new hash, and number of playlist lines rewritten.
+    TrackReplaced {
+        new_hash: ContentHash,
+        playlists_rewritten: usize,
+    },
+
+    /// List of hidden (deleted or superseded) tracks.
+    OrphansList(Vec<OrphanInfo>),
+
     /// Error response.
     Error(ProtocolError),
 }
@@ -475,6 +515,25 @@ pub enum IngestResult {
 pub struct IngestAllItem {
     pub path: InboxPath,
     pub result: IngestResult,
+}
+
+/// Why a track is hidden (shown in orphan/recover workflows).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "reason")]
+pub enum OrphanReason {
+    /// Track was soft-deleted at this timestamp.
+    Deleted { timestamp: String },
+    /// Track was superseded by another track's hash.
+    SupersededBy { replacement: ContentHash },
+}
+
+/// A hidden (deleted or superseded) track entry returned by TrackOrphans.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrphanInfo {
+    pub content_hash: ContentHash,
+    pub artist: Option<String>,
+    pub title: Option<String>,
+    pub reason: OrphanReason,
 }
 
 #[cfg(test)]
@@ -734,6 +793,136 @@ mod tests {
         let decoded: LibraryResponse = serde_json::from_str(&json).unwrap();
         match decoded {
             LibraryResponse::TrackCountForItemId(count) => assert_eq!(count, 0),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // ── track lifecycle protocol roundtrips ───────────────────────────────────
+
+    #[test]
+    fn track_delete_request_roundtrip() {
+        let req = LibraryRequest::TrackDelete {
+            hash: ContentHash::new("sha256:abc123"),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: LibraryRequest = serde_json::from_str(&json).unwrap();
+        match decoded {
+            LibraryRequest::TrackDelete { hash } => assert_eq!(hash.as_str(), "sha256:abc123"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn track_restore_request_roundtrip() {
+        let req = LibraryRequest::TrackRestore {
+            hash: ContentHash::new("sha256:abc123"),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: LibraryRequest = serde_json::from_str(&json).unwrap();
+        match decoded {
+            LibraryRequest::TrackRestore { hash } => assert_eq!(hash.as_str(), "sha256:abc123"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn track_replace_request_roundtrip() {
+        let req = LibraryRequest::TrackReplace {
+            old_hash: ContentHash::new("sha256:old"),
+            new_file_path: "/music/inbox/new.flac".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: LibraryRequest = serde_json::from_str(&json).unwrap();
+        match decoded {
+            LibraryRequest::TrackReplace {
+                old_hash,
+                new_file_path,
+            } => {
+                assert_eq!(old_hash.as_str(), "sha256:old");
+                assert_eq!(new_file_path, "/music/inbox/new.flac");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn track_orphans_request_roundtrip() {
+        let req = LibraryRequest::TrackOrphans;
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: LibraryRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, LibraryRequest::TrackOrphans));
+    }
+
+    #[test]
+    fn track_deleted_response_roundtrip() {
+        let resp = LibraryResponse::TrackDeleted;
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: LibraryResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, LibraryResponse::TrackDeleted));
+    }
+
+    #[test]
+    fn track_restored_response_roundtrip() {
+        let resp = LibraryResponse::TrackRestored;
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: LibraryResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, LibraryResponse::TrackRestored));
+    }
+
+    #[test]
+    fn track_replaced_response_roundtrip() {
+        let resp = LibraryResponse::TrackReplaced {
+            new_hash: ContentHash::new("sha256:new"),
+            playlists_rewritten: 3,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: LibraryResponse = serde_json::from_str(&json).unwrap();
+        match decoded {
+            LibraryResponse::TrackReplaced {
+                new_hash,
+                playlists_rewritten,
+            } => {
+                assert_eq!(new_hash.as_str(), "sha256:new");
+                assert_eq!(playlists_rewritten, 3);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn orphans_list_response_roundtrip() {
+        let resp = LibraryResponse::OrphansList(vec![OrphanInfo {
+            content_hash: ContentHash::new("sha256:abc"),
+            artist: Some("Artist".to_string()),
+            title: Some("Title".to_string()),
+            reason: OrphanReason::Deleted {
+                timestamp: "2026-06-01T00:00:00+00:00".to_string(),
+            },
+        }]);
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: LibraryResponse = serde_json::from_str(&json).unwrap();
+        match decoded {
+            LibraryResponse::OrphansList(items) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].content_hash.as_str(), "sha256:abc");
+                assert_eq!(items[0].title.as_deref(), Some("Title"));
+                assert!(matches!(items[0].reason, OrphanReason::Deleted { .. }));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn orphan_reason_superseded_by_roundtrip() {
+        let reason = OrphanReason::SupersededBy {
+            replacement: ContentHash::new("sha256:new123"),
+        };
+        let json = serde_json::to_string(&reason).unwrap();
+        let decoded: OrphanReason = serde_json::from_str(&json).unwrap();
+        match decoded {
+            OrphanReason::SupersededBy { replacement } => {
+                assert_eq!(replacement.as_str(), "sha256:new123");
+            }
             _ => panic!("wrong variant"),
         }
     }

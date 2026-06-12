@@ -54,6 +54,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "admin-ipc-client"
+version = "0.21.0"
+dependencies = [
+ "admin-ipc-protocol",
+ "nng",
+ "nng-transport",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "admin-ipc-protocol"
 version = "0.21.0"
 dependencies = [
@@ -462,6 +473,7 @@ dependencies = [
  "pretty_assertions",
  "rstest",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
@@ -2653,6 +2665,7 @@ dependencies = [
 name = "library-service-stub"
 version = "0.4.0"
 dependencies = [
+ "chrono",
  "library-ipc-protocol",
  "library-search",
  "music-facts",
@@ -3038,6 +3051,7 @@ dependencies = [
  "admin-ipc-protocol",
  "askama",
  "async-stream",
+ "audio-metadata",
  "audio-transcoder",
  "axum",
  "bandcamp-api",

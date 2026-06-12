@@ -3,8 +3,8 @@
 use crate::error::map_gw_to_lib_error;
 use library_ipc_client::{
     content_to_hashes, ClientError, ContentHash, FactType, InboxPath, IngestAllItem, IngestResult,
-    IngestSource, LibraryClient, LibraryRequest, LibraryResponse, MusicValue, PlaylistName,
-    ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
+    IngestSource, LibraryClient, LibraryRequest, LibraryResponse, MusicValue, OrphanInfo,
+    PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
 };
 use track_formatter::format_playlist_content;
 
@@ -302,6 +302,57 @@ impl LibraryBackend {
             fact,
         })?)
     }
+
+    // =========================================================================
+    // Track lifecycle methods
+    // =========================================================================
+
+    /// Soft-delete a track. File/blob retained; recoverable via `track_restore`.
+    pub fn track_delete(&self, hash: &ContentHash) -> Result<(), ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.track_delete(hash),
+            LibraryBackend::Gateway(_) => interpret_track_deleted(
+                self.request(&LibraryRequest::TrackDelete { hash: hash.clone() })?,
+            ),
+        }
+    }
+
+    /// Restore a soft-deleted track (retracts the Deleted fact).
+    pub fn track_restore(&self, hash: &ContentHash) -> Result<(), ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.track_restore(hash),
+            LibraryBackend::Gateway(_) => interpret_track_restored(
+                self.request(&LibraryRequest::TrackRestore { hash: hash.clone() })?,
+            ),
+        }
+    }
+
+    /// Replace an old track with a new file. `new_file_path` must be on the device.
+    pub fn track_replace(
+        &self,
+        old_hash: &ContentHash,
+        new_file_path: &str,
+    ) -> Result<(ContentHash, usize), ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.track_replace(old_hash, new_file_path),
+            LibraryBackend::Gateway(_) => {
+                interpret_track_replaced(self.request(&LibraryRequest::TrackReplace {
+                    old_hash: old_hash.clone(),
+                    new_file_path: new_file_path.to_string(),
+                })?)
+            }
+        }
+    }
+
+    /// List hidden (deleted or superseded) tracks.
+    pub fn track_orphans(&self) -> Result<Vec<OrphanInfo>, ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.track_orphans(),
+            LibraryBackend::Gateway(_) => {
+                interpret_orphans_list(self.request(&LibraryRequest::TrackOrphans)?)
+            }
+        }
+    }
 }
 
 // =========================================================================
@@ -441,6 +492,43 @@ fn interpret_fact_retracted(response: LibraryResponse) -> Result<(), ClientError
         LibraryResponse::FactRetracted => Ok(()),
         LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
         _ => Err(unexpected("RetractFact")),
+    }
+}
+
+fn interpret_track_deleted(response: LibraryResponse) -> Result<(), ClientError> {
+    match response {
+        LibraryResponse::TrackDeleted => Ok(()),
+        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+        _ => Err(unexpected("TrackDelete")),
+    }
+}
+
+fn interpret_track_restored(response: LibraryResponse) -> Result<(), ClientError> {
+    match response {
+        LibraryResponse::TrackRestored => Ok(()),
+        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+        _ => Err(unexpected("TrackRestore")),
+    }
+}
+
+fn interpret_track_replaced(
+    response: LibraryResponse,
+) -> Result<(ContentHash, usize), ClientError> {
+    match response {
+        LibraryResponse::TrackReplaced {
+            new_hash,
+            playlists_rewritten,
+        } => Ok((new_hash, playlists_rewritten)),
+        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+        _ => Err(unexpected("TrackReplace")),
+    }
+}
+
+fn interpret_orphans_list(response: LibraryResponse) -> Result<Vec<OrphanInfo>, ClientError> {
+    match response {
+        LibraryResponse::OrphansList(items) => Ok(items),
+        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+        _ => Err(unexpected("TrackOrphans")),
     }
 }
 
