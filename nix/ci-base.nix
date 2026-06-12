@@ -23,6 +23,7 @@
 
     # Audio development
     pkg-config
+    ffmpeg            # audio_decoder's build.rs generates FLAC test fixtures with it
   ] ++ lib.optionals pkgs.stdenv.isLinux [
     alsa-lib
     pipewire          # link-time dep; pulls ffmpeg transitively — accepted

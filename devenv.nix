@@ -40,7 +40,6 @@ in
     sshpass
     gh
     gitflow               # Git-flow branching workflow
-    ffmpeg                # Runtime dep for the audio transcoder (Pi-side), not build-time
   ];
 
   # Pi service sockets — available in every devenv shell automatically
