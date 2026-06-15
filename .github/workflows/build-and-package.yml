@@ -80,6 +80,11 @@ jobs:
         name: devenv
     - run: nix profile install nixpkgs#devenv
 
+    - uses: actions/cache@v4
+      with:
+        path: .cross/aarch64-sysroot
+        key: sysroot-${{ hashFiles('scripts/ci/setup-cross-sysroot.sh') }}
+
     - name: Setup cross-compilation sysroot
       run: devenv shell -- ./scripts/ci/setup-cross-sysroot.sh
 
@@ -120,6 +125,11 @@ jobs:
         name: devenv
     - run: nix profile install nixpkgs#devenv
 
+    - uses: actions/cache@v4
+      with:
+        path: .cross/aarch64-sysroot
+        key: sysroot-${{ hashFiles('scripts/ci/setup-cross-sysroot.sh') }}
+
     - name: Setup cross-compilation sysroot
       run: devenv shell -- ./scripts/ci/setup-cross-sysroot.sh
 
@@ -131,11 +141,6 @@ jobs:
           target
         key: cargo-aarch64-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: cargo-aarch64-
-
-    - uses: actions/cache@v4
-      with:
-        path: .cross/aarch64-sysroot
-        key: sysroot-${{ hashFiles('scripts/ci/setup-cross-sysroot.sh') }}
 
     - name: Build packages
       run: |
