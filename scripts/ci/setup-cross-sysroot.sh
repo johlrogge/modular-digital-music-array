@@ -14,37 +14,78 @@ TMPDIR=$(mktemp -d)
 
 trap 'rm -rf "$TMPDIR"' EXIT
 
+# If sysroot already contains pipewire headers, skip the whole setup (cache hit)
+if [ -d "$SYSROOT/usr/include/pipewire-0.3" ]; then
+  echo "Sysroot already present at $SYSROOT, skipping setup."
+  exit 0
+fi
+
 echo "Setting up aarch64 cross-compilation sysroot..."
 
-# Dynamically discover the current PipeWire version in the Void Linux repo
+# ---------------------------------------------------------------------------
+# Variant-aware PipeWire discovery with retries
+# Void may serve glibc (.aarch64.xbps) or musl (.aarch64-musl.xbps) — accept both.
+# Prefer glibc when both exist, fall back to musl.
+# ---------------------------------------------------------------------------
 echo "  Discovering current PipeWire version from Void Linux repo..."
-LIBPIPEWIRE_PKG=$(curl -sL "$VOID_REPO/" | grep -oE 'libpipewire-[0-9][0-9._]+\.aarch64\.xbps' | sort -V | tail -1)
-if [ -z "$LIBPIPEWIRE_PKG" ]; then
-  echo "ERROR: Could not discover libpipewire package from $VOID_REPO/" >&2
+
+INDEX_BODY=""
+HTTP_STATUS=""
+for attempt in 1 2 3; do
+  HTTP_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$VOID_REPO/")
+  if [ "$HTTP_STATUS" = "200" ]; then
+    INDEX_BODY=$(curl -sL "$VOID_REPO/")
+    break
+  fi
+  echo "  Attempt $attempt: HTTP $HTTP_STATUS from $VOID_REPO/ — retrying in $((attempt * 2))s..." >&2
+  sleep $((attempt * 2))
+done
+
+if [ -z "$INDEX_BODY" ]; then
+  echo "ERROR: Could not fetch package index from $VOID_REPO/ (HTTP $HTTP_STATUS)" >&2
+  echo "Response preview:" >&2
+  curl -sL "$VOID_REPO/" 2>&1 | head -c 400 >&2
   exit 1
 fi
 
-# Extract the version suffix (e.g. "1.6.2_1") from the libpipewire package name
-# and reuse it for pipewire-devel to avoid false positives from independent grepping
-# (e.g. pipewire-devel-6.6.2_1 which is actually a Linux kernel package).
-PIPEWIRE_PKG_VER=$(echo "$LIBPIPEWIRE_PKG" | sed 's/libpipewire-//;s/\.aarch64\.xbps//')
+# Try glibc variant first, then musl
+LIBPIPEWIRE_PKG=$(echo "$INDEX_BODY" | grep -oE 'libpipewire-[0-9][0-9._]+\.aarch64\.xbps' | sort -V | tail -1 || true)
+VARIANT_SUFFIX=".aarch64"
+
+if [ -z "$LIBPIPEWIRE_PKG" ]; then
+  LIBPIPEWIRE_PKG=$(echo "$INDEX_BODY" | grep -oE 'libpipewire-[0-9][0-9._]+\.aarch64-musl\.xbps' | sort -V | tail -1 || true)
+  VARIANT_SUFFIX=".aarch64-musl"
+fi
+
+if [ -z "$LIBPIPEWIRE_PKG" ]; then
+  echo "ERROR: Could not discover libpipewire package from $VOID_REPO/" >&2
+  echo "HTTP status: $HTTP_STATUS" >&2
+  echo "Response preview (first 400 bytes):" >&2
+  echo "$INDEX_BODY" | head -c 400 >&2
+  exit 1
+fi
+
+# Extract the version suffix (e.g. "1.6.6_1") from the matched filename.
+# Strip the leading "libpipewire-" and the trailing variant+extension.
+PIPEWIRE_PKG_VER=$(echo "$LIBPIPEWIRE_PKG" \
+  | sed "s/libpipewire-//;s/${VARIANT_SUFFIX//./\\.}\.xbps//")
 if [ -z "$PIPEWIRE_PKG_VER" ]; then
   echo "ERROR: Could not extract version suffix from package name: $LIBPIPEWIRE_PKG" >&2
   exit 1
 fi
 
-LIBPIPEWIRE_PKG="libpipewire-${PIPEWIRE_PKG_VER}.aarch64.xbps"
-PIPEWIRE_DEVEL_PKG="pipewire-devel-${PIPEWIRE_PKG_VER}.aarch64.xbps"
+LIBPIPEWIRE_PKG="libpipewire-${PIPEWIRE_PKG_VER}${VARIANT_SUFFIX}.xbps"
+PIPEWIRE_DEVEL_PKG="pipewire-devel-${PIPEWIRE_PKG_VER}${VARIANT_SUFFIX}.xbps"
 
 # Extract the version string (e.g. "1.4.9_1" → "1.4.9") for use in the .pc file
-# Package name format: libpipewire-<version>_<rev>.aarch64.xbps
+# Package name format: libpipewire-<version>_<rev>.<variant>.xbps
 PIPEWIRE_VER=$(echo "$LIBPIPEWIRE_PKG" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 if [ -z "$PIPEWIRE_VER" ]; then
   echo "ERROR: Could not parse PipeWire version from package name: $LIBPIPEWIRE_PKG" >&2
   exit 1
 fi
 
-echo "  Found: $LIBPIPEWIRE_PKG (version $PIPEWIRE_VER)"
+echo "  Found: $LIBPIPEWIRE_PKG (variant: ${VARIANT_SUFFIX}, version: $PIPEWIRE_VER)"
 echo "  Found: $PIPEWIRE_DEVEL_PKG"
 
 # Download packages
