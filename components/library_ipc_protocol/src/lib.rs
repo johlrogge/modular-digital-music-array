@@ -343,8 +343,12 @@ pub enum LibraryRequest {
     TrackRestore { hash: ContentHash },
 
     /// Replace an old track with a new one: ingest new file (path must be on the
-    /// device, accessible by the library service), assert SupersededBy on the old
-    /// track, rewrite playlists.
+    /// device, accessible by the library service), retract ALL old track facts
+    /// (hard delete the old identity), assert Replaces(old_hash) on the new track,
+    /// and rewrite playlists.
+    ///
+    /// After replace, the old hash is unresolvable (gone from search/list/get_track).
+    /// The new track carries a Replaces(old_hash) fact as the only trace.
     ///
     /// Note: `new_file_path` must be a path on the device running the library
     /// service. CLI users should place the file in the inbox and pass its path,
