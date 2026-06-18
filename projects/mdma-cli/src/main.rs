@@ -789,10 +789,14 @@ enum TrackCommands {
         hash: String,
     },
 
-    /// Replace an old track with a new file.
+    /// Hard-replace an old track with a new file.
     ///
     /// Ingests the new file (path must be on the device running the library service),
-    /// marks the old track as superseded, and rewrites all playlists containing it.
+    /// fully retracts all facts for the old track (the old hash stops resolving — gone
+    /// from search and list, not merely hidden), records a Replaces provenance link on
+    /// the new track, and rewrites every playlist that referenced the old track.
+    /// Playlists that still point at the old hash self-heal on read by following the
+    /// replacement chain (multi-step chains are followed automatically).
     ///
     /// Note: <new-file> must be a path accessible by the library service on the device.
     /// Place the new file in the inbox directory or another device-local path first.
@@ -803,7 +807,10 @@ enum TrackCommands {
         new_file: String,
     },
 
-    /// List hidden tracks (deleted or superseded).
+    /// List blobs on disk that no live track references (GC candidate list, read-only).
+    ///
+    /// Reports hard-replace leftovers (reason: "no live facts") and soft-deleted tracks
+    /// (reason: "deleted"). Use `mdma track delete`/`restore` for soft-delete management.
     Orphans,
 }
 
