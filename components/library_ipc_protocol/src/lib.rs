@@ -521,17 +521,21 @@ pub struct IngestAllItem {
     pub result: IngestResult,
 }
 
-/// Why a track is hidden (shown in orphan/recover workflows).
+/// Why a track is an orphan (shown in orphan/GC workflows).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "reason")]
 pub enum OrphanReason {
-    /// Track was soft-deleted at this timestamp.
+    /// Track was soft-deleted at this timestamp.  Blob is present; track is
+    /// recoverable via restore.
     Deleted { timestamp: String },
-    /// Track was superseded by another track's hash.
-    SupersededBy { replacement: ContentHash },
+    /// Blob is on disk but has no live facts in the index.  This is the
+    /// hard-replace leftover: the old blob was never deleted when its facts
+    /// were retracted.  Primary GC candidate.
+    NoLiveFacts,
 }
 
-/// A hidden (deleted or superseded) track entry returned by TrackOrphans.
+/// A track entry returned by TrackOrphans: either soft-deleted (recoverable)
+/// or a blob on disk with no live facts (hard-replace leftover, GC candidate).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrphanInfo {
     pub content_hash: ContentHash,
@@ -917,18 +921,15 @@ mod tests {
     }
 
     #[test]
-    fn orphan_reason_superseded_by_roundtrip() {
-        let reason = OrphanReason::SupersededBy {
-            replacement: ContentHash::new("sha256:new123"),
-        };
+    fn orphan_reason_no_live_facts_roundtrip() {
+        let reason = OrphanReason::NoLiveFacts;
         let json = serde_json::to_string(&reason).unwrap();
         let decoded: OrphanReason = serde_json::from_str(&json).unwrap();
-        match decoded {
-            OrphanReason::SupersededBy { replacement } => {
-                assert_eq!(replacement.as_str(), "sha256:new123");
-            }
-            _ => panic!("wrong variant"),
-        }
+        assert!(
+            matches!(decoded, OrphanReason::NoLiveFacts),
+            "expected NoLiveFacts, got: {:?}",
+            decoded
+        );
     }
 
     #[test]

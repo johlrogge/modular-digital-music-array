@@ -2037,13 +2037,26 @@ impl LibraryService {
         total_rewritten
     }
 
-    /// List all hidden (soft-deleted) tracks.
+    /// List all orphan candidates.
     ///
-    /// Note: hard-replaced tracks are fully retracted from the index and will
-    /// not appear here. Orphans only includes soft-deleted (Deleted fact) tracks.
+    /// Two categories:
+    ///
+    /// - `OrphanReason::Deleted` — soft-deleted track (still in the index with
+    ///   `deleted_at` set, blob present, recoverable via restore).
+    ///
+    /// - `OrphanReason::NoLiveFacts` — a blob exists on disk whose content hash
+    ///   has no live entry in the in-memory index.  This is the hard-replace
+    ///   leftover: `retract_all_entity_facts` removed the index entry but did
+    ///   not delete the blob file.  Primary GC candidate.
+    ///
+    /// A live (not hidden) track is never an orphan, even if a blob is present.
     fn handle_track_orphans(&self) -> LibraryResponse {
         let tracks = self.tracks.lock().unwrap();
-        let orphans: Vec<OrphanInfo> = tracks
+
+        // ----------------------------------------------------------------
+        // Part 1: soft-deleted tracks (Deleted reason)
+        // ----------------------------------------------------------------
+        let mut orphans: Vec<OrphanInfo> = tracks
             .iter()
             .filter(|t| t.is_hidden())
             .map(|t| {
@@ -2052,7 +2065,8 @@ impl LibraryService {
                         timestamp: dt.to_rfc3339(),
                     }
                 } else {
-                    // Should never happen given is_hidden() only checks deleted_at, but be safe
+                    // is_hidden() only returns true when deleted_at is set, but
+                    // be defensive.
                     OrphanReason::Deleted {
                         timestamp: "unknown".to_string(),
                     }
@@ -2065,6 +2079,46 @@ impl LibraryService {
                 }
             })
             .collect();
+
+        // ----------------------------------------------------------------
+        // Part 2: blobs on disk with no live index entry (NoLiveFacts)
+        // ----------------------------------------------------------------
+        // Build a set of all hashes currently in the index (live + hidden).
+        // Any blob whose hash is absent from this set has no live facts.
+        let indexed_hashes: std::collections::HashSet<String> = tracks
+            .iter()
+            .map(|t| t.content_hash.as_str().to_string())
+            .collect();
+
+        let blobs_dir = self.music_dir.join("blobs");
+        if let Ok(prefix_entries) = std::fs::read_dir(&blobs_dir) {
+            for prefix_entry in prefix_entries.filter_map(|e| e.ok()) {
+                if !prefix_entry.path().is_dir() {
+                    continue;
+                }
+                if let Ok(blob_entries) = std::fs::read_dir(prefix_entry.path()) {
+                    for blob_entry in blob_entries.filter_map(|e| e.ok()) {
+                        let blob_path = blob_entry.path();
+                        if !blob_path.is_file() {
+                            continue;
+                        }
+                        // Recover hash from stem: `{hash_hex}.{ext}` → `sha256:{hash_hex}`
+                        if let Some(stem) = blob_path.file_stem().and_then(|s| s.to_str()) {
+                            let content_hash = ContentHash::new(format!("sha256:{}", stem));
+                            if !indexed_hashes.contains(content_hash.as_str()) {
+                                orphans.push(OrphanInfo {
+                                    content_hash,
+                                    artist: None,
+                                    title: None,
+                                    reason: OrphanReason::NoLiveFacts,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         LibraryResponse::OrphansList(orphans)
     }
 
@@ -6744,6 +6798,154 @@ mod tests {
             hash_a.as_str(),
             "the single Replaces fact must point at A"
         );
+    }
+
+    // =========================================================================
+    // Orphan: blob-on-disk enumeration (NoLiveFacts / Deleted / live)
+    // =========================================================================
+
+    /// Helper: create a fake blob file at `music_dir/blobs/{prefix}/{hash}.flac`.
+    /// Returns the content hash with the `sha256:` prefix.
+    fn plant_blob(music_dir: &std::path::Path, hash_hex: &str) -> ContentHash {
+        let prefix = &hash_hex[..2];
+        let blob_dir = music_dir.join("blobs").join(prefix);
+        std::fs::create_dir_all(&blob_dir).unwrap();
+        let blob_path = blob_dir.join(format!("{}.flac", hash_hex));
+        std::fs::write(&blob_path, b"fake audio data").unwrap();
+        ContentHash::new(format!("sha256:{}", hash_hex))
+    }
+
+    /// A blob on disk whose hash is absent from the live index → NoLiveFacts.
+    ///
+    /// This is the hard-replace scenario: retract_all_entity_facts removed the
+    /// track from self.tracks but left the blob on disk.
+    #[test]
+    fn orphan_no_live_facts_blob_without_index_entry() {
+        let hash_hex = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        let temp_facts = write_facts_file(&[]);
+        let (service, _metadata_dir) = make_service_with_facts(temp_facts.path());
+
+        // Plant a blob that has NO corresponding index entry
+        let hash = plant_blob(&service.music_dir, hash_hex);
+
+        let resp = service.handle_request(LibraryRequest::TrackOrphans);
+        match resp {
+            LibraryResponse::OrphansList(items) => {
+                let orphan = items
+                    .iter()
+                    .find(|o| o.content_hash.as_str() == hash.as_str());
+                assert!(
+                    orphan.is_some(),
+                    "blob with no index entry must appear in orphans list"
+                );
+                assert!(
+                    matches!(orphan.unwrap().reason, OrphanReason::NoLiveFacts),
+                    "reason must be NoLiveFacts, got {:?}",
+                    orphan.unwrap().reason
+                );
+            }
+            other => panic!("expected OrphansList, got {:?}", other),
+        }
+    }
+
+    /// A live track with a blob is NOT listed as an orphan.
+    #[test]
+    fn orphan_live_track_with_blob_not_listed() {
+        let hash_hex = "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff";
+        let hash = ContentHash::new(format!("sha256:{}", hash_hex));
+
+        let temp_facts = write_facts_file(&[(hash.clone(), MusicValue::Title(Title::new("Live")))]);
+        let (service, _metadata_dir) = make_service_with_facts(temp_facts.path());
+
+        // Set blob_path in the index entry so is_orphan_blob logic sees it
+        {
+            let mut tracks = service.tracks.lock().unwrap();
+            if let Some(t) = tracks
+                .iter_mut()
+                .find(|t| t.content_hash.as_str() == hash.as_str())
+            {
+                t.blob_path = std::path::PathBuf::from(format!(
+                    "blobs/{}/{}.flac",
+                    hash_hex.get(..2).unwrap(),
+                    hash_hex
+                ));
+            }
+        }
+
+        // Plant the blob so it actually exists on disk
+        plant_blob(&service.music_dir, hash_hex);
+
+        let resp = service.handle_request(LibraryRequest::TrackOrphans);
+        match resp {
+            LibraryResponse::OrphansList(items) => {
+                let listed = items
+                    .iter()
+                    .any(|o| o.content_hash.as_str() == hash.as_str());
+                assert!(!listed, "live track must NOT appear in orphans list");
+            }
+            other => panic!("expected OrphansList, got {:?}", other),
+        }
+    }
+
+    /// Soft-deleted track → listed with reason Deleted.
+    /// Restore → no longer listed.
+    #[test]
+    fn orphan_deleted_track_listed_and_removed_after_restore() {
+        let hash_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899dead";
+        let hash = ContentHash::new(format!("sha256:{}", hash_hex));
+
+        let temp_facts =
+            write_facts_file(&[(hash.clone(), MusicValue::Title(Title::new("SoftDeleteMe")))]);
+        let (service, _metadata_dir) = make_service_with_facts(temp_facts.path());
+
+        // Give the index entry a blob_path and plant the blob
+        {
+            let mut tracks = service.tracks.lock().unwrap();
+            if let Some(t) = tracks
+                .iter_mut()
+                .find(|t| t.content_hash.as_str() == hash.as_str())
+            {
+                t.blob_path = std::path::PathBuf::from(format!(
+                    "blobs/{}/{}.flac",
+                    hash_hex.get(..2).unwrap(),
+                    hash_hex
+                ));
+            }
+        }
+        plant_blob(&service.music_dir, hash_hex);
+
+        // Soft-delete
+        service.handle_request(LibraryRequest::TrackDelete { hash: hash.clone() });
+
+        let resp = service.handle_request(LibraryRequest::TrackOrphans);
+        match resp {
+            LibraryResponse::OrphansList(items) => {
+                let orphan = items
+                    .iter()
+                    .find(|o| o.content_hash.as_str() == hash.as_str());
+                assert!(orphan.is_some(), "deleted track must appear in orphans");
+                assert!(
+                    matches!(orphan.unwrap().reason, OrphanReason::Deleted { .. }),
+                    "reason must be Deleted, got {:?}",
+                    orphan.unwrap().reason
+                );
+            }
+            other => panic!("expected OrphansList, got {:?}", other),
+        }
+
+        // Restore
+        service.handle_request(LibraryRequest::TrackRestore { hash: hash.clone() });
+
+        let resp2 = service.handle_request(LibraryRequest::TrackOrphans);
+        match resp2 {
+            LibraryResponse::OrphansList(items) => {
+                let still_listed = items
+                    .iter()
+                    .any(|o| o.content_hash.as_str() == hash.as_str());
+                assert!(!still_listed, "restored track must NOT appear in orphans");
+            }
+            other => panic!("expected OrphansList, got {:?}", other),
+        }
     }
 }
 

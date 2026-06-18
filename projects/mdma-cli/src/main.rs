@@ -4652,8 +4652,8 @@ fn handle_track_orphans(lib: &LibraryBackend) -> Result<()> {
                 let title = o.title.as_deref().unwrap_or("Unknown");
                 let reason = match &o.reason {
                     OrphanReason::Deleted { timestamp } => format!("deleted at {}", timestamp),
-                    OrphanReason::SupersededBy { replacement } => {
-                        format!("superseded by {}", replacement.as_str())
+                    OrphanReason::NoLiveFacts => {
+                        "no live facts (hard-replace leftover)".to_string()
                     }
                 };
                 println!("{}  {} - {}  [{}]", hash_short, artist, title, reason);
