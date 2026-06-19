@@ -102,6 +102,13 @@ struct IndexedTrackInfo {
     /// first matching pair, then the scalar field is re-resolved from whatever remains.
     /// For multi-valued fields (StyleDescriptor) each assertion contributes a separate entry.
     provenance: Vec<(MusicValue, music_facts::FactSource)>,
+    /// Raw FilePath value stored during fact application.
+    ///
+    /// FilePath is excluded from provenance (it never retracts) but the blob_path
+    /// derivation needs the extension.  When content_hash is empty (aggregate_facts
+    /// bulk path) the derivation is deferred; this field holds the path until the
+    /// Phase 3 post-pass calls `derive_blob_path_if_needed`.
+    raw_file_path: Option<PathBuf>,
 }
 
 impl IndexedTrackInfo {
@@ -129,6 +136,7 @@ impl IndexedTrackInfo {
             item_id: None,
             deleted_at: None,
             provenance: Vec::new(),
+            raw_file_path: None,
         }
     }
 }
@@ -141,10 +149,50 @@ impl Default for IndexedTrackInfo {
     }
 }
 
+/// Derive the blob storage path from a content hash and file path.
+///
+/// Returns `Some(PathBuf)` of the form `blobs/{prefix}/{hash_clean}.{ext}` when
+/// `content_hash` (after stripping the `sha256:` prefix) has at least two characters
+/// and `file_path` has a recognisable extension, otherwise `None`.
+fn blob_path_for(content_hash: &str, file_path: &std::path::Path) -> Option<PathBuf> {
+    let hash_clean = content_hash.strip_prefix("sha256:").unwrap_or(content_hash);
+    if hash_clean.len() < 2 {
+        return None;
+    }
+    let ext = file_path.extension()?.to_str()?;
+    Some(PathBuf::from(format!(
+        "blobs/{}/{}.{}",
+        &hash_clean[..2],
+        hash_clean,
+        ext
+    )))
+}
+
 impl IndexedTrackInfo {
     /// Returns true if this track is hidden from default views.
     fn is_hidden(&self) -> bool {
         self.deleted_at.is_some()
+    }
+
+    /// Derive `blob_path` from `raw_file_path` and `content_hash` if blob_path
+    /// is still empty.
+    ///
+    /// Called in the Phase 3 post-pass of `load_from_acid_stream` after
+    /// `content_hash` has been set from the entity key.  The aggregate_facts
+    /// bulk path initialises entries with an empty content_hash (via Default)
+    /// so the derivation inside `apply_assert_scalar` is skipped; this method
+    /// completes it once the real hash is available.
+    fn derive_blob_path_if_needed(&mut self) {
+        if !self.blob_path.as_os_str().is_empty() {
+            return; // already derived (file/stream paths)
+        }
+        let p = match &self.raw_file_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        if let Some(bp) = blob_path_for(self.content_hash.as_str(), &p) {
+            self.blob_path = bp;
+        }
     }
 }
 
@@ -248,13 +296,14 @@ fn apply_assert_scalar(
             update_if_more_recent(&mut entry.last_stopped, timestamp);
         }
         MusicValue::FilePath(p) => {
-            let hash = entry.content_hash.as_str();
-            let hash_clean = hash.strip_prefix("sha256:").unwrap_or(hash);
-            if hash_clean.len() >= 2 {
-                if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                    entry.blob_path =
-                        PathBuf::from(format!("blobs/{}/{}.{}", &hash_clean[..2], hash_clean, ext));
-                }
+            // Always stash the raw file path for deferred derivation.
+            // When content_hash is already populated (file/stream paths) we can
+            // derive blob_path immediately.  When it is empty (aggregate_facts
+            // bulk path) the helper returns None and the Phase 3 post-pass
+            // calls derive_blob_path_if_needed after content_hash is set.
+            entry.raw_file_path = Some(p.clone());
+            if let Some(bp) = blob_path_for(entry.content_hash.as_str(), p) {
+                entry.blob_path = bp;
             }
         }
         MusicValue::Format(_) => {
@@ -753,6 +802,11 @@ impl LibraryService {
 
         for (entity, entry) in &mut aggregated {
             entry.content_hash = entity.clone();
+
+            // Re-derive blob_path now that content_hash is set.  During aggregation
+            // the content_hash was empty (Default), so the FilePath arm in
+            // apply_assert_scalar could not compute the path.
+            entry.derive_blob_path_if_needed();
 
             for (value, _source) in &entry.provenance {
                 fact_index
@@ -2770,6 +2824,10 @@ impl LibraryService {
                 // individually tracked here). Retraction via retract_source_facts
                 // reads directly from ACID, so provenance is not needed for this path.
                 provenance: Vec::new(),
+                // raw_file_path is only needed for deferred blob_path derivation
+                // in the aggregate_facts bulk path; the ingest path sets blob_path
+                // directly from the indexed track, so no deferral is needed.
+                raw_file_path: None,
             });
         }
 
@@ -5876,6 +5934,55 @@ mod tests {
         );
         assert_scalar_fields_eq("2_both_retract bulk==file", &bulk_result, &file_result);
         assert_scalar_fields_eq("2_both_retract stream==file", &stream_result, &file_result);
+    }
+
+    /// Regression: blob_path must be derived from FilePath on ALL three paths.
+    ///
+    /// Before the fix, aggregate_facts (bulk path) produced an empty blob_path
+    /// because content_hash was "" during aggregation and the hash-length guard
+    /// (`hash_clean.len() >= 2`) silently skipped the derivation.  The file
+    /// and incremental paths passed `new_empty(entity_key)` which pre-seeded the
+    /// hash, so they worked.  This test catches the divergence.
+    #[test]
+    fn blob_path_derived_on_all_three_paths() {
+        let hash = ContentHash::new("sha256:deadbeef1234");
+        let source = FactSource::new("fs", "1.0.0", FactOrigin::Unknown);
+        let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+
+        let facts = vec![(
+            hash.clone(),
+            MusicValue::FilePath(std::path::PathBuf::from("/music/inbox/foo.flac")),
+            ts,
+            Operation::Assert,
+            source.clone(),
+        )];
+
+        let file_result = load_from_file_path(&hash, &facts);
+        let bulk_result = load_from_bulk_path(&hash, &facts);
+        let stream_result = apply_stream_path(&hash, &facts);
+
+        // All three must agree on the non-empty, correctly-formed blob_path.
+        let expected = "blobs/de/deadbeef1234.flac";
+        let file_blob = file_result.blob_path.to_string_lossy().to_string();
+        let bulk_blob = bulk_result.blob_path.to_string_lossy().to_string();
+        let stream_blob = stream_result.blob_path.to_string_lossy().to_string();
+
+        assert_eq!(
+            file_blob, expected,
+            "file path: blob_path should be '{}', got '{}'",
+            expected, file_blob
+        );
+        assert_eq!(
+            bulk_blob, expected,
+            "bulk path (aggregate_facts): blob_path should be '{}', got '{}' — \
+             this is the production regression: bulk load lost blob_path derivation",
+            expected, bulk_blob
+        );
+        assert_eq!(
+            stream_blob, expected,
+            "stream path: blob_path should be '{}', got '{}'",
+            expected, stream_blob
+        );
     }
 
     // =========================================================================
