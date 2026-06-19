@@ -168,9 +168,19 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ---
 
+## What's new in 0.24.0
+
+`mdma library track replace` is now a **hard replace**: the old track's facts are fully retracted and the old hash stops resolving entirely — it disappears from search and list results, not just hidden. The new track records a `Replaces` provenance link. Playlists referencing the old hash are rewritten immediately; any that still point at it self-heal on read by following the replacement chain (multi-step chains are followed automatically).
+
+`mdma library track orphans` now lists blobs on disk with no live track reference: hard-replace leftovers appear with reason `no live facts`, alongside soft-deleted tracks (reason `deleted`). The command is read-only — a GC candidate list only.
+
+`mdma library track delete` / `restore` are unchanged (soft, reversible).
+
+---
+
 ## What's new in 0.23.0
 
-Track lifecycle: `mdma track replace` swaps in a better-quality version of a track and rewrites every playlist that references the old one in place. `mdma track delete`/`restore` give you soft-delete with full recovery, and `mdma track orphans` surfaces hidden tracks for future garbage collection. CDJ-safe exports: `mdma rekordbox export` now downsamples sources above 48 kHz via soxr so Pioneer CDJs never reject the output as illegal format.
+Track lifecycle: `mdma library track replace` swaps in a better-quality version of a track and rewrites every playlist that references the old one in place. `mdma library track delete`/`restore` give you soft-delete with full recovery, and `mdma library track orphans` surfaces hidden tracks for future garbage collection. CDJ-safe exports: `mdma rekordbox export` now downsamples sources above 48 kHz via soxr so Pioneer CDJs never reject the output as illegal format.
 
 ### Earlier in 0.22.1
 
