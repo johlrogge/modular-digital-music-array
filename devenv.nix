@@ -459,7 +459,7 @@ in
            Expected: exit code 0, "bandcamp" in output
 
         7. CONSOLE — verify web UI responds:
-           curl -s -o /dev/null -w "%{http_code}" http://mdma-909.local/
+           curl -s -o /dev/null -w "%{http_code}" http://mdma-johlyroger.local/
            Expected: HTTP 200
 
         Report format:

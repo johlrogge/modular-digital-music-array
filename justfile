@@ -586,9 +586,9 @@ pi-scan-quick:
         just pi-scan
     fi
 
-# SSH into the provisioned Pi (mdma-909.local)
+# SSH into the provisioned Pi (mdma-johlyroger.local)
 pi-ssh:
-    ssh -4 -i ~/.ssh/mdma_pi admin@mdma-909.local
+    ssh -4 -i ~/.ssh/mdma_pi admin@mdma-johlyroger.local
 
 # SSH into the unprovisioned beacon Pi (welcome-to-mdma.local)
 pi-ssh-beacon:
@@ -802,7 +802,7 @@ library-cross:
 _deploy-svc svc bin *extra_scp:
     #!/usr/bin/env bash
     set -euo pipefail
-    HOST="${PI_HOST:-mdma-909.local}"
+    HOST="${PI_HOST:-mdma-johlyroger.local}"
     SSH_KEY="$HOME/.ssh/mdma_pi"
     BINARY="target/aarch64-unknown-linux-gnu/release/{{bin}}"
     RUN_SCRIPT="void-packages/srcpkgs/{{svc}}/files/{{svc}}/run"
@@ -926,7 +926,7 @@ deploy-cli: cli-cross
     #!/usr/bin/env bash
     set -euo pipefail
 
-    HOST="${PI_HOST:-mdma-909.local}"
+    HOST="${PI_HOST:-mdma-johlyroger.local}"
     BINARY="target/aarch64-unknown-linux-gnu/release/mdma"
     SSH_KEY="$HOME/.ssh/mdma_pi"
 
@@ -992,7 +992,7 @@ deploy-tui: tui-cross
     #!/usr/bin/env bash
     set -euo pipefail
 
-    HOST="${PI_HOST:-mdma-909.local}"
+    HOST="${PI_HOST:-mdma-johlyroger.local}"
     BINARY="target/aarch64-unknown-linux-gnu/release/mdma-tui"
     SSH_KEY="$HOME/.ssh/mdma_pi"
 
