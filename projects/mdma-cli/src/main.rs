@@ -358,12 +358,6 @@ enum Commands {
         #[command(subcommand)]
         command: AdminCommands,
     },
-
-    /// Track lifecycle commands (soft-delete, replace, restore, orphans)
-    Track {
-        #[command(subcommand)]
-        command: TrackCommands,
-    },
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -760,6 +754,12 @@ enum LibraryCommands {
     /// `/music/cover-art/<hash>.<ext>`. Only tracks without an existing CoverArtPath
     /// fact are processed.
     ReindexCovers,
+
+    /// Manage individual tracks (replace, delete, restore, list orphans)
+    Track {
+        #[command(subcommand)]
+        command: TrackCommands,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -777,7 +777,7 @@ enum AdminCommands {
 enum TrackCommands {
     /// Soft-delete a track (hidden from default views; file retained; recoverable).
     ///
-    /// The track is hidden from list/search results. To undo, use `mdma track restore <hash>`.
+    /// The track is hidden from list/search results. To undo, use `mdma library track restore <hash>`.
     Delete {
         /// Content hash of the track (prefix accepted, git-style).
         hash: String,
@@ -810,7 +810,7 @@ enum TrackCommands {
     /// List blobs on disk that no live track references (GC candidate list, read-only).
     ///
     /// Reports hard-replace leftovers (reason: "no live facts") and soft-deleted tracks
-    /// (reason: "deleted"). Use `mdma track delete`/`restore` for soft-delete management.
+    /// (reason: "deleted"). Use `mdma library track delete`/`restore` for soft-delete management.
     Orphans,
 }
 
@@ -4601,7 +4601,10 @@ fn handle_track_delete(lib: &LibraryBackend, hash: &str) -> Result<()> {
     let ch = ContentHash::new(hash);
     match lib.track_delete(&ch) {
         Ok(()) => {
-            println!("soft-deleted; recover with `mdma track restore {}`", hash);
+            println!(
+                "soft-deleted; recover with `mdma library track restore {}`",
+                hash
+            );
             Ok(())
         }
         Err(e) => {
@@ -5081,6 +5084,14 @@ fn main() -> Result<()> {
             let lib = connect_library(&cli);
             match command {
                 LibraryCommands::ReindexCovers => handle_library_reindex_covers(&lib),
+                LibraryCommands::Track { command } => match command {
+                    TrackCommands::Delete { hash } => handle_track_delete(&lib, hash),
+                    TrackCommands::Restore { hash } => handle_track_restore(&lib, hash),
+                    TrackCommands::Replace { old_hash, new_file } => {
+                        handle_track_replace(&lib, old_hash, new_file)
+                    }
+                    TrackCommands::Orphans => handle_track_orphans(&lib),
+                },
             }
         }
 
@@ -5131,18 +5142,6 @@ fn main() -> Result<()> {
                     ServiceModeCommands::Disable => handle_admin_service_mode_disable(&admin),
                 },
                 AdminCommands::Reboot => handle_admin_reboot(&admin),
-            }
-        }
-
-        Commands::Track { command } => {
-            let lib = connect_library(&cli);
-            match command {
-                TrackCommands::Delete { hash } => handle_track_delete(&lib, hash),
-                TrackCommands::Restore { hash } => handle_track_restore(&lib, hash),
-                TrackCommands::Replace { old_hash, new_file } => {
-                    handle_track_replace(&lib, old_hash, new_file)
-                }
-                TrackCommands::Orphans => handle_track_orphans(&lib),
             }
         }
     }
@@ -7206,16 +7205,19 @@ mod tests {
 
     #[test]
     fn track_delete_parses_correctly() {
-        let result = Cli::try_parse_from(["mdma", "track", "delete", "abc123"]);
+        let result = Cli::try_parse_from(["mdma", "library", "track", "delete", "abc123"]);
         assert!(
             result.is_ok(),
-            "clap rejected track delete: {}",
+            "clap rejected library track delete: {}",
             result.unwrap_err()
         );
         let cli = result.unwrap();
         match cli.command {
-            Commands::Track {
-                command: TrackCommands::Delete { hash },
+            Commands::Library {
+                command:
+                    LibraryCommands::Track {
+                        command: TrackCommands::Delete { hash },
+                    },
             } => {
                 assert_eq!(hash, "abc123");
             }
@@ -7225,16 +7227,19 @@ mod tests {
 
     #[test]
     fn track_restore_parses_correctly() {
-        let result = Cli::try_parse_from(["mdma", "track", "restore", "abc123"]);
+        let result = Cli::try_parse_from(["mdma", "library", "track", "restore", "abc123"]);
         assert!(
             result.is_ok(),
-            "clap rejected track restore: {}",
+            "clap rejected library track restore: {}",
             result.unwrap_err()
         );
         let cli = result.unwrap();
         match cli.command {
-            Commands::Track {
-                command: TrackCommands::Restore { hash },
+            Commands::Library {
+                command:
+                    LibraryCommands::Track {
+                        command: TrackCommands::Restore { hash },
+                    },
             } => {
                 assert_eq!(hash, "abc123");
             }
@@ -7246,6 +7251,7 @@ mod tests {
     fn track_replace_parses_correctly() {
         let result = Cli::try_parse_from([
             "mdma",
+            "library",
             "track",
             "replace",
             "abc123",
@@ -7253,13 +7259,16 @@ mod tests {
         ]);
         assert!(
             result.is_ok(),
-            "clap rejected track replace: {}",
+            "clap rejected library track replace: {}",
             result.unwrap_err()
         );
         let cli = result.unwrap();
         match cli.command {
-            Commands::Track {
-                command: TrackCommands::Replace { old_hash, new_file },
+            Commands::Library {
+                command:
+                    LibraryCommands::Track {
+                        command: TrackCommands::Replace { old_hash, new_file },
+                    },
             } => {
                 assert_eq!(old_hash, "abc123");
                 assert_eq!(new_file, "/music/inbox/new.flac");
@@ -7270,16 +7279,19 @@ mod tests {
 
     #[test]
     fn track_orphans_parses_correctly() {
-        let result = Cli::try_parse_from(["mdma", "track", "orphans"]);
+        let result = Cli::try_parse_from(["mdma", "library", "track", "orphans"]);
         assert!(
             result.is_ok(),
-            "clap rejected track orphans: {}",
+            "clap rejected library track orphans: {}",
             result.unwrap_err()
         );
         let cli = result.unwrap();
         match cli.command {
-            Commands::Track {
-                command: TrackCommands::Orphans,
+            Commands::Library {
+                command:
+                    LibraryCommands::Track {
+                        command: TrackCommands::Orphans,
+                    },
             } => {}
             other => panic!("unexpected command: {:?}", other),
         }

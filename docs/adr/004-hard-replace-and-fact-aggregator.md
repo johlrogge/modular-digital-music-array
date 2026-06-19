@@ -38,7 +38,7 @@ replacement.
   standing).
 
 - **Hard replace = retract-all-old + `Replaces(old)` on new.** `SupersededBy` is
-  removed. `track replace`:
+  removed. `library track replace`:
   1. gathers the old track's `Replaces(*)` ancestors from provenance (before retraction);
   2. ingests the new file;
   3. asserts `Replaces(old)` plus all inherited ancestors on the NEW track (deduped);
@@ -58,7 +58,7 @@ replacement.
   rewrite handles the common case; lazy repair covers playlists not present at
   replace time.
 
-- **Orphans redefined.** `mdma track orphans` walks `{music_dir}/blobs/**` and lists any
+- **Orphans redefined.** `mdma library track orphans` walks `{music_dir}/blobs/**` and lists any
   blob whose hash is absent from the live index as `OrphanReason::NoLiveFacts` (the
   hard-replace leftover, primary GC candidate). Soft-deleted tracks remain
   `OrphanReason::Deleted`. The `SupersededBy` reason is removed.
