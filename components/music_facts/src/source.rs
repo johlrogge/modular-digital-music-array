@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Source of a fact - who/what created it and where it came from
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FactSource {
     /// Tool that created the fact
     pub tool: String,
@@ -16,7 +16,7 @@ pub struct FactSource {
 }
 
 /// Origin/provenance of music data
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum FactOrigin {
     /// Downloaded/purchased from Beatport

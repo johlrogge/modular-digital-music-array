@@ -42,13 +42,12 @@ struct IndexedTrack {
     source: Option<String>,
     track_number: Option<u32>,
     disc_number: Option<u32>,
-    superseded_by: Option<ContentHash>,
     deleted_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl IndexedTrack {
     fn is_hidden(&self) -> bool {
-        self.deleted_at.is_some() || self.superseded_by.is_some()
+        self.deleted_at.is_some()
     }
 }
 
@@ -364,11 +363,7 @@ impl LibraryService {
                     .iter()
                     .filter(|t| t.is_hidden())
                     .map(|t| {
-                        let reason = if let Some(ref replacement) = t.superseded_by {
-                            OrphanReason::SupersededBy {
-                                replacement: replacement.clone(),
-                            }
-                        } else if let Some(dt) = t.deleted_at {
+                        let reason = if let Some(dt) = t.deleted_at {
                             OrphanReason::Deleted {
                                 timestamp: dt.to_rfc3339(),
                             }
@@ -499,8 +494,8 @@ fn apply_fact(entry: &mut IndexedTrack, value: &MusicValue) {
         MusicValue::TrackNumber(v) => entry.track_number = Some(v.value()),
         MusicValue::DiscNumber(v) => entry.disc_number = Some(v.value()),
         MusicValue::Source(v) => entry.source = Some(v.clone()),
-        MusicValue::SupersededBy { replacement, .. } => {
-            entry.superseded_by = Some(replacement.clone());
+        MusicValue::Replaces(_) => {
+            // Replaces is asserted on the new track; no scalar field needed in stub.
         }
         MusicValue::Deleted { timestamp } => {
             entry.deleted_at = Some(*timestamp);

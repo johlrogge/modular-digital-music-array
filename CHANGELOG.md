@@ -4,6 +4,19 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.24.0] — 2026-06-19
+
+### Changed
+
+- **`mdma library track replace` is now a HARD replace** — the new file is ingested, the old track's facts are fully retracted (the old hash stops resolving entirely, not just hidden), a `Replaces` provenance link is recorded on the new track, and playlists rewire to the new track. Self-healing replacement chains are followed on read, including multi-step chains.
+- **Track lifecycle commands moved under `mdma library track`** — `replace`, `delete`, `restore`, and `orphans` are now subcommands of `mdma library track` (previously top-level `mdma track`).
+
+### Fixed
+
+- **Fact retraction now matches on value AND source** — a metadata correction or single-source retraction no longer clobbers a still-valid value asserted by a different source. Closes #96, closes #2.
+
+---
+
 ## [0.23.0] — 2026-06-12
 
 ### Added
