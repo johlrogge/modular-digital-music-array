@@ -2360,6 +2360,8 @@ mod tests {
             added: None,
             started: None,
             stopped: None,
+            memory_cues: vec![],
+            beat_grid: None,
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.content_hash, "sha256:abc123");
@@ -2390,6 +2392,8 @@ mod tests {
             added: None,
             started: None,
             stopped: None,
+            memory_cues: vec![],
+            beat_grid: None,
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.content_hash, "sha256:deadbeef");
@@ -2420,6 +2424,8 @@ mod tests {
             added: Some("2024-01-15T12:00:00Z".to_string()),
             started: None,
             stopped: None,
+            memory_cues: vec![],
+            beat_grid: None,
         };
         let json = TrackInfoJson::from_track_info(&track);
         assert_eq!(json.disc_number, Some(2));

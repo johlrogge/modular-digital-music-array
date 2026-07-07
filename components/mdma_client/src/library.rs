@@ -391,7 +391,7 @@ fn interpret_tracks(response: LibraryResponse) -> Result<Vec<TrackInfo>, ClientE
 
 fn interpret_track(response: LibraryResponse) -> Result<TrackInfo, ClientError> {
     match response {
-        LibraryResponse::Track(track) => Ok(track),
+        LibraryResponse::Track(track) => Ok(*track),
         LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
         _ => Err(unexpected("GetTrack")),
     }

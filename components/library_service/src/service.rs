@@ -3,9 +3,9 @@
 //! Handles IPC requests and manages library state
 
 use crate::ipc::{
-    Bpm, ContentHash, DurationSeconds, FactType, InboxPath, IngestAllItem, IngestResult,
-    IngestSource, IpcServer, Key, LibraryRequest, LibraryResponse, OrphanInfo, OrphanReason,
-    ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
+    BeatGridInfo, Bpm, ContentHash, CueInfo, DurationSeconds, FactType, InboxPath, IngestAllItem,
+    IngestResult, IngestSource, IpcServer, Key, LibraryRequest, LibraryResponse, OrphanInfo,
+    OrphanReason, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
 };
 use crate::pipeline::{InboxFile, UploadSource};
 use acid_client::AcidClient;
@@ -1394,7 +1394,7 @@ impl LibraryService {
             }
 
             LibraryRequest::GetTrack { hash } => match self.get_track(&hash) {
-                Ok(track) => LibraryResponse::Track(track),
+                Ok(track) => LibraryResponse::Track(Box::new(track)),
                 Err(e) => LibraryResponse::Error(e),
             },
 
@@ -2356,6 +2356,25 @@ impl LibraryService {
             added: t.added_at.map(|dt| dt.to_rfc3339()),
             started: t.last_started.map(|dt| dt.to_rfc3339()),
             stopped: t.last_stopped.map(|dt| dt.to_rfc3339()),
+            memory_cues: t
+                .memory_cues
+                .iter()
+                .map(|c| CueInfo {
+                    position_ms: c.position_ms,
+                    kind: c.kind.clone(),
+                    label: c.label.clone(),
+                    index: c.index,
+                })
+                .collect(),
+            beat_grid: t
+                .beat_grid
+                .and_then(|(first_beat_ms, bpm_f32, beats_per_bar)| {
+                    Bpm::from_f32(bpm_f32).ok().map(|bpm| BeatGridInfo {
+                        first_beat_ms,
+                        bpm,
+                        beats_per_bar,
+                    })
+                }),
         }
     }
 
@@ -7584,6 +7603,86 @@ mod tests {
             }
             other => panic!("expected OrphansList, got {:?}", other),
         }
+    }
+
+    // =========================================================================
+    // Projection → IPC: memory_cues and beat_grid carried in TrackInfo
+    // =========================================================================
+
+    /// TrackInfo returned by GetTrack must carry projected memory_cues and beat_grid
+    /// when the corresponding facts have been asserted.
+    ///
+    /// This test catches B1: the old export path read raw display strings from
+    /// get_facts instead of using the already-projected structured data.
+    #[test]
+    fn track_info_carries_cues_and_grid_after_assertion() {
+        use music_facts::{Bpm, CueKind};
+
+        let hash = ContentHash::new("sha256:cuetest01020304050607080910111213141516");
+
+        let bpm = Bpm::from_f32(128.0).unwrap();
+        let temp = write_facts_file(&[
+            (hash.clone(), MusicValue::Title(Title::new("Cue Track"))),
+            (
+                hash.clone(),
+                MusicValue::FilePath(std::path::PathBuf::from("track.flac")),
+            ),
+            (
+                hash.clone(),
+                MusicValue::BeatGrid {
+                    first_beat_ms: 250,
+                    bpm,
+                    beats_per_bar: 4,
+                },
+            ),
+            (
+                hash.clone(),
+                MusicValue::MemoryCue {
+                    position_ms: 5500,
+                    kind: CueKind::Memory,
+                    label: Some("Intro".to_string()),
+                    index: None,
+                },
+            ),
+            (
+                hash.clone(),
+                MusicValue::MemoryCue {
+                    position_ms: 62000,
+                    kind: CueKind::Hot,
+                    label: Some("Drop".to_string()),
+                    index: Some(0),
+                },
+            ),
+        ]);
+
+        let (service, _dir) = make_service_with_facts(temp.path());
+
+        let resp = service.handle_request(LibraryRequest::GetTrack { hash: hash.clone() });
+        let track_info = match resp {
+            LibraryResponse::Track(t) => *t,
+            other => panic!("expected Track, got {:?}", other),
+        };
+
+        // beat_grid must be populated
+        let grid = track_info
+            .beat_grid
+            .as_ref()
+            .expect("beat_grid should be Some");
+        assert_eq!(grid.first_beat_ms, 250);
+        assert_eq!(grid.bpm, bpm);
+        assert_eq!(grid.beats_per_bar, 4);
+
+        // memory_cues must contain both asserted cues, in assertion order
+        assert_eq!(track_info.memory_cues.len(), 2, "expected 2 cues");
+        assert_eq!(track_info.memory_cues[0].position_ms, 5500);
+        assert!(matches!(track_info.memory_cues[0].kind, CueKind::Memory));
+        assert_eq!(track_info.memory_cues[0].label.as_deref(), Some("Intro"));
+        assert_eq!(track_info.memory_cues[0].index, None);
+
+        assert_eq!(track_info.memory_cues[1].position_ms, 62000);
+        assert!(matches!(track_info.memory_cues[1].kind, CueKind::Hot));
+        assert_eq!(track_info.memory_cues[1].label.as_deref(), Some("Drop"));
+        assert_eq!(track_info.memory_cues[1].index, Some(0));
     }
 }
 

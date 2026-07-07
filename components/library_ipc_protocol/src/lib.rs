@@ -5,7 +5,7 @@
 //! - library-ipc-client (used by CLI and console)
 
 // Re-export types used in the protocol so clients don't need to depend on music-facts
-pub use music_facts::{Bpm, ContentHash, DurationSeconds, Key, MusicValue};
+pub use music_facts::{Bpm, ContentHash, CueKind, DurationSeconds, Key, MusicValue};
 // Re-export query types so clients can use them without depending on library-search directly
 pub use library_search::{
     CamelotLetter, DurationQuery, DurationUnit, KeyQuery, NumericQuery, StringQuery, TrackQuery,
@@ -380,7 +380,7 @@ pub enum LibraryResponse {
     Tracks(Vec<TrackInfo>),
 
     /// Single track.
-    Track(TrackInfo),
+    Track(Box<TrackInfo>),
 
     /// All facts for a track (type, value pairs).
     Facts {
@@ -463,6 +463,29 @@ pub enum LibraryResponse {
 // Data Types
 // ============================================================================
 
+// ============================================================================
+// Cue and BeatGrid protocol structs
+// ============================================================================
+
+/// A single memory/hot cue or loop point as projected from the library.
+///
+/// Mirrors the internal `IndexedCue` but is serialisable over IPC.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CueInfo {
+    pub position_ms: u32,
+    pub kind: CueKind,
+    pub label: Option<String>,
+    pub index: Option<u8>,
+}
+
+/// Projected beat-grid anchor for a track.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BeatGridInfo {
+    pub first_beat_ms: u32,
+    pub bpm: Bpm,
+    pub beats_per_bar: u8,
+}
+
 /// Track information for display.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackInfo {
@@ -489,6 +512,12 @@ pub struct TrackInfo {
     /// ISO 8601 datetime when the track was last stopped. None if never played.
     #[serde(default)]
     pub stopped: Option<String>,
+    /// Projected memory/hot cue and loop points. Empty when none have been asserted.
+    #[serde(default)]
+    pub memory_cues: Vec<CueInfo>,
+    /// Projected beat-grid anchor. None when no BeatGrid fact has been asserted.
+    #[serde(default)]
+    pub beat_grid: Option<BeatGridInfo>,
 }
 
 /// Service status information.
@@ -996,11 +1025,80 @@ mod tests {
             added: None,
             started: None,
             stopped: None,
+            memory_cues: vec![],
+            beat_grid: None,
         };
 
         let json = serde_json::to_string(&track).unwrap();
         let parsed: TrackInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.title, track.title);
         assert_eq!(parsed.content_hash.as_str(), track.content_hash.as_str());
+        assert_eq!(parsed.memory_cues, track.memory_cues);
+        assert_eq!(parsed.beat_grid, track.beat_grid);
+    }
+
+    #[test]
+    fn track_info_with_cues_and_grid_roundtrip() {
+        let track = TrackInfo {
+            content_hash: ContentHash::new("sha256:cuegrid01"),
+            title: Some("Cued Track".to_string()),
+            artist: None,
+            album: None,
+            duration: None,
+            bpm: None,
+            key: None,
+            blob_path: None,
+            cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
+            started: None,
+            stopped: None,
+            memory_cues: vec![
+                CueInfo {
+                    position_ms: 5500,
+                    kind: CueKind::Memory,
+                    label: Some("Intro".to_string()),
+                    index: None,
+                },
+                CueInfo {
+                    position_ms: 62000,
+                    kind: CueKind::Hot,
+                    label: Some("Drop".to_string()),
+                    index: Some(0),
+                },
+            ],
+            beat_grid: Some(BeatGridInfo {
+                first_beat_ms: 250,
+                bpm: Bpm::from_u32(128).unwrap(),
+                beats_per_bar: 4,
+            }),
+        };
+
+        let json = serde_json::to_string(&track).unwrap();
+        let parsed: TrackInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.memory_cues, track.memory_cues);
+        assert_eq!(parsed.beat_grid, track.beat_grid);
+        assert_eq!(parsed.memory_cues.len(), 2);
+        assert_eq!(parsed.memory_cues[0].position_ms, 5500);
+        assert!(matches!(parsed.memory_cues[1].kind, CueKind::Hot));
+        assert_eq!(parsed.beat_grid.as_ref().unwrap().first_beat_ms, 250);
+    }
+
+    /// Old JSON without memory_cues/beat_grid fields must deserialise to empty defaults.
+    #[test]
+    fn track_info_backward_compat_missing_cue_fields() {
+        let json = r#"{"content_hash":"sha256:old","title":null,"artist":null,"album":null,
+            "duration":null,"bpm":null,"key":null,"blob_path":null,"cover_art_path":null,
+            "track_number":null,"disc_number":null,"added":null,"started":null,"stopped":null}"#;
+        let parsed: TrackInfo = serde_json::from_str(json).unwrap();
+        assert!(
+            parsed.memory_cues.is_empty(),
+            "missing field must default to empty vec"
+        );
+        assert!(
+            parsed.beat_grid.is_none(),
+            "missing field must default to None"
+        );
     }
 }

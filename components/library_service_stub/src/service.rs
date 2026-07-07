@@ -5,8 +5,8 @@
 //! ACID, ingestion, or file-system side effects.
 
 use crate::ipc::{
-    Bpm, ContentHash, DurationSeconds, FactType, IpcServer, LibraryRequest, LibraryResponse,
-    OrphanInfo, OrphanReason, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
+    BeatGridInfo, Bpm, ContentHash, CueInfo, DurationSeconds, FactType, IpcServer, LibraryRequest,
+    LibraryResponse, OrphanInfo, OrphanReason, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
 };
 use library_search::{matches_query, TrackFields};
 use music_facts::MusicValue;
@@ -43,6 +43,10 @@ struct IndexedTrack {
     track_number: Option<u32>,
     disc_number: Option<u32>,
     deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Projected cue points (assert-only; retract not handled in stub).
+    memory_cues: Vec<CueInfo>,
+    /// Projected beat-grid anchor (last asserted wins).
+    beat_grid: Option<BeatGridInfo>,
 }
 
 impl IndexedTrack {
@@ -75,6 +79,8 @@ impl IndexedTrack {
             added: None,
             started: None,
             stopped: None,
+            memory_cues: self.memory_cues.clone(),
+            beat_grid: self.beat_grid.clone(),
         }
     }
 
@@ -213,7 +219,7 @@ impl LibraryService {
             }
 
             LibraryRequest::GetTrack { hash } => match self.get_track(&hash) {
-                Ok(track) => LibraryResponse::Track(track),
+                Ok(track) => LibraryResponse::Track(Box::new(track)),
                 Err(e) => LibraryResponse::Error(e),
             },
 
@@ -499,6 +505,30 @@ fn apply_fact(entry: &mut IndexedTrack, value: &MusicValue) {
         }
         MusicValue::Deleted { timestamp } => {
             entry.deleted_at = Some(*timestamp);
+        }
+        MusicValue::MemoryCue {
+            position_ms,
+            kind,
+            label,
+            index,
+        } => {
+            entry.memory_cues.push(CueInfo {
+                position_ms: *position_ms,
+                kind: kind.clone(),
+                label: label.clone(),
+                index: *index,
+            });
+        }
+        MusicValue::BeatGrid {
+            first_beat_ms,
+            bpm,
+            beats_per_bar,
+        } => {
+            entry.beat_grid = Bpm::from_f32(bpm.as_f32()).ok().map(|b| BeatGridInfo {
+                first_beat_ms: *first_beat_ms,
+                bpm: b,
+                beats_per_bar: *beats_per_bar,
+            });
         }
         _ => {} // ignore all other facts (key, format, cover art, timestamps, etc.)
     }

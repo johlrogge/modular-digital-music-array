@@ -1571,7 +1571,7 @@ pub mod merge {
     use std::path::{Path, PathBuf};
 
     use super::path_uri::path_to_file_uri;
-    use super::xml::{RekordboxLibrary, RekordboxPlaylist, RekordboxTrack};
+    use super::xml::{PositionMark, RekordboxLibrary, RekordboxPlaylist, RekordboxTrack};
 
     /// A playlist to create or replace in the export.
     ///
@@ -1639,6 +1639,7 @@ pub mod merge {
         pub bitrate: Option<u32>,
         pub sample_rate: Option<u32>,
         pub location: String,
+        pub position_marks: Vec<PositionMark>,
     }
 
     pub fn plan_export(
@@ -1815,7 +1816,7 @@ pub mod merge {
                         sample_rate: r.sample_rate,
                         location: r.location,
                         tempo_anchor: None,
-                        position_marks: vec![],
+                        position_marks: r.position_marks,
                     }
                 } else if let Some(mut existing_track) = existing_tracks_by_location.remove(loc) {
                     existing_track.track_id = track_id;
@@ -1940,6 +1941,7 @@ pub mod merge {
                 bitrate: None,
                 sample_rate: None,
                 location: location.to_string(),
+                position_marks: vec![],
             }
         }
 

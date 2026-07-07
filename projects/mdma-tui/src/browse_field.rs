@@ -67,6 +67,8 @@ mod tests {
             added: None,
             started: None,
             stopped: None,
+            memory_cues: vec![],
+            beat_grid: None,
         }
     }
 
