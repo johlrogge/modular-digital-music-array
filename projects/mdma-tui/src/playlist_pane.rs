@@ -1126,6 +1126,8 @@ mod tests {
             stopped: None,
             memory_cues: vec![],
             beat_grid: None,
+            role: None,
+            energy: None,
         }
     }
 

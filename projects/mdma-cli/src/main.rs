@@ -9,13 +9,16 @@ use colored::Colorize;
 use event_protocol::{from_topic_message, PlaybackEvent, TOPIC_PLAYBACK};
 use gateway_client::{AdminRequest, AdminResponse, GatewayClient};
 use library_ipc_client::{ClientError, ContentHash, InboxPath, ProtocolError, TrackInfo};
-use library_search::{parse_date_query, parse_numeric_query, parse_string_query, TrackQuery};
+use library_search::{
+    parse_date_query, parse_numeric_query, parse_role_query, parse_string_query, TrackQuery,
+};
 use mdma_client::{
     Deck, IngestSource, LibraryBackend, PlaybackBackend, PlaybackClientError, SourceClient,
     SourceName,
 };
 use music_facts::{
-    Album, Artist, Bpm, DiscNumber, Isrc, Key, MusicValue, Title, TrackNumber, Year,
+    Album, Artist, Bpm, DiscNumber, EnergyLevel, Isrc, Key, MusicValue, Title, TrackNumber,
+    TrackRole, Year,
 };
 use nng::options::Options;
 use rekordbox_xml::{parse_xml, RekordboxTrack};
@@ -161,6 +164,14 @@ enum Commands {
         /// When combined with --started, --played=never takes precedence.
         #[arg(long)]
         played: Option<PlayedFilter>,
+
+        /// Filter by DJ role. Accepted values: opener, build-up, peak, banger, cool-down, closer, filler
+        #[arg(long)]
+        role: Option<String>,
+
+        /// Filter by energy level (1-10). Formats: 7  5..8  7+-2
+        #[arg(long)]
+        energy: Option<String>,
 
         /// Invert the search results — return tracks that do NOT match the filters.
         #[arg(long)]
@@ -609,6 +620,8 @@ enum FactField {
     BeatportLabelUrl,
     BeatportTrackUrl,
     BandcampUrl,
+    Role,
+    Energy,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone)]
@@ -1132,6 +1145,12 @@ fn handle_get(client: &LibraryBackend, hash: String) -> Result<()> {
             if let Some(key) = track.key {
                 println!("Key:      {}", key);
             }
+            if let Some(role) = track.role {
+                println!("Role:     {}", role);
+            }
+            if let Some(energy) = track.energy {
+                println!("Energy:   {}", energy);
+            }
             if let Some(path) = track.blob_path {
                 println!("Path:     {}", path);
             }
@@ -1217,6 +1236,22 @@ fn parse_field_value(field: FactField, raw: &str) -> Result<MusicValue, String> 
         FactField::BeatportLabelUrl => Ok(MusicValue::BeatportLabelUrl(raw.to_string())),
         FactField::BeatportTrackUrl => Ok(MusicValue::BeatportTrackUrl(raw.to_string())),
         FactField::BandcampUrl => Ok(MusicValue::BandcampUrl(raw.to_string())),
+        FactField::Role => raw
+            .parse::<TrackRole>()
+            .map(MusicValue::Role)
+            .map_err(|_| {
+                format!(
+                    "invalid role '{raw}': accepted values are opener, build-up, peak, banger, cool-down, closer, filler"
+                )
+            }),
+        FactField::Energy => {
+            let n = raw
+                .parse::<u8>()
+                .map_err(|e| format!("invalid integer for Energy '{raw}': {e}"))?;
+            let level = EnergyLevel::new(n)
+                .map_err(|e| format!("energy out of range for '{raw}': {e}"))?;
+            Ok(MusicValue::Energy(level))
+        }
     }
 }
 
@@ -1287,6 +1322,8 @@ fn build_track_query(
     stopped_str: Option<String>,
     added_str: Option<String>,
     played: Option<PlayedFilter>,
+    role_str: Option<String>,
+    energy_str: Option<String>,
 ) -> TrackQuery {
     let started = if matches!(played, Some(PlayedFilter::Never)) {
         // --played=never is a shortcut for started=N/A and overrides any --started value.
@@ -1324,6 +1361,24 @@ fn build_track_query(
     } else {
         None
     };
+    let role = if let Some(s) = role_str {
+        match parse_role_query(&s) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("Invalid --role value: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+    let energy = energy_str.map(|s| match parse_numeric_query(&s) {
+        Ok(q) => q,
+        Err(e) => {
+            eprintln!("Invalid --energy value: {}", e);
+            std::process::exit(1);
+        }
+    });
     TrackQuery {
         any_text: any_text.map(|s| parse_string_query(&s)),
         artist: artist.map(|s| parse_string_query(&s)),
@@ -1340,6 +1395,8 @@ fn build_track_query(
         started,
         stopped,
         added,
+        role,
+        energy,
         not: false,
     }
 }
@@ -5011,6 +5068,8 @@ fn main() -> Result<()> {
             stopped,
             added,
             played,
+            role,
+            energy,
             not,
             subcommand,
         } => {
@@ -5039,6 +5098,8 @@ fn main() -> Result<()> {
                     stopped.clone(),
                     added.clone(),
                     played.clone(),
+                    role.clone(),
+                    energy.clone(),
                 );
                 track_query.not = *not;
                 handle_search(&client, &track_query, *no_stdin)
@@ -5310,6 +5371,8 @@ mod tests {
             stopped: None,
             memory_cues: vec![],
             beat_grid: None,
+            role: None,
+            energy: None,
         }
     }
 
@@ -5589,6 +5652,8 @@ mod tests {
             stopped: None,
             memory_cues: vec![],
             beat_grid: None,
+            role: None,
+            energy: None,
         }
     }
 
@@ -5641,6 +5706,8 @@ mod tests {
             stopped: None,
             memory_cues: vec![],
             beat_grid: None,
+            role: None,
+            energy: None,
         };
         let output = std::path::Path::new("/tmp/export");
         let path = export_dest_path(output, &track, "flac");
@@ -5869,6 +5936,8 @@ mod tests {
             stopped: None,
             memory_cues: vec![],
             beat_grid: None,
+            role: None,
+            energy: None,
         }
     }
 
@@ -5953,6 +6022,8 @@ mod tests {
             stopped: None,
             memory_cues: vec![],
             beat_grid: None,
+            role: None,
+            energy: None,
         }
     }
 
@@ -5975,6 +6046,8 @@ mod tests {
             stopped: stopped.map(str::to_string),
             memory_cues: vec![],
             beat_grid: None,
+            role: None,
+            energy: None,
         }
     }
 
@@ -6007,6 +6080,8 @@ mod tests {
             None,
             None,
             Some(PlayedFilter::Never),
+            None,
+            None,
         );
         assert!(
             matches!(query.started, Some(DateQuery::NA)),
@@ -6036,6 +6111,8 @@ mod tests {
             None,
             None,
             Some(PlayedFilter::Never),
+            None,
+            None,
         );
         assert!(
             matches!(query.started, Some(DateQuery::NA)),
@@ -6136,6 +6213,8 @@ mod tests {
                 stopped: None,
                 memory_cues: vec![],
                 beat_grid: None,
+                role: None,
+                energy: None,
             }
         };
         let mut tracks = vec![
@@ -6266,6 +6345,8 @@ mod tests {
             stopped: None,
             memory_cues: vec![],
             beat_grid: None,
+            role: None,
+            energy: None,
         }
     }
 
@@ -6471,6 +6552,8 @@ mod tests {
             stopped: None,
             memory_cues: vec![],
             beat_grid: None,
+            role: None,
+            energy: None,
         }
     }
 
@@ -6959,6 +7042,8 @@ mod tests {
                     stopped: None,
                     memory_cues: vec![],
                     beat_grid: None,
+                    role: None,
+                    energy: None,
                 }
             })
             .collect();
@@ -7009,6 +7094,8 @@ mod tests {
             stopped: None,
             memory_cues: vec![],
             beat_grid: None,
+            role: None,
+            energy: None,
         };
 
         const PIPE_TERM_WIDTH: usize = 200;

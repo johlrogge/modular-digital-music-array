@@ -2615,6 +2615,7 @@ version = "0.10.1"
 dependencies = [
  "library-search",
  "music-facts",
+ "music-primitives",
  "pretty_assertions",
  "rstest",
  "serde",
@@ -2628,6 +2629,7 @@ version = "0.10.1"
 dependencies = [
  "chrono",
  "date-expression",
+ "music-primitives",
  "regex",
  "rstest",
  "serde",
@@ -2669,6 +2671,7 @@ dependencies = [
  "library-ipc-protocol",
  "library-search",
  "music-facts",
+ "music-primitives",
  "nng",
  "serde",
  "serde_json",

@@ -3,6 +3,7 @@ use crate::query::{
     StringQuery, TrackQuery,
 };
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use music_primitives::TrackRole;
 use regex::Regex;
 
 /// Flat track fields used to evaluate a `TrackQuery`.
@@ -25,6 +26,10 @@ pub struct TrackFields<'a> {
     pub last_started: Option<DateTime<Utc>>,
     pub last_stopped: Option<DateTime<Utc>>,
     pub added: Option<DateTime<Utc>>,
+    /// DJ curation role.
+    pub role: Option<TrackRole>,
+    /// Energy level 1–10.
+    pub energy: Option<u8>,
 }
 
 /// Evaluate a `TrackQuery` against a set of track fields, respecting `query.not`.
@@ -130,6 +135,18 @@ fn matches_query_inner(query: &TrackQuery, track: &TrackFields) -> bool {
 
     if let Some(q) = &query.added {
         if !matches_date(q, track.added) {
+            return false;
+        }
+    }
+
+    if let Some(role) = query.role {
+        if !track.role.is_some_and(|r| r == role) {
+            return false;
+        }
+    }
+
+    if let Some(nq) = &query.energy {
+        if !track.energy.is_some_and(|e| matches_numeric(nq, e as f32)) {
             return false;
         }
     }
@@ -320,6 +337,8 @@ mod tests {
             last_started: None,
             last_stopped: None,
             added: None,
+            role: None,
+            energy: None,
         }
     }
 
@@ -594,5 +613,146 @@ mod tests {
                 .into(),
         );
         assert!(matches_query(&q, &f));
+    }
+
+    // =========================================================================
+    // Role query tests
+    // =========================================================================
+
+    #[test]
+    fn role_exact_match() {
+        use music_primitives::TrackRole;
+        let query = TrackQuery {
+            role: Some(TrackRole::Peak),
+            ..Default::default()
+        };
+        let mut fields = empty_fields();
+        fields.role = Some(TrackRole::Peak);
+        assert!(matches_query(&query, &fields));
+    }
+
+    #[test]
+    fn role_no_match_different_role() {
+        use music_primitives::TrackRole;
+        let query = TrackQuery {
+            role: Some(TrackRole::Peak),
+            ..Default::default()
+        };
+        let mut fields = empty_fields();
+        fields.role = Some(TrackRole::Opener);
+        assert!(!matches_query(&query, &fields));
+    }
+
+    #[test]
+    fn role_no_match_when_role_absent() {
+        use music_primitives::TrackRole;
+        let query = TrackQuery {
+            role: Some(TrackRole::Banger),
+            ..Default::default()
+        };
+        let fields = empty_fields(); // role is None
+        assert!(!matches_query(&query, &fields));
+    }
+
+    #[test]
+    fn role_not_inverts_match() {
+        use music_primitives::TrackRole;
+        let query = TrackQuery {
+            role: Some(TrackRole::Closer),
+            not: true,
+            ..Default::default()
+        };
+        let mut fields = empty_fields();
+        fields.role = Some(TrackRole::Closer);
+        // not=true + matching role → false
+        assert!(!matches_query(&query, &fields));
+        // not=true + non-matching role → true
+        fields.role = Some(TrackRole::Opener);
+        assert!(matches_query(&query, &fields));
+    }
+
+    // =========================================================================
+    // Energy query tests
+    // =========================================================================
+
+    #[test]
+    fn energy_exact_match() {
+        let query = TrackQuery {
+            energy: Some(NumericQuery::Exact(7.0)),
+            ..Default::default()
+        };
+        let mut fields = empty_fields();
+        fields.energy = Some(7);
+        assert!(matches_query(&query, &fields));
+    }
+
+    #[test]
+    fn energy_exact_no_match() {
+        let query = TrackQuery {
+            energy: Some(NumericQuery::Exact(7.0)),
+            ..Default::default()
+        };
+        let mut fields = empty_fields();
+        fields.energy = Some(5);
+        assert!(!matches_query(&query, &fields));
+    }
+
+    #[test]
+    fn energy_range_match() {
+        let query = TrackQuery {
+            energy: Some(NumericQuery::Range(5.0, 9.0)),
+            ..Default::default()
+        };
+        let mut fields = empty_fields();
+        fields.energy = Some(7);
+        assert!(matches_query(&query, &fields));
+        fields.energy = Some(5);
+        assert!(matches_query(&query, &fields));
+        fields.energy = Some(9);
+        assert!(matches_query(&query, &fields));
+        fields.energy = Some(4);
+        assert!(!matches_query(&query, &fields));
+        fields.energy = Some(10);
+        assert!(!matches_query(&query, &fields));
+    }
+
+    #[test]
+    fn energy_tolerance_match() {
+        let query = TrackQuery {
+            energy: Some(NumericQuery::Tolerance {
+                value: 7.0,
+                up: 2.0,
+                down: 2.0,
+            }),
+            ..Default::default()
+        };
+        let mut fields = empty_fields();
+        fields.energy = Some(7);
+        assert!(matches_query(&query, &fields));
+        fields.energy = Some(5);
+        assert!(matches_query(&query, &fields));
+        fields.energy = Some(9);
+        assert!(matches_query(&query, &fields));
+        fields.energy = Some(4);
+        assert!(!matches_query(&query, &fields));
+        fields.energy = Some(10);
+        assert!(!matches_query(&query, &fields));
+    }
+
+    #[test]
+    fn energy_no_match_when_absent() {
+        let query = TrackQuery {
+            energy: Some(NumericQuery::Exact(7.0)),
+            ..Default::default()
+        };
+        let fields = empty_fields(); // energy is None
+        assert!(!matches_query(&query, &fields));
+    }
+
+    #[rstest]
+    #[case(TrackQuery { role: Some(music_primitives::TrackRole::Banger), ..Default::default() }, false)]
+    #[case(TrackQuery { energy: Some(NumericQuery::Exact(5.0)), ..Default::default() }, false)]
+    fn is_empty_role_energy(#[case] query: TrackQuery, #[case] is_empty: bool) {
+        assert_eq!(query.is_empty(), is_empty);
     }
 }

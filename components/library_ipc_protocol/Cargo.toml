@@ -14,6 +14,7 @@ interface = "library-ipc-protocol"
 [dependencies]
 library-search = { workspace = true }
 music-facts = { workspace = true }
+music-primitives = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"

@@ -111,7 +111,7 @@ struct IndexedTrackInfo {
     /// DJ curation role (Opener, BuildUp, Peak, etc.) — typed for query-consistency.
     role: Option<music_facts::TrackRole>,
     /// Energy level 1–10
-    energy: Option<u8>,
+    energy: Option<music_facts::EnergyLevel>,
     /// Beat-grid anchor as (first_beat_ms, bpm_f32, beats_per_bar)
     beat_grid: Option<(u32, f32, u8)>,
     /// Memory/hot cue and loop points stored as typed structs.
@@ -353,7 +353,7 @@ fn apply_assert_scalar(
             entry.deleted_at = Some(*timestamp);
         }
         MusicValue::Role(v) => entry.role = Some(*v),
-        MusicValue::Energy(v) => entry.energy = Some(v.value()),
+        MusicValue::Energy(v) => entry.energy = Some(*v),
         MusicValue::BeatGrid {
             first_beat_ms,
             bpm,
@@ -614,7 +614,7 @@ fn apply_retract_scalar(
                 last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Energy(_)))
                     .and_then(|v| {
                         if let MusicValue::Energy(e) = v {
-                            Some(e.value())
+                            Some(e)
                         } else {
                             None
                         }
@@ -2375,6 +2375,8 @@ impl LibraryService {
                         beats_per_bar,
                     })
                 }),
+            role: t.role,
+            energy: t.energy,
         }
     }
 
@@ -2665,6 +2667,8 @@ impl LibraryService {
                     last_started: t.last_started,
                     last_stopped: t.last_stopped,
                     added: t.added_at,
+                    role: t.role,
+                    energy: t.energy.map(u8::from),
                 };
                 matches_query(query, &fields)
             })
@@ -2948,7 +2952,8 @@ mod tests {
     use crate::fact_writer::FactWriter;
     use chrono::{TimeZone, Utc};
     use music_facts::{
-        ContentHash, FactOrigin, FactSource, MusicValue, StartReason, StopReason, Title,
+        ContentHash, EnergyLevel, FactOrigin, FactSource, MusicValue, StartReason, StopReason,
+        Title,
     };
     use pretty_assertions::assert_eq;
     use stainless_facts::{Fact, FactStreamWriter, Operation};
@@ -6264,7 +6269,11 @@ mod tests {
             Some(TrackRole::Peak),
             "file path: role should be Peak"
         );
-        assert_eq!(file_result.energy, Some(8), "file path: energy should be 8");
+        assert_eq!(
+            file_result.energy,
+            Some(EnergyLevel::new(8).unwrap()),
+            "file path: energy should be 8"
+        );
         assert_eq!(
             file_result.beat_grid,
             Some((500, 128.0, 4)),
@@ -6344,7 +6353,7 @@ mod tests {
                     source.clone(),
                 )],
             );
-            assert_eq!(track.energy, Some(5));
+            assert_eq!(track.energy, Some(EnergyLevel::new(5).unwrap()));
         }
 
         // BeatGrid

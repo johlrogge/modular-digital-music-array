@@ -10,6 +10,7 @@ use crate::ipc::{
 };
 use library_search::{matches_query, TrackFields};
 use music_facts::MusicValue;
+use music_primitives::{EnergyLevel, TrackRole};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -47,6 +48,10 @@ struct IndexedTrack {
     memory_cues: Vec<CueInfo>,
     /// Projected beat-grid anchor (last asserted wins).
     beat_grid: Option<BeatGridInfo>,
+    /// DJ curation role.
+    role: Option<TrackRole>,
+    /// Energy level 1–10.
+    energy: Option<EnergyLevel>,
 }
 
 impl IndexedTrack {
@@ -81,6 +86,8 @@ impl IndexedTrack {
             stopped: None,
             memory_cues: self.memory_cues.clone(),
             beat_grid: self.beat_grid.clone(),
+            role: self.role,
+            energy: self.energy,
         }
     }
 
@@ -100,6 +107,8 @@ impl IndexedTrack {
             last_started: None,
             last_stopped: None,
             added: None,
+            role: self.role,
+            energy: self.energy.map(u8::from),
         }
     }
 }
@@ -530,6 +539,8 @@ fn apply_fact(entry: &mut IndexedTrack, value: &MusicValue) {
                 beats_per_bar: *beats_per_bar,
             });
         }
+        MusicValue::Role(v) => entry.role = Some(*v),
+        MusicValue::Energy(v) => entry.energy = Some(*v),
         _ => {} // ignore all other facts (key, format, cover art, timestamps, etc.)
     }
 }

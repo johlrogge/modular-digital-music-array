@@ -6,6 +6,7 @@
 
 // Re-export types used in the protocol so clients don't need to depend on music-facts
 pub use music_facts::{Bpm, ContentHash, CueKind, DurationSeconds, Key, MusicValue};
+pub use music_primitives::{EnergyLevel, TrackRole};
 // Re-export query types so clients can use them without depending on library-search directly
 pub use library_search::{
     CamelotLetter, DurationQuery, DurationUnit, KeyQuery, NumericQuery, StringQuery, TrackQuery,
@@ -518,6 +519,12 @@ pub struct TrackInfo {
     /// Projected beat-grid anchor. None when no BeatGrid fact has been asserted.
     #[serde(default)]
     pub beat_grid: Option<BeatGridInfo>,
+    /// DJ curation role (Opener, BuildUp, Peak, etc.). None when not set.
+    #[serde(default)]
+    pub role: Option<TrackRole>,
+    /// Energy level 1–10. None when not set.
+    #[serde(default)]
+    pub energy: Option<EnergyLevel>,
 }
 
 /// Service status information.
@@ -1027,6 +1034,8 @@ mod tests {
             stopped: None,
             memory_cues: vec![],
             beat_grid: None,
+            role: None,
+            energy: None,
         };
 
         let json = serde_json::to_string(&track).unwrap();
@@ -1073,6 +1082,8 @@ mod tests {
                 bpm: Bpm::from_u32(128).unwrap(),
                 beats_per_bar: 4,
             }),
+            role: None,
+            energy: None,
         };
 
         let json = serde_json::to_string(&track).unwrap();
