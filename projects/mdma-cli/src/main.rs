@@ -6964,6 +6964,8 @@ mod tests {
                 bitrate: None,
                 sample_rate: None,
                 location: loc_mixed.clone(),
+                tempo_anchor: None,
+                position_marks: vec![],
             }],
             playlists: vec![],
         };
