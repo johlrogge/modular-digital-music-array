@@ -35,6 +35,7 @@ members = [
     "components/nng_transport",
     "components/playback_engine",
     "components/playback_primitives",
+    "components/rekordbox_roundtrip",
     "components/rekordbox_xml",
     "components/rpi_eeprom",
     "components/source_protocol",
@@ -103,6 +104,7 @@ music-primitives = { path = "components/music_primitives" }
 nng-transport = { path = "components/nng_transport" }
 playback-engine = { path = "components/playback_engine" }
 playback-primitives = { path = "components/playback_primitives" }
+rekordbox-roundtrip = { path = "components/rekordbox_roundtrip" }
 rekordbox-xml = { path = "components/rekordbox_xml" }
 rpi-eeprom = { path = "components/rpi_eeprom" }
 service = { path = "bases/service" }

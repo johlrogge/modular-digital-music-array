@@ -19,6 +19,7 @@
 //!     title: None, album: None, label: None, genre: None,
 //!     styles: &[], key: None, duration: None, year: None, source: None,
 //!     last_started: None, last_stopped: None, added: None,
+//!     role: None, energy: None,
 //! };
 //!
 //! assert!(matches_query(&query, &fields));
@@ -30,7 +31,7 @@ pub mod query;
 
 pub use eval::{matches_query, TrackFields};
 pub use parse::{
-    parse_date_query, parse_duration_query, parse_key_query, parse_numeric_query,
+    parse_date_query, parse_duration_query, parse_key_query, parse_numeric_query, parse_role_query,
     parse_string_query, ParseError,
 };
 pub use query::{

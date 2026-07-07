@@ -21,6 +21,7 @@ nng = "1.0"
 library-ipc-protocol = { workspace = true }
 library-search = { workspace = true }
 music-facts = { workspace = true }
+music-primitives = { workspace = true }
 
 # Fact stream reading
 stainless-facts = { git = "https://github.com/johlrogge/stainless_facts", rev = "2aa820a808fd5345a1bd59c11d90969bfa84b285" }

@@ -1,4 +1,5 @@
 use chrono::NaiveDate;
+use music_primitives::TrackRole;
 use serde::{Deserialize, Serialize};
 
 /// Search query for tracks. Implicit AND across all non-None fields.
@@ -23,6 +24,14 @@ pub struct TrackQuery {
     pub started: Option<DateQuery>,
     pub stopped: Option<DateQuery>,
     pub added: Option<DateQuery>,
+    /// DJ curation role (Opener, BuildUp, Peak, Banger, CoolDown, Closer, Filler).
+    /// Exact match; accepts the same string forms as `TrackRole::from_str`.
+    #[serde(default)]
+    pub role: Option<TrackRole>,
+    /// Energy level query using the same numeric syntax as bpm/year (1..=10).
+    /// e.g. `7`, `5..8`, `7+-2`
+    #[serde(default)]
+    pub energy: Option<NumericQuery>,
     /// When true, invert the match — return tracks that do NOT match the other filters.
     #[serde(default)]
     pub not: bool,
@@ -46,6 +55,8 @@ impl TrackQuery {
             && self.started.is_none()
             && self.stopped.is_none()
             && self.added.is_none()
+            && self.role.is_none()
+            && self.energy.is_none()
     }
 }
 

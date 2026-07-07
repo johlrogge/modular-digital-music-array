@@ -1,0 +1,17 @@
+[package]
+name = "rekordbox-roundtrip"
+version = "0.11.1"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/johlrogge/modular-digital-music-array"
+license = "MIT"
+
+[package.metadata.polylith]
+interface = "rekordbox-roundtrip"
+
+[dependencies]
+rekordbox-xml = { workspace = true }
+music-facts = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = "1"

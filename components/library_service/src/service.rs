@@ -3,9 +3,9 @@
 //! Handles IPC requests and manages library state
 
 use crate::ipc::{
-    Bpm, ContentHash, DurationSeconds, FactType, InboxPath, IngestAllItem, IngestResult,
-    IngestSource, IpcServer, Key, LibraryRequest, LibraryResponse, OrphanInfo, OrphanReason,
-    ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
+    BeatGridInfo, Bpm, ContentHash, CueInfo, DurationSeconds, FactType, InboxPath, IngestAllItem,
+    IngestResult, IngestSource, IpcServer, Key, LibraryRequest, LibraryResponse, OrphanInfo,
+    OrphanReason, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
 };
 use crate::pipeline::{InboxFile, UploadSource};
 use acid_client::AcidClient;
@@ -71,6 +71,18 @@ pub struct LibraryService {
     acid_events_socket: String,
 }
 
+/// A single memory cue, hot cue, or loop point stored in the in-memory index.
+///
+/// Stores `kind` as the typed `CueKind` (not a display string) for query-consistency
+/// and correct equality checks during retraction.
+#[derive(Clone, Debug, PartialEq)]
+struct IndexedCue {
+    position_ms: u32,
+    kind: music_facts::CueKind,
+    label: Option<String>,
+    index: Option<u8>,
+}
+
 /// Track info stored in memory for search
 #[derive(Clone)]
 struct IndexedTrackInfo {
@@ -96,11 +108,19 @@ struct IndexedTrackInfo {
     item_id: Option<String>,
     /// Set when a Deleted fact has been asserted (track is hidden).
     deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// DJ curation role (Opener, BuildUp, Peak, etc.) — typed for query-consistency.
+    role: Option<music_facts::TrackRole>,
+    /// Energy level 1–10
+    energy: Option<music_facts::EnergyLevel>,
+    /// Beat-grid anchor as (first_beat_ms, bpm_f32, beats_per_bar)
+    beat_grid: Option<(u32, f32, u8)>,
+    /// Memory/hot cue and loop points stored as typed structs.
+    memory_cues: Vec<IndexedCue>,
     /// Per-source provenance: ordered list of (value, source) assertions still live.
     ///
     /// Used to correctly handle retractions: Retract(value=V, source=S) removes the
     /// first matching pair, then the scalar field is re-resolved from whatever remains.
-    /// For multi-valued fields (StyleDescriptor) each assertion contributes a separate entry.
+    /// For multi-valued fields (StyleDescriptor, MemoryCue) each assertion contributes a separate entry.
     provenance: Vec<(MusicValue, music_facts::FactSource)>,
     /// Raw FilePath value stored during fact application.
     ///
@@ -135,6 +155,10 @@ impl IndexedTrackInfo {
             added_at: None,
             item_id: None,
             deleted_at: None,
+            role: None,
+            energy: None,
+            beat_grid: None,
+            memory_cues: vec![],
             provenance: Vec::new(),
             raw_file_path: None,
         }
@@ -327,6 +351,28 @@ fn apply_assert_scalar(
         }
         MusicValue::Deleted { timestamp } => {
             entry.deleted_at = Some(*timestamp);
+        }
+        MusicValue::Role(v) => entry.role = Some(*v),
+        MusicValue::Energy(v) => entry.energy = Some(*v),
+        MusicValue::BeatGrid {
+            first_beat_ms,
+            bpm,
+            beats_per_bar,
+        } => {
+            entry.beat_grid = Some((*first_beat_ms, bpm.as_f32(), *beats_per_bar));
+        }
+        MusicValue::MemoryCue {
+            position_ms,
+            kind,
+            label,
+            index,
+        } => {
+            entry.memory_cues.push(IndexedCue {
+                position_ms: *position_ms,
+                kind: kind.clone(),
+                label: label.clone(),
+                index: *index,
+            });
         }
         _ => {}
     }
@@ -552,6 +598,70 @@ fn apply_retract_scalar(
                 Some(MusicValue::Deleted { timestamp }) => Some(timestamp),
                 _ => None,
             };
+        }
+        MusicValue::Role(_) => {
+            entry.role = last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Role(_)))
+                .and_then(|v| {
+                    if let MusicValue::Role(r) = v {
+                        Some(r)
+                    } else {
+                        None
+                    }
+                });
+        }
+        MusicValue::Energy(_) => {
+            entry.energy =
+                last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Energy(_)))
+                    .and_then(|v| {
+                        if let MusicValue::Energy(e) = v {
+                            Some(e)
+                        } else {
+                            None
+                        }
+                    });
+        }
+        MusicValue::BeatGrid { .. } => {
+            entry.beat_grid = last_surviving(&entry.provenance, &|v| {
+                matches!(v, MusicValue::BeatGrid { .. })
+            })
+            .and_then(|v| {
+                if let MusicValue::BeatGrid {
+                    first_beat_ms,
+                    bpm,
+                    beats_per_bar,
+                } = v
+                {
+                    Some((first_beat_ms, bpm.as_f32(), beats_per_bar))
+                } else {
+                    None
+                }
+            });
+        }
+        MusicValue::MemoryCue { .. } => {
+            // Rebuild the full memory_cues Vec from surviving provenance,
+            // mirroring the StyleDescriptor retraction pattern.
+            entry.memory_cues = entry
+                .provenance
+                .iter()
+                .filter_map(|(v, _)| {
+                    if let MusicValue::MemoryCue {
+                        position_ms,
+                        kind,
+                        label,
+                        index,
+                    } = v
+                    {
+                        Some(IndexedCue {
+                            position_ms: *position_ms,
+                            kind: kind.clone(),
+                            label: label.clone(),
+                            index: *index,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
         }
         // TrackStarted/TrackStopped/FilePath/AddedAt retractions are not
         // emitted in the current codebase; ignore silently.
@@ -1284,7 +1394,7 @@ impl LibraryService {
             }
 
             LibraryRequest::GetTrack { hash } => match self.get_track(&hash) {
-                Ok(track) => LibraryResponse::Track(track),
+                Ok(track) => LibraryResponse::Track(Box::new(track)),
                 Err(e) => LibraryResponse::Error(e),
             },
 
@@ -2246,6 +2356,27 @@ impl LibraryService {
             added: t.added_at.map(|dt| dt.to_rfc3339()),
             started: t.last_started.map(|dt| dt.to_rfc3339()),
             stopped: t.last_stopped.map(|dt| dt.to_rfc3339()),
+            memory_cues: t
+                .memory_cues
+                .iter()
+                .map(|c| CueInfo {
+                    position_ms: c.position_ms,
+                    kind: c.kind.clone(),
+                    label: c.label.clone(),
+                    index: c.index,
+                })
+                .collect(),
+            beat_grid: t
+                .beat_grid
+                .and_then(|(first_beat_ms, bpm_f32, beats_per_bar)| {
+                    Bpm::from_f32(bpm_f32).ok().map(|bpm| BeatGridInfo {
+                        first_beat_ms,
+                        bpm,
+                        beats_per_bar,
+                    })
+                }),
+            role: t.role,
+            energy: t.energy,
         }
     }
 
@@ -2536,6 +2667,8 @@ impl LibraryService {
                     last_started: t.last_started,
                     last_stopped: t.last_stopped,
                     added: t.added_at,
+                    role: t.role,
+                    energy: t.energy.map(u8::from),
                 };
                 matches_query(query, &fields)
             })
@@ -2758,77 +2891,34 @@ impl LibraryService {
         // Write facts via fact store
         self.acid_client.write_music_facts(&content_hash, &facts)?;
 
-        // Update in-memory index
+        // Update in-memory index via the shared aggregation path.
+        //
+        // Previously this block hand-rolled a subset projection loop that omitted
+        // role/energy/beat_grid/memory_cues — the same divergence class that caused
+        // the 0.24.1 hotfix.  Now we drive `apply_fact_to_track` for every fact,
+        // exactly as the file-load and incremental paths do, then override blob_path
+        // with the authoritative value from the import pipeline.
         {
             let mut tracks = self.tracks.lock().unwrap();
-
-            // Extract metadata from facts for the index
-            let mut title = None;
-            let mut artist = None;
-            let mut album = None;
-            let mut label = None;
-            let mut genre = None;
-            let mut styles: Vec<String> = vec![];
-            let mut duration_seconds = None;
-            let mut bpm = None;
-            let mut key = None;
-            let mut year = None;
-            let mut source_str = None;
-            let mut track_number = None;
-            let mut disc_number = None;
-            let mut item_id_str = None;
-
-            for (value, _source) in &facts {
-                match value {
-                    MusicValue::Title(t) => title = Some(t.as_str().to_string()),
-                    MusicValue::Artist(a) => artist = Some(a.as_str().to_string()),
-                    MusicValue::Album(a) => album = Some(a.as_str().to_string()),
-                    MusicValue::Label(l) => label = Some(l.clone()),
-                    MusicValue::MainGenre(g) => genre = Some(g.clone()),
-                    MusicValue::StyleDescriptor(s) => styles.push(s.clone()),
-                    MusicValue::DurationSeconds(d) => duration_seconds = Some(d.value()),
-                    MusicValue::Bpm(b) => bpm = Some(b.as_f32()),
-                    MusicValue::Key(k) => key = Some(k.to_string()),
-                    MusicValue::Year(y) => year = Some(y.value()),
-                    MusicValue::Source(s) => source_str = Some(s.clone()),
-                    MusicValue::TrackNumber(n) => track_number = Some(n.value()),
-                    MusicValue::DiscNumber(n) => disc_number = Some(n.value()),
-                    MusicValue::ItemId(id) => item_id_str = Some(id.clone()),
-                    _ => {}
-                }
+            let ts = chrono::Utc::now();
+            let mut entry = IndexedTrackInfo::new_empty(content_hash.as_str().to_owned());
+            for (value, fact_src) in &facts {
+                apply_fact_to_track(
+                    &mut entry,
+                    value,
+                    ts,
+                    stainless_facts::Operation::Assert,
+                    fact_src,
+                    None,
+                    None,
+                );
             }
-
-            tracks.push(IndexedTrackInfo {
-                content_hash: content_hash.clone(),
-                title,
-                artist,
-                album,
-                label,
-                genre,
-                styles,
-                duration_seconds,
-                bpm,
-                key,
-                year,
-                source: source_str,
-                blob_path: indexed.blob_path,
-                cover_art_path: cover_art_path.clone(),
-                track_number,
-                disc_number,
-                last_started: None,
-                last_stopped: None,
-                added_at: None,
-                item_id: item_id_str,
-                deleted_at: None,
-                // Provenance is not populated for the ingest path (facts are not
-                // individually tracked here). Retraction via retract_source_facts
-                // reads directly from ACID, so provenance is not needed for this path.
-                provenance: Vec::new(),
-                // raw_file_path is only needed for deferred blob_path derivation
-                // in the aggregate_facts bulk path; the ingest path sets blob_path
-                // directly from the indexed track, so no deferral is needed.
-                raw_file_path: None,
-            });
+            // blob_path is derived from the FilePath fact inside apply_fact_to_track
+            // via blob_path_for — the result is always RELATIVE (blobs/<2ch>/<hash>.<ext>).
+            // Do NOT override it with indexed.blob_path here; that field carries the
+            // ABSOLUTE path from the import pipeline and would cause divergence between
+            // fresh-ingest output and every other projection path (file, bulk, stream).
+            tracks.push(entry);
         }
 
         // Update fact index
@@ -2862,7 +2952,8 @@ mod tests {
     use crate::fact_writer::FactWriter;
     use chrono::{TimeZone, Utc};
     use music_facts::{
-        ContentHash, FactOrigin, FactSource, MusicValue, StartReason, StopReason, Title,
+        ContentHash, EnergyLevel, FactOrigin, FactSource, MusicValue, StartReason, StopReason,
+        Title,
     };
     use pretty_assertions::assert_eq;
     use stainless_facts::{Fact, FactStreamWriter, Operation};
@@ -5733,6 +5824,40 @@ mod tests {
             .unwrap_or_else(|| IndexedTrackInfo::new_empty(hash.as_str().to_owned()))
     }
 
+    /// Model the ingest-path in-memory projection (service.rs ~2880-2898):
+    /// `new_empty` + `apply_fact_to_track` loop.
+    ///
+    /// Mirrors `ingest_file_internal` after the fix: `apply_fact_to_track`
+    /// derives the correct relative blob_path from the FilePath fact via
+    /// `blob_path_for`, so no override is needed.  If the override is ever
+    /// re-introduced to this helper or to `ingest_file_internal`, the
+    /// companion test `blob_path_is_relative_on_ingest_path` will fail again.
+    fn apply_ingest_path(
+        hash: &ContentHash,
+        facts: &[(
+            ContentHash,
+            MusicValue,
+            chrono::DateTime<Utc>,
+            Operation,
+            FactSource,
+        )],
+    ) -> IndexedTrackInfo {
+        let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut entry = IndexedTrackInfo::new_empty(hash.as_str().to_owned());
+        for (_, value, _, _, src) in facts {
+            apply_fact_to_track(
+                &mut entry,
+                value,
+                ts,
+                stainless_facts::Operation::Assert,
+                src,
+                None,
+                None,
+            );
+        }
+        entry
+    }
+
     /// Assert that two IndexedTrackInfo values agree on the scalar fields that
     /// retraction semantics apply to. Panics with a descriptive message on mismatch.
     fn assert_scalar_fields_eq(case: &str, a: &IndexedTrackInfo, b: &IndexedTrackInfo) {
@@ -5750,6 +5875,42 @@ mod tests {
         assert_eq!(
             a.album, b.album,
             "case '{}': album diverges between paths",
+            case
+        );
+        assert_eq!(a.key, b.key, "case '{}': key diverges between paths", case);
+        assert_eq!(
+            a.year, b.year,
+            "case '{}': year diverges between paths",
+            case
+        );
+        assert_eq!(
+            a.item_id, b.item_id,
+            "case '{}': item_id diverges between paths",
+            case
+        );
+        assert_eq!(
+            a.styles, b.styles,
+            "case '{}': styles diverges between paths",
+            case
+        );
+        assert_eq!(
+            a.role, b.role,
+            "case '{}': role diverges between paths",
+            case
+        );
+        assert_eq!(
+            a.energy, b.energy,
+            "case '{}': energy diverges between paths",
+            case
+        );
+        assert_eq!(
+            a.beat_grid, b.beat_grid,
+            "case '{}': beat_grid diverges between paths",
+            case
+        );
+        assert_eq!(
+            a.memory_cues, b.memory_cues,
+            "case '{}': memory_cues diverges between paths",
             case
         );
     }
@@ -5985,6 +6146,44 @@ mod tests {
         );
     }
 
+    /// Regression: blob_path must be RELATIVE after the ingest-path projection.
+    ///
+    /// Before the fix, `ingest_file_internal` (service.rs ~2897) overrode the
+    /// correctly-derived relative blob_path with the absolute path produced by
+    /// the import pipeline (`entry.blob_path = indexed.blob_path` where
+    /// `indexed.blob_path` was e.g. `/music/blobs/de/deadbeef1234.flac`).
+    ///
+    /// `apply_fact_to_track` already derives the right relative form from the
+    /// FilePath fact; the override was redundant and wrong.
+    ///
+    /// This test fails until the override is removed from both `apply_ingest_path`
+    /// and `ingest_file_internal`.
+    #[test]
+    fn blob_path_is_relative_on_ingest_path() {
+        let hash = ContentHash::new("sha256:deadbeef1234");
+        let source = FactSource::new("fs", "1.0.0", FactOrigin::Unknown);
+        let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+
+        let facts = vec![(
+            hash.clone(),
+            MusicValue::FilePath(std::path::PathBuf::from("/music/inbox/foo.flac")),
+            ts,
+            Operation::Assert,
+            source.clone(),
+        )];
+
+        let result = apply_ingest_path(&hash, &facts);
+
+        let expected = "blobs/de/deadbeef1234.flac";
+        let actual = result.blob_path.to_string_lossy().to_string();
+        assert_eq!(
+            actual, expected,
+            "ingest path: blob_path must be relative '{}', got '{}' — \
+             regression: the absolute-path override in ingest_file_internal must not return",
+            expected, actual
+        );
+    }
+
     // =========================================================================
     // Fix 2: TrackStarted/TrackStopped must be None after bulk bootstrap
     //
@@ -5992,6 +6191,366 @@ mod tests {
     // timestamp. After the fix, it must NOT populate last_started/last_stopped
     // during bulk load — those are None until refresh_event_timestamps runs.
     // =========================================================================
+
+    // =========================================================================
+    // Increment 1 field tests: Role, Energy, BeatGrid, MemoryCue
+    // =========================================================================
+
+    /// 3-path equivalence: Role + Energy + BeatGrid + MemoryCue asserted and read
+    /// back identically through all three projection paths.
+    #[test]
+    fn equivalence_new_fields_role_energy_beat_grid_memory_cue_all_paths() {
+        use music_facts::{Bpm as BpmValue, CueKind, EnergyLevel, TrackRole};
+
+        let hash = ContentHash::new("sha256:equiv_new_fields_01");
+        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let ts = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+
+        let bpm_128 = BpmValue::from_f32(128.0).unwrap();
+        let facts = vec![
+            (
+                hash.clone(),
+                MusicValue::Role(TrackRole::Peak),
+                ts,
+                Operation::Assert,
+                source.clone(),
+            ),
+            (
+                hash.clone(),
+                MusicValue::Energy(EnergyLevel::new(8).unwrap()),
+                ts,
+                Operation::Assert,
+                source.clone(),
+            ),
+            (
+                hash.clone(),
+                MusicValue::BeatGrid {
+                    first_beat_ms: 500,
+                    bpm: bpm_128,
+                    beats_per_bar: 4,
+                },
+                ts,
+                Operation::Assert,
+                source.clone(),
+            ),
+            (
+                hash.clone(),
+                MusicValue::MemoryCue {
+                    position_ms: 32000,
+                    kind: CueKind::Hot,
+                    label: Some("Drop".to_string()),
+                    index: Some(0),
+                },
+                ts,
+                Operation::Assert,
+                source.clone(),
+            ),
+            (
+                hash.clone(),
+                MusicValue::MemoryCue {
+                    position_ms: 1000,
+                    kind: CueKind::Memory,
+                    label: None,
+                    index: None,
+                },
+                ts,
+                Operation::Assert,
+                source.clone(),
+            ),
+        ];
+
+        let file_result = load_from_file_path(&hash, &facts);
+        let bulk_result = load_from_bulk_path(&hash, &facts);
+        let stream_result = apply_stream_path(&hash, &facts);
+
+        // Verify expected values on file path
+        assert_eq!(
+            file_result.role,
+            Some(TrackRole::Peak),
+            "file path: role should be Peak"
+        );
+        assert_eq!(
+            file_result.energy,
+            Some(EnergyLevel::new(8).unwrap()),
+            "file path: energy should be 8"
+        );
+        assert_eq!(
+            file_result.beat_grid,
+            Some((500, 128.0, 4)),
+            "file path: beat_grid mismatch"
+        );
+        assert_eq!(
+            file_result.memory_cues.len(),
+            2,
+            "file path: expected 2 memory cues"
+        );
+        assert_eq!(
+            file_result.memory_cues[0],
+            IndexedCue {
+                position_ms: 32000,
+                kind: CueKind::Hot,
+                label: Some("Drop".to_string()),
+                index: Some(0),
+            }
+        );
+        assert_eq!(
+            file_result.memory_cues[1],
+            IndexedCue {
+                position_ms: 1000,
+                kind: CueKind::Memory,
+                label: None,
+                index: None,
+            }
+        );
+
+        // All three paths must agree
+        assert_scalar_fields_eq(
+            "new_fields_role_energy_beatgrid_cue bulk==file",
+            &bulk_result,
+            &file_result,
+        );
+        assert_scalar_fields_eq(
+            "new_fields_role_energy_beatgrid_cue stream==file",
+            &stream_result,
+            &file_result,
+        );
+    }
+
+    /// Projection test 2a: each new field populates IndexedTrackInfo from an
+    /// asserted fact (single-path file check — covered more broadly above).
+    #[test]
+    fn projection_new_fields_asserted_individually() {
+        use music_facts::{Bpm as BpmValue, CueKind, EnergyLevel, TrackRole};
+
+        let hash = ContentHash::new("sha256:proj_new_fields_indiv");
+        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let ts = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+
+        // Role
+        {
+            let track = load_from_file_path(
+                &hash,
+                &[(
+                    hash.clone(),
+                    MusicValue::Role(TrackRole::Opener),
+                    ts,
+                    Operation::Assert,
+                    source.clone(),
+                )],
+            );
+            assert_eq!(track.role, Some(TrackRole::Opener));
+        }
+
+        // Energy
+        {
+            let track = load_from_file_path(
+                &hash,
+                &[(
+                    hash.clone(),
+                    MusicValue::Energy(EnergyLevel::new(5).unwrap()),
+                    ts,
+                    Operation::Assert,
+                    source.clone(),
+                )],
+            );
+            assert_eq!(track.energy, Some(EnergyLevel::new(5).unwrap()));
+        }
+
+        // BeatGrid
+        {
+            let bpm = BpmValue::from_f32(140.0).unwrap();
+            let track = load_from_file_path(
+                &hash,
+                &[(
+                    hash.clone(),
+                    MusicValue::BeatGrid {
+                        first_beat_ms: 200,
+                        bpm,
+                        beats_per_bar: 4,
+                    },
+                    ts,
+                    Operation::Assert,
+                    source.clone(),
+                )],
+            );
+            assert_eq!(track.beat_grid, Some((200, 140.0, 4)));
+        }
+
+        // MemoryCue (Loop variant)
+        {
+            let track = load_from_file_path(
+                &hash,
+                &[(
+                    hash.clone(),
+                    MusicValue::MemoryCue {
+                        position_ms: 64000,
+                        kind: CueKind::Loop { length_ms: 4000 },
+                        label: Some("Chorus".to_string()),
+                        index: Some(2),
+                    },
+                    ts,
+                    Operation::Assert,
+                    source.clone(),
+                )],
+            );
+            assert_eq!(track.memory_cues.len(), 1);
+            assert_eq!(
+                track.memory_cues[0],
+                IndexedCue {
+                    position_ms: 64000,
+                    kind: CueKind::Loop { length_ms: 4000 },
+                    label: Some("Chorus".to_string()),
+                    index: Some(2),
+                }
+            );
+        }
+    }
+
+    /// Projection test 2b: Retract(Role=Opener) while Role=Peak is live → Peak remains.
+    ///
+    /// This is the #96-guard on the multi-valued retraction path for Role.
+    #[test]
+    fn projection_retract_wrong_role_leaves_live_role_standing() {
+        use music_facts::TrackRole;
+
+        let hash = ContentHash::new("sha256:proj_role_retract_guard");
+        let source_a = FactSource::new("source-a", "1.0.0", FactOrigin::Unknown);
+        let source_b = FactSource::new("source-b", "1.0.0", FactOrigin::Unknown);
+        let ts = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+
+        // source-a asserts Peak; source-b attempts to retract Opener (no-match).
+        let facts = vec![
+            (
+                hash.clone(),
+                MusicValue::Role(TrackRole::Peak),
+                ts,
+                Operation::Assert,
+                source_a.clone(),
+            ),
+            (
+                hash.clone(),
+                MusicValue::Role(TrackRole::Opener),
+                ts,
+                Operation::Retract,
+                source_b.clone(),
+            ),
+        ];
+
+        let file_result = load_from_file_path(&hash, &facts);
+        let bulk_result = load_from_bulk_path(&hash, &facts);
+        let stream_result = apply_stream_path(&hash, &facts);
+
+        assert_eq!(
+            file_result.role,
+            Some(TrackRole::Peak),
+            "#96-guard file: Retract(Role=Opener) must not clear live Role=Peak"
+        );
+        assert_scalar_fields_eq("role_retract_guard bulk==file", &bulk_result, &file_result);
+        assert_scalar_fields_eq(
+            "role_retract_guard stream==file",
+            &stream_result,
+            &file_result,
+        );
+    }
+
+    /// Projection test 2c: multiple MemoryCue asserts + retracting one leaves the others.
+    #[test]
+    fn projection_retract_one_memory_cue_leaves_others() {
+        use music_facts::CueKind;
+
+        let hash = ContentHash::new("sha256:proj_cue_partial_retract");
+        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let ts = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+
+        let cue_drop = MusicValue::MemoryCue {
+            position_ms: 32000,
+            kind: CueKind::Hot,
+            label: Some("Drop".to_string()),
+            index: Some(0),
+        };
+        let cue_intro = MusicValue::MemoryCue {
+            position_ms: 1000,
+            kind: CueKind::Memory,
+            label: Some("Intro".to_string()),
+            index: None,
+        };
+        let cue_loop = MusicValue::MemoryCue {
+            position_ms: 64000,
+            kind: CueKind::Loop { length_ms: 4000 },
+            label: None,
+            index: Some(1),
+        };
+
+        // Assert all three, then retract the middle one (Drop).
+        let facts = vec![
+            (
+                hash.clone(),
+                cue_drop.clone(),
+                ts,
+                Operation::Assert,
+                source.clone(),
+            ),
+            (
+                hash.clone(),
+                cue_intro.clone(),
+                ts,
+                Operation::Assert,
+                source.clone(),
+            ),
+            (
+                hash.clone(),
+                cue_loop.clone(),
+                ts,
+                Operation::Assert,
+                source.clone(),
+            ),
+            (
+                hash.clone(),
+                cue_drop.clone(),
+                ts,
+                Operation::Retract,
+                source.clone(),
+            ),
+        ];
+
+        let file_result = load_from_file_path(&hash, &facts);
+        let bulk_result = load_from_bulk_path(&hash, &facts);
+        let stream_result = apply_stream_path(&hash, &facts);
+
+        // Only Intro and Loop should remain
+        assert_eq!(
+            file_result.memory_cues.len(),
+            2,
+            "file: Drop retracted — 2 cues remain"
+        );
+        assert_eq!(
+            file_result.memory_cues[0],
+            IndexedCue {
+                position_ms: 1000,
+                kind: CueKind::Memory,
+                label: Some("Intro".to_string()),
+                index: None,
+            },
+            "file: Intro cue should survive"
+        );
+        assert_eq!(
+            file_result.memory_cues[1],
+            IndexedCue {
+                position_ms: 64000,
+                kind: CueKind::Loop { length_ms: 4000 },
+                label: None,
+                index: Some(1),
+            },
+            "file: Loop cue should survive"
+        );
+
+        assert_scalar_fields_eq("cue_partial_retract bulk==file", &bulk_result, &file_result);
+        assert_scalar_fields_eq(
+            "cue_partial_retract stream==file",
+            &stream_result,
+            &file_result,
+        );
+    }
 
     // =========================================================================
     // Lazy playlist repair via reverse-Replaces chain
@@ -7053,6 +7612,86 @@ mod tests {
             }
             other => panic!("expected OrphansList, got {:?}", other),
         }
+    }
+
+    // =========================================================================
+    // Projection → IPC: memory_cues and beat_grid carried in TrackInfo
+    // =========================================================================
+
+    /// TrackInfo returned by GetTrack must carry projected memory_cues and beat_grid
+    /// when the corresponding facts have been asserted.
+    ///
+    /// This test catches B1: the old export path read raw display strings from
+    /// get_facts instead of using the already-projected structured data.
+    #[test]
+    fn track_info_carries_cues_and_grid_after_assertion() {
+        use music_facts::{Bpm, CueKind};
+
+        let hash = ContentHash::new("sha256:cuetest01020304050607080910111213141516");
+
+        let bpm = Bpm::from_f32(128.0).unwrap();
+        let temp = write_facts_file(&[
+            (hash.clone(), MusicValue::Title(Title::new("Cue Track"))),
+            (
+                hash.clone(),
+                MusicValue::FilePath(std::path::PathBuf::from("track.flac")),
+            ),
+            (
+                hash.clone(),
+                MusicValue::BeatGrid {
+                    first_beat_ms: 250,
+                    bpm,
+                    beats_per_bar: 4,
+                },
+            ),
+            (
+                hash.clone(),
+                MusicValue::MemoryCue {
+                    position_ms: 5500,
+                    kind: CueKind::Memory,
+                    label: Some("Intro".to_string()),
+                    index: None,
+                },
+            ),
+            (
+                hash.clone(),
+                MusicValue::MemoryCue {
+                    position_ms: 62000,
+                    kind: CueKind::Hot,
+                    label: Some("Drop".to_string()),
+                    index: Some(0),
+                },
+            ),
+        ]);
+
+        let (service, _dir) = make_service_with_facts(temp.path());
+
+        let resp = service.handle_request(LibraryRequest::GetTrack { hash: hash.clone() });
+        let track_info = match resp {
+            LibraryResponse::Track(t) => *t,
+            other => panic!("expected Track, got {:?}", other),
+        };
+
+        // beat_grid must be populated
+        let grid = track_info
+            .beat_grid
+            .as_ref()
+            .expect("beat_grid should be Some");
+        assert_eq!(grid.first_beat_ms, 250);
+        assert_eq!(grid.bpm, bpm);
+        assert_eq!(grid.beats_per_bar, 4);
+
+        // memory_cues must contain both asserted cues, in assertion order
+        assert_eq!(track_info.memory_cues.len(), 2, "expected 2 cues");
+        assert_eq!(track_info.memory_cues[0].position_ms, 5500);
+        assert!(matches!(track_info.memory_cues[0].kind, CueKind::Memory));
+        assert_eq!(track_info.memory_cues[0].label.as_deref(), Some("Intro"));
+        assert_eq!(track_info.memory_cues[0].index, None);
+
+        assert_eq!(track_info.memory_cues[1].position_ms, 62000);
+        assert!(matches!(track_info.memory_cues[1].kind, CueKind::Hot));
+        assert_eq!(track_info.memory_cues[1].label.as_deref(), Some("Drop"));
+        assert_eq!(track_info.memory_cues[1].index, Some(0));
     }
 }
 

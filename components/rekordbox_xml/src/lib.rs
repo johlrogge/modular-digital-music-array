@@ -204,8 +204,37 @@ pub mod path_uri {
 // =============================================================================
 
 pub mod xml {
+    /// Beat-grid anchor from a Rekordbox `<TEMPO>` element.
+    ///
+    /// When `None` on a track, the written TEMPO element defaults to
+    /// `Inizio="0.000"` to preserve backward-compatibility with the
+    /// existing export format.
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct TempoAnchor {
+        /// Position of the first beat in seconds.
+        pub inizio_seconds: f64,
+    }
+
+    /// A cue point or loop marker from a Rekordbox `<POSITION_MARK>` element.
+    ///
+    /// Unknown attributes (e.g. `Red`, `Green`, `Blue` from Rekordbox 6
+    /// colour metadata) are silently ignored during parsing.
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct PositionMark {
+        /// Display name (may be empty for unnamed cue points).
+        pub name: String,
+        /// Rekordbox mark type: `0` = cue / memory cue, `4` = loop.
+        pub mark_type: i32,
+        /// Cue start position in seconds.
+        pub start_seconds: f64,
+        /// Loop end position in seconds (loops only; `None` for non-loop marks).
+        pub end_seconds: Option<f64>,
+        /// Hot-cue slot: `-1` = memory cue, `0..=7` = hot cue.
+        pub num: i32,
+    }
+
     /// A single track entry for the Rekordbox XML collection.
-    #[derive(Clone)]
+    #[derive(Clone, Default)]
     pub struct RekordboxTrack {
         pub track_id: u32,
         pub name: String,
@@ -226,6 +255,10 @@ pub mod xml {
         pub bitrate: Option<u32>,
         pub sample_rate: Option<u32>,
         pub location: String, // file://localhost/ URI
+        /// Beat-grid anchor. `None` produces `Inizio="0.000"` (backward-compat).
+        pub tempo_anchor: Option<TempoAnchor>,
+        /// Cue points and loops. Empty vec produces no `<POSITION_MARK>` output.
+        pub position_marks: Vec<PositionMark>,
     }
 
     /// A playlist entry referencing tracks by ID.
@@ -370,17 +403,40 @@ pub mod xml {
 
         out.push_str(&format!(" Location=\"{}\"", xml_escape(&track.location)));
 
-        if let Some(bpm) = track.average_bpm {
-            // Has BPM: write TEMPO child element
+        let has_children = track.average_bpm.is_some() || !track.position_marks.is_empty();
+        if has_children {
             out.push_str(">\n");
-            out.push_str(&format!(
-                "      <TEMPO Inizio=\"0.000\" Bpm=\"{:.2}\" Metro=\"4/4\" Battito=\"1\"/>\n",
-                bpm
-            ));
+            if let Some(bpm) = track.average_bpm {
+                // When tempo_anchor is None, default to Inizio="0.000" for
+                // backward-compatibility with the existing export format.
+                let inizio = track
+                    .tempo_anchor
+                    .as_ref()
+                    .map_or(0.0_f64, |a| a.inizio_seconds);
+                out.push_str(&format!(
+                    "      <TEMPO Inizio=\"{:.3}\" Bpm=\"{:.2}\" Metro=\"4/4\" Battito=\"1\"/>\n",
+                    inizio, bpm
+                ));
+            }
+            for mark in &track.position_marks {
+                write_position_mark(out, mark);
+            }
             out.push_str("    </TRACK>\n");
         } else {
             out.push_str("/>\n");
         }
+    }
+
+    fn write_position_mark(out: &mut String, mark: &PositionMark) {
+        out.push_str("      <POSITION_MARK");
+        out.push_str(&format!(" Name=\"{}\"", xml_escape(&mark.name)));
+        out.push_str(&format!(" Type=\"{}\"", mark.mark_type));
+        out.push_str(&format!(" Start=\"{:.3}\"", mark.start_seconds));
+        if let Some(end) = mark.end_seconds {
+            out.push_str(&format!(" End=\"{:.3}\"", end));
+        }
+        out.push_str(&format!(" Num=\"{}\"", mark.num));
+        out.push_str("/>\n");
     }
 
     #[cfg(test)]
@@ -409,6 +465,8 @@ pub mod xml {
                     bitrate: Some(1411),
                     sample_rate: Some(44100),
                     location: "file://localhost/music/Test%20Track.aiff".to_string(),
+                    tempo_anchor: None,
+                    position_marks: vec![],
                 }],
                 playlists: vec![RekordboxPlaylist {
                     name: "My Set".to_string(),
@@ -487,6 +545,8 @@ pub mod xml {
                     bitrate: None,
                     sample_rate: None,
                     location: "file://localhost/music/nobpm.mp3".to_string(),
+                    tempo_anchor: None,
+                    position_marks: vec![],
                 }],
                 playlists: vec![],
             };
@@ -551,6 +611,8 @@ pub mod xml {
                     bitrate: None,
                     sample_rate: None,
                     location: "file://localhost/music/track.mp3".to_string(),
+                    tempo_anchor: None,
+                    position_marks: vec![],
                 }],
                 playlists: vec![],
             };
@@ -574,6 +636,149 @@ pub mod xml {
             let xml = lib.to_xml();
             assert!(xml.contains("COLLECTION Entries=\"0\""), "zero entry count");
         }
+
+        #[test]
+        fn xml_tempo_anchor_uses_real_inizio_when_some() {
+            let lib = RekordboxLibrary {
+                tracks: vec![RekordboxTrack {
+                    track_id: 1,
+                    name: "T".to_string(),
+                    artist: "A".to_string(),
+                    album: "".to_string(),
+                    genre: "".to_string(),
+                    kind: "AIFF File".to_string(),
+                    size: 1000,
+                    total_time: 300,
+                    average_bpm: Some(128.0),
+                    tonality: None,
+                    track_number: None,
+                    disc_number: None,
+                    year: None,
+                    label: None,
+                    comment: None,
+                    date_added: None,
+                    bitrate: None,
+                    sample_rate: None,
+                    location: "file://localhost/music/t.aiff".to_string(),
+                    tempo_anchor: Some(TempoAnchor {
+                        inizio_seconds: 1.5,
+                    }),
+                    position_marks: vec![],
+                }],
+                playlists: vec![],
+            };
+            let xml = lib.to_xml();
+            assert!(
+                xml.contains("<TEMPO Inizio=\"1.500\" Bpm=\"128.00\""),
+                "real Inizio should be used: {xml}"
+            );
+        }
+
+        #[test]
+        fn xml_loop_position_mark_includes_end_attribute() {
+            let lib = RekordboxLibrary {
+                tracks: vec![RekordboxTrack {
+                    track_id: 1,
+                    name: "T".to_string(),
+                    artist: "A".to_string(),
+                    album: "".to_string(),
+                    genre: "".to_string(),
+                    kind: "AIFF File".to_string(),
+                    size: 1000,
+                    total_time: 300,
+                    average_bpm: Some(128.0),
+                    tonality: None,
+                    track_number: None,
+                    disc_number: None,
+                    year: None,
+                    label: None,
+                    comment: None,
+                    date_added: None,
+                    bitrate: None,
+                    sample_rate: None,
+                    location: "file://localhost/music/t.aiff".to_string(),
+                    tempo_anchor: None,
+                    position_marks: vec![PositionMark {
+                        name: "Loop".to_string(),
+                        mark_type: 4,
+                        start_seconds: 10.0,
+                        end_seconds: Some(12.0),
+                        num: 0,
+                    }],
+                }],
+                playlists: vec![],
+            };
+            let xml = lib.to_xml();
+            assert!(xml.contains("Type=\"4\""), "loop type should be 4");
+            assert!(
+                xml.contains("End=\"12.000\""),
+                "loop should have End attribute: {xml}"
+            );
+            assert!(
+                xml.contains("Start=\"10.000\""),
+                "loop should have Start attribute"
+            );
+        }
+
+        #[test]
+        fn xml_memory_cue_has_num_minus_one_and_no_end() {
+            let lib = RekordboxLibrary {
+                tracks: vec![RekordboxTrack {
+                    track_id: 1,
+                    name: "T".to_string(),
+                    artist: "A".to_string(),
+                    album: "".to_string(),
+                    genre: "".to_string(),
+                    kind: "AIFF File".to_string(),
+                    size: 1000,
+                    total_time: 300,
+                    average_bpm: Some(128.0),
+                    tonality: None,
+                    track_number: None,
+                    disc_number: None,
+                    year: None,
+                    label: None,
+                    comment: None,
+                    date_added: None,
+                    bitrate: None,
+                    sample_rate: None,
+                    location: "file://localhost/music/t.aiff".to_string(),
+                    tempo_anchor: None,
+                    position_marks: vec![PositionMark {
+                        name: "Intro".to_string(),
+                        mark_type: 0,
+                        start_seconds: 5.5,
+                        end_seconds: None,
+                        num: -1,
+                    }],
+                }],
+                playlists: vec![],
+            };
+            let xml = lib.to_xml();
+            assert!(xml.contains("Num=\"-1\""), "memory cue Num should be -1");
+            assert!(!xml.contains("End="), "non-loop should not have End attr");
+        }
+
+        #[test]
+        fn xml_no_position_marks_produces_no_position_mark_element() {
+            // Tracks with BPM but no cues: no POSITION_MARK, just TEMPO, then /TRACK
+            let xml = make_test_library().to_xml();
+            assert!(
+                !xml.contains("POSITION_MARK"),
+                "no marks → no POSITION_MARK element"
+            );
+        }
+
+        #[test]
+        fn xml_backward_compat_no_anchor_produces_inizio_zero() {
+            // A track with tempo_anchor=None must produce Inizio="0.000" to stay
+            // byte-identical to what was exported before TempoAnchor was added.
+            let xml = make_test_library().to_xml();
+            assert!(
+                xml.contains("Inizio=\"0.000\""),
+                "None anchor must produce Inizio=\"0.000\""
+            );
+        }
     }
 }
 
@@ -582,7 +787,9 @@ pub mod xml {
 // =============================================================================
 
 pub mod parse {
-    use super::xml::{RekordboxLibrary, RekordboxPlaylist, RekordboxTrack};
+    use super::xml::{
+        PositionMark, RekordboxLibrary, RekordboxPlaylist, RekordboxTrack, TempoAnchor,
+    };
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;
     use thiserror::Error;
@@ -673,6 +880,11 @@ pub mod parse {
 
         let mut section = Section::Other;
 
+        // True while the reader is positioned inside a paired <TRACK>...</TRACK>
+        // element in the Collection section (i.e. TRACK with child elements).
+        // Self-closing TRACKs never set this flag.
+        let mut in_collection_track = false;
+
         // Stack of (playlist_name, track_ids) for nested NODE parsing.
         // Empty name = folder/root placeholder (not emitted as a playlist).
         let mut playlist_stack: Vec<(String, Vec<u32>)> = Vec::new();
@@ -690,6 +902,7 @@ pub mod parse {
                     match tag_name {
                         "TRACK" if section == Section::Collection => {
                             process_collection_track(&e, &mut tracks)?;
+                            // Self-closing TRACK: no children, flag stays false.
                         }
                         "TRACK" if section == Section::Playlists => {
                             let attrs = e.attributes();
@@ -710,6 +923,51 @@ pub mod parse {
                                 });
                             }
                         }
+                        // TEMPO and POSITION_MARK are self-closing children of a paired TRACK
+                        // in the COLLECTION section only.  The dual guard prevents a malformed
+                        // TRACK missing its </TRACK> end tag from leaking in_collection_track
+                        // into the PLAYLISTS section.
+                        "TEMPO" if section == Section::Collection && in_collection_track => {
+                            if let Some(track) = tracks.last_mut() {
+                                // First TEMPO wins — ignore subsequent ones.
+                                if track.tempo_anchor.is_none() {
+                                    let attrs = e.attributes();
+                                    if let Some(inizio) = attr_str(&attrs, b"Inizio")
+                                        .and_then(|s| s.parse::<f64>().ok())
+                                    {
+                                        track.tempo_anchor = Some(TempoAnchor {
+                                            inizio_seconds: inizio,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        "POSITION_MARK"
+                            if section == Section::Collection && in_collection_track =>
+                        {
+                            if let Some(track) = tracks.last_mut() {
+                                let attrs = e.attributes();
+                                let name = attr_str(&attrs, b"Name").unwrap_or_default();
+                                let mark_type = attr_str(&attrs, b"Type")
+                                    .and_then(|s| s.parse::<i32>().ok())
+                                    .unwrap_or(0);
+                                let start_seconds = attr_str(&attrs, b"Start")
+                                    .and_then(|s| s.parse::<f64>().ok())
+                                    .unwrap_or(0.0);
+                                let end_seconds =
+                                    attr_str(&attrs, b"End").and_then(|s| s.parse::<f64>().ok());
+                                let num = attr_str(&attrs, b"Num")
+                                    .and_then(|s| s.parse::<i32>().ok())
+                                    .unwrap_or(0);
+                                track.position_marks.push(PositionMark {
+                                    name,
+                                    mark_type,
+                                    start_seconds,
+                                    end_seconds,
+                                    num,
+                                });
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -725,8 +983,9 @@ pub mod parse {
                             section = Section::Playlists;
                         }
                         "TRACK" if section == Section::Collection => {
-                            // TRACK with TEMPO child — process it as a collection track
+                            // Paired TRACK (has children: TEMPO, POSITION_MARK, …)
                             process_collection_track(&e, &mut tracks)?;
+                            in_collection_track = true;
                         }
                         "NODE" if section == Section::Playlists => {
                             let attrs = e.attributes();
@@ -750,9 +1009,15 @@ pub mod parse {
                     match tag_name {
                         "COLLECTION" => {
                             section = Section::Other;
+                            // Reset the flag so a TRACK that leaked through a missing
+                            // </TRACK> end tag cannot bleed into the PLAYLISTS section.
+                            in_collection_track = false;
                         }
                         "PLAYLISTS" => {
                             section = Section::Other;
+                        }
+                        "TRACK" if in_collection_track => {
+                            in_collection_track = false;
                         }
                         "NODE" if section == Section::Playlists && node_depth > 0 => {
                             node_depth -= 1;
@@ -819,6 +1084,8 @@ pub mod parse {
             bitrate,
             sample_rate,
             location,
+            tempo_anchor: None,
+            position_marks: vec![],
         });
         Ok(())
     }
@@ -947,6 +1214,8 @@ pub mod parse {
                     bitrate: Some(1411),
                     sample_rate: Some(44100),
                     location: "file://localhost/music/Round%20Trip.flac".to_string(),
+                    tempo_anchor: None,
+                    position_marks: vec![],
                 }],
                 playlists: vec![RekordboxPlaylist {
                     name: "My Playlist".to_string(),
@@ -996,6 +1265,300 @@ pub mod parse {
             assert_eq!(t.name, "Love Dove (Back to 90's)");
             assert_eq!(t.artist, "DJ & Friends");
         }
+
+        // --- TEMPO anchor and POSITION_MARK parsing tests ---
+
+        #[test]
+        fn parse_tempo_anchor_from_children() {
+            // A TRACK with a TEMPO child having non-zero Inizio must populate tempo_anchor.
+            let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<DJ_PLAYLISTS Version="1.0.0">
+  <PRODUCT Name="rekordbox" Version="6.0.0" Company="AlphaTheta"/>
+  <COLLECTION Entries="1">
+    <TRACK TrackID="1" Name="Anchored" Artist="A" Album="" Genre="" Kind="AIFF File"
+           Size="1000" TotalTime="300" AverageBpm="128.00"
+           Location="file://localhost/music/track.aiff">
+      <TEMPO Inizio="1.500" Bpm="128.00" Metro="4/4" Battito="1"/>
+    </TRACK>
+  </COLLECTION>
+  <PLAYLISTS><NODE Type="0" Name="ROOT" Count="0"/></PLAYLISTS>
+</DJ_PLAYLISTS>"#;
+            let lib = parse_xml(xml).unwrap();
+            assert_eq!(lib.tracks.len(), 1);
+            let t = &lib.tracks[0];
+            let anchor = t
+                .tempo_anchor
+                .as_ref()
+                .expect("tempo_anchor should be Some");
+            assert!(
+                (anchor.inizio_seconds - 1.5).abs() < 1e-9,
+                "inizio should be 1.5, got {}",
+                anchor.inizio_seconds
+            );
+        }
+
+        #[test]
+        fn parse_position_marks_from_children() {
+            let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<DJ_PLAYLISTS Version="1.0.0">
+  <PRODUCT Name="rekordbox" Version="6.0.0" Company="AlphaTheta"/>
+  <COLLECTION Entries="1">
+    <TRACK TrackID="1" Name="Cued" Artist="A" Album="" Genre="" Kind="AIFF File"
+           Size="1000" TotalTime="300" AverageBpm="128.00"
+           Location="file://localhost/music/track.aiff">
+      <TEMPO Inizio="0.000" Bpm="128.00" Metro="4/4" Battito="1"/>
+      <POSITION_MARK Name="Intro" Type="0" Start="5.500" Num="-1"/>
+      <POSITION_MARK Name="Drop" Type="0" Start="62.000" Num="0"/>
+    </TRACK>
+  </COLLECTION>
+  <PLAYLISTS><NODE Type="0" Name="ROOT" Count="0"/></PLAYLISTS>
+</DJ_PLAYLISTS>"#;
+            let lib = parse_xml(xml).unwrap();
+            let t = &lib.tracks[0];
+            assert_eq!(t.position_marks.len(), 2, "expected 2 position marks");
+            let mem_cue = &t.position_marks[0];
+            assert_eq!(mem_cue.name, "Intro");
+            assert_eq!(mem_cue.mark_type, 0);
+            assert_eq!(mem_cue.num, -1);
+            assert!(
+                (mem_cue.start_seconds - 5.5).abs() < 1e-9,
+                "start should be 5.5"
+            );
+            assert!(mem_cue.end_seconds.is_none(), "memory cue has no end");
+            let hot_cue = &t.position_marks[1];
+            assert_eq!(hot_cue.name, "Drop");
+            assert_eq!(hot_cue.num, 0);
+            assert!((hot_cue.start_seconds - 62.0).abs() < 1e-9);
+        }
+
+        #[test]
+        fn roundtrip_with_tempo_anchor_and_position_marks() {
+            use super::super::xml::{PositionMark, RekordboxLibrary, RekordboxTrack, TempoAnchor};
+
+            let original = RekordboxLibrary {
+                tracks: vec![RekordboxTrack {
+                    track_id: 1,
+                    name: "Anchored Track".to_string(),
+                    artist: "DJ Test".to_string(),
+                    album: "Test Album".to_string(),
+                    genre: "Techno".to_string(),
+                    kind: "AIFF File".to_string(),
+                    size: 50_000_000,
+                    total_time: 420,
+                    average_bpm: Some(132.0),
+                    tonality: Some("6B".to_string()),
+                    track_number: None,
+                    disc_number: None,
+                    year: None,
+                    label: None,
+                    comment: None,
+                    date_added: None,
+                    bitrate: Some(1411),
+                    sample_rate: Some(44100),
+                    location: "file://localhost/music/anchored.aiff".to_string(),
+                    tempo_anchor: Some(TempoAnchor {
+                        inizio_seconds: 0.25,
+                    }),
+                    position_marks: vec![
+                        // memory cue: Num=-1
+                        PositionMark {
+                            name: "Intro".to_string(),
+                            mark_type: 0,
+                            start_seconds: 5.5,
+                            end_seconds: None,
+                            num: -1,
+                        },
+                        // hot cue: Num=0
+                        PositionMark {
+                            name: "Drop".to_string(),
+                            mark_type: 0,
+                            start_seconds: 62.0,
+                            end_seconds: None,
+                            num: 0,
+                        },
+                        // loop: Type=4, End set
+                        PositionMark {
+                            name: "Loop".to_string(),
+                            mark_type: 4,
+                            start_seconds: 122.0,
+                            end_seconds: Some(124.0),
+                            num: 1,
+                        },
+                    ],
+                }],
+                playlists: vec![],
+            };
+
+            let xml = original.to_xml();
+            let parsed = parse_xml(&xml).unwrap();
+
+            assert_eq!(parsed.tracks.len(), 1);
+            let t = &parsed.tracks[0];
+
+            let anchor = t
+                .tempo_anchor
+                .as_ref()
+                .expect("tempo_anchor should survive round-trip");
+            assert!(
+                (anchor.inizio_seconds - 0.25).abs() < 1e-9,
+                "inizio round-trips: {}",
+                anchor.inizio_seconds
+            );
+
+            assert_eq!(t.position_marks.len(), 3, "all 3 marks survive round-trip");
+
+            let mem = &t.position_marks[0];
+            assert_eq!(mem.name, "Intro");
+            assert_eq!(mem.mark_type, 0);
+            assert_eq!(mem.num, -1);
+            assert!((mem.start_seconds - 5.5).abs() < 1e-9);
+            assert!(mem.end_seconds.is_none());
+
+            let hot = &t.position_marks[1];
+            assert_eq!(hot.name, "Drop");
+            assert_eq!(hot.mark_type, 0);
+            assert_eq!(hot.num, 0);
+            assert!((hot.start_seconds - 62.0).abs() < 1e-9);
+            assert!(hot.end_seconds.is_none());
+
+            let lp = &t.position_marks[2];
+            assert_eq!(lp.name, "Loop");
+            assert_eq!(lp.mark_type, 4);
+            assert_eq!(lp.num, 1);
+            assert!((lp.start_seconds - 122.0).abs() < 1e-9);
+            let end = lp.end_seconds.expect("loop end should be Some");
+            assert!((end - 124.0).abs() < 1e-9);
+        }
+
+        #[test]
+        fn parser_tolerates_unknown_position_mark_attrs() {
+            // Rekordbox 6 exports include Red/Green/Blue colour attrs — must not crash.
+            let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<DJ_PLAYLISTS Version="1.0.0">
+  <PRODUCT Name="rekordbox" Version="6.0.0" Company="AlphaTheta"/>
+  <COLLECTION Entries="1">
+    <TRACK TrackID="1" Name="T" Artist="A" Album="" Genre="" Kind="AIFF File"
+           Size="1000" TotalTime="300" AverageBpm="128.00"
+           Location="file://localhost/music/t.aiff">
+      <TEMPO Inizio="0.000" Bpm="128.00" Metro="4/4" Battito="1"/>
+      <POSITION_MARK Name="Hot" Type="0" Start="10.000" Num="0" Red="40" Green="226" Blue="20"/>
+    </TRACK>
+  </COLLECTION>
+  <PLAYLISTS><NODE Type="0" Name="ROOT" Count="0"/></PLAYLISTS>
+</DJ_PLAYLISTS>"#;
+            let lib = parse_xml(xml).unwrap();
+            assert_eq!(
+                lib.tracks[0].position_marks.len(),
+                1,
+                "mark should be parsed despite unknown attrs"
+            );
+            assert_eq!(lib.tracks[0].position_marks[0].name, "Hot");
+            assert_eq!(lib.tracks[0].position_marks[0].num, 0);
+        }
+
+        #[test]
+        fn parser_multiple_tempo_first_wins() {
+            // When a TRACK has multiple TEMPO children (defensive), first Inizio wins.
+            let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<DJ_PLAYLISTS Version="1.0.0">
+  <PRODUCT Name="rekordbox" Version="6.0.0" Company="AlphaTheta"/>
+  <COLLECTION Entries="1">
+    <TRACK TrackID="1" Name="T" Artist="A" Album="" Genre="" Kind="AIFF File"
+           Size="1000" TotalTime="300" AverageBpm="128.00"
+           Location="file://localhost/music/t.aiff">
+      <TEMPO Inizio="1.000" Bpm="128.00" Metro="4/4" Battito="1"/>
+      <TEMPO Inizio="2.000" Bpm="128.00" Metro="4/4" Battito="1"/>
+    </TRACK>
+  </COLLECTION>
+  <PLAYLISTS><NODE Type="0" Name="ROOT" Count="0"/></PLAYLISTS>
+</DJ_PLAYLISTS>"#;
+            let lib = parse_xml(xml).unwrap();
+            let anchor = lib.tracks[0]
+                .tempo_anchor
+                .as_ref()
+                .expect("tempo_anchor should be Some");
+            assert!(
+                (anchor.inizio_seconds - 1.0).abs() < 1e-9,
+                "first TEMPO wins, got {}",
+                anchor.inizio_seconds
+            );
+        }
+
+        #[test]
+        fn parse_loop_position_mark_captures_end_seconds() {
+            let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<DJ_PLAYLISTS Version="1.0.0">
+  <PRODUCT Name="rekordbox" Version="6.0.0" Company="AlphaTheta"/>
+  <COLLECTION Entries="1">
+    <TRACK TrackID="1" Name="T" Artist="A" Album="" Genre="" Kind="AIFF File"
+           Size="1000" TotalTime="300" AverageBpm="128.00"
+           Location="file://localhost/music/t.aiff">
+      <TEMPO Inizio="0.000" Bpm="128.00" Metro="4/4" Battito="1"/>
+      <POSITION_MARK Name="MyLoop" Type="4" Start="32.000" End="34.000" Num="2"/>
+    </TRACK>
+  </COLLECTION>
+  <PLAYLISTS><NODE Type="0" Name="ROOT" Count="0"/></PLAYLISTS>
+</DJ_PLAYLISTS>"#;
+            let lib = parse_xml(xml).unwrap();
+            let mark = &lib.tracks[0].position_marks[0];
+            assert_eq!(mark.name, "MyLoop");
+            assert_eq!(mark.mark_type, 4);
+            assert_eq!(mark.num, 2);
+            assert!((mark.start_seconds - 32.0).abs() < 1e-9);
+            let end = mark.end_seconds.expect("loop must have end_seconds");
+            assert!((end - 34.0).abs() < 1e-9);
+        }
+
+        #[test]
+        fn parse_self_closing_track_has_empty_position_marks() {
+            // Self-closing TRACK (no children, no BPM) must have empty position_marks.
+            let lib = parse_xml(SAMPLE_XML).unwrap();
+            let t2 = &lib.tracks[1]; // the self-closing track in SAMPLE_XML
+            assert!(t2.position_marks.is_empty());
+            assert!(t2.tempo_anchor.is_none());
+        }
+
+        #[test]
+        fn tempo_and_position_mark_outside_collection_are_ignored() {
+            // A malformed XML where COLLECTION is missing its </TRACK> end tag (or where
+            // TEMPO/POSITION_MARK appear outside the Collection section) must NOT corrupt
+            // the track list.  The section guard prevents bleed-through into PLAYLISTS.
+            //
+            // This XML has a playlist TRACK (Key="1") followed by a stray TEMPO element.
+            // Without the section guard, the stray TEMPO would modify the last collection
+            // track's tempo_anchor via the leaked in_collection_track flag.
+            let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<DJ_PLAYLISTS Version="1.0.0">
+  <PRODUCT Name="rekordbox" Version="6.0.0" Company="AlphaTheta"/>
+  <COLLECTION Entries="1">
+    <TRACK TrackID="1" Name="Real" Artist="A" Album="" Genre="" Kind="AIFF File"
+           Size="1000" TotalTime="300" AverageBpm="128.00"
+           Location="file://localhost/music/t.aiff">
+      <TEMPO Inizio="1.000" Bpm="128.00" Metro="4/4" Battito="1"/>
+    </TRACK>
+  </COLLECTION>
+  <PLAYLISTS>
+    <NODE Type="0" Name="ROOT" Count="1">
+      <NODE Name="Set" Type="1" KeyType="0" Entries="1">
+        <TRACK Key="1"/>
+        <TEMPO Inizio="99.000" Bpm="999.00" Metro="4/4" Battito="1"/>
+      </NODE>
+    </NODE>
+  </PLAYLISTS>
+</DJ_PLAYLISTS>"#;
+            let lib = parse_xml(xml).unwrap();
+            assert_eq!(lib.tracks.len(), 1);
+            // The stray TEMPO in PLAYLISTS must NOT have overwritten the collection track's anchor.
+            let anchor = lib.tracks[0]
+                .tempo_anchor
+                .as_ref()
+                .expect("anchor from COLLECTION should survive");
+            assert!(
+                (anchor.inizio_seconds - 1.0).abs() < 1e-9,
+                "anchor should be 1.0 from COLLECTION, got {} — stray TEMPO in PLAYLISTS leaked",
+                anchor.inizio_seconds
+            );
+        }
     }
 }
 
@@ -1008,7 +1571,7 @@ pub mod merge {
     use std::path::{Path, PathBuf};
 
     use super::path_uri::path_to_file_uri;
-    use super::xml::{RekordboxLibrary, RekordboxPlaylist, RekordboxTrack};
+    use super::xml::{PositionMark, RekordboxLibrary, RekordboxPlaylist, RekordboxTrack};
 
     /// A playlist to create or replace in the export.
     ///
@@ -1076,6 +1639,7 @@ pub mod merge {
         pub bitrate: Option<u32>,
         pub sample_rate: Option<u32>,
         pub location: String,
+        pub position_marks: Vec<PositionMark>,
     }
 
     pub fn plan_export(
@@ -1251,6 +1815,8 @@ pub mod merge {
                         bitrate: r.bitrate,
                         sample_rate: r.sample_rate,
                         location: r.location,
+                        tempo_anchor: None,
+                        position_marks: r.position_marks,
                     }
                 } else if let Some(mut existing_track) = existing_tracks_by_location.remove(loc) {
                     existing_track.track_id = track_id;
@@ -1350,6 +1916,8 @@ pub mod merge {
                 bitrate: None,
                 sample_rate: None,
                 location: location.to_string(),
+                tempo_anchor: None,
+                position_marks: vec![],
             }
         }
 
@@ -1373,6 +1941,7 @@ pub mod merge {
                 bitrate: None,
                 sample_rate: None,
                 location: location.to_string(),
+                position_marks: vec![],
             }
         }
 
