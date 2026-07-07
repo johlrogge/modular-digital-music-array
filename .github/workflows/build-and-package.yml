@@ -101,7 +101,9 @@ jobs:
       run: devenv shell -- cargo polylith cargo --profile dev build --bin mdma
 
     - name: Unit tests
-      run: devenv shell -- cargo polylith cargo --profile dev test
+      # dj-workspace and bevy-app are laptop-only GUI crates; Vulkan/Wayland/libudev are
+      # intentionally absent from the CI shell (see devenv.nix isCI gate).
+      run: devenv shell -- cargo polylith cargo --profile dev test --workspace --exclude dj-workspace --exclude bevy-app
 
     - name: BDD integration tests
       timeout-minutes: 30
