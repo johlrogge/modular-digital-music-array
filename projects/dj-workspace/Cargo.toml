@@ -12,3 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 bevy-app = { path = "../../bases/bevy-app" }
+client = { path = "../../bases/client" }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

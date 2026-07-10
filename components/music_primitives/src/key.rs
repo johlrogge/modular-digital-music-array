@@ -180,23 +180,14 @@ impl Key {
         )
     }
 
-    /// Get Camelot notation (DJ standard)
+    /// Return the Camelot wheel number (1–12) for this key.
     ///
-    /// Camelot Wheel maps keys to numbers 1-12 and letters A (minor) or B (major)
-    ///
-    /// # Examples
-    /// ```
-    /// # use music_primitives::{Key, KeyError};
-    /// let key = Key::from_traditional("C Major")?;
-    /// assert_eq!(key.to_camelot(), "8B");
-    ///
-    /// let key = Key::from_traditional("A Minor")?;
-    /// assert_eq!(key.to_camelot(), "8A");
-    /// # Ok::<(), KeyError>(())
-    /// ```
-    pub fn to_camelot(&self) -> String {
-        // Camelot wheel mapping
-        let number = match (self.pitch, self.mode) {
+    /// The number encodes harmonic position on the Camelot wheel independently
+    /// of mode (A = minor, B = major). Use [`to_camelot`] to get the full
+    /// `"8B"` / `"8A"` string, or this method when you need the bare number for
+    /// sorting or arithmetic (e.g. `camelot_number()` + 5 mod 12 = Open Key).
+    pub fn camelot_number(&self) -> u8 {
+        match (self.pitch, self.mode) {
             (PitchClass::C, Mode::Major) => 8,
             (PitchClass::C, Mode::Minor) => 5,
             (PitchClass::CSharp, Mode::Major) => 3,
@@ -221,14 +212,29 @@ impl Key {
             (PitchClass::ASharp, Mode::Minor) => 3,
             (PitchClass::B, Mode::Major) => 1,
             (PitchClass::B, Mode::Minor) => 10,
-        };
+        }
+    }
 
+    /// Get Camelot notation (DJ standard)
+    ///
+    /// Camelot Wheel maps keys to numbers 1-12 and letters A (minor) or B (major)
+    ///
+    /// # Examples
+    /// ```
+    /// # use music_primitives::{Key, KeyError};
+    /// let key = Key::from_traditional("C Major")?;
+    /// assert_eq!(key.to_camelot(), "8B");
+    ///
+    /// let key = Key::from_traditional("A Minor")?;
+    /// assert_eq!(key.to_camelot(), "8A");
+    /// # Ok::<(), KeyError>(())
+    /// ```
+    pub fn to_camelot(&self) -> String {
         let letter = match self.mode {
             Mode::Major => "B",
             Mode::Minor => "A",
         };
-
-        format!("{}{}", number, letter)
+        format!("{}{}", self.camelot_number(), letter)
     }
 
     /// Get Open Key notation (alternative DJ notation)
@@ -247,13 +253,9 @@ impl Key {
     /// # Ok::<(), KeyError>(())
     /// ```
     pub fn to_open_key(&self) -> String {
-        // Extract Camelot number
-        let camelot_str = self.to_camelot();
-        let camelot_num = camelot_str[..camelot_str.len() - 1].parse::<u8>().unwrap();
-
         // Open Key is offset by +5 from Camelot (counterclockwise on wheel)
         // Formula: ((camelot + 4) mod 12) + 1
-        let open_key_num = ((camelot_num + 4) % 12) + 1;
+        let open_key_num = ((self.camelot_number() + 4) % 12) + 1;
 
         let letter = match self.mode {
             Mode::Major => "d",
@@ -395,6 +397,21 @@ mod tests {
         let key = Key::from_traditional(input).unwrap();
         assert_eq!(key.to_traditional_sharp(), expected_sharp);
         assert_eq!(key.to_traditional_flat(), expected_flat);
+    }
+
+    #[rstest]
+    #[case("C Major", 8)]
+    #[case("A Minor", 8)]
+    #[case("G Major", 9)]
+    #[case("E Minor", 9)]
+    #[case("B Major", 1)]
+    #[case("G# Minor", 1)]
+    #[case("F# Minor", 11)]
+    fn camelot_number_known_keys(#[case] notation: &str, #[case] expected: u8) {
+        assert_eq!(
+            Key::from_traditional(notation).unwrap().camelot_number(),
+            expected
+        );
     }
 
     #[rstest]

@@ -837,10 +837,14 @@ dependencies = [
 
 [[package]]
 name = "bevy-app"
-version = "0.1.0"
+version = "0.24.1"
 dependencies = [
  "bevy",
  "bevy_egui",
+ "library-search",
+ "mdma-client",
+ "music-primitives",
+ "tracing",
 ]
 
 [[package]]
@@ -3574,6 +3578,10 @@ name = "dj-workspace"
 version = "0.24.1"
 dependencies = [
  "bevy-app",
+ "clap",
+ "client",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -1,7 +1,21 @@
-use bevy::prelude::*;
-use bevy_egui::{egui, EguiContexts, EguiPlugin};
+pub mod config;
+pub mod filters;
+pub mod ipc;
+pub mod playlists;
+pub mod results;
+pub mod ui;
 
-pub fn run() {
+use bevy::prelude::*;
+use bevy_egui::EguiPlugin;
+
+use config::DjWorkspaceConfig;
+use filters::FilterState;
+use ipc::{poll_ipc_events, setup_ipc};
+use playlists::{CentralView, PlaylistState};
+use results::SearchResults;
+use ui::ui_system;
+
+pub fn run(config: DjWorkspaceConfig) {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -11,27 +25,12 @@ pub fn run() {
             ..default()
         }))
         .add_plugins(EguiPlugin::default())
-        .add_systems(Update, ui_system)
+        .insert_resource(config)
+        .init_resource::<PlaylistState>()
+        .init_resource::<CentralView>()
+        .init_resource::<FilterState>()
+        .init_resource::<SearchResults>()
+        .add_systems(Startup, setup_ipc)
+        .add_systems(Update, (poll_ipc_events, ui_system).chain())
         .run();
-}
-
-fn ui_system(mut contexts: EguiContexts) {
-    let Ok(ctx) = contexts.ctx_mut() else {
-        return;
-    };
-
-    #[allow(deprecated)]
-    egui::SidePanel::left("filters_panel")
-        .min_width(200.0)
-        .show(ctx, |ui| {
-            ui.heading("Filters");
-            ui.separator();
-            ui.label("(placeholder)");
-        });
-
-    #[allow(deprecated)]
-    egui::CentralPanel::default().show(ctx, |ui| {
-        ui.heading("DJ Workspace");
-        ui.label("(placeholder)");
-    });
 }

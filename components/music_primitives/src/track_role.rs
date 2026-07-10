@@ -46,6 +46,26 @@ impl TrackRole {
             TrackRole::Filler => "Filler",
         }
     }
+
+    /// DJ set-arc ordering rank (lower = earlier in a set).
+    ///
+    /// Defines the canonical progression through a DJ set. Banger sits between
+    /// Peak and CoolDown — it is the crowd-peak exclamation point before the
+    /// energy intentionally drops, making it later than Peak but before the
+    /// wind-down. Filler ranks last because it is used outside the main arc.
+    ///
+    /// Opener=0, BuildUp=1, Peak=2, Banger=3, CoolDown=4, Closer=5, Filler=6
+    pub fn set_arc_rank(&self) -> u8 {
+        match self {
+            TrackRole::Opener => 0,
+            TrackRole::BuildUp => 1,
+            TrackRole::Peak => 2,
+            TrackRole::Banger => 3,
+            TrackRole::CoolDown => 4,
+            TrackRole::Closer => 5,
+            TrackRole::Filler => 6,
+        }
+    }
 }
 
 impl FromStr for TrackRole {
@@ -168,5 +188,37 @@ mod tests {
         let json = serde_json::to_string(&role).unwrap();
         let back: TrackRole = serde_json::from_str(&json).unwrap();
         assert_eq!(role, back);
+    }
+
+    #[test]
+    fn set_arc_rank_full_order() {
+        assert_eq!(TrackRole::Opener.set_arc_rank(), 0);
+        assert_eq!(TrackRole::BuildUp.set_arc_rank(), 1);
+        assert_eq!(TrackRole::Peak.set_arc_rank(), 2);
+        assert_eq!(TrackRole::Banger.set_arc_rank(), 3);
+        assert_eq!(TrackRole::CoolDown.set_arc_rank(), 4);
+        assert_eq!(TrackRole::Closer.set_arc_rank(), 5);
+        assert_eq!(TrackRole::Filler.set_arc_rank(), 6);
+    }
+
+    #[test]
+    fn set_arc_rank_is_strictly_increasing() {
+        let roles = [
+            TrackRole::Opener,
+            TrackRole::BuildUp,
+            TrackRole::Peak,
+            TrackRole::Banger,
+            TrackRole::CoolDown,
+            TrackRole::Closer,
+            TrackRole::Filler,
+        ];
+        for window in roles.windows(2) {
+            assert!(
+                window[0].set_arc_rank() < window[1].set_arc_rank(),
+                "{:?} should rank lower than {:?}",
+                window[0],
+                window[1]
+            );
+        }
     }
 }
