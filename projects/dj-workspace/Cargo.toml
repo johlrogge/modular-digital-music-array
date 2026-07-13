@@ -1,0 +1,18 @@
+[package]
+name = "dj-workspace"
+version.workspace = true
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/johlrogge/modular-digital-music-array"
+license = "MIT"
+
+[[bin]]
+name = "dj-workspace"
+path = "src/main.rs"
+
+[dependencies]
+bevy-app = { path = "../../bases/bevy-app" }
+client = { path = "../../bases/client" }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

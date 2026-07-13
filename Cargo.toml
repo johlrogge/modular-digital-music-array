@@ -59,8 +59,9 @@ members = [
     "projects/mdma-gateway",
     "projects/mdma-library",
     "projects/mdma-playback",
-    "projects/mdma-tui"
-]
+    "projects/mdma-tui",
+    "projects/dj-workspace"
+, "bases/bevy-app"]
 resolver = "2"
 
 [workspace.package]
@@ -143,6 +144,9 @@ tower-http = { version = "0.5", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = "2"
+# DJ Workspace (laptop-only, dev profile only — not in production.profile)
+bevy = "0.19"
+bevy_egui = "0.40"
 
 [profile]
 
