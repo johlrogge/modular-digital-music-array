@@ -41,7 +41,13 @@ const ALL_ROLES: [TrackRole; 7] = [
     TrackRole::Filler,
 ];
 
-/// Bevy Update system: renders the full DJ Workspace UI.
+/// EguiPrimaryContextPass system: renders the full DJ Workspace UI.
+///
+/// Must run in `EguiPrimaryContextPass` (not `Update`) — bevy_egui 0.40
+/// multipass mode only processes UI calls made inside this schedule.
+// egui 0.34 deprecated SidePanel (type alias → Panel::left/right), SelectableLabel
+// (→ Button::selectable), and Panel::show / CentralPanel::show (→ show_inside);
+// this allow covers those three call-sites pending an egui API migration.
 #[allow(deprecated)]
 pub fn ui_system(
     mut contexts: EguiContexts,
@@ -51,10 +57,8 @@ pub fn ui_system(
     mut filter_state: ResMut<FilterState>,
     mut search_results: ResMut<SearchResults>,
     channels: Res<IpcChannels>,
-) {
-    let Ok(ctx) = contexts.ctx_mut() else {
-        return;
-    };
+) -> Result {
+    let ctx = contexts.ctx_mut()?;
 
     let status_text = match status.as_ref() {
         ConnectionStatus::Connecting => "Connecting\u{2026}".to_string(),
@@ -193,6 +197,8 @@ pub fn ui_system(
             }
         }
     });
+
+    Ok(())
 }
 
 /// Render the playlist track table inside the central panel.
