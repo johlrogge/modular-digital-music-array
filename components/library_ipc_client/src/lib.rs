@@ -111,7 +111,7 @@ impl LibraryClient {
     /// Get a specific track by content hash.
     pub fn get_track(&self, hash: &ContentHash) -> Result<TrackInfo, ClientError> {
         match self.request(&LibraryRequest::GetTrack { hash: hash.clone() })? {
-            LibraryResponse::Track(track) => Ok(track),
+            LibraryResponse::Track(track) => Ok(*track),
             LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
             _ => Err(ClientError::Protocol(ProtocolError::Internal {
                 message: "Unexpected response to GetTrack".to_string(),

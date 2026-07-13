@@ -40,6 +40,19 @@ in
     sshpass
     gh
     gitflow               # Git-flow branching workflow
+  ] ++ lib.optionals (!isCI && pkgs.stdenv.isLinux) [
+    # Bevy (dj-workspace) graphics stack — laptop-only, Linux only.
+    # pkg-config and alsa-lib are already in ci-base.nix; do not duplicate.
+    systemd          # provides libudev (required by libudev-sys build dep of gilrs/bevy)
+    vulkan-loader
+    vulkan-tools
+    libxkbcommon
+    wayland
+    wayland-protocols
+    xorg.libX11
+    xorg.libXcursor
+    xorg.libXi
+    xorg.libXrandr
   ];
 
   # Pi service sockets — available in every devenv shell automatically
@@ -195,6 +208,14 @@ in
     echo "           mdma source list|sync|status|downloads"
     echo "           mdma-volume <0-1>  mdma-status"
     echo "           just --list"
+
+    ${lib.optionalString pkgs.stdenv.isLinux ''
+      # Bevy runtime dlopen path — vulkan/wayland/xkbcommon loaded at runtime.
+      # Gated to Linux dev (CI check: CI env var is set by GitHub Actions).
+      if [ -z "''${CI:-}" ]; then
+        export LD_LIBRARY_PATH="${lib.makeLibraryPath (with pkgs; [ vulkan-loader libxkbcommon wayland ])}:''${LD_LIBRARY_PATH:-}"
+      fi
+    ''}
   '';
 
   # Claude Code integration
@@ -459,7 +480,7 @@ in
            Expected: exit code 0, "bandcamp" in output
 
         7. CONSOLE — verify web UI responds:
-           curl -s -o /dev/null -w "%{http_code}" http://mdma-909.local/
+           curl -s -o /dev/null -w "%{http_code}" http://mdma-johlyroger.local/
            Expected: HTTP 200
 
         Report format:

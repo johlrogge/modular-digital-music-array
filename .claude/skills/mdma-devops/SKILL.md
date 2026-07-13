@@ -746,7 +746,7 @@ The Bandcamp source requires browser cookies and a username to authenticate purc
 
 See [references/bandcamp-setup.md](references/bandcamp-setup.md) for:
 - How to export cookies from Firefox (Cookie Quick Manager) or Chrome (get-cookies.txt)
-- Uploading via the web console at `http://mdma-909.local`
+- Uploading via the web console at `http://mdma-johlyroger.local`
 - Manual SCP method as alternative
 - Verifying configuration with `mdma source status bandcamp`
 - Troubleshooting expired or missing cookies

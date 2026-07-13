@@ -3,6 +3,7 @@ use crate::query::{
     StringQuery,
 };
 use chrono::NaiveDate;
+use music_primitives::TrackRole;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -15,6 +16,8 @@ pub enum ParseError {
     InvalidKey(String),
     #[error("invalid date query '{0}'")]
     InvalidDateQuery(String),
+    #[error("invalid role '{0}': expected one of opener, build-up, peak, banger, cool-down, closer, filler (case-insensitive)")]
+    InvalidRole(String),
 }
 
 /// Splits `s` into `(base, up_str, down_str)` by detecting tolerance suffix patterns.
@@ -402,6 +405,15 @@ fn parse_date_with_precision(
     Err(err())
 }
 
+/// Parse a CLI role string into a `TrackRole`.
+///
+/// Accepts the same forms as `TrackRole::from_str`:
+/// lowercase, kebab-case ("build-up", "cool-down"), and PascalCase ("BuildUp").
+pub fn parse_role_query(s: &str) -> Result<TrackRole, ParseError> {
+    s.parse::<TrackRole>()
+        .map_err(|_| ParseError::InvalidRole(s.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,5 +683,36 @@ mod tests {
         let result = parse_date_query("~/~/^..~/~/$");
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), DateQuery::Range(..)));
+    }
+
+    // =========================================================================
+    // Role query parse tests
+    // =========================================================================
+
+    #[rstest]
+    #[case("banger", TrackRole::Banger)]
+    #[case("Banger", TrackRole::Banger)]
+    #[case("build-up", TrackRole::BuildUp)]
+    #[case("BuildUp", TrackRole::BuildUp)]
+    #[case("peak", TrackRole::Peak)]
+    #[case("Peak", TrackRole::Peak)]
+    #[case("opener", TrackRole::Opener)]
+    #[case("cool-down", TrackRole::CoolDown)]
+    #[case("CoolDown", TrackRole::CoolDown)]
+    #[case("closer", TrackRole::Closer)]
+    #[case("filler", TrackRole::Filler)]
+    fn parse_role_query_valid(#[case] input: &str, #[case] expected: TrackRole) {
+        assert_eq!(parse_role_query(input).unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case("invalid-role")]
+    #[case("")]
+    #[case("DJ")]
+    #[case("123")]
+    fn parse_role_query_invalid(#[case] input: &str) {
+        assert!(parse_role_query(input).is_err());
+        let err = parse_role_query(input).unwrap_err();
+        assert!(err.to_string().contains(input) || input.is_empty());
     }
 }

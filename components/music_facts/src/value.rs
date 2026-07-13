@@ -1,6 +1,6 @@
 use crate::primitives::*;
 use chrono::{DateTime, NaiveDate, Utc};
-use music_primitives::{Bpm, Key};
+use music_primitives::{Bpm, EnergyLevel, Key, TrackRole};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use std::path::PathBuf;
@@ -98,6 +98,29 @@ pub enum AlbumArtPresence {
     Absent,
 }
 
+/// Type of a cue point on a track.
+///
+/// Used within [`MusicValue::MemoryCue`] to distinguish hot cues, memory cues, and loops.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CueKind {
+    /// Standard memory cue (not mapped to a pad)
+    Memory,
+    /// Hot cue (mapped to a performance pad)
+    Hot,
+    /// Loop cue with a fixed length in milliseconds
+    Loop { length_ms: u32 },
+}
+
+impl fmt::Display for CueKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CueKind::Memory => write!(f, "Memory"),
+            CueKind::Hot => write!(f, "Hot"),
+            CueKind::Loop { length_ms } => write!(f, "Loop({}ms)", length_ms),
+        }
+    }
+}
+
 /// All possible metadata values for a music track
 ///
 /// Each variant represents a single fact that can be asserted or retracted
@@ -153,6 +176,44 @@ pub enum MusicValue {
 
     /// Full genre string as provided by source
     FullGenre(String),
+
+    /// DJ curation role for the track in a set (Opener, BuildUp, Peak, etc.)
+    Role(TrackRole),
+
+    /// Energy level on a scale from 1 (very mellow) to 10 (absolute peak)
+    Energy(EnergyLevel),
+
+    /// Beat-grid anchor: first beat position, tempo, and beats per bar.
+    ///
+    /// Describes a single fixed-tempo grid anchor.  Variable-tempo grids
+    /// (multiple anchors) are out of scope for this variant.
+    BeatGrid {
+        /// Position of the first beat in milliseconds from the start of the file
+        first_beat_ms: u32,
+        /// Grid tempo
+        bpm: Bpm,
+        /// Number of beats per bar (4 for 4/4 time)
+        beats_per_bar: u8,
+    },
+
+    // ========================================================================
+    // Cue Points
+    // ========================================================================
+    /// A single memory cue, hot cue, or loop point.
+    ///
+    /// Multiple `MemoryCue` facts may coexist for one track (one per cue
+    /// point), mirroring how `StyleDescriptor` handles multi-valued fields.
+    /// Retraction removes the exact-matching cue.
+    MemoryCue {
+        /// Position in milliseconds from the start of the file
+        position_ms: u32,
+        /// Type of cue point
+        kind: CueKind,
+        /// Optional human-readable label for this cue
+        label: Option<String>,
+        /// Optional pad/slot index (0-based)
+        index: Option<u8>,
+    },
 
     // ========================================================================
     // Catalog & Publishing
@@ -323,6 +384,10 @@ impl MusicValue {
             MusicValue::Bookmarked { .. } => "Bookmarked",
             MusicValue::Replaces(_) => "Replaces",
             MusicValue::Deleted { .. } => "Deleted",
+            MusicValue::Role(_) => "Role",
+            MusicValue::Energy(_) => "Energy",
+            MusicValue::BeatGrid { .. } => "BeatGrid",
+            MusicValue::MemoryCue { .. } => "MemoryCue",
         }
     }
 }
@@ -382,6 +447,30 @@ impl fmt::Display for MusicValue {
             },
             MusicValue::Replaces(old_hash) => write!(f, "Replaces({})", old_hash.as_str()),
             MusicValue::Deleted { timestamp } => write!(f, "Deleted at {}", timestamp),
+            MusicValue::Role(r) => write!(f, "{}", r),
+            MusicValue::Energy(e) => write!(f, "{}", e),
+            MusicValue::BeatGrid {
+                first_beat_ms,
+                bpm,
+                beats_per_bar,
+            } => write!(
+                f,
+                "BeatGrid(first={}ms, bpm={}, {}/4)",
+                first_beat_ms, bpm, beats_per_bar
+            ),
+            MusicValue::MemoryCue {
+                position_ms,
+                kind,
+                label,
+                index,
+            } => match (label.as_deref(), index) {
+                (Some(l), Some(i)) => {
+                    write!(f, "Cue #{} {} @{}ms: {}", i, kind, position_ms, l)
+                }
+                (Some(l), None) => write!(f, "Cue {} @{}ms: {}", kind, position_ms, l),
+                (None, Some(i)) => write!(f, "Cue #{} {} @{}ms", i, kind, position_ms),
+                (None, None) => write!(f, "Cue {} @{}ms", kind, position_ms),
+            },
         }
     }
 }
@@ -746,5 +835,361 @@ mod tests {
         let json = serde_json::to_string(&val).unwrap();
         let decoded: MusicValue = serde_json::from_str(&json).unwrap();
         assert_eq!(val, decoded);
+    }
+
+    // =========================================================================
+    // Role tests
+    // =========================================================================
+
+    #[test]
+    fn role_roundtrip() {
+        use music_primitives::TrackRole;
+        let val = MusicValue::Role(TrackRole::Peak);
+        let json = serde_json::to_string(&val).unwrap();
+        let back: MusicValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(val, back);
+    }
+
+    #[test]
+    fn role_display_name() {
+        use music_primitives::TrackRole;
+        let val = MusicValue::Role(TrackRole::BuildUp);
+        assert_eq!(val.display_name(), "Role");
+    }
+
+    #[test]
+    fn role_display() {
+        use music_primitives::TrackRole;
+        let val = MusicValue::Role(TrackRole::CoolDown);
+        assert_eq!(val.to_string(), "Cool Down");
+    }
+
+    #[test]
+    fn role_fact_value_format() {
+        use music_primitives::TrackRole;
+        // Wire format: {"t":"Role","v":"Peak"}
+        assert_fact_value_format!(MusicValue::Role(TrackRole::Peak));
+    }
+
+    #[test]
+    fn role_wire_format_is_pascal_case() {
+        use music_primitives::TrackRole;
+        let val = MusicValue::Role(TrackRole::BuildUp);
+        let json = serde_json::to_string(&val).unwrap();
+        // Verify the wire value is "BuildUp" not "Build Up"
+        assert!(json.contains("\"BuildUp\""), "got: {}", json);
+    }
+
+    // =========================================================================
+    // Energy tests
+    // =========================================================================
+
+    #[test]
+    fn energy_roundtrip() {
+        use music_primitives::EnergyLevel;
+        let val = MusicValue::Energy(EnergyLevel::new(7).unwrap());
+        let json = serde_json::to_string(&val).unwrap();
+        let back: MusicValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(val, back);
+    }
+
+    #[test]
+    fn energy_display_name() {
+        use music_primitives::EnergyLevel;
+        let val = MusicValue::Energy(EnergyLevel::new(5).unwrap());
+        assert_eq!(val.display_name(), "Energy");
+    }
+
+    #[test]
+    fn energy_display() {
+        use music_primitives::EnergyLevel;
+        let val = MusicValue::Energy(EnergyLevel::new(10).unwrap());
+        assert_eq!(val.to_string(), "10");
+    }
+
+    #[test]
+    fn energy_fact_value_format() {
+        use music_primitives::EnergyLevel;
+        // Wire format: {"t":"Energy","v":7}
+        assert_fact_value_format!(MusicValue::Energy(EnergyLevel::new(7).unwrap()));
+    }
+
+    #[test]
+    fn energy_wire_format_is_integer() {
+        use music_primitives::EnergyLevel;
+        let val = MusicValue::Energy(EnergyLevel::new(8).unwrap());
+        let json = serde_json::to_string(&val).unwrap();
+        // Verify the wire value is a bare integer
+        assert!(json.contains(":8}"), "got: {}", json);
+    }
+
+    // =========================================================================
+    // BeatGrid tests
+    // =========================================================================
+
+    #[test]
+    fn beat_grid_roundtrip() {
+        let bpm = Bpm::from_f32(128.0).unwrap();
+        let val = MusicValue::BeatGrid {
+            first_beat_ms: 450,
+            bpm,
+            beats_per_bar: 4,
+        };
+        let json = serde_json::to_string(&val).unwrap();
+        let back: MusicValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(val, back);
+    }
+
+    #[test]
+    fn beat_grid_display_name() {
+        let bpm = Bpm::from_f32(140.0).unwrap();
+        let val = MusicValue::BeatGrid {
+            first_beat_ms: 200,
+            bpm,
+            beats_per_bar: 4,
+        };
+        assert_eq!(val.display_name(), "BeatGrid");
+    }
+
+    #[test]
+    fn beat_grid_display() {
+        let bpm = Bpm::from_f32(128.0).unwrap();
+        let val = MusicValue::BeatGrid {
+            first_beat_ms: 450,
+            bpm,
+            beats_per_bar: 4,
+        };
+        let s = val.to_string();
+        assert!(s.contains("450ms"), "got: {}", s);
+        assert!(s.contains("128.00"), "got: {}", s);
+        assert!(s.contains("4/4"), "got: {}", s);
+    }
+
+    #[test]
+    fn beat_grid_fact_value_format() {
+        // Wire format: {"t":"BeatGrid","v":{"first_beat_ms":450,"bpm":12800,"beats_per_bar":4}}
+        let bpm = Bpm::from_f32(128.0).unwrap();
+        assert_fact_value_format!(MusicValue::BeatGrid {
+            first_beat_ms: 450,
+            bpm,
+            beats_per_bar: 4,
+        });
+    }
+
+    #[test]
+    fn beat_grid_wire_format_contains_expected_fields() {
+        let bpm = Bpm::from_f32(128.0).unwrap();
+        let val = MusicValue::BeatGrid {
+            first_beat_ms: 450,
+            bpm,
+            beats_per_bar: 4,
+        };
+        let json = serde_json::to_string(&val).unwrap();
+        assert!(json.contains("\"first_beat_ms\""), "got: {}", json);
+        assert!(json.contains("\"bpm\""), "got: {}", json);
+        assert!(json.contains("\"beats_per_bar\""), "got: {}", json);
+        // bpm 128.0 is serialised as 12800 (hundredths)
+        assert!(json.contains("12800"), "got: {}", json);
+    }
+
+    #[test]
+    fn beat_grid_exact_wire_format() {
+        // Exact golden wire format — any serde layout change breaks this.
+        // bpm=128.0 → stored as hundredths = 12800
+        let bpm = Bpm::from_f32(128.0).unwrap();
+        let val = MusicValue::BeatGrid {
+            first_beat_ms: 450,
+            bpm,
+            beats_per_bar: 4,
+        };
+        assert_eq!(
+            serde_json::to_string(&val).unwrap(),
+            r#"{"t":"BeatGrid","v":{"first_beat_ms":450,"bpm":12800,"beats_per_bar":4}}"#
+        );
+    }
+
+    // =========================================================================
+    // MemoryCue tests
+    // =========================================================================
+
+    #[test]
+    fn memory_cue_hot_roundtrip() {
+        let val = MusicValue::MemoryCue {
+            position_ms: 32000,
+            kind: CueKind::Hot,
+            label: Some("Drop".to_string()),
+            index: Some(1),
+        };
+        let json = serde_json::to_string(&val).unwrap();
+        let back: MusicValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(val, back);
+    }
+
+    #[test]
+    fn memory_cue_memory_roundtrip() {
+        let val = MusicValue::MemoryCue {
+            position_ms: 1000,
+            kind: CueKind::Memory,
+            label: None,
+            index: None,
+        };
+        let json = serde_json::to_string(&val).unwrap();
+        let back: MusicValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(val, back);
+    }
+
+    #[test]
+    fn memory_cue_loop_roundtrip() {
+        let val = MusicValue::MemoryCue {
+            position_ms: 64000,
+            kind: CueKind::Loop { length_ms: 4000 },
+            label: Some("Chorus loop".to_string()),
+            index: Some(3),
+        };
+        let json = serde_json::to_string(&val).unwrap();
+        let back: MusicValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(val, back);
+    }
+
+    #[test]
+    fn memory_cue_display_name() {
+        let val = MusicValue::MemoryCue {
+            position_ms: 0,
+            kind: CueKind::Memory,
+            label: None,
+            index: None,
+        };
+        assert_eq!(val.display_name(), "MemoryCue");
+    }
+
+    #[rstest]
+    #[case(
+        MusicValue::MemoryCue { position_ms: 1000, kind: CueKind::Hot, label: Some("Intro".to_string()), index: Some(0) },
+        "Cue #0 Hot @1000ms: Intro"
+    )]
+    #[case(
+        MusicValue::MemoryCue { position_ms: 2000, kind: CueKind::Memory, label: Some("Break".to_string()), index: None },
+        "Cue Memory @2000ms: Break"
+    )]
+    #[case(
+        MusicValue::MemoryCue { position_ms: 3000, kind: CueKind::Hot, label: None, index: Some(2) },
+        "Cue #2 Hot @3000ms"
+    )]
+    #[case(
+        MusicValue::MemoryCue { position_ms: 4000, kind: CueKind::Memory, label: None, index: None },
+        "Cue Memory @4000ms"
+    )]
+    fn memory_cue_display(#[case] val: MusicValue, #[case] expected: &str) {
+        assert_eq!(val.to_string(), expected);
+    }
+
+    #[test]
+    fn memory_cue_hot_fact_value_format() {
+        // Wire format: {"t":"MemoryCue","v":{"position_ms":32000,"kind":"Hot","label":"Drop","index":1}}
+        assert_fact_value_format!(MusicValue::MemoryCue {
+            position_ms: 32000,
+            kind: CueKind::Hot,
+            label: Some("Drop".to_string()),
+            index: Some(1),
+        });
+    }
+
+    #[test]
+    fn memory_cue_loop_fact_value_format() {
+        // Wire format: {"t":"MemoryCue","v":{"position_ms":64000,"kind":{"Loop":{"length_ms":4000}},"label":null,"index":null}}
+        assert_fact_value_format!(MusicValue::MemoryCue {
+            position_ms: 64000,
+            kind: CueKind::Loop { length_ms: 4000 },
+            label: None,
+            index: None,
+        });
+    }
+
+    #[test]
+    fn memory_cue_wire_format_contains_expected_fields() {
+        let val = MusicValue::MemoryCue {
+            position_ms: 32000,
+            kind: CueKind::Hot,
+            label: Some("Drop".to_string()),
+            index: Some(1),
+        };
+        let json = serde_json::to_string(&val).unwrap();
+        assert!(json.contains("\"position_ms\""), "got: {}", json);
+        assert!(json.contains("\"kind\""), "got: {}", json);
+        assert!(json.contains("\"label\""), "got: {}", json);
+        assert!(json.contains("\"index\""), "got: {}", json);
+        assert!(json.contains("\"Hot\""), "got: {}", json);
+    }
+
+    #[test]
+    fn memory_cue_hot_exact_wire_format() {
+        // Exact golden wire format for a Hot cue with label and index.
+        let val = MusicValue::MemoryCue {
+            position_ms: 32000,
+            kind: CueKind::Hot,
+            label: Some("Drop".to_string()),
+            index: Some(1),
+        };
+        assert_eq!(
+            serde_json::to_string(&val).unwrap(),
+            r#"{"t":"MemoryCue","v":{"position_ms":32000,"kind":"Hot","label":"Drop","index":1}}"#
+        );
+    }
+
+    #[test]
+    fn memory_cue_memory_exact_wire_format() {
+        // Exact golden wire format for a Memory cue (no label, no index).
+        let val = MusicValue::MemoryCue {
+            position_ms: 1000,
+            kind: CueKind::Memory,
+            label: None,
+            index: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&val).unwrap(),
+            r#"{"t":"MemoryCue","v":{"position_ms":1000,"kind":"Memory","label":null,"index":null}}"#
+        );
+    }
+
+    #[test]
+    fn memory_cue_loop_exact_wire_format() {
+        // Exact golden wire format for a Loop cue. Loop nests as {"Loop":{"length_ms":N}}.
+        let val = MusicValue::MemoryCue {
+            position_ms: 64000,
+            kind: CueKind::Loop { length_ms: 4000 },
+            label: None,
+            index: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&val).unwrap(),
+            r#"{"t":"MemoryCue","v":{"position_ms":64000,"kind":{"Loop":{"length_ms":4000}},"label":null,"index":null}}"#
+        );
+    }
+
+    #[test]
+    fn cue_kind_loop_wire_format() {
+        // Loop variant serialises with its length_ms field
+        let kind = CueKind::Loop { length_ms: 8000 };
+        let json = serde_json::to_string(&kind).unwrap();
+        assert!(json.contains("Loop"), "got: {}", json);
+        assert!(json.contains("8000"), "got: {}", json);
+    }
+
+    #[test]
+    fn cue_kind_loop_exact_wire_format() {
+        // Exact golden wire format for CueKind::Loop.
+        let kind = CueKind::Loop { length_ms: 8000 };
+        assert_eq!(
+            serde_json::to_string(&kind).unwrap(),
+            r#"{"Loop":{"length_ms":8000}}"#
+        );
+    }
+
+    #[rstest]
+    #[case(CueKind::Memory, "Memory")]
+    #[case(CueKind::Hot, "Hot")]
+    #[case(CueKind::Loop { length_ms: 4000 }, "Loop(4000ms)")]
+    fn cue_kind_display(#[case] kind: CueKind, #[case] expected: &str) {
+        assert_eq!(kind.to_string(), expected);
     }
 }
