@@ -14,6 +14,10 @@ MDMA runs headlessly on a Pi 5 with an NVMe drive. You control it from your lapt
 # Search — implicit AND, all filters composable
 mdma search --artist CBL --bpm "128+-4"
 
+# Filter by role, energy, and key — new in 0.25.0
+mdma search --role banger --bpm "128+-3" --key "8A~"
+mdma search --energy "8..10" --genre Techno
+
 # Filter by when tracks were added (date expressions: ~ = today, ^week = start of week)
 mdma search --added "^week"
 
@@ -43,6 +47,16 @@ mdma bookmark sha256:abc123 --scope "friday-night-picks"
 
 # List all bookmarked tracks
 mdma bookmarks
+
+# Hand-tag role and energy — new in 0.25.0
+mdma fact set sha256:abc123 role banger
+mdma fact set sha256:abc123 energy 9
+
+# Import Rekordbox XML and land beat-grid / memory-cue facts — new in 0.25.0
+mdma rekordbox import --enrich rekordbox.xml
+
+# Export memory cues back to Rekordbox (MDMA never writes beat grids back)
+mdma rekordbox export --output rekordbox-out.xml
 
 # Subscribe to live events (now playing, queue changes)
 mdma subscribe
@@ -82,7 +96,7 @@ Audio path: FLAC/MP3 → Symphonia decoder (std::thread) → rubato resampler �
 
 ## Workspace members
 
-This is a [Polylith](https://polylith.gitbook.io/polylith/) workspace. Deployable services live in `projects/`; shared logic lives in `components/`; abstract base traits live in `bases/`.
+This is a [Polylith](https://polylith.gitbook.io/polylith/) workspace. Deployable services live in `projects/`; shared logic lives in `components/`; abstract base traits live in `bases/` (client, service, http_server, tui, bevy-app).
 
 | Service (project) | Description |
 |-------------------|-------------|
@@ -97,6 +111,7 @@ This is a [Polylith](https://polylith.gitbook.io/polylith/) workspace. Deployabl
 | `mdma-bandcamp` | Bandcamp collection sync — downloads purchases into the library inbox |
 | `mdma-console` | Web management console — player controls, search, queue, upload, export |
 | `mdma-cli` | CLI — search, queue, playlists, playback, export, subscribe, bookmarks, shell completions |
+| `dj-workspace` | Bevy GUI app (laptop-only, not packaged for Pi) — playlist browser and BPM/Key/Role/Energy candidate finder with sortable results; connects via gateway (`dj-workspace --node <host>`) |
 
 **Key components** (shared libraries):
 
@@ -106,9 +121,11 @@ This is a [Polylith](https://polylith.gitbook.io/polylith/) workspace. Deployabl
 | `library_search` | Composable `TrackQuery` with string, numeric, duration, key, and date filters |
 | [`playback_engine`](components/playback_engine/README.md) | Real-time audio: Symphonia decoder + rubato resampler + PipeWire output. Single-track model (`Option<Track>`). |
 | `stream_source_protocol` | `StreamCommand`/`StreamResponse`/`StreamTrackInfo`/`StreamPlaybackState` — protocol between playback and audio source services |
-| `music_primitives` | BPM, Key, Mode types |
+| `music_primitives` | BPM, Key, Mode, TrackRole types |
+| `music_facts` | `MusicValue` fact variants: BPM, Key, BeatGrid, MemoryCue, Role (TrackRole), Energy (1–10), and more; `FactOrigin` provenance enum |
 | `storage_primitives` | Type-safe `ByteSize` |
 | `media_protocol` | Command/Response protocol between CLI and services |
+| `rekordbox_roundtrip` | Maps rekordbox beat-grid anchors and position marks to/from MDMA facts; used by `mdma rekordbox import --enrich` and `mdma rekordbox export` |
 
 ---
 
@@ -165,6 +182,36 @@ cp profiles/dev/target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.25.0
+
+### Rekordbox round-trip data contract
+
+`rekordbox_xml` now parses and writes `<TEMPO>` grid anchors and `<POSITION_MARK>` cues. A new `rekordbox_roundtrip` component maps these to typed MDMA facts (`BeatGrid`, `MemoryCue`). `mdma rekordbox import --enrich` reads a Rekordbox XML file and lands those facts in the library. `mdma rekordbox export` writes memory cues back. MDMA never writes `<TEMPO>` back — Rekordbox stays beat-grid master.
+
+### New MusicValue fact variants
+
+`music_facts::MusicValue` gains four new variants: `BeatGrid` (grid anchor from Rekordbox), `MemoryCue` (named cue point), `Role` (`TrackRole` enum — e.g. `banger`, `warmup`, `transition`), and `Energy` (integer 1–10).
+
+### Role and energy are searchable and hand-taggable
+
+```bash
+mdma search --role banger --bpm "128+-3" --key "8A~"
+mdma fact set sha256:<hash> role banger
+mdma fact set sha256:<hash> energy 9
+```
+
+### dj-workspace — Bevy GUI app
+
+New laptop-only Bevy/egui application (`dj-workspace`). Not packaged for the Pi. Connects to any MDMA node via the gateway:
+
+```bash
+dj-workspace --node mdma-909.local
+```
+
+Features a playlist browser and a candidate finder with BPM, Key, Role, and Energy filters and sortable results. Built on the new `bevy-app` base.
 
 ---
 
