@@ -161,16 +161,22 @@ mdma ping
 
 ---
 
-## Installing the CLI (macOS)
+## Installing on macOS
 
-Download the latest `mdma-cli-macos-arm64` artifact from [GitHub Actions](https://github.com/johlrogge/modular-digital-music-array/actions/workflows/build-and-package.yml), or use the GitHub CLI:
+Copy `scripts/install-mdma-macos.sh` from this repo to your Mac and run it. It requires the `gh` CLI (authenticated) and installs both `mdma` and `mdma-tui` to `/usr/local/bin/` by default.
 
 ```bash
-gh run download -R johlrogge/modular-digital-music-array -n mdma-cli-macos-arm64
-xattr -d com.apple.quarantine mdma
-chmod +x mdma
-sudo mv mdma /usr/local/bin/
+# Install latest release
+bash install-mdma-macos.sh
+
+# Install a specific tag
+bash install-mdma-macos.sh v0.25.0
+
+# Install to a user-writable location (no sudo)
+MDMA_INSTALL_DIR=~/.local/bin bash install-mdma-macos.sh
 ```
+
+The script resolves the tag to its CI run, downloads both macOS arm64 artifacts, strips the quarantine attribute, and installs with correct permissions. Artifacts expire after roughly 90 days; if none are found the script will tell you how to trigger a rebuild via `workflow_dispatch`.
 
 Or build from source:
 
