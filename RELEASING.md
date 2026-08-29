@@ -90,6 +90,7 @@ void-packages/srcpkgs/mdma-gateway/template
 void-packages/srcpkgs/mdma-bandcamp/template
 void-packages/srcpkgs/mdma-console/template
 void-packages/srcpkgs/mdma-acid/template
+void-packages/srcpkgs/mdma-admin/template
 ```
 
 ### 5. Update documentation
@@ -122,7 +123,8 @@ GitHub Actions triggers on the `master` push:
 
 1. Runs tests across all workspace members
 2. Cross-compiles all service binaries for `aarch64-unknown-linux-gnu`
-3. Builds `.xbps` packages via `xbps-src`
+3. Builds `.xbps` packages via `just pkg-build-all` (cargo-zigbuild cross-compile,
+   then `xbps-create` per service)
 4. Signs packages
 5. Publishes to GitHub Pages package repository at:
    `https://johlrogge.github.io/modular-digital-music-array/aarch64`

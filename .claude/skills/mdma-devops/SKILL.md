@@ -475,8 +475,8 @@ The secondary drive serves transcoded audio to CDJ-900/2000 players over the net
 ### Build Pipeline
 
 ```
-Git push → GitHub Actions → xbps-src builds packages →
-Upload to repository → Units update with xbps-install -Su
+Git push → GitHub Actions → just pkg-build-all (cargo-zigbuild cross-compile +
+xbps-create per service) → Upload to repository → Units update with xbps-install -Su
 ```
 
 **Time from push to live: 2-5 minutes**
