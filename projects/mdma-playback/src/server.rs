@@ -555,10 +555,10 @@ async fn auto_advance_task(
 
         // Check whether the current state is Playing before checking audio source.
         // If Paused or Idle, do not auto-advance.
-        {
+        let finished_hash = {
             let current_state = state.lock().await;
             match current_state.state() {
-                PlaybackState::Playing { .. } => {}
+                PlaybackState::Playing { hash } => hash.clone(),
                 PlaybackState::Paused { .. } => {
                     continue;
                 }
@@ -566,14 +566,18 @@ async fn auto_advance_task(
                     continue;
                 }
             }
-        }
+        };
 
-        let finished = match audio.lock().await.loaded() {
-            Ok(Some(ref info)) => matches!(info.state, StreamPlaybackState::Finished),
-            Ok(None) => false,
+        let (finished, position_ms, duration_ms) = match audio.lock().await.loaded() {
+            Ok(Some(ref info)) => (
+                matches!(info.state, StreamPlaybackState::Finished),
+                info.position_ms,
+                info.duration_ms,
+            ),
+            Ok(None) => (false, None, None),
             Err(e) => {
                 warn!("Failed to poll audio source: {e}");
-                false
+                (false, None, None)
             }
         };
         if !finished {
@@ -593,6 +597,15 @@ async fn auto_advance_task(
             }
             entry.map(|e| (e.hash, e.source))
         };
+
+        info!(
+            "Track finished: {:?}, next: {}, position_ms={:?} duration_ms={:?}",
+            finished_hash,
+            next.as_ref()
+                .map_or_else(|| "end of queue".to_string(), |(h, _)| format!("{h:?}")),
+            position_ms,
+            duration_ms,
+        );
 
         // Drive the state machine.
         let effects = state.lock().await.track_ended(next);
@@ -630,14 +643,9 @@ mod tests {
 
         std::thread::spawn(move || {
             use stream_source_protocol::StreamResponse;
-            loop {
-                match audio_stub.recv() {
-                    Ok(_) => {
-                        let reply = serde_json::to_vec(&StreamResponse::Ok).unwrap();
-                        let _ = audio_stub.send(reply.as_slice());
-                    }
-                    Err(_) => break,
-                }
+            while audio_stub.recv().is_ok() {
+                let reply = serde_json::to_vec(&StreamResponse::Ok).unwrap();
+                let _ = audio_stub.send(reply.as_slice());
             }
         });
 
