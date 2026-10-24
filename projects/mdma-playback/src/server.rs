@@ -71,13 +71,14 @@ impl Server {
         }
     }
 
-    fn publish_event(&self, event: &PlaybackEvent) {
-        publish_event_on_socket(&self.event_pub, event);
+    /// Persist the queue and announce the change (call after every queue edit).
+    fn queue_changed(&self, queue: &VecDeque<QueueEntry>) {
+        persist_and_publish(&self.queue_file, &self.event_pub, queue);
     }
 
-    /// Serialize and write the queue to disk atomically. Logs a warning on error.
-    fn persist_queue(&self, queue: &VecDeque<QueueEntry>) {
-        persist_queue_to_file(&self.queue_file, queue);
+    /// Pop the queue front, persisting and announcing the change if it popped.
+    fn pop_next(&self, queue: &mut VecDeque<QueueEntry>) -> Option<QueueEntry> {
+        pop_front_and_publish(&self.queue_file, &self.event_pub, queue)
     }
 
     /// Load the queue from disk. Returns an empty queue on first start or corruption.
@@ -215,20 +216,14 @@ impl Server {
                 info!("Queue next: hash={:?} source={:?}", hash, source);
                 let mut queue = self.queue.lock().await;
                 queue.push_front(QueueEntry { hash, source });
-                self.persist_queue(&queue);
-                self.publish_event(&PlaybackEvent::QueueChanged {
-                    length: queue.len(),
-                });
+                self.queue_changed(&queue);
                 self.ok_response()
             }
             Command::QueueAppend { hash, source } => {
                 info!("Queue append: hash={:?} source={:?}", hash, source);
                 let mut queue = self.queue.lock().await;
                 queue.push_back(QueueEntry { hash, source });
-                self.persist_queue(&queue);
-                self.publish_event(&PlaybackEvent::QueueChanged {
-                    length: queue.len(),
-                });
+                self.queue_changed(&queue);
                 self.ok_response()
             }
             Command::QueueList => {
@@ -247,9 +242,8 @@ impl Server {
             Command::QueueClear => {
                 let mut queue = self.queue.lock().await;
                 queue.clear();
-                self.persist_queue(&queue);
+                self.queue_changed(&queue);
                 info!("Queue cleared");
-                self.publish_event(&PlaybackEvent::QueueChanged { length: 0 });
                 self.ok_response()
             }
             Command::QueueRemove { hashes } => {
@@ -257,11 +251,8 @@ impl Server {
                 let before = queue.len();
                 queue.retain(|e| !hashes.contains(&e.hash));
                 let removed = before - queue.len();
-                self.persist_queue(&queue);
+                self.queue_changed(&queue);
                 info!("Removed {}/{} hash(es) from queue", removed, hashes.len());
-                self.publish_event(&PlaybackEvent::QueueChanged {
-                    length: queue.len(),
-                });
                 Response::Ok {
                     data: Some(ResponseData::Count(removed)),
                 }
@@ -272,10 +263,8 @@ impl Server {
                 for (hash, source) in entries {
                     queue.push_back(QueueEntry { hash, source });
                 }
-                let n = queue.len();
-                self.persist_queue(&queue);
-                info!("Queue replaced with {} entries", n);
-                self.publish_event(&PlaybackEvent::QueueChanged { length: n });
+                self.queue_changed(&queue);
+                info!("Queue replaced with {} entries", queue.len());
                 self.ok_response()
             }
             Command::PlayQueue => {
@@ -293,14 +282,7 @@ impl Server {
 
                 let entry = {
                     let mut queue = self.queue.lock().await;
-                    let e = queue.pop_front();
-                    if e.is_some() {
-                        self.persist_queue(&queue);
-                        self.publish_event(&PlaybackEvent::QueueChanged {
-                            length: queue.len(),
-                        });
-                    }
-                    e
+                    self.pop_next(&mut queue)
                 };
                 match entry {
                     None => Response::Err {
@@ -334,14 +316,8 @@ impl Server {
                 info!("Skip: stopping current track and advancing queue");
                 let next = {
                     let mut queue = self.queue.lock().await;
-                    let e = queue.pop_front();
-                    if e.is_some() {
-                        self.persist_queue(&queue);
-                        self.publish_event(&PlaybackEvent::QueueChanged {
-                            length: queue.len(),
-                        });
-                    }
-                    e.map(|entry| (entry.hash, entry.source))
+                    self.pop_next(&mut queue)
+                        .map(|entry| (entry.hash, entry.source))
                 };
                 let effects = self.state.lock().await.skip(next);
                 let result =
@@ -513,9 +489,224 @@ fn persist_queue_to_file(queue_file: &Path, queue: &VecDeque<QueueEntry>) {
     }
 }
 
-/// Polls the audio source every 200 ms. When the track reaches `Finished`, pops the next
-/// entry from the queue and starts playing it automatically.
-/// Auto-advance is suppressed while playback is paused (state machine handles this).
+/// Persist the queue and publish `QueueChanged` with its new length.
+fn persist_and_publish(queue_file: &Path, event_pub: &Socket, queue: &VecDeque<QueueEntry>) {
+    persist_queue_to_file(queue_file, queue);
+    publish_event_on_socket(
+        event_pub,
+        &PlaybackEvent::QueueChanged {
+            length: queue.len(),
+        },
+    );
+}
+
+/// Pop the queue front; if something was popped, persist and publish.
+fn pop_front_and_publish(
+    queue_file: &Path,
+    event_pub: &Socket,
+    queue: &mut VecDeque<QueueEntry>,
+) -> Option<QueueEntry> {
+    let entry = queue.pop_front();
+    if entry.is_some() {
+        persist_and_publish(queue_file, event_pub, queue);
+    }
+    entry
+}
+
+/// The track the audio source should have preloaded: the front of the queue
+/// while a track is Playing or Paused, nothing otherwise.
+///
+/// The same track twice in a row is not preloaded: a gapless switch from `a`
+/// to `a` is invisible to the poll (audible == current), so that case goes
+/// through the normal finished -> load path instead.
+fn desired_preload(
+    state: &PlaybackState,
+    queue: &VecDeque<QueueEntry>,
+) -> Option<media_protocol::ContentHash> {
+    match state {
+        PlaybackState::Playing { hash } | PlaybackState::Paused { hash } => queue
+            .front()
+            .filter(|e| e.hash != *hash)
+            .map(|e| e.hash.clone()),
+        PlaybackState::Idle => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum PreloadAction {
+    Preload(media_protocol::ContentHash),
+    Clear,
+}
+
+/// What to send to the audio source so its preload matches `desired`, given
+/// the last value we sent. `None` when already in sync.
+fn preload_action(
+    desired: Option<&media_protocol::ContentHash>,
+    last_sent: Option<&media_protocol::ContentHash>,
+) -> Option<PreloadAction> {
+    if desired == last_sent {
+        return None;
+    }
+    Some(match desired {
+        Some(h) => PreloadAction::Preload(h.clone()),
+        None => PreloadAction::Clear,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum PollAction {
+    Nothing,
+    /// The audio source switched to the preloaded track by itself (gapless).
+    Advanced(media_protocol::ContentHash),
+    /// The track finished with no switch; fall back to load-and-play.
+    Finished,
+}
+
+/// Classify a `Loaded` poll while Playing.
+///
+/// `heard` is the audible track reported by the source, `known_next` every
+/// hash the source may legitimately switch to while `current` plays (what we
+/// sent as a preload plus what the source reported as its next track, see
+/// `remember_next`), `current` the state machine's track.
+///
+/// The set matters because the source commits to its next track about 3 s
+/// before it is audible; a queue edit in that window changes what we last
+/// sent, but the committed track still becomes audible.
+/// A switch wins over `Finished`: the next tick sees the new track's state.
+fn classify_poll(
+    finished: bool,
+    heard: Option<&media_protocol::ContentHash>,
+    known_next: &[media_protocol::ContentHash],
+    current: &media_protocol::ContentHash,
+) -> PollAction {
+    match heard {
+        Some(h) if h != current && known_next.contains(h) => PollAction::Advanced(h.clone()),
+        _ if finished => PollAction::Finished,
+        _ => PollAction::Nothing,
+    }
+}
+
+/// Record a hash the source may switch to next (no-op for `None` or a known hash).
+fn remember_next(
+    known_next: &mut Vec<media_protocol::ContentHash>,
+    hash: Option<&media_protocol::ContentHash>,
+) {
+    let Some(h) = hash else {
+        return;
+    };
+    if !known_next.contains(h) {
+        known_next.push(h.clone());
+    }
+}
+
+/// Remove the first queue entry with `hash`. Returns whether one was removed.
+fn remove_first(queue: &mut VecDeque<QueueEntry>, hash: &media_protocol::ContentHash) -> bool {
+    match queue.iter().position(|e| &e.hash == hash) {
+        Some(i) => {
+            queue.remove(i);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Gapless advance: ask the state machine first and only touch the queue if it
+/// actually transitioned (its guard may reject a stale observation).
+///
+/// The heard track is removed from wherever it first sits in the queue: after
+/// a queue edit inside the commit window it is no longer at the front, and
+/// leaving it would play it twice. Returns the effects and whether the queue
+/// changed.
+fn advance_and_dequeue(
+    sm: &mut PlaybackStateMachine,
+    queue: &mut VecDeque<QueueEntry>,
+    current: &media_protocol::ContentHash,
+    heard: media_protocol::ContentHash,
+) -> (Vec<PlaybackEffect>, bool) {
+    let effects = sm.track_advanced(current, heard.clone());
+    if effects.is_empty() {
+        return (effects, false);
+    }
+    let removed = remove_first(queue, &heard);
+    if !removed {
+        warn!("Gapless switch to {:?} but it is not in the queue", heard);
+    }
+    (effects, removed)
+}
+
+/// Track finished without a switch: offer the queue front to the state machine
+/// and pop it only if the state machine transitioned. Returns the effects and
+/// the popped entry, if any.
+fn finish_and_dequeue(
+    sm: &mut PlaybackStateMachine,
+    queue: &mut VecDeque<QueueEntry>,
+    finished: &media_protocol::ContentHash,
+) -> (Vec<PlaybackEffect>, Option<QueueEntry>) {
+    let next = queue.front().map(|e| (e.hash.clone(), e.source.clone()));
+    let effects = sm.track_ended(finished, next);
+    if effects.is_empty() {
+        return (effects, None);
+    }
+    (effects, queue.pop_front())
+}
+
+/// Send Preload/ClearPreload if the queue front differs from the last value sent.
+/// `last_sent` is only updated when the source accepted the command; an
+/// accepted preload is also remembered in `known_next`.
+async fn reconcile_preload(
+    audio: &Arc<Mutex<StreamClient>>,
+    queue: &Arc<Mutex<VecDeque<QueueEntry>>>,
+    state: &PlaybackState,
+    last_sent: &mut Option<media_protocol::ContentHash>,
+    known_next: &mut Vec<media_protocol::ContentHash>,
+) {
+    let desired = {
+        let q = queue.lock().await;
+        desired_preload(state, &q)
+    };
+    let Some(action) = preload_action(desired.as_ref(), last_sent.as_ref()) else {
+        return;
+    };
+    let client = audio.lock().await;
+    match action {
+        PreloadAction::Preload(hash) => match client.preload(hash.clone()) {
+            Ok(()) => {
+                remember_next(known_next, Some(&hash));
+                *last_sent = Some(hash);
+            }
+            Err(e) => warn!("Failed to preload {}: {}", hash, e),
+        },
+        PreloadAction::Clear => match client.clear_preload() {
+            Ok(()) => *last_sent = None,
+            Err(e) => warn!("Failed to clear preload: {}", e),
+        },
+    }
+}
+
+/// Polls the audio source every 200 ms.
+///
+/// * While Playing or Paused, keeps the source's preload in sync with the
+///   queue front (`desired_preload`), sending `Preload`/`ClearPreload` only
+///   when it differs from the last value sent. The "last sent" value is reset
+///   whenever the state machine's track changes or goes Idle, so it is re-sent.
+/// * Gapless switch: the source reports the audible track. The source commits
+///   to its next track once its mixer promoted it (~3 s before it is audible)
+///   and can no longer replace it, so the queue may change in that window.
+///   Per current track we therefore remember every hash we sent as a preload
+///   plus every `preloaded` hash the source reported. When the audible track
+///   is one of those and not the state machine's track, the source switched on
+///   its own and the state machine is advanced via `track_advanced` (no engine
+///   effect), recording the heard track. Only if the state machine accepted
+///   the advance is the heard track's first queue occurrence removed (it may
+///   no longer be at the front after a queue edit; the edit is kept).
+/// * `Finished` with no switch (end of queue, or the source parked the preload
+///   after a sample-rate change) falls back to `track_ended` -> LoadAndPlay
+///   (the source reuses a parked preload); the queue front is popped only if
+///   the state machine accepted it.
+/// * Both transitions carry the track the poll observed, so a poll that raced
+///   with a user command (e.g. Skip) cannot act on stale state.
+///
+/// Auto-advance is suppressed while paused.
 /// Every 5th poll iteration (~1 s) broadcasts a `PositionUpdate` event while playing.
 async fn auto_advance_task(
     audio: Arc<Mutex<StreamClient>>,
@@ -526,6 +717,11 @@ async fn auto_advance_task(
     queue_file: PathBuf,
 ) {
     let mut tick: u8 = 0;
+    // Last preload value sent to the source, and the track it was sent for.
+    let mut last_sent: Option<media_protocol::ContentHash> = None;
+    let mut last_current: Option<media_protocol::ContentHash> = None;
+    // Hashes the source may switch to while `last_current` plays (see `classify_poll`).
+    let mut known: Vec<media_protocol::ContentHash> = Vec::new();
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
         tick = tick.wrapping_add(1);
@@ -553,62 +749,107 @@ async fn auto_advance_task(
             }
         }
 
-        // Check whether the current state is Playing before checking audio source.
-        // If Paused or Idle, do not auto-advance.
-        let finished_hash = {
-            let current_state = state.lock().await;
-            match current_state.state() {
-                PlaybackState::Playing { hash } => hash.clone(),
-                PlaybackState::Paused { .. } => {
-                    continue;
-                }
-                PlaybackState::Idle => {
-                    continue;
-                }
+        let snapshot = state.lock().await.state().clone();
+        let (current_hash, is_playing) = match &snapshot {
+            PlaybackState::Playing { hash } => (hash.clone(), true),
+            PlaybackState::Paused { hash } => (hash.clone(), false),
+            PlaybackState::Idle => {
+                // Stopped: the source dropped its preload; make sure we re-send later.
+                last_current = None;
+                last_sent = None;
+                known.clear();
+                continue;
             }
         };
+        if last_current.as_ref() != Some(&current_hash) {
+            // New track (manual load, skip, advance): re-send the preload.
+            last_current = Some(current_hash.clone());
+            last_sent = None;
+            known.clear();
+        }
 
-        let (finished, position_ms, duration_ms) = match audio.lock().await.loaded() {
-            Ok(Some(ref info)) => (
-                matches!(info.state, StreamPlaybackState::Finished),
-                info.position_ms,
-                info.duration_ms,
-            ),
-            Ok(None) => (false, None, None),
-            Err(e) => {
-                warn!("Failed to poll audio source: {e}");
-                (false, None, None)
-            }
-        };
-        if !finished {
+        let (finished, heard, reported_next, position_ms, duration_ms) =
+            match audio.lock().await.loaded() {
+                Ok(Some(ref info)) => (
+                    matches!(info.state, StreamPlaybackState::Finished),
+                    info.content_hash.clone(),
+                    info.preloaded.clone(),
+                    info.position_ms,
+                    info.duration_ms,
+                ),
+                Ok(None) => (false, None, None, None, None),
+                Err(e) => {
+                    warn!("Failed to poll audio source: {e}");
+                    (false, None, None, None, None)
+                }
+            };
+        remember_next(&mut known, reported_next.as_ref());
+
+        if !is_playing {
+            // Paused: no advancing, but keep the preload in sync.
+            reconcile_preload(&audio, &queue, &snapshot, &mut last_sent, &mut known).await;
             continue;
         }
 
-        // Track ended — pop next from queue.
-        let next = {
-            let mut q = queue.lock().await;
-            let entry = q.pop_front();
-            if entry.is_some() {
-                persist_queue_to_file(&queue_file, &q);
-                publish_event_on_socket(
-                    &event_pub,
-                    &PlaybackEvent::QueueChanged { length: q.len() },
-                );
+        // The snapshot predates the poll; a command (e.g. Skip) may have moved
+        // the state since. Drop this observation rather than act on it.
+        if state.lock().await.current_hash() != Some(&current_hash) {
+            continue;
+        }
+
+        match classify_poll(finished, heard.as_ref(), &known, &current_hash) {
+            PollAction::Nothing => {
+                reconcile_preload(&audio, &queue, &snapshot, &mut last_sent, &mut known).await;
+                continue;
             }
-            entry.map(|e| (e.hash, e.source))
+            PollAction::Advanced(heard_hash) => {
+                let effects = {
+                    let mut sm = state.lock().await;
+                    let mut q = queue.lock().await;
+                    let (effects, removed) =
+                        advance_and_dequeue(&mut sm, &mut q, &current_hash, heard_hash.clone());
+                    if removed {
+                        persist_and_publish(&queue_file, &event_pub, &q);
+                    }
+                    effects
+                };
+                if effects.is_empty() {
+                    continue;
+                }
+                info!("Gapless advance: {:?} -> {:?}", current_hash, heard_hash);
+                if let Err(e) = execute_effects(effects, &audio, &event_pub, &acid_client).await {
+                    warn!("Gapless advance bookkeeping failed: {}", e);
+                }
+                // The source consumed its preload; new track resets via last_current.
+                continue;
+            }
+            PollAction::Finished => {}
+        }
+        let finished_hash = current_hash;
+
+        // Track ended — drive the state machine; the queue front is popped only
+        // if it actually transitioned.
+        let (effects, next) = {
+            let mut sm = state.lock().await;
+            let mut q = queue.lock().await;
+            let (effects, popped) = finish_and_dequeue(&mut sm, &mut q, &finished_hash);
+            if popped.is_some() {
+                persist_and_publish(&queue_file, &event_pub, &q);
+            }
+            (effects, popped)
         };
+        if effects.is_empty() {
+            continue;
+        }
 
         info!(
             "Track finished: {:?}, next: {}, position_ms={:?} duration_ms={:?}",
             finished_hash,
             next.as_ref()
-                .map_or_else(|| "end of queue".to_string(), |(h, _)| format!("{h:?}")),
+                .map_or_else(|| "end of queue".to_string(), |e| format!("{:?}", e.hash)),
             position_ms,
             duration_ms,
         );
-
-        // Drive the state machine.
-        let effects = state.lock().await.track_ended(next);
 
         if let Err(e) = execute_effects(effects, &audio, &event_pub, &acid_client).await {
             warn!("Auto-advance failed: {}", e);
@@ -755,6 +996,331 @@ mod tests {
             matches!(server.state.lock().await.state(), PlaybackState::Idle),
             "Expected Idle after Skip from Paused"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Gapless pure helpers
+    // -------------------------------------------------------------------------
+
+    fn h(s: &str) -> media_protocol::ContentHash {
+        media_protocol::ContentHash::new(s)
+    }
+
+    fn entry(s: &str) -> QueueEntry {
+        QueueEntry {
+            hash: h(s),
+            source: SourceName::audio(),
+        }
+    }
+
+    #[test]
+    fn desired_preload_empty_queue_is_none() {
+        let q = VecDeque::new();
+        assert_eq!(
+            desired_preload(&PlaybackState::Playing { hash: h("a") }, &q),
+            None
+        );
+    }
+
+    #[test]
+    fn desired_preload_playing_and_paused_is_queue_front() {
+        let q: VecDeque<_> = [entry("b"), entry("c")].into();
+        assert_eq!(
+            desired_preload(&PlaybackState::Playing { hash: h("a") }, &q),
+            Some(h("b"))
+        );
+        assert_eq!(
+            desired_preload(&PlaybackState::Paused { hash: h("a") }, &q),
+            Some(h("b"))
+        );
+    }
+
+    #[test]
+    fn desired_preload_idle_is_none() {
+        let q: VecDeque<_> = [entry("b")].into();
+        assert_eq!(desired_preload(&PlaybackState::Idle, &q), None);
+    }
+
+    #[test]
+    fn desired_preload_follows_queue_changes() {
+        let state = PlaybackState::Playing { hash: h("a") };
+        let mut q: VecDeque<_> = [entry("b")].into();
+        assert_eq!(desired_preload(&state, &q), Some(h("b")));
+        q.push_front(entry("x"));
+        assert_eq!(desired_preload(&state, &q), Some(h("x")));
+        q.clear();
+        assert_eq!(desired_preload(&state, &q), None);
+    }
+
+    #[test]
+    fn preload_action_cases() {
+        // unchanged
+        assert_eq!(preload_action(Some(&h("b")), Some(&h("b"))), None);
+        assert_eq!(preload_action(None, None), None);
+        // new / changed
+        assert_eq!(
+            preload_action(Some(&h("b")), None),
+            Some(PreloadAction::Preload(h("b")))
+        );
+        assert_eq!(
+            preload_action(Some(&h("c")), Some(&h("b"))),
+            Some(PreloadAction::Preload(h("c")))
+        );
+        // queue emptied
+        assert_eq!(
+            preload_action(None, Some(&h("b"))),
+            Some(PreloadAction::Clear)
+        );
+    }
+
+    #[test]
+    fn desired_preload_is_none_when_front_is_the_current_track() {
+        // Gapless A -> A would be invisible to the poll (heard == current),
+        // so the same track twice in a row goes through the load path.
+        let q: VecDeque<_> = [entry("a"), entry("c")].into();
+        assert_eq!(
+            desired_preload(&PlaybackState::Playing { hash: h("a") }, &q),
+            None
+        );
+        assert_eq!(
+            desired_preload(&PlaybackState::Paused { hash: h("a") }, &q),
+            None
+        );
+    }
+
+    #[test]
+    fn classify_poll_gapless_switch() {
+        let action = classify_poll(false, Some(&h("b")), &[h("b")], &h("a"));
+        assert_eq!(action, PollAction::Advanced(h("b")));
+    }
+
+    #[test]
+    fn classify_poll_switch_wins_over_finished() {
+        let action = classify_poll(true, Some(&h("b")), &[h("b")], &h("a"));
+        assert_eq!(action, PollAction::Advanced(h("b")));
+    }
+
+    #[test]
+    fn classify_poll_same_track_playing_is_nothing() {
+        assert_eq!(
+            classify_poll(false, Some(&h("a")), &[h("b")], &h("a")),
+            PollAction::Nothing
+        );
+    }
+
+    #[test]
+    fn classify_poll_finished_without_switch() {
+        assert_eq!(
+            classify_poll(true, Some(&h("a")), &[h("b")], &h("a")),
+            PollAction::Finished
+        );
+        assert_eq!(
+            classify_poll(true, Some(&h("a")), &[], &h("a")),
+            PollAction::Finished
+        );
+        assert_eq!(
+            classify_poll(true, None, &[], &h("a")),
+            PollAction::Finished
+        );
+    }
+
+    #[test]
+    fn classify_poll_unrelated_hash_is_not_a_switch() {
+        // Neither preloaded by us nor reported by the source (e.g. stale poll
+        // around a manual load).
+        assert_eq!(
+            classify_poll(false, Some(&h("z")), &[h("b")], &h("a")),
+            PollAction::Nothing
+        );
+        assert_eq!(
+            classify_poll(false, Some(&h("b")), &[], &h("a")),
+            PollAction::Nothing
+        );
+    }
+
+    #[test]
+    fn classify_poll_detects_switch_to_committed_track_after_preload_was_replaced() {
+        // We sent b, the source committed b, then we replaced the preload with x.
+        // When b becomes audible it must still be detected.
+        let mut known = Vec::new();
+        remember_next(&mut known, Some(&h("b"))); // sent
+        remember_next(&mut known, Some(&h("b"))); // reported by the source (committed)
+        remember_next(&mut known, Some(&h("x"))); // sent after the queue edit
+        assert_eq!(
+            classify_poll(false, Some(&h("b")), &known, &h("a")),
+            PollAction::Advanced(h("b"))
+        );
+    }
+
+    #[test]
+    fn classify_poll_detects_switch_to_committed_track_after_preload_was_cleared() {
+        // Queue cleared after commit: nothing is sent any more, but the source
+        // reported b as its next track in an earlier poll.
+        let mut known = Vec::new();
+        remember_next(&mut known, Some(&h("b")));
+        remember_next(&mut known, None);
+        assert_eq!(
+            classify_poll(true, Some(&h("b")), &known, &h("a")),
+            PollAction::Advanced(h("b"))
+        );
+    }
+
+    #[test]
+    fn remember_next_ignores_none_and_duplicates() {
+        let mut known = Vec::new();
+        remember_next(&mut known, None);
+        remember_next(&mut known, Some(&h("b")));
+        remember_next(&mut known, Some(&h("b")));
+        assert_eq!(known, vec![h("b")]);
+    }
+
+    // -------------------------------------------------------------------------
+    // Auto-advance scenarios through the pure functions
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn scenario_queue_edited_inside_commit_window_records_heard_and_keeps_edit() {
+        // Playing a; queue [b, c]; b sent and committed; user does QueueNext x.
+        let mut sm = PlaybackStateMachine::new();
+        sm.play_queue(h("a"), SourceName::audio());
+        let mut q: VecDeque<_> = [entry("x"), entry("b"), entry("c")].into();
+        let known = vec![h("b"), h("x")];
+
+        let action = classify_poll(false, Some(&h("b")), &known, &h("a"));
+        assert_eq!(action, PollAction::Advanced(h("b")));
+        let PollAction::Advanced(heard) = action else {
+            unreachable!()
+        };
+        // b is not at the front: it is removed from where it is, the edit stays.
+        let (effects, removed) = advance_and_dequeue(&mut sm, &mut q, &h("a"), heard);
+        assert!(!effects.is_empty());
+        assert!(removed);
+        assert_eq!(sm.current_hash(), Some(&h("b")));
+        let hashes: Vec<_> = q.iter().map(|e| e.hash.clone()).collect();
+        assert_eq!(hashes, vec![h("x"), h("c")]);
+    }
+
+    #[test]
+    fn advance_rejected_by_state_machine_leaves_queue_untouched() {
+        // A Pause landed between the poll and the advance: the guard rejects.
+        let mut sm = PlaybackStateMachine::new();
+        sm.play_queue(h("a"), SourceName::audio());
+        sm.pause();
+        let mut q: VecDeque<_> = [entry("b"), entry("c")].into();
+
+        let (effects, removed) = advance_and_dequeue(&mut sm, &mut q, &h("a"), h("b"));
+        assert!(effects.is_empty());
+        assert!(!removed);
+        assert_eq!(q.len(), 2);
+        assert!(matches!(sm.state(), PlaybackState::Paused { .. }));
+    }
+
+    #[test]
+    fn finish_rejected_by_state_machine_leaves_queue_untouched() {
+        let mut sm = PlaybackStateMachine::new();
+        sm.play_queue(h("a"), SourceName::audio());
+        sm.pause();
+        let mut q: VecDeque<_> = [entry("b")].into();
+
+        let (effects, popped) = finish_and_dequeue(&mut sm, &mut q, &h("a"));
+        assert!(effects.is_empty());
+        assert!(popped.is_none());
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn finish_pops_front_when_state_machine_transitions() {
+        let mut sm = PlaybackStateMachine::new();
+        sm.play_queue(h("a"), SourceName::audio());
+        let mut q: VecDeque<_> = [entry("b"), entry("c")].into();
+
+        let (effects, popped) = finish_and_dequeue(&mut sm, &mut q, &h("a"));
+        assert!(!effects.is_empty());
+        assert_eq!(popped.map(|e| e.hash), Some(h("b")));
+        assert_eq!(q.len(), 1);
+        assert_eq!(sm.current_hash(), Some(&h("b")));
+    }
+
+    #[test]
+    fn finish_with_empty_queue_goes_idle() {
+        let mut sm = PlaybackStateMachine::new();
+        sm.play_queue(h("a"), SourceName::audio());
+        let mut q: VecDeque<QueueEntry> = VecDeque::new();
+
+        let (effects, popped) = finish_and_dequeue(&mut sm, &mut q, &h("a"));
+        assert!(!effects.is_empty());
+        assert!(popped.is_none());
+        assert_eq!(sm.state(), &PlaybackState::Idle);
+    }
+
+    #[test]
+    fn scenario_parked_preload_finished_falls_back_to_load_path() {
+        // The source parked the preload (sample-rate change): a finishes with
+        // no switch, so the queue front is popped and loaded explicitly.
+        let mut sm = PlaybackStateMachine::new();
+        sm.play_queue(h("a"), SourceName::audio());
+        let mut q: VecDeque<_> = [entry("b")].into();
+
+        let action = classify_poll(true, Some(&h("a")), &[h("b")], &h("a"));
+        assert_eq!(action, PollAction::Finished);
+        let next = q.pop_front().map(|e| (e.hash, e.source));
+        let effects = sm.track_ended(&h("a"), next);
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, PlaybackEffect::LoadAndPlay { hash, .. } if *hash == h("b"))));
+        assert_eq!(sm.current_hash(), Some(&h("b")));
+    }
+
+    #[test]
+    fn scenario_end_of_queue_goes_idle() {
+        let mut sm = PlaybackStateMachine::new();
+        sm.play_queue(h("a"), SourceName::audio());
+        let q: VecDeque<QueueEntry> = VecDeque::new();
+
+        assert_eq!(
+            desired_preload(sm.state(), &q),
+            None,
+            "nothing to preload at the end of the queue"
+        );
+        assert_eq!(
+            classify_poll(true, Some(&h("a")), &[], &h("a")),
+            PollAction::Finished
+        );
+        sm.track_ended(&h("a"), None);
+        assert_eq!(sm.state(), &PlaybackState::Idle);
+    }
+
+    #[test]
+    fn scenario_same_track_twice_plays_twice() {
+        let mut sm = PlaybackStateMachine::new();
+        sm.play_queue(h("a"), SourceName::audio());
+        let mut q: VecDeque<_> = [entry("a")].into();
+
+        // No preload for a duplicate of the current track.
+        assert_eq!(desired_preload(sm.state(), &q), None);
+        assert_eq!(
+            classify_poll(true, Some(&h("a")), &[], &h("a")),
+            PollAction::Finished
+        );
+        let next = q.pop_front().map(|e| (e.hash, e.source));
+        let effects = sm.track_ended(&h("a"), next);
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, PlaybackEffect::LoadAndPlay { hash, .. } if *hash == h("a"))));
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn remove_first_removes_first_occurrence_only() {
+        let mut q: VecDeque<_> = [entry("b"), entry("c"), entry("b")].into();
+        assert!(remove_first(&mut q, &h("c")));
+        assert_eq!(q.len(), 2);
+        assert!(remove_first(&mut q, &h("b")));
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.front().unwrap().hash, h("b"));
+        assert!(!remove_first(&mut q, &h("z")));
+        let mut empty = VecDeque::new();
+        assert!(!remove_first(&mut empty, &h("b")));
     }
 
     /// Verify state machine transitions work for stop/resume without involving audio.

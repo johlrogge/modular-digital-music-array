@@ -36,36 +36,37 @@ impl StreamClient {
         serde_json::from_slice(&msg).map_err(ServerError::from_json)
     }
 
-    pub fn load(&self, content_hash: ContentHash) -> Result<(), ServerError> {
-        match self.send(&StreamCommand::Load { content_hash })? {
+    /// Send a command whose only valid success reply is `Ok`.
+    fn expect_ok(&self, cmd: &StreamCommand) -> Result<(), ServerError> {
+        match self.send(cmd)? {
             StreamResponse::Ok => Ok(()),
             StreamResponse::Error { message } => Err(ServerError::stream(message)),
             other => Err(ServerError::stream(format!("unexpected: {other:?}"))),
         }
+    }
+
+    pub fn load(&self, content_hash: ContentHash) -> Result<(), ServerError> {
+        self.expect_ok(&StreamCommand::Load { content_hash })
+    }
+
+    pub fn preload(&self, content_hash: ContentHash) -> Result<(), ServerError> {
+        self.expect_ok(&StreamCommand::Preload { content_hash })
+    }
+
+    pub fn clear_preload(&self) -> Result<(), ServerError> {
+        self.expect_ok(&StreamCommand::ClearPreload)
     }
 
     pub fn play(&self) -> Result<(), ServerError> {
-        match self.send(&StreamCommand::Play)? {
-            StreamResponse::Ok => Ok(()),
-            StreamResponse::Error { message } => Err(ServerError::stream(message)),
-            other => Err(ServerError::stream(format!("unexpected: {other:?}"))),
-        }
+        self.expect_ok(&StreamCommand::Play)
     }
 
     pub fn stop(&self) -> Result<(), ServerError> {
-        match self.send(&StreamCommand::Stop)? {
-            StreamResponse::Ok => Ok(()),
-            StreamResponse::Error { message } => Err(ServerError::stream(message)),
-            other => Err(ServerError::stream(format!("unexpected: {other:?}"))),
-        }
+        self.expect_ok(&StreamCommand::Stop)
     }
 
     pub fn pause(&self) -> Result<(), ServerError> {
-        match self.send(&StreamCommand::Pause)? {
-            StreamResponse::Ok => Ok(()),
-            StreamResponse::Error { message } => Err(ServerError::stream(message)),
-            other => Err(ServerError::stream(format!("unexpected: {other:?}"))),
-        }
+        self.expect_ok(&StreamCommand::Pause)
     }
 
     pub fn loaded(&self) -> Result<Option<StreamTrackInfo>, ServerError> {
