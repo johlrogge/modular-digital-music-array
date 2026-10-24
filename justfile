@@ -1,3 +1,7 @@
+# cargo-zigbuild uses this zig wrapper, which strips the unsupported
+# -Wl,--fix-cortex-a53-843419 flag passed by newer rustc (see script header).
+export CARGO_ZIGBUILD_ZIG_PATH := `realpath scripts/ci/zig-filter.sh`
+
 default:
     just --list
 
