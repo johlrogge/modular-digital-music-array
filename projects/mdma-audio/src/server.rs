@@ -152,7 +152,6 @@ impl Server {
             }
         };
 
-        self.engine.set_stream_active(true);
         if let Err(e) = self.engine.play() {
             warn!("Play failed: {}", e);
             return StreamResponse::Error {
@@ -185,7 +184,9 @@ impl Server {
             if let Err(e) = self.engine.unload_track() {
                 warn!("Unload failed: {}", e);
             }
-            self.engine.set_stream_active(false);
+            // The stream stays active: stop/unload pause the engine, whose
+            // output callback keeps running (emitting silence) so the next
+            // load_track flush is serviced promptly.
             self.loaded = None;
         }
         StreamResponse::Ok

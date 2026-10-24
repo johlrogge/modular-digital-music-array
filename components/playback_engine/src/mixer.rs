@@ -21,15 +21,24 @@ impl Mixer {
         samples_per_callback: usize,
         consumer: &mut Option<HeapConsumer<f32>>,
     ) -> Result<(), PlaybackError> {
-        // How many samples are ready from the track?
+        // How many samples can we move this cycle? Bounded by what the track
+        // has ready, the callback width, the scratch buffer and the free space
+        // in the output ring. Never blocks: samples are only popped from the
+        // track when there is room to push them, so no already-popped audio
+        // is ever held across a ClearTrack/flush.
+        let free = self.output_producer.free_len();
         let to_mix = match consumer.as_ref() {
-            Some(c) => std::cmp::min(c.len(), samples_per_callback),
+            Some(c) => c
+                .len()
+                .min(samples_per_callback)
+                .min(output.len())
+                .min(free),
             None => 0,
         };
 
         if to_mix == 0 {
-            // Nothing to produce this cycle. Let the mixer ring buffer drain
-            // naturally; caller will retry after its own sleep.
+            // Nothing to produce (or ring full) this cycle; the caller
+            // sleeps and retries.
             return Ok(());
         }
 
@@ -45,15 +54,10 @@ impl Mixer {
             });
         }
 
-        // Write exactly `to_mix` samples — no silence padding
-        let mut written = 0;
-        while written < to_mix {
-            let pushed = self.output_producer.push_slice(&output[written..to_mix]);
-            written += pushed;
-            if written < to_mix {
-                std::thread::sleep(std::time::Duration::from_micros(500));
-            }
-        }
+        // Single producer and `to_mix <= free_len`: this writes everything.
+        // Exactly `to_mix` samples — no silence padding.
+        let pushed = self.output_producer.push_slice(&output[..to_mix]);
+        debug_assert_eq!(pushed, to_mix);
 
         Ok(())
     }
@@ -109,6 +113,26 @@ mod tests {
         for s in &drained {
             assert!((*s - 1.0).abs() < 1e-6, "expected sample 1.0, got {}", s);
         }
+    }
+
+    #[test]
+    fn mix_pushes_only_free_space_and_does_not_block() {
+        let (mut mixer, mut output_consumer) = make_mixer(10);
+        let (track_consumer, _track_producer) = push_samples(100, 1.0);
+        let mut consumer_opt: Option<HeapConsumer<f32>> = Some(track_consumer);
+
+        let mut output = vec![0.0f32; 3840];
+        mixer.mix(&mut output, 3840, &mut consumer_opt).unwrap();
+
+        assert_eq!(output_consumer.len(), 10, "pushes exactly the free slots");
+        // Unpushed samples stay in the track ring, not held by the mixer.
+        assert_eq!(consumer_opt.as_ref().unwrap().len(), 90);
+
+        // Once the output ring drains, the remainder flows.
+        let mut sink = [0.0f32; 10];
+        output_consumer.pop_slice(&mut sink);
+        mixer.mix(&mut output, 3840, &mut consumer_opt).unwrap();
+        assert_eq!(output_consumer.len(), 10);
     }
 
     #[test]

@@ -1,30 +1,29 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use pipewire as pw;
 use pw::{properties::properties, spa};
 use ringbuf::HeapConsumer;
 use spa::pod::Pod;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 pub const DEFAULT_CHANNELS: u32 = 2;
 pub const CHAN_SIZE: usize = std::mem::size_of::<f32>();
 
 pub enum StreamCommand {
-    SetActive(bool),
     Shutdown(mpsc::SyncSender<HeapConsumer<f32>>),
-    /// Drain the mixer output ring buffer (pop-and-discard) and flush
-    /// PipeWire's own in-flight buffers.
+    /// Flush PipeWire's own in-flight buffers. The mixer ring is drained by the
+    /// RT callback itself (see `PipewireOutput::flush`), not by this command.
     Flush,
 }
 
 impl std::fmt::Debug for StreamCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StreamCommand::SetActive(v) => write!(f, "SetActive({v})"),
             StreamCommand::Shutdown(_) => write!(f, "Shutdown(..)"),
             StreamCommand::Flush => write!(f, "Flush"),
         }
@@ -61,17 +60,66 @@ pub const DRAINED_AFTER_SILENT_CALLBACKS: u32 = 2;
 ///
 /// # Invariant
 ///
-/// A deactivated stream receives no callbacks, so the counter freezes at its
-/// last value rather than counting up.
+/// A *paused* stream (engine pause flag) does receive callbacks, but
+/// [`render`] deliberately does not record them, so the counter freezes at its
+/// last value rather than counting up. A serviced flush resets the counter.
 #[derive(Debug, Default)]
 pub struct PlayoutMonitor {
     silent_callbacks: AtomicU32,
     underrun_streak: AtomicU32,
+    /// Generation of the most recent flush request (caller side writes).
+    flush_requested: AtomicU64,
+    /// Generation of the most recent flush acknowledged (RT callback writes;
+    /// the caller may also raise it to abandon a request).
+    flush_completed: AtomicU64,
+    /// Samples discarded by the most recently serviced flush.
+    flush_drained: AtomicUsize,
 }
 
 impl PlayoutMonitor {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Ask the RT callback to discard everything in its ring consumer.
+    /// Returns the generation to pass to [`flush_acked`](Self::flush_acked).
+    /// Callable from any thread; atomics only.
+    pub fn request_flush(&self) -> u64 {
+        self.flush_requested.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// True once the callback has serviced (or the caller abandoned) request
+    /// `generation`.
+    pub fn flush_acked(&self, generation: u64) -> bool {
+        self.flush_completed.load(Ordering::Acquire) >= generation
+    }
+
+    /// Give up on request `generation` so a stalled stream does not
+    /// later discard audio produced after the caller stopped waiting.
+    pub fn abandon_flush(&self, generation: u64) {
+        self.flush_completed.fetch_max(generation, Ordering::AcqRel);
+    }
+
+    /// Samples discarded by the most recently serviced flush. Meaningful after
+    /// [`flush_acked`](Self::flush_acked) returned true.
+    pub fn last_flush_drained(&self) -> usize {
+        self.flush_drained.load(Ordering::Acquire)
+    }
+
+    /// RT side: if a flush is pending, discard everything in `consumer`,
+    /// record the count and acknowledge. No allocation, no locks.
+    fn service_flush(&self, consumer: &mut HeapConsumer<f32>) {
+        let requested = self.flush_requested.load(Ordering::Acquire);
+        if self.flush_completed.load(Ordering::Acquire) >= requested {
+            return;
+        }
+        let drained = consumer.clear();
+        // The ring was emptied by a flush, not played out: restart drain and
+        // underrun tracking. RT thread is the single writer of both counters.
+        self.silent_callbacks.store(0, Ordering::Relaxed);
+        self.underrun_streak.store(0, Ordering::Relaxed);
+        self.flush_drained.store(drained, Ordering::Release);
+        self.flush_completed.fetch_max(requested, Ordering::AcqRel);
     }
 
     /// Record one callback. Returns `true` if a mid-stream underrun warning
@@ -113,6 +161,49 @@ impl PlayoutMonitor {
     }
 }
 
+/// Outcome of one [`render`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rendered {
+    /// Paused: `out` is zeroed, the ring untouched, the monitor not updated.
+    Paused,
+    /// Played: `samples` were popped into `out` (the rest is for the caller to
+    /// treat as silence). `underrun_warn` is the monitor's verdict for this
+    /// callback.
+    Played { samples: usize, underrun_warn: bool },
+}
+
+/// Fill `out` from `consumer` for one callback and update `monitor`.
+///
+/// A pending flush is always serviced first, even while paused. If `paused`
+/// is set, `out` is zeroed, the consumer is left untouched and
+/// [`PlayoutMonitor::record`] is NOT called, so the silence counter stays
+/// frozen and a paused track never counts as drained. Otherwise the callback
+/// is recorded against `out.len()` requested samples.
+///
+/// PipeWire-independent and RT-safe (no allocation, no locks).
+pub fn render(
+    consumer: &mut HeapConsumer<f32>,
+    out: &mut [f32],
+    monitor: &PlayoutMonitor,
+    paused: &AtomicBool,
+) -> Rendered {
+    monitor.service_flush(consumer);
+    if paused.load(Ordering::Acquire) {
+        out.fill(0.0);
+        return Rendered::Paused;
+    }
+    let samples = consumer.pop_slice(out);
+    let underrun_warn = monitor.record(samples, out.len());
+    Rendered::Played {
+        samples,
+        underrun_warn,
+    }
+}
+
+/// How long [`PipewireOutput::flush`] waits for the callback to acknowledge.
+const FLUSH_TIMEOUT: Duration = Duration::from_millis(100);
+const FLUSH_POLL: Duration = Duration::from_millis(1);
+
 pub struct PipewireOutput {
     // Thread handle to keep the PipeWire thread alive
     pw_thread: Option<thread::JoinHandle<Result<(), pw::Error>>>,
@@ -123,6 +214,7 @@ pub struct PipewireOutput {
 impl PipewireOutput {
     pub fn new(
         sample_consumer: HeapConsumer<f32>,
+        paused: Arc<AtomicBool>,
         sample_rate: u32,
         target_device: Option<&str>,
     ) -> Result<Self, pw::Error> {
@@ -142,24 +234,36 @@ impl PipewireOutput {
             let context = pw::context::Context::new(&mainloop)?;
             let core = context.connect(None)?;
 
-            // Wrap consumer so it can be extracted on shutdown without moving out of UserData
-            let shared_consumer: Rc<RefCell<Option<HeapConsumer<f32>>>> =
-                Rc::new(RefCell::new(Some(sample_consumer)));
+            // The consumer is owned exclusively by the RT callback's user data.
+            // On drop (after the stream is disconnected, so the callback can no
+            // longer run) it is handed back through `consumer_return_tx`.
+            let (consumer_return_tx, consumer_return_rx) = mpsc::channel::<HeapConsumer<f32>>();
 
-            // Create user data struct to hold consumer
             struct UserData {
-                consumer: Rc<RefCell<Option<HeapConsumer<f32>>>>,
-                frame_count: usize, // For debugging
-                /// Drain / underrun bookkeeping shared with `PipewireOutput`.
+                consumer: Option<HeapConsumer<f32>>,
+                consumer_return: mpsc::Sender<HeapConsumer<f32>>,
+                /// Drain / underrun / flush bookkeeping shared with `PipewireOutput`.
                 monitor: Arc<PlayoutMonitor>,
+                /// Engine-owned pause flag: while set the callback emits silence
+                /// and leaves the ring untouched.
+                paused: Arc<AtomicBool>,
                 /// Preallocated read buffer; grown only if a larger quantum arrives.
                 scratch: Vec<f32>,
             }
 
+            impl Drop for UserData {
+                fn drop(&mut self) {
+                    if let Some(c) = self.consumer.take() {
+                        let _ = self.consumer_return.send(c);
+                    }
+                }
+            }
+
             let user_data = UserData {
-                consumer: shared_consumer.clone(),
-                frame_count: 0,
+                consumer: Some(sample_consumer),
+                consumer_return: consumer_return_tx,
                 monitor: monitor_for_cb,
+                paused,
                 scratch: vec![0.0f32; SCRATCH_FRAMES * DEFAULT_CHANNELS as usize],
             };
 
@@ -189,7 +293,7 @@ impl PipewireOutput {
             };
 
             // Held alive until the mainloop exits; dropping it would detach the process callback.
-            let _listener = stream
+            let listener = stream
                 .add_local_listener_with_user_data(user_data)
                 .process(|stream, user_data| match stream.dequeue_buffer() {
                     None => tracing::warn!("No buffer received"),
@@ -200,9 +304,6 @@ impl PipewireOutput {
 
                         let n_frames = if let Some(slice) = data.data() {
                             let n_frames = slice.len() / stride;
-
-                            // Log every 100 frames for debugging
-                            user_data.frame_count += 1;
 
                             let requested = n_frames * DEFAULT_CHANNELS as usize;
                             if user_data.scratch.len() < requested {
@@ -215,24 +316,21 @@ impl PipewireOutput {
                             }
                             let f32_buffer = &mut user_data.scratch[..requested];
 
-                            // Read from consumer (if still present — taken on shutdown)
-                            let samples_read =
-                                if let Some(ref mut consumer) = *user_data.consumer.borrow_mut() {
-                                    if user_data.frame_count % 100 == 0 {
-                                        debug!(
-                                            "Processing {} frames, consumer has {} samples",
-                                            n_frames,
-                                            consumer.len()
-                                        );
-                                    }
-                                    let n = consumer.pop_slice(f32_buffer);
-                                    if user_data.frame_count % 100 == 0 && n > 0 {
-                                        debug!("Read {} samples from consumer", n);
-                                    }
-                                    n
-                                } else {
-                                    0
-                                };
+                            // Services any pending flush, pops, and records on the
+                            // monitor (paused callbacks are not recorded).
+                            let rendered = match user_data.consumer.as_mut() {
+                                Some(consumer) => render(
+                                    consumer,
+                                    f32_buffer,
+                                    &user_data.monitor,
+                                    &user_data.paused,
+                                ),
+                                None => Rendered::Paused,
+                            };
+                            let samples_read = match rendered {
+                                Rendered::Paused => 0,
+                                Rendered::Played { samples, .. } => samples,
+                            };
 
                             // Write f32 samples directly to output buffer
                             for i in 0..n_frames {
@@ -252,7 +350,13 @@ impl PipewireOutput {
                                 }
                             }
 
-                            if user_data.monitor.record(samples_read, requested) {
+                            if matches!(
+                                rendered,
+                                Rendered::Played {
+                                    underrun_warn: true,
+                                    ..
+                                }
+                            ) {
                                 warn!(
                                     n_frames,
                                     samples_provided = samples_read,
@@ -313,33 +417,30 @@ impl PipewireOutput {
             // Held alive until the mainloop exits; dropping it would detach the channel listener.
             let stream_for_cmd = stream.clone();
             let mainloop_for_cmd = mainloop.clone();
-            let consumer_for_cmd = shared_consumer.clone();
-            let _cmd_receiver = cmd_receiver.attach(mainloop.loop_(), move |cmd| match cmd {
-                StreamCommand::SetActive(active) => {
-                    if let Err(e) = stream_for_cmd.set_active(active) {
-                        tracing::warn!("Failed to set stream active={}: {}", active, e);
-                    } else {
-                        info!("Stream set_active({})", active);
-                    }
-                }
+            // Main-loop-thread only; filled by Shutdown, answered after the loop exits.
+            let shutdown_reply: Rc<RefCell<Option<mpsc::SyncSender<HeapConsumer<f32>>>>> =
+                Rc::new(RefCell::new(None));
+            let shutdown_reply_for_cmd = shutdown_reply.clone();
+            // Set if disconnect failed: the RT callback may still be running.
+            let disconnect_failed = Rc::new(Cell::new(false));
+            let disconnect_failed_for_cmd = disconnect_failed.clone();
+            let cmd_attached = cmd_receiver.attach(mainloop.loop_(), move |cmd| match cmd {
                 StreamCommand::Shutdown(tx) => {
-                    // Take the consumer out before quitting so we can hand it back
-                    let consumer = consumer_for_cmd.borrow_mut().take();
-                    if let Some(c) = consumer {
-                        let _ = tx.send(c);
+                    // Disconnect first: this removes the stream from the data
+                    // loop, so the RT callback can no longer run once we drop
+                    // its user data (and thus recover the consumer) below.
+                    if let Err(e) = stream_for_cmd.disconnect() {
+                        tracing::error!("Shutdown: stream.disconnect() failed: {}", e);
+                        disconnect_failed_for_cmd.set(true);
                     }
+                    *shutdown_reply_for_cmd.borrow_mut() = Some(tx);
                     mainloop_for_cmd.quit();
                 }
                 StreamCommand::Flush => {
-                    // Drain the mixer output ring buffer: discard all pending samples
-                    // so old-track audio does not reach PipeWire after a skip.
-                    if let Some(ref mut consumer) = *consumer_for_cmd.borrow_mut() {
-                        let pending = consumer.len();
-                        let mut scratch = vec![0.0f32; pending];
-                        consumer.pop_slice(&mut scratch);
-                        tracing::info!("Flush: drained {} samples from mixer ring", pending);
-                    }
-                    // Tell PipeWire to drop its own in-flight buffers (drain=false = discard).
+                    // The mixer ring itself is drained by the RT callback (it owns
+                    // the consumer); see `PipewireOutput::flush`. Here we only
+                    // tell PipeWire to drop its own in-flight buffers
+                    // (drain=false = discard).
                     if let Err(e) = stream_for_cmd.flush(false) {
                         tracing::warn!("Flush: stream.flush(false) failed: {}", e);
                     }
@@ -347,6 +448,31 @@ impl PipewireOutput {
             });
 
             mainloop.run();
+
+            // Stream is disconnected on Shutdown; dropping the listener drops the
+            // user data, which returns the consumer through the channel.
+            if disconnect_failed.get() {
+                // The callback may still be running; dropping its user data
+                // would be a use-after-free. Leak it and report no consumer
+                // (dropping the reply sender makes `shutdown()` return None).
+                // Also leak everything the callback or the command closure
+                // (which holds stream/mainloop clones) may touch.
+                tracing::error!("Shutdown: leaking stream state (disconnect failed)");
+                std::mem::forget(listener);
+                std::mem::forget(cmd_attached);
+                std::mem::forget(stream);
+                std::mem::forget(core);
+                std::mem::forget(context);
+                std::mem::forget(mainloop);
+                shutdown_reply.borrow_mut().take();
+                return Ok(());
+            }
+            drop(listener);
+            if let Some(tx) = shutdown_reply.borrow_mut().take() {
+                if let Ok(consumer) = consumer_return_rx.try_recv() {
+                    let _ = tx.send(consumer);
+                }
+            }
             Ok(())
         });
 
@@ -369,17 +495,56 @@ impl PipewireOutput {
     /// Should be called after `MixerCommand::ClearTrack` and before registering the
     /// next track's consumer so that no old-track audio leaks into the new track's
     /// playback window.
+    ///
+    /// # Protocol
+    ///
+    /// The RT callback exclusively owns the ring consumer, so it (not this
+    /// thread) discards the samples: `flush` bumps a flush generation in the
+    /// [`PlayoutMonitor`], sleep-polls on the *caller* thread (up to 100 ms,
+    /// roughly two quanta) until the callback acknowledges, and only then asks
+    /// the PW main loop to flush PipeWire's own buffers (so that flush cannot
+    /// run before the last old quantum has been queued). The PipeWire flush is
+    /// sent even on timeout. The drained count is logged here, off the RT
+    /// thread.
+    ///
+    /// Pausing is done with the engine-owned `paused` flag (the callback keeps
+    /// running and emits silence), so flushes are serviced even while paused.
+    ///
+    /// If the PipeWire thread has already exited there are no callbacks at
+    /// all: the flush returns immediately with a warning. If callbacks stall
+    /// for another reason we time out, log a warning, and abandon the request
+    /// (leaving it pending would discard audio produced *after* this flush).
     pub fn flush(&self) {
+        let generation = self.monitor.request_flush();
+
+        let deadline = Instant::now() + FLUSH_TIMEOUT;
+        let mut acked = true;
+        while !self.monitor.flush_acked(generation) {
+            if self.pw_thread.as_ref().is_none_or(|t| t.is_finished()) {
+                self.monitor.abandon_flush(generation);
+                tracing::warn!("Flush: PipeWire thread has exited; mixer ring not drained");
+                return;
+            }
+            if Instant::now() >= deadline {
+                self.monitor.abandon_flush(generation);
+                tracing::warn!(
+                    "Flush: no callback acknowledged within {:?}; mixer ring not drained",
+                    FLUSH_TIMEOUT
+                );
+                acked = false;
+                break;
+            }
+            thread::sleep(FLUSH_POLL);
+        }
+        if acked {
+            tracing::info!(
+                "Flush: drained {} samples from mixer ring",
+                self.monitor.last_flush_drained()
+            );
+        }
+
         if let Err(e) = self.command_sender.send(StreamCommand::Flush) {
             tracing::warn!("Failed to send Flush to PW thread: {:?}", e);
-        }
-    }
-
-    /// Activate or deactivate the PipeWire stream.
-    /// Deactivating causes the DAC indicator to go dark; reactivating resumes output.
-    pub fn set_active(&self, active: bool) {
-        if let Err(e) = self.command_sender.send(StreamCommand::SetActive(active)) {
-            tracing::warn!("Failed to send SetActive({}) to PW thread: {:?}", active, e);
         }
     }
 
@@ -435,6 +600,182 @@ impl Drop for PipewireOutput {
 mod tests {
     use super::*;
     use ringbuf::HeapRb;
+
+    static PLAYING: AtomicBool = AtomicBool::new(false);
+
+    fn ring_with(n: usize) -> (ringbuf::HeapProducer<f32>, HeapConsumer<f32>) {
+        let (mut p, c) = HeapRb::<f32>::new(1024).split();
+        for i in 0..n {
+            p.push(i as f32).unwrap();
+        }
+        (p, c)
+    }
+
+    /// Samples popped by a render, `None` if it was paused.
+    fn popped(r: Rendered) -> Option<usize> {
+        match r {
+            Rendered::Paused => None,
+            Rendered::Played { samples, .. } => Some(samples),
+        }
+    }
+
+    #[test]
+    fn render_without_flush_pops_normally() {
+        let m = PlayoutMonitor::new();
+        let (_p, mut c) = ring_with(10);
+        let mut out = [0.0f32; 4];
+        assert_eq!(
+            render(&mut c, &mut out, &m, &PLAYING),
+            Rendered::Played {
+                samples: 4,
+                underrun_warn: false
+            }
+        );
+        assert_eq!(out, [0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(c.len(), 6);
+    }
+
+    #[test]
+    fn paused_leaves_consumer_untouched_and_output_zeroed() {
+        let m = PlayoutMonitor::new();
+        let (_p, mut c) = ring_with(10);
+        let paused = AtomicBool::new(true);
+        let mut out = [7.0f32; 4];
+        assert_eq!(render(&mut c, &mut out, &m, &paused), Rendered::Paused);
+        assert_eq!(out, [0.0; 4]);
+        assert_eq!(c.len(), 10);
+    }
+
+    #[test]
+    fn paused_renders_do_not_count_as_drained() {
+        let m = PlayoutMonitor::new();
+        let (_p, mut c) = ring_with(0);
+        let paused = AtomicBool::new(true);
+        let mut out = [0.0f32; 4];
+        for _ in 0..(DRAINED_AFTER_SILENT_CALLBACKS * 2) {
+            render(&mut c, &mut out, &m, &paused);
+        }
+        assert!(!m.is_drained(), "paused callbacks must not be recorded");
+    }
+
+    #[test]
+    fn silent_playing_renders_count_as_drained() {
+        let m = PlayoutMonitor::new();
+        let (_p, mut c) = ring_with(0);
+        let mut out = [0.0f32; 4];
+        for _ in 0..DRAINED_AFTER_SILENT_CALLBACKS {
+            render(&mut c, &mut out, &m, &PLAYING);
+        }
+        assert!(m.is_drained());
+    }
+
+    #[test]
+    fn serviced_flush_resets_drained() {
+        let m = PlayoutMonitor::new();
+        let (_p, mut c) = ring_with(0);
+        let mut out = [0.0f32; 4];
+        for _ in 0..DRAINED_AFTER_SILENT_CALLBACKS {
+            m.record(0, 4);
+        }
+        assert!(m.is_drained());
+        m.request_flush();
+        // Service the flush while paused so nothing is recorded afterwards.
+        let paused = AtomicBool::new(true);
+        render(&mut c, &mut out, &m, &paused);
+        assert!(!m.is_drained(), "flush must reset the drain tracking");
+    }
+
+    #[test]
+    fn underrun_warn_is_reported_through_render() {
+        let m = PlayoutMonitor::new();
+        let (_p, mut c) = ring_with(1);
+        let mut out = [0.0f32; 4];
+        assert_eq!(
+            render(&mut c, &mut out, &m, &PLAYING),
+            Rendered::Played {
+                samples: 1,
+                underrun_warn: true
+            }
+        );
+    }
+
+    #[test]
+    fn flush_is_serviced_while_paused() {
+        let m = PlayoutMonitor::new();
+        let (_p, mut c) = ring_with(10);
+        let paused = AtomicBool::new(true);
+        let generation = m.request_flush();
+        let mut out = [7.0f32; 4];
+        assert_eq!(render(&mut c, &mut out, &m, &paused), Rendered::Paused);
+        assert!(c.is_empty());
+        assert!(m.flush_acked(generation));
+        assert_eq!(m.last_flush_drained(), 10);
+    }
+
+    #[test]
+    fn unpausing_resumes_with_next_samples() {
+        let m = PlayoutMonitor::new();
+        let (_p, mut c) = ring_with(10);
+        let paused = AtomicBool::new(true);
+        let mut out = [0.0f32; 4];
+        render(&mut c, &mut out, &m, &paused);
+        paused.store(false, Ordering::Release);
+        assert_eq!(popped(render(&mut c, &mut out, &m, &paused)), Some(4));
+        assert_eq!(out, [0.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn flush_request_drains_on_next_render_and_acks() {
+        let m = PlayoutMonitor::new();
+        let (_p, mut c) = ring_with(10);
+        let generation = m.request_flush();
+        assert!(!m.flush_acked(generation), "not acked before callback runs");
+        let mut out = [0.0f32; 4];
+        assert_eq!(
+            popped(render(&mut c, &mut out, &m, &PLAYING)),
+            Some(0),
+            "old audio must not be rendered"
+        );
+        assert!(c.is_empty());
+        assert!(m.flush_acked(generation));
+        assert_eq!(m.last_flush_drained(), 10);
+    }
+
+    #[test]
+    fn flush_with_empty_ring_acks_with_zero() {
+        let m = PlayoutMonitor::new();
+        let (_p, mut c) = ring_with(0);
+        let generation = m.request_flush();
+        let mut out = [0.0f32; 4];
+        assert_eq!(popped(render(&mut c, &mut out, &m, &PLAYING)), Some(0));
+        assert!(m.flush_acked(generation));
+        assert_eq!(m.last_flush_drained(), 0);
+    }
+
+    #[test]
+    fn flush_is_serviced_once() {
+        let m = PlayoutMonitor::new();
+        let (mut p, mut c) = ring_with(5);
+        m.request_flush();
+        let mut out = [0.0f32; 4];
+        render(&mut c, &mut out, &m, &PLAYING);
+        p.push(9.0).unwrap();
+        assert_eq!(
+            popped(render(&mut c, &mut out, &m, &PLAYING)),
+            Some(1),
+            "new audio after flush is kept"
+        );
+    }
+
+    #[test]
+    fn abandoned_flush_does_not_drain_later() {
+        let m = PlayoutMonitor::new();
+        let (_p, mut c) = ring_with(5);
+        let generation = m.request_flush();
+        m.abandon_flush(generation);
+        let mut out = [0.0f32; 4];
+        assert_eq!(popped(render(&mut c, &mut out, &m, &PLAYING)), Some(4));
+    }
 
     #[test]
     fn fresh_monitor_is_not_drained() {
@@ -522,30 +863,5 @@ mod tests {
         assert!(m.record(10, 512));
         m.record(0, 512);
         assert!(m.record(10, 512), "streak restarts after silence");
-    }
-
-    /// Verify that `StreamCommand::Shutdown` carries a `SyncSender` and that the
-    /// consumer can be round-tripped through the channel — i.e. the shutdown
-    /// protocol compiles and works at the channel level without needing a live
-    /// PipeWire daemon.
-    #[test]
-    fn shutdown_command_round_trips_consumer() {
-        let rb = HeapRb::<f32>::new(1024);
-        let (mut producer, consumer) = rb.split();
-
-        // Push a sentinel sample so we can verify identity after round-trip
-        producer.push(1.0_f32).unwrap();
-
-        let (tx, rx) = mpsc::sync_channel::<HeapConsumer<f32>>(1);
-
-        // Simulate the PW thread sending the consumer back on Shutdown
-        tx.send(consumer).expect("send should succeed");
-
-        let recovered = rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("should receive consumer within 1 second");
-
-        // The recovered consumer still has the sentinel sample
-        assert_eq!(recovered.len(), 1);
     }
 }

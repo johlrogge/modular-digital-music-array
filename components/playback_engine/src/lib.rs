@@ -42,7 +42,10 @@ pub struct PlaybackEngine {
     current_sample_rate: Option<u32>,
     command_sender: mpsc::Sender<MixerCommand>,
     mix_task: Option<std::thread::JoinHandle<()>>,
-    stream_active: bool,
+    /// Engine-owned pause flag shared with the output callback; survives
+    /// output re-creation. While set the callback emits silence and keeps
+    /// the mixer ring untouched (but still services flushes).
+    paused: Arc<AtomicBool>,
     mix_thread_running: Arc<AtomicBool>,
     config_path: PathBuf,
     audio_config: AudioOutputConfig,
@@ -57,8 +60,62 @@ enum MixerCommand {
     },
     /// Drop the current track consumer without replacing it.
     /// After this, the mixer stops pulling samples until a RegisterTrack arrives.
-    ClearTrack,
+    ///
+    /// The mix thread sets its consumer to `None` and then signals `done`, so
+    /// the sender knows no further track samples will reach the mixer ring.
+    ClearTrack {
+        done: mpsc::SyncSender<()>,
+    },
 }
+
+/// One iteration of the mix thread: apply pending commands, then mix.
+/// Non-blocking (the mixer only moves what fits in the output ring).
+fn mix_step(
+    mixer: &mut Mixer,
+    consumer: &mut Option<HeapConsumer<f32>>,
+    temp_buffer: &mut [f32],
+    commands: &mpsc::Receiver<MixerCommand>,
+) {
+    while let Ok(cmd) = commands.try_recv() {
+        match cmd {
+            MixerCommand::RegisterTrack {
+                consumer: new_consumer,
+            } => {
+                tracing::info!("MIX THREAD: Registering new track");
+                *consumer = Some(new_consumer);
+            }
+            MixerCommand::SetVolume { volume } => {
+                mixer.set_volume(volume);
+            }
+            MixerCommand::ClearTrack { done } => {
+                tracing::info!("MIX THREAD: Clearing track consumer");
+                *consumer = None;
+                let _ = done.send(());
+            }
+        }
+    }
+    let l = temp_buffer.len();
+    if let Err(e) = mixer.mix(temp_buffer, l, consumer) {
+        tracing::error!("MIX THREAD: Error mixing: {}", e);
+    }
+}
+
+/// Mix-thread body: step, sleep, until `running` is cleared.
+fn run_mix_loop(
+    mut mixer: Mixer,
+    commands: mpsc::Receiver<MixerCommand>,
+    running: Arc<AtomicBool>,
+) {
+    let mut consumer: Option<HeapConsumer<f32>> = None;
+    let mut temp_buffer = vec![0.0f32; 1920 * 2];
+    while running.load(Ordering::Acquire) {
+        mix_step(&mut mixer, &mut consumer, &mut temp_buffer, &commands);
+        std::thread::sleep(std::time::Duration::from_micros(500));
+    }
+}
+
+/// How long to wait for the mix thread to acknowledge ClearTrack.
+const CLEAR_TRACK_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Compute the PipeWire output rate for a track.
 ///
@@ -90,40 +147,8 @@ impl PlaybackEngine {
 
         // Start the mix thread with command receiver
         let mix_task = std::thread::spawn(move || {
-            let mut mixer = Mixer::new(mixer_producer);
-            let mut consumer: Option<HeapConsumer<f32>> = None;
-            let mut temp_buffer = vec![0.0; 1920 * 2];
-
             tracing::info!("MIX THREAD: Started, will process audio");
-
-            while running.load(Ordering::Acquire) {
-                // Process any pending commands
-                while let Ok(cmd) = command_receiver.try_recv() {
-                    match cmd {
-                        MixerCommand::RegisterTrack {
-                            consumer: new_consumer,
-                        } => {
-                            tracing::info!("MIX THREAD: Registering new track");
-                            consumer = Some(new_consumer);
-                        }
-                        MixerCommand::SetVolume { volume } => {
-                            mixer.set_volume(volume);
-                        }
-                        MixerCommand::ClearTrack => {
-                            tracing::info!("MIX THREAD: Clearing track consumer");
-                            consumer = None;
-                        }
-                    }
-                }
-                let l = temp_buffer.len();
-
-                if let Err(e) = mixer.mix(&mut temp_buffer, l, &mut consumer) {
-                    tracing::error!("MIX THREAD: Error mixing: {}", e);
-                }
-
-                std::thread::sleep(std::time::Duration::from_micros(500));
-            }
-
+            run_mix_loop(Mixer::new(mixer_producer), command_receiver, running);
             tracing::info!("MIX THREAD: Exiting cleanly");
         });
 
@@ -134,7 +159,7 @@ impl PlaybackEngine {
             current_sample_rate: None,
             command_sender,
             mix_task: Some(mix_task),
-            stream_active: true,
+            paused: Arc::new(AtomicBool::new(true)),
             mix_thread_running,
             config_path,
             audio_config,
@@ -146,17 +171,6 @@ impl PlaybackEngine {
         self.mix_thread_running.store(false, Ordering::Release);
         if let Some(handle) = self.mix_task.take() {
             let _ = handle.join();
-        }
-    }
-
-    /// Activate or deactivate the PipeWire stream.
-    /// Only sends the command when the state actually changes.
-    pub fn set_stream_active(&mut self, active: bool) {
-        if self.stream_active != active {
-            if let Some(ref output) = self.audio_output {
-                output.set_active(active);
-            }
-            self.stream_active = active;
         }
     }
 
@@ -218,13 +232,18 @@ impl PlaybackEngine {
                 new_config.device_name,
                 new_config.sample_rate
             );
-            let audio_output =
-                PipewireOutput::new(consumer, new_config.sample_rate, Some(device_name.as_str()))
-                    .map_err(|e| {
-                    PlaybackError::AudioOutput(audio_output::AudioOutputError::AudioDevice(
-                        format!("PipeWire error: {}", e),
-                    ))
-                })?;
+            let audio_output = PipewireOutput::new(
+                consumer,
+                Arc::clone(&self.paused),
+                new_config.sample_rate,
+                Some(device_name.as_str()),
+            )
+            .map_err(|e| {
+                PlaybackError::AudioOutput(audio_output::AudioOutputError::AudioDevice(format!(
+                    "PipeWire error: {}",
+                    e
+                )))
+            })?;
             self.audio_output = Some(audio_output);
         }
 
@@ -241,17 +260,12 @@ impl PlaybackEngine {
         }
         self.track = None;
 
-        // If audio was flowing, clear the mixer consumer so no old samples are produced,
-        // then flush the mixer output ring and PipeWire's in-flight buffers.
-        // This reduces skip latency from ~3 s (full ring drain) to ~50 ms.
-        if self.audio_output.is_some() {
-            self.command_sender
-                .send(MixerCommand::ClearTrack)
-                .map_err(|_| PlaybackError::TaskCancelled)?;
-            if let Some(ref output) = self.audio_output {
-                output.flush();
-            }
-        }
+        // A newly loaded track starts stopped; `play()` unpauses.
+        self.paused.store(true, Ordering::Release);
+        // Note: this blocks the calling thread for the ClearTrack ack (<= 50 ms)
+        // and the output flush (<= 100 ms, normally ~1 quantum). Acceptable
+        // because the mdma-audio server handles requests sequentially.
+        self.discard_buffered_audio()?;
 
         // Create source and read its native sample rate
         let source = AudioSource::new(path)?;
@@ -294,14 +308,17 @@ impl PlaybackEngine {
                     "Creating PipeWire output at {}Hz (source: {}Hz, device: {:?})",
                     target_rate, source_rate, target_device
                 );
-                let audio_output =
-                    PipewireOutput::new(consumer, target_rate, target_device.as_deref()).map_err(
-                        |e| {
-                            PlaybackError::AudioOutput(audio_output::AudioOutputError::AudioDevice(
-                                format!("PipeWire error: {}", e),
-                            ))
-                        },
-                    )?;
+                let audio_output = PipewireOutput::new(
+                    consumer,
+                    Arc::clone(&self.paused),
+                    target_rate,
+                    target_device.as_deref(),
+                )
+                .map_err(|e| {
+                    PlaybackError::AudioOutput(audio_output::AudioOutputError::AudioDevice(
+                        format!("PipeWire error: {}", e),
+                    ))
+                })?;
                 self.audio_output = Some(audio_output);
                 self.current_sample_rate = Some(target_rate);
             }
@@ -342,6 +359,7 @@ impl PlaybackEngine {
         if let Some(ref mut track) = self.track {
             tracing::debug!("Setting track to playing state");
             track.play();
+            self.paused.store(false, Ordering::Release);
             Ok(())
         } else {
             tracing::error!("No track loaded");
@@ -353,6 +371,7 @@ impl PlaybackEngine {
         if let Some(ref mut track) = self.track {
             tracing::info!("Stopping track");
             track.stop();
+            self.paused.store(true, Ordering::Release);
             Ok(())
         } else {
             tracing::error!("No track loaded");
@@ -363,9 +382,42 @@ impl PlaybackEngine {
     pub fn unload_track(&mut self) -> Result<(), PlaybackError> {
         if self.track.is_some() {
             self.track = None;
+            self.paused.store(true, Ordering::Release);
+            self.discard_buffered_audio()?;
             tracing::info!("Unloaded track");
         } else {
             tracing::info!("No track to unload");
+        }
+        Ok(())
+    }
+
+    /// Whether the output callback is currently emitting silence instead of
+    /// consuming the mixer ring.
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    /// Clear the mixer's track consumer so no old samples are produced, wait
+    /// for the mix thread to acknowledge (so nothing more can reach the mixer
+    /// ring), then flush the mixer output ring and PipeWire's in-flight
+    /// buffers. The output callback keeps running while paused, so the flush
+    /// is acknowledged promptly (normally ~1 quantum, bounded at 100 ms).
+    /// This reduces skip latency from ~3 s (full ring drain) to ~50 ms.
+    ///
+    /// ClearTrack is sent even without an output; only the flush needs one.
+    fn discard_buffered_audio(&self) -> Result<(), PlaybackError> {
+        let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
+        self.command_sender
+            .send(MixerCommand::ClearTrack { done: done_tx })
+            .map_err(|_| PlaybackError::TaskCancelled)?;
+        if done_rx.recv_timeout(CLEAR_TRACK_ACK_TIMEOUT).is_err() {
+            tracing::warn!(
+                "discard_buffered_audio: mix thread did not acknowledge ClearTrack within {:?}",
+                CLEAR_TRACK_ACK_TIMEOUT
+            );
+        }
+        if let Some(ref output) = self.audio_output {
+            output.flush();
         }
         Ok(())
     }
@@ -382,7 +434,7 @@ impl PlaybackEngine {
     /// `load_track` flush roughly the last 4.5 s of buffered audio.
     ///
     /// Note: the drained signal is produced by the output's process
-    /// callback, so a paused or deactivated stream freezes it; while frozen
+    /// callback, so a paused stream freezes it; while frozen
     /// the result keeps its last value. With no output (PipeWire failed to
     /// start, already logged as an error) the output is treated as drained.
     pub fn is_track_finished(&self) -> bool {
@@ -404,11 +456,6 @@ impl PlaybackEngine {
     /// or `None` if no track is loaded. Returns `Some(0)` if duration is unknown.
     pub fn duration_ms(&self) -> Option<u64> {
         self.track.as_ref().map(|t| t.duration_ms())
-    }
-
-    /// Returns whether the stream is currently active.
-    pub fn is_stream_active(&self) -> bool {
-        self.stream_active
     }
 
     pub fn seek(&mut self, position: usize) -> Result<(), PlaybackError> {
@@ -460,29 +507,6 @@ mod tests {
         let config_path = tmp.path().join("audio_config.json");
         let engine = PlaybackEngine::new(config_path).expect("engine created");
         (engine, tmp)
-    }
-
-    /// Verify that set_stream_active only flips the flag when the value changes.
-    #[test]
-    fn set_stream_active_tracks_state() {
-        let (mut engine, _tmp) = engine_with_tempdir();
-        assert!(engine.is_stream_active(), "should start active");
-
-        engine.set_stream_active(false);
-        assert!(
-            !engine.is_stream_active(),
-            "should be inactive after deactivate"
-        );
-
-        // Calling again with same value should be idempotent.
-        engine.set_stream_active(false);
-        assert!(!engine.is_stream_active(), "should remain inactive");
-
-        engine.set_stream_active(true);
-        assert!(
-            engine.is_stream_active(),
-            "should be active after reactivate"
-        );
     }
 
     /// Verify that the mix thread stops cleanly when shutdown() is called.
@@ -577,6 +601,32 @@ mod tests {
         assert!(result.is_ok(), "expected Ok, got {:?}", result);
     }
 
+    #[test]
+    fn engine_starts_paused() {
+        let (engine, _tmp) = engine_with_tempdir();
+        assert!(engine.is_paused());
+    }
+
+    #[test]
+    fn play_clears_and_stop_sets_paused_flag() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        engine.track = Some(Track::new_test().expect("test track"));
+        engine.play().unwrap();
+        assert!(!engine.is_paused(), "play must unpause");
+        engine.stop().unwrap();
+        assert!(engine.is_paused(), "stop must pause");
+    }
+
+    #[test]
+    fn unload_leaves_engine_paused() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        engine.track = Some(Track::new_test().expect("test track"));
+        engine.play().unwrap();
+        engine.unload_track().unwrap();
+        assert!(engine.track.is_none());
+        assert!(engine.is_paused());
+    }
+
     /// is_track_finished() returns false when no track is loaded.
     #[test]
     fn is_track_finished_no_track() {
@@ -628,6 +678,51 @@ mod tests {
         assert_eq!(select_target_rate(192_000, 192_000), 192_000);
     }
 
+    /// With a full mixer ring (the old blocking-push scenario), an acked
+    /// ClearTrack followed by a drain leaves the ring empty: the mixer holds
+    /// no already-popped samples that could land after the flush.
+    #[test]
+    fn full_ring_then_acked_clear_leaks_nothing() {
+        use ringbuf::HeapRb;
+        use std::time::Duration;
+
+        let (mixer_producer, mut mixer_output) = HeapRb::<f32>::new(256).split();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<MixerCommand>();
+        let running = Arc::new(AtomicBool::new(true));
+        let running_clone = Arc::clone(&running);
+        let thread = std::thread::spawn(move || {
+            run_mix_loop(mixer::Mixer::new(mixer_producer), cmd_rx, running_clone);
+        });
+
+        let (mut track_producer, track_consumer) = HeapRb::<f32>::new(4096).split();
+        for _ in 0..2048 {
+            track_producer.push(1.0f32).ok();
+        }
+        cmd_tx
+            .send(MixerCommand::RegisterTrack {
+                consumer: track_consumer,
+            })
+            .unwrap();
+        // Let the output ring fill up.
+        std::thread::sleep(Duration::from_millis(20));
+
+        let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
+        cmd_tx
+            .send(MixerCommand::ClearTrack { done: done_tx })
+            .unwrap();
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        // "Flush": discard everything in the ring.
+        let mut drain = vec![0.0f32; 256];
+        mixer_output.pop_slice(&mut drain);
+        std::thread::sleep(Duration::from_millis(10));
+        let leaked = mixer_output.len();
+
+        running.store(false, Ordering::Release);
+        thread.join().unwrap();
+        assert_eq!(leaked, 0, "no samples may reach the ring after the ack");
+    }
+
     /// After sending ClearTrack, the mix thread stops producing samples.
     /// We verify by registering a consumer with data, sending ClearTrack,
     /// letting the mix thread run briefly, then checking the mixer output ring
@@ -646,27 +741,9 @@ mod tests {
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = Arc::clone(&running);
 
+        // Runs the engine's real mix loop.
         let thread = std::thread::spawn(move || {
-            let mut mixer = mixer::Mixer::new(mixer_producer);
-            let mut consumer: Option<HeapConsumer<f32>> = None;
-            let mut temp_buffer = vec![0.0f32; 1920 * 2];
-
-            while running_clone.load(Ordering::Acquire) {
-                while let Ok(cmd) = cmd_rx.try_recv() {
-                    match cmd {
-                        MixerCommand::RegisterTrack { consumer: new } => {
-                            consumer = Some(new);
-                        }
-                        MixerCommand::ClearTrack => {
-                            consumer = None;
-                        }
-                        MixerCommand::SetVolume { .. } => {}
-                    }
-                }
-                let l = temp_buffer.len();
-                let _ = mixer.mix(&mut temp_buffer, l, &mut consumer);
-                std::thread::sleep(Duration::from_micros(500));
-            }
+            run_mix_loop(mixer::Mixer::new(mixer_producer), cmd_rx, running_clone);
         });
 
         // Push samples into a track ring buffer and register it
@@ -685,11 +762,16 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
 
         // Now send ClearTrack and drain any samples that already landed
-        cmd_tx.send(MixerCommand::ClearTrack).unwrap();
-        std::thread::sleep(Duration::from_millis(5));
+        let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
+        cmd_tx
+            .send(MixerCommand::ClearTrack { done: done_tx })
+            .unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("mix thread must acknowledge ClearTrack");
 
         let before_len = mixer_output.len();
-        // Drain whatever was produced before/during the clear
+        // After the ack nothing more may arrive: drain, then the ring stays empty.
         let mut drain = vec![0.0f32; 262_144];
         mixer_output.pop_slice(&mut drain);
 
