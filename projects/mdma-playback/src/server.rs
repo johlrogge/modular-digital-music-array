@@ -13,9 +13,23 @@ use std::sync::Arc;
 use std::time::Duration;
 use stream_source_protocol::StreamPlaybackState;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::stream_client::StreamClient;
+
+/// Commands that only read state. Clients poll them, so they are logged at
+/// debug rather than info.
+fn is_read_only(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::GetLength { .. }
+            | Command::QueueList
+            | Command::NowPlaying
+            | Command::GetSession
+            | Command::ListAudioOutputs
+            | Command::GetAudioOutput
+    )
+}
 
 struct QueueEntry {
     hash: media_protocol::ContentHash,
@@ -134,21 +148,44 @@ impl Server {
         loop {
             // Receive command
             let msg = self.socket.recv().map_err(ServerError::from)?;
-            let command: Command = serde_json::from_slice(&msg)?;
-
-            info!("Received command: {:?}", command);
-
-            // Process command
-            let response = self.handle_command(command).await;
-
-            info!("Handled command, response {:?}", response);
-            // Send response
+            let response = self.handle_message(&msg).await;
             let response_data = serde_json::to_vec(&response)?;
             self.socket
                 .send(&response_data)
                 .map_err(ServerError::from)?;
-            info!("sent response");
+            debug!("sent response");
         }
+    }
+
+    /// Parse one request and answer it. A message that is not a valid
+    /// command gets an error response; it must never end the serve loop.
+    async fn handle_message(&self, msg: &[u8]) -> Response {
+        let command: Command = match serde_json::from_slice(msg) {
+            Ok(command) => command,
+            Err(e) => {
+                warn!("Invalid command: {}", e);
+                return Response::Err {
+                    message: format!("invalid command: {e}"),
+                };
+            }
+        };
+
+        // Read-only queries are polled by UIs; keep them out of the info log.
+        let read_only = is_read_only(&command);
+        if read_only {
+            debug!("Received command: {:?}", command);
+        } else {
+            info!("Received command: {:?}", command);
+        }
+
+        let response = self.handle_command(command).await;
+
+        if read_only && !matches!(response, Response::Err { .. }) {
+            debug!("Handled command, response {:?}", response);
+        } else {
+            info!("Handled command, response {:?}", response);
+        }
+        response
     }
 
     async fn handle_command(&self, command: Command) -> Response {
@@ -201,7 +238,7 @@ impl Server {
                 self.create_response(result, None)
             }
             Command::GetLength { deck: _ } => {
-                info!("Getting length");
+                debug!("Getting length");
                 match self.audio.lock().await.loaded() {
                     Ok(Some(info)) => Response::Ok {
                         data: info.duration_ms.map(|d| ResponseData::Length(d as usize)),
@@ -234,7 +271,7 @@ impl Server {
                     .iter()
                     .map(|e| e.hash.clone())
                     .collect();
-                info!("Queue list: {} items", hashes.len());
+                debug!("Queue list: {} items", hashes.len());
                 Response::Ok {
                     data: Some(ResponseData::Queue(hashes)),
                 }
@@ -307,7 +344,7 @@ impl Server {
             }
             Command::NowPlaying => {
                 let hash = self.state.lock().await.current_hash().cloned();
-                info!("Now playing: {:?}", hash);
+                debug!("Now playing: {:?}", hash);
                 Response::Ok {
                     data: Some(ResponseData::NowPlaying(hash)),
                 }
@@ -331,13 +368,13 @@ impl Server {
                     .await
                     .session_id()
                     .map(|id| id.as_str().to_owned());
-                info!("GetSession: {:?}", session_id);
+                debug!("GetSession: {:?}", session_id);
                 Response::Ok {
                     data: Some(ResponseData::Session(session_id)),
                 }
             }
             Command::ListAudioOutputs => {
-                info!("Listing audio outputs");
+                debug!("Listing audio outputs");
                 match self.audio.lock().await.list_outputs() {
                     Ok(sinks) => Response::Ok {
                         data: Some(ResponseData::AudioOutputs(sinks)),
@@ -359,7 +396,7 @@ impl Server {
                 }
             }
             Command::GetAudioOutput => {
-                info!("Getting current audio output");
+                debug!("Getting current audio output");
                 match self.audio.lock().await.get_output() {
                     Ok(config) => Response::Ok {
                         data: Some(ResponseData::AudioOutput(config)),
@@ -1337,5 +1374,17 @@ mod tests {
             matches!(server.state.lock().await.state(), PlaybackState::Idle),
             "Expected Idle after Stop from Idle"
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_message_gets_error_response_and_server_continues() {
+        let server = make_server();
+        let response = server.handle_message(b"not json at all").await;
+        assert!(matches!(response, Response::Err { .. }));
+        let response = server.handle_message(br#"{"cmd":"bogus"}"#).await;
+        assert!(matches!(response, Response::Err { .. }));
+        let valid = serde_json::to_vec(&Command::QueueList).unwrap();
+        let response = server.handle_message(&valid).await;
+        assert!(matches!(response, Response::Ok { .. }));
     }
 }

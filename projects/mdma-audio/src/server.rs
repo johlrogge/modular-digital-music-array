@@ -7,7 +7,19 @@ use std::path::PathBuf;
 use stream_source_protocol::{
     AudioOutputConfig, StreamCommand, StreamPlaybackState, StreamResponse, StreamTrackInfo,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+/// Commands that only read state. They are polled frequently (mdma-playback
+/// asks `Loaded` every 200 ms), so they are logged at debug, not info.
+fn is_read_only(command: &StreamCommand) -> bool {
+    matches!(
+        command,
+        StreamCommand::Loaded
+            | StreamCommand::Ping
+            | StreamCommand::ListOutputs
+            | StreamCommand::GetOutput
+    )
+}
 
 fn engine_audio_config_to_protocol(c: playback_engine::AudioOutputConfig) -> AudioOutputConfig {
     AudioOutputConfig {
@@ -122,7 +134,6 @@ impl Server {
         loop {
             let msg = self.socket.recv()?;
             let response = self.handle_message(&msg).await;
-            info!("Sending response: {:?}", response);
             let bytes = serde_json::to_vec(&response)?;
             self.socket
                 .send(bytes.as_slice())
@@ -136,8 +147,21 @@ impl Server {
     async fn handle_message(&mut self, msg: &[u8]) -> StreamResponse {
         match serde_json::from_slice::<StreamCommand>(msg) {
             Ok(command) => {
-                info!("Received command: {:?}", command);
-                self.handle_command(command).await
+                // Read-only queries are polled several times a second; keep
+                // them out of the info log so it does not rotate away history.
+                let read_only = is_read_only(&command);
+                if read_only {
+                    debug!("Received command: {:?}", command);
+                } else {
+                    info!("Received command: {:?}", command);
+                }
+                let response = self.handle_command(command).await;
+                if read_only && !matches!(response, StreamResponse::Error { .. }) {
+                    debug!("Sending response: {:?}", response);
+                } else {
+                    info!("Sending response: {:?}", response);
+                }
+                response
             }
             Err(e) => {
                 warn!("Invalid command: {}", e);
@@ -357,6 +381,16 @@ impl Server {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn polling_commands_are_read_only_and_state_changes_are_not() {
+        assert!(is_read_only(&StreamCommand::Loaded));
+        assert!(is_read_only(&StreamCommand::Ping));
+        assert!(!is_read_only(&StreamCommand::Play));
+        assert!(!is_read_only(&StreamCommand::Pause));
+        assert!(!is_read_only(&StreamCommand::Stop));
+        assert!(!is_read_only(&StreamCommand::ClearPreload));
+    }
 
     fn make_server() -> Server {
         use std::sync::atomic::{AtomicU64, Ordering};

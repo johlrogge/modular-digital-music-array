@@ -189,7 +189,9 @@ fn decoder_thread_fn<S: Source + Send + Sync + 'static>(
                 if output.is_empty() {
                     // All samples handed to the mixer (ring consumed) — track is done
                     state.store(TrackState::Finished as u8, Ordering::Release);
-                    tracing::info!("Track finished (EOF + pending written + ring drained)");
+                    // The mixer's ring still holds ~3 s that are not yet audible;
+                    // the audible end is reported by mdma-playback.
+                    tracing::debug!("Decoder done: all samples handed to mixer");
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 } else {
                     // Ring still holds unconsumed samples — wait for the mixer.
@@ -290,22 +292,18 @@ impl Track {
 
 impl Drop for Track {
     fn drop(&mut self) {
-        tracing::info!("Track drop beginning");
-
         // 1. Set stop flag so the loop exits even if the command channel is full
         self.stop.store(true, Ordering::Release);
 
         // 2. Best-effort shutdown command — ignore channel-full errors
         let _ = self.command_tx.try_send(TrackCommand::Shutdown);
-        tracing::info!("Stop flag set and shutdown command attempted");
 
         // 3. Join the decoder thread — deterministic shutdown
         if let Some(handle) = self.decoder_thread.take() {
-            tracing::info!("Joining decoder thread");
             handle.join().ok();
         }
 
-        tracing::info!("Track drop completed");
+        tracing::debug!("Track dropped: decoder stopped and joined");
     }
 }
 
