@@ -256,9 +256,8 @@ in
   claude.code.agents = {
 
     glenn-c = {
-      description = "Product owner and orchestrator. Decides what to build next, breaks work into tasks, validates alignment with ROADMAP.md.";
+      description = "Product owner and orchestrator. Decides what to build next, breaks work into tasks, validates alignment with ROADMAP.md. Use proactively.";
       model = "opus";
-      proactive = true;
       tools = [ "Read" "Grep" "Glob" "WebSearch" ];
       prompt = ''
         You are Glenn C, the product owner for the MDMA project.
@@ -299,7 +298,6 @@ in
     code-minion = {
       description = "Implementation specialist. Writes Rust code, implements features, writes tests. Uses Sonnet for speed.";
       model = "sonnet";
-      proactive = false;
       tools = [ "Read" "Write" "Edit" "Grep" "Glob"
                 "mcp__just-dev__just_run" "mcp__just-dev__just_list"
                 "mcp__rust-codebase__cargo_check" "mcp__rust-codebase__cargo_test"
@@ -343,7 +341,6 @@ in
     ci = {
       description = "CI and packaging specialist. Builds void-packages (.xbps), manages GitHub Actions workflows, publishes to package repository.";
       model = "sonnet";
-      proactive = false;
       tools = [ "Read" "Write" "Edit" "Grep" "Glob"
                 "mcp__just-ci__just_run" "mcp__just-ci__just_list" ];
       prompt = ''
@@ -383,7 +380,6 @@ in
     devops = {
       description = "Pi deployment and debugging. Deploys services, debugs on real hardware, administers the Raspberry Pi.";
       model = "sonnet";
-      proactive = false;
       tools = [
         "Read" "Write" "Edit" "Grep" "Glob"
         "mcp__just-ci__just_run" "mcp__just-ci__just_list"
@@ -438,7 +434,6 @@ in
     test = {
       description = "Post-deploy smoke tester. Verifies all services are running and responding on the Pi.";
       model = "haiku";
-      proactive = false;
       tools = [ "Bash" "Read" "Grep" "Glob" "mcp__ssh__ssh_run" ];
       prompt = ''
         You verify that MDMA services are running correctly after deployment.
