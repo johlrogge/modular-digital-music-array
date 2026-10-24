@@ -170,7 +170,7 @@ Copy `scripts/install-mdma-macos.sh` from this repo to your Mac and run it. It r
 bash install-mdma-macos.sh
 
 # Install a specific tag
-bash install-mdma-macos.sh v0.25.2
+bash install-mdma-macos.sh v0.26.0
 
 # Install to a user-writable location (no sudo)
 MDMA_INSTALL_DIR=~/.local/bin bash install-mdma-macos.sh
@@ -188,6 +188,28 @@ cp profiles/dev/target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.26.0
+
+### Gapless playback
+
+The next queued track is preloaded and the mixer switches to it sample-accurately when the current track ends (0-sample gap/overlap verified on hardware). MP3/AAC encoder delay and padding are trimmed so lossy joins are gapless too. If the sample rate changes between tracks (e.g. 44.1 to 48 kHz), the current track plays out fully and the output is reopened (~90 ms gap, no cut tail). Skip reuses the preloaded track (~10 ms to start).
+
+### Playback engine
+
+Pause/resume is immediate and resumes at the exact sample. Volume is applied at the output so changes are heard immediately (engine side only; CLI/playback control for volume and seek is not yet exposed, see #60). Now-playing and position follow what is actually heard (previously ~4 s ahead).
+
+### Fixes and housekeeping
+
+- PipeWire output data race between the RT callback and control thread fixed (#58); it could crash on skip/stop.
+- Old-track audio no longer leaks into the next track on skip.
+- `mdma-audio` and `mdma-playback` no longer exit on unknown or unparseable commands.
+- Stream source protocol gains `Preload`/`ClearPreload` commands and a `preloaded` status field.
+- Quieter logs: polls and per-track lifecycle at debug level.
+
+**Upgrade note:** deploy `mdma-audio` before `mdma-playback` (the new `mdma-playback` sends `Preload`, which 0.25.x `mdma-audio` cannot parse). `xbps-install -Su` upgrades both together.
 
 ---
 
