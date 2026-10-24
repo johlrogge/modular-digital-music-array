@@ -7,6 +7,12 @@
 //! **Polling:** The queue manager polls `StreamCommand::Loaded` every 200ms to detect
 //! track completion. Upon receiving `StreamPlaybackState::Finished`, the queue manager
 //! advances to the next entry.
+//!
+//! **Gapless:** The queue manager may send `Preload { content_hash }` with the next
+//! track. The source switches to it without a gap when the current track ends; there
+//! are no push events. The switch is observed through the `Loaded` poll as
+//! `content_hash` changing to the preloaded hash (`Loaded` always describes the track
+//! currently audible). `ClearPreload` cancels a pending preload.
 
 use music_primitives::ContentHash;
 pub use playback_primitives::{AudioOutputConfig, AudioSinkInfo};
@@ -19,6 +25,11 @@ pub enum StreamCommand {
     /// Streaming sources (bluetooth, radio) do not use Load — they play whatever
     /// their source currently has active.
     Load { content_hash: ContentHash },
+    /// Preload the track that follows the current one so the source can switch
+    /// to it gaplessly. Replaces any existing preload. File playback sources only.
+    Preload { content_hash: ContentHash },
+    /// Discard any preloaded track. File playback sources only.
+    ClearPreload,
     /// Start or resume playback.
     Play,
     /// Pause playback without unloading.
@@ -57,11 +68,15 @@ pub enum StreamResponse {
 
 /// What a stream source currently has loaded.
 /// None = source is idle/stopped. Some = source has content active.
+///
+/// `content_hash`, `position_ms` and `duration_ms` describe the track currently
+/// being HEARD (audible). A gapless switch is observed as `content_hash`
+/// changing to the hash previously given via `Preload`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StreamTrackInfo {
     /// Playback state of the loaded content.
     pub state: StreamPlaybackState,
-    /// Content hash (for file-backed sources; None for streaming sources).
+    /// Content hash of the audible track (file-backed sources; None for streaming sources).
     pub content_hash: Option<ContentHash>,
     /// Human-readable track title.
     pub title: Option<String>,
@@ -71,6 +86,14 @@ pub struct StreamTrackInfo {
     pub position_ms: Option<u64>,
     /// Total duration in milliseconds.
     pub duration_ms: Option<u64>,
+    /// The track the source will play next, if any: the pending track once
+    /// the source committed (promoted) to it, otherwise the registered or
+    /// parked preload. Once committed (promoted) it can no longer be
+    /// replaced: a new `Preload` then queues a track after it. It stays
+    /// reported until it becomes audible (`content_hash` switches to it).
+    /// Absent in JSON from older sources; defaults to None.
+    #[serde(default)]
+    pub preloaded: Option<ContentHash>,
 }
 
 /// The playback state of what is currently loaded.
@@ -198,6 +221,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stream_command_preload_round_trip() {
+        let cmd = StreamCommand::Preload {
+            content_hash: ContentHash::new("next1"),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#"{"cmd":"preload","content_hash":"next1"}"#);
+        let parsed: StreamCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            StreamCommand::Preload { content_hash } if content_hash == ContentHash::new("next1")
+        ));
+    }
+
+    #[test]
+    fn stream_command_clear_preload_round_trip() {
+        let json = serde_json::to_string(&StreamCommand::ClearPreload).unwrap();
+        assert_eq!(json, r#"{"cmd":"clear_preload"}"#);
+        let parsed: StreamCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, StreamCommand::ClearPreload));
+    }
+
+    fn sample_info(preloaded: Option<ContentHash>) -> StreamTrackInfo {
+        StreamTrackInfo {
+            state: StreamPlaybackState::Playing,
+            content_hash: Some(ContentHash::new("abc123")),
+            title: None,
+            artist: None,
+            album: None,
+            position_ms: Some(1),
+            duration_ms: Some(2),
+            preloaded,
+        }
+    }
+
+    #[test]
+    fn stream_track_info_round_trip_with_preloaded() {
+        let info = sample_info(Some(ContentHash::new("next1")));
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains(r#""preloaded":"next1""#));
+        let parsed: StreamTrackInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, info);
+    }
+
+    #[test]
+    fn stream_track_info_round_trip_without_preloaded() {
+        let info = sample_info(None);
+        let json = serde_json::to_string(&info).unwrap();
+        let parsed: StreamTrackInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, info);
+    }
+
+    #[test]
+    fn stream_track_info_old_json_without_preloaded_parses() {
+        let json = r#"{"state":"playing","content_hash":"abc123","title":null,"artist":null,"album":null,"position_ms":1,"duration_ms":2}"#;
+        let parsed: StreamTrackInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.preloaded, None);
+        assert_eq!(parsed, sample_info(None));
+    }
+
     // StreamResponse serialization tests
 
     #[test]
@@ -317,6 +400,7 @@ mod tests {
             album: Some("Test Album".to_string()),
             position_ms: Some(30_000),
             duration_ms: Some(180_000),
+            preloaded: None,
         };
         let expected = StreamTrackInfo {
             state: StreamPlaybackState::Finished,
@@ -326,6 +410,7 @@ mod tests {
             album: Some("Test Album".to_string()),
             position_ms: Some(30_000),
             duration_ms: Some(180_000),
+            preloaded: None,
         };
         assert_eq!(track, expected);
     }
