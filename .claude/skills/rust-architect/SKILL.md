@@ -1,0 +1,1 @@
+/nix/store/yz7bm2hpsrvfqzb5n9diwgdhyc96hpzc-claude-skills-rust-architect-SKILL.md

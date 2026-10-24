@@ -17,9 +17,12 @@ Code should run on live units within minutes of being written. This requires:
 - Application configuration templates
 - INSTALL scripts for service setup (supervise symlinks, service enabling)
 
-## xbps-src Package Structure
+## Void Package Structure
 
-MDMA uses `xbps-src` for building Void packages:
+MDMA builds Void packages with `xbps-create` (invoked by the
+`scripts/package/create-*-package.sh` wrappers), not `xbps-src`. Binaries are
+cross-compiled ahead of time with `cargo-zigbuild`; `xbps-src` is not part of
+the pipeline:
 
 ```
 void-packages/
@@ -101,22 +104,23 @@ jobs:
           repository: void-linux/void-packages
           path: void-packages
       
-      - name: Setup xbps-src
+      - name: Cross-compile binaries (cargo-zigbuild)
         run: |
-          cd void-packages
-          ./xbps-src binary-bootstrap
-      
-      - name: Copy package templates
+          cargo polylith cargo --profile dev zigbuild --release \
+            --target aarch64-unknown-linux-gnu.2.38 --bin mdma-common
+          cargo polylith cargo --profile dev zigbuild --release \
+            --target aarch64-unknown-linux-gnu.2.38 --bin mdma-909
+          cargo polylith cargo --profile dev zigbuild --release \
+            --target aarch64-unknown-linux-gnu.2.38 --bin mdma-101
+          cargo polylith cargo --profile dev zigbuild --release \
+            --target aarch64-unknown-linux-gnu.2.38 --bin mdma-303
+
+      - name: Build packages (xbps-create)
         run: |
-          cp -r mdma/packaging/srcpkgs/* void-packages/srcpkgs/
-      
-      - name: Build packages
-        run: |
-          cd void-packages
-          ./xbps-src pkg mdma-common
-          ./xbps-src pkg mdma-909
-          ./xbps-src pkg mdma-101
-          ./xbps-src pkg mdma-303
+          ./scripts/package/create-common-package.sh
+          ./scripts/package/create-909-package.sh
+          ./scripts/package/create-101-package.sh
+          ./scripts/package/create-303-package.sh
       
       - name: Collect packages
         run: |
