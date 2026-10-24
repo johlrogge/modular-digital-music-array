@@ -69,6 +69,14 @@ pub const DRAINED_AFTER_SILENT_CALLBACKS: u32 = 2;
 pub struct PlayoutMonitor {
     silent_callbacks: AtomicU32,
     underrun_streak: AtomicU32,
+    /// A partial fill awaits judgement by the next callback (see `record`).
+    pending_underrun: AtomicBool,
+    pending_provided: AtomicUsize,
+    pending_requested: AtomicUsize,
+    /// Snapshot of the underrun last returned as a warning.
+    reported_streak: AtomicU32,
+    reported_provided: AtomicUsize,
+    reported_requested: AtomicUsize,
     /// Generation of the most recent flush request (caller side writes).
     flush_requested: AtomicU64,
     /// Generation of the most recent flush acknowledged (RT callback writes;
@@ -121,18 +129,25 @@ impl PlayoutMonitor {
         // underrun tracking. RT thread is the single writer of both counters.
         self.silent_callbacks.store(0, Ordering::Relaxed);
         self.underrun_streak.store(0, Ordering::Relaxed);
+        self.pending_underrun.store(false, Ordering::Relaxed);
         self.flush_drained.store(drained, Ordering::Release);
         self.flush_completed.fetch_max(requested, Ordering::AcqRel);
         drained
     }
 
     /// Record one callback. Returns `true` if a mid-stream underrun warning
-    /// should be logged for it.
+    /// should be logged; the details are then in
+    /// [`last_underrun`](Self::last_underrun).
     ///
-    /// Only *partial* fills (`0 < samples_read < samples_requested`) are real
-    /// starvation; fully silent callbacks are expected when idle or after a
-    /// track ends. Warnings fire on the first partial fill after a clean run,
-    /// then every 100th, to stay readable during a sustained dropout.
+    /// A *partial* fill (`0 < samples_read < samples_requested`) is only a
+    /// real underrun if audio keeps coming afterwards. At the end of a track
+    /// the last buffer is always partial and is followed by silence, which is
+    /// expected. So a partial fill is held as pending and survives any number
+    /// of fully silent callbacks. It is settled by the next data-delivering
+    /// callback (full or partial) => a real underrun, reported now; or by a
+    /// flush (every new load flushes) => end of stream, no warning.
+    /// Reports fire for the first underrun after a clean run, then every
+    /// 100th, to stay readable during a sustained dropout.
     pub fn record(&self, samples_read: usize, samples_requested: usize) -> bool {
         if samples_read == 0 {
             // Saturate at the threshold: no wraparound, no further increments.
@@ -141,17 +156,40 @@ impl PlayoutMonitor {
             if silent < DRAINED_AFTER_SILENT_CALLBACKS {
                 self.silent_callbacks.store(silent + 1, Ordering::Relaxed);
             }
+            // A pending partial fill stays pending: a mid-track stall is
+            // partial, silence, then data and must still be reported.
             self.underrun_streak.store(0, Ordering::Relaxed);
             return false;
         }
         self.silent_callbacks.store(0, Ordering::Relaxed);
-        if samples_read < samples_requested {
+
+        // Data arrived: a pending partial fill was a real underrun.
+        let mut warn = false;
+        if self.pending_underrun.swap(false, Ordering::Relaxed) {
             let streak = self.underrun_streak.fetch_add(1, Ordering::Relaxed) + 1;
-            streak == 1 || streak.is_multiple_of(100)
+            if streak == 1 || streak.is_multiple_of(100) {
+                self.reported_streak.store(streak, Ordering::Relaxed);
+                self.reported_provided.store(
+                    self.pending_provided.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                self.reported_requested.store(
+                    self.pending_requested.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                warn = true;
+            }
+        }
+
+        if samples_read < samples_requested {
+            self.pending_provided.store(samples_read, Ordering::Relaxed);
+            self.pending_requested
+                .store(samples_requested, Ordering::Relaxed);
+            self.pending_underrun.store(true, Ordering::Relaxed);
         } else {
             self.underrun_streak.store(0, Ordering::Relaxed);
-            false
         }
+        warn
     }
 
     /// True once [`DRAINED_AFTER_SILENT_CALLBACKS`] consecutive fully silent
@@ -160,9 +198,26 @@ impl PlayoutMonitor {
         self.silent_callbacks.load(Ordering::Relaxed) >= DRAINED_AFTER_SILENT_CALLBACKS
     }
 
-    fn underrun_streak(&self) -> u32 {
-        self.underrun_streak.load(Ordering::Relaxed)
+    /// Details of the most recent underrun for which [`record`](Self::record)
+    /// returned `true`.
+    pub fn last_underrun(&self) -> UnderrunReport {
+        UnderrunReport {
+            streak: self.reported_streak.load(Ordering::Relaxed),
+            samples_provided: self.reported_provided.load(Ordering::Relaxed),
+            samples_requested: self.reported_requested.load(Ordering::Relaxed),
+        }
     }
+}
+
+/// A real mid-stream underrun: a partial fill that was followed by more audio.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct UnderrunReport {
+    /// Consecutive underruns up to and including this one.
+    pub streak: u32,
+    /// Samples the ring could provide in the starved callback.
+    pub samples_provided: usize,
+    /// Samples the callback asked for.
+    pub samples_requested: usize,
 }
 
 /// Engine-owned state shared with the RT callback. Owned by the engine (not
@@ -457,11 +512,15 @@ impl PipewireOutput {
                                     ..
                                 }
                             ) {
+                                // Describes the earlier starved callback, which is
+                                // only recognised as an underrun now that audio
+                                // has resumed.
+                                let underrun = user_data.monitor.last_underrun();
                                 warn!(
-                                    n_frames,
-                                    samples_provided = samples_read,
-                                    silence_samples = requested - samples_read,
-                                    underrun_streak = user_data.monitor.underrun_streak(),
+                                    samples_provided = underrun.samples_provided,
+                                    silence_samples =
+                                        underrun.samples_requested - underrun.samples_provided,
+                                    underrun_streak = underrun.streak,
                                     "pw underrun: ring buffer starved"
                                 );
                             }
@@ -938,14 +997,24 @@ mod tests {
     }
 
     #[test]
-    fn underrun_warn_is_reported_through_render() {
+    fn underrun_warn_is_reported_through_render_once_data_resumes() {
         let m = PlayoutMonitor::new();
-        let (_p, mut c) = ring_with(1);
+        let (mut p, mut c) = ring_with(1);
         let mut out = [0.0f32; 4];
         assert_eq!(
             render_unity(&mut c, &mut out, &m, &PLAYING),
             Rendered::Played {
                 samples: 1,
+                underrun_warn: false
+            }
+        );
+        for i in 0..4 {
+            p.push(i as f32).unwrap();
+        }
+        assert_eq!(
+            render_unity(&mut c, &mut out, &m, &PLAYING),
+            Rendered::Played {
+                samples: 4,
                 underrun_warn: true
             }
         );
@@ -1103,26 +1172,79 @@ mod tests {
     }
 
     #[test]
-    fn underrun_warns_only_on_partial_fills() {
+    fn final_partial_fill_followed_by_silence_and_flush_does_not_warn() {
         let m = PlayoutMonitor::new();
+        let (_p, mut c) = ring_with(0);
+        let mut out = [0.0f32; 4];
         assert!(!m.record(512, 512), "full fill must not warn");
-        assert!(!m.record(0, 512), "fully silent must not warn");
-        assert!(m.record(10, 512), "first partial fill warns");
-        assert!(!m.record(10, 512), "subsequent partial fills are throttled");
+        assert!(!m.record(10, 512), "partial fill is not judged yet");
+        assert!(!m.record(0, 512), "silence does not settle it");
+        // The next load flushes, which settles the pending fill as end of stream.
+        m.request_flush();
+        let paused = AtomicBool::new(true);
+        render_unity(&mut c, &mut out, &m, &paused);
+        assert!(
+            !m.record(512, 512),
+            "end-of-stream partial fill is expected"
+        );
     }
 
     #[test]
-    fn underrun_warning_throttled_to_every_hundredth() {
+    fn partial_fill_then_silence_then_data_warns_once() {
+        let m = PlayoutMonitor::new();
+        assert!(!m.record(10, 512));
+        assert!(!m.record(0, 512));
+        assert!(!m.record(0, 512));
+        assert!(m.record(512, 512), "mid-track stall is a real underrun");
+        assert!(!m.record(512, 512), "reported exactly once");
+    }
+
+    #[test]
+    fn partial_fill_followed_by_data_warns_with_the_partial_fills_numbers() {
+        let m = PlayoutMonitor::new();
+        assert!(!m.record(10, 512));
+        assert!(m.record(512, 512), "audio resumed: it was a real underrun");
+        assert_eq!(
+            m.last_underrun(),
+            UnderrunReport {
+                streak: 1,
+                samples_provided: 10,
+                samples_requested: 512
+            }
+        );
+    }
+
+    #[test]
+    fn underrun_warning_throttled_to_first_and_every_hundredth() {
         let m = PlayoutMonitor::new();
         let warns = (0..200).filter(|_| m.record(10, 512)).count();
-        assert_eq!(warns, 3); // 1st, 100th, 200th
+        assert_eq!(warns, 2, "199 partials judged so far: streaks 1 and 100");
+        assert!(
+            m.record(512, 512),
+            "200th partial is judged by the next data"
+        );
+        assert_eq!(m.last_underrun().streak, 200);
     }
 
     #[test]
     fn silence_resets_underrun_streak() {
         let m = PlayoutMonitor::new();
+        m.record(10, 512);
         assert!(m.record(10, 512));
         m.record(0, 512);
-        assert!(m.record(10, 512), "streak restarts after silence");
+        assert!(m.record(512, 512), "pending fill survived the silence");
+        assert_eq!(m.last_underrun().streak, 1, "streak restarts after silence");
+    }
+
+    #[test]
+    fn flush_discards_pending_partial_fill() {
+        let m = PlayoutMonitor::new();
+        let (_p, mut c) = ring_with(0);
+        let mut out = [0.0f32; 4];
+        m.record(1, 4);
+        m.request_flush();
+        let paused = AtomicBool::new(true);
+        render_unity(&mut c, &mut out, &m, &paused);
+        assert!(!m.record(4, 4), "flushed partial fill must not be reported");
     }
 }
