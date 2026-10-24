@@ -4,6 +4,27 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.25.2] — 2026-10-24
+
+### Fixed
+
+- **Auto-advance no longer cuts the last ~4–5 s of every track** — a track now counts as finished only after its ring buffer is empty and the PipeWire output has played everything out (two consecutive silent callbacks). Underrun warnings no longer spam the log while idle, and the audio callback no longer allocates per call.
+
+### Added
+
+- **`mdma-playback` logs each automatic track advance** — finished track, next track, and position/duration.
+
+### Changed
+
+- devenv-generated `.claude` paths are no longer tracked; `Cargo.lock` catch-up.
+
+### Known limitations
+
+- Very short tracks (under ~4.5 s) can still be cut in a rare timing window.
+- Gapless playback is planned next.
+
+---
+
 ## [0.24.0] — 2026-06-19
 
 ### Changed
