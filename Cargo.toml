@@ -5,7 +5,6 @@
 members = [
     "components/acid_client",
     "components/acid_protocol",
-    "components/admin_ipc_client",
     "components/admin_ipc_protocol",
     "components/acid_service",
     "components/audio_decoder",
@@ -65,7 +64,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.25.2"
+version = "0.26.0"
 edition = "2021"
 authors = ["MDMA Development Team"]
 license = "MIT"
@@ -74,7 +73,6 @@ repository = "https://github.com/johlrogge/modular-digital-music-array"
 [workspace.dependencies]
 acid-client = { path = "components/acid_client" }
 acid-protocol = { path = "components/acid_protocol" }
-admin-ipc-client = { path = "components/admin_ipc_client" }
 admin-ipc-protocol = { path = "components/admin_ipc_protocol" }
 acid-service = { path = "components/acid_service" }
 audio-decoder = { path = "components/audio_decoder" }

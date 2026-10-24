@@ -7,7 +7,7 @@ use audio_types::{AudioSegment, DecodedSegment, SegmentIndex, SEGMENT_SIZE};
 use std::collections::VecDeque;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc;
 
 use std::sync::Arc;
@@ -47,10 +47,11 @@ pub struct Track {
     command_tx: mpsc::SyncSender<TrackCommand>,
     decoder_thread: Option<std::thread::JoinHandle<()>>,
     stop: Arc<AtomicBool>,
-    /// Current playback position in milliseconds (updated by decoder thread).
-    position_ms: Arc<AtomicU64>,
     /// Total track duration in milliseconds (0 if unknown).
     duration_ms: u64,
+    /// Set (Release) once EOF was reached and everything pending has been
+    /// pushed into the track ring. Reset by seek.
+    input_complete: Arc<AtomicBool>,
 }
 
 pub enum TrackCommand {
@@ -70,8 +71,8 @@ fn decoder_thread_fn<S: Source + Send + Sync + 'static>(
     state: Arc<AtomicU8>,
     source_rate: u32,
     target_rate: u32,
-    position_ms: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    input_complete: Arc<AtomicBool>,
 ) {
     let channels = source.audio_channels() as usize;
 
@@ -106,7 +107,7 @@ fn decoder_thread_fn<S: Source + Send + Sync + 'static>(
     loop {
         // Check stop flag first — set by Drop before join
         if stop.load(Ordering::Acquire) {
-            tracing::info!("Decoder thread stopping (stop flag set)");
+            tracing::debug!("Decoder thread stopping (stop flag set)");
             return;
         }
 
@@ -120,13 +121,7 @@ fn decoder_thread_fn<S: Source + Send + Sync + 'static>(
                     }
                     pending.clear();
                     eof = false;
-                    // Update position_ms after seek.
-                    // .max(1) upholds the invariant that audio_channels() >= 1, avoiding
-                    // division by zero if a malformed stream reports 0 channels.
-                    let ch = source.audio_channels().max(1) as u64;
-                    let frames = position as u64 / ch;
-                    let ms = frames * 1000 / source_rate as u64;
-                    position_ms.store(ms, Ordering::Release);
+                    input_complete.store(false, Ordering::Release);
                     // Seek resets to Stopped — caller must call play() again if desired
                     state.store(TrackState::Stopped as u8, Ordering::Release);
                     // Reset resampler state by recreating it
@@ -135,7 +130,7 @@ fn decoder_thread_fn<S: Source + Send + Sync + 'static>(
                     }
                 }
                 TrackCommand::Shutdown => {
-                    tracing::info!("Decoder thread shutting down");
+                    tracing::debug!("Decoder thread shutting down");
                     return;
                 }
             }
@@ -164,15 +159,6 @@ fn decoder_thread_fn<S: Source + Send + Sync + 'static>(
                         };
                         pending.extend(samples);
                     }
-                    // Update position_ms from the source's current sample position.
-                    // current_position() counts all interleaved samples; divide by channels to get frames.
-                    // .max(1) upholds the invariant that audio_channels() >= 1, avoiding
-                    // division by zero if a malformed stream reports 0 channels.
-                    let ch = source.audio_channels().max(1) as u64;
-                    let sample_pos = source.current_position() as u64;
-                    let frames = sample_pos / ch;
-                    let ms = frames * 1000 / source_rate as u64;
-                    position_ms.store(ms, Ordering::Release);
                 }
                 Err(e) => {
                     tracing::error!("Decode error: {e}");
@@ -197,10 +183,15 @@ fn decoder_thread_fn<S: Source + Send + Sync + 'static>(
                 }
             }
             TrackState::Playing if eof => {
+                // Every sample is now in the ring: the mixer may switch to
+                // the next track once it has drained this one.
+                input_complete.store(true, Ordering::Release);
                 if output.is_empty() {
                     // All samples handed to the mixer (ring consumed) — track is done
                     state.store(TrackState::Finished as u8, Ordering::Release);
-                    tracing::info!("Track finished (EOF + pending written + ring drained)");
+                    // The mixer's ring still holds ~3 s that are not yet audible;
+                    // the audible end is reported by mdma-playback.
+                    tracing::debug!("Decoder done: all samples handed to mixer");
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 } else {
                     // Ring still holds unconsumed samples — wait for the mixer.
@@ -227,15 +218,15 @@ impl Track {
         target_rate: u32,
     ) -> Result<Self, PlaybackError> {
         let state = Arc::new(AtomicU8::new(TrackState::Stopped as u8));
-        let position_ms = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let duration_ms = source.duration_ms().unwrap_or(0);
 
         let (command_tx, command_rx) = mpsc::sync_channel(32);
 
         let state_clone = state.clone();
-        let position_ms_clone = position_ms.clone();
         let stop_clone = stop.clone();
+        let input_complete = Arc::new(AtomicBool::new(false));
+        let input_complete_clone = input_complete.clone();
         let decoder_thread = std::thread::spawn(move || {
             decoder_thread_fn(
                 source,
@@ -244,8 +235,8 @@ impl Track {
                 state_clone,
                 source_rate,
                 target_rate,
-                position_ms_clone,
                 stop_clone,
+                input_complete_clone,
             );
         });
 
@@ -254,8 +245,8 @@ impl Track {
             command_tx,
             decoder_thread: Some(decoder_thread),
             stop,
-            position_ms,
             duration_ms,
+            input_complete,
         })
     }
 
@@ -287,9 +278,10 @@ impl Track {
         TrackState::from_u8(self.state.load(Ordering::Acquire)) == TrackState::Finished
     }
 
-    /// Current playback position in milliseconds (from decoder progress).
-    pub fn position_ms(&self) -> u64 {
-        self.position_ms.load(Ordering::Acquire)
+    /// Shared flag: true once EOF was reached and every sample has been pushed
+    /// into the track ring (set Release; reset by seek).
+    pub fn input_complete(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.input_complete)
     }
 
     /// Total track duration in milliseconds (0 if unknown).
@@ -300,22 +292,18 @@ impl Track {
 
 impl Drop for Track {
     fn drop(&mut self) {
-        tracing::info!("Track drop beginning");
-
         // 1. Set stop flag so the loop exits even if the command channel is full
         self.stop.store(true, Ordering::Release);
 
         // 2. Best-effort shutdown command — ignore channel-full errors
         let _ = self.command_tx.try_send(TrackCommand::Shutdown);
-        tracing::info!("Stop flag set and shutdown command attempted");
 
         // 3. Join the decoder thread — deterministic shutdown
         if let Some(handle) = self.decoder_thread.take() {
-            tracing::info!("Joining decoder thread");
             handle.join().ok();
         }
 
-        tracing::info!("Track drop completed");
+        tracing::debug!("Track dropped: decoder stopped and joined");
     }
 }
 
@@ -553,11 +541,6 @@ impl Track {
         // Tests use same source and target rate to skip resampling
         Self::new(TestSource::new_from_samples(samples), prod, 48_000, 48_000)
     }
-
-    // Add this method for tests
-    pub(crate) fn ensure_ready_for_test(&mut self) -> Result<(), PlaybackError> {
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -638,6 +621,55 @@ mod tests {
         assert!(
             wait_until(std::time::Duration::from_secs(5), || track.is_finished()),
             "track should finish once ring is drained"
+        );
+    }
+
+    #[test]
+    fn input_complete_set_only_after_last_push() {
+        // Ring smaller than the source so the decoder must wait for us.
+        let samples = 4096usize;
+        let source = TestSource::new_from_samples(vec![0.25f32; samples]);
+        let (prod, mut cons) = HeapRb::new(1024).split();
+        let mut track = Track::new(source, prod, 48_000, 48_000).expect("Track::new");
+        let complete = track.input_complete();
+        assert!(!complete.load(Ordering::Acquire), "false before playing");
+        track.play();
+
+        // Let the decoder fill the ring; it cannot have pushed everything yet.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !complete.load(Ordering::Acquire),
+            "must not be complete while samples are still pending"
+        );
+
+        let mut received = 0usize;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !complete.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline, "never completed");
+            while cons.pop().is_some() {
+                received += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Everything was pushed before the flag flipped.
+        while cons.pop().is_some() {
+            received += 1;
+        }
+        assert_eq!(received, samples);
+    }
+
+    #[test]
+    fn seek_resets_input_complete() {
+        let (mut track, cons, samples) = playing_track_with_consumer(4096);
+        let complete = track.input_complete();
+        assert!(wait_until(std::time::Duration::from_secs(5), || complete
+            .load(Ordering::Acquire)));
+        assert_eq!(cons.len(), samples);
+        track.seek(0).expect("seek");
+        assert!(
+            wait_until(std::time::Duration::from_secs(5), || !complete
+                .load(Ordering::Acquire)),
+            "seek must reset input_complete"
         );
     }
 

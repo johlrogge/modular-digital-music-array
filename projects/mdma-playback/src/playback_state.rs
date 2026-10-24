@@ -82,15 +82,16 @@ impl PlaybackStateMachine {
         }
     }
 
-    /// Pop from queue and start playing. If a track is currently Playing or
-    /// Paused, it is stopped first.
+    /// Start playing a track popped from the queue. If a track is currently
+    /// Playing or Paused, its stop is recorded and the new load cuts it off.
     pub fn play_queue(&mut self, hash: ContentHash, source: SourceName) -> Vec<PlaybackEffect> {
         let mut effects = Vec::new();
 
-        // Stop whatever is currently playing/paused.
+        // Record the stop of whatever is currently playing/paused.
         match &self.state.clone() {
             PlaybackState::Playing { hash: h } | PlaybackState::Paused { hash: h } => {
-                effects.push(PlaybackEffect::StopEngine);
+                // No StopEngine: LoadAndPlay below cuts immediately, and an
+                // explicit stop would discard the preloaded next track.
                 effects.push(PlaybackEffect::WriteFact {
                     hash: h.clone(),
                     value: MusicValue::TrackStopped(StopReason::OnRequest),
@@ -149,7 +150,11 @@ impl PlaybackStateMachine {
 
         match self.state.clone() {
             PlaybackState::Playing { hash: h } | PlaybackState::Paused { hash: h } => {
-                effects.push(PlaybackEffect::StopEngine);
+                // With a next track, LoadAndPlay cuts immediately and StopEngine
+                // would discard the preload; only stop when nothing follows.
+                if next.is_none() {
+                    effects.push(PlaybackEffect::StopEngine);
+                }
                 effects.push(PlaybackEffect::WriteFact {
                     hash: h.clone(),
                     value: MusicValue::TrackStopped(StopReason::OnSkip),
@@ -235,12 +240,53 @@ impl PlaybackStateMachine {
         }
     }
 
+    /// Called when the engine switched to the preloaded next track on its own
+    /// (gapless advance). Emits the same facts/events as `track_ended` with a
+    /// next track, but no engine effect: the engine is already playing `next`.
+    ///
+    /// `from` is the track the caller observed as current. If the state moved
+    /// on in the meantime (e.g. a skip), this is a no-op.
+    pub fn track_advanced(&mut self, from: &ContentHash, next: ContentHash) -> Vec<PlaybackEffect> {
+        let mut effects = Vec::new();
+
+        if let PlaybackState::Playing { hash } = self.state.clone() {
+            if hash != *from {
+                return effects;
+            }
+            effects.push(PlaybackEffect::WriteFact {
+                hash: hash.clone(),
+                value: MusicValue::TrackStopped(StopReason::OnCompletion),
+            });
+            effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::TrackStopped {
+                hash,
+            }));
+            self.state = PlaybackState::Playing { hash: next.clone() };
+            // Session continues.
+            effects.push(PlaybackEffect::WriteFact {
+                hash: next.clone(),
+                value: MusicValue::TrackStarted(StartReason::ByQueue),
+            });
+            effects.push(PlaybackEffect::EmitEvent(PlaybackEvent::TrackStarted {
+                hash: next,
+            }));
+        }
+
+        effects
+    }
+
     /// Called when the engine reports a track has played to completion.
-    pub fn track_ended(&mut self, next: Option<(ContentHash, SourceName)>) -> Vec<PlaybackEffect> {
+    ///
+    /// `finished` is the track the caller observed as finished. If the state
+    /// moved on in the meantime (e.g. a skip), this is a no-op.
+    pub fn track_ended(
+        &mut self,
+        finished: &ContentHash,
+        next: Option<(ContentHash, SourceName)>,
+    ) -> Vec<PlaybackEffect> {
         let mut effects = Vec::new();
 
         match self.state.clone() {
-            PlaybackState::Playing { hash } => {
+            PlaybackState::Playing { hash } if hash == *finished => {
                 effects.push(PlaybackEffect::WriteFact {
                     hash: hash.clone(),
                     value: MusicValue::TrackStopped(StopReason::OnCompletion),
@@ -273,8 +319,8 @@ impl PlaybackStateMachine {
                     }
                 }
             }
-            // Should not happen, but safe.
-            PlaybackState::Paused { .. } | PlaybackState::Idle => {}
+            // Stale observation, paused or idle: safe no-op.
+            _ => {}
         }
 
         effects
@@ -352,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn play_queue_from_playing_stops_current_then_loads_new() {
+    fn play_queue_from_playing_records_stop_and_loads_new() {
         let mut sm = PlaybackStateMachine::new();
         sm.play_queue(hash_a(), source_a());
 
@@ -360,8 +406,8 @@ mod tests {
 
         assert!(matches!(sm.state(), PlaybackState::Playing { hash } if *hash == hash_b()));
 
-        // Must stop current track first.
-        assert!(effects
+        // No StopEngine: it would discard the preload; load cuts immediately.
+        assert!(!effects
             .iter()
             .any(|e| matches!(e, PlaybackEffect::StopEngine)));
         assert!(effects.iter().any(|e| matches!(e,
@@ -379,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn play_queue_from_paused_stops_then_loads_new() {
+    fn play_queue_from_paused_records_stop_and_loads_new() {
         let mut sm = PlaybackStateMachine::new();
         sm.play_queue(hash_a(), source_a());
         sm.pause();
@@ -389,7 +435,7 @@ mod tests {
         let effects = sm.play_queue(hash_b(), source_b());
 
         assert!(matches!(sm.state(), PlaybackState::Playing { hash } if *hash == hash_b()));
-        assert!(effects
+        assert!(!effects
             .iter()
             .any(|e| matches!(e, PlaybackEffect::StopEngine)));
         assert!(effects
@@ -463,7 +509,8 @@ mod tests {
         let effects = sm.skip(Some((hash_b(), source_b())));
 
         assert!(matches!(sm.state(), PlaybackState::Playing { hash } if *hash == hash_b()));
-        assert!(effects
+        // No StopEngine when a next track follows (would discard the preload).
+        assert!(!effects
             .iter()
             .any(|e| matches!(e, PlaybackEffect::StopEngine)));
         assert!(effects.iter().any(|e| matches!(e,
@@ -508,7 +555,7 @@ mod tests {
         let effects = sm.skip(Some((hash_b(), source_b())));
 
         assert!(matches!(sm.state(), PlaybackState::Playing { hash } if *hash == hash_b()));
-        assert!(effects
+        assert!(!effects
             .iter()
             .any(|e| matches!(e, PlaybackEffect::StopEngine)));
         assert!(effects
@@ -664,7 +711,7 @@ mod tests {
         let mut sm = PlaybackStateMachine::new();
         sm.play_queue(hash_a(), source_a());
 
-        let effects = sm.track_ended(Some((hash_b(), source_b())));
+        let effects = sm.track_ended(&hash_a(), Some((hash_b(), source_b())));
 
         assert!(matches!(sm.state(), PlaybackState::Playing { hash } if *hash == hash_b()));
         assert!(effects.iter().any(|e| matches!(e,
@@ -685,7 +732,7 @@ mod tests {
         let mut sm = PlaybackStateMachine::new();
         sm.play_queue(hash_a(), source_a());
 
-        let effects = sm.track_ended(None);
+        let effects = sm.track_ended(&hash_a(), None);
 
         assert_eq!(sm.state(), &PlaybackState::Idle);
         assert!(effects.iter().any(|e| matches!(e,
@@ -704,7 +751,7 @@ mod tests {
         sm.play_queue(hash_a(), source_a());
         sm.pause();
 
-        let effects = sm.track_ended(None);
+        let effects = sm.track_ended(&hash_a(), None);
 
         // Safe no-op — should not happen but handled gracefully.
         assert!(matches!(sm.state(), PlaybackState::Paused { .. }));
@@ -715,10 +762,104 @@ mod tests {
     fn track_ended_from_idle_is_noop() {
         let mut sm = PlaybackStateMachine::new();
 
-        let effects = sm.track_ended(None);
+        let effects = sm.track_ended(&hash_a(), None);
 
         assert_eq!(sm.state(), &PlaybackState::Idle);
         assert_eq!(effects, vec![]);
+    }
+
+    #[test]
+    fn track_ended_for_a_track_that_is_no_longer_current_is_noop() {
+        // A poll observed A finishing, but a skip moved us to B meanwhile.
+        let mut sm = PlaybackStateMachine::new();
+        sm.play_queue(hash_a(), source_a());
+        sm.skip(Some((hash_b(), source_b())));
+
+        let effects = sm.track_ended(&hash_a(), None);
+
+        assert_eq!(effects, vec![]);
+        assert!(matches!(sm.state(), PlaybackState::Playing { hash } if *hash == hash_b()));
+    }
+
+    // -------------------------------------------------------------------------
+    // track_advanced (gapless) transitions
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn track_advanced_emits_same_facts_and_events_as_track_ended_without_engine_effect() {
+        let mut gapless = PlaybackStateMachine::new();
+        gapless.play_queue(hash_a(), source_a());
+        let mut ended = PlaybackStateMachine::new();
+        ended.play_queue(hash_a(), source_a());
+
+        let advanced_effects = gapless.track_advanced(&hash_a(), hash_b());
+        let ended_effects = ended.track_ended(&hash_a(), Some((hash_b(), source_b())));
+
+        assert!(matches!(gapless.state(), PlaybackState::Playing { hash } if *hash == hash_b()));
+        // No engine effects at all: the engine already switched.
+        assert!(!advanced_effects.iter().any(|e| matches!(
+            e,
+            PlaybackEffect::LoadAndPlay { .. }
+                | PlaybackEffect::StopEngine
+                | PlaybackEffect::PauseEngine
+                | PlaybackEffect::PlayEngine
+        )));
+        // Same as track_ended minus the LoadAndPlay.
+        let ended_without_load: Vec<_> = ended_effects
+            .into_iter()
+            .filter(|e| !matches!(e, PlaybackEffect::LoadAndPlay { .. }))
+            .collect();
+        assert_eq!(advanced_effects, ended_without_load);
+        assert!(advanced_effects.iter().any(|e| matches!(e,
+            PlaybackEffect::WriteFact { hash, value: MusicValue::TrackStopped(StopReason::OnCompletion) }
+            if *hash == hash_a()
+        )));
+        assert!(advanced_effects.iter().any(|e| matches!(e,
+            PlaybackEffect::WriteFact { hash, value: MusicValue::TrackStarted(StartReason::ByQueue) }
+            if *hash == hash_b()
+        )));
+    }
+
+    #[test]
+    fn track_advanced_keeps_session() {
+        let mut sm = PlaybackStateMachine::new();
+        sm.play_queue(hash_a(), source_a());
+        let session = sm.session_id().cloned();
+
+        let effects = sm.track_advanced(&hash_a(), hash_b());
+
+        assert_eq!(sm.session_id(), session.as_ref());
+        assert!(!effects.iter().any(|e| matches!(
+            e,
+            PlaybackEffect::EmitEvent(PlaybackEvent::SessionStarted { .. })
+                | PlaybackEffect::EmitEvent(PlaybackEvent::SessionEnded { .. })
+        )));
+    }
+
+    #[test]
+    fn track_advanced_from_paused_or_idle_is_noop() {
+        let mut sm = PlaybackStateMachine::new();
+        assert_eq!(sm.track_advanced(&hash_a(), hash_b()), vec![]);
+        assert_eq!(sm.state(), &PlaybackState::Idle);
+
+        sm.play_queue(hash_a(), source_a());
+        sm.pause();
+        assert_eq!(sm.track_advanced(&hash_a(), hash_b()), vec![]);
+        assert!(matches!(sm.state(), PlaybackState::Paused { hash } if *hash == hash_a()));
+    }
+
+    #[test]
+    fn track_advanced_from_a_track_that_is_no_longer_current_is_noop() {
+        // A stale poll saw B audible, but a skip already moved us to B:
+        // no bogus TrackStopped(B)/TrackStarted(B).
+        let mut sm = PlaybackStateMachine::new();
+        sm.play_queue(hash_a(), source_a());
+        sm.skip(Some((hash_b(), source_b())));
+
+        let effects = sm.track_advanced(&hash_a(), hash_b());
+
+        assert_eq!(effects, vec![]);
+        assert!(matches!(sm.state(), PlaybackState::Playing { hash } if *hash == hash_b()));
     }
 
     // -------------------------------------------------------------------------
@@ -756,7 +897,7 @@ mod tests {
 
         assert_eq!(sm.state(), &PlaybackState::Idle);
         // Auto-advance (track_ended) should now be a no-op.
-        let effects = sm.track_ended(None);
+        let effects = sm.track_ended(&hash_a(), None);
         assert_eq!(effects, vec![]);
     }
 
@@ -845,7 +986,7 @@ mod tests {
 
         assert!(sm.session_id().is_some());
 
-        let effects = sm.track_ended(None);
+        let effects = sm.track_ended(&hash_a(), None);
 
         // Session cleared.
         assert_eq!(sm.session_id(), None);

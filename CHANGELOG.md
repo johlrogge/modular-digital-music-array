@@ -4,6 +4,34 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.26.0] — 2026-10-24
+
+### Added
+
+- **Gapless playback** — the next queued track is preloaded and the mixer switches to it sample-accurately when the current track ends (verified on hardware: 0-sample gap/overlap at the join). A sample-rate change between tracks (e.g. 44.1 to 48 kHz) falls back to playing the current track out fully and reopening the output (~90 ms gap, no cut tail).
+- **Encoder delay/padding trimming** for lossy formats (MP3/AAC) so joins are gapless there too.
+- **Skip reuses the preloaded track** (~10 ms to start).
+- **Immediate pause/resume** (resumes at the exact sample); volume is applied at the output so changes are heard immediately. Engine side only; CLI/playback control for volume and seek is not yet exposed (see #60).
+- **Stream source protocol** — `Preload`/`ClearPreload` commands and `preloaded` (the track that plays next) in the status.
+
+### Changed
+
+- Now-playing and position follow what is actually heard (previously ran ~4 s ahead).
+- Logging: status polls and per-track lifecycle messages are at debug level; info logs contain only meaningful events (track advances, loads, errors). Underrun warnings only for real mid-stream starvation.
+- Removed the unused `admin-ipc-client` component; builds go through polylith profiles only.
+
+### Fixed
+
+- PipeWire output data race between the RT callback and the control thread (#58) — could crash on skip/stop.
+- Old-track audio could leak into the next track on skip.
+- `mdma-audio` and `mdma-playback` no longer exit on unknown/unparseable commands.
+
+### Upgrade note
+
+Deploy `mdma-audio` before `mdma-playback`: a new `mdma-playback` sends `Preload`, which 0.25.x `mdma-audio` cannot parse. Package upgrades via `xbps-install -Su` handle both together.
+
+---
+
 ## [0.25.2] — 2026-10-24
 
 ### Fixed

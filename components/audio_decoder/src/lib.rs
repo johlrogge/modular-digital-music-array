@@ -109,12 +109,18 @@ impl AudioSource {
         let file = std::fs::File::open(path)?;
         let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
-        // Probe and get format
+        // Probe and get format. Gapless: the demuxer reports encoder
+        // delay/padding as packet trims (applied by the MP3 and Vorbis
+        // decoders), and `n_frames` / timestamps below are then relative to
+        // the trimmed audio, so the reported duration is the trimmed one.
         let probed = symphonia::default::get_probe()
             .format(
                 &hint,
                 mss,
-                &FormatOptions::default(),
+                &FormatOptions {
+                    enable_gapless: true,
+                    ..Default::default()
+                },
                 &MetadataOptions::default(),
             )
             .map_err(|e| DecoderError::Decode(e.to_string()))?;
@@ -226,28 +232,36 @@ impl AudioSource {
 impl Source for AudioSource {
     fn decode_next_frame(&self) -> Result<Vec<DecodedSegment>, DecoderError> {
         tracing::debug!("decode_next_frame");
-        if self.is_eof.load(Ordering::Relaxed) {
-            return Ok(Vec::new());
-        }
-
-        let mut decoder_state = self.decoder_state.lock();
-        let packet = match decoder_state.format_reader.next_packet() {
-            Ok(packet) => packet,
-            Err(symphonia::core::errors::Error::IoError(ref e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                self.is_eof.store(true, Ordering::Relaxed);
+        // An empty result means EOF to callers. With gapless trimming a packet
+        // can be trimmed away entirely (encoder delay/padding spanning a whole
+        // packet), so keep reading until there is audio or the real EOF.
+        loop {
+            if self.is_eof.load(Ordering::Relaxed) {
                 return Ok(Vec::new());
             }
-            Err(e) => return Err(DecoderError::Decode(e.to_string())),
-        };
 
-        let decoded = match decoder_state.decoder.decode(&packet) {
-            Ok(decoded) => decoded,
-            Err(e) => return Err(DecoderError::Decode(e.to_string())),
-        };
+            let mut decoder_state = self.decoder_state.lock();
+            let packet = match decoder_state.format_reader.next_packet() {
+                Ok(packet) => packet,
+                Err(symphonia::core::errors::Error::IoError(ref e))
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    self.is_eof.store(true, Ordering::Relaxed);
+                    return Ok(Vec::new());
+                }
+                Err(e) => return Err(DecoderError::Decode(e.to_string())),
+            };
 
-        self.extract_segments(decoded)
+            let decoded = match decoder_state.decoder.decode(&packet) {
+                Ok(decoded) => decoded,
+                Err(e) => return Err(DecoderError::Decode(e.to_string())),
+            };
+
+            let segments = self.extract_segments(decoded)?;
+            if !segments.is_empty() {
+                return Ok(segments);
+            }
+        }
     }
 
     fn seek(&self, position: usize) -> Result<(), DecoderError> {
