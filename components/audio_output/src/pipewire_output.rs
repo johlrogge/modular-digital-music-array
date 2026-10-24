@@ -18,14 +18,16 @@ pub enum StreamCommand {
     Shutdown(mpsc::SyncSender<HeapConsumer<f32>>),
     /// Flush PipeWire's own in-flight buffers. The mixer ring is drained by the
     /// RT callback itself (see `PipewireOutput::flush`), not by this command.
-    Flush,
+    /// The main-loop handler signals the sender once `stream.flush(false)` has
+    /// returned, so the caller can wait for the flush to be done.
+    Flush(mpsc::SyncSender<()>),
 }
 
 impl std::fmt::Debug for StreamCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StreamCommand::Shutdown(_) => write!(f, "Shutdown(..)"),
-            StreamCommand::Flush => write!(f, "Flush"),
+            StreamCommand::Flush(_) => write!(f, "Flush(..)"),
         }
     }
 }
@@ -108,10 +110,11 @@ impl PlayoutMonitor {
 
     /// RT side: if a flush is pending, discard everything in `consumer`,
     /// record the count and acknowledge. No allocation, no locks.
-    fn service_flush(&self, consumer: &mut HeapConsumer<f32>) {
+    /// Returns the number of samples discarded (0 if no flush was pending).
+    fn service_flush(&self, consumer: &mut HeapConsumer<f32>) -> usize {
         let requested = self.flush_requested.load(Ordering::Acquire);
         if self.flush_completed.load(Ordering::Acquire) >= requested {
-            return;
+            return 0;
         }
         let drained = consumer.clear();
         // The ring was emptied by a flush, not played out: restart drain and
@@ -120,6 +123,7 @@ impl PlayoutMonitor {
         self.underrun_streak.store(0, Ordering::Relaxed);
         self.flush_drained.store(drained, Ordering::Release);
         self.flush_completed.fetch_max(requested, Ordering::AcqRel);
+        drained
     }
 
     /// Record one callback. Returns `true` if a mid-stream underrun warning
@@ -161,6 +165,67 @@ impl PlayoutMonitor {
     }
 }
 
+/// Engine-owned state shared with the RT callback. Owned by the engine (not
+/// the output) so it survives output recreation on sample-rate change.
+#[derive(Debug, Clone)]
+pub struct OutputShared {
+    /// While set the callback emits silence and leaves the ring untouched.
+    pub paused: Arc<AtomicBool>,
+    /// Monotonic count of samples consumed from the ring: played + flushed.
+    /// See [`render`].
+    pub consumed_total: Arc<AtomicU64>,
+    /// Linear gain as `f32::to_bits`. Applied in the callback with a ramp.
+    pub gain: Arc<AtomicU32>,
+}
+
+impl OutputShared {
+    /// Fresh shared state around `paused`: zero consumed, unity gain.
+    pub fn new(paused: Arc<AtomicBool>) -> Self {
+        Self {
+            paused,
+            consumed_total: Arc::new(AtomicU64::new(0)),
+            gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+        }
+    }
+}
+
+/// Multiply interleaved `samples` by a gain ramping linearly per frame from
+/// `from` to `to` (last frame lands exactly on `to`). Both 1.0 => untouched.
+fn apply_gain(samples: &mut [f32], from: f32, to: f32) {
+    if from == 1.0 && to == 1.0 {
+        return;
+    }
+    let ch = DEFAULT_CHANNELS as usize;
+    let frames = samples.len().div_ceil(ch);
+    if from == to {
+        for s in samples.iter_mut() {
+            *s *= to;
+        }
+        return;
+    }
+    let step = (to - from) / frames as f32;
+    for (i, frame) in samples.chunks_mut(ch).enumerate() {
+        let g = if i + 1 == frames {
+            to
+        } else {
+            from + step * (i + 1) as f32
+        };
+        for s in frame {
+            *s *= g;
+        }
+    }
+}
+
+/// Frames to fill in a callback: what PipeWire requested, clamped to the
+/// mapped buffer capacity; falls back to the full capacity when it reports 0.
+fn frames_to_fill(requested: u64, capacity_frames: usize) -> usize {
+    if requested == 0 {
+        capacity_frames
+    } else {
+        usize::try_from(requested).map_or(capacity_frames, |r| r.min(capacity_frames))
+    }
+}
+
 /// Outcome of one [`render`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rendered {
@@ -181,18 +246,45 @@ pub enum Rendered {
 /// is recorded against `out.len()` requested samples.
 ///
 /// PipeWire-independent and RT-safe (no allocation, no locks).
+///
+/// # Counters and gain
+///
+/// `shared.consumed_total` grows by every sample popped for playback AND by
+/// every sample discarded by a serviced flush: the engine keeps the invariant
+/// `produced_total == consumed_total + ring_len`, and a flush throws away
+/// samples the mixer already produced, so they must count as consumed. Paused
+/// renders add nothing.
+///
+/// `shared.gain` (linear, f32 bits) is applied to the popped samples. The gain
+/// ramps linearly per frame from `*prev_gain` (the gain used by the previous
+/// callback) to the current value, ending exactly on it, and `*prev_gain` is
+/// updated. A gain of exactly 1.0 (both ends) is a bit-exact passthrough.
 pub fn render(
     consumer: &mut HeapConsumer<f32>,
     out: &mut [f32],
     monitor: &PlayoutMonitor,
-    paused: &AtomicBool,
+    shared: &OutputShared,
+    prev_gain: &mut f32,
 ) -> Rendered {
-    monitor.service_flush(consumer);
-    if paused.load(Ordering::Acquire) {
+    let flushed = monitor.service_flush(consumer);
+    if flushed > 0 {
+        shared
+            .consumed_total
+            .fetch_add(flushed as u64, Ordering::Release);
+    }
+    if shared.paused.load(Ordering::Acquire) {
         out.fill(0.0);
         return Rendered::Paused;
     }
     let samples = consumer.pop_slice(out);
+    if samples > 0 {
+        shared
+            .consumed_total
+            .fetch_add(samples as u64, Ordering::Release);
+    }
+    let target = f32::from_bits(shared.gain.load(Ordering::Acquire));
+    apply_gain(&mut out[..samples], *prev_gain, target);
+    *prev_gain = target;
     let underrun_warn = monitor.record(samples, out.len());
     Rendered::Played {
         samples,
@@ -203,6 +295,9 @@ pub fn render(
 /// How long [`PipewireOutput::flush`] waits for the callback to acknowledge.
 const FLUSH_TIMEOUT: Duration = Duration::from_millis(100);
 const FLUSH_POLL: Duration = Duration::from_millis(1);
+/// How long [`PipewireOutput::flush`] waits for the PipeWire main loop to
+/// acknowledge its own buffer flush.
+const PW_FLUSH_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub struct PipewireOutput {
     // Thread handle to keep the PipeWire thread alive
@@ -214,7 +309,7 @@ pub struct PipewireOutput {
 impl PipewireOutput {
     pub fn new(
         sample_consumer: HeapConsumer<f32>,
-        paused: Arc<AtomicBool>,
+        shared: OutputShared,
         sample_rate: u32,
         target_device: Option<&str>,
     ) -> Result<Self, pw::Error> {
@@ -244,9 +339,10 @@ impl PipewireOutput {
                 consumer_return: mpsc::Sender<HeapConsumer<f32>>,
                 /// Drain / underrun / flush bookkeeping shared with `PipewireOutput`.
                 monitor: Arc<PlayoutMonitor>,
-                /// Engine-owned pause flag: while set the callback emits silence
-                /// and leaves the ring untouched.
-                paused: Arc<AtomicBool>,
+                /// Engine-owned pause flag, consumed counter and gain.
+                shared: OutputShared,
+                /// Gain used by the previous callback (ramp start).
+                prev_gain: f32,
                 /// Preallocated read buffer; grown only if a larger quantum arrives.
                 scratch: Vec<f32>,
             }
@@ -263,7 +359,8 @@ impl PipewireOutput {
                 consumer: Some(sample_consumer),
                 consumer_return: consumer_return_tx,
                 monitor: monitor_for_cb,
-                paused,
+                prev_gain: f32::from_bits(shared.gain.load(Ordering::Acquire)),
+                shared,
                 scratch: vec![0.0f32; SCRATCH_FRAMES * DEFAULT_CHANNELS as usize],
             };
 
@@ -298,12 +395,14 @@ impl PipewireOutput {
                 .process(|stream, user_data| match stream.dequeue_buffer() {
                     None => tracing::warn!("No buffer received"),
                     Some(mut buffer) => {
+                        let buffer_requested = buffer.requested();
                         let datas = buffer.datas_mut();
                         let stride = CHAN_SIZE * DEFAULT_CHANNELS as usize;
                         let data = &mut datas[0];
 
+                        let requested_frames = buffer_requested;
                         let n_frames = if let Some(slice) = data.data() {
-                            let n_frames = slice.len() / stride;
+                            let n_frames = frames_to_fill(requested_frames, slice.len() / stride);
 
                             let requested = n_frames * DEFAULT_CHANNELS as usize;
                             if user_data.scratch.len() < requested {
@@ -323,7 +422,8 @@ impl PipewireOutput {
                                     consumer,
                                     f32_buffer,
                                     &user_data.monitor,
-                                    &user_data.paused,
+                                    &user_data.shared,
+                                    &mut user_data.prev_gain,
                                 ),
                                 None => Rendered::Paused,
                             };
@@ -436,7 +536,7 @@ impl PipewireOutput {
                     *shutdown_reply_for_cmd.borrow_mut() = Some(tx);
                     mainloop_for_cmd.quit();
                 }
-                StreamCommand::Flush => {
+                StreamCommand::Flush(done) => {
                     // The mixer ring itself is drained by the RT callback (it owns
                     // the consumer); see `PipewireOutput::flush`. Here we only
                     // tell PipeWire to drop its own in-flight buffers
@@ -444,6 +544,10 @@ impl PipewireOutput {
                     if let Err(e) = stream_for_cmd.flush(false) {
                         tracing::warn!("Flush: stream.flush(false) failed: {}", e);
                     }
+                    // Acknowledge (also after a failure: the caller must not
+                    // wait for something that will never happen). The caller
+                    // may have given up; a dropped receiver is fine.
+                    let _ = done.send(());
                 }
             });
 
@@ -504,8 +608,11 @@ impl PipewireOutput {
     /// roughly two quanta) until the callback acknowledges, and only then asks
     /// the PW main loop to flush PipeWire's own buffers (so that flush cannot
     /// run before the last old quantum has been queued). The PipeWire flush is
-    /// sent even on timeout. The drained count is logged here, off the RT
-    /// thread.
+    /// sent even on timeout, and `flush` then waits (up to
+    /// [`PW_FLUSH_TIMEOUT`]) for the main loop to acknowledge it, so it has
+    /// completed when `flush` returns: otherwise it could run after the caller
+    /// registered the next track and drop that track's first quantum. The
+    /// drained count is logged here, off the RT thread.
     ///
     /// Pausing is done with the engine-owned `paused` flag (the callback keeps
     /// running and emits silence), so flushes are serviced even while paused.
@@ -543,8 +650,16 @@ impl PipewireOutput {
             );
         }
 
-        if let Err(e) = self.command_sender.send(StreamCommand::Flush) {
+        let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
+        if let Err(e) = self.command_sender.send(StreamCommand::Flush(done_tx)) {
             tracing::warn!("Failed to send Flush to PW thread: {:?}", e);
+            return;
+        }
+        if done_rx.recv_timeout(PW_FLUSH_TIMEOUT).is_err() {
+            tracing::warn!(
+                "Flush: PipeWire main loop did not acknowledge within {:?}",
+                PW_FLUSH_TIMEOUT
+            );
         }
     }
 
@@ -611,6 +726,140 @@ mod tests {
         (p, c)
     }
 
+    /// Shim for the pre-gain tests: unity gain, fresh counters, pause state
+    /// read from `paused` on every call. Wraps `super::render`.
+    fn render_unity(
+        c: &mut HeapConsumer<f32>,
+        out: &mut [f32],
+        m: &PlayoutMonitor,
+        paused: &AtomicBool,
+    ) -> Rendered {
+        let shared = OutputShared::new(Arc::new(AtomicBool::new(paused.load(Ordering::Acquire))));
+        super::render(c, out, m, &shared, &mut 1.0)
+    }
+
+    fn shared() -> OutputShared {
+        OutputShared::new(Arc::new(AtomicBool::new(false)))
+    }
+
+    #[test]
+    fn consumed_total_counts_popped_samples() {
+        let m = PlayoutMonitor::new();
+        let (_p, mut c) = ring_with(10);
+        let s = shared();
+        let mut out = [0.0f32; 4];
+        super::render(&mut c, &mut out, &m, &s, &mut 1.0);
+        super::render(&mut c, &mut out, &m, &s, &mut 1.0);
+        assert_eq!(s.consumed_total.load(Ordering::Acquire), 8);
+    }
+
+    #[test]
+    fn consumed_total_counts_partial_pop() {
+        let m = PlayoutMonitor::new();
+        let (_p, mut c) = ring_with(3);
+        let s = shared();
+        let mut out = [0.0f32; 4];
+        super::render(&mut c, &mut out, &m, &s, &mut 1.0);
+        assert_eq!(s.consumed_total.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn consumed_total_unchanged_when_paused() {
+        let m = PlayoutMonitor::new();
+        let (_p, mut c) = ring_with(10);
+        let s = shared();
+        s.paused.store(true, Ordering::Release);
+        let mut out = [0.0f32; 4];
+        super::render(&mut c, &mut out, &m, &s, &mut 1.0);
+        assert_eq!(s.consumed_total.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn flush_adds_cleared_count_to_consumed_total() {
+        let m = PlayoutMonitor::new();
+        let (_p, mut c) = ring_with(10);
+        let s = shared();
+        m.request_flush();
+        let mut out = [0.0f32; 4];
+        super::render(&mut c, &mut out, &m, &s, &mut 1.0);
+        assert_eq!(s.consumed_total.load(Ordering::Acquire), 10);
+    }
+
+    #[test]
+    fn flush_while_paused_adds_cleared_count() {
+        let m = PlayoutMonitor::new();
+        let (_p, mut c) = ring_with(10);
+        let s = shared();
+        s.paused.store(true, Ordering::Release);
+        m.request_flush();
+        let mut out = [0.0f32; 4];
+        super::render(&mut c, &mut out, &m, &s, &mut 1.0);
+        assert_eq!(s.consumed_total.load(Ordering::Acquire), 10);
+    }
+
+    #[test]
+    fn unity_gain_is_bit_exact() {
+        let m = PlayoutMonitor::new();
+        let (mut p, mut c) = HeapRb::<f32>::new(16).split();
+        let vals = [0.1f32, -0.3333333, 0.987654, f32::MIN_POSITIVE];
+        for v in vals {
+            p.push(v).unwrap();
+        }
+        let s = shared();
+        let mut out = [0.0f32; 4];
+        super::render(&mut c, &mut out, &m, &s, &mut 1.0);
+        for (a, b) in out.iter().zip(vals) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+
+    #[test]
+    fn constant_gain_scales_samples() {
+        let m = PlayoutMonitor::new();
+        let (mut p, mut c) = HeapRb::<f32>::new(16).split();
+        for _ in 0..8 {
+            p.push(1.0).unwrap();
+        }
+        let s = shared();
+        s.gain.store(0.5f32.to_bits(), Ordering::Release);
+        let mut prev = 0.5;
+        let mut out = [0.0f32; 8];
+        super::render(&mut c, &mut out, &m, &s, &mut prev);
+        assert!(out.iter().all(|v| (*v - 0.5).abs() < 1e-6));
+        assert_eq!(prev, 0.5);
+    }
+
+    #[test]
+    fn gain_ramps_from_previous_to_new_across_buffer() {
+        let m = PlayoutMonitor::new();
+        let (mut p, mut c) = HeapRb::<f32>::new(2048).split();
+        for _ in 0..1000 {
+            p.push(1.0).unwrap();
+        }
+        let s = shared();
+        s.gain.store(0.0f32.to_bits(), Ordering::Release);
+        let mut prev = 1.0;
+        let mut out = [0.0f32; 1000];
+        super::render(&mut c, &mut out, &m, &s, &mut prev);
+        assert!(out[0] > 0.99, "first sample near old gain, got {}", out[0]);
+        assert!(
+            out[999] < 0.01,
+            "last sample near new gain, got {}",
+            out[999]
+        );
+        assert!(out.windows(2).all(|w| w[1] <= w[0] + 1e-6), "monotonic");
+        assert_eq!(out[0], out[1], "both channels of a frame share gain");
+        assert_eq!(prev, 0.0, "previous gain updated");
+    }
+
+    #[test]
+    fn frames_to_fill_uses_requested_when_nonzero_and_clamps() {
+        assert_eq!(frames_to_fill(256, 1024), 256);
+        assert_eq!(frames_to_fill(4096, 1024), 1024);
+        assert_eq!(frames_to_fill(0, 1024), 1024);
+        assert_eq!(frames_to_fill(1024, 1024), 1024);
+    }
+
     /// Samples popped by a render, `None` if it was paused.
     fn popped(r: Rendered) -> Option<usize> {
         match r {
@@ -625,7 +874,7 @@ mod tests {
         let (_p, mut c) = ring_with(10);
         let mut out = [0.0f32; 4];
         assert_eq!(
-            render(&mut c, &mut out, &m, &PLAYING),
+            render_unity(&mut c, &mut out, &m, &PLAYING),
             Rendered::Played {
                 samples: 4,
                 underrun_warn: false
@@ -641,7 +890,10 @@ mod tests {
         let (_p, mut c) = ring_with(10);
         let paused = AtomicBool::new(true);
         let mut out = [7.0f32; 4];
-        assert_eq!(render(&mut c, &mut out, &m, &paused), Rendered::Paused);
+        assert_eq!(
+            render_unity(&mut c, &mut out, &m, &paused),
+            Rendered::Paused
+        );
         assert_eq!(out, [0.0; 4]);
         assert_eq!(c.len(), 10);
     }
@@ -653,7 +905,7 @@ mod tests {
         let paused = AtomicBool::new(true);
         let mut out = [0.0f32; 4];
         for _ in 0..(DRAINED_AFTER_SILENT_CALLBACKS * 2) {
-            render(&mut c, &mut out, &m, &paused);
+            render_unity(&mut c, &mut out, &m, &paused);
         }
         assert!(!m.is_drained(), "paused callbacks must not be recorded");
     }
@@ -664,7 +916,7 @@ mod tests {
         let (_p, mut c) = ring_with(0);
         let mut out = [0.0f32; 4];
         for _ in 0..DRAINED_AFTER_SILENT_CALLBACKS {
-            render(&mut c, &mut out, &m, &PLAYING);
+            render_unity(&mut c, &mut out, &m, &PLAYING);
         }
         assert!(m.is_drained());
     }
@@ -681,7 +933,7 @@ mod tests {
         m.request_flush();
         // Service the flush while paused so nothing is recorded afterwards.
         let paused = AtomicBool::new(true);
-        render(&mut c, &mut out, &m, &paused);
+        render_unity(&mut c, &mut out, &m, &paused);
         assert!(!m.is_drained(), "flush must reset the drain tracking");
     }
 
@@ -691,7 +943,7 @@ mod tests {
         let (_p, mut c) = ring_with(1);
         let mut out = [0.0f32; 4];
         assert_eq!(
-            render(&mut c, &mut out, &m, &PLAYING),
+            render_unity(&mut c, &mut out, &m, &PLAYING),
             Rendered::Played {
                 samples: 1,
                 underrun_warn: true
@@ -706,7 +958,10 @@ mod tests {
         let paused = AtomicBool::new(true);
         let generation = m.request_flush();
         let mut out = [7.0f32; 4];
-        assert_eq!(render(&mut c, &mut out, &m, &paused), Rendered::Paused);
+        assert_eq!(
+            render_unity(&mut c, &mut out, &m, &paused),
+            Rendered::Paused
+        );
         assert!(c.is_empty());
         assert!(m.flush_acked(generation));
         assert_eq!(m.last_flush_drained(), 10);
@@ -718,9 +973,9 @@ mod tests {
         let (_p, mut c) = ring_with(10);
         let paused = AtomicBool::new(true);
         let mut out = [0.0f32; 4];
-        render(&mut c, &mut out, &m, &paused);
+        render_unity(&mut c, &mut out, &m, &paused);
         paused.store(false, Ordering::Release);
-        assert_eq!(popped(render(&mut c, &mut out, &m, &paused)), Some(4));
+        assert_eq!(popped(render_unity(&mut c, &mut out, &m, &paused)), Some(4));
         assert_eq!(out, [0.0, 1.0, 2.0, 3.0]);
     }
 
@@ -732,7 +987,7 @@ mod tests {
         assert!(!m.flush_acked(generation), "not acked before callback runs");
         let mut out = [0.0f32; 4];
         assert_eq!(
-            popped(render(&mut c, &mut out, &m, &PLAYING)),
+            popped(render_unity(&mut c, &mut out, &m, &PLAYING)),
             Some(0),
             "old audio must not be rendered"
         );
@@ -747,7 +1002,10 @@ mod tests {
         let (_p, mut c) = ring_with(0);
         let generation = m.request_flush();
         let mut out = [0.0f32; 4];
-        assert_eq!(popped(render(&mut c, &mut out, &m, &PLAYING)), Some(0));
+        assert_eq!(
+            popped(render_unity(&mut c, &mut out, &m, &PLAYING)),
+            Some(0)
+        );
         assert!(m.flush_acked(generation));
         assert_eq!(m.last_flush_drained(), 0);
     }
@@ -758,10 +1016,10 @@ mod tests {
         let (mut p, mut c) = ring_with(5);
         m.request_flush();
         let mut out = [0.0f32; 4];
-        render(&mut c, &mut out, &m, &PLAYING);
+        render_unity(&mut c, &mut out, &m, &PLAYING);
         p.push(9.0).unwrap();
         assert_eq!(
-            popped(render(&mut c, &mut out, &m, &PLAYING)),
+            popped(render_unity(&mut c, &mut out, &m, &PLAYING)),
             Some(1),
             "new audio after flush is kept"
         );
@@ -774,7 +1032,10 @@ mod tests {
         let generation = m.request_flush();
         m.abandon_flush(generation);
         let mut out = [0.0f32; 4];
-        assert_eq!(popped(render(&mut c, &mut out, &m, &PLAYING)), Some(4));
+        assert_eq!(
+            popped(render_unity(&mut c, &mut out, &m, &PLAYING)),
+            Some(4)
+        );
     }
 
     #[test]

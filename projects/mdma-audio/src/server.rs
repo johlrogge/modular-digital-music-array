@@ -1,7 +1,8 @@
 use library_ipc_client::LibraryClient;
 use music_primitives::ContentHash;
-use playback_engine::PlaybackEngine;
+use playback_engine::{PlaybackEngine, TrackId};
 use playback_primitives::AudioSinkInfo;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use stream_source_protocol::{
     AudioOutputConfig, StreamCommand, StreamPlaybackState, StreamResponse, StreamTrackInfo,
@@ -30,12 +31,58 @@ enum LoadedState {
     Paused,
 }
 
+/// Library metadata for a track known to the engine.
 struct LoadedTrack {
     content_hash: ContentHash,
     title: Option<String>,
     artist: Option<String>,
     album: Option<String>,
-    state: LoadedState,
+}
+
+/// A track resolved through the library: where it lives plus its metadata.
+struct ResolvedTrack {
+    path: PathBuf,
+    meta: LoadedTrack,
+}
+
+/// Drop metadata for ids the engine no longer owns. The engine is the single
+/// owner of track lifetime: a track can be live while neither audible nor
+/// reported as next (around a commit), so liveness is the only safe criterion.
+fn prune_tracks(tracks: &mut HashMap<TrackId, LoadedTrack>, is_live: impl Fn(TrackId) -> bool) {
+    tracks.retain(|id, _| is_live(*id));
+}
+
+/// Build the Loaded response payload describing the audible track and the
+/// track that plays next (`preloaded` in the protocol).
+fn build_loaded_info(
+    tracks: &HashMap<TrackId, LoadedTrack>,
+    audible: Option<TrackId>,
+    preloaded: Option<TrackId>,
+    play_state: LoadedState,
+    finished: bool,
+    position_ms: Option<u64>,
+    duration_ms: Option<u64>,
+) -> Option<StreamTrackInfo> {
+    let current = tracks.get(&audible?)?;
+    let state = if finished {
+        StreamPlaybackState::Finished
+    } else if play_state == LoadedState::Playing {
+        StreamPlaybackState::Playing
+    } else {
+        StreamPlaybackState::Paused
+    };
+    Some(StreamTrackInfo {
+        state,
+        content_hash: Some(current.content_hash.clone()),
+        title: current.title.clone(),
+        artist: current.artist.clone(),
+        album: current.album.clone(),
+        position_ms,
+        duration_ms,
+        preloaded: preloaded
+            .and_then(|id| tracks.get(&id))
+            .map(|t| t.content_hash.clone()),
+    })
 }
 
 pub struct Server {
@@ -43,7 +90,8 @@ pub struct Server {
     socket: nng::Socket,
     library_socket: String,
     music_dir: PathBuf,
-    loaded: Option<LoadedTrack>,
+    tracks: HashMap<TrackId, LoadedTrack>,
+    play_state: LoadedState,
 }
 
 impl Server {
@@ -58,17 +106,22 @@ impl Server {
             socket,
             library_socket,
             music_dir,
-            loaded: None,
+            tracks: HashMap::new(),
+            play_state: LoadedState::Paused,
         }
+    }
+
+    /// Drop metadata for tracks the engine no longer owns.
+    fn prune(&mut self) {
+        let engine = &self.engine;
+        prune_tracks(&mut self.tracks, |id| engine.is_live(id));
     }
 
     pub async fn run(&mut self) -> color_eyre::Result<()> {
         info!("mdma-audio server starting...");
         loop {
             let msg = self.socket.recv()?;
-            let command: StreamCommand = serde_json::from_slice(&msg)?;
-            info!("Received command: {:?}", command);
-            let response = self.handle_command(command).await;
+            let response = self.handle_message(&msg).await;
             info!("Sending response: {:?}", response);
             let bytes = serde_json::to_vec(&response)?;
             self.socket
@@ -77,9 +130,29 @@ impl Server {
         }
     }
 
+    /// Parse one request and answer it. A message that is not a valid
+    /// command (unknown command, bad JSON) gets an `Error` response; it must
+    /// never end the serve loop.
+    async fn handle_message(&mut self, msg: &[u8]) -> StreamResponse {
+        match serde_json::from_slice::<StreamCommand>(msg) {
+            Ok(command) => {
+                info!("Received command: {:?}", command);
+                self.handle_command(command).await
+            }
+            Err(e) => {
+                warn!("Invalid command: {}", e);
+                StreamResponse::Error {
+                    message: format!("invalid command: {e}"),
+                }
+            }
+        }
+    }
+
     async fn handle_command(&mut self, command: StreamCommand) -> StreamResponse {
         match command {
             StreamCommand::Load { content_hash } => self.handle_load(content_hash).await,
+            StreamCommand::Preload { content_hash } => self.handle_preload(content_hash),
+            StreamCommand::ClearPreload => self.handle_clear_preload(),
             StreamCommand::Play => self.handle_play(),
             StreamCommand::Pause => self.handle_pause(),
             StreamCommand::Stop => self.handle_stop(),
@@ -91,66 +164,103 @@ impl Server {
         }
     }
 
+    /// Look up a track in the library and compute its full path.
+    fn resolve_path(&self, content_hash: &ContentHash) -> Result<ResolvedTrack, String> {
+        let client = LibraryClient::connect(&self.library_socket).map_err(|e| {
+            warn!("Failed to connect to library: {}", e);
+            format!("Failed to connect to library: {}", e)
+        })?;
+
+        let track_info = client.get_track(content_hash).map_err(|e| {
+            warn!("Failed to get track {}: {}", content_hash.as_str(), e);
+            format!("Track not found: {}", e)
+        })?;
+
+        let blob_path = track_info
+            .blob_path
+            .clone()
+            .ok_or_else(|| "Track has no blob path".to_string())?;
+
+        Ok(ResolvedTrack {
+            path: self.music_dir.join(blob_path),
+            meta: LoadedTrack {
+                content_hash: content_hash.clone(),
+                title: track_info.title,
+                artist: track_info.artist,
+                album: track_info.album,
+            },
+        })
+    }
+
     async fn handle_load(&mut self, content_hash: ContentHash) -> StreamResponse {
-        let client = match LibraryClient::connect(&self.library_socket) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Failed to connect to library: {}", e);
-                return StreamResponse::Error {
-                    message: format!("Failed to connect to library: {}", e),
-                };
-            }
+        let resolved = match self.resolve_path(&content_hash) {
+            Ok(r) => r,
+            Err(message) => return StreamResponse::Error { message },
         };
+        info!("Loading track from {:?}", resolved.path);
 
-        let track_info = match client.get_track(&content_hash) {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("Failed to get track {}: {}", content_hash.as_str(), e);
-                return StreamResponse::Error {
-                    message: format!("Track not found: {}", e),
-                };
-            }
-        };
-
-        let blob_path = match &track_info.blob_path {
-            Some(p) => p.clone(),
-            None => {
-                return StreamResponse::Error {
-                    message: "Track has no blob path".to_string(),
-                };
-            }
-        };
-
-        let full_path = self.music_dir.join(&blob_path);
-        info!("Loading track from {:?}", full_path);
-
-        if let Err(e) = self.engine.load_track(&full_path).await {
+        // If the hash is the preloaded track the engine reuses it (same id).
+        if let Err(e) = self.engine.load_track(&resolved.path).await {
             warn!("Failed to load track: {}", e);
             return StreamResponse::Error {
                 message: format!("Failed to load track: {}", e),
             };
         }
 
-        self.loaded = Some(LoadedTrack {
-            content_hash,
-            title: track_info.title,
-            artist: track_info.artist,
-            album: track_info.album,
-            state: LoadedState::Paused,
-        });
+        self.play_state = LoadedState::Paused;
+        self.prune();
+        if let Some(id) = self.engine.audible_track_id() {
+            self.tracks.insert(id, resolved.meta);
+        }
 
         StreamResponse::Ok
     }
 
-    fn handle_play(&mut self) -> StreamResponse {
-        let loaded = match &mut self.loaded {
-            Some(l) => l,
-            None => {
-                return StreamResponse::Error {
-                    message: "nothing loaded".to_string(),
-                };
-            }
+    fn handle_preload(&mut self, content_hash: ContentHash) -> StreamResponse {
+        // `next` is the committed (promoted) track if there is one; asking
+        // for that same track again is a no-op.
+        let already_preloaded = self
+            .engine
+            .next_track_id()
+            .and_then(|id| self.tracks.get(&id))
+            .is_some_and(|t| t.content_hash == content_hash);
+        if already_preloaded {
+            return StreamResponse::Ok;
+        }
+
+        let resolved = match self.resolve_path(&content_hash) {
+            Ok(r) => r,
+            Err(message) => return StreamResponse::Error { message },
         };
+        info!("Preloading track from {:?}", resolved.path);
+
+        match self.engine.preload_track(&resolved.path) {
+            Ok(id) => {
+                self.prune();
+                self.tracks.insert(id, resolved.meta);
+                StreamResponse::Ok
+            }
+            Err(e) => {
+                warn!("Failed to preload track: {}", e);
+                StreamResponse::Error {
+                    message: format!("Failed to preload track: {}", e),
+                }
+            }
+        }
+    }
+
+    fn handle_clear_preload(&mut self) -> StreamResponse {
+        self.engine.clear_preload();
+        self.prune();
+        StreamResponse::Ok
+    }
+
+    fn handle_play(&mut self) -> StreamResponse {
+        if self.engine.audible_track_id().is_none() {
+            return StreamResponse::Error {
+                message: "nothing loaded".to_string(),
+            };
+        }
 
         if let Err(e) = self.engine.play() {
             warn!("Play failed: {}", e);
@@ -159,25 +269,24 @@ impl Server {
             };
         }
 
-        loaded.state = LoadedState::Playing;
+        self.play_state = LoadedState::Playing;
         StreamResponse::Ok
     }
 
     fn handle_pause(&mut self) -> StreamResponse {
-        let loaded = match &mut self.loaded {
-            Some(l) => l,
-            None => return StreamResponse::Ok,
-        };
+        if self.engine.audible_track_id().is_none() {
+            return StreamResponse::Ok;
+        }
 
         if let Err(e) = self.engine.stop() {
             warn!("Pause (stop) failed: {}", e);
         }
-        loaded.state = LoadedState::Paused;
+        self.play_state = LoadedState::Paused;
         StreamResponse::Ok
     }
 
     fn handle_stop(&mut self) -> StreamResponse {
-        if self.loaded.is_some() {
+        if self.engine.audible_track_id().is_some() {
             if let Err(e) = self.engine.stop() {
                 warn!("Stop failed: {}", e);
             }
@@ -186,36 +295,31 @@ impl Server {
             }
             // The stream stays active: stop/unload pause the engine, whose
             // output callback keeps running (emitting silence) so the next
-            // load_track flush is serviced promptly.
-            self.loaded = None;
+            // load_track flush is serviced promptly. Unloading also drops
+            // any preload.
+            self.play_state = LoadedState::Paused;
         }
+        self.prune();
         StreamResponse::Ok
     }
 
     fn handle_loaded(&mut self) -> StreamResponse {
-        let loaded = match &self.loaded {
-            Some(l) => l,
-            None => return StreamResponse::Loaded { info: None },
-        };
+        // Commit observed promotions before reporting.
+        self.engine.reconcile();
+        self.prune();
 
-        let state = if self.engine.is_track_finished() {
-            StreamPlaybackState::Finished
-        } else if loaded.state == LoadedState::Playing {
-            StreamPlaybackState::Playing
-        } else {
-            StreamPlaybackState::Paused
-        };
-
+        // One observation for every field.
+        let status = self.engine.status();
         StreamResponse::Loaded {
-            info: Some(StreamTrackInfo {
-                state,
-                content_hash: Some(loaded.content_hash.clone()),
-                title: loaded.title.clone(),
-                artist: loaded.artist.clone(),
-                album: loaded.album.clone(),
-                position_ms: self.engine.position_ms(),
-                duration_ms: self.engine.duration_ms(),
-            }),
+            info: build_loaded_info(
+                &self.tracks,
+                status.audible,
+                status.next,
+                self.play_state,
+                status.finished,
+                status.position_ms,
+                status.duration_ms,
+            ),
         }
     }
 
@@ -330,41 +434,148 @@ mod tests {
         assert!(matches!(response, StreamResponse::Ok));
     }
 
-    /// handle_loaded reports Playing when LoadedState::Playing.
-    #[tokio::test]
-    async fn loaded_state_playing_reports_playing() {
-        let mut server = make_server();
-        server.loaded = Some(LoadedTrack {
-            content_hash: ContentHash::new("test-hash"),
-            title: None,
+    fn track(hash: &str) -> LoadedTrack {
+        LoadedTrack {
+            content_hash: ContentHash::new(hash),
+            title: Some(format!("title-{hash}")),
             artist: None,
             album: None,
-            state: LoadedState::Playing,
-        });
-        let response = server.handle_command(StreamCommand::Loaded).await;
-        if let StreamResponse::Loaded { info: Some(info) } = response {
-            assert_eq!(info.state, StreamPlaybackState::Playing);
-        } else {
-            panic!("expected Loaded {{ info: Some(..) }}");
         }
     }
 
-    /// handle_loaded reports Paused when LoadedState::Paused.
+    fn tracks(entries: &[(TrackId, &str)]) -> HashMap<TrackId, LoadedTrack> {
+        entries.iter().map(|(id, h)| (*id, track(h))).collect()
+    }
+
+    fn info(
+        tracks: &HashMap<TrackId, LoadedTrack>,
+        audible: Option<TrackId>,
+        preloaded: Option<TrackId>,
+        play_state: LoadedState,
+        finished: bool,
+    ) -> Option<StreamTrackInfo> {
+        build_loaded_info(
+            tracks,
+            audible,
+            preloaded,
+            play_state,
+            finished,
+            Some(10),
+            Some(100),
+        )
+    }
+
+    /// Preloading an unknown hash is an error (not the old placeholder).
     #[tokio::test]
-    async fn loaded_state_paused_reports_paused() {
+    async fn preload_unknown_hash_returns_error() {
         let mut server = make_server();
-        server.loaded = Some(LoadedTrack {
-            content_hash: ContentHash::new("test-hash"),
-            title: None,
-            artist: None,
-            album: None,
-            state: LoadedState::Paused,
-        });
-        let response = server.handle_command(StreamCommand::Loaded).await;
-        if let StreamResponse::Loaded { info: Some(info) } = response {
-            assert_eq!(info.state, StreamPlaybackState::Paused);
-        } else {
-            panic!("expected Loaded {{ info: Some(..) }}");
+        let response = server
+            .handle_command(StreamCommand::Preload {
+                content_hash: ContentHash::new("nope"),
+            })
+            .await;
+        match response {
+            StreamResponse::Error { message } => assert_ne!(message, "preload unsupported"),
+            other => panic!("expected error, got {other:?}"),
         }
+    }
+
+    /// ClearPreload with nothing preloaded is Ok.
+    #[tokio::test]
+    async fn clear_preload_returns_ok() {
+        let mut server = make_server();
+        let response = server.handle_command(StreamCommand::ClearPreload).await;
+        assert!(matches!(response, StreamResponse::Ok));
+    }
+
+    #[test]
+    fn info_none_without_audible_track() {
+        let t = tracks(&[(1, "a")]);
+        assert!(info(&t, None, None, LoadedState::Paused, false).is_none());
+    }
+
+    #[test]
+    fn info_reports_playing_and_paused() {
+        let t = tracks(&[(1, "a")]);
+        let playing = info(&t, Some(1), None, LoadedState::Playing, false).unwrap();
+        assert_eq!(playing.state, StreamPlaybackState::Playing);
+        let paused = info(&t, Some(1), None, LoadedState::Paused, false).unwrap();
+        assert_eq!(paused.state, StreamPlaybackState::Paused);
+    }
+
+    #[test]
+    fn info_finished_overrides_play_state() {
+        let t = tracks(&[(1, "a")]);
+        let i = info(&t, Some(1), None, LoadedState::Playing, true).unwrap();
+        assert_eq!(i.state, StreamPlaybackState::Finished);
+    }
+
+    #[test]
+    fn info_reports_audible_and_preloaded_hashes() {
+        let t = tracks(&[(1, "a"), (2, "b")]);
+        let i = info(&t, Some(1), Some(2), LoadedState::Playing, false).unwrap();
+        assert_eq!(i.content_hash, Some(ContentHash::new("a")));
+        assert_eq!(i.title.as_deref(), Some("title-a"));
+        assert_eq!(i.preloaded, Some(ContentHash::new("b")));
+        assert_eq!(i.position_ms, Some(10));
+        assert_eq!(i.duration_ms, Some(100));
+    }
+
+    #[test]
+    fn info_preloaded_none_when_no_preload() {
+        let t = tracks(&[(1, "a")]);
+        let i = info(&t, Some(1), None, LoadedState::Paused, false).unwrap();
+        assert_eq!(i.preloaded, None);
+    }
+
+    /// Metadata lives exactly as long as the engine keeps the track alive.
+    #[test]
+    fn prune_drops_ids_the_engine_no_longer_has() {
+        let mut t = tracks(&[(1, "a"), (2, "b"), (3, "c")]);
+        prune_tracks(&mut t, |id| id == 2 || id == 3);
+        let mut ids: Vec<_> = t.keys().copied().collect();
+        ids.sort();
+        assert_eq!(ids, vec![2, 3]);
+        let i = info(&t, Some(2), Some(3), LoadedState::Playing, false).unwrap();
+        assert_eq!(i.content_hash, Some(ContentHash::new("b")));
+        assert_eq!(i.preloaded, Some(ContentHash::new("c")));
+    }
+
+    #[test]
+    fn prune_everything_when_engine_empty() {
+        let mut t = tracks(&[(1, "a"), (2, "b")]);
+        prune_tracks(&mut t, |_| false);
+        assert!(t.is_empty());
+    }
+
+    /// B1: during the commit window the engine has promoted B (live, reported
+    /// as next) while A is still audible. B's metadata must survive pruning so
+    /// that it is still there when B becomes audible.
+    #[test]
+    fn promoted_track_metadata_survives_until_it_is_audible() {
+        let mut t = tracks(&[(1, "a"), (2, "b")]);
+        // Engine: audible = A, next = B (promoted), both live.
+        prune_tracks(&mut t, |id| id == 1 || id == 2);
+        let before = info(&t, Some(1), Some(2), LoadedState::Playing, false).unwrap();
+        assert_eq!(before.content_hash, Some(ContentHash::new("a")));
+        assert_eq!(before.preloaded, Some(ContentHash::new("b")));
+        // Boundary consumed: audible = B, A no longer live.
+        prune_tracks(&mut t, |id| id == 2);
+        let after = info(&t, Some(2), None, LoadedState::Playing, false).unwrap();
+        assert_eq!(after.content_hash, Some(ContentHash::new("b")));
+        assert_eq!(after.preloaded, None);
+    }
+
+    /// M3: an unparseable message gets an Error response and the server
+    /// keeps serving.
+    #[tokio::test]
+    async fn unknown_command_gets_error_response_and_server_continues() {
+        let mut server = make_server();
+        let response = server.handle_message(br#"{"cmd":"bogus"}"#).await;
+        assert!(matches!(response, StreamResponse::Error { .. }));
+        let response = server.handle_message(b"not json at all").await;
+        assert!(matches!(response, StreamResponse::Error { .. }));
+        let response = server.handle_message(br#"{"cmd":"ping"}"#).await;
+        assert!(matches!(response, StreamResponse::Pong));
     }
 }

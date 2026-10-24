@@ -1,9 +1,11 @@
 pub mod audio_config;
 mod error;
 mod mixer;
+mod playhead;
 mod track;
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -14,12 +16,14 @@ use std::{
 pub use audio_config::{load_audio_config, save_audio_config, AudioOutputConfig};
 pub use audio_decoder::{AudioSource, DecoderError, Source};
 pub use audio_output::pipewire_devices::{self, AudioSink};
+use audio_output::pipewire_output::{OutputShared, DEFAULT_CHANNELS};
 pub use audio_output::{AudioOutputError, PipewireOutput};
 pub use audio_types::{AudioSegment, DecodedSegment, SegmentIndex, SEGMENT_SIZE};
 pub use error::PlaybackError;
-use mixer::Mixer;
+use mixer::{Mixer, MixerSnapshot, MixerStatus, Slot};
 use playback_primitives::Db;
 pub use playback_primitives::Volume;
+use playhead::{Playhead, Segment};
 use ringbuf::{HeapConsumer, HeapRb};
 use tracing::info;
 pub use track::Track;
@@ -35,67 +39,203 @@ const TRACK_BUFFER_SAMPLES: usize = 131_072;
 /// 262_144 = ~2.97 s at 44.1 kHz stereo, ~0.68 s at 192 kHz stereo.
 const MIXER_BUFFER_SAMPLES: usize = 262_144;
 
+/// Engine-assigned track identifier (non-zero; 0 means "none" in the mixer).
+pub type TrackId = u64;
+
+/// A track owned by the engine plus what is needed to account its position.
+struct TrackEntry {
+    track: Track,
+    path: PathBuf,
+    /// Output sample rate (frames per second) the track is decoded to.
+    rate: u32,
+}
+
+/// Where a preloaded track's audio currently is.
+enum PreloadSlot {
+    /// Registered with the mixer as its next track.
+    Registered,
+    /// Decoded at a rate other than the output's, so not registered with the
+    /// mixer; the consumer waits here until the track is loaded
+    /// (drain-then-reopen).
+    Parked(HeapConsumer<f32>),
+}
+
+/// The track queued to follow the audible one.
+struct Preload {
+    id: TrackId,
+    slot: PreloadSlot,
+}
+
+impl Preload {
+    fn is_parked(&self) -> bool {
+        matches!(self.slot, PreloadSlot::Parked(_))
+    }
+
+    /// Take the parked consumer (leaving the slot `Registered`, as the caller
+    /// is about to register it). `None` if it was not parked.
+    fn take_parked(&mut self) -> Option<HeapConsumer<f32>> {
+        match std::mem::replace(&mut self.slot, PreloadSlot::Registered) {
+            PreloadSlot::Parked(consumer) => Some(consumer),
+            PreloadSlot::Registered => None,
+        }
+    }
+}
+
+/// A track opened for decoding together with the consumer of its ring.
+struct OpenedTrack {
+    track: Track,
+    consumer: HeapConsumer<f32>,
+    /// Channel count of the source (interleaving of its samples).
+    channels: u32,
+    source_rate: u32,
+    /// Rate the track is decoded to (the output rate it needs).
+    rate: u32,
+}
+
+/// Open `path` and start its (stopped) decoder, decoding at the source's
+/// native rate (`fallback_rate` only if the source reports none).
+fn open_track(path: &Path, fallback_rate: u32) -> Result<OpenedTrack, PlaybackError> {
+    let source = AudioSource::new(path)?;
+    let source_rate = source.sample_rate();
+    let channels = u32::from(source.audio_channels()).max(1);
+    let rate = select_target_rate(source_rate, fallback_rate);
+    let (producer, consumer) = HeapRb::<f32>::new(TRACK_BUFFER_SAMPLES).split();
+    // The decoder resamples source_rate -> rate if they differ.
+    let track = Track::new(source, producer, source_rate, rate)?;
+    Ok(OpenedTrack {
+        track,
+        consumer,
+        channels,
+        source_rate,
+        rate,
+    })
+}
+
+/// The mixer slot for `track`, whose ring `consumer` is given.
+fn make_slot(id: TrackId, consumer: HeapConsumer<f32>, track: &Track) -> Slot {
+    Slot {
+        id,
+        consumer,
+        input_complete: track.input_complete(),
+    }
+}
+
+/// One consistent reading of the engine's observable state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineStatus {
+    /// The track being heard right now (switches at the exact output sample
+    /// of a gapless boundary).
+    pub audible: Option<TrackId>,
+    /// The track that will play next: the one the mixer already promoted but
+    /// that is not audible yet if any (committed, can no longer be
+    /// replaced), otherwise the registered or parked preload.
+    pub next: Option<TrackId>,
+    /// The audible track was fully played out and nothing follows it
+    /// gaplessly; see [`PlaybackEngine::status`].
+    pub finished: bool,
+    /// Audible position (from samples the output consumed), `None` if
+    /// nothing is loaded.
+    pub position_ms: Option<u64>,
+    /// Duration of the audible track; `Some(0)` if unknown, `None` if
+    /// nothing is loaded.
+    pub duration_ms: Option<u64>,
+    /// The output is emitting silence instead of consuming the mixer ring.
+    pub paused: bool,
+}
+
+/// What a reader saw in one go: playhead (with mixer promotions folded in and
+/// the audible switch applied), the consumed counter used for that, and the
+/// mixer snapshot used for that.
+struct Observed {
+    playhead: Playhead,
+    consumed: u64,
+    mixer: MixerSnapshot,
+}
+
 pub struct PlaybackEngine {
-    track: Option<Track>,
+    /// Every live track (audible, pending, preload, and ones the mixer still
+    /// references), keyed by id. Pruned by [`PlaybackEngine::reconcile`]. The
+    /// engine is the single owner of track lifetime: see
+    /// [`PlaybackEngine::is_live`].
+    tracks: HashMap<TrackId, TrackEntry>,
+    playhead: Playhead,
+    preload: Option<Preload>,
+    next_track_id: TrackId,
+    mixer_status: Arc<MixerStatus>,
     audio_output: Option<PipewireOutput>,
     mixer_consumer: Option<HeapConsumer<f32>>,
     current_sample_rate: Option<u32>,
     command_sender: mpsc::Sender<MixerCommand>,
     mix_task: Option<std::thread::JoinHandle<()>>,
-    /// Engine-owned pause flag shared with the output callback; survives
-    /// output re-creation. While set the callback emits silence and keeps
-    /// the mixer ring untouched (but still services flushes).
-    paused: Arc<AtomicBool>,
+    /// Engine-owned state shared with the output callback; survives output
+    /// re-creation. `paused`: while set the callback emits silence and keeps
+    /// the mixer ring untouched (but still services flushes). `consumed_total`
+    /// drives position accounting; `gain` is the linear volume.
+    shared: OutputShared,
     mix_thread_running: Arc<AtomicBool>,
     config_path: PathBuf,
     audio_config: AudioOutputConfig,
 }
 
 enum MixerCommand {
-    RegisterTrack {
-        consumer: HeapConsumer<f32>,
-    },
-    SetVolume {
-        volume: Volume,
-    },
-    /// Drop the current track consumer without replacing it.
+    /// Replace the current track (drops any pending next).
+    RegisterTrack { slot: Slot },
+    /// Preload the track that follows the current one gaplessly.
+    RegisterNext { slot: Slot },
+    /// Drop the pending next if it still has this id (ignored if already promoted).
+    ClearNext { id: u64 },
+    /// Drop current and next without replacing them.
     /// After this, the mixer stops pulling samples until a RegisterTrack arrives.
     ///
-    /// The mix thread sets its consumer to `None` and then signals `done`, so
+    /// The mix thread clears both slots and then signals `done`, so
     /// the sender knows no further track samples will reach the mixer ring.
-    ClearTrack {
-        done: mpsc::SyncSender<()>,
+    ClearTrack { done: mpsc::SyncSender<()> },
+    /// Drop only the current track; the pending next is kept (and not
+    /// promoted). Acked like `ClearTrack`.
+    DetachCurrent { done: mpsc::SyncSender<()> },
+    /// Make the pending next (if it has this id) the current track. Replies
+    /// with the mixer's `produced_total` at that instant, or `None` if the id
+    /// is not the pending next.
+    PromoteNext {
+        id: u64,
+        done: mpsc::SyncSender<Option<u64>>,
     },
 }
 
 /// One iteration of the mix thread: apply pending commands, then mix.
 /// Non-blocking (the mixer only moves what fits in the output ring).
-fn mix_step(
-    mixer: &mut Mixer,
-    consumer: &mut Option<HeapConsumer<f32>>,
-    temp_buffer: &mut [f32],
-    commands: &mpsc::Receiver<MixerCommand>,
-) {
+fn mix_step(mixer: &mut Mixer, temp_buffer: &mut [f32], commands: &mpsc::Receiver<MixerCommand>) {
     while let Ok(cmd) = commands.try_recv() {
         match cmd {
-            MixerCommand::RegisterTrack {
-                consumer: new_consumer,
-            } => {
+            MixerCommand::RegisterTrack { slot } => {
                 tracing::info!("MIX THREAD: Registering new track");
-                *consumer = Some(new_consumer);
+                mixer.register_current(slot);
             }
-            MixerCommand::SetVolume { volume } => {
-                mixer.set_volume(volume);
+            MixerCommand::RegisterNext { slot } => {
+                tracing::info!("MIX THREAD: Registering next track");
+                mixer.register_next(slot);
+            }
+            MixerCommand::ClearNext { id } => {
+                mixer.clear_next(id);
             }
             MixerCommand::ClearTrack { done } => {
-                tracing::info!("MIX THREAD: Clearing track consumer");
-                *consumer = None;
+                tracing::info!("MIX THREAD: Clearing track slots");
+                mixer.clear_all();
                 let _ = done.send(());
+            }
+            MixerCommand::DetachCurrent { done } => {
+                tracing::info!("MIX THREAD: Detaching current track");
+                mixer.clear_current();
+                let _ = done.send(());
+            }
+            MixerCommand::PromoteNext { id, done } => {
+                tracing::info!("MIX THREAD: Promoting preloaded track {id}");
+                let _ = done.send(mixer.promote_next(id));
             }
         }
     }
     let l = temp_buffer.len();
-    if let Err(e) = mixer.mix(temp_buffer, l, consumer) {
+    if let Err(e) = mixer.mix(temp_buffer, l) {
         tracing::error!("MIX THREAD: Error mixing: {}", e);
     }
 }
@@ -106,16 +246,15 @@ fn run_mix_loop(
     commands: mpsc::Receiver<MixerCommand>,
     running: Arc<AtomicBool>,
 ) {
-    let mut consumer: Option<HeapConsumer<f32>> = None;
     let mut temp_buffer = vec![0.0f32; 1920 * 2];
     while running.load(Ordering::Acquire) {
-        mix_step(&mut mixer, &mut consumer, &mut temp_buffer, &commands);
+        mix_step(&mut mixer, &mut temp_buffer, &commands);
         std::thread::sleep(std::time::Duration::from_micros(500));
     }
 }
 
-/// How long to wait for the mix thread to acknowledge ClearTrack.
-const CLEAR_TRACK_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+/// How long to wait for the mix thread to acknowledge a command.
+const MIX_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Compute the PipeWire output rate for a track.
 ///
@@ -142,24 +281,31 @@ impl PlaybackEngine {
         let mixer_rb = HeapRb::<f32>::new(MIXER_BUFFER_SAMPLES);
         let (mixer_producer, mixer_consumer) = mixer_rb.split();
 
+        let mixer = Mixer::new(mixer_producer);
+        let mixer_status = mixer.status();
+
         let mix_thread_running = Arc::new(AtomicBool::new(true));
         let running = Arc::clone(&mix_thread_running);
 
         // Start the mix thread with command receiver
         let mix_task = std::thread::spawn(move || {
             tracing::info!("MIX THREAD: Started, will process audio");
-            run_mix_loop(Mixer::new(mixer_producer), command_receiver, running);
+            run_mix_loop(mixer, command_receiver, running);
             tracing::info!("MIX THREAD: Exiting cleanly");
         });
 
         Ok(Self {
-            track: None,
+            tracks: HashMap::new(),
+            playhead: Playhead::default(),
+            preload: None,
+            next_track_id: 1,
+            mixer_status,
             audio_output: None,
             mixer_consumer: Some(mixer_consumer),
             current_sample_rate: None,
             command_sender,
             mix_task: Some(mix_task),
-            paused: Arc::new(AtomicBool::new(true)),
+            shared: OutputShared::new(Arc::new(AtomicBool::new(true))),
             mix_thread_running,
             config_path,
             audio_config,
@@ -225,6 +371,9 @@ impl PlaybackEngine {
         };
 
         self.audio_config = new_config.clone();
+        // The old output (if any) is gone; until a new one exists there is
+        // no output rate. Preload's registered-vs-parked decision reads this.
+        self.current_sample_rate = None;
 
         if let Some(consumer) = recovered_consumer {
             tracing::info!(
@@ -234,7 +383,7 @@ impl PlaybackEngine {
             );
             let audio_output = PipewireOutput::new(
                 consumer,
-                Arc::clone(&self.paused),
+                self.shared.clone(),
                 new_config.sample_rate,
                 Some(device_name.as_str()),
             )
@@ -245,175 +394,464 @@ impl PlaybackEngine {
                 )))
             })?;
             self.audio_output = Some(audio_output);
+            self.current_sample_rate = Some(new_config.sample_rate);
         }
 
         Ok(new_config)
     }
 
-    pub async fn load_track(&mut self, path: &Path) -> Result<(), PlaybackError> {
-        tracing::info!("Starting track load");
+    fn alloc_track_id(&mut self) -> TrackId {
+        let id = self.next_track_id;
+        self.next_track_id += 1;
+        id
+    }
 
-        // Stop and remove any existing track
-        if let Some(ref mut t) = self.track {
-            tracing::info!("Unloading existing track");
-            t.stop();
-        }
-        self.track = None;
-
-        // A newly loaded track starts stopped; `play()` unpauses.
-        self.paused.store(true, Ordering::Release);
-        // Note: this blocks the calling thread for the ClearTrack ack (<= 50 ms)
-        // and the output flush (<= 100 ms, normally ~1 quantum). Acceptable
-        // because the mdma-audio server handles requests sequentially.
-        self.discard_buffered_audio()?;
-
-        // Create source and read its native sample rate
-        let source = AudioSource::new(path)?;
-        let source_rate = source.sample_rate();
-
-        let max_rate = self.audio_config.sample_rate;
-        let target_rate = select_target_rate(source_rate, max_rate);
-        let target_device = self.audio_config.device_name.clone();
-
-        // (Re-)create the PipeWire output when needed:
-        //   • no output yet (first track load), OR
-        //   • the new track's native rate differs from the current output rate.
-        // When the rate changes, shut down the existing output, recover its
-        // ring-buffer consumer, then spin up a new output at the track's rate.
+    /// Make sure an output exists at `target_rate`, re-creating it (and
+    /// recovering the mixer consumer from the old one) when the rate differs.
+    fn ensure_output(&mut self, target_rate: u32) -> Result<(), PlaybackError> {
         let need_new_output = match self.current_sample_rate {
             None => true,
             Some(current) => current != target_rate,
         };
+        if !need_new_output {
+            return Ok(());
+        }
+        let target_device = self.audio_config.device_name.clone();
 
-        if need_new_output {
-            // Recover the consumer from the old output (if any) so we can
-            // hand it to the new one without touching the mix thread.
-            if let Some(old_output) = self.audio_output.take() {
-                if let Some(consumer) = old_output.shutdown() {
-                    self.mixer_consumer = Some(consumer);
-                } else {
-                    tracing::warn!(
-                        "load_track: failed to recover consumer from old PipeWire output"
-                    );
-                }
-            }
-
-            if self.mixer_consumer.is_none() {
-                tracing::error!(
-                    "load_track: no mixer consumer available and no audio output — audio will be silent"
+        // Recover the consumer from the old output (if any) so we can
+        // hand it to the new one without touching the mix thread.
+        if let Some(old_output) = self.audio_output.take() {
+            if let Some(consumer) = old_output.shutdown() {
+                self.mixer_consumer = Some(consumer);
+            } else {
+                tracing::warn!(
+                    "ensure_output: failed to recover consumer from old PipeWire output"
                 );
-            }
-            if let Some(consumer) = self.mixer_consumer.take() {
-                info!(
-                    "Creating PipeWire output at {}Hz (source: {}Hz, device: {:?})",
-                    target_rate, source_rate, target_device
-                );
-                let audio_output = PipewireOutput::new(
-                    consumer,
-                    Arc::clone(&self.paused),
-                    target_rate,
-                    target_device.as_deref(),
-                )
-                .map_err(|e| {
-                    PlaybackError::AudioOutput(audio_output::AudioOutputError::AudioDevice(
-                        format!("PipeWire error: {}", e),
-                    ))
-                })?;
-                self.audio_output = Some(audio_output);
-                self.current_sample_rate = Some(target_rate);
             }
         }
 
-        // Create ringbuffer for this track.
-        let rb = HeapRb::<f32>::new(TRACK_BUFFER_SAMPLES);
-        let (producer, consumer) = rb.split();
+        if self.mixer_consumer.is_none() {
+            tracing::error!(
+                "ensure_output: no mixer consumer available and no audio output — audio will be silent"
+            );
+        }
+        if let Some(consumer) = self.mixer_consumer.take() {
+            info!(
+                "Creating PipeWire output at {}Hz (device: {:?})",
+                target_rate, target_device
+            );
+            let audio_output = PipewireOutput::new(
+                consumer,
+                self.shared.clone(),
+                target_rate,
+                target_device.as_deref(),
+            )
+            .map_err(|e| {
+                PlaybackError::AudioOutput(audio_output::AudioOutputError::AudioDevice(format!(
+                    "PipeWire error: {}",
+                    e
+                )))
+            })?;
+            self.audio_output = Some(audio_output);
+            self.current_sample_rate = Some(target_rate);
+        }
+        Ok(())
+    }
 
-        // Create new track — decoder task will resample source_rate → target_rate
-        let track = Track::new(source, producer, source_rate, target_rate)?;
+    /// Observe the engine as of now: the consumed counter is read first, then
+    /// one mixer snapshot; promotions in it are folded into a copy of the
+    /// playhead and the audible switch applied against the consumed count.
+    ///
+    /// Reading `consumed_total` before the mixer snapshot matters: samples
+    /// past a promotion boundary are pushed to the output ring only after the
+    /// promotion record was published, so a boundary the output has already
+    /// consumed is always visible in the snapshot taken afterwards.
+    fn observe(&self) -> Observed {
+        let consumed = self.shared.consumed_total.load(Ordering::Acquire);
+        let mixer = self.mixer_status.snapshot();
+        let mut ph = self.playhead.clone();
+        if let Some(p) = mixer.last_promotion {
+            if p.promoted_id != ph.last_promotion_id() {
+                ph.note_promotion_seen(p.promoted_id);
+                if let Some(e) = self.tracks.get(&p.promoted_id) {
+                    ph.schedule(Segment {
+                        id: p.promoted_id,
+                        start_sample: p.boundary_sample,
+                        base_ms: 0,
+                        output_channels: DEFAULT_CHANNELS,
+                        rate: e.rate,
+                    });
+                }
+            }
+        }
+        ph.resolve(consumed);
+        Observed {
+            playhead: ph,
+            consumed,
+            mixer,
+        }
+    }
+
+    /// Start the playhead on a new segment of the output stream, recording
+    /// the mixer's current promotion as already seen (see
+    /// [`Playhead::start`]).
+    fn start_playhead(&mut self, id: TrackId, start_sample: u64, base_ms: u64, rate: u32) {
+        let seen = self
+            .mixer_status
+            .last_promotion()
+            .map_or(0, |p| p.promoted_id);
+        self.playhead.start(
+            Segment {
+                id,
+                start_sample,
+                base_ms,
+                output_channels: DEFAULT_CHANNELS,
+                rate,
+            },
+            seen,
+        );
+    }
+
+    /// The track that plays after the audible one: the pending (promoted,
+    /// not yet audible) track if there is one, else the registered/parked
+    /// preload.
+    fn next_of(&self, obs: &Observed) -> Option<TrackId> {
+        obs.playhead.pending_id().or_else(|| {
+            self.preload
+                .as_ref()
+                .map(|p| p.id)
+                .filter(|id| !obs.playhead.references(*id))
+        })
+    }
+
+    /// Fold mixer state into the engine: observe gapless promotions, switch
+    /// the audible track at its boundary, and drop tracks nothing references
+    /// any more. Call periodically (e.g. from the Loaded poll); every mutating
+    /// method calls it first.
+    ///
+    /// A track is only dropped once neither the playhead, the preload slot
+    /// nor the mixer (current/next) references it, so a `ClearNext` that lost
+    /// the race against a promotion never kills the track now playing.
+    pub fn reconcile(&mut self) {
+        let obs = self.observe();
+        self.playhead = obs.playhead;
+        if self
+            .preload
+            .as_ref()
+            .is_some_and(|p| self.playhead.references(p.id))
+        {
+            // Promoted: it is the playing track now, not a preload.
+            self.preload = None;
+        }
+        let preload_id = self.preload.as_ref().map(|p| p.id);
+        let ph = &self.playhead;
+        self.tracks.retain(|id, _| {
+            ph.references(*id) || Some(*id) == preload_id || obs.mixer.references(*id)
+        });
+    }
+
+    /// Drop every track and everything buffered (mixer slots, mixer ring,
+    /// in-flight output). Includes any preload.
+    fn drop_everything(&mut self) -> Result<(), PlaybackError> {
+        self.tracks.clear();
+        self.preload = None;
+        self.playhead.clear();
+        // Note: this blocks the calling thread for the ClearTrack ack (<= 50 ms)
+        // and the output flush (ring flush <= 100 ms plus PipeWire flush
+        // <= 100 ms, normally ~1 quantum each). Acceptable
+        // because the mdma-audio server handles requests sequentially.
+        self.discard_buffered_audio()
+    }
+
+    /// Open `path`, (re)create the output if its rate differs, and register
+    /// the new track as the mixer's current track. Drops all previous tracks
+    /// and any preload first. With `seek_to` (interleaved sample index at the
+    /// source rate) the track starts there.
+    fn start_fresh(&mut self, path: &Path, seek_to: Option<usize>) -> Result<(), PlaybackError> {
+        self.drop_everything()?;
+
+        let OpenedTrack {
+            mut track,
+            consumer,
+            channels,
+            source_rate,
+            rate,
+        } = open_track(path, self.audio_config.sample_rate)?;
+
+        self.ensure_output(rate)?;
+
+        let mut base_ms = 0;
+        if let Some(position) = seek_to {
+            track.seek(position)?;
+            base_ms = position as u64 / u64::from(channels) * 1000 / u64::from(source_rate.max(1));
+        }
         tracing::info!("Track is ready for playback");
 
-        // Store the track and register its consumer with the mix thread
-        self.track = Some(track);
+        let id = self.alloc_track_id();
+        let slot = make_slot(id, consumer, &track);
+        // The mixer is cleared and idle, so `produced_total` is exactly where
+        // this track's audio will start in the output stream.
+        let start_sample = self.mixer_status.produced_total();
+        self.tracks.insert(
+            id,
+            TrackEntry {
+                track,
+                path: path.to_path_buf(),
+                rate,
+            },
+        );
+        self.start_playhead(id, start_sample, base_ms, rate);
         self.command_sender
-            .send(MixerCommand::RegisterTrack { consumer })
+            .send(MixerCommand::RegisterTrack { slot })
             .map_err(|_| PlaybackError::TaskCancelled)?;
+        Ok(())
+    }
 
+    /// Load `path` as the current track, immediately (any buffered audio and
+    /// any preload are cut). If `path` is the preloaded track, its already
+    /// filled buffer is reused (instant skip). The track starts paused;
+    /// `play()` unpauses.
+    pub async fn load_track(&mut self, path: &Path) -> Result<(), PlaybackError> {
+        tracing::info!("Starting track load");
+        self.reconcile();
+
+        // A newly loaded track starts stopped; `play()` unpauses.
+        self.shared.paused.store(true, Ordering::Release);
+        if let Some(id) = self.audible_track_id() {
+            if let Some(e) = self.tracks.get_mut(&id) {
+                tracing::info!("Unloading existing track");
+                e.track.stop();
+            }
+        }
+
+        if self.try_cut_to_preload(path)? {
+            tracing::info!("Loaded preloaded track {:?}", path);
+            return Ok(());
+        }
+
+        self.start_fresh(path, None)?;
         tracing::info!("Loaded track from {:?}", path);
         Ok(())
     }
 
-    pub fn set_volume(&mut self, volume: Volume) -> Result<(), PlaybackError> {
-        match self.command_sender.send(MixerCommand::SetVolume { volume }) {
-            Ok(_) => {
-                tracing::debug!("Setting volume to {}dB", volume.raw());
-                Ok(())
-            }
-            Err(_) => {
-                tracing::error!("Failed to send volume command");
-                Err(PlaybackError::TaskCancelled)
-            }
+    /// Make the preloaded track current if `path` is that track. `Ok(false)`
+    /// means "not applicable, load normally".
+    fn try_cut_to_preload(&mut self, path: &Path) -> Result<bool, PlaybackError> {
+        let Some(pre) = self.preload.as_ref() else {
+            return Ok(false);
+        };
+        let id = pre.id;
+        let parked = pre.is_parked();
+        let Some(entry) = self.tracks.get(&id) else {
+            return Ok(false);
+        };
+        if entry.path != path {
+            return Ok(false);
         }
+        let rate = entry.rate;
+
+        let start_sample = if parked {
+            // Rate differs from the output: cut everything, re-open the
+            // output at the track's rate, register its filled consumer.
+            self.discard_buffered_audio()?;
+            self.ensure_output(rate)?;
+            let Some(consumer) = self.preload.as_mut().and_then(Preload::take_parked) else {
+                return Ok(false);
+            };
+            let Some(entry) = self.tracks.get(&id) else {
+                return Ok(false);
+            };
+            let slot = make_slot(id, consumer, &entry.track);
+            let start = self.mixer_status.produced_total();
+            self.command_sender
+                .send(MixerCommand::RegisterTrack { slot })
+                .map_err(|_| PlaybackError::TaskCancelled)?;
+            start
+        } else {
+            // Registered as the mixer's next: cut the current track and its
+            // buffered audio (detach -> ring flush ack -> PipeWire flush ack),
+            // then promote next. Nothing is produced between the detach and
+            // the promote, and both flushes are complete before it, so they
+            // cannot eat the new track's audio.
+            self.detach_current_audio()?;
+            let (tx, rx) = mpsc::sync_channel(1);
+            self.command_sender
+                .send(MixerCommand::PromoteNext { id, done: tx })
+                .map_err(|_| PlaybackError::TaskCancelled)?;
+            match rx.recv_timeout(MIX_ACK_TIMEOUT) {
+                Ok(Some(start)) => start,
+                _ => {
+                    // Already promoted (it is playing) or mix thread stalled:
+                    // fall back to a normal load.
+                    tracing::warn!("load_track: preload not promotable, loading normally");
+                    return Ok(false);
+                }
+            }
+        };
+
+        self.preload = None;
+        self.start_playhead(id, start_sample, 0, rate);
+        self.reconcile();
+        Ok(true)
+    }
+
+    /// Decode `path` ahead of time so it can follow the audible track
+    /// gaplessly. It is decoded at its native rate and fills its own ring
+    /// (~1.5 s). If that rate equals the output's it is registered with the
+    /// mixer (sample-accurate switch); otherwise it is *parked* and the
+    /// caller falls back to drain-then-`load_track`. Replaces any existing
+    /// preload. Requires a loaded track.
+    pub fn preload_track(&mut self, path: &Path) -> Result<TrackId, PlaybackError> {
+        self.reconcile();
+        if self.playhead.audible().is_none() {
+            return Err(PlaybackError::NoTrackLoaded);
+        }
+        self.clear_preload();
+
+        let OpenedTrack {
+            mut track,
+            consumer,
+            rate,
+            ..
+        } = open_track(path, self.audio_config.sample_rate)?;
+        // Fill the ring now; the decoder blocks when it is full. Independent
+        // of the pause flag.
+        track.play();
+
+        let id = self.alloc_track_id();
+        self.tracks.insert(
+            id,
+            TrackEntry {
+                track,
+                path: path.to_path_buf(),
+                rate,
+            },
+        );
+
+        let slot = if self.current_sample_rate == Some(rate) {
+            let slot = make_slot(id, consumer, &self.tracks[&id].track);
+            self.command_sender
+                .send(MixerCommand::RegisterNext { slot })
+                .map_err(|_| PlaybackError::TaskCancelled)?;
+            PreloadSlot::Registered
+        } else {
+            tracing::info!(
+                "Preload at {}Hz differs from output {:?}Hz: parked",
+                rate,
+                self.current_sample_rate
+            );
+            PreloadSlot::Parked(consumer)
+        };
+        self.preload = Some(Preload { id, slot });
+        Ok(id)
+    }
+
+    /// Drop the preload, if any. If the mixer promoted it first it is the
+    /// playing track and is left alone (see [`PlaybackEngine::reconcile`]).
+    ///
+    /// Known, accepted residual race: if the mix thread has not yet processed
+    /// `RegisterNext(B)` when this reconciles, B is in no keep-set and its
+    /// decoder is dropped. If the mixer then promotes B before it handles
+    /// `ClearNext`, B plays from a dead decoder. This needs a stall of the
+    /// 0.5 ms mix loop plus a queue edit at the exact track end. A structural
+    /// fix would keep ids with in-flight commands alive until acked.
+    pub fn clear_preload(&mut self) {
+        self.reconcile();
+        if let Some(pre) = self.preload.take() {
+            if !pre.is_parked() {
+                let _ = self
+                    .command_sender
+                    .send(MixerCommand::ClearNext { id: pre.id });
+            }
+            // The Track itself is dropped by `reconcile` once the mixer no
+            // longer references it.
+            self.reconcile();
+        }
+    }
+
+    /// Set the output gain. Applied (ramped) in the output callback.
+    pub fn set_volume(&mut self, volume: Volume) -> Result<(), PlaybackError> {
+        tracing::debug!("Setting volume to {}dB", volume.raw());
+        self.shared
+            .gain
+            .store(volume.to_linear().to_bits(), Ordering::Release);
+        Ok(())
     }
 
     pub fn play(&mut self) -> Result<(), PlaybackError> {
-        if let Some(ref mut track) = self.track {
-            tracing::debug!("Setting track to playing state");
-            track.play();
-            self.paused.store(false, Ordering::Release);
-            Ok(())
-        } else {
+        let id = self.audible_track_id().ok_or_else(|| {
             tracing::error!("No track loaded");
-            Err(PlaybackError::NoTrackLoaded)
+            PlaybackError::NoTrackLoaded
+        })?;
+        if let Some(e) = self.tracks.get_mut(&id) {
+            tracing::debug!("Setting track to playing state");
+            e.track.play();
         }
+        self.shared.paused.store(false, Ordering::Release);
+        Ok(())
     }
 
     pub fn stop(&mut self) -> Result<(), PlaybackError> {
-        if let Some(ref mut track) = self.track {
-            tracing::info!("Stopping track");
-            track.stop();
-            self.paused.store(true, Ordering::Release);
-            Ok(())
-        } else {
+        let id = self.audible_track_id().ok_or_else(|| {
             tracing::error!("No track loaded");
-            Err(PlaybackError::NoTrackLoaded)
+            PlaybackError::NoTrackLoaded
+        })?;
+        if let Some(e) = self.tracks.get_mut(&id) {
+            tracing::info!("Stopping track");
+            e.track.stop();
         }
+        self.shared.paused.store(true, Ordering::Release);
+        Ok(())
     }
 
     pub fn unload_track(&mut self) -> Result<(), PlaybackError> {
-        if self.track.is_some() {
-            self.track = None;
-            self.paused.store(true, Ordering::Release);
-            self.discard_buffered_audio()?;
-            tracing::info!("Unloaded track");
-        } else {
+        if self.tracks.is_empty() {
             tracing::info!("No track to unload");
+            return Ok(());
         }
+        self.shared.paused.store(true, Ordering::Release);
+        self.drop_everything()?;
+        tracing::info!("Unloaded track");
         Ok(())
     }
 
     /// Whether the output callback is currently emitting silence instead of
     /// consuming the mixer ring.
     pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Acquire)
+        self.shared.paused.load(Ordering::Acquire)
     }
 
     /// Clear the mixer's track consumer so no old samples are produced, wait
     /// for the mix thread to acknowledge (so nothing more can reach the mixer
     /// ring), then flush the mixer output ring and PipeWire's in-flight
-    /// buffers. The output callback keeps running while paused, so the flush
-    /// is acknowledged promptly (normally ~1 quantum, bounded at 100 ms).
+    /// buffers, returning only once both flushes completed (so a track
+    /// registered/promoted afterwards cannot lose its first quantum to a late
+    /// flush). The output callback keeps running while paused, so the flush
+    /// is acknowledged promptly (normally ~1 quantum, bounded at 100 ms each).
     /// This reduces skip latency from ~3 s (full ring drain) to ~50 ms.
     ///
     /// ClearTrack is sent even without an output; only the flush needs one.
     fn discard_buffered_audio(&self) -> Result<(), PlaybackError> {
+        self.cut_and_flush(|done| MixerCommand::ClearTrack { done })
+    }
+
+    /// Like [`Self::discard_buffered_audio`] but keeps the pending next.
+    fn detach_current_audio(&self) -> Result<(), PlaybackError> {
+        self.cut_and_flush(|done| MixerCommand::DetachCurrent { done })
+    }
+
+    fn cut_and_flush(
+        &self,
+        make: impl FnOnce(mpsc::SyncSender<()>) -> MixerCommand,
+    ) -> Result<(), PlaybackError> {
         let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
         self.command_sender
-            .send(MixerCommand::ClearTrack { done: done_tx })
+            .send(make(done_tx))
             .map_err(|_| PlaybackError::TaskCancelled)?;
-        if done_rx.recv_timeout(CLEAR_TRACK_ACK_TIMEOUT).is_err() {
+        if done_rx.recv_timeout(MIX_ACK_TIMEOUT).is_err() {
             tracing::warn!(
-                "discard_buffered_audio: mix thread did not acknowledge ClearTrack within {:?}",
-                CLEAR_TRACK_ACK_TIMEOUT
+                "cut_and_flush: mix thread did not acknowledge within {:?}",
+                MIX_ACK_TIMEOUT
             );
         }
         if let Some(ref output) = self.audio_output {
@@ -422,57 +860,101 @@ impl PlaybackEngine {
         Ok(())
     }
 
-    /// Returns true only when the current track has been fully *played out*.
+    /// Id of the track currently being heard (switches at the exact output
+    /// sample of a gapless boundary), or `None` if nothing is loaded.
+    pub fn audible_track_id(&self) -> Option<TrackId> {
+        self.observe().playhead.audible().map(|s| s.id)
+    }
+
+    /// Id of the track that plays after the audible one: the promoted (mixer
+    /// switched to it, boundary not yet heard) track if any, else the
+    /// registered or parked preload. See [`EngineStatus::next`].
+    pub fn next_track_id(&self) -> Option<TrackId> {
+        self.next_of(&self.observe())
+    }
+
+    /// Whether the engine still owns `id` (audible, promoted, preloaded, or
+    /// still referenced by the mixer). The engine is the single owner of track
+    /// lifetime: callers keeping per-track data must drop it exactly when this
+    /// turns false, never based on `audible`/`next` alone (a track is live
+    /// but neither of those for a moment around a commit).
+    pub fn is_live(&self, id: TrackId) -> bool {
+        self.tracks.contains_key(&id)
+    }
+
+    /// Everything about the engine's current state from ONE observation
+    /// (one consumed-counter read and one mixer snapshot), so the fields are
+    /// mutually consistent. Call [`PlaybackEngine::reconcile`] first to also
+    /// drop dead tracks.
     ///
-    /// Two conditions must both hold:
-    /// - the track is `Finished`: the decoder hit EOF and every sample has
-    ///   been handed to the mixer (the track ring is empty), and
+    /// `finished` is true only when the audible track has been fully *played
+    /// out* and nothing follows it gaplessly:
+    /// - the audible track is `Finished`: the decoder hit EOF and every
+    ///   sample has been handed to the mixer (the track ring is empty),
+    /// - no promotion is awaiting its boundary and no next is registered with
+    ///   the mixer, and
     /// - the audio output is drained: the mixer ring and the in-flight
-    ///   PipeWire quantum have been played, so nothing audible remains.
+    ///   PipeWire quantum have been played.
     ///
-    /// Reporting "finished" on the first condition alone would let the next
-    /// `load_track` flush roughly the last 4.5 s of buffered audio.
+    /// A *parked* preload is not registered, so it does not hold this back:
+    /// the caller then `load_track`s it (drain-then-reopen).
     ///
     /// Note: the drained signal is produced by the output's process
     /// callback, so a paused stream freezes it; while frozen
     /// the result keeps its last value. With no output (PipeWire failed to
     /// start, already logged as an error) the output is treated as drained.
-    pub fn is_track_finished(&self) -> bool {
-        let track_finished = self
-            .track
-            .as_ref()
-            .map(|t| t.is_finished())
-            .unwrap_or(false);
+    ///
+    /// `position_ms` is derived from samples the output has consumed, so it
+    /// does not run ahead by the buffer and freezes while paused.
+    pub fn status(&self) -> EngineStatus {
+        let obs = self.observe();
+        let audible_segment = obs.playhead.audible();
+        let entry = audible_segment.and_then(|s| self.tracks.get(&s.id));
+        let track_finished = entry.is_some_and(|e| e.track.is_finished());
         let drained = self.audio_output.as_ref().map(|o| o.is_drained());
-        combine_finished(track_finished, drained)
-    }
-
-    /// Returns the current playback position in milliseconds, or `None` if no track is loaded.
-    pub fn position_ms(&self) -> Option<u64> {
-        self.track.as_ref().map(|t| t.position_ms())
-    }
-
-    /// Returns the total duration in milliseconds for the loaded track,
-    /// or `None` if no track is loaded. Returns `Some(0)` if duration is unknown.
-    pub fn duration_ms(&self) -> Option<u64> {
-        self.track.as_ref().map(|t| t.duration_ms())
-    }
-
-    pub fn seek(&mut self, position: usize) -> Result<(), PlaybackError> {
-        if let Some(ref mut track) = self.track {
-            tracing::info!("Seeking to position {}", position);
-            track.seek(position)
-        } else {
-            tracing::error!("No track loaded");
-            Err(PlaybackError::NoTrackLoaded)
+        EngineStatus {
+            audible: audible_segment.map(|s| s.id),
+            next: self.next_of(&obs),
+            finished: finished_decision(
+                track_finished,
+                obs.playhead.has_pending(),
+                obs.mixer.next_id != 0,
+                drained,
+            ),
+            position_ms: audible_segment.map(|s| s.position_ms(obs.consumed)),
+            duration_ms: entry.map(|e| e.track.duration_ms()),
+            paused: self.is_paused(),
         }
+    }
+
+    /// Seek the audible track to `position` (interleaved sample index at the
+    /// track's source rate). Stale audio is cut, so nothing from before the
+    /// seek is heard; the track is left stopped (call `play()`), and any
+    /// preload is dropped (re-issue `preload_track` afterwards).
+    pub fn seek(&mut self, position: usize) -> Result<(), PlaybackError> {
+        self.reconcile();
+        let path = self
+            .audible_track_id()
+            .and_then(|id| self.tracks.get(&id))
+            .map(|e| e.path.clone())
+            .ok_or_else(|| {
+                tracing::error!("No track loaded");
+                PlaybackError::NoTrackLoaded
+            })?;
+        tracing::info!("Seeking to position {}", position);
+        self.start_fresh(&path, Some(position))
     }
 }
 
-/// Combines the track state with the output state. `drained` is `None` when
-/// there is no audio output, which counts as drained.
-fn combine_finished(track_finished: bool, drained: Option<bool>) -> bool {
-    track_finished && drained.unwrap_or(true)
+/// Whether the engine may report the audible track as finished. `drained` is
+/// `None` when there is no audio output, which counts as drained.
+fn finished_decision(
+    track_finished: bool,
+    promotion_pending: bool,
+    next_registered: bool,
+    drained: Option<bool>,
+) -> bool {
+    track_finished && !promotion_pending && !next_registered && drained.unwrap_or(true)
 }
 
 impl Drop for PlaybackEngine {
@@ -487,19 +969,26 @@ impl Drop for PlaybackEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn track_finished_requires_finished_and_drained() {
-        assert!(!combine_finished(false, Some(false)));
-        assert!(!combine_finished(false, Some(true)));
-        assert!(!combine_finished(true, Some(false)));
-        assert!(combine_finished(true, Some(true)));
+        assert!(!finished_decision(false, false, false, Some(false)));
+        assert!(!finished_decision(false, false, false, Some(true)));
+        assert!(!finished_decision(true, false, false, Some(false)));
+        assert!(finished_decision(true, false, false, Some(true)));
     }
 
     #[test]
     fn track_finished_without_output_counts_as_drained() {
-        assert!(combine_finished(true, None));
-        assert!(!combine_finished(false, None));
+        assert!(finished_decision(true, false, false, None));
+        assert!(!finished_decision(false, false, false, None));
+    }
+
+    #[test]
+    fn track_not_finished_while_next_registered_or_promotion_pending() {
+        assert!(!finished_decision(true, false, true, Some(true)));
+        assert!(!finished_decision(true, true, false, Some(true)));
     }
 
     fn engine_with_tempdir() -> (PlaybackEngine, tempfile::TempDir) {
@@ -507,6 +996,50 @@ mod tests {
         let config_path = tmp.path().join("audio_config.json");
         let engine = PlaybackEngine::new(config_path).expect("engine created");
         (engine, tmp)
+    }
+
+    impl PlaybackEngine {
+        /// Insert a test track (never registered with the mixer).
+        fn insert_test_track(&mut self) -> TrackId {
+            let id = self.alloc_track_id();
+            self.tracks.insert(
+                id,
+                TrackEntry {
+                    track: Track::new_test().expect("test track"),
+                    path: PathBuf::from(format!("/test/{id}")),
+                    rate: 48_000,
+                },
+            );
+            id
+        }
+
+        /// A test track that is the audible one.
+        fn insert_audible_test_track(&mut self) -> TrackId {
+            let id = self.insert_test_track();
+            self.start_playhead(id, 0, 0, 48_000);
+            id
+        }
+    }
+
+    fn wait_until(mut cond: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting for condition");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A mixer slot pre-filled with `count` samples.
+    fn filled_slot(id: u64, count: usize, complete: bool) -> Slot {
+        let (mut producer, consumer) = HeapRb::<f32>::new(count + 64).split();
+        for _ in 0..count {
+            producer.push(0.5).ok();
+        }
+        Slot {
+            id,
+            consumer,
+            input_complete: Arc::new(AtomicBool::new(complete)),
+        }
     }
 
     /// Verify that the mix thread stops cleanly when shutdown() is called.
@@ -610,7 +1143,7 @@ mod tests {
     #[test]
     fn play_clears_and_stop_sets_paused_flag() {
         let (mut engine, _tmp) = engine_with_tempdir();
-        engine.track = Some(Track::new_test().expect("test track"));
+        engine.insert_audible_test_track();
         engine.play().unwrap();
         assert!(!engine.is_paused(), "play must unpause");
         engine.stop().unwrap();
@@ -620,32 +1153,303 @@ mod tests {
     #[test]
     fn unload_leaves_engine_paused() {
         let (mut engine, _tmp) = engine_with_tempdir();
-        engine.track = Some(Track::new_test().expect("test track"));
+        engine.insert_audible_test_track();
         engine.play().unwrap();
         engine.unload_track().unwrap();
-        assert!(engine.track.is_none());
+        assert!(engine.tracks.is_empty());
+        assert!(engine.audible_track_id().is_none());
         assert!(engine.is_paused());
     }
 
-    /// is_track_finished() returns false when no track is loaded.
     #[test]
-    fn is_track_finished_no_track() {
-        let (engine, _tmp) = engine_with_tempdir();
-        assert!(!engine.is_track_finished());
+    fn set_volume_stores_linear_gain() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        engine.set_volume(Volume::new(-20.0).unwrap()).unwrap();
+        let gain = f32::from_bits(engine.shared.gain.load(Ordering::Acquire));
+        assert!((gain - 0.1).abs() < 1e-6, "gain {gain}");
+        engine.set_volume(Volume::UNITY).unwrap();
+        let gain = f32::from_bits(engine.shared.gain.load(Ordering::Acquire));
+        assert!((gain - 1.0).abs() < 1e-6);
     }
 
-    /// position_ms() returns None when no track is loaded.
     #[test]
-    fn position_ms_no_track() {
-        let (engine, _tmp) = engine_with_tempdir();
-        assert_eq!(engine.position_ms(), None);
+    fn position_follows_consumed_samples_and_freezes_without_consumption() {
+        let (engine, _tmp) = {
+            let (mut e, t) = engine_with_tempdir();
+            e.insert_audible_test_track();
+            (e, t)
+        };
+        assert_eq!(engine.status().position_ms, Some(0));
+        // 48 kHz stereo: 96_000 samples = 1 s.
+        engine
+            .shared
+            .consumed_total
+            .store(96_000, Ordering::Release);
+        assert_eq!(engine.status().position_ms, Some(1000));
+        assert_eq!(
+            engine.status().position_ms,
+            Some(1000),
+            "frozen without consumption"
+        );
     }
 
-    /// duration_ms() returns None when no track is loaded.
     #[test]
-    fn duration_ms_no_track() {
+    fn preload_requires_a_loaded_track() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        let r = engine.preload_track(Path::new("/nonexistent.flac"));
+        assert!(matches!(r, Err(PlaybackError::NoTrackLoaded)));
+    }
+
+    #[test]
+    fn replacing_a_parked_preload_drops_the_old_track() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        engine.insert_audible_test_track();
+        let old = engine.insert_test_track();
+        engine.preload = Some(Preload {
+            id: old,
+            slot: PreloadSlot::Parked(HeapRb::<f32>::new(8).split().1),
+        });
+        assert_eq!(engine.next_track_id(), Some(old));
+
+        engine.clear_preload();
+
+        assert_eq!(engine.next_track_id(), None);
+        assert!(!engine.tracks.contains_key(&old), "old preload dropped");
+        assert_eq!(engine.tracks.len(), 1, "audible track untouched");
+    }
+
+    #[test]
+    fn unload_drops_the_preload_too() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        engine.insert_audible_test_track();
+        let pre = engine.insert_test_track();
+        engine.preload = Some(Preload {
+            id: pre,
+            slot: PreloadSlot::Parked(HeapRb::<f32>::new(8).split().1),
+        });
+        engine.unload_track().unwrap();
+        assert!(engine.preload.is_none());
+        assert!(engine.tracks.is_empty());
+    }
+
+    /// The mixer promotes the registered next; a ClearNext that arrives
+    /// afterwards must not kill the track that is now playing, and the
+    /// audible track switches exactly at the boundary.
+    #[test]
+    fn clear_next_after_promotion_is_harmless() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        let a = engine.insert_audible_test_track();
+        let b = engine.insert_test_track();
+        // A: 100 samples, complete. B: 50 samples.
+        engine
+            .command_sender
+            .send(MixerCommand::RegisterTrack {
+                slot: filled_slot(a, 100, true),
+            })
+            .unwrap();
+        engine
+            .command_sender
+            .send(MixerCommand::RegisterNext {
+                slot: filled_slot(b, 50, false),
+            })
+            .unwrap();
+        engine.preload = Some(Preload {
+            id: b,
+            slot: PreloadSlot::Registered,
+        });
+
+        // Wait for the mix thread to promote B.
+        let status = Arc::clone(&engine.mixer_status);
+        wait_until(|| status.current_id() == b);
+        assert_eq!(
+            status.last_promotion().map(|p| p.boundary_sample),
+            Some(100)
+        );
+
+        // Boundary not yet consumed: A still audible, nothing is finished.
+        assert_eq!(engine.audible_track_id(), Some(a));
+        assert!(!engine.status().finished);
+
+        // The late ClearNext.
+        engine.clear_preload();
+        assert!(engine.tracks.contains_key(&b), "playing track must survive");
+        assert_eq!(status.current_id(), b);
+        assert_eq!(
+            engine.next_track_id(),
+            Some(b),
+            "promoted B is committed: still the next track"
+        );
+
+        // Output consumes up to the boundary: B becomes audible, A is dropped.
+        engine.shared.consumed_total.store(100, Ordering::Release);
+        engine.reconcile();
+        assert_eq!(engine.audible_track_id(), Some(b));
+        assert!(!engine.tracks.contains_key(&a));
+    }
+
+    /// B1: after the mixer promoted B, B is the track the source plays next
+    /// and stays live (its metadata owner must not drop it) until it has
+    /// become audible; only then is A dropped and `next` empty.
+    #[test]
+    fn promoted_track_is_reported_next_and_live_until_audible() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        let a = engine.insert_audible_test_track();
+        let b = engine.insert_test_track();
+        engine
+            .command_sender
+            .send(MixerCommand::RegisterTrack {
+                slot: filled_slot(a, 100, true),
+            })
+            .unwrap();
+        engine
+            .command_sender
+            .send(MixerCommand::RegisterNext {
+                slot: filled_slot(b, 50, false),
+            })
+            .unwrap();
+        engine.preload = Some(Preload {
+            id: b,
+            slot: PreloadSlot::Registered,
+        });
+        assert_eq!(engine.next_track_id(), Some(b), "registered preload");
+
+        let mixer_status = Arc::clone(&engine.mixer_status);
+        wait_until(|| mixer_status.snapshot().current_id == b);
+
+        // The Loaded poll: reconcile, then read one status.
+        engine.reconcile();
+        let st = engine.status();
+        assert_eq!(st.audible, Some(a));
+        assert_eq!(st.next, Some(b), "committed track is the one played next");
+        assert!(!st.finished);
+        assert!(engine.is_live(a) && engine.is_live(b));
+
+        // Boundary consumed: B audible, A gone, nothing next.
+        engine.shared.consumed_total.store(100, Ordering::Release);
+        engine.reconcile();
+        let st = engine.status();
+        assert_eq!(st.audible, Some(b));
+        assert_eq!(st.next, None);
+        assert!(!engine.is_live(a));
+        assert!(engine.is_live(b));
+    }
+
+    #[test]
+    fn status_is_one_consistent_read() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        let a = engine.insert_audible_test_track();
+        // 48 kHz stereo: 96_000 samples = 1 s.
+        engine
+            .shared
+            .consumed_total
+            .store(96_000, Ordering::Release);
+        let st = engine.status();
+        assert_eq!(st.audible, Some(a));
+        assert_eq!(st.position_ms, Some(1000));
+        assert_eq!(st.duration_ms, Some(0), "unknown duration is Some(0)");
+        assert!(st.paused);
+        assert_eq!(
+            engine.status().position_ms,
+            Some(1000),
+            "frozen without consumption"
+        );
+    }
+
+    #[test]
+    fn status_without_track_is_empty() {
         let (engine, _tmp) = engine_with_tempdir();
-        assert_eq!(engine.duration_ms(), None);
+        let st = engine.status();
+        assert_eq!(st.audible, None);
+        assert_eq!(st.next, None);
+        assert!(!st.finished);
+        assert_eq!(st.position_ms, None);
+        assert_eq!(st.duration_ms, None);
+        assert!(st.paused);
+    }
+
+    /// The reuse path (cut to a preloaded track): after DetachCurrent is acked
+    /// and the ring flushed, only the promoted track's samples reach the ring.
+    #[test]
+    fn detach_flush_promote_delivers_only_the_promoted_tracks_samples() {
+        let (mixer_producer, mut mixer_output) = HeapRb::<f32>::new(4096).split();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<MixerCommand>();
+        let running = Arc::new(AtomicBool::new(true));
+        let running_clone = Arc::clone(&running);
+        let thread = std::thread::spawn(move || {
+            run_mix_loop(mixer::Mixer::new(mixer_producer), cmd_rx, running_clone);
+        });
+
+        // A has plenty of audio (1.0); B (0.5) is registered as next.
+        let (mut a_producer, a_consumer) = HeapRb::<f32>::new(8192).split();
+        for _ in 0..2048 {
+            a_producer.push(1.0).ok();
+        }
+        cmd_tx
+            .send(MixerCommand::RegisterTrack {
+                slot: Slot {
+                    id: 1,
+                    consumer: a_consumer,
+                    input_complete: Arc::new(AtomicBool::new(false)),
+                },
+            })
+            .unwrap();
+        cmd_tx
+            .send(MixerCommand::RegisterNext {
+                slot: filled_slot(2, 300, true),
+            })
+            .unwrap();
+        // Let A's audio reach the ring.
+        std::thread::sleep(Duration::from_millis(20));
+
+        let (detach_tx, detach_rx) = mpsc::sync_channel::<()>(1);
+        cmd_tx
+            .send(MixerCommand::DetachCurrent { done: detach_tx })
+            .unwrap();
+        detach_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        // The output flush: discard everything A produced.
+        let mut sink = vec![0.0f32; 4096];
+        mixer_output.pop_slice(&mut sink);
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(
+            mixer_output.len(),
+            0,
+            "nothing flows between detach and promote"
+        );
+
+        let (promote_tx, promote_rx) = mpsc::sync_channel::<Option<u64>>(1);
+        cmd_tx
+            .send(MixerCommand::PromoteNext {
+                id: 2,
+                done: promote_tx,
+            })
+            .unwrap();
+        let start = promote_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .expect("B is the pending next");
+        assert!(start > 0, "A's samples were produced before the cut");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while mixer_output.len() < 300 {
+            assert!(Instant::now() < deadline, "B's samples never arrived");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        let got = {
+            let mut v = vec![0.0f32; mixer_output.len()];
+            let n = mixer_output.pop_slice(&mut v);
+            v.truncate(n);
+            v
+        };
+
+        running.store(false, Ordering::Release);
+        thread.join().unwrap();
+        assert_eq!(got.len(), 300);
+        assert!(
+            got.iter().all(|s| *s == 0.5),
+            "only B's samples (0.5) reach the ring"
+        );
     }
 
     /// select_target_rate passes source rate through without clamping (no 192 kHz ceiling).
@@ -700,7 +1504,11 @@ mod tests {
         }
         cmd_tx
             .send(MixerCommand::RegisterTrack {
-                consumer: track_consumer,
+                slot: Slot {
+                    id: 1,
+                    consumer: track_consumer,
+                    input_complete: Arc::new(AtomicBool::new(false)),
+                },
             })
             .unwrap();
         // Let the output ring fill up.
@@ -754,7 +1562,11 @@ mod tests {
         }
         cmd_tx
             .send(MixerCommand::RegisterTrack {
-                consumer: track_consumer,
+                slot: Slot {
+                    id: 1,
+                    consumer: track_consumer,
+                    input_complete: Arc::new(AtomicBool::new(false)),
+                },
             })
             .unwrap();
 
