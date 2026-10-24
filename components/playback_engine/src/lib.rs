@@ -208,23 +208,23 @@ fn mix_step(mixer: &mut Mixer, temp_buffer: &mut [f32], commands: &mpsc::Receive
     while let Ok(cmd) = commands.try_recv() {
         match cmd {
             MixerCommand::RegisterTrack { slot } => {
-                tracing::info!("MIX THREAD: Registering new track");
+                tracing::debug!("MIX THREAD: Registering new track");
                 mixer.register_current(slot);
             }
             MixerCommand::RegisterNext { slot } => {
-                tracing::info!("MIX THREAD: Registering next track");
+                tracing::debug!("MIX THREAD: Registering next track");
                 mixer.register_next(slot);
             }
             MixerCommand::ClearNext { id } => {
                 mixer.clear_next(id);
             }
             MixerCommand::ClearTrack { done } => {
-                tracing::info!("MIX THREAD: Clearing track slots");
+                tracing::debug!("MIX THREAD: Clearing track slots");
                 mixer.clear_all();
                 let _ = done.send(());
             }
             MixerCommand::DetachCurrent { done } => {
-                tracing::info!("MIX THREAD: Detaching current track");
+                tracing::debug!("MIX THREAD: Detaching current track");
                 mixer.clear_current();
                 let _ = done.send(());
             }

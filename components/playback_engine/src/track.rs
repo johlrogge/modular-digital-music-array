@@ -107,7 +107,7 @@ fn decoder_thread_fn<S: Source + Send + Sync + 'static>(
     loop {
         // Check stop flag first — set by Drop before join
         if stop.load(Ordering::Acquire) {
-            tracing::info!("Decoder thread stopping (stop flag set)");
+            tracing::debug!("Decoder thread stopping (stop flag set)");
             return;
         }
 
@@ -130,7 +130,7 @@ fn decoder_thread_fn<S: Source + Send + Sync + 'static>(
                     }
                 }
                 TrackCommand::Shutdown => {
-                    tracing::info!("Decoder thread shutting down");
+                    tracing::debug!("Decoder thread shutting down");
                     return;
                 }
             }
