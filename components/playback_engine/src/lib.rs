@@ -370,11 +370,29 @@ impl PlaybackEngine {
         Ok(())
     }
 
+    /// Returns true only when the current track has been fully *played out*.
+    ///
+    /// Two conditions must both hold:
+    /// - the track is `Finished`: the decoder hit EOF and every sample has
+    ///   been handed to the mixer (the track ring is empty), and
+    /// - the audio output is drained: the mixer ring and the in-flight
+    ///   PipeWire quantum have been played, so nothing audible remains.
+    ///
+    /// Reporting "finished" on the first condition alone would let the next
+    /// `load_track` flush roughly the last 4.5 s of buffered audio.
+    ///
+    /// Note: the drained signal is produced by the output's process
+    /// callback, so a paused or deactivated stream freezes it; while frozen
+    /// the result keeps its last value. With no output (PipeWire failed to
+    /// start, already logged as an error) the output is treated as drained.
     pub fn is_track_finished(&self) -> bool {
-        self.track
+        let track_finished = self
+            .track
             .as_ref()
             .map(|t| t.is_finished())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        let drained = self.audio_output.as_ref().map(|o| o.is_drained());
+        combine_finished(track_finished, drained)
     }
 
     /// Returns the current playback position in milliseconds, or `None` if no track is loaded.
@@ -404,6 +422,12 @@ impl PlaybackEngine {
     }
 }
 
+/// Combines the track state with the output state. `drained` is `None` when
+/// there is no audio output, which counts as drained.
+fn combine_finished(track_finished: bool, drained: Option<bool>) -> bool {
+    track_finished && drained.unwrap_or(true)
+}
+
 impl Drop for PlaybackEngine {
     fn drop(&mut self) {
         self.mix_thread_running.store(false, Ordering::Release);
@@ -416,6 +440,20 @@ impl Drop for PlaybackEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn track_finished_requires_finished_and_drained() {
+        assert!(!combine_finished(false, Some(false)));
+        assert!(!combine_finished(false, Some(true)));
+        assert!(!combine_finished(true, Some(false)));
+        assert!(combine_finished(true, Some(true)));
+    }
+
+    #[test]
+    fn track_finished_without_output_counts_as_drained() {
+        assert!(combine_finished(true, None));
+        assert!(!combine_finished(false, None));
+    }
 
     fn engine_with_tempdir() -> (PlaybackEngine, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");

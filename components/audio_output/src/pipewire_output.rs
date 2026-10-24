@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 
 use pipewire as pw;
@@ -30,10 +31,93 @@ impl std::fmt::Debug for StreamCommand {
     }
 }
 
+/// Frames of scratch space preallocated for the RT callback. Larger than any
+/// quantum PipeWire normally negotiates, so the steady state never allocates.
+const SCRATCH_FRAMES: usize = 8192;
+
+/// Consecutive fully silent callbacks required before the output is
+/// considered drained.
+///
+/// The first silent callback proves the last real samples reached the graph;
+/// the driver/ALSA buffer holds roughly 1-2 further quanta that must still be
+/// played out. Requiring 2 silent callbacks gives that margin.
+pub const DRAINED_AFTER_SILENT_CALLBACKS: u32 = 2;
+
+/// Per-callback bookkeeping shared between the PipeWire RT callback and
+/// [`PipewireOutput`]. Independent of PipeWire so it can be unit tested.
+///
+/// Only atomic loads/stores are used: safe to call from the RT thread
+/// (no locks, no allocation).
+///
+/// # Drain semantics
+///
+/// A fully silent callback (`samples_read == 0`) means the *previous* callback
+/// already handed the last real samples to the graph, so the in-flight
+/// quantum is accounted for and the output has played everything it was given.
+/// That alone does not mean the driver/ALSA buffer (~1-2 quanta) has played
+/// it, so [`is_drained`](Self::is_drained) requires
+/// [`DRAINED_AFTER_SILENT_CALLBACKS`] consecutive fully silent callbacks. A
+/// fresh stream has recorded nothing and is NOT drained.
+///
+/// # Invariant
+///
+/// A deactivated stream receives no callbacks, so the counter freezes at its
+/// last value rather than counting up.
+#[derive(Debug, Default)]
+pub struct PlayoutMonitor {
+    silent_callbacks: AtomicU32,
+    underrun_streak: AtomicU32,
+}
+
+impl PlayoutMonitor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one callback. Returns `true` if a mid-stream underrun warning
+    /// should be logged for it.
+    ///
+    /// Only *partial* fills (`0 < samples_read < samples_requested`) are real
+    /// starvation; fully silent callbacks are expected when idle or after a
+    /// track ends. Warnings fire on the first partial fill after a clean run,
+    /// then every 100th, to stay readable during a sustained dropout.
+    pub fn record(&self, samples_read: usize, samples_requested: usize) -> bool {
+        if samples_read == 0 {
+            // Saturate at the threshold: no wraparound, no further increments.
+            // Single writer (RT thread), so load/store is race-free.
+            let silent = self.silent_callbacks.load(Ordering::Relaxed);
+            if silent < DRAINED_AFTER_SILENT_CALLBACKS {
+                self.silent_callbacks.store(silent + 1, Ordering::Relaxed);
+            }
+            self.underrun_streak.store(0, Ordering::Relaxed);
+            return false;
+        }
+        self.silent_callbacks.store(0, Ordering::Relaxed);
+        if samples_read < samples_requested {
+            let streak = self.underrun_streak.fetch_add(1, Ordering::Relaxed) + 1;
+            streak == 1 || streak.is_multiple_of(100)
+        } else {
+            self.underrun_streak.store(0, Ordering::Relaxed);
+            false
+        }
+    }
+
+    /// True once [`DRAINED_AFTER_SILENT_CALLBACKS`] consecutive fully silent
+    /// callbacks were recorded.
+    pub fn is_drained(&self) -> bool {
+        self.silent_callbacks.load(Ordering::Relaxed) >= DRAINED_AFTER_SILENT_CALLBACKS
+    }
+
+    fn underrun_streak(&self) -> u32 {
+        self.underrun_streak.load(Ordering::Relaxed)
+    }
+}
+
 pub struct PipewireOutput {
     // Thread handle to keep the PipeWire thread alive
     pw_thread: Option<thread::JoinHandle<Result<(), pw::Error>>>,
     command_sender: pw::channel::Sender<StreamCommand>,
+    monitor: Arc<PlayoutMonitor>,
 }
 
 impl PipewireOutput {
@@ -43,6 +127,8 @@ impl PipewireOutput {
         target_device: Option<&str>,
     ) -> Result<Self, pw::Error> {
         let (cmd_sender, cmd_receiver) = pw::channel::channel::<StreamCommand>();
+        let monitor = Arc::new(PlayoutMonitor::new());
+        let monitor_for_cb = monitor.clone();
 
         // Clone target_device into an owned String so it can move into the thread.
         let target_device: Option<String> = target_device.map(|s| s.to_owned());
@@ -64,18 +150,17 @@ impl PipewireOutput {
             struct UserData {
                 consumer: Rc<RefCell<Option<HeapConsumer<f32>>>>,
                 frame_count: usize, // For debugging
-                /// Counts consecutive callbacks that ended with a partial fill
-                /// (i.e. the ring buffer ran dry mid-callback). Reset to 0 on
-                /// a fully-supplied callback. We log only on the *first* underrun
-                /// after a clean run, then every 100th thereafter, to stay readable
-                /// during a sustained dropout without flooding the log.
-                underrun_streak: u32,
+                /// Drain / underrun bookkeeping shared with `PipewireOutput`.
+                monitor: Arc<PlayoutMonitor>,
+                /// Preallocated read buffer; grown only if a larger quantum arrives.
+                scratch: Vec<f32>,
             }
 
             let user_data = UserData {
                 consumer: shared_consumer.clone(),
                 frame_count: 0,
-                underrun_streak: 0,
+                monitor: monitor_for_cb,
+                scratch: vec![0.0f32; SCRATCH_FRAMES * DEFAULT_CHANNELS as usize],
             };
 
             let stream = if let Some(ref name) = target_device {
@@ -119,8 +204,16 @@ impl PipewireOutput {
                             // Log every 100 frames for debugging
                             user_data.frame_count += 1;
 
-                            // Temporary buffer to read from consumer
-                            let mut f32_buffer = vec![0.0f32; n_frames * DEFAULT_CHANNELS as usize];
+                            let requested = n_frames * DEFAULT_CHANNELS as usize;
+                            if user_data.scratch.len() < requested {
+                                warn!(
+                                    requested,
+                                    capacity = user_data.scratch.len(),
+                                    "pw quantum larger than scratch buffer; growing (allocates in RT callback)"
+                                );
+                                user_data.scratch.resize(requested, 0.0);
+                            }
+                            let f32_buffer = &mut user_data.scratch[..requested];
 
                             // Read from consumer (if still present — taken on shutdown)
                             let samples_read =
@@ -132,7 +225,7 @@ impl PipewireOutput {
                                             consumer.len()
                                         );
                                     }
-                                    let n = consumer.pop_slice(&mut f32_buffer);
+                                    let n = consumer.pop_slice(f32_buffer);
                                     if user_data.frame_count % 100 == 0 && n > 0 {
                                         debug!("Read {} samples from consumer", n);
                                     }
@@ -159,25 +252,14 @@ impl PipewireOutput {
                                 }
                             }
 
-                            let silence_samples =
-                                (n_frames * DEFAULT_CHANNELS as usize).saturating_sub(samples_read);
-                            if silence_samples > 0 {
-                                user_data.underrun_streak += 1;
-                                // Log on the first underrun after a clean run, then every 100th.
-                                // Avoids flooding at ~1000 callbacks/s during a sustained dropout.
-                                if user_data.underrun_streak == 1
-                                    || user_data.underrun_streak % 100 == 0
-                                {
-                                    warn!(
-                                        n_frames,
-                                        samples_provided = samples_read,
-                                        silence_samples,
-                                        underrun_streak = user_data.underrun_streak,
-                                        "pw underrun: ring buffer starved"
-                                    );
-                                }
-                            } else {
-                                user_data.underrun_streak = 0;
+                            if user_data.monitor.record(samples_read, requested) {
+                                warn!(
+                                    n_frames,
+                                    samples_provided = samples_read,
+                                    silence_samples = requested - samples_read,
+                                    underrun_streak = user_data.monitor.underrun_streak(),
+                                    "pw underrun: ring buffer starved"
+                                );
                             }
 
                             n_frames
@@ -271,7 +353,15 @@ impl PipewireOutput {
         Ok(Self {
             pw_thread: Some(pw_thread),
             command_sender: cmd_sender,
+            monitor,
         })
+    }
+
+    /// True when the output has played everything it was given: the last
+    /// callback(s) found the ring buffer completely empty. A fresh stream is
+    /// not drained. See [`PlayoutMonitor`] for semantics.
+    pub fn is_drained(&self) -> bool {
+        self.monitor.is_drained()
     }
 
     /// Drain the mixer output ring buffer and flush PipeWire's in-flight buffers.
@@ -345,6 +435,94 @@ impl Drop for PipewireOutput {
 mod tests {
     use super::*;
     use ringbuf::HeapRb;
+
+    #[test]
+    fn fresh_monitor_is_not_drained() {
+        assert!(!PlayoutMonitor::new().is_drained());
+    }
+
+    #[test]
+    fn partial_fill_is_not_drained() {
+        let m = PlayoutMonitor::new();
+        m.record(100, 512);
+        assert!(!m.is_drained());
+    }
+
+    #[test]
+    fn full_fill_is_not_drained() {
+        let m = PlayoutMonitor::new();
+        m.record(512, 512);
+        assert!(!m.is_drained());
+    }
+
+    #[test]
+    fn single_silent_callback_is_not_drained() {
+        let m = PlayoutMonitor::new();
+        m.record(512, 512);
+        m.record(0, 512);
+        assert!(!m.is_drained());
+    }
+
+    #[test]
+    fn consecutive_silent_callbacks_are_drained() {
+        let m = PlayoutMonitor::new();
+        m.record(512, 512);
+        for _ in 0..DRAINED_AFTER_SILENT_CALLBACKS {
+            m.record(0, 512);
+        }
+        assert!(m.is_drained());
+        m.record(0, 512);
+        assert!(m.is_drained());
+    }
+
+    #[test]
+    fn silent_counter_saturates_at_threshold() {
+        let m = PlayoutMonitor::new();
+        for _ in 0..(DRAINED_AFTER_SILENT_CALLBACKS * 10) {
+            m.record(0, 512);
+        }
+        assert_eq!(
+            m.silent_callbacks.load(Ordering::Relaxed),
+            DRAINED_AFTER_SILENT_CALLBACKS
+        );
+    }
+
+    #[test]
+    fn data_after_silence_resets_drained() {
+        let m = PlayoutMonitor::new();
+        for _ in 0..DRAINED_AFTER_SILENT_CALLBACKS {
+            m.record(0, 512);
+        }
+        assert!(m.is_drained());
+        m.record(64, 512);
+        assert!(!m.is_drained());
+        m.record(0, 512);
+        assert!(!m.is_drained(), "silence count restarts after data");
+    }
+
+    #[test]
+    fn underrun_warns_only_on_partial_fills() {
+        let m = PlayoutMonitor::new();
+        assert!(!m.record(512, 512), "full fill must not warn");
+        assert!(!m.record(0, 512), "fully silent must not warn");
+        assert!(m.record(10, 512), "first partial fill warns");
+        assert!(!m.record(10, 512), "subsequent partial fills are throttled");
+    }
+
+    #[test]
+    fn underrun_warning_throttled_to_every_hundredth() {
+        let m = PlayoutMonitor::new();
+        let warns = (0..200).filter(|_| m.record(10, 512)).count();
+        assert_eq!(warns, 3); // 1st, 100th, 200th
+    }
+
+    #[test]
+    fn silence_resets_underrun_streak() {
+        let m = PlayoutMonitor::new();
+        assert!(m.record(10, 512));
+        m.record(0, 512);
+        assert!(m.record(10, 512), "streak restarts after silence");
+    }
 
     /// Verify that `StreamCommand::Shutdown` carries a `SyncSender` and that the
     /// consumer can be round-tripped through the channel — i.e. the shutdown
