@@ -1,1 +1,0 @@
-/nix/store/dyxhkxmjj8jb0lcv4vjvszm2340a6xl0-polylith.md
