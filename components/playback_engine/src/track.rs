@@ -26,6 +26,9 @@ use ringbuf::HeapRb;
 pub enum TrackState {
     Stopped = 0,
     Playing = 1,
+    /// All samples have been handed to the mixer (EOF reached and the track ring
+    /// is empty). This does NOT mean the audio has been heard; audibility is
+    /// checked separately against the output.
     Finished = 2,
 }
 
@@ -194,10 +197,16 @@ fn decoder_thread_fn<S: Source + Send + Sync + 'static>(
                 }
             }
             TrackState::Playing if eof => {
-                // All decoded samples written — track is done
-                state.store(TrackState::Finished as u8, Ordering::Release);
-                tracing::info!("Track finished (EOF + pending drained)");
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                if output.is_empty() {
+                    // All samples handed to the mixer (ring consumed) — track is done
+                    state.store(TrackState::Finished as u8, Ordering::Release);
+                    tracing::info!("Track finished (EOF + pending written + ring drained)");
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                } else {
+                    // Ring still holds unconsumed samples — wait for the mixer.
+                    // Loop top keeps honouring stop/seek/shutdown.
+                    std::thread::sleep(std::time::Duration::from_micros(500));
+                }
             }
             TrackState::Playing => {
                 std::thread::sleep(std::time::Duration::from_micros(500));
@@ -272,6 +281,8 @@ impl Track {
         TrackState::from_u8(self.state.load(Ordering::Acquire)) == TrackState::Playing
     }
 
+    /// True once all samples have been handed to the mixer (EOF and track ring
+    /// empty). Not "audible": output latency is checked separately.
     pub fn is_finished(&self) -> bool {
         TrackState::from_u8(self.state.load(Ordering::Acquire)) == TrackState::Finished
     }
@@ -582,5 +593,65 @@ mod tests {
             Track::new(source, prod, sample_rate, sample_rate).expect("Track::new should succeed");
         // Dropping the track should not panic or deadlock
         drop(track);
+    }
+
+    fn wait_until(timeout: std::time::Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        cond()
+    }
+
+    /// Build a playing track whose whole source fits in the ring; the test holds the consumer.
+    fn playing_track_with_consumer(samples: usize) -> (Track, ringbuf::HeapConsumer<f32>, usize) {
+        let source = TestSource::new_from_samples(vec![0.25f32; samples]);
+        let (prod, cons) = HeapRb::new(samples * 2).split();
+        let mut track = Track::new(source, prod, 48_000, 48_000).expect("Track::new");
+        track.play();
+        (track, cons, samples)
+    }
+
+    #[test]
+    fn track_not_finished_while_ring_still_holds_samples() {
+        let (track, mut cons, samples) = playing_track_with_consumer(4096);
+        // Wait until everything has been pushed into the ring.
+        assert!(wait_until(std::time::Duration::from_secs(5), || cons.len() == samples));
+        // EOF has been reached and pending is empty, but the ring is not drained.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !track.is_finished(),
+            "must not finish while ring is non-empty"
+        );
+        assert_eq!(cons.len(), samples);
+        while cons.pop().is_some() {}
+    }
+
+    #[test]
+    fn track_finishes_after_ring_is_drained() {
+        let (track, mut cons, samples) = playing_track_with_consumer(4096);
+        assert!(wait_until(std::time::Duration::from_secs(5), || cons.len() == samples));
+        while cons.pop().is_some() {}
+        assert!(
+            wait_until(std::time::Duration::from_secs(5), || track.is_finished()),
+            "track should finish once ring is drained"
+        );
+    }
+
+    #[test]
+    fn seek_after_finished_resets_to_stopped() {
+        let (mut track, mut cons, samples) = playing_track_with_consumer(4096);
+        assert!(wait_until(std::time::Duration::from_secs(5), || cons.len() == samples));
+        while cons.pop().is_some() {}
+        assert!(wait_until(std::time::Duration::from_secs(5), || track.is_finished()));
+        track.seek(0).expect("seek");
+        assert!(
+            wait_until(std::time::Duration::from_secs(5), || !track.is_finished()
+                && !track.is_playing()),
+            "seek should reset state to Stopped"
+        );
     }
 }
