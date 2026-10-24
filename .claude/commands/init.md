@@ -1,1 +1,1 @@
-/nix/store/jiph31kqafj9xn6w7sqs451rcj5rzmfc-claude-commands-init.md
+/nix/store/ljf3q4n104hamaclkq2ssw8vm14zwwql-claude-commands-init.md
