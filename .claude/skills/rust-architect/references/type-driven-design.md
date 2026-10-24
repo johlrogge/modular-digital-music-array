@@ -1,1 +1,0 @@
-/nix/store/9g64ai9q0kcqq8bl1y67dbaagmxjmj7r-type-driven-design.md

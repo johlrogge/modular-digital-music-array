@@ -1,1 +1,0 @@
-/nix/store/0bh8w66q9zwz748vyh7sm9shc4y69pga-patterns.md
