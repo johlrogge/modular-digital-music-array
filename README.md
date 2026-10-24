@@ -170,7 +170,7 @@ Copy `scripts/install-mdma-macos.sh` from this repo to your Mac and run it. It r
 bash install-mdma-macos.sh
 
 # Install a specific tag
-bash install-mdma-macos.sh v0.25.0
+bash install-mdma-macos.sh v0.25.2
 
 # Install to a user-writable location (no sudo)
 MDMA_INSTALL_DIR=~/.local/bin bash install-mdma-macos.sh
