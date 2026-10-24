@@ -26,6 +26,12 @@ cargo_clippy       # lint
 hygiene_report     # test + clippy + coverage in one shot
 ```
 
+Builds go through polylith profiles: `cargo polylith cargo --profile <dev|production> <cmd>` (the MCP tools and just recipes do this). `--profile` generates the workspace manifest from `profiles/<name>.profile` for that one run.
+
+Don't run plain `cargo` against the root manifest: it resolves a different member set and rewrites Cargo.lock differently (lockfile churn).
+
+`cargo polylith profile list` shows profile contents; `change-profile` is for local development only.
+
 Other tasks via `just` (use `just --list` or `mcp__just__just_list` to see all):
 ```bash
 just watch              # Watch mode: check → test → build → clippy
