@@ -183,6 +183,19 @@
             box-shadow: 0 5px 15px rgba(231, 76, 60, 0.4);
         }
 
+        button:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+        .wipe-section {
+            border: 2px solid #e74c3c;
+            border-radius: 8px;
+            padding: 15px;
+        }
+
         .update-button {
             background: linear-gradient(135deg, #f39c12 0%, #e67e22 100%);
             margin-top: 10px;
@@ -247,47 +260,53 @@
             <p class="dev-hint" style="margin-top: 8px;">
                 <a href="/logs" style="color: #856404;">📋 View beacon logs</a>
             </p>
+            <p class="dev-hint" style="margin-top: 8px;">
+                <a href="/boot-order" style="color: #856404;">💾 Switch boot order (SD / NVMe)</a>
+            </p>
         </div>
+
+        {% match notice %}
+        {% when Some with (message) %}
+        <div class="error-panel" id="notice">
+            <p>{{ message }}</p>
+        </div>
+        {% when None %}
+        {% endmatch %}
 
         {% match layout_error %}
         {% when Some with (err) %}
         <div class="error-panel">
-            <h3>Incompatible Existing Partition Layout</h3>
-            <p>The NVMe drive was provisioned with a different partition scheme.
-               Re-provisioning with the current layout would shift partition byte offsets
-               and corrupt data.</p>
+            <h3>The NVMe drive cannot be provisioned as it is</h3>
+            <p>Nothing was changed: <strong>/music</strong> and <strong>/metadata</strong>
+               were left untouched.</p>
             <div class="error-detail">{{ err.message }}</div>
-            <p>Force-provisioning will <strong>permanently erase</strong> all existing
-               partitions, including <strong>/music</strong> (your music library) and
-               <strong>/metadata</strong> (track metadata). There is <strong>no undo</strong>.</p>
-            <form action="/provision" method="post" id="force-wipe-form">
-                <input type="hidden" name="unit_type" value="{{ err.unit_type }}">
-                <input type="hidden" name="hostname" value="{{ err.hostname }}">
-                <input type="hidden" name="ssh_key" value="{{ err.ssh_key }}">
-                <input type="hidden" name="force_wipe_partitions" value="true">
-                <button type="button" class="wipe-button" id="confirm-force-wipe">
-                    Force Wipe and Re-provision
-                </button>
-            </form>
-            <script>
-                document.getElementById('confirm-force-wipe').addEventListener('click', function() {
-                    var hostname = document.querySelector('#force-wipe-form input[name="hostname"]').value;
-                    var confirmed = confirm(
-                        "WARNING: This will PERMANENTLY ERASE all data on the NVMe drive,\n" +
-                        "including /music (your music library) and /metadata (track metadata).\n\n" +
-                        "There is NO undo.\n\n" +
-                        "Type the unit hostname to confirm: " + hostname + "\n\n" +
-                        "(Click OK only if you typed the hostname above)"
-                    );
-                    if (!confirmed) return;
-                    var typed = prompt("Type the hostname \"" + hostname + "\" to confirm:");
-                    if (typed !== hostname) {
-                        alert("Hostname did not match. Wipe cancelled.");
-                        return;
-                    }
-                    document.getElementById('force-wipe-form').submit();
-                });
-            </script>
+            {% if err.can_wipe %}
+            <div id="wipe-override">
+                <p>If you really want to start over, you can <strong>wipe the drive</strong>.
+                   This destroys <strong>ALL data on it, music and metadata included</strong>,
+                   and cannot be undone.</p>
+                {% include "existing_drives.html" %}
+                <form action="/provision" method="post">
+                    <input type="hidden" name="unit_type" value="{{ err.unit_type }}">
+                    <input type="hidden" name="hostname" value="{{ err.hostname }}">
+                    <input type="hidden" name="ssh_key" value="{{ err.ssh_key }}">
+                    <input type="hidden" name="wipe_all" value="true">
+                    <input type="hidden" name="wipe_fingerprint" value="{{ wipe_fingerprint }}">
+                    <label for="override_wipe_confirmation">
+                        Type <strong>{{ wipe_word }}</strong> to confirm
+                    </label>
+                    <input type="text" name="wipe_confirmation" id="override_wipe_confirmation"
+                           autocomplete="off" data-wipe-word="{{ wipe_word }}"
+                           data-wipe-button="override_wipe_button">
+                    <button type="submit" id="override_wipe_button" class="wipe-button" disabled>
+                        Wipe drive and continue
+                    </button>
+                </form>
+            </div>
+            {% else %}
+            <p class="help-text">A wipe would not resolve this, so it is not offered. Check the
+               drives and the NVMe order, then try again.</p>
+            {% endif %}
         </div>
         {% when None %}
         {% endmatch %}
@@ -326,50 +345,60 @@
                 <div class="help-text">Paste your public key from ~/.ssh/id_ed25519.pub or ~/.ssh/id_rsa.pub</div>
             </div>
 
-            <input type="hidden" name="force_wipe_partitions" id="main-force-wipe-hidden" value="false">
-            <button type="submit">Provision System</button>
+            <div class="section">
+                <label>
+                    <input type="checkbox" name="reinstall_os" value="true">
+                    Reinstall OS (reformat boot, root and var)
+                </label>
+                <div class="help-text">Music and metadata are never touched. Leave unchecked to keep the existing OS partitions.</div>
+            </div>
+
+            <div class="section wipe-section">
+                <label>
+                    <input type="checkbox" name="wipe_all" id="wipe_all" value="true">
+                    Wipe drive and provision fresh
+                </label>
+                <div class="help-text">Destroys <strong>ALL data on the target drive(s), music and
+                    metadata included</strong>. Leave unchecked to keep your data.</div>
+                <div id="wipe-details" hidden>
+                    {% include "existing_drives.html" %}
+                    <input type="hidden" name="wipe_fingerprint" value="{{ wipe_fingerprint }}">
+                    <label for="wipe_confirmation">
+                        Type <strong>{{ wipe_word }}</strong> to confirm
+                    </label>
+                    <input type="text" name="wipe_confirmation" id="wipe_confirmation"
+                           autocomplete="off" data-wipe-word="{{ wipe_word }}"
+                           data-wipe-button="provision_button">
+                </div>
+            </div>
+
+            <button type="submit" id="provision_button">Provision System</button>
         </form>
-
-        <form action="/provision" method="post" id="main-force-wipe-form" style="margin-top: 12px;">
-            <input type="hidden" name="unit_type" id="fw-unit-type">
-            <input type="hidden" name="hostname" id="fw-hostname">
-            <input type="hidden" name="ssh_key" id="fw-ssh-key">
-            <input type="hidden" name="force_wipe_partitions" value="true">
-            <button type="button" class="wipe-button" id="main-confirm-force-wipe">
-                Force Wipe and Re-provision
-            </button>
-        </form>
-        <script>
-            document.getElementById('main-confirm-force-wipe').addEventListener('click', function() {
-                var mainForm = document.querySelector('form[action="/provision"]:not(#main-force-wipe-form)');
-                var unitType = mainForm.querySelector('select[name="unit_type"]').value;
-                var hostname = mainForm.querySelector('input[name="hostname"]').value;
-                var sshKey = mainForm.querySelector('textarea[name="ssh_key"]').value;
-
-                if (!hostname) {
-                    alert("Please fill in the Hostname field first.");
-                    return;
-                }
-
-                var confirmed = confirm(
-                    "WARNING: This will PERMANENTLY ERASE all data on the NVMe drive,\n" +
-                    "including /music (your music library) and /metadata (track metadata).\n\n" +
-                    "There is NO undo.\n\n" +
-                    "Type the unit hostname to confirm: " + hostname + "\n\n" +
-                    "(Click OK only if you typed the hostname above)"
-                );
-                if (!confirmed) return;
-                var typed = prompt("Type the hostname \"" + hostname + "\" to confirm:");
-                if (typed !== hostname) {
-                    alert("Hostname did not match. Wipe cancelled.");
-                    return;
-                }
-
-                document.getElementById('fw-unit-type').value = unitType;
-                document.getElementById('fw-hostname').value = hostname;
-                document.getElementById('fw-ssh-key').value = sshKey;
-                document.getElementById('main-force-wipe-form').submit();
-            });
-        </script>
     </div>
+    <script>
+        // Convenience only: the server validates the confirmation again.
+        (function () {
+            var box = document.getElementById('wipe_all');
+            var details = document.getElementById('wipe-details');
+            function wordOk(input) {
+                return input.value.trim() === input.getAttribute('data-wipe-word');
+            }
+            document.querySelectorAll('input[data-wipe-word]').forEach(function (input) {
+                var button = document.getElementById(input.getAttribute('data-wipe-button'));
+                function update() {
+                    if (input.id === 'wipe_confirmation') {
+                        details.hidden = !box.checked;
+                        button.disabled = box.checked && !wordOk(input);
+                    } else {
+                        button.disabled = !wordOk(input);
+                    }
+                }
+                input.addEventListener('input', update);
+                if (input.id === 'wipe_confirmation') {
+                    box.addEventListener('change', update);
+                    update();
+                }
+            });
+        })();
+    </script>
 {% endblock %}

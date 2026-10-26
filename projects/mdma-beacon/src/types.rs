@@ -230,7 +230,9 @@ impl From<&str> for DevicePath {
 /// Adding a new mount point requires explicitly deciding its filesystem type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MountPoint {
-    /// Boot partition (/boot/firmware) - FAT32, holds Pi firmware and bootloader files
+    /// Boot partition (/boot) - FAT32, holds Pi firmware, kernel and cmdline.
+    /// Mounted at /boot (as Void expects) so rpi-kernel/rpi-firmware packages
+    /// write directly to it.
     Boot,
     /// Root filesystem (/)
     Root,
@@ -248,13 +250,40 @@ impl MountPoint {
     /// Get the mount point as a string slice
     pub const fn as_str(&self) -> &'static str {
         match self {
-            MountPoint::Boot => "/boot/firmware",
+            MountPoint::Boot => "/boot",
             MountPoint::Root => "/",
             MountPoint::Var => "/var",
             MountPoint::Music => "/music",
             MountPoint::Metadata => "/metadata",
             MountPoint::Cache => "/cache",
         }
+    }
+
+    /// Whether this mount point holds user data (never to be touched wholesale
+    /// by provisioning, and mounted `nofail`).
+    pub const fn is_data(&self) -> bool {
+        matches!(
+            self,
+            MountPoint::Music | MountPoint::Metadata | MountPoint::Cache
+        )
+    }
+
+    /// Every mount point.
+    pub const ALL: [MountPoint; 6] = [
+        MountPoint::Boot,
+        MountPoint::Root,
+        MountPoint::Var,
+        MountPoint::Music,
+        MountPoint::Metadata,
+        MountPoint::Cache,
+    ];
+
+    /// Whether `label` is the partition/filesystem label of a data mount point
+    /// (music, metadata, cache). Derived from [`MountPoint::is_data`].
+    pub fn is_data_label(label: &str) -> bool {
+        Self::ALL
+            .iter()
+            .any(|m| m.is_data() && m.label().as_str() == label)
     }
 
     /// Get the mount point as a Path reference
@@ -427,10 +456,28 @@ pub struct ProvisionConfig {
     pub unit_type: UnitType,
     pub hostname: Hostname,
     pub ssh_key: SshPublicKey,
-    /// When true, skip the incompatible-layout abort and wipe all existing
-    /// partitions. Defaults to false (safe). Requires explicit user opt-in.
+    /// What to do with data already on the drive. Defaults to `Preserve`.
     #[serde(default)]
-    pub force_wipe_partitions: bool,
+    pub existing_data: ExistingDataPolicy,
+}
+
+/// What provisioning may do with data already on the NVMe drive(s).
+///
+/// Music and metadata are never lost by accident: only `WipeAll` touches them,
+/// and it must be chosen and confirmed by the user.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExistingDataPolicy {
+    /// Keep everything that is already on disk (default).
+    #[default]
+    Preserve,
+    /// Reformat the OS partitions (boot, root, var) for a fresh install.
+    /// Music and metadata partitions are never touched.
+    ReinstallOs,
+    /// Destroys ALL data on the target drive(s), music and metadata included,
+    /// and provisions a fresh layout. User-initiated only: the beacon route
+    /// requires an explicit typed confirmation before it sets this.
+    WipeAll,
 }
 
 #[cfg(test)]
@@ -438,6 +485,16 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
+
+    #[rstest]
+    #[case("\"preserve\"", ExistingDataPolicy::Preserve)]
+    #[case("\"reinstall_os\"", ExistingDataPolicy::ReinstallOs)]
+    #[case("\"wipe_all\"", ExistingDataPolicy::WipeAll)]
+    fn existing_data_policy_serde(#[case] json: &str, #[case] expected: ExistingDataPolicy) {
+        let parsed: ExistingDataPolicy = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed, expected);
+        assert_eq!(serde_json::to_string(&expected).unwrap(), json);
+    }
 
     #[rstest]
     #[case("mdma-909", true)]
@@ -472,7 +529,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case(MountPoint::Boot, "/boot/firmware", FilesystemType::Fat32, "boot")]
+    #[case(MountPoint::Boot, "/boot", FilesystemType::Fat32, "boot")]
     #[case(MountPoint::Root, "/", FilesystemType::Ext4, "root")]
     #[case(MountPoint::Var, "/var", FilesystemType::Ext4, "var")]
     #[case(MountPoint::Music, "/music", FilesystemType::Ext4, "music")]
@@ -488,6 +545,17 @@ mod tests {
         assert_eq!(mp.to_string(), expected_path);
         assert_eq!(mp.filesystem_type(), expected_fs);
         assert_eq!(mp.label().as_str(), expected_label);
+    }
+
+    #[rstest]
+    #[case(MountPoint::Boot, false)]
+    #[case(MountPoint::Root, false)]
+    #[case(MountPoint::Var, false)]
+    #[case(MountPoint::Music, true)]
+    #[case(MountPoint::Metadata, true)]
+    #[case(MountPoint::Cache, true)]
+    fn mount_point_is_data(#[case] mp: MountPoint, #[case] expected: bool) {
+        assert_eq!(mp.is_data(), expected);
     }
 
     #[rstest]
