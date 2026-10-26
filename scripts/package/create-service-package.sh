@@ -139,6 +139,9 @@ for mapping in "${EXTRA_FILES[@]+"${EXTRA_FILES[@]}"}"; do
     mkdir -p "$dest_dir"
     echo "  -> Copying extra file: $src -> $PACKAGE_DIR/$dest"
     cp "$src" "$PACKAGE_DIR/$dest"
+    case "$dest" in
+        usr/libexec/*) chmod 755 "$PACKAGE_DIR/$dest" ;;
+    esac
 done
 
 # ---------------------------------------------------------------------------

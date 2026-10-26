@@ -1,0 +1,273 @@
+#!/bin/sh
+# migrate-bootfs -- move the NVMe boot partition (p1) from /boot/firmware to
+# /boot on an already-provisioned unit (issue #65).
+#
+# Void's rpi-kernel installs into /boot. Units provisioned before the fix
+# mounted p1 at /boot/firmware, so kernel upgrades never reached the partition
+# the firmware boots from.
+#
+# Dry-run by default: prints what it would do. Pass --apply to execute.
+# Resumable: if /boot is already a vfat mount (a previous run got that far),
+# the fstab rewrite and remount are skipped, but the package re-extract and
+# the verification still run, so a half-finished run can be completed by
+# running the script again.
+# Never reboots. Never touches /music.
+#
+# The fstab rewrite is done by `mdma-admin migrate-fstab` (pure Rust, tested).
+#
+# The MIGRATE_* environment variables below exist for the stubbed test in
+# scripts/package/test-migrate-bootfs.sh; leave them unset on a real unit.
+
+set -eu
+
+APPLY=0
+case "${1:-}" in
+    --apply) APPLY=1 ;;
+    "" | --dry-run) ;;
+    -h | --help)
+        echo "usage: migrate-bootfs [--apply]   (dry-run unless --apply)"
+        exit 0
+        ;;
+    *)
+        echo "usage: migrate-bootfs [--apply]" >&2
+        exit 2
+        ;;
+esac
+
+FSTAB=${MIGRATE_FSTAB:-/etc/fstab}
+BOOT=${MIGRATE_BOOT:-/boot}
+FIRMWARE=${MIGRATE_FIRMWARE:-/boot/firmware}
+BACKUP_DIR=${MIGRATE_BACKUP_DIR:-/var/backups}
+MODULES_DIR=${MIGRATE_MODULES:-/usr/lib/modules}
+FSTAB_BACKUP=$FSTAB.pre-65
+TAR_BACKUP=$BACKUP_DIR/bootfs-pre-65.tar
+CONFIG_BACKUP=$BACKUP_DIR/bootfs-pre-65.config.txt
+MIN_FREE_MB=200
+
+info() { echo "==> $*"; }
+warn() { echo "WARNING: $*" >&2; }
+die() {
+    echo "migrate-bootfs: ERROR: $*" >&2
+    exit 1
+}
+
+# Run a mutating command, or only print it in dry-run mode.
+run() {
+    if [ "$APPLY" -eq 1 ]; then
+        echo "+ $*"
+        "$@"
+    else
+        echo "[dry-run] $*"
+    fi
+}
+
+# Filesystem type mounted exactly at $1 (empty if not a mount point).
+fstype_at() { findmnt -n -o FSTYPE -M "$1" 2>/dev/null || true; }
+
+print_rollback() {
+    cat <<EOF
+
+Rollback:
+  umount $BOOT
+  cp $FSTAB_BACKUP $FSTAB
+  mount $FIRMWARE
+
+If the files on p1 themselves are damaged, restore them from the backup
+(with p1 mounted at $FIRMWARE):
+  tar -C $FIRMWARE -xf $TAR_BACKUP
+EOF
+}
+
+ROLLBACK_ARMED=0
+NEW_FSTAB=""
+# $1 is the exit status of the script, captured by the trap before anything
+# else can clobber $?.
+on_exit() {
+    status=$1
+    if [ -n "$NEW_FSTAB" ]; then
+        rm -f "$NEW_FSTAB"
+    fi
+    if [ "$status" -ne 0 ] && [ "$ROLLBACK_ARMED" -eq 1 ]; then
+        echo "migrate-bootfs: FAILED part-way (exit $status)." >&2
+        print_rollback >&2
+    fi
+}
+# shellcheck disable=SC2154
+trap 'st=$?; on_exit "$st"' EXIT
+
+[ "$(id -u)" -eq 0 ] || die "must run as root"
+
+# --- Preconditions (nothing is changed before all of these pass) -------------
+
+if [ "$(fstype_at "$BOOT")" = "vfat" ]; then
+    RESUME=1
+    BOOT_SRC=$BOOT
+    info "$BOOT is already a vfat mount: resuming (re-extract and verify only)"
+else
+    RESUME=0
+    BOOT_SRC=$FIRMWARE
+    [ "$(fstype_at "$FIRMWARE")" = "vfat" ] ||
+        die "$FIRMWARE is not a vfat mount; nothing to migrate"
+fi
+
+xbps-query -p conf_files rpi-firmware 2>/dev/null | grep -q '/boot/cmdline.txt' ||
+    die "rpi-firmware does not list /boot/cmdline.txt as a conf_file"
+
+KPKG=$(xbps-query -p pkgver rpi-kernel) || die "rpi-kernel is not installed"
+KVER=${KPKG#rpi-kernel-}
+[ -n "$KVER" ] && [ "$KVER" != "$KPKG" ] || die "cannot parse rpi-kernel pkgver '$KPKG'"
+[ -d "$MODULES_DIR/$KVER" ] || die "$MODULES_DIR/$KVER is missing"
+
+# The re-extract must be a reinstall of exactly what is installed. A plain
+# `xbps-install -f rpi-kernel` would UPGRADE if the repository has a newer
+# kernel, deleting the modules of the running one, so both are pinned to
+# their installed pkgver.
+FWPKG=$(xbps-query -p pkgver rpi-firmware) || die "rpi-firmware is not installed"
+[ -n "$FWPKG" ] || die "cannot determine the rpi-firmware pkgver"
+
+FREE_MB=$(df -Pm "$BOOT_SRC" | awk 'NR==2 {print $4}')
+[ "${FREE_MB:-0}" -gt "$MIN_FREE_MB" ] ||
+    die "p1 has ${FREE_MB:-0} MB free; need more than $MIN_FREE_MB MB"
+
+command -v mdma-admin >/dev/null 2>&1 || die "mdma-admin not found in PATH"
+
+P1_DEV=$(findmnt -n -o SOURCE -M "$BOOT_SRC") || die "cannot determine the device mounted at $BOOT_SRC"
+ROOT_DEV=$(findmnt -n -o SOURCE -M /) || die "cannot determine the root device"
+P1_PARTUUID=$(blkid -s PARTUUID -o value "$P1_DEV") || die "cannot determine PARTUUID of $P1_DEV"
+ROOT_PARTUUID=$(blkid -s PARTUUID -o value "$ROOT_DEV") || die "cannot determine PARTUUID of $ROOT_DEV"
+[ -n "$P1_PARTUUID" ] || die "cannot determine PARTUUID of $P1_DEV"
+[ -n "$ROOT_PARTUUID" ] || die "cannot determine PARTUUID of $ROOT_DEV"
+
+# The firmware boots whatever cmdline.txt on p1 says. If it names the root by
+# device node (root=/dev/nvme0n1p2) instead of PARTUUID, the unit may not find
+# its root after the migration, so stop now, before touching anything.
+grep -q "root=PARTUUID=$ROOT_PARTUUID" "$BOOT_SRC/cmdline.txt" ||
+    die "$BOOT_SRC/cmdline.txt does not contain root=PARTUUID=$ROOT_PARTUUID.
+Nothing was changed. Fix cmdline.txt on p1 to name the root by PARTUUID
+(root=PARTUUID=$ROOT_PARTUUID) -- it may use a device node such as
+root=/dev/nvme0n1p2 -- and re-run."
+
+# The package re-extract below runs after the remount; make sure it can
+# succeed (repository reachable, packages resolvable) before we get there.
+DRY_OUT=$(xbps-install -n -Syf "$KPKG" "$FWPKG" 2>&1) ||
+    die "xbps-install dry run failed, the re-extract would fail after the remount. Nothing was changed.
+$DRY_OUT"
+
+# It must show a reinstall of exactly the installed versions and nothing else
+# (an upgrade would delete the modules of the running kernel).
+is_reinstall() {
+    printf '%s\n' "$DRY_OUT" | awk -v p="$1" '$1 == p && $2 == "reinstall" { f = 1 } END { exit !f }'
+}
+is_reinstall "$KPKG" && is_reinstall "$FWPKG" &&
+    ! printf '%s\n' "$DRY_OUT" | awk '$2 == "update" || $2 == "install" || $2 == "remove" { f = 1 } END { exit !f }' ||
+    die "the xbps dry run does not show a plain reinstall of $KPKG and $FWPKG. Nothing was changed.
+$DRY_OUT"
+
+info "rpi-kernel $KVER, p1 $P1_DEV (PARTUUID $P1_PARTUUID), root PARTUUID $ROOT_PARTUUID"
+
+if [ "$RESUME" -eq 0 ]; then
+    NEW_FSTAB=$(mktemp)
+    mdma-admin migrate-fstab --partuuid "$P1_PARTUUID" <"$FSTAB" >"$NEW_FSTAB" ||
+        die "cannot rewrite $FSTAB"
+    info "fstab change:"
+    diff -u "$FSTAB" "$NEW_FSTAB" || true
+fi
+
+if [ "$APPLY" -eq 0 ]; then
+    echo
+    info "dry-run: the following would be executed with --apply"
+fi
+
+# --- Backup (never overwrite an earlier backup: it holds the true original) --
+
+if [ "$RESUME" -eq 0 ]; then
+    [ -e "$FSTAB_BACKUP" ] || run cp "$FSTAB" "$FSTAB_BACKUP"
+fi
+run mkdir -p "$BACKUP_DIR"
+[ -e "$TAR_BACKUP" ] || run tar -C "$BOOT_SRC" -cf "$TAR_BACKUP" .
+[ -e "$CONFIG_BACKUP" ] || run cp "$BOOT_SRC/config.txt" "$CONFIG_BACKUP"
+
+if [ "$RESUME" -eq 0 ]; then
+    # --- fstab: only the /boot/firmware line changes ------------------------
+
+    ROLLBACK_ARMED=$APPLY
+    run cp "$NEW_FSTAB" "$FSTAB.new-65"
+    run mv "$FSTAB.new-65" "$FSTAB"
+
+    # --- Remount p1 at /boot ------------------------------------------------
+
+    run umount "$FIRMWARE"
+    run mount "$BOOT"
+    if [ "$APPLY" -eq 1 ]; then
+        [ "$(fstype_at "$BOOT")" = "vfat" ] || die "$BOOT is not vfat after remount"
+    fi
+fi
+
+# --- Re-extract package files so they land on p1 ----------------------------
+
+run xbps-install -Syf "$KPKG" "$FWPKG"
+
+# --- Verify -----------------------------------------------------------------
+
+if [ "$APPLY" -eq 1 ]; then
+    info "verifying"
+
+    # rpi-kernel must verify cleanly.
+    PKGDB_KERNEL=$(xbps-pkgdb rpi-kernel 2>&1) ||
+        die "xbps-pkgdb rpi-kernel reported problems: $PKGDB_KERNEL"
+    [ -z "$PKGDB_KERNEL" ] || die "xbps-pkgdb rpi-kernel reported problems: $PKGDB_KERNEL"
+
+    # rpi-firmware's config.txt/cmdline.txt are conf_files that we modify on
+    # purpose, so xbps-pkgdb flags them; anything else is a real problem.
+    PKGDB_RC=0
+    PKGDB_FW=$(xbps-pkgdb rpi-firmware 2>&1) || PKGDB_RC=$?
+    PKGDB_FW_REAL=$(printf '%s\n' "$PKGDB_FW" |
+        grep -v -e '/boot/config\.txt' -e '/boot/cmdline\.txt' | grep -v '^$' || true)
+    [ -z "$PKGDB_FW_REAL" ] || die "xbps-pkgdb rpi-firmware reported problems: $PKGDB_FW_REAL"
+    if [ "$PKGDB_RC" -ne 0 ] && [ -z "$PKGDB_FW" ]; then
+        die "xbps-pkgdb rpi-firmware failed (exit $PKGDB_RC) without output"
+    fi
+
+    grep -q "root=PARTUUID=$ROOT_PARTUUID" "$BOOT/cmdline.txt" ||
+        die "$BOOT/cmdline.txt does not contain root=PARTUUID=$ROOT_PARTUUID"
+    if [ -e "$CONFIG_BACKUP" ]; then
+        cmp -s "$CONFIG_BACKUP" "$BOOT/config.txt" ||
+            die "$BOOT/config.txt differs from backup $CONFIG_BACKUP"
+    else
+        warn "$CONFIG_BACKUP not found; cannot check that config.txt is unchanged"
+    fi
+
+    for f in "$BOOT"/*.new-*; do
+        if [ -e "$f" ]; then
+            warn "$f left behind by xbps; review and merge manually"
+        fi
+    done
+
+    sync
+    info "migration complete"
+fi
+
+# --- Next steps -------------------------------------------------------------
+
+if [ "$APPLY" -eq 1 ]; then
+    cat <<EOF
+
+Next steps (this script does NOT reboot):
+  1. Reboot with the SD card removed.
+  2. Check: uname -r        (expect $KVER)
+  3. Check: findmnt $BOOT   (expect vfat on $P1_DEV)
+  4. Once the unit has booted correctly, optional cleanup:
+     - p1 may hold a leftover backup directory from the old kernel upgrade
+       path, e.g. $BOOT/backup-6.12.87/ . If it is there and the new kernel
+       boots fine:   rm -rf $BOOT/backup-*
+     - The root filesystem's own /boot directory is now hidden underneath the
+       p1 mount and may hold stale kernel files. View them with:
+           mkdir -p /mnt/r && mount --bind / /mnt/r && ls -la /mnt/r/boot
+       and, when you are sure nothing there is needed:
+           rm -rf /mnt/r/boot/* ; umount /mnt/r
+EOF
+    print_rollback
+else
+    echo
+    info "dry-run only; nothing was changed. Re-run with --apply to migrate."
+fi
