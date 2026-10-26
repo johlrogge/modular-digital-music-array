@@ -172,7 +172,7 @@ Copy `scripts/install-mdma-macos.sh` from this repo to your Mac and run it. It r
 bash install-mdma-macos.sh
 
 # Install a specific tag
-bash install-mdma-macos.sh v0.27.0
+bash install-mdma-macos.sh v0.27.1
 
 # Install to a user-writable location (no sudo)
 MDMA_INSTALL_DIR=~/.local/bin bash install-mdma-macos.sh
@@ -190,6 +190,24 @@ cp profiles/dev/target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.27.1
+
+### Beacon self-update fixed (#66)
+
+Self-update never worked. The beacon package depended on `avahi-daemon` (a service name, not a Void package; the package is `avahi`), and SD images never configured the MDMA package repo. The package now depends on `avahi` and ships `/etc/xbps.d/10-mdma.conf`; the image build refuses to produce an image without it. The update check also no longer reports "Already at latest version" when it actually failed. Known issue: the update page may stay on "Update started" when there is nothing to update or the update fails (#67).
+
+**Upgrade note:** beacons from an image built before 0.27.1 need the repo configured once, as root on the beacon:
+
+```
+echo 'repository=https://johlrogge.github.io/modular-digital-music-array/aarch64' > /etc/xbps.d/10-mdma.conf
+xbps-install -S
+xbps-install -u beacon
+```
+
+Or flash a fresh 0.27.1 image. See CHANGELOG.md.
 
 ---
 

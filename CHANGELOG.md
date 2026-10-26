@@ -4,6 +4,38 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.27.1] — 2026-10-26
+
+### Fixed
+
+- **Beacon self-update never worked: wrong dependency.** The beacon package depended on `avahi-daemon`, which is not a Void package. The package is `avahi`; `avahi-daemon` is only its service name. Every beacon update since 0.22.1 failed with `MISSING: avahi-daemon>=0`.
+- **Beacon self-update could not find the MDMA package repo (#66).** SD images never configured the MDMA repository, so `xbps-install -u beacon` reported "Package 'beacon' not found". The beacon package now ships `/etc/xbps.d/10-mdma.conf` as a conf_file. The image build now refuses to produce an image without it, including when a stale cached platformfs is present.
+- **The update check reported "Already at latest version" when it had actually failed.** Failures are now reported with xbps's message. When the beacon is already up to date, the install step is skipped.
+
+### Correction
+
+- The 0.22.1 entry "beacon depends on `avahi-daemon` — was `avahi`" was wrong; `avahi` was the correct package name. The old line is left as it is.
+
+### Known issues
+
+- The update page may stay on "Update started" when there is nothing to update, or when the update fails (#67).
+
+### Upgrade notes
+
+Beacons from an image built before 0.27.1 have no MDMA repo configured, so they cannot self-update to 0.27.1 until you do this once, as root on the beacon (`ssh root@welcome-to-mdma.local`, password `voidlinux`):
+
+```
+echo 'repository=https://johlrogge.github.io/modular-digital-music-array/aarch64' > /etc/xbps.d/10-mdma.conf
+xbps-install -S
+xbps-install -u beacon
+```
+
+After that, the update button in the beacon UI works.
+
+No `avahi-daemon` workaround is needed when upgrading straight to 0.27.1, because xbps checks the new package's dependencies, which are correct. Alternatively, flash a fresh 0.27.1 beacon image.
+
+---
+
 ## [0.27.0] — 2026-10-26
 
 ### Added
