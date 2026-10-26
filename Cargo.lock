@@ -143,6 +143,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 name = "admin-ipc-protocol"
 version = "0.21.0"
 dependencies = [
+ "boot-health",
  "pretty_assertions",
  "serde",
  "serde_json",
@@ -2422,6 +2423,17 @@ dependencies = [
  "futures-io",
  "futures-lite",
  "piper",
+]
+
+[[package]]
+name = "boot-health"
+version = "0.26.0"
+dependencies = [
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -5749,6 +5761,7 @@ name = "mdma-admin"
 version = "0.26.0"
 dependencies = [
  "admin-ipc-protocol",
+ "boot-health",
  "clap",
  "color-eyre",
  "libc",
@@ -5844,6 +5857,7 @@ dependencies = [
  "askama",
  "async-stream",
  "axum",
+ "boot-health",
  "clap",
  "color-eyre",
  "futures",
@@ -8020,6 +8034,7 @@ dependencies = [
 name = "rpi-eeprom"
 version = "0.26.0"
 dependencies = [
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

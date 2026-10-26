@@ -1,0 +1,24 @@
+[package]
+name = "boot-health"
+version.workspace = true
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/johlrogge/modular-digital-music-array"
+license = "MIT"
+
+[package.metadata.polylith]
+interface = "boot-health"
+
+[features]
+# Types and pure verdict logic are always available; the I/O layer (`gather`,
+# `list_modules`) needs tokio and is opt-in so protocol crates stay light.
+io = ["dep:tokio"]
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+pretty_assertions = { workspace = true }
