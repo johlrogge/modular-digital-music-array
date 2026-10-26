@@ -830,11 +830,50 @@ pub struct ConfiguredSystem {
 
 impl std::fmt::Display for ConfiguredSystem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "✅ System configured")
+        write!(f, "✅ System configured\n{}", self.wifi_summary())
     }
 }
 
 impl ConfiguredSystem {
+    /// One-line description of what stage 5 does about wifi. Never includes
+    /// the PSK.
+    ///
+    /// With no wifi supplied, previous wifi setup survives only when the root
+    /// filesystem is kept: policy `Preserve` and stage 3 did not format root.
+    pub fn wifi_summary(&self) -> String {
+        match &self.config().network {
+            Some(net) => format!(
+                "wifi: SSID \"{}\" country {} → /{}, enable wpa_supplicant",
+                net.ssid(),
+                net.country(),
+                wifi_config::WPA_SUPPLICANT_CONF_PATH
+            ),
+            None => match self.config().existing_data {
+                ExistingDataPolicy::Preserve if self.root_will_be_formatted() => {
+                    "wifi: not configured — the root partition is reformatted, any previous wifi setup is removed".to_string()
+                }
+                ExistingDataPolicy::Preserve => {
+                    "wifi: not configured here — any existing wifi setup is kept".to_string()
+                }
+                ExistingDataPolicy::ReinstallOs | ExistingDataPolicy::WipeAll => {
+                    "wifi: not configured — the OS is reinstalled, any previous wifi setup is removed".to_string()
+                }
+            },
+        }
+    }
+
+    /// Whether stage 3 formats (or formatted) the root partition.
+    fn root_will_be_formatted(&self) -> bool {
+        let formatted = &self.fstab_configured.installed.mounted.formatted;
+        formatted.format_actions.iter().any(|a| match a {
+            PartitionFormatAction::WillFormat { device, .. } => self
+                .partitions()
+                .iter()
+                .any(|p| p.mount_point == MountPoint::Root && &p.device == device),
+            PartitionFormatAction::AlreadyFormatted { .. } => false,
+        })
+    }
+
     /// Get the mount point where the system is installed
     pub fn mount_root(&self) -> &std::path::Path {
         &self.fstab_configured.installed.mounted.mount_root

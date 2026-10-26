@@ -20,6 +20,7 @@ use serde::Deserialize;
 use std::convert::Infallible;
 use std::time::Duration;
 use tracing::info;
+use wifi_config::{CountryCode, NetworkConfig, WifiPassphrase, WifiSsid};
 
 use super::{spawn_with_start_signal, AppError};
 
@@ -63,6 +64,10 @@ struct LayoutErrorContext {
     unit_type: String,
     hostname: String,
     ssh_key: String,
+    /// Wifi network name and country, re-posted by the override. The
+    /// passphrase is deliberately absent: it is never echoed back into a page.
+    wifi_ssid: String,
+    wifi_country: String,
 }
 
 /// The word that must be typed to authorise `WipeAll`.
@@ -102,6 +107,47 @@ fn resolve_existing_data(
     } else {
         Ok(ExistingDataPolicy::Preserve)
     }
+}
+
+/// Turn the submitted wifi fields into a network config. The SSID and country
+/// are trimmed, so SSIDs with leading or trailing spaces are not supported; the
+/// passphrase is not trimmed (spaces are valid in it). All three blank
+/// means no wifi. There is no default country: the regulatory domain is the
+/// user's to state.
+fn resolve_network(ssid: &str, psk: &str, country: &str) -> Result<Option<NetworkConfig>, String> {
+    let ssid = ssid.trim();
+    let country = country.trim();
+
+    if ssid.is_empty() && psk.is_empty() && country.is_empty() {
+        return Ok(None);
+    }
+    if ssid.is_empty() {
+        return Err(
+            "Wifi settings were given without a network name (SSID). Nothing was changed."
+                .to_string(),
+        );
+    }
+    if psk.is_empty() {
+        return Err(
+            "A wifi network name (SSID) was given without a password. Nothing was changed."
+                .to_string(),
+        );
+    }
+    if country.is_empty() {
+        return Err(
+            "Wifi needs a two-letter country code (for example SE). Nothing was changed."
+                .to_string(),
+        );
+    }
+
+    let ssid = WifiSsid::new(ssid)
+        .map_err(|e| format!("Invalid wifi network name: {e}. Nothing was changed."))?;
+    let passphrase = WifiPassphrase::new(psk)
+        .map_err(|e| format!("Invalid wifi password: {e}. Nothing was changed."))?;
+    let country = CountryCode::new(country)
+        .map_err(|e| format!("Invalid wifi country: {e}. Nothing was changed."))?;
+
+    Ok(Some(NetworkConfig::new(ssid, &passphrase, country)))
 }
 
 /// The devices provisioning writes to. Stage 1 requires exactly the NVMe drives
@@ -183,7 +229,7 @@ struct ProvisionPageTemplate {
 }
 
 /// Provisioning form submission
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub(crate) struct ProvisionForm {
     unit_type: String,
     hostname: String,
@@ -203,6 +249,39 @@ pub(crate) struct ProvisionForm {
     /// matches the drives as they are when the form is posted.
     #[serde(default)]
     wipe_fingerprint: String,
+    /// Optional wifi network name.
+    #[serde(default)]
+    wifi_ssid: String,
+    /// Wifi passphrase. Secret: never logged (see the manual `Debug`) and never
+    /// rendered back into a page.
+    #[serde(default)]
+    wifi_psk: String,
+    /// Two-letter regulatory country code for wifi.
+    #[serde(default)]
+    wifi_country: String,
+}
+
+// Hand-written so the passphrase can never reach the log (shown at /logs).
+impl std::fmt::Debug for ProvisionForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let psk = if self.wifi_psk.is_empty() {
+            "<empty>"
+        } else {
+            "<redacted>"
+        };
+        f.debug_struct("ProvisionForm")
+            .field("unit_type", &self.unit_type)
+            .field("hostname", &self.hostname)
+            .field("ssh_key", &self.ssh_key)
+            .field("reinstall_os", &self.reinstall_os)
+            .field("wipe_all", &self.wipe_all)
+            .field("wipe_confirmation", &self.wipe_confirmation)
+            .field("wipe_fingerprint", &self.wipe_fingerprint)
+            .field("wifi_ssid", &self.wifi_ssid)
+            .field("wifi_psk", &format_args!("{psk}"))
+            .field("wifi_country", &self.wifi_country)
+            .finish()
+    }
 }
 
 /// Handler for the main page
@@ -264,7 +343,11 @@ pub async fn provision(
     let hostname = Hostname::new(form.hostname.clone())?;
     let ssh_key = SshPublicKey::new(form.ssh_key.clone())?;
 
+    let network = resolve_network(&form.wifi_ssid, &form.wifi_psk, &form.wifi_country)
+        .map_err(AppError::Validation)?;
+
     let config = ProvisionConfig {
+        network,
         ssh_key,
         unit_type,
         hostname,
@@ -335,6 +418,8 @@ pub async fn provision(
                     unit_type: form.unit_type.clone(),
                     hostname: form.hostname.clone(),
                     ssh_key: form.ssh_key.clone(),
+                    wifi_ssid: form.wifi_ssid.trim().to_string(),
+                    wifi_country: form.wifi_country.trim().to_string(),
                 }),
                 existing_drives,
                 existing_drives_error,
@@ -543,6 +628,8 @@ mod tests {
             unit_type: "mdma-909".into(),
             hostname: "h".into(),
             ssh_key: "k".into(),
+            wifi_ssid: String::new(),
+            wifi_country: String::new(),
         };
         let html = render(Some(ctx), drives);
         let field = format!("name=\"wipe_fingerprint\" value=\"{fp}\"");
@@ -552,6 +639,7 @@ mod tests {
     #[test]
     fn disk_strings_are_escaped_in_the_pages() {
         let evil = "<script>alert(1)</script>";
+        let evil_ssid = "<script>\"&";
         let html = render(
             Some(LayoutErrorContext {
                 message: evil.into(),
@@ -559,6 +647,8 @@ mod tests {
                 unit_type: "mdma-909".into(),
                 hostname: evil.into(),
                 ssh_key: evil.into(),
+                wifi_ssid: evil_ssid.into(),
+                wifi_country: evil.into(),
             }),
             vec![ExistingDrive {
                 device: "/dev/nvme0n1".into(),
@@ -566,6 +656,7 @@ mod tests {
             }],
         );
         assert!(!html.contains(evil), "unescaped markup in page");
+        assert!(!html.contains(evil_ssid), "unescaped SSID in page");
         assert!(html.contains("&lt;script&gt;"));
     }
 
@@ -592,8 +683,162 @@ mod tests {
             unit_type: "mdma-909".into(),
             hostname: "h".into(),
             ssh_key: "k".into(),
+            wifi_ssid: String::new(),
+            wifi_country: String::new(),
         };
         assert!(render(Some(ctx(true)), Vec::new()).contains("id=\"wipe-override\""));
         assert!(!render(Some(ctx(false)), Vec::new()).contains("id=\"wipe-override\""));
+    }
+
+    // ---- wifi ----
+
+    const GOOD_PSK: &str = "correct horse battery";
+
+    #[test]
+    fn all_blank_wifi_is_none() {
+        assert_eq!(resolve_network("", "", ""), Ok(None));
+        assert_eq!(resolve_network("  ", "", " "), Ok(None));
+    }
+
+    #[rstest]
+    #[case("1234567")]
+    #[case("pässword-long-enough")]
+    fn invalid_passphrase_error_does_not_echo_the_passphrase(#[case] psk: &str) {
+        let err = resolve_network("net", psk, "SE").unwrap_err();
+        assert!(err.contains("password"), "got: {err}");
+        assert!(!err.contains(psk), "error leaks the passphrase: {err}");
+    }
+
+    #[test]
+    fn valid_trio_resolves_and_normalises() {
+        let net = resolve_network("  Home Net ", GOOD_PSK, " se ")
+            .unwrap()
+            .expect("some network");
+        assert_eq!(net.ssid().as_str(), "Home Net");
+        assert_eq!(net.country().as_str(), "SE");
+    }
+
+    #[test]
+    fn passphrase_is_not_trimmed() {
+        let spaced = resolve_network("net", "  spaced out  ", "SE")
+            .unwrap()
+            .unwrap();
+        let trimmed = resolve_network("net", "spaced out", "SE").unwrap().unwrap();
+        assert_ne!(spaced.psk(), trimmed.psk());
+    }
+
+    #[rstest]
+    #[case("net", "", "SE")]
+    #[case("net", "", "")]
+    #[case("", GOOD_PSK, "SE")]
+    #[case("", GOOD_PSK, "")]
+    #[case("net", GOOD_PSK, "")]
+    #[case("", "", "SE")]
+    #[case("net", GOOD_PSK, "  ")]
+    fn incomplete_wifi_is_rejected(#[case] ssid: &str, #[case] psk: &str, #[case] country: &str) {
+        let err = resolve_network(ssid, psk, country).unwrap_err();
+        assert!(err.ends_with("Nothing was changed."), "got: {err}");
+    }
+
+    #[rstest]
+    #[case(&"s".repeat(33), GOOD_PSK, "SE", "network name")]
+    #[case("net", "short", "SE", "password")]
+    #[case("net", GOOD_PSK, "SWE", "country")]
+    #[case("net", GOOD_PSK, "S1", "country")]
+    fn invalid_wifi_values_are_rejected(
+        #[case] ssid: &str,
+        #[case] psk: &str,
+        #[case] country: &str,
+        #[case] what: &str,
+    ) {
+        let err = resolve_network(ssid, psk, country).unwrap_err();
+        assert!(err.contains(what), "got: {err}");
+        assert!(err.ends_with("Nothing was changed."), "got: {err}");
+    }
+
+    fn form_with_psk(psk: String) -> ProvisionForm {
+        ProvisionForm {
+            unit_type: "mdma-909".into(),
+            hostname: "h".into(),
+            ssh_key: "k".into(),
+            reinstall_os: false,
+            wipe_all: false,
+            wipe_confirmation: String::new(),
+            wipe_fingerprint: String::new(),
+            wifi_ssid: "net".into(),
+            wifi_psk: psk,
+            wifi_country: "SE".into(),
+        }
+    }
+
+    #[test]
+    fn form_debug_marks_empty_and_redacted_psk() {
+        assert!(format!("{:?}", form_with_psk(String::new())).contains("wifi_psk: <empty>"));
+        assert!(format!("{:?}", form_with_psk(GOOD_PSK.into())).contains("wifi_psk: <redacted>"));
+    }
+
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn form_debug_never_contains_psk(psk in "[ -~]{8,63}[g-zG-Z]") {
+                let debug = format!("{:?}", form_with_psk(psk.clone()));
+                prop_assert!(!debug.contains(&psk));
+            }
+        }
+    }
+
+    #[test]
+    fn override_page_never_echoes_the_psk() {
+        let psk = "Zq9-never-echo-me";
+        let form = form_with_psk(psk.into());
+        let html = render(
+            Some(LayoutErrorContext {
+                message: "m".into(),
+                can_wipe: true,
+                unit_type: form.unit_type.clone(),
+                hostname: form.hostname.clone(),
+                ssh_key: form.ssh_key.clone(),
+                wifi_ssid: form.wifi_ssid.clone(),
+                wifi_country: form.wifi_country.clone(),
+            }),
+            Vec::new(),
+        );
+        assert!(!html.contains(psk));
+        assert!(html.contains("name=\"wifi_ssid\" value=\"net\""));
+        assert!(html.contains("name=\"wifi_country\" value=\"SE\""));
+        // The visible password input for the override has no value and is
+        // required because an SSID was given.
+        let start = html
+            .find("name=\"wifi_psk\" id=\"override_wifi_psk\"")
+            .unwrap();
+        let end = start + html[start..].find('>').unwrap();
+        let tag = &html[start..end];
+        assert!(!tag.contains("value="), "got: {tag}");
+        assert!(tag.contains("required"), "got: {tag}");
+        assert!(tag.contains("autocomplete=\"new-password\""), "got: {tag}");
+    }
+
+    #[test]
+    fn override_psk_not_required_without_ssid() {
+        let html = render(
+            Some(LayoutErrorContext {
+                message: "m".into(),
+                can_wipe: true,
+                unit_type: "mdma-909".into(),
+                hostname: "h".into(),
+                ssh_key: "k".into(),
+                wifi_ssid: String::new(),
+                wifi_country: String::new(),
+            }),
+            Vec::new(),
+        );
+        let start = html
+            .find("name=\"wifi_psk\" id=\"override_wifi_psk\"")
+            .unwrap();
+        let end = start + html[start..].find('>').unwrap();
+        assert!(!html[start..end].contains("required"));
     }
 }
