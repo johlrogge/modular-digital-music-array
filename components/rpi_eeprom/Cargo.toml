@@ -13,3 +13,4 @@ interface = "rpi-eeprom"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tempfile = { workspace = true }

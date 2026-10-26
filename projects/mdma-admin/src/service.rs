@@ -1,8 +1,8 @@
-use admin_ipc_protocol::{AdminRequest, AdminResponse};
+use admin_ipc_protocol::{AdminRequest, AdminResponse, REBOOT_REFUSED_PREFIX};
+use boot_health::{assess, gather, BootHealth};
 use nng::options::{Options, RecvTimeout, SendTimeout};
 use rpi_eeprom::{
-    apply_eeprom_config, read_current_eeprom_config, EepromConfig, BOOT_ORDER_NVME_FIRST,
-    BOOT_ORDER_SD_FIRST,
+    read_current_eeprom_config, stage_boot_target, BootTarget, EepromConfig, BOOT_ORDER_NVME_FIRST,
 };
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
@@ -21,51 +21,24 @@ pub async fn dispatch(req: AdminRequest) -> AdminResponse {
             Ok(config) => build_status_response(&config),
         },
 
-        AdminRequest::ServiceModeEnable => {
-            let config = match read_current_eeprom_config().await {
-                Err(e) => {
-                    return AdminResponse::Error {
-                        message: format!("failed to read EEPROM config: {e}"),
-                    }
-                }
-                Ok(c) => c,
-            };
-            let pcie_probe = config.get("PCIE_PROBE").unwrap_or("0");
-            if pcie_probe != "1" {
-                return AdminResponse::Error {
-                    message: "PCIE_PROBE must be 1 before enabling service mode \
-                              — return path would break"
-                        .to_string(),
-                };
-            }
-            let new_config = config.with_boot_order(BOOT_ORDER_SD_FIRST);
-            match apply_eeprom_config(&new_config).await {
-                Ok(()) => AdminResponse::Ok,
-                Err(e) => AdminResponse::Error {
-                    message: format!("failed to apply EEPROM config: {e}"),
-                },
-            }
-        }
+        AdminRequest::ServiceModeEnable => stage_target(BootTarget::SdFirst).await,
 
-        AdminRequest::ServiceModeDisable => {
-            let config = match read_current_eeprom_config().await {
-                Err(e) => {
-                    return AdminResponse::Error {
-                        message: format!("failed to read EEPROM config: {e}"),
-                    }
-                }
-                Ok(c) => c,
-            };
-            let new_config = config.with_boot_order(BOOT_ORDER_NVME_FIRST);
-            match apply_eeprom_config(&new_config).await {
-                Ok(()) => AdminResponse::Ok,
-                Err(e) => AdminResponse::Error {
-                    message: format!("failed to apply EEPROM config: {e}"),
-                },
-            }
-        }
+        AdminRequest::ServiceModeDisable => stage_target(BootTarget::NvmeFirst).await,
 
-        AdminRequest::Reboot => {
+        AdminRequest::BootHealth => match current_boot_health().await {
+            Ok(verdict) => AdminResponse::BootHealth { verdict },
+            Err(message) => AdminResponse::Error { message },
+        },
+
+        AdminRequest::Reboot { force } => {
+            let health = current_boot_health().await;
+            if let Err(message) = check_reboot_allowed(&health, force) {
+                tracing::warn!(%message, "reboot refused");
+                return AdminResponse::Error { message };
+            }
+            if force {
+                tracing::warn!(?health, "reboot forced past boot-health guard");
+            }
             tokio::spawn(async {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 match std::process::Command::new("reboot").spawn() {
@@ -75,6 +48,44 @@ pub async fn dispatch(req: AdminRequest) -> AdminResponse {
             });
             AdminResponse::Ok
         }
+    }
+}
+
+/// Stage (and verify) an EEPROM update for `target`; also sets PCIE_PROBE=1.
+async fn stage_target(target: BootTarget) -> AdminResponse {
+    match stage_boot_target(target).await {
+        Ok(path) => {
+            tracing::info!(?target, staged = %path.display(), "EEPROM update staged");
+            AdminResponse::Ok
+        }
+        Err(e) => AdminResponse::Error {
+            message: format!("failed to stage EEPROM config: {e}"),
+        },
+    }
+}
+
+/// Gather live boot facts and assess them.
+async fn current_boot_health() -> Result<BootHealth, String> {
+    gather()
+        .await
+        .map(|facts| assess(&facts))
+        .map_err(|e| format!("failed to determine boot health: {e}"))
+}
+
+/// Reboot guard (issue #65): only a `Healthy` or `RebootPending` unit may
+/// reboot, unless `force` overrides. An unknown verdict (`Err`) also refuses.
+fn check_reboot_allowed(health: &Result<BootHealth, String>, force: bool) -> Result<(), String> {
+    if force {
+        return Ok(());
+    }
+    match health {
+        Ok(verdict) if verdict.allows_reboot() => Ok(()),
+        Ok(verdict) => Err(format!(
+            "{REBOOT_REFUSED_PREFIX}: {verdict}; fix the boot partition or pass force to override"
+        )),
+        Err(e) => Err(format!(
+            "{REBOOT_REFUSED_PREFIX}: {e}; pass force to override"
+        )),
     }
 }
 
@@ -220,7 +231,7 @@ use service::ServiceSockets;
 mod tests {
     use super::*;
     use admin_ipc_protocol::{AdminRequest, AdminResponse};
-    use rpi_eeprom::{BOOT_ORDER_NVME_FIRST, BOOT_ORDER_SD_FIRST};
+    use rpi_eeprom::BOOT_ORDER_SD_FIRST;
 
     // --- Ping → Pong ---------------------------------------------------------
 
@@ -228,6 +239,56 @@ mod tests {
     async fn ping_returns_pong() {
         let resp = dispatch(AdminRequest::Ping).await;
         assert_eq!(resp, AdminResponse::Pong);
+    }
+
+    // --- Reboot guard (issue #65) --------------------------------------------
+
+    fn pending() -> BootHealth {
+        BootHealth::RebootPending {
+            running: "6.12.90_1".to_string(),
+            installed: "6.12.95_1".to_string(),
+        }
+    }
+
+    fn unsafe_verdicts() -> Vec<BootHealth> {
+        vec![
+            BootHealth::BootfsNotMounted,
+            BootHealth::KernelImageStale {
+                pkg: "rpi-kernel-6.12.95_1".to_string(),
+            },
+            BootHealth::ModulesMissing {
+                version: "6.12.95_1".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn reboot_allowed_when_healthy_or_pending() {
+        assert!(check_reboot_allowed(&Ok(BootHealth::Healthy), false).is_ok());
+        assert!(check_reboot_allowed(&Ok(pending()), false).is_ok());
+    }
+
+    #[test]
+    fn reboot_refused_for_each_unsafe_verdict() {
+        for verdict in unsafe_verdicts() {
+            let err = check_reboot_allowed(&Ok(verdict.clone()), false).unwrap_err();
+            assert!(err.contains("refused"), "{verdict:?}: {err}");
+            assert!(err.contains(&verdict.to_string()), "{verdict:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn reboot_refused_when_health_cannot_be_determined() {
+        let err = check_reboot_allowed(&Err("xbps-query missing".to_string()), false).unwrap_err();
+        assert!(err.contains("xbps-query missing"), "{err}");
+    }
+
+    #[test]
+    fn force_overrides_every_verdict() {
+        for verdict in unsafe_verdicts() {
+            assert!(check_reboot_allowed(&Ok(verdict), true).is_ok());
+        }
+        assert!(check_reboot_allowed(&Err("boom".to_string()), true).is_ok());
     }
 
     // --- service_mode_armed boolean ------------------------------------------
@@ -281,35 +342,5 @@ mod tests {
             }
             other => panic!("expected Status, got {other:?}"),
         }
-    }
-
-    // --- ServiceModeEnable PCIE_PROBE guard ----------------------------------
-
-    #[test]
-    fn enable_guard_fires_when_pcie_probe_is_0() {
-        let raw = format!("BOOT_ORDER={BOOT_ORDER_NVME_FIRST}\nPCIE_PROBE=0\n");
-        let config = rpi_eeprom::EepromConfig::parse(&raw);
-        let pcie_probe = config.get("PCIE_PROBE").unwrap_or("0");
-        assert_eq!(pcie_probe, "0");
-        assert_ne!(pcie_probe, "1", "guard should fire: pcie_probe is not 1");
-    }
-
-    #[test]
-    fn enable_guard_passes_when_pcie_probe_is_1() {
-        let raw = format!("BOOT_ORDER={BOOT_ORDER_NVME_FIRST}\nPCIE_PROBE=1\n");
-        let config = rpi_eeprom::EepromConfig::parse(&raw);
-        let pcie_probe = config.get("PCIE_PROBE").unwrap_or("0");
-        assert_eq!(pcie_probe, "1", "guard should pass when PCIE_PROBE=1");
-    }
-
-    #[test]
-    fn enable_guard_fires_when_pcie_probe_missing() {
-        let raw = format!("BOOT_ORDER={BOOT_ORDER_NVME_FIRST}\n");
-        let config = rpi_eeprom::EepromConfig::parse(&raw);
-        let pcie_probe = config.get("PCIE_PROBE").unwrap_or("0");
-        assert_ne!(
-            pcie_probe, "1",
-            "guard should fire when PCIE_PROBE is absent"
-        );
     }
 }

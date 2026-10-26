@@ -239,6 +239,42 @@ fn read_bandcamp_username(conf_path: &std::path::Path) -> String {
         .unwrap_or_default()
 }
 
+/// Write `contents` to `path` with mode 0600 (owner read/write only).
+///
+/// Writes to a sibling temp file and renames it into place so readers never
+/// see a partial file.  Cookies are credentials, so they must never be
+/// group- or world-readable.
+async fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = path.to_path_buf();
+    let contents = contents.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let mut tmp_name = path.as_os_str().to_owned();
+        tmp_name.push(".tmp");
+        let tmp_path = std::path::PathBuf::from(tmp_name);
+        // Remove any stale temp file so `mode` applies to a fresh inode.
+        let _ = std::fs::remove_file(&tmp_path);
+        let result = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp_path)?;
+            file.write_all(&contents)?;
+            file.sync_all()?;
+            std::fs::rename(&tmp_path, &path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        result
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
 /// Check whether the cookies file parses successfully
 fn check_cookies_valid(cookies_path: &std::path::Path) -> bool {
     match std::fs::read_to_string(cookies_path) {
@@ -783,7 +819,7 @@ async fn bandcamp_configure(
     }
 
     // Save cookies file
-    if let Err(e) = tokio::fs::write(&state.bandcamp_cookies_path, cookies_str.as_bytes()).await {
+    if let Err(e) = write_private_file(&state.bandcamp_cookies_path, cookies_str.as_bytes()).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to save cookies: {}", e)})),
@@ -1697,7 +1733,7 @@ async fn admin_reboot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .ok_or_else(|| "Admin service not available".to_string())
         .and_then(|client| {
             client
-                .admin_request(&AdminRequest::Reboot)
+                .admin_request(&AdminRequest::Reboot { force: false })
                 .map_err(|e| e.to_string())
         });
 
@@ -1711,23 +1747,50 @@ async fn admin_reboot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 Err(_) => Html("<p>Rebooting…</p>").into_response(),
             }
         }
+        // Plain text bodies: the messages come from other services and must
+        // not be interpreted as HTML.
         Ok(AdminResponse::Error { message }) => {
             tracing::warn!(message, "reboot refused");
+            (reboot_error_status(&message), message).into_response()
+        }
+        Ok(other) => {
+            tracing::error!(?other, "unexpected admin response to reboot");
             (
                 StatusCode::BAD_GATEWAY,
-                Html(format!("<p>Reboot refused: {message}</p>")),
+                format!("Unexpected response from admin service: {other:?}"),
             )
                 .into_response()
         }
-        Ok(_) => Html("<p>Rebooting…</p>").into_response(),
         Err(e) => {
             tracing::error!(error = %e, "reboot failed");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Html(format!("<p>Error: {e}</p>")),
-            )
-                .into_response()
+            (StatusCode::SERVICE_UNAVAILABLE, format!("Error: {e}")).into_response()
         }
+    }
+}
+
+/// 409 for a boot-health refusal, 502 for any other admin-side failure.
+fn reboot_error_status(message: &str) -> StatusCode {
+    if admin_ipc_protocol::is_reboot_refusal(message) {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
+#[cfg(test)]
+mod reboot_status_tests {
+    use super::*;
+
+    #[test]
+    fn refusal_maps_to_conflict_other_errors_to_bad_gateway() {
+        assert_eq!(
+            reboot_error_status("reboot refused: /boot is not the vfat boot partition"),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            reboot_error_status("failed to spawn"),
+            StatusCode::BAD_GATEWAY
+        );
     }
 }
 
@@ -2335,6 +2398,30 @@ mod tests {
         let content = r#"[{"name":"identity","value":"abc123","domain":".bandcamp.com"}]"#;
         std::fs::write(&path, content).unwrap();
         assert!(check_cookies_valid(&path));
+    }
+
+    #[tokio::test]
+    async fn write_private_file_creates_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cookies.json");
+        write_private_file(&path, b"[]").await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"[]");
+    }
+
+    #[tokio::test]
+    async fn write_private_file_overwrite_tightens_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cookies.json");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private_file(&path, b"new").await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }
 
     #[test]

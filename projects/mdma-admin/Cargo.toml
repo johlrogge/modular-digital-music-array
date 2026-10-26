@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 admin-ipc-protocol = { workspace = true }
+boot-health = { workspace = true, features = ["io"] }
 rpi-eeprom = { workspace = true }
 service = { workspace = true }
 nng = { workspace = true }

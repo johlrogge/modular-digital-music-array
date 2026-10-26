@@ -55,6 +55,11 @@ pub enum BeaconError {
 
     #[error("EEPROM error")]
     Eeprom(#[from] EepromError),
+
+    /// Stage 2 refused to continue because of the disk layout. Nothing was
+    /// changed. Typed so the web UI can explain it.
+    #[error(transparent)]
+    Layout(#[from] crate::provisioning::LayoutError),
 }
 
 /// Helper to create IO error with operation context

@@ -143,6 +143,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 name = "admin-ipc-protocol"
 version = "0.21.0"
 dependencies = [
+ "boot-health",
  "pretty_assertions",
  "serde",
  "serde_json",
@@ -826,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "bevy-app"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "bevy",
  "bevy_egui",
@@ -2425,6 +2426,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "boot-health"
+version = "0.26.1"
+dependencies = [
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "bstr"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3564,7 +3576,7 @@ checksum = "c9c272297e804878a2a4b707cfcfc6d2328b5bb936944613b4fdf2b9269afdfd"
 
 [[package]]
 name = "dj-workspace"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "bevy-app",
  "clap",
@@ -5732,7 +5744,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "mdma-acid"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "acid-service",
  "clap",
@@ -5746,9 +5758,10 @@ dependencies = [
 
 [[package]]
 name = "mdma-admin"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "admin-ipc-protocol",
+ "boot-health",
  "clap",
  "color-eyre",
  "libc",
@@ -5764,7 +5777,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-audio"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "clap",
  "color-eyre",
@@ -5785,7 +5798,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-bandcamp"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "bandcamp-api",
  "chrono",
@@ -5839,11 +5852,12 @@ dependencies = [
 
 [[package]]
 name = "mdma-beacon"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "askama",
  "async-stream",
  "axum",
+ "boot-health",
  "clap",
  "color-eyre",
  "futures",
@@ -5866,7 +5880,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-cli"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "audio-transcoder",
  "chrono",
@@ -5918,7 +5932,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-console"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "admin-ipc-protocol",
  "askama",
@@ -5954,7 +5968,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-gateway"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "acid-protocol",
  "clap",
@@ -5974,7 +5988,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-library"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "clap",
  "color-eyre",
@@ -5987,7 +6001,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-playback"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "acid-client",
  "clap",
@@ -6011,7 +6025,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-tui"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "clap",
  "client",
@@ -8018,8 +8032,9 @@ dependencies = [
 
 [[package]]
 name = "rpi-eeprom"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

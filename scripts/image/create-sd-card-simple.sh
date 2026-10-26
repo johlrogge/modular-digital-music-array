@@ -38,6 +38,9 @@ if [ ! -d "$MKLIVE_DIR" ]; then
     git clone --depth 1 https://github.com/void-linux/void-mklive.git "$MKLIVE_DIR"
 else
     echo "Updating void-mklive..."
+    # Drop our patches from earlier runs so the pull cannot conflict and the
+    # patches below are applied to a pristine tree (#64).
+    git -C "$MKLIVE_DIR" checkout -- .
     git -C "$MKLIVE_DIR" pull --ff-only || true
 fi
 
@@ -54,7 +57,10 @@ sed -i 's/\[ -z "${XBPS_TARGET_ARCH##\*arm\*}" \]/[ -z "${XBPS_TARGET_ARCH##*arm
 # Patch: configure Pi 5 boot (initramfs + correct dtoverlay)
 # These config.txt tweaks must be in mkimage.sh (after boot partition is mounted)
 # not in the post-install hook (before boot partition is populated).
-sed -i '/PARTUUID.*cmdline.txt/a\\techo "initramfs initrd followkernel" >> "${ROOTFS}/boot/config.txt"\n\tsed -i "s/^dtoverlay=vc4-kms-v3d$/dtoverlay=vc4-kms-v3d-pi5/" "${ROOTFS}/boot/config.txt"' "$MKLIVE_DIR/mkimage.sh"
+# Idempotent: skip if the patch is already present.
+if ! grep -q 'initramfs initrd followkernel' "$MKLIVE_DIR/mkimage.sh"; then
+    sed -i '/PARTUUID.*cmdline.txt/a\\techo "initramfs initrd followkernel" >> "${ROOTFS}/boot/config.txt"\n\tsed -i "s/^dtoverlay=vc4-kms-v3d$/dtoverlay=vc4-kms-v3d-pi5/" "${ROOTFS}/boot/config.txt"' "$MKLIVE_DIR/mkimage.sh"
+fi
 
 mkdir -p "$OUTPUT_DIR"
 cd "$MKLIVE_DIR"

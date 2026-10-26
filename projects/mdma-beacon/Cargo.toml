@@ -14,6 +14,7 @@ path = "src/main.rs"
 http-server = { path = "../../bases/http_server" }
 storage_primitives = { path = "../../components/storage_primitives" }
 rpi-eeprom = { path = "../../components/rpi_eeprom" }
+boot-health = { workspace = true, features = ["io"] }
 tokio = { version = "1.36", features = ["full"] }
 color-eyre = "0.6"
 axum = "0.7"
