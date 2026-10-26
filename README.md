@@ -170,7 +170,7 @@ Copy `scripts/install-mdma-macos.sh` from this repo to your Mac and run it. It r
 bash install-mdma-macos.sh
 
 # Install a specific tag
-bash install-mdma-macos.sh v0.26.0
+bash install-mdma-macos.sh v0.26.1
 
 # Install to a user-writable location (no sudo)
 MDMA_INSTALL_DIR=~/.local/bin bash install-mdma-macos.sh
@@ -188,6 +188,24 @@ cp profiles/dev/target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.26.1
+
+### Boot partition and safer provisioning
+
+The NVMe boot partition is now mounted at `/boot` (#65), so kernel updates via xbps land where the firmware reads them. Before, a Pi could hang on its next reboot after `xbps-install -Su`. `mdma admin boot-health` checks the boot partition, and `mdma-admin` refuses to reboot into a kernel without matching modules (`--force` overrides).
+
+Provisioning no longer destroys data by accident: an existing partition table is never rewritten, failed reads abort, and data partitions are formatted only when created in that run. Force-wipe is replaced by "Reinstall OS" (boot/root/var only) and a deliberate "Wipe drive" that requires typing WIPE. The beacon gains a "Boot order" page (#63) for SD-first rescue or NVMe-first normal boot.
+
+### Fixes
+
+- `/etc/mdma` is writable by the `mdma` group; the Bandcamp cookie file is 0600 (#38).
+- SD image `config.txt` no longer accumulates duplicate initramfs lines (#64).
+- New ADR-006 and ADR-007; ADR-002 amended.
+
+**Upgrade note:** on units provisioned before 0.26.1, do not run `xbps-install -Su` until `migrate-bootfs` has run. Install the new `mdma-admin` first, then run `/usr/libexec/mdma/migrate-bootfs` (dry-run by default, `--apply` to change, resumable, never touches `/music`).
 
 ---
 

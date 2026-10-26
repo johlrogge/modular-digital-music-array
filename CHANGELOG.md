@@ -4,6 +4,37 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.26.1] — 2026-10-26
+
+### Fixed
+
+- **NVMe boot partition is now mounted at `/boot`** (#65) — kernel updates via xbps reached the rootfs `/boot` but not the boot partition the firmware reads, so a Pi hung on its next reboot after `xbps-install -Su`.
+- **Provisioning never destroys data by accident** (ADR-007):
+  - an existing partition table is never rewritten;
+  - failed partition reads abort instead of being treated as empty;
+  - data partitions are formatted only when created in that run;
+  - fstab uses PARTUUID, with `nofail` on data partitions;
+  - the beacon no longer updates itself mid-provision.
+- `/etc/mdma` is writable by the `mdma` group, and the Bandcamp cookie file is mode 0600 (#38).
+- The SD image's `config.txt` no longer accumulates duplicate initramfs lines (#64).
+
+### Added
+
+- **Reboot guard** — `mdma admin boot-health` checks that the boot partition holds the installed kernel, and `mdma-admin` refuses to reboot into a kernel without matching modules (`--force` overrides).
+- **`/usr/libexec/mdma/migrate-bootfs`** for already-provisioned units: dry-run by default, `--apply` to change anything, resumable, never touches `/music`.
+- **Beacon "Boot order" page** (#63) — switch between SD-first (rescue) and NVMe-first (normal).
+- ADR-006 (boot partition at `/boot`) and ADR-007 (provisioning never destroys data partitions); ADR-002 amended.
+
+### Changed
+
+- Force-wipe is replaced by **Reinstall OS** (boot/root/var only) and a deliberate **Wipe drive**, which requires typing `WIPE` and checks that the drives have not changed since the page loaded.
+
+### Upgrade notes
+
+Do not run `xbps-install -Su` on units provisioned before 0.26.1 until `migrate-bootfs` has run. Install the new `mdma-admin` first (`xbps-install -u mdma-admin`), then run `/usr/libexec/mdma/migrate-bootfs` (review the dry-run, then `--apply`).
+
+---
+
 ## [0.26.0] — 2026-10-24
 
 ### Added
