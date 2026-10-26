@@ -8,6 +8,15 @@ export RUST_LOG=info
 # before chpst drops privs) is reliable and idempotent.
 /usr/sbin/setcap 'cap_net_bind_service=+ep' /usr/bin/mdma-console
 
+# The console writes Bandcamp cookies to /etc/mdma as the 'mdma' user: the
+# directory must be group-writable by mdma, and any existing cookie file must be
+# owned by mdma and private (#38). Runs as root, before chpst drops privs.
+install -d -o root -g mdma -m 2775 /etc/mdma
+if [ -f /etc/mdma/bandcamp-cookies.json ]; then
+    chown mdma:mdma /etc/mdma/bandcamp-cookies.json
+    chmod 0600 /etc/mdma/bandcamp-cookies.json
+fi
+
 exec chpst -u mdma /usr/bin/mdma-console \
     --port 80 \
     --gateway tcp://127.0.0.1:5555 \
