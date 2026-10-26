@@ -190,7 +190,7 @@ LABEL=mdma-cdj-export /cdj-export ext4  defaults,noatime      0 2
 #### 7. Install System Packages
 ```bash
 xbps-install -S -r /mnt \
-  avahi-daemon nss-mdns \
+  avahi nss-mdns \
   alsa-utils alsa-lib \
   runit-void-apparmor \
   nfs-utils     # 909 only

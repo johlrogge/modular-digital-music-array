@@ -48,7 +48,7 @@ archs="aarch64"
 build_style=cargo
 hostmakedepends="cargo pkg-config"
 makedepends="alsa-lib-devel"
-depends="mdma-common alsa-utils avahi-daemon"
+depends="mdma-common alsa-utils avahi"
 short_desc="MDMA main processing unit"
 maintainer="Your Name <your@email>"
 license="MIT"
@@ -445,7 +445,7 @@ Repository sources live in `/etc/xbps.d/`:
 # Content: repository=https://repo-default.voidlinux.org/current/aarch64
 
 # MDMA package repo
-/etc/xbps.d/10-mdma-repo.conf
+/etc/xbps.d/10-mdma.conf
 # Content: repository=https://johlrogge.github.io/modular-digital-music-array/aarch64
 ```
 
