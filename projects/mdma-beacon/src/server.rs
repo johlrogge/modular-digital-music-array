@@ -43,6 +43,10 @@ pub async fn run(
         .route("/update", post(routes::update::update_beacon))
         .route("/stream", get(routes::provision::stream_events))
         .route("/test-stream", get(routes::provision::test_stream))
+        .route(
+            "/boot-order",
+            get(routes::boot_order::show).post(routes::boot_order::switch),
+        )
         .route("/logs", get(routes::logs::index))
         .route("/logs/:name", get(routes::logs::view))
         .route("/logs/:name/page/:n", get(routes::logs::view_page))

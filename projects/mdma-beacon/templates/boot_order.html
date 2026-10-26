@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+
+{% block title %}Boot Order{% endblock %}
+
+{% block style %}
+        body {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: flex-start;
+            justify-content: center;
+            padding: 40px 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 600px;
+            width: 100%;
+            padding: 40px;
+        }
+        h1 { color: #2c3e50; margin-bottom: 8px; font-size: 2em; }
+        .subtitle { color: #7f8c8d; margin-bottom: 30px; font-size: 0.9em; }
+        .back-link { display: inline-block; color: #667eea; text-decoration: none; margin-bottom: 20px; font-size: 0.9em; }
+        .back-link:hover { text-decoration: underline; }
+        .config-box { background: #f8f9fa; border-radius: 8px; padding: 15px; margin-bottom: 20px; color: #2c3e50; }
+        .config-box code { font-family: 'Courier New', monospace; }
+        .notice { border-radius: 8px; padding: 15px; margin-bottom: 20px; }
+        .notice.ok { background: #d4edda; border: 2px solid #27ae60; color: #1e6b3a; }
+        .notice.fail { background: #fdecea; border: 2px solid #e74c3c; color: #7f1a1a; }
+        .help-text { color: #7f8c8d; font-size: 0.85em; margin: 6px 0 16px 0; }
+        button {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 1.1em;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        button.rescue { background: linear-gradient(135deg, #f39c12 0%, #e67e22 100%); }
+{% endblock %}
+
+{% block content %}
+    <div class="container">
+        <a class="back-link" href="/">&larr; Back to home</a>
+        <h1>Boot Order</h1>
+        <p class="subtitle">Pi 5 EEPROM boot order (SD card vs NVMe)</p>
+
+        {% match message %}
+        {% when Some with (msg) %}
+        <div class="notice ok">{{ msg }}</div>
+        {% when None %}
+        {% endmatch %}
+
+        {% match failure %}
+        {% when Some with (msg) %}
+        <div class="notice fail">Failed to stage EEPROM update: {{ msg }}</div>
+        {% when None %}
+        {% endmatch %}
+
+        {% match read_error %}
+        {% when Some with (msg) %}
+        <div class="notice fail">Could not read EEPROM config: {{ msg }}</div>
+        {% when None %}
+        {% endmatch %}
+
+        <div class="config-box">
+            <div>BOOT_ORDER: <code>{{ boot_order }}</code></div>
+            <div>PCIE_PROBE: <code>{{ pcie_probe }}</code></div>
+            <div>{{ description }}</div>
+            <div class="help-text">Shows the live EEPROM. A change staged here appears only after the next reboot.</div>
+        </div>
+
+        <form action="/boot-order" method="post">
+            <input type="hidden" name="target" value="sd">
+            <button type="submit" class="rescue">Boot SD first (rescue)</button>
+            <div class="help-text">
+                The update is staged on the SD card and only applies when the Pi boots from it.
+                For a hung NVMe system:
+                <ol>
+                    <li>With the NVMe disconnected, boot the beacon from the SD card and choose this.</li>
+                    <li>Reboot with the NVMe still disconnected, so the update applies from the SD card.</li>
+                    <li>Confirm this page now shows the live BOOT_ORDER <code>0xf461</code>.</li>
+                    <li>Power off completely (never hot-plug the NVMe), reconnect the NVMe, then power on.</li>
+                </ol>
+            </div>
+        </form>
+
+        <form action="/boot-order" method="post">
+            <input type="hidden" name="target" value="nvme">
+            <button type="submit">Boot NVMe first (normal)</button>
+            <div class="help-text">
+                Restores the normal order. Reboot once with the SD card inserted so the update
+                applies, then remove the SD card.
+            </div>
+        </form>
+    </div>
+{% endblock %}
