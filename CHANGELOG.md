@@ -4,6 +4,34 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.27.0] — 2026-10-26
+
+### Added
+
+- **Optional wifi in the beacon provisioning form** (#41) — three fields: SSID, passphrase, and a required country code.
+  - The provisioned Pi prefers ethernet whenever it is plugged in and falls back to wifi otherwise. This comes from dhcpcd route metrics, with no custom fallback logic.
+  - wpa_supplicant runs from the stock runit service, pinned to wlan0.
+  - The passphrase never reaches the Pi: the beacon derives the WPA PSK (PBKDF2) and writes only that, to a 0600 file.
+  - The passphrase is redacted from all logs, including the beacon's `/logs` page. It is never echoed back into a page; the wipe-override form asks for it again.
+  - The plan summary says whether existing wifi is kept: kept when existing data is preserved; removed when the OS is reinstalled or wiped, or the root partition is reformatted.
+  - Recovery: if wifi fails, plug in ethernet and reprovision.
+  - See ADR-008.
+- **New `private-file` component** — writes credential files atomically: a unique temp file, then fsync and rename, with the exact mode applied. A symlink at the target is replaced, not followed. mdma-console's cookie file now uses it.
+- **New `wifi-config` component** — validated SSID, passphrase and country types, plus PSK derivation and wpa_supplicant config rendering.
+
+### Known limitations
+
+- WPA3-only (SAE) networks are not supported; WPA2 and WPA2/WPA3 mixed mode work.
+- Only one network can be configured.
+- Changing wifi on an already-provisioned Pi requires reprovisioning.
+- `<host>.local` may resolve to two addresses while both ethernet and wifi are up.
+
+### Upgrade notes
+
+Wifi is set only at provisioning time, so existing installs are not affected. Leaving the wifi fields blank behaves exactly like 0.26.1. The 0.26.1 migration notes (`migrate-bootfs`) still apply to Pis provisioned before 0.26.1.
+
+---
+
 ## [0.26.1] — 2026-10-26
 
 ### Fixed

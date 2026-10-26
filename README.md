@@ -100,7 +100,7 @@ This is a [Polylith](https://polylith.gitbook.io/polylith/) workspace. Deployabl
 
 | Service (project) | Description |
 |-------------------|-------------|
-| `mdma-beacon` | Provisioning server — installs and configures MDMA on a fresh Raspberry Pi |
+| `mdma-beacon` | Provisioning server — installs and configures MDMA on a fresh Raspberry Pi, with optional wifi (ethernet preferred, wifi fallback) |
 | `mdma-admin` | System-level operations service (EEPROM, reboot) — root-owned, IPC socket `0660 root:mdma` |
 | `mdma-gateway` | Single TCP gateway (port 5555) routing to all internal IPC services |
 | `mdma-library` | Library service — content-addressed storage and fact-based metadata |
@@ -125,6 +125,8 @@ This is a [Polylith](https://polylith.gitbook.io/polylith/) workspace. Deployabl
 | `music_facts` | `MusicValue` fact variants: BPM, Key, BeatGrid, MemoryCue, Role (TrackRole), Energy (1–10), and more; `FactOrigin` provenance enum |
 | `storage_primitives` | Type-safe `ByteSize` |
 | `media_protocol` | Command/Response protocol between CLI and services |
+| `private_file` | Atomic writer for credential files (unique temp file, fsync, rename, exact mode; symlinks at the target are replaced) |
+| `wifi_config` | Validated SSID, passphrase and country types; WPA PSK derivation and wpa_supplicant config rendering |
 | `rekordbox_roundtrip` | Maps rekordbox beat-grid anchors and position marks to/from MDMA facts; used by `mdma rekordbox import --enrich` and `mdma rekordbox export` |
 
 ---
@@ -170,7 +172,7 @@ Copy `scripts/install-mdma-macos.sh` from this repo to your Mac and run it. It r
 bash install-mdma-macos.sh
 
 # Install a specific tag
-bash install-mdma-macos.sh v0.26.1
+bash install-mdma-macos.sh v0.27.0
 
 # Install to a user-writable location (no sudo)
 MDMA_INSTALL_DIR=~/.local/bin bash install-mdma-macos.sh
@@ -188,6 +190,20 @@ cp profiles/dev/target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.27.0
+
+### Optional wifi at provisioning (#41)
+
+The beacon form takes an optional SSID, passphrase and (required) country code. The provisioned Pi prefers ethernet when plugged in and falls back to wifi, via dhcpcd route metrics. wpa_supplicant runs from the stock runit service on wlan0. The passphrase never reaches the Pi: the beacon derives the WPA PSK and writes only that, to a 0600 file. It is redacted from all logs and never echoed back into a page. The plan summary says whether existing wifi is kept or removed. If wifi fails, plug in ethernet and reprovision. See ADR-008.
+
+New components: `private_file` (atomic credential-file writer, now used for the console cookie file) and `wifi_config` (validated types, PSK derivation, wpa_supplicant config).
+
+**Limitations:** no WPA3-only (SAE) networks; one network only; changing wifi needs reprovisioning; `<host>.local` may resolve to two addresses while ethernet and wifi are both up.
+
+**Upgrade note:** wifi is set only at provisioning time, so existing installs are unaffected. Blank wifi fields behave exactly like 0.26.1.
 
 ---
 
