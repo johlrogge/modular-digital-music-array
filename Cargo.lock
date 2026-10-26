@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "bevy-app"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "bevy",
  "bevy_egui",
@@ -2346,7 +2346,16 @@ version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34ddef2995421ab6a5c779542c81ee77c115206f4ad9d5a8e05f4ff49716a3dd"
 dependencies = [
- "bit-vec",
+ "bit-vec 0.9.1",
+]
+
+[[package]]
+name = "bit-set"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56d87354e4229f54a44f7bf2435906a4656dba36026ab6eaca629a2c436a691c"
+dependencies = [
+ "bit-vec 0.10.1",
 ]
 
 [[package]]
@@ -2354,6 +2363,16 @@ name = "bit-vec"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b71798fca2c1fe1086445a7258a4bc81e6e49dcd24c8d0dd9a1e57395b603f51"
+
+[[package]]
+name = "bit-vec"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5727b15fa97d4f4fee0a3b7c3d550ed0269f54329207b86388de918604e31269"
+dependencies = [
+ "borsh",
+ "serde",
+]
 
 [[package]]
 name = "bitflags"
@@ -2427,13 +2446,37 @@ dependencies = [
 
 [[package]]
 name = "boot-health"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "pretty_assertions",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "borsh"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "553c5d846a6ba5150c65e3b1b8ec073bcf1abc20f9b7220de384a4443ea4e20a"
+dependencies = [
+ "borsh-derive",
+ "bytes",
+ "cfg_aliases",
+]
+
+[[package]]
+name = "borsh-derive"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12cdfe656708a01f89b451a7d36466e6fe6c414de0aa18fc54f864f6f9ca9f56"
+dependencies = [
+ "once_cell",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -2635,6 +2678,17 @@ name = "cfg_aliases"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
+
+[[package]]
+name = "chacha20"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "rand_core 0.10.1",
+]
 
 [[package]]
 name = "chrono"
@@ -3048,6 +3102,12 @@ dependencies = [
  "core-foundation 0.9.4",
  "libc",
 ]
+
+[[package]]
+name = "core_detect"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
 
 [[package]]
 name = "core_maths"
@@ -3576,7 +3636,7 @@ checksum = "c9c272297e804878a2a4b707cfcfc6d2328b5bb936944613b4fdf2b9269afdfd"
 
 [[package]]
 name = "dj-workspace"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "bevy-app",
  "clap",
@@ -4278,6 +4338,7 @@ dependencies = [
  "js-sys",
  "libc",
  "r-efi 6.0.0",
+ "rand_core 0.10.1",
  "wasip2",
  "wasip3",
  "wasm-bindgen",
@@ -5744,7 +5805,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "mdma-acid"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "acid-service",
  "clap",
@@ -5758,7 +5819,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-admin"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "admin-ipc-protocol",
  "boot-health",
@@ -5777,7 +5838,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-audio"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "clap",
  "color-eyre",
@@ -5798,7 +5859,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-bandcamp"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "bandcamp-api",
  "chrono",
@@ -5852,7 +5913,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-beacon"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "askama",
  "async-stream",
@@ -5863,6 +5924,8 @@ dependencies = [
  "futures",
  "http-server",
  "pretty_assertions",
+ "private-file",
+ "proptest",
  "rpi-eeprom",
  "rstest",
  "serde",
@@ -5876,11 +5939,12 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
+ "wifi-config",
 ]
 
 [[package]]
 name = "mdma-cli"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "audio-transcoder",
  "chrono",
@@ -5932,7 +5996,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-console"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "admin-ipc-protocol",
  "askama",
@@ -5954,6 +6018,7 @@ dependencies = [
  "nng",
  "nng-transport",
  "pretty_assertions",
+ "private-file",
  "rstest",
  "serde",
  "serde_json",
@@ -5968,7 +6033,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-gateway"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "acid-protocol",
  "clap",
@@ -5988,7 +6053,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-library"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "clap",
  "color-eyre",
@@ -6001,7 +6066,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-playback"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "acid-client",
  "clap",
@@ -6025,7 +6090,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-tui"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "clap",
  "client",
@@ -6213,7 +6278,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2bf919621e7975acb27d881bae2fb993e0d45c8e0446e85e6272971e00dc8df"
 dependencies = [
  "arrayvec",
- "bit-set",
+ "bit-set 0.9.1",
  "bitflags 2.11.1",
  "cfg-if",
  "cfg_aliases",
@@ -7469,6 +7534,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "private-file"
+version = "0.27.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "proc-macro-crate"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7491,6 +7563,26 @@ name = "profiling"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
+
+[[package]]
+name = "proptest"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8530004ccb15eae51c7e40009fbe317f341f804db54dc033eec1c50be28cfa0"
+dependencies = [
+ "bit-set 0.11.1",
+ "bit-vec 0.10.1",
+ "bitflags 2.11.1",
+ "chacha20",
+ "core_detect",
+ "num-traits",
+ "rand 0.10.2",
+ "rand_xorshift",
+ "regex-syntax 0.8.10",
+ "rusty-fork",
+ "tempfile",
+ "unarray",
+]
 
 [[package]]
 name = "psl-types"
@@ -7528,6 +7620,12 @@ dependencies = [
  "web-sys",
  "winapi",
 ]
+
+[[package]]
+name = "quick-error"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quick-error"
@@ -7719,6 +7817,15 @@ checksum = "4d431c2703ccf129de4d45253c03f49ebb22b97d6ad79ee3ecfc7e3f4862c1d8"
 dependencies = [
  "num-traits",
  "rand 0.10.2",
+]
+
+[[package]]
+name = "rand_xorshift"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60aa6af80be32871323012e02e6e65f8a7cc7890931ae421d217ad8fe0df2ccf"
+dependencies = [
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -8032,7 +8139,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-eeprom"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "tempfile",
  "thiserror 1.0.69",
@@ -8188,6 +8295,18 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
+
+[[package]]
+name = "rusty-fork"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc6bf79ff24e648f6da1f8d1f011e9cac26491b619e6b9280f2b47f1774e6ee2"
+dependencies = [
+ "fnv",
+ "quick-error 1.2.3",
+ "tempfile",
+ "wait-timeout",
+]
 
 [[package]]
 name = "ruzstd"
@@ -9051,6 +9170,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "syn"
+version = "3.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d78c8dee4c7bf0e14673097256fed6142ce9d3b85a408189d07482442145823b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "sync_wrapper"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9269,7 +9399,7 @@ dependencies = [
  "fax",
  "flate2",
  "half",
- "quick-error",
+ "quick-error 2.0.1",
  "weezl",
  "zune-jpeg",
 ]
@@ -9780,6 +9910,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "unarray"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
+
+[[package]]
 name = "unicase"
 version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9940,6 +10076,15 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "wait-timeout"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "walkdir"
@@ -10325,8 +10470,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f519832254e56965a9940c4af57dcb75f702b6f6fa4a0b172f685395843a4d7"
 dependencies = [
  "arrayvec",
- "bit-set",
- "bit-vec",
+ "bit-set 0.9.1",
+ "bit-vec 0.9.1",
  "bitflags 2.11.1",
  "bytemuck",
  "cfg_aliases",
@@ -10387,7 +10532,7 @@ dependencies = [
  "android_system_properties",
  "arrayvec",
  "ash",
- "bit-set",
+ "bit-set 0.9.1",
  "bitflags 2.11.1",
  "block2 0.6.2",
  "bytemuck",
@@ -10455,6 +10600,17 @@ dependencies = [
  "raw-window-handle",
  "serde",
  "web-sys",
+]
+
+[[package]]
+name = "wifi-config"
+version = "0.27.0"
+dependencies = [
+ "pbkdf2",
+ "proptest",
+ "rstest",
+ "sha1",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

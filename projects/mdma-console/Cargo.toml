@@ -24,6 +24,7 @@ nng-transport = { path = "../../components/nng_transport" }
 media-protocol = { path = "../../components/media_protocol" }
 library-search = { path = "../../components/library_search" }
 bandcamp-api = { path = "../../components/bandcamp_api" }
+private-file = { workspace = true }
 tokio = { version = "1.36", features = ["full"] }
 color-eyre = "0.6"
 tracing = "0.1"

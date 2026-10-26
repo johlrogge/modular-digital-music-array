@@ -1267,6 +1267,7 @@ mod tests {
                 unit_type: UnitType::Mdma909,
                 ssh_key: SshPublicKey::new("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA96k1y1Y1326DtI4csBGXSqu57wjNuBYEkyjUQ3uS7x mdma-pi-access".to_owned()).expect("works"),
                 existing_data: ExistingDataPolicy::Preserve,
+                network: None,
             },
             drives: secondary
                 .map(|s| ValidatedDrives::TwoDrives(primary.clone(), s))

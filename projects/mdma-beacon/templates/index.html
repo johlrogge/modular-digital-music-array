@@ -290,6 +290,11 @@
                     <input type="hidden" name="unit_type" value="{{ err.unit_type }}">
                     <input type="hidden" name="hostname" value="{{ err.hostname }}">
                     <input type="hidden" name="ssh_key" value="{{ err.ssh_key }}">
+                    <input type="hidden" name="wifi_ssid" value="{{ err.wifi_ssid }}">
+                    <input type="hidden" name="wifi_country" value="{{ err.wifi_country }}">
+                    <label for="override_wifi_psk">Wifi password (re-enter; it is never kept on this page)</label>
+                    <input type="password" name="wifi_psk" id="override_wifi_psk"
+                           autocomplete="new-password"{% if !err.wifi_ssid.is_empty() %} required{% endif %}>
                     <input type="hidden" name="wipe_all" value="true">
                     <input type="hidden" name="wipe_fingerprint" value="{{ wipe_fingerprint }}">
                     <label for="override_wipe_confirmation">
@@ -343,6 +348,33 @@
                     required
                 ></textarea>
                 <div class="help-text">Paste your public key from ~/.ssh/id_ed25519.pub or ~/.ssh/id_rsa.pub</div>
+            </div>
+
+            <div class="section">
+                <label for="wifi_ssid">Wifi (optional)</label>
+                <input
+                    type="text"
+                    name="wifi_ssid"
+                    id="wifi_ssid"
+                    placeholder="Network name (SSID)"
+                    maxlength="32"
+                >
+                <input
+                    type="password"
+                    name="wifi_psk"
+                    id="wifi_psk"
+                    placeholder="Password"
+                    autocomplete="new-password"
+                >
+                <input
+                    type="text"
+                    name="wifi_country"
+                    id="wifi_country"
+                    placeholder="SE"
+                    maxlength="2"
+                    pattern="[A-Za-z]{2}"
+                >
+                <div class="help-text">Optional. Leaving this blank keeps the existing wifi setup only when the OS is not reinstalled; reinstalling the OS or wiping the drive without wifi details leaves the Pi on ethernet only. Ethernet is used whenever plugged in; wifi is the fallback. If wifi fails, plug in ethernet and reprovision. WPA3-only networks are not supported (WPA2 or WPA2/WPA3 mixed mode work).</div>
             </div>
 
             <div class="section">
