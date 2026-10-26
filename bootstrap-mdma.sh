@@ -20,7 +20,7 @@ if [ -f /var/lib/mdma/.bootstrapped ]; then
 fi
 
 log "Configuring MDMA package repository..."
-cat > /etc/xbps.d/99-mdma-repo.conf << EOF
+cat > /etc/xbps.d/10-mdma.conf << EOF
 repository=${REPO_URL}/aarch64
 EOF
 
@@ -39,7 +39,7 @@ fi
 
 log "Installing dependencies..."
 # These should be pulled in by beacon's depends, but ensure they're there
-xbps-install -y dbus avahi-daemon 2>&1 | tee -a "$LOG" || true
+xbps-install -y dbus avahi 2>&1 | tee -a "$LOG" || true
 
 log "Enabling services..."
 # Enable dbus (required by avahi)

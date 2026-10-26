@@ -407,6 +407,27 @@ sudo rm -rf /var/cache/xbps/*
 sudo xbps-install -S
 ```
 
+### Beacon cannot self-update
+
+**Symptoms:**
+- `xbps-install -u beacon` (or the beacon UI update button) reports `Package 'beacon' not found in repository pool`
+- Update fails with `MISSING: avahi-daemon>=0`
+
+**Cause:** an SD image built before 0.27.1 has no MDMA repo configured, and beacon packages before 0.27.1 depend on the non-existent `avahi-daemon` (the package is `avahi`).
+
+**Fix:** as root on the beacon (`ssh root@welcome-to-mdma.local`, password `voidlinux`):
+```bash
+echo 'repository=https://johlrogge.github.io/modular-digital-music-array/aarch64' > /etc/xbps.d/10-mdma.conf
+xbps-install -S
+xbps-install -u beacon
+```
+
+Going straight to 0.27.1 needs no further workaround. If the beacon is stuck on a version below 0.27.1 and cannot go straight to 0.27.1, add a virtual package first:
+```bash
+echo 'virtualpkg=avahi-daemon:avahi' > /etc/xbps.d/20-avahi-virtual.conf
+```
+Verified on mdma-stage on 2026-10-26.
+
 ## Backup Best Practices
 
 ### What to Backup

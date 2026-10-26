@@ -117,6 +117,19 @@ fi
 # freshly-built package is used instead of whatever was cached from a previous run.
 rm -f "${MKLIVE_DIR}/xbps-cache/aarch64/beacon-"*.xbps
 
+# Invalidate a cached platformfs if the local beacon package is newer than it,
+# otherwise the image would ship an old beacon (e.g. without /etc/xbps.d/10-mdma.conf).
+if [ -n "$PLATFORMFS_TAR" ]; then
+    for pkg in "${LOCAL_REPO}"/beacon-*.xbps; do
+        if [ -f "$pkg" ] && [ "$pkg" -nt "$PLATFORMFS_TAR" ]; then
+            echo "Local beacon package is newer than cached platformfs; discarding $PLATFORMFS_TAR"
+            rm -f "$PLATFORMFS_TAR"
+            PLATFORMFS_TAR=""
+            break
+        fi
+    done
+fi
+
 if [ -z "$PLATFORMFS_TAR" ]; then
     echo "Step 2/3: Building platform rootfs with beacon..."
     echo "  Local repo : ${LOCAL_REPO}"
@@ -139,6 +152,14 @@ if [ -z "$PLATFORMFS_TAR" ]; then
     PLATFORMFS_TAR=$(ls -t void-rpi-aarch64-PLATFORMFS-*.tar.xz | head -1)
 else
     echo "Step 2/3: Using cached platformfs: $PLATFORMFS_TAR"
+fi
+
+# The beacon package must ship the xbps repo conf; fail loudly if it does not.
+if ! tar -tJf "$PLATFORMFS_TAR" | grep -q 'etc/xbps.d/10-mdma.conf'; then
+    echo "Error: $PLATFORMFS_TAR does not contain etc/xbps.d/10-mdma.conf"
+    echo "The beacon package installed into the platformfs is missing the repo conf."
+    echo "Rebuild packages ('just pkg-build-all') and delete the cached platformfs tarball."
+    exit 1
 fi
 
 # Step 3: Create bootable disk image
