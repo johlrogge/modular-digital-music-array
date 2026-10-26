@@ -74,6 +74,10 @@ the beacon pre-installed. Until that is solved, onboarding uses a bootstrap scri
 The workaround adds friction (SSH access, running a script) that we want to eliminate
 before beta.
 
+**Network:** Provisioning needs an ethernet cable once. Wifi can be configured during
+provisioning (optional SSID, passphrase and country code on the beacon form, #41), after
+which the unit runs on wifi when ethernet is unplugged. See ADR-008.
+
 ### Recovery
 
 If the system becomes unbootable or needs to be reprovisioned:
@@ -84,6 +88,9 @@ If the system becomes unbootable or needs to be reprovisioned:
 4. Music and metadata are preserved on the NVMe
 
 This gives users a safe path back without losing their library.
+
+Broken wifi (wrong passphrase, moved router) is fixed the same way: plug in ethernet and
+reprovision with the beacon (#41).
 
 ### Validation: Full Reinstall from SD Card
 
