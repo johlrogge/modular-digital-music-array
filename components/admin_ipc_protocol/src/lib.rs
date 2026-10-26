@@ -6,7 +6,17 @@
 //! - mdma-cli (consumer via gateway)
 //! - gateway envelope routing
 
+use boot_health::BootHealth;
 use serde::{Deserialize, Serialize};
+
+/// Prefix of the `AdminResponse::Error` message when a reboot is refused by
+/// the boot-health guard (as opposed to an operational failure).
+pub const REBOOT_REFUSED_PREFIX: &str = "reboot refused";
+
+/// Whether an admin error message is a boot-health reboot refusal.
+pub fn is_reboot_refusal(message: &str) -> bool {
+    message.starts_with(REBOOT_REFUSED_PREFIX)
+}
 
 // ============================================================================
 // Request Types
@@ -24,8 +34,14 @@ pub enum AdminRequest {
     ServiceModeEnable,
     /// Disarm service mode: restore NVMe-first boot order.
     ServiceModeDisable,
-    /// Trigger a system reboot.
-    Reboot,
+    /// Report whether the unit can safely reboot into its installed kernel.
+    BootHealth,
+    /// Trigger a system reboot. Refused unless boot health allows it,
+    /// unless `force` is set.
+    Reboot {
+        #[serde(default)]
+        force: bool,
+    },
 }
 
 // ============================================================================
@@ -47,6 +63,8 @@ pub enum AdminResponse {
         /// PCIE_PROBE value from rpi-eeprom-config, e.g. "1" or "0".
         pcie_probe: String,
     },
+    /// Boot health verdict (reply to `BootHealth`).
+    BootHealth { verdict: BootHealth },
     /// Success with no additional data (Enable/Disable/Reboot).
     Ok,
     /// Error response for any failure path.
@@ -65,13 +83,21 @@ mod tests {
     // ---- AdminRequest -------------------------------------------------------
 
     #[test]
+    fn reboot_refusal_is_recognised_by_prefix() {
+        assert!(is_reboot_refusal("reboot refused: /boot is not vfat"));
+        assert!(!is_reboot_refusal("failed to determine boot health: x"));
+    }
+
+    #[test]
     fn admin_request_roundtrip() {
         let variants: Vec<AdminRequest> = vec![
             AdminRequest::Ping,
             AdminRequest::ServiceModeStatus,
             AdminRequest::ServiceModeEnable,
             AdminRequest::ServiceModeDisable,
-            AdminRequest::Reboot,
+            AdminRequest::BootHealth,
+            AdminRequest::Reboot { force: false },
+            AdminRequest::Reboot { force: true },
         ];
         for req in variants {
             let json = serde_json::to_string(&req).unwrap();
@@ -119,9 +145,29 @@ mod tests {
 
     #[test]
     fn admin_request_reboot_has_type_tag() {
-        let req = AdminRequest::Reboot;
+        let req = AdminRequest::Reboot { force: false };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"type\":\"Reboot\""), "json was: {json}");
+    }
+
+    #[test]
+    fn admin_request_reboot_without_force_field_defaults_to_false() {
+        // Wire format of older clients that predate the `force` field.
+        let parsed: AdminRequest = serde_json::from_str(r#"{"type":"Reboot"}"#).unwrap();
+        assert_eq!(parsed, AdminRequest::Reboot { force: false });
+    }
+
+    #[test]
+    fn admin_response_boot_health_roundtrip() {
+        let resp = AdminResponse::BootHealth {
+            verdict: BootHealth::KernelImageStale {
+                pkg: "rpi-kernel-6.12.95_1".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"BootHealth\""), "json was: {json}");
+        let parsed: AdminResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, resp);
     }
 
     // ---- AdminResponse ------------------------------------------------------

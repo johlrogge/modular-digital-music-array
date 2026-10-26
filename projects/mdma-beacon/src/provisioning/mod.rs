@@ -19,7 +19,9 @@ mod stage6_finalize;
 
 pub use stage0_safety::CheckRaspberryPiAction;
 pub use stage1_validate::ValidateHardwareAction;
-pub use stage2_partition::PartitionDrivesAction;
+pub use stage2_partition::{
+    describe_existing_drives, ExistingDrive, LayoutError, PartitionDrivesAction,
+};
 pub use stage3_format::FormatPartitionsAction;
 pub use stage4_install::InstallSystemAction;
 pub use stage5_configure::ConfigureSystemAction;
@@ -234,6 +236,7 @@ fn build_provisioned_system_from_hardware(
                     }
                 }
             },
+            created: vec![],
         },
         format_actions: vec![],
     };
@@ -283,7 +286,7 @@ mod tests {
             hostname: Hostname::new("test-909".to_string()).unwrap(),
             unit_type: UnitType::Mdma909,
             ssh_key: SshPublicKey::new("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA96k1y1Y1326DtI4csBGXSqu57wjNuBYEkyjUQ3uS7x mdma-pi-access".to_string()).unwrap(),
-            force_wipe_partitions: false,
+            existing_data: crate::types::ExistingDataPolicy::Preserve,
         }
     }
 
@@ -297,10 +300,15 @@ mod tests {
         let result =
             build_provisioning_plan(config, hardware, crate::actions::ExecutionMode::DryRun).await;
 
-        // On non-Pi systems, expect safety check failure
+        // On non-Pi systems, expect the safety check to fail. Where it passes,
+        // the mock drive does not exist, so stage 2 must refuse (it never
+        // mistakes an unreadable disk for an empty one).
         if result.is_err() {
-            let err = result.unwrap_err();
-            assert!(err.to_string().contains("Raspberry Pi"));
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("Raspberry Pi") || err.contains("Cannot read the partition table"),
+                "unexpected error: {err}"
+            );
         }
     }
 }

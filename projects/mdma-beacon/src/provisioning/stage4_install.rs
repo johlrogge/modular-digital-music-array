@@ -2,9 +2,12 @@
 //! Stage 4: Install base system
 //!
 //! This stage is implemented as a composite of sub-actions:
-//! 1. Mount partitions
-//! 2. Install packages (xbps-install base-system)
-//! 3. Configure fstab
+//! 1. Mount partitions (root first, then `/boot` and the rest)
+//! 2. Install packages (xbps-install base-system). The boot partition is
+//!    already mounted at `<root>/boot`, so the Void kernel/firmware packages
+//!    write straight to it; if it is empty (reprovision), `PopulateBootfs`
+//!    force re-extracts the packages that own `/boot`.
+//! 3. Configure fstab (always regenerated, PARTUUID based)
 //!
 //! Note: Unmount is handled by stage 6 (finalize) so that stage 5 (configure)
 //! can work with the mounted filesystem.
@@ -13,9 +16,10 @@
 
 use crate::actions::{Action, ActionId, PlannedAction};
 use crate::error::Result;
+use crate::provisioning::stage5_configure::get_partuuid;
 use crate::provisioning::types::{
-    ConfiguredFstab, FormattedSystem, FstabPlan, FstabState, InstallPlan, InstallState,
-    InstalledPackages, MountPlan, MountState, MountedPartitions, Partition,
+    ConfiguredFstab, FilesystemType, FormattedSystem, FstabPlan, InstallPlan, InstallState,
+    InstalledPackages, MountPlan, MountPoint, MountState, MountedPartitions, Partition,
 };
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -42,9 +46,8 @@ impl Action<FormattedSystem, MountPlan, MountedPartitions> for MountPartitionsAc
     ) -> Result<PlannedAction<FormattedSystem, MountPlan, MountedPartitions, Self>> {
         let mount_root = PathBuf::from("/mnt/mdma-install");
 
-        // Collect all partitions from the partition plan, sorted by mount path length
-        // so that parent mounts are always established before child mounts
-        // (e.g. "/" before "/boot/firmware").
+        // Collect all partitions from the partition plan, ordered so that parent
+        // mounts are always established before child mounts (e.g. "/" before "/boot").
         let mut partitions: Vec<Partition> = match &input.partitioned.plan {
             crate::provisioning::types::CompletedPartitionPlan::SingleDrive {
                 partitions, ..
@@ -59,7 +62,7 @@ impl Action<FormattedSystem, MountPlan, MountedPartitions> for MountPartitionsAc
                 all
             }
         };
-        partitions.sort_by_key(|p| p.mount_point.as_str().len());
+        sort_for_mounting(&mut partitions);
 
         // Check which partitions are already mounted
         let mut mount_states = Vec::new();
@@ -128,6 +131,21 @@ impl Action<FormattedSystem, MountPlan, MountedPartitions> for MountPartitionsAc
     }
 }
 
+/// Order partitions so parents are mounted before children: shallower mount
+/// paths first ("/" before "/boot" and "/var"). The sort is stable.
+fn sort_for_mounting(partitions: &mut [Partition]) {
+    partitions.sort_by_key(|p| p.mount_point.as_path().components().count());
+}
+
+/// Whether `device` appears as the source of a mount in `mount` output
+/// (`<source> on <target> type <fs> (<opts>)`). Exact match on the source
+/// field, so `/dev/nvme0n1p1` does not match `/dev/nvme0n1p10`.
+fn is_device_mounted(mount_output: &str, device: &str) -> bool {
+    mount_output
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some(device))
+}
+
 /// Check if a device is currently mounted
 async fn check_if_mounted(device: &str) -> Result<bool> {
     let output = Command::new("mount")
@@ -136,17 +154,19 @@ async fn check_if_mounted(device: &str) -> Result<bool> {
         .map_err(|e| crate::error::BeaconError::command_failed("mount", e))?;
 
     if !output.status.success() {
-        return Ok(false);
+        return Err(crate::error::BeaconError::Provisioning(format!(
+            "`mount` failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.contains(device))
+    Ok(is_device_mounted(&stdout, device))
 }
 
 /// Mount a single partition
 async fn mount_partition(mount_root: &std::path::Path, partition: &Partition) -> Result<()> {
-    use crate::provisioning::types::MountPoint;
-
     // Determine target mount path
     let target_path = match partition.mount_point {
         MountPoint::Root => mount_root.to_path_buf(),
@@ -272,6 +292,10 @@ impl Action<MountedPartitions, InstallPlan, InstalledPackages> for InstallPackag
             }
         }
 
+        // The boot partition is mounted at <root>/boot. On a reprovision the
+        // base system may already exist while the boot partition is empty.
+        populate_bootfs(&plan.mounted.mount_root).await?;
+
         Ok(InstalledPackages {
             mounted: plan.mounted.clone(),
             packages: plan.packages.clone(),
@@ -279,40 +303,140 @@ impl Action<MountedPartitions, InstallPlan, InstalledPackages> for InstallPackag
     }
 }
 
-/// Check if base-system and rpi-base are already installed
+/// Check if the base system is already installed in the root filesystem.
+///
+/// The kernel is deliberately not checked here: `/boot` lives on its own
+/// partition, which may be empty after a reformat (see [`populate_bootfs`]).
 async fn check_if_base_system_installed(mount_root: &std::path::Path) -> InstallState {
     // Check for /usr/bin/xbps-query (from base-system)
     let xbps_query_path = mount_root.join("usr/bin/xbps-query");
-    // Check for /boot/kernel8.img (from rpi-base/rpi-kernel)
-    let kernel_path = mount_root.join("boot/kernel8.img");
 
-    let base_system_exists = tokio::fs::try_exists(&xbps_query_path)
+    if tokio::fs::try_exists(&xbps_query_path)
         .await
-        .unwrap_or(false);
-    let rpi_kernel_exists = tokio::fs::try_exists(&kernel_path).await.unwrap_or(false);
-
-    if base_system_exists && rpi_kernel_exists {
+        .unwrap_or(false)
+    {
         tracing::info!(
-            "Found {} and {} - system appears fully installed",
-            xbps_query_path.display(),
-            kernel_path.display()
+            "Found {} - base system already installed",
+            xbps_query_path.display()
         );
         InstallState::AlreadyInstalled
     } else {
-        if !base_system_exists {
-            tracing::info!(
-                "{} not found - base-system needs to be installed",
-                xbps_query_path.display()
-            );
-        }
-        if !rpi_kernel_exists {
-            tracing::info!(
-                "{} not found - rpi-base needs to be installed",
-                kernel_path.display()
-            );
-        }
+        tracing::info!(
+            "{} not found - base-system needs to be installed",
+            xbps_query_path.display()
+        );
         InstallState::NeedsInstall
     }
+}
+
+/// Packages known to own files in `/boot` (fallback when xbps-query yields none).
+const BOOT_PACKAGES: [&str; 2] = [boot_health::KERNEL_PKG, "rpi-firmware"];
+
+/// Void repositories (aarch64). `nonfree` is required for `rpi-eeprom`.
+const REPO_URL: &str = "https://repo-default.voidlinux.org/current/aarch64";
+const NONFREE_REPO_URL: &str = "https://repo-default.voidlinux.org/current/aarch64/nonfree";
+
+/// Parse `xbps-query -o '/boot/*'` output into unique package names.
+///
+/// Each line looks like `rpi-kernel-6.12.20_1: /boot/kernel8.img (regular file)`;
+/// the version is stripped from the `pkgver` before the colon. Order of first
+/// appearance is preserved.
+fn parse_boot_owners(xbps_query_output: &str) -> Vec<String> {
+    let mut owners: Vec<String> = Vec::new();
+    for line in xbps_query_output.lines() {
+        let Some((pkgver, _path)) = line.split_once(':') else {
+            continue;
+        };
+        let Some((name, _version)) = pkgver.trim().rsplit_once('-') else {
+            continue;
+        };
+        if !name.is_empty() && !owners.iter().any(|o| o == name) {
+            owners.push(name.to_string());
+        }
+    }
+    owners
+}
+
+/// Arguments for force re-extracting `packages` into `mount_root`.
+fn force_reinstall_args(mount_root: &Path, packages: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "-r".to_string(),
+        mount_root.display().to_string(),
+        "-R".to_string(),
+        REPO_URL.to_string(),
+        "-R".to_string(),
+        NONFREE_REPO_URL.to_string(),
+        "-Syf".to_string(),
+    ];
+    args.extend(packages.iter().cloned());
+    args
+}
+
+/// Find the packages that own files in `<root>/boot`, falling back to
+/// [`BOOT_PACKAGES`] when the query fails or finds nothing.
+async fn discover_boot_owners(mount_root: &Path) -> Vec<String> {
+    let queried = Command::new("xbps-query")
+        .arg("-r")
+        .arg(mount_root)
+        .args(["-o", "/boot/*"])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_boot_owners(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default();
+
+    if queried.is_empty() {
+        BOOT_PACKAGES.iter().map(|s| s.to_string()).collect()
+    } else {
+        queried
+    }
+}
+
+/// Sub-step `PopulateBootfs`: make sure the boot partition (mounted at
+/// `<root>/boot`) contains the kernel.
+///
+/// On a reprovision the root may already hold the base system while the boot
+/// partition is empty or reformatted; xbps would consider the packages
+/// installed, so they are force re-extracted.
+async fn populate_bootfs(mount_root: &Path) -> Result<()> {
+    let kernel_path = mount_root.join("boot").join(boot_health::KERNEL_IMAGE_NAME);
+    let kernel_exists = tokio::fs::try_exists(&kernel_path).await.unwrap_or(false);
+
+    if !kernel_exists {
+        let owners = discover_boot_owners(mount_root).await;
+        tracing::info!(
+            "{} missing - re-extracting boot packages: {}",
+            kernel_path.display(),
+            owners.join(", ")
+        );
+
+        copy_xbps_keys(mount_root).await?;
+        let output = Command::new("xbps-install")
+            .args(force_reinstall_args(mount_root, &owners))
+            .output()
+            .await
+            .map_err(|e| crate::error::BeaconError::command_failed("xbps-install -f", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(crate::error::BeaconError::Provisioning(format!(
+                "Failed to populate boot partition ({}): {}",
+                owners.join(" "),
+                stderr.trim()
+            )));
+        }
+    }
+
+    if !tokio::fs::try_exists(&kernel_path).await.unwrap_or(false) {
+        return Err(crate::error::BeaconError::Provisioning(format!(
+            "{} not found after install - boot partition not populated (rpi-kernel missing?)",
+            kernel_path.display()
+        )));
+    }
+
+    tracing::info!("✅ Boot partition populated ({})", kernel_path.display());
+    Ok(())
 }
 
 /// Copy xbps repository keys to the target root
@@ -384,10 +508,8 @@ async fn copy_xbps_keys(mount_root: &Path) -> Result<()> {
 
 /// Install base system packages using xbps-install
 async fn install_base_system(mount_root: &PathBuf, packages: &[String]) -> Result<()> {
-    // Void Linux repo URLs for aarch64 (Raspberry Pi 5).
-    // `nonfree` is required for `rpi-eeprom` (Pi firmware tools live there).
-    let repo_url = "https://repo-default.voidlinux.org/current/aarch64";
-    let nonfree_repo_url = "https://repo-default.voidlinux.org/current/aarch64/nonfree";
+    let repo_url = REPO_URL;
+    let nonfree_repo_url = NONFREE_REPO_URL;
 
     tracing::info!(
         "Installing packages to {}: {}",
@@ -461,16 +583,8 @@ async fn install_base_system(mount_root: &PathBuf, packages: &[String]) -> Resul
         )));
     }
 
-    // Verify rpi-base installed (check for kernel image)
-    let kernel_path = mount_root.join("boot/kernel8.img");
-    if !tokio::fs::try_exists(&kernel_path).await.unwrap_or(false) {
-        return Err(crate::error::BeaconError::Provisioning(format!(
-            "xbps-install reported success but {} not found - rpi-base installation may have failed",
-            kernel_path.display()
-        )));
-    }
-
-    tracing::info!("✅ Base system and RPi kernel installed successfully");
+    // The kernel image on the boot partition is verified by `populate_bootfs`.
+    tracing::info!("✅ Base system installed successfully");
     Ok(())
 }
 
@@ -494,13 +608,9 @@ impl Action<InstalledPackages, FstabPlan, ConfiguredFstab> for ConfigureFstabAct
         &self,
         input: &InstalledPackages,
     ) -> Result<PlannedAction<InstalledPackages, FstabPlan, ConfiguredFstab, Self>> {
-        // Check if fstab already has the expected entries
-        let config_state =
-            check_if_fstab_configured(&input.mounted.mount_root, &input.mounted.partitions).await;
-
+        // fstab is always regenerated
         let planned_work = FstabPlan {
             installed: input.clone(),
-            config_state,
         };
 
         let assumed_output = ConfiguredFstab {
@@ -517,18 +627,11 @@ impl Action<InstalledPackages, FstabPlan, ConfiguredFstab> for ConfigureFstabAct
     }
 
     async fn apply(&self, plan: &FstabPlan) -> Result<ConfiguredFstab> {
-        match plan.config_state {
-            FstabState::NeedsConfig => {
-                write_fstab(
-                    &plan.installed.mounted.mount_root,
-                    &plan.installed.mounted.partitions,
-                )
-                .await?;
-            }
-            FstabState::AlreadyConfigured => {
-                tracing::info!("fstab already configured, skipping");
-            }
-        }
+        write_fstab(
+            &plan.installed.mounted.mount_root,
+            &plan.installed.mounted.partitions,
+        )
+        .await?;
 
         Ok(ConfiguredFstab {
             installed: plan.installed.clone(),
@@ -536,86 +639,80 @@ impl Action<InstalledPackages, FstabPlan, ConfiguredFstab> for ConfigureFstabAct
     }
 }
 
-/// Check if fstab is already configured with expected partition entries
-async fn check_if_fstab_configured(
-    mount_root: &std::path::Path,
-    partitions: &[Partition],
-) -> FstabState {
-    let fstab_path = mount_root.join("etc/fstab");
-
-    // Try to read existing fstab
-    let existing_content = match tokio::fs::read_to_string(&fstab_path).await {
-        Ok(content) => content,
-        Err(_) => {
-            tracing::info!(
-                "{} does not exist or is not readable - needs configuration",
-                fstab_path.display()
-            );
-            return FstabState::NeedsConfig;
-        }
-    };
-
-    // Check if all partitions have entries in fstab
-    for partition in partitions {
-        let device = partition.device.as_str();
-        let mount_point = partition.mount_point.as_str();
-
-        // Simple check: does fstab contain both the device and mount point?
-        if !existing_content.contains(device) || !existing_content.contains(mount_point) {
-            tracing::info!(
-                "fstab missing entry for {} -> {} - needs configuration",
-                device,
-                mount_point
-            );
-            return FstabState::NeedsConfig;
-        }
-    }
-
-    tracing::info!(
-        "fstab at {} appears to have all {} partition entries",
-        fstab_path.display(),
-        partitions.len()
-    );
-    FstabState::AlreadyConfigured
+/// One fstab line's inputs: a partition identified by PARTUUID.
+#[derive(Debug, Clone, PartialEq)]
+struct FstabEntry {
+    partuuid: String,
+    mount_point: MountPoint,
 }
 
-/// Generate and write /etc/fstab
-async fn write_fstab(mount_root: &std::path::Path, partitions: &[Partition]) -> Result<()> {
-    use crate::provisioning::types::MountPoint;
+/// fstab mount options: data partitions and the boot partition are `nofail`
+/// so a missing disk never blocks boot; root and /var must mount.
+fn fstab_options(mount_point: MountPoint) -> &'static str {
+    if mount_point == MountPoint::Boot || mount_point.is_data() {
+        "defaults,nofail"
+    } else {
+        "defaults"
+    }
+}
 
-    let fstab_path = mount_root.join("etc/fstab");
+/// fsck pass: root is checked first, everything else second.
+fn fstab_pass(mount_point: MountPoint) -> u8 {
+    if mount_point == MountPoint::Root {
+        1
+    } else {
+        2
+    }
+}
 
-    tracing::info!("Writing fstab to {}", fstab_path.display());
-
-    // Generate fstab content
+/// Render /etc/fstab content from PARTUUID-identified entries (pure).
+fn render_fstab(entries: &[FstabEntry]) -> String {
     let mut content = String::new();
     content.push_str("# /etc/fstab - MDMA system partition table\n");
     content.push_str("# Generated by MDMA Beacon provisioning\n");
     content.push_str("#\n");
     content.push_str("# <device>  <mount point>  <type>  <options>  <dump>  <pass>\n\n");
 
-    for partition in partitions {
-        let device = partition.device.as_str();
-        let mount_point = partition.mount_point.as_str();
-        let fs_type = match partition.filesystem_type() {
-            crate::provisioning::types::FilesystemType::Ext4 => "ext4",
-            crate::provisioning::types::FilesystemType::Fat32 => "vfat",
+    for entry in entries {
+        let fs_type = match entry.mount_point.filesystem_type() {
+            FilesystemType::Ext4 => "ext4",
+            FilesystemType::Fat32 => "vfat",
         };
+        content.push_str(&format!(
+            "PARTUUID={}\t{}\t{}\t{}\t0\t{}\n",
+            entry.partuuid,
+            entry.mount_point.as_str(),
+            fs_type,
+            fstab_options(entry.mount_point),
+            fstab_pass(entry.mount_point)
+        ));
+    }
+    content
+}
 
-        // Root partition gets pass=1, others get pass=2
-        let pass = if partition.mount_point == MountPoint::Root {
-            1
-        } else {
-            2
-        };
+/// Generate and write /etc/fstab
+async fn write_fstab(mount_root: &std::path::Path, partitions: &[Partition]) -> Result<()> {
+    let fstab_path = mount_root.join("etc/fstab");
 
-        let line = format!(
-            "{}\t{}\t{}\tdefaults\t0\t{}\n",
-            device, mount_point, fs_type, pass
-        );
+    tracing::info!("Writing fstab to {}", fstab_path.display());
 
-        tracing::info!("  {}", line.trim());
-        content.push_str(&line);
+    let mut ordered = partitions.to_vec();
+    sort_for_mounting(&mut ordered);
+
+    let mut entries = Vec::with_capacity(ordered.len());
+    for partition in &ordered {
+        entries.push(FstabEntry {
+            partuuid: get_partuuid(partition.device.as_str()).await?,
+            mount_point: partition.mount_point,
+        });
+    }
+
+    let content = render_fstab(&entries);
+    for line in content
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+    {
+        tracing::info!("  {}", line);
     }
 
     // Ensure /etc directory exists
@@ -744,5 +841,91 @@ impl Action<FormattedSystem, InstallationPlan, ConfiguredFstab> for InstallSyste
 
         tracing::info!("✅ Installation complete (partitions remain mounted for stage 5)");
         Ok(final_output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provisioning::types::{DevicePath, PartitionSize};
+
+    fn part(mount_point: MountPoint, device: &str) -> Partition {
+        Partition {
+            device: DevicePath::new(device).expect("device"),
+            mount_point,
+            size: PartitionSize::from_mb(512),
+        }
+    }
+
+    fn entry(partuuid: &str, mount_point: MountPoint) -> FstabEntry {
+        FstabEntry {
+            partuuid: partuuid.to_string(),
+            mount_point,
+        }
+    }
+
+    #[test]
+    fn root_is_mounted_before_boot() {
+        let mut parts = vec![
+            part(MountPoint::Boot, "/dev/nvme0n1p1"),
+            part(MountPoint::Music, "/dev/nvme1n1p1"),
+            part(MountPoint::Root, "/dev/nvme0n1p2"),
+        ];
+        sort_for_mounting(&mut parts);
+        assert_eq!(parts[0].mount_point, MountPoint::Root);
+    }
+
+    #[test]
+    fn is_device_mounted_matches_exactly() {
+        let out = "/dev/nvme0n1p10 on /mnt/x type ext4 (rw)\n\
+                   /dev/nvme0n1p2 on /mnt/mdma-install type ext4 (rw)\n";
+        assert!(!is_device_mounted(out, "/dev/nvme0n1p1"));
+        assert!(is_device_mounted(out, "/dev/nvme0n1p10"));
+        assert!(is_device_mounted(out, "/dev/nvme0n1p2"));
+    }
+
+    #[test]
+    fn render_fstab_golden() {
+        let content = render_fstab(&[
+            entry("aaaa-02", MountPoint::Root),
+            entry("aaaa-01", MountPoint::Boot),
+            entry("aaaa-03", MountPoint::Var),
+            entry("aaaa-04", MountPoint::Metadata),
+            entry("bbbb-01", MountPoint::Music),
+        ]);
+        let expected = "\
+# /etc/fstab - MDMA system partition table
+# Generated by MDMA Beacon provisioning
+#
+# <device>  <mount point>  <type>  <options>  <dump>  <pass>
+
+PARTUUID=aaaa-02\t/\text4\tdefaults\t0\t1
+PARTUUID=aaaa-01\t/boot\tvfat\tdefaults,nofail\t0\t2
+PARTUUID=aaaa-03\t/var\text4\tdefaults\t0\t2
+PARTUUID=aaaa-04\t/metadata\text4\tdefaults,nofail\t0\t2
+PARTUUID=bbbb-01\t/music\text4\tdefaults,nofail\t0\t2
+";
+        assert_eq!(content, expected);
+    }
+
+    #[test]
+    fn parse_boot_owners_strips_versions_and_dedupes() {
+        let out = "rpi-kernel-6.12.20_1: /boot/kernel8.img (regular file)\n\
+                   rpi-kernel-6.12.20_1: /boot/overlays/a.dtbo (regular file)\n\
+                   rpi-firmware-20250101_1: /boot/config.txt (regular file)\n\
+                   garbage line\n";
+        assert_eq!(parse_boot_owners(out), vec!["rpi-kernel", "rpi-firmware"]);
+        assert!(parse_boot_owners("").is_empty());
+    }
+
+    #[test]
+    fn force_reinstall_args_force_extract_into_root() {
+        let args = force_reinstall_args(
+            Path::new("/mnt/mdma-install"),
+            &["rpi-kernel".to_string(), "rpi-firmware".to_string()],
+        );
+        assert_eq!(&args[..2], ["-r", "/mnt/mdma-install"]);
+        assert!(args.contains(&"-Syf".to_string()));
+        assert_eq!(&args[args.len() - 2..], ["rpi-kernel", "rpi-firmware"]);
     }
 }

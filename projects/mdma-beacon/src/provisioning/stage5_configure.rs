@@ -9,19 +9,19 @@
 //! 5. Configure sshd (disable root login)
 //! 6. Install additional packages
 //! 7. Enable services (runit)
-//! 8. Sync kernel from rootfs /boot/ to NVMe Boot partition (/boot/firmware/)
-//! 9. Write NVMe Boot partition cmdline.txt
-//! 10. Set Pi 5 EEPROM BOOT_ORDER to USB→NVMe→SD (0xf164)
+//! 8. Write boot partition cmdline.txt (`/boot/cmdline.txt`; the boot partition is
+//!    mounted at `/boot`, so the kernel packages write to it directly)
+//! 9. Set Pi 5 EEPROM BOOT_ORDER to USB→NVMe→SD (0xf164)
 
 use crate::actions::{Action, ActionId, PlannedAction};
 use crate::error::{BeaconError, Result};
-use crate::provisioning::types::{ConfiguredFstab, ConfiguredSystem};
+use crate::provisioning::types::{ConfiguredFstab, ConfiguredSystem, MountPoint, Partition};
 use rpi_eeprom::{
     apply_eeprom_config, find_staged_eeprom_file, read_current_eeprom_config,
-    verify_staged_eeprom_boot_order, BOOT_ORDER_NVME_FIRST,
+    verify_staged_eeprom_boot_order, EepromError, BOOT_ORDER_NVME_FIRST,
 };
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 #[derive(Clone, Debug)]
@@ -59,9 +59,6 @@ impl Action<ConfiguredFstab, ConfiguredSystem, ConfiguredSystem> for ConfigureSy
         let mount_root = planned_output.mount_root();
         let config = planned_output.config();
 
-        // 0. Update SD card system FIRST (ensures matching kernel versions)
-        update_sd_card_system().await?;
-
         // 1. Set hostname
         configure_hostname(mount_root, config.hostname.as_str()).await?;
 
@@ -92,19 +89,17 @@ impl Action<ConfiguredFstab, ConfiguredSystem, ConfiguredSystem> for ConfigureSy
         // 10. Enable services
         enable_services(mount_root).await?;
 
-        // 11. Sync kernel + DTBs + config.txt from rootfs /boot/ → NVMe Boot partition
-        sync_kernel_to_nvme_boot(mount_root).await?;
+        // 11. Write boot partition cmdline.txt (#55, #65) — the boot partition is
+        // mounted at /boot, so packages already wrote the kernel to it.
+        configure_nvme_boot_cmdline(mount_root, root_device(planned_output.partitions())?).await?;
 
-        // 12. Write NVMe Boot partition cmdline.txt (#55, updated for Phase 2)
-        configure_nvme_boot_cmdline(mount_root, "/dev/nvme0n1p2").await?;
-
-        // 13. Set up /music directory ownership for mdma user (#60)
+        // 12. Set up /music directory ownership for mdma user (#60)
         setup_music_directory(mount_root).await?;
 
-        // 14. Seed bandcamp.conf if not already present (#61)
+        // 13. Seed bandcamp.conf if not already present (#61)
         seed_bandcamp_config(mount_root).await?;
 
-        // 15. Set EEPROM BOOT_ORDER to USB→NVMe→SD — MUST be last (#22)
+        // 14. Set EEPROM BOOT_ORDER to USB→NVMe→SD — MUST be last (#22)
         configure_pi_eeprom_boot_order().await?;
 
         tracing::info!("✅ Stage 5: System configuration complete");
@@ -112,37 +107,13 @@ impl Action<ConfiguredFstab, ConfiguredSystem, ConfiguredSystem> for ConfigureSy
     }
 }
 
-/// Update the SD card (running system) before configuring NVMe
-///
-/// This ensures both SD and NVMe have matching kernel versions,
-/// allowing easy switching between boot sources via cmdline.txt.
-async fn update_sd_card_system() -> Result<()> {
-    tracing::info!("Updating SD card system packages (for kernel matching)");
-
-    // Sync and update all packages on the running system
-    let output = Command::new("xbps-install")
-        .args(["-Syu"])
-        .output()
-        .await
-        .map_err(|e| BeaconError::command_failed("xbps-install -Syu", e))?;
-
-    // Log output
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        tracing::info!("  [xbps] {}", line);
-    }
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Don't fail if already up to date
-        if !stderr.contains("up to date") {
-            tracing::warn!("xbps-install -Syu returned non-zero: {}", stderr);
-            // Continue anyway - kernel sync will handle mismatches
-        }
-    }
-
-    tracing::info!("✅ SD card system updated");
-    Ok(())
+/// Find the device of the Root partition in the provisioning plan.
+fn root_device(partitions: &[Partition]) -> Result<&str> {
+    partitions
+        .iter()
+        .find(|p| p.mount_point == MountPoint::Root)
+        .map(|p| p.device.as_str())
+        .ok_or_else(|| BeaconError::Provisioning("No Root partition in provisioning plan".into()))
 }
 
 /// Set hostname from ProvisionConfig
@@ -565,17 +536,11 @@ async fn install_mdma_packages(mount_root: &Path) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Don't fail provisioning if MDMA packages aren't available yet
-        // This allows provisioning to work before packages are published
-        tracing::warn!(
-            "MDMA packages not installed (may not be published yet): {}",
-            stderr
-        );
-        tracing::warn!(
-            "You can install them manually later with: xbps-install {}",
-            TARGET_PACKAGES.join(" ")
-        );
-        return Ok(());
+        return Err(BeaconError::Provisioning(format!(
+            "Failed to install MDMA packages ({}): {}",
+            TARGET_PACKAGES.join(" "),
+            stderr.trim()
+        )));
     }
 
     tracing::info!("✅ MDMA packages installed");
@@ -754,169 +719,11 @@ async fn enable_services(mount_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Sync kernel, DTBs, overlays, and config.txt from the installed rootfs to the
-/// NVMe Boot partition.
-///
-/// After `rpi5-kernel` and `rpi-firmware` are installed into the rootfs during
-/// stage 4, they land in `mount_root/boot/`. The NVMe Boot partition (a separate
-/// FAT32 partition, mounted at `mount_root/boot/firmware/` per Phase 1 of #22)
-/// is what the Pi firmware actually reads at boot time. This function populates it.
-///
-/// Files copied:
-/// - `kernel8.img`          — Pi 5 kernel
-/// - `*.dtb`                — device tree blobs
-/// - `*.dtbo`               — device tree overlays
-/// - `config.txt`           — firmware configuration
-/// - `initramfs-*.img`      — dracut initramfs if present
-pub(crate) async fn sync_kernel_to_nvme_boot(mount_root: &Path) -> Result<()> {
-    tracing::info!("Syncing kernel + firmware to NVMe Boot partition");
-
-    let src = mount_root.join("boot");
-    let dest = mount_root.join("boot/firmware");
-
-    // Verify source kernel exists (installed by rpi5-kernel package in stage 4)
-    let src_kernel = src.join("kernel8.img");
-    if !src_kernel.exists() {
-        return Err(BeaconError::Provisioning(format!(
-            "kernel8.img not found at {} — rpi5-kernel may not have been installed",
-            src_kernel.display()
-        )));
-    }
-
-    // Ensure destination exists (should be mounted, but create defensively)
-    tokio::fs::create_dir_all(&dest).await.map_err(|e| {
-        BeaconError::Provisioning(format!("Failed to create {}: {}", dest.display(), e))
-    })?;
-
-    // Copy kernel8.img
-    tracing::info!("  Copying kernel8.img");
-    tokio::fs::copy(&src_kernel, dest.join("kernel8.img"))
-        .await
-        .map_err(|e| BeaconError::Provisioning(format!("Failed to copy kernel8.img: {}", e)))?;
-
-    // Copy config.txt — hard error if missing (rpi-firmware not installed)
-    let src_config = src.join("config.txt");
-    if src_config.exists() {
-        tracing::info!("  Copying config.txt");
-        tokio::fs::copy(&src_config, dest.join("config.txt"))
-            .await
-            .map_err(|e| BeaconError::Provisioning(format!("Failed to copy config.txt: {}", e)))?;
-    } else {
-        return Err(BeaconError::Provisioning(format!(
-            "config.txt not found at {} — rpi-firmware package may not be installed in rootfs",
-            src_config.display()
-        )));
-    }
-
-    // Copy *.dtb and initramfs-*.img from flat boot/
-    let mut dtb_count = 0usize;
-    let mut initramfs_count = 0usize;
-
-    let mut entries = tokio::fs::read_dir(&src).await.map_err(|e| {
-        BeaconError::Provisioning(format!("Failed to read {}: {}", src.display(), e))
-    })?;
-
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|e| BeaconError::Provisioning(format!("Failed to read dir entry: {}", e)))?
-    {
-        let path = entry.path();
-        let filename = match path.file_name() {
-            Some(f) => f.to_owned(),
-            None => continue,
-        };
-        let name_str = filename.to_string_lossy();
-
-        let should_copy = if let Some(ext) = path.extension() {
-            let ext = ext.to_string_lossy();
-            if ext == "dtb" {
-                dtb_count += 1;
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        let should_copy =
-            should_copy || (name_str.starts_with("initramfs-") && name_str.ends_with(".img"));
-        if name_str.starts_with("initramfs-") && name_str.ends_with(".img") {
-            initramfs_count += 1;
-        }
-
-        if should_copy {
-            tokio::fs::copy(&path, dest.join(&filename))
-                .await
-                .map_err(|e| {
-                    BeaconError::Provisioning(format!("Failed to copy {}: {}", path.display(), e))
-                })?;
-        }
-    }
-
-    // Copy boot/overlays/*.dtbo → boot/firmware/overlays/*.dtbo
-    // Overlays are provided by rpi-kernel and must be in <bootfs>/overlays/ for the firmware.
-    let src_overlays = src.join("overlays");
-    if !src_overlays.exists() {
-        return Err(BeaconError::Provisioning(format!(
-            "boot/overlays/ not found at {} — rpi-kernel package may not be installed in rootfs",
-            src_overlays.display()
-        )));
-    }
-    let dest_overlays = dest.join("overlays");
-    tokio::fs::create_dir_all(&dest_overlays)
-        .await
-        .map_err(|e| {
-            BeaconError::Provisioning(format!(
-                "Failed to create {}: {}",
-                dest_overlays.display(),
-                e
-            ))
-        })?;
-
-    let mut dtbo_count = 0usize;
-    let mut overlay_entries = tokio::fs::read_dir(&src_overlays).await.map_err(|e| {
-        BeaconError::Provisioning(format!("Failed to read {}: {}", src_overlays.display(), e))
-    })?;
-
-    while let Some(entry) = overlay_entries.next_entry().await.map_err(|e| {
-        BeaconError::Provisioning(format!("Failed to read overlay dir entry: {}", e))
-    })? {
-        let path = entry.path();
-        let filename = match path.file_name() {
-            Some(f) => f.to_owned(),
-            None => continue,
-        };
-        if path.extension().map(|e| e == "dtbo").unwrap_or(false) {
-            tokio::fs::copy(&path, dest_overlays.join(&filename))
-                .await
-                .map_err(|e| {
-                    BeaconError::Provisioning(format!(
-                        "Failed to copy overlay {}: {}",
-                        path.display(),
-                        e
-                    ))
-                })?;
-            dtbo_count += 1;
-        }
-    }
-
-    tracing::info!(
-        "  Copied {} dtb, {} dtbo (overlays), {} initramfs files",
-        dtb_count,
-        dtbo_count,
-        initramfs_count
-    );
-    tracing::info!("NVMe Boot partition populated");
-    Ok(())
-}
-
 /// Look up the PARTUUID for a block device using blkid.
 ///
 /// Returns the PARTUUID string (e.g. `"abc123ef-02"`) or an error if blkid
 /// fails or the device has no PARTUUID.
-async fn get_partuuid(device: &str) -> Result<String> {
+pub(crate) async fn get_partuuid(device: &str) -> Result<String> {
     let output = Command::new("blkid")
         .args(["-s", "PARTUUID", "-o", "value", device])
         .output()
@@ -1021,27 +828,35 @@ async fn write_cmdline(root_partuuid: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Write NVMe Boot partition `cmdline.txt` so it boots from the NVMe root partition (#55, updated for #22 Phase 2).
+/// Path of the boot partition's `cmdline.txt` (boot partition is mounted at `/boot`, #65).
+fn boot_cmdline_path(mount_root: &Path) -> PathBuf {
+    mount_root.join("boot/cmdline.txt")
+}
+
+/// Write `<mount_root>/boot/cmdline.txt` booting from `root_partuuid`.
+async fn write_boot_cmdline(mount_root: &Path, root_partuuid: &str) -> Result<()> {
+    let cmdline = boot_cmdline_path(mount_root);
+    // Ensure the directory exists (should be mounted, but create defensively)
+    if let Some(parent) = cmdline.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            BeaconError::Provisioning(format!("Failed to create {}: {}", parent.display(), e))
+        })?;
+    }
+    write_cmdline(root_partuuid, &cmdline).await
+}
+
+/// Write NVMe Boot partition `cmdline.txt` so it boots from the NVMe root partition (#55, #65).
 ///
-/// Without this, the NVMe's `/boot/cmdline.txt` still contains whatever the
-/// tarball default was (e.g. `root=/dev/mmcblk0p2`), which would cause a boot
-/// loop if the Pi ever loads the NVMe's boot partition directly.
+/// The boot partition is mounted at `<mount_root>/boot`, so the Void kernel
+/// packages write straight to it. `cmdline.txt` is a conf_file of `rpi-firmware`,
+/// so the rewritten copy survives package updates.
 async fn configure_nvme_boot_cmdline(mount_root: &Path, nvme_root_device: &str) -> Result<()> {
     tracing::info!("Writing NVMe Boot partition cmdline.txt");
 
     let partuuid = get_partuuid(nvme_root_device).await?;
     tracing::info!("  NVMe root PARTUUID: {}", partuuid);
 
-    // Phase 1 of #22 mounts the NVMe Boot (FAT32) partition at boot/firmware/
-    let nvme_cmdline = mount_root.join("boot/firmware/cmdline.txt");
-    // Ensure the directory exists (should be mounted, but create defensively)
-    if let Some(parent) = nvme_cmdline.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            BeaconError::Provisioning(format!("Failed to create {}: {}", parent.display(), e))
-        })?;
-    }
-
-    write_cmdline(&partuuid, &nvme_cmdline).await?;
+    write_boot_cmdline(mount_root, &partuuid).await?;
 
     tracing::info!("✅ NVMe Boot partition cmdline.txt written");
     Ok(())
@@ -1088,13 +903,8 @@ async fn configure_pi_eeprom_boot_order() -> Result<()> {
     // `rpi-eeprom-config --apply` writes pieeprom.upd to the bootfs;
     // the live EEPROM is only re-flashed on next reboot, so reading live
     // EEPROM here would always return the OLD value.
-    let staged_path = find_staged_eeprom_file().ok_or_else(|| {
-        BeaconError::Provisioning(
-            "rpi-eeprom-config --apply did not produce a staged file \
-             (checked /boot/firmware/pieeprom.upd and /boot/pieeprom.upd)"
-                .to_string(),
-        )
-    })?;
+    let staged_path = find_staged_eeprom_file()
+        .ok_or_else(|| BeaconError::Provisioning(EepromError::NoStagedFile.to_string()))?;
     tracing::info!("  Found staged EEPROM file: {}", staged_path.display());
 
     verify_staged_eeprom_boot_order(&staged_path)
@@ -1107,6 +917,15 @@ async fn configure_pi_eeprom_boot_order() -> Result<()> {
     );
     Ok(())
 }
+
+/// Directories (inside the target) that provisioning creates and chowns to
+/// `mdma:mdma`. Chowned non-recursively so an existing library is not walked.
+const MUSIC_CHOWN_PATHS: [&str; 4] = [
+    "/music",
+    "/music/downloads",
+    "/music/inbox",
+    "/music/by-artist",
+];
 
 /// Set up /music directory and required subdirectories for the mdma user (#60).
 ///
@@ -1125,10 +944,12 @@ async fn setup_music_directory(mount_root: &Path) -> Result<()> {
         tracing::info!("  Created {}", path.display());
     }
 
-    // chown -R mdma:mdma /music (inside the target)
+    // Non-recursive chown of only the directories provisioning creates (inside
+    // the target). A recursive chown would walk the whole existing library.
     let output = Command::new("chroot")
         .arg(mount_root)
-        .args(["chown", "-R", "mdma:mdma", "/music"])
+        .args(["chown", "mdma:mdma"])
+        .args(MUSIC_CHOWN_PATHS)
         .output()
         .await
         .map_err(|e| BeaconError::command_failed("chroot chown /music", e))?;
@@ -1191,8 +1012,10 @@ async fn seed_bandcamp_config(mount_root: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{rewrite_cmdline, sync_kernel_to_nvme_boot, TARGET_PACKAGES};
-    use crate::error::BeaconError;
+    use super::{
+        boot_cmdline_path, rewrite_cmdline, root_device, write_boot_cmdline, MountPoint, Partition,
+        MUSIC_CHOWN_PATHS, TARGET_PACKAGES,
+    };
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -1339,124 +1162,62 @@ mod tests {
         );
     }
 
-    // ── #22 Phase 2: NVMe boot kernel sync ───────────────────────────────────
+    // ── #65: boot partition is mounted at /boot ──────────────────────────────
 
-    #[tokio::test]
-    async fn sync_kernel_to_nvme_boot_copies_files() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mount_root = dir.path();
-
-        // Set up fake mount_root/boot/ with kernel + dtbs + config.txt
-        let boot = mount_root.join("boot");
-        std::fs::create_dir_all(&boot).expect("create boot");
-        std::fs::write(boot.join("kernel8.img"), b"fake-kernel").expect("write kernel");
-        std::fs::write(boot.join("bcm2712-rpi-5-b.dtb"), b"fake-dtb").expect("write dtb");
-        std::fs::write(boot.join("config.txt"), b"# rpi config").expect("write config");
-
-        // Overlays live in boot/overlays/ — provided by rpi-kernel package
-        let overlays = boot.join("overlays");
-        std::fs::create_dir_all(&overlays).expect("create overlays");
-        std::fs::write(overlays.join("some.dtbo"), b"fake-overlay").expect("write dtbo");
-
-        // Destination must exist (mount point for NVMe Boot partition)
-        let firmware = mount_root.join("boot/firmware");
-        std::fs::create_dir_all(&firmware).expect("create firmware");
-
-        sync_kernel_to_nvme_boot(mount_root)
-            .await
-            .expect("sync_kernel_to_nvme_boot");
-
-        assert!(
-            firmware.join("kernel8.img").exists(),
-            "kernel8.img missing from firmware"
-        );
-        assert!(
-            firmware.join("bcm2712-rpi-5-b.dtb").exists(),
-            "dtb missing from firmware"
-        );
-        assert!(
-            firmware.join("config.txt").exists(),
-            "config.txt missing from firmware"
-        );
-        // Overlays must be in firmware/overlays/, not flat in firmware/
-        assert!(
-            firmware.join("overlays/some.dtbo").exists(),
-            "some.dtbo missing from firmware/overlays/"
-        );
-        assert!(
-            !firmware.join("some.dtbo").exists(),
-            "dtbo must NOT be copied flat into firmware/ — must be in overlays/"
+    #[test]
+    fn boot_cmdline_path_is_boot_cmdline_txt() {
+        let root = std::path::Path::new("/mnt/mdma-install");
+        assert_eq!(
+            boot_cmdline_path(root),
+            std::path::PathBuf::from("/mnt/mdma-install/boot/cmdline.txt")
         );
     }
 
     #[tokio::test]
-    async fn sync_kernel_to_nvme_boot_errors_on_missing_config_txt() {
+    async fn write_boot_cmdline_writes_to_boot_cmdline_txt() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mount_root = dir.path();
 
-        let boot = mount_root.join("boot");
-        std::fs::create_dir_all(&boot).expect("create boot");
-        std::fs::write(boot.join("kernel8.img"), b"fake-kernel").expect("write kernel");
-        // No config.txt — rpi-firmware not installed
-        let overlays = boot.join("overlays");
-        std::fs::create_dir_all(&overlays).expect("create overlays");
-
-        let firmware = mount_root.join("boot/firmware");
-        std::fs::create_dir_all(&firmware).expect("create firmware");
-
-        let err = sync_kernel_to_nvme_boot(mount_root)
+        write_boot_cmdline(mount_root, "aabbccdd-02")
             .await
-            .expect_err("should fail when config.txt is missing");
+            .expect("write_boot_cmdline");
 
-        match err {
-            BeaconError::Provisioning(msg) => {
-                assert!(
-                    msg.contains("config.txt"),
-                    "error should mention config.txt, got: {}",
-                    msg
-                );
-                assert!(
-                    msg.contains("rpi-firmware"),
-                    "error should mention rpi-firmware, got: {}",
-                    msg
-                );
-            }
-            other => panic!("expected Provisioning error, got: {:?}", other),
-        }
+        let written = std::fs::read_to_string(mount_root.join("boot/cmdline.txt"))
+            .expect("boot/cmdline.txt must exist");
+        assert!(written.contains("root=PARTUUID=aabbccdd-02"), "{written}");
+        assert!(
+            !mount_root.join("boot/firmware").exists(),
+            "must not create boot/firmware"
+        );
     }
 
-    #[tokio::test]
-    async fn sync_kernel_to_nvme_boot_errors_on_missing_overlays_dir() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mount_root = dir.path();
+    #[test]
+    fn root_device_comes_from_the_plan_root_partition() {
+        use crate::provisioning::types::{DevicePath, PartitionSize};
 
-        let boot = mount_root.join("boot");
-        std::fs::create_dir_all(&boot).expect("create boot");
-        std::fs::write(boot.join("kernel8.img"), b"fake-kernel").expect("write kernel");
-        std::fs::write(boot.join("config.txt"), b"# rpi config").expect("write config");
-        // No overlays/ dir — rpi-kernel not installed
+        let part = |mp, dev: &str| Partition {
+            device: DevicePath::new(dev).expect("device"),
+            mount_point: mp,
+            size: PartitionSize::from_mb(512),
+        };
+        let parts = vec![
+            part(MountPoint::Boot, "/dev/nvme0n1p1"),
+            part(MountPoint::Root, "/dev/nvme0n1p2"),
+        ];
+        assert_eq!(root_device(&parts).expect("root"), "/dev/nvme0n1p2");
+        assert!(root_device(&parts[..1]).is_err());
+    }
 
-        let firmware = mount_root.join("boot/firmware");
-        std::fs::create_dir_all(&firmware).expect("create firmware");
-
-        let err = sync_kernel_to_nvme_boot(mount_root)
-            .await
-            .expect_err("should fail when boot/overlays/ is missing");
-
-        match err {
-            BeaconError::Provisioning(msg) => {
-                assert!(
-                    msg.contains("overlays"),
-                    "error should mention overlays, got: {}",
-                    msg
-                );
-                assert!(
-                    msg.contains("rpi-kernel"),
-                    "error should mention rpi-kernel, got: {}",
-                    msg
-                );
-            }
-            other => panic!("expected Provisioning error, got: {:?}", other),
-        }
+    #[test]
+    fn music_chown_paths_are_the_created_directories() {
+        assert_eq!(
+            MUSIC_CHOWN_PATHS,
+            [
+                "/music",
+                "/music/downloads",
+                "/music/inbox",
+                "/music/by-artist"
+            ]
+        );
     }
 }

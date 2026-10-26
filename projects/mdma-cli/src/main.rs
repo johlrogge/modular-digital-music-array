@@ -782,8 +782,14 @@ enum AdminCommands {
         #[command(subcommand)]
         command: ServiceModeCommands,
     },
-    /// Reboot the host
-    Reboot,
+    /// Report whether the host can safely reboot into its installed kernel
+    BootHealth,
+    /// Reboot the host (refused if the boot partition looks unhealthy)
+    Reboot {
+        /// Reboot even if the boot-health check fails
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -4902,8 +4908,33 @@ fn handle_admin_service_mode_disable(client: &GatewayClient) -> Result<()> {
     }
 }
 
-fn handle_admin_reboot(client: &GatewayClient) -> Result<()> {
-    match client.admin_request(&AdminRequest::Reboot) {
+/// Print the boot-health verdict; exit 1 when a reboot would not be safe.
+fn handle_admin_boot_health(client: &GatewayClient) -> Result<()> {
+    match client.admin_request(&AdminRequest::BootHealth) {
+        Ok(AdminResponse::BootHealth { verdict }) => {
+            println!("Boot health: {verdict}");
+            if !verdict.allows_reboot() {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Ok(AdminResponse::Error { message }) => {
+            eprintln!("error: {}", message);
+            std::process::exit(1);
+        }
+        Ok(other) => {
+            eprintln!("unexpected response: {:?}", other);
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("request failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_admin_reboot(client: &GatewayClient, force: bool) -> Result<()> {
+    match client.admin_request(&AdminRequest::Reboot { force }) {
         Ok(AdminResponse::Ok) => {
             println!("Reboot initiated. Connection will drop within ~2 seconds.");
             Ok(())
@@ -5277,7 +5308,8 @@ fn main() -> Result<()> {
                     ServiceModeCommands::Enable => handle_admin_service_mode_enable(&admin),
                     ServiceModeCommands::Disable => handle_admin_service_mode_disable(&admin),
                 },
-                AdminCommands::Reboot => handle_admin_reboot(&admin),
+                AdminCommands::BootHealth => handle_admin_boot_health(&admin),
+                AdminCommands::Reboot { force } => handle_admin_reboot(&admin, *force),
             }
         }
     }
@@ -7178,6 +7210,17 @@ mod tests {
     }
 
     #[test]
+    fn admin_boot_health_parses_correctly() {
+        let cli = Cli::try_parse_from(["mdma", "admin", "boot-health"]).unwrap();
+        match cli.command {
+            Commands::Admin {
+                command: AdminCommands::BootHealth,
+            } => {}
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
     fn admin_reboot_parses_correctly() {
         let result = Cli::try_parse_from(["mdma", "admin", "reboot"]);
         assert!(
@@ -7188,7 +7231,7 @@ mod tests {
         let cli = result.unwrap();
         match cli.command {
             Commands::Admin {
-                command: AdminCommands::Reboot,
+                command: AdminCommands::Reboot { force: false },
             } => {}
             other => panic!("unexpected command: {:?}", other),
         }

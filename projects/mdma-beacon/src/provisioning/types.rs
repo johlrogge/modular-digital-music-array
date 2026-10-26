@@ -17,8 +17,8 @@ use crate::hardware::HardwareInfo;
 // ============================================================================
 
 pub use crate::types::{
-    ByteSize, DevicePath, FilesystemType, MountPoint, PartitionLabel, PartitionSize,
-    ProvisionConfig, UnitType,
+    ByteSize, DevicePath, ExistingDataPolicy, FilesystemType, MountPoint, PartitionLabel,
+    PartitionSize, ProvisionConfig, UnitType,
 };
 
 // ============================================================================
@@ -141,9 +141,11 @@ impl PartitionedDrives {
     /// to know about Planned vs Exists state. This method converts
     /// the plan to contain just Partition data.
     pub fn into_completed(self) -> CompletedPartitionedDrives {
+        let created = self.plan.planned_devices();
         CompletedPartitionedDrives {
             validated: self.validated,
             plan: self.plan.into_completed(),
+            created,
         }
     }
 }
@@ -161,6 +163,9 @@ impl std::fmt::Display for PartitionedDrives {
 pub struct CompletedPartitionedDrives {
     pub validated: ValidatedHardware,
     pub plan: CompletedPartitionPlan,
+    /// Partitions created by stage 2 in this run. Anything not listed here
+    /// existed before and may hold user data.
+    pub created: Vec<DevicePath>,
 }
 
 impl std::fmt::Display for CompletedPartitionedDrives {
@@ -267,6 +272,31 @@ impl std::fmt::Display for PartitionPlan {
 }
 
 impl PartitionPlan {
+    /// Devices of the partitions that stage 2 will create (state `Planned`).
+    pub fn planned_devices(&self) -> Vec<DevicePath> {
+        let planned = |states: &[PartitionState]| -> Vec<DevicePath> {
+            states
+                .iter()
+                .filter_map(|s| match s {
+                    PartitionState::Planned(p) => Some(p.device.clone()),
+                    PartitionState::Exists(_) => None,
+                })
+                .collect()
+        };
+        match self {
+            PartitionPlan::SingleDrive { partitions, .. } => planned(partitions),
+            PartitionPlan::DualDrive {
+                primary_partitions,
+                secondary_partitions,
+                ..
+            } => {
+                let mut devices = planned(primary_partitions);
+                devices.extend(planned(secondary_partitions));
+                devices
+            }
+        }
+    }
+
     /// Convert from workflow state (PartitionState) to completed partitions
     ///
     /// After stage 2 completes, all partitions exist on disk. This method
@@ -677,32 +707,15 @@ impl std::fmt::Display for InstalledPackages {
 // Stage 4.3: Configure fstab
 // ----------------------------------------------------------------------------
 
-/// Workflow state for fstab configuration
-#[derive(Debug, Clone, PartialEq)]
-pub enum FstabState {
-    NeedsConfig,
-    AlreadyConfigured,
-}
-
-impl std::fmt::Display for FstabState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FstabState::NeedsConfig => write!(f, "✨ Configure /etc/fstab"),
-            FstabState::AlreadyConfigured => write!(f, "⏭️  /etc/fstab already configured"),
-        }
-    }
-}
-
-/// Planned work for configuring fstab (WITH workflow state)
+/// Planned work for configuring fstab (always regenerated)
 #[derive(Debug, Clone, PartialEq)]
 pub struct FstabPlan {
     pub installed: InstalledPackages, // Thread input through for apply()
-    pub config_state: FstabState,
 }
 
 impl std::fmt::Display for FstabPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "{}", self.config_state)?;
+        writeln!(f, "✨ Configure /etc/fstab")?;
         writeln!(
             f,
             "Target: {}/etc/fstab",

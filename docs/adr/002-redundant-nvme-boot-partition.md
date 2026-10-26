@@ -3,6 +3,9 @@
 ## Status
 Accepted — 2026-05-07 (revised 2026-05-07)
 
+Decision §2 (Population) superseded by ADR-006 (mount the NVMe boot partition
+at `/boot`). See the incident note below.
+
 ## Context
 
 The MDMA provisioning pipeline originally booted the Pi 5 exclusively from the SD
@@ -40,9 +43,13 @@ self-contained beacon image used only for rescue scenarios.
    `stage4_install` / `stage5_configure`. `config.txt` is sourced from the
    rootfs `/boot/config.txt` (installed by the `rpi-firmware` package —
    verified via `xbps-query --files rpi-firmware`; it does NOT come from
-   `rpi-base`). Kernel updates write to the NVMe boot partition and the NVMe
+   `rpi-base`). ~~Kernel updates write to the NVMe boot partition and the NVMe
    rootfs `/lib/modules` together — same disk, handled natively by xbps's
-   `rpi5-kernel` post-install hook. No cross-device sync invariant required.
+   `rpi5-kernel` post-install hook. No cross-device sync invariant required.~~
+   **Incorrect, superseded by ADR-006.** Provisioning mounted p1 at
+   `/boot/firmware`, while Void's `rpi-kernel` installs to `/boot`, and
+   `rpi-kernel` has no triggers or kernel hooks (verified on the unit). Kernel
+   updates therefore never reached p1.
 3. **Boot order.** Pi 5 firmware `BOOT_ORDER` is set to **USB → NVMe → SD**.
    The encoded value is **`0xf164`** (right-to-left encoding: 4 = USB first,
    6 = NVMe second, 1 = SD third, f = loop). USB remains first to preserve
@@ -111,6 +118,19 @@ self-contained beacon image used only for rescue scenarios.
 - Lessons from the 2026-05-07 boot incident: SD/NVMe coupling is the
   fragility, not the kernel update mechanism itself. The fix is structural
   elimination, not mitigation.
+
+## Incident: 2026-10-24 stale boot partition
+
+- `xbps-install -Su` on mdma-johlyroger installed rpi-kernel 6.12.95_1 into
+  rootfs `/boot` and removed `/lib/modules/6.12.87_1`. p1 still held the
+  6.12.87_1 `kernel8.img` from provisioning (Jun 10).
+- The next reboot hung: no network or SSH.
+- Recovered on 2026-10-25 by setting the EEPROM to SD-first (via a
+  recovery.bin/pieeprom.upd update) and booting the beacon with the NVMe
+  attached. The new kernel, dtbs and overlays were copied to p1 by hand.
+- Root cause: the "no sync invariant" claim in Decision §2 was false. The
+  same failure class as 2026-05-07 survived, now between `/boot` and p1.
+- Tracked in #65. Fix: ADR-006.
 
 ## Follow-up
 

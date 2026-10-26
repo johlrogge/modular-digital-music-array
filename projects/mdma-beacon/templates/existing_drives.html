@@ -1,0 +1,24 @@
+{# What is on the NVMe drives right now (included by index.html). All values come
+   from the disk and are HTML-escaped by askama. #}
+{% match existing_drives_error %}
+{% when Some with (reason) %}
+<p><strong>The drives could not be read:</strong> <span class="error-detail">{{ reason }}</span>
+   A wipe will abort for the same reason; nothing is changed.</p>
+{% when None %}
+{% if existing_drives.is_empty() %}
+<p>No existing partitions or signatures were found on the NVMe drives.</p>
+{% else %}
+<p>Drives that may be wiped (the provisioning target) &mdash; these will be
+   <strong>destroyed</strong>:</p>
+{% for drive in existing_drives %}
+<div class="error-detail">
+    <strong>{{ drive.device }}</strong>
+    <ul>
+        {% for partition in drive.partitions %}
+        <li>{{ partition }}</li>
+        {% endfor %}
+    </ul>
+</div>
+{% endfor %}
+{% endif %}
+{% endmatch %}
