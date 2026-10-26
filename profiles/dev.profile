@@ -32,6 +32,7 @@ music-primitives = "components/music_primitives"
 nng-transport = "components/nng_transport"
 playback-engine = "components/playback_engine"
 playback-primitives = "components/playback_primitives"
+private-file = "components/private_file"
 service = "bases/service"
 source-protocol = "components/source_protocol"
 storage_primitives = "components/storage_primitives"
@@ -40,6 +41,7 @@ rekordbox-roundtrip = "components/rekordbox_roundtrip"
 rekordbox-xml = "components/rekordbox_xml"
 track-formatter = "components/track_formatter"
 track-matcher = "components/track_matcher"
+wifi-config = "components/wifi_config"
 
 [profile.release]
 strip = true

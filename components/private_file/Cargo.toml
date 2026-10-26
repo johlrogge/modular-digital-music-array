@@ -1,0 +1,13 @@
+[package]
+name = "private-file"
+version.workspace = true
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/johlrogge/modular-digital-music-array"
+license = "MIT"
+
+[package.metadata.polylith]
+interface = "private-file"
+
+[dependencies]
+tempfile = { workspace = true }
