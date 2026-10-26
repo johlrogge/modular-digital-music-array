@@ -451,14 +451,15 @@ impl std::str::FromStr for UnitType {
 /// Provisioning configuration submitted by user
 ///
 /// All fields use validated newtypes to ensure correctness.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProvisionConfig {
     pub unit_type: UnitType,
     pub hostname: Hostname,
     pub ssh_key: SshPublicKey,
     /// What to do with data already on the drive. Defaults to `Preserve`.
-    #[serde(default)]
     pub existing_data: ExistingDataPolicy,
+    /// Optional wifi network to join (key already derived, never the passphrase).
+    pub network: Option<wifi_config::NetworkConfig>,
 }
 
 /// What provisioning may do with data already on the NVMe drive(s).

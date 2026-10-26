@@ -12,6 +12,9 @@
 //! 8. Write boot partition cmdline.txt (`/boot/cmdline.txt`; the boot partition is
 //!    mounted at `/boot`, so the kernel packages write to it directly)
 //! 9. Set Pi 5 EEPROM BOOT_ORDER to USB→NVMe→SD (0xf164)
+//!
+//! Optionally (when the user supplied a wifi network) the wifi configuration
+//! is written and `wpa_supplicant` is enabled (#41).
 
 use crate::actions::{Action, ActionId, PlannedAction};
 use crate::error::{BeaconError, Result};
@@ -86,8 +89,15 @@ impl Action<ConfiguredFstab, ConfiguredSystem, ConfiguredSystem> for ConfigureSy
         // 9. Set up pipewire system service (copy example, fix run script for runit)
         setup_pipewire_service(mount_root).await?;
 
+        // 9b. Configure wifi (only when the user supplied a network). After the
+        // package installs so wpa_supplicant owns /etc/sv/wpa_supplicant first.
+        let system = planned_output.clone();
+        tokio::task::spawn_blocking(move || configure_wifi(&system))
+            .await
+            .map_err(|e| BeaconError::Provisioning(format!("wifi configuration task: {e}")))??;
+
         // 10. Enable services
-        enable_services(mount_root).await?;
+        enable_services(mount_root, config.network.as_ref()).await?;
 
         // 11. Write boot partition cmdline.txt (#55, #65) — the boot partition is
         // mounted at /boot, so packages already wrote the kernel to it.
@@ -163,6 +173,55 @@ slaac private
     }
 
     tracing::info!("✅ Networking configured");
+    Ok(())
+}
+
+/// Write the wifi configuration, if one was supplied.
+///
+/// `Some`: writes `wpa_supplicant.conf` (0600, it holds the PSK) and the runit
+/// service `conf` that pins the service to wlan0. `None`: touches nothing and
+/// logs what that means for the given data policy. Sync (blocking fs); callers
+/// in async code use `spawn_blocking`. Must run after `install_packages` so the
+/// wpa_supplicant package owns `/etc/sv/wpa_supplicant/` first.
+fn configure_wifi(system: &ConfiguredSystem) -> Result<()> {
+    let mount_root = system.mount_root();
+    let Some(network) = system.config().network.as_ref() else {
+        tracing::info!("{}", system.wifi_summary());
+        return Ok(());
+    };
+    tracing::info!(
+        "Configuring wifi: SSID \"{}\" country {}",
+        network.ssid(),
+        network.country()
+    );
+
+    let files = [
+        (
+            wifi_config::WPA_SUPPLICANT_CONF_PATH,
+            wifi_config::render_wpa_supplicant_conf(network),
+            0o600,
+        ),
+        (
+            wifi_config::WPA_SERVICE_CONF_PATH,
+            wifi_config::render_wpa_service_conf(),
+            0o644,
+        ),
+    ];
+    // A symlink at `path` itself is replaced, not followed; symlinks in parent
+    // directories are followed.
+    for (rel, content, mode) in files {
+        let path = mount_root.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                BeaconError::Provisioning(format!("Failed to create {}: {}", parent.display(), e))
+            })?;
+        }
+        private_file::write_file_atomic(&path, content.as_bytes(), mode).map_err(|e| {
+            BeaconError::Provisioning(format!("Failed to write {}: {}", path.display(), e))
+        })?;
+    }
+
+    tracing::info!("✅ Wifi configured");
     Ok(())
 }
 
@@ -458,6 +517,7 @@ async fn install_packages(mount_root: &Path) -> Result<()> {
     let packages = [
         "openssh",
         "dhcpcd",
+        "wpa_supplicant",
         "dbus",
         "avahi",
         "nss-mdns",
@@ -647,37 +707,35 @@ exec chpst -P -u _pipewire:_pipewire:audio:video pipewire
     Ok(())
 }
 
+/// Non-MDMA runit services that are always enabled.
+const BASE_SERVICES: [&str; 5] = ["sshd", "dhcpcd", "dbus", "avahi-daemon", "pipewire"];
+
+/// The runit services to enable: the base services, every MDMA package (each
+/// `TARGET_PACKAGES` entry is also its service name), and `wpa_supplicant` only
+/// when a wifi network is configured.
+fn services_to_enable(network: Option<&wifi_config::NetworkConfig>) -> Vec<&'static str> {
+    let mut services: Vec<&'static str> = BASE_SERVICES
+        .iter()
+        .chain(TARGET_PACKAGES.iter())
+        .copied()
+        .collect();
+    if network.is_some() {
+        services.push("wpa_supplicant");
+    }
+    services
+}
+
 /// Enable runit services via symlinks
-async fn enable_services(mount_root: &Path) -> Result<()> {
+async fn enable_services(
+    mount_root: &Path,
+    network: Option<&wifi_config::NetworkConfig>,
+) -> Result<()> {
     tracing::info!("Enabling services (runit)");
 
-    let services = [
-        "sshd",
-        "dhcpcd",
-        "dbus",
-        "avahi-daemon",
-        "pipewire",
-        "mdma-acid",
-        "mdma-admin",
-        "mdma-audio",
-        "mdma-bandcamp",
-        "mdma-console",
-        "mdma-gateway",
-        "mdma-library",
-        "mdma-playback",
-    ];
+    let services = services_to_enable(network);
 
     // Create log directories for MDMA services
-    for log_dir in [
-        "mdma-acid",
-        "mdma-admin",
-        "mdma-audio",
-        "mdma-bandcamp",
-        "mdma-console",
-        "mdma-gateway",
-        "mdma-library",
-        "mdma-playback",
-    ] {
+    for log_dir in TARGET_PACKAGES {
         let log_path = mount_root.join(format!("var/log/{}", log_dir));
         tokio::fs::create_dir_all(&log_path).await.map_err(|e| {
             BeaconError::Provisioning(format!("Failed to create {}: {}", log_path.display(), e))
@@ -685,7 +743,7 @@ async fn enable_services(mount_root: &Path) -> Result<()> {
         tracing::info!("  Created log directory: /var/log/{}", log_dir);
     }
 
-    for service in &services {
+    for service in services {
         tracing::info!("  Enabling {}...", service);
 
         // Create symlink: ln -s /etc/sv/<service> /etc/runit/runsvdir/default/
@@ -1110,6 +1168,286 @@ mod tests {
     fn rewrite_cmdline_always_ends_with_newline() {
         let out = rewrite_cmdline("console=tty1 root=PARTUUID=x rootfstype=ext4 rootwait", "y");
         assert!(out.ends_with('\n'));
+    }
+
+    // ── wifi (#41) ───────────────────────────────────────────────────────────
+
+    use super::{configure_wifi, services_to_enable, ConfigureSystemAction};
+    use crate::actions::Action;
+    use crate::provisioning::types::{
+        CompletedPartitionPlan, CompletedPartitionedDrives, ConfiguredFstab, ConfiguredSystem,
+        DriveInfo, FormattedSystem, InstalledPackages, MountedPartitions, ValidatedDrives,
+        ValidatedHardware,
+    };
+    use crate::types::{
+        ByteSize, DevicePath, ExistingDataPolicy, Hostname, ProvisionConfig, SshPublicKey, UnitType,
+    };
+    use wifi_config::{
+        render_wpa_supplicant_conf, CountryCode, NetworkConfig, WifiPassphrase, WifiSsid,
+        WPA_SERVICE_CONF_PATH, WPA_SUPPLICANT_CONF_PATH,
+    };
+
+    fn network() -> NetworkConfig {
+        NetworkConfig::new(
+            WifiSsid::new("HomeNet").expect("ssid"),
+            &WifiPassphrase::new("correct horse battery").expect("pass"),
+            CountryCode::new("se").expect("country"),
+        )
+    }
+
+    fn fstab(mount_root: &std::path::Path, network: Option<NetworkConfig>) -> ConfiguredFstab {
+        fstab_with_policy(mount_root, network, ExistingDataPolicy::Preserve)
+    }
+
+    fn fstab_with_policy(
+        mount_root: &std::path::Path,
+        network: Option<NetworkConfig>,
+        existing_data: ExistingDataPolicy,
+    ) -> ConfiguredFstab {
+        let drive = DriveInfo {
+            device: DevicePath::new("/dev/nvme0n1").expect("device"),
+            size_bytes: ByteSize::from_gb(512),
+            model: "Test".to_string(),
+        };
+        let config = ProvisionConfig {
+            hostname: Hostname::new("test-909".to_string()).expect("hostname"),
+            unit_type: UnitType::Mdma909,
+            ssh_key: SshPublicKey::new(
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA96k1y1Y1326DtI4csBGXSqu57wjNuBYEkyjUQ3uS7x t"
+                    .to_string(),
+            )
+            .expect("key"),
+            existing_data,
+            network,
+        };
+        ConfiguredFstab {
+            installed: InstalledPackages {
+                mounted: MountedPartitions {
+                    formatted: FormattedSystem {
+                        partitioned: CompletedPartitionedDrives {
+                            validated: ValidatedHardware {
+                                config,
+                                drives: ValidatedDrives::OneDrive(drive.clone()),
+                            },
+                            plan: CompletedPartitionPlan::SingleDrive {
+                                device: drive,
+                                partitions: vec![],
+                            },
+                            created: vec![],
+                        },
+                        format_actions: vec![],
+                    },
+                    mount_root: mount_root.to_path_buf(),
+                    partitions: vec![],
+                },
+                packages: vec![],
+            },
+        }
+    }
+
+    fn mode_of(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    fn system(
+        dir: &std::path::Path,
+        network: Option<NetworkConfig>,
+        policy: ExistingDataPolicy,
+    ) -> ConfiguredSystem {
+        ConfiguredSystem {
+            fstab_configured: fstab_with_policy(dir, network, policy),
+        }
+    }
+
+    #[test]
+    fn configure_wifi_some_writes_private_conf_and_service_conf() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let net = network();
+        configure_wifi(&system(
+            dir.path(),
+            Some(net.clone()),
+            ExistingDataPolicy::Preserve,
+        ))
+        .expect("wifi");
+
+        let conf = dir.path().join(WPA_SUPPLICANT_CONF_PATH);
+        assert_eq!(mode_of(&conf), 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&conf).expect("read"),
+            render_wpa_supplicant_conf(&net)
+        );
+        let svc = std::fs::read_to_string(dir.path().join(WPA_SERVICE_CONF_PATH)).expect("svc");
+        assert!(svc.contains("WPA_INTERFACE=wlan0"), "{svc}");
+    }
+
+    #[test]
+    fn configure_wifi_tightens_existing_permissions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conf = dir.path().join(WPA_SUPPLICANT_CONF_PATH);
+        std::fs::create_dir_all(conf.parent().expect("parent")).expect("mkdir");
+        // Longer than the new content, so truncation is exercised too.
+        std::fs::write(&conf, "old\n".repeat(200)).expect("write");
+        std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let net = network();
+        configure_wifi(&system(
+            dir.path(),
+            Some(net.clone()),
+            ExistingDataPolicy::Preserve,
+        ))
+        .expect("wifi");
+
+        assert_eq!(mode_of(&conf), 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&conf).expect("read"),
+            render_wpa_supplicant_conf(&net)
+        );
+    }
+
+    #[test]
+    fn configure_wifi_replaces_symlink_instead_of_following_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = tempfile::tempdir().expect("victim dir");
+        let victim_file = victim.path().join("host-file");
+        std::fs::write(&victim_file, "host").expect("write");
+        let conf = dir.path().join(WPA_SUPPLICANT_CONF_PATH);
+        std::fs::create_dir_all(conf.parent().expect("parent")).expect("mkdir");
+        std::os::unix::fs::symlink(&victim_file, &conf).expect("symlink");
+
+        configure_wifi(&system(
+            dir.path(),
+            Some(network()),
+            ExistingDataPolicy::Preserve,
+        ))
+        .expect("wifi");
+
+        assert_eq!(std::fs::read(&victim_file).expect("read"), b"host");
+        assert_eq!(mode_of(&conf), 0o600);
+    }
+
+    #[test]
+    fn configure_wifi_none_touches_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conf = dir.path().join(WPA_SUPPLICANT_CONF_PATH);
+        std::fs::create_dir_all(conf.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&conf, "keep me\n").expect("write");
+        std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        configure_wifi(&system(dir.path(), None, ExistingDataPolicy::Preserve)).expect("wifi");
+
+        assert_eq!(std::fs::read(&conf).expect("read"), b"keep me\n");
+        assert_eq!(mode_of(&conf), 0o644);
+        assert!(!dir.path().join(WPA_SERVICE_CONF_PATH).exists());
+    }
+
+    #[test]
+    fn services_to_enable_adds_wpa_supplicant_only_with_wifi() {
+        let net = network();
+        let with = services_to_enable(Some(&net));
+        let without = services_to_enable(None);
+        assert!(with.contains(&"wpa_supplicant"));
+        assert!(!without.contains(&"wpa_supplicant"));
+        let filtered: Vec<_> = with
+            .iter()
+            .copied()
+            .filter(|s| *s != "wpa_supplicant")
+            .collect();
+        assert_eq!(filtered, without);
+    }
+
+    #[tokio::test]
+    async fn plan_states_wifi_without_psk_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let net = network();
+        let psk = net.psk().to_hex();
+        let input = fstab(dir.path(), Some(net));
+
+        let planned = ConfigureSystemAction.plan(&input).await.expect("plan");
+        let text = planned.assumed_output.to_string();
+
+        assert!(text.contains("SSID \"HomeNet\" country SE"), "{text}");
+        assert!(
+            text.contains("etc/wpa_supplicant/wpa_supplicant.conf"),
+            "{text}"
+        );
+        assert!(text.contains("enable wpa_supplicant"), "{text}");
+        assert!(!text.contains(&psk));
+        assert_eq!(
+            std::fs::read_dir(dir.path()).expect("readdir").count(),
+            0,
+            "check mode (plan) must write nothing"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(
+        ExistingDataPolicy::Preserve,
+        "wifi: not configured here — any existing wifi setup is kept"
+    )]
+    #[case(ExistingDataPolicy::ReinstallOs, "the OS is reinstalled")]
+    #[case(ExistingDataPolicy::WipeAll, "the OS is reinstalled")]
+    fn wifi_summary_without_wifi_is_policy_aware(
+        #[case] policy: ExistingDataPolicy,
+        #[case] expected: &str,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sys = system(dir.path(), None, policy);
+        assert!(
+            sys.wifi_summary().contains(expected),
+            "{}",
+            sys.wifi_summary()
+        );
+        assert!(sys.to_string().contains(expected));
+    }
+
+    #[test]
+    fn wifi_summary_under_preserve_says_removed_when_root_is_formatted() {
+        use crate::provisioning::types::{PartitionFormatAction, PartitionSize};
+        use crate::types::FilesystemType;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut fstab = fstab(dir.path(), None);
+        let root = Partition {
+            device: DevicePath::new("/dev/nvme0n1p2").expect("device"),
+            mount_point: MountPoint::Root,
+            size: PartitionSize::from_mb(512),
+        };
+        fstab.installed.mounted.formatted.format_actions =
+            vec![PartitionFormatAction::WillFormat {
+                device: root.device.clone(),
+                label: root.label(),
+                fs_type: FilesystemType::Ext4,
+            }];
+        fstab.installed.mounted.partitions = vec![root];
+        let sys = ConfiguredSystem {
+            fstab_configured: fstab,
+        };
+        assert!(
+            sys.wifi_summary()
+                .contains("any previous wifi setup is removed"),
+            "{}",
+            sys.wifi_summary()
+        );
+    }
+
+    #[test]
+    fn debug_of_configured_system_does_not_leak_psk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let net = network();
+        let psk = net.psk().to_hex();
+        let sys = ConfiguredSystem {
+            fstab_configured: fstab(dir.path(), Some(net)),
+        };
+        let provisioned = crate::provisioning::types::ProvisionedSystem {
+            configured: sys.clone(),
+        };
+        assert!(!format!("{sys:?}").contains(&psk));
+        assert!(!format!("{provisioned:?}").contains(&psk));
+        assert!(format!("{sys:?}").contains("redacted"));
     }
 
     // ── #62: authorized_keys permissions ─────────────────────────────────────

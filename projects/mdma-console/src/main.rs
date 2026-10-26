@@ -241,38 +241,15 @@ fn read_bandcamp_username(conf_path: &std::path::Path) -> String {
 
 /// Write `contents` to `path` with mode 0600 (owner read/write only).
 ///
-/// Writes to a sibling temp file and renames it into place so readers never
-/// see a partial file.  Cookies are credentials, so they must never be
-/// group- or world-readable.
-async fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
+/// Cookies are credentials, so they must never be group- or world-readable.
+/// The write itself is atomic (see `private_file`); this wraps it in
+/// `spawn_blocking`.
+async fn write_private_file_async(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     let path = path.to_path_buf();
     let contents = contents.to_vec();
-    tokio::task::spawn_blocking(move || {
-        let mut tmp_name = path.as_os_str().to_owned();
-        tmp_name.push(".tmp");
-        let tmp_path = std::path::PathBuf::from(tmp_name);
-        // Remove any stale temp file so `mode` applies to a fresh inode.
-        let _ = std::fs::remove_file(&tmp_path);
-        let result = (|| {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp_path)?;
-            file.write_all(&contents)?;
-            file.sync_all()?;
-            std::fs::rename(&tmp_path, &path)
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&tmp_path);
-        }
-        result
-    })
-    .await
-    .map_err(std::io::Error::other)?
+    tokio::task::spawn_blocking(move || private_file::write_private_file(&path, &contents))
+        .await
+        .map_err(std::io::Error::other)?
 }
 
 /// Check whether the cookies file parses successfully
@@ -819,7 +796,9 @@ async fn bandcamp_configure(
     }
 
     // Save cookies file
-    if let Err(e) = write_private_file(&state.bandcamp_cookies_path, cookies_str.as_bytes()).await {
+    if let Err(e) =
+        write_private_file_async(&state.bandcamp_cookies_path, cookies_str.as_bytes()).await
+    {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to save cookies: {}", e)})),
@@ -2405,7 +2384,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cookies.json");
-        write_private_file(&path, b"[]").await.unwrap();
+        write_private_file_async(&path, b"[]").await.unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(std::fs::read(&path).unwrap(), b"[]");
@@ -2418,7 +2397,7 @@ mod tests {
         let path = dir.path().join("cookies.json");
         std::fs::write(&path, "old").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        write_private_file(&path, b"new").await.unwrap();
+        write_private_file_async(&path, b"new").await.unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(std::fs::read(&path).unwrap(), b"new");

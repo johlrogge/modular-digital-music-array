@@ -1,0 +1,19 @@
+[package]
+name = "wifi-config"
+version.workspace = true
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/johlrogge/modular-digital-music-array"
+license = "MIT"
+
+[package.metadata.polylith]
+interface = "wifi-config"
+
+[dependencies]
+thiserror = { workspace = true }
+pbkdf2 = { workspace = true }
+sha1 = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+rstest = { workspace = true }
