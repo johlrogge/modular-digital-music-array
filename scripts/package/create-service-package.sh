@@ -11,6 +11,8 @@
 #     [--extra-dirs DIRS] space-separated extra dirs to create inside the package
 #     [--extra-install FILE] path to shell snippet appended inside the post) block
 #     [--extra-files SRC:DEST ...] extra files to copy into the package tree
+#     [--conf-files FILES] space-separated absolute paths xbps keeps on upgrade
+#                          (passed to xbps-create --config-files)
 
 set -euo pipefail
 
@@ -24,6 +26,7 @@ CARGO_TOML=""
 DEPS=""
 EXTRA_DIRS=""
 EXTRA_INSTALL=""
+CONF_FILES=""
 EXTRA_FILES=()
 
 while [[ $# -gt 0 ]]; do
@@ -35,6 +38,7 @@ while [[ $# -gt 0 ]]; do
         --deps)        DEPS="$2";         shift 2 ;;
         --extra-dirs)  EXTRA_DIRS="$2";   shift 2 ;;
         --extra-install) EXTRA_INSTALL="$2"; shift 2 ;;
+        --conf-files)  CONF_FILES="$2";   shift 2 ;;
         --extra-files) shift
                        while [[ $# -gt 0 && "$1" != --* ]]; do
                            EXTRA_FILES+=("$1")
@@ -141,6 +145,7 @@ for mapping in "${EXTRA_FILES[@]+"${EXTRA_FILES[@]}"}"; do
     cp "$src" "$PACKAGE_DIR/$dest"
     case "$dest" in
         usr/libexec/*) chmod 755 "$PACKAGE_DIR/$dest" ;;
+        etc/*) chmod 644 "$PACKAGE_DIR/$dest" ;;
     esac
 done
 
@@ -249,6 +254,10 @@ if [[ -n "$DEPS" ]]; then
     # xbps-create takes one -D flag per dependency group or accepts space-separated
     # The original scripts passed the whole string as a single -D argument.
     XBPS_ARGS+=(-D "$DEPS")
+fi
+
+if [[ -n "$CONF_FILES" ]]; then
+    XBPS_ARGS+=(--config-files "$CONF_FILES")
 fi
 
 XBPS_ARGS+=("$PACKAGE_DIR_ABS")

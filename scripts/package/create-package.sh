@@ -5,5 +5,7 @@ exec "$SCRIPT_DIR/create-service-package.sh" \
     --bin beacon \
     --desc "MDMA provisioning beacon" \
     --cargo-toml projects/mdma-beacon/Cargo.toml \
-    --deps "avahi-daemon>=0 dbus>=0" \
-    --extra-install "$SCRIPT_DIR/install/beacon.sh"
+    --deps "avahi>=0 dbus>=0" \
+    --extra-install "$SCRIPT_DIR/install/beacon.sh" \
+    --conf-files "/etc/xbps.d/10-mdma.conf" \
+    --extra-files "void-packages/srcpkgs/beacon/files/10-mdma.conf:etc/xbps.d/10-mdma.conf"

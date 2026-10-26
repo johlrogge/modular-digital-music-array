@@ -70,18 +70,28 @@ pub async fn update_beacon_from_repo() -> Result<()> {
     info!("Checking for beacon updates...");
 
     let check = Command::new("xbps-install")
-        .args(["-n", "beacon"])
+        .args(["-n", "-u", "beacon"])
         .output()
         .await
         .map_err(|e| BeaconError::Installation(format!("Failed to check updates: {}", e)))?;
 
-    let check_output = String::from_utf8_lossy(&check.stdout);
-    info!("Update check output: {}", check_output);
+    let check_stdout = String::from_utf8_lossy(&check.stdout);
+    let check_stderr = String::from_utf8_lossy(&check.stderr);
+    info!("Update check output: {}", check_stdout);
 
-    if check_output.contains("beacon") {
-        info!("Update available!");
-    } else {
-        info!("Already at latest version");
+    match classify_dry_run(check.status.success(), &check_stdout, &check_stderr) {
+        DryRunOutcome::UpdateAvailable(line) => info!("Update available: {}", line),
+        DryRunOutcome::UpToDate => {
+            info!("Already at latest version");
+            return Ok(());
+        }
+        DryRunOutcome::Failed(stderr) => {
+            error!("Update check failed: {}", stderr);
+            return Err(BeaconError::Installation(format!(
+                "Update check failed: {}",
+                stderr
+            )));
+        }
     }
 
     // Step 4: Update beacon package
@@ -163,8 +173,121 @@ pub fn full_version() -> String {
     format!("{} ({})", current_version(), git_hash())
 }
 
+/// Result of interpreting a `xbps-install -n -u beacon` dry run
+#[derive(Debug, PartialEq, Eq)]
+pub enum DryRunOutcome {
+    /// xbps wants to update beacon; carries the relevant output line
+    UpdateAvailable(String),
+    /// xbps succeeded and has nothing to do for beacon
+    UpToDate,
+    /// xbps failed (non-zero exit, package not found, unresolved deps); carries stderr
+    Failed(String),
+}
+
+/// Classify the result of a `xbps-install -n -u beacon` dry run.
+pub fn classify_dry_run(status_success: bool, stdout: &str, stderr: &str) -> DryRunOutcome {
+    if !status_success || stderr.contains("not found") || stderr.contains("MISSING:") {
+        let message = if !stderr.trim().is_empty() {
+            stderr.to_string()
+        } else if !stdout.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            "xbps-install exited with an error".to_string()
+        };
+        return DryRunOutcome::Failed(message);
+    }
+
+    stdout
+        .lines()
+        .find(|line| is_beacon_transaction_line(line))
+        .map_or(DryRunOutcome::UpToDate, |line| {
+            DryRunOutcome::UpdateAvailable(line.trim().to_string())
+        })
+}
+
+/// True for a transaction line like `beacon-0.27.1_1 update aarch64 <url> 1 2`:
+/// first field is `beacon-<digit>...` (pkgver) and second is `update` or `install`.
+fn is_beacon_transaction_line(line: &str) -> bool {
+    let mut fields = line.split_whitespace();
+    let is_beacon_pkg = fields
+        .next()
+        .and_then(|pkg| pkg.strip_prefix("beacon-"))
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+    is_beacon_pkg && matches!(fields.next(), Some("update" | "install"))
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{classify_dry_run, DryRunOutcome};
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::update_available(
+        true,
+        "beacon-0.27.0_1 update aarch64 https://example.org/aarch64 123 456\n",
+        "",
+        DryRunOutcome::UpdateAvailable(
+            "beacon-0.27.0_1 update aarch64 https://example.org/aarch64 123 456".to_string()
+        )
+    )]
+    #[case::empty_success(true, "", "", DryRunOutcome::UpToDate)]
+    #[case::not_found(
+        false,
+        "",
+        "ERROR: Package 'beacon' not found in repository pool.\n",
+        DryRunOutcome::Failed("ERROR: Package 'beacon' not found in repository pool.\n".to_string())
+    )]
+    #[case::not_found_exit_zero(
+        true,
+        "",
+        "ERROR: Package 'beacon' not found in repository pool.\n",
+        DryRunOutcome::Failed("ERROR: Package 'beacon' not found in repository pool.\n".to_string())
+    )]
+    #[case::missing_dependency(
+        false,
+        "",
+        "MISSING: avahi-daemon>=0\nERROR: Transaction aborted due to unresolved dependencies.\n",
+        DryRunOutcome::Failed(
+            "MISSING: avahi-daemon>=0\nERROR: Transaction aborted due to unresolved dependencies.\n"
+                .to_string()
+        )
+    )]
+    #[case::multi_line_beacon_after_other(
+        true,
+        "avahi-0.8_2 install aarch64 https://example.org/aarch64 1 2\nbeacon-0.27.1_1 update aarch64 https://johlrogge.github.io/modular-digital-music-array/aarch64 1 2\n",
+        "",
+        DryRunOutcome::UpdateAvailable(
+            "beacon-0.27.1_1 update aarch64 https://johlrogge.github.io/modular-digital-music-array/aarch64 1 2"
+                .to_string()
+        )
+    )]
+    #[case::other_package_with_beacon_in_url(
+        true,
+        "avahi-0.8_2 update aarch64 https://example.org/beacon/aarch64 1 2\n",
+        "",
+        DryRunOutcome::UpToDate
+    )]
+    #[case::failure_message_from_stdout(
+        false,
+        "ERROR: something went wrong\n",
+        "",
+        DryRunOutcome::Failed("ERROR: something went wrong".to_string())
+    )]
+    #[case::failure_without_any_output(
+        false,
+        "",
+        "  \n",
+        DryRunOutcome::Failed("xbps-install exited with an error".to_string())
+    )]
+    fn classifies_dry_run(
+        #[case] success: bool,
+        #[case] stdout: &str,
+        #[case] stderr: &str,
+        #[case] expected: DryRunOutcome,
+    ) {
+        assert_eq!(classify_dry_run(success, stdout, stderr), expected);
+    }
+
     #[test]
     fn current_version() {
         let version = super::current_version();

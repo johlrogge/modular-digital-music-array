@@ -144,7 +144,7 @@ The `setup-beacon-on-pi.sh` script must:
 2. **Configure MDMA repository**
    ```bash
    echo "repository=https://johlrogge.github.io/modular-digital-music-array/aarch64" \
-     > /etc/xbps.d/10-mdma-repo.conf
+     > /etc/xbps.d/10-mdma.conf
    xbps-install -S
    ```
 

@@ -18,7 +18,7 @@ echo ""
 
 # 2. Configure repository
 echo "🔧 Configuring MDMA repository..."
-cat > /etc/xbps.d/10-mdma-repo.conf <<'EOF'
+cat > /etc/xbps.d/10-mdma.conf <<'EOF'
 repository=https://johlrogge.github.io/modular-digital-music-array/aarch64
 EOF
 
