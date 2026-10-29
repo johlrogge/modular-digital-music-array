@@ -4,6 +4,30 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.28.0] — 2026-10-29
+
+### Fixed
+
+- **NVMe dropout on Pi 5 (#69).** With kernel 6.12.95 the NVMe controller dropped off PCIe about 65 seconds after boot (`controller is down; will reset: CSTS=0xffffffff`), hanging all disk I/O and SSH. Power was ruled out. Provisioning now writes `nvme_core.default_ps_max_latency_us=0 pcie_aspm=off pcie_port_pm=off` into the boot partition's `cmdline.txt`. The write is idempotent: reprovisioning with Preserve does not duplicate the parameters, and conflicting values are replaced.
+
+### Changed
+
+- **Beacon provisioning form: one exclusive choice for existing data.** "Reinstall OS" and "Wipe drive" were independent checkboxes, and wipe silently won when both were ticked. They are now a single radio group (keep existing system and data / reinstall OS / wipe drive), posted as one `existing_data` field. Wipe still requires the typed confirmation word and the drive fingerprint. A page reload never restores a hidden wipe selection.
+
+### Known issues
+
+- The beacon has no DNS fallback when the router's resolver does not answer (#68).
+- mdma-bandcamp crash-loops when no cookie file exists (#70).
+- The update page may stay on "Update started" (#67).
+
+### Upgrade notes
+
+Already-provisioned nodes do not get the NVMe parameters automatically, because only provisioning writes `cmdline.txt`. To apply them by hand, append ` nvme_core.default_ps_max_latency_us=0 pcie_aspm=off pcie_port_pm=off` to the single line in `/boot/cmdline.txt` and reboot. Alternatively, reprovision with "Keep existing system and data".
+
+Update the beacon through its UI ("Update") to get the new form and the NVMe fix.
+
+---
+
 ## [0.27.1] — 2026-10-26
 
 ### Fixed
