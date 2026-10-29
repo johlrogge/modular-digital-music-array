@@ -194,6 +194,19 @@
             border: 2px solid #e74c3c;
             border-radius: 8px;
             padding: 15px;
+            margin-top: 15px;
+        }
+
+        fieldset.existing-data {
+            border: none;
+            padding: 0;
+            min-width: 0;
+        }
+
+        fieldset.existing-data legend {
+            padding: 0;
+            font-weight: 600;
+            margin-bottom: 8px;
         }
 
         .update-button {
@@ -295,7 +308,7 @@
                     <label for="override_wifi_psk">Wifi password (re-enter; it is never kept on this page)</label>
                     <input type="password" name="wifi_psk" id="override_wifi_psk"
                            autocomplete="new-password"{% if !err.wifi_ssid.is_empty() %} required{% endif %}>
-                    <input type="hidden" name="wipe_all" value="true">
+                    <input type="hidden" name="existing_data" value="wipe_all">
                     <input type="hidden" name="wipe_fingerprint" value="{{ wipe_fingerprint }}">
                     <label for="override_wipe_confirmation">
                         Type <strong>{{ wipe_word }}</strong> to confirm
@@ -377,21 +390,26 @@
                 <div class="help-text">Optional. Leaving this blank keeps the existing wifi setup only when the OS is not reinstalled; reinstalling the OS or wiping the drive without wifi details leaves the Pi on ethernet only. Ethernet is used whenever plugged in; wifi is the fallback. If wifi fails, plug in ethernet and reprovision. WPA3-only networks are not supported (WPA2 or WPA2/WPA3 mixed mode work).</div>
             </div>
 
-            <div class="section">
+            <fieldset class="section existing-data">
+                <legend>Existing data on the drive</legend>
                 <label>
-                    <input type="checkbox" name="reinstall_os" value="true">
+                    <input type="radio" name="existing_data" value="preserve" checked autocomplete="off">
+                    Keep existing system and data
+                </label>
+                <div class="help-text">Keeps the existing OS partitions, music and metadata.</div>
+                <label>
+                    <input type="radio" name="existing_data" value="reinstall_os" autocomplete="off">
                     Reinstall OS (reformat boot, root and var)
                 </label>
-                <div class="help-text">Music and metadata are never touched. Leave unchecked to keep the existing OS partitions.</div>
-            </div>
+                <div class="help-text">Music and metadata are never touched.</div>
 
-            <div class="section wipe-section">
+                <div class="wipe-section">
                 <label>
-                    <input type="checkbox" name="wipe_all" id="wipe_all" value="true">
+                    <input type="radio" name="existing_data" value="wipe_all" id="wipe_all" autocomplete="off">
                     Wipe drive and provision fresh
                 </label>
                 <div class="help-text">Destroys <strong>ALL data on the target drive(s), music and
-                    metadata included</strong>. Leave unchecked to keep your data.</div>
+                    metadata included</strong>.</div>
                 <div id="wipe-details" hidden>
                     {% include "existing_drives.html" %}
                     <input type="hidden" name="wipe_fingerprint" value="{{ wipe_fingerprint }}">
@@ -400,9 +418,10 @@
                     </label>
                     <input type="text" name="wipe_confirmation" id="wipe_confirmation"
                            autocomplete="off" data-wipe-word="{{ wipe_word }}"
-                           data-wipe-button="provision_button">
+                           data-wipe-button="provision_button" data-wipe-gate="wipe_all">
                 </div>
-            </div>
+                </div>
+            </fieldset>
 
             <button type="submit" id="provision_button">Provision System</button>
         </form>
@@ -410,24 +429,31 @@
     <script>
         // Convenience only: the server validates the confirmation again.
         (function () {
-            var box = document.getElementById('wipe_all');
             var details = document.getElementById('wipe-details');
+            var radios = document.querySelectorAll('input[type="radio"][name="existing_data"]');
             function wordOk(input) {
                 return input.value.trim() === input.getAttribute('data-wipe-word');
             }
             document.querySelectorAll('input[data-wipe-word]').forEach(function (input) {
                 var button = document.getElementById(input.getAttribute('data-wipe-button'));
+                var gate = input.getAttribute('data-wipe-gate');
+                var wipeRadio = gate
+                    ? document.querySelector('input[type="radio"][name="existing_data"][value="' + gate + '"]')
+                    : null;
                 function update() {
-                    if (input.id === 'wipe_confirmation') {
-                        details.hidden = !box.checked;
-                        button.disabled = box.checked && !wordOk(input);
+                    if (wipeRadio) {
+                        details.hidden = !wipeRadio.checked;
+                        button.disabled = wipeRadio.checked && !wordOk(input);
                     } else {
                         button.disabled = !wordOk(input);
                     }
                 }
                 input.addEventListener('input', update);
-                if (input.id === 'wipe_confirmation') {
-                    box.addEventListener('change', update);
+                if (wipeRadio) {
+                    radios.forEach(function (radio) {
+                        radio.addEventListener('change', update);
+                    });
+                    window.addEventListener('pageshow', update);
                     update();
                 }
             });

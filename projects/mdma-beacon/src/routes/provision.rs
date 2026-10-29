@@ -85,28 +85,21 @@ fn wipe_can_resolve(err: &LayoutError) -> bool {
     )
 }
 
-/// Turn the submitted checkboxes into a policy. `WipeAll` is returned only when
-/// the wipe box is ticked AND the confirmation word was typed exactly; a
-/// ticked box with a missing or wrong confirmation is an error, never a
-/// downgrade, so the user is not surprised by a different outcome.
+/// Validate the chosen policy. `WipeAll` is accepted only when the
+/// confirmation word was typed exactly; a wipe choice with a missing or wrong
+/// confirmation is an error, never a downgrade, so the user is not surprised
+/// by a different outcome. Other choices ignore the confirmation.
 fn resolve_existing_data(
-    wipe_all: bool,
-    reinstall_os: bool,
+    chosen: ExistingDataPolicy,
     confirmation: &str,
 ) -> Result<ExistingDataPolicy, String> {
-    if wipe_all {
-        if confirmation.trim() != WIPE_CONFIRMATION {
-            return Err(format!(
-                "Wiping the drive requires typing {} to confirm. Nothing was changed.",
-                WIPE_CONFIRMATION
-            ));
-        }
-        Ok(ExistingDataPolicy::WipeAll)
-    } else if reinstall_os {
-        Ok(ExistingDataPolicy::ReinstallOs)
-    } else {
-        Ok(ExistingDataPolicy::Preserve)
+    if chosen == ExistingDataPolicy::WipeAll && confirmation.trim() != WIPE_CONFIRMATION {
+        return Err(format!(
+            "Wiping the drive requires typing {} to confirm. Nothing was changed.",
+            WIPE_CONFIRMATION
+        ));
     }
+    Ok(chosen)
 }
 
 /// Turn the submitted wifi fields into a network config. The SSID and country
@@ -234,14 +227,12 @@ pub(crate) struct ProvisionForm {
     unit_type: String,
     hostname: String,
     ssh_key: String,
-    /// Checkbox: reformat boot, root and var. Music and metadata are never
-    /// touched, whatever this says.
+    /// Radio group, one exclusive choice: `preserve` (default), `reinstall_os`
+    /// (reformat boot, root and var; music and metadata are never touched) or
+    /// `wipe_all` (destroys ALL data including music and metadata; honoured
+    /// only together with `wipe_confirmation`).
     #[serde(default)]
-    reinstall_os: bool,
-    /// Checkbox: wipe the drive(s), destroying ALL data including music and
-    /// metadata. Honoured only together with `wipe_confirmation`.
-    #[serde(default)]
-    wipe_all: bool,
+    existing_data: ExistingDataPolicy,
     /// Must equal [`WIPE_CONFIRMATION`] for `wipe_all` to take effect.
     #[serde(default)]
     wipe_confirmation: String,
@@ -273,8 +264,7 @@ impl std::fmt::Debug for ProvisionForm {
             .field("unit_type", &self.unit_type)
             .field("hostname", &self.hostname)
             .field("ssh_key", &self.ssh_key)
-            .field("reinstall_os", &self.reinstall_os)
-            .field("wipe_all", &self.wipe_all)
+            .field("existing_data", &self.existing_data)
             .field("wipe_confirmation", &self.wipe_confirmation)
             .field("wipe_fingerprint", &self.wipe_fingerprint)
             .field("wifi_ssid", &self.wifi_ssid)
@@ -352,12 +342,8 @@ pub async fn provision(
         unit_type,
         hostname,
         // Validated here, server-side: a wipe needs the typed confirmation.
-        existing_data: resolve_existing_data(
-            form.wipe_all,
-            form.reinstall_os,
-            &form.wipe_confirmation,
-        )
-        .map_err(AppError::Validation)?,
+        existing_data: resolve_existing_data(form.existing_data, &form.wipe_confirmation)
+            .map_err(AppError::Validation)?,
     };
 
     let hardware = state.hardware.lock().await.clone();
@@ -477,22 +463,59 @@ mod tests {
     use rstest::rstest;
 
     #[rstest]
-    #[case(false, false, "", ExistingDataPolicy::Preserve)]
-    #[case(false, true, "", ExistingDataPolicy::ReinstallOs)]
-    // A confirmation word without the box ticked changes nothing.
-    #[case(false, false, "WIPE", ExistingDataPolicy::Preserve)]
-    #[case(true, false, "WIPE", ExistingDataPolicy::WipeAll)]
-    #[case(true, true, " WIPE ", ExistingDataPolicy::WipeAll)]
+    #[case(ExistingDataPolicy::Preserve, "", ExistingDataPolicy::Preserve)]
+    #[case(ExistingDataPolicy::ReinstallOs, "", ExistingDataPolicy::ReinstallOs)]
+    // A confirmation word without choosing wipe changes nothing.
+    #[case(ExistingDataPolicy::Preserve, "WIPE", ExistingDataPolicy::Preserve)]
+    #[case(
+        ExistingDataPolicy::ReinstallOs,
+        "WIPE",
+        ExistingDataPolicy::ReinstallOs
+    )]
+    #[case(ExistingDataPolicy::WipeAll, "WIPE", ExistingDataPolicy::WipeAll)]
+    #[case(ExistingDataPolicy::WipeAll, " WIPE ", ExistingDataPolicy::WipeAll)]
     fn resolves_policy(
-        #[case] wipe_all: bool,
-        #[case] reinstall_os: bool,
+        #[case] chosen: ExistingDataPolicy,
         #[case] confirmation: &str,
         #[case] expected: ExistingDataPolicy,
     ) {
-        assert_eq!(
-            resolve_existing_data(wipe_all, reinstall_os, confirmation),
-            Ok(expected)
-        );
+        assert_eq!(resolve_existing_data(chosen, confirmation), Ok(expected));
+    }
+
+    /// Parse a urlencoded POST body the way the `/provision` handler does.
+    async fn parse_form(extra: &str) -> Option<ProvisionForm> {
+        use axum::extract::FromRequest;
+        let body = format!("unit_type=mdma-909&hostname=h&ssh_key=k&{extra}");
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        Form::<ProvisionForm>::from_request(request, &())
+            .await
+            .ok()
+            .map(|Form(f)| f)
+    }
+
+    #[rstest]
+    #[case("", ExistingDataPolicy::Preserve)]
+    #[case("existing_data=preserve", ExistingDataPolicy::Preserve)]
+    #[case("existing_data=reinstall_os", ExistingDataPolicy::ReinstallOs)]
+    #[case("existing_data=wipe_all", ExistingDataPolicy::WipeAll)]
+    // The old checkbox fields are gone and select nothing.
+    #[case("wipe_all=true&reinstall_os=true", ExistingDataPolicy::Preserve)]
+    #[tokio::test]
+    async fn form_parses_existing_data_choice(
+        #[case] extra: &str,
+        #[case] expected: ExistingDataPolicy,
+    ) {
+        let form = parse_form(extra).await.expect("form should parse");
+        assert_eq!(form.existing_data, expected);
+    }
+
+    #[tokio::test]
+    async fn form_rejects_unknown_existing_data_choice() {
+        assert!(parse_form("existing_data=both").await.is_none());
     }
 
     #[rstest]
@@ -502,10 +525,8 @@ mod tests {
     #[case("yes")]
     #[case("mdma-909")]
     fn wipe_without_correct_confirmation_is_rejected(#[case] confirmation: &str) {
-        let err = resolve_existing_data(true, false, confirmation).unwrap_err();
+        let err = resolve_existing_data(ExistingDataPolicy::WipeAll, confirmation).unwrap_err();
         assert!(err.contains("Nothing was changed"), "got: {err}");
-        // Also when reinstall is ticked: never silently downgraded.
-        assert!(resolve_existing_data(true, true, confirmation).is_err());
     }
 
     #[test]
@@ -671,7 +692,12 @@ mod tests {
         );
         assert!(html.contains("/dev/nvme0n1p5 (label: music, size: 3072 MB)"));
         assert!(html.contains("name=\"wipe_confirmation\""));
-        assert!(html.contains("name=\"wipe_all\""));
+        assert!(html.contains("name=\"existing_data\""));
+        assert!(html.contains("value=\"preserve\""));
+        assert!(html.contains("value=\"reinstall_os\""));
+        assert!(html.contains("value=\"wipe_all\""));
+        assert!(!html.contains("name=\"wipe_all\""));
+        assert!(!html.contains("name=\"reinstall_os\""));
         assert!(html.contains("music"));
     }
 
@@ -688,6 +714,30 @@ mod tests {
         };
         assert!(render(Some(ctx(true)), Vec::new()).contains("id=\"wipe-override\""));
         assert!(!render(Some(ctx(false)), Vec::new()).contains("id=\"wipe-override\""));
+    }
+
+    #[test]
+    fn override_form_posts_wipe_all_once_and_main_form_defaults_to_preserve() {
+        let html = render(
+            Some(LayoutErrorContext {
+                message: "m".into(),
+                can_wipe: true,
+                unit_type: "mdma-909".into(),
+                hostname: "h".into(),
+                ssh_key: "k".into(),
+                wifi_ssid: String::new(),
+                wifi_country: String::new(),
+            }),
+            Vec::new(),
+        );
+        let hidden = "type=\"hidden\" name=\"existing_data\" value=\"wipe_all\"";
+        assert_eq!(html.matches(hidden).count(), 1);
+        let preserve = html
+            .find("value=\"preserve\"")
+            .expect("preserve radio present");
+        let tag_end = html[preserve..].find('>').expect("tag end") + preserve;
+        assert!(html[preserve..tag_end].contains("checked"));
+        assert!(html[preserve..tag_end].contains("autocomplete=\"off\""));
     }
 
     // ---- wifi ----
@@ -761,8 +811,7 @@ mod tests {
             unit_type: "mdma-909".into(),
             hostname: "h".into(),
             ssh_key: "k".into(),
-            reinstall_os: false,
-            wipe_all: false,
+            existing_data: ExistingDataPolicy::Preserve,
             wipe_confirmation: String::new(),
             wipe_fingerprint: String::new(),
             wifi_ssid: "net".into(),
