@@ -172,7 +172,7 @@ Copy `scripts/install-mdma-macos.sh` from this repo to your Mac and run it. It r
 bash install-mdma-macos.sh
 
 # Install a specific tag
-bash install-mdma-macos.sh v0.27.1
+bash install-mdma-macos.sh v0.28.0
 
 # Install to a user-writable location (no sudo)
 MDMA_INSTALL_DIR=~/.local/bin bash install-mdma-macos.sh
@@ -190,6 +190,22 @@ cp profiles/dev/target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.28.0
+
+### NVMe dropout fixed (#69)
+
+With kernel 6.12.95 the NVMe controller dropped off PCIe about 65 seconds after boot, hanging all disk I/O and SSH. Provisioning now writes `nvme_core.default_ps_max_latency_us=0 pcie_aspm=off pcie_port_pm=off` into `cmdline.txt`, idempotently (reprovisioning with Preserve does not duplicate; conflicting values are replaced).
+
+### Exclusive existing-data choice
+
+The beacon form's "Reinstall OS" and "Wipe drive" checkboxes are now one radio group (keep existing system and data / reinstall OS / wipe drive), posted as a single `existing_data` field. Previously wipe silently won when both were ticked. Wipe still needs the typed confirmation word and drive fingerprint.
+
+**Upgrade note:** already-provisioned nodes do not get the NVMe parameters automatically. Append ` nvme_core.default_ps_max_latency_us=0 pcie_aspm=off pcie_port_pm=off` to the single line in `/boot/cmdline.txt` and reboot, or reprovision with "Keep existing system and data". Update the beacon via its UI to get the new form.
+
+**Known issues:** no DNS fallback in the beacon when the router's resolver does not answer (#68); mdma-bandcamp crash-loops when no cookie file exists (#70); update page may hang at "Update started" (#67). See CHANGELOG.md.
 
 ---
 
