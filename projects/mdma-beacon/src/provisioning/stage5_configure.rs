@@ -807,52 +807,79 @@ pub(crate) async fn get_partuuid(device: &str) -> Result<String> {
     Ok(partuuid)
 }
 
+/// Kernel params disabling NVMe APST and PCIe ASPM / port power management (#69).
+///
+/// On Pi 5 the NVMe controller can drop off the PCIe bus (~65s after boot,
+/// `CSTS=0xffffffff`), hanging the system. MDMA is mains-powered, so we trade
+/// power saving for stability unconditionally.
+const NVME_STABILITY_PARAMS: [&str; 3] = [
+    "nvme_core.default_ps_max_latency_us=0",
+    "pcie_aspm=off",
+    "pcie_port_pm=off",
+];
+
+/// The key of a kernel parameter: the part before `=`, or the whole token.
+fn param_key(tok: &str) -> &str {
+    tok.split_once('=').map_or(tok, |(k, _)| k)
+}
+
 /// Build a cmdline.txt that boots from `root_partuuid`.
 ///
 /// Replaces the `root=` token in `current_cmdline` with the PARTUUID form.
-/// All other kernel parameters are preserved. A trailing newline is always
-/// appended.
+/// All other kernel parameters are preserved, except the
+/// [`NVME_STABILITY_PARAMS`] keys, whose existing values are replaced. A
+/// trailing newline is always appended.
 ///
 /// If `current_cmdline` is empty or contains no `root=` token, a safe
 /// default is produced from scratch.
+///
+/// The [`NVME_STABILITY_PARAMS`] are always present exactly once in the result.
 fn rewrite_cmdline(current_cmdline: &str, root_partuuid: &str) -> String {
     let new_root = format!("root=PARTUUID={}", root_partuuid);
 
     let trimmed = current_cmdline.trim();
-    if trimmed.is_empty() {
+    let base = if trimmed.is_empty() {
         // No existing cmdline — generate a minimal one.
-        return format!(
-            "console=serial0,115200 console=tty1 {} rootfstype=ext4 rootwait\n",
+        format!(
+            "console=serial0,115200 console=tty1 {} rootfstype=ext4 rootwait",
             new_root
-        );
-    }
+        )
+    } else {
+        // Replace any existing `root=...` token, preserving all other parameters.
+        let mut tokens: Vec<String> = trimmed
+            .split_whitespace()
+            .map(|tok| {
+                if tok.starts_with("root=") {
+                    new_root.clone()
+                } else {
+                    tok.to_string()
+                }
+            })
+            .collect();
+        // If there was no root= token at all, append one.
+        if !tokens.iter().any(|t| t.starts_with("root=")) {
+            tokens.push(new_root);
+        }
+        tokens.join(" ")
+    };
 
-    // Replace any existing `root=...` token, preserving all other parameters.
-    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-    let rewritten: Vec<String> = tokens
-        .iter()
-        .map(|tok| {
-            if tok.starts_with("root=") {
-                new_root.clone()
-            } else {
-                tok.to_string()
-            }
+    // Drop any existing occurrence (any value) of our params, then append once.
+    let mut out: Vec<&str> = base
+        .split_whitespace()
+        .filter(|tok| {
+            let key = param_key(tok);
+            !NVME_STABILITY_PARAMS.iter().any(|p| param_key(p) == key)
         })
         .collect();
-
-    // If there was no root= token at all, append one.
-    if !tokens.iter().any(|t| t.starts_with("root=")) {
-        format!("{} {}\n", rewritten.join(" "), new_root)
-    } else {
-        format!("{}\n", rewritten.join(" "))
-    }
+    out.extend(NVME_STABILITY_PARAMS);
+    format!("{}\n", out.join(" "))
 }
 
 /// Write `cmdline.txt` at `dest` using `root_partuuid` as the root device.
 ///
-/// Reads the existing file (if any) to preserve non-root kernel parameters,
-/// then rewrites only the `root=` token. Creates a `.bak` backup on first
-/// write.
+/// Reads the existing file (if any) and preserves all other kernel parameters,
+/// except the [`NVME_STABILITY_PARAMS`] keys, whose existing values are
+/// replaced. Creates a `.bak` backup on first write.
 async fn write_cmdline(root_partuuid: &str, dest: &Path) -> Result<()> {
     let current = if dest.exists() {
         tokio::fs::read_to_string(dest).await.map_err(|e| {
@@ -865,7 +892,7 @@ async fn write_cmdline(root_partuuid: &str, dest: &Path) -> Result<()> {
     let new_content = rewrite_cmdline(&current, root_partuuid);
 
     if current.trim() == new_content.trim() {
-        tracing::info!("  {} already has correct root= — no change", dest.display());
+        tracing::info!("  {} already up to date — no change", dest.display());
         return Ok(());
     }
 
@@ -1151,6 +1178,49 @@ mod tests {
                 out
             );
         }
+    }
+
+    fn count_token(cmdline: &str, token: &str) -> usize {
+        cmdline.split_whitespace().filter(|t| *t == token).count()
+    }
+
+    #[test]
+    fn rewrite_cmdline_adds_nvme_stability_params_exactly_once() {
+        for input in ["", "console=tty1 root=/dev/mmcblk0p2 rootwait\n"] {
+            let out = rewrite_cmdline(input, "aa-01");
+            for p in super::NVME_STABILITY_PARAMS {
+                assert_eq!(count_token(&out, p), 1, "{p} in: {out}");
+            }
+            assert!(out.contains("root=PARTUUID=aa-01"), "{out}");
+            assert_eq!(out.matches("root=").count(), 1, "{out}");
+        }
+    }
+
+    #[test]
+    fn rewrite_cmdline_nvme_params_idempotent() {
+        let input = "root=PARTUUID=old rootwait pcie_aspm=off quiet \
+                     nvme_core.default_ps_max_latency_us=0 pcie_port_pm=off\n";
+        let once = rewrite_cmdline(input, "new-01");
+        for p in super::NVME_STABILITY_PARAMS {
+            assert_eq!(count_token(&once, p), 1, "{p} in: {once}");
+        }
+        assert!(once.contains("root=PARTUUID=new-01") && once.contains("quiet"));
+        assert_eq!(rewrite_cmdline(&once, "new-01"), once);
+    }
+
+    #[test]
+    fn rewrite_cmdline_overrides_conflicting_nvme_param_values() {
+        let out = rewrite_cmdline(
+            "root=/dev/x pcie_aspm=force pcie_aspm=force pcie_aspm.policy=performance",
+            "u-01",
+        );
+        assert_eq!(count_token(&out, "pcie_aspm=off"), 1, "{out}");
+        assert_eq!(
+            count_token(&out, "pcie_aspm.policy=performance"),
+            1,
+            "{out}"
+        );
+        assert!(!out.contains("pcie_aspm=force"), "{out}");
     }
 
     #[test]
