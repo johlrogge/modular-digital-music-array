@@ -4,6 +4,35 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.28.1] — 2026-11-01
+
+### Fixed
+
+- **NVMe dropout on Pi 5 with wifi active (#69): root cause found.** In an Argon NEO 5 M.2 case the NVMe dropped off PCIe within a minute of boot whenever the Pi's wifi radio was active (2.4 GHz transmissions interfering with the PCIe Gen2 link on the case's ribbon). Ruled out: power supply, kernel version (6.12.87 vs 6.12.95), `/boot` consistency, and the NVMe APST/ASPM kernel params added in 0.28.0. Provisioning now always writes `dtparam=pciex1_gen=1` into the NVMe boot partition's `config.txt` (PCIe Gen1, about 250 MB/s, ample for audio). The write is section-aware (applies at top level / `[all]`) and idempotent. The 0.28.0 cmdline params stay as a defensive measure.
+- **`cmdline.txt` and `config.txt` are now written atomically** (temp file + fsync + rename). Previously `cmdline.txt` was rewritten in place, and a power loss could leave it empty (unbootable).
+- **A missing `config.txt` on the target boot partition is now a provisioning error** instead of being silently created.
+
+### Correction
+
+- 0.28.0 said the NVMe dropout was fixed by disabling APST/ASPM. That was incomplete: those params did not prevent it; PCIe Gen1 does.
+
+### Known issues
+
+- The beacon has no DNS fallback when the router's resolver does not answer, and the startup clock-sync wait is ineffective (#68).
+- mdma-bandcamp crash-loops when no cookie file exists (#70).
+- The update page may stay on "Update started" (#67).
+- The wifi SSID is free text, so typos go unnoticed (#71).
+
+### Upgrade notes
+
+Already-provisioned nodes do not get the setting automatically. To apply it by hand, append `dtparam=pciex1_gen=1` under an `[all]` section at the end of `/boot/config.txt` and reboot. Verify with `cat /sys/bus/pci/devices/0001:01:00.0/current_link_speed`, which should print `2.5 GT/s PCIe`. Alternatively, reprovision with "Keep existing system and data".
+
+`config.txt` is an rpi-firmware conf_file: package updates keep your edit and write new defaults to `config.txt.new-*`.
+
+Hardware note: metal cases with the NVMe on a ribbon near the wifi antenna (e.g. Argon NEO 5) are susceptible. Ethernet-only units were not affected.
+
+---
+
 ## [0.28.0] — 2026-10-29
 
 ### Fixed

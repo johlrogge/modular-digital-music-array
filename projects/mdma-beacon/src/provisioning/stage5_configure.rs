@@ -11,7 +11,13 @@
 //! 7. Enable services (runit)
 //! 8. Write boot partition cmdline.txt (`/boot/cmdline.txt`; the boot partition is
 //!    mounted at `/boot`, so the kernel packages write to it directly)
-//! 9. Set Pi 5 EEPROM BOOT_ORDER to USB→NVMe→SD (0xf164)
+//! 9. Force the PCIe link to Gen1 in `/boot/config.txt` (`dtparam=pciex1_gen=1`,
+//!    the actual fix for NVMe dropping off the bus, #69)
+//! 10. Set up `/music` ownership and seed `bandcamp.conf`
+//! 11. Set Pi 5 EEPROM BOOT_ORDER to USB→NVMe→SD (0xf164)
+//!
+//! `cmdline.txt` and `config.txt` are rewritten atomically; a `.bak` copy of the
+//! original is kept the first time a file changes.
 //!
 //! Optionally (when the user supplied a wifi network) the wifi configuration
 //! is written and `wpa_supplicant` is enabled (#41).
@@ -103,13 +109,16 @@ impl Action<ConfiguredFstab, ConfiguredSystem, ConfiguredSystem> for ConfigureSy
         // mounted at /boot, so packages already wrote the kernel to it.
         configure_nvme_boot_cmdline(mount_root, root_device(planned_output.partitions())?).await?;
 
-        // 12. Set up /music directory ownership for mdma user (#60)
+        // 12. config.txt PCIe Gen1 (#69)
+        ensure_boot_config_pcie_gen1(mount_root).await?;
+
+        // 13. Set up /music directory ownership for mdma user (#60)
         setup_music_directory(mount_root).await?;
 
-        // 13. Seed bandcamp.conf if not already present (#61)
+        // 14. Seed bandcamp.conf if not already present (#61)
         seed_bandcamp_config(mount_root).await?;
 
-        // 14. Set EEPROM BOOT_ORDER to USB→NVMe→SD — MUST be last (#22)
+        // 15. Set EEPROM BOOT_ORDER to USB→NVMe→SD — MUST be last (#22)
         configure_pi_eeprom_boot_order().await?;
 
         tracing::info!("✅ Stage 5: System configuration complete");
@@ -809,9 +818,11 @@ pub(crate) async fn get_partuuid(device: &str) -> Result<String> {
 
 /// Kernel params disabling NVMe APST and PCIe ASPM / port power management (#69).
 ///
-/// On Pi 5 the NVMe controller can drop off the PCIe bus (~65s after boot,
-/// `CSTS=0xffffffff`), hanging the system. MDMA is mains-powered, so we trade
-/// power saving for stability unconditionally.
+/// Defensive only: on Pi 5 the NVMe controller can drop off the PCIe bus
+/// (~65s after boot, `CSTS=0xffffffff`), hanging the system, but these params
+/// turned out NOT to be the fix. The actual fix for #69 is forcing the PCIe
+/// link to Gen1 via [`PCIE_GEN1_LINE`] in config.txt. MDMA is mains-powered,
+/// so we keep these as harmless extra stability measures.
 const NVME_STABILITY_PARAMS: [&str; 3] = [
     "nvme_core.default_ps_max_latency_us=0",
     "pcie_aspm=off",
@@ -875,42 +886,84 @@ fn rewrite_cmdline(current_cmdline: &str, root_partuuid: &str) -> String {
     format!("{}\n", out.join(" "))
 }
 
-/// Write `cmdline.txt` at `dest` using `root_partuuid` as the root device.
+/// Outcome of [`rewrite_boot_file`].
+#[derive(Debug, PartialEq, Eq)]
+enum Rewritten {
+    Unchanged,
+    Written,
+}
+
+/// What [`rewrite_boot_file`] does when the file does not exist.
+#[derive(Clone, Copy)]
+enum IfMissing {
+    /// Treat as empty and create the file (the parent directory must exist).
+    StartEmpty,
+    /// Fail: the boot partition is unpopulated or not mounted.
+    Error,
+}
+
+/// Rewrite a boot partition file through `transform`, atomically.
 ///
-/// Reads the existing file (if any) and preserves all other kernel parameters,
-/// except the [`NVME_STABILITY_PARAMS`] keys, whose existing values are
-/// replaced. Creates a `.bak` backup on first write.
-async fn write_cmdline(root_partuuid: &str, dest: &Path) -> Result<()> {
-    let current = if dest.exists() {
-        tokio::fs::read_to_string(dest).await.map_err(|e| {
-            BeaconError::Provisioning(format!("Failed to read {}: {}", dest.display(), e))
-        })?
-    } else {
-        String::new()
+/// Skips the write when the output equals the input exactly. Before the first
+/// change a `<name>.bak` copy of a non-empty original is kept (never
+/// overwritten). The parent directory is never created.
+fn rewrite_boot_file(
+    path: &Path,
+    if_missing: IfMissing,
+    transform: impl FnOnce(&str) -> String,
+) -> Result<Rewritten> {
+    let current = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match if_missing {
+            IfMissing::StartEmpty => String::new(),
+            IfMissing::Error => {
+                return Err(BeaconError::Provisioning(format!(
+                    "{} does not exist — boot partition is unpopulated or not mounted",
+                    path.display()
+                )))
+            }
+        },
+        Err(e) => {
+            return Err(BeaconError::Provisioning(format!(
+                "Failed to read {}: {}",
+                path.display(),
+                e
+            )))
+        }
     };
 
-    let new_content = rewrite_cmdline(&current, root_partuuid);
-
-    if current.trim() == new_content.trim() {
-        tracing::info!("  {} already up to date — no change", dest.display());
-        return Ok(());
+    let new_content = transform(&current);
+    if new_content == current {
+        tracing::info!("  {} already up to date — no change", path.display());
+        return Ok(Rewritten::Unchanged);
     }
 
-    // Backup original on first write
-    let backup = dest.with_extension("txt.bak");
-    if !backup.exists() && !current.is_empty() {
-        tokio::fs::write(&backup, &current).await.map_err(|e| {
-            BeaconError::Provisioning(format!("Failed to backup {}: {}", dest.display(), e))
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(".bak");
+    let backup = PathBuf::from(backup);
+    if !current.is_empty() && !backup.exists() {
+        private_file::write_file_atomic(&backup, current.as_bytes(), 0o644).map_err(|e| {
+            BeaconError::Provisioning(format!("Failed to backup {}: {}", path.display(), e))
         })?;
         tracing::info!("  Backed up original to {}", backup.display());
     }
 
-    tokio::fs::write(dest, &new_content).await.map_err(|e| {
-        BeaconError::Provisioning(format!("Failed to write {}: {}", dest.display(), e))
+    private_file::write_file_atomic(path, new_content.as_bytes(), 0o644).map_err(|e| {
+        BeaconError::Provisioning(format!("Failed to write {}: {}", path.display(), e))
     })?;
+    tracing::info!("  Wrote {}", path.display());
+    Ok(Rewritten::Written)
+}
 
-    tracing::info!("  Wrote {}: {}", dest.display(), new_content.trim());
-    Ok(())
+/// Run [`rewrite_boot_file`] on the blocking pool.
+async fn rewrite_boot_file_blocking(
+    path: PathBuf,
+    if_missing: IfMissing,
+    transform: impl FnOnce(&str) -> String + Send + 'static,
+) -> Result<Rewritten> {
+    tokio::task::spawn_blocking(move || rewrite_boot_file(&path, if_missing, transform))
+        .await
+        .map_err(|e| BeaconError::Provisioning(format!("boot file rewrite task: {e}")))?
 }
 
 /// Path of the boot partition's `cmdline.txt` (boot partition is mounted at `/boot`, #65).
@@ -919,15 +972,169 @@ fn boot_cmdline_path(mount_root: &Path) -> PathBuf {
 }
 
 /// Write `<mount_root>/boot/cmdline.txt` booting from `root_partuuid`.
+///
+/// A missing cmdline.txt is created from a default; the `boot` directory must
+/// already exist (it is the mounted boot partition).
 async fn write_boot_cmdline(mount_root: &Path, root_partuuid: &str) -> Result<()> {
-    let cmdline = boot_cmdline_path(mount_root);
-    // Ensure the directory exists (should be mounted, but create defensively)
-    if let Some(parent) = cmdline.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            BeaconError::Provisioning(format!("Failed to create {}: {}", parent.display(), e))
-        })?;
+    let uuid = root_partuuid.to_string();
+    rewrite_boot_file_blocking(
+        boot_cmdline_path(mount_root),
+        IfMissing::StartEmpty,
+        move |c| rewrite_cmdline(c, &uuid),
+    )
+    .await?;
+    Ok(())
+}
+
+/// The config.txt line forcing the external PCIe link to Gen1 (#69).
+///
+/// Verified on hardware to keep the NVMe stable with wifi active. Gen1
+/// (~250 MB/s) is ample for audio, so it is applied unconditionally. The
+/// kernel-side companions are [`NVME_STABILITY_PARAMS`].
+const PCIE_GEN1_LINE: &str = "dtparam=pciex1_gen=1";
+
+/// Key of the PCIe generation dtparam.
+const PCIE_GEN_KEY: &str = "pciex1_gen=";
+
+/// One config.txt line, as seen by all passes of [`ensure_pcie_gen1`].
+#[derive(Debug, PartialEq, Eq)]
+enum Line<'a> {
+    /// A `[...]` section header (trimmed).
+    Header(&'a str),
+    /// A standalone `dtparam=pciex1_gen=<v>` line.
+    PcieGen {
+        gen1: bool,
+    },
+    /// A `dtparam=a=b,pciex1_gen=<v>,...` comma-combined line.
+    PcieGenCombined,
+    Other,
+}
+
+/// Classify one config.txt line.
+///
+/// Assumption: the firmware treats `#` as the start of a comment, so
+/// `[pi4]  # note` is still a section header. Stripping is the conservative
+/// direction: a commented header is always reported as a header (so a gen line
+/// below it is never trusted as top-level), and it is returned with its comment
+/// intact so it can never equal `[all]` and is never applicable, even if the
+/// firmware turns out not to parse it as a header.
+fn classify(line: &str) -> Line<'_> {
+    let t = line.trim();
+    let code = t.split('#').next().unwrap_or(t).trim_end();
+    if code.starts_with('[') && code.ends_with(']') {
+        return Line::Header(if code.len() == t.len() { code } else { t });
     }
-    write_cmdline(root_partuuid, &cmdline).await
+    let Some(rest) = t.strip_prefix("dtparam=") else {
+        return Line::Other;
+    };
+    if !rest.contains(',') {
+        return match rest.strip_prefix(PCIE_GEN_KEY) {
+            Some(v) => Line::PcieGen { gen1: v == "1" },
+            None => Line::Other,
+        };
+    }
+    if rest.split(',').any(|p| p.trim().starts_with(PCIE_GEN_KEY)) {
+        Line::PcieGenCombined
+    } else {
+        Line::Other
+    }
+}
+
+/// Whether a header resets to the unconditional region. Only top level and
+/// `[all]` apply; filters like `[pi5]` AND together with earlier ones, so no
+/// other header is trusted.
+fn header_is_applicable(header: &str) -> bool {
+    header == "[all]"
+}
+
+/// Ensure config.txt contains exactly one applicable `dtparam=pciex1_gen=1`
+/// that is also the effective one (#69).
+///
+/// A line is applicable when it is at top level or under `[all]` with no other
+/// header since. If exactly one applicable standalone gen line exists, it is
+/// `=1`, and no later gen line of any kind (including ones in conditional
+/// sections) could override it, the content is returned unchanged (apart from
+/// a guaranteed trailing newline). Otherwise every applicable standalone
+/// `dtparam=pciex1_gen=` line is removed and ours is appended (later wins),
+/// preceded by `[all]` unless the file has no headers or the last header is
+/// `[all]`. Gen lines in non-applicable sections (`[pi4]`, `[cm4]`, ...) are
+/// left byte-for-byte.
+///
+/// Comma-combined lines (`dtparam=audio=on,pciex1_gen=3`) are never rewritten;
+/// if one follows our line (or there is no line of ours), ours is re-appended
+/// at EOF so it wins.
+///
+/// `include` directives in config.txt are not followed; gen lines in included
+/// files are neither seen nor removed.
+fn ensure_pcie_gen1(current: &str) -> String {
+    let mut base = current.to_string();
+    if !base.is_empty() && !base.ends_with('\n') {
+        base.push('\n');
+    }
+
+    // Per line: (raw, classification, applicable). Applicability is the state
+    // *at* that line.
+    let mut applicable = true;
+    let mut lines: Vec<(&str, Line<'_>, bool)> = Vec::new();
+    for raw in base.split_inclusive('\n') {
+        let c = classify(raw);
+        if let Line::Header(h) = c {
+            applicable = header_is_applicable(h);
+        }
+        lines.push((raw, c, applicable));
+    }
+
+    let applicable_gen: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, c, a))| *a && matches!(c, Line::PcieGen { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    if let [i] = applicable_gen[..] {
+        let correct = matches!(lines[i].1, Line::PcieGen { gen1: true });
+        let overridden = lines[i + 1..]
+            .iter()
+            .any(|(_, c, _)| matches!(c, Line::PcieGen { .. } | Line::PcieGenCombined));
+        if correct && !overridden {
+            return base;
+        }
+    }
+
+    let mut out = String::with_capacity(base.len() + 32);
+    let mut last_header: Option<&str> = None;
+    for (raw, c, a) in &lines {
+        match c {
+            Line::PcieGen { .. } if *a => continue,
+            Line::Header(h) => last_header = Some(h),
+            _ => {}
+        }
+        out.push_str(raw);
+    }
+    if last_header.is_some_and(|h| !header_is_applicable(h)) {
+        out.push_str("[all]\n");
+    }
+    out.push_str(PCIE_GEN1_LINE);
+    out.push('\n');
+    out
+}
+
+/// Path of the boot partition's `config.txt` (boot partition is mounted at `/boot`, #65).
+fn boot_config_path(mount_root: &Path) -> PathBuf {
+    mount_root.join("boot/config.txt")
+}
+
+/// Ensure `<mount_root>/boot/config.txt` forces PCIe Gen1 (#69).
+///
+/// config.txt is owned by `rpi-firmware` (ADR-006), so a missing file is an
+/// error rather than something to create.
+async fn ensure_boot_config_pcie_gen1(mount_root: &Path) -> Result<()> {
+    tracing::info!("Ensuring NVMe Boot partition config.txt forces PCIe Gen1");
+    rewrite_boot_file_blocking(boot_config_path(mount_root), IfMissing::Error, |c| {
+        ensure_pcie_gen1(c)
+    })
+    .await?;
+    tracing::info!("✅ NVMe Boot partition config.txt updated");
+    Ok(())
 }
 
 /// Write NVMe Boot partition `cmdline.txt` so it boots from the NVMe root partition (#55, #65).
@@ -1098,8 +1305,9 @@ async fn seed_bandcamp_config(mount_root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        boot_cmdline_path, rewrite_cmdline, root_device, write_boot_cmdline, MountPoint, Partition,
-        MUSIC_CHOWN_PATHS, TARGET_PACKAGES,
+        boot_cmdline_path, classify, ensure_boot_config_pcie_gen1, ensure_pcie_gen1,
+        header_is_applicable, rewrite_boot_file, rewrite_cmdline, root_device, write_boot_cmdline,
+        IfMissing, Line, MountPoint, Partition, Rewritten, MUSIC_CHOWN_PATHS, TARGET_PACKAGES,
     };
     use std::os::unix::fs::PermissionsExt;
 
@@ -1585,6 +1793,7 @@ mod tests {
     async fn write_boot_cmdline_writes_to_boot_cmdline_txt() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mount_root = dir.path();
+        std::fs::create_dir_all(mount_root.join("boot")).expect("mkdir boot");
 
         write_boot_cmdline(mount_root, "aabbccdd-02")
             .await
@@ -1597,6 +1806,442 @@ mod tests {
             !mount_root.join("boot/firmware").exists(),
             "must not create boot/firmware"
         );
+    }
+
+    // ── #69: PCIe Gen1 in config.txt ─────────────────────────────────────────
+
+    fn gen_lines(s: &str) -> Vec<&str> {
+        s.lines()
+            .filter(|l| l.trim().starts_with("dtparam=pciex1_gen="))
+            .collect()
+    }
+
+    #[test]
+    fn ensure_pcie_gen1_adds_when_absent() {
+        let out = ensure_pcie_gen1("dtparam=audio=on\n");
+        assert_eq!(out, "dtparam=audio=on\ndtparam=pciex1_gen=1\n");
+    }
+
+    #[test]
+    fn ensure_pcie_gen1_empty_input() {
+        assert_eq!(ensure_pcie_gen1(""), "dtparam=pciex1_gen=1\n");
+    }
+
+    #[test]
+    fn ensure_pcie_gen1_adds_missing_trailing_newline() {
+        let out = ensure_pcie_gen1("dtparam=audio=on");
+        assert_eq!(out, "dtparam=audio=on\ndtparam=pciex1_gen=1\n");
+    }
+
+    #[test]
+    fn ensure_pcie_gen1_is_idempotent() {
+        for input in [
+            "",
+            "dtparam=audio=on\n",
+            "[pi4]\narm_boost=1\n",
+            "[all]\ndtoverlay=x\n[pi4]\nfoo=1\n",
+        ] {
+            let once = ensure_pcie_gen1(input);
+            assert_eq!(ensure_pcie_gen1(&once), once, "input: {input:?}");
+            assert_eq!(gen_lines(&once), vec!["dtparam=pciex1_gen=1"]);
+        }
+    }
+
+    #[test]
+    fn ensure_pcie_gen1_replaces_other_values() {
+        for v in ["2", "3"] {
+            let input = format!("a=1\ndtparam=pciex1_gen={v}\nb=2\n");
+            assert_eq!(ensure_pcie_gen1(&input), "a=1\nb=2\ndtparam=pciex1_gen=1\n");
+        }
+    }
+
+    #[test]
+    fn ensure_pcie_gen1_does_not_duplicate() {
+        let input = "dtparam=pciex1_gen=1\nx=1\ndtparam=pciex1_gen=1\n";
+        assert_eq!(ensure_pcie_gen1(input), "x=1\ndtparam=pciex1_gen=1\n");
+    }
+
+    #[test]
+    fn ensure_pcie_gen1_pi5_after_other_filter_is_not_trusted() {
+        assert_eq!(
+            ensure_pcie_gen1("[gpio4=1]\n[pi5]\nx=1\n"),
+            "[gpio4=1]\n[pi5]\nx=1\n[all]\ndtparam=pciex1_gen=1\n"
+        );
+    }
+
+    #[test]
+    fn ensure_pcie_gen1_keeps_correct_line_under_all_after_other_sections() {
+        let input = "[pi4]\na=1\n[all]\ndtparam=pciex1_gen=1\nb=2\n";
+        assert_eq!(ensure_pcie_gen1(input), input);
+    }
+
+    #[test]
+    fn ensure_pcie_gen1_correct_and_wrong_in_different_regions_leaves_one() {
+        let input = "dtparam=pciex1_gen=3\n[pi4]\nx=1\n[all]\ndtparam=pciex1_gen=1\n";
+        assert_eq!(
+            ensure_pcie_gen1(input),
+            "[pi4]\nx=1\n[all]\ndtparam=pciex1_gen=1\n"
+        );
+    }
+
+    #[test]
+    fn ensure_pcie_gen1_none_and_board_type_sections_are_not_applicable() {
+        for h in ["[none]", "[board-type=0x17]"] {
+            let input = format!("{h}\ndtparam=pciex1_gen=1\n");
+            assert_eq!(
+                ensure_pcie_gen1(&input),
+                format!("{h}\ndtparam=pciex1_gen=1\n[all]\ndtparam=pciex1_gen=1\n")
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_pcie_gen1_comma_combined_line_is_kept_and_ours_wins_after_it() {
+        assert_eq!(
+            ensure_pcie_gen1("dtparam=audio=on,pciex1_gen=3\n"),
+            "dtparam=audio=on,pciex1_gen=3\ndtparam=pciex1_gen=1\n"
+        );
+        let settled = "dtparam=audio=on,pciex1_gen=3\ndtparam=pciex1_gen=1\n";
+        assert_eq!(ensure_pcie_gen1(settled), settled);
+        assert_eq!(
+            ensure_pcie_gen1("dtparam=pciex1_gen=1\ndtparam=audio=on,pciex1_gen=3\n"),
+            settled
+        );
+    }
+
+    #[test]
+    fn classify_lines() {
+        assert_eq!(classify(" [pi5] \n"), Line::Header("[pi5]"));
+        assert_eq!(
+            classify("dtparam=pciex1_gen=1\n"),
+            Line::PcieGen { gen1: true }
+        );
+        assert_eq!(
+            classify("dtparam=pciex1_gen=2"),
+            Line::PcieGen { gen1: false }
+        );
+        assert_eq!(classify("dtparam=a=on,pciex1_gen=1"), Line::PcieGenCombined);
+        assert_eq!(classify("#dtparam=pciex1_gen=1"), Line::Other);
+        assert_eq!(classify("dtparam=audio=on,i2c=on"), Line::Other);
+        assert!(header_is_applicable("[all]"));
+        assert!(!header_is_applicable("[pi5]"));
+    }
+
+    mod prop {
+        use super::super::ensure_pcie_gen1;
+        use proptest::prelude::*;
+
+        const LINES: [&str; 14] = [
+            "[all]",
+            "[pi4]",
+            "[pi5]",
+            "[none]",
+            "[gpio4=1]",
+            "[pi4]  # comment",
+            "[all] # comment",
+            "dtparam=pciex1_gen=1",
+            "dtparam=pciex1_gen=2",
+            "dtparam=pciex1_gen=3",
+            "dtparam=audio=on,pciex1_gen=3",
+            "foo=1",
+            "#dtparam=pciex1_gen=3",
+            "",
+        ];
+
+        const GEN1: &str = "dtparam=pciex1_gen=1";
+
+        fn arb_config() -> impl Strategy<Value = String> {
+            (
+                prop::collection::vec(prop::sample::select(LINES.to_vec()), 0..14),
+                any::<bool>(),
+            )
+                .prop_map(|(v, trailing_newline)| {
+                    let mut s = v.join("\n");
+                    if trailing_newline {
+                        s.push('\n');
+                    }
+                    s
+                })
+        }
+
+        // ── Independent oracle: literal string matching only, valid because
+        // every generated line comes from LINES (no surrounding whitespace). ──
+
+        fn body(raw: &str) -> &str {
+            raw.trim_end_matches('\n')
+        }
+
+        fn is_standalone_gen(l: &str) -> bool {
+            l.starts_with("dtparam=pciex1_gen=")
+        }
+
+        fn is_any_gen(l: &str) -> bool {
+            l.starts_with("dtparam=") && l.contains("pciex1_gen=")
+        }
+
+        /// (raw line, applicable at that line): applicable = top level or under
+        /// `[all]` exactly, any other `[` line makes the region non-applicable.
+        fn with_applicability(text: &str) -> Vec<(&str, bool)> {
+            let mut applicable = true;
+            text.split_inclusive('\n')
+                .map(|raw| {
+                    let l = body(raw);
+                    if l.starts_with('[') {
+                        applicable = l == "[all]";
+                    }
+                    (raw, applicable)
+                })
+                .collect()
+        }
+
+        /// The postcondition: exactly one applicable standalone gen line, it is
+        /// `=1`, and it is the last gen line of any kind in the file.
+        fn satisfied(text: &str) -> bool {
+            let lines = with_applicability(text);
+            let applicable_gen: Vec<&str> = lines
+                .iter()
+                .filter(|(raw, a)| *a && is_standalone_gen(body(raw)))
+                .map(|(raw, _)| body(raw))
+                .collect();
+            let last_gen = lines
+                .iter()
+                .rev()
+                .find(|(raw, _)| is_any_gen(body(raw)))
+                .map(|(raw, a)| (*a, body(raw)));
+            applicable_gen == [GEN1] && last_gen == Some((true, GEN1))
+        }
+
+        fn normalized(input: &str) -> String {
+            let mut n = input.to_string();
+            if !n.is_empty() && !n.ends_with('\n') {
+                n.push('\n');
+            }
+            n
+        }
+
+        proptest! {
+            #[test]
+            fn result_satisfies_postcondition_and_is_idempotent(input in arb_config()) {
+                let once = ensure_pcie_gen1(&input);
+                prop_assert!(satisfied(&once), "not satisfied: {:?}", once);
+                prop_assert_eq!(ensure_pcie_gen1(&once), once.clone());
+            }
+
+            #[test]
+            fn preserves_everything_except_applicable_standalone_gen_lines(input in arb_config()) {
+                let norm = normalized(&input);
+                let out = ensure_pcie_gen1(&input);
+
+                let kept: Vec<&str> = with_applicability(&norm)
+                    .into_iter()
+                    .filter(|(raw, a)| !(*a && is_standalone_gen(body(raw))))
+                    .map(|(raw, _)| raw)
+                    .collect();
+                let last_header = kept.iter().rev().map(|r| body(r)).find(|l| l.starts_with('['));
+                let suffix = if last_header.is_some_and(|h| h != "[all]") {
+                    format!("[all]\n{GEN1}\n")
+                } else {
+                    format!("{GEN1}\n")
+                };
+                let filtered = kept.concat();
+
+                prop_assert!(
+                    out == norm || out == format!("{filtered}{suffix}"),
+                    "norm: {:?}\nout: {:?}",
+                    norm,
+                    out
+                );
+            }
+
+            #[test]
+            fn already_satisfied_input_is_a_noop(input in arb_config()) {
+                let norm = normalized(&input);
+                if satisfied(&norm) {
+                    prop_assert_eq!(ensure_pcie_gen1(&input), norm);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn classify_strips_trailing_comment_on_headers() {
+        assert_eq!(
+            classify("[pi4]  # comment\n"),
+            Line::Header("[pi4]  # comment")
+        );
+        // A commented header is never equal to [all]: conservative either way.
+        assert!(!header_is_applicable("[all] # c"));
+        assert_eq!(classify("#[pi4]"), Line::Other);
+    }
+
+    #[test]
+    fn ensure_pcie_gen1_commented_header_ends_applicable_region() {
+        assert_eq!(
+            ensure_pcie_gen1("[pi4]  # comment\ndtparam=pciex1_gen=3\n"),
+            "[pi4]  # comment\ndtparam=pciex1_gen=3\n[all]\ndtparam=pciex1_gen=1\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_boot_cmdline_fails_without_boot_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_boot_cmdline(dir.path(), "aa-01")
+            .await
+            .expect_err("missing boot/ must fail");
+        assert!(!dir.path().join("boot").exists());
+    }
+
+    #[test]
+    fn rewrite_boot_file_makes_no_backup_for_missing_or_empty_original() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("a.txt");
+        let r = rewrite_boot_file(&missing, IfMissing::StartEmpty, |_| "x\n".into()).expect("a");
+        assert_eq!(r, Rewritten::Written);
+        assert!(!dir.path().join("a.txt.bak").exists());
+
+        let empty = dir.path().join("b.txt");
+        std::fs::write(&empty, "").expect("seed");
+        let r = rewrite_boot_file(&empty, IfMissing::Error, |_| "x\n".into()).expect("b");
+        assert_eq!(r, Rewritten::Written);
+        assert!(!dir.path().join("b.txt.bak").exists());
+    }
+
+    #[tokio::test]
+    async fn cmdline_reprovision_is_unchanged_and_backup_keeps_original() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let boot = dir.path().join("boot");
+        std::fs::create_dir_all(&boot).expect("mkdir");
+        let original = "console=tty1 root=/dev/mmcblk0p2 rootwait\n";
+        std::fs::write(boot.join("cmdline.txt"), original).expect("seed");
+
+        write_boot_cmdline(dir.path(), "aa-01")
+            .await
+            .expect("first");
+        let first = std::fs::read_to_string(boot.join("cmdline.txt")).expect("read");
+        assert_ne!(first, original);
+
+        let r = rewrite_boot_file(&boot.join("cmdline.txt"), IfMissing::StartEmpty, |c| {
+            rewrite_cmdline(c, "aa-01")
+        })
+        .expect("second");
+        assert_eq!(r, Rewritten::Unchanged);
+
+        write_boot_cmdline(dir.path(), "aa-01")
+            .await
+            .expect("third");
+        assert_eq!(
+            std::fs::read_to_string(boot.join("cmdline.txt")).expect("read"),
+            first
+        );
+        assert_eq!(
+            std::fs::read_to_string(boot.join("cmdline.txt.bak")).expect("bak"),
+            original
+        );
+    }
+
+    #[test]
+    fn ensure_pcie_gen1_existing_line_unchanged_in_place() {
+        let input = "dtparam=pciex1_gen=1\n[all]\nfoo=1\n";
+        assert_eq!(ensure_pcie_gen1(input), input);
+    }
+
+    #[test]
+    fn ensure_pcie_gen1_appends_all_section_after_pi4_section() {
+        let input = "dtparam=audio=on\n[pi4]\narm_boost=1\n";
+        let out = ensure_pcie_gen1(input);
+        assert_eq!(
+            out,
+            "dtparam=audio=on\n[pi4]\narm_boost=1\n[all]\ndtparam=pciex1_gen=1\n"
+        );
+    }
+
+    #[test]
+    fn ensure_pcie_gen1_preserves_pi4_line_and_appends_all() {
+        let input = "[pi4]\ndtparam=pciex1_gen=1\n";
+        let out = ensure_pcie_gen1(input);
+        assert_eq!(
+            out,
+            "[pi4]\ndtparam=pciex1_gen=1\n[all]\ndtparam=pciex1_gen=1\n"
+        );
+    }
+
+    #[test]
+    fn ensure_pcie_gen1_no_extra_header_when_last_section_is_all() {
+        assert_eq!(
+            ensure_pcie_gen1("[pi4]\na=1\n[all]\nb=2\n"),
+            "[pi4]\na=1\n[all]\nb=2\ndtparam=pciex1_gen=1\n"
+        );
+        assert_eq!(
+            ensure_pcie_gen1("[pi5]\nb=2\n"),
+            "[pi5]\nb=2\n[all]\ndtparam=pciex1_gen=1\n"
+        );
+    }
+
+    #[test]
+    fn ensure_pcie_gen1_preserves_other_lines_and_comments() {
+        let input = "# comment\n\ndtparam=audio=on\n#dtparam=pciex1_gen=3\ndtoverlay=vc4-kms-v3d\n[cm4]\notg_mode=1\n";
+        let out = ensure_pcie_gen1(input);
+        assert!(out.starts_with(input), "{out}");
+        assert!(out.contains("#dtparam=pciex1_gen=3\n"));
+        assert_eq!(gen_lines(&out), vec!["dtparam=pciex1_gen=1"]);
+    }
+
+    #[tokio::test]
+    async fn ensure_boot_config_writes_and_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("boot")).expect("mkdir");
+        std::fs::write(root.join("boot/config.txt"), "[pi4]\nx=1\n").expect("seed");
+
+        ensure_boot_config_pcie_gen1(root).await.expect("first");
+        let first = std::fs::read_to_string(root.join("boot/config.txt")).expect("read");
+        assert_eq!(first, "[pi4]\nx=1\n[all]\ndtparam=pciex1_gen=1\n");
+
+        let mut names: Vec<String> = std::fs::read_dir(root.join("boot"))
+            .expect("readdir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["config.txt", "config.txt.bak"]);
+
+        ensure_boot_config_pcie_gen1(root).await.expect("second");
+        let second = std::fs::read_to_string(root.join("boot/config.txt")).expect("read");
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn ensure_boot_config_missing_file_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("boot")).expect("mkdir");
+        let err = ensure_boot_config_pcie_gen1(dir.path())
+            .await
+            .expect_err("missing config.txt must fail");
+        assert!(err.to_string().contains("config.txt"), "{err}");
+        assert!(!dir.path().join("boot/config.txt").exists());
+    }
+
+    #[test]
+    fn rewrite_boot_file_backup_is_original_and_never_overwritten() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.txt");
+        let bak = dir.path().join("config.txt.bak");
+        std::fs::write(&path, "[pi4]\nx=1\n").expect("seed");
+
+        let r = rewrite_boot_file(&path, IfMissing::Error, ensure_pcie_gen1).expect("first");
+        assert_eq!(r, Rewritten::Written);
+        assert_eq!(std::fs::read_to_string(&bak).expect("bak"), "[pi4]\nx=1\n");
+
+        std::fs::write(&path, "[all]\ndtparam=pciex1_gen=3\n").expect("modify");
+        let r = rewrite_boot_file(&path, IfMissing::Error, ensure_pcie_gen1).expect("second");
+        assert_eq!(r, Rewritten::Written);
+        assert_eq!(std::fs::read_to_string(&bak).expect("bak"), "[pi4]\nx=1\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "[all]\ndtparam=pciex1_gen=1\n"
+        );
+
+        let r = rewrite_boot_file(&path, IfMissing::Error, ensure_pcie_gen1).expect("third");
+        assert_eq!(r, Rewritten::Unchanged);
     }
 
     #[test]
