@@ -172,7 +172,7 @@ Copy `scripts/install-mdma-macos.sh` from this repo to your Mac and run it. It r
 bash install-mdma-macos.sh
 
 # Install a specific tag
-bash install-mdma-macos.sh v0.28.0
+bash install-mdma-macos.sh v0.28.1
 
 # Install to a user-writable location (no sudo)
 MDMA_INSTALL_DIR=~/.local/bin bash install-mdma-macos.sh
@@ -190,6 +190,24 @@ cp profiles/dev/target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.28.1
+
+### NVMe dropout root cause found (#69)
+
+In an Argon NEO 5 M.2 case the NVMe dropped off PCIe within a minute of boot whenever the Pi's wifi radio was active (2.4 GHz interfering with the PCIe Gen2 link on the case's ribbon). Ruled out: power supply, kernel version (6.12.87 vs 6.12.95), /boot consistency, and the 0.28.0 APST/ASPM params. Provisioning now always writes `dtparam=pciex1_gen=1` into the boot partition's `config.txt` (PCIe Gen1, about 250 MB/s, ample for audio). It is section-aware (top level / `[all]`) and idempotent. The 0.28.0 cmdline params stay as a defensive measure.
+
+**Correction:** 0.28.0 claimed APST/ASPM fixed the dropout. They did not; PCIe Gen1 does.
+
+### Safer boot config writes
+
+`cmdline.txt` and `config.txt` are now written atomically (temp file, fsync, rename); previously a power loss during the `cmdline.txt` rewrite could leave it empty and the node unbootable. A missing `config.txt` on the target is now a provisioning error instead of being silently created.
+
+**Upgrade note:** already-provisioned nodes do not get the setting automatically. Append `dtparam=pciex1_gen=1` under an `[all]` section at the end of `/boot/config.txt` and reboot; verify with `cat /sys/bus/pci/devices/0001:01:00.0/current_link_speed` (expect `2.5 GT/s PCIe`). Or reprovision with "Keep existing system and data". `config.txt` is a conf_file, so package updates keep your edit and write new defaults to `config.txt.new-*`. Metal cases with the NVMe on a ribbon near the wifi antenna (e.g. Argon NEO 5) are susceptible; ethernet-only units were not affected.
+
+**Known issues:** no DNS fallback in the beacon / startup clock-sync wait ineffective (#68); mdma-bandcamp crash-loops without a cookie file (#70); update page may hang at "Update started" (#67); wifi SSID is free text, so typos go unnoticed (#71). See CHANGELOG.md.
 
 ---
 
