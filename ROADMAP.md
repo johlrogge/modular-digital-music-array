@@ -519,8 +519,8 @@ mdma-library  mdma-playback  /run/mdma/sources/*.sock
 ```
 
 **void-packages as single source of truth:**
-- All 6 services have srcpkg entries: `void-packages/srcpkgs/<name>/template` + `files/<name>/run`
-- Package scripts and deploy recipes copy run scripts from void-packages (no more heredocs)
+- Every package has a srcpkg: `void-packages/srcpkgs/<name>/` holds `template` (depends, short_desc, conf_files, revision), `INSTALL`/`REMOVE`, `files/<d>/` runit service dirs and a `files/rootfs/` overlay. Only the binary and the version (Cargo.toml) come from elsewhere
+- `scripts/package/create-service-package.sh --srcpkg` assembles the package from the srcpkg; the `create-*-package.sh` wrappers only name the srcpkg and binary; `scripts/ci/verify-packages.sh` (`just pkg-verify`) checks built packages against it in CI
 - CLI: `LibraryBackend` + `PlaybackBackend` enums dispatch via gateway or direct IPC
 - `MDMA_NODE` is the only env var needed from laptop; the CLI derives the gateway address automatically
 - Provisioning (stage5) installs and enables all 6 services
@@ -746,7 +746,7 @@ Unix pipes.
 - **2026-02-22:** Priority 3a fully complete — gateway deployed and verified on Pi.
   - All services behind gateway: only ports 5555 (gateway) and 80 (console) exposed
   - Library and playback run IPC-only (no more `--tcp` flags, no ports 5557/5558)
-  - void-packages as single source of truth: 6 srcpkg entries with templates + run scripts
+  - void-packages as single source of truth: srcpkg entries with templates + run scripts (extended to INSTALL/REMOVE, depends, descriptions and the rootfs overlay, with a CI verify step)
   - Package scripts and deploy recipes copy run scripts from void-packages (no heredocs)
   - CLI: `LibraryBackend` + `PlaybackBackend` enums with Direct/Gateway variants
   - Deploy recipes handle first-time install (wait for runit supervise directory)

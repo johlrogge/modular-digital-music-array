@@ -1,9 +1,3 @@
 #!/usr/bin/env bash
-# Create Void package for mdma-library
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "$SCRIPT_DIR/create-service-package.sh" \
-    --bin mdma-library \
-    --desc "MDMA music library service" \
-    --cargo-toml projects/mdma-library/Cargo.toml \
-    --extra-dirs "music/inbox music/blobs metadata" \
-    --extra-install "$SCRIPT_DIR/install/mdma-library.sh"
+# Create Void package for mdma-library (everything comes from void-packages/srcpkgs/mdma-library/)
+exec "$(dirname "${BASH_SOURCE[0]}")/create-service-package.sh" --srcpkg void-packages/srcpkgs/mdma-library

@@ -1,229 +1,184 @@
 #!/usr/bin/env bash
-# Generic Void package creator for MDMA services
+# Generic Void package creator for MDMA services.
+#
+# void-packages/srcpkgs/<pkg>/ is the single source of truth for everything
+# except the binary and the version (which comes from Cargo.toml):
+#
+#   template              depends, short_desc, conf_files (sourced)
+#   INSTALL, REMOVE       copied verbatim when present
+#   files/<d>/            every dir containing a `run` is copied whole to
+#                         etc/sv/<d>/ (down, log/run, ... preserved); a default
+#                         log/run is generated only when absent
+#   files/rootfs/**       copied verbatim into the package root
 #
 # Usage:
 #   create-service-package.sh \
-#     --bin NAME          binary name (e.g. mdma-library)
-#     --svc NAME          service/package name, defaults to --bin value
-#     --desc TEXT         xbps package description
-#     --cargo-toml PATH   path to Cargo.toml (relative to project root)
-#     [--deps TEXT]       xbps runtime dependencies
-#     [--extra-dirs DIRS] space-separated extra dirs to create inside the package
-#     [--extra-install FILE] path to shell snippet appended inside the post) block
-#     [--extra-files SRC:DEST ...] extra files to copy into the package tree
-#     [--conf-files FILES] space-separated absolute paths xbps keeps on upgrade
-#                          (passed to xbps-create --config-files)
+#     --srcpkg DIR          void-packages/srcpkgs/<pkg> (relative to the project root)
+#     [--bin NAME]          binary name; the package ships it as usr/bin/<pkgname>
+#                           (every MDMA binary is named like its package)
+#     [--cargo-toml PATH]   manifest holding the version (relative to project
+#                           root); default: projects/<pkg> or projects/mdma-<pkg>
+#
+# Always runs from the project root, whatever the caller's cwd.
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/package/lib-srcpkg.sh
+source "$SCRIPT_DIR/lib-srcpkg.sh"
+cd "$LIB_REPO_ROOT"
 
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
+SRCPKG=""
 BIN=""
-SVC=""
-DESC=""
 CARGO_TOML=""
-DEPS=""
-EXTRA_DIRS=""
-EXTRA_INSTALL=""
-CONF_FILES=""
-EXTRA_FILES=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --bin)         BIN="$2";          shift 2 ;;
-        --svc)         SVC="$2";          shift 2 ;;
-        --desc)        DESC="$2";         shift 2 ;;
-        --cargo-toml)  CARGO_TOML="$2";   shift 2 ;;
-        --deps)        DEPS="$2";         shift 2 ;;
-        --extra-dirs)  EXTRA_DIRS="$2";   shift 2 ;;
-        --extra-install) EXTRA_INSTALL="$2"; shift 2 ;;
-        --conf-files)  CONF_FILES="$2";   shift 2 ;;
-        --extra-files) shift
-                       while [[ $# -gt 0 && "$1" != --* ]]; do
-                           EXTRA_FILES+=("$1")
-                           shift
-                       done ;;
+        --srcpkg)      SRCPKG="$2";     shift 2 ;;
+        --bin)         BIN="$2";        shift 2 ;;
+        --cargo-toml)  CARGO_TOML="$2"; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
 
-# ---------------------------------------------------------------------------
-# Validate required args
-# ---------------------------------------------------------------------------
-if [[ -z "$BIN" ]]; then
-    echo "Error: --bin is required" >&2
+if [[ -z "$SRCPKG" ]]; then
+    echo "Error: --srcpkg is required" >&2
     exit 1
 fi
-if [[ -z "$DESC" ]]; then
-    echo "Error: --desc is required" >&2
-    exit 1
-fi
-if [[ -z "$CARGO_TOML" ]]; then
-    echo "Error: --cargo-toml is required" >&2
+SRCPKG="${SRCPKG%/}"
+if [[ ! -d "$SRCPKG" ]]; then
+    echo "Error: srcpkg directory not found: $SRCPKG" >&2
     exit 1
 fi
 
-# Default service name = binary name
-SVC="${SVC:-$BIN}"
+# ---------------------------------------------------------------------------
+# Metadata from the template (single source of truth)
+# ---------------------------------------------------------------------------
+srcpkg_load "$SRCPKG"
+SVC="$TPL_PKGNAME"
+if [[ -z "$SVC" || "$SVC" != "$(basename "$SRCPKG")" ]]; then
+    echo "Error: template pkgname '$SVC' does not match directory $(basename "$SRCPKG")" >&2
+    exit 1
+fi
+if [[ -z "$TPL_SHORT_DESC" ]]; then
+    echo "Error: short_desc missing in $SRCPKG/template" >&2
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
-# Paths — all relative to project root (where the script is called from)
+# Paths — all relative to the project root
 # ---------------------------------------------------------------------------
+BIN="${BIN:-$SVC}"
+if [[ "$BIN" != "$SVC" ]]; then
+    echo "Error: binary '$BIN' must be named like the package '$SVC' (shipped as usr/bin/$SVC)" >&2
+    exit 1
+fi
 BINARY="target/aarch64-unknown-linux-gnu/release/${BIN}"
 PACKAGE_DIR="build/package-${SVC}"
 PACKAGES_DIR="build/packages"
 
 echo "Creating ${SVC} Void package..."
 
-# ---------------------------------------------------------------------------
-# Verify binary
-# ---------------------------------------------------------------------------
 if [[ ! -f "$BINARY" ]]; then
     echo "Error: Binary not found at $BINARY" >&2
     exit 1
 fi
 
-# ---------------------------------------------------------------------------
-# Create package directory structure
-# ---------------------------------------------------------------------------
-rm -rf "$PACKAGE_DIR"
-mkdir -p "$PACKAGE_DIR/usr/bin"
-mkdir -p "$PACKAGE_DIR/etc/sv/${SVC}/log"
-
-# Extra dirs requested by the caller
-if [[ -n "$EXTRA_DIRS" ]]; then
-    for dir in $EXTRA_DIRS; do
-        mkdir -p "$PACKAGE_DIR/$dir"
-    done
+if [[ ! -f "$SRCPKG/files/${SVC}/run" ]]; then
+    echo "Error: $SRCPKG/files/${SVC}/run not found (every package needs its service)" >&2
+    exit 1
 fi
 
 # ---------------------------------------------------------------------------
-# Copy binary
+# Package directory structure
+# ---------------------------------------------------------------------------
+rm -rf "$PACKAGE_DIR"
+mkdir -p "$PACKAGE_DIR/usr/bin"
+
+# ---------------------------------------------------------------------------
+# Binary
 # ---------------------------------------------------------------------------
 echo "  -> Copying ${BIN} binary..."
 cp "$BINARY" "$PACKAGE_DIR/usr/bin/"
 chmod +x "$PACKAGE_DIR/usr/bin/${BIN}"
 
 # ---------------------------------------------------------------------------
-# Copy run script from void-packages (single source of truth)
-# Fall back to a minimal generated script if not present.
+# rootfs overlay (files/rootfs/** -> package root)
 # ---------------------------------------------------------------------------
-RUN_SCRIPT="void-packages/srcpkgs/${SVC}/files/${SVC}/run"
-if [[ -f "$RUN_SCRIPT" ]]; then
-    echo "  -> Copying service script from void-packages..."
-    cp "$RUN_SCRIPT" "$PACKAGE_DIR/etc/sv/${SVC}/run"
-else
-    echo "  -> Service script not found in void-packages, generating default..."
-    cat > "$PACKAGE_DIR/etc/sv/${SVC}/run" <<RUNSCRIPT
-#!/bin/sh
-exec 2>&1
-exec chpst -u mdma /usr/bin/${BIN}
-RUNSCRIPT
+ROOTFS="$SRCPKG/files/rootfs"
+if [[ -d "$ROOTFS" ]]; then
+    echo "  -> Copying rootfs overlay..."
+    cp -a "$ROOTFS/." "$PACKAGE_DIR/"
+    # Normalised: 755 if the source has the user x-bit, else 644.
+    while IFS= read -r -d '' rel; do
+        chmod "$(data_file_mode "$ROOTFS/$rel")" "$PACKAGE_DIR/$rel"
+    done < <(cd "$ROOTFS" && find . -type f -printf '%P\0')
 fi
-chmod +x "$PACKAGE_DIR/etc/sv/${SVC}/run"
 
 # ---------------------------------------------------------------------------
-# Log service
+# Runit service directories (files/<d>/ with a `run` -> etc/sv/<d>/)
 # ---------------------------------------------------------------------------
-echo "  -> Creating log service script..."
-cat > "$PACKAGE_DIR/etc/sv/${SVC}/log/run" <<LOGSCRIPT
-#!/bin/sh
-exec svlogd -tt /var/log/${SVC}
-LOGSCRIPT
-chmod +x "$PACKAGE_DIR/etc/sv/${SVC}/log/run"
-
-# ---------------------------------------------------------------------------
-# Extra files (--extra-files SRC:DEST)
-# ---------------------------------------------------------------------------
-for mapping in "${EXTRA_FILES[@]+"${EXTRA_FILES[@]}"}"; do
-    src="${mapping%%:*}"
-    dest="${mapping#*:}"
-    dest_dir="$(dirname "$PACKAGE_DIR/$dest")"
-    mkdir -p "$dest_dir"
-    echo "  -> Copying extra file: $src -> $PACKAGE_DIR/$dest"
-    cp "$src" "$PACKAGE_DIR/$dest"
-    case "$dest" in
-        usr/libexec/*) chmod 755 "$PACKAGE_DIR/$dest" ;;
-        etc/*) chmod 644 "$PACKAGE_DIR/$dest" ;;
-    esac
-done
-
-# ---------------------------------------------------------------------------
-# INSTALL script
-# We always generate the boilerplate (log dir, service symlink, restart).
-# Service-specific bits are read from --extra-install snippet if provided.
-# ---------------------------------------------------------------------------
-echo "  -> Creating INSTALL script..."
-
-# Build the extra-install content once so we can embed it safely
-EXTRA_INSTALL_CONTENT=""
-if [[ -n "$EXTRA_INSTALL" ]]; then
-    if [[ ! -f "$EXTRA_INSTALL" ]]; then
-        echo "Error: --extra-install file not found: $EXTRA_INSTALL" >&2
+while read -r name; do
+    [[ -n "$name" ]] || continue
+    src="$SRCPKG/files/$name"
+    if [[ ! -f "$src/run" ]]; then
+        echo "Error: $src has no run script (not a service dir?)" >&2
         exit 1
     fi
-    EXTRA_INSTALL_CONTENT="$(cat "$EXTRA_INSTALL")"
-fi
-
-# Write the INSTALL script using printf to avoid heredoc quoting surprises
-# xbps calls INSTALL with positional args: $1=action $2=pkgname $3=version $4="yes" if upgrade
-{
-    printf '#!/bin/sh\n'
-    printf '# INSTALL script for %s package\n' "$SVC"
-    printf '# $1=action  $2=pkgname  $3=version  $4="yes" if upgrade\n'
-    printf 'case "$1" in\n'
-    printf 'post)\n'
-    printf '    # Create log directory for svlogd\n'
-    printf '    mkdir -p /var/log/%s\n' "$SVC"
-    printf '\n'
-    if [[ -n "$EXTRA_INSTALL_CONTENT" ]]; then
-        printf '%s\n' "$EXTRA_INSTALL_CONTENT"
-        printf '\n'
+    dest="$PACKAGE_DIR/etc/sv/$name"
+    echo "  -> Copying service dir $name -> etc/sv/$name/"
+    mkdir -p "$dest"
+    cp -a "$src/." "$dest/"
+    if [[ ! -f "$dest/log/run" ]]; then
+        echo "     (generating log/run)"
+        mkdir -p "$dest/log"
+        printf '#!/bin/sh\nexec svlogd -tt /var/log/%s\n' "$name" > "$dest/log/run"
     fi
-    printf '    # Enable service on first install\n'
-    printf '    if [ ! -d /var/service ]; then\n'
-    printf '        mkdir -p /var/service\n'
-    printf '    fi\n'
-    printf '    if [ ! -e /var/service/%s ]; then\n' "$SVC"
-    printf '        ln -sf /etc/sv/%s /var/service/%s\n' "$SVC" "$SVC"
-    printf '        echo "%s service enabled"\n' "$SVC"
-    printf '    fi\n'
-    printf '\n'
-    printf '    # On upgrade, restart only if the service is currently up\n'
-    printf '    if [ "$4" = "yes" ]; then\n'
-    printf '        if sv check %s >/dev/null 2>&1; then\n' "$SVC"
-    printf '            sv restart %s\n' "$SVC"
-    printf '            echo "%s service restarted"\n' "$SVC"
-    printf '        fi\n'
-    printf '    fi\n'
-    printf '    ;;\n'
-    printf 'esac\n'
-} > "$PACKAGE_DIR/INSTALL"
-chmod +x "$PACKAGE_DIR/INSTALL"
+    # runit-executed files (run, log/run, finish, check, control/*) are 0755;
+    # anything else (e.g. `down`) is 755 only if the source has the x-bit.
+    while IFS= read -r -d '' rel; do
+        if service_file_is_exec "$rel"; then
+            chmod 755 "$dest/$rel"
+        elif [[ -f "$src/$rel" ]]; then
+            chmod "$(data_file_mode "$src/$rel")" "$dest/$rel"
+        fi
+    done < <(cd "$dest" && find . -type f -printf '%P\0')
+done < <(srcpkg_service_dirs "$SRCPKG")
+
+# ---------------------------------------------------------------------------
+# INSTALL / REMOVE (verbatim)
+# ---------------------------------------------------------------------------
+for hook in INSTALL REMOVE; do
+    if [[ -f "$SRCPKG/$hook" ]]; then
+        echo "  -> Copying $hook..."
+        cp "$SRCPKG/$hook" "$PACKAGE_DIR/$hook"
+        chmod 755 "$PACKAGE_DIR/$hook"
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # Version from Cargo.toml
 # ---------------------------------------------------------------------------
-if [[ ! -f "$CARGO_TOML" ]]; then
-    echo "Error: $CARGO_TOML not found!" >&2
+CARGO_TOML="${CARGO_TOML:-$(cargo_toml_for "$SVC" || true)}"
+if [[ -z "$CARGO_TOML" || ! -f "$CARGO_TOML" ]]; then
+    echo "Error: Cargo.toml for ${SVC} not found (got '${CARGO_TOML}'); pass --cargo-toml" >&2
     exit 1
 fi
 
-RAW=$(grep '^version[. =]' "$CARGO_TOML" | head -1)
-if echo "$RAW" | grep -q 'workspace = true'; then
-    REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-    VERSION=$(awk '/^\[workspace\.package\]/{flag=1; next} /^\[/{flag=0} flag && /^version/{gsub(/[" ]/,""); split($0,a,"="); print a[2]; exit}' "${REPO_ROOT}/Cargo.toml")
-else
-    VERSION=$(echo "$RAW" | sed 's/version *= *"\(.*\)"/\1/')
-fi
+VERSION="$(cargo_version "$CARGO_TOML")"
 echo "  Version from ${CARGO_TOML}: ${VERSION}"
 if [[ -z "$VERSION" ]]; then
     echo "Error: Could not extract version from $CARGO_TOML" >&2
     exit 1
 fi
+if [[ "$TPL_VERSION" != "$VERSION" ]]; then
+    echo "Warning: template version ($TPL_VERSION) differs from Cargo.toml ($VERSION); using Cargo.toml" >&2
+fi
 
-REVISION="1"
+REVISION="$TPL_REVISION"
 FULLVERSION="${VERSION}_${REVISION}"
 echo "  -> Package version: ${FULLVERSION}"
 
@@ -234,8 +189,11 @@ mkdir -p "$PACKAGES_DIR"
 PACKAGE_DIR_ABS=$(realpath "$PACKAGE_DIR")
 PACKAGES_DIR_ABS=$(realpath "$PACKAGES_DIR")
 
+# Drop packages of older versions so stale files never reach the repository.
+rm -f "$PACKAGES_DIR"/"${SVC}"-[0-9]*.aarch64.xbps
+
 echo "  -> Directory contents:"
-ls -lR "$PACKAGE_DIR_ABS" | head -30
+ls -lR "$PACKAGE_DIR_ABS" | head -60
 
 cd "$PACKAGES_DIR_ABS"
 
@@ -244,20 +202,19 @@ echo "  -> Running xbps-create..."
 XBPS_ARGS=(
     -A aarch64
     -n "${SVC}-${FULLVERSION}"
-    -s "$DESC"
+    -s "$TPL_SHORT_DESC"
     -H "https://github.com/johlrogge/modular-digital-music-array"
     -l MIT
     -m "Joakim Ohlrogge <joakim.ohlrogge@agical.se>"
 )
 
-if [[ -n "$DEPS" ]]; then
-    # xbps-create takes one -D flag per dependency group or accepts space-separated
-    # The original scripts passed the whole string as a single -D argument.
-    XBPS_ARGS+=(-D "$DEPS")
+if [[ -n "$TPL_DEPENDS" ]]; then
+    # One -D argument holding the whole space-separated list.
+    XBPS_ARGS+=(-D "$TPL_DEPENDS")
 fi
 
-if [[ -n "$CONF_FILES" ]]; then
-    XBPS_ARGS+=(--config-files "$CONF_FILES")
+if [[ -n "$TPL_CONF_FILES" ]]; then
+    XBPS_ARGS+=(--config-files "$TPL_CONF_FILES")
 fi
 
 XBPS_ARGS+=("$PACKAGE_DIR_ABS")

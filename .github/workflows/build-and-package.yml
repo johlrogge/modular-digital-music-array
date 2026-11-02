@@ -74,6 +74,10 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Verify package sources (void-packages/srcpkgs)
+      # Static and fast: needs only bash/awk/sh, no build. Covers PRs.
+      run: bash ./scripts/ci/verify-packages.sh --static
+
     - uses: cachix/install-nix-action@v31
     - uses: cachix/cachix-action@v16
       with:
@@ -144,9 +148,23 @@ jobs:
         key: cargo-aarch64-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: cargo-aarch64-
 
+    - name: Check working tree before build (informational)
+      # TODO: make fatal once a master run is clean (see the script).
+      run: bash ./scripts/ci/check-clean-tree.sh "before the build"
+
     - name: Build packages
       run: |
         devenv shell -- just pkg-build-all
+
+    - name: Check working tree after build (informational)
+      # A dirty tree makes the beacon build report `-dirty`. Prints status and
+      # diff stat and warns; compare with the step before the build.
+      # TODO: make fatal once a master run is clean (see the script).
+      run: bash ./scripts/ci/check-clean-tree.sh "after the build"
+
+    - name: Verify packages against void-packages/srcpkgs
+      run: |
+        devenv shell -- just pkg-verify --require-all
 
     - name: Setup signing key
       env:

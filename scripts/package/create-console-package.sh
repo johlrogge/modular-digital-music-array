@@ -1,9 +1,3 @@
 #!/usr/bin/env bash
-# Create Void package for mdma-console
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "$SCRIPT_DIR/create-service-package.sh" \
-    --bin mdma-console \
-    --desc "MDMA web console" \
-    --cargo-toml projects/mdma-console/Cargo.toml \
-    --deps "ffmpeg>=0" \
-    --extra-install "$SCRIPT_DIR/install/mdma-console.sh"
+# Create Void package for mdma-console (everything comes from void-packages/srcpkgs/mdma-console/)
+exec "$(dirname "${BASH_SOURCE[0]}")/create-service-package.sh" --srcpkg void-packages/srcpkgs/mdma-console

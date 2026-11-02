@@ -15,65 +15,84 @@ Code should run on live units within minutes of being written. This requires:
 - Runtime dependencies
 - runit service definitions
 - Application configuration templates
-- INSTALL scripts for service setup (supervise symlinks, service enabling)
+- INSTALL/REMOVE scripts for service setup (users, directories, supervise symlinks, service enabling)
 
 ## Void Package Structure
 
-MDMA builds Void packages with `xbps-create` (invoked by the
-`scripts/package/create-*-package.sh` wrappers), not `xbps-src`. Binaries are
+MDMA builds Void packages with `xbps-create`, not `xbps-src`. Binaries are
 cross-compiled ahead of time with `cargo-zigbuild`; `xbps-src` is not part of
-the pipeline:
+the pipeline. `void-packages/srcpkgs/<pkg>/` is the **single source of truth**
+for everything in a package except the binary and the version (which comes from
+`Cargo.toml`):
 
 ```
-void-packages/
-├── srcpkgs/
-│   ├── mdma-909/
-│   │   └── template
-│   ├── mdma-101/
-│   │   └── template
-│   ├── mdma-303/
-│   │   └── template
-│   └── mdma-common/
-│       └── template
+void-packages/srcpkgs/mdma-bandcamp/
+├── template                 # metadata only (see below)
+├── INSTALL                  # copied verbatim into the package (when present)
+├── REMOVE                   # copied verbatim (when present)
+└── files/
+    ├── mdma-bandcamp/       # a runit service dir: any files/<d>/ with a `run`
+    │   ├── run              #   -> etc/sv/<d>/ (down, finish, log/run preserved)
+    │   └── log/run          #   optional; generated (svlogd) when absent
+    └── rootfs/              # copied verbatim into the package root
+        └── etc/mdma/bandcamp.conf.example
 ```
 
-### Package Template Example: mdma-909
+`scripts/package/create-<x>-package.sh` are 3-line wrappers that pass
+`--srcpkg void-packages/srcpkgs/<pkg> --bin <binary>` to
+`scripts/package/create-service-package.sh`, which assembles the package.
+Never add package metadata (deps, description, extra files, INSTALL snippets)
+to a wrapper or the script; change the srcpkg instead.
+
+### template (metadata only)
+
+The template is sourced by the packaging script; nothing in it builds anything.
+Only these fields are read: `depends` (bare names are normalised to `name>=0`),
+`short_desc`, `conf_files` (absolute paths xbps keeps on upgrade; each must exist
+under `files/rootfs/`). Empty directories cannot be packaged (xbps-create skips
+them); create them in INSTALL. `version=` is not used for the package version; it
+is asserted equal to `Cargo.toml` by `verify-packages.sh`.
 
 ```bash
-# Template file
-pkgname=mdma-909
-version=0.1.0
+pkgname=mdma-playback
+version=0.29.0
 revision=1
 archs="aarch64"
-build_style=cargo
-hostmakedepends="cargo pkg-config"
-makedepends="alsa-lib-devel"
-depends="mdma-common alsa-utils avahi"
-short_desc="MDMA main processing unit"
+depends="pipewire wireplumber libspa-alsa alsa-pipewire mdma-audio"
+short_desc="MDMA audio playback server"
 maintainer="Your Name <your@email>"
 license="MIT"
-homepage="https://github.com/yourusername/mdma"
-distfiles="https://github.com/yourusername/mdma/archive/v${version}.tar.gz"
-checksum="SKIP"  # Or actual checksum
-
-post_install() {
-    # Install runit service
-    vsv mdma-909
-    
-    # Install configuration
-    vinstall config/mdma-909.toml 644 etc/mdma
-}
+homepage="https://github.com/johlrogge/modular-digital-music-array"
 ```
+
+### INSTALL / REMOVE
+
+Plain `/bin/sh` scripts (`$1` = `post`/..., `$4` = `yes` on upgrade). Each
+service's INSTALL contains its own boilerplate (log dir, `/var/service` enable
+symlink, restart on upgrade only if running) plus service-specific work (mdma
+user, `mkdir`/`chown`, PipeWire/WirePlumber drop-ins, conf seeding). There are no
+generated or merged snippets: what is in the srcpkg is what is shipped.
 
 ### runit Service Definition
 
-Location: `srcpkgs/mdma-909/files/mdma-909/run`
+Location: `srcpkgs/mdma-playback/files/mdma-playback/run` (made 0755 in the package)
 
 ```bash
 #!/bin/sh
 exec 2>&1
-exec chpst -u mdma:mdma /usr/bin/mdma-909 --config /etc/mdma/mdma-909.toml
+exec chpst -u mdma:mdma /usr/bin/mdma-playback
 ```
+
+### Verification
+
+- `just pkg-verify-static` (`scripts/ci/verify-packages.sh --static`): no build
+  needed; checks declarations are well-formed, template version == `Cargo.toml`,
+  every service dir has a `run`. Runs in the CI `test` job.
+- `just pkg-verify [--require-all]`: after a build, checks each
+  `build/packages/*.aarch64.xbps` against its srcpkg (service dir files and
+  modes, INSTALL/REMOVE byte-identical, `run_depends`, `conf_files`, rootfs
+  files, versions). Runs in CI after "Build packages" and before signing, and in
+  `just ci-simulate`.
 
 ## GitHub Actions Build Pipeline
 

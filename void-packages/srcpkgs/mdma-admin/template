@@ -1,27 +1,12 @@
-# Template file for mdma-admin package
+# Package metadata for mdma-admin (not an xbps-src build template; see
+# void-packages/srcpkgs/beacon/template for the contract).
 pkgname=mdma-admin
 version=0.29.0
 revision=1
 archs="aarch64"
-build_style=cargo
-hostmakedepends="cargo"
-makedepends="rust-std"
 # Used by migrate-bootfs: tar, diff, findmnt/blkid/mount/umount, xbps-*
-depends="tar>=0 diffutils>=0 util-linux>=0 xbps>=0"
+depends="tar diffutils util-linux xbps"
 short_desc="MDMA Admin privileged system-level operations service"
 maintainer="Joakim Ohlrogge <joakim.ohlrogge@agical.se>"
 license="MIT"
 homepage="https://github.com/johlrogge/modular-digital-music-array"
-
-distfiles="https://github.com/johlrogge/modular-digital-music-array/archive/v${version}.tar.gz"
-checksum="SKIP"
-
-do_build() {
-    cargo polylith cargo --profile production build --release --bin mdma-admin --target aarch64-unknown-linux-gnu
-}
-
-do_install() {
-    vbin target/aarch64-unknown-linux-gnu/release/mdma-admin
-    vinstall ${FILESDIR}/mdma-admin/migrate-bootfs 755 usr/libexec/mdma
-    vsv mdma-admin
-}

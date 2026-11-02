@@ -8,7 +8,7 @@
 # touched.
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-SCRIPT="$SCRIPT_DIR/../../void-packages/srcpkgs/mdma-admin/files/mdma-admin/migrate-bootfs"
+SCRIPT="$SCRIPT_DIR/../../void-packages/srcpkgs/mdma-admin/files/rootfs/usr/libexec/mdma/migrate-bootfs"
 
 ROOT=$(mktemp -d)
 trap 'rm -rf "$ROOT"' EXIT

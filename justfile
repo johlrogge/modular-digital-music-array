@@ -265,6 +265,9 @@ ci-simulate:
     echo ""
     just ci-pipeline
     just ci-test-beacon
+    just pkg-verify-static
+    just pkg-build-all
+    just pkg-verify --require-all
     echo ""
     echo "✅ Local CI simulation complete!"
     echo "   This is exactly what GitHub Actions will run"
@@ -407,6 +410,16 @@ pkg-build-all: check-prereqs pkg-repository
     @echo "To test locally:"
     @echo "  1. Serve repository: just pkg-serve"
     @echo "  2. On Pi: configure and install"
+
+# Verify built packages in build/packages/ against void-packages/srcpkgs/ (pass --require-all in CI)
+[group('package')]
+pkg-verify *args:
+    bash ./scripts/ci/verify-packages.sh {{args}}
+
+# Fast check of the srcpkg declarations only (no build needed)
+[group('package')]
+pkg-verify-static:
+    bash ./scripts/ci/verify-packages.sh --static
 
 # Serve repository locally for testing
 [group('package')]
@@ -953,7 +966,7 @@ deploy-cli: cli-cross
 # Deploy bandcamp service to Pi (includes conf file)
 [group('dev')]
 deploy-bandcamp: bandcamp-cross
-    @just _deploy-svc mdma-bandcamp mdma-bandcamp "void-packages/srcpkgs/mdma-bandcamp/files/mdma-bandcamp/conf"
+    @just _deploy-svc mdma-bandcamp mdma-bandcamp "void-packages/srcpkgs/mdma-bandcamp/files/rootfs/etc/mdma/bandcamp.conf.example"
 
 # Deploy acid service to Pi
 [group('dev')]

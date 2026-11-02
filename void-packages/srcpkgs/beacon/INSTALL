@@ -6,6 +6,9 @@ post)
     # Create log directory for svlogd
     mkdir -p /var/log/beacon /var/log/beacon-wifi
 
+    # beacon runs as root (the service script uses chpst -u root), so no
+    # user/group setup is needed here.
+
     # Enable service on first install
     if [ ! -d /var/service ]; then
         mkdir -p /var/service
