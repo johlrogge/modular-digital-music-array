@@ -1,7 +1,7 @@
 # Package metadata for mdma-bandcamp (not an xbps-src build template; see
 # void-packages/srcpkgs/beacon/template for the contract).
 pkgname=mdma-bandcamp
-version=0.31.0
+version=0.32.0
 revision=1
 archs="aarch64"
 short_desc="MDMA Bandcamp music source"
