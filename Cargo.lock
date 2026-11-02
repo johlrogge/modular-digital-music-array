@@ -5874,6 +5874,7 @@ dependencies = [
  "nng",
  "parking_lot",
  "pretty_assertions",
+ "rstest",
  "serde",
  "serde_json",
  "service",
