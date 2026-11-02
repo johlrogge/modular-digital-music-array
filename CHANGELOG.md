@@ -4,6 +4,33 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.31.0] — 2026-11-02
+
+### Added
+
+- **Clean power-button shutdown (#77).** A short press on the Pi 5 power button now shuts the node down cleanly.
+  - mdma-admin depends on acpid, and Void's stock handler runs `shutdown -P now`.
+  - runit stops the services in order and a wtmp shutdown record is written.
+  - There is no filesystem recovery on the next boot.
+  - Verified on stage hardware. A long press is still a hard power cut by the PMIC; avoid it.
+- **Persistent kernel log (#77).** The new `mdma-klog` service writes the kernel log to `/var/log/mdma-klog`, with svlogd rotation capped at about 20 MB.
+  - The ring buffer is replayed once per boot, so the previous boot's kernel messages survive a reboot or power cut.
+  - Caveat: after a hard cut, the last seconds before it may be missing, and an NVMe dropout cannot write its own errors to the NVMe.
+- **Coverage.** New installs enable both during provisioning; existing nodes get them on the mdma-admin upgrade. The beacon SD also gets acpid.
+- **Disabling.** To disable either service permanently: `touch /etc/sv/<svc>/down`. Upgrades re-link a removed `/var/service` link.
+
+### Known issues
+
+- Beacon self-update leaves the package half-configured (`uu`); run `xbps-reconfigure beacon` once afterwards (#76).
+- mdma-playback logs a bare "Error:" after boot (#78).
+- Prod halted after its ethernet was unplugged. Evidence points to a held power button (a hard PMIC cut), not software; the new mdma-klog will settle any recurrence (#74).
+- The TUI and dj-workspace still use only `MDMA_NODE`.
+- The beacon has no DNS fallback when the router's resolver does not answer, and the startup clock-sync wait is ineffective (#68).
+- The update page may stay on "Update started" (#67).
+- The wifi SSID is free text, so typos go unnoticed (#71).
+
+---
+
 ## [0.30.0] — 2026-11-02
 
 ### Added
