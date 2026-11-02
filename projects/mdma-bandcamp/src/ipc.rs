@@ -20,6 +20,11 @@ pub enum IpcError {
     Connection(String),
 }
 
+/// Parse a raw message into a request.
+pub fn parse_request(bytes: &[u8]) -> Result<SourceRequest, IpcError> {
+    Ok(serde_json::from_slice(bytes)?)
+}
+
 /// IPC Server for the bandcamp service
 pub struct IpcServer {
     socket: nng::Socket,
@@ -39,11 +44,13 @@ impl IpcServer {
         Ok(())
     }
 
-    /// Receive a request (blocking)
-    pub fn recv(&self) -> Result<SourceRequest, IpcError> {
+    /// Receive the raw bytes of a request (blocking).
+    ///
+    /// Parsing is separate ([`parse_request`]) so a malformed request can
+    /// still be answered: on a REP socket every received message needs a reply.
+    pub fn recv_raw(&self) -> Result<Vec<u8>, IpcError> {
         let msg = self.socket.recv()?;
-        let request: SourceRequest = serde_json::from_slice(&msg)?;
-        Ok(request)
+        Ok(msg.as_slice().to_vec())
     }
 
     /// Send a response
@@ -64,6 +71,17 @@ mod tests {
         let req = SourceRequest::GetStatus;
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("GetStatus"));
+    }
+
+    #[test]
+    fn parse_request_roundtrip_and_garbage() {
+        let bytes = serde_json::to_vec(&SourceRequest::GetStatus).unwrap();
+        assert!(matches!(
+            parse_request(&bytes),
+            Ok(SourceRequest::GetStatus)
+        ));
+        assert!(parse_request(b"{\"NoSuchRequest\":1}").is_err());
+        assert!(parse_request(b"not json").is_err());
     }
 
     #[test]

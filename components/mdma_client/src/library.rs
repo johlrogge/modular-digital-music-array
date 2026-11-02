@@ -234,20 +234,18 @@ impl LibraryBackend {
     /// Resolve a slice of content hashes to `TrackInfo` records and format them
     /// as canonical playlist content.
     ///
-    /// Hashes that fail to resolve are skipped with a warning. Returns the
-    /// formatted string ready to pass to `playlist_replace` or `playlist_append`.
-    pub fn resolve_and_format_playlist(&self, hashes: &[ContentHash]) -> String {
+    /// Fails on the first hash that cannot be resolved, so a transient error
+    /// never yields a partial playlist. Returns the formatted string ready to
+    /// pass to `playlist_replace` or `playlist_append`.
+    pub fn resolve_and_format_playlist(
+        &self,
+        hashes: &[ContentHash],
+    ) -> Result<String, ClientError> {
         let tracks: Vec<TrackInfo> = hashes
             .iter()
-            .filter_map(|h| match self.get_track(h) {
-                Ok(t) => Some(t),
-                Err(e) => {
-                    tracing::warn!("Failed to resolve hash {}: {}", h.as_str(), e);
-                    None
-                }
-            })
-            .collect();
-        format_playlist_content(&tracks)
+            .map(|h| self.get_track(h))
+            .collect::<Result<_, _>>()?;
+        Ok(format_playlist_content(&tracks))
     }
 
     pub fn playlist_remove(&self, name: &PlaylistName) -> Result<(), ClientError> {

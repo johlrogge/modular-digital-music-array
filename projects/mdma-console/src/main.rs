@@ -2705,7 +2705,7 @@ mod tests {
             "Mango".to_string(),
             "banana".to_string(),
         ];
-        values.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        values.sort_by_key(|a| a.to_lowercase());
         assert_eq!(values, vec!["apple", "banana", "Mango", "Zebra"],);
     }
 
@@ -2716,7 +2716,7 @@ mod tests {
             "abbey road".to_string(),
             "Kind of Blue".to_string(),
         ];
-        values.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        values.sort_by_key(|a| a.to_lowercase());
         assert_eq!(values, vec!["abbey road", "Kind of Blue", "Ziggy Stardust"],);
     }
 }

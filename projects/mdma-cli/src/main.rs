@@ -30,7 +30,7 @@ use track_formatter::{
     format_track_line as format_track_line_shared, render_for_user, short_hash, ViewColumn,
     ALL_COLUMNS,
 };
-use track_matcher::{CandidateTrack, MatchResult, TrackLookup};
+use track_matcher::{CandidateTrack, MatchConfidence, MatchResult, TrackLookup};
 
 // =============================================================================
 // CLI Definition
@@ -198,6 +198,12 @@ enum Commands {
     Source {
         #[command(subcommand)]
         command: SourceCommands,
+    },
+
+    /// Bandcamp playlist commands
+    Bandcamp {
+        #[command(subcommand)]
+        command: BandcampCommands,
     },
 
     /// Playback control commands
@@ -511,6 +517,26 @@ enum InboxCommands {
 
     /// Ingest all files in inbox
     IngestAll,
+}
+
+#[derive(Subcommand, Debug)]
+enum BandcampCommands {
+    /// List your Bandcamp playlists
+    Playlists,
+
+    /// Import a Bandcamp playlist as an MDMA playlist (definitive matches only)
+    ImportPlaylist {
+        /// Playlist slug or URL
+        playlist: String,
+
+        /// MDMA playlist name (default: sanitised Bandcamp title)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Show the report without writing the playlist
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -967,8 +993,27 @@ fn connect_playback(cli: &Cli) -> PlaybackBackend {
 
 /// Connect to a source, via gateway or direct IPC.
 fn connect_source(cli: &Cli, name: &str) -> SourceClient {
+    connect_source_or_exit(cli, name, None)
+}
+
+/// Request timeout for `mdma bandcamp` commands: fetching a playlist makes
+/// several rate-limited Bandcamp requests, well beyond the default 5s.
+const BANDCAMP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Connect to a source, with the default request timeout or a custom one.
+fn connect_source_or_exit(
+    cli: &Cli,
+    name: &str,
+    timeout: Option<std::time::Duration>,
+) -> SourceClient {
     let gateway = resolve_gateway(cli);
-    match SourceClient::connect(gateway.as_deref(), &cli.sources_dir, name) {
+    let connected = match timeout {
+        Some(t) => {
+            SourceClient::connect_with_timeout(gateway.as_deref(), &cli.sources_dir, name, t)
+        }
+        None => SourceClient::connect(gateway.as_deref(), &cli.sources_dir, name),
+    };
+    match connected {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{}", e);
@@ -4163,8 +4208,51 @@ fn handle_rekordbox_export(
 // Rekordbox Import
 // =============================================================================
 
+/// Remembers the first library lookup failure.
+///
+/// [`TrackLookup`] is infallible, so a failed search cannot be returned from
+/// the lookup itself. Treating it as "not in library" would let an import
+/// overwrite a good playlist with a partial one, so callers must check
+/// [`LookupErrors::take`] after matching and abort.
+#[derive(Default)]
+struct LookupErrors(std::cell::RefCell<Option<String>>);
+
+impl LookupErrors {
+    fn record(&self, message: String) {
+        let mut slot = self.0.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(message);
+        }
+    }
+
+    fn take(&self) -> Option<String> {
+        self.0.borrow_mut().take()
+    }
+}
+
 struct LibraryTrackLookup<'a> {
     library: &'a LibraryBackend,
+    errors: LookupErrors,
+}
+
+impl<'a> LibraryTrackLookup<'a> {
+    fn new(library: &'a LibraryBackend) -> Self {
+        Self {
+            library,
+            errors: LookupErrors::default(),
+        }
+    }
+
+    /// Fail if any lookup errored; the import must stop before writing.
+    fn check(&self) -> Result<()> {
+        match self.errors.take() {
+            None => Ok(()),
+            Some(e) => Err(color_eyre::eyre::eyre!(
+                "Library lookup failed: {}. Aborting before anything was written.",
+                e
+            )),
+        }
+    }
 }
 
 impl TrackLookup for LibraryTrackLookup<'_> {
@@ -4192,18 +4280,24 @@ impl TrackLookup for LibraryTrackLookup<'_> {
                     (t.content_hash, duration)
                 })
                 .collect(),
-            Err(_) => vec![],
+            Err(e) => {
+                self.errors.record(e.to_string());
+                vec![]
+            }
         }
     }
 }
 
 /// Minimal seam for the rekordbox playlist-write path.
 ///
-/// Only the three operations used by `write_rekordbox_playlist` are required;
+/// Only the three operations used by `write_playlist` are required;
 /// this keeps the test fake minimal while locking the canonical-format invariant.
 trait PlaylistWriteOps {
     /// Resolve content hashes to canonical playlist content.
-    fn resolve_and_format_playlist(&self, hashes: &[ContentHash]) -> String;
+    fn resolve_and_format_playlist(
+        &self,
+        hashes: &[ContentHash],
+    ) -> Result<String, library_ipc_client::ClientError>;
     /// Create a new playlist with pre-formatted content. Fails if already exists.
     fn playlist_new(
         &self,
@@ -4219,7 +4313,10 @@ trait PlaylistWriteOps {
 }
 
 impl PlaylistWriteOps for LibraryBackend {
-    fn resolve_and_format_playlist(&self, hashes: &[ContentHash]) -> String {
+    fn resolve_and_format_playlist(
+        &self,
+        hashes: &[ContentHash],
+    ) -> Result<String, library_ipc_client::ClientError> {
         self.resolve_and_format_playlist(hashes)
     }
 
@@ -4243,21 +4340,397 @@ impl PlaylistWriteOps for LibraryBackend {
 /// Write a single named playlist via the [`PlaylistWriteOps`] seam.
 ///
 /// Formats the hashes as canonical content, then calls `playlist_new`.
-/// Falls back to `playlist_replace` if the playlist already exists.
+/// Falls back to `playlist_replace` only if the playlist already exists;
+/// any other error is returned as-is.
 /// Returns `Ok(true)` when created, `Ok(false)` when replaced.
-fn write_rekordbox_playlist(
+fn write_playlist(
     backend: &dyn PlaylistWriteOps,
     name: &library_ipc_client::PlaylistName,
     hashes: &[ContentHash],
 ) -> Result<bool, library_ipc_client::ClientError> {
-    let content = backend.resolve_and_format_playlist(hashes);
+    use library_ipc_client::{ClientError, ProtocolError};
+
+    let content = backend.resolve_and_format_playlist(hashes)?;
     match backend.playlist_new(name, content.clone()) {
         Ok(()) => Ok(true),
-        Err(_) => {
+        Err(ClientError::Protocol(ProtocolError::PlaylistAlreadyExists { .. })) => {
             backend.playlist_replace(name, content)?;
             Ok(false)
         }
+        Err(e) => Err(e),
     }
+}
+
+/// Report the outcome of [`write_playlist`], warning after a replace.
+fn print_write_outcome(name: &str, track_count: usize, created: bool) {
+    if created {
+        println!("Created playlist '{}' with {} tracks", name, track_count);
+    } else {
+        println!("Replaced playlist '{}' with {} tracks", name, track_count);
+        println!(
+            "Note: re-running this import replaces playlist '{}' again, \
+             including any manual edits.",
+            name
+        );
+    }
+}
+
+/// Sanitise a user-supplied playlist name for `flag`, exiting if nothing is left.
+/// Prints a note when the name was changed.
+fn sanitized_name_or_exit(raw: &str, flag: &str) -> String {
+    let sanitized = sanitize_playlist_name(raw);
+    if sanitized.is_empty() {
+        eprintln!("Invalid {} '{}': name sanitizes to empty", flag, raw);
+        std::process::exit(1);
+    }
+    if sanitized != raw {
+        eprintln!(
+            "Note: playlist name sanitized from '{}' to '{}'",
+            raw, sanitized
+        );
+    }
+    sanitized
+}
+
+/// Sanitise a free-form name into a playlist name: every character outside
+/// `[a-zA-Z0-9_-]` becomes `-`, then leading/trailing `-` are trimmed.
+/// The result may be empty; callers decide how to handle that.
+fn sanitize_playlist_name(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+// =============================================================================
+// Source playlist import (mdma bandcamp import-playlist)
+// =============================================================================
+
+/// Name of the source service the `mdma bandcamp` commands talk to.
+const BANDCAMP_SOURCE: &str = "bandcamp";
+
+/// Result of matching one source playlist track against the library.
+#[derive(Debug, Clone, PartialEq)]
+enum TrackOutcome {
+    Matched(ContentHash),
+    Ambiguous(Vec<ContentHash>),
+    /// Artist and title match but every library duration is outside the
+    /// matcher's tolerance: probably a different version (e.g. a radio edit).
+    /// Never written to the playlist.
+    DurationMismatch {
+        hash: ContentHash,
+        library_secs: u32,
+        source_secs: u32,
+    },
+    Missing,
+}
+
+/// Match every playlist track, preserving source order.
+fn match_source_playlist(
+    tracks: &[source_protocol::SourcePlaylistTrack],
+    lookup: &impl TrackLookup,
+) -> Vec<TrackOutcome> {
+    tracks
+        .iter()
+        .map(|t| {
+            let candidate = CandidateTrack {
+                isrc: None,
+                artist: Some(t.artist.clone()).filter(|s| !s.is_empty()),
+                title: Some(t.title.clone()).filter(|s| !s.is_empty()),
+                duration_secs: if t.duration_secs > 0.0 {
+                    Some(t.duration_secs.round() as u32)
+                } else {
+                    None
+                },
+            };
+            match track_matcher::match_track(&candidate, lookup) {
+                MatchResult::Definitive(hash, MatchConfidence::ArtistTitleOnly) => {
+                    match candidate.duration_secs {
+                        Some(source_secs) => {
+                            definitive_with_duration(&candidate, hash, source_secs, lookup)
+                        }
+                        None => TrackOutcome::Matched(hash),
+                    }
+                }
+                MatchResult::Definitive(hash, _) => TrackOutcome::Matched(hash),
+                MatchResult::Ambiguous(hashes, _) => TrackOutcome::Ambiguous(hashes),
+                MatchResult::NoMatch => TrackOutcome::Missing,
+            }
+        })
+        .collect()
+}
+
+/// The matcher fell back to artist+title although the source has a duration,
+/// so the duration filter removed every candidate: the library version
+/// differs. Look up the library duration to report it.
+fn definitive_with_duration(
+    candidate: &CandidateTrack,
+    hash: ContentHash,
+    source_secs: u32,
+    lookup: &impl TrackLookup,
+) -> TrackOutcome {
+    let (Some(artist), Some(title)) = (&candidate.artist, &candidate.title) else {
+        return TrackOutcome::Matched(hash);
+    };
+    let library_secs = lookup
+        .find_by_artist_title(
+            &track_matcher::normalize(artist),
+            &track_matcher::normalize(title),
+        )
+        .into_iter()
+        .find(|(h, _)| *h == hash)
+        .and_then(|(_, d)| d);
+    match library_secs {
+        Some(library_secs) => TrackOutcome::DurationMismatch {
+            hash,
+            library_secs,
+            source_secs,
+        },
+        // Cannot tell how it differs: do not write it silently.
+        None => TrackOutcome::Ambiguous(vec![hash]),
+    }
+}
+
+/// `m:ss` for a number of seconds.
+fn format_mmss(secs: u32) -> String {
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// Warning line when fewer tracks were fetched than the playlist reports.
+fn truncation_warning(fetched: usize, total: u32) -> Option<String> {
+    (fetched != total as usize).then(|| {
+        format!(
+            "Warning: fetched {} of {} tracks; playlist may be incomplete",
+            fetched, total
+        )
+    })
+}
+
+/// Content hashes of the definitive matches, in playlist order.
+fn matched_hashes(outcomes: &[TrackOutcome]) -> Vec<ContentHash> {
+    outcomes
+        .iter()
+        .filter_map(|o| match o {
+            TrackOutcome::Matched(h) => Some(h.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Render the numbered per-track report plus the summary line.
+fn format_import_report(
+    tracks: &[source_protocol::SourcePlaylistTrack],
+    outcomes: &[TrackOutcome],
+) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let (mut matched, mut ambiguous, mut missing) = (0, 0, 0);
+    for (t, outcome) in tracks.iter().zip(outcomes) {
+        let label = format!("{} - {}", t.artist, t.title);
+        match outcome {
+            TrackOutcome::Matched(_) => {
+                matched += 1;
+                let _ = writeln!(out, "{:3}. ✓ matched        {}", t.position, label);
+            }
+            TrackOutcome::Ambiguous(hashes) => {
+                ambiguous += 1;
+                let _ = writeln!(out, "{:3}. ? ambiguous      {}", t.position, label);
+                for h in hashes.iter().take(3) {
+                    let _ = writeln!(
+                        out,
+                        "         candidate: {}",
+                        &h.as_str()[..h.as_str().len().min(16)]
+                    );
+                }
+            }
+            TrackOutcome::DurationMismatch {
+                hash,
+                library_secs,
+                source_secs,
+            } => {
+                ambiguous += 1;
+                let _ = writeln!(
+                    out,
+                    "{:3}. ? duration differs (library {} vs bandcamp {}) {}",
+                    t.position,
+                    format_mmss(*library_secs),
+                    format_mmss(*source_secs),
+                    label
+                );
+                let _ = writeln!(
+                    out,
+                    "         candidate: {}",
+                    &hash.as_str()[..hash.as_str().len().min(16)]
+                );
+            }
+            TrackOutcome::Missing => {
+                missing += 1;
+                let note = if t.owned { "" } else { " (not owned)" };
+                let _ = writeln!(out, "{:3}. ✗ not in library {}{}", t.position, label, note);
+            }
+        }
+    }
+    let _ = write!(
+        out,
+        "{} matched, {} ambiguous, {} missing of {}",
+        matched,
+        ambiguous,
+        missing,
+        tracks.len()
+    );
+    out
+}
+
+/// Last non-empty path segment of a URL, or the input itself when it is a slug.
+///
+/// Deliberately duplicates `bandcamp_api::slug_from_url`: the CLI is
+/// source-agnostic and must not depend on a source-specific crate.
+fn slug_from_playlist_arg(arg: &str) -> &str {
+    arg.split(['?', '#'])
+        .next()
+        .unwrap_or(arg)
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(arg)
+}
+
+/// Default MDMA playlist name: sanitised title, else sanitised slug.
+fn default_import_name(title: &str, slug_or_url: &str) -> String {
+    let from_title = sanitize_playlist_name(title);
+    if from_title.is_empty() {
+        sanitize_playlist_name(slug_from_playlist_arg(slug_or_url))
+    } else {
+        from_title
+    }
+}
+
+fn handle_bandcamp_playlists(client: &SourceClient) -> Result<()> {
+    match client.request(BANDCAMP_SOURCE, &SourceRequest::ListPlaylists) {
+        Ok(SourceResponse::Playlists(playlists)) => {
+            if playlists.is_empty() {
+                println!("No playlists found");
+                return Ok(());
+            }
+            let slug_w = playlists
+                .iter()
+                .map(|p| p.slug.chars().count())
+                .max()
+                .unwrap_or(4)
+                .max(4);
+            let title_w = playlists
+                .iter()
+                .map(|p| p.title.chars().count())
+                .max()
+                .unwrap_or(5)
+                .max(5);
+            println!(
+                "{:<slug_w$}  {:<title_w$}  {:>6}  PRIVATE",
+                "SLUG", "TITLE", "TRACKS"
+            );
+            for p in &playlists {
+                println!(
+                    "{:<slug_w$}  {:<title_w$}  {:>6}  {}",
+                    p.slug,
+                    p.title,
+                    p.track_count,
+                    if p.is_private { "yes" } else { "no" }
+                );
+            }
+            Ok(())
+        }
+        Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
+        Ok(_) => handle_source_error(&"Unexpected response"),
+        Err(e) => handle_source_error(&e),
+    }
+}
+
+fn handle_bandcamp_import_playlist(
+    client: &SourceClient,
+    library: &LibraryBackend,
+    playlist: &str,
+    name: &Option<String>,
+    dry_run: bool,
+) -> Result<()> {
+    // Validate --name before spending time on the network fetch
+    let explicit_name = name.as_deref().map(|n| sanitized_name_or_exit(n, "--name"));
+
+    let pl = match client.request(
+        BANDCAMP_SOURCE,
+        &SourceRequest::GetPlaylist {
+            playlist: playlist.to_string(),
+        },
+    ) {
+        Ok(SourceResponse::Playlist(pl)) => pl,
+        Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
+        Ok(_) => handle_source_error(&"Unexpected response"),
+        Err(e) => handle_source_error(&e),
+    };
+
+    let sanitized = match explicit_name {
+        Some(s) => s,
+        None => {
+            let s = default_import_name(&pl.title, playlist);
+            if s.is_empty() {
+                eprintln!(
+                    "Cannot derive a playlist name from '{}'; use --name",
+                    pl.title
+                );
+                std::process::exit(1);
+            }
+            s
+        }
+    };
+
+    let lookup = LibraryTrackLookup::new(library);
+    let outcomes = match_source_playlist(&pl.tracks, &lookup);
+    lookup.check()?;
+
+    println!(
+        "Playlist '{}' ({} of {} tracks)",
+        pl.title,
+        pl.tracks.len(),
+        pl.total_count
+    );
+    if let Some(warning) = truncation_warning(pl.tracks.len(), pl.total_count) {
+        eprintln!("{}", warning);
+    }
+    println!("{}", format_import_report(&pl.tracks, &outcomes));
+
+    let hashes = matched_hashes(&outcomes);
+    if dry_run {
+        println!(
+            "[dry-run] Would write playlist '{}' with {} tracks",
+            sanitized,
+            hashes.len()
+        );
+    } else if hashes.is_empty() {
+        println!(
+            "No definitive matches; playlist '{}' not written",
+            sanitized
+        );
+    } else {
+        let pname = parse_playlist_name(&sanitized);
+        let created = write_playlist(library, &pname, &hashes)
+            .map_err(|e| color_eyre::eyre::eyre!("Failed to write playlist: {}", e))?;
+        print_write_outcome(&sanitized, hashes.len(), created);
+    }
+
+    if outcomes.iter().any(|o| matches!(o, TrackOutcome::Missing)) {
+        println!(
+            "Some tracks are missing from the library; run 'mdma source sync {}' to download them.",
+            BANDCAMP_SOURCE
+        );
+    }
+    Ok(())
 }
 
 fn handle_rekordbox_import(
@@ -4285,7 +4758,7 @@ fn handle_rekordbox_import(
     }
 
     // 2. Create lookup and match tracks
-    let lookup = LibraryTrackLookup { library };
+    let lookup = LibraryTrackLookup::new(library);
 
     let mut matched: Vec<(&RekordboxTrack, ContentHash)> = Vec::new();
     let mut ambiguous: Vec<(&RekordboxTrack, Vec<ContentHash>)> = Vec::new();
@@ -4323,6 +4796,9 @@ fn handle_rekordbox_import(
             }
         }
     }
+
+    // A failed library search must not look like "not in library"
+    lookup.check()?;
 
     // 3. Print summary
     println!("Matched:   {:3} tracks", matched.len());
@@ -4370,27 +4846,7 @@ fn handle_rekordbox_import(
 
     // 6. Create --playlist if requested
     if let Some(pname) = playlist {
-        let sanitized: String = pname
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        let sanitized = sanitized.trim_matches('-').to_string();
-        if sanitized.is_empty() {
-            eprintln!("Invalid --playlist '{}': name sanitizes to empty", pname);
-            std::process::exit(1);
-        }
-        if sanitized != *pname {
-            eprintln!(
-                "Note: playlist name sanitized from '{}' to '{}'",
-                pname, sanitized
-            );
-        }
+        let sanitized = sanitized_name_or_exit(pname, "--playlist");
         let name = parse_playlist_name(&sanitized);
         let hashes: Vec<ContentHash> = matched.iter().map(|(_, h)| h.clone()).collect();
 
@@ -4401,20 +4857,9 @@ fn handle_rekordbox_import(
                 hashes.len()
             );
         } else {
-            match write_rekordbox_playlist(library, &name, &hashes)
-                .map_err(|e| color_eyre::eyre::eyre!("Failed to write playlist: {}", e))?
-            {
-                true => println!(
-                    "Created playlist '{}' with {} tracks",
-                    sanitized,
-                    hashes.len()
-                ),
-                false => println!(
-                    "Replaced playlist '{}' with {} tracks",
-                    sanitized,
-                    hashes.len()
-                ),
-            }
+            let created = write_playlist(library, &name, &hashes)
+                .map_err(|e| color_eyre::eyre::eyre!("Failed to write playlist: {}", e))?;
+            print_write_outcome(&sanitized, hashes.len(), created);
         }
     }
 
@@ -4435,20 +4880,7 @@ fn handle_rekordbox_import(
                 continue;
             }
 
-            // Sanitize playlist name: replace non-alphanumeric chars with '-'
-            let sanitized: String = rb_playlist
-                .name
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                        c
-                    } else {
-                        '-'
-                    }
-                })
-                .collect();
-            // Trim leading/trailing dashes
-            let sanitized = sanitized.trim_matches('-').to_string();
+            let sanitized = sanitize_playlist_name(&rb_playlist.name);
 
             if sanitized.is_empty() {
                 eprintln!(
@@ -4467,17 +4899,8 @@ fn handle_rekordbox_import(
                 );
             } else {
                 let name = parse_playlist_name(&sanitized);
-                match write_rekordbox_playlist(library, &name, &resolved) {
-                    Ok(true) => println!(
-                        "Created playlist '{}' with {} tracks",
-                        sanitized,
-                        resolved.len()
-                    ),
-                    Ok(false) => println!(
-                        "Replaced playlist '{}' with {} tracks",
-                        sanitized,
-                        resolved.len()
-                    ),
+                match write_playlist(library, &name, &resolved) {
+                    Ok(created) => print_write_outcome(&sanitized, resolved.len(), created),
                     Err(e) => {
                         eprintln!("Failed to write playlist '{}': {}", sanitized, e)
                     }
@@ -5062,6 +5485,22 @@ fn main() -> Result<()> {
                     handle_queue_replace(&lib, &pb, hashes_arg_or_stdin(None))
                 }
                 QueueCommands::Edit => handle_queue_edit(&lib, &pb),
+            }
+        }
+
+        Commands::Bandcamp { command } => {
+            let client =
+                connect_source_or_exit(&cli, BANDCAMP_SOURCE, Some(BANDCAMP_REQUEST_TIMEOUT));
+            match command {
+                BandcampCommands::Playlists => handle_bandcamp_playlists(&client),
+                BandcampCommands::ImportPlaylist {
+                    playlist,
+                    name,
+                    dry_run,
+                } => {
+                    let lib = connect_library(&cli);
+                    handle_bandcamp_import_playlist(&client, &lib, playlist, name, *dry_run)
+                }
             }
         }
 
@@ -6116,7 +6555,7 @@ mod tests {
         let stdin = hash_set(&["sha256:h1aaaaaa", "sha256:h2aaaaaa"]);
         let result = apply_stdin_filter(tracks, Some(&stdin), true);
         let hashes: Vec<_> = result.iter().map(|t| t.content_hash.as_str()).collect();
-        assert_eq!(hashes, vec!["sha256:h3aaaaaa", "sha256:h4aaaaaa"]);
+        assert_eq!(hashes, ["sha256:h3aaaaaa", "sha256:h4aaaaaa"]);
     }
 
     #[test]
@@ -6130,7 +6569,7 @@ mod tests {
         let stdin = hash_set(&["abcdef", "deadbe"]);
         let result = apply_stdin_filter(tracks, Some(&stdin), true);
         let hashes: Vec<_> = result.iter().map(|t| t.content_hash.as_str()).collect();
-        assert_eq!(hashes, vec!["sha256:cafebabe78"]);
+        assert_eq!(hashes, ["sha256:cafebabe78"]);
     }
 
     #[test]
@@ -6144,7 +6583,7 @@ mod tests {
         let stdin = hash_set(&["sha256:h1aaaaaa", "sha256:h2aaaaaa"]);
         let result = apply_stdin_filter(tracks, Some(&stdin), false);
         let hashes: Vec<_> = result.iter().map(|t| t.content_hash.as_str()).collect();
-        assert_eq!(hashes, vec!["sha256:h1aaaaaa", "sha256:h2aaaaaa"]);
+        assert_eq!(hashes, ["sha256:h1aaaaaa", "sha256:h2aaaaaa"]);
     }
 
     #[test]
@@ -6284,7 +6723,7 @@ mod tests {
 
     #[test]
     fn sort_started_ascending_puts_none_first() {
-        let mut tracks = vec![
+        let mut tracks = [
             make_track_with_started("sha256:never", None),
             make_track_with_started("sha256:old", Some("2024-01-01T00:00:00Z")),
             make_track_with_started("sha256:recent", Some("2025-06-15T12:00:00Z")),
@@ -6300,14 +6739,14 @@ mod tests {
         let hashes: Vec<_> = tracks.iter().map(|t| t.content_hash.as_str()).collect();
         assert_eq!(
             hashes,
-            vec!["sha256:never", "sha256:old", "sha256:recent"],
+            ["sha256:never", "sha256:old", "sha256:recent"],
             "ascending: never-played first (None = -∞), then oldest→newest"
         );
     }
 
     #[test]
     fn sort_started_descending_puts_none_last() {
-        let mut tracks = vec![
+        let mut tracks = [
             make_track_with_started("sha256:never", None),
             make_track_with_started("sha256:old", Some("2024-01-01T00:00:00Z")),
             make_track_with_started("sha256:recent", Some("2025-06-15T12:00:00Z")),
@@ -6323,14 +6762,14 @@ mod tests {
         let hashes: Vec<_> = tracks.iter().map(|t| t.content_hash.as_str()).collect();
         assert_eq!(
             hashes,
-            vec!["sha256:recent", "sha256:old", "sha256:never"],
+            ["sha256:recent", "sha256:old", "sha256:never"],
             "descending: newest first, never-played last (None = -∞)"
         );
     }
 
     #[test]
     fn sort_by_stopped_descending_newest_first() {
-        let mut tracks = vec![
+        let mut tracks = [
             make_track_with_stopped("sha256:never", None),
             make_track_with_stopped("sha256:old", Some("2024-03-01T00:00:00Z")),
             make_track_with_stopped("sha256:recent", Some("2025-11-20T08:00:00Z")),
@@ -6346,7 +6785,7 @@ mod tests {
         let hashes: Vec<_> = tracks.iter().map(|t| t.content_hash.as_str()).collect();
         assert_eq!(
             hashes,
-            vec!["sha256:recent", "sha256:old", "sha256:never"],
+            ["sha256:recent", "sha256:old", "sha256:never"],
             "descending: newest first, never-stopped last"
         );
     }
@@ -6376,7 +6815,7 @@ mod tests {
                 energy: None,
             }
         };
-        let mut tracks = vec![
+        let mut tracks = [
             make("sha256:unknown", None),
             make("sha256:new", Some("2025-12-01T00:00:00Z")),
             make("sha256:early", Some("2020-01-01T00:00:00Z")),
@@ -6392,7 +6831,7 @@ mod tests {
         let hashes: Vec<_> = tracks.iter().map(|t| t.content_hash.as_str()).collect();
         assert_eq!(
             hashes,
-            vec!["sha256:unknown", "sha256:early", "sha256:new"],
+            ["sha256:unknown", "sha256:early", "sha256:new"],
             "ascending added: None first, then oldest→newest"
         );
     }
@@ -6509,9 +6948,9 @@ mod tests {
         }
     }
 
-    // ── write_rekordbox_playlist real regression tests ───────────────────────
+    // ── write_playlist real regression tests ─────────────────────────────────
     //
-    // These tests drive the actual `write_rekordbox_playlist` code path through a
+    // These tests drive the actual `write_playlist` code path through a
     // `RecordingFake` that captures the `String` arguments passed to `playlist_new`
     // and `playlist_replace`.  The canonical-format assertion would fail if anyone
     // reverted the import code to pass raw `&[ContentHash]` instead of the
@@ -6529,6 +6968,11 @@ mod tests {
         /// When `true`, `playlist_new` returns `PlaylistAlreadyExists` so the
         /// code falls through to `playlist_replace`.
         force_conflict: bool,
+        /// When `true`, `playlist_new` fails with an unrelated error that must
+        /// NOT trigger the replace fallback.
+        force_other_error: bool,
+        /// When `true`, resolving hashes fails (e.g. a gateway hiccup).
+        force_resolve_error: bool,
     }
 
     impl RecordingFake {
@@ -6538,6 +6982,22 @@ mod tests {
                 new_calls: RefCell::new(Vec::new()),
                 replace_calls: RefCell::new(Vec::new()),
                 force_conflict: false,
+                force_other_error: false,
+                force_resolve_error: false,
+            }
+        }
+
+        fn with_resolve_error(tracks: Vec<TrackInfo>) -> Self {
+            Self {
+                force_resolve_error: true,
+                ..Self::new(tracks)
+            }
+        }
+
+        fn with_other_error(tracks: Vec<TrackInfo>) -> Self {
+            Self {
+                force_other_error: true,
+                ..Self::new(tracks)
             }
         }
 
@@ -6550,10 +7010,20 @@ mod tests {
     }
 
     impl PlaylistWriteOps for RecordingFake {
-        fn resolve_and_format_playlist(&self, _hashes: &[ContentHash]) -> String {
+        fn resolve_and_format_playlist(
+            &self,
+            _hashes: &[ContentHash],
+        ) -> Result<String, library_ipc_client::ClientError> {
+            if self.force_resolve_error {
+                return Err(library_ipc_client::ClientError::Protocol(
+                    library_ipc_client::ProtocolError::Internal {
+                        message: "resolve hiccup".to_string(),
+                    },
+                ));
+            }
             // Produce canonical content from the pre-canned tracks (ignoring hashes
             // so no actual IPC is needed).
-            track_formatter::format_playlist_content(&self.tracks)
+            Ok(track_formatter::format_playlist_content(&self.tracks))
         }
 
         fn playlist_new(
@@ -6565,6 +7035,13 @@ mod tests {
                 return Err(library_ipc_client::ClientError::Protocol(
                     library_ipc_client::ProtocolError::PlaylistAlreadyExists {
                         name: "test".to_string(),
+                    },
+                ));
+            }
+            if self.force_other_error {
+                return Err(library_ipc_client::ClientError::Protocol(
+                    library_ipc_client::ProtocolError::Internal {
+                        message: "disk on fire".to_string(),
                     },
                 ));
             }
@@ -6623,7 +7100,7 @@ mod tests {
         let fake = RecordingFake::new(tracks);
         let name = library_ipc_client::PlaylistName::new("my-set").unwrap();
 
-        let created = write_rekordbox_playlist(&fake, &name, &hashes).unwrap();
+        let created = write_playlist(&fake, &name, &hashes).unwrap();
         assert!(created, "expected playlist_new to succeed (created=true)");
 
         let new_calls = fake.new_calls.borrow();
@@ -6657,7 +7134,7 @@ mod tests {
         let fake = RecordingFake::with_conflict(tracks);
         let name = library_ipc_client::PlaylistName::new("my-set").unwrap();
 
-        let created = write_rekordbox_playlist(&fake, &name, &hashes).unwrap();
+        let created = write_playlist(&fake, &name, &hashes).unwrap();
         assert!(
             !created,
             "expected playlist_replace fallback (created=false)"
@@ -6683,6 +7160,238 @@ mod tests {
             lines[0],
             "8d4e7b2cabc1  Carbon Based Lifeforms - Polyrytmi  [6:07]"
         );
+    }
+
+    /// A resolve failure aborts before touching the playlist: neither
+    /// `playlist_new` nor `playlist_replace` is called.
+    #[test]
+    fn write_playlist_resolve_failure_writes_nothing() {
+        for fake in [
+            RecordingFake::with_resolve_error(vec![]),
+            RecordingFake {
+                force_conflict: true,
+                ..RecordingFake::with_resolve_error(vec![])
+            },
+        ] {
+            let name = library_ipc_client::PlaylistName::new("my-set").unwrap();
+            let err = write_playlist(&fake, &name, &[]).unwrap_err();
+            assert!(err.to_string().contains("resolve hiccup"), "got: {err}");
+            assert!(fake.new_calls.borrow().is_empty());
+            assert!(fake.replace_calls.borrow().is_empty());
+        }
+    }
+
+    /// Any `playlist_new` failure other than "already exists" is returned as-is
+    /// and never replaces an existing playlist.
+    #[test]
+    fn write_playlist_does_not_replace_on_other_errors() {
+        let fake = RecordingFake::with_other_error(vec![]);
+        let name = library_ipc_client::PlaylistName::new("my-set").unwrap();
+
+        let err = write_playlist(&fake, &name, &[]).unwrap_err();
+        assert!(err.to_string().contains("disk on fire"), "got: {err}");
+        assert!(fake.replace_calls.borrow().is_empty());
+    }
+
+    // ── playlist name sanitising ─────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_playlist_name_replaces_and_trims() {
+        assert_eq!(sanitize_playlist_name("Friday Set #1!"), "Friday-Set--1");
+        assert_eq!(sanitize_playlist_name("ok_name-2"), "ok_name-2");
+        assert_eq!(sanitize_playlist_name("  --x--  "), "x");
+    }
+
+    #[test]
+    fn sanitize_playlist_name_can_be_empty() {
+        assert_eq!(sanitize_playlist_name("!!! ???"), "");
+        assert_eq!(sanitize_playlist_name("åäö"), "");
+    }
+
+    #[test]
+    fn default_import_name_prefers_title_then_slug() {
+        assert_eq!(default_import_name("Friday Set", "friday"), "Friday-Set");
+        assert_eq!(default_import_name("!!!", "my-slug"), "my-slug");
+        assert_eq!(
+            default_import_name("???", "https://bandcamp.com/u/x/playlists/cool-set/?a=1"),
+            "cool-set"
+        );
+    }
+
+    // ── source playlist matching / report ────────────────────────────────────
+
+    /// (artist, title) normalised -> candidates (hash, duration secs)
+    type FakeLookupEntry = (&'static str, &'static str, Vec<(ContentHash, Option<u32>)>);
+
+    struct FakePlaylistLookup {
+        entries: Vec<FakeLookupEntry>,
+    }
+
+    impl TrackLookup for FakePlaylistLookup {
+        fn find_by_isrc(&self, _isrc: &str) -> Vec<ContentHash> {
+            vec![]
+        }
+        fn find_by_artist_title(
+            &self,
+            artist: &str,
+            title: &str,
+        ) -> Vec<(ContentHash, Option<u32>)> {
+            self.entries
+                .iter()
+                .find(|(a, t, _)| *a == artist && *t == title)
+                .map(|(_, _, c)| c.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    fn pl_track(
+        pos: u32,
+        artist: &str,
+        title: &str,
+        secs: f64,
+    ) -> source_protocol::SourcePlaylistTrack {
+        source_protocol::SourcePlaylistTrack {
+            position: pos,
+            source_track_id: format!("t{pos}"),
+            title: title.to_string(),
+            artist: artist.to_string(),
+            album: None,
+            duration_secs: secs,
+            owned: true,
+        }
+    }
+
+    fn hash(s: &str) -> ContentHash {
+        ContentHash::new(format!("sha256:{s}"))
+    }
+
+    fn sample_lookup() -> FakePlaylistLookup {
+        FakePlaylistLookup {
+            entries: vec![
+                ("a", "one", vec![(hash("1111111111111111"), Some(300))]),
+                (
+                    "b",
+                    "two",
+                    vec![
+                        (hash("2222222222222222"), Some(200)),
+                        (hash("3333333333333333"), Some(200)),
+                    ],
+                ),
+                ("d", "four", vec![(hash("4444444444444444"), Some(100))]),
+            ],
+        }
+    }
+
+    fn sample_tracks() -> Vec<source_protocol::SourcePlaylistTrack> {
+        vec![
+            pl_track(1, "A", "One", 300.2),
+            pl_track(2, "B", "Two", 200.0),
+            pl_track(3, "C", "Three", 150.0),
+            pl_track(4, "D", "Four", 100.0),
+        ]
+    }
+
+    #[test]
+    fn match_source_playlist_classifies_in_order() {
+        let outcomes = match_source_playlist(&sample_tracks(), &sample_lookup());
+        assert_eq!(outcomes.len(), 4);
+        assert_eq!(outcomes[0], TrackOutcome::Matched(hash("1111111111111111")));
+        assert!(matches!(&outcomes[1], TrackOutcome::Ambiguous(h) if h.len() == 2));
+        assert_eq!(outcomes[2], TrackOutcome::Missing);
+        assert_eq!(outcomes[3], TrackOutcome::Matched(hash("4444444444444444")));
+    }
+
+    #[test]
+    fn duration_mismatch_is_flagged_not_matched() {
+        // Library has a 210s edit; the Bandcamp track is the 545s original.
+        let lookup = FakePlaylistLookup {
+            entries: vec![("a", "one", vec![(hash("5555555555555555"), Some(210))])],
+        };
+        let tracks = [pl_track(1, "A", "One", 545.088)];
+        let outcomes = match_source_playlist(&tracks, &lookup);
+        assert_eq!(
+            outcomes,
+            [TrackOutcome::DurationMismatch {
+                hash: hash("5555555555555555"),
+                library_secs: 210,
+                source_secs: 545,
+            }]
+        );
+        assert!(matched_hashes(&outcomes).is_empty());
+
+        let report = format_import_report(&tracks, &outcomes);
+        assert!(
+            report.contains("? duration differs (library 3:30 vs bandcamp 9:05)"),
+            "got: {report}"
+        );
+        assert!(report.ends_with("0 matched, 1 ambiguous, 0 missing of 1"));
+    }
+
+    #[test]
+    fn unknown_source_duration_still_matches_on_artist_title() {
+        let lookup = FakePlaylistLookup {
+            entries: vec![("a", "one", vec![(hash("5555555555555555"), Some(210))])],
+        };
+        let tracks = [pl_track(1, "A", "One", 0.0)];
+        assert_eq!(
+            match_source_playlist(&tracks, &lookup),
+            [TrackOutcome::Matched(hash("5555555555555555"))]
+        );
+    }
+
+    #[test]
+    fn truncation_warning_only_when_counts_differ() {
+        assert_eq!(truncation_warning(64, 64), None);
+        let w = truncation_warning(49, 64).unwrap();
+        assert_eq!(
+            w,
+            "Warning: fetched 49 of 64 tracks; playlist may be incomplete"
+        );
+    }
+
+    #[test]
+    fn lookup_errors_are_recorded_for_the_caller() {
+        let errors = LookupErrors::default();
+        assert_eq!(errors.take(), None);
+        errors.record("boom".to_string());
+        errors.record("second".to_string());
+        assert_eq!(errors.take(), Some("boom".to_string()));
+        assert_eq!(errors.take(), None);
+    }
+
+    #[test]
+    fn matched_hashes_keeps_only_definitive_in_order() {
+        let outcomes = match_source_playlist(&sample_tracks(), &sample_lookup());
+        assert_eq!(
+            matched_hashes(&outcomes),
+            [hash("1111111111111111"), hash("4444444444444444")]
+        );
+    }
+
+    #[test]
+    fn format_import_report_lists_each_position_and_summary() {
+        let tracks = sample_tracks();
+        let outcomes = match_source_playlist(&tracks, &sample_lookup());
+        let report = format_import_report(&tracks, &outcomes);
+        let lines: Vec<&str> = report.lines().collect();
+        assert!(lines[0].contains("1. ✓ matched") && lines[0].contains("A - One"));
+        assert!(lines[1].contains("2. ? ambiguous") && lines[1].contains("B - Two"));
+        assert!(lines[2].contains("candidate: sha256:2222"));
+        assert!(lines[3].contains("candidate: sha256:3333"));
+        assert!(lines[4].contains("3. ✗ not in library") && lines[4].contains("C - Three"));
+        assert!(lines[5].contains("4. ✓ matched"));
+        assert_eq!(
+            lines.last().unwrap(),
+            &"2 matched, 1 ambiguous, 1 missing of 4"
+        );
+    }
+
+    #[test]
+    fn format_import_report_flags_unowned_missing_tracks() {
+        let mut tracks = [pl_track(1, "C", "Three", 150.0)];
+        tracks[0].owned = false;
+        let report = format_import_report(&tracks, &[TrackOutcome::Missing]);
+        assert!(report.contains("(not owned)"));
     }
 
     // ── mdma view: ViewColumn / render_for_user ───────────
@@ -7051,7 +7760,7 @@ mod tests {
 
         // Simulate the playlist filter as it exists in the production path.
         // This is the FIXED version — it normalises case at the lookup boundary.
-        let hashes = vec![hash.to_string()];
+        let hashes = [hash.to_string()];
         let locations: Vec<String> = hashes
             .iter()
             .filter_map(|h| {
@@ -7067,7 +7776,7 @@ mod tests {
 
         assert_eq!(
             locations,
-            vec![location_upper.clone()],
+            std::slice::from_ref(&location_upper),
             "playlist must reference the track even when URI case differs between \
              existing-XML round-trip and freshly-emitted path"
         );

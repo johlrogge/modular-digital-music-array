@@ -68,6 +68,14 @@ pub enum SourceRequest {
     /// Check if a single item is stale by fetching current details and
     /// comparing track count against the library.
     CheckItem { identifier: String },
+
+    /// List the user's playlists on this source.
+    /// Answer with `SourceResponse::Playlists`.
+    ListPlaylists,
+
+    /// Fetch one playlist. `playlist` is a slug or a URL.
+    /// Answer with `SourceResponse::Playlist`.
+    GetPlaylist { playlist: String },
 }
 
 // ============================================================================
@@ -115,6 +123,12 @@ pub enum SourceResponse {
         stored_track_count: usize,
         stale: bool,
     },
+
+    /// Result of a ListPlaylists request.
+    Playlists(Vec<SourcePlaylistSummary>),
+
+    /// Result of a GetPlaylist request.
+    Playlist(SourcePlaylist),
 
     /// Error response.
     Error(SourceError),
@@ -193,6 +207,39 @@ impl std::fmt::Display for DownloadState {
     }
 }
 
+/// Summary of a playlist on a source.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourcePlaylistSummary {
+    pub id: String,
+    pub title: String,
+    pub url: String,
+    pub slug: String,
+    pub track_count: u32,
+    pub is_private: bool,
+}
+
+/// A full playlist from a source, tracks in source order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourcePlaylist {
+    pub id: String,
+    pub title: String,
+    pub url: String,
+    pub total_count: u32,
+    pub tracks: Vec<SourcePlaylistTrack>,
+}
+
+/// A single track within a source playlist.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourcePlaylistTrack {
+    pub position: u32,
+    pub source_track_id: String,
+    pub title: String,
+    pub artist: String,
+    pub album: Option<String>,
+    pub duration_secs: f64,
+    pub owned: bool,
+}
+
 // ============================================================================
 // Error Types
 // ============================================================================
@@ -220,6 +267,19 @@ pub enum SourceError {
 
     #[error("check failed for {identifier}: {reason}")]
     CheckFailed { identifier: String, reason: String },
+
+    /// The source does not support the requested operation.
+    #[error("unsupported request: {request}")]
+    Unsupported { request: String },
+}
+
+impl SourceError {
+    /// Build an `Unsupported` error naming the request.
+    pub fn unsupported(request: impl Into<String>) -> Self {
+        Self::Unsupported {
+            request: request.into(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -472,6 +532,98 @@ mod tests {
         let parsed: SourceResponse = serde_json::from_str(&json).unwrap();
         match parsed {
             SourceResponse::ItemChecked { stale, .. } => assert!(!stale),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    fn sample_playlist() -> SourcePlaylist {
+        SourcePlaylist {
+            id: "pl1".to_string(),
+            title: "Friday Set".to_string(),
+            url: "https://bandcamp.com/u/x/playlists/friday".to_string(),
+            total_count: 2,
+            tracks: vec![
+                SourcePlaylistTrack {
+                    position: 1,
+                    source_track_id: "t1".to_string(),
+                    title: "One".to_string(),
+                    artist: "A".to_string(),
+                    album: Some("Alb".to_string()),
+                    duration_secs: 301.5,
+                    owned: true,
+                },
+                SourcePlaylistTrack {
+                    position: 2,
+                    source_track_id: "t2".to_string(),
+                    title: "Two".to_string(),
+                    artist: "B".to_string(),
+                    album: None,
+                    duration_secs: 200.0,
+                    owned: false,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn request_list_playlists_roundtrip() {
+        let json = serde_json::to_string(&SourceRequest::ListPlaylists).unwrap();
+        let parsed: SourceRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, SourceRequest::ListPlaylists));
+    }
+
+    #[test]
+    fn request_get_playlist_roundtrip() {
+        let req = SourceRequest::GetPlaylist {
+            playlist: "friday".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: SourceRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SourceRequest::GetPlaylist { playlist } => assert_eq!(playlist, "friday"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn response_playlists_roundtrip() {
+        let summary = SourcePlaylistSummary {
+            id: "pl1".to_string(),
+            title: "Friday Set".to_string(),
+            url: "https://example/friday".to_string(),
+            slug: "friday".to_string(),
+            track_count: 12,
+            is_private: true,
+        };
+        let resp = SourceResponse::Playlists(vec![summary.clone()]);
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: SourceResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SourceResponse::Playlists(v) => assert_eq!(v, vec![summary]),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn response_playlist_roundtrip() {
+        let pl = sample_playlist();
+        let json = serde_json::to_string(&SourceResponse::Playlist(pl.clone())).unwrap();
+        let parsed: SourceResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SourceResponse::Playlist(p) => assert_eq!(p, pl),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn source_error_unsupported_roundtrip() {
+        let resp = SourceResponse::Error(SourceError::unsupported("ListPlaylists"));
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: SourceResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SourceResponse::Error(e @ SourceError::Unsupported { .. }) => {
+                assert_eq!(e.to_string(), "unsupported request: ListPlaylists");
+            }
             _ => panic!("wrong variant"),
         }
     }

@@ -341,7 +341,7 @@ mod tests {
 
         // Verify we got a segment
         assert!(
-            segments.len() > 0,
+            !segments.is_empty(),
             "Should have decoded atleast one segment"
         );
 

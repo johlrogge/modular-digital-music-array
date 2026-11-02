@@ -3,16 +3,23 @@
 //! Async HTTP client with rate limiting for interacting with Bandcamp.
 
 use crate::error::BandcampError;
+use crate::html::extract_data_blob;
+use crate::playlist::{
+    assemble_playlist, parse_more_tracks, parse_playlist_page, parse_playlists_response, Playlist,
+    PlaylistSummary,
+};
 use crate::types::*;
 use governor::{Quota, RateLimiter};
 use music_facts::{Artist, Title, Year};
 use nonzero_ext::nonzero;
 use reqwest::{Client, Method};
-use scraper::{Html, Selector};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
+
+/// Upper bound on paginated requests for a single listing, to avoid runaway loops
+const MAX_PAGINATION_ITERATIONS: usize = 100;
 
 /// Bandcamp API client with rate limiting
 pub struct BandcampClient {
@@ -46,9 +53,17 @@ impl BandcampClient {
 
     /// Make a rate-limited HTTP request
     async fn request(&self, method: Method, url: &str) -> Result<reqwest::Response, BandcampError> {
+        self.send_checked(self.http.request(method, url)).await
+    }
+
+    /// Rate-limit, send, and map non-success statuses to errors
+    async fn send_checked(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, BandcampError> {
         self.wait_for_rate_limit().await;
 
-        let response = self.http.request(method, url).send().await?;
+        let response = builder.send().await?;
 
         if response.status().is_success() {
             Ok(response)
@@ -79,13 +94,7 @@ impl BandcampClient {
         // Parse the page to extract the data blob
         let fanpage_data = self.parse_fanpage_data(&body)?;
 
-        // Check if this is the user's own page
-        if fanpage_data.fan_data.is_own_page != Some(true) {
-            return Err(BandcampError::Auth(format!(
-                "Not logged in as '{}'. Check your cookies.",
-                username
-            )));
-        }
+        Self::require_own_page(&fanpage_data.fan_data, username)?;
 
         // Get initial items from page
         let mut items = self.parse_collection_items(&fanpage_data)?;
@@ -101,22 +110,22 @@ impl BandcampClient {
         Ok(items)
     }
 
+    /// Fail unless the fan page was served as the logged-in user's own page
+    fn require_own_page(fan_data: &FanData, username: &str) -> Result<(), BandcampError> {
+        if fan_data.is_own_page != Some(true) {
+            return Err(BandcampError::Auth(format!(
+                "Not logged in as '{}'. Check your cookies.",
+                username
+            )));
+        }
+        Ok(())
+    }
+
     /// Parse the data blob from a user's collection page
     fn parse_fanpage_data(&self, html: &str) -> Result<ParsedFanpageData, BandcampError> {
-        let document = Html::parse_document(html);
-        let selector = Selector::parse("#pagedata")
-            .map_err(|e| BandcampError::HtmlParse(format!("Failed to create selector: {:?}", e)))?;
+        let data_blob = extract_data_blob(html, "pagedata")?;
 
-        let element = document.select(&selector).next().ok_or_else(|| {
-            BandcampError::HtmlParse("Could not find #pagedata element".to_string())
-        })?;
-
-        let data_blob = element
-            .value()
-            .attr("data-blob")
-            .ok_or_else(|| BandcampError::HtmlParse("Missing data-blob attribute".to_string()))?;
-
-        serde_json::from_str(data_blob)
+        serde_json::from_str(&data_blob)
             .map_err(|e| BandcampError::HtmlParse(format!("Failed to parse data blob: {}", e)))
     }
 
@@ -275,6 +284,159 @@ impl BandcampClient {
         Ok(all_items)
     }
 
+    /// Build a playlist URL from either a slug (e.g. `november-2`) or a full URL.
+    ///
+    /// Full URLs (with or without scheme) must be on `bandcamp.com` or one of its
+    /// subdomains, so the service never fetches arbitrary hosts.
+    pub fn playlist_url(username: &str, slug_or_url: &str) -> Result<String, BandcampError> {
+        let arg = slug_or_url.trim();
+        let has_scheme = arg.starts_with("http://") || arg.starts_with("https://");
+        // Slugs never contain dots; a dotted first segment is a scheme-less host
+        let first_segment = arg.split('/').next().unwrap_or_default();
+        if !has_scheme && !first_segment.contains('.') {
+            return Ok(format!(
+                "https://bandcamp.com/{}/playlist/{}",
+                username,
+                arg.trim_matches('/')
+            ));
+        }
+
+        let candidate = if has_scheme {
+            arg.to_string()
+        } else {
+            format!("https://{}", arg)
+        };
+        let invalid = || BandcampError::InvalidUrl(slug_or_url.to_string());
+        let parsed = reqwest::Url::parse(&candidate).map_err(|_| invalid())?;
+        // Cookies carry no Secure flag: never send them over cleartext, to a
+        // custom port, or with embedded credentials.
+        if parsed.scheme() != "https"
+            || parsed.port().is_some()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err(invalid());
+        }
+        let host = parsed.host_str().ok_or_else(invalid)?;
+        if host == "bandcamp.com" || host.ends_with(".bandcamp.com") {
+            Ok(parsed.to_string())
+        } else {
+            Err(invalid())
+        }
+    }
+
+    /// POST a JSON body (rate-limited) and return the response text
+    async fn post_json(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<String, BandcampError> {
+        let builder = self
+            .http
+            .post(url)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/json; charset=UTF-8",
+            )
+            .body(body.to_string());
+        Ok(self.send_checked(builder).await?.text().await?)
+    }
+
+    /// Verify a pagination cursor advanced and the iteration cap was not hit
+    fn check_cursor_progress(
+        previous: Option<u64>,
+        next: u64,
+        iterations: usize,
+    ) -> Result<(), BandcampError> {
+        if previous == Some(next) {
+            return Err(BandcampError::CollectionFetch(format!(
+                "Pagination cursor {} did not advance",
+                next
+            )));
+        }
+        if iterations >= MAX_PAGINATION_ITERATIONS {
+            return Err(BandcampError::CollectionFetch(format!(
+                "Pagination exceeded {} requests",
+                MAX_PAGINATION_ITERATIONS
+            )));
+        }
+        Ok(())
+    }
+
+    /// List the fan's playlists (including private ones when logged in)
+    pub async fn list_playlists(
+        &self,
+        username: &str,
+    ) -> Result<Vec<PlaylistSummary>, BandcampError> {
+        let url = format!("https://bandcamp.com/{}", username);
+        tracing::debug!("Fetching fan page for playlists: {}", username);
+        let body = self.request(Method::GET, &url).await?.text().await?;
+        let fanpage_data = self.parse_fanpage_data(&body)?;
+        Self::require_own_page(&fanpage_data.fan_data, username)?;
+        let fan_id = self.extract_fan_id(&fanpage_data.fan_data)?;
+        let fan_id_json = fan_id
+            .parse::<u64>()
+            .map(serde_json::Value::from)
+            .unwrap_or_else(|_| serde_json::Value::String(fan_id.clone()));
+
+        let mut playlists = Vec::new();
+        let mut cursor: Option<u64> = None;
+        let mut iterations = 0;
+        loop {
+            let mut req = serde_json::json!({ "page_size": 20, "page_fan_id": fan_id_json });
+            if let Some(c) = cursor {
+                req["next_cursor"] = c.into();
+            }
+            let text = self
+                .post_json("https://bandcamp.com/api/fan_collection/1/playlists", &req)
+                .await?;
+            let page = parse_playlists_response(&text)?;
+            playlists.extend(page.playlists);
+            iterations += 1;
+
+            match page.next_cursor {
+                None => break,
+                Some(next) => {
+                    Self::check_cursor_progress(cursor, next, iterations)?;
+                    cursor = Some(next);
+                }
+            }
+        }
+
+        tracing::info!("Found {} playlists for {}", playlists.len(), username);
+        Ok(playlists)
+    }
+
+    /// Fetch a playlist (page plus all further track chunks) by URL
+    pub async fn get_playlist(&self, url: &str) -> Result<Playlist, BandcampError> {
+        tracing::debug!("Fetching playlist: {}", url);
+        let body = self.request(Method::GET, url).await?.text().await?;
+        let page = parse_playlist_page(&body)?;
+
+        let mut more = Vec::new();
+        let mut cursor = page.chunk.next_cursor;
+        let mut previous: Option<u64> = None;
+        let mut iterations = 0;
+        while let Some(next) = cursor {
+            Self::check_cursor_progress(previous, next, iterations)?;
+            let req = serde_json::json!({
+                "item_type": "playlist",
+                "item_id": page.id,
+                "next_cursor": next,
+            });
+            let text = self
+                .post_json("https://bandcamp.com/api/player/2/player_data_web", &req)
+                .await?;
+            let chunk = parse_more_tracks(&text)?;
+            iterations += 1;
+            previous = Some(next);
+            cursor = chunk.next_cursor;
+            more.push(chunk);
+        }
+
+        Ok(assemble_playlist(page, more))
+    }
+
     /// Get detailed item information including download formats
     pub async fn get_item_details(&self, download_url: &str) -> Result<DigitalItem, BandcampError> {
         tracing::debug!("Fetching item details from: {}", download_url);
@@ -287,20 +449,9 @@ impl BandcampClient {
 
     /// Parse digital item from download page
     fn parse_digital_item(&self, html: &str) -> Result<DigitalItem, BandcampError> {
-        let document = Html::parse_document(html);
-        let selector = Selector::parse("#pagedata")
-            .map_err(|e| BandcampError::HtmlParse(format!("Failed to create selector: {:?}", e)))?;
+        let data_blob = extract_data_blob(html, "pagedata")?;
 
-        let element = document.select(&selector).next().ok_or_else(|| {
-            BandcampError::HtmlParse("Could not find #pagedata element".to_string())
-        })?;
-
-        let data_blob = element
-            .value()
-            .attr("data-blob")
-            .ok_or_else(|| BandcampError::HtmlParse("Missing data-blob attribute".to_string()))?;
-
-        let parsed: serde_json::Value = serde_json::from_str(data_blob)?;
+        let parsed: serde_json::Value = serde_json::from_str(&data_blob)?;
 
         // Extract digital_items array
         let digital_items = parsed
@@ -675,5 +826,94 @@ impl BandcampClient {
             "Unexpected statdownload response: {}",
             &json_str[..json_str.len().min(300)]
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playlist_url_from_slug() {
+        assert_eq!(
+            BandcampClient::playlist_url("testuser", "november-2").unwrap(),
+            "https://bandcamp.com/testuser/playlist/november-2"
+        );
+    }
+
+    #[test]
+    fn playlist_url_passes_full_url_through() {
+        let url = "https://bandcamp.com/testuser/playlist/november-2";
+        assert_eq!(BandcampClient::playlist_url("other", url).unwrap(), url);
+    }
+
+    #[test]
+    fn playlist_url_accepts_subdomain() {
+        let url = "https://artist.bandcamp.com/album/x";
+        assert_eq!(BandcampClient::playlist_url("u", url).unwrap(), url);
+    }
+
+    #[test]
+    fn playlist_url_scheme_less_is_treated_as_url() {
+        assert_eq!(
+            BandcampClient::playlist_url("other", "bandcamp.com/testuser/playlist/n-2").unwrap(),
+            "https://bandcamp.com/testuser/playlist/n-2"
+        );
+    }
+
+    #[test]
+    fn playlist_url_rejects_non_bandcamp_hosts() {
+        for input in [
+            "https://example.com/testuser/playlist/x",
+            "https://evilbandcamp.com/x",
+            "https://bandcamp.com.evil.com/x",
+            "https://bandcamp.com@evil.com/x",
+            "evil.com/testuser/playlist/x",
+            "http://127.0.0.1:8080/x",
+            "http://bandcamp.com/x",
+            "https://bandcamp.com:8080/x",
+            "https://u:p@bandcamp.com/x",
+        ] {
+            assert!(
+                matches!(
+                    BandcampClient::playlist_url("u", input),
+                    Err(BandcampError::InvalidUrl(_))
+                ),
+                "should reject {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn own_page_required() {
+        let own = FanData {
+            fan_id: serde_json::Value::from(1),
+            is_own_page: Some(true),
+        };
+        assert!(BandcampClient::require_own_page(&own, "u").is_ok());
+        for flag in [Some(false), None] {
+            let other = FanData {
+                fan_id: serde_json::Value::from(1),
+                is_own_page: flag,
+            };
+            assert!(matches!(
+                BandcampClient::require_own_page(&other, "u"),
+                Err(BandcampError::Auth(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn cursor_must_advance() {
+        assert!(BandcampClient::check_cursor_progress(None, 49, 0).is_ok());
+        assert!(BandcampClient::check_cursor_progress(Some(49), 99, 1).is_ok());
+        assert!(BandcampClient::check_cursor_progress(Some(49), 49, 1).is_err());
+    }
+
+    #[test]
+    fn iteration_cap_enforced() {
+        assert!(
+            BandcampClient::check_cursor_progress(Some(1), 2, MAX_PAGINATION_ITERATIONS).is_err()
+        );
     }
 }

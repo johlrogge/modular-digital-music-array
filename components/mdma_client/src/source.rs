@@ -11,10 +11,13 @@ pub enum SourceClient {
 }
 
 impl SourceClient {
+    fn socket_path(sources_dir: &str, name: &str) -> String {
+        format!("ipc://{}/{}.sock", sources_dir, name)
+    }
+
     /// Connect directly to a source IPC socket.
     pub fn connect_direct(sources_dir: &str, name: &str) -> Result<Self, NngClientError> {
-        let socket_path = format!("ipc://{}/{}.sock", sources_dir, name);
-        let socket = nng_transport::connect(&socket_path)?;
+        let socket = nng_transport::connect(&Self::socket_path(sources_dir, name))?;
         Ok(SourceClient::Direct(socket))
     }
 
@@ -33,6 +36,29 @@ impl SourceClient {
         match gateway {
             Some(gw) => Self::connect_gateway(gw),
             None => Self::connect_direct(sources_dir, name),
+        }
+    }
+
+    /// Like [`connect`](Self::connect), but every request is bounded by `timeout`.
+    ///
+    /// The dial happens in the background, so an unreachable peer shows up as
+    /// a timeout on the first request rather than blocking here.
+    pub fn connect_with_timeout(
+        gateway: Option<&str>,
+        sources_dir: &str,
+        name: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Self, NngClientError> {
+        match gateway {
+            Some(gw) => Ok(SourceClient::Gateway(
+                gateway_client::GatewayClient::connect_with_timeout(gw, timeout)?,
+            )),
+            None => {
+                let path = Self::socket_path(sources_dir, name);
+                Ok(SourceClient::Direct(nng_transport::connect_with_timeout(
+                    &path, timeout,
+                )?))
+            }
         }
     }
 

@@ -373,7 +373,7 @@ mod tests {
             title: title.map(String::from),
             artist: artist.map(String::from),
             album: None,
-            duration: duration.map(|s| library_ipc_protocol::DurationSeconds::new(s)),
+            duration: duration.map(library_ipc_protocol::DurationSeconds::new),
             bpm: None,
             key: None,
             blob_path: None,
@@ -608,7 +608,7 @@ mod tests {
             "hash column must not be empty even at narrow terminal (subset path)"
         );
         assert!(
-            hash_token.chars().next().map_or(false, |c| c.is_ascii_hexdigit()),
+            hash_token.chars().next().is_some_and(|c| c.is_ascii_hexdigit()),
             "hash column token must start with hex chars (may end with ellipsis at narrow widths), got: {hash_token:?}"
         );
         // At wide-enough terminals (which is the realistic case), it's exactly 12:
@@ -807,7 +807,7 @@ mod tests {
             first_token
                 .chars()
                 .next()
-                .map_or(false, |c| c.is_ascii_hexdigit()),
+                .is_some_and(|c| c.is_ascii_hexdigit()),
             "first token must start with hex (hash column present), got: {first_token:?}"
         );
     }
