@@ -1,0 +1,165 @@
+{
+  "tracklist": {
+    "itemType": "playlist",
+    "itemId": 982341,
+    "itemUrl": "https://bandcamp.com/testuser/playlist/november-2",
+    "title": "november",
+    "subtitle": null,
+    "imageId": 48314923,
+    "isArt": false,
+    "date": "01 Nov 2026 20:58:49 GMT",
+    "description": null,
+    "imageCaption": null,
+    "attribution": {
+      "accountId": 1234,
+      "accountType": "fan",
+      "bylineType": null,
+      "name": "testuser",
+      "imageId": null,
+      "url": "https://bandcamp.com/testuser",
+      "isLabel": null
+    },
+    "compiledTrack": null,
+    "tracks": [
+      {
+        "album": {
+          "id": 1456614991,
+          "title": "KHR073 | Medieval Romances",
+          "artId": 1548269636,
+          "bandId": 3874220687,
+          "isPreorder": false,
+          "isPurchasable": true,
+          "isFreeDownload": false,
+          "isSetPrice": false,
+          "price": {
+            "amount": 6.0,
+            "currency": "EUR",
+            "isMoney": true
+          },
+          "url": "https://vanmorph.bandcamp.com/album/khr073-medieval-romances",
+          "isWishlisted": false,
+          "isOwned": true
+        },
+        "id": 1097862570,
+        "title": "Alseids (Original mix)",
+        "bandId": 3874220687,
+        "sellingBandId": 2518155403,
+        "bandImageId": 47696595,
+        "artistName": "Van Morph",
+        "bandUrl": "https://vanmorph.bandcamp.com",
+        "duration": 576.0,
+        "artId": 1548269636,
+        "isPreorder": false,
+        "isStreamingDisabled": false,
+        "isPurchasable": true,
+        "isFreeDownload": false,
+        "isSetPrice": false,
+        "price": {
+          "amount": 2.0,
+          "currency": "EUR",
+          "isMoney": true
+        },
+        "url": "https://vanmorph.bandcamp.com/track/alseids-original-mix",
+        "streamUrl": "https://t4.bcbits.com/stream/965131f17952f09b3fbd922ea36ebc0e/mp3-128/1097862570?REDACTED",
+        "isWishlisted": false,
+        "isOwned": true,
+        "playLimit": null,
+        "streamType": "l",
+        "timecode": null
+      },
+      {
+        "album": {
+          "id": 1884130137,
+          "title": "The Philosophy Of Living",
+          "artId": 1880664756,
+          "bandId": 1799400199,
+          "isPreorder": false,
+          "isPurchasable": true,
+          "isFreeDownload": false,
+          "isSetPrice": false,
+          "price": {
+            "amount": 7.0,
+            "currency": "EUR",
+            "isMoney": true
+          },
+          "url": "https://spclnch.bandcamp.com/album/the-philosophy-of-living",
+          "isWishlisted": false,
+          "isOwned": true
+        },
+        "id": 221252835,
+        "title": "The Philosophy Of Living (Kooscha remix)",
+        "bandId": 1799400199,
+        "sellingBandId": 1799400199,
+        "bandImageId": 24224516,
+        "artistName": "Djalo",
+        "bandUrl": "https://spclnch.bandcamp.com",
+        "duration": 373.333,
+        "artId": 1880664756,
+        "isPreorder": false,
+        "isStreamingDisabled": false,
+        "isPurchasable": false,
+        "isFreeDownload": false,
+        "isSetPrice": false,
+        "price": null,
+        "url": "https://spclnch.bandcamp.com/track/the-philosophy-of-living-kooscha-remix",
+        "streamUrl": "https://t4.bcbits.com/stream/8fd064b860b2265ddf73ecef1e7c5f5b/mp3-128/221252835?REDACTED",
+        "isWishlisted": false,
+        "isOwned": true,
+        "playLimit": null,
+        "streamType": "l",
+        "timecode": null
+      },
+      {
+        "album": {
+          "id": 2246268064,
+          "title": "Weekend",
+          "artId": 2354097010,
+          "bandId": 2428642569,
+          "isPreorder": false,
+          "isPurchasable": true,
+          "isFreeDownload": false,
+          "isSetPrice": false,
+          "price": {
+            "amount": 4.5,
+            "currency": "USD",
+            "isMoney": true
+          },
+          "url": "https://deepnoticrecords.bandcamp.com/album/weekend",
+          "isWishlisted": true,
+          "isOwned": false
+        },
+        "id": 3954154607,
+        "title": "Weekend",
+        "bandId": 2428642569,
+        "sellingBandId": 2428642569,
+        "bandImageId": 41872148,
+        "artistName": "DEKEL, SHTUBY",
+        "bandUrl": "https://deepnoticrecords.bandcamp.com",
+        "duration": 480.0,
+        "artId": 2354097010,
+        "isPreorder": false,
+        "isStreamingDisabled": false,
+        "isPurchasable": true,
+        "isFreeDownload": false,
+        "isSetPrice": false,
+        "price": {
+          "amount": 1.9,
+          "currency": "USD",
+          "isMoney": true
+        },
+        "url": "https://deepnoticrecords.bandcamp.com/track/weekend",
+        "streamUrl": "https://t4.bcbits.com/stream/3c1fa551b920ea7a24afec6a8adaed61/mp3-128/3954154607?REDACTED",
+        "isWishlisted": true,
+        "isOwned": true,
+        "playLimit": null,
+        "streamType": "l",
+        "timecode": null
+      }
+    ],
+    "tracksSummary": {
+      "totalCount": 64,
+      "totalDuration": 26782.0
+    },
+    "nextCursor": null
+  }
+}

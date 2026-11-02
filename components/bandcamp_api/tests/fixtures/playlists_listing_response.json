@@ -1,0 +1,81 @@
+{
+  "items": [
+    {
+      "attribution": {
+        "accountId": 1234,
+        "accountType": "fan",
+        "bylineType": null,
+        "name": "testuser",
+        "imageId": null,
+        "url": "https://bandcamp.com/testuser",
+        "isLabel": null
+      },
+      "creatorId": 1234,
+      "description": null,
+      "imageId": 48326514,
+      "imageState": "generated",
+      "isFeatured": null,
+      "isPrivate": false,
+      "itemId": 1015249,
+      "itemUrl": "https://bandcamp.com/testuser/playlist/chill-openers",
+      "modDate": "02 Nov 2026 13:43:03 GMT",
+      "title": "chill openers",
+      "tracksSummary": {
+        "totalCount": 82,
+        "totalDuration": 33497.0
+      }
+    },
+    {
+      "attribution": {
+        "accountId": 1234,
+        "accountType": "fan",
+        "bylineType": null,
+        "name": "testuser",
+        "imageId": null,
+        "url": "https://bandcamp.com/testuser",
+        "isLabel": null
+      },
+      "creatorId": 1234,
+      "description": null,
+      "imageId": 48314923,
+      "imageState": "generated",
+      "isFeatured": null,
+      "isPrivate": true,
+      "itemId": 982341,
+      "itemUrl": "https://bandcamp.com/testuser/playlist/november-2",
+      "modDate": "01 Nov 2026 20:58:49 GMT",
+      "title": "november",
+      "tracksSummary": {
+        "totalCount": 64,
+        "totalDuration": 26782.0
+      }
+    },
+    {
+      "attribution": {
+        "accountId": 1234,
+        "accountType": "fan",
+        "bylineType": null,
+        "name": "testuser",
+        "imageId": null,
+        "url": "https://bandcamp.com/testuser",
+        "isLabel": null
+      },
+      "creatorId": 1234,
+      "description": null,
+      "imageId": 47247462,
+      "imageState": "generated",
+      "isFeatured": null,
+      "isPrivate": true,
+      "itemId": 930015,
+      "itemUrl": "https://bandcamp.com/testuser/playlist/hypno-trance-set",
+      "modDate": "08 Sep 2026 16:22:04 GMT",
+      "title": "hypno-trance set",
+      "tracksSummary": {
+        "totalCount": 27,
+        "totalDuration": 11488.0
+      }
+    }
+  ],
+  "nextCursor": null,
+  "totalCount": 11
+}

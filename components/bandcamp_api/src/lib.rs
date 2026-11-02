@@ -42,11 +42,14 @@
 mod client;
 mod cookies;
 mod error;
+mod html;
+mod playlist;
 mod types;
 
 pub use client::BandcampClient;
 pub use cookies::{load_cookies, parse_cookies, CookieJar};
 pub use error::BandcampError;
+pub use playlist::{Playlist, PlaylistSummary, PlaylistTrack};
 pub use types::{
     AudioFormat, CollectionItem, DigitalItem, DownloadEvent, DownloadProgress, ItemId, ItemType,
     TrackInfo,

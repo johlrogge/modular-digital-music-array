@@ -1,0 +1,266 @@
+{
+  "appData": {
+    "title": "november",
+    "playlistId": 982341,
+    "isPrivate": true,
+    "tracklist": {
+      "itemType": "playlist",
+      "itemId": 982341,
+      "itemUrl": "https://bandcamp.com/testuser/playlist/november-2",
+      "title": "november",
+      "subtitle": null,
+      "imageId": 48314923,
+      "isArt": false,
+      "date": "01 Nov 2026 20:58:49 GMT",
+      "description": null,
+      "imageCaption": null,
+      "attribution": {
+        "accountId": 1234,
+        "accountType": "fan",
+        "bylineType": null,
+        "name": "testuser",
+        "imageId": null,
+        "url": "https://bandcamp.com/testuser",
+        "isLabel": null
+      },
+      "compiledTrack": null,
+      "tracks": [
+        {
+          "album": {
+            "id": 784675455,
+            "title": "Obsidian",
+            "artId": 2692643518,
+            "bandId": 381481133,
+            "isPreorder": false,
+            "isPurchasable": true,
+            "isFreeDownload": false,
+            "isSetPrice": false,
+            "price": {
+              "amount": 6.0,
+              "currency": "EUR",
+              "isMoney": true
+            },
+            "url": "https://lokd.bandcamp.com/album/obsidian",
+            "isWishlisted": false,
+            "isOwned": true
+          },
+          "id": 1150569772,
+          "title": "Obsidian",
+          "bandId": 381481133,
+          "sellingBandId": 381481133,
+          "bandImageId": 40697044,
+          "artistName": "Sun Drine, Ben Jarli, Dit:eau, Tricky Jones",
+          "bandUrl": "https://lokd.bandcamp.com",
+          "duration": 545.088,
+          "artId": 2692643518,
+          "isPreorder": false,
+          "isStreamingDisabled": false,
+          "isPurchasable": true,
+          "isFreeDownload": false,
+          "isSetPrice": false,
+          "price": {
+            "amount": 1.5,
+            "currency": "EUR",
+            "isMoney": true
+          },
+          "url": "https://lokd.bandcamp.com/track/obsidian",
+          "streamUrl": "https://t4.bcbits.com/stream/80be3f26ae6bc404202a1f0f0b7bd6b8/mp3-128/1150569772?REDACTED",
+          "isWishlisted": false,
+          "isOwned": true,
+          "playLimit": null,
+          "streamType": "l",
+          "timecode": null
+        },
+        {
+          "album": {
+            "id": 1957019919,
+            "title": "AMR015 TWO YEARS",
+            "artId": 3284089667,
+            "bandId": 4291937065,
+            "isPreorder": false,
+            "isPurchasable": true,
+            "isFreeDownload": false,
+            "isSetPrice": false,
+            "price": {
+              "amount": 29.0,
+              "currency": "EUR",
+              "isMoney": true
+            },
+            "url": "https://auroramisticarecords.bandcamp.com/album/amr015-two-years",
+            "isWishlisted": false,
+            "isOwned": false
+          },
+          "id": 2965118215,
+          "title": "Dirl (Original Mix)",
+          "bandId": 4291937065,
+          "sellingBandId": 4291937065,
+          "bandImageId": 35428711,
+          "artistName": "Hyarbor",
+          "bandUrl": "https://auroramisticarecords.bandcamp.com",
+          "duration": 471.864,
+          "artId": 2299411074,
+          "isPreorder": false,
+          "isStreamingDisabled": false,
+          "isPurchasable": true,
+          "isFreeDownload": false,
+          "isSetPrice": false,
+          "price": {
+            "amount": 2.0,
+            "currency": "EUR",
+            "isMoney": true
+          },
+          "url": "https://auroramisticarecords.bandcamp.com/track/dirl-original-mix",
+          "streamUrl": "https://t4.bcbits.com/stream/a42daa618f08efb46a6bb25f6f5d6407/mp3-128/2965118215?REDACTED",
+          "isWishlisted": false,
+          "isOwned": true,
+          "playLimit": null,
+          "streamType": "l",
+          "timecode": null
+        },
+        {
+          "album": {
+            "id": 1042298105,
+            "title": "AMR016 Self-Portrait LP",
+            "artId": 3219813762,
+            "bandId": 4291937065,
+            "isPreorder": false,
+            "isPurchasable": true,
+            "isFreeDownload": false,
+            "isSetPrice": false,
+            "price": {
+              "amount": 9.0,
+              "currency": "EUR",
+              "isMoney": true
+            },
+            "url": "https://auroramisticarecords.bandcamp.com/album/amr016-self-portrait-lp",
+            "isWishlisted": false,
+            "isOwned": true
+          },
+          "id": 883888449,
+          "title": "Solar Chant (Original Mix)",
+          "bandId": 4291937065,
+          "sellingBandId": 4291937065,
+          "bandImageId": 35428711,
+          "artistName": "Re:Axis",
+          "bandUrl": "https://auroramisticarecords.bandcamp.com",
+          "duration": 403.81,
+          "artId": 3448819326,
+          "isPreorder": false,
+          "isStreamingDisabled": false,
+          "isPurchasable": true,
+          "isFreeDownload": false,
+          "isSetPrice": false,
+          "price": {
+            "amount": 1.5,
+            "currency": "EUR",
+            "isMoney": true
+          },
+          "url": "https://auroramisticarecords.bandcamp.com/track/solar-chant-original-mix-2",
+          "streamUrl": "https://t4.bcbits.com/stream/49dbee70416acb6a8c764171aa98b035/mp3-128/883888449?REDACTED",
+          "isWishlisted": false,
+          "isOwned": true,
+          "playLimit": null,
+          "streamType": "l",
+          "timecode": null
+        },
+        {
+          "album": {
+            "id": 2832029448,
+            "title": "Rinascimento",
+            "artId": 2896058623,
+            "bandId": 1126718299,
+            "isPreorder": false,
+            "isPurchasable": true,
+            "isFreeDownload": false,
+            "isSetPrice": false,
+            "price": {
+              "amount": 7.0,
+              "currency": "EUR",
+              "isMoney": true
+            },
+            "url": "https://indefinitepitch.bandcamp.com/album/rinascimento",
+            "isWishlisted": false,
+            "isOwned": true
+          },
+          "id": 46958684,
+          "title": "La primavera di botticelli",
+          "bandId": 1126718299,
+          "sellingBandId": 1126718299,
+          "bandImageId": 36194887,
+          "artistName": "Kryss Hypnowave",
+          "bandUrl": "https://indefinitepitch.bandcamp.com",
+          "duration": 435.81,
+          "artId": 2896058623,
+          "isPreorder": false,
+          "isStreamingDisabled": false,
+          "isPurchasable": true,
+          "isFreeDownload": false,
+          "isSetPrice": false,
+          "price": {
+            "amount": 2.0,
+            "currency": "EUR",
+            "isMoney": true
+          },
+          "url": "https://indefinitepitch.bandcamp.com/track/la-primavera-di-botticelli",
+          "streamUrl": "https://t4.bcbits.com/stream/5d87932d3737803a5239c9190bb037fe/mp3-128/46958684?REDACTED",
+          "isWishlisted": false,
+          "isOwned": true,
+          "playLimit": null,
+          "streamType": "l",
+          "timecode": null
+        },
+        {
+          "album": {
+            "id": 2716154707,
+            "title": "Alexskyspirit - Rvanegon",
+            "artId": 1955809202,
+            "bandId": 3540844056,
+            "isPreorder": false,
+            "isPurchasable": true,
+            "isFreeDownload": false,
+            "isSetPrice": false,
+            "price": {
+              "amount": 9.0,
+              "currency": "EUR",
+              "isMoney": true
+            },
+            "url": "https://quartal.bandcamp.com/album/alexskyspirit-rvanegon",
+            "isWishlisted": false,
+            "isOwned": true
+          },
+          "id": 2240358472,
+          "title": "B2 Alexskyspirit - Rvanegon (Balanca Hybrid Remix)",
+          "bandId": 3540844056,
+          "sellingBandId": 3540844056,
+          "bandImageId": 33019888,
+          "artistName": "Alexskyspirit, Balanca, TAAR1",
+          "bandUrl": "https://quartal.bandcamp.com",
+          "duration": 408.5,
+          "artId": 1955809202,
+          "isPreorder": false,
+          "isStreamingDisabled": false,
+          "isPurchasable": true,
+          "isFreeDownload": false,
+          "isSetPrice": false,
+          "price": {
+            "amount": 2.0,
+            "currency": "EUR",
+            "isMoney": true
+          },
+          "url": "https://quartal.bandcamp.com/track/b2-alexskyspirit-rvanegon-balanca-hybrid-remix",
+          "streamUrl": "https://t4.bcbits.com/stream/bef47ae1523f4471b7342846baf5dc7f/mp3-128/2240358472?REDACTED",
+          "isWishlisted": false,
+          "isOwned": true,
+          "playLimit": null,
+          "streamType": "l",
+          "timecode": null
+        }
+      ],
+      "tracksSummary": {
+        "totalCount": 64,
+        "totalDuration": 26782.0
+      },
+      "nextCursor": 49
+    }
+  }
+}
