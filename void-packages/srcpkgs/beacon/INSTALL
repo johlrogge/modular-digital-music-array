@@ -25,6 +25,15 @@ post)
         echo "beacon-wifi service enabled"
     fi
 
+    # Enable acpid (Pi 5 power key -> clean shutdown); also on upgrades.
+    # To disable it lastingly, touch /etc/sv/acpid/down: upgrades re-link a
+    # /var/service link that was removed.
+    if [ -d /etc/sv/acpid ] && [ ! -e /var/service/acpid ] && [ ! -L /var/service/acpid ]; then
+        if ln -sfn /etc/sv/acpid /var/service/acpid; then
+            echo "acpid service enabled"
+        fi
+    fi
+
     # dhcpcd manages wlan0 as well as ethernet; skip if any dhcpcd* service
     # (e.g. dhcpcd-eth0) is already enabled, two instances would fight
     found=

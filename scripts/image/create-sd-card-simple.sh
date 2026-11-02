@@ -101,6 +101,8 @@ ln -sfn /etc/sv/beacon "${ROOTFS}/etc/runit/runsvdir/default/beacon"
 ln -sfn /etc/sv/dbus "${ROOTFS}/etc/runit/runsvdir/default/dbus"
 ln -sfn /etc/sv/avahi-daemon "${ROOTFS}/etc/runit/runsvdir/default/avahi-daemon"
 ln -sfn /etc/sv/chronyd "${ROOTFS}/etc/runit/runsvdir/default/chronyd"
+# acpid handles the power key (stock handler.sh: PBTN -> shutdown -P now).
+ln -sfn /etc/sv/acpid "${ROOTFS}/etc/runit/runsvdir/default/acpid"
 # beacon-wifi ships a 'down' file; the beacon brings it up on demand.
 ln -sfn /etc/sv/beacon-wifi "${ROOTFS}/etc/runit/runsvdir/default/beacon-wifi"
 # dhcpcd manages wlan0 too (idempotent; base image may or may not enable it).
@@ -155,7 +157,7 @@ if [ -z "$PLATFORMFS_TAR" ]; then
     # — local builds with in-flight fixes must win over the published ones.
     # So we pass them in REVERSE of desired final order:
     ./mkplatformfs.sh \
-        -p "beacon dbus avahi cloud-guest-utils rpi5-kernel dracut uboot-mkimage rpi-eeprom void-repo-nonfree chrony wpa_supplicant dhcpcd iw wireless-regdb rpi-firmware" \
+        -p "beacon dbus avahi cloud-guest-utils rpi5-kernel dracut uboot-mkimage rpi-eeprom void-repo-nonfree chrony wpa_supplicant dhcpcd acpid iw wireless-regdb rpi-firmware" \
         -r "$VOID_NONFREE_REPO" \
         -r "$MDMA_REPO" \
         -r "$LOCAL_REPO" \
