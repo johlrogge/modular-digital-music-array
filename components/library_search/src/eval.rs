@@ -471,8 +471,10 @@ mod tests {
 
     #[test]
     fn started_na_matches_none() {
-        let mut q = TrackQuery::default();
-        q.started = Some(DateQuery::NA);
+        let q = TrackQuery {
+            started: Some(DateQuery::NA),
+            ..Default::default()
+        };
         let mut f = empty_fields();
         f.last_started = None;
         assert!(matches_query(&q, &f));
@@ -480,8 +482,10 @@ mod tests {
 
     #[test]
     fn started_na_no_match_when_started() {
-        let mut q = TrackQuery::default();
-        q.started = Some(DateQuery::NA);
+        let q = TrackQuery {
+            started: Some(DateQuery::NA),
+            ..Default::default()
+        };
         let mut f = empty_fields();
         f.last_started = Some(DateTime::from_timestamp(0, 0).unwrap());
         assert!(!matches_query(&q, &f));
@@ -490,12 +494,14 @@ mod tests {
     #[test]
     fn started_after_year_month() {
         use chrono::NaiveDate;
-        let mut q = TrackQuery::default();
         // After January 2026 — matches February onwards
-        q.started = Some(DateQuery::After(
-            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
-            DatePrecision::YearMonth,
-        ));
+        let q = TrackQuery {
+            started: Some(DateQuery::After(
+                NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                DatePrecision::YearMonth,
+            )),
+            ..Default::default()
+        };
         let mut f = empty_fields();
         // Started on 2026-02-15
         f.last_started = Some(
@@ -509,11 +515,13 @@ mod tests {
     #[test]
     fn started_after_no_match_within_period() {
         use chrono::NaiveDate;
-        let mut q = TrackQuery::default();
-        q.started = Some(DateQuery::After(
-            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
-            DatePrecision::YearMonth,
-        ));
+        let q = TrackQuery {
+            started: Some(DateQuery::After(
+                NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                DatePrecision::YearMonth,
+            )),
+            ..Default::default()
+        };
         let mut f = empty_fields();
         // Started on 2026-01-15 — inside January, NOT after it
         f.last_started = Some(
@@ -527,13 +535,15 @@ mod tests {
     #[test]
     fn started_range_year_month() {
         use chrono::NaiveDate;
-        let mut q = TrackQuery::default();
-        q.started = Some(DateQuery::Range(
-            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
-            DatePrecision::YearMonth,
-            NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(),
-            DatePrecision::YearMonth,
-        ));
+        let q = TrackQuery {
+            started: Some(DateQuery::Range(
+                NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                DatePrecision::YearMonth,
+                NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(),
+                DatePrecision::YearMonth,
+            )),
+            ..Default::default()
+        };
         let mut f = empty_fields();
         // Started on 2026-02-15 — within Jan-Mar 2026
         f.last_started = Some(
@@ -582,8 +592,10 @@ mod tests {
 
     #[test]
     fn added_na_matches_none() {
-        let mut q = TrackQuery::default();
-        q.added = Some(DateQuery::NA);
+        let q = TrackQuery {
+            added: Some(DateQuery::NA),
+            ..Default::default()
+        };
         let mut f = empty_fields();
         f.added = None;
         assert!(matches_query(&q, &f));
@@ -591,8 +603,10 @@ mod tests {
 
     #[test]
     fn added_na_no_match_when_added() {
-        let mut q = TrackQuery::default();
-        q.added = Some(DateQuery::NA);
+        let q = TrackQuery {
+            added: Some(DateQuery::NA),
+            ..Default::default()
+        };
         let mut f = empty_fields();
         f.added = Some(DateTime::from_timestamp(0, 0).unwrap());
         assert!(!matches_query(&q, &f));
@@ -601,11 +615,13 @@ mod tests {
     #[test]
     fn added_after_year_matches() {
         use chrono::NaiveDate;
-        let mut q = TrackQuery::default();
-        q.added = Some(DateQuery::After(
-            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
-            DatePrecision::Year,
-        ));
+        let q = TrackQuery {
+            added: Some(DateQuery::After(
+                NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                DatePrecision::Year,
+            )),
+            ..Default::default()
+        };
         let mut f = empty_fields();
         f.added = Some(
             chrono::DateTime::parse_from_rfc3339("2027-01-01T00:00:00Z")

@@ -2946,14 +2946,359 @@ impl LibraryService {
     }
 }
 
+// =========================================================================
+// Lazy playlist repair implementation
+// =========================================================================
+
+impl LibraryService {
+    /// Return all hashes that `hash` directly replaced, by scanning `hash`'s
+    /// in-memory provenance for `Replaces(X)` entries.
+    ///
+    /// Call this BEFORE retracting `hash` so the provenance is still present.
+    /// The returned vec is deduplicated. An empty vec means `hash` was never
+    /// itself a replacement (first-generation track).
+    ///
+    /// Used by `handle_track_replace` to forward-inherit the chain: when C
+    /// replaces B, C must also claim every hash that B had replaced (e.g. A),
+    /// so that a playlist still pointing at A can find its way to C even after
+    /// B is fully retracted.
+    pub(crate) fn gather_ancestor_replaces(&self, hash: &ContentHash) -> Vec<ContentHash> {
+        let normalize = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
+        let target_clean = normalize(hash.as_str());
+
+        let tracks = self.tracks.lock().unwrap();
+        let entry = match tracks
+            .iter()
+            .find(|t| normalize(t.content_hash.as_str()) == target_clean)
+        {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut result: Vec<ContentHash> = Vec::new();
+
+        for (v, _) in &entry.provenance {
+            if let MusicValue::Replaces(old) = v {
+                let old_clean = normalize(old.as_str());
+                if seen.insert(old_clean) {
+                    result.push(old.clone());
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Follow the reverse-Replaces chain from `hash` to find the live successor.
+    ///
+    /// Scans the in-memory track index for a track whose provenance contains
+    /// `Replaces(hash)`. If found and that track is live (not hidden, resolvable),
+    /// return it. If found but not live, recurse with that track's hash.
+    ///
+    /// Terminates on:
+    /// - cycle: a visited-set bounds iteration to MAX_CHAIN_DEPTH hops
+    /// - dead end: no track asserts Replaces(X) and X is not live → None
+    ///
+    /// "Live" means: the track is in the index AND is not hidden (deleted_at is None).
+    /// This is stricter than resolve_hash (which accepts hidden tracks).
+    fn resolve_through_replaces(&self, hash: &ContentHash) -> Option<ContentHash> {
+        const MAX_CHAIN_DEPTH: usize = 64;
+
+        let normalize = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
+        let target_clean = normalize(hash.as_str());
+
+        let mut visited: HashSet<String> = HashSet::new();
+        visited.insert(target_clean.clone());
+
+        let mut current = hash.clone();
+
+        for _ in 0..MAX_CHAIN_DEPTH {
+            let current_clean = normalize(current.as_str());
+
+            // Scan all tracks' provenance for Replaces(current)
+            let successor = {
+                let tracks = self.tracks.lock().unwrap();
+                tracks
+                    .iter()
+                    .find(|t| {
+                        t.provenance.iter().any(|(v, _)| {
+                            if let MusicValue::Replaces(old) = v {
+                                let old_clean = normalize(old.as_str());
+                                old_clean == current_clean
+                            } else {
+                                false
+                            }
+                        })
+                    })
+                    .map(|t| t.content_hash.clone())
+            };
+
+            match successor {
+                None => {
+                    // No track asserts Replaces(current) — dead end
+                    return None;
+                }
+                Some(next_hash) => {
+                    let next_clean = normalize(next_hash.as_str());
+
+                    // Cycle guard
+                    if visited.contains(&next_clean) {
+                        tracing::warn!(
+                            hash = %hash.as_str(),
+                            chain = %next_hash.as_str(),
+                            "Cycle detected in Replaces chain during playlist repair — terminating"
+                        );
+                        return None;
+                    }
+                    visited.insert(next_clean.clone());
+
+                    // Check if next_hash is live (in index and not hidden)
+                    let is_live = {
+                        let tracks = self.tracks.lock().unwrap();
+                        tracks.iter().any(|t| {
+                            let h = normalize(t.content_hash.as_str());
+                            h == next_clean && t.deleted_at.is_none()
+                        })
+                    };
+
+                    if is_live {
+                        return Some(next_hash);
+                    } else {
+                        // Not live — continue chain
+                        current = next_hash;
+                    }
+                }
+            }
+        }
+
+        tracing::warn!(
+            hash = %hash.as_str(),
+            "Replaces chain exceeded max depth during playlist repair — giving up"
+        );
+        None
+    }
+
+    /// Scan a playlist's content, follow the Replaces chain for any unresolvable
+    /// hash, amend lines to the live successor, and persist the file if anything changed.
+    ///
+    /// Returns the (possibly amended) content string.
+    fn repair_playlist_content(&self, content: &str, plist_path: &std::path::Path) -> String {
+        use std::io::Write;
+
+        let normalize = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
+
+        let mut changed = false;
+        let new_lines: Vec<String> = content
+            .lines()
+            .map(|line| {
+                let token = line.split_whitespace().next().unwrap_or("");
+                if token.is_empty() {
+                    return line.to_string();
+                }
+
+                let token_clean = normalize(token);
+                // Build a ContentHash from the token to try resolve_hash
+                let candidate = ContentHash::new(token);
+
+                // Is this hash already live?
+                let is_live = {
+                    let tracks = self.tracks.lock().unwrap();
+                    tracks.iter().any(|t| {
+                        let h = normalize(t.content_hash.as_str());
+                        (h.starts_with(&token_clean) || token_clean.starts_with(&h))
+                            && t.deleted_at.is_none()
+                    })
+                };
+
+                if is_live {
+                    return line.to_string();
+                }
+
+                // Not live — try repair via Replaces chain
+                match self.resolve_through_replaces(&candidate) {
+                    None => {
+                        // Dead end — leave line unchanged
+                        line.to_string()
+                    }
+                    Some(successor) => {
+                        changed = true;
+                        // Replace only the hash token; preserve rest of line verbatim
+                        let rest = line[token.len()..].to_string();
+                        format!("{}{}", successor.as_str(), rest)
+                    }
+                }
+            })
+            .collect();
+
+        let new_content = new_lines.join("\n");
+        let new_content = if content.ends_with('\n') {
+            format!("{}\n", new_content)
+        } else {
+            new_content
+        };
+
+        if changed {
+            // Persist atomically via temp file (same approach as rewrite_playlists_replace_hash)
+            let tmp_path = plist_path.with_extension("plist.tmp");
+            if let Ok(mut f) = std::fs::File::create(&tmp_path) {
+                if f.write_all(new_content.as_bytes()).is_ok() {
+                    let _ = std::fs::rename(&tmp_path, plist_path);
+                } else {
+                    let _ = std::fs::remove_file(&tmp_path);
+                }
+            }
+        }
+
+        new_content
+    }
+}
+
+/// Run the IPC server loop
+pub fn run_ipc_server(service: Arc<LibraryService>, address: &str) -> Result<(), ServiceError> {
+    let server = IpcServer::bind(address)?;
+
+    tracing::info!("IPC server running, waiting for requests...");
+
+    loop {
+        match server.recv() {
+            Ok(request) => {
+                let response = service.handle_request(request);
+                if let Err(e) = server.send(&response) {
+                    tracing::error!(error = %e, "Failed to send response, sending error fallback");
+                    let fallback = LibraryResponse::Error(ProtocolError::Internal {
+                        message: format!("Internal error: {}", e),
+                    });
+                    if let Err(e2) = server.send(&fallback) {
+                        tracing::error!(error = %e2, "Failed to send fallback error response");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to receive request");
+            }
+        }
+    }
+}
+
+/// Spawn a background thread that subscribes to ACID fact notifications and
+/// applies incremental updates to the library index.
+///
+/// On receiving an `acid/facts/asserted` or `acid/facts/retracted` event, fetches new facts from the ACID stream
+/// starting at the in-memory cursor, applies them to the in-memory index, and
+/// updates the in-memory cursor. The cursor is never persisted to disk.
+///
+/// The thread retries indefinitely on dial or recv failure with a 5-second backoff.
+pub fn spawn_fact_subscriber(service: Arc<LibraryService>) {
+    let acid_events_socket = service.acid_events_socket.clone();
+    let acid_socket_addr = service.acid_socket.clone();
+
+    std::thread::spawn(move || {
+        use nng::options::Options;
+
+        let sub = match nng::Socket::new(nng::Protocol::Sub0) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to create Sub0 socket for ACID events");
+                return;
+            }
+        };
+
+        if let Err(e) =
+            sub.set_opt::<nng::options::protocol::pubsub::Subscribe>(TOPIC_ACID.as_bytes().to_vec())
+        {
+            tracing::error!(error = %e, "Failed to subscribe to ACID events topic");
+            return;
+        }
+
+        // Outer retry loop: reconnect after dial or recv failure.
+        loop {
+            if let Err(e) = sub.dial(&acid_events_socket) {
+                tracing::warn!(
+                    error = %e,
+                    socket = %acid_events_socket,
+                    "Failed to connect to ACID events socket, retrying in 5s"
+                );
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                continue;
+            }
+
+            tracing::info!(
+                socket = %acid_events_socket,
+                "Subscribed to ACID facts events"
+            );
+
+            // Create a dedicated ACID client for the subscriber thread
+            let acid_client = match AcidClient::connect(&acid_socket_addr) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Subscriber: failed to connect to ACID service, retrying in 5s"
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    continue;
+                }
+            };
+
+            // Inner recv loop: process events until a recv error forces reconnect.
+            loop {
+                let msg = match sub.recv() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ACID subscriber: recv error, reconnecting in 5s");
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        break;
+                    }
+                };
+
+                let event = match acid_event_from_topic_message(&msg) {
+                    Ok((_, e)) => e,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ACID subscriber: failed to parse event");
+                        continue;
+                    }
+                };
+
+                match &event {
+                    AcidEvent::FactsAsserted { cursor, .. } => {
+                        tracing::debug!(cursor = %cursor, "Received ACID facts-asserted notification");
+                    }
+                    AcidEvent::FactsRetracted { cursor, .. } => {
+                        tracing::debug!(cursor = %cursor, "Received ACID facts-retracted notification");
+                    }
+                };
+
+                // Fetch new facts starting from our in-memory cursor
+                let current_cursor = service.cursor.lock().unwrap().clone();
+                match acid_client.read_stream(current_cursor, 10_000) {
+                    Ok(chunk) => {
+                        if !chunk.lines.is_empty() {
+                            tracing::debug!(
+                                count = chunk.lines.len(),
+                                "Applying incremental facts from ACID stream"
+                            );
+                            service.apply_stream_lines(&chunk.lines);
+                        }
+                        // Update in-memory cursor only — no disk persistence
+                        *service.cursor.lock().unwrap() = Some(chunk.cursor.clone());
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Subscriber: failed to read incremental stream");
+                    }
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fact_writer::FactWriter;
     use chrono::{TimeZone, Utc};
     use music_facts::{
-        ContentHash, EnergyLevel, FactOrigin, FactSource, MusicValue, StartReason, StopReason,
-        Title,
+        ContentHash, FactOrigin, FactSource, MusicValue, StartReason, StopReason, Title,
     };
     use pretty_assertions::assert_eq;
     use stainless_facts::{Fact, FactStreamWriter, Operation};
@@ -3623,7 +3968,7 @@ mod tests {
         let partial = ContentHash::new("sha256:abcdef00");
         let result = service.resolve_hash(&partial);
         assert!(
-            matches!(result, Err(_)),
+            result.is_err(),
             "expected Ambiguous error for genuine prefix collision, got: {:?}",
             result
         );
@@ -7693,350 +8038,4 @@ mod tests {
         assert_eq!(track_info.memory_cues[1].label.as_deref(), Some("Drop"));
         assert_eq!(track_info.memory_cues[1].index, Some(0));
     }
-}
-
-// =========================================================================
-// Lazy playlist repair implementation
-// =========================================================================
-
-impl LibraryService {
-    /// Return all hashes that `hash` directly replaced, by scanning `hash`'s
-    /// in-memory provenance for `Replaces(X)` entries.
-    ///
-    /// Call this BEFORE retracting `hash` so the provenance is still present.
-    /// The returned vec is deduplicated. An empty vec means `hash` was never
-    /// itself a replacement (first-generation track).
-    ///
-    /// Used by `handle_track_replace` to forward-inherit the chain: when C
-    /// replaces B, C must also claim every hash that B had replaced (e.g. A),
-    /// so that a playlist still pointing at A can find its way to C even after
-    /// B is fully retracted.
-    pub(crate) fn gather_ancestor_replaces(&self, hash: &ContentHash) -> Vec<ContentHash> {
-        let normalize = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
-        let target_clean = normalize(hash.as_str());
-
-        let tracks = self.tracks.lock().unwrap();
-        let entry = match tracks
-            .iter()
-            .find(|t| normalize(t.content_hash.as_str()) == target_clean)
-        {
-            Some(e) => e,
-            None => return Vec::new(),
-        };
-
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut result: Vec<ContentHash> = Vec::new();
-
-        for (v, _) in &entry.provenance {
-            if let MusicValue::Replaces(old) = v {
-                let old_clean = normalize(old.as_str());
-                if seen.insert(old_clean) {
-                    result.push(old.clone());
-                }
-            }
-        }
-
-        result
-    }
-
-    /// Follow the reverse-Replaces chain from `hash` to find the live successor.
-    ///
-    /// Scans the in-memory track index for a track whose provenance contains
-    /// `Replaces(hash)`. If found and that track is live (not hidden, resolvable),
-    /// return it. If found but not live, recurse with that track's hash.
-    ///
-    /// Terminates on:
-    /// - cycle: a visited-set bounds iteration to MAX_CHAIN_DEPTH hops
-    /// - dead end: no track asserts Replaces(X) and X is not live → None
-    ///
-    /// "Live" means: the track is in the index AND is not hidden (deleted_at is None).
-    /// This is stricter than resolve_hash (which accepts hidden tracks).
-    fn resolve_through_replaces(&self, hash: &ContentHash) -> Option<ContentHash> {
-        const MAX_CHAIN_DEPTH: usize = 64;
-
-        let normalize = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
-        let target_clean = normalize(hash.as_str());
-
-        let mut visited: HashSet<String> = HashSet::new();
-        visited.insert(target_clean.clone());
-
-        let mut current = hash.clone();
-
-        for _ in 0..MAX_CHAIN_DEPTH {
-            let current_clean = normalize(current.as_str());
-
-            // Scan all tracks' provenance for Replaces(current)
-            let successor = {
-                let tracks = self.tracks.lock().unwrap();
-                tracks
-                    .iter()
-                    .find(|t| {
-                        t.provenance.iter().any(|(v, _)| {
-                            if let MusicValue::Replaces(old) = v {
-                                let old_clean = normalize(old.as_str());
-                                old_clean == current_clean
-                            } else {
-                                false
-                            }
-                        })
-                    })
-                    .map(|t| t.content_hash.clone())
-            };
-
-            match successor {
-                None => {
-                    // No track asserts Replaces(current) — dead end
-                    return None;
-                }
-                Some(next_hash) => {
-                    let next_clean = normalize(next_hash.as_str());
-
-                    // Cycle guard
-                    if visited.contains(&next_clean) {
-                        tracing::warn!(
-                            hash = %hash.as_str(),
-                            chain = %next_hash.as_str(),
-                            "Cycle detected in Replaces chain during playlist repair — terminating"
-                        );
-                        return None;
-                    }
-                    visited.insert(next_clean.clone());
-
-                    // Check if next_hash is live (in index and not hidden)
-                    let is_live = {
-                        let tracks = self.tracks.lock().unwrap();
-                        tracks.iter().any(|t| {
-                            let h = normalize(t.content_hash.as_str());
-                            h == next_clean && t.deleted_at.is_none()
-                        })
-                    };
-
-                    if is_live {
-                        return Some(next_hash);
-                    } else {
-                        // Not live — continue chain
-                        current = next_hash;
-                    }
-                }
-            }
-        }
-
-        tracing::warn!(
-            hash = %hash.as_str(),
-            "Replaces chain exceeded max depth during playlist repair — giving up"
-        );
-        None
-    }
-
-    /// Scan a playlist's content, follow the Replaces chain for any unresolvable
-    /// hash, amend lines to the live successor, and persist the file if anything changed.
-    ///
-    /// Returns the (possibly amended) content string.
-    fn repair_playlist_content(&self, content: &str, plist_path: &std::path::Path) -> String {
-        use std::io::Write;
-
-        let normalize = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
-
-        let mut changed = false;
-        let new_lines: Vec<String> = content
-            .lines()
-            .map(|line| {
-                let token = line.split_whitespace().next().unwrap_or("");
-                if token.is_empty() {
-                    return line.to_string();
-                }
-
-                let token_clean = normalize(token);
-                // Build a ContentHash from the token to try resolve_hash
-                let candidate = ContentHash::new(token);
-
-                // Is this hash already live?
-                let is_live = {
-                    let tracks = self.tracks.lock().unwrap();
-                    tracks.iter().any(|t| {
-                        let h = normalize(t.content_hash.as_str());
-                        (h.starts_with(&token_clean) || token_clean.starts_with(&h))
-                            && t.deleted_at.is_none()
-                    })
-                };
-
-                if is_live {
-                    return line.to_string();
-                }
-
-                // Not live — try repair via Replaces chain
-                match self.resolve_through_replaces(&candidate) {
-                    None => {
-                        // Dead end — leave line unchanged
-                        line.to_string()
-                    }
-                    Some(successor) => {
-                        changed = true;
-                        // Replace only the hash token; preserve rest of line verbatim
-                        let rest = line[token.len()..].to_string();
-                        format!("{}{}", successor.as_str(), rest)
-                    }
-                }
-            })
-            .collect();
-
-        let new_content = new_lines.join("\n");
-        let new_content = if content.ends_with('\n') {
-            format!("{}\n", new_content)
-        } else {
-            new_content
-        };
-
-        if changed {
-            // Persist atomically via temp file (same approach as rewrite_playlists_replace_hash)
-            let tmp_path = plist_path.with_extension("plist.tmp");
-            if let Ok(mut f) = std::fs::File::create(&tmp_path) {
-                if f.write_all(new_content.as_bytes()).is_ok() {
-                    let _ = std::fs::rename(&tmp_path, plist_path);
-                } else {
-                    let _ = std::fs::remove_file(&tmp_path);
-                }
-            }
-        }
-
-        new_content
-    }
-}
-
-/// Run the IPC server loop
-pub fn run_ipc_server(service: Arc<LibraryService>, address: &str) -> Result<(), ServiceError> {
-    let server = IpcServer::bind(address)?;
-
-    tracing::info!("IPC server running, waiting for requests...");
-
-    loop {
-        match server.recv() {
-            Ok(request) => {
-                let response = service.handle_request(request);
-                if let Err(e) = server.send(&response) {
-                    tracing::error!(error = %e, "Failed to send response, sending error fallback");
-                    let fallback = LibraryResponse::Error(ProtocolError::Internal {
-                        message: format!("Internal error: {}", e),
-                    });
-                    if let Err(e2) = server.send(&fallback) {
-                        tracing::error!(error = %e2, "Failed to send fallback error response");
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to receive request");
-            }
-        }
-    }
-}
-
-/// Spawn a background thread that subscribes to ACID fact notifications and
-/// applies incremental updates to the library index.
-///
-/// On receiving an `acid/facts/asserted` or `acid/facts/retracted` event, fetches new facts from the ACID stream
-/// starting at the in-memory cursor, applies them to the in-memory index, and
-/// updates the in-memory cursor. The cursor is never persisted to disk.
-///
-/// The thread retries indefinitely on dial or recv failure with a 5-second backoff.
-pub fn spawn_fact_subscriber(service: Arc<LibraryService>) {
-    let acid_events_socket = service.acid_events_socket.clone();
-    let acid_socket_addr = service.acid_socket.clone();
-
-    std::thread::spawn(move || {
-        use nng::options::Options;
-
-        let sub = match nng::Socket::new(nng::Protocol::Sub0) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to create Sub0 socket for ACID events");
-                return;
-            }
-        };
-
-        if let Err(e) =
-            sub.set_opt::<nng::options::protocol::pubsub::Subscribe>(TOPIC_ACID.as_bytes().to_vec())
-        {
-            tracing::error!(error = %e, "Failed to subscribe to ACID events topic");
-            return;
-        }
-
-        // Outer retry loop: reconnect after dial or recv failure.
-        loop {
-            if let Err(e) = sub.dial(&acid_events_socket) {
-                tracing::warn!(
-                    error = %e,
-                    socket = %acid_events_socket,
-                    "Failed to connect to ACID events socket, retrying in 5s"
-                );
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                continue;
-            }
-
-            tracing::info!(
-                socket = %acid_events_socket,
-                "Subscribed to ACID facts events"
-            );
-
-            // Create a dedicated ACID client for the subscriber thread
-            let acid_client = match AcidClient::connect(&acid_socket_addr) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "Subscriber: failed to connect to ACID service, retrying in 5s"
-                    );
-                    std::thread::sleep(std::time::Duration::from_secs(5));
-                    continue;
-                }
-            };
-
-            // Inner recv loop: process events until a recv error forces reconnect.
-            loop {
-                let msg = match sub.recv() {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "ACID subscriber: recv error, reconnecting in 5s");
-                        std::thread::sleep(std::time::Duration::from_secs(5));
-                        break;
-                    }
-                };
-
-                let event = match acid_event_from_topic_message(&msg) {
-                    Ok((_, e)) => e,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "ACID subscriber: failed to parse event");
-                        continue;
-                    }
-                };
-
-                match &event {
-                    AcidEvent::FactsAsserted { cursor, .. } => {
-                        tracing::debug!(cursor = %cursor, "Received ACID facts-asserted notification");
-                    }
-                    AcidEvent::FactsRetracted { cursor, .. } => {
-                        tracing::debug!(cursor = %cursor, "Received ACID facts-retracted notification");
-                    }
-                };
-
-                // Fetch new facts starting from our in-memory cursor
-                let current_cursor = service.cursor.lock().unwrap().clone();
-                match acid_client.read_stream(current_cursor, 10_000) {
-                    Ok(chunk) => {
-                        if !chunk.lines.is_empty() {
-                            tracing::debug!(
-                                count = chunk.lines.len(),
-                                "Applying incremental facts from ACID stream"
-                            );
-                            service.apply_stream_lines(&chunk.lines);
-                        }
-                        // Update in-memory cursor only — no disk persistence
-                        *service.cursor.lock().unwrap() = Some(chunk.cursor.clone());
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Subscriber: failed to read incremental stream");
-                    }
-                }
-            }
-        }
-    });
 }

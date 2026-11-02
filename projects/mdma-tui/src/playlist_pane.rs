@@ -766,7 +766,7 @@ mod tests {
         sel.selected.insert(0);
         sel.selected.insert(2);
 
-        let hashes = vec![hash("sha256:aaa"), hash("sha256:bbb"), hash("sha256:ccc")];
+        let hashes = [hash("sha256:aaa"), hash("sha256:bbb"), hash("sha256:ccc")];
 
         // Replicate the resolve_selection logic
         let result: Vec<ContentHash> = sel
@@ -1082,7 +1082,7 @@ mod tests {
     /// Non-contiguous selection (indices 0 and 2) → error, no movement.
     #[test]
     fn shift_j_noncontiguous_selection_noop_with_status() {
-        let hashes = vec![hash("a"), hash("b"), hash("c"), hash("d")];
+        let hashes = [hash("a"), hash("b"), hash("c"), hash("d")];
         let mut sel = SelectionState::new(hashes.len());
         sel.selected.insert(0);
         sel.selected.insert(2); // gap at 1
