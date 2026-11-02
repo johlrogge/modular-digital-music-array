@@ -180,7 +180,7 @@ Copy `scripts/install-mdma-macos.sh` from this repo to your Mac and run it. It r
 bash install-mdma-macos.sh
 
 # Install a specific tag
-bash install-mdma-macos.sh v0.30.0
+bash install-mdma-macos.sh v0.31.0
 
 # Install to a user-writable location (no sudo)
 MDMA_INSTALL_DIR=~/.local/bin bash install-mdma-macos.sh
@@ -198,6 +198,18 @@ cp profiles/dev/target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.31.0
+
+### Clean power-button shutdown and persistent kernel log (#77)
+
+A short press on the Pi 5 power button now shuts the node down cleanly. mdma-admin depends on acpid and Void's stock handler runs `shutdown -P now`, so runit stops the services in order, a wtmp shutdown record is written, and the next boot needs no filesystem recovery. Verified on stage hardware. A long press is still a hard power cut by the PMIC; avoid it.
+
+The new `mdma-klog` service writes the kernel log to `/var/log/mdma-klog` (svlogd rotation, about 20 MB cap) and replays the ring buffer once per boot, so the previous boot's kernel messages survive a reboot or power cut. After a hard cut the last seconds may be missing, and an NVMe dropout cannot write its own errors to the NVMe.
+
+New installs enable both during provisioning; existing nodes get them on the mdma-admin upgrade. The beacon SD also gets acpid. To disable either permanently: `touch /etc/sv/<svc>/down` (upgrades re-link a removed `/var/service` link). See CHANGELOG.md.
 
 ---
 
