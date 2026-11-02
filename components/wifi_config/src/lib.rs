@@ -293,6 +293,197 @@ pub fn render_wpa_supplicant_conf(config: &NetworkConfig) -> String {
     )
 }
 
+// ============================================================================
+// InstalledWifiConf
+// ============================================================================
+
+/// Upper bound on the size of an installed `wpa_supplicant.conf` we accept.
+pub const MAX_INSTALLED_CONF_BYTES: usize = 64 * 1024;
+
+/// A `wpa_supplicant.conf` read from an installed system, validated but kept
+/// verbatim so hand-added lines (e.g. `freq_list`) survive being copied.
+///
+/// Deliberately not serialisable; `Debug` shows only the [`summary`].
+///
+/// [`summary`]: InstalledWifiConf::summary
+#[derive(Clone, PartialEq, Eq)]
+pub struct InstalledWifiConf(String);
+
+/// Non-secret facts about an [`InstalledWifiConf`]. Never contains the psk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledWifiSummary {
+    /// SSIDs of all `network` blocks that have one, decoded to text.
+    pub ssids: Vec<String>,
+    /// Value of the top-level `country=` line, if any.
+    pub country: Option<String>,
+    /// Whether any line sets `freq_list`.
+    pub has_freq_list: bool,
+    /// Every value of every `freq_list` line, as written (MHz in a sane
+    /// configuration), split on whitespace and commas.
+    pub freq_list: Vec<String>,
+}
+
+/// What the installed `freq_list` pins the radio to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrequencyPin {
+    /// No `freq_list`: the radio scans every band.
+    NotPinned,
+    /// Every listed frequency is a number of at least 5000 MHz.
+    FiveGhz,
+    /// A `freq_list` that is empty, holds 2.4 GHz values, or anything not a
+    /// plain number.
+    Other,
+}
+
+impl InstalledWifiSummary {
+    /// Classify the `freq_list`. 5 GHz only when there is at least one value
+    /// and every value is a number of at least 5000.
+    pub fn frequency_pin(&self) -> FrequencyPin {
+        if !self.has_freq_list {
+            return FrequencyPin::NotPinned;
+        }
+        let all_five_ghz = !self.freq_list.is_empty()
+            && self
+                .freq_list
+                .iter()
+                .all(|f| f.parse::<u32>().is_ok_and(|mhz| mhz >= 5000));
+        if all_five_ghz {
+            FrequencyPin::FiveGhz
+        } else {
+            FrequencyPin::Other
+        }
+    }
+}
+
+/// One parsed `network={ ... }` block (secret fields reduced to presence).
+#[derive(Default)]
+struct NetworkBlock {
+    ssid: Option<String>,
+    has_psk: bool,
+    open: bool,
+}
+
+impl NetworkBlock {
+    fn is_usable(&self) -> bool {
+        self.ssid.is_some() && (self.has_psk || self.open)
+    }
+}
+
+/// Meaningful (non-blank, non-comment) lines, trimmed.
+fn conf_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+}
+
+fn split_key_value(line: &str) -> Option<(&str, &str)> {
+    let (k, v) = line.split_once('=')?;
+    Some((k.trim(), v.trim()))
+}
+
+fn opens_network_block(line: &str) -> bool {
+    line.split_once('=')
+        .is_some_and(|(k, v)| k.trim() == "network" && v.trim() == "{")
+}
+
+fn decode_ssid(value: &str) -> Option<String> {
+    if let Some(inner) = value.strip_prefix('"') {
+        let inner = inner.strip_suffix('"')?;
+        return (!inner.is_empty()).then(|| inner.to_owned());
+    }
+    let bytes = from_hex(value).filter(|b| !b.is_empty())?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Returns the network blocks, ignoring everything outside them.
+fn network_blocks(text: &str) -> Vec<NetworkBlock> {
+    let mut blocks = Vec::new();
+    let mut current: Option<NetworkBlock> = None;
+    for line in conf_lines(text) {
+        match current.as_mut() {
+            None if opens_network_block(line) => current = Some(NetworkBlock::default()),
+            None => {}
+            Some(_) if line == "}" => blocks.extend(current.take()),
+            Some(block) => match split_key_value(line) {
+                Some(("ssid", v)) => block.ssid = decode_ssid(v),
+                Some(("psk", v)) => block.has_psk = !v.is_empty(),
+                Some(("key_mgmt", "NONE")) => block.open = true,
+                _ => {}
+            },
+        }
+    }
+    blocks
+}
+
+impl InstalledWifiConf {
+    /// Accepts the text only if it is at most 64 KiB and has at least one
+    /// `network` block with an `ssid` and either a `psk` or `key_mgmt=NONE`.
+    pub fn parse(text: &str) -> Option<Self> {
+        if text.len() > MAX_INSTALLED_CONF_BYTES {
+            return None;
+        }
+        network_blocks(text)
+            .iter()
+            .any(NetworkBlock::is_usable)
+            .then(|| Self(text.to_owned()))
+    }
+
+    /// The verbatim file text, for writing out.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Non-secret summary of the configuration.
+    pub fn summary(&self) -> InstalledWifiSummary {
+        let ssids = network_blocks(&self.0)
+            .into_iter()
+            .filter_map(|b| b.ssid)
+            .collect();
+
+        let mut country = None;
+        let mut has_freq_list = false;
+        let mut freq_list = Vec::new();
+        let mut depth_in_block = false;
+        for line in conf_lines(&self.0) {
+            if depth_in_block {
+                depth_in_block = line != "}";
+            } else if opens_network_block(line) {
+                depth_in_block = true;
+            }
+            match split_key_value(line) {
+                Some(("freq_list", v)) => {
+                    has_freq_list = true;
+                    freq_list.extend(
+                        v.split(|c: char| c.is_whitespace() || c == ',')
+                            .filter(|t| !t.is_empty())
+                            .map(str::to_owned),
+                    );
+                }
+                Some(("country", v)) if !depth_in_block && country.is_none() => {
+                    country = Some(v.to_owned());
+                }
+                _ => {}
+            }
+        }
+
+        InstalledWifiSummary {
+            ssids,
+            country,
+            has_freq_list,
+            freq_list,
+        }
+    }
+}
+
+impl fmt::Debug for InstalledWifiConf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InstalledWifiConf")
+            .field("summary", &self.summary())
+            .field("contents", &format_args!("<redacted>"))
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,7 +586,135 @@ network={\n\
         assert_eq!(WifiSsid::new(input), Err(WifiError::InvalidSsidChars));
     }
 
+    fn quoted_conf(psk_line: &str) -> String {
+        format!("country=SE\nnetwork={{\n\tssid=\"Home Net\"\n\t{psk_line}\n}}\n")
+    }
+
+    #[test]
+    fn rendered_conf_parses_with_matching_ssid() {
+        let cfg = NetworkConfig::new(
+            WifiSsid::new("IEEE").unwrap(),
+            &WifiPassphrase::new("password").unwrap(),
+            CountryCode::new("se").unwrap(),
+        );
+        let rendered = render_wpa_supplicant_conf(&cfg);
+        let conf = InstalledWifiConf::parse(&rendered).unwrap();
+        let summary = conf.summary();
+        assert_eq!(summary.ssids, vec!["IEEE".to_owned()]);
+        assert_eq!(summary.country.as_deref(), Some("SE"));
+        assert!(!summary.has_freq_list);
+        assert_eq!(conf.as_str(), rendered);
+    }
+
+    #[test]
+    fn quoted_ssid_parses() {
+        let conf = InstalledWifiConf::parse(&quoted_conf("psk=\"secret pass\"")).unwrap();
+        assert_eq!(conf.summary().ssids, vec!["Home Net".to_owned()]);
+    }
+
+    #[test]
+    fn open_network_parses() {
+        assert!(InstalledWifiConf::parse(&quoted_conf("key_mgmt=NONE")).is_some());
+    }
+
+    #[test]
+    fn freq_list_preserved_byte_for_byte() {
+        let text = "# my wifi\r\n\
+            network={\n\
+            \tssid=\"Home\"\n\
+            \tpsk=\"hunter2hunter2\"\n\
+            \x20   freq_list=5180 5200\n\
+            \tkey_mgmt=WPA-PSK\n\
+            }\n\n";
+        let conf = InstalledWifiConf::parse(text).unwrap();
+        assert_eq!(conf.as_str(), text);
+        assert!(conf.summary().has_freq_list);
+    }
+
+    fn pin_of(freq_line: &str) -> FrequencyPin {
+        let text =
+            format!("network={{\n\tssid=\"Home\"\n\tpsk=\"hunter2hunter2\"\n{freq_line}\n}}\n");
+        InstalledWifiConf::parse(&text)
+            .unwrap()
+            .summary()
+            .frequency_pin()
+    }
+
+    #[rstest]
+    #[case::none("", FrequencyPin::NotPinned)]
+    #[case::five_ghz("\tfreq_list=5180 5200", FrequencyPin::FiveGhz)]
+    #[case::five_ghz_commas("\tfreq_list=5180,5745", FrequencyPin::FiveGhz)]
+    #[case::boundary("\tfreq_list=5000", FrequencyPin::FiveGhz)]
+    #[case::two_four("\tfreq_list=2412 2437", FrequencyPin::Other)]
+    #[case::mixed("\tfreq_list=2412 5180", FrequencyPin::Other)]
+    #[case::just_below("\tfreq_list=4999", FrequencyPin::Other)]
+    #[case::empty_value("\tfreq_list=", FrequencyPin::Other)]
+    #[case::not_a_number("\tfreq_list=5180 abc", FrequencyPin::Other)]
+    #[case::range("\tfreq_list=5180-5320", FrequencyPin::Other)]
+    fn frequency_pin_classification(#[case] line: &str, #[case] expected: FrequencyPin) {
+        assert_eq!(pin_of(line), expected);
+    }
+
+    #[test]
+    fn summary_lists_freq_list_values() {
+        let text =
+            "network={\n\tssid=\"Home\"\n\tpsk=\"hunter2hunter2\"\n\tfreq_list=5180 5200\n}\n";
+        let summary = InstalledWifiConf::parse(text).unwrap().summary();
+        assert_eq!(
+            summary.freq_list,
+            vec!["5180".to_owned(), "5200".to_owned()]
+        );
+    }
+
+    #[test]
+    fn tolerates_comments_and_spacing() {
+        let text = "  # c\n  network = {\n  # ssid=\"No\"\n  ssid = 4173\n  psk = abc\n  }\n";
+        let conf = InstalledWifiConf::parse(text).unwrap();
+        assert_eq!(conf.summary().ssids, vec!["As".to_owned()]);
+    }
+
+    #[rstest]
+    #[case::no_network("country=SE\nctrl_interface=/run/x\n")]
+    #[case::no_ssid("network={\n\tpsk=\"abcdefgh\"\n}\n")]
+    #[case::no_psk_or_open("network={\n\tssid=\"Home\"\n\tkey_mgmt=WPA-PSK\n}\n")]
+    #[case::unterminated("network={\n\tssid=\"Home\"\n\tpsk=\"abcdefgh\"\n")]
+    #[case::garbage("\u{0}\u{1}garbage {{{ ===")]
+    #[case::empty("")]
+    fn rejects_invalid(#[case] text: &str) {
+        assert!(InstalledWifiConf::parse(text).is_none());
+    }
+
+    #[test]
+    fn rejects_oversized() {
+        let ok = quoted_conf("psk=\"abcdefgh\"");
+        let padding = "#".repeat(MAX_INSTALLED_CONF_BYTES);
+        assert!(InstalledWifiConf::parse(&ok).is_some());
+        assert!(InstalledWifiConf::parse(&format!("{ok}{padding}")).is_none());
+    }
+
+    #[test]
+    fn accepts_exactly_max_size() {
+        let ok = quoted_conf("psk=\"abcdefgh\"");
+        let padding = "#".repeat(MAX_INSTALLED_CONF_BYTES - ok.len());
+        let text = format!("{ok}{padding}");
+        assert_eq!(text.len(), MAX_INSTALLED_CONF_BYTES);
+        assert!(InstalledWifiConf::parse(&text).is_some());
+    }
+
     proptest! {
+        #[test]
+        fn installed_conf_never_leaks_psk(psk in "[!#-~]{8,63}") {
+            let baseline = InstalledWifiConf::parse(&quoted_conf("psk=\"x\"")).unwrap();
+            let baseline_out = format!("{baseline:?}{:?}", baseline.summary());
+            prop_assume!(!baseline_out.contains(&psk));
+
+            let conf = InstalledWifiConf::parse(&quoted_conf(&format!("psk=\"{psk}\""))).unwrap();
+            let debug = format!("{conf:?}");
+            let summary = format!("{:?}", conf.summary());
+            prop_assert!(!debug.contains(&psk));
+            prop_assert!(!summary.contains(&psk));
+        }
+
         #[test]
         fn ssid_hex_round_trips(s in "[^\\x00-\\x1f\\x7f]{1,32}") {
             prop_assume!(s.len() <= 32);

@@ -18,7 +18,7 @@ use crate::hardware::HardwareInfo;
 
 pub use crate::types::{
     ByteSize, DevicePath, ExistingDataPolicy, FilesystemType, MountPoint, PartitionLabel,
-    PartitionSize, ProvisionConfig, UnitType,
+    PartitionSize, ProvisionConfig, UnitType, WifiSetup,
 };
 
 // ============================================================================
@@ -834,6 +834,27 @@ impl std::fmt::Display for ConfiguredSystem {
     }
 }
 
+/// What stage 5 does about wifi.
+#[derive(Debug, Clone, Copy)]
+pub enum WifiAction<'a> {
+    /// Write `wpa_supplicant.conf` and the service conf, and enable
+    /// `wpa_supplicant`.
+    Write(WifiWrite<'a>),
+    /// A carried-over configuration onto a kept root: touch nothing (no files
+    /// written, the service neither enabled nor disabled).
+    KeepExisting,
+    /// No wifi is set up here.
+    Nothing,
+}
+
+/// The wifi to write.
+#[derive(Debug, Clone, Copy)]
+pub enum WifiWrite<'a> {
+    FromForm(&'a wifi_config::NetworkConfig),
+    /// Written verbatim.
+    CarriedOver(&'a wifi_config::InstalledWifiConf),
+}
+
 impl ConfiguredSystem {
     /// One-line description of what stage 5 does about wifi. Never includes
     /// the PSK.
@@ -841,14 +862,22 @@ impl ConfiguredSystem {
     /// With no wifi supplied, previous wifi setup survives only when the root
     /// filesystem is kept: policy `Preserve` and stage 3 did not format root.
     pub fn wifi_summary(&self) -> String {
-        match &self.config().network {
-            Some(net) => format!(
+        match self.wifi_action() {
+            WifiAction::Write(WifiWrite::FromForm(net)) => format!(
                 "wifi: SSID \"{}\" country {} → /{}, enable wpa_supplicant",
                 net.ssid(),
                 net.country(),
                 wifi_config::WPA_SUPPLICANT_CONF_PATH
             ),
-            None => match self.config().existing_data {
+            WifiAction::Write(WifiWrite::CarriedOver(conf)) => format!(
+                "wifi: carried over verbatim from the installed system (SSID {}) → /{}, enable wpa_supplicant",
+                conf.summary().ssids.join(", "),
+                wifi_config::WPA_SUPPLICANT_CONF_PATH
+            ),
+            WifiAction::KeepExisting => {
+                "wifi: carried over from the installed system — the root partition is kept, so nothing is changed: its wifi files stay as they are and the wpa_supplicant service is neither enabled nor disabled".to_string()
+            }
+            WifiAction::Nothing => match self.config().existing_data {
                 ExistingDataPolicy::Preserve if self.root_will_be_formatted() => {
                     "wifi: not configured — the root partition is reformatted, any previous wifi setup is removed".to_string()
                 }
@@ -860,6 +889,27 @@ impl ConfiguredSystem {
                 }
             },
         }
+    }
+
+    /// What stage 5 does about wifi. The single decision that the wifi files,
+    /// the service enabling and the summary all derive from.
+    ///
+    /// A carried-over configuration is not written when the existing root
+    /// filesystem, and with it `/etc`, is kept (policy `Preserve` and stage 3
+    /// does not format root): `KeepExisting` touches nothing.
+    pub fn wifi_action(&self) -> WifiAction<'_> {
+        match &self.config().wifi {
+            WifiSetup::None => WifiAction::Nothing,
+            WifiSetup::FromForm(net) => WifiAction::Write(WifiWrite::FromForm(net)),
+            WifiSetup::CarriedOver(_) if self.root_is_kept() => WifiAction::KeepExisting,
+            WifiSetup::CarriedOver(conf) => WifiAction::Write(WifiWrite::CarriedOver(conf)),
+        }
+    }
+
+    /// Whether the existing root filesystem is kept.
+    fn root_is_kept(&self) -> bool {
+        self.config().existing_data == ExistingDataPolicy::Preserve
+            && !self.root_will_be_formatted()
     }
 
     /// Whether stage 3 formats (or formatted) the root partition.

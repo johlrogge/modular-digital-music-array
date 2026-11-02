@@ -5924,6 +5924,7 @@ dependencies = [
  "color-eyre",
  "futures",
  "http-server",
+ "libc",
  "pretty_assertions",
  "private-file",
  "proptest",

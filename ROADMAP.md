@@ -76,7 +76,9 @@ before beta.
 
 **Network:** Provisioning needs an ethernet cable once. Wifi can be configured during
 provisioning (optional SSID, passphrase and country code on the beacon form, #41), after
-which the unit runs on wifi when ethernet is unplugged. See ADR-008.
+which the unit runs on wifi when ethernet is unplugged. If the beacon finds no ethernet
+link it reuses the installed system's wifi (#72); provisioning over wifi works but is
+discouraged (NVMe dropout on 2.4 GHz, #69). See ADR-008.
 
 ### Recovery
 
@@ -90,7 +92,9 @@ If the system becomes unbootable or needs to be reprovisioned:
 This gives users a safe path back without losing their library.
 
 Broken wifi (wrong passphrase, moved router) is fixed the same way: plug in ethernet and
-reprovision with the beacon (#41).
+reprovision with the beacon (#41). Update: on wifi-only units the beacon now reuses the
+installed system's wifi when there is no ethernet link, so recovery works without a cable
+(#72, ADR-008 amendment).
 
 ### Validation: Full Reinstall from SD Card
 

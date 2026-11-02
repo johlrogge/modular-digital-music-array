@@ -7,6 +7,7 @@
 //! formatted; the type system enforces this through [`target::FormatTarget`].
 
 use crate::actions::{Action, ActionId, PlannedAction};
+use crate::block_devices::{blkid_args, interpret_blkid, BlkidResult};
 use crate::error::Result;
 use crate::provisioning::types::{
     CompletedPartitionPlan, CompletedPartitionedDrives, DevicePath, ExistingDataPolicy,
@@ -28,45 +29,6 @@ pub(crate) fn role_of(mount_point: MountPoint) -> PartitionRole {
     match mount_point {
         MountPoint::Boot | MountPoint::Root | MountPoint::Var => PartitionRole::Os,
         MountPoint::Music | MountPoint::Metadata | MountPoint::Cache => PartitionRole::Data,
-    }
-}
-
-/// What `blkid` told us about a partition.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BlkidResult {
-    /// A filesystem signature was found.
-    Signature {
-        fs_type: String,
-        label: Option<String>,
-    },
-    /// blkid ran fine and found no signature (exit status 2).
-    NoSignature,
-    /// blkid could not tell us. Never treated as "empty".
-    Error(String),
-}
-
-/// Interpret a finished `blkid -o export -s TYPE -s LABEL` run.
-pub(crate) fn interpret_blkid(code: Option<i32>, stdout: &str, stderr: &str) -> BlkidResult {
-    match code {
-        Some(0) => {
-            let value = |key: &str| {
-                stdout
-                    .lines()
-                    .find_map(|l| l.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
-                    .map(|v| v.trim().to_string())
-                    .filter(|v| !v.is_empty())
-            };
-            match value("TYPE") {
-                Some(fs_type) => BlkidResult::Signature {
-                    fs_type,
-                    label: value("LABEL"),
-                },
-                None => BlkidResult::NoSignature,
-            }
-        }
-        // blkid: 2 = "nothing found"
-        Some(2) => BlkidResult::NoSignature,
-        other => BlkidResult::Error(format!("blkid exited with {:?}: {}", other, stderr.trim())),
     }
 }
 
@@ -341,7 +303,7 @@ impl Action<CompletedPartitionedDrives, FormattedSystem, FormattedSystem>
 /// directly and is not fooled by stale kernel caches after `wipefs -a` (#53).
 async fn run_blkid(device: &str) -> BlkidResult {
     let output = tokio::process::Command::new("blkid")
-        .args(["-p", "-o", "export", "-s", "TYPE", "-s", "LABEL", device])
+        .args(blkid_args(device))
         .output()
         .await;
 

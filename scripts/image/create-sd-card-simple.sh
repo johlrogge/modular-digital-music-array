@@ -97,10 +97,23 @@ echo "welcome-to-mdma" > "${ROOTFS}/etc/hostname"
 # Enable services in runit by linking into the default runsvdir.
 # void-mklive creates /etc/runit/runsvdir/default for enabled services.
 mkdir -p "${ROOTFS}/etc/runit/runsvdir/default"
-ln -sf /etc/sv/beacon "${ROOTFS}/etc/runit/runsvdir/default/beacon"
-ln -sf /etc/sv/dbus "${ROOTFS}/etc/runit/runsvdir/default/dbus"
-ln -sf /etc/sv/avahi-daemon "${ROOTFS}/etc/runit/runsvdir/default/avahi-daemon"
-ln -sf /etc/sv/chronyd "${ROOTFS}/etc/runit/runsvdir/default/chronyd"
+ln -sfn /etc/sv/beacon "${ROOTFS}/etc/runit/runsvdir/default/beacon"
+ln -sfn /etc/sv/dbus "${ROOTFS}/etc/runit/runsvdir/default/dbus"
+ln -sfn /etc/sv/avahi-daemon "${ROOTFS}/etc/runit/runsvdir/default/avahi-daemon"
+ln -sfn /etc/sv/chronyd "${ROOTFS}/etc/runit/runsvdir/default/chronyd"
+# beacon-wifi ships a 'down' file; the beacon brings it up on demand.
+ln -sfn /etc/sv/beacon-wifi "${ROOTFS}/etc/runit/runsvdir/default/beacon-wifi"
+# dhcpcd manages wlan0 too (idempotent; base image may or may not enable it).
+# The stock wpa_supplicant service is deliberately NOT enabled: it reads
+# /etc/wpa_supplicant/wpa_supplicant.conf, and no credentials may land on the SD.
+found=
+for s in "${ROOTFS}"/etc/runit/runsvdir/default/dhcpcd*; do
+    # -L too: the links are absolute, so they dangle on the build host
+    if [ -e "$s" ] || [ -L "$s" ]; then found=1; fi
+done
+if [ -z "$found" ]; then
+    ln -sfn /etc/sv/dhcpcd "${ROOTFS}/etc/runit/runsvdir/default/dhcpcd"
+fi
 
 echo "MDMA beacon configured for first boot"
 HOOKEOF
@@ -142,7 +155,7 @@ if [ -z "$PLATFORMFS_TAR" ]; then
     # — local builds with in-flight fixes must win over the published ones.
     # So we pass them in REVERSE of desired final order:
     ./mkplatformfs.sh \
-        -p "beacon dbus avahi cloud-guest-utils rpi5-kernel dracut uboot-mkimage rpi-eeprom void-repo-nonfree chrony" \
+        -p "beacon dbus avahi cloud-guest-utils rpi5-kernel dracut uboot-mkimage rpi-eeprom void-repo-nonfree chrony wpa_supplicant dhcpcd iw wireless-regdb rpi-firmware" \
         -r "$VOID_NONFREE_REPO" \
         -r "$MDMA_REPO" \
         -r "$LOCAL_REPO" \

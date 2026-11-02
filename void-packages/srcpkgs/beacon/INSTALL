@@ -4,15 +4,33 @@
 case "$1" in
 post)
     # Create log directory for svlogd
-    mkdir -p /var/log/beacon
+    mkdir -p /var/log/beacon /var/log/beacon-wifi
 
     # Enable service on first install
     if [ ! -d /var/service ]; then
         mkdir -p /var/service
     fi
     if [ ! -e /var/service/beacon ]; then
-        ln -sf /etc/sv/beacon /var/service/beacon
+        ln -sfn /etc/sv/beacon /var/service/beacon
         echo "beacon service enabled"
+    fi
+
+    # Enable beacon-wifi (ships a 'down' file, so it stays stopped until the
+    # beacon runs 'sv up beacon-wifi'; never started or restarted here)
+    if [ ! -e /var/service/beacon-wifi ]; then
+        ln -sfn /etc/sv/beacon-wifi /var/service/beacon-wifi
+        echo "beacon-wifi service enabled"
+    fi
+
+    # dhcpcd manages wlan0 as well as ethernet; skip if any dhcpcd* service
+    # (e.g. dhcpcd-eth0) is already enabled, two instances would fight
+    found=
+    for s in /var/service/dhcpcd*; do
+        if [ -e "$s" ] || [ -L "$s" ]; then found=1; fi
+    done
+    if [ -z "$found" ]; then
+        ln -sfn /etc/sv/dhcpcd /var/service/dhcpcd
+        echo "dhcpcd service enabled"
     fi
 
     # On upgrade, restart only if the service is currently running

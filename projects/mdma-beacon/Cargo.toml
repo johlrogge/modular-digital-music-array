@@ -17,6 +17,7 @@ rpi-eeprom = { path = "../../components/rpi_eeprom" }
 boot-health = { workspace = true, features = ["io"] }
 wifi-config = { workspace = true }
 private-file = { workspace = true }
+libc = { workspace = true }
 tokio = { version = "1.36", features = ["full"] }
 color-eyre = "0.6"
 axum = "0.7"

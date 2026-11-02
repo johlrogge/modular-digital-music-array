@@ -255,6 +255,12 @@
                     </div>
                     {% endfor %}
                 {% endif %}
+
+                {% if network.has_network() %}
+                <div class="hardware-item" id="network-source">{{ network.label() }}</div>
+                {% else %}
+                <div class="hardware-item warning" id="network-source">{{ network.label() }}</div>
+                {% endif %}
             </div>
         </div>
 
@@ -329,6 +335,12 @@
         {% when None %}
         {% endmatch %}
 
+        {% if network.is_wifi_from_installed_system() %}
+        <div class="dev-tools" id="wifi-provisioning-warning">
+            <p class="dev-hint">Provisioning over wifi: in some cases (Argon NEO 5) the NVMe may drop while wifi is active; ethernet is recommended.</p>
+        </div>
+        {% endif %}
+
         <form action="/provision" method="post">
             <div class="section">
                 <label for="unit_type">Unit Type</label>
@@ -387,7 +399,11 @@
                     maxlength="2"
                     pattern="[A-Za-z]{2}"
                 >
+                {% if let Some(ssids) = network.installed_wifi_ssids() %}
+                <div class="help-text" id="wifi-carry-over-note">Leave blank to keep the current wifi settings (SSID {{ ssids }}). Ethernet is used whenever plugged in; wifi is the fallback. WPA3-only networks are not supported (WPA2 or WPA2/WPA3 mixed mode work).</div>
+                {% else %}
                 <div class="help-text">Optional. Leaving this blank keeps the existing wifi setup only when the OS is not reinstalled; reinstalling the OS or wiping the drive without wifi details leaves the Pi on ethernet only. Ethernet is used whenever plugged in; wifi is the fallback. If wifi fails, plug in ethernet and reprovision. WPA3-only networks are not supported (WPA2 or WPA2/WPA3 mixed mode work).</div>
+                {% endif %}
             </div>
 
             <fieldset class="section existing-data">

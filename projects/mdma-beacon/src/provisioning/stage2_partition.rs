@@ -13,127 +13,15 @@
 //! a drive that is NOT being repartitioned still aborts.
 
 use crate::actions::{Action, ActionId, PlannedAction};
+use crate::block_devices::{
+    read_table, scan_nvme_drives, OnDiskPartition, OnDiskTable, ReadError, ScannedDrive,
+};
 use crate::error::Result;
 use crate::provisioning::types::{
     CompletedPartitionedDrives, Partition, PartitionPlan, PartitionState, PartitionedDrives,
     ValidatedHardware,
 };
-use crate::types::{ExistingDataPolicy, MountPoint, ValidationError};
-use serde::Deserialize;
-use std::process::Command;
-
-// ── Reading the on-disk table (`sfdisk --json`) ───────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct SfdiskOutput {
-    partitiontable: SfdiskTable,
-}
-
-#[derive(Debug, Deserialize)]
-struct SfdiskTable {
-    label: String,
-    /// Bytes per sector; sfdisk reports partition sizes in sectors.
-    #[serde(default)]
-    sectorsize: Option<u64>,
-    #[serde(default)]
-    partitions: Vec<SfdiskPartition>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SfdiskPartition {
-    node: String,
-    /// Size in sectors
-    #[serde(default)]
-    size: Option<u64>,
-    /// GPT partition name (set by `name=` when we create the table)
-    #[serde(default)]
-    name: Option<String>,
-}
-
-/// A partition as found on disk.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OnDiskPartition {
-    pub node: String,
-    pub name: Option<String>,
-    /// Size in bytes, when sfdisk reported it. Only used for display.
-    pub size_bytes: Option<u64>,
-}
-
-impl OnDiskPartition {
-    /// One-line description for logs and the confirmation page.
-    pub(crate) fn describe(&self) -> String {
-        let size = self
-            .size_bytes
-            .map(|b| format!("{} MB", b / (1024 * 1024)))
-            .unwrap_or_else(|| "unknown size".to_string());
-        format!(
-            "{} (label: {}, size: {})",
-            self.node,
-            self.name.as_deref().unwrap_or("<unnamed>"),
-            size
-        )
-    }
-}
-
-/// The partition table as found on disk.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum OnDiskTable {
-    /// The drive has no partition table and no signature of any kind.
-    NoTable,
-    /// No partition table, but the whole disk carries a signature (a
-    /// filesystem, LUKS, LVM, ZFS ...). It is not blank.
-    Unrecognised { signature: String },
-    Table {
-        /// Table type as reported by sfdisk (`gpt`, `dos`, ...)
-        label: String,
-        partitions: Vec<OnDiskPartition>,
-    },
-}
-
-impl OnDiskTable {
-    /// True when the drive holds nothing at all: no partitions, no signature.
-    fn is_blank(&self) -> bool {
-        match self {
-            OnDiskTable::NoTable => true,
-            OnDiskTable::Unrecognised { .. } => false,
-            OnDiskTable::Table { partitions, .. } => partitions.is_empty(),
-        }
-    }
-
-    /// What a wipe of this drive destroys, as pseudo-partitions for display
-    /// and signature wiping. A whole-disk signature is listed as the disk.
-    fn destroyed_by_wipe(&self, device: &str) -> Vec<OnDiskPartition> {
-        match self {
-            OnDiskTable::NoTable => Vec::new(),
-            OnDiskTable::Unrecognised { signature } => vec![OnDiskPartition {
-                node: device.to_string(),
-                name: Some(format!("whole-disk signature: {}", signature)),
-                size_bytes: None,
-            }],
-            OnDiskTable::Table { partitions, .. } => partitions.clone(),
-        }
-    }
-
-    /// Names of the data partitions (music/metadata/cache) on this drive.
-    fn data_labels(&self) -> Vec<String> {
-        match self {
-            OnDiskTable::NoTable | OnDiskTable::Unrecognised { .. } => Vec::new(),
-            OnDiskTable::Table { partitions, .. } => partitions
-                .iter()
-                .filter_map(|p| p.name.as_deref())
-                .filter(|n| MountPoint::is_data_label(n))
-                .map(str::to_string)
-                .collect(),
-        }
-    }
-}
-
-/// A drive together with the table found on it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ScannedDrive {
-    pub device: String,
-    pub table: OnDiskTable,
-}
+use crate::types::{ExistingDataPolicy, ValidationError};
 
 /// Data partitions found on a drive where the plan does not expect them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,157 +90,14 @@ pub enum LayoutError {
     PartiallyExisting { device: String },
 }
 
-/// Interpret the result of `sfdisk --json <device>`.
-///
-/// Only the explicit "no partition table" answer counts as an empty drive. Any
-/// other failure, or output we cannot parse, is an error: a failed read must
-/// never be mistaken for an empty disk.
-pub(crate) fn parse_sfdisk(
-    device: &str,
-    success: bool,
-    stdout: &[u8],
-    stderr: &str,
-) -> std::result::Result<OnDiskTable, LayoutError> {
-    if !success {
-        if stderr.contains("does not contain a recognized partition table") {
-            return Ok(OnDiskTable::NoTable);
+impl From<ReadError> for LayoutError {
+    /// A failed read always aborts: it is never mistaken for an empty disk.
+    fn from(e: ReadError) -> Self {
+        LayoutError::Unreadable {
+            device: e.device,
+            reason: e.reason,
         }
-        return Err(LayoutError::Unreadable {
-            device: device.to_string(),
-            reason: format!("sfdisk failed: {}", stderr.trim()),
-        });
     }
-
-    let parsed: SfdiskOutput =
-        serde_json::from_slice(stdout).map_err(|e| LayoutError::Unreadable {
-            device: device.to_string(),
-            reason: format!("cannot parse sfdisk output: {}", e),
-        })?;
-
-    let sector = parsed.partitiontable.sectorsize.unwrap_or(512);
-    Ok(OnDiskTable::Table {
-        label: parsed.partitiontable.label,
-        partitions: parsed
-            .partitiontable
-            .partitions
-            .into_iter()
-            .map(|p| OnDiskPartition {
-                node: p.node,
-                name: p.name,
-                size_bytes: p.size.map(|s| s.saturating_mul(sector)),
-            })
-            .collect(),
-    })
-}
-
-/// Interpret `wipefs --noheadings --output TYPE <disk>` (list mode, changes
-/// nothing). `Ok(None)` means the disk carries no signature at all; a failed
-/// probe is an error, never "no signature".
-pub(crate) fn interpret_signature_probe(
-    device: &str,
-    success: bool,
-    stdout: &str,
-    stderr: &str,
-) -> std::result::Result<Option<String>, LayoutError> {
-    if !success {
-        return Err(LayoutError::Unreadable {
-            device: device.to_string(),
-            reason: format!("signature probe failed: {}", stderr.trim()),
-        });
-    }
-    let mut types: Vec<&str> = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    types.dedup();
-    Ok((!types.is_empty()).then(|| types.join(", ")))
-}
-
-/// Combine the sfdisk result with the whole-disk signature probe: "no
-/// partition table" is a blank drive only if there is also no signature.
-pub(crate) fn combine_with_signature(table: OnDiskTable, signature: Option<String>) -> OnDiskTable {
-    match (table, signature) {
-        (OnDiskTable::NoTable, Some(signature)) => OnDiskTable::Unrecognised { signature },
-        (table, _) => table,
-    }
-}
-
-/// Read the partition table of `device` with `sfdisk --json`. A drive without
-/// a table is additionally probed for whole-disk signatures (ext4, LUKS, LVM,
-/// ZFS ...).
-fn read_table(device: &str) -> std::result::Result<OnDiskTable, LayoutError> {
-    let output = Command::new("sfdisk")
-        .args(["--json", device])
-        .output()
-        .map_err(|e| LayoutError::Unreadable {
-            device: device.to_string(),
-            reason: format!("failed to run sfdisk: {}", e),
-        })?;
-
-    let table = parse_sfdisk(
-        device,
-        output.status.success(),
-        &output.stdout,
-        &String::from_utf8_lossy(&output.stderr),
-    )?;
-    if table != OnDiskTable::NoTable {
-        return Ok(table);
-    }
-
-    let probe = Command::new("wipefs")
-        .args(["--noheadings", "--output", "TYPE", device])
-        .output()
-        .map_err(|e| LayoutError::Unreadable {
-            device: device.to_string(),
-            reason: format!("failed to run wipefs: {}", e),
-        })?;
-    let signature = interpret_signature_probe(
-        device,
-        probe.status.success(),
-        &String::from_utf8_lossy(&probe.stdout),
-        &String::from_utf8_lossy(&probe.stderr),
-    )?;
-    Ok(combine_with_signature(table, signature))
-}
-
-/// True for whole-disk NVMe names such as `nvme0n1` (not partitions like `nvme0n1p2`).
-pub(crate) fn is_nvme_disk_name(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix("nvme") else {
-        return false;
-    };
-    let Some((controller, namespace)) = rest.split_once('n') else {
-        return false;
-    };
-    let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
-    digits(controller) && digits(namespace)
-}
-
-/// Read the tables of every NVMe drive in the machine plus the given targets.
-/// Aborts if any of them cannot be read.
-fn scan_nvme_drives(targets: &[String]) -> std::result::Result<Vec<ScannedDrive>, LayoutError> {
-    let entries = std::fs::read_dir("/dev").map_err(|e| LayoutError::Unreadable {
-        device: "/dev".to_string(),
-        reason: format!("cannot enumerate NVMe drives: {}", e),
-    })?;
-
-    let mut devices: Vec<String> = entries
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| is_nvme_disk_name(name))
-        .map(|name| format!("/dev/{}", name))
-        .chain(targets.iter().cloned())
-        .collect();
-    devices.sort();
-    devices.dedup();
-
-    devices
-        .into_iter()
-        .map(|device| {
-            let table = read_table(&device)?;
-            Ok(ScannedDrive { device, table })
-        })
-        .collect()
 }
 
 // ── Reconciling plan and disk (pure) ──────────────────────────────────────────
@@ -623,7 +368,7 @@ pub struct ExistingDrive {
 /// Read every NVMe drive and list those that have partitions. These are what
 /// a `WipeAll` would destroy. Errors (unreadable table) are returned as text.
 pub fn describe_existing_drives() -> std::result::Result<Vec<ExistingDrive>, String> {
-    let scanned = scan_nvme_drives(&[]).map_err(|e| e.to_string())?;
+    let scanned = scan_nvme_drives(&[]).map_err(|e| LayoutError::from(e).to_string())?;
     Ok(scanned
         .into_iter()
         .filter(|drive| !drive.table.is_blank())
@@ -969,7 +714,7 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
         // Read every NVMe drive's partition table. If any read fails we abort:
         // a failed read is never treated as an empty disk.
         let targets: Vec<String> = expected_labels(&plan).into_iter().map(|(d, _)| d).collect();
-        let scanned = scan_nvme_drives(&targets)?;
+        let scanned = scan_nvme_drives(&targets).map_err(LayoutError::from)?;
         for drive in &scanned {
             tracing::info!(
                 "Found {} on {}",
@@ -1063,7 +808,7 @@ impl Action<ValidatedHardware, PartitionedDrives, CompletedPartitionedDrives>
             // The disk may have changed since planning: re-read it right now
             // (aborting if unreadable). Without WipeAll only a verified empty
             // drive is written.
-            let current = read_table(device_path)?;
+            let current = read_table(device_path).map_err(LayoutError::from)?;
             let destroyed = partitions_to_destroy(device_path, &current, policy)?;
             if !destroyed.is_empty() {
                 log_destroyed(device_path, &destroyed);
@@ -1243,6 +988,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crate::block_devices::{combine_with_signature, interpret_signature_probe, parse_sfdisk};
     use crate::provisioning::types::{MountPoint, PartitionSize};
     use rstest::rstest;
     use storage_primitives::ByteSize;
@@ -1267,7 +1013,7 @@ mod tests {
                 unit_type: UnitType::Mdma909,
                 ssh_key: SshPublicKey::new("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA96k1y1Y1326DtI4csBGXSqu57wjNuBYEkyjUQ3uS7x mdma-pi-access".to_owned()).expect("works"),
                 existing_data: ExistingDataPolicy::Preserve,
-                network: None,
+                wifi: crate::types::WifiSetup::None,
             },
             drives: secondary
                 .map(|s| ValidatedDrives::TwoDrives(primary.clone(), s))
@@ -2058,14 +1804,6 @@ mod tests {
     }
 
     #[test]
-    fn signature_probe_failure_is_an_error_not_blank() {
-        assert!(matches!(
-            interpret_signature_probe("/dev/nvme0n1", false, "", "wipefs: busy"),
-            Err(LayoutError::Unreadable { .. })
-        ));
-    }
-
-    #[test]
     fn no_table_with_signature_is_not_blank() {
         let t = combine_with_signature(OnDiskTable::NoTable, Some("ext4".to_string()));
         assert_eq!(
@@ -2337,13 +2075,14 @@ mod tests {
 
     #[test]
     fn parse_sfdisk_other_failure_is_an_error_not_an_empty_disk() {
-        let err = parse_sfdisk(
+        let err: LayoutError = parse_sfdisk(
             "/dev/nvme0n1",
             false,
             b"",
             "sfdisk: cannot open /dev/nvme0n1: Device or resource busy",
         )
-        .expect_err("a failed read must abort");
+        .expect_err("a failed read must abort")
+        .into();
         assert!(matches!(err, LayoutError::Unreadable { .. }));
         assert!(err.to_string().contains("left untouched"));
     }
@@ -2352,19 +2091,6 @@ mod tests {
     fn parse_sfdisk_garbage_is_an_error() {
         assert!(parse_sfdisk("/dev/nvme0n1", true, b"not json", "").is_err());
         assert!(parse_sfdisk("/dev/nvme0n1", true, b"", "").is_err());
-    }
-
-    #[rstest]
-    #[case("nvme0n1", true)]
-    #[case("nvme1n1", true)]
-    #[case("nvme10n2", true)]
-    #[case("nvme0n1p2", false)]
-    #[case("nvme", false)]
-    #[case("nvme0", false)]
-    #[case("nvmen1", false)]
-    #[case("sda", false)]
-    fn nvme_disk_name_detection(#[case] name: &str, #[case] expected: bool) {
-        assert_eq!(is_nvme_disk_name(name), expected);
     }
 
     // ── sfdisk GPT type GUID tests ────────────────────────────────────────────
