@@ -1,0 +1,11 @@
+#!/bin/sh
+exec 2>&1
+[ -c /dev/kmsg ] || { echo "mdma-klog: /dev/kmsg unavailable"; sleep 60; exit 1; }
+# Replay the whole ring buffer only once per boot (the marker lives on tmpfs).
+# A later restart follows new messages only, so sv restart does not duplicate
+# the log, at the cost of the ~1s between a crash and the restart.
+if [ -e /run/mdma-klog.seen ]; then
+    exec dmesg --follow-new --decode --time-format iso
+fi
+touch /run/mdma-klog.seen
+exec dmesg --follow --decode --time-format iso
