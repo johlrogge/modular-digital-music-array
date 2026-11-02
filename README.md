@@ -154,7 +154,15 @@ just beacon-cross       # cross-compile beacon for aarch64
 just deploy-dev         # build and deploy all services to welcome-to-mdma.local
 ```
 
-From the laptop, set `MDMA_NODE` and all CLI commands route to the Pi automatically:
+From the laptop on the same network, the CLI finds nodes on its own:
+
+```bash
+mdma node list      # discover nodes (confirmed by Identify)
+mdma node select    # pick and remember one
+mdma ping
+```
+
+`MDMA_NODE` and `--node` still override discovery:
 
 ```bash
 export MDMA_NODE="mdma-909.local"
@@ -172,7 +180,7 @@ Copy `scripts/install-mdma-macos.sh` from this repo to your Mac and run it. It r
 bash install-mdma-macos.sh
 
 # Install a specific tag
-bash install-mdma-macos.sh v0.29.0
+bash install-mdma-macos.sh v0.30.0
 
 # Install to a user-writable location (no sudo)
 MDMA_INSTALL_DIR=~/.local/bin bash install-mdma-macos.sh
@@ -190,6 +198,22 @@ cp profiles/dev/target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.30.0
+
+### The CLI finds nodes on its own (#73)
+
+Nodes announce `_mdma._tcp` over mDNS and the gateway answers a new Identify request, so `MDMA_NODE` is no longer required. The CLI resolves its target in order: `--node` then `MDMA_NODE`, local IPC on the Pi, the remembered node (verified by Identify), then discovery or an interactive pick. mDNS results are only candidates; every address is confirmed by Identify before it is used or remembered, so a swapped Pi on the same IP is never silently targeted.
+
+New commands: `mdma node list`, `select`, `forget` and `show`. The choice is cached at `~/.config/mdma/node.json` on Linux (under Application Support on macOS, where first use shows a Local Network permission prompt).
+
+Gateways at 0.29.0 or older answer Identify as "unsupported" and are not remembered through discovery; use `--node` until they are updated. The TUI and dj-workspace still use only `MDMA_NODE`.
+
+### Packaging fix (#75)
+
+Packages are now assembled from `void-packages/srcpkgs`. The 0.29.0 beacon package lacked the `beacon-wifi` service and its dependencies, so the wifi fallback could not start; 0.30.0 ships them (beacon SD cards on 0.29.0 should self-update). The gateway now depends on avahi and withdraws its mDNS announcement on uninstall. CI verifies every built package against its declaration. See CHANGELOG.md.
 
 ---
 

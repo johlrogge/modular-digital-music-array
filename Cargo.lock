@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "bevy-app"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "bevy",
  "bevy_egui",
@@ -2446,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "boot-health"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "pretty_assertions",
  "serde",
@@ -3636,7 +3636,7 @@ checksum = "c9c272297e804878a2a4b707cfcfc6d2328b5bb936944613b4fdf2b9269afdfd"
 
 [[package]]
 name = "dj-workspace"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "bevy-app",
  "clap",
@@ -5826,7 +5826,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "mdma-acid"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "acid-service",
  "clap",
@@ -5840,7 +5840,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-admin"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "admin-ipc-protocol",
  "boot-health",
@@ -5859,7 +5859,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-audio"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "clap",
  "color-eyre",
@@ -5880,7 +5880,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-bandcamp"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "bandcamp-api",
  "chrono",
@@ -5935,7 +5935,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-beacon"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "askama",
  "async-stream",
@@ -5967,7 +5967,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-cli"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "audio-transcoder",
  "chrono",
@@ -6020,7 +6020,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-console"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "admin-ipc-protocol",
  "askama",
@@ -6057,7 +6057,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-gateway"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "acid-protocol",
  "clap",
@@ -6077,7 +6077,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-library"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "clap",
  "color-eyre",
@@ -6090,7 +6090,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-playback"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "acid-client",
  "clap",
@@ -6114,7 +6114,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-tui"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "clap",
  "client",
@@ -7588,7 +7588,7 @@ dependencies = [
 
 [[package]]
 name = "private-file"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "tempfile",
 ]
@@ -8192,7 +8192,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-eeprom"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "tempfile",
  "thiserror 1.0.69",
@@ -10660,7 +10660,7 @@ dependencies = [
 
 [[package]]
 name = "wifi-config"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "pbkdf2",
  "proptest",

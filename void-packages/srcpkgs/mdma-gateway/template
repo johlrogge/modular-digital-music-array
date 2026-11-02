@@ -1,7 +1,7 @@
 # Package metadata for mdma-gateway (not an xbps-src build template; see
 # void-packages/srcpkgs/beacon/template for the contract).
 pkgname=mdma-gateway
-version=0.29.0
+version=0.30.0
 revision=1
 archs="aarch64"
 # avahi: the run script publishes the DNS-SD announcement (removed by REMOVE)
