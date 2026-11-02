@@ -542,6 +542,45 @@ fn open_history_pane(app: &mut App, days: u32) {
     }
 }
 
+/// Return hashes in the order they should be passed to successive `queue_next`
+/// calls so that the final "next up" sequence preserves the original selection
+/// order.
+///
+/// `queue_next` inserts immediately after the currently-playing track, so
+/// inserting [C, B, A] in that order leaves the queue as `[current, A, B, C,
+/// rest…]`.  Reversing the caller's selection achieves this.
+fn queue_next_order(hashes: Vec<ContentHash>) -> Vec<ContentHash> {
+    hashes.into_iter().rev().collect()
+}
+
+/// Route a PaneAction returned from a pane's key handler to the App.
+fn dispatch_pane_action(app: &mut App, action: PaneAction) {
+    match action {
+        PaneAction::Consumed => {}
+        PaneAction::Ignored => {}
+        PaneAction::Error(msg) => app.set_status(format!("Error: {}", msg)),
+        PaneAction::Info(msg) => app.set_status(msg),
+        PaneAction::Cut(hashes) => {
+            let count = hashes.len();
+            app.clipboard = hashes;
+            app.set_status(format!("Cut {} track(s) — press p to paste", count));
+        }
+        PaneAction::OpenPlaylist(name) => {
+            // Open the requested playlist in the ACTIVE pane (replaces it).
+            let library = Rc::clone(&app.library);
+            match PlaylistPane::open(name.clone(), library) {
+                Ok(playlist_pane) => {
+                    app.switch_active_pane(Box::new(playlist_pane));
+                    app.set_status(format!("Opened playlist: {}", name));
+                }
+                Err(e) => {
+                    app.set_status(format!("Failed to open playlist {}: {}", name, e));
+                }
+            }
+        }
+    }
+}
+
 // =========================================================================
 // Tests
 // =========================================================================
@@ -776,44 +815,5 @@ mod tests {
     #[test]
     fn history_query_zero_is_today() {
         assert_eq!(super::history_query(0), ":started '~'");
-    }
-}
-
-/// Return hashes in the order they should be passed to successive `queue_next`
-/// calls so that the final "next up" sequence preserves the original selection
-/// order.
-///
-/// `queue_next` inserts immediately after the currently-playing track, so
-/// inserting [C, B, A] in that order leaves the queue as `[current, A, B, C,
-/// rest…]`.  Reversing the caller's selection achieves this.
-fn queue_next_order(hashes: Vec<ContentHash>) -> Vec<ContentHash> {
-    hashes.into_iter().rev().collect()
-}
-
-/// Route a PaneAction returned from a pane's key handler to the App.
-fn dispatch_pane_action(app: &mut App, action: PaneAction) {
-    match action {
-        PaneAction::Consumed => {}
-        PaneAction::Ignored => {}
-        PaneAction::Error(msg) => app.set_status(format!("Error: {}", msg)),
-        PaneAction::Info(msg) => app.set_status(msg),
-        PaneAction::Cut(hashes) => {
-            let count = hashes.len();
-            app.clipboard = hashes;
-            app.set_status(format!("Cut {} track(s) — press p to paste", count));
-        }
-        PaneAction::OpenPlaylist(name) => {
-            // Open the requested playlist in the ACTIVE pane (replaces it).
-            let library = Rc::clone(&app.library);
-            match PlaylistPane::open(name.clone(), library) {
-                Ok(playlist_pane) => {
-                    app.switch_active_pane(Box::new(playlist_pane));
-                    app.set_status(format!("Opened playlist: {}", name));
-                }
-                Err(e) => {
-                    app.set_status(format!("Failed to open playlist {}: {}", name, e));
-                }
-            }
-        }
     }
 }

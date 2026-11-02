@@ -50,6 +50,9 @@ pub enum BandcampError {
         expired_ago_secs: u64,
     },
 
+    #[error("Not an acceptable Bandcamp URL (must be https://bandcamp.com or a subdomain, no port or credentials): {0}")]
+    InvalidUrl(String),
+
     #[error("Download signature expired — needs page refresh")]
     DownloadExpired,
 }

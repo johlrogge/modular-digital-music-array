@@ -33,16 +33,15 @@ fn bench_decode_frame(c: &mut Criterion) {
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(5));
 
-    for name in ["short.flac"] {
-        group.bench_with_input(BenchmarkId::from_parameter(name), name, |b, name| {
-            let path = test_file_path(name);
-            b.iter(|| {
-                let source = AudioSource::new(&path).expect("Could not create source");
-                let segments = source.decode_next_frame().expect("Failed to decode");
-                black_box(segments.len());
-            });
+    let name = "short.flac";
+    group.bench_with_input(BenchmarkId::from_parameter(name), name, |b, name| {
+        let path = test_file_path(name);
+        b.iter(|| {
+            let source = AudioSource::new(&path).expect("Could not create source");
+            let segments = source.decode_next_frame().expect("Failed to decode");
+            black_box(segments.len());
         });
-    }
+    });
 
     group.finish();
 }

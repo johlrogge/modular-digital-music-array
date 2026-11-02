@@ -69,7 +69,6 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
-    use serde_json;
 
     #[rstest]
     #[case(1)]

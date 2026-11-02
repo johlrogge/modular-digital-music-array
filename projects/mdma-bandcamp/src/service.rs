@@ -5,8 +5,9 @@
 
 use crate::cache::DownloadCache;
 use crate::ipc::{
-    DownloadId, DownloadState, DownloadStatus, IpcServer, SourceError, SourceRequest,
-    SourceResponse, SourceStatus,
+    parse_request, DownloadId, DownloadState, DownloadStatus, IpcServer, SourceError,
+    SourcePlaylist, SourcePlaylistSummary, SourcePlaylistTrack, SourceRequest, SourceResponse,
+    SourceStatus,
 };
 use bandcamp_api::{AudioFormat, BandcampClient, CollectionItem, CookieJar};
 use library_ipc_client::{
@@ -176,6 +177,78 @@ fn classify_check_result(live_count: usize, stored_count: usize) -> bool {
     live_count > stored_count
 }
 
+/// Pure mapping: bandcamp_api playlist summary -> wire type.
+fn to_source_playlist_summary(summary: bandcamp_api::PlaylistSummary) -> SourcePlaylistSummary {
+    SourcePlaylistSummary {
+        id: summary.id.to_string(),
+        title: summary.title,
+        url: summary.url,
+        slug: summary.slug,
+        track_count: summary.track_count,
+        is_private: summary.is_private,
+    }
+}
+
+/// Pure mapping: bandcamp_api playlist -> wire type (positions preserved).
+fn to_source_playlist(playlist: bandcamp_api::Playlist) -> SourcePlaylist {
+    SourcePlaylist {
+        id: playlist.id.to_string(),
+        title: playlist.title,
+        url: playlist.url,
+        total_count: playlist.total_count,
+        tracks: playlist
+            .tracks
+            .into_iter()
+            .map(|t| SourcePlaylistTrack {
+                position: t.position,
+                source_track_id: t.track_id.to_string(),
+                title: t.title,
+                artist: t.artist,
+                album: t.album_title,
+                duration_secs: t.duration_secs,
+                owned: t.is_owned,
+            })
+            .collect(),
+    }
+}
+
+/// Pure error mapping for playlist fetches: HTTP 404 on a named playlist means
+/// it does not exist; everything else is a generic fetch failure. `playlist` is
+/// `None` when listing (nothing specific can be "not found").
+fn playlist_error_for_status(
+    status: Option<u16>,
+    message: &str,
+    playlist: Option<&str>,
+) -> SourceError {
+    match (status, playlist) {
+        (Some(404), Some(playlist)) => SourceError::ItemNotFound {
+            identifier: playlist.to_string(),
+        },
+        _ => SourceError::SyncFailed {
+            message: message.to_string(),
+        },
+    }
+}
+
+/// Map a Bandcamp error from a playlist request to a wire error.
+fn playlist_error(e: &bandcamp_api::BandcampError, playlist: Option<&str>) -> SourceError {
+    use bandcamp_api::BandcampError;
+    match e {
+        BandcampError::NotLoggedIn
+        | BandcampError::Auth(_)
+        | BandcampError::CookiesExpired { .. } => SourceError::NotAuthenticated {
+            message: e.to_string(),
+        },
+        BandcampError::RateLimited { retry_after_secs } => SourceError::RateLimited {
+            retry_after_secs: *retry_after_secs,
+        },
+        BandcampError::Http(inner) => {
+            playlist_error_for_status(inner.status().map(|s| s.as_u16()), &e.to_string(), playlist)
+        }
+        _ => playlist_error_for_status(None, &e.to_string(), playlist),
+    }
+}
+
 impl BandcampService {
     /// Create a new service
     pub fn new(
@@ -323,6 +396,62 @@ impl BandcampService {
             SourceRequest::ResyncItem { identifier } => self.handle_resync(identifier).await,
 
             SourceRequest::CheckItem { identifier } => self.handle_check_item(identifier).await,
+
+            SourceRequest::ListPlaylists => self.handle_list_playlists().await,
+
+            SourceRequest::GetPlaylist { playlist } => self.handle_get_playlist(playlist).await,
+        }
+    }
+
+    /// List the configured user's playlists.
+    async fn handle_list_playlists(&self) -> SourceResponse {
+        let client = match self.client() {
+            Ok(c) => c,
+            Err(e) => return SourceResponse::Error(e),
+        };
+        let username = match self.require_username() {
+            Ok(u) => u,
+            Err(e) => return SourceResponse::Error(e),
+        };
+
+        match client.list_playlists(&username).await {
+            Ok(playlists) => SourceResponse::Playlists(
+                playlists
+                    .into_iter()
+                    .map(to_source_playlist_summary)
+                    .collect(),
+            ),
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to list playlists");
+                SourceResponse::Error(playlist_error(&e, None))
+            }
+        }
+    }
+
+    /// Fetch one playlist by slug or URL.
+    async fn handle_get_playlist(&self, playlist: String) -> SourceResponse {
+        let client = match self.client() {
+            Ok(c) => c,
+            Err(e) => return SourceResponse::Error(e),
+        };
+        let username = match self.require_username() {
+            Ok(u) => u,
+            Err(e) => return SourceResponse::Error(e),
+        };
+
+        let url = match BandcampClient::playlist_url(&username, &playlist) {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!(error = %e, %playlist, "Rejected playlist argument");
+                return SourceResponse::Error(playlist_error(&e, Some(&playlist)));
+            }
+        };
+        match client.get_playlist(&url).await {
+            Ok(p) => SourceResponse::Playlist(to_source_playlist(p)),
+            Err(e) => {
+                tracing::error!(error = %e, %url, "Failed to fetch playlist");
+                SourceResponse::Error(playlist_error(&e, Some(&playlist)))
+            }
         }
     }
 
@@ -771,10 +900,25 @@ fn run_nng_bridge(
 
     loop {
         // Blocking recv
-        let request = match server.recv() {
+        let raw = match server.recv_raw() {
             Ok(r) => r,
             Err(e) => {
+                // Nothing was received, so there is nothing to reply to
                 tracing::error!(error = %e, "Failed to receive request");
+                continue;
+            }
+        };
+        let request = match parse_request(&raw) {
+            Ok(r) => r,
+            Err(e) => {
+                // Reply so the gateway doesn't stall until its timeout
+                tracing::error!(error = %e, "Failed to parse request");
+                let reply = SourceResponse::Error(SourceError::unsupported(format!(
+                    "unparseable request: {e}"
+                )));
+                if let Err(e) = server.send(&reply) {
+                    tracing::error!(error = %e, "Failed to send parse-error reply");
+                }
                 continue;
             }
         };
@@ -1139,6 +1283,136 @@ mod tests {
     }
 
     // =========================================================================
+    // Playlist mapping tests
+    // =========================================================================
+
+    #[test]
+    fn playlist_summary_maps_to_protocol() {
+        let summary = bandcamp_api::PlaylistSummary {
+            id: 42,
+            title: "Night drive".to_string(),
+            url: "https://bandcamp.com/someone/playlist/night-drive".to_string(),
+            slug: "night-drive".to_string(),
+            track_count: 7,
+            is_private: true,
+        };
+        let mapped = to_source_playlist_summary(summary);
+        assert_eq!(mapped.id, "42");
+        assert_eq!(mapped.title, "Night drive");
+        assert_eq!(mapped.slug, "night-drive");
+        assert_eq!(mapped.track_count, 7);
+        assert!(mapped.is_private);
+    }
+
+    #[test]
+    fn playlist_maps_to_protocol_keeping_positions_and_fields() {
+        let playlist = bandcamp_api::Playlist {
+            id: 9,
+            title: "Mix".to_string(),
+            url: "https://bandcamp.com/someone/playlist/mix".to_string(),
+            is_private: false,
+            total_count: 2,
+            tracks: vec![
+                bandcamp_api::PlaylistTrack {
+                    position: 1,
+                    track_id: 111,
+                    title: "One".to_string(),
+                    artist: "A".to_string(),
+                    album_title: Some("Album".to_string()),
+                    album_id: Some(5),
+                    duration_secs: 12.5,
+                    is_owned: true,
+                    url: "https://a.bandcamp.com/track/one".to_string(),
+                },
+                bandcamp_api::PlaylistTrack {
+                    position: 2,
+                    track_id: 222,
+                    title: "Two".to_string(),
+                    artist: "B".to_string(),
+                    album_title: None,
+                    album_id: None,
+                    duration_secs: 30.0,
+                    is_owned: false,
+                    url: "https://b.bandcamp.com/track/two".to_string(),
+                },
+            ],
+        };
+        let mapped = to_source_playlist(playlist);
+        assert_eq!(mapped.id, "9");
+        assert_eq!(mapped.total_count, 2);
+        assert_eq!(mapped.tracks.len(), 2);
+        assert_eq!(mapped.tracks[0].position, 1);
+        assert_eq!(mapped.tracks[0].source_track_id, "111");
+        assert_eq!(mapped.tracks[0].album.as_deref(), Some("Album"));
+        assert!(mapped.tracks[0].owned);
+        assert_eq!(mapped.tracks[1].position, 2);
+        assert_eq!(mapped.tracks[1].album, None);
+        assert!(!mapped.tracks[1].owned);
+    }
+
+    #[test]
+    fn playlist_error_404_is_item_not_found() {
+        match playlist_error_for_status(Some(404), "boom", Some("my-list")) {
+            SourceError::ItemNotFound { identifier } => assert_eq!(identifier, "my-list"),
+            other => panic!("expected ItemNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn playlist_error_404_when_listing_is_not_item_not_found() {
+        match playlist_error_for_status(Some(404), "boom", None) {
+            SourceError::SyncFailed { message } => assert_eq!(message, "boom"),
+            other => panic!("expected SyncFailed, got {other:?}"),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::server_error(Some(500))]
+    #[case::no_status(None)]
+    fn playlist_error_other_is_generic(#[case] status: Option<u16>) {
+        match playlist_error_for_status(status, "boom", Some("my-list")) {
+            SourceError::SyncFailed { message } => assert_eq!(message, "boom"),
+            other => panic!("expected SyncFailed, got {other:?}"),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::not_logged_in(bandcamp_api::BandcampError::NotLoggedIn)]
+    #[case::auth(bandcamp_api::BandcampError::Auth("nope".to_string()))]
+    #[case::cookies_expired(bandcamp_api::BandcampError::CookiesExpired {
+        cookie: "identity".to_string(),
+        expired_ago_secs: 5,
+    })]
+    fn playlist_error_auth_failures_are_not_authenticated(
+        #[case] err: bandcamp_api::BandcampError,
+    ) {
+        match playlist_error(&err, Some("my-list")) {
+            SourceError::NotAuthenticated { message } => assert_eq!(message, err.to_string()),
+            other => panic!("expected NotAuthenticated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn playlist_error_rate_limited_is_rate_limited() {
+        let err = bandcamp_api::BandcampError::RateLimited {
+            retry_after_secs: 42,
+        };
+        match playlist_error(&err, None) {
+            SourceError::RateLimited { retry_after_secs } => assert_eq!(retry_after_secs, 42),
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn playlist_error_invalid_url_is_sync_failed_with_reason() {
+        let err = bandcamp_api::BandcampError::InvalidUrl("http://evil".to_string());
+        match playlist_error(&err, Some("http://evil")) {
+            SourceError::SyncFailed { message } => assert!(message.contains("http://evil")),
+            other => panic!("expected SyncFailed, got {other:?}"),
+        }
+    }
+
+    // =========================================================================
     // should_skip_by_work_identity tests
     // =========================================================================
 
@@ -1299,6 +1573,8 @@ mod tests {
     #[case::sync(SourceRequest::Sync)]
     #[case::resync(SourceRequest::ResyncItem { identifier: "x".to_string() })]
     #[case::check(SourceRequest::CheckItem { identifier: "x".to_string() })]
+    #[case::list_playlists(SourceRequest::ListPlaylists)]
+    #[case::get_playlist(SourceRequest::GetPlaylist { playlist: "x".to_string() })]
     #[tokio::test]
     async fn request_without_cookies_returns_not_configured_error(#[case] request: SourceRequest) {
         let dir = tempfile::tempdir().unwrap();
@@ -1464,7 +1740,7 @@ mod tests {
                 make_collection_item("p_vinyl_111", "Carbon Based Lifeforms", "Interloper");
             let digital_item =
                 make_collection_item("p_digital_222", "Carbon Based Lifeforms", "Interloper");
-            let collection = vec![vinyl_item, digital_item];
+            let collection = [vinyl_item, digital_item];
 
             // Collect all ItemIds from collection for has_facts call (mirrors handle_sync logic)
             let all_ids: Vec<String> = collection

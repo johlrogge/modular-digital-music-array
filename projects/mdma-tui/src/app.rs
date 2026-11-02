@@ -523,6 +523,8 @@ mod tests {
     /// Instead we test `activate_tab` logic via an App built by directly
     /// constructing the struct fields. We define a `test_app` helper that builds
     /// the minimum App shell needed without backend connections.
+    // Test helper returning the raw App tab fields; a named struct would add noise.
+    #[allow(clippy::type_complexity)]
     fn make_tab_state(
         left_pane: Box<dyn Pane>,
         right_pane: Box<dyn Pane>,
