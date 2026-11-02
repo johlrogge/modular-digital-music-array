@@ -3,6 +3,70 @@ exec 2>&1
 mkdir -p /run/mdma/sources
 chown mdma:mdma /run/mdma /run/mdma/sources
 export RUST_LOG=info
+
+# Node identity: provisioned hostname (stable across avahi conflict renames)
+NODE_ID=""
+if [ -r /etc/hostname ]; then
+    NODE_ID=$(head -n 1 /etc/hostname | tr -d '[:space:]')
+fi
+[ -n "$NODE_ID" ] || NODE_ID=$(hostname 2>/dev/null | tr -d '[:space:]')
+# Only [A-Za-z0-9.-] is safe to embed in XML and env; otherwise leave identity unset
+case "$NODE_ID" in
+    ''|*[!A-Za-z0-9.-]*)
+        echo "warning: no valid hostname; node identity left unset" >&2
+        NODE_ID=""
+        ;;
+esac
+VER=$(/usr/bin/mdma-gateway --version 2>/dev/null | head -n 1 | awk '{print $NF}')
+case "$VER" in
+    ''|*[!A-Za-z0-9.+-]*) VER="unknown" ;;
+esac
+
+# Announce over DNS-SD; never block gateway startup on failure
+publish_avahi_service() {
+    dir=/etc/avahi/services
+    target=$dir/mdma.service
+    [ -d "$dir" ] || return 1
+    # Clear debris left by a killed earlier run
+    rm -f "$dir"/.mdma.service.*
+    tmp=$(mktemp "$dir/.mdma.service.XXXXXX") || return 1
+    cat >"$tmp" <<EOF || { rm -f "$tmp"; return 1; }
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name replace-wildcards="yes">%h</name>
+  <service>
+    <type>_mdma._tcp</type>
+    <port>5555</port>
+    <txt-record>id=$NODE_ID</txt-record>
+    <txt-record>name=$NODE_ID</txt-record>
+    <txt-record>ver=$VER</txt-record>
+    <txt-record>kind=node</txt-record>
+    <txt-record>proto=1</txt-record>
+  </service>
+</service-group>
+EOF
+    if [ -f "$target" ] && cmp -s "$tmp" "$target"; then
+        rm -f "$tmp"
+        return 0
+    fi
+    if chmod 644 "$tmp" && mv -f "$tmp" "$target"; then return 0; fi
+    rm -f "$tmp"
+    return 1
+}
+if [ -n "$NODE_ID" ]; then
+    publish_avahi_service || echo "warning: could not write avahi service file" >&2
+else
+    echo "warning: skipping avahi service file (no node id)" >&2
+fi
+
+# The gateway reads its identity from the environment; an older binary ignores it
+if [ -n "$NODE_ID" ]; then
+    MDMA_NODE_ID="$NODE_ID"
+    MDMA_NODE_NAME="$NODE_ID"
+    export MDMA_NODE_ID MDMA_NODE_NAME
+fi
+
 exec chpst -u mdma /usr/bin/mdma-gateway \
     --listen tcp://0.0.0.0:5555 \
     --library-socket ipc:///run/mdma/library.sock \

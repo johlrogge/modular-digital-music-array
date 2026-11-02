@@ -1,6 +1,6 @@
 use clap::Parser;
 use color_eyre::Result;
-use gateway_protocol::{GatewayRequest, GatewayResponse, SourceName};
+use gateway_protocol::{GatewayRequest, GatewayResponse, NodeIdentity, SourceName, IDENTITY_PROTO};
 use nng::options::Options;
 use serde::{de::DeserializeOwned, Serialize};
 // Polylith: explicitly names the `service` base crate selected for this binary.
@@ -57,6 +57,26 @@ struct Args {
     /// ACID event source to subscribe to (Sub0)
     #[arg(long, default_value = "ipc:///run/mdma/acid-events.sock")]
     acid_event_source: String,
+
+    /// Node id reported to clients (the hostname set at provisioning)
+    #[arg(long, env = "MDMA_NODE_ID")]
+    node_id: Option<String>,
+
+    /// Node name reported to clients
+    #[arg(long, env = "MDMA_NODE_NAME")]
+    node_name: Option<String>,
+}
+
+/// Build the identity answered to `GatewayRequest::Identify`.
+/// Missing (or empty) id/name stay `None`: "not configured".
+fn build_identity(node_id: Option<&str>, node_name: Option<&str>) -> NodeIdentity {
+    let non_empty = |s: &str| (!s.is_empty()).then(|| s.to_string());
+    NodeIdentity {
+        id: node_id.and_then(non_empty),
+        name: node_name.and_then(non_empty),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        proto: IDENTITY_PROTO,
+    }
 }
 
 /// Connect a Req0 socket to a backend with reconnect options.
@@ -226,6 +246,12 @@ fn main() -> Result<()> {
         "Starting MDMA Gateway"
     );
 
+    if args.node_id.is_none() || args.node_name.is_none() {
+        tracing::warn!("MDMA_NODE_ID/MDMA_NODE_NAME not set; node identity is unconfigured");
+    }
+    let identity = build_identity(args.node_id.as_deref(), args.node_name.as_deref());
+    tracing::info!(id = ?identity.id, name = ?identity.name, "Node identity");
+
     // Create sources directory if it doesn't exist
     std::fs::create_dir_all(&args.sources_dir)?;
 
@@ -280,9 +306,7 @@ fn main() -> Result<()> {
         let envelope: GatewayRequest = match serde_json::from_slice(&msg) {
             Ok(e) => e,
             Err(e) => {
-                let response = GatewayResponse::Error {
-                    message: format!("Invalid request: {}", e),
-                };
+                let response = GatewayResponse::invalid_request(e);
                 let data = serde_json::to_vec(&response)
                     .expect("GatewayResponse::Error serialization must not fail");
                 let _ = frontend.send(nng::Message::from(&data[..]));
@@ -339,6 +363,10 @@ fn main() -> Result<()> {
                 }
             }
 
+            GatewayRequest::Identify => GatewayResponse::Identity {
+                identity: identity.clone(),
+            },
+
             GatewayRequest::ListSources => {
                 // Handle ListSources with optional liveness check
                 let raw_names = list_sources(&args.sources_dir);
@@ -370,5 +398,49 @@ fn main() -> Result<()> {
         if let Err((_, e)) = frontend.send(nng::Message::from(&data[..])) {
             tracing::error!(error = %e, "Failed to send response");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_uses_given_id_and_name() {
+        let id = build_identity(Some("mdma-stage"), Some("Stage Pi"));
+        assert_eq!(id.id.as_deref(), Some("mdma-stage"));
+        assert_eq!(id.name.as_deref(), Some("Stage Pi"));
+        assert_eq!(id.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(id.proto, IDENTITY_PROTO);
+    }
+
+    #[test]
+    fn identity_is_none_when_not_configured() {
+        let id = build_identity(None, None);
+        assert_eq!(id.id, None);
+        assert_eq!(id.name, None);
+        let id = build_identity(Some(""), Some(""));
+        assert_eq!(id.id, None);
+        assert_eq!(id.name, None);
+    }
+
+    // Single test touching the process environment, to avoid races between tests.
+    #[test]
+    fn args_parse_node_flags_and_env() {
+        std::env::remove_var("MDMA_NODE_ID");
+        std::env::remove_var("MDMA_NODE_NAME");
+        let args = Args::parse_from(["mdma-gateway", "--node-id", "a", "--node-name", "b"]);
+        assert_eq!(args.node_id.as_deref(), Some("a"));
+        assert_eq!(args.node_name.as_deref(), Some("b"));
+        let args = Args::parse_from(["mdma-gateway"]);
+        assert!(args.node_id.is_none() && args.node_name.is_none());
+
+        std::env::set_var("MDMA_NODE_ID", "mdma-stage");
+        std::env::set_var("MDMA_NODE_NAME", "Stage");
+        let args = Args::parse_from(["mdma-gateway"]);
+        std::env::remove_var("MDMA_NODE_ID");
+        std::env::remove_var("MDMA_NODE_NAME");
+        assert_eq!(args.node_id.as_deref(), Some("mdma-stage"));
+        assert_eq!(args.node_name.as_deref(), Some("Stage"));
     }
 }

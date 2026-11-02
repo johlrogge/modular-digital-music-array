@@ -6,6 +6,7 @@ archs="aarch64"
 build_style=cargo
 hostmakedepends="cargo"
 makedepends="rust-std"
+depends="avahi"
 short_desc="MDMA API gateway"
 maintainer="Joakim Ohlrogge <joakim.ohlrogge@agical.se>"
 license="MIT"
