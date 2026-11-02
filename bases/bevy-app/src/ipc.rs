@@ -327,7 +327,7 @@ mod tests {
 
         fn playlist_get(&self, name: &PlaylistName) -> Result<Vec<ContentHash>, String> {
             match self.playlist_tracks.get(name.as_str()) {
-                Some(hashes) => Ok(hashes.iter().map(|h| ContentHash::new(h)).collect()),
+                Some(hashes) => Ok(hashes.iter().map(ContentHash::new).collect()),
                 None => Err(format!("Playlist not found: {}", name.as_str())),
             }
         }
@@ -485,7 +485,7 @@ mod tests {
             make_track("sha256:r2", "Result Two"),
         ]);
 
-        let evt = handle_request(&port, IpcRequest::Search(Box::new(TrackQuery::default())));
+        let evt = handle_request(&port, IpcRequest::Search(Box::default()));
 
         match evt {
             IpcEvent::SearchResults(tracks) => {
@@ -501,7 +501,7 @@ mod tests {
         let mut port = FakeLibraryPort::new();
         port.search_result = Err("search blew up".to_string());
 
-        let evt = handle_request(&port, IpcRequest::Search(Box::new(TrackQuery::default())));
+        let evt = handle_request(&port, IpcRequest::Search(Box::default()));
 
         match evt {
             IpcEvent::RequestFailed { context, message } => {

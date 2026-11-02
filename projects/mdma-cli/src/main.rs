@@ -6723,7 +6723,7 @@ mod tests {
 
     #[test]
     fn sort_started_ascending_puts_none_first() {
-        let mut tracks = vec![
+        let mut tracks = [
             make_track_with_started("sha256:never", None),
             make_track_with_started("sha256:old", Some("2024-01-01T00:00:00Z")),
             make_track_with_started("sha256:recent", Some("2025-06-15T12:00:00Z")),
@@ -6746,7 +6746,7 @@ mod tests {
 
     #[test]
     fn sort_started_descending_puts_none_last() {
-        let mut tracks = vec![
+        let mut tracks = [
             make_track_with_started("sha256:never", None),
             make_track_with_started("sha256:old", Some("2024-01-01T00:00:00Z")),
             make_track_with_started("sha256:recent", Some("2025-06-15T12:00:00Z")),
@@ -6769,7 +6769,7 @@ mod tests {
 
     #[test]
     fn sort_by_stopped_descending_newest_first() {
-        let mut tracks = vec![
+        let mut tracks = [
             make_track_with_stopped("sha256:never", None),
             make_track_with_stopped("sha256:old", Some("2024-03-01T00:00:00Z")),
             make_track_with_stopped("sha256:recent", Some("2025-11-20T08:00:00Z")),
@@ -6815,7 +6815,7 @@ mod tests {
                 energy: None,
             }
         };
-        let mut tracks = vec![
+        let mut tracks = [
             make("sha256:unknown", None),
             make("sha256:new", Some("2025-12-01T00:00:00Z")),
             make("sha256:early", Some("2020-01-01T00:00:00Z")),
@@ -7776,7 +7776,7 @@ mod tests {
 
         assert_eq!(
             locations,
-            [location_upper.clone()],
+            std::slice::from_ref(&location_upper),
             "playlist must reference the track even when URI case differs between \
              existing-XML round-trip and freshly-emitted path"
         );
