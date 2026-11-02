@@ -77,6 +77,48 @@ Accepted — 2026-11-02
 - The id depends on the provisioned hostname. Renaming a host changes the node's
   identity for cached clients.
 
+## Amendment 2026-11-02: resolution order details (§5)
+
+The original text above is kept as written. Where it conflicts with this
+amendment, the amendment wins.
+
+**Trust model:** The identify answer at an IP is the only authority for which
+node is at that IP; mDNS/DNS-SD results are candidates, never proof.
+
+- **Unverifiable at the cached IP is accepted only as a last resort.**
+  - Unverifiable means an old gateway that doesn't support Identify, or a
+    gateway with no id.
+  - It is accepted only after the fresh name lookup and the browse by id have
+    failed, and only when the cached `.local` name still resolves to that same
+    IP. Otherwise the cached node is treated as not found.
+  - Rationale: a cache entry is only created from a node that has an id, so an
+    unverifiable answer at the cached IP most likely comes from a different node
+    holding the same DHCP lease. That is the stage/prod swap.
+- **A gateway that supports Identify but returns a service error, or an
+  unexpected response, counts as a failed identity check** and is never
+  accepted.
+- **Browse results are deduplicated by id when one is present,** so an
+  avahi-renamed record doesn't list the same node twice.
+  - The dedup key is kind plus id, so a beacon that announces the installed
+    system's hostname never merges with the node itself.
+- **Browse relocation:** a node found by browse with the cached id is accepted
+  only after identify at one of its addresses confirms that id. Each announced
+  IPv4 except the already-failed cached IP is tried in turn. Unconfirmed
+  candidates are ignored.
+- **`mdma node select`:**
+  - A node whose announced id differs from its identify answer, or that
+    announced an id but answers without one, is rejected as an identity mismatch
+    and never saved.
+  - A node that announced no id may be remembered under the id its gateway
+    reports.
+- **Worst-case resolve latency:** about 1 s for the cached IP, 1 s for the fresh
+  name, 2 s for the browse, plus 1 s per candidate IP.
+- **Caveat on "fresh":** fresh name resolution bypasses only MDMA's own disk
+  cache. avahi-daemon keeps its own record cache (A-record TTL around 120 s), so
+  right after a stage/prod swap the name can briefly still map to the old IP.
+  That is acceptable, because the unverifiable fallback also requires that
+  mapping and an unverifiable answer.
+
 ## Related
 
 - ADR-008 — wifi provisioning; avahi may publish on two interfaces and rename

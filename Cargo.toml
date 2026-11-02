@@ -5,8 +5,8 @@
 members = [
     "components/acid_client",
     "components/acid_protocol",
-    "components/admin_ipc_protocol",
     "components/acid_service",
+    "components/admin_ipc_protocol",
     "components/audio_decoder",
     "components/audio_metadata",
     "components/audio_output",
@@ -33,6 +33,7 @@ members = [
     "components/music_facts",
     "components/music_primitives",
     "components/nng_transport",
+    "components/node_discovery",
     "components/playback_engine",
     "components/playback_primitives",
     "components/private_file",
@@ -46,10 +47,12 @@ members = [
     "components/track_matcher",
     "components/wifi_config",
     "bases/bdd-runner",
+    "bases/bevy-app",
     "bases/client",
     "bases/http_server",
     "bases/service",
     "bases/tui",
+    "projects/dj-workspace",
     "projects/mdma-acid",
     "projects/mdma-admin",
     "projects/mdma-audio",
@@ -61,9 +64,8 @@ members = [
     "projects/mdma-gateway",
     "projects/mdma-library",
     "projects/mdma-playback",
-    "projects/mdma-tui",
-    "projects/dj-workspace"
-, "bases/bevy-app"]
+    "projects/mdma-tui"
+]
 resolver = "2"
 
 [workspace.package]
@@ -76,8 +78,8 @@ repository = "https://github.com/johlrogge/modular-digital-music-array"
 [workspace.dependencies]
 acid-client = { path = "components/acid_client" }
 acid-protocol = { path = "components/acid_protocol" }
-admin-ipc-protocol = { path = "components/admin_ipc_protocol" }
 acid-service = { path = "components/acid_service" }
+admin-ipc-protocol = { path = "components/admin_ipc_protocol" }
 audio-decoder = { path = "components/audio_decoder" }
 audio-metadata = { path = "components/audio_metadata" }
 audio-output = { path = "components/audio_output" }
@@ -105,6 +107,7 @@ media-protocol = { path = "components/media_protocol" }
 music-facts = { path = "components/music_facts" }
 music-primitives = { path = "components/music_primitives" }
 nng-transport = { path = "components/nng_transport" }
+node-discovery = { path = "components/node_discovery" }
 playback-engine = { path = "components/playback_engine" }
 playback-primitives = { path = "components/playback_primitives" }
 private-file = { path = "components/private_file" }
@@ -118,28 +121,30 @@ stream-source-protocol = { path = "components/stream_source_protocol" }
 track-formatter = { path = "components/track_formatter" }
 track-matcher = { path = "components/track_matcher" }
 wifi-config = { path = "components/wifi_config" }
-pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
-sha1 = "0.10"
-libc = "0.2"
 askama = "0.12"
 assert_matches = "1.5"
 async-stream = "0.3"
 axum = { version = "0.7", features = ["multipart"] }
+bevy = "=0.19.0"
+bevy_egui = "=0.40.1"
 chrono = "0.4"
 clap = { version = "4.5", features = ["derive", "env"] }
 clap_complete = "4"
 color-eyre = "0.6"
 dirs = "6"
 futures = "0.3"
+libc = "0.2"
 lofty = "0.18"
 nng = "1.0"
 parking_lot = "0.12"
+pbkdf2 = { version = "0.12", features = ["hmac"] }
 pretty_assertions = "1"
 proptest = "1"
 rstest = "0.26"
 scopeguard = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
+sha1 = "0.10"
 socket2 = "0.5"
 tempfile = "3"
 thiserror = "1.0"
@@ -150,9 +155,6 @@ tower-http = { version = "0.5", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = "2"
-# DJ Workspace (laptop-only, dev profile only — not in production.profile)
-bevy = "0.19"
-bevy_egui = "0.40"
 
 [profile]
 

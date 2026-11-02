@@ -55,6 +55,18 @@ impl GatewayClient {
         Ok(Self { socket })
     }
 
+    /// Connect without waiting, with every request bounded by `timeout`.
+    ///
+    /// For probing whether a gateway answers: an unreachable address surfaces
+    /// as a timeout on the first request rather than blocking here.
+    pub fn connect_with_timeout(
+        address: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Self, ClientError> {
+        let socket = nng_transport::connect_with_timeout(address, timeout)?;
+        Ok(Self { socket })
+    }
+
     /// Send a raw gateway request and receive a response.
     fn request(&self, request: &GatewayRequest) -> Result<GatewayResponse, ClientError> {
         nng_transport::request_response(&self.socket, request)
