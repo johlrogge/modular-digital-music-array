@@ -4,6 +4,45 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.30.0] — 2026-11-02
+
+### Added
+
+- **The CLI finds nodes on its own (#73).** `MDMA_NODE` is no longer required.
+  - Nodes announce `_mdma._tcp` over mDNS. The gateway answers a new Identify request.
+  - The CLI resolves its target in this order:
+    1. `--node`, then `MDMA_NODE`
+    2. local IPC on the Pi
+    3. the remembered node, verified by Identify
+    4. discovery, or an interactive pick
+  - mDNS results are only candidates. Every address is confirmed by Identify before it is used or remembered, so a swapped Pi on the same IP is never silently targeted.
+  - New commands: `mdma node list`, `select`, `forget` and `show`.
+  - The remembered node is cached at `~/.config/mdma/node.json` on Linux, and under Application Support on macOS.
+  - First use on macOS shows a Local Network permission prompt.
+
+### Fixed
+
+- **Packages are now assembled from `void-packages/srcpkgs` (#75).**
+  - The 0.29.0 beacon package was missing the `beacon-wifi` service and its dependencies, so the wifi fallback from #72 could not start. 0.30.0 ships them.
+  - The gateway now depends on avahi and ships a REMOVE script that withdraws its mDNS announcement on uninstall.
+  - CI verifies every built package against its declaration.
+
+### Known issues
+
+- Prod halted after its ethernet was unplugged; under investigation (#74).
+- The TUI and dj-workspace still use only `MDMA_NODE`.
+- The beacon has no DNS fallback when the router's resolver does not answer, and the startup clock-sync wait is ineffective (#68).
+- The update page may stay on "Update started" (#67).
+- The wifi SSID is free text, so typos go unnoticed (#71).
+
+### Upgrade notes
+
+Beacon SD cards on 0.29.0 should self-update to get `beacon-wifi`.
+
+Older gateways (0.29.0 and earlier) answer Identify as "unsupported". The CLI then treats them as unverifiable and won't remember them through discovery. Use `--node` until they are updated.
+
+---
+
 ## [0.29.0] — 2026-11-02
 
 ### Added

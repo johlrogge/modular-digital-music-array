@@ -1,7 +1,7 @@
 # Package metadata for mdma-library (not an xbps-src build template; see
 # void-packages/srcpkgs/beacon/template for the contract).
 pkgname=mdma-library
-version=0.29.0
+version=0.30.0
 revision=1
 archs="aarch64"
 short_desc="MDMA music library service"
