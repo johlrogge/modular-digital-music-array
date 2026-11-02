@@ -1,0 +1,5 @@
+#!/bin/sh
+mkdir -p /var/log/mdma-klog
+# ~20 MB cap (10 x 2 MB); an existing config (operator edits) is kept
+[ -e /var/log/mdma-klog/config ] || printf 's2000000\nn10\n' > /var/log/mdma-klog/config
+exec svlogd -tt /var/log/mdma-klog

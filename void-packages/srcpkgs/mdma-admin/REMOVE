@@ -1,0 +1,11 @@
+#!/bin/sh
+# REMOVE script for mdma-admin package
+# $1 = action (pre/post), $2 = pkgname, $3 = version, $4 = "yes" if upgrade
+case "$1" in
+post)
+    # Drop the service links (not on upgrade). acpid and the logs are left alone.
+    if [ "$4" != "yes" ]; then
+        rm -f /var/service/mdma-klog /var/service/mdma-admin
+    fi
+    ;;
+esac
