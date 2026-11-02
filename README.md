@@ -172,7 +172,7 @@ Copy `scripts/install-mdma-macos.sh` from this repo to your Mac and run it. It r
 bash install-mdma-macos.sh
 
 # Install a specific tag
-bash install-mdma-macos.sh v0.28.2
+bash install-mdma-macos.sh v0.29.0
 
 # Install to a user-writable location (no sudo)
 MDMA_INSTALL_DIR=~/.local/bin bash install-mdma-macos.sh
@@ -190,6 +190,20 @@ cp profiles/dev/target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.29.0
+
+### The beacon reuses the installed system's wifi (#72)
+
+With no ethernet, the beacon now borrows the wifi of the installed system, so service mode, recovery and reinstall work on wifi-only units without a cable. It mounts the root partition read-only, never touches `/music`, and never touches the NVMe at all when ethernet is linked. The wifi config is copied verbatim into tmpfs, so a 5 GHz `freq_list` pin survives, and credentials never land on the SD card. The UI shows the network source and warns about provisioning over wifi (#69).
+
+Reinstall, Wipe all, and Preserve with a reformatted root keep the current wifi settings when the wifi fields are left blank on such a beacon. To provision without wifi, boot the beacon with ethernet attached.
+
+The beacon package now depends on wpa_supplicant, dhcpcd, iw and wireless-regdb, and ships a `beacon-wifi` service (log in `/var/log/beacon-wifi`).
+
+Existing beacon SD cards: self-update installs the dependencies and enables `beacon-wifi`. Older images may lack the Pi 5 wifi firmware (from `rpi-firmware`). If `/usr/lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,5-model-b.bin` is missing, install `rpi-firmware` or flash a new image. See CHANGELOG.md.
 
 ---
 
