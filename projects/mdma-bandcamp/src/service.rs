@@ -8,7 +8,7 @@ use crate::ipc::{
     DownloadId, DownloadState, DownloadStatus, IpcServer, SourceError, SourceRequest,
     SourceResponse, SourceStatus,
 };
-use bandcamp_api::{AudioFormat, BandcampClient, CollectionItem};
+use bandcamp_api::{AudioFormat, BandcampClient, CollectionItem, CookieJar};
 use library_ipc_client::{
     InboxPath, IngestSource, LibraryClient, MusicValue, TrackInfo, TrackQuery,
 };
@@ -70,6 +70,36 @@ impl InternalDownloadState {
     }
 }
 
+/// Message returned to clients while no usable cookie file exists.
+const NOT_CONFIGURED_MESSAGE: &str = "Bandcamp not configured: upload cookies via the web console.";
+
+/// Whether a usable cookie file is present.
+///
+/// The cookie file is re-checked on demand, so uploading cookies (which also
+/// restarts this service) never requires polling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CookieState {
+    Configured,
+    NotConfigured { reason: String },
+}
+
+impl From<Result<CookieJar, bandcamp_api::BandcampError>> for CookieState {
+    fn from(loaded: Result<CookieJar, bandcamp_api::BandcampError>) -> Self {
+        match loaded {
+            Ok(_) => Self::Configured,
+            Err(e) => Self::NotConfigured {
+                reason: e.to_string(),
+            },
+        }
+    }
+}
+
+fn not_configured_error() -> SourceError {
+    SourceError::NotAuthenticated {
+        message: NOT_CONFIGURED_MESSAGE.to_string(),
+    }
+}
+
 /// Download queue entry
 #[derive(Clone)]
 struct QueuedDownload {
@@ -112,8 +142,6 @@ pub struct BandcampService {
     paused: AtomicBool,
     /// Audio format to download
     format: AudioFormat,
-    /// Whether cookies are currently loaded
-    cookies_loaded: AtomicBool,
     /// Library service socket address for auto-ingest
     library_socket: String,
     /// Bandcamp username (read from cookies/config)
@@ -162,8 +190,17 @@ impl BandcampService {
         // Load cache
         let cache = DownloadCache::open(&cache_path)?;
 
-        // Check if cookies exist
-        let cookies_exist = cookie_path.exists();
+        // A missing or invalid cookie file is not fatal: stay up in the
+        // NotConfigured state (warn once) so supervisors don't crash-loop us.
+        if let CookieState::NotConfigured { reason } =
+            bandcamp_api::load_cookies(&cookie_path).into()
+        {
+            tracing::warn!(
+                path = %cookie_path.display(),
+                %reason,
+                "Bandcamp not configured: upload cookies via the web console (see bandcamp-setup.md). Running in not-configured state"
+            );
+        }
 
         Ok(Self {
             cookie_path,
@@ -178,10 +215,43 @@ impl BandcampService {
             start_time: Instant::now(),
             paused: AtomicBool::new(false),
             format,
-            cookies_loaded: AtomicBool::new(cookies_exist),
             library_socket,
             username,
         })
+    }
+
+    /// Current cookie state, re-read from disk.
+    pub fn cookie_state(&self) -> CookieState {
+        self.load_jar().into()
+    }
+
+    /// The single cookie-loading primitive: silent, re-reads the file each call.
+    fn load_jar(&self) -> Result<CookieJar, bandcamp_api::BandcampError> {
+        bandcamp_api::load_cookies(&self.cookie_path)
+    }
+
+    /// Build a Bandcamp client from the cookie file, or the not-configured error.
+    fn client(&self) -> Result<BandcampClient, SourceError> {
+        match self.load_jar() {
+            Ok(jar) => {
+                tracing::info!(path = %self.cookie_path.display(), "Loaded cookies");
+                Ok(BandcampClient::new(jar))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, path = %self.cookie_path.display(), "Failed to load cookies");
+                Err(not_configured_error())
+            }
+        }
+    }
+
+    /// The configured username, or a NotAuthenticated error explaining how to set it.
+    fn require_username(&self) -> Result<String, SourceError> {
+        self.username
+            .clone()
+            .ok_or_else(|| SourceError::NotAuthenticated {
+                message: "No username configured. Set --username or MDMA_BANDCAMP_USERNAME."
+                    .to_string(),
+            })
     }
 
     /// Try to connect to the library service
@@ -190,22 +260,6 @@ impl BandcampService {
             Ok(client) => Some(client),
             Err(e) => {
                 tracing::warn!(error = %e, socket = %self.library_socket, "Failed to connect to library");
-                None
-            }
-        }
-    }
-
-    /// Try to load the Bandcamp client from cookies
-    fn try_load_client(&self) -> Option<BandcampClient> {
-        match bandcamp_api::load_cookies(&self.cookie_path) {
-            Ok(jar) => {
-                tracing::info!(path = %self.cookie_path.display(), "Loaded cookies");
-                self.cookies_loaded.store(true, Ordering::Relaxed);
-                Some(BandcampClient::new(jar))
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, path = %self.cookie_path.display(), "Failed to load cookies");
-                self.cookies_loaded.store(false, Ordering::Relaxed);
                 None
             }
         }
@@ -222,10 +276,11 @@ impl BandcampService {
                 let status = SourceStatus {
                     name: "bandcamp".to_string(),
                     version: env!("CARGO_PKG_VERSION").to_string(),
-                    auth: if self.cookies_loaded.load(Ordering::Relaxed) {
-                        source_protocol::AuthStatus::Authenticated
-                    } else {
-                        source_protocol::AuthStatus::NotAuthenticated
+                    auth: match self.cookie_state() {
+                        CookieState::Configured => source_protocol::AuthStatus::Authenticated,
+                        CookieState::NotConfigured { .. } => {
+                            source_protocol::AuthStatus::NotAuthenticated
+                        }
                     },
                     downloads_active: self.active_downloads.lock().len(),
                     downloads_queued: self.download_queue.lock().len(),
@@ -316,23 +371,14 @@ impl BandcampService {
 
     /// Handle a forced resync of a specific item by identifier.
     async fn handle_resync(&self, identifier: String) -> SourceResponse {
-        let client = match self.try_load_client() {
-            Some(c) => c,
-            None => {
-                return SourceResponse::Error(SourceError::NotAuthenticated {
-                    message: "Cookies not loaded. Upload cookies first.".to_string(),
-                });
-            }
+        let client = match self.client() {
+            Ok(c) => c,
+            Err(e) => return SourceResponse::Error(e),
         };
 
-        let username = match &self.username {
-            Some(u) => u.clone(),
-            None => {
-                return SourceResponse::Error(SourceError::NotAuthenticated {
-                    message: "No username configured. Set --username or MDMA_BANDCAMP_USERNAME."
-                        .to_string(),
-                });
-            }
+        let username = match self.require_username() {
+            Ok(u) => u,
+            Err(e) => return SourceResponse::Error(e),
         };
 
         let collection = match client.get_collection(&username).await {
@@ -367,23 +413,14 @@ impl BandcampService {
     /// Handle a check-item request: fetch live track count from bandcamp and compare
     /// against the library's stored count for the given item identifier.
     async fn handle_check_item(&self, identifier: String) -> SourceResponse {
-        let client = match self.try_load_client() {
-            Some(c) => c,
-            None => {
-                return SourceResponse::Error(SourceError::NotAuthenticated {
-                    message: "Cookies not loaded. Upload cookies first.".to_string(),
-                });
-            }
+        let client = match self.client() {
+            Ok(c) => c,
+            Err(e) => return SourceResponse::Error(e),
         };
 
-        let username = match &self.username {
-            Some(u) => u.clone(),
-            None => {
-                return SourceResponse::Error(SourceError::NotAuthenticated {
-                    message: "No username configured. Set --username or MDMA_BANDCAMP_USERNAME."
-                        .to_string(),
-                });
-            }
+        let username = match self.require_username() {
+            Ok(u) => u,
+            Err(e) => return SourceResponse::Error(e),
         };
 
         // Fetch the collection to find the item's download URL
@@ -463,24 +500,15 @@ impl BandcampService {
     /// Username is read from the service config (no longer passed in the request).
     async fn handle_sync(&self) -> SourceResponse {
         // Try to load client (also reloads cookies)
-        let client = match self.try_load_client() {
-            Some(c) => c,
-            None => {
-                return SourceResponse::Error(SourceError::NotAuthenticated {
-                    message: "Cookies not loaded. Upload cookies first.".to_string(),
-                });
-            }
+        let client = match self.client() {
+            Ok(c) => c,
+            Err(e) => return SourceResponse::Error(e),
         };
 
         // Get username from config
-        let username = match &self.username {
-            Some(u) => u.clone(),
-            None => {
-                return SourceResponse::Error(SourceError::NotAuthenticated {
-                    message: "No username configured. Set --username or MDMA_BANDCAMP_USERNAME."
-                        .to_string(),
-                });
-            }
+        let username = match self.require_username() {
+            Ok(u) => u,
+            Err(e) => return SourceResponse::Error(e),
         };
 
         // Store the username
@@ -819,13 +847,13 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
         }
 
         // Load client for this download
-        let client = match service.try_load_client() {
-            Some(c) => c,
-            None => {
+        let client = match service.client() {
+            Ok(c) => c,
+            Err(_) => {
                 let mut active = service.active_downloads.lock();
                 if let Some(dl) = active.get_mut(&item_id) {
                     dl.state = InternalDownloadState::Failed;
-                    dl.error = Some("No authenticated client available".to_string());
+                    dl.error = Some(NOT_CONFIGURED_MESSAGE.to_string());
                 }
                 service.downloads_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
@@ -1212,6 +1240,108 @@ mod tests {
             should_skip_by_work_identity(&item, &[existing]),
             "strings differing only in case/whitespace should still match via normalize"
         );
+    }
+
+    // =========================================================================
+    // Cookie state tests
+    // =========================================================================
+
+    const VALID_COOKIES: &str =
+        r#"[{"name":"identity","value":"abc123","domain":".bandcamp.com"}]"#;
+
+    fn make_service(dir: &std::path::Path, cookies: PathBuf) -> BandcampService {
+        BandcampService::new(
+            cookies,
+            dir.join("downloads"),
+            dir.join("inbox"),
+            dir.join("cache"),
+            AudioFormat::Flac,
+            "ipc:///nonexistent/library.sock".to_string(),
+            Some("someone".to_string()),
+        )
+        .expect("service should start even without cookies")
+    }
+
+    /// Regression guard for #70: a missing cookie file must not make startup fail.
+    #[test]
+    fn new_succeeds_without_cookie_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.json");
+        let result = BandcampService::new(
+            missing,
+            dir.path().join("downloads"),
+            dir.path().join("inbox"),
+            dir.path().join("cache"),
+            AudioFormat::Flac,
+            "ipc:///nonexistent/library.sock".to_string(),
+            None,
+        );
+        let service = result.expect("missing cookie file must not fail startup");
+        assert!(matches!(
+            service.cookie_state(),
+            CookieState::NotConfigured { .. }
+        ));
+    }
+
+    #[test]
+    fn startup_with_invalid_cookie_file_is_not_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cookies.json");
+        std::fs::write(&path, "not json").unwrap();
+        let service = make_service(dir.path(), path);
+        assert!(matches!(
+            service.cookie_state(),
+            CookieState::NotConfigured { .. }
+        ));
+    }
+
+    #[rstest::rstest]
+    #[case::sync(SourceRequest::Sync)]
+    #[case::resync(SourceRequest::ResyncItem { identifier: "x".to_string() })]
+    #[case::check(SourceRequest::CheckItem { identifier: "x".to_string() })]
+    #[tokio::test]
+    async fn request_without_cookies_returns_not_configured_error(#[case] request: SourceRequest) {
+        let dir = tempfile::tempdir().unwrap();
+        let service = make_service(dir.path(), dir.path().join("missing.json"));
+        match service.handle_request(request).await {
+            SourceResponse::Error(SourceError::NotAuthenticated { message }) => {
+                assert!(message.contains("not configured"), "got: {message}");
+            }
+            other => panic!("expected NotAuthenticated error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn status_without_cookies_reports_not_authenticated() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = make_service(dir.path(), dir.path().join("missing.json"));
+        match service.handle_request(SourceRequest::GetStatus).await {
+            SourceResponse::Status(status) => {
+                assert_eq!(status.auth, source_protocol::AuthStatus::NotAuthenticated);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cookie_upload_after_startup_becomes_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cookies.json");
+        let service = make_service(dir.path(), path.clone());
+        assert!(matches!(
+            service.cookie_state(),
+            CookieState::NotConfigured { .. }
+        ));
+
+        std::fs::write(&path, VALID_COOKIES).unwrap();
+
+        assert_eq!(service.cookie_state(), CookieState::Configured);
+        match service.handle_request(SourceRequest::GetStatus).await {
+            SourceResponse::Status(status) => {
+                assert_eq!(status.auth, source_protocol::AuthStatus::Authenticated);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
     }
 
     // =========================================================================

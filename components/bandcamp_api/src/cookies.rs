@@ -29,8 +29,11 @@ struct JsonCookie {
     http_only: bool,
 }
 
+/// Shared cookie jar produced by [`load_cookies`] and consumed by `BandcampClient`.
+pub type CookieJar = Arc<Jar>;
+
 /// Load cookies from a file (auto-detects format)
-pub fn load_cookies(path: &Path) -> Result<Arc<Jar>, BandcampError> {
+pub fn load_cookies(path: &Path) -> Result<CookieJar, BandcampError> {
     let content = std::fs::read_to_string(path).map_err(|_| BandcampError::CookieFileNotFound {
         path: path.display().to_string(),
     })?;

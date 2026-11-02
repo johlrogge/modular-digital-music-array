@@ -4,6 +4,24 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.28.2] — 2026-11-02
+
+### Fixed
+
+- **mdma-bandcamp no longer crash-loops when `/etc/mdma/bandcamp-cookies.json` is missing or invalid (#70).** Previously it exited and runit restarted it every second, producing two log lines a second and constant NVMe writes on any node without a Bandcamp login. It now stays up in a "not configured" state and reports "Bandcamp not configured: upload cookies via the web console". It picks up cookies after the console upload, which restarts the service. The stale `mdma-909.local` hint is gone from the error.
+
+### Correction
+
+- **0.28.1 presented PCIe Gen1 as the fix for the NVMe dropout (#69). Further testing shows it only delayed it.** On a Pi 5 in an Argon NEO 5 M.2 case with 2.4 GHz wifi active, Gen1 (`dtparam=pciex1_gen=1`) postponed the dropout from about 1 minute to about 25 minutes. With the wifi limited to 5 GHz (`freq_list` in `wpa_supplicant.conf`), the unit has stayed stable for over an hour so far. The Gen1 setting stays. On affected hardware, prefer 5 GHz wifi or ethernet. Investigation continues in #69.
+
+### Known issues
+
+- The beacon has no DNS fallback when the router's resolver does not answer, and the startup clock-sync wait is ineffective (#68).
+- The update page may stay on "Update started" (#67).
+- The wifi SSID is free text, so typos go unnoticed (#71).
+
+---
+
 ## [0.28.1] — 2026-11-01
 
 ### Fixed

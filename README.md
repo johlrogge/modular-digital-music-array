@@ -172,7 +172,7 @@ Copy `scripts/install-mdma-macos.sh` from this repo to your Mac and run it. It r
 bash install-mdma-macos.sh
 
 # Install a specific tag
-bash install-mdma-macos.sh v0.28.1
+bash install-mdma-macos.sh v0.28.2
 
 # Install to a user-writable location (no sudo)
 MDMA_INSTALL_DIR=~/.local/bin bash install-mdma-macos.sh
@@ -190,6 +190,18 @@ cp profiles/dev/target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.28.2
+
+### mdma-bandcamp no longer crash-loops without cookies (#70)
+
+Without a valid `/etc/mdma/bandcamp-cookies.json`, mdma-bandcamp used to exit and be restarted by runit every second (two log lines a second, constant NVMe writes). It now stays up "not configured" and reports "Bandcamp not configured: upload cookies via the web console". It picks up cookies after the console upload, which restarts the service.
+
+### Correction to 0.28.1 (#69)
+
+PCIe Gen1 only delayed the NVMe dropout on 2.4 GHz wifi (about 25 minutes instead of about 1 minute). With wifi limited to 5 GHz (`freq_list` in `wpa_supplicant.conf`), the unit has stayed stable for over an hour so far. The Gen1 setting stays; on affected hardware prefer 5 GHz or ethernet. Investigation continues in #69. See CHANGELOG.md.
 
 ---
 

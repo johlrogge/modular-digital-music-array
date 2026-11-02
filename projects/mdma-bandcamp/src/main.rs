@@ -98,18 +98,9 @@ async fn main() -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Validate cookies before starting the service so failures surface immediately
-    // with an actionable message rather than obscure downstream errors.
-    if let Err(err) = bandcamp_api::load_cookies(&args.cookies) {
-        tracing::error!(
-            path = %args.cookies.display(),
-            error = %err,
-            "Bandcamp cookies not found or invalid at {} — upload via web console at http://mdma-909.local or see bandcamp-setup.md",
-            args.cookies.display(),
-        );
-        std::process::exit(1);
-    }
-
+    // Missing/invalid cookies are not fatal: BandcampService::new logs a single
+    // warning and the service stays up in the NotConfigured state. The console's
+    // cookie upload restarts this service, and cookies are re-read on demand.
     let format = parse_format(&args.format);
 
     // Initialize service

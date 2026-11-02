@@ -33,6 +33,7 @@ zip = "2"
 
 [dev-dependencies]
 pretty_assertions = "1"
+rstest = "0.26"
 tempfile = "3"
 library-service-stub = { workspace = true }
 music-facts = { workspace = true }
