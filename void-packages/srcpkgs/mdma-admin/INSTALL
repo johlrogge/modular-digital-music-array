@@ -11,9 +11,23 @@ post)
         mkdir -p /var/service
     fi
     if [ ! -e /var/service/mdma-admin ]; then
-        ln -sf /etc/sv/mdma-admin /var/service/mdma-admin
-        echo "mdma-admin service enabled"
+        if ln -sfn /etc/sv/mdma-admin /var/service/mdma-admin; then
+            echo "mdma-admin service enabled"
+        fi
     fi
+
+    # Enable acpid (power key) and mdma-klog (persistent kernel log), also on
+    # upgrades. Never restarted here: restarting mdma-klog replays the ring
+    # buffer and would duplicate the log.
+    # To disable these services lastingly, touch /etc/sv/<svc>/down: upgrades
+    # re-link a /var/service link that was removed.
+    for svc in acpid mdma-klog; do
+        if [ -d "/etc/sv/$svc" ] && [ ! -e "/var/service/$svc" ] && [ ! -L "/var/service/$svc" ]; then
+            if ln -sfn "/etc/sv/$svc" "/var/service/$svc"; then
+                echo "$svc service enabled"
+            fi
+        fi
+    done
 
     # On upgrade, restart only if the service is currently running
     if [ "$4" = "yes" ]; then

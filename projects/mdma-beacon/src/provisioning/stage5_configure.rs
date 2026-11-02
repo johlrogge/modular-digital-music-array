@@ -735,16 +735,33 @@ exec chpst -P -u _pipewire:_pipewire:audio:video pipewire
 }
 
 /// Non-MDMA runit services that are always enabled.
-const BASE_SERVICES: [&str; 5] = ["sshd", "dhcpcd", "dbus", "avahi-daemon", "pipewire"];
+///
+/// `acpid` is installed via mdma-admin's `depends` and `pipewire` via
+/// mdma-audio's. They are enabled here but deliberately not listed in
+/// `install_packages`, so there is one source of truth for packages.
+const BASE_SERVICES: [&str; 6] = [
+    "sshd",
+    "dhcpcd",
+    "dbus",
+    "avahi-daemon",
+    "pipewire",
+    "acpid",
+];
+
+/// Extra services shipped inside `TARGET_PACKAGES` (`mdma-klog` comes from
+/// `mdma-admin`). These are service names, not package names.
+const EXTRA_PACKAGE_SERVICES: [&str; 1] = ["mdma-klog"];
 
 /// The runit services to enable: the base services, every MDMA package (each
-/// `TARGET_PACKAGES` entry is also its service name), and `wpa_supplicant` only
+/// `TARGET_PACKAGES` entry is also its service name), the extra services
+/// shipped inside those packages, and `wpa_supplicant` only
 /// when wifi is written. `KeepExisting` and `Nothing` neither enable nor
 /// disable it.
 fn services_to_enable(wifi: &WifiAction<'_>) -> Vec<&'static str> {
     let mut services: Vec<&'static str> = BASE_SERVICES
         .iter()
         .chain(TARGET_PACKAGES.iter())
+        .chain(EXTRA_PACKAGE_SERVICES.iter())
         .copied()
         .collect();
     if matches!(wifi, WifiAction::Write(_)) {
@@ -1811,6 +1828,13 @@ mod tests {
             .filter(|s| *s != "wpa_supplicant")
             .collect();
         assert_eq!(filtered, without);
+    }
+
+    #[test]
+    fn services_to_enable_always_includes_acpid_and_klog() {
+        let services = services_to_enable(&WifiAction::Nothing);
+        assert!(services.contains(&"acpid"));
+        assert!(services.contains(&"mdma-klog"));
     }
 
     #[tokio::test]
