@@ -58,6 +58,10 @@ mdma rekordbox import --enrich rekordbox.xml
 # Export memory cues back to Rekordbox (MDMA never writes beat grids back)
 mdma rekordbox export --output rekordbox-out.xml
 
+# List your Bandcamp playlists and import one (preview with --dry-run) — new in 0.32.0
+mdma bandcamp playlists
+mdma bandcamp import-playlist my-playlist --dry-run
+
 # Subscribe to live events (now playing, queue changes)
 mdma subscribe
 ```
@@ -108,9 +112,9 @@ This is a [Polylith](https://polylith.gitbook.io/polylith/) workspace. Deployabl
 | `mdma-playback` | Queue manager — drives audio sources via StreamClient; persists queue to `/metadata/queue.json` |
 | `mdma-audio` | Audio playback source — wraps PlaybackEngine (Symphonia + rubato + PipeWire), speaks `stream_source_protocol` over NNG |
 | `mdma-tui` | Terminal UI — multi-pane tabs (nnn-style, `1`–`5`/`6`–`0`), field-aware search grammar (`:artist`, `:bpm`, `:added`, …), DJ shortcuts (`A`, `P`, `d`/`p`, `u`), modal keybindings, command palette, live queue sync, intelligent column compression |
-| `mdma-bandcamp` | Bandcamp collection sync — downloads purchases into the library inbox |
+| `mdma-bandcamp` | Bandcamp source — collection sync into the library inbox, and fan playlist listing/fetching for `mdma bandcamp` |
 | `mdma-console` | Web management console — player controls, search, queue, upload, export |
-| `mdma-cli` | CLI — search, queue, playlists, playback, export, subscribe, bookmarks, shell completions |
+| `mdma-cli` | CLI — search, queue, playlists, playback, export, subscribe, bookmarks, Bandcamp playlist import, shell completions |
 | `dj-workspace` | Bevy GUI app (laptop-only, not packaged for Pi) — playlist browser and BPM/Key/Role/Energy candidate finder with sortable results; connects via gateway (`dj-workspace --node <host>`) |
 
 **Key components** (shared libraries):
@@ -180,7 +184,7 @@ Copy `scripts/install-mdma-macos.sh` from this repo to your Mac and run it. It r
 bash install-mdma-macos.sh
 
 # Install a specific tag
-bash install-mdma-macos.sh v0.31.0
+bash install-mdma-macos.sh v0.32.0
 
 # Install to a user-writable location (no sudo)
 MDMA_INSTALL_DIR=~/.local/bin bash install-mdma-macos.sh
@@ -198,6 +202,22 @@ cp profiles/dev/target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.32.0
+
+### Bandcamp playlist import
+
+`mdma bandcamp playlists` lists your Bandcamp fan playlists, private ones included. `mdma bandcamp import-playlist <slug-or-url> [--name N] [--dry-run]` imports one into an MDMA playlist in the same order, matching tracks against the library by artist, title and duration.
+
+It prints a per-track report: `✓` matched, `?` ambiguous or duration differs (not written), `✗` not in library. It warns if fewer tracks were fetched than the playlist has, and aborts without writing if a library lookup fails. Re-running replaces the playlist, including manual edits. The Bandcamp service fetches through the Pi's stored cookies and accepts only https bandcamp.com URLs.
+
+The source protocol gains `ListPlaylists` and `GetPlaylist` requests and an `Unsupported` error. mdma-bandcamp now answers unparseable requests with an error instead of stalling the gateway. The rekordbox and Bandcamp imports share playlist writing, which only replaces on "already exists" and no longer silently drops tracks on a lookup failure.
+
+**Upgrade notes:** mdma-gateway, mdma-bandcamp and the CLI must all be 0.32.0; older gateways reject the new requests. The `mdma bandcamp` commands use a 30 s CLI timeout but the gateway caps source requests at 10 s and is blocked while one runs, so don't run imports or syncs during playback (#81). Units provisioned before 0.26.1 that haven't run migrate-bootfs: name the mdma-* packages explicitly, never a bare `xbps-install -Su`.
+
+**Known issues:** long source operations block the gateway (#81); avahi renames the node to `-2` when ethernet and wifi share a subnet (#80); wifi association delays after boot (#79); Argon NEO 5 + wifi NVMe instability (#74, #69). See CHANGELOG.md.
 
 ---
 

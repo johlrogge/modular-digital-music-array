@@ -4,6 +4,47 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.32.0] — 2026-11-02
+
+### Added
+
+- **Bandcamp playlist import.**
+  - `mdma bandcamp playlists` lists your Bandcamp fan playlists, private ones included.
+  - `mdma bandcamp import-playlist <slug-or-url> [--name N] [--dry-run]` imports a playlist into an MDMA playlist, in the same order.
+  - Tracks are matched against the library by artist, title and duration.
+  - A per-track report is printed: `✓` matched, `?` ambiguous or duration differs (not written), `✗` not in library.
+  - It warns if fewer tracks were fetched than the playlist has.
+  - It aborts without writing if a library lookup fails.
+  - Re-running replaces the playlist, including manual edits.
+  - The Bandcamp service fetches through the Pi's stored cookies. Only https bandcamp.com URLs are accepted.
+
+### Changed
+
+- **Source protocol.** New `ListPlaylists` and `GetPlaylist` requests and an `Unsupported` error.
+- **mdma-bandcamp** answers unparseable requests with an error instead of stalling the gateway.
+- **Shared playlist writing** for the rekordbox and Bandcamp imports. It only replaces on "already exists", and a lookup failure no longer silently drops tracks.
+
+### Internal
+
+- Fixed Rust 1.99 clippy lints across the workspace (#62). The workspace is clippy-clean with all targets.
+
+### Known issues
+
+- Long source operations block the gateway (#81).
+- Avahi renames the node to `-2` when ethernet and wifi share a subnet (#80).
+- Wifi association is delayed after boot (#79).
+- Argon NEO 5 with wifi shows NVMe instability (#74, #69; see the research in #69).
+
+### Upgrade notes
+
+mdma-gateway, mdma-bandcamp and the CLI must all be 0.32.0. The gateway parses source messages, so older gateways reject the new requests.
+
+The `mdma bandcamp` commands use a 30 s CLI timeout, but the gateway caps source requests at 10 s, and the gateway is blocked while a request runs. Don't run imports or syncs during playback (#81).
+
+Units provisioned before 0.26.1 that haven't run migrate-bootfs: upgrade by naming the mdma-* packages explicitly, never a bare `xbps-install -Su`.
+
+---
+
 ## [0.31.0] — 2026-11-02
 
 ### Added
