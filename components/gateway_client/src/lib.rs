@@ -5,7 +5,9 @@
 
 pub use acid_protocol::{AcidRequest, AcidResponse};
 pub use admin_ipc_protocol::{AdminRequest, AdminResponse};
-pub use gateway_protocol::{GatewayRequest, GatewayResponse, SourceName};
+pub use gateway_protocol::{
+    is_unsupported_request, GatewayRequest, GatewayResponse, NodeIdentity, SourceName,
+};
 pub use library_ipc_protocol::{LibraryRequest, LibraryResponse};
 pub use media_protocol::{Command, Response};
 pub use source_protocol::{SourceRequest, SourceResponse};
@@ -15,6 +17,29 @@ pub use source_protocol::{SourceRequest, SourceResponse};
 /// This is an alias for [`nng_transport::NngClientError`]. The `Service` variant
 /// carries gateway-level error messages.
 pub type ClientError = nng_transport::NngClientError;
+
+/// Errors from [`GatewayClient::identify`].
+#[derive(Debug, thiserror::Error)]
+pub enum IdentifyError {
+    /// The gateway is too old to understand the identify request.
+    #[error("gateway does not support identify: {0}")]
+    Unsupported(String),
+    /// Transport failure or any other error.
+    #[error(transparent)]
+    Client(#[from] ClientError),
+}
+
+/// Map a gateway response to an identity result.
+fn identity_from_response(response: GatewayResponse) -> Result<NodeIdentity, IdentifyError> {
+    match response {
+        GatewayResponse::Identity { identity } => Ok(identity),
+        GatewayResponse::Error { message } if is_unsupported_request(&message) => {
+            Err(IdentifyError::Unsupported(message))
+        }
+        GatewayResponse::Error { message } => Err(ClientError::Service(message).into()),
+        _ => Err(ClientError::Service("Unexpected response type for identify".to_string()).into()),
+    }
+}
 
 /// Client for connecting to the API gateway.
 pub struct GatewayClient {
@@ -27,6 +52,18 @@ impl GatewayClient {
     /// Supports both IPC and TCP addresses.
     pub fn connect(address: &str) -> Result<Self, ClientError> {
         let socket = nng_transport::connect(address)?;
+        Ok(Self { socket })
+    }
+
+    /// Connect without waiting, with every request bounded by `timeout`.
+    ///
+    /// For probing whether a gateway answers: an unreachable address surfaces
+    /// as a timeout on the first request rather than blocking here.
+    pub fn connect_with_timeout(
+        address: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Self, ClientError> {
+        let socket = nng_transport::connect_with_timeout(address, timeout)?;
         Ok(Self { socket })
     }
 
@@ -130,6 +167,20 @@ impl GatewayClient {
         }
     }
 
+    // =========================================================================
+    // Identity
+    // =========================================================================
+
+    /// Ask the gateway which node it runs on.
+    ///
+    /// Returns [`IdentifyError::Unsupported`] for gateways that predate the
+    /// identify request, and [`IdentifyError::Client`] for transport and other
+    /// errors.
+    pub fn identify(&self) -> Result<NodeIdentity, IdentifyError> {
+        let response = self.request(&GatewayRequest::Identify)?;
+        identity_from_response(response)
+    }
+
     /// List available music sources.
     pub fn list_sources(&self) -> Result<Vec<SourceName>, ClientError> {
         match self.request(&GatewayRequest::ListSources)? {
@@ -139,5 +190,59 @@ impl GatewayClient {
                 "Unexpected response type for list_sources".to_string(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity() -> NodeIdentity {
+        NodeIdentity {
+            id: Some("mdma-stage".to_string()),
+            name: Some("mdma-stage".to_string()),
+            version: "0.29.0".to_string(),
+            proto: 1,
+        }
+    }
+
+    #[test]
+    fn identity_response_is_returned() {
+        let got = identity_from_response(GatewayResponse::Identity {
+            identity: identity(),
+        })
+        .unwrap();
+        assert_eq!(got, identity());
+    }
+
+    #[test]
+    fn old_gateway_parse_error_is_unsupported() {
+        let response = GatewayResponse::Error {
+            message: "Invalid request: unknown variant `identify`".to_string(),
+        };
+        assert!(matches!(
+            identity_from_response(response),
+            Err(IdentifyError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn other_gateway_error_is_client_error() {
+        let response = GatewayResponse::Error {
+            message: "library service unreachable".to_string(),
+        };
+        assert!(matches!(
+            identity_from_response(response),
+            Err(IdentifyError::Client(ClientError::Service(_)))
+        ));
+    }
+
+    #[test]
+    fn unexpected_response_is_client_error() {
+        let response = GatewayResponse::Sources { names: vec![] };
+        assert!(matches!(
+            identity_from_response(response),
+            Err(IdentifyError::Client(_))
+        ));
     }
 }

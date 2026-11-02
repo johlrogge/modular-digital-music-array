@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "bevy-app"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "bevy",
  "bevy_egui",
@@ -2446,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "boot-health"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "pretty_assertions",
  "serde",
@@ -3636,7 +3636,7 @@ checksum = "c9c272297e804878a2a4b707cfcfc6d2328b5bb936944613b4fdf2b9269afdfd"
 
 [[package]]
 name = "dj-workspace"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "bevy-app",
  "clap",
@@ -4016,6 +4016,17 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+]
+
+[[package]]
+name = "flume"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da0e4dd2a88388a1f4ccc7c9ce104604dab68d9f408dc34cd45823d5a9069095"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "spin 0.9.8",
 ]
 
 [[package]]
@@ -5058,6 +5069,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "if-addrs"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69b2eeee38fef3aa9b4cc5f1beea8a2444fc00e7377cafae396de3f5c2065e24"
+dependencies = [
+ "libc",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "ignore"
 version = "0.4.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5805,7 +5826,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "mdma-acid"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "acid-service",
  "clap",
@@ -5819,7 +5840,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-admin"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "admin-ipc-protocol",
  "boot-health",
@@ -5838,7 +5859,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-audio"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "clap",
  "color-eyre",
@@ -5859,7 +5880,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-bandcamp"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "bandcamp-api",
  "chrono",
@@ -5914,7 +5935,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-beacon"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "askama",
  "async-stream",
@@ -5946,7 +5967,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-cli"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "audio-transcoder",
  "chrono",
@@ -5965,6 +5986,7 @@ dependencies = [
  "music-facts",
  "nng",
  "nng-transport",
+ "node-discovery",
  "pretty_assertions",
  "rekordbox-roundtrip",
  "rekordbox-xml",
@@ -5998,7 +6020,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-console"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "admin-ipc-protocol",
  "askama",
@@ -6035,7 +6057,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-gateway"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "acid-protocol",
  "clap",
@@ -6055,7 +6077,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-library"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "clap",
  "color-eyre",
@@ -6068,7 +6090,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-playback"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "acid-client",
  "clap",
@@ -6092,7 +6114,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-tui"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "clap",
  "client",
@@ -6113,6 +6135,20 @@ dependencies = [
  "tracing-subscriber",
  "track-formatter",
  "tui-base",
+]
+
+[[package]]
+name = "mdns-sd"
+version = "0.13.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "328f4e1041f7cfeb3affccb814ddbe2f004856a2ce769c8bf22080d74c5204c6"
+dependencies = [
+ "fastrand",
+ "flume",
+ "if-addrs",
+ "log",
+ "mio 1.2.0",
+ "socket2 0.5.10",
 ]
 
 [[package]]
@@ -6415,6 +6451,21 @@ name = "no-std-compat"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b93853da6d84c2e3c7d730d6473e8817692dd89be387eb01b94d7f108ecb5b8c"
+
+[[package]]
+name = "node-discovery"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "mdns-sd",
+ "private-file",
+ "rstest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+]
 
 [[package]]
 name = "nohash-hasher"
@@ -7537,7 +7588,7 @@ dependencies = [
 
 [[package]]
 name = "private-file"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "tempfile",
 ]
@@ -8141,7 +8192,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-eeprom"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "tempfile",
  "thiserror 1.0.69",
@@ -8796,6 +8847,9 @@ name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+dependencies = [
+ "lock_api",
+]
 
 [[package]]
 name = "spin"
@@ -10606,7 +10660,7 @@ dependencies = [
 
 [[package]]
 name = "wifi-config"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "pbkdf2",
  "proptest",

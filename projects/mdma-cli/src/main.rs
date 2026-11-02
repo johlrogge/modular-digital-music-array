@@ -2,8 +2,10 @@
 //!
 //! Connects to services via gateway (single address) or direct IPC.
 
+mod node;
+
 use chrono::NaiveDate;
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use color_eyre::Result;
 use colored::Colorize;
 use event_protocol::{from_topic_message, PlaybackEvent, TOPIC_PLAYBACK};
@@ -38,9 +40,14 @@ use track_matcher::{CandidateTrack, MatchResult, TrackLookup};
 #[command(name = "mdma")]
 #[command(author, version, about = "MDMA CLI - Control the music services")]
 struct Cli {
-    /// Node hostname (e.g. mdma-909.local). Derives gateway addresses automatically.
-    #[arg(long, env = "MDMA_NODE")]
+    /// Node hostname (e.g. mdma-909.local), optionally with a port. Also read from
+    /// MDMA_NODE. Without either, the remembered or discovered node is used.
+    #[arg(long)]
     node: Option<String>,
+
+    /// The node resolved at startup (not a flag).
+    #[arg(skip)]
+    target: Option<node_discovery::Target>,
 
     /// Library IPC socket address (direct mode, ignored when --node is set)
     #[arg(
@@ -369,6 +376,37 @@ enum Commands {
         #[command(subcommand)]
         command: AdminCommands,
     },
+
+    /// Find and choose the MDMA node to talk to
+    Node {
+        #[command(subcommand)]
+        command: NodeCommands,
+    },
+}
+
+impl Commands {
+    /// Whether the command talks to a node, so one has to be resolved first.
+    fn needs_node(&self) -> bool {
+        !matches!(
+            self,
+            Commands::Node { .. } | Commands::GenerateCompletions { .. }
+        )
+    }
+}
+
+#[derive(Subcommand, Debug)]
+enum NodeCommands {
+    /// List MDMA nodes on the network (* marks the remembered node)
+    List,
+    /// Remember a node (by name or id; prompts when omitted)
+    Select {
+        /// Node name or id
+        name: Option<String>,
+    },
+    /// Forget the remembered node
+    Forget,
+    /// Show which node commands would use, and why
+    Show,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -880,26 +918,17 @@ enum FactCommands {
 // Gateway Resolution Helpers
 // =============================================================================
 
-/// Resolve the effective gateway address.
-/// Derived from `--node` / `MDMA_NODE` (already in `cli.node` via clap): `tcp://<node>:5555`
-/// Returns `None` when `--node` is not set — caller falls back to direct IPC.
+/// Resolve the effective gateway address from the node resolved at startup:
+/// `tcp://<ip>:<port>`.
+/// Returns `None` for local IPC — caller falls back to direct IPC.
 fn resolve_gateway(cli: &Cli) -> Option<String> {
-    client::ClientConfig {
-        node: cli.node.clone(),
-        ..Default::default()
-    }
-    .gateway_addr()
+    node::client_config(cli.target.as_ref()).gateway_addr()
 }
 
-/// Resolve the effective event gateway address.
-/// Derived from `--node` / `MDMA_NODE`: `tcp://<node>:5556`
-/// Returns `None` when `--node` is not set.
+/// Resolve the effective event gateway address: `tcp://<ip>:5556`.
+/// Returns `None` for local IPC.
 fn resolve_event_gateway(cli: &Cli) -> Option<String> {
-    client::ClientConfig {
-        node: cli.node.clone(),
-        ..Default::default()
-    }
-    .event_addr()
+    node::client_config(cli.target.as_ref()).event_addr()
 }
 
 // =============================================================================
@@ -953,10 +982,12 @@ fn connect_source(cli: &Cli, name: &str) -> SourceClient {
 
 /// Connect to the admin service via gateway.
 ///
-/// Exits with a message when the gateway address cannot be derived (--node not set).
+/// Exits with a message when there is no gateway to connect to (local IPC).
 fn connect_admin(cli: &Cli) -> GatewayClient {
     let gateway = resolve_gateway(cli).unwrap_or_else(|| {
-        eprintln!("error: --node (or MDMA_NODE) is required for admin commands");
+        eprintln!(
+            "error: admin commands need a gateway; use --node (or MDMA_NODE) to name the node"
+        );
         std::process::exit(1);
     });
     match GatewayClient::connect(&gateway) {
@@ -1277,7 +1308,7 @@ fn handle_fact_add(
     let content_hash = ContentHash::new(hash.clone());
     match client.write_fact(&content_hash, music_value) {
         Ok(()) => {
-            println!("Added fact for {}: {:?} = {}", &hash, field, value);
+            println!("Added fact for {}: {:?} = {}", hash, field, value);
             Ok(())
         }
         Err(e) => handle_error(e),
@@ -1300,7 +1331,7 @@ fn handle_fact_retract(
     let content_hash = ContentHash::new(hash.clone());
     match client.retract_fact(&content_hash, music_value) {
         Ok(()) => {
-            println!("Retracted fact for {}: {:?} = {}", &hash, field, value);
+            println!("Retracted fact for {}: {:?} = {}", hash, field, value);
             Ok(())
         }
         Err(e) => handle_error(e),
@@ -3235,12 +3266,6 @@ fn print_event_human(event: &PlaybackEvent, library: Option<&LibraryBackend>) {
 // Upload Command Handler
 // =============================================================================
 
-/// Extract hostname from a gateway address like `tcp://mdma-909.local:5555`.
-fn extract_hostname(gateway: &str) -> Option<&str> {
-    let after_scheme = gateway.strip_prefix("tcp://")?;
-    after_scheme.split(':').next()
-}
-
 /// Expand `~` to the user's home directory.
 fn expand_tilde(path: &str) -> std::path::PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
@@ -3297,19 +3322,11 @@ fn handle_upload(
         std::process::exit(1);
     }
 
-    // 2. Extract hostname from gateway (derived from --node / MDMA_NODE)
-    let gateway_resolved = match resolve_gateway(cli) {
-        Some(gw) => gw,
+    // 2. Host to scp to: the resolved node, by IP when known
+    let hostname = match node::remote_host(cli.target.as_ref()) {
+        Some((host, ip)) => ip.map_or(host, |ip| ip.to_string()),
         None => {
             eprintln!("Upload requires --node or MDMA_NODE to determine the Pi hostname");
-            std::process::exit(1);
-        }
-    };
-
-    let hostname = match extract_hostname(&gateway_resolved) {
-        Some(h) => h.to_string(),
-        None => {
-            eprintln!("Cannot parse hostname from gateway: {}", gateway_resolved);
             std::process::exit(1);
         }
     };
@@ -3483,14 +3500,14 @@ fn parse_hash_from_line(line: &str) -> Option<String> {
     None
 }
 
-/// Require `--node` / `MDMA_NODE` to be set and return the hostname.
+/// Require a remote node and return its hostname and, when known, its IP.
 ///
-/// Prints an error and exits if the node is absent or empty.
-fn require_node(cli: &Cli) -> String {
-    match cli.node.as_deref() {
-        Some(n) if !n.is_empty() => n.to_string(),
-        _ => {
-            eprintln!("MDMA_NODE is not set.");
+/// Prints an error and exits when the CLI talks to local services over IPC.
+fn require_node(cli: &Cli) -> (String, Option<std::net::Ipv4Addr>) {
+    match node::remote_host(cli.target.as_ref()) {
+        Some(remote) => remote,
+        None => {
+            eprintln!("No remote node to talk to.");
             eprintln!(
                 "Set --node or MDMA_NODE to the hostname of your MDMA device (e.g. mdma-909.local)"
             );
@@ -3501,22 +3518,28 @@ fn require_node(cli: &Cli) -> String {
 
 /// Build the shared blocking HTTP client used by export handlers.
 ///
-/// Resolves `node` to an IPv4 address (using avahi for `.local` hostnames) and
-/// pins that address via `resolve_to_addrs` so the request succeeds even in
-/// environments where mDNS is not wired into the system resolver (e.g.
+/// Pins the node's known IPv4 address via `resolve_to_addrs`; without one,
+/// resolves `node` (using avahi for `.local` hostnames) so the request succeeds
+/// even in environments where mDNS is not wired into the system resolver (e.g.
 /// Nix-glibc).  HTTP on port 80 is used; the URL hostname is kept as-is so
 /// virtual-host routing on the server side is unaffected.
-fn build_http_client(node: &str) -> Result<reqwest::blocking::Client> {
+fn build_http_client(
+    node: &str,
+    known_ip: Option<std::net::Ipv4Addr>,
+) -> Result<reqwest::blocking::Client> {
     use std::net::{IpAddr, SocketAddr};
 
-    let ip_str = nng_transport::resolve_hostname_to_ipv4(node).map_err(|e| {
-        color_eyre::eyre::eyre!(
-            "Failed to resolve '{}' to an IP address: {}. \
-             Try passing an explicit IP with --node <ip>.",
-            node,
-            e
-        )
-    })?;
+    let ip_str = match known_ip {
+        Some(ip) => ip.to_string(),
+        None => nng_transport::resolve_hostname_to_ipv4(node).map_err(|e| {
+            color_eyre::eyre::eyre!(
+                "Failed to resolve '{}' to an IP address: {}. \
+                 Try passing an explicit IP with --node <ip>.",
+                node,
+                e
+            )
+        })?,
+    };
     let ip: IpAddr = ip_str.parse().map_err(|e| {
         color_eyre::eyre::eyre!("Resolved address '{}' is not a valid IP: {}", ip_str, e)
     })?;
@@ -3779,7 +3802,7 @@ fn handle_rekordbox_export(
     use std::collections::HashSet;
     use std::io::BufRead;
 
-    let node = require_node(cli);
+    let (node, node_ip) = require_node(cli);
 
     // Collect hashes per playlist, or from stdin when no playlists given.
     //
@@ -3842,7 +3865,7 @@ fn handle_rekordbox_export(
         std::process::exit(1);
     }
 
-    let http = build_http_client(&node)?;
+    let http = build_http_client(&node, node_ip)?;
 
     // Create output directory early so we can canonicalise it for stable paths
     if let Err(e) = std::fs::create_dir_all(output) {
@@ -4653,7 +4676,7 @@ fn handle_export(
 ) -> Result<()> {
     use std::io::BufRead;
 
-    let node = require_node(cli);
+    let (node, node_ip) = require_node(cli);
 
     // Read hashes from stdin
     let raw_hashes: Vec<String> = std::io::stdin()
@@ -4677,7 +4700,7 @@ fn handle_export(
         std::process::exit(1);
     }
 
-    let http = build_http_client(&node)?;
+    let http = build_http_client(&node, node_ip)?;
 
     let results = download_tracks(&node, &tracks, output, &http, |track| {
         resolve_export_format(
@@ -4967,10 +4990,32 @@ fn generate_completions(shell: clap_complete::Shell, out: &mut dyn std::io::Writ
 // Main
 // =============================================================================
 
+/// Whether `--socket` / `--playback-socket` (or `MDMA_LIBRARY_SOCKET` /
+/// `MDMA_PLAYBACK_SOCKET`) were given, as opposed to left at their defaults.
+/// `--sources-dir` / `MDMA_SOURCES_DIR` is deliberately not considered: it
+/// only locates source sockets and says nothing about the library or playback.
+fn sockets_given(matches: &clap::ArgMatches) -> bool {
+    ["socket", "playback_socket"].iter().any(|id| {
+        matches
+            .value_source(id)
+            .is_some_and(|s| s != clap::parser::ValueSource::DefaultValue)
+    })
+}
+
 fn main() -> Result<()> {
     color_eyre::install()?;
 
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+
+    let library_socket = cli.socket.strip_prefix("ipc://").unwrap_or(&cli.socket);
+    let local_ipc =
+        node::local_ipc_wanted(sockets_given(&matches), Path::new(library_socket).exists());
+
+    // Resolve the node once, and only for commands that talk to one.
+    if cli.command.needs_node() {
+        cli.target = Some(node::resolve_startup(cli.node.as_deref(), local_ipc));
+    }
 
     // Dispatch command - connect to appropriate service based on command
     match &cli.command {
@@ -5175,11 +5220,11 @@ fn main() -> Result<()> {
             handle_sort(&client, field.clone(), *ascending, *descending)
         }
         Commands::Subscribe { topic } => {
-            // Resolve event gateway from --node / MDMA_NODE (tcp://<node>:5556)
+            // Event gateway of the resolved node (tcp://<ip>:5556)
             let addr = match resolve_event_gateway(&cli) {
                 Some(a) => a,
                 None => {
-                    eprintln!("No node specified.");
+                    eprintln!("Subscribe needs a remote node.");
                     eprintln!("Set --node or MDMA_NODE to the hostname of your MDMA device");
                     std::process::exit(1);
                 }
@@ -5300,6 +5345,13 @@ fn main() -> Result<()> {
             handle_view(&lib, columns)
         }
 
+        Commands::Node { command } => match command {
+            NodeCommands::List => node::handle_list(),
+            NodeCommands::Select { name } => node::handle_select(name.as_deref()),
+            NodeCommands::Forget => node::handle_forget(),
+            NodeCommands::Show => node::handle_show(cli.node.as_deref(), local_ipc),
+        },
+
         Commands::Admin { command } => {
             let admin = connect_admin(&cli);
             match command {
@@ -5357,31 +5409,106 @@ mod tests {
     }
 
     #[test]
-    fn resolve_gateway_uses_cli_node_field() {
-        // When cli.node is set, resolve_gateway derives tcp://<node>:5555
+    fn resolve_gateway_uses_resolved_target() {
+        // The resolved target's IP and port give the gateway address
         let cli = Cli {
-            node: Some("mdma-909.local".to_string()),
-            socket: "ipc:///run/mdma/library.sock".to_string(),
-            playback_socket: "ipc:///run/mdma/playback.sock".to_string(),
-            sources_dir: "/run/mdma/sources".to_string(),
-            command: Commands::Ping,
+            target: Some(node_discovery::Target::Remote(
+                node_discovery::RemoteTarget {
+                    host: "mdma-909.local".to_string(),
+                    ip: Some(std::net::Ipv4Addr::new(192, 168, 0, 9)),
+                    port: 5555,
+                    source: node_discovery::Source::Cache,
+                },
+            )),
+            ..cli_with_target(None)
         };
-        let result = resolve_gateway(&cli);
-        assert_eq!(result, Some("tcp://mdma-909.local:5555".to_string()));
+        assert_eq!(
+            resolve_gateway(&cli),
+            Some("tcp://192.168.0.9:5555".to_string())
+        );
+        assert_eq!(
+            resolve_event_gateway(&cli),
+            Some("tcp://192.168.0.9:5556".to_string())
+        );
     }
 
     #[test]
-    fn resolve_gateway_returns_none_when_node_unset() {
-        // When cli.node is None, resolve_gateway returns None
-        let cli = Cli {
+    fn resolve_gateway_returns_none_when_no_target() {
+        // No resolved target (local IPC) means no gateway
+        let cli = cli_with_target(None);
+        assert_eq!(resolve_gateway(&cli), None);
+        assert_eq!(resolve_event_gateway(&cli), None);
+    }
+
+    fn cli_with_target(target: Option<node_discovery::Target>) -> Cli {
+        Cli {
             node: None,
+            target,
             socket: "ipc:///run/mdma/library.sock".to_string(),
             playback_socket: "ipc:///run/mdma/playback.sock".to_string(),
             sources_dir: "/run/mdma/sources".to_string(),
             command: Commands::Ping,
+        }
+    }
+
+    #[test]
+    fn node_commands_do_not_need_a_resolved_node() {
+        let node_cmd = Commands::Node {
+            command: NodeCommands::List,
         };
-        let result = resolve_gateway(&cli);
-        assert_eq!(result, None);
+        assert!(!node_cmd.needs_node());
+        assert!(!Commands::GenerateCompletions {
+            shell: clap_complete::Shell::Bash
+        }
+        .needs_node());
+        assert!(Commands::Ping.needs_node());
+        assert!(Commands::Status.needs_node());
+    }
+
+    fn given(args: &[&str]) -> bool {
+        let mut argv = vec!["mdma"];
+        argv.extend_from_slice(args);
+        let matches = Cli::command()
+            .try_get_matches_from(argv)
+            .expect("valid args");
+        sockets_given(&matches)
+    }
+
+    #[test]
+    fn explicit_sockets_are_detected_from_flags_and_environment() {
+        // One test, because it touches process-wide environment variables.
+        std::env::remove_var("MDMA_LIBRARY_SOCKET");
+        std::env::remove_var("MDMA_PLAYBACK_SOCKET");
+
+        assert!(!given(&["ping"]), "defaults are not explicit");
+        assert!(given(&["--socket", "ipc:///tmp/lib.sock", "ping"]));
+        assert!(given(&["--playback-socket", "ipc:///tmp/pb.sock", "ping"]));
+
+        // The sources directory says nothing about library/playback.
+        assert!(!given(&["--sources-dir", "/tmp/sources", "ping"]));
+        std::env::set_var("MDMA_SOURCES_DIR", "/tmp/sources");
+        assert!(!given(&["ping"]));
+        std::env::remove_var("MDMA_SOURCES_DIR");
+
+        std::env::set_var("MDMA_LIBRARY_SOCKET", "ipc:///tmp/lib.sock");
+        assert!(given(&["ping"]), "an environment override counts");
+        std::env::remove_var("MDMA_LIBRARY_SOCKET");
+
+        std::env::set_var("MDMA_PLAYBACK_SOCKET", "ipc:///tmp/pb.sock");
+        assert!(given(&["ping"]));
+        std::env::remove_var("MDMA_PLAYBACK_SOCKET");
+    }
+
+    #[test]
+    fn node_flag_no_longer_reads_the_environment() {
+        // MDMA_NODE is read separately so --node and the env var can be told apart.
+        let arg = Cli::command()
+            .get_arguments()
+            .find(|a| a.get_id() == "node")
+            .expect("node arg")
+            .get_env()
+            .is_none();
+        assert!(arg);
     }
 
     fn make_track(artist: &str, title: &str, duration_secs: u32) -> TrackInfo {

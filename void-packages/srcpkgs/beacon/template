@@ -1,45 +1,23 @@
-# Template file for beacon package
+# Package metadata for beacon.
+#
+# This is NOT an xbps-src build template: nothing here builds anything. The
+# binary is cross-compiled by scripts/ci/ and the package is assembled by
+# scripts/package/create-service-package.sh, which sources this file for
+# depends, short_desc, conf_files and revision. The package version comes from
+# Cargo.toml; `version=` below is only checked against it by
+# scripts/ci/verify-packages.sh (bump it together with Cargo.toml).
+#
+# Also part of the package (see the script header for the full contract):
+#   INSTALL, REMOVE   package scripts, copied verbatim
+#   files/<d>/        runit service dirs (those with a `run`) -> /etc/sv/<d>/
+#   files/rootfs/**   copied verbatim into the package root
 pkgname=beacon
-version=0.29.0
+version=0.30.0
 revision=1
 archs="aarch64"
-build_style=cargo
-hostmakedepends="cargo"
-makedepends="rust-std"
 depends="avahi dbus wpa_supplicant dhcpcd iw wireless-regdb"
 conf_files="/etc/xbps.d/10-mdma.conf"
 short_desc="MDMA provisioning beacon"
 maintainer="Joakim Ohlrogge <joakim.ohlrogge@agical.se>"
 license="MIT"
 homepage="https://github.com/johlrogge/modular-digital-music-array"
-
-# Set this to your actual git tag/commit
-distfiles="https://github.com/johlrogge/modular-digital-music-array/archive/v${version}.tar.gz"
-checksum="SKIP"  # For development; use real checksum for production
-
-# Build only the beacon binary
-do_build() {
-    cargo build --release --bin beacon --target aarch64-unknown-linux-gnu
-}
-
-do_install() {
-    # Install beacon binary
-    vbin target/aarch64-unknown-linux-gnu/release/beacon
-    
-    # Install runit service
-    vsv beacon
-
-    # Wifi service for the beacon (credentials come from the installed
-    # system, copied to tmpfs). The 'down' file keeps it from starting at
-    # boot; the beacon runs 'sv up beacon-wifi' when needed. vsv copies the
-    # whole files/beacon-wifi directory, so 'down' ships with it.
-    vsv beacon-wifi
-
-    # Install MDMA package repo config so the device can self-update
-    vinstall ${FILESDIR}/10-mdma.conf 644 etc/xbps.d
-}
-
-post_install() {
-    # The service will be enabled by bootstrap script
-    :
-}

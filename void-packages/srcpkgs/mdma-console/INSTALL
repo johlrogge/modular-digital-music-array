@@ -6,6 +6,9 @@ post)
     # Create log directory for svlogd
     mkdir -p /var/log/mdma-console
 
+    # CAP_NET_BIND_SERVICE is applied in the runit run script (before chpst drops
+    # privileges to the 'mdma' user). No capability work needed here.
+
     # Enable service on first install
     if [ ! -d /var/service ]; then
         mkdir -p /var/service

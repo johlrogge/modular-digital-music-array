@@ -47,23 +47,50 @@ pub enum ConnectionError {
 /// # Ok::<(), nng_transport::ConnectionError>(())
 /// ```
 pub fn connect(address: &str) -> Result<nng::Socket, ConnectionError> {
-    let resolved_address = resolve_tcp_hostname(address)?;
+    let socket = new_req_socket(DEFAULT_TIMEOUT)?;
+    dial(&socket, address, false)?;
+    Ok(socket)
+}
 
+/// Like [`connect`], but the dial does not wait for the connection.
+///
+/// The dial happens in the background and every later request is bounded by
+/// `timeout`: sending fails with a timeout if no connection is up in time, and
+/// so does waiting for the reply. Use it to probe whether a node answers.
+///
+/// Only an IP address (or IPC path) keeps this call free of waiting: a
+/// hostname in a `tcp://` address is still resolved synchronously first, which
+/// can block.
+pub fn connect_with_timeout(
+    address: &str,
+    timeout: Duration,
+) -> Result<nng::Socket, ConnectionError> {
+    let socket = new_req_socket(timeout)?;
+    dial(&socket, address, true)?;
+    Ok(socket)
+}
+
+fn new_req_socket(timeout: Duration) -> Result<nng::Socket, ConnectionError> {
     let socket = nng::Socket::new(nng::Protocol::Req0)?;
-    socket
-        .set_opt::<SendTimeout>(Some(DEFAULT_TIMEOUT))
-        .map_err(|e| {
-            ConnectionError::ConnectionFailed(format!("Failed to set send timeout: {}", e))
-        })?;
-    socket
-        .set_opt::<RecvTimeout>(Some(DEFAULT_TIMEOUT))
-        .map_err(|e| {
-            ConnectionError::ConnectionFailed(format!("Failed to set recv timeout: {}", e))
-        })?;
-    socket.dial(&resolved_address).map_err(|e| {
-        ConnectionError::ConnectionFailed(format!("Failed to connect to {}: {}", address, e))
+    socket.set_opt::<SendTimeout>(Some(timeout)).map_err(|e| {
+        ConnectionError::ConnectionFailed(format!("Failed to set send timeout: {}", e))
+    })?;
+    socket.set_opt::<RecvTimeout>(Some(timeout)).map_err(|e| {
+        ConnectionError::ConnectionFailed(format!("Failed to set recv timeout: {}", e))
     })?;
     Ok(socket)
+}
+
+fn dial(socket: &nng::Socket, address: &str, background: bool) -> Result<(), ConnectionError> {
+    let resolved_address = resolve_tcp_hostname(address)?;
+    let result = if background {
+        socket.dial_async(&resolved_address)
+    } else {
+        socket.dial(&resolved_address)
+    };
+    result.map_err(|e| {
+        ConnectionError::ConnectionFailed(format!("Failed to connect to {}: {}", address, e))
+    })
 }
 
 /// Resolve `host` to an IPv4 address string using the project's resolution
@@ -78,6 +105,19 @@ pub fn connect(address: &str) -> Result<nng::Socket, ConnectionError> {
 /// Returns [`ConnectionError::DnsResolution`] when neither avahi nor std
 /// resolver can find the host and there is no cached result.
 pub fn resolve_hostname_to_ipv4(host: &str) -> Result<String, ConnectionError> {
+    resolve_hostname_to_ipv4_fresh(host).or_else(|e| read_cached_ip(host).ok_or(e))
+}
+
+/// Like [`resolve_hostname_to_ipv4`] but never falls back to the disk cache.
+///
+/// Use this to check whether a name still resolves, where a stale cached
+/// address would hide a dead one. A successful lookup still refreshes the cache.
+///
+/// # Errors
+///
+/// Returns [`ConnectionError::DnsResolution`] when neither avahi nor the std
+/// resolver can find the host.
+pub fn resolve_hostname_to_ipv4_fresh(host: &str) -> Result<String, ConnectionError> {
     // If host already looks like an IP address, pass through
     if host.chars().all(|c| c.is_ascii_digit() || c == '.') {
         return Ok(host.to_string());
@@ -95,15 +135,10 @@ pub fn resolve_hostname_to_ipv4(host: &str) -> Result<String, ConnectionError> {
             write_cached_ip(host, &ip);
             Ok(ip)
         }
-        None => {
-            if let Some(cached_ip) = read_cached_ip(host) {
-                return Ok(cached_ip);
-            }
-            Err(ConnectionError::DnsResolution(format!(
-                "No IPv4 address found for {}",
-                host
-            )))
-        }
+        None => Err(ConnectionError::DnsResolution(format!(
+            "No IPv4 address found for {}",
+            host
+        ))),
     }
 }
 
@@ -343,6 +378,56 @@ mod tests {
     fn resolve_ipv4_address_passes_through() {
         let ip = "192.168.0.1";
         assert_eq!(resolve_hostname_to_ipv4(ip).unwrap(), ip);
+    }
+
+    #[test]
+    fn connect_with_timeout_gives_up_on_dead_address() {
+        let started = Instant::now();
+        let socket = connect_with_timeout("tcp://127.0.0.1:1", Duration::from_millis(300)).unwrap();
+        let sent = socket.send(nng::Message::from(&b"ping"[..]));
+        assert!(sent.is_err(), "nothing listens on port 1");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn connect_with_timeout_bounds_waiting_for_a_reply() {
+        let addr = format!(
+            "ipc://{}/nng-transport-silent-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        // A server that accepts requests and never answers.
+        let server = nng::Socket::new(nng::Protocol::Rep0).unwrap();
+        server.listen(&addr).unwrap();
+
+        let socket = connect_with_timeout(&addr, Duration::from_millis(200)).unwrap();
+        socket
+            .send(nng::Message::from(&b"ping"[..]))
+            .expect("request is accepted by the silent server");
+        let started = Instant::now();
+        assert!(socket.recv().is_err(), "no reply was ever sent");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(server);
+    }
+
+    #[test]
+    fn fresh_resolve_ipv4_address_passes_through() {
+        assert_eq!(
+            resolve_hostname_to_ipv4_fresh("192.168.0.1").unwrap(),
+            "192.168.0.1"
+        );
+    }
+
+    #[test]
+    fn fresh_resolve_localhost_returns_loopback() {
+        let result = resolve_hostname_to_ipv4_fresh("localhost").unwrap();
+        assert!(result.starts_with("127."), "got {}", result);
+    }
+
+    #[test]
+    fn fresh_resolve_unknown_host_is_an_error() {
+        // `.invalid` never resolves (RFC 2606), whatever the cache holds.
+        assert!(resolve_hostname_to_ipv4_fresh("no-such-node.invalid").is_err());
     }
 
     #[test]

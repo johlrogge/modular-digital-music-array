@@ -52,6 +52,54 @@ pub enum GatewayRequest {
     /// Route to the admin service.
     #[serde(rename = "admin")]
     Admin { request: AdminRequest },
+
+    /// Ask the gateway which node it belongs to (handled by gateway itself).
+    ///
+    /// Old gateways do not know this variant. Their envelope parse fails and
+    /// they answer `GatewayResponse::Error { message: "Invalid request: unknown
+    /// variant `identify`, ..." }` (the message starts with
+    /// [`INVALID_REQUEST_PREFIX`]). Clients use [`is_unsupported_request`] to
+    /// tell that apart from transport errors.
+    #[serde(rename = "identify")]
+    Identify,
+}
+
+/// Prefix of the error message a gateway sends when it cannot parse a request envelope.
+/// Frozen: gateways up to 0.29.0 emit it literally, and clients match on it.
+pub const INVALID_REQUEST_PREFIX: &str = "Invalid request:";
+
+impl GatewayResponse {
+    /// The error a gateway answers when it cannot parse a request envelope.
+    pub fn invalid_request(e: impl std::fmt::Display) -> Self {
+        GatewayResponse::Error {
+            message: format!("{} {}", INVALID_REQUEST_PREFIX, e),
+        }
+    }
+}
+
+/// True if a gateway-level error message means "this gateway does not
+/// understand the request" (e.g. an old gateway receiving `Identify`).
+pub fn is_unsupported_request(message: &str) -> bool {
+    message.starts_with(INVALID_REQUEST_PREFIX)
+}
+
+/// Current version of the identity payload.
+pub const IDENTITY_PROTO: u32 = 1;
+
+/// Identity of the node a gateway runs on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeIdentity {
+    /// Stable node id: the hostname set at provisioning (not the mDNS name).
+    /// `None` means the gateway was not configured with one (unverifiable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Human-readable node name. `None` means not configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Gateway version.
+    pub version: String,
+    /// Identity payload version.
+    pub proto: u32,
 }
 
 // ============================================================================
@@ -88,6 +136,10 @@ pub enum GatewayResponse {
     /// Response from the admin service.
     #[serde(rename = "admin")]
     Admin { response: AdminResponse },
+
+    /// Identity of the node this gateway runs on.
+    #[serde(rename = "identity")]
+    Identity { identity: NodeIdentity },
 
     /// Gateway-level error (routing failure, service unreachable, etc.).
     #[serde(rename = "error")]
@@ -265,6 +317,75 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn identify_request_roundtrip() {
+        let json = serde_json::to_string(&GatewayRequest::Identify).unwrap();
+        assert_eq!(json, "{\"service\":\"identify\"}");
+        let parsed: GatewayRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, GatewayRequest::Identify));
+    }
+
+    #[test]
+    fn identity_response_roundtrip() {
+        let identity = NodeIdentity {
+            id: Some("mdma-stage".to_string()),
+            name: Some("mdma-stage".to_string()),
+            version: "0.29.0".to_string(),
+            proto: IDENTITY_PROTO,
+        };
+        let resp = GatewayResponse::Identity {
+            identity: identity.clone(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"service\":\"identity\""));
+        assert!(json.contains("\"id\":\"mdma-stage\""));
+        assert!(json.contains("\"proto\":1"));
+        match serde_json::from_str::<GatewayResponse>(&json).unwrap() {
+            GatewayResponse::Identity { identity: parsed } => assert_eq!(parsed, identity),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn unconfigured_identity_omits_id_and_name() {
+        let resp = GatewayResponse::Identity {
+            identity: NodeIdentity {
+                id: None,
+                name: None,
+                version: "0.29.0".to_string(),
+                proto: IDENTITY_PROTO,
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("\"id\""));
+        assert!(!json.contains("\"name\""));
+        match serde_json::from_str::<GatewayResponse>(&json).unwrap() {
+            GatewayResponse::Identity { identity } => {
+                assert_eq!(identity.id, None);
+                assert_eq!(identity.name, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn invalid_request_prefix_is_frozen() {
+        // Gateways up to 0.29.0 emit this literally; clients match on it.
+        assert_eq!(INVALID_REQUEST_PREFIX, "Invalid request:");
+    }
+
+    #[test]
+    fn is_unsupported_request_matches_invalid_request_message() {
+        let err = serde_json::from_str::<GatewayRequest>("{\"service\":\"bogus\"}").unwrap_err();
+        match GatewayResponse::invalid_request(err) {
+            GatewayResponse::Error { message } => {
+                assert!(is_unsupported_request(&message));
+            }
+            _ => panic!("wrong variant"),
+        }
+        assert!(!is_unsupported_request("library service unreachable: x"));
     }
 
     #[test]

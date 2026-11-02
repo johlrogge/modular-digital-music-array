@@ -1,0 +1,25 @@
+[package]
+name = "node-discovery"
+version = "0.1.0"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
+
+[package.metadata]
+
+[package.metadata.polylith]
+interface = "node-discovery"
+
+[dependencies]
+dirs = { workspace = true }
+mdns-sd = "0.13"
+private-file = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+tempfile = { workspace = true }

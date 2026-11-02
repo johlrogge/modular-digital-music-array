@@ -24,7 +24,12 @@ MDMA uses [Semantic Versioning](https://semver.org/):
   `version = "x.y.z"` (not `version.workspace = true`) must be bumped individually based on
   what changed in that package.
 - **xbps templates** — `void-packages/srcpkgs/*/template` each has its own `version=` field.
-  This must match the corresponding `Cargo.toml` version (workspace or independent).
+  This must match the corresponding `Cargo.toml` version (workspace or independent). The built
+  package version comes from `Cargo.toml`; `version=` is only checked against it
+  (`just pkg-verify-static`, also run in the CI `test` job, fails on a mismatch).
+- **Everything else about a package** (depends, short_desc, conf_files, INSTALL/REMOVE, service
+  dirs, rootfs files) lives only in `void-packages/srcpkgs/<pkg>/`. The
+  `scripts/package/create-*-package.sh` wrappers carry no package metadata.
 - **Package revision** — reset `revision=1` whenever `version=` is bumped. Increment revision
   (e.g., `_2`) when the template changes but the code version does not (e.g., fixing a run
   script or INSTALL hook).
@@ -78,6 +83,7 @@ bump the version individually based on what changed in that package. Only packag
 
 Update `version=` in each template under `void-packages/srcpkgs/*/template`. The value
 must match the corresponding `Cargo.toml` version. Reset `revision=1` on every version bump.
+Run `just pkg-verify-static` to check all templates against `Cargo.toml`.
 
 Packages to check:
 
@@ -121,12 +127,15 @@ git push github master develop --tags
 
 GitHub Actions triggers on the `master` push:
 
-1. Runs tests across all workspace members
+1. Runs tests across all workspace members (and `verify-packages.sh --static` on the srcpkgs)
 2. Cross-compiles all service binaries for `aarch64-unknown-linux-gnu`
 3. Builds `.xbps` packages via `just pkg-build-all` (cargo-zigbuild cross-compile,
-   then `xbps-create` per service)
-4. Signs packages
-5. Publishes to GitHub Pages package repository at:
+   then `xbps-create` per service, assembled from `void-packages/srcpkgs/<pkg>/`)
+4. Verifies the packages against the srcpkgs (`just pkg-verify --require-all`: service dirs,
+   INSTALL/REMOVE, depends, conf_files, rootfs files, versions) and fails if the working tree
+   is dirty after the build
+5. Signs packages
+6. Publishes to GitHub Pages package repository at:
    `https://johlrogge.github.io/modular-digital-music-array/aarch64`
 
 Monitor the Actions run and verify it completes without errors before proceeding.
@@ -266,8 +275,10 @@ host `pi` in dependency order: library → audio → playback → gateway → ba
 ### Package build fails in CI
 
 Check the GitHub Actions run log. Common causes:
-- xbps template `version=` does not match `Cargo.toml` version
-- `checksum=` field outdated (set `checksum="SKIP"` for development builds)
+- xbps template `version=` does not match `Cargo.toml` version (`just pkg-verify-static`)
+- `pkg-verify` reports a package that differs from its srcpkg (reproduce locally with
+  `just pkg-build-all && just pkg-verify --require-all`)
+- Working tree dirty after the build (the step prints `git status --porcelain` and `git diff --stat`)
 - Cross-compilation target misconfigured
 
 ### Version mismatch between Pi and expected

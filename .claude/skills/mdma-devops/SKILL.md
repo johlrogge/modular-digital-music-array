@@ -213,32 +213,35 @@ sv restart beacon
    exec chpst -u servicename /usr/bin/servicename
    ```
 
-2. **Supervise symlink** - `/etc/sv/servicename/supervise`
-   ```bash
-   ln -sf /run/runit/supervise.servicename supervise
-   ```
-
-**Without the supervise symlink:**
-- `sv status` fails: "unable to change to service directory"
-- Service may run but supervision breaks
-- Critical for beacon, avahi, dbus, all MDMA services
+2. **Enable symlink** - `/var/service/servicename -> /etc/sv/servicename`
+   (created by the package INSTALL; runsvdir then starts supervision itself)
 
 ### Package INSTALL Scripts
 
-Every MDMA package should create supervise symlink:
+Each package's INSTALL lives in `void-packages/srcpkgs/<pkg>/INSTALL` and is
+shipped verbatim (single source of truth; nothing is generated or merged in at
+package time). xbps calls it as `INSTALL <action> <pkgname> <version> <update>`,
+so the script reads `$1` (`pre`/`post`) and `$4` (`yes` on upgrade):
 
-```bash
-# In package INSTALL script
-case "${ACTION}" in
+```sh
+#!/bin/sh
+# $1 = action  $2 = pkgname  $3 = version  $4 = "yes" if upgrade
+case "$1" in
 post)
-    # Create supervise symlink
-    ln -sf /run/runit/supervise.beacon /etc/sv/beacon/supervise
-    
-    # Enable service
-    ln -sf /etc/sv/beacon /var/service/beacon
+    mkdir -p /var/log/beacon                       # svlogd log dir
+    # ... service-specific: mdma user, mkdir/chown, config seeding ...
+    [ -d /var/service ] || mkdir -p /var/service
+    if [ ! -e /var/service/beacon ]; then          # enable on first install
+        ln -sf /etc/sv/beacon /var/service/beacon
+    fi
+    if [ "$4" = "yes" ] && sv check beacon >/dev/null 2>&1; then
+        sv restart beacon                          # on upgrade, only if running
+    fi
     ;;
 esac
 ```
+
+An optional `REMOVE` (same conventions) is shipped the same way.
 
 ## Golden Image Creation
 
@@ -485,27 +488,14 @@ xbps-create per service) → Upload to repository → Units update with xbps-ins
 
 **Every MDMA package must:**
 
-1. Include supervise symlink creation
-2. Enable service automatically
-3. Create necessary users/groups
-4. Set proper permissions
-5. Include health check support
+1. Ship a runit service dir (`files/<pkg>/run`) in its srcpkg
+2. Enable the service automatically (INSTALL `/var/service` symlink, first install only)
+3. Create necessary users/groups and directories, set ownership
+4. Restart on upgrade only if the service is running
+5. Pass `just pkg-verify` (service files, INSTALL/REMOVE, depends and versions match the srcpkg)
 
-**Example INSTALL script:**
-```bash
-#!/bin/sh
-case "${ACTION}" in
-post)
-    # Create supervise symlink
-    ln -sf /run/runit/supervise.beacon /etc/sv/beacon/supervise
-    
-    # Enable service
-    if [ ! -e /var/service/beacon ]; then
-        ln -sf /etc/sv/beacon /var/service/beacon
-    fi
-    ;;
-esac
-```
+**INSTALL contract:** see "Package INSTALL Scripts" above and
+`void-packages/srcpkgs/*/INSTALL` for real examples.
 
 ## NVMe Provisioning (Future)
 

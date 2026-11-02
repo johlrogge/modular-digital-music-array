@@ -1,0 +1,11 @@
+#!/bin/sh
+# REMOVE script for mdma-gateway package
+# $1 = action (pre/post), $2 = pkgname, $3 = version, $4 = "yes" if upgrade
+case "$1" in
+post)
+    # Drop the DNS-SD announcement (not on upgrade; the run script rewrites it)
+    if [ "$4" != "yes" ]; then
+        rm -f /etc/avahi/services/mdma.service
+    fi
+    ;;
+esac
