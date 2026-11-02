@@ -61,6 +61,77 @@ Accepted — 2026-10-26
   rename, to be checked during acceptance.
 - Wifi is hard-coded to interface `wlan0`.
 
+## Amendment 2026-11-02: beacon reuses the installed system's wifi (#72)
+
+The original text above is kept as written. Where it conflicts with this
+amendment, the amendment wins.
+
+### Why
+
+- On wifi-only units (the first user), the beacon was unreachable. That broke
+  service mode, recovery and reinstall, and made a wrong boot order
+  unrecoverable.
+- On a Pi 5 in an Argon NEO 5 M.2 case, the NVMe drops off PCIe while 2.4 GHz
+  wifi is active (#69). Stage is stable with `freq_list` pinning wifi to 5 GHz
+  plus `dtparam=pciex1_gen=1`.
+
+### Decision
+
+At startup, if eth0 has no carrier within 10 s (after `ip link set eth0 up`),
+the beacon borrows the installed system's wifi config:
+
+- It finds exactly one GPT partition named `root` (ext4, LABEL=root, not
+  already mounted).
+- It mounts that partition `ro,noload,nosuid,nodev,noexec`, refuses symlinks
+  along the path to `etc/wpa_supplicant/wpa_supplicant.conf`, and caps the read
+  at 64 KiB.
+- It always unmounts, then copies the file VERBATIM to tmpfs at
+  `/run/beacon/wifi/` (directory 0700, file 0600). Verbatim means hand-added
+  lines such as `freq_list` survive.
+- It starts the `beacon-wifi` runit service. The service ships with a `down`
+  file and runs `wpa_supplicant -M -c /run/beacon/wifi/... -i wlan0`, without
+  debug flags.
+- Credentials never land on the SD card, the stock wpa_supplicant service stays
+  disabled on the beacon, and /music is never mounted.
+- Ethernet still wins. With a link, the NVMe is never touched, and dhcpcd route
+  metrics prefer wired.
+- Only psk and open networks are supported (no EAP or SAE), as before.
+
+### Amended clauses
+
+- **§1:** provisioning over wifi is possible but discouraged. The UI warns about
+  the NVMe dropout.
+- **§2:** "No custom fallback logic" no longer holds for the beacon. Route
+  preference is still left to dhcpcd, but the beacon now has startup logic to
+  bring wifi up when there is no wired link.
+- **§5:**
+  - When the wifi fields are blank and the beacon's network came from the
+    installed system, ReinstallOs, WipeAll, and Preserve when stage 3
+    reformats root all carry the installed conf over verbatim.
+  - Preserve with root kept touches nothing wifi-related: no files are written
+    and no service is enabled or disabled.
+  - Half-filled wifi fields are rejected and never fall back to the
+    carried-over conf. Explicit, complete form fields win.
+  - The carried-over conf is the one parsed and validated at beacon startup. It
+    is not re-read from disk.
+  - **Escape route:** to provision WITHOUT wifi on a unit whose beacon came up
+    on the installed system's wifi, boot the beacon with ethernet attached.
+    Blank fields then mean no wifi.
+  - Future option, not done: a three-way choice (Keep current / New network /
+    No wifi) mapping onto the `WifiSetup` variants.
+- **§6:** recovery on a wifi-only unit works without ethernet.
+
+### Testing note
+
+Side effects go through a crate-private `Host` trait in `network_fallback.rs`.
+This is a test seam, not a component interface, so it is distinct from the
+project's build-time polymorphism rule for components.
+
+### Future options (not done)
+
+- Write credentials to the beacon SD at provisioning time.
+- Access-point fallback.
+
 ## Related
 
 - ADR-007 — provisioning data policy (`Preserve`, `ReinstallOs`, `WipeAll`)

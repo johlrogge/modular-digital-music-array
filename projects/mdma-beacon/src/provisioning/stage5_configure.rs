@@ -19,12 +19,16 @@
 //! `cmdline.txt` and `config.txt` are rewritten atomically; a `.bak` copy of the
 //! original is kept the first time a file changes.
 //!
-//! Optionally (when the user supplied a wifi network) the wifi configuration
-//! is written and `wpa_supplicant` is enabled (#41).
+//! Optionally (when the user supplied a wifi network, or the beacon runs on the
+//! installed system's wifi and the form's wifi fields were blank, in which case
+//! that configuration is carried over verbatim) the wifi configuration is
+//! written and `wpa_supplicant` is enabled (#41, #72).
 
 use crate::actions::{Action, ActionId, PlannedAction};
 use crate::error::{BeaconError, Result};
-use crate::provisioning::types::{ConfiguredFstab, ConfiguredSystem, MountPoint, Partition};
+use crate::provisioning::types::{
+    ConfiguredFstab, ConfiguredSystem, MountPoint, Partition, WifiAction, WifiWrite,
+};
 use rpi_eeprom::{
     apply_eeprom_config, find_staged_eeprom_file, read_current_eeprom_config,
     verify_staged_eeprom_boot_order, EepromError, BOOT_ORDER_NVME_FIRST,
@@ -103,7 +107,7 @@ impl Action<ConfiguredFstab, ConfiguredSystem, ConfiguredSystem> for ConfigureSy
             .map_err(|e| BeaconError::Provisioning(format!("wifi configuration task: {e}")))??;
 
         // 10. Enable services
-        enable_services(mount_root, config.network.as_ref()).await?;
+        enable_services(mount_root, &planned_output.wifi_action()).await?;
 
         // 11. Write boot partition cmdline.txt (#55, #65) — the boot partition is
         // mounted at /boot, so packages already wrote the kernel to it.
@@ -185,31 +189,45 @@ slaac private
     Ok(())
 }
 
-/// Write the wifi configuration, if one was supplied.
+/// The `wpa_supplicant.conf` text to write. A carried-over configuration is
+/// used verbatim.
+fn wpa_supplicant_conf_text(wifi: WifiWrite<'_>) -> String {
+    match wifi {
+        WifiWrite::FromForm(network) => wifi_config::render_wpa_supplicant_conf(network),
+        WifiWrite::CarriedOver(conf) => conf.as_str().to_owned(),
+    }
+}
+
+/// Write the wifi configuration, as decided by [`ConfiguredSystem::wifi_action`].
 ///
-/// `Some`: writes `wpa_supplicant.conf` (0600, it holds the PSK) and the runit
-/// service `conf` that pins the service to wlan0. `None`: touches nothing and
-/// logs what that means for the given data policy. Sync (blocking fs); callers
-/// in async code use `spawn_blocking`. Must run after `install_packages` so the
-/// wpa_supplicant package owns `/etc/sv/wpa_supplicant/` first.
+/// `Write`: writes `wpa_supplicant.conf` (0600, it holds the PSK; a
+/// carried-over one verbatim) and the runit service `conf` that pins the service
+/// to wlan0. `Nothing` and `KeepExisting`: touch nothing and log what that
+/// means. Sync (blocking fs); callers in async code use `spawn_blocking`. Must
+/// run after `install_packages` so the wpa_supplicant package owns
+/// `/etc/sv/wpa_supplicant/` first.
 fn configure_wifi(system: &ConfiguredSystem) -> Result<()> {
     let mount_root = system.mount_root();
-    let Some(network) = system.config().network.as_ref() else {
-        tracing::info!("{}", system.wifi_summary());
-        return Ok(());
+    let conf_text = match system.wifi_action() {
+        WifiAction::Nothing | WifiAction::KeepExisting => {
+            tracing::info!("{}", system.wifi_summary());
+            return Ok(());
+        }
+        WifiAction::Write(write) => {
+            match write {
+                WifiWrite::FromForm(network) => tracing::info!(
+                    "Configuring wifi: SSID \"{}\" country {}",
+                    network.ssid(),
+                    network.country()
+                ),
+                WifiWrite::CarriedOver(_) => tracing::info!("{}", system.wifi_summary()),
+            }
+            wpa_supplicant_conf_text(write)
+        }
     };
-    tracing::info!(
-        "Configuring wifi: SSID \"{}\" country {}",
-        network.ssid(),
-        network.country()
-    );
 
     let files = [
-        (
-            wifi_config::WPA_SUPPLICANT_CONF_PATH,
-            wifi_config::render_wpa_supplicant_conf(network),
-            0o600,
-        ),
+        (wifi_config::WPA_SUPPLICANT_CONF_PATH, conf_text, 0o600),
         (
             wifi_config::WPA_SERVICE_CONF_PATH,
             wifi_config::render_wpa_service_conf(),
@@ -721,27 +739,25 @@ const BASE_SERVICES: [&str; 5] = ["sshd", "dhcpcd", "dbus", "avahi-daemon", "pip
 
 /// The runit services to enable: the base services, every MDMA package (each
 /// `TARGET_PACKAGES` entry is also its service name), and `wpa_supplicant` only
-/// when a wifi network is configured.
-fn services_to_enable(network: Option<&wifi_config::NetworkConfig>) -> Vec<&'static str> {
+/// when wifi is written. `KeepExisting` and `Nothing` neither enable nor
+/// disable it.
+fn services_to_enable(wifi: &WifiAction<'_>) -> Vec<&'static str> {
     let mut services: Vec<&'static str> = BASE_SERVICES
         .iter()
         .chain(TARGET_PACKAGES.iter())
         .copied()
         .collect();
-    if network.is_some() {
+    if matches!(wifi, WifiAction::Write(_)) {
         services.push("wpa_supplicant");
     }
     services
 }
 
 /// Enable runit services via symlinks
-async fn enable_services(
-    mount_root: &Path,
-    network: Option<&wifi_config::NetworkConfig>,
-) -> Result<()> {
+async fn enable_services(mount_root: &Path, wifi: &WifiAction<'_>) -> Result<()> {
     tracing::info!("Enabling services (runit)");
 
-    let services = services_to_enable(network);
+    let services = services_to_enable(wifi);
 
     // Create log directories for MDMA services
     for log_dir in TARGET_PACKAGES {
@@ -1450,7 +1466,10 @@ mod tests {
 
     // ── wifi (#41) ───────────────────────────────────────────────────────────
 
-    use super::{configure_wifi, services_to_enable, ConfigureSystemAction};
+    use super::{
+        configure_wifi, services_to_enable, wpa_supplicant_conf_text, ConfigureSystemAction,
+        WifiAction, WifiWrite,
+    };
     use crate::actions::Action;
     use crate::provisioning::types::{
         CompletedPartitionPlan, CompletedPartitionedDrives, ConfiguredFstab, ConfiguredSystem,
@@ -1458,11 +1477,12 @@ mod tests {
         ValidatedHardware,
     };
     use crate::types::{
-        ByteSize, DevicePath, ExistingDataPolicy, Hostname, ProvisionConfig, SshPublicKey, UnitType,
+        ByteSize, DevicePath, ExistingDataPolicy, Hostname, ProvisionConfig, SshPublicKey,
+        UnitType, WifiSetup,
     };
     use wifi_config::{
-        render_wpa_supplicant_conf, CountryCode, NetworkConfig, WifiPassphrase, WifiSsid,
-        WPA_SERVICE_CONF_PATH, WPA_SUPPLICANT_CONF_PATH,
+        render_wpa_supplicant_conf, CountryCode, InstalledWifiConf, NetworkConfig, WifiPassphrase,
+        WifiSsid, WPA_SERVICE_CONF_PATH, WPA_SUPPLICANT_CONF_PATH,
     };
 
     fn network() -> NetworkConfig {
@@ -1473,13 +1493,17 @@ mod tests {
         )
     }
 
+    fn form_wifi(network: Option<NetworkConfig>) -> WifiSetup {
+        network.map_or(WifiSetup::None, WifiSetup::FromForm)
+    }
+
     fn fstab(mount_root: &std::path::Path, network: Option<NetworkConfig>) -> ConfiguredFstab {
-        fstab_with_policy(mount_root, network, ExistingDataPolicy::Preserve)
+        fstab_with_policy(mount_root, form_wifi(network), ExistingDataPolicy::Preserve)
     }
 
     fn fstab_with_policy(
         mount_root: &std::path::Path,
-        network: Option<NetworkConfig>,
+        wifi: WifiSetup,
         existing_data: ExistingDataPolicy,
     ) -> ConfiguredFstab {
         let drive = DriveInfo {
@@ -1496,7 +1520,7 @@ mod tests {
             )
             .expect("key"),
             existing_data,
-            network,
+            wifi,
         };
         ConfiguredFstab {
             installed: InstalledPackages {
@@ -1536,9 +1560,161 @@ mod tests {
         network: Option<NetworkConfig>,
         policy: ExistingDataPolicy,
     ) -> ConfiguredSystem {
+        system_with_wifi(dir, form_wifi(network), policy)
+    }
+
+    fn system_with_wifi(
+        dir: &std::path::Path,
+        wifi: WifiSetup,
+        policy: ExistingDataPolicy,
+    ) -> ConfiguredSystem {
         ConfiguredSystem {
-            fstab_configured: fstab_with_policy(dir, network, policy),
+            fstab_configured: fstab_with_policy(dir, wifi, policy),
         }
+    }
+
+    /// A staged conf with a hand-added `freq_list`, as the beacon would carry over.
+    const CARRIED_CONF: &str = "country=SE\nctrl_interface=/run/wpa_supplicant\n\
+        network={\n    ssid=\"HomeNet\"\n    psk=\"hunter2-secret\"\n    freq_list=5180 5200\n}\n";
+
+    fn carried_over() -> WifiSetup {
+        WifiSetup::CarriedOver(InstalledWifiConf::parse(CARRIED_CONF).expect("usable conf"))
+    }
+
+    /// Mark the root partition as formatted by stage 3.
+    fn with_root_formatted(mut sys: ConfiguredSystem) -> ConfiguredSystem {
+        use crate::provisioning::types::{PartitionFormatAction, PartitionSize};
+        use crate::types::FilesystemType;
+        let root = Partition {
+            device: DevicePath::new("/dev/nvme0n1p2").expect("device"),
+            mount_point: MountPoint::Root,
+            size: PartitionSize::from_mb(512),
+        };
+        let mounted = &mut sys.fstab_configured.installed.mounted;
+        mounted.formatted.format_actions = vec![PartitionFormatAction::WillFormat {
+            device: root.device.clone(),
+            label: root.label(),
+            fs_type: FilesystemType::Ext4,
+        }];
+        mounted.partitions = vec![root];
+        sys
+    }
+
+    #[test]
+    fn carried_over_conf_is_written_verbatim_when_the_os_is_reinstalled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        configure_wifi(&system_with_wifi(
+            dir.path(),
+            carried_over(),
+            ExistingDataPolicy::ReinstallOs,
+        ))
+        .expect("wifi");
+
+        let conf = dir.path().join(WPA_SUPPLICANT_CONF_PATH);
+        assert_eq!(std::fs::read_to_string(&conf).expect("read"), CARRIED_CONF);
+        assert_eq!(mode_of(&conf), 0o600);
+        let svc = std::fs::read_to_string(dir.path().join(WPA_SERVICE_CONF_PATH)).expect("svc");
+        assert!(svc.contains("WPA_INTERFACE=wlan0"), "{svc}");
+    }
+
+    #[test]
+    fn carried_over_conf_is_written_under_preserve_when_root_is_formatted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sys = with_root_formatted(system_with_wifi(
+            dir.path(),
+            carried_over(),
+            ExistingDataPolicy::Preserve,
+        ));
+        configure_wifi(&sys).expect("wifi");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(WPA_SUPPLICANT_CONF_PATH)).expect("read"),
+            CARRIED_CONF
+        );
+    }
+
+    #[test]
+    fn carried_over_conf_leaves_a_kept_root_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conf = dir.path().join(WPA_SUPPLICANT_CONF_PATH);
+        std::fs::create_dir_all(conf.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&conf, "existing\n").expect("write");
+
+        configure_wifi(&system_with_wifi(
+            dir.path(),
+            carried_over(),
+            ExistingDataPolicy::Preserve,
+        ))
+        .expect("wifi");
+
+        assert_eq!(std::fs::read(&conf).expect("read"), b"existing\n");
+        assert!(!dir.path().join(WPA_SERVICE_CONF_PATH).exists());
+    }
+
+    #[test]
+    fn form_wifi_wins_over_the_carried_over_conf_text() {
+        let net = network();
+        assert_eq!(
+            wpa_supplicant_conf_text(WifiWrite::FromForm(&net)),
+            render_wpa_supplicant_conf(&net)
+        );
+        let WifiSetup::CarriedOver(conf) = carried_over() else {
+            unreachable!()
+        };
+        assert_eq!(
+            wpa_supplicant_conf_text(WifiWrite::CarriedOver(&conf)),
+            CARRIED_CONF
+        );
+    }
+
+    #[test]
+    fn carried_over_wifi_enables_wpa_supplicant_when_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sys = system_with_wifi(dir.path(), carried_over(), ExistingDataPolicy::ReinstallOs);
+        assert!(matches!(sys.wifi_action(), WifiAction::Write(_)));
+        assert!(services_to_enable(&sys.wifi_action()).contains(&"wpa_supplicant"));
+    }
+
+    #[test]
+    fn kept_root_neither_writes_nor_enables_wifi() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sys = system_with_wifi(dir.path(), carried_over(), ExistingDataPolicy::Preserve);
+        assert!(matches!(sys.wifi_action(), WifiAction::KeepExisting));
+        assert!(!services_to_enable(&sys.wifi_action()).contains(&"wpa_supplicant"));
+    }
+
+    #[test]
+    fn kept_root_with_carried_over_is_a_reformatted_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sys = with_root_formatted(system_with_wifi(
+            dir.path(),
+            carried_over(),
+            ExistingDataPolicy::Preserve,
+        ));
+        assert!(matches!(sys.wifi_action(), WifiAction::Write(_)));
+    }
+
+    #[test]
+    fn no_wifi_is_nothing_and_not_enabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sys = system(dir.path(), None, ExistingDataPolicy::ReinstallOs);
+        assert!(matches!(sys.wifi_action(), WifiAction::Nothing));
+        assert!(!services_to_enable(&sys.wifi_action()).contains(&"wpa_supplicant"));
+    }
+
+    #[test]
+    fn carried_over_summary_and_debug_never_leak_the_psk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sys = system_with_wifi(dir.path(), carried_over(), ExistingDataPolicy::ReinstallOs);
+        let summary = sys.wifi_summary();
+        assert!(summary.contains("carried over verbatim"), "{summary}");
+        assert!(summary.contains("HomeNet"), "{summary}");
+        assert!(!summary.contains("hunter2-secret"));
+        assert!(!format!("{sys:?}").contains("hunter2-secret"));
+
+        let kept = system_with_wifi(dir.path(), carried_over(), ExistingDataPolicy::Preserve);
+        let text = kept.wifi_summary();
+        assert!(text.contains("nothing is changed"), "{text}");
+        assert!(text.contains("neither enabled nor disabled"), "{text}");
     }
 
     #[test]
@@ -1625,8 +1801,8 @@ mod tests {
     #[test]
     fn services_to_enable_adds_wpa_supplicant_only_with_wifi() {
         let net = network();
-        let with = services_to_enable(Some(&net));
-        let without = services_to_enable(None);
+        let with = services_to_enable(&WifiAction::Write(WifiWrite::FromForm(&net)));
+        let without = services_to_enable(&WifiAction::Nothing);
         assert!(with.contains(&"wpa_supplicant"));
         assert!(!without.contains(&"wpa_supplicant"));
         let filtered: Vec<_> = with

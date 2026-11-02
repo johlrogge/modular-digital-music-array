@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::hardware::HardwareInfo;
+use crate::network_fallback::NetworkFallback;
 use axum::{
     routing::{get, post},
     Router,
@@ -17,6 +18,8 @@ use crate::routes;
 pub(crate) struct AppState {
     pub(crate) hardware: Arc<Mutex<HardwareInfo>>,
     pub(crate) config: Config,
+    /// Where the network came from (shown on the main page).
+    pub(crate) network: NetworkFallback,
     /// Path to the live log file (e.g. /var/log/beacon/current)
     pub(crate) log_path: PathBuf,
     /// Oneshot sender to signal provisioning can start (protected by mutex)
@@ -26,12 +29,14 @@ pub(crate) struct AppState {
 /// Run the beacon HTTP server
 pub async fn run(
     hardware: HardwareInfo,
+    network: NetworkFallback,
     config: Config,
     log_path: PathBuf,
 ) -> color_eyre::Result<()> {
     let state = AppState {
         hardware: Arc::new(Mutex::new(hardware)),
         config: config.clone(),
+        network,
         log_path,
         provision_start: Arc::new(Mutex::new(None)),
     };

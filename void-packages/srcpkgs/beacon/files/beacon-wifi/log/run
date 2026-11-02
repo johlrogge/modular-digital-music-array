@@ -1,0 +1,3 @@
+#!/bin/sh
+mkdir -p /var/log/beacon-wifi
+exec svlogd -tt /var/log/beacon-wifi

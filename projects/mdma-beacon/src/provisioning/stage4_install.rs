@@ -16,6 +16,7 @@
 
 use crate::actions::{Action, ActionId, PlannedAction};
 use crate::error::Result;
+use crate::mounts::is_device_mounted;
 use crate::provisioning::stage5_configure::get_partuuid;
 use crate::provisioning::types::{
     ConfiguredFstab, FilesystemType, FormattedSystem, FstabPlan, InstallPlan, InstallState,
@@ -135,15 +136,6 @@ impl Action<FormattedSystem, MountPlan, MountedPartitions> for MountPartitionsAc
 /// paths first ("/" before "/boot" and "/var"). The sort is stable.
 fn sort_for_mounting(partitions: &mut [Partition]) {
     partitions.sort_by_key(|p| p.mount_point.as_path().components().count());
-}
-
-/// Whether `device` appears as the source of a mount in `mount` output
-/// (`<source> on <target> type <fs> (<opts>)`). Exact match on the source
-/// field, so `/dev/nvme0n1p1` does not match `/dev/nvme0n1p10`.
-fn is_device_mounted(mount_output: &str, device: &str) -> bool {
-    mount_output
-        .lines()
-        .any(|line| line.split_whitespace().next() == Some(device))
 }
 
 /// Check if a device is currently mounted
@@ -873,15 +865,6 @@ mod tests {
         ];
         sort_for_mounting(&mut parts);
         assert_eq!(parts[0].mount_point, MountPoint::Root);
-    }
-
-    #[test]
-    fn is_device_mounted_matches_exactly() {
-        let out = "/dev/nvme0n1p10 on /mnt/x type ext4 (rw)\n\
-                   /dev/nvme0n1p2 on /mnt/mdma-install type ext4 (rw)\n";
-        assert!(!is_device_mounted(out, "/dev/nvme0n1p1"));
-        assert!(is_device_mounted(out, "/dev/nvme0n1p10"));
-        assert!(is_device_mounted(out, "/dev/nvme0n1p2"));
     }
 
     #[test]

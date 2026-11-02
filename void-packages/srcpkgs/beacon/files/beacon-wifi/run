@@ -1,0 +1,11 @@
+#!/bin/sh
+exec 2>&1
+CONF=/run/beacon/wifi/wpa_supplicant.conf
+if [ ! -s "$CONF" ]; then
+    echo "beacon-wifi: $CONF missing or empty, staying down"
+    exec sv down .
+fi
+# ctrl_interface directory
+mkdir -p /run/wpa_supplicant
+# Never add -d, -dd or -K: they can dump key material.
+exec wpa_supplicant -M -c "$CONF" -i wlan0

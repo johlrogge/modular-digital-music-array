@@ -1,12 +1,12 @@
 # Template file for beacon package
 pkgname=beacon
-version=0.28.2
+version=0.29.0
 revision=1
 archs="aarch64"
 build_style=cargo
 hostmakedepends="cargo"
 makedepends="rust-std"
-depends="avahi dbus"
+depends="avahi dbus wpa_supplicant dhcpcd iw wireless-regdb"
 conf_files="/etc/xbps.d/10-mdma.conf"
 short_desc="MDMA provisioning beacon"
 maintainer="Joakim Ohlrogge <joakim.ohlrogge@agical.se>"
@@ -28,6 +28,12 @@ do_install() {
     
     # Install runit service
     vsv beacon
+
+    # Wifi service for the beacon (credentials come from the installed
+    # system, copied to tmpfs). The 'down' file keeps it from starting at
+    # boot; the beacon runs 'sv up beacon-wifi' when needed. vsv copies the
+    # whole files/beacon-wifi directory, so 'down' ships with it.
+    vsv beacon-wifi
 
     # Install MDMA package repo config so the device can self-update
     vinstall ${FILESDIR}/10-mdma.conf 644 etc/xbps.d

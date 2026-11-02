@@ -458,8 +458,26 @@ pub struct ProvisionConfig {
     pub ssh_key: SshPublicKey,
     /// What to do with data already on the drive. Defaults to `Preserve`.
     pub existing_data: ExistingDataPolicy,
-    /// Optional wifi network to join (key already derived, never the passphrase).
-    pub network: Option<wifi_config::NetworkConfig>,
+    /// What wifi the installed system gets.
+    pub wifi: WifiSetup,
+}
+
+/// The wifi the installed system is given. Secrets stay out of `Debug`: the
+/// form variant holds the derived key only, and the carried-over configuration
+/// prints as a redacted summary.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WifiSetup {
+    /// No wifi is written. Previous wifi setup survives only when the root
+    /// filesystem is kept.
+    None,
+    /// A network the user typed into the form (key already derived, never the
+    /// passphrase). Explicit form fields always win over a carried-over
+    /// configuration.
+    FromForm(wifi_config::NetworkConfig),
+    /// The beacon is running on the installed system's wifi and the form's wifi
+    /// fields were blank: the staged `wpa_supplicant.conf` goes into the new
+    /// install verbatim, so hand-added lines such as `freq_list` survive.
+    CarriedOver(wifi_config::InstalledWifiConf),
 }
 
 /// What provisioning may do with data already on the NVMe drive(s).

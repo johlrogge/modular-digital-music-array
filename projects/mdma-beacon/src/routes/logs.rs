@@ -217,6 +217,7 @@ mod tests {
         AppState {
             hardware: Arc::new(Mutex::new(hardware)),
             config,
+            network: crate::network_fallback::NetworkFallback::Ethernet,
             log_path,
             provision_start: Arc::new(Mutex::new(None)),
         }

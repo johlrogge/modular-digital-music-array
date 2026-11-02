@@ -4,6 +4,34 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.29.0] — 2026-11-02
+
+### Added
+
+- **The beacon reuses the installed system's wifi when there is no ethernet (#72).** Service mode, recovery and reinstall now work on wifi-only units without a cable.
+  - It mounts the root partition read-only, never touches `/music`, and never touches the NVMe at all when ethernet is linked.
+  - It copies the wifi config verbatim into tmpfs, so a 5 GHz `freq_list` pin survives. Credentials never land on the SD card.
+  - The UI shows the network source and warns about provisioning over wifi (#69).
+
+### Changed
+
+- **Reinstall, Wipe all, and Preserve with a reformatted root keep the current wifi settings** when the wifi fields are left blank on a beacon running on the installed system's wifi. To provision without wifi, boot the beacon with ethernet attached.
+- **The beacon package now depends on wpa_supplicant, dhcpcd, iw and wireless-regdb**, and ships a `beacon-wifi` service (log in `/var/log/beacon-wifi`).
+
+### Known issues
+
+- The beacon has no DNS fallback when the router's resolver does not answer, and the startup clock-sync wait is ineffective (#68).
+- The update page may stay on "Update started" (#67).
+- The wifi SSID is free text, so typos go unnoticed (#71).
+
+### Upgrade notes
+
+Existing beacon SD cards: self-update installs the new dependencies and enables `beacon-wifi`.
+
+Older images may lack the Pi 5 wifi firmware, which comes from `rpi-firmware`. If `/usr/lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,5-model-b.bin` is missing, install `rpi-firmware`, or flash a new image. New images include it.
+
+---
+
 ## [0.28.2] — 2026-11-02
 
 ### Fixed

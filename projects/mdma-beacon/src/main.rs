@@ -3,11 +3,14 @@ use clap::Parser;
 use color_eyre::Result;
 
 mod actions;
+mod block_devices;
 mod config;
 mod error;
 mod hardware;
 mod log_archive;
 mod log_tail;
+mod mounts;
+mod network_fallback;
 mod provisioning;
 mod routes;
 mod server;
@@ -65,8 +68,28 @@ async fn main() -> Result<()> {
     let hardware_info = hardware::detect_hardware().await?;
     tracing::info!("Detected hardware: {:?}", hardware_info);
 
+    // Network: on a wifi-only unit, reuse the installed system's wifi. This must
+    // run before the server, which blocks on `chronyc waitsync` (needs network).
+    // Check mode never mounts or touches services.
+    let network = if config.is_check_mode() {
+        network_fallback::NetworkFallback::Skipped
+    } else {
+        tokio::task::spawn_blocking(|| {
+            network_fallback::bring_up_wifi_from_installed_system(
+                &network_fallback::SystemHost,
+                &network_fallback::Settings::default(),
+            )
+        })
+        .await
+        .unwrap_or_else(|e| {
+            let reason = format!("network fallback task failed: {e}");
+            tracing::warn!("{reason}");
+            network_fallback::NetworkFallback::Failed(reason)
+        })
+    };
+
     // Start HTTP server
-    server::run(hardware_info, config.clone(), config.log_file).await?;
+    server::run(hardware_info, network, config.clone(), config.log_file).await?;
 
     Ok(())
 }

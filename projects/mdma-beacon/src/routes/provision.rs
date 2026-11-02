@@ -1,9 +1,10 @@
 use crate::hardware::HardwareInfo;
+use crate::network_fallback::NetworkFallback;
 use crate::provisioning;
 use crate::provisioning::types::{ProvisionConfig, UnitType};
 use crate::provisioning::{ExistingDrive, LayoutError};
 use crate::server::AppState;
-use crate::types::{ExistingDataPolicy, Hostname, SshPublicKey};
+use crate::types::{ExistingDataPolicy, Hostname, SshPublicKey, WifiSetup};
 use askama::Template;
 use axum::{
     extract::State,
@@ -31,6 +32,9 @@ struct IndexTemplate {
     hardware: HardwareInfo,
     version: String,
     build_time: &'static str,
+    /// Where the network came from; shown on the page, and a wifi source adds a
+    /// warning to the provisioning form.
+    network: NetworkFallback,
     /// Present when stage 2 refused the existing disk layout. Nothing was
     /// changed. The page explains why and, where a wipe could resolve it,
     /// offers the deliberate (typed-confirmation) override.
@@ -141,6 +145,24 @@ fn resolve_network(ssid: &str, psk: &str, country: &str) -> Result<Option<Networ
         .map_err(|e| format!("Invalid wifi country: {e}. Nothing was changed."))?;
 
     Ok(Some(NetworkConfig::new(ssid, &passphrase, country)))
+}
+
+/// Decide which wifi the installed system gets. Explicit form fields always
+/// win. With the fields blank, a beacon running on the installed system's wifi
+/// carries that configuration over (verbatim, `freq_list` included), so a
+/// wifi-only unit is not cut off by reprovisioning; otherwise no wifi.
+fn resolve_wifi(
+    ssid: &str,
+    psk: &str,
+    country: &str,
+    network: &NetworkFallback,
+) -> Result<WifiSetup, String> {
+    Ok(match resolve_network(ssid, psk, country)? {
+        Some(net) => WifiSetup::FromForm(net),
+        None => network
+            .installed_wifi_conf()
+            .map_or(WifiSetup::None, |conf| WifiSetup::CarriedOver(conf.clone())),
+    })
 }
 
 /// The devices provisioning writes to. Stage 1 requires exactly the NVMe drives
@@ -283,6 +305,7 @@ pub async fn index(State(state): State<AppState>) -> Result<Html<String>, AppErr
         hardware,
         version: crate::update::full_version(),
         build_time: crate::update::build_timestamp(),
+        network: state.network.clone(),
         layout_error: None,
         wipe_fingerprint: page_fingerprint(&existing_drives, &existing_drives_error),
         existing_drives,
@@ -333,11 +356,16 @@ pub async fn provision(
     let hostname = Hostname::new(form.hostname.clone())?;
     let ssh_key = SshPublicKey::new(form.ssh_key.clone())?;
 
-    let network = resolve_network(&form.wifi_ssid, &form.wifi_psk, &form.wifi_country)
-        .map_err(AppError::Validation)?;
+    let wifi = resolve_wifi(
+        &form.wifi_ssid,
+        &form.wifi_psk,
+        &form.wifi_country,
+        &state.network,
+    )
+    .map_err(AppError::Validation)?;
 
     let config = ProvisionConfig {
-        network,
+        wifi,
         ssh_key,
         unit_type,
         hostname,
@@ -364,6 +392,7 @@ pub async fn provision(
                 hardware,
                 version: crate::update::full_version(),
                 build_time: crate::update::build_timestamp(),
+                network: state.network.clone(),
                 layout_error: None,
                 wipe_fingerprint: page_fingerprint(&current, &scan_error),
                 existing_drives: current,
@@ -398,6 +427,7 @@ pub async fn provision(
                 hardware,
                 version: crate::update::full_version(),
                 build_time: crate::update::build_timestamp(),
+                network: state.network.clone(),
                 layout_error: Some(LayoutErrorContext {
                     message: layout_err.to_string(),
                     can_wipe: wipe_can_resolve(layout_err),
@@ -557,7 +587,16 @@ mod tests {
     }
 
     fn render(layout_error: Option<LayoutErrorContext>, drives: Vec<ExistingDrive>) -> String {
+        render_with_network(NetworkFallback::NoInstalledSystem, layout_error, drives)
+    }
+
+    fn render_with_network(
+        network: NetworkFallback,
+        layout_error: Option<LayoutErrorContext>,
+        drives: Vec<ExistingDrive>,
+    ) -> String {
         IndexTemplate {
+            network,
             hardware: HardwareInfo {
                 model: "Raspberry Pi 5".into(),
                 serial: None,
@@ -868,6 +907,154 @@ mod tests {
         assert!(!tag.contains("value="), "got: {tag}");
         assert!(tag.contains("required"), "got: {tag}");
         assert!(tag.contains("autocomplete=\"new-password\""), "got: {tag}");
+    }
+
+    // ---- network source ----
+
+    const WIFI_WARNING: &str = "Provisioning over wifi: in some cases (Argon NEO 5) the NVMe may drop while wifi is active; ethernet is recommended.";
+
+    const INSTALLED_PSK: &str = "installed-psk-do-not-show";
+
+    fn installed_conf(freq_list: Option<&str>) -> wifi_config::InstalledWifiConf {
+        let freq = freq_list.map_or(String::new(), |f| format!("    freq_list={f}\n"));
+        wifi_config::InstalledWifiConf::parse(&format!(
+            "country=SE\nnetwork={{\n    ssid=\"Home <Net>\"\n    psk=\"{INSTALLED_PSK}\"\n{freq}}}\n"
+        ))
+        .expect("usable conf")
+    }
+
+    fn wifi_outcome(has_freq_list: bool) -> NetworkFallback {
+        NetworkFallback::WifiFromInstalledSystem {
+            conf: installed_conf(has_freq_list.then_some("5180 5200")),
+        }
+    }
+
+    // ---- carrying the installed wifi over ----
+
+    const NOTE_ID: &str = "id=\"wifi-carry-over-note\"";
+
+    #[test]
+    fn blank_fields_carry_the_installed_wifi_over() {
+        let network = wifi_outcome(true);
+        let setup = resolve_wifi("", "", "", &network).unwrap();
+        assert_eq!(
+            setup,
+            WifiSetup::CarriedOver(installed_conf(Some("5180 5200")))
+        );
+    }
+
+    #[test]
+    fn filled_fields_win_over_the_installed_wifi() {
+        let network = wifi_outcome(true);
+        let setup = resolve_wifi("Other Net", GOOD_PSK, "se", &network).unwrap();
+        let WifiSetup::FromForm(net) = setup else {
+            panic!("expected the form to win, got {setup:?}");
+        };
+        assert_eq!(net.ssid().as_str(), "Other Net");
+    }
+
+    #[test]
+    fn incomplete_fields_are_rejected_even_when_wifi_could_be_carried_over() {
+        let network = wifi_outcome(true);
+        let err = resolve_wifi("Other Net", "", "SE", &network).unwrap_err();
+        assert!(err.ends_with("Nothing was changed."), "got: {err}");
+    }
+
+    #[rstest]
+    #[case(NetworkFallback::Skipped)]
+    #[case(NetworkFallback::Ethernet)]
+    #[case(NetworkFallback::NoWifiHardware)]
+    #[case(NetworkFallback::NoInstalledSystem)]
+    #[case(NetworkFallback::Failed("x".into()))]
+    fn blank_fields_without_installed_wifi_mean_no_wifi(#[case] network: NetworkFallback) {
+        assert_eq!(resolve_wifi("", "", "", &network), Ok(WifiSetup::None));
+    }
+
+    #[test]
+    fn ethernet_with_filled_fields_is_unchanged() {
+        let setup = resolve_wifi("Home", GOOD_PSK, "SE", &NetworkFallback::Ethernet).unwrap();
+        assert!(matches!(setup, WifiSetup::FromForm(_)));
+    }
+
+    #[test]
+    fn form_shows_the_keep_note_for_installed_wifi_without_the_psk() {
+        let html = render_with_network(wifi_outcome(true), None, Vec::new());
+        assert!(html.contains(NOTE_ID), "note missing");
+        assert!(
+            html.contains("Leave blank to keep the current wifi settings (SSID Home &lt;Net&gt;).")
+        );
+        assert!(!html.contains(INSTALLED_PSK));
+    }
+
+    #[rstest]
+    #[case(NetworkFallback::Ethernet)]
+    #[case(NetworkFallback::Skipped)]
+    #[case(NetworkFallback::NoWifiHardware)]
+    #[case(NetworkFallback::NoInstalledSystem)]
+    #[case(NetworkFallback::Failed("x".into()))]
+    fn form_has_no_keep_note_without_installed_wifi(#[case] network: NetworkFallback) {
+        let html = render_with_network(network, None, Vec::new());
+        assert!(!html.contains(NOTE_ID));
+        assert!(!html.contains("Leave blank to keep the current wifi settings"));
+    }
+
+    #[test]
+    fn page_shows_ethernet_without_wifi_warning() {
+        let html = render_with_network(NetworkFallback::Ethernet, None, Vec::new());
+        assert!(html.contains("Network: ethernet"));
+        assert!(!html.contains(WIFI_WARNING));
+    }
+
+    #[rstest]
+    #[case(NetworkFallback::Skipped)]
+    #[case(NetworkFallback::NoWifiHardware)]
+    #[case(NetworkFallback::NoInstalledSystem)]
+    #[case(NetworkFallback::Failed("mounting failed".into()))]
+    fn page_shows_no_network_without_wifi_warning(#[case] outcome: NetworkFallback) {
+        let html = render_with_network(outcome, None, Vec::new());
+        assert!(html.contains("Network: none detected"));
+        assert!(!html.contains(WIFI_WARNING));
+        assert!(!html.contains("mounting failed"));
+    }
+
+    #[test]
+    fn page_shows_wifi_ssid_pinned_and_warns() {
+        let html = render_with_network(wifi_outcome(true), None, Vec::new());
+        // SSIDs come from a disk and are escaped.
+        assert!(html.contains(
+            "Network: wifi from installed system \u{2014} SSID Home &lt;Net&gt; (5 GHz pinned)"
+        ));
+        assert!(!html.contains("Home <Net>"));
+        assert!(html.contains(WIFI_WARNING));
+    }
+
+    #[test]
+    fn page_labels_a_non_five_ghz_pin_as_frequencies_pinned() {
+        let outcome = NetworkFallback::WifiFromInstalledSystem {
+            conf: installed_conf(Some("2412 5180")),
+        };
+        let html = render_with_network(outcome, None, Vec::new());
+        assert!(html.contains("SSID Home &lt;Net&gt; (frequencies pinned)"));
+        assert!(!html.contains("5 GHz pinned"));
+    }
+
+    #[test]
+    fn page_omits_pinned_note_without_freq_list_but_still_warns() {
+        let html = render_with_network(wifi_outcome(false), None, Vec::new());
+        assert!(html.contains("SSID Home &lt;Net&gt;"));
+        assert!(!html.contains("5 GHz pinned"));
+        assert!(html.contains(WIFI_WARNING));
+    }
+
+    #[test]
+    fn wifi_warning_sits_above_the_provisioning_form_which_stays_available() {
+        let html = render_with_network(wifi_outcome(true), None, Vec::new());
+        let warning = html.find(WIFI_WARNING).expect("warning");
+        let form = html
+            .find("id=\"provision_button\"")
+            .expect("provision button");
+        assert!(warning < form);
+        assert!(!html.contains("id=\"provision_button\" disabled"));
     }
 
     #[test]
