@@ -12,9 +12,12 @@ use std::path::Path;
 use music_primitives::AudioHash;
 use sha2::{Digest, Sha256};
 
+pub use pcm::{pcm_hash, pcm_hash_reader, PcmHashError};
+
 mod flac;
 mod mp3;
 mod mp4;
+mod pcm;
 mod sniff;
 mod tags;
 mod wav;
