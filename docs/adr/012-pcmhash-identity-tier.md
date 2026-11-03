@@ -47,7 +47,17 @@ AudioHash v1 (ADR-010) hashes encoded bytes, so any re-encode changes it: FLAC c
 - The same audio as FLAC at any level or block size, WAV, AIFF and AIFF-C gets one PcmHash, while their AudioHash values differ.
 - A future AIFF→FLAC conversion must compute PcmHash of source and output and keep the source on mismatch; this is the conversion's acceptance check.
 - Adding a container or replacing the decoder needs no new version as long as the golden and cross-format tests pass. Changing the preimage requires v2, coexisting v1/v2 facts and a re-backfill.
-- Known false negatives: lossy files; resampled, dithered or gain-changed copies; more than 2 channels; float PCM; 32-bit FLAC and FLACs with escape-coded residuals (claxon unsupported); STREAMINFO count wrong; WAV/AIFF with trailing partial frames.
+- Known false negatives (no fact is written):
+  - lossy files;
+  - resampled, dithered or gain-changed copies;
+  - more than 2 channels;
+  - float PCM;
+  - FLACs claxon cannot decode:
+    - escape-coded residual partitions;
+    - frame headers that take bits-per-sample from STREAMINFO (code 000), which libFLAC writes for depths outside {8, 12, 16, 20, 24} — so 4–7, 17–19, 21–23 and 32-bit FLAC;
+    - STREAMINFO min block size below 16 (some variable-blocksize encoders);
+  - FLAC with a wrong STREAMINFO total-sample count;
+  - WAV/AIFF with trailing partial frames.
 - Requires a full decode: order of tens of minutes for about 30 GB of FLAC on a Pi 5 (to be measured). Backfill runs at low priority beside playback.
 - Tests use checked-in reference fixtures made with libFLAC and sox (with a regeneration script), unlike ADR-010's synthetic-only fixtures.
 - MusicValue gains a variant: per ADR-004, gateway, library and console must be redeployed together.
