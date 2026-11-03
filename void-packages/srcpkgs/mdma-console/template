@@ -1,7 +1,7 @@
 # Package metadata for mdma-console (not an xbps-src build template; see
 # void-packages/srcpkgs/beacon/template for the contract).
 pkgname=mdma-console
-version=0.32.0
+version=0.33.0
 revision=1
 archs="aarch64"
 depends="ffmpeg"

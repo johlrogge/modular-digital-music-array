@@ -4,6 +4,53 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.33.0] — 2026-11-03
+
+### Added
+
+- **Bandcamp playlist import runs on the node.** `mdma bandcamp import-playlist <slug-or-url>` now starts a background job in mdma-bandcamp.
+  - It fetches the playlist and matches it against the library.
+  - If owned tracks are missing, it runs a full collection sync and waits for the downloads.
+  - It re-matches, then writes the playlist once. It never writes an empty playlist, and it replaces an existing one.
+  - The CLI polls for progress.
+  - New flag `--no-wait`, and new command `mdma bandcamp import-status`.
+  - `--dry-run` reports matches and writes nothing.
+  - Paused or timed-out downloads are reported in the result.
+  - If an import is already running, a new one is refused ("Import NOT started", exit 1).
+
+### Changed
+
+- **Shared playlist import.** Playlist matching and writing moved into a shared `playlist_import` component. The rekordbox import uses it too.
+- **rekordbox export path length.** New export paths are capped at 250 bytes of the encoded rekordbox Location, measured in NFD the way macOS stores names. rekordbox on macOS rejects paths of about 256 bytes and halts the whole import.
+  - Long names are shortened title first, then album, then artist. Each gets a stable `~hash` suffix.
+  - Paths already in the existing `rekordbox.xml` are kept, so rekordbox keeps their cues. `--replace` skips this grandfathering.
+- **Source protocol.** `SourceRequest` and `SourceResponse` gained import variants.
+
+### Fixed
+
+- **Bandcamp sync.** Dedup no longer holds the download queue lock during library calls, so status polls don't stall.
+- Items already queued or downloading are not queued twice, by sync, import or resync.
+- Cancelling a queued item ends any wait on it.
+
+### Internal
+
+- CI frees runner disk space before building (#83).
+
+### Known issues
+
+- `mdma source sync` still times out client-side; the sync continues on the node (#81).
+- The gateway serialises requests (#84).
+- rekordbox import treats artist+title matches with different durations as matched (#85).
+- Playback writes play events under short hashes (#86).
+
+### Upgrade notes
+
+mdma-gateway, mdma-bandcamp and the CLI must all be 0.33.0. The source protocol gained import variants.
+
+Upgrade the mdma-* packages by name, never a bare `xbps-install -Su`, which would pull in the rpi-kernel on units that haven't run migrate-bootfs.
+
+---
+
 ## [0.32.0] — 2026-11-02
 
 ### Added
