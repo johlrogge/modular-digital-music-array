@@ -201,15 +201,19 @@ enum Commands {
     },
 
     /// Music source management
+    #[command(
+        override_usage = "mdma source list\n       mdma source <SOURCE-NAME> <COMMAND>",
+        after_help = "Per-source commands: mdma source <SOURCE-NAME> <COMMAND>\n\n\
+                      Commands:\n  \
+                      sync, status, downloads, cancel, pause, resume, resync,\n  \
+                      check-item, check-updates, playlists, import-playlist, import-status\n\n\
+                      Example: mdma source bandcamp sync\n\
+                      Run 'mdma source <SOURCE-NAME> --help' for details.\n\
+                      'list' is reserved and cannot be a source name."
+    )]
     Source {
         #[command(subcommand)]
-        command: SourceCommands,
-    },
-
-    /// Bandcamp playlist commands
-    Bandcamp {
-        #[command(subcommand)]
-        command: BandcampCommands,
+        command: SourceTop,
     },
 
     /// Playback control commands
@@ -528,17 +532,87 @@ enum InboxCommands {
     IngestAll,
 }
 
+/// Top level of `mdma source`: the global `list`, or `<source-name> <command>`.
+///
+/// `<source-name>` comes first, so it cannot be a positional of the group
+/// (it would collide with `list`). Anything that is not `list` is captured as
+/// an external subcommand and re-parsed as a [`SourceInvocation`], which keeps
+/// full clap help and validation for the per-source commands. `list` is
+/// therefore reserved and cannot be used as a source name.
 #[derive(Subcommand, Debug)]
-enum BandcampCommands {
-    /// List your Bandcamp playlists
+enum SourceTop {
+    /// List available music sources
+    List,
+
+    /// `<SOURCE-NAME> <COMMAND>`: run a command on a source (see `mdma source <SOURCE-NAME> --help`)
+    #[command(external_subcommand)]
+    Named(Vec<String>),
+}
+
+/// The per-source commands: `mdma source <source-name> <command> [args]`.
+#[derive(Parser, Debug)]
+#[command(
+    arg_required_else_help = true,
+    subcommand_required = true,
+    about = "Commands for one music source"
+)]
+struct SourceInvocation {
+    #[command(subcommand)]
+    command: SourceCommands,
+}
+
+#[derive(Subcommand, Debug, PartialEq)]
+enum SourceCommands {
+    /// Sync the source (download new items)
+    Sync,
+
+    /// Show source status
+    Status,
+
+    /// List downloads for the source
+    Downloads,
+
+    /// Cancel a download
+    Cancel {
+        /// Download ID to cancel
+        id: String,
+    },
+
+    /// Pause all downloads for the source
+    Pause,
+
+    /// Resume downloads for the source
+    Resume,
+
+    /// Force re-sync of a specific item (bypasses dedup)
+    Resync {
+        /// Source-specific item identifier (e.g. "p123456" for bandcamp)
+        identifier: String,
+    },
+
+    /// Check if a specific item has changed upstream
+    CheckItem {
+        /// Source-specific item identifier
+        identifier: String,
+    },
+
+    /// Check the whole source collection for stale items
+    CheckUpdates {
+        /// Auto-apply resync for any stale items found
+        #[arg(long)]
+        apply: bool,
+    },
+
+    /// List the source's playlists (for sources that support playlists)
     Playlists,
 
-    /// Import a Bandcamp playlist as an MDMA playlist (definitive matches only)
+    /// Import a source playlist as an MDMA playlist (definitive matches only;
+    /// for sources that support playlists)
     ImportPlaylist {
         /// Playlist slug or URL
         playlist: String,
 
-        /// MDMA playlist name (default: sanitised Bandcamp title)
+        /// MDMA playlist name (default: sanitised source title)
         #[arg(long)]
         name: Option<String>,
 
@@ -551,77 +625,30 @@ enum BandcampCommands {
         no_wait: bool,
     },
 
-    /// Show the current or last playlist import job (follows it while running)
+    /// Show the current or last playlist import job, following it while running
+    /// (for sources that support playlists)
     ImportStatus,
 }
 
-#[derive(Subcommand, Debug)]
-enum SourceCommands {
-    /// List available music sources
-    List,
+/// Parse the arguments captured by [`SourceTop::Named`]: `<name> <command> ...`.
+fn parse_source_args(args: &[String]) -> Result<(String, SourceCommands), clap::Error> {
+    let (name, rest) = args
+        .split_first()
+        .expect("external subcommand always has a name");
+    let argv = std::iter::once(format!("mdma source {name}")).chain(rest.iter().cloned());
+    let invocation = SourceInvocation::try_parse_from(argv)?;
+    Ok((name.clone(), invocation.command))
+}
 
-    /// Sync a music source (download new items)
-    Sync {
-        /// Source name (e.g. bandcamp)
-        name: String,
-    },
-
-    /// Show source status
-    Status {
-        /// Source name (e.g. bandcamp)
-        name: String,
-    },
-
-    /// List downloads for a source
-    Downloads {
-        /// Source name (e.g. bandcamp)
-        name: String,
-    },
-
-    /// Cancel a download
-    Cancel {
-        /// Source name
-        name: String,
-        /// Download ID to cancel
-        id: String,
-    },
-
-    /// Pause all downloads for a source
-    Pause {
-        /// Source name
-        name: String,
-    },
-
-    /// Resume downloads for a source
-    Resume {
-        /// Source name
-        name: String,
-    },
-
-    /// Force re-sync of a specific item (bypasses dedup)
-    Resync {
-        /// Source name (e.g. bandcamp)
-        name: String,
-        /// Source-specific item identifier (e.g. "p123456" for bandcamp)
-        identifier: String,
-    },
-
-    /// Check if a specific item has changed upstream
-    CheckItem {
-        /// Source name (e.g. bandcamp)
-        name: String,
-        /// Source-specific item identifier
-        identifier: String,
-    },
-
-    /// Check the whole source collection for stale items
-    CheckUpdates {
-        /// Source name
-        name: String,
-        /// Auto-apply resync for any stale items found
-        #[arg(long)]
-        apply: bool,
-    },
+/// Print a parse error (with a `mdma source list` hint) and exit.
+fn exit_source_parse_error(e: clap::Error) -> ! {
+    let failed = e.use_stderr();
+    let code = e.exit_code();
+    let _ = e.print();
+    if failed {
+        eprintln!("\nHint: 'mdma source list' shows the available sources");
+    }
+    std::process::exit(code);
 }
 
 #[derive(Subcommand, Debug)]
@@ -1012,9 +1039,9 @@ fn connect_source(cli: &Cli, name: &str) -> SourceClient {
     connect_source_or_exit(cli, name, None)
 }
 
-/// Request timeout for `mdma bandcamp playlists`: listing makes several
-/// rate-limited Bandcamp requests, well beyond the default 5s.
-const BANDCAMP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Request timeout for `mdma source playlists`: listing may make several
+/// rate-limited upstream requests (e.g. Bandcamp), well beyond the default 5s.
+const SOURCE_LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Connect to a source, with the default request timeout or a custom one.
 fn connect_source_or_exit(
@@ -1036,6 +1063,7 @@ fn connect_source_or_exit(
             if gateway.is_none() {
                 eprintln!("Is mdma-{} running?", name);
             }
+            eprintln!("Hint: 'mdma source list' shows the available sources");
             std::process::exit(1);
         }
     }
@@ -2653,7 +2681,7 @@ fn handle_source_check_updates(
     } else {
         println!("Run with --apply to resync stale items, or resync individually with:");
         for id in &stale_ids {
-            println!("  mdma source resync {} {}", name, id);
+            println!("  {}", resync_command(name, id));
         }
     }
 
@@ -4431,14 +4459,25 @@ fn sanitized_name_or_exit(raw: &str, flag: &str) -> String {
 }
 
 // =============================================================================
-// Source playlist import (mdma bandcamp import-playlist)
+// Source playlists (mdma source playlists / import-playlist / import-status)
 // =============================================================================
 
-/// Name of the source service the `mdma bandcamp` commands talk to.
-const BANDCAMP_SOURCE: &str = "bandcamp";
+/// Message for a source that answers `SourceError::Unsupported`.
+fn unsupported_message(source: &str, feature: &str) -> String {
+    format!("source '{}' does not support {}", source, feature)
+}
 
-fn handle_bandcamp_playlists(client: &SourceClient) -> Result<()> {
-    match client.request(BANDCAMP_SOURCE, &SourceRequest::ListPlaylists) {
+/// Report a source error; `Unsupported` gets a friendly message naming the source.
+fn handle_playlist_source_error(source: &str, feature: &str, err: &SourceError) -> ! {
+    if matches!(err, SourceError::Unsupported { .. }) {
+        eprintln!("{}", unsupported_message(source, feature));
+        std::process::exit(1);
+    }
+    handle_source_error(err)
+}
+
+fn handle_source_playlists(client: &SourceClient, source: &str) -> Result<()> {
+    match client.request(source, &SourceRequest::ListPlaylists) {
         Ok(SourceResponse::Playlists(playlists)) => {
             if playlists.is_empty() {
                 println!("No playlists found");
@@ -4471,22 +4510,34 @@ fn handle_bandcamp_playlists(client: &SourceClient) -> Result<()> {
             }
             Ok(())
         }
-        Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
+        Ok(SourceResponse::Error(e)) => handle_playlist_source_error(source, "playlists", &e),
         Ok(_) => handle_source_error(&"Unexpected response"),
         Err(e) => handle_source_error(&e),
     }
 }
 
+/// The command hinted at to follow an import job (name first, as parsed).
+fn import_status_command(source: &str) -> String {
+    format!("mdma source {} import-status", source)
+}
+
+/// The command hinted at to force-resync one item.
+fn resync_command(source: &str, identifier: &str) -> String {
+    format!("mdma source {} resync {}", source, identifier)
+}
+
 /// Message for a refused import: another job holds the single import slot.
-fn import_not_started_message(running_job_id: u64) -> String {
+fn import_not_started_message(source: &str, running_job_id: u64) -> String {
     format!(
-        "Import NOT started: job {} is already running (see 'mdma bandcamp import-status')",
-        running_job_id
+        "Import NOT started: job {} is already running (see '{}')",
+        running_job_id,
+        import_status_command(source)
     )
 }
 
-fn handle_bandcamp_import_playlist(
+fn handle_source_import_playlist(
     client: &SourceClient,
+    source: &str,
     playlist: &str,
     name: &Option<String>,
     dry_run: bool,
@@ -4496,7 +4547,7 @@ fn handle_bandcamp_import_playlist(
     let explicit_name = name.as_deref().map(|n| sanitized_name_or_exit(n, "--name"));
 
     let job_id = match client.request(
-        BANDCAMP_SOURCE,
+        source,
         &SourceRequest::ImportPlaylist {
             playlist: playlist.to_string(),
             name: explicit_name,
@@ -4510,23 +4561,23 @@ fn handle_bandcamp_import_playlist(
         Ok(SourceResponse::Error(SourceError::ImportInProgress { job_id })) => {
             // The running job may be a different playlist or a dry run, so
             // following it would report someone else's result as ours.
-            eprintln!("{}", import_not_started_message(job_id));
+            eprintln!("{}", import_not_started_message(source, job_id));
             std::process::exit(1);
         }
-        Ok(SourceResponse::Error(e)) => handle_source_error(&e),
+        Ok(SourceResponse::Error(e)) => handle_playlist_source_error(source, "playlist import", &e),
         Ok(_) => handle_source_error(&"Unexpected response"),
         Err(e) => handle_source_error(&e),
     };
 
     if no_wait {
-        println!("Check progress with 'mdma bandcamp import-status'");
+        println!("Check progress with '{}'", import_status_command(source));
         return Ok(());
     }
-    follow_import_job(client, job_id)
+    follow_import_job(client, source, job_id)
 }
 
-fn handle_bandcamp_import_status(client: &SourceClient) -> Result<()> {
-    match client.request(BANDCAMP_SOURCE, &SourceRequest::GetImportStatus) {
+fn handle_source_import_status(client: &SourceClient, source: &str) -> Result<()> {
+    match client.request(source, &SourceRequest::GetImportStatus) {
         Ok(SourceResponse::ImportStatus(None)) => {
             println!("No import job");
             Ok(())
@@ -4536,10 +4587,10 @@ fn handle_bandcamp_import_status(client: &SourceClient) -> Result<()> {
                 finish_import(&status)
             } else {
                 println!("Import job {} is running", status.job_id);
-                follow_import_job(client, status.job_id)
+                follow_import_job(client, source, status.job_id)
             }
         }
-        Ok(SourceResponse::Error(e)) => handle_source_error(&e),
+        Ok(SourceResponse::Error(e)) => handle_playlist_source_error(source, "playlist import", &e),
         Ok(_) => handle_source_error(&"Unexpected response"),
         Err(e) => handle_source_error(&e),
     }
@@ -4675,11 +4726,11 @@ fn finish_import(status: &ImportJobStatus) -> Result<()> {
 }
 
 /// Poll the server until `job_id` finishes, then print its report.
-fn follow_import_job(client: &SourceClient, job_id: u64) -> Result<()> {
+fn follow_import_job(client: &SourceClient, source: &str, job_id: u64) -> Result<()> {
     let mut poller = ImportPoller::new(job_id);
     let mut last_error: Option<String> = None;
     loop {
-        let input = match client.request(BANDCAMP_SOURCE, &SourceRequest::GetImportStatus) {
+        let input = match client.request(source, &SourceRequest::GetImportStatus) {
             Ok(SourceResponse::ImportStatus(s)) => PollInput::Status(s),
             Ok(SourceResponse::Error(e)) => {
                 last_error = Some(e.to_string());
@@ -4704,9 +4755,10 @@ fn follow_import_job(client: &SourceClient, job_id: u64) -> Result<()> {
             PollFlow::GiveUp => {
                 eprintln!(
                     "Lost contact with the import job {} ({}); \
-                     check later with 'mdma bandcamp import-status'",
+                     check later with '{}'",
                     job_id,
-                    last_error.unwrap_or_else(|| "no status for the job".to_string())
+                    last_error.unwrap_or_else(|| "no status for the job".to_string()),
+                    import_status_command(source)
                 );
                 std::process::exit(1);
             }
@@ -5412,6 +5464,53 @@ fn sockets_given(matches: &clap::ArgMatches) -> bool {
     })
 }
 
+/// Run one per-source command against the source `name`.
+fn run_source_command(cli: &Cli, name: &str, command: &SourceCommands) -> Result<()> {
+    match command {
+        SourceCommands::Playlists => {
+            let client = connect_source_or_exit(cli, name, Some(SOURCE_LISTING_TIMEOUT));
+            handle_source_playlists(&client, name)
+        }
+        _ => {
+            let client = connect_source(cli, name);
+            match command {
+                SourceCommands::Sync => handle_source_sync(&client, name),
+                SourceCommands::Status => handle_source_status(&client, name),
+                SourceCommands::Downloads => handle_source_downloads(&client, name),
+                SourceCommands::Cancel { id } => handle_source_cancel(&client, name, id.clone()),
+                SourceCommands::Pause => handle_source_pause(&client, name),
+                SourceCommands::Resume => handle_source_resume(&client, name),
+                SourceCommands::Resync { identifier } => {
+                    handle_source_resync(&client, name, identifier)
+                }
+                SourceCommands::CheckItem { identifier } => {
+                    handle_source_check_item(&client, name, identifier)
+                }
+                SourceCommands::CheckUpdates { apply } => {
+                    handle_source_check_updates(cli, &client, name, *apply)
+                }
+                // Import requests return immediately (the job runs server-side),
+                // so the default request timeout is enough for start and polls.
+                SourceCommands::ImportPlaylist {
+                    playlist,
+                    name: import_name,
+                    dry_run,
+                    no_wait,
+                } => handle_source_import_playlist(
+                    &client,
+                    name,
+                    playlist,
+                    import_name,
+                    *dry_run,
+                    *no_wait,
+                ),
+                SourceCommands::ImportStatus => handle_source_import_status(&client, name),
+                SourceCommands::Playlists => unreachable!("handled above"),
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     color_eyre::install()?;
 
@@ -5475,67 +5574,12 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::Bandcamp { command } => match command {
-            BandcampCommands::Playlists => {
-                let client =
-                    connect_source_or_exit(&cli, BANDCAMP_SOURCE, Some(BANDCAMP_REQUEST_TIMEOUT));
-                handle_bandcamp_playlists(&client)
-            }
-            // Import requests return immediately (the job runs server-side),
-            // so the default request timeout is enough for start and polls.
-            BandcampCommands::ImportPlaylist {
-                playlist,
-                name,
-                dry_run,
-                no_wait,
-            } => {
-                let client = connect_source(&cli, BANDCAMP_SOURCE);
-                handle_bandcamp_import_playlist(&client, playlist, name, *dry_run, *no_wait)
-            }
-            BandcampCommands::ImportStatus => {
-                let client = connect_source(&cli, BANDCAMP_SOURCE);
-                handle_bandcamp_import_status(&client)
-            }
-        },
-
         Commands::Source { command } => match command {
-            SourceCommands::List => handle_source_list(&cli),
-            SourceCommands::Sync { name } => {
-                let client = connect_source(&cli, name);
-                handle_source_sync(&client, name)
-            }
-            SourceCommands::Status { name } => {
-                let client = connect_source(&cli, name);
-                handle_source_status(&client, name)
-            }
-            SourceCommands::Downloads { name } => {
-                let client = connect_source(&cli, name);
-                handle_source_downloads(&client, name)
-            }
-            SourceCommands::Cancel { name, id } => {
-                let client = connect_source(&cli, name);
-                handle_source_cancel(&client, name, id.clone())
-            }
-            SourceCommands::Pause { name } => {
-                let client = connect_source(&cli, name);
-                handle_source_pause(&client, name)
-            }
-            SourceCommands::Resume { name } => {
-                let client = connect_source(&cli, name);
-                handle_source_resume(&client, name)
-            }
-            SourceCommands::Resync { name, identifier } => {
-                let client = connect_source(&cli, name);
-                handle_source_resync(&client, name, identifier)
-            }
-            SourceCommands::CheckItem { name, identifier } => {
-                let client = connect_source(&cli, name);
-                handle_source_check_item(&client, name, identifier)
-            }
-            SourceCommands::CheckUpdates { name, apply } => {
-                let client = connect_source(&cli, name);
-                handle_source_check_updates(&cli, &client, name, *apply)
-            }
+            SourceTop::List => handle_source_list(&cli),
+            SourceTop::Named(args) => match parse_source_args(args) {
+                Ok((name, command)) => run_source_command(&cli, &name, &command),
+                Err(e) => exit_source_parse_error(e),
+            },
         },
 
         // Library commands - connect to library service
@@ -5831,8 +5875,211 @@ mod tests {
     #[test]
     fn refused_import_message_says_not_started_and_names_the_running_job() {
         assert_eq!(
-            import_not_started_message(7),
-            "Import NOT started: job 7 is already running (see 'mdma bandcamp import-status')"
+            import_not_started_message("bandcamp", 7),
+            "Import NOT started: job 7 is already running (see 'mdma source bandcamp import-status')"
+        );
+    }
+
+    /// Parse a hinted command line with the real parser, as a user pasting it would.
+    fn parse_hinted(command: &str) -> (String, SourceCommands) {
+        let words: Vec<String> = command.split_whitespace().map(String::from).collect();
+        assert_eq!(&words[..2], ["mdma", "source"], "{command}");
+        let cli = Cli::try_parse_from(&words).unwrap_or_else(|e| panic!("{command}: {e}"));
+        match cli.command {
+            Commands::Source {
+                command: SourceTop::Named(args),
+            } => parse_source_args(&args).unwrap_or_else(|e| panic!("{command}: {e}")),
+            other => panic!("{command}: unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_status_hint_parses_to_import_status_for_that_source() {
+        for src in ["bandcamp", "beatport"] {
+            let (name, command) = parse_hinted(&import_status_command(src));
+            assert_eq!(name, src);
+            assert_eq!(command, SourceCommands::ImportStatus);
+            // The refusal message embeds the same hint.
+            assert!(import_not_started_message(src, 1).contains(&import_status_command(src)));
+        }
+    }
+
+    #[test]
+    fn resync_hint_parses_to_resync_for_that_source() {
+        let (name, command) = parse_hinted(&resync_command("bandcamp", "p123"));
+        assert_eq!(name, "bandcamp");
+        assert_eq!(
+            command,
+            SourceCommands::Resync {
+                identifier: "p123".into()
+            }
+        );
+    }
+
+    fn parse_source(args: &[&str]) -> Result<(String, SourceCommands), clap::Error> {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        parse_source_args(&args)
+    }
+
+    #[test]
+    fn every_per_source_command_parses_with_the_name_first() {
+        let cases: Vec<(Vec<&str>, SourceCommands)> = vec![
+            (vec!["bandcamp", "sync"], SourceCommands::Sync),
+            (vec!["bandcamp", "status"], SourceCommands::Status),
+            (vec!["bandcamp", "downloads"], SourceCommands::Downloads),
+            (
+                vec!["bandcamp", "cancel", "d1"],
+                SourceCommands::Cancel { id: "d1".into() },
+            ),
+            (vec!["bandcamp", "pause"], SourceCommands::Pause),
+            (vec!["bandcamp", "resume"], SourceCommands::Resume),
+            (
+                vec!["bandcamp", "resync", "p1"],
+                SourceCommands::Resync {
+                    identifier: "p1".into(),
+                },
+            ),
+            (
+                vec!["bandcamp", "check-item", "p1"],
+                SourceCommands::CheckItem {
+                    identifier: "p1".into(),
+                },
+            ),
+            (
+                vec!["bandcamp", "check-updates", "--apply"],
+                SourceCommands::CheckUpdates { apply: true },
+            ),
+            (vec!["bandcamp", "playlists"], SourceCommands::Playlists),
+            (
+                vec![
+                    "bandcamp",
+                    "import-playlist",
+                    "my-list",
+                    "--name",
+                    "x",
+                    "--dry-run",
+                    "--no-wait",
+                ],
+                SourceCommands::ImportPlaylist {
+                    playlist: "my-list".into(),
+                    name: Some("x".into()),
+                    dry_run: true,
+                    no_wait: true,
+                },
+            ),
+            (
+                vec!["bandcamp", "import-status"],
+                SourceCommands::ImportStatus,
+            ),
+        ];
+        for (args, expected) in cases {
+            let (name, command) = parse_source(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            assert_eq!(name, "bandcamp");
+            assert_eq!(command, expected, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn import_playlist_defaults_have_no_flags_set() {
+        let (_, command) = parse_source(&["bandcamp", "import-playlist", "p"]).unwrap();
+        assert_eq!(
+            command,
+            SourceCommands::ImportPlaylist {
+                playlist: "p".into(),
+                name: None,
+                dry_run: false,
+                no_wait: false,
+            }
+        );
+    }
+
+    #[test]
+    fn source_list_parses_as_the_global_command() {
+        let cli = Cli::try_parse_from(["mdma", "source", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Source {
+                command: SourceTop::List
+            }
+        ));
+    }
+
+    #[test]
+    fn source_name_then_command_reaches_named() {
+        let cli = Cli::try_parse_from(["mdma", "source", "bandcamp", "sync"]).unwrap();
+        match cli.command {
+            Commands::Source {
+                command: SourceTop::Named(args),
+            } => assert_eq!(args, vec!["bandcamp", "sync"]),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_per_source_command_fails() {
+        let e = parse_source(&["bandcamp", "frobnicate"]).unwrap_err();
+        assert!(e.use_stderr());
+    }
+
+    #[test]
+    fn source_name_without_command_fails() {
+        let e = parse_source(&["bandcamp"]).unwrap_err();
+        assert!(e.use_stderr() || e.kind() != clap::error::ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn old_name_last_order_is_rejected() {
+        // `mdma source sync bandcamp` reads `sync` as the source name.
+        assert!(parse_source(&["sync", "bandcamp"]).is_err());
+    }
+
+    #[test]
+    fn bandcamp_command_group_is_gone() {
+        assert!(Cli::try_parse_from(["mdma", "bandcamp", "playlists"]).is_err());
+    }
+
+    #[test]
+    fn source_help_lists_list_and_explains_the_name_first_form() {
+        let e = Cli::try_parse_from(["mdma", "source", "--help"]).unwrap_err();
+        assert_eq!(e.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = e.to_string();
+        assert!(help.contains("list"), "{help}");
+        assert!(help.contains("<SOURCE-NAME> <COMMAND>"), "{help}");
+    }
+
+    #[test]
+    fn per_source_help_lists_the_commands() {
+        let e = parse_source(&["bandcamp", "--help"]).unwrap_err();
+        assert_eq!(e.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = e.to_string();
+        for cmd in [
+            "sync",
+            "status",
+            "downloads",
+            "cancel",
+            "pause",
+            "resume",
+            "resync",
+            "check-item",
+            "check-updates",
+            "playlists",
+            "import-playlist",
+            "import-status",
+        ] {
+            assert!(help.contains(cmd), "missing {cmd} in {help}");
+        }
+        assert!(help.contains("mdma source bandcamp"), "{help}");
+    }
+
+    #[test]
+    fn unsupported_message_names_the_source_and_feature() {
+        assert_eq!(
+            unsupported_message("beatport", "playlist import"),
+            "source 'beatport' does not support playlist import"
+        );
+        assert_eq!(
+            unsupported_message("beatport", "playlists"),
+            "source 'beatport' does not support playlists"
         );
     }
 

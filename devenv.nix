@@ -208,7 +208,7 @@ in
 
     echo ""
     echo "Commands:  mdma --help | mdma-tui"
-    echo "           mdma source list|sync|status|downloads"
+    echo "           mdma source list | mdma source <name> sync|status|downloads"
     echo "           mdma-volume <0-1>  mdma-status"
     echo "           just --list"
 

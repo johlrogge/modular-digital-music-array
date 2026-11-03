@@ -60,10 +60,10 @@ mdma rekordbox export --output rekordbox-out.xml
 
 # List your Bandcamp playlists and import one (preview with --dry-run)
 # Import runs as a background job on the node — new in 0.33.0
-mdma bandcamp playlists
-mdma bandcamp import-playlist my-playlist --dry-run
-mdma bandcamp import-playlist my-playlist --no-wait
-mdma bandcamp import-status
+mdma source bandcamp playlists
+mdma source bandcamp import-playlist my-playlist --dry-run
+mdma source bandcamp import-playlist my-playlist --no-wait
+mdma source bandcamp import-status
 
 # Subscribe to live events (now playing, queue changes)
 mdma subscribe
@@ -115,7 +115,7 @@ This is a [Polylith](https://polylith.gitbook.io/polylith/) workspace. Deployabl
 | `mdma-playback` | Queue manager — drives audio sources via StreamClient; persists queue to `/metadata/queue.json` |
 | `mdma-audio` | Audio playback source — wraps PlaybackEngine (Symphonia + rubato + PipeWire), speaks `stream_source_protocol` over NNG |
 | `mdma-tui` | Terminal UI — multi-pane tabs (nnn-style, `1`–`5`/`6`–`0`), field-aware search grammar (`:artist`, `:bpm`, `:added`, …), DJ shortcuts (`A`, `P`, `d`/`p`, `u`), modal keybindings, command palette, live queue sync, intelligent column compression |
-| `mdma-bandcamp` | Bandcamp source — collection sync into the library inbox, fan playlist listing/fetching, and background playlist import jobs for `mdma bandcamp` |
+| `mdma-bandcamp` | Bandcamp source — collection sync into the library inbox, fan playlist listing/fetching, and background playlist import jobs for `mdma source bandcamp` |
 | `mdma-console` | Web management console — player controls, search, queue, upload, export |
 | `mdma-cli` | CLI — search, queue, playlists, playback, export, subscribe, bookmarks, Bandcamp playlist import, shell completions |
 | `dj-workspace` | Bevy GUI app (laptop-only, not packaged for Pi) — playlist browser and BPM/Key/Role/Energy candidate finder with sortable results; connects via gateway (`dj-workspace --node <host>`) |
@@ -244,9 +244,9 @@ ADR-011 is new and ADR-004 is amended.
 
 ### Bandcamp playlist import runs on the node
 
-`mdma bandcamp import-playlist <slug|url>` now starts a background job in mdma-bandcamp. It fetches the playlist and matches it against the library. If owned tracks are missing, it runs a full collection sync and waits for the downloads, then re-matches and writes the playlist once. It never writes an empty playlist, and it replaces an existing one. The CLI polls for progress.
+`mdma source bandcamp import-playlist <slug|url>` now starts a background job in mdma-bandcamp. It fetches the playlist and matches it against the library. If owned tracks are missing, it runs a full collection sync and waits for the downloads, then re-matches and writes the playlist once. It never writes an empty playlist, and it replaces an existing one. The CLI polls for progress.
 
-`--no-wait` returns right after starting the job; `mdma bandcamp import-status` shows the job's progress and result. `--dry-run` reports matches and writes nothing. Paused or timed-out downloads are reported in the result. If an import is already running, a new one is refused ("Import NOT started", exit 1).
+`--no-wait` returns right after starting the job; `mdma source bandcamp import-status` shows the job's progress and result. `--dry-run` reports matches and writes nothing. Paused or timed-out downloads are reported in the result. If an import is already running, a new one is refused ("Import NOT started", exit 1).
 
 Playlist matching and writing now live in a shared `playlist_import` component, which the rekordbox import uses too.
 
@@ -260,7 +260,7 @@ New export paths are capped at 250 bytes of the encoded rekordbox Location, meas
 
 **Upgrade notes:** `SourceRequest`/`SourceResponse` gained import variants, so mdma-gateway, mdma-bandcamp and the CLI must all be 0.33.0. Upgrade the mdma-* packages by name, never a bare `xbps-install -Su`, which would pull in the rpi-kernel on unmigrated units.
 
-**Known issues:** `mdma source sync` still times out client-side, though the sync continues on the node (#81); the gateway serialises requests (#84); rekordbox import treats artist+title matches with different durations as matched (#85); playback writes play events under short hashes (#86). See CHANGELOG.md.
+**Known issues:** `mdma source bandcamp sync` still times out client-side, though the sync continues on the node (#81); the gateway serialises requests (#84); rekordbox import treats artist+title matches with different durations as matched (#85); playback writes play events under short hashes (#86). See CHANGELOG.md.
 
 ---
 
@@ -268,13 +268,13 @@ New export paths are capped at 250 bytes of the encoded rekordbox Location, meas
 
 ### Bandcamp playlist import
 
-`mdma bandcamp playlists` lists your Bandcamp fan playlists, private ones included. `mdma bandcamp import-playlist <slug-or-url> [--name N] [--dry-run]` imports one into an MDMA playlist in the same order, matching tracks against the library by artist, title and duration.
+`mdma source bandcamp playlists` lists your Bandcamp fan playlists, private ones included. `mdma source bandcamp import-playlist <slug-or-url> [--name N] [--dry-run]` imports one into an MDMA playlist in the same order, matching tracks against the library by artist, title and duration.
 
 It prints a per-track report: `✓` matched, `?` ambiguous or duration differs (not written), `✗` not in library. It warns if fewer tracks were fetched than the playlist has, and aborts without writing if a library lookup fails. Re-running replaces the playlist, including manual edits. The Bandcamp service fetches through the Pi's stored cookies and accepts only https bandcamp.com URLs.
 
 The source protocol gains `ListPlaylists` and `GetPlaylist` requests and an `Unsupported` error. mdma-bandcamp now answers unparseable requests with an error instead of stalling the gateway. The rekordbox and Bandcamp imports share playlist writing, which only replaces on "already exists" and no longer silently drops tracks on a lookup failure.
 
-**Upgrade notes:** mdma-gateway, mdma-bandcamp and the CLI must all be 0.32.0; older gateways reject the new requests. The `mdma bandcamp` commands use a 30 s CLI timeout but the gateway caps source requests at 10 s and is blocked while one runs, so don't run imports or syncs during playback (#81). Units provisioned before 0.26.1 that haven't run migrate-bootfs: name the mdma-* packages explicitly, never a bare `xbps-install -Su`.
+**Upgrade notes:** mdma-gateway, mdma-bandcamp and the CLI must all be 0.32.0; older gateways reject the new requests. The `mdma source bandcamp` commands use a 30 s CLI timeout but the gateway caps source requests at 10 s and is blocked while one runs, so don't run imports or syncs during playback (#81). Units provisioned before 0.26.1 that haven't run migrate-bootfs: name the mdma-* packages explicitly, never a bare `xbps-install -Su`.
 
 **Known issues:** long source operations block the gateway (#81); avahi renames the node to `-2` when ethernet and wifi share a subnet (#80); wifi association delays after boot (#79); Argon NEO 5 + wifi NVMe instability (#74, #69). See CHANGELOG.md.
 
@@ -649,8 +649,8 @@ INSTALL scripts for all 8 services now create `/var/log/<svc>` at install time. 
 
 ### Bandcamp
 
-- `mdma source check-item <source> <id>` and `mdma source check-updates <source> [--apply]` — on-demand stale-item detection via track-count comparison.
-- `mdma source resync <source> <id>` — force-resync for manual override.
+- `mdma source <source> check-item <id>` and `mdma source <source> check-updates [--apply]` — on-demand stale-item detection via track-count comparison.
+- `mdma source <source> resync <id>` — force-resync for manual override.
 
 ---
 
