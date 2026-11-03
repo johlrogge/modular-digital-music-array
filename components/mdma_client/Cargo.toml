@@ -21,7 +21,7 @@ media-protocol = { workspace = true }
 gateway-client = { workspace = true }
 source-protocol = { workspace = true }
 nng-transport = { workspace = true }
-track-formatter = { workspace = true }
+playlist-import = { workspace = true }
 
 # NNG + serialization
 nng = "1.0"

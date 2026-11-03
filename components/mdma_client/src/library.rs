@@ -6,7 +6,7 @@ use library_ipc_client::{
     IngestSource, LibraryClient, LibraryRequest, LibraryResponse, MusicValue, OrphanInfo,
     PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
 };
-use track_formatter::format_playlist_content;
+use playlist_import::PlaylistWriteOps;
 
 /// Abstraction for library requests, works in both gateway and direct mode.
 pub enum LibraryBackend {
@@ -181,7 +181,7 @@ impl LibraryBackend {
 
     /// Create a new playlist with pre-formatted content.
     ///
-    /// `content` must be in the canonical `{8hash}  {Artist} - {Title}  [{duration}]`
+    /// `content` must be in the canonical `{12-hex short hash}  {Artist} - {Title}  [{duration}]`
     /// format produced by `track_formatter::format_playlist_content`.
     pub fn playlist_new(&self, name: &PlaylistName, content: String) -> Result<(), ClientError> {
         match self {
@@ -197,7 +197,7 @@ impl LibraryBackend {
 
     /// Append pre-formatted content lines to an existing playlist.
     ///
-    /// `content` must be in the canonical `{8hash}  {Artist} - {Title}  [{duration}]`
+    /// `content` must be in the canonical `{12-hex short hash}  {Artist} - {Title}  [{duration}]`
     /// format produced by `track_formatter::format_playlist_content`.
     pub fn playlist_append(&self, name: &PlaylistName, content: String) -> Result<(), ClientError> {
         match self {
@@ -213,7 +213,7 @@ impl LibraryBackend {
 
     /// Replace a playlist with pre-formatted content.
     ///
-    /// `content` must be in the canonical `{8hash}  {Artist} - {Title}  [{duration}]`
+    /// `content` must be in the canonical `{12-hex short hash}  {Artist} - {Title}  [{duration}]`
     /// format produced by `track_formatter::format_playlist_content`.
     pub fn playlist_replace(
         &self,
@@ -241,11 +241,7 @@ impl LibraryBackend {
         &self,
         hashes: &[ContentHash],
     ) -> Result<String, ClientError> {
-        let tracks: Vec<TrackInfo> = hashes
-            .iter()
-            .map(|h| self.get_track(h))
-            .collect::<Result<_, _>>()?;
-        Ok(format_playlist_content(&tracks))
+        playlist_import::resolve_and_format_playlist(hashes, |h| self.get_track(h))
     }
 
     pub fn playlist_remove(&self, name: &PlaylistName) -> Result<(), ClientError> {
@@ -350,6 +346,20 @@ impl LibraryBackend {
                 interpret_orphans_list(self.request(&LibraryRequest::TrackOrphans)?)
             }
         }
+    }
+}
+
+impl PlaylistWriteOps for LibraryBackend {
+    fn resolve_and_format_playlist(&self, hashes: &[ContentHash]) -> Result<String, ClientError> {
+        self.resolve_and_format_playlist(hashes)
+    }
+
+    fn playlist_new(&self, name: &PlaylistName, content: String) -> Result<(), ClientError> {
+        self.playlist_new(name, content)
+    }
+
+    fn playlist_replace(&self, name: &PlaylistName, content: String) -> Result<(), ClientError> {
+        self.playlist_replace(name, content)
     }
 }
 
