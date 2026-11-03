@@ -14,7 +14,9 @@ use sha2::{Digest, Sha256};
 
 pub use pcm::{pcm_hash, pcm_hash_reader, PcmHashError};
 
+mod aiff;
 mod flac;
+mod iff;
 mod mp3;
 mod mp4;
 mod pcm;

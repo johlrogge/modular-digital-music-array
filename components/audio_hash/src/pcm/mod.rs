@@ -96,16 +96,40 @@ impl Channels {
     }
 }
 
-impl TryFrom<u32> for Channels {
-    type Error = PcmHashError;
+/// Why a channel count is not [`Channels`]. Each container decides how to
+/// report it (zero is malformed input, more than two is merely unsupported).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChannelsError {
+    Zero,
+    TooMany,
+}
 
-    fn try_from(n: u32) -> Result<Self, PcmHashError> {
+impl ChannelsError {
+    fn for_container(self, container: Container) -> PcmHashError {
+        match self {
+            ChannelsError::Zero => PcmHashError::malformed(container, "zero channels"),
+            ChannelsError::TooMany => PcmHashError::Unsupported("more than 2 channels"),
+        }
+    }
+}
+
+impl TryFrom<u32> for Channels {
+    type Error = ChannelsError;
+
+    fn try_from(n: u32) -> Result<Self, ChannelsError> {
         match n {
-            0 => Err(PcmHashError::Decode("zero channels")),
+            0 => Err(ChannelsError::Zero),
             1 => Ok(Channels::Mono),
             2 => Ok(Channels::Stereo),
-            _ => Err(PcmHashError::Unsupported("more than 2 channels")),
+            _ => Err(ChannelsError::TooMany),
         }
+    }
+}
+
+impl Channels {
+    /// Channel count from a container field.
+    pub fn from_field(n: u32, container: Container) -> Result<Self, PcmHashError> {
+        Channels::try_from(n).map_err(|e| e.for_container(container))
     }
 }
 
@@ -136,8 +160,10 @@ impl StoredBits {
         32 - u32::from(self.0)
     }
 
-    pub fn bits(self) -> u8 {
-        self.0
+    /// Whether `s` is representable as a signed `bits`-bit integer.
+    pub fn fits(self, s: i32) -> bool {
+        let half = 1i64 << (self.0 - 1);
+        (-half..half).contains(&i64::from(s))
     }
 
     /// Bytes per sample in the MD5 packing: `ceil(bits / 8)`.
@@ -218,6 +244,8 @@ impl PcmHasher {
     }
 
     fn push(&mut self, s: i32) {
+        // Callers guarantee this; it also keeps the left shift lossless.
+        debug_assert!(self.bits.fits(s), "sample {s} exceeds {} bits", self.bits.0);
         self.buf
             .extend_from_slice(&(s << self.bits.shift()).to_le_bytes());
         if let Some((_, packed)) = &mut self.md5 {
@@ -403,13 +431,19 @@ mod tests {
     fn channels_accept_only_mono_and_stereo() {
         assert_eq!(Channels::try_from(1).unwrap(), Channels::Mono);
         assert_eq!(Channels::try_from(2).unwrap(), Channels::Stereo);
+        assert_eq!(Channels::try_from(3), Err(ChannelsError::TooMany));
+        assert_eq!(Channels::try_from(0), Err(ChannelsError::Zero));
+        // each container reports zero channels as its own Malformed
+        for c in [Container::Wav, Container::Aiff, Container::Flac] {
+            assert!(matches!(
+                Channels::from_field(0, c),
+                Err(PcmHashError::Container(AudioHashError::Malformed { container, reason: "zero channels" }))
+                    if container == c
+            ));
+        }
         assert!(matches!(
-            Channels::try_from(3),
+            Channels::from_field(3, Container::Wav),
             Err(PcmHashError::Unsupported(_))
-        ));
-        assert!(matches!(
-            Channels::try_from(0),
-            Err(PcmHashError::Decode(_))
         ));
     }
 
@@ -536,16 +570,20 @@ mod tests {
 
     #[test]
     fn error_conversions() {
-        let e: PcmHashError = io::Error::other("x").into();
-        assert!(matches!(e, PcmHashError::Container(AudioHashError::Io(_))));
-        assert!(!PcmHashError::Md5Mismatch.to_string().is_empty());
-        assert!(!PcmHashError::DecoderPanic.to_string().is_empty());
-        assert!(PcmHashError::SampleCountMismatch {
-            declared: 1,
-            decoded: 2
-        }
-        .to_string()
-        .contains('2'));
+        let e: PcmHashError = io::Error::new(io::ErrorKind::NotFound, "x").into();
+        assert!(matches!(
+            e,
+            PcmHashError::Container(AudioHashError::Io(ref ioe))
+                if ioe.kind() == io::ErrorKind::NotFound
+        ));
+        assert_eq!(
+            PcmHashError::SampleCountMismatch {
+                declared: 1,
+                decoded: 2
+            }
+            .to_string(),
+            "sample count mismatch: declared 1, decoded 2"
+        );
     }
 
     // --- dispatch ---
@@ -842,6 +880,27 @@ mod tests {
             chunk_sized(b"data", 0xFFFF_FFFF, &le_samples(&VALS, 2)),
         ]);
         assert_eq!(ok(&w).as_str(), GOLDEN_PCM);
+
+        // The payload runs to EOF, so a trailing chunk that is not a whole
+        // number of frames makes `data` partial: Malformed.
+        let partial = [
+            le_samples(&VALS, 2),
+            chunk(b"LIST", b"ab"), // 10 bytes, frames are 4
+        ]
+        .concat();
+        let w = riff(&[
+            wav_fmt(1, 2, 44100, 4, 16),
+            chunk_sized(b"data", 0xFFFF_FFFF, &partial),
+        ]);
+        assert!(is_malformed(pcm(&w)));
+
+        // A trailing chunk of whole frames is hashed as audio (as in v1).
+        let whole = [le_samples(&VALS, 2), chunk(b"LIST", b"abcd")].concat();
+        let w = riff(&[
+            wav_fmt(1, 2, 44100, 4, 16),
+            chunk_sized(b"data", 0xFFFF_FFFF, &whole),
+        ]);
+        assert_ne!(ok(&w).as_str(), GOLDEN_PCM);
     }
 
     #[test]
@@ -1024,21 +1083,42 @@ mod tests {
 
     #[test]
     fn flac_streaminfo_disagreeing_with_frames_is_rejected() {
+        // Assert the exact reasons, so the test fails if our own checks stop
+        // running (claxon would otherwise decode these frames happily).
         // channels
         let b = flac(&[si_block(1, 16, 0, [0; 16])], &golden_frames());
-        assert!(matches!(pcm(&b), Err(PcmHashError::Decode(_))));
+        assert!(matches!(
+            pcm(&b),
+            Err(PcmHashError::Decode(
+                "frame channel count differs from STREAMINFO"
+            ))
+        ));
         // samples exceed STREAMINFO bits
         let b = flac(&[si_block(2, 8, 0, [0; 16])], &golden_frames());
-        assert!(matches!(pcm(&b), Err(PcmHashError::Decode(_))));
+        assert!(matches!(
+            pcm(&b),
+            Err(PcmHashError::Decode(
+                "sample exceeds STREAMINFO bits per sample"
+            ))
+        ));
         // more than 2 channels
         let b = flac(&[si_block(3, 16, 0, [0; 16])], &golden_frames());
-        assert!(is_unsupported(pcm(&b)));
+        assert!(matches!(
+            pcm(&b),
+            Err(PcmHashError::Unsupported("more than 2 channels"))
+        ));
         // zero sample rate
         let b = flac(
             &[(0, flac_streaminfo(0, 2, 16, 0, [0; 16]))],
             &golden_frames(),
         );
-        assert!(is_malformed(pcm(&b)));
+        assert!(matches!(
+            pcm(&b),
+            Err(PcmHashError::Container(AudioHashError::Malformed {
+                container: Container::Flac,
+                reason: "zero sample rate"
+            }))
+        ));
     }
 
     #[test]

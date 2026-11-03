@@ -2,9 +2,10 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
-use super::raw::{EightBit, Endian, RawPcmLayout};
+use super::raw::{ContainerBytes, EightBit, RawPcmLayout};
 use super::{Channels, PcmHashError, SampleRate};
-use crate::tags::le_u32;
+use crate::iff::Endian;
+use crate::tags::{le_u16, le_u32};
 use crate::{wav, Container};
 
 const C: Container = Container::Wav;
@@ -18,10 +19,6 @@ const GUID_TAIL: [u8; 12] = [
 ];
 /// WAVEFORMATEXTENSIBLE: 18-byte WAVEFORMATEX + 22 bytes.
 const EXTENSIBLE_LEN: u64 = 40;
-
-fn le_u16(b: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([b[at], b[at + 1]])
-}
 
 pub(crate) fn layout<R: Read + Seek>(
     r: &mut R,
@@ -61,10 +58,7 @@ pub(crate) fn layout<R: Read + Seek>(
     }
 
     let channel_count = le_u16(&fmt, 2);
-    if channel_count == 0 {
-        return Err(PcmHashError::malformed(C, "zero channels"));
-    }
-    let channels = Channels::try_from(u32::from(channel_count))?;
+    let channels = Channels::from_field(u32::from(channel_count), C)?;
     let rate = SampleRate::new(le_u32(&fmt, 4))
         .ok_or_else(|| PcmHashError::malformed(C, "zero sample rate"))?;
     let block_align = le_u16(&fmt, 12);
@@ -76,30 +70,20 @@ pub(crate) fn layout<R: Read + Seek>(
     }
     // ADR-012: stored bits come from the block align; wBitsPerSample,
     // wValidBitsPerSample and dwChannelMask are ignored.
-    let container = block_align / channel_count;
-    let container_bytes = match u8::try_from(container) {
-        Ok(n @ 1..=4) => n,
-        _ => {
-            return Err(PcmHashError::Unsupported(
-                "wav: sample container over 4 bytes",
-            ))
-        }
-    };
+    let container = ContainerBytes::new(block_align / channel_count).ok_or(
+        PcmHashError::Unsupported("wav: sample container over 4 bytes"),
+    )?;
 
-    let data_len = l.data.end - l.data.start;
-    if !data_len.is_multiple_of(u64::from(block_align)) {
-        return Err(PcmHashError::malformed(
-            C,
-            "data is not a whole number of frames",
-        ));
-    }
-    Ok(RawPcmLayout {
-        order: Endian::Little,
-        eight_bit: EightBit::Unsigned,
-        container_bytes,
+    // `data` must be whole frames. With an unbounded (0xFFFFFFFF) data size
+    // the payload runs to EOF, so a trailing chunk of whole frames is hashed
+    // as audio (consistent with AudioHash v1); anything else is Malformed.
+    RawPcmLayout::new(
+        Endian::Little,
+        EightBit::Unsigned,
+        container,
         channels,
         rate,
-        data: l.data,
-        frames: data_len / u64::from(block_align),
-    })
+        l.data,
+    )
+    .ok_or_else(|| PcmHashError::malformed(C, "data is not a whole number of frames"))
 }

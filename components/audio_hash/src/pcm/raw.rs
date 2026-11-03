@@ -7,13 +7,8 @@ use std::ops::Range;
 use music_primitives::PcmHash;
 
 use super::{Channels, PcmHashError, PcmHasher, SampleRate, StoredBits};
+use crate::iff::Endian;
 use crate::BUF_SIZE;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Endian {
-    Little,
-    Big,
-}
 
 /// Signedness of 1-byte samples (WAV 8-bit is unsigned, AIFF 8-bit signed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,17 +17,79 @@ pub(crate) enum EightBit {
     Unsigned,
 }
 
+/// Bytes per stored sample: 1 to 4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContainerBytes {
+    One,
+    Two,
+    Three,
+    Four,
+}
+
+impl ContainerBytes {
+    pub fn new(bytes: u16) -> Option<Self> {
+        match bytes {
+            1 => Some(ContainerBytes::One),
+            2 => Some(ContainerBytes::Two),
+            3 => Some(ContainerBytes::Three),
+            4 => Some(ContainerBytes::Four),
+            _ => None,
+        }
+    }
+
+    fn get(self) -> usize {
+        match self {
+            ContainerBytes::One => 1,
+            ContainerBytes::Two => 2,
+            ContainerBytes::Three => 3,
+            ContainerBytes::Four => 4,
+        }
+    }
+
+    fn stored_bits(self) -> StoredBits {
+        StoredBits(self.get() as u8 * 8)
+    }
+}
+
+/// Where integer PCM samples are and how they are stored. Always describes a
+/// whole number of frames.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RawPcmLayout {
-    pub order: Endian,
-    pub eight_bit: EightBit,
-    /// Bytes per stored sample, 1..=4. Stored bits are `container_bytes * 8`.
-    pub container_bytes: u8,
-    pub channels: Channels,
-    pub rate: SampleRate,
-    /// Byte range of the sample data; exactly `frames` whole frames.
-    pub data: Range<u64>,
-    pub frames: u64,
+    order: Endian,
+    eight_bit: EightBit,
+    container: ContainerBytes,
+    channels: Channels,
+    rate: SampleRate,
+    data: Range<u64>,
+    frames: u64,
+}
+
+impl RawPcmLayout {
+    /// `None` when `data` is not a whole number of frames.
+    pub fn new(
+        order: Endian,
+        eight_bit: EightBit,
+        container: ContainerBytes,
+        channels: Channels,
+        rate: SampleRate,
+        data: Range<u64>,
+    ) -> Option<Self> {
+        let frame_bytes = (container.get() * channels.count()) as u64;
+        let len = data.end.checked_sub(data.start)?;
+        (len % frame_bytes == 0).then_some(RawPcmLayout {
+            order,
+            eight_bit,
+            container,
+            channels,
+            rate,
+            frames: len / frame_bytes,
+            data,
+        })
+    }
+
+    pub fn frames(&self) -> u64 {
+        self.frames
+    }
 }
 
 /// Sign-extended, right-justified value of one stored sample.
@@ -59,20 +116,9 @@ pub(crate) fn hash<R: Read + Seek>(
     if layout.frames == 0 {
         return Err(PcmHashError::no_audio());
     }
-    let cb = usize::from(layout.container_bytes);
-    let bits = u8::try_from(cb * 8)
-        .ok()
-        .and_then(StoredBits::new)
-        .ok_or(PcmHashError::Decode("bad sample container size"))?;
+    let cb = layout.container.get();
     let frame_bytes = cb * layout.channels.count();
-    let data_len = layout.data.end.saturating_sub(layout.data.start);
-    if data_len != layout.frames.saturating_mul(frame_bytes as u64) {
-        return Err(PcmHashError::Decode(
-            "data length disagrees with frame count",
-        ));
-    }
-
-    let mut hasher = PcmHasher::new(layout.channels, layout.rate, bits);
+    let mut hasher = PcmHasher::new(layout.channels, layout.rate, layout.container.stored_bits());
     r.seek(SeekFrom::Start(layout.data.start))?;
     let chunk_frames = (BUF_SIZE / frame_bytes).max(1) as u64;
     let mut raw = vec![0u8; chunk_frames as usize * frame_bytes];
@@ -91,21 +137,33 @@ pub(crate) fn hash<R: Read + Seek>(
         hasher.write_interleaved(&samples);
         remaining -= n;
     }
-
-    let digest = hasher.finish()?;
-    if digest.frames != layout.frames {
-        return Err(PcmHashError::SampleCountMismatch {
-            declared: layout.frames,
-            decoded: digest.frames,
-        });
-    }
-    Ok(digest.hash)
+    Ok(hasher.finish()?.hash)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn layout_derives_frames_and_rejects_partial_frames() {
+        let rate = SampleRate::new(44100).unwrap();
+        let mk = |len: u64| {
+            RawPcmLayout::new(
+                Endian::Little,
+                EightBit::Signed,
+                ContainerBytes::Three,
+                Channels::Stereo,
+                rate,
+                10..10 + len,
+            )
+        };
+        assert_eq!(mk(18).unwrap().frames(), 3);
+        assert_eq!(mk(0).unwrap().frames(), 0);
+        assert!(mk(17).is_none());
+        assert_eq!(ContainerBytes::new(0), None);
+        assert_eq!(ContainerBytes::new(5), None);
+    }
 
     #[test]
     fn decodes_every_width_and_order() {

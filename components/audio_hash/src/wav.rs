@@ -4,14 +4,11 @@
 use std::io::{Read, Seek};
 use std::ops::Range;
 
-use crate::tags::{le_u32, read_at};
+use crate::iff::{self, Endian, Unbounded};
+use crate::tags::read_at;
 use crate::{AudioHashError, Container};
 
 const C: Container = Container::Wav;
-
-/// A `data` size of this value means "runs to end of file" (streamed WAV).
-/// A size of 0 is a literally empty payload.
-const UNBOUNDED_DATA: u64 = 0xFFFF_FFFF;
 
 /// Byte ranges of a WAV file's `fmt ` and `data` payloads.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,33 +32,21 @@ pub(crate) fn layout<R: Read + Seek>(
         return Err(C.malformed("not a RIFF/WAVE file"));
     }
 
-    let mut fmt: Option<Range<u64>> = None;
-    let mut data: Option<Range<u64>> = None;
-    let mut pos = 12u64;
-    while (fmt.is_none() || data.is_none()) && file_len.saturating_sub(pos) >= 8 {
-        let h: [u8; 8] = read_at(r, pos)?;
-        let size = u64::from(le_u32(&h, 4));
-        let payload = pos + 8;
-        let is_data = &h[0..4] == b"data";
-        let end = if is_data && size == UNBOUNDED_DATA {
-            file_len
-        } else {
-            payload + size
-        };
-        if end > file_len {
-            return Err(C.malformed(if is_data {
-                "data chunk truncated"
-            } else {
-                "chunk extends past end of file"
-            }));
-        }
-        match &h[0..4] {
-            b"fmt " if fmt.is_none() => fmt = Some(payload..end),
-            b"data" if data.is_none() => data = Some(payload..end),
-            _ => {}
-        }
-        pos = end + (end - payload) % 2;
-    }
+    // A `data` size of 0xFFFFFFFF means "runs to end of file" (streamed WAV).
+    // A size of 0 is a literally empty payload.
+    let data_chunk = Unbounded {
+        id: *b"data",
+        truncated: "data chunk truncated",
+    };
+    let [fmt, data] = iff::walk(
+        r,
+        file_len,
+        C,
+        Endian::Little,
+        12,
+        [b"fmt ", b"data"],
+        Some(&data_chunk),
+    )?;
 
     let fmt = fmt.ok_or_else(|| C.malformed("missing fmt chunk"))?;
     let data = data.ok_or_else(|| C.malformed("missing data chunk"))?;
