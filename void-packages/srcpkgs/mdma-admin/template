@@ -1,7 +1,7 @@
 # Package metadata for mdma-admin (not an xbps-src build template; see
 # void-packages/srcpkgs/beacon/template for the contract).
 pkgname=mdma-admin
-version=0.33.0
+version=0.34.0
 revision=1
 archs="aarch64"
 # Used by migrate-bootfs: tar, diff, findmnt/blkid/mount/umount, xbps-*
