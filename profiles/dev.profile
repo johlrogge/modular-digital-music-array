@@ -48,3 +48,6 @@ wifi-config = "components/wifi_config"
 
 [profile.release]
 strip = true
+
+[profile.release.package.claxon]
+codegen-units = 1

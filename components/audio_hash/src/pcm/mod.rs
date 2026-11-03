@@ -9,12 +9,14 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::num::NonZeroU32;
 use std::path::Path;
 
+use md5::Md5;
 use music_primitives::PcmHash;
 use sha2::{Digest, Sha256};
 
 use crate::{sniff, AudioHashError, Container, BUF_SIZE};
 
 mod aiff;
+mod flac;
 mod raw;
 mod wav;
 
@@ -64,7 +66,7 @@ pub fn pcm_hash_reader<R: Read + Seek>(mut r: R) -> Result<PcmHash, PcmHashError
     let file_len = r.seek(SeekFrom::End(0))?;
     let container = sniff::sniff(&mut r, file_len)?;
     match container {
-        Container::Flac => Err(PcmHashError::Unsupported("flac: not yet")),
+        Container::Flac => flac::hash(&mut r, file_len),
         Container::Mp3 => Err(PcmHashError::Unsupported("mp3: lossy")),
         Container::Mp4 => Err(PcmHashError::Unsupported("mp4: not supported")),
         Container::Wav => {
@@ -134,6 +136,10 @@ impl StoredBits {
         32 - u32::from(self.0)
     }
 
+    pub fn bits(self) -> u8 {
+        self.0
+    }
+
     /// Bytes per sample in the MD5 packing: `ceil(bits / 8)`.
     pub fn bytes(self) -> usize {
         usize::from(self.0).div_ceil(8)
@@ -144,12 +150,10 @@ impl StoredBits {
 pub(crate) struct PcmDigest {
     pub hash: PcmHash,
     pub frames: u64,
-    /// Present when the MD5 side-channel was enabled: the right-justified,
-    /// little-endian, `ceil(bits / 8)`-byte packed samples, i.e. exactly the
-    /// byte stream FLAC's STREAMINFO MD5 is computed over. Hashing it with MD5
-    /// is left to the FLAC phase (the `md-5` dependency is not added yet).
-    #[allow(dead_code)] // consumed by the FLAC phase
-    pub md5_packed: Option<Vec<u8>>,
+    /// Present when the MD5 side-channel was enabled: the MD5 of the
+    /// right-justified, little-endian, `ceil(bits / 8)`-byte packed samples,
+    /// i.e. FLAC's STREAMINFO MD5 form.
+    pub md5: Option<[u8; 16]>,
 }
 
 /// Feeds samples into the PcmHash v1 preimage.
@@ -162,7 +166,8 @@ pub(crate) struct PcmHasher {
     channels: Channels,
     bits: StoredBits,
     samples: u64,
-    md5_packed: Option<Vec<u8>>,
+    /// MD5 side-channel: hasher plus its packing buffer (flushed with `buf`).
+    md5: Option<(Md5, Vec<u8>)>,
 }
 
 impl PcmHasher {
@@ -178,14 +183,13 @@ impl PcmHasher {
             channels,
             bits,
             samples: 0,
-            md5_packed: None,
+            md5: None,
         }
     }
 
-    /// Also collect the MD5 packing of every sample.
-    #[allow(dead_code)] // used by the FLAC phase
-    pub fn with_md5_packing(mut self) -> Self {
-        self.md5_packed = Some(Vec::new());
+    /// Also MD5 the packed samples (streaming; nothing is retained).
+    pub fn with_md5(mut self) -> Self {
+        self.md5 = Some((Md5::new(), Vec::with_capacity(BUF_SIZE + 4)));
         self
     }
 
@@ -197,7 +201,6 @@ impl PcmHasher {
     }
 
     /// One slice per channel, all of equal length.
-    #[allow(dead_code)] // used by the FLAC phase
     pub fn write_planar(&mut self, planes: &[&[i32]]) -> Result<(), PcmHashError> {
         if planes.len() != self.channels.count() {
             return Err(PcmHashError::Decode("wrong channel count"));
@@ -217,8 +220,8 @@ impl PcmHasher {
     fn push(&mut self, s: i32) {
         self.buf
             .extend_from_slice(&(s << self.bits.shift()).to_le_bytes());
-        if let Some(md5) = &mut self.md5_packed {
-            md5.extend_from_slice(&s.to_le_bytes()[..self.bits.bytes()]);
+        if let Some((_, packed)) = &mut self.md5 {
+            packed.extend_from_slice(&s.to_le_bytes()[..self.bits.bytes()]);
         }
         self.samples += 1;
         if self.buf.len() >= BUF_SIZE {
@@ -229,6 +232,10 @@ impl PcmHasher {
     fn flush(&mut self) {
         self.sha.update(&self.buf);
         self.buf.clear();
+        if let Some((md5, packed)) = &mut self.md5 {
+            md5.update(packed.as_slice());
+            packed.clear();
+        }
     }
 
     pub fn finish(mut self) -> Result<PcmDigest, PcmHashError> {
@@ -240,7 +247,7 @@ impl PcmHasher {
         Ok(PcmDigest {
             hash: PcmHash::from_sha256_v1(self.sha.finalize().into()),
             frames: self.samples / ch,
-            md5_packed: self.md5_packed,
+            md5: self.md5.map(|(m, _)| m.finalize().into()),
         })
     }
 }
@@ -445,7 +452,7 @@ mod tests {
         let d16 = h16.finish().unwrap();
         assert_eq!(d16.hash.as_str(), want);
         assert_eq!(d16.frames, 3);
-        assert!(d16.md5_packed.is_none());
+        assert!(d16.md5.is_none());
 
         let v24: Vec<i32> = VALS.iter().map(|v| v * 256).collect();
         let mut h24 = hasher(Channels::Stereo, 24);
@@ -488,32 +495,43 @@ mod tests {
     #[test]
     fn md5_packing_is_right_justified_little_endian() {
         // 12-bit: 2 bytes each. -1 = ff ff, 0x7ff = ff 07, -2048 = 00 f8.
-        let mut h = hasher(Channels::Mono, 12).with_md5_packing();
-        h.write_interleaved(&[-1, 0x7FF, -2048]);
+        fn md5_of(bits: u8, samples: &[i32]) -> [u8; 16] {
+            let mut h = hasher(Channels::Mono, bits).with_md5();
+            h.write_interleaved(samples);
+            h.finish().unwrap().md5.unwrap()
+        }
+        let md5 = |bytes: &[u8]| -> [u8; 16] { Md5::digest(bytes).into() };
         assert_eq!(
-            h.finish().unwrap().md5_packed.unwrap(),
-            vec![0xff, 0xff, 0xff, 0x07, 0x00, 0xf8]
+            md5_of(12, &[-1, 0x7FF, -2048]),
+            md5(&[0xff, 0xff, 0xff, 0x07, 0x00, 0xf8])
         );
         // 24-bit: 3 bytes each.
-        let mut h = hasher(Channels::Mono, 24).with_md5_packing();
-        h.write_interleaved(&[-1, 1, -8_388_608]);
         assert_eq!(
-            h.finish().unwrap().md5_packed.unwrap(),
-            vec![0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x80]
+            md5_of(24, &[-1, 1, -8_388_608]),
+            md5(&[0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x80])
         );
         // 8-bit: 1 byte each.
-        let mut h = hasher(Channels::Mono, 8).with_md5_packing();
-        h.write_interleaved(&[-128, 127, -1]);
-        assert_eq!(
-            h.finish().unwrap().md5_packed.unwrap(),
-            vec![0x80, 0x7f, 0xff]
-        );
-        // The side-channel does not change the hash.
+        assert_eq!(md5_of(8, &[-128, 127, -1]), md5(&[0x80, 0x7f, 0xff]));
+        // The side-channel does not change the hash, and is off by default.
         let mut plain = hasher(Channels::Mono, 8);
         plain.write_interleaved(&[-128, 127, -1]);
-        let mut with = hasher(Channels::Mono, 8).with_md5_packing();
+        let mut with = hasher(Channels::Mono, 8).with_md5();
         with.write_interleaved(&[-128, 127, -1]);
         assert_eq!(plain.finish().unwrap().hash, with.finish().unwrap().hash);
+    }
+
+    #[test]
+    fn md5_streams_across_flush_boundaries() {
+        let n = 2 * BUF_SIZE + 5;
+        let vals: Vec<i32> = (0..n as i32).map(|i| (i * 7919) % 60000 - 30000).collect();
+        let mut h = hasher(Channels::Mono, 16).with_md5();
+        h.write_interleaved(&vals);
+        let packed: Vec<u8> = vals
+            .iter()
+            .flat_map(|s| s.to_le_bytes()[..2].to_vec())
+            .collect();
+        let want: [u8; 16] = Md5::digest(&packed).into();
+        assert_eq!(h.finish().unwrap().md5.unwrap(), want);
     }
 
     #[test]
@@ -534,7 +552,6 @@ mod tests {
 
     #[test]
     fn other_containers_are_unsupported() {
-        assert!(is_unsupported(pcm(&flac(&[streaminfo()], &flac_frames(1)))));
         assert!(is_unsupported(pcm(&mp3_frames(2))));
         assert!(is_unsupported(pcm(&mp4(&[
             ftyp(),
@@ -836,12 +853,225 @@ mod tests {
         assert_eq!(ok(&aiff16(2, 44100, &vals)).as_str(), want);
     }
 
+    // --- FLAC ---
+    //
+    // FLAC is hand-encoded: VERBATIM and CONSTANT subframes, 16-bit, with real
+    // CRC-8 / CRC-16 (see `fixtures::flac_frame16`). Real libFLAC fixtures come
+    // in a later phase.
+
+    const LEFT: [i32; 3] = [0, 32767, 1];
+    const RIGHT: [i32; 3] = [-1, -32768, 256];
+
+    /// STREAMINFO MD5 form: interleaved, signed, LE, right-justified 16-bit.
+    fn flac_md5(interleaved: &[i32]) -> [u8; 16] {
+        let bytes: Vec<u8> = interleaved
+            .iter()
+            .flat_map(|s| s.to_le_bytes()[..2].to_vec())
+            .collect();
+        Md5::digest(&bytes).into()
+    }
+
+    fn si_block(channels: u8, bits: u8, total: u64, md5: [u8; 16]) -> (u8, Vec<u8>) {
+        (0, flac_streaminfo(44100, channels, bits, total, md5))
+    }
+
+    fn golden_frames() -> Vec<u8> {
+        flac_frame16(0, 3, &[Sub::Verbatim(&LEFT), Sub::Verbatim(&RIGHT)])
+    }
+
+    fn flac_with(total: u64, md5: [u8; 16], frames: &[u8]) -> Vec<u8> {
+        flac(&[si_block(2, 16, total, md5)], frames)
+    }
+
+    fn golden_flac() -> Vec<u8> {
+        flac_with(3, flac_md5(&VALS), &golden_frames())
+    }
+
+    #[test]
+    fn flac_equals_wav_and_aiff_golden() {
+        assert_eq!(ok(&golden_flac()).as_str(), GOLDEN_PCM);
+    }
+
+    #[test]
+    fn flac_frame_layout_does_not_matter() {
+        // Same samples split over two frames of different sizes.
+        let two = [
+            flac_frame16(
+                0,
+                2,
+                &[Sub::Verbatim(&LEFT[..2]), Sub::Verbatim(&RIGHT[..2])],
+            ),
+            flac_frame16(
+                1,
+                1,
+                &[Sub::Verbatim(&LEFT[2..]), Sub::Verbatim(&RIGHT[2..])],
+            ),
+        ]
+        .concat();
+        assert_eq!(
+            ok(&flac_with(3, flac_md5(&VALS), &two)).as_str(),
+            GOLDEN_PCM
+        );
+    }
+
+    #[test]
+    fn flac_constant_subframes_equal_wav_silence() {
+        let f = flac_with(
+            4,
+            flac_md5(&[0; 8]),
+            &flac_frame16(0, 4, &[Sub::Constant(0), Sub::Constant(0)]),
+        );
+        assert_eq!(ok(&f), ok(&wav16(2, 44100, &[0; 8])));
+        // mono, non-zero constant
+        let mono = flac(
+            &[si_block(1, 16, 3, flac_md5(&[-5, -5, -5]))],
+            &flac_frame16(0, 3, &[Sub::Constant(-5)]),
+        );
+        assert_eq!(ok(&mono), ok(&wav16(1, 44100, &[-5, -5, -5])));
+        assert_ne!(ok(&mono), ok(&wav16(2, 44100, &[-5, -5, -5, -5, -5, -5])));
+    }
+
+    #[test]
+    fn flac_md5_is_checked_when_set() {
+        let good = flac_md5(&VALS);
+        assert_eq!(
+            ok(&flac_with(3, good, &golden_frames())).as_str(),
+            GOLDEN_PCM
+        );
+        for i in 0..16 {
+            let mut bad = good;
+            bad[i] ^= 0x01;
+            assert!(
+                matches!(
+                    pcm(&flac_with(3, bad, &golden_frames())),
+                    Err(PcmHashError::Md5Mismatch)
+                ),
+                "byte {i}"
+            );
+        }
+        // all zeros = not set: skipped
+        assert_eq!(
+            ok(&flac_with(3, [0; 16], &golden_frames())).as_str(),
+            GOLDEN_PCM
+        );
+    }
+
+    #[test]
+    fn flac_sample_count_is_checked_unless_zero() {
+        let md5 = flac_md5(&VALS);
+        for total in [2, 4] {
+            // even though the MD5 matches
+            assert!(
+                matches!(
+                    pcm(&flac_with(total, md5, &golden_frames())),
+                    Err(PcmHashError::SampleCountMismatch {
+                        declared,
+                        decoded: 3
+                    }) if declared == total
+                ),
+                "total {total}"
+            );
+        }
+        assert_eq!(
+            ok(&flac_with(0, md5, &golden_frames())).as_str(),
+            GOLDEN_PCM
+        );
+    }
+
+    #[test]
+    fn flac_corruption_is_a_decode_error() {
+        let frames = golden_frames();
+        // header byte (CRC-8), sample byte (CRC-16), footer byte (CRC-16)
+        for at in [2, 8, 12, frames.len() - 1] {
+            let mut bad = frames.clone();
+            bad[at] ^= 0x10;
+            assert!(
+                matches!(
+                    pcm(&flac_with(0, [0; 16], &bad)),
+                    Err(PcmHashError::Decode(_))
+                ),
+                "byte {at}"
+            );
+        }
+    }
+
+    #[test]
+    fn flac_tags_and_metadata_do_not_matter() {
+        let md5 = flac_md5(&VALS);
+        let mut tagged = id3v2(40, false);
+        tagged.extend(flac(
+            &[
+                si_block(2, 16, 3, md5),
+                padding(300),
+                vorbis(30),
+                picture(100_000),
+            ],
+            &golden_frames(),
+        ));
+        tagged.extend(ape(50, true));
+        tagged.extend(id3v1());
+        assert_eq!(ok(&tagged).as_str(), GOLDEN_PCM);
+    }
+
+    #[test]
+    fn flac_streaminfo_must_be_first() {
+        let (ty, si) = si_block(2, 16, 3, flac_md5(&VALS));
+        let b = flac(&[padding(10), (ty, si)], &golden_frames());
+        assert!(is_malformed(pcm(&b)));
+        let b = flac(&[vorbis(10)], &golden_frames());
+        assert!(is_malformed(pcm(&b)));
+    }
+
+    #[test]
+    fn flac_streaminfo_disagreeing_with_frames_is_rejected() {
+        // channels
+        let b = flac(&[si_block(1, 16, 0, [0; 16])], &golden_frames());
+        assert!(matches!(pcm(&b), Err(PcmHashError::Decode(_))));
+        // samples exceed STREAMINFO bits
+        let b = flac(&[si_block(2, 8, 0, [0; 16])], &golden_frames());
+        assert!(matches!(pcm(&b), Err(PcmHashError::Decode(_))));
+        // more than 2 channels
+        let b = flac(&[si_block(3, 16, 0, [0; 16])], &golden_frames());
+        assert!(is_unsupported(pcm(&b)));
+        // zero sample rate
+        let b = flac(
+            &[(0, flac_streaminfo(0, 2, 16, 0, [0; 16]))],
+            &golden_frames(),
+        );
+        assert!(is_malformed(pcm(&b)));
+    }
+
+    #[test]
+    fn flac_without_frames_is_no_audio() {
+        assert!(is_no_audio(pcm(&flac(&[si_block(2, 16, 0, [0; 16])], &[]))));
+    }
+
+    #[test]
+    fn flac_bits_are_left_justified_like_other_containers() {
+        // 16-bit FLAC equals the same signal as 24-bit WAV (x256).
+        let v24: Vec<i32> = VALS.iter().map(|v| v * 256).collect();
+        let w24 = riff(&[
+            wav_fmt(1, 2, 44100, 6, 24),
+            chunk(b"data", &le_samples(&v24, 3)),
+        ]);
+        assert_eq!(ok(&golden_flac()), ok(&w24));
+    }
+
     // --- fuzzing ---
 
     fn valid_inputs() -> Vec<Vec<u8>> {
         vec![
             golden_wav(),
             golden_aiff(),
+            golden_flac(),
+            flac(
+                &[
+                    si_block(1, 16, 3, flac_md5(&[-5, -5, -5])),
+                    padding(20),
+                    vorbis(30),
+                ],
+                &flac_frame16(0, 3, &[Sub::Constant(-5)]),
+            ),
             riff(&[
                 chunk(b"LIST", b"INFOabc"),
                 wav_fmt_ext(2, 44100, 6, 24, 24, 3, 1),
@@ -875,7 +1105,7 @@ mod tests {
 
         #[test]
         fn mutated_valid_files_never_panic(
-            base in 0usize..6,
+            base in 0usize..8,
             edits in proptest::collection::vec(
                 (any::<usize>(), any::<[u8; 8]>(), any::<bool>()),
                 0..4,
@@ -894,7 +1124,10 @@ mod tests {
                 let t = t % (bytes.len() + 1);
                 bytes.truncate(t);
             }
-            let _ = pcm_hash_reader(Cursor::new(bytes));
+            // A claxon panic would be caught and reported as DecoderPanic;
+            // it must never happen on malformed input.
+            let res = pcm_hash_reader(Cursor::new(bytes));
+            prop_assert!(!matches!(res, Err(PcmHashError::DecoderPanic)));
         }
     }
 }

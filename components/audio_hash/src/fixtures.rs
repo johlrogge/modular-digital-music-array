@@ -140,6 +140,93 @@ pub fn flac(blocks: &[(u8, Vec<u8>)], frames: &[u8]) -> Vec<u8> {
     v
 }
 
+/// FLAC frame-header CRC-8 (poly 0x07, init 0).
+pub fn crc8(data: &[u8]) -> u8 {
+    data.iter().fold(0u8, |mut crc, &b| {
+        crc ^= b;
+        for _ in 0..8 {
+            crc = if crc & 0x80 != 0 {
+                (crc << 1) ^ 0x07
+            } else {
+                crc << 1
+            };
+        }
+        crc
+    })
+}
+
+/// FLAC frame CRC-16 (poly 0x8005, init 0).
+pub fn crc16(data: &[u8]) -> u16 {
+    data.iter().fold(0u16, |mut crc, &b| {
+        crc ^= u16::from(b) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x8005
+            } else {
+                crc << 1
+            };
+        }
+        crc
+    })
+}
+
+/// One subframe of a hand-encoded 16-bit FLAC frame.
+pub enum Sub<'a> {
+    Verbatim(&'a [i32]),
+    Constant(i32),
+}
+
+/// A valid 16-bit, 44100 Hz FLAC frame with independent channels (1 or 2
+/// subframes), `block` samples (1..=256) per channel, fixed blocking strategy
+/// and a frame number below 128. Header CRC-8 and frame CRC-16 included.
+pub fn flac_frame16(frame_no: u8, block: usize, subs: &[Sub]) -> Vec<u8> {
+    assert!((1..=256).contains(&block) && frame_no < 128 && (1..=2).contains(&subs.len()));
+    let mut f = vec![
+        0xFF,
+        0xF8,                                   // sync, fixed blocking
+        0x69,                                   // block size from 8-bit field, 44100 Hz
+        (((subs.len() - 1) as u8) << 4) | 0x08, // independent channels, 16 bits
+        frame_no,
+        (block - 1) as u8,
+    ];
+    f.push(crc8(&f));
+    for s in subs {
+        match s {
+            Sub::Constant(v) => {
+                f.push(0x00);
+                f.extend((*v as i16).to_be_bytes());
+            }
+            Sub::Verbatim(vals) => {
+                assert_eq!(vals.len(), block);
+                f.push(0x02);
+                f.extend(be_samples(vals, 2));
+            }
+        }
+    }
+    f.extend(crc16(&f).to_be_bytes());
+    f
+}
+
+/// STREAMINFO payload (34 bytes). Frame sizes are left unknown (0).
+pub fn flac_streaminfo(
+    rate: u32,
+    channels: u8,
+    bits: u8,
+    total_samples: u64,
+    md5: [u8; 16],
+) -> Vec<u8> {
+    let mut v = 16u16.to_be_bytes().to_vec(); // min block size
+    v.extend(256u16.to_be_bytes()); // max block size
+    v.extend([0u8; 6]); // min/max frame size unknown
+    let packed: u64 = (u64::from(rate) << 44)
+        | (u64::from(channels - 1) << 41)
+        | (u64::from(bits - 1) << 36)
+        | total_samples;
+    v.extend(packed.to_be_bytes());
+    v.extend(md5);
+    v
+}
+
 /// `n` fake MP3 frames, each starting `FF FB`.
 pub fn mp3_frames(n: usize) -> Vec<u8> {
     let mut v = Vec::new();
