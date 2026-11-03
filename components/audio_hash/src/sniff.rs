@@ -26,6 +26,9 @@ pub(crate) fn sniff<R: Read + Seek>(r: &mut R, file_len: u64) -> Result<Containe
         if head.len() >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"WAVE" {
             return Ok(Container::Wav);
         }
+        if head.len() >= 12 && &head[0..4] == b"FORM" && matches!(&head[8..12], b"AIFF" | b"AIFC") {
+            return Ok(Container::Aiff);
+        }
         if head.starts_with(b"RF64") {
             return Err(AudioHashError::UnsupportedContainer);
         }
@@ -74,6 +77,23 @@ mod tests {
         let mut b = id3v2(40, true);
         b.extend(mp3_frames(1));
         assert_eq!(s(&b).unwrap(), Container::Mp3);
+    }
+
+    #[test]
+    fn aiff_and_aifc_are_recognised_at_offset_zero() {
+        assert_eq!(s(b"FORM\0\0\0\x04AIFF").unwrap(), Container::Aiff);
+        assert_eq!(s(b"FORM\0\0\0\x04AIFCCOMM").unwrap(), Container::Aiff);
+        assert!(matches!(
+            s(b"FORM\0\0\0\x04AIFX"),
+            Err(AudioHashError::UnsupportedContainer)
+        ));
+    }
+
+    #[test]
+    fn aiff_after_head_id3v2_is_unsupported() {
+        let mut b = id3v2(10, false);
+        b.extend(b"FORM\0\0\0\x04AIFF");
+        assert!(matches!(s(&b), Err(AudioHashError::UnsupportedContainer)));
     }
 
     #[test]
