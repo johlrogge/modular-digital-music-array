@@ -4,6 +4,44 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.34.0] — 2026-11-03
+
+### Changed
+
+- **Read-your-writes projection (ADR-011).** Every library write now reaches the in-memory index through one `catch_up` path: read stream, apply, advance cursor, under a lock.
+  - The fact subscriber shares this path.
+  - `WriteFact`, `RetractFact` and bookmarks now show up immediately.
+
+### Fixed
+
+- Facts applied twice after ingest. Duplicate memory cues and styles stayed in memory until restart and could leak into a rekordbox export taken in that window. Counter drift is fixed too.
+- Back-to-back track replaces no longer lose `Replaces` ancestry (#44).
+- **Ghost entries.** Replaced or retracted hashes no longer reappear as empty entries after replay. A track exists only while it has live facts.
+- **Phantom rows.** Play-event-only entries written under short or empty hashes by older playback (#86) are no longer listed as tracks. On prod data the track count goes from 983 to 870.
+  - Removing the empty-key phantom also makes playlist lazy repair work again. Before, every playlist line counted as live.
+- **Deadlock.** Fixed a lock-order inversion in the ingest dedup path.
+- **Multi-source facts.** Retracting one source's facts now keeps values that another source still asserts, instead of clearing them.
+
+### Docs
+
+- ADR-011 is new. ADR-004 is amended.
+
+### Known issues
+
+- `mdma source sync` still times out client-side; the sync continues on the node (#81).
+- The gateway serialises requests (#84).
+- rekordbox import treats artist+title matches with different durations as matched (#85).
+- Playback writes play events under short hashes (#86).
+- Library projection follow-ups: retract scan cost, cover cache not refreshed while running (#87).
+
+### Upgrade notes
+
+No protocol change. Only mdma-library behaviour changes, but upgrade all mdma-* packages together, by name.
+
+Expect `tracks_indexed` / the library track count to drop by the number of phantom entries.
+
+---
+
 ## [0.33.0] — 2026-11-03
 
 ### Added

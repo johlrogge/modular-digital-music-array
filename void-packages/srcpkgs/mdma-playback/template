@@ -1,7 +1,7 @@
 # Package metadata for mdma-playback (not an xbps-src build template; see
 # void-packages/srcpkgs/beacon/template for the contract).
 pkgname=mdma-playback
-version=0.33.0
+version=0.34.0
 revision=1
 archs="aarch64"
 depends="pipewire wireplumber libspa-alsa alsa-pipewire mdma-audio"

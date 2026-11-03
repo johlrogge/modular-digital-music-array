@@ -187,7 +187,7 @@ Copy `scripts/install-mdma-macos.sh` from this repo to your Mac and run it. It r
 bash install-mdma-macos.sh
 
 # Install a specific tag
-bash install-mdma-macos.sh v0.33.0
+bash install-mdma-macos.sh v0.34.0
 
 # Install to a user-writable location (no sudo)
 MDMA_INSTALL_DIR=~/.local/bin bash install-mdma-macos.sh
@@ -205,6 +205,24 @@ cp profiles/dev/target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.34.0
+
+### Library: read-your-writes projection
+
+Every library write now reaches the in-memory index through one `catch_up` path (read stream, apply, advance cursor, under a lock), shared with the fact subscriber. This fixes facts being applied twice after ingest, which left duplicate memory cues and styles in memory until restart and could leak into a rekordbox export taken in that window. It also fixes counter drift. `WriteFact`, `RetractFact` and bookmarks now show up immediately.
+
+Also fixed: back-to-back track replaces no longer lose `Replaces` ancestry (#44); replaced or retracted hashes no longer reappear as empty entries after replay (a track exists only while it has live facts); a lock-order inversion in the ingest dedup path (deadlock); and retracting one source's facts now keeps values another source still asserts.
+
+Play-event-only phantom entries written under short or empty hashes by older playback (#86) are no longer listed as tracks. On prod data the track count goes from 983 to 870. Removing the empty-key phantom also makes playlist lazy repair work again; before, every playlist line counted as live.
+
+ADR-011 is new and ADR-004 is amended.
+
+**Upgrade notes:** No protocol change; only mdma-library behaviour changes. Upgrade all mdma-* packages together, by name. Expect `tracks_indexed` / the library track count to drop by the number of phantom entries.
+
+**Known issues:** #81, #84, #85 and #86 carry over from 0.33.0; new #87 (library projection follow-ups: retract scan cost, cover cache not refreshed while running). See CHANGELOG.md.
 
 ---
 
