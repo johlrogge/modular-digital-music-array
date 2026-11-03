@@ -907,6 +907,21 @@ acid-cross:
     file target/aarch64-unknown-linux-gnu/release/mdma-acid
     ls -lh target/aarch64-unknown-linux-gnu/release/mdma-acid
 
+# Cross-compile the PcmHash benchmark example for aarch64 (production profile)
+[group('build')]
+pcm-bench-cross:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building pcm_bench for aarch64..."
+    cargo polylith cargo --profile production zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        -p audio-hash --example pcm_bench
+    echo ""
+    echo "pcm_bench built!"
+    file target/aarch64-unknown-linux-gnu/release/examples/pcm_bench
+    ls -lh target/aarch64-unknown-linux-gnu/release/examples/pcm_bench
+
 # Cross-compile bandcamp for aarch64 (dev profile workspace)
 [group('build')]
 bandcamp-cross:

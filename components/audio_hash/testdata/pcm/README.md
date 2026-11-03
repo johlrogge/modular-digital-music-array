@@ -107,6 +107,34 @@ Findings from `INFO.txt`:
   Unsupported case is a unit test with a hand-patched STREAMINFO bps and
   frame-header bps code 000 (claxon: "header without bits per sample info").
 
+## Benchmarking on the Pi
+
+`examples/pcm_bench.rs` times PcmHash (and AudioHash v1) over a directory tree.
+
+```
+just pcm-bench-cross
+# -> target/aarch64-unknown-linux-gnu/release/examples/pcm_bench
+```
+
+Copy it to the Pi, then run twice (cold cache, then warm) and keep both outputs:
+
+```
+nice -n 19 ionice -c3 ./pcm_bench /music/blobs > cold.tsv
+nice -n 19 ionice -c3 ./pcm_bench /music/blobs > warm.tsv
+```
+
+Options: `--no-v1` skips AudioHash v1, `--limit N` takes the first N files
+(sorted). Per file: path, bytes, audio_s, pcm_ms, realtime_x, v1_ms,
+decode_ms (claxon only, FLAC), sha_ms (SHA-256 of the raw file), result. The
+`#` lines at the end are totals, per-GB times, a 30 GB extrapolation, and an
+error histogram by variant + reason (the gate for claxon's unsupported cases).
+
+Baseline for the same subset (reference decoder cost):
+
+```
+time flac -t -s <the same files>
+```
+
 ## Size
 
 `regen.sh` prints the total; the target is under 600 KB.
