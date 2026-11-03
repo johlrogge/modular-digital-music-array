@@ -8,6 +8,8 @@ Amends and supersedes the **replace/supersession** half of ADR-003. ADR-003's
 soft-delete (`Deleted`) and restore decisions remain in force. The `SupersededBy`
 variant and its "hidden = deleted OR superseded" rule are withdrawn.
 
+Amended by ADR-011 (2026-11-03): the deferred #44 alternative and the sub-second `Replaces`-window consequence are superseded by a single read-your-writes catch-up path.
+
 ## Context
 
 ADR-003 modeled replace as a pure-assert `SupersededBy { replacement }` fact on the
@@ -87,7 +89,7 @@ replacement.
 - **Lazy-only playlist repair (no eager rewrite).** Rejected: eager rewrite fixes the
   common case immediately; lazy repair is the safety net. They are idempotent together.
 - **Synchronously updating in-memory provenance in the replace path.** Deferred: the
-  background fact subscriber reconciles it; ACID is the source of truth. Tracked as #44.
+  background fact subscriber reconciles it; ACID is the source of truth. Tracked as #44. *Superseded by ADR-011.*
 
 ## Consequences
 
@@ -97,7 +99,7 @@ replacement.
 - The new track's *in-memory* `Replaces` provenance is populated by the background fact
   subscriber, not synchronously in `handle_track_replace`. A sub-second window exists
   where back-to-back replaces could gather an incomplete ancestor set in memory; ACID is
-  unaffected and a restart self-heals. Tracked as #44.
+  unaffected and a restart self-heals. Tracked as #44. *Superseded by ADR-011: writers now catch up synchronously after each ACID write.*
 - Disk is not reclaimed on replace; the orphaned blob is a `NoLiveFacts` GC candidate
   (future GC work).
 - All services embedding `library_ipc_protocol` (gateway, library, console) must be
