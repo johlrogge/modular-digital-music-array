@@ -2,12 +2,13 @@
 # void-packages/srcpkgs/beacon/template for the contract).
 pkgname=mdma-admin
 version=0.35.0
-revision=1
+revision=2
 archs="aarch64"
 # Used by migrate-bootfs: tar, diff, findmnt/blkid/mount/umount, xbps-*
 # acpid handles the Pi 5 power key via the stock /etc/acpi/handler.sh
 # (PBTN -> shutdown -P now); util-linux's dmesg feeds the mdma-klog service.
-depends="tar diffutils util-linux xbps acpid"
+# socklog-void provides the socklog-unix syslog service on /dev/log (#89).
+depends="tar diffutils util-linux xbps acpid socklog-void"
 short_desc="MDMA Admin privileged system-level operations service"
 maintainer="Joakim Ohlrogge <joakim.ohlrogge@agical.se>"
 license="MIT"

@@ -280,6 +280,16 @@ The source protocol gains `ListPlaylists` and `GetPlaylist` requests and an `Uns
 
 ---
 
+## Unreleased
+
+### System log capture with socklog (#89)
+
+wpa_supplicant, dhcpcd and avahi-daemon log through `vlogger` to `/dev/log`. There was no syslog daemon, so those logs were lost. Nodes now run `socklog-unix` (package `socklog-void`), which writes rotated logs per facility under `/var/log/socklog/`. Daemon-facility messages from those three services are in `/var/log/socklog/daemon/current`; for a wifi dropout, `grep -E 'wpa_supplicant|dhcpcd' /var/log/socklog/daemon/current`. Kernel messages stay in `/var/log/mdma-klog`.
+
+New installs enable it during provisioning; existing nodes get it (and avahi-daemon, #80) on the mdma-admin upgrade. To disable permanently: `touch /etc/sv/socklog-unix/down`.
+
+---
+
 ## What's new in 0.31.0
 
 ### Clean power-button shutdown and persistent kernel log (#77)

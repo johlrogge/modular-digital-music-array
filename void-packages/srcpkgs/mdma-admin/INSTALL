@@ -16,12 +16,13 @@ post)
         fi
     fi
 
-    # Enable acpid (power key) and mdma-klog (persistent kernel log), also on
-    # upgrades. Never restarted here: restarting mdma-klog replays the ring
-    # buffer and would duplicate the log.
+    # Enable acpid (power key), mdma-klog (persistent kernel log), socklog-unix
+    # (syslog on /dev/log, #89) and avahi-daemon (mDNS, #80), also on upgrades.
+    # Never restarted here: restarting mdma-klog replays the ring buffer and
+    # would duplicate the log; the others are only started by runit when linked.
     # To disable these services lastingly, touch /etc/sv/<svc>/down: upgrades
     # re-link a /var/service link that was removed.
-    for svc in acpid mdma-klog; do
+    for svc in acpid mdma-klog socklog-unix avahi-daemon; do
         if [ -d "/etc/sv/$svc" ] && [ ! -e "/var/service/$svc" ] && [ ! -L "/var/service/$svc" ]; then
             if ln -sfn "/etc/sv/$svc" "/var/service/$svc"; then
                 echo "$svc service enabled"
