@@ -12,6 +12,8 @@ license = "MIT"
 interface = "library-ingestion"
 
 [dependencies]
+# Not used yet: wired into ingestion in the next branch (ADR-010).
+audio-hash = { workspace = true }
 thiserror = "1.0"
 tracing = "0.1"
 chrono = "0.4"
@@ -22,7 +24,7 @@ music-primitives = { workspace = true }
 audio-metadata = { workspace = true }
 
 # Hashing
-sha2 = "0.10"
+sha2 = { workspace = true }
 hex = "0.4"
 
 # Path utilities

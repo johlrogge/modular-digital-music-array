@@ -1,0 +1,21 @@
+[package]
+name = "audio-hash"
+version.workspace = true
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/johlrogge/modular-digital-music-array"
+license = "MIT"
+
+[package.metadata.polylith]
+interface = "audio-hash"
+
+[dependencies]
+music-primitives = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+proptest = { workspace = true }
+rstest = { workspace = true }
+tempfile = { workspace = true }

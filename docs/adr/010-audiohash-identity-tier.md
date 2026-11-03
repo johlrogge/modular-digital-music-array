@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed — 2026-11-03
+Accepted — 2026-11-03
 
 ## Context
 
@@ -12,12 +12,17 @@ ContentHash (SHA-256 of the whole file) is the entity key (ADR-003, ADR-004). Re
 
 - New fact `MusicValue::AudioHash(AudioHash)`; ContentHash remains the entity key.
 - Format: `audio-sha256-v1:<64 lowercase hex>`; validated newtype in music_primitives. The version is part of the value; hashes of different versions never compare equal.
-- v1 = SHA-256( "mdma-audiohash\0v1\0" || container_tag[4] || Σ(u64_le(len) || bytes) ) over container-defined ranges:
-  - FLAC: bytes after the last metadata block to EOF (after skipping a leading ID3v2 and stripping trailing ID3v1/APEv2/Lyrics3v2/ID3v2-footer).
-  - MP3: after the leading ID3v2 chain (and zero padding) to EOF minus the same trailers; the Xing/LAME frame is included.
-  - WAV: `fmt ` payload, then `data` payload; all other chunks ignored.
-  - M4A/MP4: all top-level `mdat` payloads in file order.
-  container_tag ∈ {b"flac", b"mp3\0", b"wav\0", b"mp4\0"}. Zero total audio bytes → error, no fact.
+- v1 = SHA-256( "mdma-audiohash\0v1\0" || container_tag[4] || Σ(u64_le(len) || bytes) ) over container-defined ranges, in file order. container_tag ∈ {b"flac", b"mp3\0", b"wav\0", b"mp4\0"}.
+  - **Trailer stripping** (FLAC and MP3): trailing tags are stripped by repeating the following checks against the current end of the range, in this order, until none matches; the range end never moves below its start. A match on the signature commits to that tag type; any subsequent inconsistency is an error (no fact). Strongest signatures are checked first so that a weak signature (`TAG`) inside another tag cannot misfire.
+    1. APEv2/APEv1 footer: `APETAGEX` at end−32 with version (u32 LE at footer offset 8) 1000 or 2000. Size = u32 LE at footer offset 12, must be ≥ 32; total = size, plus 32 if flags (u32 LE at footer offset 20) bit 31 is set, in which case `APETAGEX` must also appear at end−total. Strip total.
+    2. Lyrics3v2: `LYRICS200` at end−9 preceded by 6 ASCII decimal digits (size); total = size + 15, and `LYRICSBEGIN` must appear at end−total. Strip total.
+    3. Appended ID3v2.4: `3DI` at end−10 with major version 4, revision ≠ 0xFF, footer flag 0x10 set, syncsafe size; total = size + 20, and `ID3` with major version 4 must appear at end−total. Strip total.
+    4. ID3v1: `TAG` at end−128; strip 128. Then, if `TAG+` is at end−227, strip 227 more.
+  - **FLAC:** skip a leading ID3v2 chain, require `fLaC`, walk metadata blocks until the last-block flag; the range is from the first byte after the last block to the stripped end. STREAMINFO and all other metadata blocks are excluded.
+  - **MP3:** skip a leading ID3v2 chain and then up to 64 KiB of `0x00` padding (acceptance only; skipped bytes are never hashed); the range is from the first frame sync to the stripped end. The Xing/LAME/VBRI frame is included.
+  - **WAV:** walk RIFF chunks; the payload of the *first* `fmt ` chunk, then the payload of the *first* `data` chunk; later duplicates and all other chunks are ignored. The odd-size pad byte is skipped, not hashed. A `data` size of `0xFFFFFFFF` means the payload runs to EOF; a size of 0 means an empty payload.
+  - **M4A/MP4:** walk top-level boxes; every `mdat` payload in file order. The payload excludes the 8-byte header (16 bytes when size==1, 64-bit largesize); size==0 means the box runs to EOF. Empty `mdat` boxes still contribute `u64_le(0)`.
+- **Empty audio** → error, no fact: FLAC/MP3 range empty after stripping; WAV `data` payload empty; MP4 no `mdat`, or all `mdat` payloads empty.
 - Computed by a new `audio_hash` component with std + sha2 only. Never via a decoder or demuxer.
 - Failure (unsupported, malformed, empty audio) → no fact; ingest continues.
 - Backfill is explicit (CLI/IPC request), never synchronous at service startup.
@@ -39,6 +44,7 @@ ContentHash (SHA-256 of the whole file) is the entity key (ADR-003, ADR-004). Re
 
 - Identical encoded audio on different releases (album vs compilation) gets the same AudioHash. The merge must preserve release context or be user-confirmed.
 - Known false negatives: re-encodes, transcodes, rebuilt MP3 VBR headers, Lyrics3v1, WAV fmt-variant rewrites, RF64.
+- The golden-hash tests in the audio_hash component are generated from, and checked against, a hand-built preimage of this definition; changing either requires v2.
 - Changing the algorithm requires v2, coexisting v1/v2 facts, and a re-backfill.
 - MusicValue gains a variant: per ADR-004, every service embedding `library_ipc_protocol` (gateway, library, console) must be redeployed together.
 
