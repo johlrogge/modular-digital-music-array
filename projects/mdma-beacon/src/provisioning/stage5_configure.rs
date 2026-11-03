@@ -537,20 +537,26 @@ async fn configure_mdma_repository(mount_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Void Linux packages installed on the provisioned target.
+const VOID_PACKAGES: [&str; 9] = [
+    // Syslog daemon on /dev/log (#89): wpa_supplicant, dhcpcd and
+    // avahi-daemon log there via vlogger; without it those logs are lost.
+    "socklog-void",
+    "openssh",
+    "dhcpcd",
+    "wpa_supplicant",
+    "dbus",
+    "avahi",
+    "nss-mdns",
+    "sudo",
+    "void-repo-nonfree",
+];
+
 /// Install additional packages (Void Linux base packages)
 async fn install_packages(mount_root: &Path) -> Result<()> {
     tracing::info!("Installing additional Void Linux packages");
 
-    let packages = [
-        "openssh",
-        "dhcpcd",
-        "wpa_supplicant",
-        "dbus",
-        "avahi",
-        "nss-mdns",
-        "sudo",
-        "void-repo-nonfree",
-    ];
+    let packages = VOID_PACKAGES;
 
     tracing::info!("  Packages: {}", packages.join(", "));
 
@@ -739,7 +745,9 @@ exec chpst -P -u _pipewire:_pipewire:audio:video pipewire
 /// `acpid` is installed via mdma-admin's `depends` and `pipewire` via
 /// mdma-audio's. They are enabled here but deliberately not listed in
 /// `install_packages`, so there is one source of truth for packages.
-const BASE_SERVICES: [&str; 6] = [
+const BASE_SERVICES: [&str; 7] = [
+    // Owns /dev/log; logs land in /var/log/socklog/<facility>/ (#89).
+    "socklog-unix",
     "sshd",
     "dhcpcd",
     "dbus",
@@ -1485,7 +1493,7 @@ mod tests {
 
     use super::{
         configure_wifi, services_to_enable, wpa_supplicant_conf_text, ConfigureSystemAction,
-        WifiAction, WifiWrite,
+        WifiAction, WifiWrite, VOID_PACKAGES,
     };
     use crate::actions::Action;
     use crate::provisioning::types::{
@@ -1835,6 +1843,19 @@ mod tests {
         let services = services_to_enable(&WifiAction::Nothing);
         assert!(services.contains(&"acpid"));
         assert!(services.contains(&"mdma-klog"));
+    }
+
+    #[test]
+    fn services_to_enable_includes_socklog_unix() {
+        // #89: vlogger-based services (wpa_supplicant, dhcpcd, avahi-daemon)
+        // log to /dev/log, which socklog-unix serves.
+        let services = services_to_enable(&WifiAction::Nothing);
+        assert!(services.contains(&"socklog-unix"));
+    }
+
+    #[test]
+    fn void_packages_include_socklog_void() {
+        assert!(VOID_PACKAGES.contains(&"socklog-void"));
     }
 
     #[tokio::test]
