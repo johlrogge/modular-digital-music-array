@@ -20,6 +20,9 @@ mod flac;
 mod raw;
 mod wav;
 
+#[cfg(test)]
+mod real_fixtures;
+
 const DOMAIN: &[u8] = b"mdma-pcmhash\0v1\0";
 /// Sample format byte: signed integer PCM. Other values are reserved.
 const FORMAT_SIGNED_INT: u8 = 0x01;

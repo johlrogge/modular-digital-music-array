@@ -20,4 +20,6 @@ thiserror = { workspace = true }
 pretty_assertions = { workspace = true }
 proptest = { workspace = true }
 rstest = { workspace = true }
+# Second, independent decoder used only as a test oracle for PcmHash.
+symphonia = { version = "0.5", default-features = false, features = ["flac", "wav", "aiff", "pcm"] }
 tempfile = { workspace = true }

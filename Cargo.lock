@@ -660,6 +660,7 @@ dependencies = [
  "proptest",
  "rstest",
  "sha2",
+ "symphonia",
  "tempfile",
  "thiserror 1.0.69",
 ]
