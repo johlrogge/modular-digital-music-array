@@ -194,7 +194,14 @@ mod tests {
 
     static ACID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-    fn spawn_acid() -> (acid_service::ServerHandle, String) {
+    /// An in-process ACID server plus the private directory it stores facts in.
+    /// Dropping it stops the server first (field order), then removes the directory.
+    struct AcidGuard {
+        _handle: acid_service::ServerHandle,
+        _dir: tempfile::TempDir,
+    }
+
+    fn spawn_acid() -> (AcidGuard, String) {
         let id = ACID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pid = std::process::id();
         let addr = format!("ipc:///tmp/mdma-test-acidclient-{pid}-{id}.sock");
@@ -205,10 +212,18 @@ mod tests {
         let pub_sock = nng::Socket::new(nng::Protocol::Pub0).expect("pub socket");
         pub_sock.listen(&events_addr).expect("pub listen");
 
-        let handle = acid_service::start(rep, pub_sock, std::path::Path::new("/tmp"))
-            .expect("start acid service");
+        // Own metadata dir per server: a shared one would mix facts across parallel
+        // tests and runs under the file-backed fact store.
+        let dir = tempfile::tempdir().expect("acid metadata dir");
+        let handle = acid_service::start(rep, pub_sock, dir.path()).expect("start acid service");
         std::thread::sleep(std::time::Duration::from_millis(20));
-        (handle, addr)
+        (
+            AcidGuard {
+                _handle: handle,
+                _dir: dir,
+            },
+            addr,
+        )
     }
 
     #[test]
