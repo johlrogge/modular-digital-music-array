@@ -650,6 +650,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio-hash"
+version = "0.32.0"
+dependencies = [
+ "music-primitives",
+ "pretty_assertions",
+ "proptest",
+ "rstest",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "audio-metadata"
 version = "0.10.1"
 dependencies = [
@@ -5521,6 +5534,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 name = "library-ingestion"
 version = "0.1.0"
 dependencies = [
+ "audio-hash",
  "audio-metadata",
  "chrono",
  "hex",

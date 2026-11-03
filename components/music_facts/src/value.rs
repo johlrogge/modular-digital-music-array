@@ -134,6 +134,9 @@ pub enum MusicValue {
     /// File path on filesystem
     FilePath(PathBuf),
 
+    /// Container-aware hash of the encoded audio payload (ADR-010)
+    AudioHash(music_primitives::AudioHash),
+
     // ========================================================================
     // Basic Metadata (from tags)
     // ========================================================================
@@ -344,6 +347,7 @@ impl MusicValue {
     pub fn display_name(&self) -> &'static str {
         match self {
             MusicValue::FilePath(_) => "FilePath",
+            MusicValue::AudioHash(_) => "AudioHash",
             MusicValue::Title(_) => "Title",
             MusicValue::Artist(_) => "Artist",
             MusicValue::Album(_) => "Album",
@@ -396,6 +400,7 @@ impl fmt::Display for MusicValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             MusicValue::FilePath(p) => write!(f, "{}", p.display()),
+            MusicValue::AudioHash(h) => write!(f, "{}", h.as_str()),
             MusicValue::Title(s) => write!(f, "{}", s),
             MusicValue::Artist(s) => write!(f, "{}", s),
             MusicValue::Album(s) => write!(f, "{}", s),
@@ -748,6 +753,47 @@ mod tests {
     fn recording_date_fact_value_format() {
         let date = NaiveDate::from_ymd_opt(2024, 6, 15).unwrap();
         assert_fact_value_format!(MusicValue::RecordingDate(date));
+    }
+
+    fn sample_audio_hash() -> music_primitives::AudioHash {
+        music_primitives::AudioHash::from_sha256_v1([0xAB; 32])
+    }
+
+    #[test]
+    fn audio_hash_roundtrip() {
+        let val = MusicValue::AudioHash(sample_audio_hash());
+        let json = serde_json::to_string(&val).unwrap();
+        let decoded: MusicValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(val, decoded);
+    }
+
+    #[test]
+    fn audio_hash_fact_value_format() {
+        assert_fact_value_format!(MusicValue::AudioHash(sample_audio_hash()));
+    }
+
+    #[test]
+    fn audio_hash_golden_wire_format() {
+        let val = MusicValue::AudioHash(sample_audio_hash());
+        let expected = format!(
+            r#"{{"t":"AudioHash","v":"audio-sha256-v1:{}"}}"#,
+            "ab".repeat(32)
+        );
+        assert_eq!(serde_json::to_string(&val).unwrap(), expected);
+    }
+
+    #[test]
+    fn audio_hash_rejects_wrong_prefix_on_wire() {
+        let json = format!(r#"{{"t":"AudioHash","v":"sha256:{}"}}"#, "ab".repeat(32));
+        assert!(serde_json::from_str::<MusicValue>(&json).is_err());
+    }
+
+    #[test]
+    fn audio_hash_display_and_name() {
+        let h = sample_audio_hash();
+        let val = MusicValue::AudioHash(h.clone());
+        assert_eq!(val.display_name(), "AudioHash");
+        assert_eq!(val.to_string(), h.as_str());
     }
 
     #[test]

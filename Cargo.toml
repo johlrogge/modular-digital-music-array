@@ -8,6 +8,7 @@ members = [
     "components/acid_service",
     "components/admin_ipc_protocol",
     "components/audio_decoder",
+    "components/audio_hash",
     "components/audio_metadata",
     "components/audio_output",
     "components/audio_resampler",
@@ -82,6 +83,7 @@ acid-protocol = { path = "components/acid_protocol" }
 acid-service = { path = "components/acid_service" }
 admin-ipc-protocol = { path = "components/admin_ipc_protocol" }
 audio-decoder = { path = "components/audio_decoder" }
+audio-hash = { path = "components/audio_hash" }
 audio-metadata = { path = "components/audio_metadata" }
 audio-output = { path = "components/audio_output" }
 audio-resampler = { path = "components/audio_resampler" }
@@ -147,6 +149,7 @@ scopeguard = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 sha1 = "0.10"
+sha2 = "0.10"
 socket2 = "0.5"
 tempfile = "3"
 thiserror = "1.0"
