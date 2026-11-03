@@ -17,6 +17,14 @@ pub(crate) fn read_at<R: Read + Seek, const N: usize>(
 
 // Fixed-width field readers. Callers always pass buffers whose length is
 // known at compile time, so the indexing here cannot go out of bounds.
+pub(crate) fn le_u16(b: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([b[at], b[at + 1]])
+}
+
+pub(crate) fn be_u16(b: &[u8], at: usize) -> u16 {
+    u16::from_be_bytes([b[at], b[at + 1]])
+}
+
 pub(crate) fn le_u32(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
 }

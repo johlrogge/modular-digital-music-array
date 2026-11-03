@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-pub use music_primitives::{AudioHash, ContentHash};
+pub use music_primitives::{AudioHash, ContentHash, PcmHash};
 
 /// International Standard Recording Code
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

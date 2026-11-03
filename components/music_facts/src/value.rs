@@ -137,6 +137,9 @@ pub enum MusicValue {
     /// Container-aware hash of the encoded audio payload (ADR-010)
     AudioHash(music_primitives::AudioHash),
 
+    /// Exact hash of the decoded lossless PCM samples
+    PcmHash(music_primitives::PcmHash),
+
     // ========================================================================
     // Basic Metadata (from tags)
     // ========================================================================
@@ -348,6 +351,7 @@ impl MusicValue {
         match self {
             MusicValue::FilePath(_) => "FilePath",
             MusicValue::AudioHash(_) => "AudioHash",
+            MusicValue::PcmHash(_) => "PcmHash",
             MusicValue::Title(_) => "Title",
             MusicValue::Artist(_) => "Artist",
             MusicValue::Album(_) => "Album",
@@ -401,6 +405,7 @@ impl fmt::Display for MusicValue {
         match self {
             MusicValue::FilePath(p) => write!(f, "{}", p.display()),
             MusicValue::AudioHash(h) => write!(f, "{}", h.as_str()),
+            MusicValue::PcmHash(h) => write!(f, "{}", h.as_str()),
             MusicValue::Title(s) => write!(f, "{}", s),
             MusicValue::Artist(s) => write!(f, "{}", s),
             MusicValue::Album(s) => write!(f, "{}", s),
@@ -793,6 +798,52 @@ mod tests {
         let h = sample_audio_hash();
         let val = MusicValue::AudioHash(h.clone());
         assert_eq!(val.display_name(), "AudioHash");
+        assert_eq!(val.to_string(), h.as_str());
+    }
+
+    fn sample_pcm_hash() -> music_primitives::PcmHash {
+        music_primitives::PcmHash::from_sha256_v1([0xAB; 32])
+    }
+
+    #[test]
+    fn pcm_hash_roundtrip() {
+        let val = MusicValue::PcmHash(sample_pcm_hash());
+        let json = serde_json::to_string(&val).unwrap();
+        let decoded: MusicValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(val, decoded);
+    }
+
+    #[test]
+    fn pcm_hash_fact_value_format() {
+        assert_fact_value_format!(MusicValue::PcmHash(sample_pcm_hash()));
+    }
+
+    #[test]
+    fn pcm_hash_golden_wire_format() {
+        let val = MusicValue::PcmHash(sample_pcm_hash());
+        let expected = format!(
+            r#"{{"t":"PcmHash","v":"pcm-sha256-v1:{}"}}"#,
+            "ab".repeat(32)
+        );
+        assert_eq!(serde_json::to_string(&val).unwrap(), expected);
+    }
+
+    #[test]
+    fn pcm_hash_rejects_other_prefixes_on_wire() {
+        for prefix in ["sha256:", "audio-sha256-v1:"] {
+            let json = format!(r#"{{"t":"PcmHash","v":"{prefix}{}"}}"#, "ab".repeat(32));
+            assert!(
+                serde_json::from_str::<MusicValue>(&json).is_err(),
+                "prefix {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pcm_hash_display_and_name() {
+        let h = sample_pcm_hash();
+        let val = MusicValue::PcmHash(h.clone());
+        assert_eq!(val.display_name(), "PcmHash");
         assert_eq!(val.to_string(), h.as_str());
     }
 
