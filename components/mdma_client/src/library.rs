@@ -2,9 +2,10 @@
 
 use crate::error::map_gw_to_lib_error;
 use library_ipc_client::{
-    content_to_hashes, ClientError, ContentHash, FactType, InboxPath, IngestAllItem, IngestResult,
-    IngestSource, LibraryClient, LibraryRequest, LibraryResponse, MusicValue, OrphanInfo,
-    PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
+    content_to_hashes, interpret_identity_backfill, interpret_identity_backfill_status,
+    ClientError, ContentHash, FactType, IdentityBackfillStart, IdentityBackfillStatus, InboxPath,
+    IngestAllItem, IngestResult, IngestSource, LibraryClient, LibraryRequest, LibraryResponse,
+    MusicValue, OrphanInfo, PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
 };
 use playlist_import::PlaylistWriteOps;
 
@@ -345,6 +346,39 @@ impl LibraryBackend {
             LibraryBackend::Gateway(_) => {
                 interpret_orphans_list(self.request(&LibraryRequest::TrackOrphans)?)
             }
+        }
+    }
+
+    /// Start the identity-hash backfill (or learn that one is already running).
+    pub fn identity_backfill(
+        &self,
+        include_pcm: bool,
+    ) -> Result<IdentityBackfillStart, ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.identity_backfill(include_pcm),
+            LibraryBackend::Gateway(_) => interpret_identity_backfill(
+                self.request(&LibraryRequest::IdentityBackfill { include_pcm })?,
+            ),
+        }
+    }
+
+    /// Report progress of the identity-hash backfill.
+    pub fn identity_backfill_status(&self) -> Result<IdentityBackfillStatus, ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.identity_backfill_status(),
+            LibraryBackend::Gateway(_) => interpret_identity_backfill_status(
+                self.request(&LibraryRequest::GetIdentityBackfillStatus)?,
+            ),
+        }
+    }
+
+    /// Ask a running identity-hash backfill to stop; returns the current status.
+    pub fn identity_backfill_cancel(&self) -> Result<IdentityBackfillStatus, ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.identity_backfill_cancel(),
+            LibraryBackend::Gateway(_) => interpret_identity_backfill_status(
+                self.request(&LibraryRequest::CancelIdentityBackfill)?,
+            ),
         }
     }
 }

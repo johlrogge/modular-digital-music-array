@@ -306,6 +306,22 @@ pub enum LibraryRequest {
     /// Re-extract cover art for tracks that don't have a CoverArtPath fact yet.
     ReindexCovers,
 
+    /// Start the explicit identity-hash backfill (AudioHash, and PcmHash when
+    /// `include_pcm`) for tracks that lack the requested hash fact.
+    ///
+    /// Runs on a low-priority background worker in the library service and never
+    /// blocks other requests. If a run is already in progress it is left alone and
+    /// the response says so. Poll with `GetIdentityBackfillStatus`.
+    IdentityBackfill { include_pcm: bool },
+
+    /// Report progress of the identity-hash backfill.
+    GetIdentityBackfillStatus,
+
+    /// Ask a running identity-hash backfill to stop after the track in hand.
+    /// Progress is kept, and a later `IdentityBackfill` resumes (tracks that already
+    /// carry the hash are skipped). Answered with the current status.
+    CancelIdentityBackfill,
+
     /// Write a bookmark fact for a track.
     WriteBookmark {
         hash: ContentHash,
@@ -456,6 +472,12 @@ pub enum LibraryResponse {
     /// List of hidden (deleted or superseded) tracks.
     OrphansList(Vec<OrphanInfo>),
 
+    /// Answer to `IdentityBackfill`.
+    IdentityBackfillStarted(IdentityBackfillStart),
+
+    /// Answer to `GetIdentityBackfillStatus` and `CancelIdentityBackfill`.
+    IdentityBackfillStatus(IdentityBackfillStatus),
+
     /// Error response.
     Error(ProtocolError),
 }
@@ -557,6 +579,47 @@ pub struct IngestAllItem {
     pub result: IngestResult,
 }
 
+/// Progress counters of one identity-hash backfill run.
+///
+/// `total` counts the tracks that lacked a requested hash when the run started
+/// (tracks that already carry it are left out, which makes a run resumable).
+/// `done` counts tracks handled so far: written, `failed` and `skipped` alike.
+/// `skipped` are tracks retired or already hashed by someone else between planning
+/// and writing; nothing is written for them and they are not errors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityBackfillProgress {
+    pub include_pcm: bool,
+    pub total: usize,
+    pub done: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub last_error: Option<String>,
+}
+
+/// State and progress of the identity-hash backfill worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum IdentityBackfillStatus {
+    /// No backfill has run since the service started.
+    Idle,
+    /// A worker is processing tracks.
+    Running(IdentityBackfillProgress),
+    /// The last run finished (individual tracks may still have failed).
+    Done(IdentityBackfillProgress),
+    /// The last run was cancelled; progress is kept and a new run resumes.
+    Cancelled(IdentityBackfillProgress),
+}
+
+/// Answer to `IdentityBackfill`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "start", rename_all = "snake_case")]
+pub enum IdentityBackfillStart {
+    /// A new run was started.
+    Started(IdentityBackfillProgress),
+    /// A run is already in progress and was left untouched.
+    AlreadyRunning(IdentityBackfillProgress),
+}
+
 /// Why a track is an orphan (shown in orphan/GC workflows).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "reason")]
@@ -585,6 +648,54 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
+
+    fn progress() -> IdentityBackfillProgress {
+        IdentityBackfillProgress {
+            include_pcm: true,
+            total: 5,
+            done: 3,
+            failed: 1,
+            skipped: 1,
+            last_error: Some("boom".into()),
+        }
+    }
+
+    #[test]
+    fn identity_backfill_status_roundtrips_and_is_tagged_by_state() {
+        for status in [
+            IdentityBackfillStatus::Idle,
+            IdentityBackfillStatus::Running(progress()),
+            IdentityBackfillStatus::Done(progress()),
+            IdentityBackfillStatus::Cancelled(progress()),
+        ] {
+            let json =
+                serde_json::to_string(&LibraryResponse::IdentityBackfillStatus(status.clone()))
+                    .unwrap();
+            match serde_json::from_str::<LibraryResponse>(&json).unwrap() {
+                LibraryResponse::IdentityBackfillStatus(back) => assert_eq!(back, status),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        let json = serde_json::to_value(IdentityBackfillStatus::Running(progress())).unwrap();
+        assert_eq!(json["state"], "running");
+        assert_eq!(json["total"], 5);
+    }
+
+    #[test]
+    fn identity_backfill_start_roundtrips() {
+        for start in [
+            IdentityBackfillStart::Started(progress()),
+            IdentityBackfillStart::AlreadyRunning(progress()),
+        ] {
+            let json =
+                serde_json::to_string(&LibraryResponse::IdentityBackfillStarted(start.clone()))
+                    .unwrap();
+            match serde_json::from_str::<LibraryResponse>(&json).unwrap() {
+                LibraryResponse::IdentityBackfillStarted(back) => assert_eq!(back, start),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
 
     #[rstest]
     #[case("track.flac")]

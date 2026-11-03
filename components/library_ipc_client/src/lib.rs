@@ -493,6 +493,54 @@ impl LibraryClient {
             })),
         }
     }
+
+    /// Start the identity-hash backfill (or learn that one is already running).
+    pub fn identity_backfill(
+        &self,
+        include_pcm: bool,
+    ) -> Result<IdentityBackfillStart, ClientError> {
+        interpret_identity_backfill(
+            self.request(&LibraryRequest::IdentityBackfill { include_pcm })?,
+        )
+    }
+
+    /// Report progress of the identity-hash backfill.
+    pub fn identity_backfill_status(&self) -> Result<IdentityBackfillStatus, ClientError> {
+        interpret_identity_backfill_status(
+            self.request(&LibraryRequest::GetIdentityBackfillStatus)?,
+        )
+    }
+
+    /// Ask a running identity-hash backfill to stop; returns the current status.
+    pub fn identity_backfill_cancel(&self) -> Result<IdentityBackfillStatus, ClientError> {
+        interpret_identity_backfill_status(self.request(&LibraryRequest::CancelIdentityBackfill)?)
+    }
+}
+
+/// Interpret the answer to `IdentityBackfill`.
+pub fn interpret_identity_backfill(
+    response: LibraryResponse,
+) -> Result<IdentityBackfillStart, ClientError> {
+    match response {
+        LibraryResponse::IdentityBackfillStarted(start) => Ok(start),
+        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+        _ => Err(ClientError::Protocol(ProtocolError::Internal {
+            message: "Unexpected response to IdentityBackfill".to_string(),
+        })),
+    }
+}
+
+/// Interpret the answer to `GetIdentityBackfillStatus` / `CancelIdentityBackfill`.
+pub fn interpret_identity_backfill_status(
+    response: LibraryResponse,
+) -> Result<IdentityBackfillStatus, ClientError> {
+    match response {
+        LibraryResponse::IdentityBackfillStatus(status) => Ok(status),
+        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+        _ => Err(ClientError::Protocol(ProtocolError::Internal {
+            message: "Unexpected response to IdentityBackfillStatus".to_string(),
+        })),
+    }
 }
 
 // =========================================================================

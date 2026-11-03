@@ -2626,14 +2626,12 @@ mod tests {
             metadata_dir: &std::path::Path,
             socket_path: &std::path::Path,
         ) -> std::thread::JoinHandle<()> {
-            let svc = Arc::new(
-                LibraryService::new(
-                    metadata_dir.to_path_buf(),
-                    metadata_dir.to_path_buf(),
-                    "ipc:///dev/null",
-                )
-                .expect("failed to create stub library"),
-            );
+            let svc = LibraryService::new(
+                metadata_dir.to_path_buf(),
+                metadata_dir.to_path_buf(),
+                "ipc:///dev/null",
+            )
+            .expect("failed to create stub library");
             let addr = format!("ipc://{}", socket_path.display());
             std::thread::spawn(move || {
                 run_ipc_server(svc, &addr).ok();

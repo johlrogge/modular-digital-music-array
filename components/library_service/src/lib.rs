@@ -7,6 +7,7 @@ pub mod fact_generator {
     pub use library_ingestion::fact_generator::*;
 }
 pub mod fact_writer;
+pub(crate) mod identity;
 pub mod ipc;
 pub mod pipeline {
     pub use library_ingestion::pipeline::*;

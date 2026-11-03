@@ -2,6 +2,7 @@
 //!
 //! Handles IPC requests and manages library state
 
+use crate::identity::{identity_facts_for_blob, IdentityOpts};
 use crate::ipc::{
     BeatGridInfo, Bpm, ContentHash, CueInfo, DurationSeconds, FactType, InboxPath, IngestAllItem,
     IngestResult, IngestSource, IpcServer, Key, LibraryRequest, LibraryResponse, OrphanInfo,
@@ -60,7 +61,9 @@ pub struct LibraryService {
     /// stream line is projected exactly once no matter who triggers the catch-up
     /// (the fact subscriber or a writer that just wrote to ACID).
     ///
-    /// Lock order: `cursor` -> `tracks` -> `fact_index` -> `content_hashes`.
+    /// Lock order: `retire_gate` -> `cursor` -> `tracks` -> `fact_index` ->
+    /// `content_hashes`. `identity_backfill` is independent: take it alone and never
+    /// together with another lock in this list.
     /// No projection lock may be held while calling `catch_up`.
     cursor: Mutex<Option<String>>,
     /// Cursor for incremental reads in refresh_event_timestamps.
@@ -77,6 +80,81 @@ pub struct LibraryService {
     acid_socket: String,
     /// Address of the ACID events pub/sub socket.
     acid_events_socket: String,
+    /// Weak handle to the `Arc` this service lives in (`Arc::new_cyclic`). The
+    /// identity backfill worker outlives the request that starts it, so it needs
+    /// an owning handle.
+    self_ref: std::sync::Weak<LibraryService>,
+    /// State and progress of the explicit identity-hash backfill (see `backfill`
+    /// module). Lock order: outermost, or held alone; see `cursor`.
+    identity_backfill: Mutex<crate::ipc::IdentityBackfillStatus>,
+    /// Set by `CancelIdentityBackfill`; the worker checks it between tracks.
+    identity_cancel: std::sync::atomic::AtomicBool,
+    /// Serialises *retiring* an entity against *out-of-band writers*. ACID has no
+    /// conditional write, so "check the entity is live, then write" races with a
+    /// retire that has already read the entity's facts: a late write is not in the
+    /// retract set and would leave the entity alive on that fact alone (identity
+    /// facts are provenance-tracked).
+    ///
+    /// Every retire path (`retract_all_entity_facts`, and the phase-2 duplicate merge
+    /// of ADR-013) must hold it for its whole body, catch-up included. Every
+    /// out-of-band writer that targets entities chosen from a snapshot (the identity
+    /// backfill) must hold it from its liveness re-check until its write returns.
+    /// Lock order: before `cursor`; see there.
+    retire_gate: Mutex<()>,
+    /// Test-only: called by the backfill worker after hashing a track and before
+    /// the liveness check + write, to inject a concurrent change at that point.
+    #[cfg(test)]
+    identity_write_hook: Mutex<Option<IdentityWriteHook>>,
+    /// Test-only: called inside `retract_all_entity_facts` right after it has read
+    /// the entity's facts and before it retracts them.
+    #[cfg(test)]
+    retire_mid_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+
+#[cfg(test)]
+type IdentityWriteHook = Box<dyn Fn(&LibraryService, &ContentHash) + Send + Sync>;
+
+mod backfill;
+
+/// Write handle given to the closure of `write_batch_and_project_with`; the only
+/// thing it can do is write facts.
+struct BatchWriter<'a> {
+    client: &'a AcidClient,
+    wrote: std::cell::Cell<bool>,
+}
+
+impl BatchWriter<'_> {
+    fn write_music_facts(
+        &self,
+        hash: &ContentHash,
+        facts: &[(MusicValue, music_facts::FactSource)],
+    ) -> Result<usize, acid_client::ClientError> {
+        let written = self.client.write_music_facts(hash, facts)?;
+        self.wrote.set(true);
+        Ok(written)
+    }
+}
+
+/// Runs the batch's single catch-up on drop (normal exit or unwind), if anything
+/// was written.
+struct ProjectOnDrop<'a> {
+    service: &'a LibraryService,
+    writer: &'a BatchWriter<'a>,
+}
+
+impl Drop for ProjectOnDrop<'_> {
+    fn drop(&mut self) {
+        // While unwinding, skip the catch-up: it takes the projection locks, which a
+        // panic elsewhere may have poisoned, and a panic inside a drop during unwind
+        // aborts the process. Skipping is safe: the facts are already durable in ACID
+        // and the fact subscriber converges the index.
+        if std::thread::panicking() {
+            return;
+        }
+        if self.writer.wrote.get() {
+            self.service.catch_up_after_write_with(self.writer.client);
+        }
+    }
 }
 
 /// A single memory cue, hot cue, or loop point stored in the in-memory index.
@@ -303,6 +381,10 @@ fn apply_fact_to_track(
 /// Timestamp-only values (TrackStarted, TrackStopped) use a separate most-recent-wins
 /// strategy and are intentionally excluded — retractions for those are not emitted
 /// in production and the timestamp logic is handled elsewhere.
+///
+/// `AddedAt` is excluded too: a retract of it is a no-op (there is no provenance to
+/// fall back to), and only ingest's `now()` ever writes it. Projection is
+/// latest-wins (`apply_assert_scalar`).
 fn is_provenance_tracked(value: &MusicValue) -> bool {
     !matches!(
         value,
@@ -354,9 +436,8 @@ fn apply_assert_scalar(
         MusicValue::CoverArtPath(p) => {
             entry.cover_art_path = Some(PathBuf::from(p));
         }
-        MusicValue::AddedAt(dt) if entry.added_at.is_none() => {
-            entry.added_at = Some(*dt);
-        }
+        // Latest AddedAt value wins (order-independent, so every projection path agrees).
+        MusicValue::AddedAt(dt) => update_if_more_recent(&mut entry.added_at, *dt),
         MusicValue::ItemId(v) => entry.item_id = Some(v.clone()),
         MusicValue::Replaces(_) => {
             // Replaces is stored in provenance only; no scalar field needed.
@@ -757,6 +838,16 @@ fn is_retractable_bandcamp_attribute(value: &MusicValue) -> bool {
     )
 }
 
+/// The `FactSource` the library service stamps on facts it derives itself
+/// (format, cover art, identity hashes, ingest provenance).
+fn library_fact_source() -> music_facts::FactSource {
+    music_facts::FactSource::new(
+        "mdma-library",
+        env!("CARGO_PKG_VERSION"),
+        music_facts::FactOrigin::Unknown,
+    )
+}
+
 /// Map a `FactOrigin` variant to its canonical source-name string.
 ///
 /// This is the single source of truth for the `source_name` → `FactOrigin`
@@ -779,7 +870,7 @@ impl LibraryService {
         music_dir: PathBuf,
         metadata_dir: PathBuf,
         acid_socket: &str,
-    ) -> Result<Self, ServiceError> {
+    ) -> Result<Arc<Self>, ServiceError> {
         Self::new_with_events(
             music_dir,
             metadata_dir,
@@ -789,12 +880,15 @@ impl LibraryService {
     }
 
     /// Create a new library service with an explicit ACID events socket address.
+    ///
+    /// Returns an `Arc` because the identity backfill worker needs an owning handle
+    /// to the service (`Arc::new_cyclic`).
     pub fn new_with_events(
         music_dir: PathBuf,
         metadata_dir: PathBuf,
         acid_socket: &str,
         acid_events_socket: &str,
-    ) -> Result<Self, ServiceError> {
+    ) -> Result<Arc<Self>, ServiceError> {
         // Connect to ACID service for writing and streaming
         let acid_client = AcidClient::connect(acid_socket)?;
 
@@ -805,7 +899,8 @@ impl LibraryService {
         let tracks_count = loaded.tracks.len();
         let album_cover_cache = Self::build_album_cover_cache(&loaded.tracks);
 
-        let service = Self {
+        // The fallible bootstrap above runs before `new_cyclic`, whose closure cannot fail.
+        let service = Arc::new_cyclic(|self_ref| Self {
             music_dir,
             metadata_dir,
             start_time: Instant::now(),
@@ -820,7 +915,15 @@ impl LibraryService {
             event_cursor: Mutex::new(None),
             acid_socket: acid_socket.to_string(),
             acid_events_socket: acid_events_socket.to_string(),
-        };
+            self_ref: self_ref.clone(),
+            identity_backfill: Mutex::new(crate::ipc::IdentityBackfillStatus::Idle),
+            identity_cancel: std::sync::atomic::AtomicBool::new(false),
+            retire_gate: Mutex::new(()),
+            #[cfg(test)]
+            identity_write_hook: Mutex::new(None),
+            #[cfg(test)]
+            retire_mid_hook: Mutex::new(None),
+        });
 
         // Backfill Format facts for tracks that don't have one yet
         service.backfill_format_facts(&loaded.has_format);
@@ -1101,27 +1204,22 @@ impl LibraryService {
             "Backfilling Format facts for tracks"
         );
 
-        let source = music_facts::FactSource::new(
-            "mdma-library",
-            env!("CARGO_PKG_VERSION"),
-            music_facts::FactOrigin::Unknown,
-        );
+        let source = library_fact_source();
 
-        let mut backfilled = 0;
-
-        for (hash, music_format) in &needs_backfill {
-            let value = MusicValue::Format(*music_format);
-            if self
-                .acid_client
-                .write_music_facts(hash, &[(value, source.clone())])
-                .is_ok()
-            {
-                backfilled += 1;
+        // The batch seam projects the written facts (index, fact_index, counters)
+        // through the single path once the closure returns.
+        let backfilled = self.write_batch_and_project_with(&self.acid_client, |w| {
+            let mut backfilled = 0;
+            for (hash, music_format) in &needs_backfill {
+                let value = MusicValue::Format(*music_format);
+                if w.write_music_facts(hash, &[(value, source.clone())])
+                    .is_ok()
+                {
+                    backfilled += 1;
+                }
             }
-        }
-
-        // Project the written facts (index, fact_index, counters) via the single path.
-        self.catch_up_after_write();
+            backfilled
+        });
 
         tracing::info!(backfilled, "Format fact backfill complete");
     }
@@ -1218,30 +1316,24 @@ impl LibraryService {
             "Backfilling CoverArtPath facts for tracks"
         );
 
-        let fact_source = music_facts::FactSource::new(
-            "mdma-library",
-            env!("CARGO_PKG_VERSION"),
-            music_facts::FactOrigin::Unknown,
-        );
+        let fact_source = library_fact_source();
 
-        let mut backfilled = 0;
-
-        for (hash, blob_rel_path) in &needs_backfill {
-            let blob_abs = self.music_dir.join(blob_rel_path);
-            if let Some(rel_path) = self.extract_and_store_cover_art(&blob_abs, hash) {
-                let value = MusicValue::CoverArtPath(rel_path.to_string_lossy().to_string());
-                if self
-                    .acid_client
-                    .write_music_facts(hash, &[(value.clone(), fact_source.clone())])
-                    .is_ok()
-                {
-                    backfilled += 1;
+        // Written facts are projected through the single path when the batch ends.
+        let backfilled = self.write_batch_and_project_with(&self.acid_client, |w| {
+            let mut backfilled = 0;
+            for (hash, blob_rel_path) in &needs_backfill {
+                let blob_abs = self.music_dir.join(blob_rel_path);
+                if let Some(rel_path) = self.extract_and_store_cover_art(&blob_abs, hash) {
+                    let value = MusicValue::CoverArtPath(rel_path.to_string_lossy().to_string());
+                    if w.write_music_facts(hash, &[(value, fact_source.clone())])
+                        .is_ok()
+                    {
+                        backfilled += 1;
+                    }
                 }
             }
-        }
-
-        // Project the written facts (index, fact_index, counters) via the single path.
-        self.catch_up_after_write();
+            backfilled
+        });
 
         tracing::info!(backfilled, "CoverArtPath fact backfill complete");
         backfilled
@@ -1438,9 +1530,45 @@ impl LibraryService {
         hash: &ContentHash,
         facts: &[(MusicValue, music_facts::FactSource)],
     ) -> Result<usize, acid_client::ClientError> {
-        let written = self.acid_client.write_music_facts(hash, facts)?;
-        self.catch_up_after_write();
+        self.write_and_project_with(&self.acid_client, hash, facts)
+    }
+
+    /// [`write_and_project`](Self::write_and_project) through an explicit ACID client.
+    ///
+    /// A thread other than the request thread (the backfill worker) must use its own
+    /// client: nng REQ sockets cannot be shared between concurrent requests.
+    fn write_and_project_with(
+        &self,
+        client: &AcidClient,
+        hash: &ContentHash,
+        facts: &[(MusicValue, music_facts::FactSource)],
+    ) -> Result<usize, acid_client::ClientError> {
+        let written = client.write_music_facts(hash, facts)?;
+        self.catch_up_after_write_with(client);
         Ok(written)
+    }
+
+    /// Batch form of [`write_and_project_with`](Self::write_and_project_with): `f`
+    /// writes any number of entities through the [`BatchWriter`], and the written
+    /// facts are projected with a single catch-up when `f` returns, or unwinds (the
+    /// catch-up is a `Drop` guard). Nothing in `f` can write to ACID without going
+    /// through here, so a batch cannot forget to project.
+    ///
+    /// Holds no lock itself; callers needing `retire_gate` take it inside `f`.
+    fn write_batch_and_project_with<R>(
+        &self,
+        client: &AcidClient,
+        f: impl FnOnce(&BatchWriter<'_>) -> R,
+    ) -> R {
+        let writer = BatchWriter {
+            client,
+            wrote: std::cell::Cell::new(false),
+        };
+        let _projection = ProjectOnDrop {
+            service: self,
+            writer: &writer,
+        };
+        f(&writer)
     }
 
     /// Retract facts in ACID and project them. See [`write_and_project`](Self::write_and_project).
@@ -1458,7 +1586,11 @@ impl LibraryService {
     /// durable, so a failed read here only delays visibility until the
     /// subscriber's next catch-up. Log and carry on.
     fn catch_up_after_write(&self) {
-        if let Err(e) = self.catch_up() {
+        self.catch_up_after_write_with(&self.acid_client);
+    }
+
+    fn catch_up_after_write_with(&self, client: &AcidClient) {
+        if let Err(e) = self.catch_up_with(client) {
             tracing::warn!(error = %e, "catch_up after ACID write failed; subscriber will converge");
         }
     }
@@ -1729,6 +1861,21 @@ impl LibraryService {
                 })
             }
 
+            LibraryRequest::IdentityBackfill { include_pcm } => {
+                match self.start_identity_backfill(include_pcm) {
+                    Ok(start) => LibraryResponse::IdentityBackfillStarted(start),
+                    Err(e) => LibraryResponse::Error(e),
+                }
+            }
+
+            LibraryRequest::GetIdentityBackfillStatus => {
+                LibraryResponse::IdentityBackfillStatus(self.identity_backfill_status())
+            }
+
+            LibraryRequest::CancelIdentityBackfill => {
+                LibraryResponse::IdentityBackfillStatus(self.cancel_identity_backfill())
+            }
+
             LibraryRequest::WriteBookmark { hash, scope } => {
                 let full_hash = match self.resolve_hash(&hash) {
                     Ok(h) => h,
@@ -1834,6 +1981,10 @@ impl LibraryService {
     /// sent to ACID via `retract_and_project`, which projects each retraction
     /// through the stream path; scalar fields are re-resolved from whatever
     /// provenance survives (another source's Album stays).
+    ///
+    /// Retire safety: this retracts only facts with the given source and does not
+    /// take `retire_gate`. It must never be what empties an entity; any path that can
+    /// leave an entity with no live facts has to go through `retract_all_entity_facts`.
     fn retract_source_facts(&self, item_id: &str, source_name: &str) -> LibraryResponse {
         use music_facts::FactSource;
 
@@ -2017,11 +2168,20 @@ impl LibraryService {
     pub(crate) fn retract_all_entity_facts(&self, hash: &ContentHash) -> Result<usize, String> {
         use music_facts::FactSource;
 
+        // Hold the gate for the whole retire: read, retract and the catch-up inside
+        // `retract_and_project`. See `retire_gate`.
+        let _gate = self.retire_gate.lock().unwrap();
+
         // Read all fact lines for this entity from ACID
         let lines = self
             .acid_client
             .read_entity(hash.as_str())
             .map_err(|e| format!("Failed to read entity from ACID: {}", e))?;
+
+        #[cfg(test)]
+        if let Some(hook) = self.retire_mid_hook.lock().unwrap().as_ref() {
+            hook();
+        }
 
         // Collect all (value, source) pairs from Assert operations.
         // We retract exactly the asserted (value, source) pairs so the provenance
@@ -2854,11 +3014,7 @@ impl LibraryService {
             let _ = std::fs::remove_file(path);
 
             // Append source facts that don't exist yet for this track
-            let fact_source = music_facts::FactSource::new(
-                "mdma-library",
-                env!("CARGO_PKG_VERSION"),
-                music_facts::FactOrigin::Unknown,
-            );
+            let fact_source = library_fact_source();
             let new_facts = Self::source_facts(source, &fact_source);
             if !new_facts.is_empty() {
                 // Check if this track already has a Source fact
@@ -2891,11 +3047,7 @@ impl LibraryService {
         let indexed = extracted.import(&self.music_dir)?;
 
         // Stage 5: Extract cover art from blob and store it
-        let fact_source = music_facts::FactSource::new(
-            "mdma-library",
-            env!("CARGO_PKG_VERSION"),
-            music_facts::FactOrigin::Unknown,
-        );
+        let fact_source = library_fact_source();
         let blob_path = self.music_dir.join(&indexed.blob_path);
         let cover_art_path = self.extract_and_store_cover_art(&blob_path, &content_hash);
         if let Some(ref rel_path) = cover_art_path {
@@ -2904,6 +3056,10 @@ impl LibraryService {
                 fact_source.clone(),
             ));
         }
+
+        // Identity: AudioHash v1 (PcmHash is left to the explicit backfill). A failure
+        // is logged and simply yields no fact; ingest continues.
+        facts.extend(identity_facts_for_blob(&blob_path, IdentityOpts::INGEST, &fact_source).facts);
 
         // Add provenance facts from source metadata
         let source_facts = Self::source_facts(source, &fact_source);
@@ -3573,7 +3729,14 @@ mod tests {
 
     static ACID_SERVER_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-    fn spawn_acid_server() -> (acid_service::ServerHandle, String, String) {
+    /// An in-process ACID server plus the private directory it stores facts in.
+    /// Dropping it stops the server first (field order), then removes the directory.
+    struct AcidGuard {
+        _handle: acid_service::ServerHandle,
+        _dir: tempfile::TempDir,
+    }
+
+    fn spawn_acid_server() -> (AcidGuard, String, String) {
         let id = ACID_SERVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pid = std::process::id();
         let facts_addr = format!("ipc:///tmp/mdma-test-acid-facts-{}-{}.sock", pid, id);
@@ -3585,21 +3748,27 @@ mod tests {
         let pub_sock = nng::Socket::new(nng::Protocol::Pub0).expect("pub socket");
         pub_sock.listen(&events_addr).expect("pub listen");
 
-        let handle = acid_service::start(rep, pub_sock, std::path::Path::new("/tmp"))
-            .expect("failed to start acid server");
+        // Every server gets its own metadata dir: under the file-backed fact store a
+        // shared directory would mix facts across parallel tests and across runs.
+        let dir = tempfile::tempdir().expect("acid metadata dir");
+        let handle =
+            acid_service::start(rep, pub_sock, dir.path()).expect("failed to start acid server");
         std::thread::sleep(std::time::Duration::from_millis(20));
-        (handle, facts_addr, events_addr)
+        (
+            AcidGuard {
+                _handle: handle,
+                _dir: dir,
+            },
+            facts_addr,
+            events_addr,
+        )
     }
 
     /// Helper: build an empty service backed by a real (in-process) ACID server.
     ///
     /// Returns `(service, metadata_dir, acid_handle)`. Callers must keep
     /// `_acid` alive for the duration of the test; dropping it shuts the server down.
-    fn make_empty_service() -> (
-        LibraryService,
-        tempfile::TempDir,
-        acid_service::ServerHandle,
-    ) {
+    fn make_empty_service() -> (Arc<LibraryService>, tempfile::TempDir, AcidGuard) {
         let music_dir = tempfile::tempdir().unwrap();
         let metadata_dir = tempfile::tempdir().unwrap();
         let (acid_handle, facts_addr, events_addr) = spawn_acid_server();
@@ -3613,11 +3782,7 @@ mod tests {
         (service, metadata_dir, acid_handle)
     }
 
-    fn make_service_with_playlists_dir() -> (
-        LibraryService,
-        tempfile::TempDir,
-        acid_service::ServerHandle,
-    ) {
+    fn make_service_with_playlists_dir() -> (Arc<LibraryService>, tempfile::TempDir, AcidGuard) {
         let music_dir = tempfile::tempdir().unwrap();
         let metadata_dir = tempfile::tempdir().unwrap();
         // create the playlists sub-directory
@@ -4218,7 +4383,7 @@ mod tests {
     /// library bootstrap reads them via the ACID stream (no file fallback).
     fn make_service_with_facts(
         facts_file: &std::path::Path,
-    ) -> (LibraryService, tempfile::TempDir) {
+    ) -> (Arc<LibraryService>, tempfile::TempDir) {
         let music_dir = tempfile::tempdir().unwrap();
         // Use a shared metadata dir for both ACID and the service so that
         // acid_service::start() can replay the facts file from it.
@@ -4258,7 +4423,7 @@ mod tests {
     /// so the caller can connect an external AcidClient and write additional facts.
     fn make_service_with_facts_and_addr(
         facts_file: &std::path::Path,
-    ) -> (LibraryService, tempfile::TempDir, String) {
+    ) -> (Arc<LibraryService>, tempfile::TempDir, String) {
         let music_dir = tempfile::tempdir().unwrap();
         let metadata_dir = tempfile::tempdir().unwrap();
         let facts_dest = metadata_dir.path().join("facts.jsonl");
@@ -6457,6 +6622,42 @@ mod tests {
         assert_scalar_fields_eq("2_both_retract stream==file", &stream_result, &file_result);
     }
 
+    /// AddedAt aggregation is latest-wins, whatever the assertion order, on all paths.
+    #[test]
+    fn equivalence_added_at_latest_wins_all_paths() {
+        let hash = ContentHash::new("sha256:equiv_added_at");
+        let source = FactSource::new("source-a", "1.0.0", FactOrigin::Unknown);
+        let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let older = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let newer = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+
+        let fact = |v: MusicValue| (hash.clone(), v, ts, Operation::Assert, source.clone());
+        // Title keeps the entity live; AddedAt itself is not provenance-tracked.
+        let title = || fact(MusicValue::Title(Title::new("T")));
+        for (case, order) in [
+            ("older first", [older, newer]),
+            ("newer first", [newer, older]),
+        ] {
+            let facts = vec![
+                title(),
+                fact(MusicValue::AddedAt(order[0])),
+                fact(MusicValue::AddedAt(order[1])),
+            ];
+            let file_result = load_from_file_path(&hash, &facts);
+            let bulk_result = load_from_bulk_path(&hash, &facts);
+            let stream_result = apply_stream_path(&hash, &facts);
+            let ingest_result = apply_ingest_path(&hash, &facts);
+            for (path, r) in [
+                ("file", &file_result),
+                ("bulk", &bulk_result),
+                ("stream", &stream_result),
+                ("ingest", &ingest_result),
+            ] {
+                assert_eq!(r.added_at, Some(newer), "{case}: {path} path");
+            }
+        }
+    }
+
     /// Regression: blob_path must be derived from FilePath on ALL three paths.
     ///
     /// Before the fix, aggregate_facts (bulk path) produced an empty blob_path
@@ -6935,11 +7136,7 @@ mod tests {
     fn make_service_with_replaces(
         live_tracks: &[(ContentHash, &str)],
         replaces_pairs: &[(ContentHash, ContentHash)],
-    ) -> (
-        LibraryService,
-        tempfile::TempDir,
-        acid_service::ServerHandle,
-    ) {
+    ) -> (Arc<LibraryService>, tempfile::TempDir, AcidGuard) {
         let music_dir = tempfile::tempdir().unwrap();
         let metadata_dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(metadata_dir.path().join("playlists")).unwrap();
@@ -7924,6 +8121,367 @@ mod tests {
             .unwrap_or(0)
     }
 
+    // =========================================================================
+    // Identity hashes: ingest and explicit backfill
+    // =========================================================================
+
+    const FIXTURE_S16_L8: &[u8] =
+        include_bytes!("../../audio_hash/testdata/pcm/fixtures/s16_l8.flac");
+    const FIXTURE_S16_L8_TAGS: &[u8] =
+        include_bytes!("../../audio_hash/testdata/pcm/fixtures/s16_l8_tags.flac");
+
+    /// Identity facts (AudioHash, PcmHash) stored in ACID for `hash`.
+    fn identity_facts_in_acid(service: &LibraryService, hash: &ContentHash) -> Vec<MusicValue> {
+        service
+            .acid_client
+            .read_entity(hash.as_str())
+            .unwrap()
+            .iter()
+            .filter_map(|l| {
+                serde_json::from_str::<Fact<ContentHash, MusicValue, FactSource>>(l).ok()
+            })
+            .map(|f| f.value().clone())
+            .filter(|v| matches!(v, MusicValue::AudioHash(_) | MusicValue::PcmHash(_)))
+            .collect()
+    }
+
+    fn fixture_audio_hash(bytes: &[u8]) -> MusicValue {
+        MusicValue::AudioHash(audio_hash::audio_hash_reader(std::io::Cursor::new(bytes)).unwrap())
+    }
+
+    fn ingest_bytes(service: &LibraryService, name: &str, bytes: &[u8]) -> ContentHash {
+        let inbox = service.music_dir.join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let path = inbox.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        service.ingest_file_internal(&path, None).unwrap()
+    }
+
+    #[test]
+    fn ingest_adds_audio_hash_fact_for_flac() {
+        let (service, _metadata_dir, _acid) = make_empty_service();
+        let hash = ingest_bytes(&service, "Artist - Song.flac", FIXTURE_S16_L8);
+        assert_eq!(
+            identity_facts_in_acid(&service, &hash),
+            vec![fixture_audio_hash(FIXTURE_S16_L8)]
+        );
+    }
+
+    #[test]
+    fn files_differing_only_in_tags_get_equal_audio_hash_facts() {
+        let (service, _metadata_dir, _acid) = make_empty_service();
+        let a = ingest_bytes(&service, "a.flac", FIXTURE_S16_L8);
+        let b = ingest_bytes(&service, "b.flac", FIXTURE_S16_L8_TAGS);
+        assert_ne!(a, b, "different bytes, different content hashes");
+        let fa = identity_facts_in_acid(&service, &a);
+        let fb = identity_facts_in_acid(&service, &b);
+        assert_eq!(fa.len(), 1);
+        assert_eq!(fa, fb);
+    }
+
+    /// Create a track whose blob is `bytes` but which has no identity facts.
+    fn seed_blob_track(service: &LibraryService, hex: &str, bytes: &[u8]) -> ContentHash {
+        let hash = ContentHash::new(format!("sha256:{hex}"));
+        let file_path = std::path::PathBuf::from("x.flac");
+        service
+            .acid_client
+            .write_music_facts(
+                &hash,
+                &[
+                    (MusicValue::Title(Title::new(hex)), user_source()),
+                    (MusicValue::FilePath(file_path.clone()), user_source()),
+                ],
+            )
+            .unwrap();
+        service.catch_up().unwrap();
+        let blob = service
+            .music_dir
+            .join(blob_path_for(hash.as_str(), &file_path).unwrap());
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(blob, bytes).unwrap();
+        hash
+    }
+
+    use library_ipc_protocol::{
+        IdentityBackfillProgress, IdentityBackfillStart, IdentityBackfillStatus,
+    };
+
+    /// Start a backfill and wait until the worker stops (`Done` or `Cancelled`).
+    fn run_backfill_to_end(service: &LibraryService, include_pcm: bool) -> IdentityBackfillStatus {
+        match service.handle_request(LibraryRequest::IdentityBackfill { include_pcm }) {
+            LibraryResponse::IdentityBackfillStarted(IdentityBackfillStart::Started(_)) => {}
+            other => panic!("expected a started backfill, got {other:?}"),
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            match service.handle_request(LibraryRequest::GetIdentityBackfillStatus) {
+                LibraryResponse::IdentityBackfillStatus(IdentityBackfillStatus::Running(_)) => {}
+                LibraryResponse::IdentityBackfillStatus(s) => return s,
+                other => panic!("unexpected response {other:?}"),
+            }
+            assert!(Instant::now() < deadline, "backfill did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Like `run_backfill_to_end`, but the run must have completed.
+    fn run_backfill(service: &LibraryService, include_pcm: bool) -> IdentityBackfillProgress {
+        match run_backfill_to_end(service, include_pcm) {
+            IdentityBackfillStatus::Done(p) => p,
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    /// Blob that is a recognised FLAC but cut short: hashing it fails.
+    fn corrupt_flac() -> &'static [u8] {
+        &FIXTURE_S16_L8[..20]
+    }
+
+    #[test]
+    fn backfill_skips_existing_counts_and_survives_failures() {
+        let (service, _dir, _acid) = make_empty_service();
+        // The failing file comes first: the run must carry on past it.
+        let bad = seed_blob_track(&service, "bad0000000001", corrupt_flac());
+        let fresh = seed_blob_track(&service, "fresh000000001", FIXTURE_S16_L8);
+        let have = seed_blob_track(&service, "have0000000001", FIXTURE_S16_L8_TAGS);
+        let existing = fixture_audio_hash(FIXTURE_S16_L8_TAGS);
+        service
+            .acid_client
+            .write_music_facts(&have, &[(existing.clone(), user_source())])
+            .unwrap();
+        service.catch_up().unwrap();
+
+        let status = run_backfill(&service, false);
+
+        // `have` was skipped, so it is not part of the run.
+        assert_eq!(
+            (status.total, status.done, status.failed, status.skipped),
+            (2, 2, 1, 0)
+        );
+        assert!(!status.include_pcm);
+        assert!(status.last_error.as_deref().unwrap().contains("AudioHash"));
+        assert_eq!(
+            identity_facts_in_acid(&service, &fresh),
+            vec![fixture_audio_hash(FIXTURE_S16_L8)]
+        );
+        assert_eq!(identity_facts_in_acid(&service, &have), vec![existing]);
+        assert!(identity_facts_in_acid(&service, &bad).is_empty());
+
+        // The run projected its writes: a second run has only the failing track left.
+        let again = run_backfill(&service, false);
+        assert_eq!((again.total, again.done, again.failed), (1, 1, 1));
+    }
+
+    #[test]
+    fn backfill_with_pcm_adds_only_the_missing_hash() {
+        let (service, _dir, _acid) = make_empty_service();
+        let hash = seed_blob_track(&service, "pcm00000000001", FIXTURE_S16_L8);
+
+        run_backfill(&service, false);
+        let status = run_backfill(&service, true);
+        assert_eq!((status.total, status.done, status.failed), (1, 1, 0));
+
+        let facts = identity_facts_in_acid(&service, &hash);
+        assert_eq!(facts.len(), 2, "one AudioHash, one PcmHash: {facts:?}");
+        assert!(matches!(facts[0], MusicValue::AudioHash(_)));
+        assert!(matches!(facts[1], MusicValue::PcmHash(_)));
+
+        // Nothing left to do.
+        let done = run_backfill(&service, true);
+        assert_eq!((done.total, done.done), (0, 0));
+    }
+
+    /// B1: a track retired (hard-retracted) between planning and writing must not be
+    /// resurrected by the backfill writing identity facts for its still-on-disk blob.
+    #[test]
+    fn backfill_does_not_resurrect_a_track_retired_mid_run() {
+        let (service, _dir, _acid) = make_empty_service();
+        let hash = seed_blob_track(&service, "retired0000001", FIXTURE_S16_L8);
+        *service.identity_write_hook.lock().unwrap() = Some(Box::new(|svc, h| {
+            svc.retract_all_entity_facts(h).unwrap();
+        }));
+
+        let status = run_backfill(&service, false);
+
+        assert!(
+            service.resolve_hash(&hash).is_err(),
+            "retired track came back to life"
+        );
+        assert!(identity_facts_in_acid(&service, &hash).is_empty());
+        // Retired is neither a failure nor a write: it is counted as skipped.
+        assert_eq!(
+            (status.total, status.done, status.failed, status.skipped),
+            (1, 1, 0, 1)
+        );
+    }
+
+    /// A panic inside a batch closure must not abort (no catch-up during unwind), and
+    /// the service stays usable: the write is durable and the next catch-up sees it.
+    #[test]
+    fn panic_in_a_write_batch_unwinds_without_abort_and_service_still_works() {
+        let (service, _dir, _acid) = make_empty_service();
+        let hash = ContentHash::new("sha256:batchpanic0001");
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            service.write_batch_and_project_with(&service.acid_client, |w| {
+                w.write_music_facts(
+                    &hash,
+                    &[(MusicValue::Title(Title::new("Durable")), user_source())],
+                )
+                .unwrap();
+                panic!("boom inside the batch");
+            })
+        }));
+        assert!(result.is_err());
+
+        // Not projected during the unwind, but durable; the next catch-up applies it.
+        assert!(service.resolve_hash(&hash).is_err());
+        assert_eq!(service.catch_up().unwrap(), 1);
+        assert_eq!(service.resolve_hash(&hash).unwrap(), hash);
+    }
+
+    /// N7: a retired track whose hashing also failed is skipped, not failed.
+    #[test]
+    fn retired_track_with_a_failed_hash_counts_as_skipped() {
+        let (service, _dir, _acid) = make_empty_service();
+        let hash = seed_blob_track(&service, "retfail0000001", corrupt_flac());
+        *service.identity_write_hook.lock().unwrap() = Some(Box::new(|svc, h| {
+            svc.retract_all_entity_facts(h).unwrap();
+        }));
+        let status = run_backfill(&service, false);
+        assert_eq!(
+            (status.total, status.done, status.failed, status.skipped),
+            (1, 1, 0, 1)
+        );
+        assert!(service.resolve_hash(&hash).is_err());
+    }
+
+    /// N1: a retire that is *partway through* (facts read, not yet retracted) must not
+    /// be undone by a backfill write landing in that window. The write would not be
+    /// in the retire's retract set, so the entity would survive on AudioHash alone.
+    ///
+    /// Deterministic: the retire thread parks inside `retract_all_entity_facts`
+    /// after its read; the backfill is started while it is parked; then the retire
+    /// is released. With the retire gate the worker waits for the retire to finish
+    /// and then sees the entity gone.
+    #[test]
+    fn backfill_write_cannot_land_inside_a_retire_in_progress() {
+        let (service, _dir, _acid) = make_empty_service();
+        let hash = seed_blob_track(&service, "midretire00001", FIXTURE_S16_L8);
+
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        *service.retire_mid_hook.lock().unwrap() = Some(Box::new(move || {
+            parked_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        }));
+
+        let retire = {
+            let service = Arc::clone(&service);
+            let hash = hash.clone();
+            std::thread::spawn(move || service.retract_all_entity_facts(&hash).unwrap())
+        };
+        parked_rx.recv().unwrap(); // the retire has read the entity and is parked
+
+        let started =
+            service.handle_request(LibraryRequest::IdentityBackfill { include_pcm: false });
+        assert!(matches!(
+            started,
+            LibraryResponse::IdentityBackfillStarted(IdentityBackfillStart::Started(_))
+        ));
+        // Give the worker time to hash and reach its write (it must not get through).
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        release_tx.send(()).unwrap();
+        retire.join().unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        while matches!(
+            service.identity_backfill_status(),
+            IdentityBackfillStatus::Running(_)
+        ) {
+            assert!(Instant::now() < deadline, "backfill did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert!(
+            service.resolve_hash(&hash).is_err(),
+            "the backfill write landed inside the retire and resurrected the track"
+        );
+        assert!(identity_facts_in_acid(&service, &hash).is_empty());
+    }
+
+    #[test]
+    fn unrecognised_files_are_neither_failures_nor_facts() {
+        let (service, _dir, _acid) = make_empty_service();
+        let hash = seed_blob_track(&service, "junk0000000001", b"not audio at all");
+        let status = run_backfill(&service, true);
+        assert_eq!(
+            (status.total, status.done, status.failed, status.skipped),
+            (1, 1, 0, 0)
+        );
+        assert!(status.last_error.is_none());
+        assert!(identity_facts_in_acid(&service, &hash).is_empty());
+    }
+
+    #[test]
+    fn cancel_stops_after_the_track_in_hand_and_a_new_run_resumes() {
+        let (service, _dir, _acid) = make_empty_service();
+        let hashes: Vec<_> = (0..3)
+            .map(|i| seed_blob_track(&service, &format!("cancel00000000{i}"), FIXTURE_S16_L8))
+            .collect();
+        // Cancel while the first track is in hand.
+        *service.identity_write_hook.lock().unwrap() = Some(Box::new(|svc, _| {
+            svc.handle_request(LibraryRequest::CancelIdentityBackfill);
+        }));
+
+        let status = run_backfill_to_end(&service, false);
+        let IdentityBackfillStatus::Cancelled(p) = status else {
+            panic!("expected Cancelled, got {status:?}");
+        };
+        assert_eq!((p.total, p.done), (3, 1));
+        // No manual catch-up here: the cancelled run's own projection must have made
+        // the finished track visible, or the resumed run would re-plan it.
+
+        // Progress is kept: the finished track is skipped by the next run.
+        *service.identity_write_hook.lock().unwrap() = None;
+        let resumed = run_backfill(&service, false);
+        assert_eq!((resumed.total, resumed.done, resumed.failed), (2, 2, 0));
+        for h in &hashes {
+            assert_eq!(identity_facts_in_acid(&service, h).len(), 1, "{h:?}");
+        }
+    }
+
+    #[test]
+    fn backfill_never_runs_at_startup() {
+        let (service, _dir, _acid) = make_empty_service();
+        assert_eq!(
+            service.identity_backfill_status(),
+            IdentityBackfillStatus::Idle
+        );
+    }
+
+    #[test]
+    fn backfill_request_while_running_reports_already_running() {
+        let (service, _dir, _acid) = make_empty_service();
+        let running = IdentityBackfillProgress {
+            include_pcm: false,
+            total: 4,
+            done: 1,
+            failed: 0,
+            skipped: 0,
+            last_error: None,
+        };
+        *service.identity_backfill.lock().unwrap() =
+            IdentityBackfillStatus::Running(running.clone());
+        match service.handle_request(LibraryRequest::IdentityBackfill { include_pcm: true }) {
+            LibraryResponse::IdentityBackfillStarted(IdentityBackfillStart::AlreadyRunning(p)) => {
+                assert_eq!(p, running)
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
     /// Ingest (real WAV through validate + extract_metadata + import), then a
     /// subscriber-style catch-up: every fact is held exactly once, and the
     /// counters agree with the ACID stream.
@@ -8053,7 +8611,6 @@ mod tests {
     #[test]
     fn concurrent_catch_ups_apply_each_line_once() {
         let (service, _metadata_dir, _acid) = make_empty_service();
-        let service = Arc::new(service);
         let hash = ContentHash::new("sha256:catch_up_threads_0001");
         let n = 40usize;
 
