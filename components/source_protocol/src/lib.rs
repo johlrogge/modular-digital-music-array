@@ -76,6 +76,20 @@ pub enum SourceRequest {
     /// Fetch one playlist. `playlist` is a slug or a URL.
     /// Answer with `SourceResponse::Playlist`.
     GetPlaylist { playlist: String },
+
+    /// Start a background job importing a playlist into the library.
+    /// `playlist` is a slug or a URL; `name` overrides the target playlist
+    /// name. Answer with `SourceResponse::ImportStarted`, or
+    /// `SourceError::ImportInProgress` if a job is running.
+    ImportPlaylist {
+        playlist: String,
+        name: Option<String>,
+        dry_run: bool,
+    },
+
+    /// Get the current or last import job.
+    /// Answer with `SourceResponse::ImportStatus`.
+    GetImportStatus,
 }
 
 // ============================================================================
@@ -129,6 +143,12 @@ pub enum SourceResponse {
 
     /// Result of a GetPlaylist request.
     Playlist(SourcePlaylist),
+
+    /// An import job was started.
+    ImportStarted { job_id: u64 },
+
+    /// Result of a GetImportStatus request: the current or last job, if any.
+    ImportStatus(Option<ImportJobStatus>),
 
     /// Error response.
     Error(SourceError),
@@ -240,6 +260,110 @@ pub struct SourcePlaylistTrack {
     pub owned: bool,
 }
 
+/// Phase of a server-side playlist import job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImportPhase {
+    /// Fetching the playlist from the source.
+    Fetching,
+    /// Matching playlist tracks against the library.
+    Matching,
+    /// Syncing the collection and waiting for queued downloads.
+    Syncing,
+    /// Matching again after downloads finished.
+    Rematching,
+    /// Writing the playlist.
+    Writing,
+    /// Finished successfully, with what the job did.
+    Done(ImportResult),
+    /// Aborted with an error.
+    Failed { message: String },
+}
+
+/// How a finished import job ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImportResult {
+    /// The playlist was written.
+    Written(ImportWritten),
+    /// Dry run: this many tracks would have been written. Never zero; a dry
+    /// run without matches is `NothingMatched`.
+    DryRun { would_write: u32 },
+    /// No track matched definitively, so nothing was written (an existing
+    /// playlist is never replaced with an empty one).
+    NothingMatched,
+}
+
+/// Progress of the downloads queued by the sync an import job triggered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportSyncProgress {
+    pub queued: u32,
+    pub completed: u32,
+    pub failed: u32,
+    /// Why the wait for the downloads ended; `None` while still waiting.
+    pub ended: Option<SyncWaitEnd>,
+}
+
+/// Why an import stopped waiting for its downloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SyncWaitEnd {
+    /// Every download completed, failed or was cancelled.
+    AllFinished,
+    /// Downloads were paused, so the rest were not fetched.
+    Paused,
+    /// The time limit passed first.
+    TimedOut,
+}
+
+/// Result of matching one playlist track against the library.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ImportTrackOutcome {
+    /// Exactly one library track matched.
+    Matched { hash: String },
+    /// Several library tracks matched; never written.
+    Ambiguous { candidates: Vec<String> },
+    /// Artist and title match but the duration is outside tolerance
+    /// (probably a different version); never written.
+    DurationMismatch {
+        hash: String,
+        library_secs: u32,
+        source_secs: u32,
+    },
+    /// No library match. `not_owned` is true when the user does not own
+    /// the track on the source, so a sync cannot fetch it.
+    Missing { not_owned: bool },
+}
+
+/// Match report line for one playlist track, in source order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportTrackReport {
+    pub position: u32,
+    pub artist: String,
+    pub title: String,
+    pub outcome: ImportTrackOutcome,
+}
+
+/// Outcome of writing the playlist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportWritten {
+    /// False when an existing playlist was replaced.
+    pub created: bool,
+    pub tracks: u32,
+}
+
+/// Status of a playlist import job.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportJobStatus {
+    pub job_id: u64,
+    /// Request metadata: whether the job was asked not to write. The outcome
+    /// is in `phase` (`ImportPhase::Done`).
+    pub dry_run: bool,
+    pub playlist_title: Option<String>,
+    pub target_name: Option<String>,
+    pub total_count: Option<u32>,
+    pub phase: ImportPhase,
+    pub tracks: Vec<ImportTrackReport>,
+    pub sync: Option<ImportSyncProgress>,
+}
+
 // ============================================================================
 // Error Types
 // ============================================================================
@@ -271,6 +395,15 @@ pub enum SourceError {
     /// The source does not support the requested operation.
     #[error("unsupported request: {request}")]
     Unsupported { request: String },
+
+    /// The request is understood but its arguments are invalid
+    /// (for example an unusable playlist name).
+    #[error("invalid request: {message}")]
+    InvalidRequest { message: String },
+
+    /// A playlist import job is already running.
+    #[error("import already running: job {job_id}")]
+    ImportInProgress { job_id: u64 },
 }
 
 impl SourceError {
@@ -623,6 +756,213 @@ mod tests {
         match parsed {
             SourceResponse::Error(e @ SourceError::Unsupported { .. }) => {
                 assert_eq!(e.to_string(), "unsupported request: ListPlaylists");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn request_import_playlist_roundtrip() {
+        let req = SourceRequest::ImportPlaylist {
+            playlist: "friday".to_string(),
+            name: Some("Friday Import".to_string()),
+            dry_run: true,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: SourceRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SourceRequest::ImportPlaylist {
+                playlist,
+                name,
+                dry_run,
+            } => {
+                assert_eq!(playlist, "friday");
+                assert_eq!(name.as_deref(), Some("Friday Import"));
+                assert!(dry_run);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn request_get_import_status_roundtrip() {
+        let json = serde_json::to_string(&SourceRequest::GetImportStatus).unwrap();
+        let parsed: SourceRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, SourceRequest::GetImportStatus));
+    }
+
+    #[test]
+    fn response_import_started_roundtrip() {
+        let json = serde_json::to_string(&SourceResponse::ImportStarted { job_id: 7 }).unwrap();
+        let parsed: SourceResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            SourceResponse::ImportStarted { job_id: 7 }
+        ));
+    }
+
+    #[test]
+    fn response_import_status_none_roundtrip() {
+        let json = serde_json::to_string(&SourceResponse::ImportStatus(None)).unwrap();
+        let parsed: SourceResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, SourceResponse::ImportStatus(None)));
+    }
+
+    fn sample_import_status() -> ImportJobStatus {
+        ImportJobStatus {
+            job_id: 3,
+            dry_run: false,
+            playlist_title: Some("Friday Set".to_string()),
+            target_name: Some("Friday Set".to_string()),
+            total_count: Some(5),
+            phase: ImportPhase::Syncing,
+            tracks: vec![
+                ImportTrackReport {
+                    position: 1,
+                    artist: "A".to_string(),
+                    title: "One".to_string(),
+                    outcome: ImportTrackOutcome::Matched {
+                        hash: "1111111111111111".to_string(),
+                    },
+                },
+                ImportTrackReport {
+                    position: 2,
+                    artist: "B".to_string(),
+                    title: "Two".to_string(),
+                    outcome: ImportTrackOutcome::Ambiguous {
+                        candidates: vec!["22".to_string(), "33".to_string()],
+                    },
+                },
+                ImportTrackReport {
+                    position: 3,
+                    artist: "C".to_string(),
+                    title: "Three".to_string(),
+                    outcome: ImportTrackOutcome::DurationMismatch {
+                        hash: "44".to_string(),
+                        library_secs: 210,
+                        source_secs: 545,
+                    },
+                },
+                ImportTrackReport {
+                    position: 4,
+                    artist: "D".to_string(),
+                    title: "Four".to_string(),
+                    outcome: ImportTrackOutcome::Missing { not_owned: true },
+                },
+            ],
+            sync: Some(ImportSyncProgress {
+                queued: 4,
+                completed: 2,
+                failed: 1,
+                ended: Some(SyncWaitEnd::Paused),
+            }),
+        }
+    }
+
+    #[test]
+    fn sync_wait_end_roundtrip() {
+        for end in [
+            SyncWaitEnd::AllFinished,
+            SyncWaitEnd::Paused,
+            SyncWaitEnd::TimedOut,
+        ] {
+            let progress = ImportSyncProgress {
+                queued: 3,
+                completed: 1,
+                failed: 0,
+                ended: Some(end),
+            };
+            let json = serde_json::to_string(&progress).unwrap();
+            let parsed: ImportSyncProgress = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, progress);
+        }
+        let waiting = ImportSyncProgress {
+            queued: 3,
+            completed: 1,
+            failed: 0,
+            ended: None,
+        };
+        let parsed: ImportSyncProgress =
+            serde_json::from_str(&serde_json::to_string(&waiting).unwrap()).unwrap();
+        assert_eq!(parsed, waiting);
+    }
+
+    #[test]
+    fn import_phase_done_variants_roundtrip() {
+        for result in [
+            ImportResult::Written(ImportWritten {
+                created: false,
+                tracks: 3,
+            }),
+            ImportResult::DryRun { would_write: 2 },
+            ImportResult::NothingMatched,
+        ] {
+            let phase = ImportPhase::Done(result);
+            let json = serde_json::to_string(&phase).unwrap();
+            let parsed: ImportPhase = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, phase);
+        }
+    }
+
+    #[test]
+    fn duration_mismatch_is_whole_seconds_on_the_wire() {
+        let outcome = ImportTrackOutcome::DurationMismatch {
+            hash: "44".to_string(),
+            library_secs: 210,
+            source_secs: 545,
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(json.contains("\"library_secs\":210"), "got: {json}");
+        assert!(!json.contains("210."), "got: {json}");
+        let parsed: ImportTrackOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, outcome);
+    }
+
+    #[test]
+    fn source_error_invalid_request_roundtrip() {
+        let resp = SourceResponse::Error(SourceError::InvalidRequest {
+            message: "bad name".to_string(),
+        });
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: SourceResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SourceResponse::Error(e @ SourceError::InvalidRequest { .. }) => {
+                assert_eq!(e.to_string(), "invalid request: bad name");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn response_import_status_roundtrip() {
+        let status = sample_import_status();
+        let resp = SourceResponse::ImportStatus(Some(status.clone()));
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: SourceResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SourceResponse::ImportStatus(Some(s)) => assert_eq!(s, status),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn import_phase_failed_roundtrip() {
+        let phase = ImportPhase::Failed {
+            message: "boom".to_string(),
+        };
+        let json = serde_json::to_string(&phase).unwrap();
+        let parsed: ImportPhase = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, phase);
+    }
+
+    #[test]
+    fn source_error_import_in_progress_roundtrip() {
+        let resp = SourceResponse::Error(SourceError::ImportInProgress { job_id: 9 });
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: SourceResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SourceResponse::Error(e @ SourceError::ImportInProgress { .. }) => {
+                assert_eq!(e.to_string(), "import already running: job 9");
             }
             _ => panic!("wrong variant"),
         }

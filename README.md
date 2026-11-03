@@ -58,9 +58,12 @@ mdma rekordbox import --enrich rekordbox.xml
 # Export memory cues back to Rekordbox (MDMA never writes beat grids back)
 mdma rekordbox export --output rekordbox-out.xml
 
-# List your Bandcamp playlists and import one (preview with --dry-run) — new in 0.32.0
+# List your Bandcamp playlists and import one (preview with --dry-run)
+# Import runs as a background job on the node — new in 0.33.0
 mdma bandcamp playlists
 mdma bandcamp import-playlist my-playlist --dry-run
+mdma bandcamp import-playlist my-playlist --no-wait
+mdma bandcamp import-status
 
 # Subscribe to live events (now playing, queue changes)
 mdma subscribe
@@ -112,7 +115,7 @@ This is a [Polylith](https://polylith.gitbook.io/polylith/) workspace. Deployabl
 | `mdma-playback` | Queue manager — drives audio sources via StreamClient; persists queue to `/metadata/queue.json` |
 | `mdma-audio` | Audio playback source — wraps PlaybackEngine (Symphonia + rubato + PipeWire), speaks `stream_source_protocol` over NNG |
 | `mdma-tui` | Terminal UI — multi-pane tabs (nnn-style, `1`–`5`/`6`–`0`), field-aware search grammar (`:artist`, `:bpm`, `:added`, …), DJ shortcuts (`A`, `P`, `d`/`p`, `u`), modal keybindings, command palette, live queue sync, intelligent column compression |
-| `mdma-bandcamp` | Bandcamp source — collection sync into the library inbox, and fan playlist listing/fetching for `mdma bandcamp` |
+| `mdma-bandcamp` | Bandcamp source — collection sync into the library inbox, fan playlist listing/fetching, and background playlist import jobs for `mdma bandcamp` |
 | `mdma-console` | Web management console — player controls, search, queue, upload, export |
 | `mdma-cli` | CLI — search, queue, playlists, playback, export, subscribe, bookmarks, Bandcamp playlist import, shell completions |
 | `dj-workspace` | Bevy GUI app (laptop-only, not packaged for Pi) — playlist browser and BPM/Key/Role/Energy candidate finder with sortable results; connects via gateway (`dj-workspace --node <host>`) |
@@ -184,7 +187,7 @@ Copy `scripts/install-mdma-macos.sh` from this repo to your Mac and run it. It r
 bash install-mdma-macos.sh
 
 # Install a specific tag
-bash install-mdma-macos.sh v0.32.0
+bash install-mdma-macos.sh v0.33.0
 
 # Install to a user-writable location (no sudo)
 MDMA_INSTALL_DIR=~/.local/bin bash install-mdma-macos.sh
@@ -202,6 +205,30 @@ cp profiles/dev/target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.33.0
+
+### Bandcamp playlist import runs on the node
+
+`mdma bandcamp import-playlist <slug|url>` now starts a background job in mdma-bandcamp. It fetches the playlist and matches it against the library. If owned tracks are missing, it runs a full collection sync and waits for the downloads, then re-matches and writes the playlist once. It never writes an empty playlist, and it replaces an existing one. The CLI polls for progress.
+
+`--no-wait` returns right after starting the job; `mdma bandcamp import-status` shows the job's progress and result. `--dry-run` reports matches and writes nothing. Paused or timed-out downloads are reported in the result. If an import is already running, a new one is refused ("Import NOT started", exit 1).
+
+Playlist matching and writing now live in a shared `playlist_import` component, which the rekordbox import uses too.
+
+### Bandcamp sync fixes
+
+Dedup no longer holds the download queue lock during library calls, so status polls don't stall. Items already queued or downloading are not queued twice, by sync, import or resync. Cancelling a queued item ends any wait on it.
+
+### rekordbox export path length
+
+New export paths are capped at 250 bytes of the encoded rekordbox Location, measured in NFD the way macOS stores names; rekordbox on macOS rejects paths of about 256 bytes and halts the whole import. Long names are shortened title first, then album, then artist, each with a stable `~hash` suffix. Paths already in the existing `rekordbox.xml` are kept, so rekordbox keeps their cues; `--replace` skips this.
+
+**Upgrade notes:** `SourceRequest`/`SourceResponse` gained import variants, so mdma-gateway, mdma-bandcamp and the CLI must all be 0.33.0. Upgrade the mdma-* packages by name, never a bare `xbps-install -Su`, which would pull in the rpi-kernel on unmigrated units.
+
+**Known issues:** `mdma source sync` still times out client-side, though the sync continues on the node (#81); the gateway serialises requests (#84); rekordbox import treats artist+title matches with different durations as matched (#85); playback writes play events under short hashes (#86). See CHANGELOG.md.
 
 ---
 

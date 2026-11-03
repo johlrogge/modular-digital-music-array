@@ -16,6 +16,7 @@ source-protocol = { path = "../../components/source_protocol" }
 library-ipc-client = { path = "../../components/library_ipc_client" }
 library-search = { workspace = true }
 track-matcher = { workspace = true }
+playlist-import = { workspace = true }
 inbox-utils = { path = "../../components/inbox_utils" }
 service = { workspace = true }
 nng = "1.0"

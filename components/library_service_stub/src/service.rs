@@ -6,7 +6,8 @@
 
 use crate::ipc::{
     BeatGridInfo, Bpm, ContentHash, CueInfo, DurationSeconds, FactType, IpcServer, LibraryRequest,
-    LibraryResponse, OrphanInfo, OrphanReason, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
+    LibraryResponse, OrphanInfo, OrphanReason, PlaylistName, ProtocolError, ServiceStatus,
+    TrackInfo, TrackQuery,
 };
 use library_search::{matches_query, TrackFields};
 use music_facts::MusicValue;
@@ -117,6 +118,9 @@ impl IndexedTrack {
 pub struct LibraryService {
     tracks: Mutex<Vec<IndexedTrack>>,
     fact_index: Mutex<HashMap<FactType, HashSet<String>>>,
+    /// Playlist name -> content (list/get/new/replace; append, remove and
+    /// rename are not supported).
+    playlists: Mutex<HashMap<String, String>>,
     tracks_count: usize,
     facts_count: usize,
     start_time: Instant,
@@ -151,6 +155,7 @@ impl LibraryService {
                         return Ok(Self {
                             tracks: Mutex::new(vec![]),
                             fact_index: Mutex::new(HashMap::new()),
+                            playlists: Mutex::new(HashMap::new()),
                             tracks_count: 0,
                             facts_count: 0,
                             start_time: Instant::now(),
@@ -192,6 +197,7 @@ impl LibraryService {
         Ok(Self {
             tracks: Mutex::new(tracks),
             fact_index: Mutex::new(fact_index),
+            playlists: Mutex::new(HashMap::new()),
             tracks_count,
             facts_count,
             start_time: Instant::now(),
@@ -281,18 +287,50 @@ impl LibraryService {
                 }
             }
 
-            // Stub no-ops for playlist operations
-            LibraryRequest::PlaylistList => LibraryResponse::PlaylistNames(vec![]),
-
-            LibraryRequest::PlaylistGet { name } => {
-                LibraryResponse::Error(ProtocolError::PlaylistNotFound {
-                    name: name.to_string(),
-                })
+            // Playlists are kept in memory. List, get, new and replace mirror the
+            // real service (list is sorted; replace creates a missing playlist).
+            LibraryRequest::PlaylistList => {
+                let mut names: Vec<PlaylistName> = self
+                    .playlists
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .filter_map(|n| PlaylistName::new(n).ok())
+                    .collect();
+                names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+                LibraryResponse::PlaylistNames(names)
             }
 
-            LibraryRequest::PlaylistNew { .. }
-            | LibraryRequest::PlaylistAppend { .. }
-            | LibraryRequest::PlaylistReplace { .. }
+            LibraryRequest::PlaylistGet { name } => {
+                match self.playlists.lock().unwrap().get(name.as_str()) {
+                    Some(content) => LibraryResponse::PlaylistContent(content.clone()),
+                    None => LibraryResponse::Error(ProtocolError::PlaylistNotFound {
+                        name: name.to_string(),
+                    }),
+                }
+            }
+
+            LibraryRequest::PlaylistNew { name, content } => {
+                let mut playlists = self.playlists.lock().unwrap();
+                if playlists.contains_key(name.as_str()) {
+                    LibraryResponse::Error(ProtocolError::PlaylistAlreadyExists {
+                        name: name.to_string(),
+                    })
+                } else {
+                    playlists.insert(name.as_str().to_string(), content.clone());
+                    LibraryResponse::PlaylistContent(content)
+                }
+            }
+
+            LibraryRequest::PlaylistReplace { name, content } => {
+                self.playlists
+                    .lock()
+                    .unwrap()
+                    .insert(name.as_str().to_string(), content.clone());
+                LibraryResponse::PlaylistContent(content)
+            }
+
+            LibraryRequest::PlaylistAppend { .. }
             | LibraryRequest::PlaylistRemove { .. }
             | LibraryRequest::PlaylistRename { .. } => {
                 LibraryResponse::Error(ProtocolError::Internal {
@@ -568,4 +606,59 @@ pub fn run_ipc_server(svc: Arc<LibraryService>, address: &str) -> Result<(), Ser
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_service() -> LibraryService {
+        LibraryService::new(
+            PathBuf::from("/nonexistent"),
+            PathBuf::from("/nonexistent"),
+            "ipc:///dev/null",
+        )
+        .expect("empty stub")
+    }
+
+    fn name(s: &str) -> PlaylistName {
+        PlaylistName::new(s).expect("valid name")
+    }
+
+    fn list(svc: &LibraryService) -> Vec<String> {
+        match svc.handle_request(LibraryRequest::PlaylistList) {
+            LibraryResponse::PlaylistNames(names) => {
+                names.iter().map(|n| n.as_str().to_string()).collect()
+            }
+            other => panic!("expected PlaylistNames, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn playlist_list_is_empty_without_playlists() {
+        assert!(list(&empty_service()).is_empty());
+    }
+
+    #[test]
+    fn playlist_list_returns_stored_playlists_sorted() {
+        let svc = empty_service();
+        for n in ["zeta", "alpha"] {
+            svc.handle_request(LibraryRequest::PlaylistNew {
+                name: name(n),
+                content: String::new(),
+            });
+        }
+        assert_eq!(list(&svc), vec!["alpha".to_string(), "zeta".to_string()]);
+    }
+
+    #[test]
+    fn playlist_replace_creates_a_missing_playlist_like_the_real_service() {
+        let svc = empty_service();
+        let resp = svc.handle_request(LibraryRequest::PlaylistReplace {
+            name: name("fresh"),
+            content: "x\n".to_string(),
+        });
+        assert!(matches!(resp, LibraryResponse::PlaylistContent(_)));
+        assert_eq!(list(&svc), vec!["fresh".to_string()]);
+    }
 }

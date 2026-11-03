@@ -10,16 +10,24 @@ use crate::ipc::{
     SourceStatus,
 };
 use bandcamp_api::{AudioFormat, BandcampClient, CollectionItem, CookieJar};
+use library_ipc_client::PlaylistName;
 use library_ipc_client::{
     InboxPath, IngestSource, LibraryClient, MusicValue, TrackInfo, TrackQuery,
 };
 use library_search::StringQuery;
 use parking_lot::Mutex;
+use playlist_import::{
+    default_import_name, has_owned_missing, match_source_playlist, matched_hashes,
+    sanitize_playlist_name, to_import_reports, write_playlist, LibraryTrackLookup, TrackOutcome,
+};
+use source_protocol::{
+    ImportJobStatus, ImportPhase, ImportResult, ImportSyncProgress, ImportWritten, SyncWaitEnd,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use track_matcher::normalize;
@@ -55,6 +63,11 @@ enum InternalDownloadState {
 }
 
 impl InternalDownloadState {
+    /// Whether the download has ended (completed, failed or cancelled).
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+
     fn to_protocol(&self, error: &Option<String>) -> DownloadState {
         match self {
             InternalDownloadState::Queued => DownloadState::Queued,
@@ -147,6 +160,66 @@ pub struct BandcampService {
     library_socket: String,
     /// Bandcamp username (read from cookies/config)
     username: Option<String>,
+    /// Current or last playlist import job
+    import_status: Mutex<Option<ImportJobStatus>>,
+    /// Last issued import job id
+    last_import_job_id: AtomicU64,
+}
+
+/// How often an import job polls the downloads it is waiting for.
+const IMPORT_DOWNLOAD_POLL: Duration = Duration::from_secs(2);
+/// How long an import job waits for downloads before carrying on.
+const IMPORT_DOWNLOAD_LIMIT: Duration = Duration::from_secs(30 * 60);
+
+/// What a collection sync queued.
+struct SyncOutcome {
+    total_items: usize,
+    /// Ids of the items that are missing from the library and now queued or
+    /// downloading: freshly queued by this sync, plus ones already in flight
+    /// from an earlier sync. Anything waiting for downloads waits on these.
+    queued_ids: Vec<String>,
+    /// How many of `queued_ids` this sync queued itself.
+    newly_queued: usize,
+}
+
+/// Whether the job is still doing work (not Done or Failed).
+fn import_phase_is_running(phase: &ImportPhase) -> bool {
+    !matches!(phase, ImportPhase::Done(_) | ImportPhase::Failed { .. })
+}
+
+/// Describe why a spawned import task did not return.
+fn join_error_message(e: &tokio::task::JoinError) -> String {
+    if e.is_panic() {
+        format!("import job panicked: {e}")
+    } else {
+        format!("import job cancelled: {e}")
+    }
+}
+
+/// Sanitise and validate a target playlist name.
+fn validated_playlist_name(raw: &str) -> Result<(String, PlaylistName), String> {
+    let sanitized = sanitize_playlist_name(raw);
+    PlaylistName::new(&sanitized)
+        .map(|name| (sanitized, name))
+        .map_err(|e| format!("invalid playlist name {raw:?}: {e}"))
+}
+
+/// Count queued downloads of `ids` that finished: `(completed, failed)`.
+///
+/// An id absent from `active` is still pending: it may be waiting in the
+/// queue, or between `pop_front` and the insert into `active`. Cancelled
+/// counts as failed, since it will never complete. Cancelling a queued item
+/// records a Cancelled entry in `active`, so such a wait ends too.
+fn tally_downloads(active: &HashMap<String, QueuedDownload>, ids: &[String]) -> (u32, u32) {
+    let (mut completed, mut failed) = (0, 0);
+    for id in ids {
+        match active.get(id).map(|dl| &dl.state) {
+            Some(InternalDownloadState::Completed) => completed += 1,
+            Some(InternalDownloadState::Failed | InternalDownloadState::Cancelled) => failed += 1,
+            _ => {}
+        }
+    }
+    (completed, failed)
 }
 
 /// Pure helper: decide whether a collection item should be skipped based on library search results.
@@ -166,6 +239,103 @@ pub(crate) fn should_skip_by_work_identity(
         let track_album = normalize(track.album.as_deref().unwrap_or(""));
         track_artist == item_artist && track_album == item_album
     })
+}
+
+/// Drop the collection items the library already has, by ItemId or by work
+/// identity (artist + album; the new ItemId is then backfilled onto the
+/// matching track so later syncs short-circuit).
+///
+/// Makes blocking library calls for every item: run it in `spawn_blocking`
+/// and never with a service lock held. When the library is unreachable every
+/// item is kept (the download cache is the fallback dedup).
+fn drop_items_known_to_library(
+    library_socket: &str,
+    collection: Vec<CollectionItem>,
+) -> Vec<CollectionItem> {
+    let lib_client = match LibraryClient::connect(library_socket) {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                socket = %library_socket,
+                "Library not available, falling back to cache-only dedup"
+            );
+            return collection;
+        }
+    };
+
+    // Primary dedup: ItemIds the library already knows.
+    let all_item_ids: Vec<String> = collection
+        .iter()
+        .map(|i| i.id.as_str().to_string())
+        .collect();
+    let library_known: HashSet<String> = match lib_client.has_facts("ItemId", all_item_ids) {
+        Ok(existing) => {
+            tracing::info!(
+                count = existing.len(),
+                "Library reports items already ingested"
+            );
+            existing.into_iter().collect()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to query library, falling back to cache only");
+            HashSet::new()
+        }
+    };
+
+    let mut unknown = Vec::new();
+    for item in collection {
+        let item_id_str = item.id.as_str().to_string();
+
+        if library_known.contains(&item_id_str) {
+            continue;
+        }
+
+        // Not found by ItemId — try work-identity dedup (artist + album).
+        // This catches duplicate purchases (e.g. vinyl + digital) that share the
+        // same work but carry different ItemIds.
+        let query = TrackQuery {
+            artist: Some(StringQuery::Contains(normalize(item.artist.as_str()))),
+            album: Some(StringQuery::Contains(normalize(item.title.as_str()))),
+            ..Default::default()
+        };
+        match lib_client.search(&query) {
+            Ok(results) if should_skip_by_work_identity(&item, &results) => {
+                let matched = results.first().expect("non-empty checked above");
+                let matched_hash = matched.content_hash.clone();
+                tracing::info!(
+                    artist = %item.artist,
+                    album = %item.title,
+                    live_item_id = %item_id_str,
+                    matched_hash = %matched_hash.as_str(),
+                    "Work already in library under different ItemId — skipping download"
+                );
+
+                // Backfill: record the new ItemId so future syncs short-circuit via
+                // the cheap has_facts("ItemId", ...) path.
+                if let Err(e) =
+                    lib_client.write_fact(&matched_hash, MusicValue::ItemId(item_id_str.clone()))
+                {
+                    tracing::warn!(
+                        error = %e,
+                        item_id = %item_id_str,
+                        "Failed to backfill ItemId fact — skip still applies"
+                    );
+                }
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    item_id = %item_id_str,
+                    "Work-identity search failed — falling through to download"
+                );
+            }
+        }
+        unknown.push(item);
+    }
+    unknown
 }
 
 /// Pure helper: determine whether a bandcamp item is stale based on track counts.
@@ -290,6 +460,8 @@ impl BandcampService {
             format,
             library_socket,
             username,
+            import_status: Mutex::new(None),
+            last_import_job_id: AtomicU64::new(0),
         })
     }
 
@@ -339,7 +511,7 @@ impl BandcampService {
     }
 
     /// Handle a request asynchronously
-    pub async fn handle_request(&self, request: SourceRequest) -> SourceResponse {
+    pub async fn handle_request(self: &Arc<Self>, request: SourceRequest) -> SourceResponse {
         tracing::debug!(?request, "Handling request");
 
         match request {
@@ -400,6 +572,16 @@ impl BandcampService {
             SourceRequest::ListPlaylists => self.handle_list_playlists().await,
 
             SourceRequest::GetPlaylist { playlist } => self.handle_get_playlist(playlist).await,
+
+            SourceRequest::ImportPlaylist {
+                playlist,
+                name,
+                dry_run,
+            } => self.handle_import_playlist(playlist, name, dry_run),
+
+            SourceRequest::GetImportStatus => {
+                SourceResponse::ImportStatus(self.import_status.lock().clone())
+            }
         }
     }
 
@@ -430,27 +612,26 @@ impl BandcampService {
 
     /// Fetch one playlist by slug or URL.
     async fn handle_get_playlist(&self, playlist: String) -> SourceResponse {
-        let client = match self.client() {
-            Ok(c) => c,
-            Err(e) => return SourceResponse::Error(e),
-        };
-        let username = match self.require_username() {
-            Ok(u) => u,
-            Err(e) => return SourceResponse::Error(e),
-        };
+        match self.fetch_playlist(&playlist).await {
+            Ok(p) => SourceResponse::Playlist(p),
+            Err(e) => SourceResponse::Error(e),
+        }
+    }
 
-        let url = match BandcampClient::playlist_url(&username, &playlist) {
-            Ok(u) => u,
-            Err(e) => {
-                tracing::warn!(error = %e, %playlist, "Rejected playlist argument");
-                return SourceResponse::Error(playlist_error(&e, Some(&playlist)));
-            }
-        };
+    /// Fetch one playlist by slug or URL from Bandcamp.
+    async fn fetch_playlist(&self, playlist: &str) -> Result<SourcePlaylist, SourceError> {
+        let client = self.client()?;
+        let username = self.require_username()?;
+
+        let url = BandcampClient::playlist_url(&username, playlist).map_err(|e| {
+            tracing::warn!(error = %e, %playlist, "Rejected playlist argument");
+            playlist_error(&e, Some(playlist))
+        })?;
         match client.get_playlist(&url).await {
-            Ok(p) => SourceResponse::Playlist(to_source_playlist(p)),
+            Ok(p) => Ok(to_source_playlist(p)),
             Err(e) => {
                 tracing::error!(error = %e, %url, "Failed to fetch playlist");
-                SourceResponse::Error(playlist_error(&e, Some(&playlist)))
+                Err(playlist_error(&e, Some(playlist)))
             }
         }
     }
@@ -458,7 +639,7 @@ impl BandcampService {
     /// Force-queue an item, bypassing library and cache dedup.
     ///
     /// Retracts existing library facts and evicts the cache entry (best-effort),
-    /// then pushes the item onto the download queue unconditionally.
+    /// then queues the item by the common rule (`enqueue_items`).
     async fn queue_item_forcibly(&self, item: CollectionItem) -> Result<(), ServiceError> {
         // Best-effort: retract library facts
         if let Some(lib_client) = self.try_library_client() {
@@ -486,15 +667,9 @@ impl BandcampService {
             }
         }
 
-        // Push onto download queue unconditionally
-        let queued = QueuedDownload {
-            item,
-            state: InternalDownloadState::Queued,
-            downloaded_bytes: 0,
-            total_bytes: None,
-            error: None,
-        };
-        self.download_queue.lock().push_back(queued);
+        // Queue regardless of library and cache state (just cleared above);
+        // an item already queued or downloading is not queued twice.
+        self.enqueue_items(vec![item]);
         Ok(())
     }
 
@@ -628,17 +803,23 @@ impl BandcampService {
     /// Handle sync request - fetches collection and queues new downloads.
     /// Username is read from the service config (no longer passed in the request).
     async fn handle_sync(&self) -> SourceResponse {
+        match self.queue_collection_sync().await {
+            Ok(outcome) => SourceResponse::SyncStarted {
+                total_items: outcome.total_items,
+                new_items: outcome.newly_queued,
+            },
+            Err(e) => SourceResponse::Error(e),
+        }
+    }
+
+    /// Fetch the collection and queue the items that are new.
+    /// Returns the ids of the items it queued.
+    async fn queue_collection_sync(&self) -> Result<SyncOutcome, SourceError> {
         // Try to load client (also reloads cookies)
-        let client = match self.client() {
-            Ok(c) => c,
-            Err(e) => return SourceResponse::Error(e),
-        };
+        let client = self.client()?;
 
         // Get username from config
-        let username = match self.require_username() {
-            Ok(u) => u,
-            Err(e) => return SourceResponse::Error(e),
-        };
+        let username = self.require_username()?;
 
         // Store the username
         *self.current_username.lock() = Some(username.clone());
@@ -650,7 +831,7 @@ impl BandcampService {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to fetch collection");
-                return SourceResponse::Error(SourceError::SyncFailed {
+                return Err(SourceError::SyncFailed {
                     message: e.to_string(),
                 });
             }
@@ -659,125 +840,383 @@ impl BandcampService {
         let total_items = collection.len();
         tracing::info!(total = total_items, "Fetched collection");
 
-        // Check library for already-ingested items (primary dedup)
-        let maybe_lib_client = self.try_library_client();
-        let library_known: HashSet<String> = match &maybe_lib_client {
-            Some(lib_client) => {
-                let all_item_ids: Vec<String> = collection
-                    .iter()
-                    .map(|i| i.id.as_str().to_string())
-                    .collect();
-                match lib_client.has_facts("ItemId", all_item_ids) {
-                    Ok(existing) => {
-                        tracing::info!(
-                            count = existing.len(),
-                            "Library reports items already ingested"
-                        );
-                        existing.into_iter().collect()
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Failed to query library, falling back to cache only");
-                        HashSet::new()
-                    }
-                }
-            }
-            None => {
-                tracing::warn!("Library not available, falling back to cache-only dedup");
-                HashSet::new()
-            }
-        };
+        // Library dedup makes blocking IPC calls for every item, so it runs
+        // on the blocking pool with no service lock held: status polls, the
+        // download worker and cancels must not wait on it.
+        let socket = self.library_socket.clone();
+        let unknown =
+            tokio::task::spawn_blocking(move || drop_items_known_to_library(&socket, collection))
+                .await
+                .map_err(|e| SourceError::SyncFailed {
+                    message: format!("library dedup task failed: {e}"),
+                })?;
 
-        // Queue new items (not in library and not in fallback cache).
-        let mut new_items = 0;
-        {
-            let mut queue = self.download_queue.lock();
-            for item in collection {
-                let item_id_str = item.id.as_str().to_string();
-
-                if library_known.contains(&item_id_str) {
-                    // Already in library via ItemId fast path, skip
-                    continue;
-                }
-
-                // Not found by ItemId — try work-identity dedup (artist + album).
-                // This catches duplicate purchases (e.g. vinyl + digital) that share the
-                // same work but carry different ItemIds.
-                if let Some(lib_client) = &maybe_lib_client {
-                    let query = TrackQuery {
-                        artist: Some(StringQuery::Contains(normalize(item.artist.as_str()))),
-                        album: Some(StringQuery::Contains(normalize(item.title.as_str()))),
-                        ..Default::default()
-                    };
-                    match lib_client.search(&query) {
-                        Ok(results) if should_skip_by_work_identity(&item, &results) => {
-                            let matched = results.first().expect("non-empty checked above");
-                            let matched_hash = matched.content_hash.clone();
-                            tracing::info!(
-                                artist = %item.artist,
-                                album = %item.title,
-                                live_item_id = %item_id_str,
-                                matched_hash = %matched_hash.as_str(),
-                                "Work already in library under different ItemId — skipping download"
-                            );
-
-                            // Backfill: record the new ItemId so future syncs short-circuit via
-                            // the cheap has_facts("ItemId", ...) path.
-                            if let Err(e) = lib_client
-                                .write_fact(&matched_hash, MusicValue::ItemId(item_id_str.clone()))
-                            {
-                                tracing::warn!(
-                                    error = %e,
-                                    item_id = %item_id_str,
-                                    "Failed to backfill ItemId fact — skip still applies"
-                                );
-                            }
-
-                            continue;
-                        }
-                        Ok(_) => {
-                            // No match — fall through to cache check and queue
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                item_id = %item_id_str,
-                                "Work-identity search failed — falling through to download"
-                            );
-                        }
-                    }
-                }
-
-                // Not in library — check fallback cache
-                {
-                    let cache = self.cache.lock();
-                    let cache_key =
-                        format!("{}|{}|{}|0", item.artist, item.title, item.id.as_str());
-                    if cache.is_downloaded(&cache_key) || cache.is_item_downloaded(item.id.as_str())
-                    {
-                        continue;
-                    }
-                }
-
-                new_items += 1;
-                queue.push_back(QueuedDownload {
-                    item,
-                    state: InternalDownloadState::Queued,
-                    downloaded_bytes: 0,
-                    total_bytes: None,
-                    error: None,
-                });
-            }
-        }
+        let (queued_ids, newly_queued) = self.enqueue_new_items(unknown);
 
         tracing::info!(
             total = total_items,
-            new = new_items,
+            new = newly_queued,
+            awaiting = queued_ids.len(),
             "Sync complete, items queued"
         );
 
-        SourceResponse::SyncStarted {
+        Ok(SyncOutcome {
             total_items,
-            new_items,
+            queued_ids,
+            newly_queued,
+        })
+    }
+
+    /// Queue the items the library does not have, unless the download cache
+    /// says they were fetched already.
+    ///
+    /// Returns `(ids to wait on, how many were newly queued)`. An item already
+    /// in the queue or downloading is not queued twice, but its id is still
+    /// returned so an import waits for it. No blocking calls: the queue locks
+    /// are held only for this in-memory bookkeeping.
+    fn enqueue_new_items(&self, items: Vec<CollectionItem>) -> (Vec<String>, usize) {
+        let items: Vec<CollectionItem> = {
+            let cache = self.cache.lock();
+            items
+                .into_iter()
+                .filter(|item| {
+                    let cache_key =
+                        format!("{}|{}|{}|0", item.artist, item.title, item.id.as_str());
+                    !(cache.is_downloaded(&cache_key) || cache.is_item_downloaded(item.id.as_str()))
+                })
+                .collect()
+        };
+        self.enqueue_items(items)
+    }
+
+    /// The single queueing rule: queue each item unless it is already in the
+    /// queue or downloading, and clear a stale finished entry first. Returns
+    /// `(ids to wait on, how many were newly queued)`; in-flight ids are
+    /// returned too. Callers apply any library or cache dedup beforehand.
+    fn enqueue_items(&self, items: Vec<CollectionItem>) -> (Vec<String>, usize) {
+        let mut wanted_ids = Vec::new();
+        let mut newly_queued = 0;
+        // Lock order: queue, then active (as `cancel_download` and the worker).
+        let mut queue = self.download_queue.lock();
+        let mut active = self.active_downloads.lock();
+        for item in items {
+            let id = item.id.as_str().to_string();
+            let in_flight = queue.iter().any(|dl| dl.item.id.as_str() == id)
+                || active.get(&id).is_some_and(|dl| !dl.state.is_terminal());
+            wanted_ids.push(id.clone());
+            if in_flight {
+                continue;
+            }
+            // A finished entry from an earlier run must not be mistaken
+            // for this one by anything waiting on the item.
+            active.remove(&id);
+            queue.push_back(QueuedDownload {
+                item,
+                state: InternalDownloadState::Queued,
+                downloaded_bytes: 0,
+                total_bytes: None,
+                error: None,
+            });
+            newly_queued += 1;
+        }
+        (wanted_ids, newly_queued)
+    }
+
+    /// Start a playlist import job in the background and return at once.
+    ///
+    /// Only one job runs at a time. The job ends in Done or Failed, whatever
+    /// happens inside it.
+    fn handle_import_playlist(
+        self: &Arc<Self>,
+        playlist: String,
+        name: Option<String>,
+        dry_run: bool,
+    ) -> SourceResponse {
+        let target = match name.as_deref().map(validated_playlist_name).transpose() {
+            Ok(target) => target,
+            Err(message) => return SourceResponse::Error(SourceError::InvalidRequest { message }),
+        };
+
+        let job_id = match self.begin_import_job(dry_run) {
+            Ok(job_id) => job_id,
+            Err(running) => {
+                return SourceResponse::Error(SourceError::ImportInProgress { job_id: running })
+            }
+        };
+        tracing::info!(job_id, %playlist, dry_run, "Import job started");
+
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            // The job runs in its own task so a panic surfaces as a JoinError
+            // here instead of leaving the status stuck in a running phase.
+            let job = tokio::spawn({
+                let service = Arc::clone(&service);
+                async move {
+                    service
+                        .run_import_job(job_id, playlist, target, dry_run)
+                        .await
+                }
+            });
+            if let Err(e) = job.await {
+                service.fail_import(job_id, join_error_message(&e));
+            }
+        });
+
+        SourceResponse::ImportStarted { job_id }
+    }
+
+    /// Create the status of a new import job (phase Fetching) and return its id.
+    /// `Err` carries the id of the job that is still running.
+    fn begin_import_job(&self, dry_run: bool) -> Result<u64, u64> {
+        let mut status = self.import_status.lock();
+        if let Some(running) = status
+            .as_ref()
+            .filter(|s| import_phase_is_running(&s.phase))
+        {
+            return Err(running.job_id);
+        }
+        let job_id = self.last_import_job_id.fetch_add(1, Ordering::Relaxed) + 1;
+        *status = Some(ImportJobStatus {
+            job_id,
+            dry_run,
+            playlist_title: None,
+            target_name: None,
+            total_count: None,
+            phase: ImportPhase::Fetching,
+            tracks: Vec::new(),
+            sync: None,
+        });
+        Ok(job_id)
+    }
+
+    /// End import job `job_id` as Failed.
+    fn fail_import(&self, job_id: u64, message: String) {
+        tracing::error!(job_id, error = %message, "Import job failed");
+        self.set_import_phase(job_id, ImportPhase::Failed { message });
+    }
+
+    /// Update the status of import job `job_id`. Ignored when the current
+    /// status belongs to another job, so a stale task cannot overwrite the
+    /// status of a newer one.
+    fn update_import(&self, job_id: u64, update: impl FnOnce(&mut ImportJobStatus)) {
+        if let Some(status) = self
+            .import_status
+            .lock()
+            .as_mut()
+            .filter(|s| s.job_id == job_id)
+        {
+            update(status);
+        }
+    }
+
+    /// Move import job `job_id` to `phase`, logging the change.
+    fn set_import_phase(&self, job_id: u64, phase: ImportPhase) {
+        self.update_import(job_id, |status| {
+            tracing::info!(job_id = status.job_id, ?phase, "Import phase changed");
+            status.phase = phase;
+        });
+    }
+
+    /// Fetch the playlist, then run the import.
+    async fn run_import_job(
+        &self,
+        job_id: u64,
+        playlist_arg: String,
+        target: Option<(String, PlaylistName)>,
+        dry_run: bool,
+    ) {
+        match self.fetch_playlist(&playlist_arg).await {
+            Ok(source) => {
+                self.run_import(job_id, source, &playlist_arg, target, dry_run)
+                    .await
+            }
+            Err(e) => self.fail_import(job_id, e.to_string()),
+        }
+    }
+
+    /// Run the import steps; an error ends the job as Failed.
+    async fn run_import(
+        &self,
+        job_id: u64,
+        source: SourcePlaylist,
+        playlist_arg: &str,
+        target: Option<(String, PlaylistName)>,
+        dry_run: bool,
+    ) {
+        if let Err(message) = self
+            .import_steps(job_id, source, playlist_arg, target, dry_run)
+            .await
+        {
+            self.fail_import(job_id, message);
+        }
+    }
+
+    /// Match, sync if needed, rematch and write.
+    ///
+    /// A dry run skips the sync and the write. Otherwise, when an owned track
+    /// is missing from the library it runs a full collection sync, waits for
+    /// the downloads it needs, and matches again before writing.
+    ///
+    /// If downloads are paused while the import waits for them, the wait ends
+    /// at once and the import carries on to the rematch with what the library
+    /// has (as it does after a timeout or failed downloads); the report lists
+    /// what is still missing, and the queued downloads resume with the queue.
+    async fn import_steps(
+        &self,
+        job_id: u64,
+        source: SourcePlaylist,
+        playlist_arg: &str,
+        target: Option<(String, PlaylistName)>,
+        dry_run: bool,
+    ) -> Result<(), String> {
+        let (target_name, playlist_name) = match target {
+            Some(target) => target,
+            None => validated_playlist_name(&default_import_name(&source.title, playlist_arg))?,
+        };
+        self.update_import(job_id, |status| {
+            status.playlist_title = Some(source.title.clone());
+            status.target_name = Some(target_name.clone());
+            status.total_count = Some(source.total_count);
+        });
+
+        let tracks: Arc<[SourcePlaylistTrack]> = source.tracks.into();
+
+        self.set_import_phase(job_id, ImportPhase::Matching);
+        let mut outcomes = self.match_import_tracks(&tracks).await?;
+        self.update_import(job_id, |status| {
+            status.tracks = to_import_reports(&tracks, &outcomes)
+        });
+
+        // A dry run never syncs: it reports what the library has now.
+        if !dry_run && has_owned_missing(&tracks, &outcomes) {
+            self.set_import_phase(job_id, ImportPhase::Syncing);
+            let queued = self
+                .queue_collection_sync()
+                .await
+                .map_err(|e| e.to_string())?
+                .queued_ids;
+            self.wait_for_downloads(job_id, &queued, IMPORT_DOWNLOAD_POLL, IMPORT_DOWNLOAD_LIMIT)
+                .await;
+
+            self.set_import_phase(job_id, ImportPhase::Rematching);
+            outcomes = self.match_import_tracks(&tracks).await?;
+            self.update_import(job_id, |status| {
+                status.tracks = to_import_reports(&tracks, &outcomes)
+            });
+        }
+
+        let hashes = matched_hashes(&outcomes);
+        if hashes.is_empty() {
+            // Never replace an existing playlist with an empty one; a dry
+            // run reports the same, not "would write 0 tracks".
+            tracing::warn!("Import matched no tracks, playlist not written");
+            self.set_import_phase(job_id, ImportPhase::Done(ImportResult::NothingMatched));
+            return Ok(());
+        }
+
+        if dry_run {
+            self.set_import_phase(
+                job_id,
+                ImportPhase::Done(ImportResult::DryRun {
+                    would_write: hashes.len() as u32,
+                }),
+            );
+            return Ok(());
+        }
+
+        self.set_import_phase(job_id, ImportPhase::Writing);
+        let written_tracks = hashes.len() as u32;
+        let socket = self.library_socket.clone();
+        let created = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+            let client = LibraryClient::connect(&socket)
+                .map_err(|e| format!("library not available: {e}"))?;
+            write_playlist(&client, &playlist_name, &hashes)
+                .map_err(|e| format!("failed to write playlist: {e}"))
+        })
+        .await
+        .map_err(|e| format!("write task failed: {e}"))??;
+
+        self.set_import_phase(
+            job_id,
+            ImportPhase::Done(ImportResult::Written(ImportWritten {
+                created,
+                tracks: written_tracks,
+            })),
+        );
+        Ok(())
+    }
+
+    /// Match the playlist tracks against the library. The library calls
+    /// block, so they run on the blocking pool with their own client.
+    /// A failed library lookup is an error: nothing may be written from a
+    /// partial match.
+    async fn match_import_tracks(
+        &self,
+        tracks: &Arc<[SourcePlaylistTrack]>,
+    ) -> Result<Vec<TrackOutcome>, String> {
+        let socket = self.library_socket.clone();
+        let tracks = Arc::clone(tracks);
+        tokio::task::spawn_blocking(move || -> Result<Vec<TrackOutcome>, String> {
+            let client = LibraryClient::connect(&socket)
+                .map_err(|e| format!("library not available: {e}"))?;
+            let lookup = LibraryTrackLookup::new(|query| client.search(query));
+            let outcomes = match_source_playlist(&tracks, &lookup);
+            lookup.check().map_err(|e| e.to_string())?;
+            Ok(outcomes)
+        })
+        .await
+        .map_err(|e| format!("match task failed: {e}"))?
+    }
+
+    /// Wait until every id in `ids` has finished downloading (completed or
+    /// failed) or `limit` has passed, updating the job's sync progress on
+    /// each poll. On timeout, or when downloads are paused (the remaining
+    /// ones would not arrive), it only logs: the import carries on with
+    /// whatever has arrived.
+    async fn wait_for_downloads(
+        &self,
+        job_id: u64,
+        ids: &[String],
+        poll: Duration,
+        limit: Duration,
+    ) -> SyncWaitEnd {
+        let queued = ids.len() as u32;
+        let started = Instant::now();
+        loop {
+            let (completed, failed) = tally_downloads(&self.active_downloads.lock(), ids);
+            let ended = if completed + failed >= queued {
+                Some(SyncWaitEnd::AllFinished)
+            } else if self.paused.load(Ordering::Relaxed) {
+                tracing::warn!(
+                    queued,
+                    completed,
+                    failed,
+                    "Downloads are paused, continuing import with what has arrived"
+                );
+                Some(SyncWaitEnd::Paused)
+            } else if started.elapsed() >= limit {
+                tracing::warn!(
+                    queued,
+                    completed,
+                    failed,
+                    "Timed out waiting for import downloads, continuing with what has arrived"
+                );
+                Some(SyncWaitEnd::TimedOut)
+            } else {
+                None
+            };
+            self.update_import(job_id, |status| {
+                status.sync = Some(ImportSyncProgress {
+                    queued,
+                    completed,
+                    failed,
+                    ended,
+                });
+            });
+            if let Some(end) = ended {
+                return end;
+            }
+            tokio::time::sleep(poll).await;
         }
     }
 
@@ -812,15 +1251,22 @@ impl BandcampService {
         downloads
     }
 
-    /// Cancel a download
+    /// Cancel a download.
+    ///
+    /// A queued item leaves the queue and gets a Cancelled entry in
+    /// `active_downloads`, the record anything waiting on the item reads. An
+    /// active one is marked Cancelled. Finished downloads stay as they are.
     fn cancel_download(&self, id: &str) {
-        // Remove from queue if queued
+        // Lock order: queue, then active (as the worker and enqueue do).
         let mut queue = self.download_queue.lock();
-        queue.retain(|dl| dl.item.id.as_str() != id);
-
-        // Mark as cancelled if active
         let mut active = self.active_downloads.lock();
-        if let Some(dl) = active.get_mut(id) {
+
+        let queued = queue.iter().find(|dl| dl.item.id.as_str() == id).cloned();
+        queue.retain(|dl| dl.item.id.as_str() != id);
+        if let Some(mut dl) = queued {
+            dl.state = InternalDownloadState::Cancelled;
+            active.insert(id.to_string(), dl);
+        } else if let Some(dl) = active.get_mut(id).filter(|dl| !dl.state.is_terminal()) {
             dl.state = InternalDownloadState::Cancelled;
         }
     }
@@ -969,26 +1415,28 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
             continue;
         }
 
-        // Get next item from queue
+        // Get next item from queue and move it to active downloads in one
+        // step, so it is never in neither (a sync or cancel arriving in
+        // between would otherwise miss it). Lock order: queue, then active.
         let next_item = {
             let mut queue = service.download_queue.lock();
-            queue.pop_front()
+            queue.pop_front().map(|mut queued| {
+                queued.state = InternalDownloadState::Downloading;
+                service
+                    .active_downloads
+                    .lock()
+                    .insert(queued.item.id.as_str().to_string(), queued.clone());
+                queued
+            })
         };
 
-        let Some(mut queued) = next_item else {
+        let Some(queued) = next_item else {
             // Queue empty, wait a bit
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             continue;
         };
 
         let item_id = queued.item.id.as_str().to_string();
-        queued.state = InternalDownloadState::Downloading;
-
-        // Add to active downloads
-        {
-            let mut active = service.active_downloads.lock();
-            active.insert(item_id.clone(), queued.clone());
-        }
 
         // Load client for this download
         let client = match service.client() {
@@ -1523,17 +1971,506 @@ mod tests {
     const VALID_COOKIES: &str =
         r#"[{"name":"identity","value":"abc123","domain":".bandcamp.com"}]"#;
 
-    fn make_service(dir: &std::path::Path, cookies: PathBuf) -> BandcampService {
-        BandcampService::new(
-            cookies,
-            dir.join("downloads"),
-            dir.join("inbox"),
-            dir.join("cache"),
-            AudioFormat::Flac,
-            "ipc:///nonexistent/library.sock".to_string(),
-            Some("someone".to_string()),
+    fn make_service(dir: &std::path::Path, cookies: PathBuf) -> Arc<BandcampService> {
+        make_service_with_library(dir, cookies, "ipc:///nonexistent/library.sock")
+    }
+
+    fn make_service_with_library(
+        dir: &std::path::Path,
+        cookies: PathBuf,
+        library_socket: &str,
+    ) -> Arc<BandcampService> {
+        Arc::new(
+            BandcampService::new(
+                cookies,
+                dir.join("downloads"),
+                dir.join("inbox"),
+                dir.join("cache"),
+                AudioFormat::Flac,
+                library_socket.to_string(),
+                Some("someone".to_string()),
+            )
+            .expect("service should start even without cookies"),
         )
-        .expect("service should start even without cookies")
+    }
+
+    // =========================================================================
+    // Playlist import tests
+    // =========================================================================
+
+    fn queued_download(id: &str, state: InternalDownloadState) -> QueuedDownload {
+        QueuedDownload {
+            item: make_collection_item(id, "Artist", "Album"),
+            state,
+            downloaded_bytes: 0,
+            total_bytes: None,
+            error: None,
+        }
+    }
+
+    fn ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn import_status(service: &Arc<BandcampService>) -> ImportJobStatus {
+        service
+            .import_status
+            .lock()
+            .clone()
+            .expect("an import job should exist")
+    }
+
+    #[test]
+    fn tally_counts_finished_downloads_and_treats_absent_ids_as_pending() {
+        let mut active = HashMap::new();
+        active.insert(
+            "done".to_string(),
+            queued_download("done", InternalDownloadState::Completed),
+        );
+        active.insert(
+            "bad".to_string(),
+            queued_download("bad", InternalDownloadState::Failed),
+        );
+        active.insert(
+            "stopped".to_string(),
+            queued_download("stopped", InternalDownloadState::Cancelled),
+        );
+        active.insert(
+            "busy".to_string(),
+            queued_download("busy", InternalDownloadState::Downloading),
+        );
+        let wanted = ids(&["done", "bad", "stopped", "busy", "not-yet-inserted"]);
+        assert_eq!(tally_downloads(&active, &wanted), (1, 2));
+        // Entries for other ids are ignored.
+        assert_eq!(tally_downloads(&active, &ids(&["done"])), (1, 0));
+    }
+
+    #[test]
+    fn validated_playlist_name_sanitises_and_rejects_empty() {
+        let (sanitized, name) = validated_playlist_name("Friday Set").unwrap();
+        assert_eq!(sanitized, "Friday-Set");
+        assert_eq!(name.as_str(), "Friday-Set");
+        assert!(validated_playlist_name("!!!").is_err());
+    }
+
+    #[tokio::test]
+    async fn wait_for_downloads_returns_when_all_finished_and_reports_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = make_service(dir.path(), dir.path().join("missing.json"));
+        let job_id = service.begin_import_job(false).unwrap();
+        // "a" is still absent from active_downloads (between pop_front and insert).
+        service.active_downloads.lock().insert(
+            "b".to_string(),
+            queued_download("b", InternalDownloadState::Failed),
+        );
+
+        let finisher = Arc::clone(&service);
+        let finish = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            finisher.active_downloads.lock().insert(
+                "a".to_string(),
+                queued_download("a", InternalDownloadState::Downloading),
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            finisher.active_downloads.lock().get_mut("a").unwrap().state =
+                InternalDownloadState::Completed;
+        });
+
+        let outcome = service
+            .wait_for_downloads(
+                job_id,
+                &ids(&["a", "b"]),
+                Duration::from_millis(10),
+                Duration::from_secs(10),
+            )
+            .await;
+        finish.await.unwrap();
+        assert_eq!(outcome, SyncWaitEnd::AllFinished);
+        assert_eq!(
+            import_status(&service).sync,
+            Some(ImportSyncProgress {
+                queued: 2,
+                completed: 1,
+                failed: 1,
+                ended: Some(SyncWaitEnd::AllFinished)
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_downloads_gives_up_at_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = make_service(dir.path(), dir.path().join("missing.json"));
+        let job_id = service.begin_import_job(false).unwrap();
+        service.active_downloads.lock().insert(
+            "a".to_string(),
+            queued_download("a", InternalDownloadState::Downloading),
+        );
+
+        let outcome = service
+            .wait_for_downloads(
+                job_id,
+                &ids(&["a", "never"]),
+                Duration::from_millis(10),
+                Duration::from_millis(50),
+            )
+            .await;
+        assert_eq!(outcome, SyncWaitEnd::TimedOut);
+        assert_eq!(
+            import_status(&service).sync,
+            Some(ImportSyncProgress {
+                queued: 2,
+                completed: 0,
+                failed: 0,
+                ended: Some(SyncWaitEnd::TimedOut)
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_downloads_with_nothing_queued_returns_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = make_service(dir.path(), dir.path().join("missing.json"));
+        let job_id = service.begin_import_job(false).unwrap();
+        service
+            .wait_for_downloads(
+                job_id,
+                &[],
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            )
+            .await;
+        assert_eq!(
+            import_status(&service).sync,
+            Some(ImportSyncProgress {
+                queued: 0,
+                completed: 0,
+                failed: 0,
+                ended: Some(SyncWaitEnd::AllFinished)
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_downloads_ends_at_once_when_downloads_are_paused() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = make_service(dir.path(), dir.path().join("missing.json"));
+        let job_id = service.begin_import_job(false).unwrap();
+        service.active_downloads.lock().insert(
+            "a".to_string(),
+            queued_download("a", InternalDownloadState::Downloading),
+        );
+        service.paused.store(true, Ordering::Relaxed);
+
+        let started = Instant::now();
+        let outcome = service
+            .wait_for_downloads(
+                job_id,
+                &ids(&["a"]),
+                Duration::from_millis(10),
+                Duration::from_secs(60),
+            )
+            .await;
+        assert_eq!(outcome, SyncWaitEnd::Paused);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            import_status(&service).sync,
+            Some(ImportSyncProgress {
+                queued: 1,
+                completed: 0,
+                failed: 0,
+                ended: Some(SyncWaitEnd::Paused)
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_downloads_reports_finished_even_when_paused() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = make_service(dir.path(), dir.path().join("missing.json"));
+        let job_id = service.begin_import_job(false).unwrap();
+        service.active_downloads.lock().insert(
+            "a".to_string(),
+            queued_download("a", InternalDownloadState::Completed),
+        );
+        service.paused.store(true, Ordering::Relaxed);
+        let outcome = service
+            .wait_for_downloads(
+                job_id,
+                &ids(&["a"]),
+                Duration::from_millis(10),
+                Duration::from_secs(60),
+            )
+            .await;
+        assert_eq!(outcome, SyncWaitEnd::AllFinished);
+    }
+
+    #[test]
+    fn cancelling_a_queued_item_records_a_terminal_cancelled_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = make_service(dir.path(), dir.path().join("missing.json"));
+        service
+            .download_queue
+            .lock()
+            .push_back(queued_download("q", InternalDownloadState::Queued));
+        service
+            .download_queue
+            .lock()
+            .push_back(queued_download("other", InternalDownloadState::Queued));
+
+        service.cancel_download("q");
+
+        let queue = service.download_queue.lock();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].item.id.as_str(), "other");
+        let active = service.active_downloads.lock();
+        assert!(active["q"].state == InternalDownloadState::Cancelled);
+        // A wait on the cancelled item ends: it counts as failed.
+        assert_eq!(tally_downloads(&active, &ids(&["q"])), (0, 1));
+    }
+
+    #[test]
+    fn cancelling_an_active_item_marks_it_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = make_service(dir.path(), dir.path().join("missing.json"));
+        service.active_downloads.lock().insert(
+            "a".to_string(),
+            queued_download("a", InternalDownloadState::Downloading),
+        );
+        service.cancel_download("a");
+        assert!(service.active_downloads.lock()["a"].state == InternalDownloadState::Cancelled);
+    }
+
+    #[test]
+    fn cancelling_a_finished_item_leaves_it_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = make_service(dir.path(), dir.path().join("missing.json"));
+        service.active_downloads.lock().insert(
+            "a".to_string(),
+            queued_download("a", InternalDownloadState::Completed),
+        );
+        service.cancel_download("a");
+        assert!(service.active_downloads.lock()["a"].state == InternalDownloadState::Completed);
+    }
+
+    #[test]
+    fn enqueue_queues_new_items_and_counts_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = make_service(dir.path(), dir.path().join("missing.json"));
+        let (wanted, newly) = service.enqueue_new_items(vec![
+            make_collection_item("a", "Artist", "One"),
+            make_collection_item("b", "Artist", "Two"),
+        ]);
+        assert_eq!(wanted, ids(&["a", "b"]));
+        assert_eq!(newly, 2);
+        assert_eq!(service.download_queue.lock().len(), 2);
+    }
+
+    #[test]
+    fn enqueue_skips_in_flight_items_but_still_returns_their_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = make_service(dir.path(), dir.path().join("missing.json"));
+        service
+            .download_queue
+            .lock()
+            .push_back(queued_download("queued", InternalDownloadState::Queued));
+        service.active_downloads.lock().insert(
+            "busy".to_string(),
+            queued_download("busy", InternalDownloadState::Downloading),
+        );
+
+        let (wanted, newly) = service.enqueue_new_items(vec![
+            make_collection_item("queued", "Artist", "One"),
+            make_collection_item("busy", "Artist", "Two"),
+            make_collection_item("fresh", "Artist", "Three"),
+        ]);
+
+        assert_eq!(wanted, ids(&["queued", "busy", "fresh"]));
+        assert_eq!(newly, 1, "only 'fresh' is new");
+        let queue = service.download_queue.lock();
+        let queued_ids: Vec<&str> = queue.iter().map(|d| d.item.id.as_str()).collect();
+        assert_eq!(queued_ids, vec!["queued", "fresh"], "no duplicates queued");
+        assert!(
+            service.active_downloads.lock()["busy"].state == InternalDownloadState::Downloading
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_resync_does_not_queue_an_in_flight_item_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = make_service(dir.path(), dir.path().join("missing.json"));
+        service
+            .download_queue
+            .lock()
+            .push_back(queued_download("q", InternalDownloadState::Queued));
+        service.active_downloads.lock().insert(
+            "busy".to_string(),
+            queued_download("busy", InternalDownloadState::Downloading),
+        );
+        service.active_downloads.lock().insert(
+            "old".to_string(),
+            queued_download("old", InternalDownloadState::Completed),
+        );
+
+        for id in ["q", "busy", "old"] {
+            service
+                .queue_item_forcibly(make_collection_item(id, "Artist", "Album"))
+                .await
+                .unwrap();
+        }
+
+        let queue = service.download_queue.lock();
+        let queued: Vec<&str> = queue.iter().map(|d| d.item.id.as_str()).collect();
+        assert_eq!(queued, vec!["q", "old"], "in-flight items not duplicated");
+        assert!(!service.active_downloads.lock().contains_key("old"));
+        assert!(service.active_downloads.lock().contains_key("busy"));
+    }
+
+    #[test]
+    fn enqueue_replaces_finished_entries_from_earlier_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = make_service(dir.path(), dir.path().join("missing.json"));
+        for (id, state) in [
+            ("failed", InternalDownloadState::Failed),
+            ("stopped", InternalDownloadState::Cancelled),
+        ] {
+            service
+                .active_downloads
+                .lock()
+                .insert(id.to_string(), queued_download(id, state));
+        }
+
+        let (wanted, newly) = service.enqueue_new_items(vec![
+            make_collection_item("failed", "Artist", "One"),
+            make_collection_item("stopped", "Artist", "Two"),
+        ]);
+
+        assert_eq!(wanted, ids(&["failed", "stopped"]));
+        assert_eq!(newly, 2);
+        let active = service.active_downloads.lock();
+        assert!(!active.contains_key("failed") && !active.contains_key("stopped"));
+        // Nothing waiting on them can mistake the old outcome for the new one.
+        assert_eq!(tally_downloads(&active, &wanted), (0, 0));
+    }
+
+    #[test]
+    fn stale_job_cannot_update_a_newer_jobs_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = make_service(dir.path(), dir.path().join("missing.json"));
+        let old = service.begin_import_job(false).unwrap();
+        service.fail_import(old, "first job failed".to_string());
+        let new = service.begin_import_job(false).unwrap();
+        assert_ne!(old, new);
+
+        service.set_import_phase(old, ImportPhase::Writing);
+        service.update_import(old, |s| s.playlist_title = Some("stale".to_string()));
+        service.fail_import(old, "late failure".to_string());
+
+        let status = import_status(&service);
+        assert_eq!(status.job_id, new);
+        assert_eq!(status.phase, ImportPhase::Fetching);
+        assert_eq!(status.playlist_title, None);
+
+        service.set_import_phase(new, ImportPhase::Matching);
+        assert_eq!(import_status(&service).phase, ImportPhase::Matching);
+    }
+
+    #[tokio::test]
+    async fn join_error_says_panicked_only_for_a_panic() {
+        let panicking = tokio::spawn(async { panic!("boom") });
+        let e = panicking.await.unwrap_err();
+        let message = join_error_message(&e);
+        assert!(message.contains("panicked"), "got: {message}");
+
+        let hanging = tokio::spawn(std::future::pending::<()>());
+        hanging.abort();
+        let e = hanging.await.unwrap_err();
+        let message = join_error_message(&e);
+        assert!(message.contains("cancelled"), "got: {message}");
+        assert!(!message.contains("panicked"), "got: {message}");
+    }
+
+    fn import_request(name: Option<&str>) -> SourceRequest {
+        SourceRequest::ImportPlaylist {
+            playlist: "my-set".to_string(),
+            name: name.map(str::to_string),
+            dry_run: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn import_with_bad_name_is_rejected_without_starting_a_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = make_service(dir.path(), dir.path().join("missing.json"));
+        match service.handle_request(import_request(Some("???"))).await {
+            SourceResponse::Error(SourceError::InvalidRequest { message }) => {
+                assert!(message.contains("invalid playlist name"), "got: {message}");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+        assert!(service.import_status.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn import_while_one_is_running_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = make_service(dir.path(), dir.path().join("missing.json"));
+        let running = service.begin_import_job(false).unwrap();
+        match service.handle_request(import_request(None)).await {
+            SourceResponse::Error(SourceError::ImportInProgress { job_id }) => {
+                assert_eq!(job_id, running);
+            }
+            other => panic!("expected ImportInProgress, got {other:?}"),
+        }
+        // The running job's status is untouched.
+        assert_eq!(import_status(&service).job_id, running);
+        assert_eq!(import_status(&service).phase, ImportPhase::Fetching);
+    }
+
+    #[tokio::test]
+    async fn import_without_cookies_ends_failed_and_allows_a_new_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = make_service(dir.path(), dir.path().join("missing.json"));
+        let job_id = match service.handle_request(import_request(None)).await {
+            SourceResponse::ImportStarted { job_id } => job_id,
+            other => panic!("expected ImportStarted, got {other:?}"),
+        };
+        let status = wait_for_import_end(&service).await;
+        assert_eq!(status.job_id, job_id);
+        match status.phase {
+            ImportPhase::Failed { message } => {
+                assert!(message.contains("not configured"), "got: {message}")
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        match service.handle_request(SourceRequest::GetImportStatus).await {
+            SourceResponse::ImportStatus(Some(s)) => assert_eq!(s.job_id, job_id),
+            other => panic!("expected ImportStatus, got {other:?}"),
+        }
+        assert_eq!(service.begin_import_job(false), Ok(job_id + 1));
+    }
+
+    #[tokio::test]
+    async fn import_status_is_none_before_any_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = make_service(dir.path(), dir.path().join("missing.json"));
+        assert!(matches!(
+            service.handle_request(SourceRequest::GetImportStatus).await,
+            SourceResponse::ImportStatus(None)
+        ));
+    }
+
+    /// Poll the status until the job is Done or Failed.
+    async fn wait_for_import_end(service: &Arc<BandcampService>) -> ImportJobStatus {
+        for _ in 0..500 {
+            let status = import_status(service);
+            if !import_phase_is_running(&status.phase) {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("import job did not finish");
     }
 
     /// Regression guard for #70: a missing cookie file must not make startup fail.
@@ -1798,6 +2735,263 @@ mod tests {
                 after_backfill.contains(&"p_digital_222".to_string()),
                 "after backfill, p_digital_222 should be found by ItemId"
             );
+        }
+
+        fn source_track(
+            position: u32,
+            artist: &str,
+            title: &str,
+            owned: bool,
+        ) -> SourcePlaylistTrack {
+            SourcePlaylistTrack {
+                position,
+                source_track_id: format!("t{position}"),
+                title: title.to_string(),
+                artist: artist.to_string(),
+                album: None,
+                duration_secs: 0.0,
+                owned,
+            }
+        }
+
+        fn source_playlist(tracks: Vec<SourcePlaylistTrack>) -> SourcePlaylist {
+            SourcePlaylist {
+                id: "1".to_string(),
+                title: "My Set".to_string(),
+                url: "https://bandcamp.com/someone/playlist/my-set".to_string(),
+                total_count: tracks.len() as u32,
+                tracks,
+            }
+        }
+
+        /// A service wired to a stub library holding one track,
+        /// "Carbon Based Lifeforms - Interloper". Keeps the tempdir alive.
+        fn service_with_library(
+            socket_name: &str,
+        ) -> (tempfile::TempDir, Arc<BandcampService>, LibraryClient) {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            seed_track_with_item_id(
+                temp.path(),
+                &format!("{:0<64}", "deadbeef"),
+                "Carbon Based Lifeforms",
+                "Interloper",
+                "p_1",
+            );
+            let socket_path = temp.path().join(socket_name);
+            let _srv = start_stub_library(temp.path(), &socket_path);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let lib_socket = format!("ipc://{}", socket_path.display());
+            let service = make_service_with_library(
+                temp.path(),
+                temp.path().join("missing.json"),
+                &lib_socket,
+            );
+            let client = LibraryClient::connect(&lib_socket).expect("connect");
+            (temp, service, client)
+        }
+
+        #[tokio::test]
+        async fn import_with_nothing_missing_writes_playlist_and_finishes_done() {
+            let (_temp, service, client) = service_with_library("import-happy.sock");
+            let job_id = service.begin_import_job(false).unwrap();
+            let playlist = source_playlist(vec![source_track(
+                1,
+                "Carbon Based Lifeforms",
+                "Interloper",
+                true,
+            )]);
+
+            service
+                .run_import(job_id, playlist, "my-set", None, false)
+                .await;
+
+            let status = import_status(&service);
+            assert_eq!(status.job_id, job_id);
+            assert_eq!(status.playlist_title.as_deref(), Some("My Set"));
+            assert_eq!(status.target_name.as_deref(), Some("My-Set"));
+            assert_eq!(status.total_count, Some(1));
+            assert_eq!(status.sync, None, "nothing missing: no sync");
+            assert_eq!(
+                status.phase,
+                ImportPhase::Done(ImportResult::Written(ImportWritten {
+                    created: true,
+                    tracks: 1
+                }))
+            );
+            assert!(matches!(
+                status.tracks[0].outcome,
+                source_protocol::ImportTrackOutcome::Matched { .. }
+            ));
+            let written = client
+                .playlist_get(&PlaylistName::new("My-Set").unwrap())
+                .expect("playlist was written");
+            assert_eq!(written.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn import_with_explicit_name_replaces_an_existing_playlist() {
+            let (_temp, service, client) = service_with_library("import-replace.sock");
+            let name = PlaylistName::new("mine").unwrap();
+            client
+                .playlist_new(&name, "old".to_string())
+                .expect("seed playlist");
+            let job_id = service.begin_import_job(false).unwrap();
+            let playlist = source_playlist(vec![source_track(
+                1,
+                "Carbon Based Lifeforms",
+                "Interloper",
+                true,
+            )]);
+
+            service
+                .run_import(
+                    job_id,
+                    playlist,
+                    "my-set",
+                    Some(validated_playlist_name("mine").unwrap()),
+                    false,
+                )
+                .await;
+
+            let status = import_status(&service);
+            assert_eq!(status.target_name.as_deref(), Some("mine"));
+            assert_eq!(
+                status.phase,
+                ImportPhase::Done(ImportResult::Written(ImportWritten {
+                    created: false,
+                    tracks: 1
+                }))
+            );
+        }
+
+        #[tokio::test]
+        async fn dry_run_reports_matches_but_never_syncs_or_writes() {
+            let (_temp, service, client) = service_with_library("import-dry.sock");
+            let job_id = service.begin_import_job(true).unwrap();
+            // The second track is owned but missing: a real run would sync.
+            let playlist = source_playlist(vec![
+                source_track(1, "Carbon Based Lifeforms", "Interloper", true),
+                source_track(2, "Nobody", "Nothing", true),
+            ]);
+
+            service
+                .run_import(job_id, playlist, "my-set", None, true)
+                .await;
+
+            let status = import_status(&service);
+            assert_eq!(
+                status.phase,
+                ImportPhase::Done(ImportResult::DryRun { would_write: 1 })
+            );
+            assert!(status.dry_run);
+            assert_eq!(status.sync, None);
+            assert_eq!(status.tracks.len(), 2);
+            assert_eq!(
+                status.tracks[1].outcome,
+                source_protocol::ImportTrackOutcome::Missing { not_owned: false }
+            );
+            assert!(
+                client
+                    .playlist_get(&PlaylistName::new("My-Set").unwrap())
+                    .is_err(),
+                "dry run must not write"
+            );
+        }
+
+        #[tokio::test]
+        async fn dry_run_with_no_matches_reports_nothing_matched_not_zero_tracks() {
+            let (_temp, service, _client) = service_with_library("import-dry-none.sock");
+            let job_id = service.begin_import_job(true).unwrap();
+            let playlist = source_playlist(vec![source_track(1, "Nobody", "Nothing", true)]);
+
+            service
+                .run_import(job_id, playlist, "my-set", None, true)
+                .await;
+
+            let status = import_status(&service);
+            assert_eq!(
+                status.phase,
+                ImportPhase::Done(ImportResult::NothingMatched)
+            );
+            assert!(status.dry_run);
+        }
+
+        #[test]
+        fn drop_items_known_to_library_keeps_only_unknown_items_and_backfills() {
+            // The stub was seeded with ItemId "p_1" for the Interloper track.
+            let (_temp, service, client) = service_with_library("drop-known.sock");
+            let socket = service.library_socket.clone();
+            let items = vec![
+                make_collection_item("p_1", "Carbon Based Lifeforms", "Interloper"),
+                make_collection_item("p_2", "Carbon Based Lifeforms", "Interloper"),
+                make_collection_item("p_3", "Somebody Else", "Other Album"),
+            ];
+
+            let unknown = drop_items_known_to_library(&socket, items);
+
+            let ids: Vec<&str> = unknown.iter().map(|i| i.id.as_str()).collect();
+            assert_eq!(ids, vec!["p_3"]);
+            let known = client
+                .has_facts("ItemId", vec!["p_2".to_string()])
+                .expect("has_facts");
+            assert_eq!(known, vec!["p_2".to_string()], "ItemId backfilled");
+        }
+
+        #[test]
+        fn drop_items_known_to_library_keeps_everything_when_library_is_down() {
+            let items = vec![make_collection_item("p_1", "A", "B")];
+            let kept = drop_items_known_to_library("ipc:///nonexistent/library.sock", items);
+            assert_eq!(kept.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn import_with_no_matches_leaves_an_existing_playlist_untouched() {
+            let (_temp, service, client) = service_with_library("import-nomatch.sock");
+            let name = PlaylistName::new("mine").unwrap();
+            // Unowned and absent from the library: no sync, no match.
+            let playlist = source_playlist(vec![source_track(1, "Nobody", "Nothing", false)]);
+            client
+                .playlist_new(&name, "aaaaaaaaaaaa  Old - Track  [1:00]\n".to_string())
+                .expect("seed playlist");
+            let before = client.playlist_get(&name).expect("seeded");
+            let job_id = service.begin_import_job(false).unwrap();
+
+            service
+                .run_import(
+                    job_id,
+                    playlist,
+                    "my-set",
+                    Some(validated_playlist_name("mine").unwrap()),
+                    false,
+                )
+                .await;
+
+            let status = import_status(&service);
+            assert_eq!(
+                status.phase,
+                ImportPhase::Done(ImportResult::NothingMatched)
+            );
+            assert_eq!(client.playlist_get(&name).unwrap(), before);
+        }
+
+        #[tokio::test]
+        async fn import_fails_and_writes_nothing_when_the_library_is_unavailable() {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let service = make_service(temp.path(), temp.path().join("missing.json"));
+            let job_id = service.begin_import_job(false).unwrap();
+            let playlist = source_playlist(vec![source_track(1, "A", "One", true)]);
+
+            service
+                .run_import(job_id, playlist, "my-set", None, false)
+                .await;
+
+            let status = import_status(&service);
+            match status.phase {
+                ImportPhase::Failed { message } => {
+                    assert!(message.contains("library"), "got: {message}")
+                }
+                other => panic!("expected Failed, got {other:?}"),
+            }
         }
 
         /// Adversarial test: a Contains-only probe returns a result whose artist/album only

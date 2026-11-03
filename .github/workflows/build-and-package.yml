@@ -72,6 +72,16 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+    - name: Free disk space
+      # Nix + devenv + sysroot + cargo target/ overflow the ~14 GB free on the
+      # hosted runner (#83). Remove preinstalled toolchains this project never uses.
+      run: |
+        df -h /
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+          /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+        sudo docker image prune --all --force || true
+        df -h /
+
     - uses: actions/checkout@v4
 
     - name: Verify package sources (void-packages/srcpkgs)
@@ -123,6 +133,15 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
+    - name: Free disk space
+      # Same as the test job (#83): keep the publish job from hitting ENOSPC.
+      run: |
+        df -h /
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+          /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+        sudo docker image prune --all --force || true
+        df -h /
+
     - uses: actions/checkout@v4
 
     - uses: cachix/install-nix-action@v31

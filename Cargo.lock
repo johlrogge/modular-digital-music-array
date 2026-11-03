@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "bevy-app"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "bevy",
  "bevy_egui",
@@ -2446,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "boot-health"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "pretty_assertions",
  "serde",
@@ -3636,7 +3636,7 @@ checksum = "c9c272297e804878a2a4b707cfcfc6d2328b5bb936944613b4fdf2b9269afdfd"
 
 [[package]]
 name = "dj-workspace"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "bevy-app",
  "clap",
@@ -5826,7 +5826,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "mdma-acid"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "acid-service",
  "clap",
@@ -5840,7 +5840,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-admin"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "admin-ipc-protocol",
  "boot-health",
@@ -5859,7 +5859,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-audio"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "clap",
  "color-eyre",
@@ -5880,7 +5880,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-bandcamp"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "bandcamp-api",
  "chrono",
@@ -5894,6 +5894,7 @@ dependencies = [
  "music-facts",
  "nng",
  "parking_lot",
+ "playlist-import",
  "pretty_assertions",
  "rstest",
  "serde",
@@ -5935,7 +5936,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-beacon"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "askama",
  "async-stream",
@@ -5967,7 +5968,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-cli"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "audio-transcoder",
  "chrono",
@@ -5987,6 +5988,7 @@ dependencies = [
  "nng",
  "nng-transport",
  "node-discovery",
+ "playlist-import",
  "pretty_assertions",
  "rekordbox-roundtrip",
  "rekordbox-xml",
@@ -5997,6 +5999,7 @@ dependencies = [
  "terminal_size",
  "track-formatter",
  "track-matcher",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -6011,16 +6014,16 @@ dependencies = [
  "media-protocol",
  "nng",
  "nng-transport",
+ "playlist-import",
  "serde_json",
  "source-protocol",
  "thiserror 1.0.69",
  "tracing",
- "track-formatter",
 ]
 
 [[package]]
 name = "mdma-console"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "admin-ipc-protocol",
  "askama",
@@ -6057,7 +6060,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-gateway"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "acid-protocol",
  "clap",
@@ -6077,7 +6080,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-library"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "clap",
  "color-eyre",
@@ -6090,7 +6093,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-playback"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "acid-client",
  "clap",
@@ -6114,7 +6117,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-tui"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "clap",
  "client",
@@ -7432,6 +7435,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "playlist-import"
+version = "0.33.0"
+dependencies = [
+ "library-ipc-client",
+ "library-search",
+ "pretty_assertions",
+ "source-protocol",
+ "thiserror 1.0.69",
+ "track-formatter",
+ "track-matcher",
+]
+
+[[package]]
 name = "plotters"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7588,7 +7604,7 @@ dependencies = [
 
 [[package]]
 name = "private-file"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "tempfile",
 ]
@@ -8192,7 +8208,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-eeprom"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "tempfile",
  "thiserror 1.0.69",
@@ -9990,6 +10006,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b09c83c3c29d37506a3e260c08c03743a6bb66a9cd432c6934ab501a190571f"
 
 [[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
 name = "unicode-segmentation"
 version = "1.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10660,7 +10685,7 @@ dependencies = [
 
 [[package]]
 name = "wifi-config"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "pbkdf2",
  "proptest",

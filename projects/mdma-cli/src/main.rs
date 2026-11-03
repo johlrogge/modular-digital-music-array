@@ -23,14 +23,20 @@ use music_facts::{
     TrackRole, Year,
 };
 use nng::options::Options;
+use playlist_import::{
+    format_import_status, format_write_outcome, sanitize_playlist_name, write_playlist,
+    LibraryTrackLookup,
+};
 use rekordbox_xml::{parse_xml, RekordboxTrack};
-use source_protocol::{SourceError, SourceRequest, SourceResponse};
+use source_protocol::{
+    ImportJobStatus, ImportPhase, ImportSyncProgress, SourceError, SourceRequest, SourceResponse,
+};
 use std::path::Path;
 use track_formatter::{
     format_track_line as format_track_line_shared, render_for_user, short_hash, ViewColumn,
     ALL_COLUMNS,
 };
-use track_matcher::{CandidateTrack, MatchConfidence, MatchResult, TrackLookup};
+use track_matcher::{CandidateTrack, MatchResult};
 
 // =============================================================================
 // CLI Definition
@@ -462,6 +468,9 @@ enum RekordboxCommands {
         #[arg(long, value_enum)]
         format: Option<ExportFormat>,
         /// Force a fresh XML and re-download everything (discards incremental sync).
+        /// Also skips grandfathering of existing paths: tracks whose paths exceed
+        /// the rekordbox Location budget get new, shortened paths (rekordbox will
+        /// see them as new tracks and cues are lost).
         #[arg(long)]
         replace: bool,
     },
@@ -533,10 +542,17 @@ enum BandcampCommands {
         #[arg(long)]
         name: Option<String>,
 
-        /// Show the report without writing the playlist
+        /// Show the report without syncing or writing the playlist
         #[arg(long)]
         dry_run: bool,
+
+        /// Print the job id and exit once the import has started
+        #[arg(long)]
+        no_wait: bool,
     },
+
+    /// Show the current or last playlist import job (follows it while running)
+    ImportStatus,
 }
 
 #[derive(Subcommand, Debug)]
@@ -996,8 +1012,8 @@ fn connect_source(cli: &Cli, name: &str) -> SourceClient {
     connect_source_or_exit(cli, name, None)
 }
 
-/// Request timeout for `mdma bandcamp` commands: fetching a playlist makes
-/// several rate-limited Bandcamp requests, well beyond the default 5s.
+/// Request timeout for `mdma bandcamp playlists`: listing makes several
+/// rate-limited Bandcamp requests, well beyond the default 5s.
 const BANDCAMP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Connect to a source, with the default request timeout or a custom one.
@@ -3481,20 +3497,196 @@ fn sanitize_path_component(s: &str) -> String {
         .collect()
 }
 
-/// Build the destination path for an exported track.
+/// Budget, in bytes, for the length of the *encoded rekordbox `Location`*
+/// (`file://localhost` + percent-encoded, NFD-normalized absolute path) of a
+/// NEW export entry.
+///
+/// rekordbox on macOS rejects paths of about 256 bytes (observed by Joakim:
+/// one over-long track name made rekordbox reject the whole XML and halt the
+/// import). Two things are unknown, and we are conservative about both:
+///
+/// 1. Whether the ~256 limit applies to the decoded path or to the
+///    percent-encoded Location. We measure the encoded Location, which is
+///    never shorter than the decoded path.
+/// 2. Whether macOS measures the NFD form (HFS+/APFS-style decomposition) or
+///    the NFC form we write. We measure NFD, which is never shorter than NFC.
+///
+/// The `file://localhost` prefix counts towards the budget too. Existing
+/// entries are grandfathered and never shortened (see
+/// [`export_dest_path_checked`]), so this only affects new tracks.
+const MAX_LOCATION_URI_BYTES: usize = 250;
+/// Secondary guard: maximum cost of a directory name (macOS/Windows/Linux
+/// limit is 255 bytes; macOS stores names NFD-decomposed, so leave headroom).
+const MAX_DIR_NAME_BYTES: usize = 120;
+/// Secondary guard: maximum cost of a file name including the extension.
+const MAX_FILE_NAME_BYTES: usize = 180;
+/// Smallest cost a component is shortened to when spending the path budget.
+const MIN_COMPONENT_BYTES: usize = 16;
+
+/// Length of the rekordbox Location URI for `s` taken as an absolute path,
+/// measured over its NFD form. Encoding rules come from
+/// [`rekordbox_xml::path_to_file_uri`], not duplicated here.
+fn location_cost(s: &str) -> usize {
+    use unicode_normalization::UnicodeNormalization;
+    let nfd: String = s.nfd().collect();
+    rekordbox_xml::path_to_file_uri(std::path::Path::new(&nfd)).len()
+}
+
+/// Exact byte cost of a path or path component inside the rekordbox Location
+/// (NFD, percent-encoded, without the `file://localhost` prefix). Additive
+/// over concatenation, so it works per component and per character.
+fn path_cost(s: &str) -> usize {
+    location_cost(s) - location_cost("")
+}
+
+/// File extension of an exported track: fixed for converted formats, derived
+/// from the blob path for `Original`.
+fn export_extension(format: &ExportFormat, track: &TrackInfo) -> String {
+    match format.static_extension() {
+        Some(fixed) => fixed.to_string(),
+        None => track
+            .blob_path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).extension())
+            .and_then(|e| e.to_str())
+            .unwrap_or("bin")
+            .to_lowercase(),
+    }
+}
+
+/// Normalised key for comparing Location URIs: NFD and lowercase. Existing
+/// Locations come from `canonicalize()`, which on HFS+ returns NFD names,
+/// while track metadata is NFC; case is folded as in `plan_export`.
+fn location_key(uri: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    uri.nfd().collect::<String>().to_lowercase()
+}
+
+/// Set of [`location_key`]s of an existing export, for grandfathering.
+fn existing_location_set(
+    existing: Option<&rekordbox_xml::RekordboxLibrary>,
+) -> std::collections::HashSet<String> {
+    existing
+        .map(|lib| {
+            lib.tracks
+                .iter()
+                .map(|t| location_key(&t.location))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Stable FNV-1a hash used to disambiguate truncated names.
+fn fnv1a(s: &str) -> u32 {
+    s.bytes().fold(0x811c_9dc5_u32, |h, b| {
+        (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+    })
+}
+
+/// Shorten `s` so its cost is at most `max_cost` (but never below
+/// [`MIN_COMPONENT_BYTES`]). Strings that already fit are returned unchanged.
+/// Truncation happens on a char boundary, trailing spaces/dots are trimmed
+/// (Windows rejects them) and a `~<hash of the full name>` suffix is appended
+/// so that two different long names never collapse onto the same path.
+fn shorten_component(s: &str, max_cost: usize) -> String {
+    if path_cost(s) <= max_cost {
+        return s.to_string();
+    }
+    let suffix = format!("~{:08x}", fnv1a(s));
+    let budget = max_cost
+        .max(MIN_COMPONENT_BYTES)
+        .saturating_sub(suffix.len());
+    let mut used = 0;
+    let mut kept = String::new();
+    for c in s.chars() {
+        let cost = path_cost(c.encode_utf8(&mut [0; 4]));
+        if used + cost > budget {
+            break;
+        }
+        used += cost;
+        kept.push(c);
+    }
+    let trimmed = kept.trim_end_matches([' ', '.']);
+    format!("{trimmed}{suffix}")
+}
+
+/// Build the destination path for an exported track and report whether it
+/// fits [`MAX_LOCATION_URI_BYTES`].
 ///
 /// Layout: `<output>/<artist>/<album>/<title>.<ext>`
 ///
-/// Each path component is sanitized to remove filesystem-unsafe characters.
+/// Components are sanitized first. If the resulting unshortened path is
+/// already an entry of the existing export (`existing_locations`: lowercased
+/// Location URIs), it is returned as-is and reported as fitting: renaming a
+/// previously exported file would make rekordbox see a new track and lose its
+/// cues. Otherwise components are shortened: per-component caps, then (if the
+/// whole path is still too long) title first, album, artist.
+/// Paths within all limits are returned byte-identical to the unlimited form.
+fn export_dest_path_checked(
+    output: &std::path::Path,
+    track: &TrackInfo,
+    ext: &str,
+    existing_locations: &std::collections::HashSet<String>,
+) -> (std::path::PathBuf, bool) {
+    let mut artist = sanitize_path_component(track.artist.as_deref().unwrap_or("Unknown Artist"));
+    let mut album = sanitize_path_component(track.album.as_deref().unwrap_or("Unknown Album"));
+    let mut title = sanitize_path_component(track.title.as_deref().unwrap_or("Unknown"));
+    let dot_ext = format!(".{ext}");
+    let ext_cost = path_cost(&dot_ext);
+
+    let unshortened = output
+        .join(&artist)
+        .join(&album)
+        .join(format!("{title}{dot_ext}"));
+    let unshortened_location = rekordbox_xml::path_to_file_uri(&unshortened);
+    let unshortened_location = location_key(&unshortened_location);
+    if existing_locations.contains(&unshortened_location) {
+        return (unshortened, true);
+    }
+
+    artist = shorten_component(&artist, MAX_DIR_NAME_BYTES);
+    album = shorten_component(&album, MAX_DIR_NAME_BYTES);
+    title = shorten_component(&title, MAX_FILE_NAME_BYTES.saturating_sub(ext_cost));
+
+    let build = |artist: &str, album: &str, title: &str| {
+        output
+            .join(artist)
+            .join(album)
+            .join(format!("{title}{dot_ext}"))
+    };
+    let total = |p: &std::path::Path| location_cost(&p.to_string_lossy());
+
+    // Spend the whole-path budget: title first, then album, then artist.
+    // A name shortened twice is re-hashed from its first shortened form, which
+    // embeds the first hash, so distinct originals stay distinct.
+    for which in 0..3 {
+        let over = total(&build(&artist, &album, &title)).saturating_sub(MAX_LOCATION_URI_BYTES);
+        if over == 0 {
+            break;
+        }
+        let field = match which {
+            0 => &mut title,
+            1 => &mut album,
+            _ => &mut artist,
+        };
+        let cost = path_cost(field);
+        let target = cost.saturating_sub(over).max(MIN_COMPONENT_BYTES);
+        if target < cost {
+            *field = shorten_component(field, target);
+        }
+    }
+
+    let path = build(&artist, &album, &title);
+    let fits = total(&path) <= MAX_LOCATION_URI_BYTES;
+    (path, fits)
+}
+
+/// Build the destination path for an exported track with no existing export
+/// to preserve (see [`export_dest_path_checked`]).
+///
 /// Missing metadata falls back to `"Unknown Artist"`, `"Unknown Album"`, `"Unknown"`.
 fn export_dest_path(output: &std::path::Path, track: &TrackInfo, ext: &str) -> std::path::PathBuf {
-    let artist = sanitize_path_component(track.artist.as_deref().unwrap_or("Unknown Artist"));
-    let album = sanitize_path_component(track.album.as_deref().unwrap_or("Unknown Album"));
-    let title = sanitize_path_component(track.title.as_deref().unwrap_or("Unknown"));
-    output
-        .join(artist)
-        .join(album)
-        .join(format!("{}.{}", title, ext))
+    export_dest_path_checked(output, track, ext, &std::collections::HashSet::new()).0
 }
 
 /// Build a `hash → location-URI` map that resolves all three hash forms a playlist
@@ -3622,12 +3814,16 @@ struct DownloadAttempt {
 /// Download a list of tracks to `output`, resolving each track's format via
 /// `resolve_format`.  Progress is printed to stderr.  Returns one
 /// `DownloadAttempt` per input track, in order.
+///
+/// `dest_for(track, ext)` gives the destination path of a track, so callers
+/// that planned destinations up front (rekordbox export) download to exactly
+/// the planned path.
 fn download_tracks(
     node: &str,
     tracks: &[TrackInfo],
-    output: &std::path::Path,
     http: &reqwest::blocking::Client,
     resolve_format: impl Fn(&TrackInfo) -> ExportFormat,
+    dest_for: impl Fn(&TrackInfo, &str) -> std::path::PathBuf,
 ) -> Vec<DownloadAttempt> {
     use std::io::Write;
 
@@ -3667,22 +3863,9 @@ fn download_tracks(
         }
 
         // Determine extension: fixed for converted formats, derived from blob_path for Original.
-        let source_ext_owned: String;
-        let ext: &str = match resolved_format.static_extension() {
-            Some(fixed) => fixed,
-            None => {
-                source_ext_owned = track
-                    .blob_path
-                    .as_deref()
-                    .and_then(|p| std::path::Path::new(p).extension())
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("bin")
-                    .to_lowercase();
-                &source_ext_owned
-            }
-        };
+        let ext = export_extension(&resolved_format, track);
 
-        let dest = export_dest_path(output, track, ext);
+        let dest = dest_for(track, &ext);
 
         if let Some(parent) = dest.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -3926,41 +4109,9 @@ fn handle_rekordbox_export(
     // Resolve format: only --format (no lossless/lossy split for rekordbox export)
     let format_owned = format.cloned().unwrap_or(ExportFormat::Original);
 
-    // Build (TrackInfo, canonical_dest_path, ext) for every unique desired track.
-    // dest_path is canonicalised so the Location URI is stable pre- and post-download.
-    let desired: Vec<(TrackInfo, std::path::PathBuf, String)> = tracks
-        .into_iter()
-        .map(|track| {
-            let ext: String = match format_owned.static_extension() {
-                Some(fixed) => fixed.to_string(),
-                None => track
-                    .blob_path
-                    .as_deref()
-                    .and_then(|p| std::path::Path::new(p).extension())
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("bin")
-                    .to_lowercase(),
-            };
-            let raw_dest = export_dest_path(&output_canon, &track, &ext);
-            // Canonicalise if the file already exists; fall back to the absolute path otherwise.
-            let dest = raw_dest.canonicalize().unwrap_or_else(|_| raw_dest.clone());
-            (track, dest, ext)
-        })
-        .collect();
-
-    // hash → canonical dest location URI, for playlist location building.
-    // Insert all three hash forms (full, 12-char short, 8-char short) so that
-    // playlists stored in any format on disk resolve correctly.
-    let hash_location_pairs: Vec<rekordbox_roundtrip::HashLocation> = desired
-        .iter()
-        .map(|(track, dest, _)| rekordbox_roundtrip::HashLocation {
-            hash: track.content_hash.clone(),
-            location: rekordbox_xml::path_to_file_uri(dest),
-        })
-        .collect();
-    let hash_to_location = rekordbox_roundtrip::build_hash_to_location(&hash_location_pairs);
-
-    // Load existing XML for incremental sync (skip when --replace)
+    // Load existing XML for incremental sync (skip when --replace). Loaded
+    // before planning destinations: its entries keep their paths even when
+    // those exceed the Location budget (stable Locations preserve cues).
     let xml_path = output_canon.join("rekordbox.xml");
     let existing: Option<rekordbox_xml::RekordboxLibrary> = if !replace && xml_path.exists() {
         match std::fs::read_to_string(&xml_path) {
@@ -3981,6 +4132,48 @@ fn handle_rekordbox_export(
     } else {
         None
     };
+    let existing_locations = existing_location_set(existing.as_ref());
+
+    // Build (TrackInfo, canonical_dest_path, ext) for every unique desired track.
+    // dest_path is canonicalised so the Location URI is stable pre- and post-download.
+    let mut too_long_count = 0usize;
+    let desired: Vec<(TrackInfo, std::path::PathBuf, String)> = tracks
+        .into_iter()
+        .map(|track| {
+            let ext = export_extension(&format_owned, &track);
+            let (raw_dest, fits) =
+                export_dest_path_checked(&output_canon, &track, &ext, &existing_locations);
+            too_long_count += usize::from(!fits);
+            // Canonicalise if the file already exists; fall back to the absolute path otherwise.
+            let dest = raw_dest.canonicalize().unwrap_or_else(|_| raw_dest.clone());
+            (track, dest, ext)
+        })
+        .collect();
+
+    if too_long_count > 0 {
+        eprintln!(
+            "warning: {} new track path(s) still exceed {} bytes as an encoded rekordbox \
+             Location even with artist/album/title shortened to the minimum; the output \
+             directory {} ({} bytes) leaves too little room. rekordbox on macOS may reject \
+             them. Use a shorter output directory (e.g. ~/mdma-export).",
+            too_long_count,
+            MAX_LOCATION_URI_BYTES,
+            output_canon.display(),
+            path_cost(&output_canon.to_string_lossy())
+        );
+    }
+
+    // hash → canonical dest location URI, for playlist location building.
+    // Insert all three hash forms (full, 12-char short, 8-char short) so that
+    // playlists stored in any format on disk resolve correctly.
+    let hash_location_pairs: Vec<rekordbox_roundtrip::HashLocation> = desired
+        .iter()
+        .map(|(track, dest, _)| rekordbox_roundtrip::HashLocation {
+            hash: track.content_hash.clone(),
+            location: rekordbox_xml::path_to_file_uri(dest),
+        })
+        .collect();
+    let hash_to_location = rekordbox_roundtrip::build_hash_to_location(&hash_location_pairs);
 
     // Build DesiredTrack list for the planner
     let desired_for_plan: Vec<rekordbox_xml::DesiredTrack> = desired
@@ -3996,7 +4189,8 @@ fn handle_rekordbox_export(
     // Warn about planning anomalies
     for collision in &plan.collisions {
         eprintln!(
-            "warning: destination path {} shared by {} tracks: {}",
+            "warning: destination path {} is shared by {} tracks ({}); each later track \
+             overwrites the previous one, so only the last will remain on disk",
             collision.dest_path.display(),
             collision.source_ids.len(),
             collision.source_ids.join(", ")
@@ -4034,12 +4228,18 @@ fn handle_rekordbox_export(
     let new_count = plan.to_download.len();
     let unchanged_count = plan.to_skip.len();
 
+    // Download to exactly the planned destinations (which may be grandfathered
+    // paths longer than the budget), not a re-derived budgeted path.
+    let planned_dest: std::collections::HashMap<&str, &std::path::PathBuf> = desired
+        .iter()
+        .map(|(track, dest, _)| (track.content_hash.as_str(), dest))
+        .collect();
     let results = download_tracks(
         &node,
         &download_tracks_only,
-        &output_canon,
         &http,
         |_track| format_owned,
+        |track, _ext| planned_dest[track.content_hash.as_str()].clone(),
     );
 
     let fail_count = results
@@ -4208,171 +4408,9 @@ fn handle_rekordbox_export(
 // Rekordbox Import
 // =============================================================================
 
-/// Remembers the first library lookup failure.
-///
-/// [`TrackLookup`] is infallible, so a failed search cannot be returned from
-/// the lookup itself. Treating it as "not in library" would let an import
-/// overwrite a good playlist with a partial one, so callers must check
-/// [`LookupErrors::take`] after matching and abort.
-#[derive(Default)]
-struct LookupErrors(std::cell::RefCell<Option<String>>);
-
-impl LookupErrors {
-    fn record(&self, message: String) {
-        let mut slot = self.0.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(message);
-        }
-    }
-
-    fn take(&self) -> Option<String> {
-        self.0.borrow_mut().take()
-    }
-}
-
-struct LibraryTrackLookup<'a> {
-    library: &'a LibraryBackend,
-    errors: LookupErrors,
-}
-
-impl<'a> LibraryTrackLookup<'a> {
-    fn new(library: &'a LibraryBackend) -> Self {
-        Self {
-            library,
-            errors: LookupErrors::default(),
-        }
-    }
-
-    /// Fail if any lookup errored; the import must stop before writing.
-    fn check(&self) -> Result<()> {
-        match self.errors.take() {
-            None => Ok(()),
-            Some(e) => Err(color_eyre::eyre::eyre!(
-                "Library lookup failed: {}. Aborting before anything was written.",
-                e
-            )),
-        }
-    }
-}
-
-impl TrackLookup for LibraryTrackLookup<'_> {
-    fn find_by_isrc(&self, _isrc: &str) -> Vec<ContentHash> {
-        // TODO: ISRC search is not available via TrackQuery — no ISRC field in library_search.
-        // HasFact could be used but returns bool, not ContentHash.
-        // For now, return empty and rely on artist+title matching.
-        vec![]
-    }
-
-    fn find_by_artist_title(&self, artist: &str, title: &str) -> Vec<(ContentHash, Option<u32>)> {
-        use library_search::StringQuery;
-
-        let query = TrackQuery {
-            artist: Some(StringQuery::Contains(artist.to_string())),
-            title: Some(StringQuery::Contains(title.to_string())),
-            ..Default::default()
-        };
-
-        match self.library.search(&query) {
-            Ok(tracks) => tracks
-                .into_iter()
-                .map(|t| {
-                    let duration = t.duration.map(|d| d.value());
-                    (t.content_hash, duration)
-                })
-                .collect(),
-            Err(e) => {
-                self.errors.record(e.to_string());
-                vec![]
-            }
-        }
-    }
-}
-
-/// Minimal seam for the rekordbox playlist-write path.
-///
-/// Only the three operations used by `write_playlist` are required;
-/// this keeps the test fake minimal while locking the canonical-format invariant.
-trait PlaylistWriteOps {
-    /// Resolve content hashes to canonical playlist content.
-    fn resolve_and_format_playlist(
-        &self,
-        hashes: &[ContentHash],
-    ) -> Result<String, library_ipc_client::ClientError>;
-    /// Create a new playlist with pre-formatted content. Fails if already exists.
-    fn playlist_new(
-        &self,
-        name: &library_ipc_client::PlaylistName,
-        content: String,
-    ) -> Result<(), library_ipc_client::ClientError>;
-    /// Replace an existing playlist with pre-formatted content.
-    fn playlist_replace(
-        &self,
-        name: &library_ipc_client::PlaylistName,
-        content: String,
-    ) -> Result<(), library_ipc_client::ClientError>;
-}
-
-impl PlaylistWriteOps for LibraryBackend {
-    fn resolve_and_format_playlist(
-        &self,
-        hashes: &[ContentHash],
-    ) -> Result<String, library_ipc_client::ClientError> {
-        self.resolve_and_format_playlist(hashes)
-    }
-
-    fn playlist_new(
-        &self,
-        name: &library_ipc_client::PlaylistName,
-        content: String,
-    ) -> Result<(), library_ipc_client::ClientError> {
-        self.playlist_new(name, content)
-    }
-
-    fn playlist_replace(
-        &self,
-        name: &library_ipc_client::PlaylistName,
-        content: String,
-    ) -> Result<(), library_ipc_client::ClientError> {
-        self.playlist_replace(name, content)
-    }
-}
-
-/// Write a single named playlist via the [`PlaylistWriteOps`] seam.
-///
-/// Formats the hashes as canonical content, then calls `playlist_new`.
-/// Falls back to `playlist_replace` only if the playlist already exists;
-/// any other error is returned as-is.
-/// Returns `Ok(true)` when created, `Ok(false)` when replaced.
-fn write_playlist(
-    backend: &dyn PlaylistWriteOps,
-    name: &library_ipc_client::PlaylistName,
-    hashes: &[ContentHash],
-) -> Result<bool, library_ipc_client::ClientError> {
-    use library_ipc_client::{ClientError, ProtocolError};
-
-    let content = backend.resolve_and_format_playlist(hashes)?;
-    match backend.playlist_new(name, content.clone()) {
-        Ok(()) => Ok(true),
-        Err(ClientError::Protocol(ProtocolError::PlaylistAlreadyExists { .. })) => {
-            backend.playlist_replace(name, content)?;
-            Ok(false)
-        }
-        Err(e) => Err(e),
-    }
-}
-
 /// Report the outcome of [`write_playlist`], warning after a replace.
 fn print_write_outcome(name: &str, track_count: usize, created: bool) {
-    if created {
-        println!("Created playlist '{}' with {} tracks", name, track_count);
-    } else {
-        println!("Replaced playlist '{}' with {} tracks", name, track_count);
-        println!(
-            "Note: re-running this import replaces playlist '{}' again, \
-             including any manual edits.",
-            name
-        );
-    }
+    println!("{}", format_write_outcome(name, track_count, created));
 }
 
 /// Sanitise a user-supplied playlist name for `flag`, exiting if nothing is left.
@@ -4392,226 +4430,12 @@ fn sanitized_name_or_exit(raw: &str, flag: &str) -> String {
     sanitized
 }
 
-/// Sanitise a free-form name into a playlist name: every character outside
-/// `[a-zA-Z0-9_-]` becomes `-`, then leading/trailing `-` are trimmed.
-/// The result may be empty; callers decide how to handle that.
-fn sanitize_playlist_name(raw: &str) -> String {
-    raw.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string()
-}
-
 // =============================================================================
 // Source playlist import (mdma bandcamp import-playlist)
 // =============================================================================
 
 /// Name of the source service the `mdma bandcamp` commands talk to.
 const BANDCAMP_SOURCE: &str = "bandcamp";
-
-/// Result of matching one source playlist track against the library.
-#[derive(Debug, Clone, PartialEq)]
-enum TrackOutcome {
-    Matched(ContentHash),
-    Ambiguous(Vec<ContentHash>),
-    /// Artist and title match but every library duration is outside the
-    /// matcher's tolerance: probably a different version (e.g. a radio edit).
-    /// Never written to the playlist.
-    DurationMismatch {
-        hash: ContentHash,
-        library_secs: u32,
-        source_secs: u32,
-    },
-    Missing,
-}
-
-/// Match every playlist track, preserving source order.
-fn match_source_playlist(
-    tracks: &[source_protocol::SourcePlaylistTrack],
-    lookup: &impl TrackLookup,
-) -> Vec<TrackOutcome> {
-    tracks
-        .iter()
-        .map(|t| {
-            let candidate = CandidateTrack {
-                isrc: None,
-                artist: Some(t.artist.clone()).filter(|s| !s.is_empty()),
-                title: Some(t.title.clone()).filter(|s| !s.is_empty()),
-                duration_secs: if t.duration_secs > 0.0 {
-                    Some(t.duration_secs.round() as u32)
-                } else {
-                    None
-                },
-            };
-            match track_matcher::match_track(&candidate, lookup) {
-                MatchResult::Definitive(hash, MatchConfidence::ArtistTitleOnly) => {
-                    match candidate.duration_secs {
-                        Some(source_secs) => {
-                            definitive_with_duration(&candidate, hash, source_secs, lookup)
-                        }
-                        None => TrackOutcome::Matched(hash),
-                    }
-                }
-                MatchResult::Definitive(hash, _) => TrackOutcome::Matched(hash),
-                MatchResult::Ambiguous(hashes, _) => TrackOutcome::Ambiguous(hashes),
-                MatchResult::NoMatch => TrackOutcome::Missing,
-            }
-        })
-        .collect()
-}
-
-/// The matcher fell back to artist+title although the source has a duration,
-/// so the duration filter removed every candidate: the library version
-/// differs. Look up the library duration to report it.
-fn definitive_with_duration(
-    candidate: &CandidateTrack,
-    hash: ContentHash,
-    source_secs: u32,
-    lookup: &impl TrackLookup,
-) -> TrackOutcome {
-    let (Some(artist), Some(title)) = (&candidate.artist, &candidate.title) else {
-        return TrackOutcome::Matched(hash);
-    };
-    let library_secs = lookup
-        .find_by_artist_title(
-            &track_matcher::normalize(artist),
-            &track_matcher::normalize(title),
-        )
-        .into_iter()
-        .find(|(h, _)| *h == hash)
-        .and_then(|(_, d)| d);
-    match library_secs {
-        Some(library_secs) => TrackOutcome::DurationMismatch {
-            hash,
-            library_secs,
-            source_secs,
-        },
-        // Cannot tell how it differs: do not write it silently.
-        None => TrackOutcome::Ambiguous(vec![hash]),
-    }
-}
-
-/// `m:ss` for a number of seconds.
-fn format_mmss(secs: u32) -> String {
-    format!("{}:{:02}", secs / 60, secs % 60)
-}
-
-/// Warning line when fewer tracks were fetched than the playlist reports.
-fn truncation_warning(fetched: usize, total: u32) -> Option<String> {
-    (fetched != total as usize).then(|| {
-        format!(
-            "Warning: fetched {} of {} tracks; playlist may be incomplete",
-            fetched, total
-        )
-    })
-}
-
-/// Content hashes of the definitive matches, in playlist order.
-fn matched_hashes(outcomes: &[TrackOutcome]) -> Vec<ContentHash> {
-    outcomes
-        .iter()
-        .filter_map(|o| match o {
-            TrackOutcome::Matched(h) => Some(h.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Render the numbered per-track report plus the summary line.
-fn format_import_report(
-    tracks: &[source_protocol::SourcePlaylistTrack],
-    outcomes: &[TrackOutcome],
-) -> String {
-    use std::fmt::Write;
-
-    let mut out = String::new();
-    let (mut matched, mut ambiguous, mut missing) = (0, 0, 0);
-    for (t, outcome) in tracks.iter().zip(outcomes) {
-        let label = format!("{} - {}", t.artist, t.title);
-        match outcome {
-            TrackOutcome::Matched(_) => {
-                matched += 1;
-                let _ = writeln!(out, "{:3}. ✓ matched        {}", t.position, label);
-            }
-            TrackOutcome::Ambiguous(hashes) => {
-                ambiguous += 1;
-                let _ = writeln!(out, "{:3}. ? ambiguous      {}", t.position, label);
-                for h in hashes.iter().take(3) {
-                    let _ = writeln!(
-                        out,
-                        "         candidate: {}",
-                        &h.as_str()[..h.as_str().len().min(16)]
-                    );
-                }
-            }
-            TrackOutcome::DurationMismatch {
-                hash,
-                library_secs,
-                source_secs,
-            } => {
-                ambiguous += 1;
-                let _ = writeln!(
-                    out,
-                    "{:3}. ? duration differs (library {} vs bandcamp {}) {}",
-                    t.position,
-                    format_mmss(*library_secs),
-                    format_mmss(*source_secs),
-                    label
-                );
-                let _ = writeln!(
-                    out,
-                    "         candidate: {}",
-                    &hash.as_str()[..hash.as_str().len().min(16)]
-                );
-            }
-            TrackOutcome::Missing => {
-                missing += 1;
-                let note = if t.owned { "" } else { " (not owned)" };
-                let _ = writeln!(out, "{:3}. ✗ not in library {}{}", t.position, label, note);
-            }
-        }
-    }
-    let _ = write!(
-        out,
-        "{} matched, {} ambiguous, {} missing of {}",
-        matched,
-        ambiguous,
-        missing,
-        tracks.len()
-    );
-    out
-}
-
-/// Last non-empty path segment of a URL, or the input itself when it is a slug.
-///
-/// Deliberately duplicates `bandcamp_api::slug_from_url`: the CLI is
-/// source-agnostic and must not depend on a source-specific crate.
-fn slug_from_playlist_arg(arg: &str) -> &str {
-    arg.split(['?', '#'])
-        .next()
-        .unwrap_or(arg)
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or(arg)
-}
-
-/// Default MDMA playlist name: sanitised title, else sanitised slug.
-fn default_import_name(title: &str, slug_or_url: &str) -> String {
-    let from_title = sanitize_playlist_name(title);
-    if from_title.is_empty() {
-        sanitize_playlist_name(slug_from_playlist_arg(slug_or_url))
-    } else {
-        from_title
-    }
-}
 
 fn handle_bandcamp_playlists(client: &SourceClient) -> Result<()> {
     match client.request(BANDCAMP_SOURCE, &SourceRequest::ListPlaylists) {
@@ -4653,84 +4477,241 @@ fn handle_bandcamp_playlists(client: &SourceClient) -> Result<()> {
     }
 }
 
+/// Message for a refused import: another job holds the single import slot.
+fn import_not_started_message(running_job_id: u64) -> String {
+    format!(
+        "Import NOT started: job {} is already running (see 'mdma bandcamp import-status')",
+        running_job_id
+    )
+}
+
 fn handle_bandcamp_import_playlist(
     client: &SourceClient,
-    library: &LibraryBackend,
     playlist: &str,
     name: &Option<String>,
     dry_run: bool,
+    no_wait: bool,
 ) -> Result<()> {
-    // Validate --name before spending time on the network fetch
+    // Validate --name before talking to the server
     let explicit_name = name.as_deref().map(|n| sanitized_name_or_exit(n, "--name"));
 
-    let pl = match client.request(
+    let job_id = match client.request(
         BANDCAMP_SOURCE,
-        &SourceRequest::GetPlaylist {
+        &SourceRequest::ImportPlaylist {
             playlist: playlist.to_string(),
+            name: explicit_name,
+            dry_run,
         },
     ) {
-        Ok(SourceResponse::Playlist(pl)) => pl,
-        Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
+        Ok(SourceResponse::ImportStarted { job_id }) => {
+            println!("Import started (job {})", job_id);
+            job_id
+        }
+        Ok(SourceResponse::Error(SourceError::ImportInProgress { job_id })) => {
+            // The running job may be a different playlist or a dry run, so
+            // following it would report someone else's result as ours.
+            eprintln!("{}", import_not_started_message(job_id));
+            std::process::exit(1);
+        }
+        Ok(SourceResponse::Error(e)) => handle_source_error(&e),
         Ok(_) => handle_source_error(&"Unexpected response"),
         Err(e) => handle_source_error(&e),
     };
 
-    let sanitized = match explicit_name {
-        Some(s) => s,
-        None => {
-            let s = default_import_name(&pl.title, playlist);
-            if s.is_empty() {
+    if no_wait {
+        println!("Check progress with 'mdma bandcamp import-status'");
+        return Ok(());
+    }
+    follow_import_job(client, job_id)
+}
+
+fn handle_bandcamp_import_status(client: &SourceClient) -> Result<()> {
+    match client.request(BANDCAMP_SOURCE, &SourceRequest::GetImportStatus) {
+        Ok(SourceResponse::ImportStatus(None)) => {
+            println!("No import job");
+            Ok(())
+        }
+        Ok(SourceResponse::ImportStatus(Some(status))) => {
+            if is_terminal_phase(&status.phase) {
+                finish_import(&status)
+            } else {
+                println!("Import job {} is running", status.job_id);
+                follow_import_job(client, status.job_id)
+            }
+        }
+        Ok(SourceResponse::Error(e)) => handle_source_error(&e),
+        Ok(_) => handle_source_error(&"Unexpected response"),
+        Err(e) => handle_source_error(&e),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Import job polling
+// -----------------------------------------------------------------------------
+
+const IMPORT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Consecutive failed polls tolerated before giving up (about a minute).
+const IMPORT_POLL_MAX_FAILURES: u32 = 30;
+
+fn is_terminal_phase(phase: &ImportPhase) -> bool {
+    matches!(phase, ImportPhase::Done(_) | ImportPhase::Failed { .. })
+}
+
+fn import_phase_line(phase: &ImportPhase) -> &'static str {
+    match phase {
+        ImportPhase::Fetching => "Fetching playlist...",
+        ImportPhase::Matching => "Matching tracks against the library...",
+        ImportPhase::Syncing => {
+            "Syncing Bandcamp collection (missing tracks found), waiting for downloads..."
+        }
+        ImportPhase::Rematching => "Matching tracks again after downloads...",
+        ImportPhase::Writing => "Writing playlist...",
+        ImportPhase::Done(_) => "Import finished",
+        ImportPhase::Failed { .. } => "Import failed",
+    }
+}
+
+/// What one poll attempt produced.
+enum PollInput {
+    /// The server answered with its current/last job status.
+    Status(Option<ImportJobStatus>),
+    /// Request failed, timed out, or got an unusable answer.
+    Failure,
+}
+
+/// What the poll loop should do next.
+#[derive(Debug, PartialEq)]
+enum PollFlow {
+    Continue,
+    /// The awaited job reached Done or Failed.
+    Finished(Box<ImportJobStatus>),
+    /// Too many consecutive failures.
+    GiveUp,
+}
+
+#[derive(Debug, PartialEq)]
+struct PollStep {
+    /// Progress lines to print, in order.
+    lines: Vec<String>,
+    flow: PollFlow,
+}
+
+/// Pure state machine behind the import poll loop (no I/O).
+struct ImportPoller {
+    job_id: u64,
+    last_phase: Option<ImportPhase>,
+    last_sync: Option<ImportSyncProgress>,
+    failures: u32,
+}
+
+impl ImportPoller {
+    fn new(job_id: u64) -> Self {
+        Self {
+            job_id,
+            last_phase: None,
+            last_sync: None,
+            failures: 0,
+        }
+    }
+
+    /// A miss counts as a failure: failed requests, no job, or a status for
+    /// a different job (which is otherwise ignored).
+    fn miss(&mut self) -> PollStep {
+        self.failures += 1;
+        let flow = if self.failures >= IMPORT_POLL_MAX_FAILURES {
+            PollFlow::GiveUp
+        } else {
+            PollFlow::Continue
+        };
+        PollStep {
+            lines: Vec::new(),
+            flow,
+        }
+    }
+
+    fn step(&mut self, input: PollInput) -> PollStep {
+        let status = match input {
+            PollInput::Status(Some(s)) if s.job_id == self.job_id => s,
+            PollInput::Status(_) | PollInput::Failure => return self.miss(),
+        };
+        self.failures = 0;
+
+        let mut lines = Vec::new();
+        if self.last_phase.as_ref() != Some(&status.phase) {
+            lines.push(import_phase_line(&status.phase).to_string());
+            self.last_phase = Some(status.phase.clone());
+        }
+        if status.phase == ImportPhase::Syncing {
+            if let Some(sync) = &status.sync {
+                if self.last_sync.as_ref() != Some(sync) {
+                    lines.push(format!(
+                        "downloads: {}/{} (failed {})",
+                        sync.completed, sync.queued, sync.failed
+                    ));
+                    self.last_sync = Some(sync.clone());
+                }
+            }
+        }
+
+        let flow = if is_terminal_phase(&status.phase) {
+            PollFlow::Finished(Box::new(status))
+        } else {
+            PollFlow::Continue
+        };
+        PollStep { lines, flow }
+    }
+}
+
+/// Print the final report; exit non-zero when the job failed.
+fn finish_import(status: &ImportJobStatus) -> Result<()> {
+    let report = format_import_status(status);
+    if matches!(status.phase, ImportPhase::Failed { .. }) {
+        eprintln!("{}", report);
+        std::process::exit(1);
+    }
+    println!("{}", report);
+    Ok(())
+}
+
+/// Poll the server until `job_id` finishes, then print its report.
+fn follow_import_job(client: &SourceClient, job_id: u64) -> Result<()> {
+    let mut poller = ImportPoller::new(job_id);
+    let mut last_error: Option<String> = None;
+    loop {
+        let input = match client.request(BANDCAMP_SOURCE, &SourceRequest::GetImportStatus) {
+            Ok(SourceResponse::ImportStatus(s)) => PollInput::Status(s),
+            Ok(SourceResponse::Error(e)) => {
+                last_error = Some(e.to_string());
+                PollInput::Failure
+            }
+            Ok(_) => {
+                last_error = Some("Unexpected response".to_string());
+                PollInput::Failure
+            }
+            Err(e) => {
+                last_error = Some(e.to_string());
+                PollInput::Failure
+            }
+        };
+        let step = poller.step(input);
+        for line in &step.lines {
+            println!("{}", line);
+        }
+        match step.flow {
+            PollFlow::Continue => std::thread::sleep(IMPORT_POLL_INTERVAL),
+            PollFlow::Finished(status) => return finish_import(&status),
+            PollFlow::GiveUp => {
                 eprintln!(
-                    "Cannot derive a playlist name from '{}'; use --name",
-                    pl.title
+                    "Lost contact with the import job {} ({}); \
+                     check later with 'mdma bandcamp import-status'",
+                    job_id,
+                    last_error.unwrap_or_else(|| "no status for the job".to_string())
                 );
                 std::process::exit(1);
             }
-            s
         }
-    };
-
-    let lookup = LibraryTrackLookup::new(library);
-    let outcomes = match_source_playlist(&pl.tracks, &lookup);
-    lookup.check()?;
-
-    println!(
-        "Playlist '{}' ({} of {} tracks)",
-        pl.title,
-        pl.tracks.len(),
-        pl.total_count
-    );
-    if let Some(warning) = truncation_warning(pl.tracks.len(), pl.total_count) {
-        eprintln!("{}", warning);
     }
-    println!("{}", format_import_report(&pl.tracks, &outcomes));
-
-    let hashes = matched_hashes(&outcomes);
-    if dry_run {
-        println!(
-            "[dry-run] Would write playlist '{}' with {} tracks",
-            sanitized,
-            hashes.len()
-        );
-    } else if hashes.is_empty() {
-        println!(
-            "No definitive matches; playlist '{}' not written",
-            sanitized
-        );
-    } else {
-        let pname = parse_playlist_name(&sanitized);
-        let created = write_playlist(library, &pname, &hashes)
-            .map_err(|e| color_eyre::eyre::eyre!("Failed to write playlist: {}", e))?;
-        print_write_outcome(&sanitized, hashes.len(), created);
-    }
-
-    if outcomes.iter().any(|o| matches!(o, TrackOutcome::Missing)) {
-        println!(
-            "Some tracks are missing from the library; run 'mdma source sync {}' to download them.",
-            BANDCAMP_SOURCE
-        );
-    }
-    Ok(())
 }
 
 fn handle_rekordbox_import(
@@ -4758,7 +4739,7 @@ fn handle_rekordbox_import(
     }
 
     // 2. Create lookup and match tracks
-    let lookup = LibraryTrackLookup::new(library);
+    let lookup = LibraryTrackLookup::new(|q| library.search(q));
 
     let mut matched: Vec<(&RekordboxTrack, ContentHash)> = Vec::new();
     let mut ambiguous: Vec<(&RekordboxTrack, Vec<ContentHash>)> = Vec::new();
@@ -5125,14 +5106,20 @@ fn handle_export(
 
     let http = build_http_client(&node, node_ip)?;
 
-    let results = download_tracks(&node, &tracks, output, &http, |track| {
-        resolve_export_format(
-            track.blob_path.as_deref(),
-            format,
-            lossless_format,
-            lossy_format,
-        )
-    });
+    let results = download_tracks(
+        &node,
+        &tracks,
+        &http,
+        |track| {
+            resolve_export_format(
+                track.blob_path.as_deref(),
+                format,
+                lossless_format,
+                lossy_format,
+            )
+        },
+        |track, ext| export_dest_path(output, track, ext),
+    );
 
     // Summary
     let success_count = results
@@ -5488,21 +5475,28 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::Bandcamp { command } => {
-            let client =
-                connect_source_or_exit(&cli, BANDCAMP_SOURCE, Some(BANDCAMP_REQUEST_TIMEOUT));
-            match command {
-                BandcampCommands::Playlists => handle_bandcamp_playlists(&client),
-                BandcampCommands::ImportPlaylist {
-                    playlist,
-                    name,
-                    dry_run,
-                } => {
-                    let lib = connect_library(&cli);
-                    handle_bandcamp_import_playlist(&client, &lib, playlist, name, *dry_run)
-                }
+        Commands::Bandcamp { command } => match command {
+            BandcampCommands::Playlists => {
+                let client =
+                    connect_source_or_exit(&cli, BANDCAMP_SOURCE, Some(BANDCAMP_REQUEST_TIMEOUT));
+                handle_bandcamp_playlists(&client)
             }
-        }
+            // Import requests return immediately (the job runs server-side),
+            // so the default request timeout is enough for start and polls.
+            BandcampCommands::ImportPlaylist {
+                playlist,
+                name,
+                dry_run,
+                no_wait,
+            } => {
+                let client = connect_source(&cli, BANDCAMP_SOURCE);
+                handle_bandcamp_import_playlist(&client, playlist, name, *dry_run, *no_wait)
+            }
+            BandcampCommands::ImportStatus => {
+                let client = connect_source(&cli, BANDCAMP_SOURCE);
+                handle_bandcamp_import_status(&client)
+            }
+        },
 
         Commands::Source { command } => match command {
             SourceCommands::List => handle_source_list(&cli),
@@ -5810,6 +5804,138 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use source_protocol::ImportResult;
+
+    fn job(job_id: u64, phase: ImportPhase, sync: Option<(u32, u32, u32)>) -> ImportJobStatus {
+        ImportJobStatus {
+            job_id,
+            dry_run: false,
+            playlist_title: None,
+            target_name: None,
+            total_count: None,
+            phase,
+            tracks: vec![],
+            sync: sync.map(|(queued, completed, failed)| ImportSyncProgress {
+                queued,
+                completed,
+                failed,
+                ended: None,
+            }),
+        }
+    }
+
+    fn done() -> ImportPhase {
+        ImportPhase::Done(ImportResult::NothingMatched)
+    }
+
+    #[test]
+    fn refused_import_message_says_not_started_and_names_the_running_job() {
+        assert_eq!(
+            import_not_started_message(7),
+            "Import NOT started: job 7 is already running (see 'mdma bandcamp import-status')"
+        );
+    }
+
+    #[test]
+    fn syncing_phase_line_says_a_full_collection_sync_runs() {
+        let line = import_phase_line(&ImportPhase::Syncing);
+        assert!(line.contains("Syncing Bandcamp collection"), "got: {line}");
+        assert!(line.contains("missing tracks found"), "got: {line}");
+    }
+
+    #[test]
+    fn done_with_any_result_is_terminal() {
+        assert!(is_terminal_phase(&ImportPhase::Done(
+            ImportResult::DryRun { would_write: 1 }
+        )));
+        assert!(is_terminal_phase(&done()));
+        assert!(!is_terminal_phase(&ImportPhase::Writing));
+    }
+
+    fn status_input(s: ImportJobStatus) -> PollInput {
+        PollInput::Status(Some(s))
+    }
+
+    #[test]
+    fn poller_prints_line_only_on_phase_change() {
+        let mut p = ImportPoller::new(1);
+        let s1 = p.step(status_input(job(1, ImportPhase::Fetching, None)));
+        assert_eq!(s1.lines, vec!["Fetching playlist...".to_string()]);
+        assert_eq!(s1.flow, PollFlow::Continue);
+        let s2 = p.step(status_input(job(1, ImportPhase::Fetching, None)));
+        assert!(s2.lines.is_empty());
+        let s3 = p.step(status_input(job(1, ImportPhase::Matching, None)));
+        assert_eq!(s3.lines.len(), 1);
+    }
+
+    #[test]
+    fn poller_prints_download_progress_only_when_it_changes() {
+        let mut p = ImportPoller::new(1);
+        let a = p.step(status_input(job(1, ImportPhase::Syncing, Some((5, 1, 0)))));
+        assert_eq!(a.lines.len(), 2);
+        assert_eq!(a.lines[1], "downloads: 1/5 (failed 0)");
+        let b = p.step(status_input(job(1, ImportPhase::Syncing, Some((5, 1, 0)))));
+        assert!(b.lines.is_empty());
+        let c = p.step(status_input(job(1, ImportPhase::Syncing, Some((5, 3, 1)))));
+        assert_eq!(c.lines, vec!["downloads: 3/5 (failed 1)".to_string()]);
+    }
+
+    #[test]
+    fn poller_finishes_on_done_and_failed() {
+        let mut p = ImportPoller::new(1);
+        let done = job(1, done(), None);
+        let step = p.step(status_input(done.clone()));
+        assert_eq!(step.flow, PollFlow::Finished(Box::new(done)));
+
+        let mut p = ImportPoller::new(1);
+        let failed = job(
+            1,
+            ImportPhase::Failed {
+                message: "x".into(),
+            },
+            None,
+        );
+        let step = p.step(status_input(failed.clone()));
+        assert_eq!(step.flow, PollFlow::Finished(Box::new(failed)));
+    }
+
+    #[test]
+    fn poller_ignores_other_jobs_status() {
+        let mut p = ImportPoller::new(1);
+        let step = p.step(status_input(job(2, done(), None)));
+        assert_eq!(step.flow, PollFlow::Continue);
+        assert!(step.lines.is_empty());
+    }
+
+    #[test]
+    fn poller_gives_up_after_consecutive_failures() {
+        let mut p = ImportPoller::new(1);
+        for _ in 0..IMPORT_POLL_MAX_FAILURES - 1 {
+            assert_eq!(p.step(PollInput::Failure).flow, PollFlow::Continue);
+        }
+        assert_eq!(p.step(PollInput::Failure).flow, PollFlow::GiveUp);
+    }
+
+    #[test]
+    fn poller_success_resets_failure_count() {
+        let mut p = ImportPoller::new(1);
+        for _ in 0..IMPORT_POLL_MAX_FAILURES - 1 {
+            p.step(PollInput::Failure);
+        }
+        p.step(status_input(job(1, ImportPhase::Matching, None)));
+        for _ in 0..IMPORT_POLL_MAX_FAILURES - 1 {
+            assert_eq!(p.step(PollInput::Failure).flow, PollFlow::Continue);
+        }
+    }
+
+    #[test]
+    fn poller_counts_missing_job_as_failure() {
+        let mut p = ImportPoller::new(1);
+        for _ in 0..IMPORT_POLL_MAX_FAILURES - 1 {
+            p.step(PollInput::Status(None));
+        }
+        assert_eq!(p.step(PollInput::Status(None)).flow, PollFlow::GiveUp);
+    }
 
     /// Derive the command gateway address from an MDMA node hostname.
     /// The gateway is always at port 5555.
@@ -6329,6 +6455,256 @@ mod tests {
             path,
             std::path::PathBuf::from("/out/Art_ist_Name/Album____Name/Track _Remix_.aiff")
         );
+    }
+
+    // ── export_dest_path length limits ───────────────────────────────────────
+
+    fn rel_components(output: &std::path::Path, path: &std::path::Path) -> Vec<String> {
+        path.strip_prefix(output)
+            .unwrap()
+            .components()
+            .map(|c| c.as_os_str().to_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn assert_clean_name(name: &str) {
+        assert!(!name.ends_with('.'), "trailing dot in {name:?}");
+        assert!(!name.ends_with(' '), "trailing space in {name:?}");
+    }
+
+    #[test]
+    fn export_dest_path_caps_long_ascii_title_and_keeps_extension() {
+        let title = "a".repeat(300);
+        let track = make_track_full("Artist", "Album", &title, "x.flac");
+        let out = std::path::Path::new("/out");
+        let path = export_dest_path(out, &track, "flac");
+        let comps = rel_components(out, &path);
+        assert_eq!(comps.len(), 3);
+        assert!(comps[2].len() <= 180, "file name {} bytes", comps[2].len());
+        assert!(comps[2].ends_with(".flac"));
+        assert_clean_name(&comps[2]);
+    }
+
+    #[test]
+    fn export_dest_path_truncates_multibyte_on_char_boundary() {
+        for ch in ["å", "ä", "漢"] {
+            let title = ch.repeat(300);
+            let track = make_track_full("Artist", "Album", &title, "x.mp3");
+            let out = std::path::Path::new("/out");
+            let path = export_dest_path(out, &track, "mp3");
+            let comps = rel_components(out, &path);
+            assert!(comps[2].len() <= 180);
+            assert!(comps[2].ends_with(".mp3"));
+            assert!(comps[2].starts_with(ch));
+        }
+    }
+
+    #[test]
+    fn export_dest_path_caps_long_directories() {
+        let long = "b".repeat(300);
+        let track = make_track_full(&long, &long, "T", "x.flac");
+        let out = std::path::Path::new("/out");
+        let path = export_dest_path(out, &track, "flac");
+        let comps = rel_components(out, &path);
+        assert!(comps[0].len() <= 120);
+        assert!(comps[1].len() <= 120);
+        assert_eq!(comps[2], "T.flac");
+    }
+
+    #[test]
+    fn export_dest_path_total_relative_length_is_bounded() {
+        let long = "c".repeat(300);
+        let track = make_track_full(&long, &long, &long, "x.flac");
+        let out = std::path::Path::new("/out");
+        let path = export_dest_path(out, &track, "flac");
+        let full = path.to_str().unwrap();
+        assert!(
+            location_cost(full) <= MAX_LOCATION_URI_BYTES,
+            "path {} bytes",
+            location_cost(full)
+        );
+        assert!(full.ends_with(".flac"));
+    }
+
+    #[test]
+    fn export_dest_path_long_output_dir_shrinks_title_first() {
+        let out_dir = format!("/{}", "o".repeat(150));
+        let out = std::path::Path::new(&out_dir);
+        let track = make_track_full("Artist Name", "Album Name", &"t".repeat(100), "x");
+        let (path, fits) = export_dest_path_checked(out, &track, "flac", &no_existing());
+        assert!(fits);
+        let full = path.to_str().unwrap();
+        assert!(location_cost(full) <= MAX_LOCATION_URI_BYTES);
+        let comps = rel_components(out, &path);
+        assert_eq!(comps[0], "Artist Name");
+        assert_eq!(comps[1], "Album Name");
+        assert!(comps[2].len() < 100 && comps[2].ends_with(".flac"));
+    }
+
+    #[test]
+    fn export_dest_path_reports_when_output_dir_leaves_no_room() {
+        let out_dir = format!("/{}", "o".repeat(240));
+        let out = std::path::Path::new(&out_dir);
+        let track = make_track_full("Artist", "Album", "Title", "x");
+        let (_, fits) = export_dest_path_checked(out, &track, "flac", &no_existing());
+        assert!(!fits);
+    }
+
+    fn no_existing() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
+    #[test]
+    fn export_dest_path_counts_non_ascii_by_utf8_bytes() {
+        // 60 CJK chars = 180 UTF-8 bytes (CJK does not decompose); with
+        // ".flac" that exceeds the 180-byte file name cap, so it is shortened.
+        let title = "漢".repeat(60);
+        let track = make_track_full("A", "B", &title, "x");
+        let out = std::path::Path::new("/out");
+        let path = export_dest_path(out, &track, "flac");
+        assert_ne!(path, out.join("A").join("B").join(format!("{title}.flac")));
+        assert!(location_cost(path.to_str().unwrap()) <= MAX_LOCATION_URI_BYTES);
+    }
+
+    #[test]
+    fn path_cost_measures_nfd_exactly() {
+        // é (precomposed) is 2 bytes in NFC but 3 in NFD (e + U+0301).
+        assert_eq!(path_cost("é"), 3);
+        // Hangul syllable: 3 bytes NFC, 3 jamo x 3 bytes = 9 in NFD.
+        assert_eq!(path_cost("한"), 9);
+        assert_eq!(path_cost("abc"), 3);
+    }
+
+    #[test]
+    fn export_dest_path_latin_accents_under_nfd_budget_are_not_shortened() {
+        // 35 x é = 105 bytes NFD per component. Whole Location is
+        // 16 + 4 + 2 + 1 + 105 + 1 + 105 + 5 = 239 <= 250. The old 3x rule
+        // (210 bytes per component) would have renamed this.
+        let accented = "é".repeat(35);
+        let track = make_track_full("A", &accented, &accented, "x");
+        let out = std::path::Path::new("/out");
+        let (path, fits) = export_dest_path_checked(out, &track, "flac", &no_existing());
+        assert!(fits);
+        assert_eq!(
+            path,
+            out.join("A")
+                .join(&accented)
+                .join(format!("{accented}.flac"))
+        );
+    }
+
+    #[test]
+    fn export_dest_path_counts_spaces_as_encoded_bytes() {
+        // Each component: 20 x "x " + "y" = 41 raw bytes, 81 encoded (space is
+        // %20). Raw path is ~135 bytes, but the encoded Location is 271 > 250.
+        let part = format!("{}y", "x ".repeat(20));
+        let track = make_track_full(&part, &part, &part, "x");
+        let out = std::path::Path::new("/out");
+        let unshortened = out.join(&part).join(&part).join(format!("{part}.flac"));
+        let (path, fits) = export_dest_path_checked(out, &track, "flac", &no_existing());
+        assert_ne!(path, unshortened);
+        assert!(fits);
+        assert!(
+            rekordbox_xml::path_to_file_uri(&path).len() <= MAX_LOCATION_URI_BYTES,
+            "encoded location too long"
+        );
+    }
+
+    #[test]
+    fn export_dest_path_grandfathers_nfd_location_for_nfc_metadata() {
+        use unicode_normalization::UnicodeNormalization;
+        // Over-budget accented path; the existing Location was written from an
+        // HFS+ realpath, i.e. NFD, while the track metadata is NFC.
+        let title = "é".repeat(100);
+        let track = make_track_full("Artist", "Album", &title, "x");
+        let out = std::path::Path::new("/out");
+        let unshortened = out
+            .join("Artist")
+            .join("Album")
+            .join(format!("{title}.flac"));
+        let nfd_uri: String = rekordbox_xml::path_to_file_uri(&unshortened)
+            .nfd()
+            .collect();
+        assert_ne!(nfd_uri, rekordbox_xml::path_to_file_uri(&unshortened));
+        let existing: std::collections::HashSet<String> =
+            [location_key(&nfd_uri)].into_iter().collect();
+        let (kept, fits) = export_dest_path_checked(out, &track, "flac", &existing);
+        assert_eq!(kept, unshortened);
+        assert!(fits);
+    }
+
+    #[test]
+    fn export_dest_path_grandfathers_existing_export_entry() {
+        let title = "a".repeat(300);
+        let track = make_track_full("Artist", "Album", &title, "x");
+        let out = std::path::Path::new("/out");
+        let unshortened = out
+            .join("Artist")
+            .join("Album")
+            .join(format!("{title}.flac"));
+        // Without an existing entry the path is shortened.
+        let (shortened, _) = export_dest_path_checked(out, &track, "flac", &no_existing());
+        assert_ne!(shortened, unshortened);
+        // With an existing entry (any case) the unshortened path is kept.
+        let existing: std::collections::HashSet<String> = [location_key(
+            &rekordbox_xml::path_to_file_uri(&unshortened).to_uppercase(),
+        )]
+        .into_iter()
+        .collect();
+        let (kept, fits) = export_dest_path_checked(out, &track, "flac", &existing);
+        assert_eq!(kept, unshortened);
+        assert!(fits);
+        // Another track is unaffected by that entry.
+        let other = make_track_full("Artist", "Album", &"b".repeat(300), "x");
+        let (other_path, _) = export_dest_path_checked(out, &other, "flac", &existing);
+        assert_ne!(
+            other_path,
+            out.join("Artist")
+                .join("Album")
+                .join(format!("{}.flac", "b".repeat(300)))
+        );
+    }
+
+    #[test]
+    fn export_dest_path_trims_trailing_dots_and_spaces_after_truncation() {
+        // Place a space/dot exactly at the truncation point.
+        let out = std::path::Path::new("/out");
+        for n in 30..60 {
+            let t = format!("{}{}{}", "d".repeat(100 + n), ". ".repeat(40), "e");
+            let track2 = make_track_full(&format!("{}. ", "f".repeat(100 + n)), "Album", &t, "x");
+            let comps = rel_components(out, &export_dest_path(out, &track2, "flac"));
+            assert_clean_name(&comps[0]);
+            let stem = comps[2].strip_suffix(".flac").unwrap();
+            assert_clean_name(stem);
+        }
+    }
+
+    #[test]
+    fn export_dest_path_truncated_collisions_are_disambiguated() {
+        let base = "g".repeat(400);
+        let t1 = make_track_full("Artist", "Album", &format!("{base}one"), "x");
+        let t2 = make_track_full("Artist", "Album", &format!("{base}two"), "x");
+        let out = std::path::Path::new("/out");
+        let p1 = export_dest_path(out, &t1, "flac");
+        let p2 = export_dest_path(out, &t2, "flac");
+        assert_ne!(p1, p2);
+        // Deterministic across calls.
+        assert_eq!(p1, export_dest_path(out, &t1, "flac"));
+    }
+
+    #[test]
+    fn export_dest_path_short_paths_are_unchanged() {
+        let track = make_track_full("Björk", "Homogenic", "Jóga ", "x.flac");
+        let out = std::path::Path::new("/out");
+        assert_eq!(
+            export_dest_path(out, &track, "flac"),
+            std::path::PathBuf::from("/out/Björk/Homogenic/Jóga .flac")
+        );
+        // Exactly at the file-name limit stays untouched.
+        let title = "h".repeat(180 - ".flac".len());
+        let track = make_track_full("A", "B", &title, "x");
+        let p = export_dest_path(out, &track, "flac");
+        assert_eq!(p, out.join("A").join("B").join(format!("{title}.flac")));
     }
 
     // ── Shell completions ─────────────────────────────────────────────────────
@@ -6911,487 +7287,6 @@ mod tests {
     fn parse_field_value_recording_date_bad_format() {
         let result = parse_field_value(FactField::RecordingDate, "2024/06/15");
         assert!(result.is_err(), "expected Err for bad date format");
-    }
-
-    // ── rekordbox import playlist format regression ───────────────────────────
-    //
-    // These tests pin the on-disk format produced by the rekordbox import path.
-    // The critical invariant: playlist content must be in the canonical
-    // `{8hash}  {Artist} - {Title}  [{duration}]` format, never a bare hash.
-
-    fn make_rekordbox_track(
-        hash: &str,
-        artist: &str,
-        title: &str,
-        duration_secs: u32,
-    ) -> TrackInfo {
-        use library_ipc_client::{ContentHash, DurationSeconds};
-        TrackInfo {
-            content_hash: ContentHash::new(hash),
-            title: Some(title.to_string()),
-            artist: Some(artist.to_string()),
-            album: None,
-            duration: Some(DurationSeconds::new(duration_secs)),
-            bpm: None,
-            key: None,
-            blob_path: None,
-            cover_art_path: None,
-            track_number: None,
-            disc_number: None,
-            added: None,
-            started: None,
-            stopped: None,
-            memory_cues: vec![],
-            beat_grid: None,
-            role: None,
-            energy: None,
-        }
-    }
-
-    // ── write_playlist real regression tests ─────────────────────────────────
-    //
-    // These tests drive the actual `write_playlist` code path through a
-    // `RecordingFake` that captures the `String` arguments passed to `playlist_new`
-    // and `playlist_replace`.  The canonical-format assertion would fail if anyone
-    // reverted the import code to pass raw `&[ContentHash]` instead of the
-    // formatted content string.
-
-    use std::cell::RefCell;
-
-    struct RecordingFake {
-        /// Pre-canned TrackInfo entries the fake will "resolve" for any hash.
-        tracks: Vec<TrackInfo>,
-        /// `playlist_new` content arguments, in call order.
-        new_calls: RefCell<Vec<String>>,
-        /// `playlist_replace` content arguments, in call order.
-        replace_calls: RefCell<Vec<String>>,
-        /// When `true`, `playlist_new` returns `PlaylistAlreadyExists` so the
-        /// code falls through to `playlist_replace`.
-        force_conflict: bool,
-        /// When `true`, `playlist_new` fails with an unrelated error that must
-        /// NOT trigger the replace fallback.
-        force_other_error: bool,
-        /// When `true`, resolving hashes fails (e.g. a gateway hiccup).
-        force_resolve_error: bool,
-    }
-
-    impl RecordingFake {
-        fn new(tracks: Vec<TrackInfo>) -> Self {
-            Self {
-                tracks,
-                new_calls: RefCell::new(Vec::new()),
-                replace_calls: RefCell::new(Vec::new()),
-                force_conflict: false,
-                force_other_error: false,
-                force_resolve_error: false,
-            }
-        }
-
-        fn with_resolve_error(tracks: Vec<TrackInfo>) -> Self {
-            Self {
-                force_resolve_error: true,
-                ..Self::new(tracks)
-            }
-        }
-
-        fn with_other_error(tracks: Vec<TrackInfo>) -> Self {
-            Self {
-                force_other_error: true,
-                ..Self::new(tracks)
-            }
-        }
-
-        fn with_conflict(tracks: Vec<TrackInfo>) -> Self {
-            Self {
-                force_conflict: true,
-                ..Self::new(tracks)
-            }
-        }
-    }
-
-    impl PlaylistWriteOps for RecordingFake {
-        fn resolve_and_format_playlist(
-            &self,
-            _hashes: &[ContentHash],
-        ) -> Result<String, library_ipc_client::ClientError> {
-            if self.force_resolve_error {
-                return Err(library_ipc_client::ClientError::Protocol(
-                    library_ipc_client::ProtocolError::Internal {
-                        message: "resolve hiccup".to_string(),
-                    },
-                ));
-            }
-            // Produce canonical content from the pre-canned tracks (ignoring hashes
-            // so no actual IPC is needed).
-            Ok(track_formatter::format_playlist_content(&self.tracks))
-        }
-
-        fn playlist_new(
-            &self,
-            _name: &library_ipc_client::PlaylistName,
-            content: String,
-        ) -> Result<(), library_ipc_client::ClientError> {
-            if self.force_conflict {
-                return Err(library_ipc_client::ClientError::Protocol(
-                    library_ipc_client::ProtocolError::PlaylistAlreadyExists {
-                        name: "test".to_string(),
-                    },
-                ));
-            }
-            if self.force_other_error {
-                return Err(library_ipc_client::ClientError::Protocol(
-                    library_ipc_client::ProtocolError::Internal {
-                        message: "disk on fire".to_string(),
-                    },
-                ));
-            }
-            self.new_calls.borrow_mut().push(content);
-            Ok(())
-        }
-
-        fn playlist_replace(
-            &self,
-            _name: &library_ipc_client::PlaylistName,
-            content: String,
-        ) -> Result<(), library_ipc_client::ClientError> {
-            self.replace_calls.borrow_mut().push(content);
-            Ok(())
-        }
-    }
-
-    /// Assert every line of `content` is in canonical `{12hash}  {text}` form.
-    fn assert_all_lines_canonical(content: &str, context: &str) {
-        assert!(!content.is_empty(), "{context}: content must not be empty");
-        for line in content.lines() {
-            // Must not be a bare hash
-            assert!(
-                !line.starts_with("sha256:"),
-                "{context}: line must not be a bare sha256: hash; got: {line:?}"
-            );
-            // Must start with exactly 12 lowercase hex chars followed by two spaces
-            let prefix: String = line.chars().take(12).collect();
-            assert!(
-                prefix.chars().all(|c| c.is_ascii_hexdigit()),
-                "{context}: line must start with 12 hex chars; got: {line:?}"
-            );
-            assert!(
-                line.len() > 14 && &line[12..14] == "  ",
-                "{context}: line must have two spaces after hash; got: {line:?}"
-            );
-        }
-    }
-
-    /// Happy path: `playlist_new` receives canonical content on the first import.
-    #[test]
-    fn rekordbox_import_playlist_new_produces_canonical_format() {
-        use library_ipc_client::ContentHash;
-
-        let tracks = vec![
-            make_rekordbox_track(
-                "sha256:8d4e7b2cabc12345",
-                "Carbon Based Lifeforms",
-                "Polyrytmi",
-                367,
-            ),
-            make_rekordbox_track("sha256:a3f91e0dabc12345", "Sunju Hargun", "Silverhaze", 421),
-        ];
-        let hashes: Vec<ContentHash> = tracks.iter().map(|t| t.content_hash.clone()).collect();
-
-        let fake = RecordingFake::new(tracks);
-        let name = library_ipc_client::PlaylistName::new("my-set").unwrap();
-
-        let created = write_playlist(&fake, &name, &hashes).unwrap();
-        assert!(created, "expected playlist_new to succeed (created=true)");
-
-        let new_calls = fake.new_calls.borrow();
-        assert_eq!(new_calls.len(), 1, "playlist_new called exactly once");
-        assert_all_lines_canonical(&new_calls[0], "playlist_new content");
-
-        // Verify exact canonical format for both tracks
-        let lines: Vec<&str> = new_calls[0].lines().collect();
-        assert_eq!(lines.len(), 2);
-        assert_eq!(
-            lines[0],
-            "8d4e7b2cabc1  Carbon Based Lifeforms - Polyrytmi  [6:07]"
-        );
-        assert_eq!(lines[1], "a3f91e0dabc1  Sunju Hargun - Silverhaze  [7:01]");
-    }
-
-    /// Conflict path: `playlist_replace` receives canonical content when the
-    /// playlist already exists (`playlist_new` returns `PlaylistAlreadyExists`).
-    #[test]
-    fn rekordbox_import_playlist_replace_conflict_produces_canonical_format() {
-        use library_ipc_client::ContentHash;
-
-        let tracks = vec![make_rekordbox_track(
-            "sha256:8d4e7b2cabc12345",
-            "Carbon Based Lifeforms",
-            "Polyrytmi",
-            367,
-        )];
-        let hashes: Vec<ContentHash> = tracks.iter().map(|t| t.content_hash.clone()).collect();
-
-        let fake = RecordingFake::with_conflict(tracks);
-        let name = library_ipc_client::PlaylistName::new("my-set").unwrap();
-
-        let created = write_playlist(&fake, &name, &hashes).unwrap();
-        assert!(
-            !created,
-            "expected playlist_replace fallback (created=false)"
-        );
-
-        // playlist_new was NOT recorded (it returned an error before we pushed)
-        assert!(
-            fake.new_calls.borrow().is_empty(),
-            "playlist_new should not record content when it returns an error"
-        );
-
-        let replace_calls = fake.replace_calls.borrow();
-        assert_eq!(
-            replace_calls.len(),
-            1,
-            "playlist_replace called exactly once"
-        );
-        assert_all_lines_canonical(&replace_calls[0], "playlist_replace content");
-
-        let lines: Vec<&str> = replace_calls[0].lines().collect();
-        assert_eq!(lines.len(), 1);
-        assert_eq!(
-            lines[0],
-            "8d4e7b2cabc1  Carbon Based Lifeforms - Polyrytmi  [6:07]"
-        );
-    }
-
-    /// A resolve failure aborts before touching the playlist: neither
-    /// `playlist_new` nor `playlist_replace` is called.
-    #[test]
-    fn write_playlist_resolve_failure_writes_nothing() {
-        for fake in [
-            RecordingFake::with_resolve_error(vec![]),
-            RecordingFake {
-                force_conflict: true,
-                ..RecordingFake::with_resolve_error(vec![])
-            },
-        ] {
-            let name = library_ipc_client::PlaylistName::new("my-set").unwrap();
-            let err = write_playlist(&fake, &name, &[]).unwrap_err();
-            assert!(err.to_string().contains("resolve hiccup"), "got: {err}");
-            assert!(fake.new_calls.borrow().is_empty());
-            assert!(fake.replace_calls.borrow().is_empty());
-        }
-    }
-
-    /// Any `playlist_new` failure other than "already exists" is returned as-is
-    /// and never replaces an existing playlist.
-    #[test]
-    fn write_playlist_does_not_replace_on_other_errors() {
-        let fake = RecordingFake::with_other_error(vec![]);
-        let name = library_ipc_client::PlaylistName::new("my-set").unwrap();
-
-        let err = write_playlist(&fake, &name, &[]).unwrap_err();
-        assert!(err.to_string().contains("disk on fire"), "got: {err}");
-        assert!(fake.replace_calls.borrow().is_empty());
-    }
-
-    // ── playlist name sanitising ─────────────────────────────────────────────
-
-    #[test]
-    fn sanitize_playlist_name_replaces_and_trims() {
-        assert_eq!(sanitize_playlist_name("Friday Set #1!"), "Friday-Set--1");
-        assert_eq!(sanitize_playlist_name("ok_name-2"), "ok_name-2");
-        assert_eq!(sanitize_playlist_name("  --x--  "), "x");
-    }
-
-    #[test]
-    fn sanitize_playlist_name_can_be_empty() {
-        assert_eq!(sanitize_playlist_name("!!! ???"), "");
-        assert_eq!(sanitize_playlist_name("åäö"), "");
-    }
-
-    #[test]
-    fn default_import_name_prefers_title_then_slug() {
-        assert_eq!(default_import_name("Friday Set", "friday"), "Friday-Set");
-        assert_eq!(default_import_name("!!!", "my-slug"), "my-slug");
-        assert_eq!(
-            default_import_name("???", "https://bandcamp.com/u/x/playlists/cool-set/?a=1"),
-            "cool-set"
-        );
-    }
-
-    // ── source playlist matching / report ────────────────────────────────────
-
-    /// (artist, title) normalised -> candidates (hash, duration secs)
-    type FakeLookupEntry = (&'static str, &'static str, Vec<(ContentHash, Option<u32>)>);
-
-    struct FakePlaylistLookup {
-        entries: Vec<FakeLookupEntry>,
-    }
-
-    impl TrackLookup for FakePlaylistLookup {
-        fn find_by_isrc(&self, _isrc: &str) -> Vec<ContentHash> {
-            vec![]
-        }
-        fn find_by_artist_title(
-            &self,
-            artist: &str,
-            title: &str,
-        ) -> Vec<(ContentHash, Option<u32>)> {
-            self.entries
-                .iter()
-                .find(|(a, t, _)| *a == artist && *t == title)
-                .map(|(_, _, c)| c.clone())
-                .unwrap_or_default()
-        }
-    }
-
-    fn pl_track(
-        pos: u32,
-        artist: &str,
-        title: &str,
-        secs: f64,
-    ) -> source_protocol::SourcePlaylistTrack {
-        source_protocol::SourcePlaylistTrack {
-            position: pos,
-            source_track_id: format!("t{pos}"),
-            title: title.to_string(),
-            artist: artist.to_string(),
-            album: None,
-            duration_secs: secs,
-            owned: true,
-        }
-    }
-
-    fn hash(s: &str) -> ContentHash {
-        ContentHash::new(format!("sha256:{s}"))
-    }
-
-    fn sample_lookup() -> FakePlaylistLookup {
-        FakePlaylistLookup {
-            entries: vec![
-                ("a", "one", vec![(hash("1111111111111111"), Some(300))]),
-                (
-                    "b",
-                    "two",
-                    vec![
-                        (hash("2222222222222222"), Some(200)),
-                        (hash("3333333333333333"), Some(200)),
-                    ],
-                ),
-                ("d", "four", vec![(hash("4444444444444444"), Some(100))]),
-            ],
-        }
-    }
-
-    fn sample_tracks() -> Vec<source_protocol::SourcePlaylistTrack> {
-        vec![
-            pl_track(1, "A", "One", 300.2),
-            pl_track(2, "B", "Two", 200.0),
-            pl_track(3, "C", "Three", 150.0),
-            pl_track(4, "D", "Four", 100.0),
-        ]
-    }
-
-    #[test]
-    fn match_source_playlist_classifies_in_order() {
-        let outcomes = match_source_playlist(&sample_tracks(), &sample_lookup());
-        assert_eq!(outcomes.len(), 4);
-        assert_eq!(outcomes[0], TrackOutcome::Matched(hash("1111111111111111")));
-        assert!(matches!(&outcomes[1], TrackOutcome::Ambiguous(h) if h.len() == 2));
-        assert_eq!(outcomes[2], TrackOutcome::Missing);
-        assert_eq!(outcomes[3], TrackOutcome::Matched(hash("4444444444444444")));
-    }
-
-    #[test]
-    fn duration_mismatch_is_flagged_not_matched() {
-        // Library has a 210s edit; the Bandcamp track is the 545s original.
-        let lookup = FakePlaylistLookup {
-            entries: vec![("a", "one", vec![(hash("5555555555555555"), Some(210))])],
-        };
-        let tracks = [pl_track(1, "A", "One", 545.088)];
-        let outcomes = match_source_playlist(&tracks, &lookup);
-        assert_eq!(
-            outcomes,
-            [TrackOutcome::DurationMismatch {
-                hash: hash("5555555555555555"),
-                library_secs: 210,
-                source_secs: 545,
-            }]
-        );
-        assert!(matched_hashes(&outcomes).is_empty());
-
-        let report = format_import_report(&tracks, &outcomes);
-        assert!(
-            report.contains("? duration differs (library 3:30 vs bandcamp 9:05)"),
-            "got: {report}"
-        );
-        assert!(report.ends_with("0 matched, 1 ambiguous, 0 missing of 1"));
-    }
-
-    #[test]
-    fn unknown_source_duration_still_matches_on_artist_title() {
-        let lookup = FakePlaylistLookup {
-            entries: vec![("a", "one", vec![(hash("5555555555555555"), Some(210))])],
-        };
-        let tracks = [pl_track(1, "A", "One", 0.0)];
-        assert_eq!(
-            match_source_playlist(&tracks, &lookup),
-            [TrackOutcome::Matched(hash("5555555555555555"))]
-        );
-    }
-
-    #[test]
-    fn truncation_warning_only_when_counts_differ() {
-        assert_eq!(truncation_warning(64, 64), None);
-        let w = truncation_warning(49, 64).unwrap();
-        assert_eq!(
-            w,
-            "Warning: fetched 49 of 64 tracks; playlist may be incomplete"
-        );
-    }
-
-    #[test]
-    fn lookup_errors_are_recorded_for_the_caller() {
-        let errors = LookupErrors::default();
-        assert_eq!(errors.take(), None);
-        errors.record("boom".to_string());
-        errors.record("second".to_string());
-        assert_eq!(errors.take(), Some("boom".to_string()));
-        assert_eq!(errors.take(), None);
-    }
-
-    #[test]
-    fn matched_hashes_keeps_only_definitive_in_order() {
-        let outcomes = match_source_playlist(&sample_tracks(), &sample_lookup());
-        assert_eq!(
-            matched_hashes(&outcomes),
-            [hash("1111111111111111"), hash("4444444444444444")]
-        );
-    }
-
-    #[test]
-    fn format_import_report_lists_each_position_and_summary() {
-        let tracks = sample_tracks();
-        let outcomes = match_source_playlist(&tracks, &sample_lookup());
-        let report = format_import_report(&tracks, &outcomes);
-        let lines: Vec<&str> = report.lines().collect();
-        assert!(lines[0].contains("1. ✓ matched") && lines[0].contains("A - One"));
-        assert!(lines[1].contains("2. ? ambiguous") && lines[1].contains("B - Two"));
-        assert!(lines[2].contains("candidate: sha256:2222"));
-        assert!(lines[3].contains("candidate: sha256:3333"));
-        assert!(lines[4].contains("3. ✗ not in library") && lines[4].contains("C - Three"));
-        assert!(lines[5].contains("4. ✓ matched"));
-        assert_eq!(
-            lines.last().unwrap(),
-            &"2 matched, 1 ambiguous, 1 missing of 4"
-        );
-    }
-
-    #[test]
-    fn format_import_report_flags_unowned_missing_tracks() {
-        let mut tracks = [pl_track(1, "C", "Three", 150.0)];
-        tracks[0].owned = false;
-        let report = format_import_report(&tracks, &[TrackOutcome::Missing]);
-        assert!(report.contains("(not owned)"));
     }
 
     // ── mdma view: ViewColumn / render_for_user ───────────

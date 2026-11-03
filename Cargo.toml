@@ -36,6 +36,7 @@ members = [
     "components/node_discovery",
     "components/playback_engine",
     "components/playback_primitives",
+    "components/playlist_import",
     "components/private_file",
     "components/rekordbox_roundtrip",
     "components/rekordbox_xml",
@@ -69,7 +70,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.32.0"
+version = "0.33.0"
 edition = "2021"
 authors = ["MDMA Development Team"]
 license = "MIT"
@@ -110,6 +111,7 @@ nng-transport = { path = "components/nng_transport" }
 node-discovery = { path = "components/node_discovery" }
 playback-engine = { path = "components/playback_engine" }
 playback-primitives = { path = "components/playback_primitives" }
+playlist-import = { path = "components/playlist_import" }
 private-file = { path = "components/private_file" }
 rekordbox-roundtrip = { path = "components/rekordbox_roundtrip" }
 rekordbox-xml = { path = "components/rekordbox_xml" }
@@ -154,6 +156,7 @@ tokio-util = "0.7"
 tower-http = { version = "0.5", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-normalization = "0.1"
 zip = "2"
 
 [profile]

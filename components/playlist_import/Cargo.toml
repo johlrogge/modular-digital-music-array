@@ -1,0 +1,21 @@
+[package]
+name = "playlist-import"
+version.workspace = true
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/johlrogge/modular-digital-music-array"
+license = "MIT"
+
+[package.metadata.polylith]
+interface = "playlist-import"
+
+[dependencies]
+library-ipc-client = { workspace = true }
+library-search = { workspace = true }
+source-protocol = { workspace = true }
+thiserror = { workspace = true }
+track-formatter = { workspace = true }
+track-matcher = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
