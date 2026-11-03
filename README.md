@@ -187,7 +187,7 @@ Copy `scripts/install-mdma-macos.sh` from this repo to your Mac and run it. It r
 bash install-mdma-macos.sh
 
 # Install a specific tag
-bash install-mdma-macos.sh v0.34.0
+bash install-mdma-macos.sh v0.35.0
 
 # Install to a user-writable location (no sudo)
 MDMA_INSTALL_DIR=~/.local/bin bash install-mdma-macos.sh
@@ -205,6 +205,20 @@ cp profiles/dev/target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.35.0
+
+### New `audio_hash` component (not yet active)
+
+A new `audio_hash` component computes an AudioHash: a tag-independent identity hash over container-defined byte ranges (FLAC audio frames; MP3 frames including Xing/LAME; WAV `fmt ` plus `data`; MP4/M4A `mdat`). Trailing APEv2, Lyrics3v2, ID3v2-footer and ID3v1 tags are stripped, strongest signature first. It never decodes, never panics on malformed input, and is versioned as `audio-sha256-v1:<hex>`. A validated `AudioHash` newtype and a `MusicValue::AudioHash` fact variant come with it. ADR-010 is accepted with the exact frozen v1 definition (refs #55).
+
+Ingest does not compute or write AudioHash yet, and there is no backfill; both come in a later release. No user-visible behaviour change.
+
+**Upgrade notes:** `MusicValue` gained a variant. Per ADR-004, redeploy all services that embed the protocol together (gateway, library, console): upgrade all mdma-* packages together, by name.
+
+**Known issues:** #81, #84, #85, #86 and #87 carry over from 0.34.0. See CHANGELOG.md.
 
 ---
 

@@ -4,6 +4,41 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.35.0] — 2026-11-03
+
+### Added
+
+- **`audio_hash` component (ADR-010, #55).** Computes an AudioHash: a tag-independent identity hash over container-defined byte ranges.
+  - FLAC: audio frames.
+  - MP3: frames, including Xing/LAME.
+  - WAV: `fmt ` plus `data`.
+  - MP4/M4A: `mdat`.
+  - Trailing APEv2, Lyrics3v2, ID3v2-footer and ID3v1 tags are stripped, strongest signature first.
+  - It never decodes and never panics on malformed input. Hashes are versioned as `audio-sha256-v1:<hex>`.
+- **`AudioHash` newtype and fact.** A validated `AudioHash` newtype and a `MusicValue::AudioHash` fact variant.
+
+### Not yet active
+
+- Ingest does not compute or write AudioHash yet, and there is no backfill. Both come in a later release. No user-visible behaviour change.
+
+### Docs
+
+- ADR-010 is accepted, with the exact frozen v1 definition. It shipped in 0.34.0's tree; the code ships here.
+
+### Known issues
+
+- `mdma source sync` still times out client-side; the sync continues on the node (#81).
+- The gateway serialises requests (#84).
+- rekordbox import treats artist+title matches with different durations as matched (#85).
+- Playback writes play events under short hashes (#86).
+- Library projection follow-ups: retract scan cost, cover cache not refreshed while running (#87).
+
+### Upgrade notes
+
+`MusicValue` gained a variant. Per ADR-004, redeploy all services that embed the protocol together (gateway, library, console): upgrade all mdma-* packages together, by name.
+
+---
+
 ## [0.34.0] — 2026-11-03
 
 ### Changed
