@@ -1,0 +1,191 @@
+== tools
+flac 1.5.0
+metaflac 1.5.0
+sox:      SoX v14.4.2
+
+== skipped (tool could not produce these)
+(none)
+
+== WAV format tags (1 = PCM, 65534 = EXTENSIBLE, 3 = float)
+fixtures/m16.wav:      1
+fixtures/s16.wav:      1
+fixtures/s16_w24.wav:  65534
+fixtures/s16_w32.wav:  65534
+fixtures/s24.wav:  65534
+fixtures/s8.wav:      1
+
+== AIFF / AIFF-C headers (first 64 bytes)
+fixtures/m16.aiff:
+   F   O   R   M  \0  \0   " 304   A   I   F   F   C   O   M   T
+  \0  \0  \0 032  \0 001   |   % 260 200  \0  \0  \0 020   P   r
+   o   c   e   s   s   e   d       b   y       S   o   X   C   O
+   M   M  \0  \0  \0 022  \0 001  \0  \0 021   :  \0 020   @ 016
+fixtures/s16.aiff:
+   F   O   R   M  \0  \0   E   8   A   I   F   F   C   O   M   T
+  \0  \0  \0 032  \0 001   |   % 260 200  \0  \0  \0 020   P   r
+   o   c   e   s   s   e   d       b   y       S   o   X   C   O
+   M   M  \0  \0  \0 022  \0 002  \0  \0 021   :  \0 020   @ 016
+fixtures/s24.aiff:
+   F   O   R   M  \0  \0   g 254   A   I   F   F   C   O   M   T
+  \0  \0  \0 032  \0 001   |   % 260 200  \0  \0  \0 020   P   r
+   o   c   e   s   s   e   d       b   y       S   o   X   C   O
+   M   M  \0  \0  \0 022  \0 002  \0  \0 021   :  \0 030   @ 016
+fixtures/s8.aiff:
+   F   O   R   M  \0  \0   " 304   A   I   F   F   C   O   M   T
+  \0  \0  \0 032  \0 001   |   % 260 200  \0  \0  \0 020   P   r
+   o   c   e   s   s   e   d       b   y       S   o   X   C   O
+   M   M  \0  \0  \0 022  \0 002  \0  \0 021   :  \0  \b   @ 016
+fixtures/s16_none.aifc:
+   F   O   R   M  \0  \0   E   6   A   I   F   C   F   V   E   R
+  \0  \0  \0 004 242 200   Q   @   C   O   M   M  \0  \0  \0   &
+  \0 002  \0  \0 021   :  \0 020   @ 016 254   D  \0  \0  \0  \0
+  \0  \0   N   O   N   E 016   n   o   t       c   o   m   p   r
+
+== soxi
+
+Input File     : 'fixtures/m16.wav'
+Channels       : 1
+Sample Rate    : 44100
+Precision      : 16-bit
+Duration       : 00:00:00.10 = 4410 samples = 7.5 CDDA sectors
+File Size      : 8.86k
+Bit Rate       : 709k
+Sample Encoding: 16-bit Signed Integer PCM
+
+
+
+Input File     : 'fixtures/s16.wav'
+Channels       : 2
+Sample Rate    : 44100
+Precision      : 16-bit
+Duration       : 00:00:00.10 = 4410 samples = 7.5 CDDA sectors
+File Size      : 17.7k
+Bit Rate       : 1.41M
+Sample Encoding: 16-bit Signed Integer PCM
+
+
+
+Input File     : 'fixtures/s16_w24.wav'
+Channels       : 2
+Sample Rate    : 44100
+Precision      : 24-bit
+Duration       : 00:00:00.10 = 4410 samples = 7.5 CDDA sectors
+File Size      : 26.5k
+Bit Rate       : 2.12M
+Sample Encoding: 24-bit Signed Integer PCM
+
+
+
+Input File     : 'fixtures/s16_w32.wav'
+Channels       : 2
+Sample Rate    : 44100
+Precision      : 32-bit
+Duration       : 00:00:00.10 = 4410 samples = 7.5 CDDA sectors
+File Size      : 35.4k
+Bit Rate       : 2.83M
+Sample Encoding: 32-bit Signed Integer PCM
+
+
+
+Input File     : 'fixtures/s24.wav'
+Channels       : 2
+Sample Rate    : 44100
+Precision      : 24-bit
+Duration       : 00:00:00.10 = 4410 samples = 7.5 CDDA sectors
+File Size      : 26.5k
+Bit Rate       : 2.12M
+Sample Encoding: 24-bit Signed Integer PCM
+
+
+
+Input File     : 'fixtures/s8.wav'
+Channels       : 2
+Sample Rate    : 44100
+Precision      : 8-bit
+Duration       : 00:00:00.10 = 4410 samples = 7.5 CDDA sectors
+File Size      : 8.86k
+Bit Rate       : 709k
+Sample Encoding: 8-bit Unsigned Integer PCM
+
+
+
+Input File     : 'fixtures/m16.aiff'
+Channels       : 1
+Sample Rate    : 44100
+Precision      : 16-bit
+Duration       : 00:00:00.10 = 4410 samples = 7.5 CDDA sectors
+File Size      : 8.91k
+Bit Rate       : 713k
+Sample Encoding: 16-bit Signed Integer PCM
+Comment        : 'Processed by SoX'
+
+
+
+Input File     : 'fixtures/s16.aiff'
+Channels       : 2
+Sample Rate    : 44100
+Precision      : 16-bit
+Duration       : 00:00:00.10 = 4410 samples = 7.5 CDDA sectors
+File Size      : 17.7k
+Bit Rate       : 1.42M
+Sample Encoding: 16-bit Signed Integer PCM
+Comment        : 'Processed by SoX'
+
+
+
+Input File     : 'fixtures/s24.aiff'
+Channels       : 2
+Sample Rate    : 44100
+Precision      : 24-bit
+Duration       : 00:00:00.10 = 4410 samples = 7.5 CDDA sectors
+File Size      : 26.5k
+Bit Rate       : 2.12M
+Sample Encoding: 24-bit Signed Integer PCM
+Comment        : 'Processed by SoX'
+
+
+
+Input File     : 'fixtures/s8.aiff'
+Channels       : 2
+Sample Rate    : 44100
+Precision      : 8-bit
+Duration       : 00:00:00.10 = 4410 samples = 7.5 CDDA sectors
+File Size      : 8.91k
+Bit Rate       : 713k
+Sample Encoding: 8-bit Signed Integer PCM
+Comment        : 'Processed by SoX'
+
+
+
+Input File     : 'fixtures/s16_none.aifc'
+Channels       : 2
+Sample Rate    : 44100
+Precision      : 16-bit
+Duration       : 00:00:00.10 = 4410 samples = 7.5 CDDA sectors
+File Size      : 17.7k
+Bit Rate       : 1.42M
+Sample Encoding: 16-bit Signed Integer PCM
+
+
+== FLAC STREAMINFO
+fixtures/m16_l0.flac: 16 1 44100 4410 58dff77a45be4ab6940fe9bf09477c43
+fixtures/m16_l8.flac: 16 1 44100 4410 58dff77a45be4ab6940fe9bf09477c43
+fixtures/s16_l0.flac: 16 2 44100 4410 22740a02b2c981865850f6526416cb73
+fixtures/s16_l5.flac: 16 2 44100 4410 22740a02b2c981865850f6526416cb73
+fixtures/s16_l8.flac: 16 2 44100 4410 22740a02b2c981865850f6526416cb73
+fixtures/s16_l8_bs192.flac: 16 2 44100 4410 22740a02b2c981865850f6526416cb73
+fixtures/s16_l8_bs4096.flac: 16 2 44100 4410 22740a02b2c981865850f6526416cb73
+fixtures/s16_l8_id3both.flac: 16 2 44100 4410 22740a02b2c981865850f6526416cb73
+fixtures/s16_l8_id3v1.flac: 16 2 44100 4410 22740a02b2c981865850f6526416cb73
+fixtures/s16_l8_id3v2.flac: 16 2 44100 4410 22740a02b2c981865850f6526416cb73
+fixtures/s16_l8_junk.flac: 16 2 44100 4410 22740a02b2c981865850f6526416cb73
+fixtures/s16_l8_md5zero.flac: 16 2 44100 4410 00000000000000000000000000000000
+fixtures/s16_l8_ms.flac: 16 2 44100 4410 22740a02b2c981865850f6526416cb73
+fixtures/s16_l8_noms.flac: 16 2 44100 4410 22740a02b2c981865850f6526416cb73
+fixtures/s16_l8_pad4096.flac: 16 2 44100 4410 22740a02b2c981865850f6526416cb73
+fixtures/s16_l8_picture.flac: 16 2 44100 4410 22740a02b2c981865850f6526416cb73
+fixtures/s16_l8_tags.flac: 16 2 44100 4410 22740a02b2c981865850f6526416cb73
+fixtures/s24_l0.flac: 24 2 44100 4410 eb3f442eddc3356e7bfcfd479b484e4f
+fixtures/s24_l8.flac: 24 2 44100 4410 eb3f442eddc3356e7bfcfd479b484e4f
+fixtures/s32_l8.flac: 32 2 44100 4410 0d1e787a374509c8c5c2fbc2c5e0728f
+fixtures/s8_l8.flac: 8 2 44100 4410 ea7183d7167d7a9ade9b0b67d4a46696
