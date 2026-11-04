@@ -421,8 +421,7 @@ pub(crate) fn edit(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     };
 
     // 2. Edit a temp file in $EDITOR
-    let tmp_path = std::env::temp_dir().join(format!("mdma_playlist_{}.plist", name.0));
-    let new_content = crate::editor::edit_text(&tmp_path, &current);
+    let new_content = crate::editor::edit_text("mdma-playlist-", &current);
 
     // 3. Replace
     expect_library(
@@ -433,9 +432,6 @@ pub(crate) fn edit(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
         playlist_content,
     );
     eprintln!("Updated playlist '{}'", name.0);
-
-    // Cleanup
-    let _ = std::fs::remove_file(&tmp_path);
     Ok(())
 }
 

@@ -218,7 +218,6 @@ pub(crate) fn edit(ctx: &Ctx) -> Result<()> {
     // 2. Look up each track for display info. Unresolvable entries are written as
     //    plain-hash comment lines so they survive the edit round-trip unchanged.
     // 3. Write to temp file in playlist format.
-    let tmp_path = std::env::temp_dir().join("mdma_queue_edit.plist");
     let mut content = String::from(
         "# MDMA queue — reorder, delete, or add lines. Save to apply.\n\
          # Lines not starting with an 8-12 character lowercase hash followed by a space are ignored.\n\
@@ -239,12 +238,10 @@ pub(crate) fn edit(ctx: &Ctx) -> Result<()> {
         content.push('\n');
     }
     // 4. Launch $EDITOR (fallback to vi) and read back what was saved.
-    let edited = crate::editor::edit_text(&tmp_path, &content);
+    let edited = crate::editor::edit_text("mdma-queue-", &content);
 
     // 5. Parse hashes using the standard filter.
     let edited_hashes = hashes_in(&edited);
-
-    let _ = std::fs::remove_file(&tmp_path);
 
     // 6. Replace queue with reordered hashes.
     let entries: Vec<(ContentHash, SourceName)> = edited_hashes
