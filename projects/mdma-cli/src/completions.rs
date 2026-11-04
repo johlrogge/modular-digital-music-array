@@ -3,14 +3,18 @@ use clap::CommandFactory;
 use color_eyre::Result;
 
 #[derive(clap::Args, Debug)]
-pub(crate) struct Args {
+pub(crate) struct CompletionsCli {
     #[arg(value_enum)]
-    shell: clap_complete::Shell,
+    pub(crate) shell: clap_complete::Shell,
 }
 
-pub(crate) fn generate(args: Args) -> Result<()> {
-    let Args { shell } = &args;
-    generate_completions(*shell, &mut std::io::stdout());
+/// The shell to generate completions for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShellArg(pub clap_complete::Shell);
+
+pub(crate) fn generate(shell: ShellArg) -> Result<()> {
+    let ShellArg(shell) = shell;
+    generate_completions(shell, &mut std::io::stdout());
     Ok(())
 }
 

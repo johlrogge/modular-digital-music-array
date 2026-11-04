@@ -1,3 +1,4 @@
+use crate::args::TrackArg;
 use crate::ctx::Ctx;
 use crate::output::handle_error;
 use chrono::NaiveDate;
@@ -45,15 +46,25 @@ pub(crate) enum Command {
 /// A fact on a track, as named on the command line.
 #[derive(Debug)]
 pub(crate) struct FactArgs {
-    hash: String,
     field: FactField,
     value: String,
+    hash: TrackArg,
+}
+
+impl FactArgs {
+    fn new(field: FactField, value: String, hash: String) -> Self {
+        Self {
+            field,
+            value,
+            hash: TrackArg(ContentHash::new(hash)),
+        }
+    }
 }
 
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
     match command {
-        Command::Add { hash, field, value } => add(FactArgs { hash, field, value }, ctx),
-        Command::Retract { hash, field, value } => retract(FactArgs { hash, field, value }, ctx),
+        Command::Add { hash, field, value } => add(FactArgs::new(field, value, hash), ctx),
+        Command::Retract { hash, field, value } => retract(FactArgs::new(field, value, hash), ctx),
     }
 }
 
@@ -250,11 +261,14 @@ fn parse_field_value_or_exit(field: FactField, raw: &str) -> MusicValue {
 }
 
 pub(crate) fn add(args: FactArgs, ctx: &Ctx) -> Result<()> {
-    let FactArgs { hash, field, value } = args;
-    let client = ctx.library();
+    let FactArgs {
+        field,
+        value,
+        hash: TrackArg(hash),
+    } = args;
+    let library = ctx.library();
     let music_value = parse_field_value_or_exit(field, &value);
-    let content_hash = ContentHash::new(hash.clone());
-    match client.write_fact(&content_hash, music_value) {
+    match library.write_fact(&hash, music_value) {
         Ok(()) => {
             println!("Added fact for {}: {:?} = {}", hash, field, value);
             Ok(())
@@ -264,11 +278,14 @@ pub(crate) fn add(args: FactArgs, ctx: &Ctx) -> Result<()> {
 }
 
 pub(crate) fn retract(args: FactArgs, ctx: &Ctx) -> Result<()> {
-    let FactArgs { hash, field, value } = args;
-    let client = ctx.library();
+    let FactArgs {
+        field,
+        value,
+        hash: TrackArg(hash),
+    } = args;
+    let library = ctx.library();
     let music_value = parse_field_value_or_exit(field, &value);
-    let content_hash = ContentHash::new(hash.clone());
-    match client.retract_fact(&content_hash, music_value) {
+    match library.retract_fact(&hash, music_value) {
         Ok(()) => {
             println!("Retracted fact for {}: {:?} = {}", hash, field, value);
             Ok(())

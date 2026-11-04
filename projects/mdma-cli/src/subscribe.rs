@@ -7,14 +7,18 @@ use nng::options::Options;
 use track_formatter::short_hash;
 
 #[derive(clap::Args, Debug)]
-pub(crate) struct SubscribeArgs {
+pub(crate) struct SubscribeCli {
     /// Topic filter (e.g. "playback/track_started"). Default: all playback events.
     #[arg(long)]
-    topic: Option<String>,
+    pub(crate) topic: Option<String>,
 }
 
-pub(crate) fn subscribe(args: SubscribeArgs, ctx: &Ctx) -> Result<()> {
-    let SubscribeArgs { topic } = args;
+/// Topic filter for events (all playback events when `None`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TopicArg(pub Option<String>);
+
+pub(crate) fn subscribe(topic: TopicArg, ctx: &Ctx) -> Result<()> {
+    let TopicArg(topic) = topic;
     // Event gateway of the resolved node (tcp://<ip>:5556)
     let addr = match ctx.event_gateway() {
         Some(a) => a,
@@ -24,8 +28,8 @@ pub(crate) fn subscribe(args: SubscribeArgs, ctx: &Ctx) -> Result<()> {
             std::process::exit(1);
         }
     };
-    let lib = ctx.library();
-    listen(&addr, topic.as_deref(), Some(&lib))
+    let library = ctx.library();
+    listen(&addr, topic.as_deref(), Some(&library))
 }
 
 fn listen(

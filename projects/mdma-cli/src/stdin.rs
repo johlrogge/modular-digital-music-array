@@ -18,23 +18,47 @@ pub fn read_stdin_to_string() -> String {
     content
 }
 
-pub fn is_yes(answer: &str) -> bool {
+fn is_yes(answer: &str) -> bool {
     matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+/// Print `prompt` (which ends in `[y/N] `) and read the answer from stdin:
+/// `true` only for y/yes.
+pub fn confirm(prompt: &str) -> std::io::Result<bool> {
+    use std::io::Write;
+    print!("{}", prompt);
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(is_yes(&answer))
+}
+
+/// The hashes in `lines`, in order (see [`parse_hash_from_line`]).
+fn hashes_from_lines<L: AsRef<str>>(lines: impl Iterator<Item = L>) -> Vec<ContentHash> {
+    lines
+        .filter_map(|line| parse_hash_from_line(line.as_ref()))
+        .map(ContentHash::new)
+        .collect()
+}
+
+/// The hashes in `text`, one per line (e.g. playlist content).
+pub fn hashes_in(text: &str) -> Vec<ContentHash> {
+    hashes_from_lines(text.lines())
+}
+
+/// Read ALL lines from stdin and extract the hashes in them (empty when there are none).
+pub fn read_hashes() -> Vec<ContentHash> {
+    use std::io::BufRead;
+    hashes_from_lines(std::io::stdin().lock().lines().map_while(Result::ok))
 }
 
 /// Return the provided hash as a single-element vec, or read ALL lines from stdin and
 /// extract valid hashes (8+ lowercase hex chars, or sha256:-prefixed full hashes, as first token).
-pub fn hashes_arg_or_stdin(hash: Option<String>) -> Vec<String> {
+pub fn hashes_arg_or_stdin(hash: Option<ContentHash>) -> Vec<ContentHash> {
     match hash {
         Some(h) => vec![h],
         None => {
-            use std::io::BufRead;
-            let hashes: Vec<String> = std::io::stdin()
-                .lock()
-                .lines()
-                .map_while(Result::ok)
-                .filter_map(|line| parse_hash_from_line(&line))
-                .collect();
+            let hashes = read_hashes();
             if hashes.is_empty() {
                 eprintln!("No hash provided and stdin was empty");
                 std::process::exit(1);
@@ -44,19 +68,19 @@ pub fn hashes_arg_or_stdin(hash: Option<String>) -> Vec<String> {
     }
 }
 
-/// Resolve a list of raw hash strings to `TrackInfo`, skipping any that the library
+/// Resolve a list of hashes to `TrackInfo`, skipping any that the library
 /// cannot find and printing a warning for each skipped entry.
-pub fn resolve_tracks_skip_errors(client: &LibraryBackend, hashes: Vec<String>) -> Vec<TrackInfo> {
+pub fn resolve_tracks_skip_errors(
+    library: &LibraryBackend,
+    hashes: Vec<ContentHash>,
+) -> Vec<TrackInfo> {
     hashes
         .into_iter()
-        .filter_map(|hash| {
-            let content_hash = ContentHash::new(hash.clone());
-            match client.get_track(&content_hash) {
-                Ok(t) => Some(t),
-                Err(e) => {
-                    eprintln!("Warning: skipping track {}: {}", hash, e);
-                    None
-                }
+        .filter_map(|hash| match library.get_track(&hash) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!("Warning: skipping track {}: {}", hash, e);
+                None
             }
         })
         .collect()
@@ -104,7 +128,8 @@ pub fn parse_hash_from_line(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
 
-    use crate::stdin::{is_yes, parse_hash_from_line};
+    use crate::stdin::{hashes_in, is_yes, parse_hash_from_line};
+    use library_ipc_client::ContentHash;
 
     use pretty_assertions::assert_eq;
 
@@ -166,6 +191,18 @@ mod tests {
         // The hash must survive the round-trip through parse_hash_from_line.
         let result = parse_hash_from_line("a1b2c3d4  # [unavailable: track not found]");
         assert_eq!(result, Some("a1b2c3d4".to_string()));
+    }
+
+    #[test]
+    fn hashes_in_keeps_hash_lines_in_order_and_skips_the_rest() {
+        let text = "# header\n\nabcd1234  Artist - Title  [1:00]\nnot a hash\nsha256:0123abcd\n";
+        assert_eq!(
+            hashes_in(text),
+            vec![
+                ContentHash::new("abcd1234"),
+                ContentHash::new("sha256:0123abcd")
+            ]
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
+use crate::args::TrackArg;
 use crate::ctx::Ctx;
 use crate::library::Yes;
-use crate::stdin::is_yes;
+use crate::stdin::confirm;
 use clap::Subcommand;
 use color_eyre::Result;
 use library_ipc_client::{
@@ -28,7 +29,7 @@ pub(crate) enum Command {
 
 /// What `mdma library dedup` takes: the listing's `--apply`, or a subcommand.
 #[derive(clap::Args, Debug)]
-pub(crate) struct Args {
+pub(crate) struct DedupCli {
     /// Merge the automatic groups (the others are only listed)
     #[arg(long)]
     apply: bool,
@@ -43,30 +44,33 @@ pub(crate) struct Apply(pub bool);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MergeArgs {
-    pub(crate) winner: ContentHash,
-    pub(crate) losers: Vec<ContentHash>,
     pub(crate) yes: Yes,
+    pub(crate) winner: TrackArg,
+    pub(crate) losers: Vec<TrackArg>,
 }
 
 impl MergeArgs {
-    fn new(winner: String, losers: Vec<String>, yes: bool) -> Self {
+    fn new(yes: bool, winner: String, losers: Vec<String>) -> Self {
         Self {
-            winner: ContentHash::new(winner),
-            losers: losers.into_iter().map(ContentHash::new).collect(),
             yes: Yes(yes),
+            winner: TrackArg(ContentHash::new(winner)),
+            losers: losers
+                .into_iter()
+                .map(|loser| TrackArg(ContentHash::new(loser)))
+                .collect(),
         }
     }
 }
 
-pub(crate) fn dispatch(args: Args, ctx: &Ctx) -> Result<()> {
-    let Args { apply, command } = args;
+pub(crate) fn dispatch(args: DedupCli, ctx: &Ctx) -> Result<()> {
+    let DedupCli { apply, command } = args;
     match command {
         None => scan(Apply(apply), ctx),
         Some(Command::Merge {
             winner,
             losers,
             yes,
-        }) => merge(MergeArgs::new(winner, losers, yes), ctx),
+        }) => merge(MergeArgs::new(yes, winner, losers), ctx),
     }
 }
 
@@ -167,8 +171,8 @@ fn find_dedup_group<'a>(
 
 pub(crate) fn scan(apply: Apply, ctx: &Ctx) -> Result<()> {
     let Apply(apply) = apply;
-    let client = ctx.library();
-    let report = match client.dedup_scan(apply) {
+    let library = ctx.library();
+    let report = match library.dedup_scan(apply) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -197,13 +201,14 @@ pub(crate) fn scan(apply: Apply, ctx: &Ctx) -> Result<()> {
 
 pub(crate) fn merge(args: MergeArgs, ctx: &Ctx) -> Result<()> {
     let MergeArgs {
-        winner,
-        losers,
         yes: Yes(yes),
+        winner: TrackArg(winner),
+        losers,
     } = args;
-    let client = ctx.library();
+    let losers: Vec<ContentHash> = losers.into_iter().map(|TrackArg(h)| h).collect();
+    let library = ctx.library();
     if !yes {
-        if let Ok(report) = client.dedup_scan(false) {
+        if let Ok(report) = library.dedup_scan(false) {
             // Every prefix must name at most one group before anything is confirmed.
             let mut shown = None;
             for prefix in std::iter::once(&winner)
@@ -222,20 +227,17 @@ pub(crate) fn merge(args: MergeArgs, ctx: &Ctx) -> Result<()> {
                 println!("{}\n", format_dedup_groups(std::slice::from_ref(group)));
             }
         }
-        print!(
+        let prompt = format!(
             "Merge {} track(s) into {winner}? Their audio files are moved to the archive. [y/N] ",
             losers.len()
         );
-        std::io::Write::flush(&mut std::io::stdout())?;
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        if !is_yes(&answer) {
+        if !confirm(&prompt)? {
             println!("Aborted");
             return Ok(());
         }
     }
 
-    match client.dedup_merge(&winner, &losers) {
+    match library.dedup_merge(&winner, &losers) {
         Ok(report) => {
             println!("{}", format_dedup_applied(&report));
             if !report.errors.is_empty() {
@@ -278,7 +280,7 @@ mod tests {
             .command
         {
             Commands::Library {
-                command: library::Command::Dedup(Args { apply, command }),
+                command: library::Command::Dedup(DedupCli { apply, command }),
             } => (
                 apply,
                 command.map(
@@ -286,7 +288,7 @@ mod tests {
                          winner,
                          losers,
                          yes,
-                     }| MergeArgs::new(winner, losers, yes),
+                     }| MergeArgs::new(yes, winner, losers),
                 ),
             ),
             other => panic!("unexpected command: {:?}", other),
@@ -306,9 +308,12 @@ mod tests {
             (
                 false,
                 Some(MergeArgs {
-                    winner: ContentHash::new("abc123"),
-                    losers: vec![ContentHash::new("def456"), ContentHash::new("0a1b2c")],
                     yes: Yes(false),
+                    winner: TrackArg(ContentHash::new("abc123")),
+                    losers: vec![
+                        TrackArg(ContentHash::new("def456")),
+                        TrackArg(ContentHash::new("0a1b2c"))
+                    ],
                 })
             )
         );

@@ -1,6 +1,7 @@
+use crate::args::OptTrackArg;
 use crate::ctx::Ctx;
 use crate::output::{format_track_line, handle_playback_error, render_track_table};
-use crate::stdin::{hashes_arg_or_stdin, parse_hash_from_line};
+use crate::stdin::{hashes_arg_or_stdin, hashes_in};
 use clap::Subcommand;
 use color_eyre::Result;
 use colored::Colorize;
@@ -53,24 +54,23 @@ pub(crate) enum Command {
 
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
     match command {
-        Command::Next { hash } => next(OptTrackHash(hash), ctx),
-        Command::Append { hash } => append(OptTrackHash(hash), ctx),
+        Command::Next { hash } => next(OptTrackArg(hash.map(ContentHash::new)), ctx),
+        Command::Append { hash } => append(OptTrackArg(hash.map(ContentHash::new)), ctx),
         Command::List => list(ctx),
         Command::Clear => clear(ctx),
-        Command::Remove { hash } => remove(OptTrackHash(hash), ctx),
+        Command::Remove { hash } => remove(OptTrackArg(hash.map(ContentHash::new)), ctx),
         Command::Replace => replace(ctx),
         Command::Edit => edit(ctx),
     }
 }
 
-pub(crate) fn next(hash: OptTrackHash, ctx: &Ctx) -> Result<()> {
-    let media_client = ctx.playback();
+pub(crate) fn next(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
+    let playback = ctx.playback();
     let hashes = hashes_arg_or_stdin(hash.0);
     let count = hashes.len();
     // Prepend in reverse so the first hash ends up at the front of the queue.
-    for hash in hashes.into_iter().rev() {
-        let content_hash = ContentHash::new(hash);
-        if let Err(e) = media_client.queue_next(content_hash, SourceName::audio()) {
+    for content_hash in hashes.into_iter().rev() {
+        if let Err(e) = playback.queue_next(content_hash, SourceName::audio()) {
             handle_playback_error(e);
         }
     }
@@ -78,13 +78,12 @@ pub(crate) fn next(hash: OptTrackHash, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn append(hash: OptTrackHash, ctx: &Ctx) -> Result<()> {
-    let media_client = ctx.playback();
+pub(crate) fn append(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
+    let playback = ctx.playback();
     let hashes = hashes_arg_or_stdin(hash.0);
     let count = hashes.len();
-    for hash in hashes {
-        let content_hash = ContentHash::new(hash);
-        if let Err(e) = media_client.queue_append(content_hash, SourceName::audio()) {
+    for content_hash in hashes {
+        if let Err(e) = playback.queue_append(content_hash, SourceName::audio()) {
             handle_playback_error(e);
         }
     }
@@ -93,9 +92,9 @@ pub(crate) fn append(hash: OptTrackHash, ctx: &Ctx) -> Result<()> {
 }
 
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
-    let library_client = ctx.library();
-    let media_client = ctx.playback();
-    let hashes = match media_client.queue_list() {
+    let library = ctx.library();
+    let playback = ctx.playback();
+    let hashes = match playback.queue_list() {
         Ok(h) => h,
         Err(e) => handle_playback_error(e),
     };
@@ -111,7 +110,7 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     // Resolve each hash, keeping a Result per slot so positions stay aligned.
     let resolved: Vec<Result<TrackInfo, String>> = hashes
         .iter()
-        .map(|hash| library_client.get_track(hash).map_err(|e| e.to_string()))
+        .map(|hash| library.get_track(hash).map_err(|e| e.to_string()))
         .collect();
 
     use std::io::IsTerminal;
@@ -165,16 +164,15 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn remove(hash: OptTrackHash, ctx: &Ctx) -> Result<()> {
-    let media_client = ctx.playback();
-    let hashes = hashes_arg_or_stdin(hash.0);
-    let content_hashes: Vec<ContentHash> = hashes.into_iter().map(ContentHash::new).collect();
+pub(crate) fn remove(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
+    let playback = ctx.playback();
+    let content_hashes = hashes_arg_or_stdin(hash.0);
 
     if content_hashes.is_empty() {
         return Ok(());
     }
 
-    match media_client.queue_remove(content_hashes) {
+    match playback.queue_remove(content_hashes) {
         Ok(removed) if removed > 0 => {
             println!("Removed {} track(s) from queue", removed);
         }
@@ -185,8 +183,8 @@ pub(crate) fn remove(hash: OptTrackHash, ctx: &Ctx) -> Result<()> {
 }
 
 pub(crate) fn clear(ctx: &Ctx) -> Result<()> {
-    let media_client = ctx.playback();
-    if let Err(e) = media_client.queue_clear() {
+    let playback = ctx.playback();
+    if let Err(e) = playback.queue_clear() {
         handle_playback_error(e);
     }
     println!("Queue cleared");
@@ -194,14 +192,14 @@ pub(crate) fn clear(ctx: &Ctx) -> Result<()> {
 }
 
 pub(crate) fn replace(ctx: &Ctx) -> Result<()> {
-    let media_client = ctx.playback();
+    let playback = ctx.playback();
     let hashes = hashes_arg_or_stdin(None);
     let entries: Vec<(ContentHash, SourceName)> = hashes
         .into_iter()
-        .map(|hash| (ContentHash::new(hash), SourceName::audio()))
+        .map(|hash| (hash, SourceName::audio()))
         .collect();
     let count = entries.len();
-    if let Err(e) = media_client.queue_replace(entries) {
+    if let Err(e) = playback.queue_replace(entries) {
         handle_playback_error(e);
     }
     println!("Queue replaced: {} tracks", count);
@@ -209,10 +207,10 @@ pub(crate) fn replace(ctx: &Ctx) -> Result<()> {
 }
 
 pub(crate) fn edit(ctx: &Ctx) -> Result<()> {
-    let library_client = ctx.library();
-    let media_client = ctx.playback();
+    let library = ctx.library();
+    let playback = ctx.playback();
     // 1. Get current queue hashes.
-    let hashes = match media_client.queue_list() {
+    let hashes = match playback.queue_list() {
         Ok(h) => h,
         Err(e) => handle_playback_error(e),
     };
@@ -227,7 +225,7 @@ pub(crate) fn edit(ctx: &Ctx) -> Result<()> {
          \n",
     );
     for hash in &hashes {
-        match library_client.get_track(hash) {
+        match library.get_track(hash) {
             Ok(track) => {
                 content.push_str(&format_track_line(&track));
             }
@@ -240,58 +238,23 @@ pub(crate) fn edit(ctx: &Ctx) -> Result<()> {
         }
         content.push('\n');
     }
-    std::fs::write(&tmp_path, &content)
-        .map_err(|e| {
-            eprintln!("Failed to write temp file: {}", e);
-            std::process::exit(1);
-        })
-        .unwrap();
+    // 4. Launch $EDITOR (fallback to vi) and read back what was saved.
+    let edited = crate::editor::edit_text(&tmp_path, &content);
 
-    // 4. Launch $EDITOR (fallback to vi).
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-    let status = std::process::Command::new(&editor)
-        .arg(&tmp_path)
-        .status()
-        .map_err(|e| {
-            eprintln!("Failed to launch editor '{}': {}", editor, e);
-            std::process::exit(1);
-        })
-        .unwrap();
-
-    if !status.success() {
-        eprintln!("Editor exited with non-zero status");
-        std::process::exit(1);
-    }
-
-    // 5. Read back, parse hashes using the standard filter.
-    use std::io::BufRead;
-    let file = std::fs::File::open(&tmp_path)
-        .map_err(|e| {
-            eprintln!("Failed to read temp file: {}", e);
-            std::process::exit(1);
-        })
-        .unwrap();
-    let edited_hashes: Vec<String> = std::io::BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
-        .filter_map(|line| parse_hash_from_line(&line))
-        .collect();
+    // 5. Parse hashes using the standard filter.
+    let edited_hashes = hashes_in(&edited);
 
     let _ = std::fs::remove_file(&tmp_path);
 
     // 6. Replace queue with reordered hashes.
     let entries: Vec<(ContentHash, SourceName)> = edited_hashes
         .into_iter()
-        .map(|hash| (ContentHash::new(hash), SourceName::audio()))
+        .map(|hash| (hash, SourceName::audio()))
         .collect();
     let count = entries.len();
-    if let Err(e) = media_client.queue_replace(entries) {
+    if let Err(e) = playback.queue_replace(entries) {
         handle_playback_error(e);
     }
     println!("Queue updated: {} tracks", count);
     Ok(())
 }
-
-/// Optional content hash of a track.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OptTrackHash(pub Option<String>);

@@ -1,40 +1,39 @@
+use crate::args::{OptTrackArg, TrackArg};
 use crate::ctx::Ctx;
 use crate::output::{
     format_track_line, handle_error, handle_playback_error, print_tracks, terminal_width,
     PIPE_TERM_WIDTH,
 };
-use crate::stdin::{hashes_arg_or_stdin, parse_hash_from_line, resolve_tracks_skip_errors};
-use crate::Cli;
-use clap::CommandFactory;
+use crate::stdin::{hashes_arg_or_stdin, read_hashes, resolve_tracks_skip_errors};
 use color_eyre::Result;
-use library_ipc_client::{ContentHash, TrackInfo};
+use library_ipc_client::TrackInfo;
 use track_formatter::{render_for_user, short_hash, ViewColumn};
 
 #[derive(clap::Args, Debug)]
-pub(crate) struct ListArgs {
+pub(crate) struct ListCli {
     /// Maximum number of tracks to show
     #[arg(short, long)]
-    limit: Option<usize>,
+    pub(crate) limit: Option<usize>,
+}
+
+/// Maximum number of tracks to show (all when `None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LimitArg(pub Option<usize>);
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct GetCli {
+    /// Content hash (full or partial, with or without sha256: prefix)
+    pub(crate) hash: String,
 }
 
 #[derive(clap::Args, Debug)]
-pub(crate) struct GetArgs {
+pub(crate) struct FactsCli {
     /// Content hash (full or partial, with or without sha256: prefix)
-    hash: String,
-}
-
-#[derive(clap::Args, Debug)]
-pub(crate) struct FactsArgs {
-    /// Content hash (full or partial, with or without sha256: prefix)
-    hash: String,
+    pub(crate) hash: String,
 }
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct SortArgs {
-    /// Field to sort by
-    #[arg(value_enum)]
-    field: SortField,
-
     /// Sort ascending (A→Z, low→high)
     #[arg(short = 'a')]
     ascending: bool,
@@ -42,19 +41,30 @@ pub(crate) struct SortArgs {
     /// Sort descending (Z→A, high→low)
     #[arg(short = 'd')]
     descending: bool,
+
+    /// Field to sort by
+    #[arg(value_enum)]
+    field: SortField,
 }
 
+// What `mdma bookmark` parses; converted into `BookmarkArgs` by the dispatch.
 #[derive(clap::Args, Debug)]
-pub(crate) struct BookmarkArgs {
-    /// Content hash of track to bookmark (defaults to now-playing if omitted)
-    hash: Option<String>,
+pub(crate) struct BookmarkCli {
     /// Optional scope — associate bookmark with a named set
     #[arg(long)]
-    scope: Option<String>,
+    pub(crate) scope: Option<String>,
+    /// Content hash of track to bookmark (defaults to now-playing if omitted)
+    pub(crate) hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BookmarkArgs {
+    pub(crate) scope: Option<String>,
+    pub(crate) hash: OptTrackArg,
 }
 
 #[derive(clap::Args, Debug)]
-pub(crate) struct ViewArgs {
+pub(crate) struct ViewCli {
     /// Show the 12-character content hash
     #[arg(long)]
     hash: bool,
@@ -160,8 +170,8 @@ impl SortDirection {
 }
 
 pub(crate) fn ping(ctx: &Ctx) -> Result<()> {
-    let client = ctx.library();
-    match client.ping() {
+    let library = ctx.library();
+    match library.ping() {
         Ok(()) => {
             println!("pong - service is alive");
             Ok(())
@@ -171,8 +181,8 @@ pub(crate) fn ping(ctx: &Ctx) -> Result<()> {
 }
 
 pub(crate) fn status(ctx: &Ctx) -> Result<()> {
-    let client = ctx.library();
-    match client.status() {
+    let library = ctx.library();
+    match library.status() {
         Ok(status) => {
             println!("MDMA Library Service v{}", status.version);
             println!("{}", "=".repeat(35));
@@ -186,10 +196,10 @@ pub(crate) fn status(ctx: &Ctx) -> Result<()> {
     }
 }
 
-pub(crate) fn list(args: ListArgs, ctx: &Ctx) -> Result<()> {
-    let ListArgs { limit } = args;
-    let client = ctx.library();
-    match client.list_tracks(limit) {
+pub(crate) fn list(limit: LimitArg, ctx: &Ctx) -> Result<()> {
+    let LimitArg(limit) = limit;
+    let library = ctx.library();
+    match library.list_tracks(limit) {
         Ok(tracks) => {
             if tracks.is_empty() {
                 println!("No tracks in library");
@@ -212,12 +222,10 @@ pub(crate) fn list(args: ListArgs, ctx: &Ctx) -> Result<()> {
     }
 }
 
-pub(crate) fn get(args: GetArgs, ctx: &Ctx) -> Result<()> {
-    let GetArgs { hash } = args;
-    let hash = TrackHash(hash);
-    let client = ctx.library();
-    let content_hash = hash.into_content_hash();
-    match client.get_track(&content_hash) {
+pub(crate) fn get(hash: TrackArg, ctx: &Ctx) -> Result<()> {
+    let TrackArg(content_hash) = hash;
+    let library = ctx.library();
+    match library.get_track(&content_hash) {
         Ok(track) => {
             println!("Track: {}", track.content_hash.as_str());
             println!("{}", "=".repeat(65));
@@ -254,12 +262,10 @@ pub(crate) fn get(args: GetArgs, ctx: &Ctx) -> Result<()> {
     }
 }
 
-pub(crate) fn facts(args: FactsArgs, ctx: &Ctx) -> Result<()> {
-    let FactsArgs { hash } = args;
-    let hash = TrackHash(hash);
-    let client = ctx.library();
-    let content_hash = hash.into_content_hash();
-    match client.get_facts(&content_hash) {
+pub(crate) fn facts(hash: TrackArg, ctx: &Ctx) -> Result<()> {
+    let TrackArg(content_hash) = hash;
+    let library = ctx.library();
+    match library.get_facts(&content_hash) {
         Ok((full_hash, facts)) => {
             println!("Facts for: {}", full_hash.as_str());
             println!("{}", "=".repeat(65));
@@ -301,18 +307,18 @@ fn compare_optional<T: Ord>(
 
 pub(crate) fn sort(args: SortArgs, ctx: &Ctx) -> Result<()> {
     let SortArgs {
-        field,
         ascending,
         descending,
+        field,
     } = args;
-    let client = ctx.library();
+    let library = ctx.library();
     let Some(direction) = SortDirection::from_flags(ascending, descending) else {
         eprintln!("Specify exactly one of -a (ascending) or -d (descending)");
         std::process::exit(1);
     };
 
     let hashes = hashes_arg_or_stdin(None);
-    let mut tracks = resolve_tracks_skip_errors(&client, hashes);
+    let mut tracks = resolve_tracks_skip_errors(&library, hashes);
 
     tracks.sort_by(|a, b| match field {
         SortField::Bpm => compare_optional(a.bpm, b.bpm, direction),
@@ -360,12 +366,15 @@ pub(crate) fn sort(args: SortArgs, ctx: &Ctx) -> Result<()> {
 }
 
 pub(crate) fn bookmark(args: BookmarkArgs, ctx: &Ctx) -> Result<()> {
-    let BookmarkArgs { hash, scope } = args;
-    let lib = ctx.library();
-    let pb = ctx.playback();
+    let BookmarkArgs {
+        scope,
+        hash: OptTrackArg(hash),
+    } = args;
+    let library = ctx.library();
+    let playback = ctx.playback();
     let content_hash = match hash {
-        Some(h) => ContentHash::new(h),
-        None => match pb.now_playing() {
+        Some(h) => h,
+        None => match playback.now_playing() {
             Ok(Some(h)) => h,
             Ok(None) => {
                 eprintln!("Nothing is currently playing");
@@ -375,7 +384,7 @@ pub(crate) fn bookmark(args: BookmarkArgs, ctx: &Ctx) -> Result<()> {
         },
     };
 
-    match lib.write_bookmark(&content_hash, scope) {
+    match library.write_bookmark(&content_hash, scope) {
         Ok(()) => {
             println!("Bookmarked.");
             Ok(())
@@ -385,22 +394,20 @@ pub(crate) fn bookmark(args: BookmarkArgs, ctx: &Ctx) -> Result<()> {
 }
 
 pub(crate) fn bookmarks(ctx: &Ctx) -> Result<()> {
-    let library_client = ctx.library();
-    let tracks = match library_client.list_tracks(None) {
+    let library = ctx.library();
+    let tracks = match library.list_tracks(None) {
         Ok(t) => t,
         Err(e) => handle_error(e),
     };
 
     let bookmarked: Vec<TrackInfo> = tracks
         .into_iter()
-        .filter(
-            |track| match library_client.get_facts(&track.content_hash) {
-                Ok((_hash, facts)) => facts
-                    .iter()
-                    .any(|(fact_type, _value)| fact_type == "Bookmarked"),
-                Err(_) => false,
-            },
-        )
+        .filter(|track| match library.get_facts(&track.content_hash) {
+            Ok((_hash, facts)) => facts
+                .iter()
+                .any(|(fact_type, _value)| fact_type == "Bookmarked"),
+            Err(_) => false,
+        })
         .collect();
 
     if bookmarked.is_empty() {
@@ -425,7 +432,7 @@ pub(crate) fn bookmarks(ctx: &Ctx) -> Result<()> {
 /// insertion order in the derive API. We use `ArgMatches::indices_of` to recover the argv
 /// position of each flag that was actually set, then sort by position to honour the order the
 /// user typed them in. This implements `mdma view --title --hash` → title-first, hash-second.
-fn view_columns_from_matches(matches: &clap::ArgMatches) -> Vec<ViewColumn> {
+pub(crate) fn view_columns_from_matches(matches: &clap::ArgMatches) -> Vec<ViewColumn> {
     // Collect (argv_index, column) pairs for every flag that was set.
     let mut indexed: Vec<(usize, ViewColumn)> = Vec::new();
     for (flag, col) in &[
@@ -448,20 +455,16 @@ fn view_columns_from_matches(matches: &clap::ArgMatches) -> Vec<ViewColumn> {
     indexed.into_iter().map(|(_, col)| col).collect()
 }
 
-pub(crate) fn view(_args: ViewArgs, ctx: &Ctx) -> Result<()> {
-    use std::io::{BufRead, IsTerminal};
+/// The columns `mdma view` shows, in the order their flags were typed
+/// (see [`view_columns_from_matches`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ViewColumns(pub Vec<ViewColumn>);
 
-    // Re-parse argv via ArgMatches to recover the order the flags appeared.
-    // This implements Option A from the field-order spec: use indices_of on
-    // the raw matches for the `view` subcommand to sort boolean flags by
-    // their argv position.
-    let matches = Cli::command().get_matches();
-    let view_matches = matches.subcommand_matches("view").unwrap_or_else(|| {
-        eprintln!("internal error: expected 'view' subcommand matches");
-        std::process::exit(1);
-    });
-    let columns = view_columns_from_matches(view_matches);
-    let client = ctx.library();
+pub(crate) fn view(columns: ViewColumns, ctx: &Ctx) -> Result<()> {
+    use std::io::IsTerminal;
+
+    let ViewColumns(columns) = columns;
+    let library = ctx.library();
 
     if columns.is_empty() {
         eprintln!("No fields selected. Use --hash, --artist, --title, and/or --duration.");
@@ -469,12 +472,7 @@ pub(crate) fn view(_args: ViewArgs, ctx: &Ctx) -> Result<()> {
     }
 
     // Read hashes from stdin (same format as `mdma playlist append` / `mdma search` output).
-    let hashes: Vec<String> = std::io::stdin()
-        .lock()
-        .lines()
-        .map_while(Result::ok)
-        .filter_map(|line| parse_hash_from_line(&line))
-        .collect();
+    let hashes = read_hashes();
 
     if hashes.is_empty() {
         if std::io::stdout().is_terminal() {
@@ -486,8 +484,7 @@ pub(crate) fn view(_args: ViewArgs, ctx: &Ctx) -> Result<()> {
     // Look up TrackInfo for each hash, preserving order.
     let mut tracks: Vec<TrackInfo> = Vec::with_capacity(hashes.len());
     for hash in hashes {
-        let content_hash = ContentHash::new(hash.clone());
-        match client.get_track(&content_hash) {
+        match library.get_track(&hash) {
             Ok(track) => tracks.push(track),
             Err(e) => {
                 eprintln!("Warning: could not resolve {}: {}", hash, e);
@@ -516,16 +513,6 @@ pub(crate) fn view(_args: ViewArgs, ctx: &Ctx) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Content hash of a track (full or partial, with or without `sha256:` prefix).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrackHash(pub String);
-
-impl TrackHash {
-    fn into_content_hash(self) -> ContentHash {
-        ContentHash::new(self.0)
-    }
 }
 
 #[cfg(test)]
@@ -721,7 +708,7 @@ mod tests {
             "clap rejected view --hash --artist --title --duration: {}",
             result.unwrap_err()
         );
-        if let Commands::View(ViewArgs {
+        if let Commands::View(ViewCli {
             hash,
             artist,
             title,
@@ -745,7 +732,7 @@ mod tests {
             "clap rejected view --title --hash: {}",
             result.unwrap_err()
         );
-        if let Commands::View(ViewArgs {
+        if let Commands::View(ViewCli {
             hash,
             artist,
             title,

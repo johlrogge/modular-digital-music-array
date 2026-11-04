@@ -1,16 +1,10 @@
-use crate::args::parse_playlist_name;
-use crate::args::sanitized_name_or_exit;
+use crate::args::{parse_playlist_name, sanitized_name_or_exit};
 use crate::ctx::Ctx;
-use crate::stdin::{parse_hash_from_line, resolve_tracks_skip_errors};
-use crate::transfer::build_http_client;
-use crate::transfer::download_tracks;
-use crate::transfer::existing_location_set;
-use crate::transfer::export_dest_path_checked;
-use crate::transfer::export_extension;
-use crate::transfer::path_cost;
-use crate::transfer::DownloadOutcome;
-use crate::transfer::ExportFormat;
-use crate::transfer::MAX_LOCATION_URI_BYTES;
+use crate::stdin::{read_hashes, resolve_tracks_skip_errors};
+use crate::transfer::{
+    build_http_client, download_tracks, existing_location_set, export_dest_path_checked,
+    export_extension, path_cost, DownloadOutcome, ExportFormat, MAX_LOCATION_URI_BYTES,
+};
 use clap::Subcommand;
 use color_eyre::Result;
 use library_ipc_client::{ContentHash, TrackInfo};
@@ -103,11 +97,11 @@ pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
             dry_run,
         } => import(
             RekordboxImportArgs {
-                path,
                 playlist,
                 all_playlists,
                 enrich,
                 dry_run,
+                path,
             },
             ctx,
         ),
@@ -129,11 +123,11 @@ pub(crate) struct RekordboxExportArgs {
 /// only after the XML has been read and matched (phase-2 parse-time candidate).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RekordboxImportArgs {
-    pub(crate) path: std::path::PathBuf,
     pub(crate) playlist: Option<String>,
     pub(crate) all_playlists: bool,
     pub(crate) enrich: bool,
     pub(crate) dry_run: bool,
+    pub(crate) path: std::path::PathBuf,
 }
 
 /// Build a single `RekordboxTrack` from MDMA metadata and file facts.
@@ -221,14 +215,14 @@ fn build_rekordbox_track(
 /// Normalises case at the lookup boundary only; the URI written to
 /// rekordbox.xml preserves its original case.
 fn playlist_locations(
-    hashes: &[String],
+    hashes: &[ContentHash],
     hash_to_location: &std::collections::HashMap<String, String>,
     refreshed_locations: &std::collections::HashSet<String>,
 ) -> Vec<String> {
     hashes
         .iter()
         .filter_map(|h| {
-            let loc = hash_to_location.get(h)?;
+            let loc = hash_to_location.get(h.as_str())?;
             if refreshed_locations.contains(&loc.to_lowercase()) {
                 Some(loc.clone())
             } else {
@@ -240,7 +234,6 @@ fn playlist_locations(
 
 pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
     use std::collections::HashSet;
-    use std::io::BufRead;
 
     let RekordboxExportArgs {
         playlist: playlists,
@@ -261,16 +254,13 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
     //
     // hashes_per_playlist: ordered list of (playlist_name, ordered_hashes).
     // When stdin mode, one entry with empty name.
-    let hashes_per_playlist: Vec<(String, Vec<String>)> = if !playlists.is_empty() {
+    let hashes_per_playlist: Vec<(String, Vec<ContentHash>)> = if !playlists.is_empty() {
         let mut result = Vec::with_capacity(playlists.len());
         for pname in &playlists {
             let name = parse_playlist_name(pname);
             match library.playlist_get(&name) {
                 Ok(hashes) => {
-                    result.push((
-                        pname.clone(),
-                        hashes.into_iter().map(|h| h.as_str().to_string()).collect(),
-                    ));
+                    result.push((pname.clone(), hashes));
                 }
                 Err(e) => {
                     eprintln!("error: playlist '{}' not found: {}", pname, e);
@@ -280,18 +270,12 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
         }
         result
     } else {
-        let hashes: Vec<String> = std::io::stdin()
-            .lock()
-            .lines()
-            .map_while(Result::ok)
-            .filter_map(|line| parse_hash_from_line(&line))
-            .collect();
-        vec![("".to_string(), hashes)]
+        vec![("".to_string(), read_hashes())]
     };
 
     // Union of all hashes, deduped while preserving first-occurrence order.
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut all_hashes: Vec<String> = Vec::new();
+    let mut seen: HashSet<ContentHash> = HashSet::new();
+    let mut all_hashes: Vec<ContentHash> = Vec::new();
     for (_, hs) in &hashes_per_playlist {
         for h in hs {
             if seen.insert(h.clone()) {
@@ -619,11 +603,11 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
     use std::collections::HashMap;
 
     let RekordboxImportArgs {
-        path,
         playlist,
         all_playlists,
         enrich,
         dry_run,
+        path,
     } = args;
     let library = ctx.library();
 
@@ -974,6 +958,7 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::playlist_locations;
+    use library_ipc_client::ContentHash;
     use pretty_assertions::assert_eq;
 
     // ── case-insensitive location URI matching ───────────────────────────────────
@@ -1008,7 +993,7 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        let hashes = [hash.to_string()];
+        let hashes = [ContentHash::new(hash)];
         let locations = playlist_locations(&hashes, &hash_to_location, &refreshed_locations);
 
         assert_eq!(

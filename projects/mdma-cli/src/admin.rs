@@ -24,18 +24,18 @@ pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
     match command {
         Command::ServiceMode { command } => service_mode::dispatch(command, ctx),
         Command::BootHealth => boot_health(ctx),
-        Command::Reboot { force } => reboot(force, ctx),
+        Command::Reboot { force } => reboot(Force(force), ctx),
     }
 }
 
 /// Send an admin request and hand the response to `accept`. A response it
 /// declines, an error response, or a failed request is reported and exits 1.
 fn admin_call<T>(
-    client: &GatewayClient,
+    admin: &GatewayClient,
     request: &AdminRequest,
     accept: impl FnOnce(AdminResponse) -> std::result::Result<T, AdminResponse>,
 ) -> T {
-    match client.admin_request(request) {
+    match admin.admin_request(request) {
         Ok(AdminResponse::Error { message }) => {
             eprintln!("error: {}", message);
             std::process::exit(1);
@@ -52,8 +52,8 @@ fn admin_call<T>(
 }
 
 /// Like [`admin_call`] for requests that are answered with a plain `Ok`.
-fn admin_call_ok(client: &GatewayClient, request: &AdminRequest) {
-    admin_call(client, request, |response| match response {
+fn admin_call_ok(admin: &GatewayClient, request: &AdminRequest) {
+    admin_call(admin, request, |response| match response {
         AdminResponse::Ok => Ok(()),
         other => Err(other),
     });
@@ -61,9 +61,9 @@ fn admin_call_ok(client: &GatewayClient, request: &AdminRequest) {
 
 /// Print the boot-health verdict; exit 1 when a reboot would not be safe.
 pub(crate) fn boot_health(ctx: &Ctx) -> Result<()> {
-    let client = ctx.admin();
+    let admin = ctx.admin();
     let verdict = admin_call(
-        &client,
+        &admin,
         &AdminRequest::BootHealth,
         |response| match response {
             AdminResponse::BootHealth { verdict } => Ok(verdict),
@@ -77,9 +77,14 @@ pub(crate) fn boot_health(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn reboot(force: bool, ctx: &Ctx) -> Result<()> {
-    let client = ctx.admin();
-    admin_call_ok(&client, &AdminRequest::Reboot { force });
+/// Reboot even if the boot-health check fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Force(pub bool);
+
+pub(crate) fn reboot(force: Force, ctx: &Ctx) -> Result<()> {
+    let Force(force) = force;
+    let admin = ctx.admin();
+    admin_call_ok(&admin, &AdminRequest::Reboot { force });
     println!("Reboot initiated. Connection will drop within ~2 seconds.");
     Ok(())
 }
@@ -106,9 +111,9 @@ mod service_mode {
     }
 
     pub(crate) fn status(ctx: &Ctx) -> Result<()> {
-        let client = ctx.admin();
+        let admin = ctx.admin();
         let (boot_order, service_mode_armed, pcie_probe) = admin_call(
-            &client,
+            &admin,
             &AdminRequest::ServiceModeStatus,
             |response| match response {
                 AdminResponse::Status {
@@ -144,8 +149,8 @@ mod service_mode {
     }
 
     pub(crate) fn enable(ctx: &Ctx) -> Result<()> {
-        let client = ctx.admin();
-        admin_call_ok(&client, &AdminRequest::ServiceModeEnable);
+        let admin = ctx.admin();
+        admin_call_ok(&admin, &AdminRequest::ServiceModeEnable);
         println!("Service mode armed.");
         println!(
             "Reboot the device with `mdma admin reboot` (or `sudo reboot`) \
@@ -155,8 +160,8 @@ mod service_mode {
     }
 
     pub(crate) fn disable(ctx: &Ctx) -> Result<()> {
-        let client = ctx.admin();
-        admin_call_ok(&client, &AdminRequest::ServiceModeDisable);
+        let admin = ctx.admin();
+        admin_call_ok(&admin, &AdminRequest::ServiceModeDisable);
         println!("Service mode disarmed. NVMe-first boot order restored.");
         Ok(())
     }

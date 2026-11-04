@@ -29,8 +29,8 @@ pub(crate) enum Command {
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
     match command {
         Command::List => list(ctx),
-        Command::Delete { filename } => delete(InboxFile(filename), ctx),
-        Command::Ingest { filename } => ingest(InboxFile(filename), ctx),
+        Command::Delete { filename } => delete(InboxFileArg(filename), ctx),
+        Command::Ingest { filename } => ingest(InboxFileArg(filename), ctx),
         Command::IngestAll => ingest_all(ctx),
     }
 }
@@ -39,9 +39,9 @@ pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
 /// library connection is made, so invalid names keep failing at the same
 /// point as before (phase-2 parse-time candidate).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct InboxFile(pub String);
+pub(crate) struct InboxFileArg(pub String);
 
-impl InboxFile {
+impl InboxFileArg {
     fn path(&self) -> InboxPath {
         match InboxPath::new(&self.0) {
             Ok(p) => p,
@@ -53,9 +53,9 @@ impl InboxFile {
     }
 }
 
-fn list(ctx: &Ctx) -> Result<()> {
-    let client = ctx.library();
-    match client.inbox_queue() {
+pub(crate) fn list(ctx: &Ctx) -> Result<()> {
+    let library = ctx.library();
+    match library.inbox_queue() {
         Ok(files) => {
             if files.is_empty() {
                 println!("Inbox is empty");
@@ -74,11 +74,11 @@ fn list(ctx: &Ctx) -> Result<()> {
     }
 }
 
-fn delete(file: InboxFile, ctx: &Ctx) -> Result<()> {
-    let client = ctx.library();
+pub(crate) fn delete(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
+    let library = ctx.library();
     let path = file.path();
 
-    match client.delete_inbox_file(&path) {
+    match library.delete_inbox_file(&path) {
         Ok(result) => {
             use mdma_client::IngestResult;
             match result {
@@ -94,13 +94,13 @@ fn delete(file: InboxFile, ctx: &Ctx) -> Result<()> {
     }
 }
 
-fn ingest(file: InboxFile, ctx: &Ctx) -> Result<()> {
-    let client = ctx.library();
+pub(crate) fn ingest(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
+    let library = ctx.library();
     let path = file.path();
 
     println!("Ingesting: {}", file.0);
 
-    match client.ingest_file(&path) {
+    match library.ingest_file(&path) {
         Ok(result) => {
             use mdma_client::IngestResult;
             match result {
@@ -122,11 +122,11 @@ fn ingest(file: InboxFile, ctx: &Ctx) -> Result<()> {
     }
 }
 
-fn ingest_all(ctx: &Ctx) -> Result<()> {
-    let client = ctx.library();
+pub(crate) fn ingest_all(ctx: &Ctx) -> Result<()> {
+    let library = ctx.library();
     println!("Ingesting all files in inbox...");
 
-    match client.ingest_all() {
+    match library.ingest_all() {
         Ok(results) => {
             if results.is_empty() {
                 println!("Inbox is empty - nothing to ingest");

@@ -22,12 +22,18 @@ pub(crate) enum Command {
     },
 }
 
+// `mdma search`: a track query, or a subcommand.
+#[derive(clap::Args, Debug)]
+pub(crate) struct SearchCli {
+    #[command(flatten)]
+    pub(crate) query: SearchArgs,
+
+    #[command(subcommand)]
+    pub(crate) subcommand: Option<Command>,
+}
+
 #[derive(clap::Args, Debug)]
 pub(crate) struct SearchArgs {
-    /// Free-text query applied to all text fields (title, artist, album, label, genre).
-    /// Supports CamelCase initialism (CarbBased) and /regex/ syntax.
-    query: Option<String>,
-
     /// Filter by artist name
     #[arg(long)]
     artist: Option<String>,
@@ -105,13 +111,31 @@ pub(crate) struct SearchArgs {
     #[arg(long)]
     not: bool,
 
-    #[command(subcommand)]
-    subcommand: Option<Command>,
+    /// Free-text query applied to all text fields (title, artist, album, label, genre).
+    /// Supports CamelCase initialism (CarbBased) and /regex/ syntax.
+    query: Option<String>,
 }
 
-pub(crate) fn search(args: SearchArgs, ctx: &Ctx) -> Result<()> {
+/// A fact type name (e.g. MainGenre, Label, Key).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FactTypeArg(pub library_ipc_client::FactType);
+
+pub(crate) fn dispatch(cli: SearchCli, ctx: &Ctx) -> Result<()> {
+    let SearchCli {
+        query: args,
+        subcommand,
+    } = cli;
+    match subcommand {
+        Some(Command::FactValuesFor { fact_type }) => fact_values_for(
+            FactTypeArg(library_ipc_client::FactType::new(fact_type)),
+            ctx,
+        ),
+        None => query(args, ctx),
+    }
+}
+
+pub(crate) fn query(args: SearchArgs, ctx: &Ctx) -> Result<()> {
     let SearchArgs {
-        query,
         artist,
         title,
         album,
@@ -131,34 +155,29 @@ pub(crate) fn search(args: SearchArgs, ctx: &Ctx) -> Result<()> {
         role,
         energy,
         not,
-        subcommand,
+        query,
     } = args;
-    let client = ctx.library();
-    match subcommand {
-        Some(Command::FactValuesFor { fact_type }) => fact_values_for(&client, fact_type),
-        None => {
-            let mut track_query = build_track_query(SearchFilters {
-                any_text: query,
-                artist,
-                title,
-                album,
-                label,
-                genre,
-                style,
-                bpm,
-                year,
-                source,
-                started,
-                stopped,
-                added,
-                played,
-                role,
-                energy,
-            });
-            track_query.not = not;
-            search_tracks(&client, &track_query, no_stdin)
-        }
-    }
+    let library = ctx.library();
+    let mut track_query = build_track_query(SearchFilters {
+        any_text: query,
+        artist,
+        title,
+        album,
+        label,
+        genre,
+        style,
+        bpm,
+        year,
+        source,
+        started,
+        stopped,
+        added,
+        played,
+        role,
+        energy,
+    });
+    track_query.not = not;
+    search_tracks(&library, &track_query, no_stdin)
 }
 
 /// Filter by playback history.
@@ -208,6 +227,21 @@ struct SearchFilters {
     energy: Option<String>,
 }
 
+/// Parse the value given for `flag`, if any; an invalid one is reported
+/// (`Invalid <flag> value: <error>`) and exits 1.
+fn parse_or_exit<T, E: std::fmt::Display>(
+    value: Option<String>,
+    flag: &str,
+    parse: impl Fn(&str) -> std::result::Result<T, E>,
+) -> Option<T> {
+    value.map(|s| {
+        parse(&s).unwrap_or_else(|e| {
+            eprintln!("Invalid {} value: {}", flag, e);
+            std::process::exit(1);
+        })
+    })
+}
+
 /// Build a TrackQuery from the search filters.
 ///
 /// Precedence: `--played=never` overrides any explicit `--started` value.
@@ -233,57 +267,13 @@ fn build_track_query(filters: SearchFilters) -> TrackQuery {
     let started = if matches!(played, Some(PlayedFilter::Never)) {
         // --played=never is a shortcut for started=N/A and overrides any --started value.
         Some(library_search::DateQuery::NA)
-    } else if let Some(s) = started_str {
-        match parse_date_query(&s) {
-            Ok(q) => Some(q),
-            Err(e) => {
-                eprintln!("Invalid --started value: {}", e);
-                std::process::exit(1);
-            }
-        }
     } else {
-        None
+        parse_or_exit(started_str, "--started", parse_date_query)
     };
-    let stopped = if let Some(s) = stopped_str {
-        match parse_date_query(&s) {
-            Ok(q) => Some(q),
-            Err(e) => {
-                eprintln!("Invalid --stopped value: {}", e);
-                std::process::exit(1);
-            }
-        }
-    } else {
-        None
-    };
-    let added = if let Some(s) = added_str {
-        match parse_date_query(&s) {
-            Ok(q) => Some(q),
-            Err(e) => {
-                eprintln!("Invalid --added value: {}", e);
-                std::process::exit(1);
-            }
-        }
-    } else {
-        None
-    };
-    let role = if let Some(s) = role_str {
-        match parse_role_query(&s) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                eprintln!("Invalid --role value: {}", e);
-                std::process::exit(1);
-            }
-        }
-    } else {
-        None
-    };
-    let energy = energy_str.map(|s| match parse_numeric_query(&s) {
-        Ok(q) => q,
-        Err(e) => {
-            eprintln!("Invalid --energy value: {}", e);
-            std::process::exit(1);
-        }
-    });
+    let stopped = parse_or_exit(stopped_str, "--stopped", parse_date_query);
+    let added = parse_or_exit(added_str, "--added", parse_date_query);
+    let role = parse_or_exit(role_str, "--role", parse_role_query);
+    let energy = parse_or_exit(energy_str, "--energy", parse_numeric_query);
     TrackQuery {
         any_text: any_text.map(|s| parse_string_query(&s)),
         artist: artist.map(|s| parse_string_query(&s)),
@@ -349,7 +339,7 @@ fn apply_stdin_filter(
     }
 }
 
-fn search_tracks(client: &LibraryBackend, query: &TrackQuery, no_stdin: bool) -> Result<()> {
+fn search_tracks(library: &LibraryBackend, query: &TrackQuery, no_stdin: bool) -> Result<()> {
     use std::collections::HashSet;
     use std::io::{BufRead, IsTerminal};
 
@@ -376,7 +366,7 @@ fn search_tracks(client: &LibraryBackend, query: &TrackQuery, no_stdin: bool) ->
         effective_query.not = false;
     }
 
-    match client.search(&effective_query) {
+    match library.search(&effective_query) {
         Ok(tracks) => {
             let tracks = apply_stdin_filter(tracks, stdin_filter.as_ref(), effective_not);
 
@@ -394,9 +384,11 @@ fn search_tracks(client: &LibraryBackend, query: &TrackQuery, no_stdin: bool) ->
     }
 }
 
-fn fact_values_for(client: &LibraryBackend, fact_type: String) -> Result<()> {
+pub(crate) fn fact_values_for(fact_type: FactTypeArg, ctx: &Ctx) -> Result<()> {
     use std::io::IsTerminal;
-    match client.get_fact_values(&fact_type) {
+    let FactTypeArg(fact_type) = fact_type;
+    let library = ctx.library();
+    match library.get_fact_values(fact_type.as_str()) {
         Ok(values) => {
             if std::io::stdout().is_terminal() {
                 if values.is_empty() {

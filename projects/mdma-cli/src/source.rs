@@ -3,11 +3,10 @@ mod import;
 use crate::args::sanitized_name_or_exit;
 use crate::ctx::Ctx;
 use crate::output::handle_source_error;
-use crate::source::import::finish_import;
-use crate::source::import::follow_import_job;
-use crate::source::import::is_terminal_phase;
+use crate::source::import::{finish_import, follow_import_job, is_terminal_phase};
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
+use mdma_client::SourceClient;
 use source_protocol::{SourceError, SourceRequest, SourceResponse};
 
 /// Top level of `mdma source`: the global `list`, or `<source-name> <command>`.
@@ -43,15 +42,26 @@ pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SourceArg(pub mdma_client::SourceName);
 
+impl SourceArg {
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
 /// Whether `check-updates` resyncs the stale items it finds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ApplyUpdates(pub bool);
 
+/// A download of a source, as listed by `downloads`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DownloadArg(pub source_protocol::DownloadId);
+
+/// A source-specific item identifier (e.g. "p123456" for bandcamp).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ItemIdArg(pub String);
+
 #[derive(clap::Args, Debug, PartialEq)]
 pub(crate) struct ImportPlaylistArgs {
-    /// Playlist slug or URL
-    playlist: String,
-
     /// MDMA playlist name (default: sanitised source title)
     #[arg(long)]
     name: Option<String>,
@@ -63,6 +73,9 @@ pub(crate) struct ImportPlaylistArgs {
     /// Print the job id and exit once the import has started
     #[arg(long)]
     no_wait: bool,
+
+    /// Playlist slug or URL
+    playlist: String,
 }
 
 /// The per-source commands: `mdma source <source-name> <command> [args]`.
@@ -159,7 +172,7 @@ fn exit_source_parse_error(e: clap::Error) -> ! {
 /// rate-limited upstream requests (e.g. Bandcamp), well beyond the default 5s.
 const SOURCE_LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-fn list(ctx: &Ctx) -> Result<()> {
+pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     let gateway = ctx.gateway();
     let sources = match mdma_client::list_available_sources(gateway.as_deref(), ctx.sources_dir()) {
         Ok(s) => s,
@@ -178,213 +191,247 @@ fn list(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn sync(source: SourceArg, ctx: &Ctx) -> Result<()> {
-    let name = source.0.as_str();
-    let client = ctx.source(name, None);
-    println!("Syncing {}...", name);
-    match client.request(name, &SourceRequest::Sync) {
-        Ok(SourceResponse::SyncStarted {
-            total_items,
-            new_items,
-        }) => {
-            println!("Sync started for {}", name);
-            println!("Total items: {}, New items: {}", total_items, new_items);
-            Ok(())
-        }
-        Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
-        Ok(_) => handle_source_error(&"Unexpected response"),
+/// Send `request` to the source `name` and hand the response to `accept`. A
+/// response it declines (an error response or an unexpected one) or a failed
+/// request is reported and exits 1. The declined response is boxed because
+/// `SourceResponse` is large.
+fn source_call<T>(
+    source: &SourceClient,
+    name: &str,
+    request: &SourceRequest,
+    accept: impl FnOnce(SourceResponse) -> std::result::Result<T, Box<SourceResponse>>,
+) -> T {
+    match source.request(name, request) {
+        Ok(response) => accept(response).unwrap_or_else(|declined| match *declined {
+            SourceResponse::Error(e) => handle_source_error(&e),
+            _ => handle_source_error(&"Unexpected response"),
+        }),
         Err(e) => handle_source_error(&e),
     }
+}
+
+/// Report an item the source does not have and exit 1.
+fn item_not_found(identifier: &str, source: &str) -> ! {
+    eprintln!(
+        "Item {} not found in your {} collection",
+        identifier, source
+    );
+    std::process::exit(1);
+}
+
+pub(crate) fn sync(source: SourceArg, ctx: &Ctx) -> Result<()> {
+    let name = source.as_str();
+    let source = ctx.source(name, None);
+    println!("Syncing {}...", name);
+    let (total_items, new_items) =
+        source_call(
+            &source,
+            name,
+            &SourceRequest::Sync,
+            |response| match response {
+                SourceResponse::SyncStarted {
+                    total_items,
+                    new_items,
+                } => Ok((total_items, new_items)),
+                other => Err(Box::new(other)),
+            },
+        );
+    println!("Sync started for {}", name);
+    println!("Total items: {}, New items: {}", total_items, new_items);
+    Ok(())
 }
 
 pub(crate) fn status(source: SourceArg, ctx: &Ctx) -> Result<()> {
-    let name = source.0.as_str();
-    let client = ctx.source(name, None);
-    match client.request(name, &SourceRequest::GetStatus) {
-        Ok(SourceResponse::Status(status)) => {
-            println!("Source: {} v{}", status.name, status.version);
-            println!("{}", "=".repeat(40));
-            println!(
-                "Authenticated:     {}",
-                if status.auth == source_protocol::AuthStatus::Authenticated {
-                    "yes"
-                } else {
-                    "no"
-                }
-            );
-            println!("Downloads active:  {}", status.downloads_active);
-            println!("Downloads queued:  {}", status.downloads_queued);
-            println!("Downloads done:    {}", status.downloads_completed);
-            println!("Downloads failed:  {}", status.downloads_failed);
-            println!("Uptime:            {} seconds", status.uptime_seconds);
-            println!(
-                "Paused:            {}",
-                if status.queue == source_protocol::QueueState::Paused {
-                    "yes"
-                } else {
-                    "no"
-                }
-            );
-            Ok(())
+    let name = source.as_str();
+    let source = ctx.source(name, None);
+    let status = source_call(
+        &source,
+        name,
+        &SourceRequest::GetStatus,
+        |response| match response {
+            SourceResponse::Status(status) => Ok(status),
+            other => Err(Box::new(other)),
+        },
+    );
+    println!("Source: {} v{}", status.name, status.version);
+    println!("{}", "=".repeat(40));
+    println!(
+        "Authenticated:     {}",
+        if status.auth == source_protocol::AuthStatus::Authenticated {
+            "yes"
+        } else {
+            "no"
         }
-        Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
-        Ok(_) => handle_source_error(&"Unexpected response"),
-        Err(e) => handle_source_error(&e),
-    }
+    );
+    println!("Downloads active:  {}", status.downloads_active);
+    println!("Downloads queued:  {}", status.downloads_queued);
+    println!("Downloads done:    {}", status.downloads_completed);
+    println!("Downloads failed:  {}", status.downloads_failed);
+    println!("Uptime:            {} seconds", status.uptime_seconds);
+    println!(
+        "Paused:            {}",
+        if status.queue == source_protocol::QueueState::Paused {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    Ok(())
 }
 
 pub(crate) fn downloads(source: SourceArg, ctx: &Ctx) -> Result<()> {
-    let name = source.0.as_str();
-    let client = ctx.source(name, None);
-    match client.request(name, &SourceRequest::ListDownloads) {
-        Ok(SourceResponse::Downloads(downloads)) => {
-            if downloads.is_empty() {
-                println!("No downloads in progress");
-                return Ok(());
-            }
-
-            println!("Downloads ({}):", downloads.len());
-            println!("{}", "=".repeat(65));
-
-            for dl in downloads {
-                let progress = if let Some(total) = dl.total_bytes {
-                    let pct = (dl.downloaded_bytes as f64 / total as f64) * 100.0;
-                    format!("{:.1}%", pct)
-                } else {
-                    format!("{} bytes", dl.downloaded_bytes)
-                };
-
-                let status = match &dl.state {
-                    source_protocol::DownloadState::Queued => "queued".to_string(),
-                    source_protocol::DownloadState::Downloading => {
-                        format!("downloading {}", progress)
-                    }
-                    source_protocol::DownloadState::Processing => "processing".to_string(),
-                    source_protocol::DownloadState::Completed => "completed".to_string(),
-                    source_protocol::DownloadState::Failed { message } => {
-                        format!("failed: {}", message)
-                    }
-                    source_protocol::DownloadState::Cancelled => "cancelled".to_string(),
-                };
-
-                println!("{} | {} - {} | {}", dl.id, dl.artist, dl.title, status);
-            }
-            Ok(())
-        }
-        Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
-        Ok(_) => handle_source_error(&"Unexpected response"),
-        Err(e) => handle_source_error(&e),
+    let name = source.as_str();
+    let source = ctx.source(name, None);
+    let downloads =
+        source_call(
+            &source,
+            name,
+            &SourceRequest::ListDownloads,
+            |response| match response {
+                SourceResponse::Downloads(downloads) => Ok(downloads),
+                other => Err(Box::new(other)),
+            },
+        );
+    if downloads.is_empty() {
+        println!("No downloads in progress");
+        return Ok(());
     }
+
+    println!("Downloads ({}):", downloads.len());
+    println!("{}", "=".repeat(65));
+
+    for dl in downloads {
+        let progress = if let Some(total) = dl.total_bytes {
+            let pct = (dl.downloaded_bytes as f64 / total as f64) * 100.0;
+            format!("{:.1}%", pct)
+        } else {
+            format!("{} bytes", dl.downloaded_bytes)
+        };
+
+        let status = match &dl.state {
+            source_protocol::DownloadState::Queued => "queued".to_string(),
+            source_protocol::DownloadState::Downloading => {
+                format!("downloading {}", progress)
+            }
+            source_protocol::DownloadState::Processing => "processing".to_string(),
+            source_protocol::DownloadState::Completed => "completed".to_string(),
+            source_protocol::DownloadState::Failed { message } => {
+                format!("failed: {}", message)
+            }
+            source_protocol::DownloadState::Cancelled => "cancelled".to_string(),
+        };
+
+        println!("{} | {} - {} | {}", dl.id, dl.artist, dl.title, status);
+    }
+    Ok(())
 }
 
-pub(crate) fn cancel(source: SourceArg, id: source_protocol::DownloadId, ctx: &Ctx) -> Result<()> {
-    let name = source.0.as_str();
-    let client = ctx.source(name, None);
-    match client.request(name, &SourceRequest::CancelDownload { id: id.clone() }) {
-        Ok(SourceResponse::Cancelled { .. }) => {
-            println!("Cancelled download: {}", id);
-            Ok(())
-        }
-        Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
-        Ok(_) => handle_source_error(&"Unexpected response"),
-        Err(e) => handle_source_error(&e),
-    }
+pub(crate) fn cancel(source: SourceArg, id: DownloadArg, ctx: &Ctx) -> Result<()> {
+    let DownloadArg(id) = id;
+    let name = source.as_str();
+    let source = ctx.source(name, None);
+    let request = SourceRequest::CancelDownload { id: id.clone() };
+    source_call(&source, name, &request, |response| match response {
+        SourceResponse::Cancelled { .. } => Ok(()),
+        other => Err(Box::new(other)),
+    });
+    println!("Cancelled download: {}", id);
+    Ok(())
 }
 
 pub(crate) fn pause(source: SourceArg, ctx: &Ctx) -> Result<()> {
-    let name = source.0.as_str();
-    let client = ctx.source(name, None);
-    match client.request(name, &SourceRequest::PauseAll) {
-        Ok(SourceResponse::Paused) => {
-            println!("Downloads paused");
-            Ok(())
-        }
-        Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
-        Ok(_) => handle_source_error(&"Unexpected response"),
-        Err(e) => handle_source_error(&e),
-    }
+    let name = source.as_str();
+    let source = ctx.source(name, None);
+    source_call(
+        &source,
+        name,
+        &SourceRequest::PauseAll,
+        |response| match response {
+            SourceResponse::Paused => Ok(()),
+            other => Err(Box::new(other)),
+        },
+    );
+    println!("Downloads paused");
+    Ok(())
 }
 
 pub(crate) fn resume(source: SourceArg, ctx: &Ctx) -> Result<()> {
-    let name = source.0.as_str();
-    let client = ctx.source(name, None);
-    match client.request(name, &SourceRequest::ResumeAll) {
-        Ok(SourceResponse::Resumed) => {
-            println!("Downloads resumed");
-            Ok(())
-        }
-        Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
-        Ok(_) => handle_source_error(&"Unexpected response"),
-        Err(e) => handle_source_error(&e),
-    }
+    let name = source.as_str();
+    let source = ctx.source(name, None);
+    source_call(
+        &source,
+        name,
+        &SourceRequest::ResumeAll,
+        |response| match response {
+            SourceResponse::Resumed => Ok(()),
+            other => Err(Box::new(other)),
+        },
+    );
+    println!("Downloads resumed");
+    Ok(())
 }
 
-pub(crate) fn resync(source: SourceArg, identifier: String, ctx: &Ctx) -> Result<()> {
-    let name = source.0.as_str();
-    let client = ctx.source(name, None);
+pub(crate) fn resync(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) -> Result<()> {
+    let ItemIdArg(identifier) = identifier;
+    let name = source.as_str();
+    let source = ctx.source(name, None);
     println!("Requesting resync of {} from {}...", identifier, name);
-    match client.request(name, &SourceRequest::ResyncItem { identifier }) {
-        Ok(SourceResponse::ResyncQueued {
-            identifier,
-            tracks_queued,
-        }) => {
-            println!(
-                "Queued resync for {} ({} item queued)",
-                identifier, tracks_queued
-            );
-            Ok(())
-        }
-        Ok(SourceResponse::Error(SourceError::ItemNotFound { identifier: ref id })) => {
-            eprintln!("Item {} not found in your {} collection", id, name);
-            std::process::exit(1);
-        }
-        Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
-        Ok(_) => handle_source_error(&"Unexpected response"),
-        Err(e) => handle_source_error(&e),
-    }
+    let request = SourceRequest::ResyncItem { identifier };
+    let (identifier, tracks_queued) =
+        source_call(&source, name, &request, |response| match response {
+            SourceResponse::ResyncQueued {
+                identifier,
+                tracks_queued,
+            } => Ok((identifier, tracks_queued)),
+            SourceResponse::Error(SourceError::ItemNotFound { identifier }) => {
+                item_not_found(&identifier, name)
+            }
+            other => Err(Box::new(other)),
+        });
+    println!(
+        "Queued resync for {} ({} item queued)",
+        identifier, tracks_queued
+    );
+    Ok(())
 }
 
-pub(crate) fn check_item(source: SourceArg, identifier: String, ctx: &Ctx) -> Result<()> {
-    let name = source.0.as_str();
-    let client = ctx.source(name, None);
-    match client.request(name, &SourceRequest::CheckItem { identifier }) {
-        Ok(SourceResponse::ItemChecked {
-            identifier,
-            live_track_count,
-            stored_track_count,
-            stale,
-        }) => {
-            if stale {
-                println!(
-                    "STALE {}: live={} stored={}",
-                    identifier, live_track_count, stored_track_count
-                );
-            } else {
-                println!("OK {}: {} tracks", identifier, stored_track_count);
+pub(crate) fn check_item(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) -> Result<()> {
+    let ItemIdArg(identifier) = identifier;
+    let name = source.as_str();
+    let source = ctx.source(name, None);
+    let request = SourceRequest::CheckItem { identifier };
+    let (identifier, live_track_count, stored_track_count, stale) =
+        source_call(&source, name, &request, |response| match response {
+            SourceResponse::ItemChecked {
+                identifier,
+                live_track_count,
+                stored_track_count,
+                stale,
+            } => Ok((identifier, live_track_count, stored_track_count, stale)),
+            SourceResponse::Error(SourceError::ItemNotFound { identifier }) => {
+                item_not_found(&identifier, name)
             }
-            Ok(())
-        }
-        Ok(SourceResponse::Error(SourceError::ItemNotFound { identifier: ref id })) => {
-            eprintln!("Item {} not found in your {} collection", id, name);
-            std::process::exit(1);
-        }
-        Ok(SourceResponse::Error(e)) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-        Ok(_) => handle_source_error(&"Unexpected response"),
-        Err(e) => handle_source_error(&e),
+            other => Err(Box::new(other)),
+        });
+    if stale {
+        println!(
+            "STALE {}: live={} stored={}",
+            identifier, live_track_count, stored_track_count
+        );
+    } else {
+        println!("OK {}: {} tracks", identifier, stored_track_count);
     }
+    Ok(())
 }
 
 pub(crate) fn check_updates(source: SourceArg, apply: ApplyUpdates, ctx: &Ctx) -> Result<()> {
-    let name = source.0.as_str();
+    let name = source.as_str();
     let apply = apply.0;
-    let source_client = ctx.source(name, None);
+    let source = ctx.source(name, None);
     // Fetch all ItemId values from the library for this source.
     // We use GetFactValues("ItemId") — returns all ItemId values the library knows about.
-    let lib = ctx.library();
-    let all_item_ids = match lib.request(&library_ipc_client::LibraryRequest::GetFactValues {
+    let library = ctx.library();
+    let all_item_ids = match library.request(&library_ipc_client::LibraryRequest::GetFactValues {
         fact_type: library_ipc_client::FactType::new("ItemId"),
     }) {
         Ok(library_ipc_client::LibraryResponse::FactValues(values)) => values,
@@ -415,7 +462,7 @@ pub(crate) fn check_updates(source: SourceArg, apply: ApplyUpdates, ctx: &Ctx) -
     for (idx, item_id) in all_item_ids.iter().enumerate() {
         eprint!("[{}/{}] checking {} ... ", idx + 1, total, item_id);
 
-        match source_client.request(
+        match source.request(
             name,
             &SourceRequest::CheckItem {
                 identifier: item_id.clone(),
@@ -476,7 +523,7 @@ pub(crate) fn check_updates(source: SourceArg, apply: ApplyUpdates, ctx: &Ctx) -
 
     if apply {
         for id in &stale_ids {
-            match source_client.request(
+            match source.request(
                 name,
                 &SourceRequest::ResyncItem {
                     identifier: id.clone(),
@@ -521,45 +568,49 @@ fn handle_playlist_source_error(source: &str, feature: &str, err: &SourceError) 
 }
 
 pub(crate) fn playlists(source: SourceArg, ctx: &Ctx) -> Result<()> {
-    let source = source.0.as_str();
-    let client = ctx.source(source, Some(SOURCE_LISTING_TIMEOUT));
-    match client.request(source, &SourceRequest::ListPlaylists) {
-        Ok(SourceResponse::Playlists(playlists)) => {
-            if playlists.is_empty() {
-                println!("No playlists found");
-                return Ok(());
-            }
-            let slug_w = playlists
-                .iter()
-                .map(|p| p.slug.chars().count())
-                .max()
-                .unwrap_or(4)
-                .max(4);
-            let title_w = playlists
-                .iter()
-                .map(|p| p.title.chars().count())
-                .max()
-                .unwrap_or(5)
-                .max(5);
-            println!(
-                "{:<slug_w$}  {:<title_w$}  {:>6}  PRIVATE",
-                "SLUG", "TITLE", "TRACKS"
-            );
-            for p in &playlists {
-                println!(
-                    "{:<slug_w$}  {:<title_w$}  {:>6}  {}",
-                    p.slug,
-                    p.title,
-                    p.track_count,
-                    if p.is_private { "yes" } else { "no" }
-                );
-            }
-            Ok(())
-        }
-        Ok(SourceResponse::Error(e)) => handle_playlist_source_error(source, "playlists", &e),
-        Ok(_) => handle_source_error(&"Unexpected response"),
-        Err(e) => handle_source_error(&e),
+    let name = source.as_str();
+    let source = ctx.source(name, Some(SOURCE_LISTING_TIMEOUT));
+    let playlists =
+        source_call(
+            &source,
+            name,
+            &SourceRequest::ListPlaylists,
+            |response| match response {
+                SourceResponse::Playlists(playlists) => Ok(playlists),
+                SourceResponse::Error(e) => handle_playlist_source_error(name, "playlists", &e),
+                other => Err(Box::new(other)),
+            },
+        );
+    if playlists.is_empty() {
+        println!("No playlists found");
+        return Ok(());
     }
+    let slug_w = playlists
+        .iter()
+        .map(|p| p.slug.chars().count())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let title_w = playlists
+        .iter()
+        .map(|p| p.title.chars().count())
+        .max()
+        .unwrap_or(5)
+        .max(5);
+    println!(
+        "{:<slug_w$}  {:<title_w$}  {:>6}  PRIVATE",
+        "SLUG", "TITLE", "TRACKS"
+    );
+    for p in &playlists {
+        println!(
+            "{:<slug_w$}  {:<title_w$}  {:>6}  {}",
+            p.slug,
+            p.title,
+            p.track_count,
+            if p.is_private { "yes" } else { "no" }
+        );
+    }
+    Ok(())
 }
 
 /// The command hinted at to follow an import job (name first, as parsed).
@@ -588,66 +639,70 @@ pub(crate) fn import_playlist(
     args: ImportPlaylistArgs,
     ctx: &Ctx,
 ) -> Result<()> {
-    let source = source.0.as_str();
-    let client = ctx.source(source, None);
+    let name = source.as_str();
+    let source = ctx.source(name, None);
     let ImportPlaylistArgs {
-        playlist,
-        name,
+        name: playlist_name,
         dry_run,
         no_wait,
+        playlist,
     } = args;
     // Validate --name before talking to the server
-    let explicit_name = name.as_deref().map(|n| sanitized_name_or_exit(n, "--name"));
+    let explicit_name = playlist_name
+        .as_deref()
+        .map(|n| sanitized_name_or_exit(n, "--name"));
 
-    let job_id = match client.request(
-        source,
-        &SourceRequest::ImportPlaylist {
-            playlist,
-            name: explicit_name,
-            dry_run,
-        },
-    ) {
-        Ok(SourceResponse::ImportStarted { job_id }) => {
-            println!("Import started (job {})", job_id);
-            job_id
-        }
-        Ok(SourceResponse::Error(SourceError::ImportInProgress { job_id })) => {
+    let request = SourceRequest::ImportPlaylist {
+        playlist,
+        name: explicit_name,
+        dry_run,
+    };
+    let job_id = source_call(&source, name, &request, |response| match response {
+        SourceResponse::ImportStarted { job_id } => Ok(job_id),
+        SourceResponse::Error(SourceError::ImportInProgress { job_id }) => {
             // The running job may be a different playlist or a dry run, so
             // following it would report someone else's result as ours.
-            eprintln!("{}", import_not_started_message(source, job_id));
+            eprintln!("{}", import_not_started_message(name, job_id));
             std::process::exit(1);
         }
-        Ok(SourceResponse::Error(e)) => handle_playlist_source_error(source, "playlist import", &e),
-        Ok(_) => handle_source_error(&"Unexpected response"),
-        Err(e) => handle_source_error(&e),
-    };
+        SourceResponse::Error(e) => handle_playlist_source_error(name, "playlist import", &e),
+        other => Err(Box::new(other)),
+    });
+    println!("Import started (job {})", job_id);
 
     if no_wait {
-        println!("Check progress with '{}'", import_status_command(source));
+        println!("Check progress with '{}'", import_status_command(name));
         return Ok(());
     }
-    follow_import_job(&client, source, job_id)
+    follow_import_job(&source, name, job_id)
 }
 
 pub(crate) fn import_status(source: SourceArg, ctx: &Ctx) -> Result<()> {
-    let source = source.0.as_str();
-    let client = ctx.source(source, None);
-    match client.request(source, &SourceRequest::GetImportStatus) {
-        Ok(SourceResponse::ImportStatus(None)) => {
+    let name = source.as_str();
+    let source = ctx.source(name, None);
+    let status =
+        source_call(
+            &source,
+            name,
+            &SourceRequest::GetImportStatus,
+            |response| match response {
+                SourceResponse::ImportStatus(status) => Ok(status),
+                SourceResponse::Error(e) => {
+                    handle_playlist_source_error(name, "playlist import", &e)
+                }
+                other => Err(Box::new(other)),
+            },
+        );
+    match status {
+        None => {
             println!("No import job");
             Ok(())
         }
-        Ok(SourceResponse::ImportStatus(Some(status))) => {
-            if is_terminal_phase(&status.phase) {
-                finish_import(&status)
-            } else {
-                println!("Import job {} is running", status.job_id);
-                follow_import_job(&client, source, status.job_id)
-            }
+        Some(status) if is_terminal_phase(&status.phase) => finish_import(&status),
+        Some(status) => {
+            println!("Import job {} is running", status.job_id);
+            follow_import_job(&source, name, status.job_id)
         }
-        Ok(SourceResponse::Error(e)) => handle_playlist_source_error(source, "playlist import", &e),
-        Ok(_) => handle_source_error(&"Unexpected response"),
-        Err(e) => handle_source_error(&e),
     }
 }
 
@@ -657,11 +712,15 @@ fn run_source_command(source: SourceArg, command: SourceCommand, ctx: &Ctx) -> R
         SourceCommand::Sync => sync(source, ctx),
         SourceCommand::Status => status(source, ctx),
         SourceCommand::Downloads => downloads(source, ctx),
-        SourceCommand::Cancel { id } => cancel(source, source_protocol::DownloadId::new(id), ctx),
+        SourceCommand::Cancel { id } => cancel(
+            source,
+            DownloadArg(source_protocol::DownloadId::new(id)),
+            ctx,
+        ),
         SourceCommand::Pause => pause(source, ctx),
         SourceCommand::Resume => resume(source, ctx),
-        SourceCommand::Resync { identifier } => resync(source, identifier, ctx),
-        SourceCommand::CheckItem { identifier } => check_item(source, identifier, ctx),
+        SourceCommand::Resync { identifier } => resync(source, ItemIdArg(identifier), ctx),
+        SourceCommand::CheckItem { identifier } => check_item(source, ItemIdArg(identifier), ctx),
         SourceCommand::CheckUpdates { apply } => check_updates(source, ApplyUpdates(apply), ctx),
         SourceCommand::Playlists => playlists(source, ctx),
         SourceCommand::ImportPlaylist { args } => import_playlist(source, args, ctx),

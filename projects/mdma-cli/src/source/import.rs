@@ -132,11 +132,11 @@ pub(crate) fn finish_import(status: &ImportJobStatus) -> Result<()> {
 }
 
 /// Poll the server until `job_id` finishes, then print its report.
-pub(crate) fn follow_import_job(client: &SourceClient, source: &str, job_id: u64) -> Result<()> {
+pub(crate) fn follow_import_job(source: &SourceClient, name: &str, job_id: u64) -> Result<()> {
     let mut poller = ImportPoller::new(job_id);
     let mut last_error: Option<String> = None;
     loop {
-        let input = match client.request(source, &SourceRequest::GetImportStatus) {
+        let input = match source.request(name, &SourceRequest::GetImportStatus) {
             Ok(SourceResponse::ImportStatus(s)) => PollInput::Status(s),
             Ok(SourceResponse::Error(e)) => {
                 last_error = Some(e.to_string());
@@ -164,7 +164,7 @@ pub(crate) fn follow_import_job(client: &SourceClient, source: &str, job_id: u64
                      check later with '{}'",
                     job_id,
                     last_error.unwrap_or_else(|| "no status for the job".to_string()),
-                    import_status_command(source)
+                    import_status_command(name)
                 );
                 std::process::exit(1);
             }

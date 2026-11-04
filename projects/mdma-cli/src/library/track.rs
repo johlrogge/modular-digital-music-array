@@ -1,3 +1,4 @@
+use crate::args::TrackArg;
 use crate::ctx::Ctx;
 use clap::Subcommand;
 use color_eyre::Result;
@@ -59,10 +60,6 @@ pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
     }
 }
 
-/// Content hash of a track, as typed (a prefix is accepted; the service resolves it).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrackArg(pub ContentHash);
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReplaceArgs {
     pub(crate) old_hash: TrackArg,
@@ -71,9 +68,9 @@ pub(crate) struct ReplaceArgs {
 }
 
 pub(crate) fn delete(hash: TrackArg, ctx: &Ctx) -> Result<()> {
-    let lib = ctx.library();
+    let library = ctx.library();
     let TrackArg(ch) = hash;
-    match lib.track_delete(&ch) {
+    match library.track_delete(&ch) {
         Ok(()) => {
             println!(
                 "soft-deleted; recover with `mdma library track restore {}`",
@@ -89,9 +86,9 @@ pub(crate) fn delete(hash: TrackArg, ctx: &Ctx) -> Result<()> {
 }
 
 pub(crate) fn restore(hash: TrackArg, ctx: &Ctx) -> Result<()> {
-    let lib = ctx.library();
+    let library = ctx.library();
     let TrackArg(ch) = hash;
-    match lib.track_restore(&ch) {
+    match library.track_restore(&ch) {
         Ok(()) => {
             println!("track restored");
             Ok(())
@@ -108,8 +105,8 @@ pub(crate) fn replace(args: ReplaceArgs, ctx: &Ctx) -> Result<()> {
         old_hash: TrackArg(old_hash),
         new_file,
     } = args;
-    let lib = ctx.library();
-    match lib.track_replace(&old_hash, &new_file) {
+    let library = ctx.library();
+    match library.track_replace(&old_hash, &new_file) {
         Ok((new_hash, playlists)) => {
             println!("{} -> {}", old_hash, new_hash.as_str());
             println!("{} playlist(s) rewritten", playlists);
@@ -125,8 +122,8 @@ pub(crate) fn replace(args: ReplaceArgs, ctx: &Ctx) -> Result<()> {
 pub(crate) fn orphans(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::OrphanReason;
 
-    let lib = ctx.library();
-    match lib.track_orphans() {
+    let library = ctx.library();
+    match library.track_orphans() {
         Ok(orphans) => {
             if orphans.is_empty() {
                 println!("no hidden tracks");

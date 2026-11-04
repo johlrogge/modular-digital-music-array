@@ -1,6 +1,6 @@
 use crate::ctx::Ctx;
 use crate::library::Yes;
-use crate::stdin::is_yes;
+use crate::stdin::confirm;
 use clap::Subcommand;
 use color_eyre::Result;
 use library_ipc_client::{ArchiveEmptyReport, ArchiveListing};
@@ -83,8 +83,8 @@ fn format_archive_emptied(r: &ArchiveEmptyReport) -> String {
 }
 
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
-    let client = ctx.library();
-    match client.archive_list() {
+    let library = ctx.library();
+    match library.archive_list() {
         Ok(l) => {
             println!("{}", format_archive_listing(&l));
             Ok(())
@@ -98,11 +98,11 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
 
 pub(crate) fn empty(yes: Yes, ctx: &Ctx) -> Result<()> {
     let Yes(yes) = yes;
-    let client = ctx.library();
+    let library = ctx.library();
     // `--yes` without a listing deletes everything; after a prompt, only what was shown.
     let mut up_to = None;
     if !yes {
-        let listing = match client.archive_list() {
+        let listing = match library.archive_list() {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("Error: {}", e);
@@ -113,18 +113,14 @@ pub(crate) fn empty(yes: Yes, ctx: &Ctx) -> Result<()> {
         if listing.entries.is_empty() {
             return Ok(());
         }
-        print!("{}", archive_empty_prompt(&listing));
-        std::io::Write::flush(&mut std::io::stdout())?;
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        if !is_yes(&answer) {
+        if !confirm(&archive_empty_prompt(&listing))? {
             println!("Aborted");
             return Ok(());
         }
         up_to = Some(archive_cutoff(&listing));
     }
 
-    match client.archive_empty(up_to.as_deref()) {
+    match library.archive_empty(up_to.as_deref()) {
         Ok(report) => {
             println!("{}", format_archive_emptied(&report));
             if !report.errors.is_empty() {

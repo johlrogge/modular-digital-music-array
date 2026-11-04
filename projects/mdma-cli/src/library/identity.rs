@@ -94,8 +94,8 @@ fn identity_already_running_message(running_pcm: bool, requested_pcm: bool) -> S
 pub(crate) fn backfill(args: BackfillArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::IdentityBackfillStart;
     let BackfillArgs { pcm, no_wait } = args;
-    let client = ctx.library();
-    match client.identity_backfill(pcm) {
+    let library = ctx.library();
+    match library.identity_backfill(pcm) {
         Ok(IdentityBackfillStart::Started(p)) => {
             println!("Identity backfill started: {} tracks to process", p.total)
         }
@@ -115,7 +115,7 @@ pub(crate) fn backfill(args: BackfillArgs, ctx: &Ctx) -> Result<()> {
     let mut last_printed = String::new();
     let mut failures = 0;
     loop {
-        match client.identity_backfill_status() {
+        match library.identity_backfill_status() {
             Ok(s) => {
                 failures = 0;
                 let line = format_identity_status(&s);
@@ -143,8 +143,8 @@ pub(crate) fn backfill(args: BackfillArgs, ctx: &Ctx) -> Result<()> {
 }
 
 pub(crate) fn status(ctx: &Ctx) -> Result<()> {
-    let client = ctx.library();
-    match client.identity_backfill_status() {
+    let library = ctx.library();
+    match library.identity_backfill_status() {
         Ok(s) => {
             println!("{}", format_identity_status(&s));
             Ok(())
@@ -158,8 +158,8 @@ pub(crate) fn status(ctx: &Ctx) -> Result<()> {
 
 pub(crate) fn cancel(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::IdentityBackfillStatus;
-    let client = ctx.library();
-    match client.identity_backfill_cancel() {
+    let library = ctx.library();
+    match library.identity_backfill_cancel() {
         Ok(IdentityBackfillStatus::Running(_)) => {
             println!(
                 "Cancelling after the current track; progress is kept. \

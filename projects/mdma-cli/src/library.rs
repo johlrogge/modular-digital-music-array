@@ -39,7 +39,7 @@ pub(crate) enum Command {
     ///
     /// Needs identity hashes: run `mdma library identity backfill` first.
     #[command(args_conflicts_with_subcommands = true)]
-    Dedup(dedup::Args),
+    Dedup(dedup::DedupCli),
 
     /// List the files that duplicate merges moved to the archive.
     ///
@@ -65,8 +65,8 @@ pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
 
 pub(crate) fn reindex_covers(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{LibraryRequest, LibraryResponse};
-    let client = ctx.library();
-    let response = client.request(&LibraryRequest::ReindexCovers);
+    let library = ctx.library();
+    let response = library.request(&LibraryRequest::ReindexCovers);
     match response {
         Ok(LibraryResponse::IngestResult(result)) => match result {
             library_ipc_client::IngestResult::Success { message, .. } => {

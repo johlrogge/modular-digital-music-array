@@ -51,14 +51,14 @@ pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
         Command::Now => now(ctx),
         Command::Session => session(ctx),
         Command::Outputs => outputs(ctx),
-        Command::SetOutput { name } => set_output(name, ctx),
+        Command::SetOutput { name } => set_output(OutputNameArg(name), ctx),
         Command::GetOutput => get_output(ctx),
     }
 }
 
 pub(crate) fn start(ctx: &Ctx) -> Result<()> {
-    let media_client = ctx.playback();
-    if let Err(e) = media_client.play_queue() {
+    let playback = ctx.playback();
+    if let Err(e) = playback.play_queue() {
         handle_playback_error(e);
     }
     println!("Playing from queue");
@@ -66,8 +66,8 @@ pub(crate) fn start(ctx: &Ctx) -> Result<()> {
 }
 
 pub(crate) fn stop(ctx: &Ctx) -> Result<()> {
-    let media_client = ctx.playback();
-    if let Err(e) = media_client.stop(Deck::A) {
+    let playback = ctx.playback();
+    if let Err(e) = playback.stop(Deck::A) {
         handle_playback_error(e);
     }
 
@@ -76,8 +76,8 @@ pub(crate) fn stop(ctx: &Ctx) -> Result<()> {
 }
 
 pub(crate) fn pause(ctx: &Ctx) -> Result<()> {
-    let media_client = ctx.playback();
-    if let Err(e) = media_client.pause(Deck::A) {
+    let playback = ctx.playback();
+    if let Err(e) = playback.pause(Deck::A) {
         handle_playback_error(e);
     }
 
@@ -86,8 +86,8 @@ pub(crate) fn pause(ctx: &Ctx) -> Result<()> {
 }
 
 pub(crate) fn resume(ctx: &Ctx) -> Result<()> {
-    let media_client = ctx.playback();
-    if let Err(e) = media_client.resume(Deck::A) {
+    let playback = ctx.playback();
+    if let Err(e) = playback.resume(Deck::A) {
         handle_playback_error(e);
     }
 
@@ -96,8 +96,8 @@ pub(crate) fn resume(ctx: &Ctx) -> Result<()> {
 }
 
 pub(crate) fn skip(ctx: &Ctx) -> Result<()> {
-    let media_client = ctx.playback();
-    if let Err(e) = media_client.skip() {
+    let playback = ctx.playback();
+    if let Err(e) = playback.skip() {
         handle_playback_error(e);
     }
 
@@ -107,10 +107,10 @@ pub(crate) fn skip(ctx: &Ctx) -> Result<()> {
 
 pub(crate) fn now(ctx: &Ctx) -> Result<()> {
     use std::io::IsTerminal;
-    let media_client = ctx.playback();
+    let playback = ctx.playback();
     // The library is only consulted on a terminal, where the track is shown in full.
-    let library_client = std::io::stdout().is_terminal().then(|| ctx.library());
-    let hash = match media_client.now_playing() {
+    let library = std::io::stdout().is_terminal().then(|| ctx.library());
+    let hash = match playback.now_playing() {
         Ok(h) => h,
         Err(e) => handle_playback_error(e),
     };
@@ -119,10 +119,10 @@ pub(crate) fn now(ctx: &Ctx) -> Result<()> {
             eprintln!("Nothing playing");
             std::process::exit(1);
         }
-        Some(h) => match library_client {
+        Some(h) => match library {
             None => println!("{}", h.as_str()),
-            Some(lib) => {
-                let track = match lib.get_track(&h) {
+            Some(library) => {
+                let track = match library.get_track(&h) {
                     Ok(t) => t,
                     Err(e) => handle_error(e),
                 };
@@ -140,8 +140,8 @@ pub(crate) fn now(ctx: &Ctx) -> Result<()> {
 }
 
 pub(crate) fn session(ctx: &Ctx) -> Result<()> {
-    let media_client = ctx.playback();
-    match media_client.session() {
+    let playback = ctx.playback();
+    match playback.session() {
         Ok(Some(id)) => {
             println!("{}", id);
         }
@@ -154,8 +154,8 @@ pub(crate) fn session(ctx: &Ctx) -> Result<()> {
 }
 
 pub(crate) fn outputs(ctx: &Ctx) -> Result<()> {
-    let media_client = ctx.playback();
-    let sinks = match media_client.list_audio_outputs() {
+    let playback = ctx.playback();
+    let sinks = match playback.list_audio_outputs() {
         Ok(s) => s,
         Err(e) => handle_playback_error(e),
     };
@@ -174,9 +174,14 @@ pub(crate) fn outputs(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn set_output(name: String, ctx: &Ctx) -> Result<()> {
-    let media_client = ctx.playback();
-    let cfg = match media_client.set_audio_output(name) {
+/// An audio output device name as shown by `mdma playback outputs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OutputNameArg(pub String);
+
+pub(crate) fn set_output(name: OutputNameArg, ctx: &Ctx) -> Result<()> {
+    let OutputNameArg(name) = name;
+    let playback = ctx.playback();
+    let cfg = match playback.set_audio_output(name) {
         Ok(c) => c,
         Err(e) => handle_playback_error(e),
     };
@@ -190,8 +195,8 @@ pub(crate) fn set_output(name: String, ctx: &Ctx) -> Result<()> {
 }
 
 pub(crate) fn get_output(ctx: &Ctx) -> Result<()> {
-    let media_client = ctx.playback();
-    let cfg = match media_client.get_audio_output() {
+    let playback = ctx.playback();
+    let cfg = match playback.get_audio_output() {
         Ok(c) => c,
         Err(e) => handle_playback_error(e),
     };

@@ -1,6 +1,15 @@
 //! Argument helpers shared by several command modules.
 
+use library_ipc_client::ContentHash;
 use playlist_import::sanitize_playlist_name;
+
+/// Content hash of a track, as typed (a prefix is accepted; the service resolves it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrackArg(pub ContentHash);
+
+/// Optional content hash of a track; commands read stdin when it is omitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OptTrackArg(pub Option<ContentHash>);
 
 pub(crate) fn parse_playlist_name(name: &str) -> library_ipc_client::PlaylistName {
     library_ipc_client::PlaylistName::new(name).unwrap_or_else(|e| {

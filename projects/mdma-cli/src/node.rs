@@ -439,7 +439,7 @@ pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> color_eyre::Result<()> {
     match command {
         Command::List => list(ctx),
         // Phase 2: a typed node name parsed by hicli; resolution matches on the raw text today.
-        Command::Select { name } => select(name, ctx),
+        Command::Select { name } => select(OptNodeQueryArg(name), ctx),
         Command::Forget => forget(ctx),
         Command::Show => show(ctx),
     }
@@ -460,8 +460,13 @@ pub(crate) fn list(_ctx: &Ctx) -> color_eyre::Result<()> {
     Ok(())
 }
 
+/// A node name or id as typed, matched against the discovered nodes (none: prompt).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OptNodeQueryArg(pub Option<String>);
+
 /// `mdma node select [name|id]`
-pub(crate) fn select(query: Option<String>, _ctx: &Ctx) -> color_eyre::Result<()> {
+pub(crate) fn select(query: OptNodeQueryArg, _ctx: &Ctx) -> color_eyre::Result<()> {
+    let OptNodeQueryArg(query) = query;
     let nodes = node_discovery::browse(BROWSE_TIMEOUT);
     let mut effects = SelectEffects {
         identify_at: Box::new(identify_at),

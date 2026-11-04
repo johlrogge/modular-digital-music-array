@@ -1,5 +1,5 @@
 use crate::ctx::Ctx;
-use crate::stdin::{parse_hash_from_line, resolve_tracks_skip_errors};
+use crate::stdin::{read_hashes, resolve_tracks_skip_errors};
 use color_eyre::Result;
 use library_ipc_client::TrackInfo;
 use mdma_client::IngestSource;
@@ -8,9 +8,6 @@ use track_formatter::short_hash;
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct UploadArgs {
-    /// Path to file (audio file or ZIP archive)
-    file: std::path::PathBuf,
-
     /// SSH key for SCP transfer
     #[arg(long, default_value = "~/.ssh/mdma_pi", env = "MDMA_SSH_KEY")]
     ssh_key: String,
@@ -22,6 +19,9 @@ pub(crate) struct UploadArgs {
     /// Remote inbox directory
     #[arg(long, default_value = "/music/inbox/", env = "MDMA_INBOX_DIR")]
     inbox_dir: String,
+
+    /// Path to file (audio file or ZIP archive)
+    file: std::path::PathBuf,
 }
 
 #[derive(clap::Args, Debug)]
@@ -104,10 +104,10 @@ pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::InboxPath;
 
     let UploadArgs {
-        file,
         ssh_key,
         ssh_user,
         inbox_dir,
+        file,
     } = args;
 
     // 1. Validate file exists
@@ -162,7 +162,7 @@ pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<()> {
     }
 
     // 6. Ingest each file via the library service
-    let lib = ctx.library();
+    let library = ctx.library();
     let mut success_count = 0;
     let mut fail_count = 0;
 
@@ -182,7 +182,7 @@ pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<()> {
             }
         };
 
-        match lib.ingest_file_with_source(&inbox_path, Some(IngestSource::Upload)) {
+        match library.ingest_file_with_source(&inbox_path, Some(IngestSource::Upload)) {
             Ok(mdma_client::IngestResult::Success { hash, .. }) => {
                 let hash_str = hash
                     .as_ref()
@@ -475,7 +475,6 @@ pub(crate) enum DownloadOutcome {
 /// Rekordbox XML builder.
 pub(crate) struct DownloadAttempt {
     pub(crate) track: TrackInfo,
-    pub(crate) hash: String,
     pub(crate) outcome: DownloadOutcome,
 }
 
@@ -512,7 +511,6 @@ pub(crate) fn download_tracks(
                 eprintln!("FAILED ({})", $msg);
                 results.push(DownloadAttempt {
                     track: track.clone(),
-                    hash: full_hash.to_string(),
                     outcome: DownloadOutcome::Failure {
                         error: $msg.to_string(),
                     },
@@ -554,7 +552,6 @@ pub(crate) fn download_tracks(
         eprintln!("OK  {} ({} bytes)", dest.display(), size);
         results.push(DownloadAttempt {
             track: track.clone(),
-            hash: full_hash.to_string(),
             outcome: DownloadOutcome::Success {
                 dest,
                 size,
@@ -602,8 +599,6 @@ fn resolve_export_format(blob_path: Option<&str>, formats: &ExportFormats) -> Ex
 }
 
 pub(crate) fn export(args: ExportArgs, ctx: &Ctx) -> Result<()> {
-    use std::io::BufRead;
-
     let ExportArgs {
         format,
         lossless_format,
@@ -622,12 +617,7 @@ pub(crate) fn export(args: ExportArgs, ctx: &Ctx) -> Result<()> {
     let (node, node_ip) = ctx.require_node();
 
     // Read hashes from stdin
-    let raw_hashes: Vec<String> = std::io::stdin()
-        .lock()
-        .lines()
-        .map_while(Result::ok)
-        .filter_map(|line| parse_hash_from_line(&line))
-        .collect();
+    let raw_hashes = read_hashes();
 
     if raw_hashes.is_empty() {
         eprintln!("No hashes provided on stdin.");
@@ -688,7 +678,7 @@ pub(crate) fn export(args: ExportArgs, ctx: &Ctx) -> Result<()> {
                 None
             }
         }) {
-            eprintln!("  {} — {}", r.hash, error);
+            eprintln!("  {} — {}", r.track.content_hash, error);
         }
         std::process::exit(1);
     }
@@ -749,8 +739,6 @@ impl std::str::FromStr for ExportFormat {
 mod tests {
     use super::*;
     use crate::test_support::track;
-
-    use library_ipc_client::TrackInfo;
 
     use pretty_assertions::assert_eq;
 

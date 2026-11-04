@@ -6,6 +6,7 @@ mod admin;
 mod args;
 mod completions;
 mod ctx;
+mod editor;
 mod fact;
 mod inbox;
 mod library;
@@ -27,10 +28,7 @@ mod transfer;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use color_eyre::Result;
 use ctx::{Ctx, Globals};
-
-// =============================================================================
-// CLI Definition
-// =============================================================================
+use library_ipc_client::ContentHash;
 
 #[derive(Parser, Debug)]
 #[command(name = "mdma")]
@@ -75,16 +73,16 @@ enum Commands {
     Status,
 
     /// List tracks in library
-    List(tracks::ListArgs),
+    List(tracks::ListCli),
 
     /// Get a specific track by hash (supports partial hashes like git)
-    Get(tracks::GetArgs),
+    Get(tracks::GetCli),
 
     /// Show all facts for a track
-    Facts(tracks::FactsArgs),
+    Facts(tracks::FactsCli),
 
     /// Search for tracks
-    Search(search::SearchArgs),
+    Search(search::SearchCli),
 
     /// Inbox management commands
     Inbox {
@@ -131,7 +129,7 @@ enum Commands {
     Sort(tracks::SortArgs),
 
     /// Subscribe to real-time events from the playback system
-    Subscribe(subscribe::SubscribeArgs),
+    Subscribe(subscribe::SubscribeCli),
 
     /// Upload a file (audio or ZIP of audio) to the library
     Upload(transfer::UploadArgs),
@@ -174,7 +172,7 @@ enum Commands {
     },
 
     /// Bookmark the currently playing track, or a specific track by hash
-    Bookmark(tracks::BookmarkArgs),
+    Bookmark(tracks::BookmarkCli),
 
     /// List all bookmarked tracks
     Bookmarks,
@@ -198,11 +196,11 @@ enum Commands {
     ///   mdma search --artist CBL | mdma view --hash --artist --title
     ///   mdma search --genre Techno | mdma view --title --duration
     ///   cat friday.plist | mdma view --hash --artist --title --duration
-    View(tracks::ViewArgs),
+    View(tracks::ViewCli),
 
     /// Generate shell completions
     #[command(hide = true)]
-    GenerateCompletions(completions::Args),
+    GenerateCompletions(completions::CompletionsCli),
 
     /// Admin commands (service mode, reboot)
     Admin {
@@ -216,10 +214,6 @@ enum Commands {
         command: node::Command,
     },
 }
-
-// =============================================================================
-// Main
-// =============================================================================
 
 /// The global options, with `socket` and `playback_socket` only set when given.
 fn globals_from(cli: &Cli, matches: &clap::ArgMatches) -> Globals {
@@ -251,26 +245,49 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Ping => tracks::ping(&ctx),
         Commands::Status => tracks::status(&ctx),
-        Commands::List(args) => tracks::list(args, &ctx),
-        Commands::Get(args) => tracks::get(args, &ctx),
-        Commands::Facts(args) => tracks::facts(args, &ctx),
-        Commands::Search(args) => search::search(args, &ctx),
+        Commands::List(tracks::ListCli { limit }) => tracks::list(tracks::LimitArg(limit), &ctx),
+        Commands::Get(tracks::GetCli { hash }) => {
+            tracks::get(args::TrackArg(ContentHash::new(hash)), &ctx)
+        }
+        Commands::Facts(tracks::FactsCli { hash }) => {
+            tracks::facts(args::TrackArg(ContentHash::new(hash)), &ctx)
+        }
+        Commands::Search(cli) => search::dispatch(cli, &ctx),
         Commands::Inbox { command } => inbox::dispatch(command, &ctx),
         Commands::Source { command } => source::dispatch(command, &ctx),
         Commands::Playback { command } => playback::dispatch(command, &ctx),
         Commands::Queue { command } => queue::dispatch(command, &ctx),
         Commands::Sort(args) => tracks::sort(args, &ctx),
-        Commands::Subscribe(args) => subscribe::subscribe(args, &ctx),
+        Commands::Subscribe(subscribe::SubscribeCli { topic }) => {
+            subscribe::subscribe(subscribe::TopicArg(topic), &ctx)
+        }
         Commands::Upload(args) => transfer::upload(args, &ctx),
         Commands::Export(args) => transfer::export(args, &ctx),
         Commands::Rekordbox { command } => rekordbox::dispatch(command, &ctx),
         Commands::Playlist { command } => playlist::dispatch(command, &ctx),
         Commands::Library { command } => library::dispatch(command, &ctx),
-        Commands::Bookmark(args) => tracks::bookmark(args, &ctx),
+        Commands::Bookmark(tracks::BookmarkCli { scope, hash }) => tracks::bookmark(
+            tracks::BookmarkArgs {
+                scope,
+                hash: args::OptTrackArg(hash.map(ContentHash::new)),
+            },
+            &ctx,
+        ),
         Commands::Bookmarks => tracks::bookmarks(&ctx),
         Commands::Fact { command } => fact::dispatch(command, &ctx),
-        Commands::View(args) => tracks::view(args, &ctx),
-        Commands::GenerateCompletions(args) => completions::generate(args),
+        Commands::View(_) => {
+            // The column order is the order the flags were typed, which only the
+            // raw matches know.
+            let view_matches = matches.subcommand_matches("view").unwrap_or_else(|| {
+                eprintln!("internal error: expected 'view' subcommand matches");
+                std::process::exit(1);
+            });
+            let columns = tracks::view_columns_from_matches(view_matches);
+            tracks::view(tracks::ViewColumns(columns), &ctx)
+        }
+        Commands::GenerateCompletions(completions::CompletionsCli { shell }) => {
+            completions::generate(completions::ShellArg(shell))
+        }
         Commands::Admin { command } => admin::dispatch(command, &ctx),
         Commands::Node { command } => node::dispatch(command, &ctx),
     }
