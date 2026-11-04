@@ -2,31 +2,37 @@
 //!
 //! Connects to services via gateway (single address) or direct IPC.
 
+mod args;
+mod ctx;
 mod node;
+mod output;
+mod stdin;
 
+use args::ExportFormat;
 use chrono::NaiveDate;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use color_eyre::Result;
 use colored::Colorize;
+use ctx::{Ctx, Globals};
 use event_protocol::{from_topic_message, PlaybackEvent, TOPIC_PLAYBACK};
 use gateway_client::{AdminRequest, AdminResponse, GatewayClient};
 use library_ipc_client::{
-    ArchiveEmptyReport, ArchiveListing, ClientError, ConfirmationReason, ContentHash,
-    DedupApplyReport, DedupDisposition, DedupGroup, DedupMember, InboxPath, ProtocolError,
-    TrackInfo,
+    ArchiveEmptyReport, ArchiveListing, ConfirmationReason, ContentHash, DedupApplyReport,
+    DedupDisposition, DedupGroup, DedupMember, InboxPath, TrackInfo,
 };
 use library_search::{
     parse_date_query, parse_numeric_query, parse_role_query, parse_string_query, TrackQuery,
 };
-use mdma_client::{
-    Deck, IngestSource, LibraryBackend, PlaybackBackend, PlaybackClientError, SourceClient,
-    SourceName,
-};
+use mdma_client::{Deck, IngestSource, LibraryBackend, PlaybackBackend, SourceClient, SourceName};
 use music_facts::{
     Album, Artist, Bpm, DiscNumber, EnergyLevel, Isrc, Key, MusicValue, Title, TrackNumber,
     TrackRole, Year,
 };
 use nng::options::Options;
+use output::{
+    format_track_line, handle_error, handle_playback_error, handle_source_error, print_tracks,
+    render_track_table, terminal_width, PIPE_TERM_WIDTH,
+};
 use playlist_import::{
     format_import_status, format_write_outcome, sanitize_playlist_name, write_playlist,
     LibraryTrackLookup,
@@ -36,11 +42,12 @@ use source_protocol::{
     ImportJobStatus, ImportPhase, ImportSyncProgress, SourceError, SourceRequest, SourceResponse,
 };
 use std::path::Path;
-use storage_primitives::ByteSize;
-use track_formatter::{
-    format_track_line as format_track_line_shared, render_for_user, short_hash, ViewColumn,
-    ALL_COLUMNS,
+use stdin::{
+    hashes_arg_or_stdin, is_yes, parse_hash_from_line, read_stdin_to_string,
+    resolve_tracks_skip_errors,
 };
+use storage_primitives::ByteSize;
+use track_formatter::{render_for_user, short_hash, ViewColumn};
 use track_matcher::{CandidateTrack, MatchResult};
 
 // =============================================================================
@@ -56,14 +63,10 @@ struct Cli {
     #[arg(long)]
     node: Option<String>,
 
-    /// The node resolved at startup (not a flag).
-    #[arg(skip)]
-    target: Option<node_discovery::Target>,
-
     /// Library IPC socket address (direct mode, ignored when --node is set)
     #[arg(
         long,
-        default_value = "ipc:///run/mdma/library.sock",
+        default_value = ctx::DEFAULT_LIBRARY_SOCKET,
         env = "MDMA_LIBRARY_SOCKET"
     )]
     socket: String,
@@ -71,7 +74,7 @@ struct Cli {
     /// Playback server socket address (direct mode, ignored when --node is set)
     #[arg(
         long,
-        default_value = "ipc:///run/mdma/playback.sock",
+        default_value = ctx::DEFAULT_PLAYBACK_SOCKET,
         env = "MDMA_PLAYBACK_SOCKET"
     )]
     playback_socket: String,
@@ -405,16 +408,6 @@ enum Commands {
     },
 }
 
-impl Commands {
-    /// Whether the command talks to a node, so one has to be resolved first.
-    fn needs_node(&self) -> bool {
-        !matches!(
-            self,
-            Commands::Node { .. } | Commands::GenerateCompletions { .. }
-        )
-    }
-}
-
 #[derive(Subcommand, Debug)]
 enum NodeCommands {
     /// List MDMA nodes on the network (* marks the remembered node)
@@ -428,34 +421,6 @@ enum NodeCommands {
     Forget,
     /// Show which node commands would use, and why
     Show,
-}
-
-#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
-enum ExportFormat {
-    /// Transfer the file without conversion (default)
-    Original,
-    Aiff,
-    Wav,
-}
-
-impl ExportFormat {
-    /// Return the fixed file extension for converted formats, or `None` for `Original`.
-    fn static_extension(&self) -> Option<&'static str> {
-        match self {
-            Self::Original => None,
-            Self::Aiff => Some("aiff"),
-            Self::Wav => Some("wav"),
-        }
-    }
-
-    /// Format string to pass in the `?format=` query parameter.
-    fn format_param(&self) -> &'static str {
-        match self {
-            Self::Original => "original",
-            Self::Aiff => "aiff",
-            Self::Wav => "wav",
-        }
-    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -1079,216 +1044,9 @@ enum FactCommands {
     },
 }
 
-// =============================================================================
-// Gateway Resolution Helpers
-// =============================================================================
-
-/// Resolve the effective gateway address from the node resolved at startup:
-/// `tcp://<ip>:<port>`.
-/// Returns `None` for local IPC — caller falls back to direct IPC.
-fn resolve_gateway(cli: &Cli) -> Option<String> {
-    node::client_config(cli.target.as_ref()).gateway_addr()
-}
-
-/// Resolve the effective event gateway address: `tcp://<ip>:5556`.
-/// Returns `None` for local IPC.
-fn resolve_event_gateway(cli: &Cli) -> Option<String> {
-    node::client_config(cli.target.as_ref()).event_addr()
-}
-
-// =============================================================================
-// Connection Helpers
-// =============================================================================
-
-/// Connect to the library backend (gateway or direct).
-fn connect_library(cli: &Cli) -> LibraryBackend {
-    let gateway = resolve_gateway(cli);
-    match LibraryBackend::connect(gateway.as_deref(), &cli.socket) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("Failed to connect to library: {}", e);
-            if gateway.is_none() {
-                eprintln!("Is mdma-library running?");
-            }
-            std::process::exit(1);
-        }
-    }
-}
-
-/// Connect to the playback backend (gateway or direct).
-fn connect_playback(cli: &Cli) -> PlaybackBackend {
-    let gateway = resolve_gateway(cli);
-    match PlaybackBackend::connect(gateway.as_deref(), &cli.playback_socket) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("Failed to connect to playback: {}", e);
-            if gateway.is_none() {
-                eprintln!("Is mdma-playback running?");
-            }
-            std::process::exit(1);
-        }
-    }
-}
-
-/// Connect to a source, via gateway or direct IPC.
-fn connect_source(cli: &Cli, name: &str) -> SourceClient {
-    connect_source_or_exit(cli, name, None)
-}
-
 /// Request timeout for `mdma source playlists`: listing may make several
 /// rate-limited upstream requests (e.g. Bandcamp), well beyond the default 5s.
 const SOURCE_LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Connect to a source, with the default request timeout or a custom one.
-fn connect_source_or_exit(
-    cli: &Cli,
-    name: &str,
-    timeout: Option<std::time::Duration>,
-) -> SourceClient {
-    let gateway = resolve_gateway(cli);
-    let connected = match timeout {
-        Some(t) => {
-            SourceClient::connect_with_timeout(gateway.as_deref(), &cli.sources_dir, name, t)
-        }
-        None => SourceClient::connect(gateway.as_deref(), &cli.sources_dir, name),
-    };
-    match connected {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{}", e);
-            if gateway.is_none() {
-                eprintln!("Is mdma-{} running?", name);
-            }
-            eprintln!("Hint: 'mdma source list' shows the available sources");
-            std::process::exit(1);
-        }
-    }
-}
-
-/// Connect to the admin service via gateway.
-///
-/// Exits with a message when there is no gateway to connect to (local IPC).
-fn connect_admin(cli: &Cli) -> GatewayClient {
-    let gateway = resolve_gateway(cli).unwrap_or_else(|| {
-        eprintln!(
-            "error: admin commands need a gateway; use --node (or MDMA_NODE) to name the node"
-        );
-        std::process::exit(1);
-    });
-    match GatewayClient::connect(&gateway) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to connect to gateway: {}", e);
-            std::process::exit(1);
-        }
-    }
-}
-
-// =============================================================================
-// Display Helpers
-// =============================================================================
-
-/// Canonical playlist line format: `{short_hash}  {Artist} - {Title}  [{duration}]`
-/// Used for pipe mode output and temp files (no colors, no alignment).
-///
-/// Delegates to `track_formatter::format_track_line` — the shared implementation
-/// used by both CLI and TUI to guarantee format consistency.
-fn format_track_line(track: &TrackInfo) -> String {
-    format_track_line_shared(track)
-}
-
-// =============================================================================
-// Track Table Rendering (colored)
-// =============================================================================
-
-/// Detect terminal width.
-///
-/// Priority:
-/// 1. `$COLUMNS` env var — honoured first so BDD tests can override the width.
-/// 2. ioctl via `terminal_size` — reads the actual PTY/terminal dimensions.
-/// 3. Hard-coded fallback of 80 — used in CI / piped contexts.
-fn terminal_width() -> usize {
-    // Prefer $COLUMNS if explicitly set (e.g. in BDD tests)
-    if let Some(w) = std::env::var("COLUMNS").ok().and_then(|s| s.parse().ok()) {
-        return w;
-    }
-    // Query the actual terminal via ioctl
-    terminal_size::terminal_size()
-        .map(|(w, _)| w.0 as usize)
-        .unwrap_or(80)
-}
-
-/// Virtual terminal width used when stdout is not a TTY (pipe, file redirection).
-///
-/// Wide enough to guarantee that corsett never shrinks the 8-char hash column,
-/// and that typical artist/title content is not truncated (Joakim's uniqueness hypothesis).
-const PIPE_TERM_WIDTH: usize = 200;
-
-/// Render tracks as a colored, aligned table for terminal display.
-/// Returns one formatted string per track row.
-///
-/// `reserved_prefix` is subtracted from the terminal width before column sizing.
-/// Pass `0` for plain output; for queue display, pass `pos_width + 3` (digit(s) + "." + 2 spaces).
-fn render_track_table(tracks: &[TrackInfo], reserved_prefix: usize) -> Vec<String> {
-    render_track_table_inner(tracks, reserved_prefix, terminal_width())
-}
-
-/// Inner implementation of `render_track_table` that accepts an explicit `term_width`,
-/// allowing tests to inject a known width without relying on `$COLUMNS`.
-///
-/// Delegates to `track_formatter::render_for_user` with the full default column set.
-fn render_track_table_inner(
-    tracks: &[TrackInfo],
-    reserved_prefix: usize,
-    term_width: usize,
-) -> Vec<String> {
-    render_for_user(tracks, ALL_COLUMNS, term_width, reserved_prefix)
-}
-
-/// Print tracks with a bold header in terminal mode; canonical lines in pipe mode.
-fn print_tracks(tracks: &[TrackInfo], header: &str) {
-    use std::io::IsTerminal;
-    if std::io::stdout().is_terminal() {
-        println!("{}", header.bold());
-        println!();
-        for line in render_track_table(tracks, 0) {
-            println!("{}", line);
-        }
-    } else {
-        for track in tracks {
-            println!("{}", format_track_line(track));
-        }
-    }
-}
-
-/// Handle library client errors uniformly
-fn handle_error(err: ClientError) -> ! {
-    match err {
-        ClientError::Protocol(ProtocolError::TrackNotFound { hash }) => {
-            eprintln!("Track not found: {}", hash);
-        }
-        ClientError::Protocol(ProtocolError::InboxFileNotFound { path }) => {
-            eprintln!("Inbox file not found: {}", path);
-        }
-        ClientError::Protocol(e) => {
-            eprintln!("Error: {}", e);
-        }
-        ClientError::Transport(nng_transport::NngClientError::Connection(e)) => {
-            eprintln!("Connection failed: {}", e);
-            eprintln!("Is mdma-library running?");
-        }
-        e => {
-            eprintln!("Error: {}", e);
-        }
-    }
-    std::process::exit(1);
-}
-
-/// Handle source errors uniformly
-fn handle_source_error(err: &dyn std::fmt::Display) -> ! {
-    eprintln!("Error: {}", err);
-    std::process::exit(1);
-}
 
 // =============================================================================
 // Command Handlers
@@ -1957,18 +1715,6 @@ fn parse_playlist_name(name: &str) -> library_ipc_client::PlaylistName {
     })
 }
 
-fn read_stdin_to_string() -> String {
-    use std::io::Read;
-    let mut content = String::new();
-    std::io::stdin()
-        .read_to_string(&mut content)
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to read stdin: {}", e);
-            std::process::exit(1);
-        });
-    content
-}
-
 fn playlist_expect_content(
     response: std::result::Result<
         library_ipc_client::LibraryResponse,
@@ -2569,10 +2315,6 @@ fn find_dedup_group<'a>(
     Ok(found)
 }
 
-fn is_yes(answer: &str) -> bool {
-    matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
-}
-
 fn handle_dedup(client: &LibraryBackend, apply: bool) -> Result<()> {
     let report = match client.dedup_scan(apply) {
         Ok(r) => r,
@@ -2862,9 +2604,9 @@ fn handle_bookmarks(library_client: &LibraryBackend) -> Result<()> {
 // Source Command Handlers
 // =============================================================================
 
-fn handle_source_list(cli: &Cli) -> Result<()> {
-    let gateway = resolve_gateway(cli);
-    let sources = match mdma_client::list_available_sources(gateway.as_deref(), &cli.sources_dir) {
+fn handle_source_list(ctx: &Ctx) -> Result<()> {
+    let gateway = ctx.gateway();
+    let sources = match mdma_client::list_available_sources(gateway.as_deref(), ctx.sources_dir()) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("{}", e);
@@ -3080,14 +2822,14 @@ fn handle_source_check_item(client: &SourceClient, name: &str, identifier: &str)
 }
 
 fn handle_source_check_updates(
-    cli: &Cli,
+    ctx: &Ctx,
     source_client: &SourceClient,
     name: &str,
     apply: bool,
 ) -> Result<()> {
     // Fetch all ItemId values from the library for this source.
     // We use GetFactValues("ItemId") — returns all ItemId values the library knows about.
-    let lib = connect_library(cli);
+    let lib = ctx.library();
     let all_item_ids = match lib.request(&library_ipc_client::LibraryRequest::GetFactValues {
         fact_type: library_ipc_client::FactType::new("ItemId"),
     }) {
@@ -3213,19 +2955,6 @@ fn handle_source_check_updates(
 // =============================================================================
 // Playback Command Handlers
 // =============================================================================
-
-fn handle_playback_error(err: PlaybackClientError) -> ! {
-    match err {
-        PlaybackClientError::Connection(e) => {
-            eprintln!("Connection failed: {}", e);
-            eprintln!("Is mdma-playback running?");
-        }
-        e => {
-            eprintln!("Error: {}", e);
-        }
-    }
-    std::process::exit(1);
-}
 
 fn handle_playback_start(media_client: &PlaybackBackend) -> Result<()> {
     if let Err(e) = media_client.play_queue() {
@@ -3506,28 +3235,6 @@ fn handle_queue_edit(
     Ok(())
 }
 
-/// Return the provided hash as a single-element vec, or read ALL lines from stdin and
-/// extract valid hashes (8+ lowercase hex chars, or sha256:-prefixed full hashes, as first token).
-fn hashes_arg_or_stdin(hash: Option<String>) -> Vec<String> {
-    match hash {
-        Some(h) => vec![h],
-        None => {
-            use std::io::BufRead;
-            let hashes: Vec<String> = std::io::stdin()
-                .lock()
-                .lines()
-                .map_while(Result::ok)
-                .filter_map(|line| parse_hash_from_line(&line))
-                .collect();
-            if hashes.is_empty() {
-                eprintln!("No hash provided and stdin was empty");
-                std::process::exit(1);
-            }
-            hashes
-        }
-    }
-}
-
 /// Compare two optional values treating `None` as negative-infinity (-∞).
 ///
 /// Semantics:
@@ -3549,24 +3256,6 @@ fn compare_optional<T: Ord>(a: Option<T>, b: Option<T>, asc: bool) -> std::cmp::
     } else {
         ord.reverse()
     }
-}
-
-/// Resolve a list of raw hash strings to `TrackInfo`, skipping any that the library
-/// cannot find and printing a warning for each skipped entry.
-fn resolve_tracks_skip_errors(client: &LibraryBackend, hashes: Vec<String>) -> Vec<TrackInfo> {
-    hashes
-        .into_iter()
-        .filter_map(|hash| {
-            let content_hash = ContentHash::new(hash.clone());
-            match client.get_track(&content_hash) {
-                Ok(t) => Some(t),
-                Err(e) => {
-                    eprintln!("Warning: skipping track {}: {}", hash, e);
-                    None
-                }
-            }
-        })
-        .collect()
 }
 
 fn handle_sort(
@@ -3919,7 +3608,7 @@ fn scp_file(
 }
 
 fn handle_upload(
-    cli: &Cli,
+    ctx: &Ctx,
     file: &Path,
     ssh_key: &str,
     ssh_user: &str,
@@ -3934,7 +3623,7 @@ fn handle_upload(
     }
 
     // 2. Host to scp to: the resolved node, by IP when known
-    let hostname = match node::remote_host(cli.target.as_ref()) {
+    let hostname = match ctx.remote_host() {
         Some((host, ip)) => ip.map_or(host, |ip| ip.to_string()),
         None => {
             eprintln!("Upload requires --node or MDMA_NODE to determine the Pi hostname");
@@ -3979,7 +3668,7 @@ fn handle_upload(
     }
 
     // 6. Ingest each file via the library service
-    let lib = connect_library(cli);
+    let lib = ctx.library();
     let mut success_count = 0;
     let mut fail_count = 0;
 
@@ -4237,70 +3926,6 @@ fn export_dest_path_checked(
 /// Missing metadata falls back to `"Unknown Artist"`, `"Unknown Album"`, `"Unknown"`.
 fn export_dest_path(output: &std::path::Path, track: &TrackInfo, ext: &str) -> std::path::PathBuf {
     export_dest_path_checked(output, track, ext, &std::collections::HashSet::new()).0
-}
-
-/// Build a `hash → location-URI` map that resolves all three hash forms a playlist
-/// may use to look up a track:
-///
-/// - Full `sha256:<64hex>` form (what the resolver always returns)
-/// - 12-char short hex (canonical 0.18.1+ playlist format)
-/// - 8-char short hex (legacy 0.18.x playlist format)
-///
-/// The `location_fn` closure produces the location URI for each `(track, dest, ext)` tuple.
-/// Passing it as a closure keeps this helper pure and testable without filesystem I/O.
-/// Extract a content hash from a line of text.
-///
-/// Handles multiple formats:
-/// - Plain hash: `abcd1234ef567890`
-/// - Full sha256: prefix: `sha256:abcdef0123...`
-/// - Search output: `{8-char-hash}  {Artist} - {Title}  [{duration}]`
-/// - Any line whose first whitespace-separated token looks like a hash
-///
-/// Returns `None` for blank lines, comment lines (starting with `#`), and lines
-/// where the first token doesn't resemble a hash.
-fn parse_hash_from_line(line: &str) -> Option<String> {
-    let line = line.trim();
-    if line.is_empty() || line.starts_with('#') {
-        return None;
-    }
-    let token = line.split_whitespace().next()?;
-    // Accept sha256: prefixed full hashes
-    if token.starts_with("sha256:") {
-        let hex_part = token.strip_prefix("sha256:")?;
-        if hex_part.len() >= 8
-            && hex_part
-                .chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
-        {
-            return Some(token.to_string());
-        }
-        return None;
-    }
-    // Accept plain hex tokens of 8+ chars (short or full)
-    if token.len() >= 8
-        && token
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
-    {
-        return Some(token.to_string());
-    }
-    None
-}
-
-/// Require a remote node and return its hostname and, when known, its IP.
-///
-/// Prints an error and exits when the CLI talks to local services over IPC.
-fn require_node(cli: &Cli) -> (String, Option<std::net::Ipv4Addr>) {
-    match node::remote_host(cli.target.as_ref()) {
-        Some(remote) => remote,
-        None => {
-            eprintln!("No remote node to talk to.");
-            eprintln!(
-                "Set --node or MDMA_NODE to the hostname of your MDMA device (e.g. mdma-909.local)"
-            );
-            std::process::exit(1);
-        }
-    }
 }
 
 /// Build the shared blocking HTTP client used by export handlers.
@@ -4570,7 +4195,7 @@ fn build_rekordbox_track(
 }
 
 fn handle_rekordbox_export(
-    cli: &Cli,
+    ctx: &Ctx,
     library: &LibraryBackend,
     playlists: &[String],
     output: &std::path::Path,
@@ -4580,7 +4205,7 @@ fn handle_rekordbox_export(
     use std::collections::HashSet;
     use std::io::BufRead;
 
-    let (node, node_ip) = require_node(cli);
+    let (node, node_ip) = ctx.require_node();
 
     // Collect hashes per playlist, or from stdin when no playlists given.
     //
@@ -5289,7 +4914,7 @@ fn follow_import_job(client: &SourceClient, source: &str, job_id: u64) -> Result
 }
 
 fn handle_rekordbox_import(
-    _cli: &Cli,
+    _ctx: &Ctx,
     library: &LibraryBackend,
     path: &std::path::Path,
     playlist: &Option<String>,
@@ -5645,7 +5270,7 @@ fn handle_rekordbox_import(
 }
 
 fn handle_export(
-    cli: &Cli,
+    ctx: &Ctx,
     library: &LibraryBackend,
     format: &Option<ExportFormat>,
     lossless_format: &Option<ExportFormat>,
@@ -5654,7 +5279,7 @@ fn handle_export(
 ) -> Result<()> {
     use std::io::BufRead;
 
-    let (node, node_ip) = require_node(cli);
+    let (node, node_ip) = ctx.require_node();
 
     // Read hashes from stdin
     let raw_hashes: Vec<String> = std::io::stdin()
@@ -5978,23 +5603,31 @@ fn generate_completions(shell: clap_complete::Shell, out: &mut dyn std::io::Writ
 /// `MDMA_PLAYBACK_SOCKET`) were given, as opposed to left at their defaults.
 /// `--sources-dir` / `MDMA_SOURCES_DIR` is deliberately not considered: it
 /// only locates source sockets and says nothing about the library or playback.
-fn sockets_given(matches: &clap::ArgMatches) -> bool {
-    ["socket", "playback_socket"].iter().any(|id| {
+/// The global options, with `socket` and `playback_socket` only set when given.
+fn globals_from(cli: &Cli, matches: &clap::ArgMatches) -> Globals {
+    let given = |id: &str, value: &String| {
         matches
             .value_source(id)
             .is_some_and(|s| s != clap::parser::ValueSource::DefaultValue)
-    })
+            .then(|| value.clone())
+    };
+    Globals {
+        node: cli.node.clone(),
+        socket: given("socket", &cli.socket),
+        playback_socket: given("playback_socket", &cli.playback_socket),
+        sources_dir: cli.sources_dir.clone(),
+    }
 }
 
 /// Run one per-source command against the source `name`.
-fn run_source_command(cli: &Cli, name: &str, command: &SourceCommands) -> Result<()> {
+fn run_source_command(ctx: &Ctx, name: &str, command: &SourceCommands) -> Result<()> {
     match command {
         SourceCommands::Playlists => {
-            let client = connect_source_or_exit(cli, name, Some(SOURCE_LISTING_TIMEOUT));
+            let client = ctx.source(name, Some(SOURCE_LISTING_TIMEOUT));
             handle_source_playlists(&client, name)
         }
         _ => {
-            let client = connect_source(cli, name);
+            let client = ctx.source(name, None);
             match command {
                 SourceCommands::Sync => handle_source_sync(&client, name),
                 SourceCommands::Status => handle_source_status(&client, name),
@@ -6009,7 +5642,7 @@ fn run_source_command(cli: &Cli, name: &str, command: &SourceCommands) -> Result
                     handle_source_check_item(&client, name, identifier)
                 }
                 SourceCommands::CheckUpdates { apply } => {
-                    handle_source_check_updates(cli, &client, name, *apply)
+                    handle_source_check_updates(ctx, &client, name, *apply)
                 }
                 // Import requests return immediately (the job runs server-side),
                 // so the default request timeout is enough for start and polls.
@@ -6037,21 +5670,16 @@ fn main() -> Result<()> {
     color_eyre::install()?;
 
     let matches = Cli::command().get_matches();
-    let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
-    let library_socket = cli.socket.strip_prefix("ipc://").unwrap_or(&cli.socket);
-    let local_ipc =
-        node::local_ipc_wanted(sockets_given(&matches), Path::new(library_socket).exists());
-
-    // Resolve the node once, and only for commands that talk to one.
-    if cli.command.needs_node() {
-        cli.target = Some(node::resolve_startup(cli.node.as_deref(), local_ipc));
-    }
+    // The node is resolved once, on first use, so only commands that talk to
+    // one resolve it.
+    let ctx = Ctx::new(globals_from(&cli, &matches));
 
     // Dispatch command - connect to appropriate service based on command
     match &cli.command {
         Commands::Playback { command } => {
-            let pb = connect_playback(&cli);
+            let pb = ctx.playback();
             match command {
                 PlaybackCommands::Start => handle_playback_start(&pb),
                 PlaybackCommands::Stop => handle_playback_stop(&pb),
@@ -6061,7 +5689,7 @@ fn main() -> Result<()> {
                 PlaybackCommands::Now => {
                     use std::io::IsTerminal;
                     if std::io::stdout().is_terminal() {
-                        let lib = connect_library(&cli);
+                        let lib = ctx.library();
                         handle_playback_now(&pb, Some(&lib))
                     } else {
                         handle_playback_now(&pb, None)
@@ -6075,8 +5703,8 @@ fn main() -> Result<()> {
         }
 
         Commands::Queue { command } => {
-            let lib = connect_library(&cli);
-            let pb = connect_playback(&cli);
+            let lib = ctx.library();
+            let pb = ctx.playback();
             match command {
                 QueueCommands::Next { hash } => {
                     handle_queue_next(&lib, &pb, hashes_arg_or_stdin(hash.clone()))
@@ -6097,32 +5725,32 @@ fn main() -> Result<()> {
         }
 
         Commands::Source { command } => match command {
-            SourceTop::List => handle_source_list(&cli),
+            SourceTop::List => handle_source_list(&ctx),
             SourceTop::Named(args) => match parse_source_args(args) {
-                Ok((name, command)) => run_source_command(&cli, &name, &command),
+                Ok((name, command)) => run_source_command(&ctx, &name, &command),
                 Err(e) => exit_source_parse_error(e),
             },
         },
 
         // Library commands - connect to library service
         Commands::Ping => {
-            let client = connect_library(&cli);
+            let client = ctx.library();
             handle_ping(&client)
         }
         Commands::Status => {
-            let client = connect_library(&cli);
+            let client = ctx.library();
             handle_status(&client)
         }
         Commands::List { limit } => {
-            let client = connect_library(&cli);
+            let client = ctx.library();
             handle_list(&client, *limit)
         }
         Commands::Get { hash } => {
-            let client = connect_library(&cli);
+            let client = ctx.library();
             handle_get(&client, hash.clone())
         }
         Commands::Facts { hash } => {
-            let client = connect_library(&cli);
+            let client = ctx.library();
             handle_facts(&client, hash.clone())
         }
         Commands::Search {
@@ -6148,7 +5776,7 @@ fn main() -> Result<()> {
             not,
             subcommand,
         } => {
-            let client = connect_library(&cli);
+            let client = ctx.library();
             if let Some(sub) = subcommand {
                 match sub {
                     SearchSubcommands::FactValuesFor { fact_type } => {
@@ -6181,7 +5809,7 @@ fn main() -> Result<()> {
             }
         }
         Commands::Playlist { command } => {
-            let lib = connect_library(&cli);
+            let lib = ctx.library();
             match command {
                 PlaylistCommands::List => handle_playlist_list(&lib),
                 PlaylistCommands::Get { name } => handle_playlist_get(&lib, name),
@@ -6198,7 +5826,7 @@ fn main() -> Result<()> {
         }
 
         Commands::Inbox { command } => {
-            let client = connect_library(&cli);
+            let client = ctx.library();
             match command {
                 InboxCommands::List => handle_inbox_list(&client),
                 InboxCommands::Delete { filename } => {
@@ -6215,12 +5843,12 @@ fn main() -> Result<()> {
             ascending,
             descending,
         } => {
-            let client = connect_library(&cli);
+            let client = ctx.library();
             handle_sort(&client, field.clone(), *ascending, *descending)
         }
         Commands::Subscribe { topic } => {
             // Event gateway of the resolved node (tcp://<ip>:5556)
-            let addr = match resolve_event_gateway(&cli) {
+            let addr = match ctx.event_gateway() {
                 Some(a) => a,
                 None => {
                     eprintln!("Subscribe needs a remote node.");
@@ -6228,7 +5856,7 @@ fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             };
-            let lib = connect_library(&cli);
+            let lib = ctx.library();
             handle_subscribe(&addr, topic.as_deref(), Some(&lib))
         }
         Commands::Upload {
@@ -6236,18 +5864,18 @@ fn main() -> Result<()> {
             ssh_key,
             ssh_user,
             inbox_dir,
-        } => handle_upload(&cli, file, ssh_key, ssh_user, inbox_dir),
+        } => handle_upload(&ctx, file, ssh_key, ssh_user, inbox_dir),
         Commands::Export {
             format,
             lossless_format,
             lossy_format,
             output,
         } => {
-            let lib = connect_library(&cli);
-            handle_export(&cli, &lib, format, lossless_format, lossy_format, output)
+            let lib = ctx.library();
+            handle_export(&ctx, &lib, format, lossless_format, lossy_format, output)
         }
         Commands::Rekordbox { command } => {
-            let lib = connect_library(&cli);
+            let lib = ctx.library();
             match command {
                 RekordboxCommands::Export {
                     playlist,
@@ -6261,7 +5889,7 @@ fn main() -> Result<()> {
                             .unwrap_or_else(|| std::path::PathBuf::from("./rekordbox-export/"))
                     });
                     handle_rekordbox_export(
-                        &cli,
+                        &ctx,
                         &lib,
                         playlist,
                         &resolved_output,
@@ -6276,7 +5904,7 @@ fn main() -> Result<()> {
                     enrich,
                     dry_run,
                 } => handle_rekordbox_import(
-                    &cli,
+                    &ctx,
                     &lib,
                     path,
                     playlist,
@@ -6292,7 +5920,7 @@ fn main() -> Result<()> {
         }
 
         Commands::Library { command } => {
-            let lib = connect_library(&cli);
+            let lib = ctx.library();
             match command {
                 LibraryCommands::ReindexCovers => handle_library_reindex_covers(&lib),
                 LibraryCommands::Identity { command } => match command {
@@ -6326,18 +5954,18 @@ fn main() -> Result<()> {
         }
 
         Commands::Bookmark { hash, scope } => {
-            let lib = connect_library(&cli);
-            let pb = connect_playback(&cli);
+            let lib = ctx.library();
+            let pb = ctx.playback();
             handle_bookmark(&lib, Some(&pb), hash.clone(), scope.clone())
         }
 
         Commands::Bookmarks => {
-            let lib = connect_library(&cli);
+            let lib = ctx.library();
             handle_bookmarks(&lib)
         }
 
         Commands::Fact { command } => {
-            let lib = connect_library(&cli);
+            let lib = ctx.library();
             match command {
                 FactCommands::Add { hash, field, value } => {
                     handle_fact_add(&lib, hash.clone(), *field, value.clone())
@@ -6359,7 +5987,7 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             });
             let columns = view_columns_from_matches(view_matches);
-            let lib = connect_library(&cli);
+            let lib = ctx.library();
             handle_view(&lib, columns)
         }
 
@@ -6367,11 +5995,11 @@ fn main() -> Result<()> {
             NodeCommands::List => node::handle_list(),
             NodeCommands::Select { name } => node::handle_select(name.as_deref()),
             NodeCommands::Forget => node::handle_forget(),
-            NodeCommands::Show => node::handle_show(cli.node.as_deref(), local_ipc),
+            NodeCommands::Show => node::handle_show(ctx.node_flag(), ctx.local_ipc()),
         },
 
         Commands::Admin { command } => {
-            let admin = connect_admin(&cli);
+            let admin = ctx.admin();
             match command {
                 AdminCommands::ServiceMode { command } => match command {
                     ServiceModeCommands::Status => handle_admin_service_mode_status(&admin),
@@ -6388,8 +6016,10 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::render_track_table_inner;
     use pretty_assertions::assert_eq;
     use source_protocol::ImportResult;
+    use track_formatter::ALL_COLUMNS;
 
     fn job(job_id: u64, phase: ImportPhase, sync: Option<(u32, u32, u32)>) -> ImportJobStatus {
         ImportJobStatus {
@@ -6761,70 +6391,15 @@ mod tests {
         assert_eq!(result, "tcp://some-pi.local:5556");
     }
 
-    #[test]
-    fn resolve_gateway_uses_resolved_target() {
-        // The resolved target's IP and port give the gateway address
-        let cli = Cli {
-            target: Some(node_discovery::Target::Remote(
-                node_discovery::RemoteTarget {
-                    host: "mdma-909.local".to_string(),
-                    ip: Some(std::net::Ipv4Addr::new(192, 168, 0, 9)),
-                    port: 5555,
-                    source: node_discovery::Source::Cache,
-                },
-            )),
-            ..cli_with_target(None)
-        };
-        assert_eq!(
-            resolve_gateway(&cli),
-            Some("tcp://192.168.0.9:5555".to_string())
-        );
-        assert_eq!(
-            resolve_event_gateway(&cli),
-            Some("tcp://192.168.0.9:5556".to_string())
-        );
-    }
-
-    #[test]
-    fn resolve_gateway_returns_none_when_no_target() {
-        // No resolved target (local IPC) means no gateway
-        let cli = cli_with_target(None);
-        assert_eq!(resolve_gateway(&cli), None);
-        assert_eq!(resolve_event_gateway(&cli), None);
-    }
-
-    fn cli_with_target(target: Option<node_discovery::Target>) -> Cli {
-        Cli {
-            node: None,
-            target,
-            socket: "ipc:///run/mdma/library.sock".to_string(),
-            playback_socket: "ipc:///run/mdma/playback.sock".to_string(),
-            sources_dir: "/run/mdma/sources".to_string(),
-            command: Commands::Ping,
-        }
-    }
-
-    #[test]
-    fn node_commands_do_not_need_a_resolved_node() {
-        let node_cmd = Commands::Node {
-            command: NodeCommands::List,
-        };
-        assert!(!node_cmd.needs_node());
-        assert!(!Commands::GenerateCompletions {
-            shell: clap_complete::Shell::Bash
-        }
-        .needs_node());
-        assert!(Commands::Ping.needs_node());
-        assert!(Commands::Status.needs_node());
-    }
-
     fn given(args: &[&str]) -> bool {
         let mut argv = vec!["mdma"];
         argv.extend_from_slice(args);
         let matches = Cli::command()
             .try_get_matches_from(argv)
             .expect("valid args");
-        sockets_given(&matches)
+        let cli = Cli::from_arg_matches(&matches).expect("valid args");
+        let globals = globals_from(&cli, &matches);
+        globals.socket.is_some() || globals.playback_socket.is_some()
     }
 
     #[test]
