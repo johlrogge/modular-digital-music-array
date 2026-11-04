@@ -463,6 +463,15 @@ impl LibraryService {
                 message: "DedupMerge not supported in stub".to_string(),
             }),
 
+            // The stub archives nothing: the listing is empty and emptying is a no-op.
+            LibraryRequest::ArchiveList => {
+                LibraryResponse::ArchiveListing(library_ipc_protocol::ArchiveListing::default())
+            }
+
+            LibraryRequest::ArchiveEmpty { .. } => {
+                LibraryResponse::ArchiveEmptied(library_ipc_protocol::ArchiveEmptyReport::default())
+            }
+
             LibraryRequest::TrackOrphans => {
                 let tracks = self.tracks.lock().unwrap();
                 let orphans: Vec<OrphanInfo> = tracks
@@ -688,6 +697,25 @@ mod tests {
                 names.iter().map(|n| n.as_str().to_string()).collect()
             }
             other => panic!("expected PlaylistNames, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn archive_is_empty_and_emptying_it_is_a_no_op() {
+        let svc = empty_service();
+        match svc.handle_request(LibraryRequest::ArchiveList) {
+            LibraryResponse::ArchiveListing(l) => {
+                assert!(l.entries.is_empty());
+                assert_eq!(l.total_bytes, 0);
+            }
+            other => panic!("expected ArchiveListing, got {other:?}"),
+        }
+        match svc.handle_request(LibraryRequest::ArchiveEmpty { up_to: None }) {
+            LibraryResponse::ArchiveEmptied(r) => {
+                assert_eq!((r.files_deleted, r.bytes_freed), (0, 0));
+                assert!(r.errors.is_empty());
+            }
+            other => panic!("expected ArchiveEmptied, got {other:?}"),
         }
     }
 

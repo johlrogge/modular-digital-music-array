@@ -7,7 +7,8 @@ use super::tests::{
 };
 use super::*;
 use crate::ipc::{
-    ConfirmationReason, DedupApplyReport, DedupDisposition, DedupGroup, IdentityBackfillStatus,
+    ArchiveEmptyReport, ArchiveListing, ConfirmationReason, DedupApplyReport, DedupDisposition,
+    DedupGroup, IdentityBackfillStatus,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use music_facts::{
@@ -773,9 +774,23 @@ fn the_loser_blob_is_removed_only_after_its_facts_are_retracted() {
         seen.load(Ordering::SeqCst),
         "blob was deleted before the retire"
     );
-    assert_eq!(report.blobs_removed, 1, "{report:?}");
+    assert_eq!(report.blobs_archived, 1, "{report:?}");
     assert!(!old_blob.exists());
+    assert_eq!(
+        std::fs::read(archived(&service, &old_blob)).unwrap(),
+        b"old",
+        "the loser's blob is moved, bytes intact"
+    );
     assert!(new_blob.exists(), "the winner's blob is kept");
+    assert!(!archived(&service, &new_blob).exists());
+}
+
+/// Where the archive keeps the file at `abs` (under `music_dir`).
+fn archived(service: &LibraryService, abs: &Path) -> std::path::PathBuf {
+    service
+        .music_dir
+        .join("archive")
+        .join(abs.strip_prefix(&service.music_dir).unwrap())
 }
 
 #[test]
@@ -822,8 +837,444 @@ fn cover_art_is_removed_unless_another_live_track_uses_it() {
 
     apply(&service);
 
-    assert!(!own_abs.exists(), "unshared cover art is removed");
+    assert!(!own_abs.exists(), "unshared cover art leaves cover-art/");
+    assert_eq!(
+        std::fs::read(archived(&service, &own_abs)).unwrap(),
+        b"jpg",
+        "unshared cover art is archived"
+    );
     assert!(shared_abs.exists(), "shared cover art is kept");
+    assert!(!archived(&service, &shared_abs).exists());
+}
+
+fn archive_listing(service: &LibraryService) -> ArchiveListing {
+    match service.handle_request(LibraryRequest::ArchiveList) {
+        LibraryResponse::ArchiveListing(l) => l,
+        other => panic!("expected ArchiveListing, got {other:?}"),
+    }
+}
+
+fn empty_archive(service: &LibraryService) -> ArchiveEmptyReport {
+    empty_archive_up_to(service, None)
+}
+
+fn empty_archive_up_to(service: &LibraryService, up_to: Option<String>) -> ArchiveEmptyReport {
+    match service.handle_request(LibraryRequest::ArchiveEmpty { up_to }) {
+        LibraryResponse::ArchiveEmptied(r) => r,
+        other => panic!("expected ArchiveEmptied, got {other:?}"),
+    }
+}
+
+fn set_mtime(path: &Path, when: std::time::SystemTime) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
+
+#[test]
+fn a_name_collision_in_the_archive_keeps_both_files() {
+    let (service, _d, _acid) = make_empty_service();
+    let old = seed_with_blob(&service, "old", base(1, Some("p1"), 1));
+    seed_with_blob(&service, "new", base(1, Some("p1"), 2));
+    let earlier = archived(&service, &blob_file(&service, &old));
+    std::fs::create_dir_all(earlier.parent().unwrap()).unwrap();
+    std::fs::write(&earlier, b"earlier").unwrap();
+
+    let (report, _) = apply(&service);
+
+    assert_eq!(
+        (report.blobs_archived, report.errors.len()),
+        (1, 0),
+        "{report:?}"
+    );
+    assert_eq!(
+        std::fs::read(&earlier).unwrap(),
+        b"earlier",
+        "never overwritten"
+    );
+    let listing = archive_listing(&service);
+    let mut contents: Vec<Vec<u8>> = listing
+        .entries
+        .iter()
+        .map(|e| std::fs::read(service.music_dir.join("archive").join(&e.path)).unwrap())
+        .collect();
+    contents.sort();
+    assert_eq!(contents, vec![b"earlier".to_vec(), b"old".to_vec()]);
+    assert!(
+        listing.entries.iter().all(|e| e.hash == "old"),
+        "{listing:?}"
+    );
+}
+
+#[test]
+fn the_archive_lists_hash_size_and_the_time_it_was_archived() {
+    let (service, _d, _acid) = make_empty_service();
+    assert_eq!(archive_listing(&service), ArchiveListing::default());
+    let old = seed_with_blob(&service, "old", base(1, Some("p1"), 1));
+    seed_with_blob(&service, "new", base(1, Some("p1"), 2));
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400 * 30);
+    set_mtime(&blob_file(&service, &old), long_ago);
+
+    apply(&service);
+
+    let listing = archive_listing(&service);
+    assert_eq!(listing.entries.len(), 1, "{listing:?}");
+    assert_eq!(listing.total_bytes, 3);
+    let e = &listing.entries[0];
+    assert_eq!((e.hash.as_str(), e.size_bytes), ("old", 3));
+    assert!(e.path.starts_with("blobs/"), "{e:?}");
+    let at = DateTime::parse_from_rfc3339(e.archived_at.as_deref().unwrap()).unwrap();
+    assert!(
+        Utc::now().signed_duration_since(at).num_seconds() < 60,
+        "archived time is when it was moved, not the file's old mtime: {e:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_archived_after_the_cutoff_is_never_deleted_even_with_an_old_mtime() {
+    use std::os::unix::fs::PermissionsExt;
+    let (service, _d, _acid) = make_empty_service();
+    let old = seed_with_blob(&service, "old", base(1, Some("p1"), 1));
+    seed_with_blob(&service, "new", base(1, Some("p1"), 2));
+    let src = blob_file(&service, &old);
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400 * 30);
+    set_mtime(&src, long_ago);
+    // A read-only source: the archived time must still be stamped.
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let cutoff = (Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+
+    apply(&service);
+    assert!(archived(&service, &src).exists());
+
+    let report = empty_archive_up_to(&service, Some(cutoff));
+
+    assert_eq!(report.files_deleted, 0, "{report:?}");
+    assert!(
+        archived(&service, &src).exists(),
+        "archived after the cutoff"
+    );
+}
+
+#[test]
+fn emptying_the_archive_deletes_only_the_archive() {
+    let (service, _d, _acid) = make_empty_service();
+    let old = seed_with_blob(&service, "old", base(1, Some("p1"), 1));
+    let new = seed_with_blob(&service, "new", base(1, Some("p1"), 2));
+    let other = |rel: &str| {
+        let p = service.music_dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"keep").unwrap();
+        p
+    };
+    let (inbox, art, archive_like) = (
+        other("inbox/song.flac"),
+        other("cover-art/live.jpg"),
+        other("archive-not/x.flac"),
+    );
+    apply(&service);
+    assert!(archived(&service, &blob_file(&service, &old)).exists());
+
+    let report = empty_archive(&service);
+
+    assert_eq!(
+        (report.files_deleted, report.bytes_freed),
+        (1, 3),
+        "{report:?}"
+    );
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert_eq!(archive_listing(&service), ArchiveListing::default());
+    assert!(!archived(&service, &blob_file(&service, &old)).exists());
+    assert!(blob_file(&service, &new).exists(), "live blobs stay");
+    assert!(inbox.exists() && art.exists() && archive_like.exists());
+    // Idempotent, and nothing to do on a library that never archived.
+    assert_eq!(empty_archive(&service).files_deleted, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn emptying_the_archive_never_follows_a_symlink_out_of_it() {
+    let (service, _d, _acid) = make_empty_service();
+    let outside = tempfile::tempdir().unwrap();
+    let victim = outside.path().join("victim.flac");
+    std::fs::write(&victim, b"precious").unwrap();
+    let archive = service.music_dir.join("archive");
+    std::fs::create_dir_all(archive.join("blobs")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), archive.join("blobs/escape")).unwrap();
+    std::os::unix::fs::symlink(&victim, archive.join("blobs/link.flac")).unwrap();
+
+    let report = empty_archive(&service);
+
+    assert!(
+        victim.exists(),
+        "a symlink target outside the archive survives"
+    );
+    assert!(outside.path().exists());
+    assert!(report.errors.is_empty(), "{report:?}");
+    for gone in ["blobs/escape", "blobs/link.flac"] {
+        assert!(
+            archive.join(gone).symlink_metadata().is_err(),
+            "{gone} removed"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_archive_root_is_never_walked_or_emptied() {
+    let (service, _d, _acid) = make_empty_service();
+    let outside = tempfile::tempdir().unwrap();
+    let victim = outside.path().join("victim.flac");
+    std::fs::write(&victim, b"precious").unwrap();
+    std::fs::create_dir_all(&service.music_dir).unwrap();
+    std::os::unix::fs::symlink(outside.path(), service.music_dir.join("archive")).unwrap();
+
+    assert_eq!(
+        archive_listing(&service),
+        ArchiveListing::default(),
+        "nothing is listed through the link"
+    );
+    let report = empty_archive(&service);
+
+    assert!(victim.exists(), "the link's target is untouched");
+    assert_eq!(report.files_deleted, 0, "{report:?}");
+    assert!(
+        !report.errors.is_empty(),
+        "the refusal is reported: {report:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_archive_directory_is_reported_not_hidden() {
+    use std::os::unix::fs::PermissionsExt;
+    let (service, _d, _acid) = make_empty_service();
+    let locked = service.music_dir.join("archive/blobs");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::write(locked.join("a.flac"), b"x").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let readable_anyway = std::fs::read_dir(&locked).is_ok();
+    let report = empty_archive(&service);
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if !readable_anyway {
+        assert!(
+            !report.errors.is_empty(),
+            "a skipped subtree is reported: {report:?}"
+        );
+        assert!(locked.join("a.flac").exists());
+    }
+}
+
+#[test]
+fn a_confirmed_emptying_deletes_only_what_was_listed() {
+    let (service, _d, _acid) = make_empty_service();
+    let archive = service.music_dir.join("archive/blobs");
+    std::fs::create_dir_all(&archive).unwrap();
+    let listed_at = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+    let later = listed_at + std::time::Duration::from_secs(60);
+    for (name, at) in [("listed.flac", listed_at), ("later.flac", later)] {
+        std::fs::write(archive.join(name), name).unwrap();
+        set_mtime(&archive.join(name), at);
+    }
+    let cutoff = archive_listing(&service)
+        .entries
+        .iter()
+        .find(|e| e.path.ends_with("listed.flac"))
+        .and_then(|e| e.archived_at.clone())
+        .unwrap();
+
+    let report = empty_archive_up_to(&service, Some(cutoff));
+
+    assert_eq!(report.files_deleted, 1, "{report:?}");
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert!(!archive.join("listed.flac").exists());
+    assert!(
+        archive.join("later.flac").exists(),
+        "archived after the cutoff"
+    );
+    assert_eq!(empty_archive_up_to(&service, None).files_deleted, 1);
+    assert!(!archive.join("later.flac").exists());
+
+    let refused = empty_archive_up_to(&service, Some("yesterday".into()));
+    assert!(!refused.errors.is_empty(), "{refused:?}");
+}
+
+#[test]
+fn a_loser_that_comes_back_before_archiving_keeps_its_files() {
+    let (service, _d, _acid) = make_empty_service();
+    let art_rel = "cover-art/old.jpg".to_owned();
+    let art = service.music_dir.join(&art_rel);
+    std::fs::create_dir_all(art.parent().unwrap()).unwrap();
+    std::fs::write(&art, b"jpg").unwrap();
+    let old_facts = || {
+        [
+            base(1, Some("p1"), 1),
+            vec![
+                src(MusicValue::FilePath("x.flac".into())),
+                src(MusicValue::CoverArtPath(art_rel.clone())),
+            ],
+        ]
+        .concat()
+    };
+    let old = seed_with_blob(&service, "old", old_facts());
+    let new = seed_with_blob(&service, "new", base(1, Some("p1"), 2));
+    // The loser's bytes are ingested again between the merge and the archiving.
+    *service.merge_pre_archive_hook.lock().unwrap() = Some(Box::new({
+        let facts = old_facts();
+        move |service, loser| write(service, loser, facts.clone())
+    }));
+
+    let (report, _) = apply(&service);
+
+    assert_eq!(report.merged, 1, "{report:?}");
+    assert_eq!(report.blobs_archived, 0, "{report:?}");
+    assert!(blob_file(&service, &old).exists(), "the revived blob stays");
+    assert!(art.exists(), "the revived cover art stays");
+    assert!(!archived(&service, &blob_file(&service, &old)).exists());
+    assert!(blob_file(&service, &new).exists());
+}
+
+/// A cover-art file `cover-art/<name>.jpg` under `music_dir`; returns its relative path.
+fn cover_file(service: &LibraryService, name: &str) -> String {
+    let rel = format!("cover-art/{name}.jpg");
+    let abs = service.music_dir.join(&rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+    std::fs::write(&abs, b"jpg").unwrap();
+    rel
+}
+
+#[test]
+fn cover_art_that_the_album_cache_hands_to_other_tracks_is_kept() {
+    let (service, _d, _acid) = make_empty_service();
+    let rel = cover_file(&service, "album");
+    seed(
+        &service,
+        "old",
+        [
+            base(1, Some("p1"), 1),
+            vec![src(album("A")), src(MusicValue::CoverArtPath(rel.clone()))],
+        ]
+        .concat(),
+    );
+    seed(
+        &service,
+        "new",
+        [base(1, Some("p1"), 2), vec![src(album("A"))]].concat(),
+    );
+    // As built at startup: the album's cover is the old copy's.
+    service
+        .album_cover_cache
+        .lock()
+        .unwrap()
+        .insert("A".into(), rel.clone());
+
+    apply(&service);
+
+    assert!(
+        service.music_dir.join(&rel).exists(),
+        "still shown for the album"
+    );
+    assert!(!archived(&service, &service.music_dir.join(&rel)).exists());
+    assert_eq!(
+        service.album_cover_cache.lock().unwrap().get("A"),
+        Some(&rel)
+    );
+}
+
+#[test]
+fn an_album_cache_entry_is_repointed_when_its_cover_is_archived() {
+    let (service, _d, _acid) = make_empty_service();
+    let (old_rel, new_rel) = (cover_file(&service, "old"), cover_file(&service, "new"));
+    seed(
+        &service,
+        "old",
+        [
+            base(1, Some("p1"), 1),
+            vec![
+                src(album("A")),
+                src(MusicValue::CoverArtPath(old_rel.clone())),
+            ],
+        ]
+        .concat(),
+    );
+    seed(
+        &service,
+        "new",
+        [
+            base(1, Some("p1"), 2),
+            vec![
+                src(album("A")),
+                src(MusicValue::CoverArtPath(new_rel.clone())),
+            ],
+        ]
+        .concat(),
+    );
+    service
+        .album_cover_cache
+        .lock()
+        .unwrap()
+        .insert("A".into(), old_rel.clone());
+
+    apply(&service);
+
+    assert!(
+        archived(&service, &service.music_dir.join(&old_rel)).exists(),
+        "unused cover art is archived"
+    );
+    assert_eq!(
+        service.album_cover_cache.lock().unwrap().get("A"),
+        Some(&new_rel),
+        "the cache no longer names an archived file"
+    );
+}
+
+#[test]
+fn only_plain_paths_below_the_stores_may_be_archived() {
+    use super::dedup::is_store_path;
+    assert!(is_store_path(Path::new("blobs/ab/abcd.flac"), "blobs"));
+    assert!(is_store_path(Path::new("cover-art/x.jpg"), "cover-art"));
+    for bad in [
+        "blobs/../secret",
+        "/etc/passwd",
+        "/blobs/x",
+        "cover-art/x.jpg",
+        "archive/blobs/x",
+        "other/x",
+    ] {
+        assert!(!is_store_path(Path::new(bad), "blobs"), "{bad}");
+    }
+
+    let (service, _d, _acid) = make_empty_service();
+    let victim = service.music_dir.join("secret.txt");
+    std::fs::create_dir_all(&service.music_dir).unwrap();
+    std::fs::write(&victim, b"x").unwrap();
+    let mut report = DedupApplyReport::default();
+    let gate = service.retire_gate.lock().unwrap();
+    service.archive_retired_files(
+        &gate,
+        &RetiredFiles {
+            blob: Some("blobs/../secret.txt".into()),
+            cover_art: Some("cover-art/../secret.txt".into()),
+        },
+        &mut report,
+    );
+    assert!(victim.exists(), "a traversing path moves nothing");
+    assert_eq!(report, DedupApplyReport::default());
+    assert!(!service.music_dir.join("archive").exists());
+}
+
+#[test]
+fn only_plain_paths_below_the_archive_may_be_deleted() {
+    use super::dedup::is_archive_path;
+    assert!(is_archive_path(Path::new("blobs/ab/abcd.flac")));
+    for bad in ["", "..", "../x", "blobs/../../x", "/abs", "./x"] {
+        assert!(!is_archive_path(Path::new(bad)), "{bad:?}");
+    }
 }
 
 fn plant(service: &LibraryService, hex: &str) -> std::path::PathBuf {
@@ -866,9 +1317,15 @@ fn orphan_cleanup_removes_only_merge_orphans_and_is_idempotent() {
     let (first, _) = apply(&service);
     let (second, _) = apply(&service);
 
-    assert_eq!(first.blobs_removed, 1, "{first:?}");
-    assert_eq!(second.blobs_removed, 0);
+    assert_eq!(first.blobs_archived, 1, "{first:?}");
+    assert_eq!(second.blobs_archived, 0);
     assert!(!merge_orphan.exists());
+    assert_eq!(
+        std::fs::read(archived(&service, &merge_orphan)).unwrap(),
+        b"aa11merged",
+        "the orphan cleanup archives instead of deleting"
+    );
+    assert!(!archived(&service, &plain_orphan).exists());
     assert!(plain_orphan.exists(), "other NoLiveFacts orphans stay");
     assert!(replace_leftover.exists(), "ADR-004 leftovers stay");
     assert!(live_again.exists(), "a live track's blob stays");
@@ -893,7 +1350,7 @@ fn a_confirmed_merge_accepts_short_hashes_and_merges_across_item_ids() {
     let LibraryResponse::DedupMerged(report) = resp else {
         panic!("expected DedupMerged, got {resp:?}");
     };
-    assert_eq!((report.merged, report.blobs_removed), (1, 1), "{report:?}");
+    assert_eq!((report.merged, report.blobs_archived), (1, 1), "{report:?}");
     assert!(gone(&service, &old));
     assert!(service.get_track(&new).is_ok());
 }
@@ -1299,7 +1756,7 @@ fn a_user_replaces_the_loser_carried_is_not_a_merge_orphan() {
         1,
         "the user's link is inherited"
     );
-    assert_eq!(second.blobs_removed, 0);
+    assert_eq!(second.blobs_archived, 0);
     assert!(
         x.exists(),
         "an ADR-004 replaced blob is not the dedup cleanup's business"
@@ -1371,7 +1828,7 @@ fn tagliabue_prerelease_and_release_merge_into_one_track() {
     let (report, left) = apply(&service);
 
     assert_eq!(
-        (report.merged, report.blobs_removed, report.errors.len()),
+        (report.merged, report.blobs_archived, report.errors.len()),
         (1, 1, 0),
         "{report:?}"
     );
@@ -1385,6 +1842,7 @@ fn tagliabue_prerelease_and_release_merge_into_one_track() {
     assert_eq!(t.added, Some(day(20).to_rfc3339()));
     assert!(gone(&service, &prerelease));
     assert!(!blob_file(&service, &prerelease).exists());
+    assert!(archived(&service, &blob_file(&service, &prerelease)).exists());
     assert!(blob_file(&service, &release).exists());
 }
 

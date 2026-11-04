@@ -3,20 +3,22 @@
 //! A duplicate group is a connected component of live tracks that share an
 //! AudioHash v1 or a PcmHash v1. `merge_group` merges its losers into the winner
 //! through `merge_into`, the generalised ADR-004 replace that `track replace` uses
-//! too. Facts are made durable first and files are deleted afterwards, so a crash
-//! leaves either a still-detectable group or a merge orphan that the cleanup
-//! removes.
+//! too. Facts are made durable first and the losers' files are moved to
+//! `<music_dir>/archive/` afterwards (never deleted; `archive_empty` is the only
+//! deletion), so a crash leaves either a still-detectable group or a merge orphan
+//! that the cleanup archives.
 
 use super::*;
 use crate::ipc::{
-    ConfirmationReason, DedupApplyReport, DedupDisposition, DedupGroup, DedupMember,
-    DedupScanReport,
+    ArchiveEmptyReport, ArchiveEntry, ArchiveListing, ConfirmationReason, DedupApplyReport,
+    DedupDisposition, DedupGroup, DedupMember, DedupScanReport,
 };
 use chrono::{DateTime, Utc};
 use music_facts::{FactOrigin, FactSource};
 use stainless_facts::Operation;
 use std::collections::BTreeSet;
 use std::mem::{discriminant, Discriminant};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 /// `FactSource::tool` of the facts a dedup merge writes itself (`Replaces(loser)`).
@@ -365,13 +367,56 @@ fn build_group(tracks: &[ScanTrack], component: &[usize]) -> DedupGroup {
     }
 }
 
-/// Only plain components below `dir` may be deleted: a fact must never steer a
-/// deletion outside the blob and cover-art stores.
-fn is_store_path(rel: &Path, dir: &str) -> bool {
-    rel.starts_with(dir)
+/// Where merged duplicates' files go, below `music_dir`. Only `archive_empty`
+/// deletes from it.
+const ARCHIVE_DIR: &str = "archive";
+
+/// Only plain components below `dir` may be archived: a fact must never steer a
+/// move outside the blob and cover-art stores.
+pub(super) fn is_store_path(rel: &Path, dir: &str) -> bool {
+    rel.starts_with(dir) && is_archive_path(rel)
+}
+
+/// A non-empty path of plain components: no `..`, no root, no `.` prefix. Anything
+/// the archive walk yields satisfies it; the check keeps deletion confined if it
+/// ever did not.
+pub(super) fn is_archive_path(rel: &Path) -> bool {
+    rel.components().next().is_some()
         && rel
             .components()
             .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// Why nothing is walked or deleted when `archive/` is not a real directory.
+const NOT_A_PLAIN_DIR: &str = "archive/ is not a plain directory; refusing";
+
+/// What a walk of `archive/` found.
+#[derive(Default)]
+struct ArchiveWalk {
+    files: Vec<(PathBuf, std::fs::Metadata)>,
+    dirs: Vec<PathBuf>,
+    /// Refusals and entries the walk could not cover.
+    problems: Vec<String>,
+}
+
+/// `dst`, or the first of `stem.1.ext`, `stem.2.ext`, ... that does not exist yet.
+fn free_archive_path(dst: &Path) -> PathBuf {
+    if dst.symlink_metadata().is_err() {
+        return dst.to_path_buf();
+    }
+    let name = dst
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_owned();
+    let (stem, ext) = match name.split_once('.') {
+        Some((stem, ext)) => (stem.to_owned(), format!(".{ext}")),
+        None => (name, String::new()),
+    };
+    (1u32..)
+        .map(|n| dst.with_file_name(format!("{stem}.{n}{ext}")))
+        .find(|p| p.symlink_metadata().is_err())
+        .expect("an unbounded counter finds a free name")
 }
 
 impl LibraryService {
@@ -428,8 +473,16 @@ impl LibraryService {
             tracing::info!(
                 winner = %winner.as_str(),
                 merged = report.merged,
-                blobs_removed = report.blobs_removed,
+                blobs_archived = report.blobs_archived,
                 "Ingest merged a re-downloaded copy into its predecessor"
+            );
+        } else if report.merged > 0 {
+            tracing::warn!(
+                winner = %winner.as_str(),
+                merged = report.merged,
+                errors = ?report.errors,
+                "Ingest merged a re-downloaded copy, but archiving its files (or merging \
+                 another copy) had errors"
             );
         } else {
             tracing::warn!(
@@ -501,7 +554,7 @@ impl LibraryService {
             let losers: Vec<ContentHash> = group.losers().map(|m| m.hash.clone()).collect();
             let merged = self.merge_group(&group.winner, &losers);
             report.merged += merged.merged;
-            report.blobs_removed += merged.blobs_removed;
+            report.blobs_archived += merged.blobs_archived;
             report.errors.extend(merged.errors);
         }
         self.cleanup_merge_orphans(&mut report);
@@ -514,7 +567,7 @@ impl LibraryService {
 
     /// Handle `DedupMerge`: a user-confirmed merge. The tracks must form (part of)
     /// one duplicate group as the scan finds it, so a mistyped hash cannot make the
-    /// service delete the blob of an unrelated track.
+    /// service archive the blob of an unrelated track.
     pub(super) fn dedup_merge_request(
         &self,
         winner: &ContentHash,
@@ -558,7 +611,7 @@ impl LibraryService {
         LibraryResponse::DedupMerged(self.merge_group(&winner, &resolved))
     }
 
-    /// Merge every loser into the winner, one after the other, and remove the
+    /// Merge every loser into the winner, one after the other, and archive the
     /// losers' files once their facts are retracted. Stops at the first failure:
     /// the rest of the group stays detectable and a rerun completes it.
     pub(super) fn merge_group(
@@ -583,8 +636,9 @@ impl LibraryService {
             match self.merge_into(winner, loser, &source, carry.take().unwrap_or_default()) {
                 Ok(outcome) => {
                     report.merged += 1;
-                    // The facts are retracted (and projected): now the files may go.
-                    self.remove_retired_files(&outcome.retired, &mut report);
+                    // The facts are retracted (and projected): now the files may be
+                    // moved to the archive, unless the loser came back meanwhile.
+                    self.archive_retired_files_if_still_gone(loser, &outcome.retired, &mut report);
                 }
                 Err(e) => {
                     report.errors.push(format!("{loser} into {winner}: {e}"));
@@ -613,41 +667,128 @@ impl LibraryService {
     }
 
     // =====================================================================
-    // File removal
+    // File archiving (a merge never deletes; only `archive_empty` does)
     // =====================================================================
 
-    fn remove_store_file(&self, rel: &Path, report: &mut DedupApplyReport) -> bool {
-        match std::fs::remove_file(self.music_dir.join(rel)) {
+    /// Move `rel` (relative to `music_dir`, in `blobs` or `cover-art`) to the same
+    /// place under `archive/`. `true` when a file was moved; a file that is already
+    /// gone counts as nothing to do. A name already taken in the archive is never
+    /// overwritten: the file gets a numbered name instead. The gate proves that the
+    /// caller serialises with merges and the backfill; it has re-checked that the
+    /// file's track is still gone.
+    fn archive_store_file(
+        &self,
+        _gate: &super::RetireGuard<'_>,
+        rel: &Path,
+        report: &mut DedupApplyReport,
+    ) -> bool {
+        if !is_store_path(rel, "blobs") && !is_store_path(rel, "cover-art") {
+            return false;
+        }
+        let src = self.music_dir.join(rel);
+        let src_exists = || src.symlink_metadata().is_ok();
+        if !src_exists() {
+            return false;
+        }
+        // `rename` keeps the mtime and the archive lists when a file was archived, so
+        // stamp it BEFORE the move: there is then no moment at which an archived file
+        // carries its old ingest-time mtime (`archive empty` could delete it unseen).
+        // Opened read-only: the owner may set times without write permission.
+        let stamped = match src.symlink_metadata() {
+            Ok(meta) if meta.is_file() => {
+                std::fs::File::open(&src).and_then(|f| f.set_modified(std::time::SystemTime::now()))
+            }
+            Ok(_) => Err(std::io::Error::other("not a regular file")),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = stamped {
+            tracing::warn!(
+                path = %src.display(),
+                error = %e,
+                "Could not set the archived time; archiving anyway"
+            );
+        }
+        let dst = free_archive_path(&self.music_dir.join(ARCHIVE_DIR).join(rel));
+        let try_move = || {
+            dst.parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::rename(&src, &dst))
+        };
+        let mut moved = try_move();
+        // `NotFound` can be the source or the destination directory (e.g. a
+        // concurrent `archive empty` pruned it): retry once while the source is there.
+        if matches!(&moved, Err(e) if e.kind() == std::io::ErrorKind::NotFound) && src_exists() {
+            moved = try_move();
+        }
+        match moved {
             Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !src_exists() => false,
             Err(e) => {
                 report
                     .errors
-                    .push(format!("failed to remove {}: {e}", rel.display()));
+                    .push(format!("failed to archive {}: {e}", rel.display()));
                 false
             }
         }
     }
 
-    /// Remove cover art that no live track references any more.
-    fn remove_cover_art_if_unused(&self, rel: &Path, report: &mut DedupApplyReport) {
+    /// Whether a live track shows the cover art `rel`: as its own, or through
+    /// `album_cover_cache`, which hands it to the album's tracks that have none. A
+    /// cache entry that points at `rel` but is not needed is repointed at another
+    /// cover of the album, or evicted, so it never names an archived file.
+    fn cover_art_in_use(&self, rel: &Path) -> bool {
+        let tracks = self.tracks.lock().unwrap();
+        if tracks
+            .iter()
+            .any(|t| t.cover_art_path.as_deref() == Some(rel))
+        {
+            return true;
+        }
+        let rel_str = rel.to_string_lossy();
+        let mut cache = self.album_cover_cache.lock().unwrap();
+        let albums: Vec<String> = cache
+            .iter()
+            .filter(|(_, path)| path.as_str() == rel_str)
+            .map(|(album, _)| album.clone())
+            .collect();
+        let mut serving = false;
+        for album in albums {
+            let of_album = || {
+                tracks
+                    .iter()
+                    .filter(|t| t.album.as_deref() == Some(album.as_str()))
+            };
+            if let Some(other) = of_album().find_map(|t| t.cover_art_path.as_ref()) {
+                cache.insert(album, other.to_string_lossy().into_owned());
+            } else if of_album().next().is_some() {
+                // Tracks of the album without a cover of their own show this one.
+                serving = true;
+            } else {
+                cache.remove(&album);
+            }
+        }
+        serving
+    }
+
+    /// Archive cover art that no live track references any more.
+    fn archive_cover_art_if_unused(
+        &self,
+        gate: &super::RetireGuard<'_>,
+        rel: &Path,
+        report: &mut DedupApplyReport,
+    ) {
         if !is_store_path(rel, "cover-art") {
             return;
         }
-        let in_use = self
-            .tracks
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|t| t.cover_art_path.as_deref() == Some(rel));
-        if !in_use {
-            self.remove_store_file(rel, report);
+        if !self.cover_art_in_use(rel) {
+            self.archive_store_file(gate, rel, report);
         }
     }
 
-    /// Delete the files of a track whose facts are already retracted.
-    pub(super) fn remove_retired_files(
+    /// Archive the files of a track whose facts are already retracted.
+    pub(super) fn archive_retired_files(
         &self,
+        gate: &super::RetireGuard<'_>,
         retired: &RetiredFiles,
         report: &mut DedupApplyReport,
     ) {
@@ -656,13 +797,196 @@ impl LibraryService {
             .as_deref()
             .filter(|b| is_store_path(b, "blobs"))
         {
-            if self.remove_store_file(blob, report) {
-                report.blobs_removed += 1;
+            if self.archive_store_file(gate, blob, report) {
+                report.blobs_archived += 1;
             }
         }
         if let Some(cover) = &retired.cover_art {
-            self.remove_cover_art_if_unused(cover, report);
+            self.archive_cover_art_if_unused(gate, cover, report);
         }
+    }
+
+    /// Archive the files of the merged-away `loser` unless it came back to life since
+    /// the merge (a re-ingest of its bytes). Takes the retire gate for the check and
+    /// the moves. Ingest does not take the gate, so the check closes all but a tiny
+    /// window; a file archived in it is recoverable, because it is archived, not
+    /// deleted.
+    fn archive_retired_files_if_still_gone(
+        &self,
+        loser: &ContentHash,
+        retired: &RetiredFiles,
+        report: &mut DedupApplyReport,
+    ) {
+        #[cfg(test)]
+        if let Some(hook) = self.merge_pre_archive_hook.lock().unwrap().as_ref() {
+            hook(self, loser);
+        }
+        let gate = self.retire_gate.lock().unwrap();
+        if self.is_live(loser) {
+            return;
+        }
+        self.archive_retired_files(&gate, retired, report);
+    }
+
+    // =====================================================================
+    // The archive: listing and explicit emptying
+    // =====================================================================
+
+    /// Walk `archive/`: every file (symlinks are listed, never followed) and every
+    /// directory, both relative to the archive. Nothing is walked unless `archive/`
+    /// is a real directory, so a symlink or file in its place can never steer a
+    /// walk (and an emptying) somewhere else; an entry on another filesystem
+    /// is not descended into. Whatever is skipped or unreadable is in
+    /// `problems`, so a result is never silently partial.
+    fn walk_archive(&self) -> ArchiveWalk {
+        let root = self.music_dir.join(ARCHIVE_DIR);
+        let mut walk = ArchiveWalk::default();
+        let root_dev = match root.symlink_metadata() {
+            Ok(meta) if meta.is_dir() => meta.dev(),
+            Ok(_) => {
+                walk.problems.push(NOT_A_PLAIN_DIR.to_owned());
+                return walk;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return walk,
+            Err(e) => {
+                walk.problems.push(format!("{NOT_A_PLAIN_DIR}: {e}"));
+                return walk;
+            }
+        };
+
+        let mut pending = vec![PathBuf::new()];
+        while let Some(rel) = pending.pop() {
+            let entries = match std::fs::read_dir(root.join(&rel)) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    walk.problems
+                        .push(format!("cannot read archive/{}: {e}", rel.display()));
+                    continue;
+                }
+            };
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        walk.problems.push(format!(
+                            "cannot read an entry of archive/{}: {e}",
+                            rel.display()
+                        ));
+                        continue;
+                    }
+                };
+                let rel = rel.join(entry.file_name());
+                match entry.path().symlink_metadata() {
+                    Ok(meta) if meta.is_dir() && meta.dev() != root_dev => {
+                        let shown = rel.display();
+                        walk.problems
+                            .push(format!("skipping archive/{shown}: another filesystem"));
+                    }
+                    Ok(meta) if meta.is_dir() => {
+                        walk.dirs.push(rel.clone());
+                        pending.push(rel);
+                    }
+                    Ok(meta) => walk.files.push((rel, meta)),
+                    Err(e) => walk
+                        .problems
+                        .push(format!("cannot stat archive/{}: {e}", rel.display())),
+                }
+            }
+        }
+        walk
+    }
+
+    /// Handle `ArchiveList`: what merges moved out of the library, oldest first.
+    pub(super) fn archive_listing(&self) -> ArchiveListing {
+        let walk = self.walk_archive();
+        for problem in &walk.problems {
+            tracing::warn!(problem = %problem, "The archive listing is incomplete");
+        }
+        let mut entries: Vec<(std::time::SystemTime, ArchiveEntry)> = walk
+            .files
+            .into_iter()
+            .filter(|(rel, _)| is_archive_path(rel))
+            .map(|(rel, meta)| {
+                let modified = meta.modified().ok();
+                let hash = rel
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.split('.').next())
+                    .unwrap_or_default()
+                    .to_owned();
+                (
+                    modified.unwrap_or(std::time::UNIX_EPOCH),
+                    ArchiveEntry {
+                        path: rel.to_string_lossy().into_owned(),
+                        hash,
+                        size_bytes: meta.len(),
+                        archived_at: modified.map(|t| DateTime::<Utc>::from(t).to_rfc3339()),
+                    },
+                )
+            })
+            .collect();
+        entries.sort_by(|a, b| (a.0, &a.1.path).cmp(&(b.0, &b.1.path)));
+        let entries: Vec<ArchiveEntry> = entries.into_iter().map(|(_, e)| e).collect();
+        ArchiveListing {
+            total_bytes: entries.iter().map(|e| e.size_bytes).sum(),
+            entries,
+        }
+    }
+
+    /// Handle `ArchiveEmpty`: permanently delete the archive's files. Confined to
+    /// `archive/`: only plain relative paths found by walking it are touched, and a
+    /// symlink is removed itself, never followed. Emptied directories are pruned
+    /// (the `archive/` directory itself stays). With `up_to` (RFC 3339), only files
+    /// archived at or before it go: what a user confirmed from a listing. Anything
+    /// the walk could not cover is in `errors`.
+    pub(super) fn archive_empty(&self, up_to: Option<&str>) -> ArchiveEmptyReport {
+        let root = self.music_dir.join(ARCHIVE_DIR);
+        let mut report = ArchiveEmptyReport::default();
+        let cutoff = match up_to.map(DateTime::parse_from_rfc3339).transpose() {
+            Ok(cutoff) => cutoff.map(|c| c.with_timezone(&Utc)),
+            Err(e) => {
+                report
+                    .errors
+                    .push(format!("invalid cutoff {up_to:?}, nothing deleted: {e}"));
+                return report;
+            }
+        };
+        // Serialised against archive moves (which hold the gate); nothing else is held.
+        let _gate = self.retire_gate.lock().unwrap();
+        let ArchiveWalk {
+            files,
+            mut dirs,
+            problems,
+        } = self.walk_archive();
+        report.errors.extend(problems);
+        let archived_by_cutoff = |meta: &std::fs::Metadata| {
+            cutoff.is_none_or(|cutoff| {
+                let at = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                DateTime::<Utc>::from(at) <= cutoff
+            })
+        };
+        for (rel, meta) in files
+            .into_iter()
+            .filter(|(rel, _)| is_archive_path(rel))
+            .filter(|(_, meta)| archived_by_cutoff(meta))
+        {
+            match std::fs::remove_file(root.join(&rel)) {
+                Ok(()) => {
+                    report.files_deleted += 1;
+                    report.bytes_freed += meta.len();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => report
+                    .errors
+                    .push(format!("failed to delete {}: {e}", rel.display())),
+            }
+        }
+        // Deepest first; `remove_dir` only ever removes an empty directory.
+        dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+        for dir in dirs.into_iter().filter(|d| is_archive_path(d)) {
+            let _ = std::fs::remove_dir(root.join(dir));
+        }
+        report
     }
 
     // =====================================================================
@@ -710,43 +1034,38 @@ impl LibraryService {
             .collect()
     }
 
-    /// Delete the blob and cover art of every merge orphan. Idempotent, and it only
+    /// Archive the blob and cover art of every merge orphan. Idempotent, and it only
     /// ever touches hashes named by a live `Replaces` from `mdma-dedup`: other
     /// `NoLiveFacts` orphans (ADR-004 replace leftovers) are not its business.
     pub(super) fn cleanup_merge_orphans(&self, report: &mut DedupApplyReport) {
         for key in self.merge_orphan_candidates() {
             // Liveness is re-checked under the retire gate right before the files
-            // go, so a track that came back since the candidate list was made keeps
-            // its blob.
+            // move, so a track that came back since the candidate list was made
+            // keeps its blob.
             let gate = self.retire_gate.lock().unwrap();
-            self.remove_orphan_files_if_still_gone(&gate, &key, report);
+            self.archive_orphan_files_if_still_gone(&gate, &key, report);
         }
     }
 
-    /// Remove the files of `key` unless it came back to life. The gate is the proof
-    /// that nothing can revive it between the check and the removal.
-    fn remove_orphan_files_if_still_gone(
+    /// Archive the files of `key` unless it came back to life. The gate serialises
+    /// against merges and the backfill. Ingest does not take it, so the check closes
+    /// all but a tiny window, which is recoverable: files are archived, not deleted.
+    fn archive_orphan_files_if_still_gone(
         &self,
-        _gate: &super::RetireGuard<'_>,
+        gate: &super::RetireGuard<'_>,
         key: &str,
         report: &mut DedupApplyReport,
     ) {
-        let is_live = self
-            .tracks
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|t| hash_key(t.content_hash.as_str()) == key);
-        if is_live {
+        if self.is_live(&ContentHash::new(key)) {
             return;
         }
         for blob in self.store_files_named("blobs", key.get(..2), key) {
-            if self.remove_store_file(&blob, report) {
-                report.blobs_removed += 1;
+            if self.archive_store_file(gate, &blob, report) {
+                report.blobs_archived += 1;
             }
         }
         for art in self.store_files_named("cover-art", None, key) {
-            self.remove_cover_art_if_unused(&art, report);
+            self.archive_cover_art_if_unused(gate, &art, report);
         }
     }
 }

@@ -63,7 +63,8 @@ pub struct LibraryService {
     ///
     /// Lock order: `retire_gate` -> `cursor` -> `tracks` -> `fact_index` ->
     /// `content_hashes`; `event_cursor` -> `tracks` -> `play_events`
-    /// (`refresh_event_timestamps`). `identity_backfill` is independent: take it alone and never
+    /// (`refresh_event_timestamps`); `tracks` -> `album_cover_cache` (nothing taken while
+    /// holding it). `identity_backfill` is independent: take it alone and never
     /// together with another lock in this list.
     /// No projection lock may be held while calling `catch_up`.
     cursor: Mutex<Option<String>>,
@@ -126,6 +127,11 @@ pub struct LibraryService {
     /// winner's facts, to inject a concurrent change at that point.
     #[cfg(test)]
     merge_pre_write_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Test-only: called by `merge_group` with the loser after its merge and before
+    /// the retire gate is taken to archive the loser's files, to inject a concurrent
+    /// change (a re-ingest) in that window.
+    #[cfg(test)]
+    merge_pre_archive_hook: Mutex<Option<IdentityWriteHook>>,
 }
 
 #[cfg(test)]
@@ -1070,6 +1076,8 @@ impl LibraryService {
             retire_mid_hook: Mutex::new(None),
             #[cfg(test)]
             merge_pre_write_hook: Mutex::new(None),
+            #[cfg(test)]
+            merge_pre_archive_hook: Mutex::new(None),
         });
 
         // Backfill Format facts for tracks that don't have one yet
@@ -2106,6 +2114,12 @@ impl LibraryService {
 
             LibraryRequest::DedupMerge { winner, losers } => {
                 self.dedup_merge_request(&winner, &losers)
+            }
+
+            LibraryRequest::ArchiveList => LibraryResponse::ArchiveListing(self.archive_listing()),
+
+            LibraryRequest::ArchiveEmpty { up_to } => {
+                LibraryResponse::ArchiveEmptied(self.archive_empty(up_to.as_deref()))
             }
         }
     }

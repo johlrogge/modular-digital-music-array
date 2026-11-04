@@ -99,7 +99,7 @@ Projection mechanics today:
 - Facts logged against X after the fold go back to X (their origin is X).
 - Un-folding is a sequential operation on the log, so a full replay and incremental catch-up agree.
 - **Interim.** Until the origin-tagged un-fold exists, `catch_up` handles a retracted `Replaces` by rebuilding the projection from ACID: `load_from_acid_stream(None)` under the cursor lock, then swapping in fresh `tracks`, `fact_index` and `content_hashes`. This is rare and costs one full read.
-- **Undo after the blob has been removed** restores X's metadata but not its audio, so X would come back live with a missing blob. Either refuse the undo, or show the track as file-missing (open question).
+- **Undo restores the blob from the archive.** A merge moves X's blob to `archive/` (§10), so an undo moves it back. If the archive has been emptied, the undo restores X's metadata but not its audio, so X would come back live with a missing blob; the undo must then refuse or show X as file-missing (see Open questions, 2).
 
 ### 9. Play history
 
@@ -120,11 +120,11 @@ Projection mechanics today:
   - Adding timestamp and origin to provenance costs about 16–24 B per entry; about 30k entries is about 0.7 MB.
   - Negligible on a Pi 5.
 
-### 10. Loser blob removal (ADR-013, revised for the fold model)
+### 10. Loser blob archiving (ADR-013, revised for the fold model)
 
-- The loser's blob is removed after its `Replaces` is durable, under `retire_gate`, followed by the merge-orphan cleanup.
+- The loser's blob is moved to `/music/archive/` (same relative layout, no overwrite) after its `Replaces` is durable, under `retire_gate`, followed by the merge-orphan cleanup. A merge never deletes a file; the archive is emptied only by the explicit `mdma library archive empty`.
 - An orphan candidate is a hash that a live `Replaces` from `mdma-dedup` names and that the projection holds as **replaced**. ADR-004 leftovers are still out of scope.
-- **#91 liveness recheck.** "No live facts" is no longer the test. Immediately before deleting, under the gate, re-check that:
+- **#91 liveness recheck.** "No live facts" is no longer the test. Immediately before archiving, under the gate, re-check that:
   - the hash is still replaced;
   - its chain head is live;
   - the head's blob is a different file.
@@ -132,7 +132,7 @@ Projection mechanics today:
   A concurrent retraction of the `Replaces` (an undo) or a retire of the head therefore keeps the blob.
 - `retire_gate` stays, with two remaining jobs:
   - serialising the check-then-write in merges (both members live, loser not already folded elsewhere);
-  - guarding blob removal.
+  - guarding blob archiving.
 - The backfill can no longer resurrect a loser. A write to a replaced hash is redirected, and its identity facts are keep-target on the head, so they are ignored.
 
 ### 11. ADR-004 hard replace
@@ -206,11 +206,13 @@ Projection mechanics today:
 
 ## Open questions
 
-1. Playlists: resolve at projection level only, or keep the eager rewrite?
-2. Undo after the blob has been removed: refuse it, or allow it and show the track as file-missing?
-3. Does ACID guarantee monotonic timestamps? If not, ACID should clamp them.
-4. Legacy restamped carried values (the ItemId display on already-merged items): repair them or accept them?
-5. Interim full reload on `Replaces` retraction, or the origin-tagged un-fold right away?
+Answers marked **decided** were given by Joakim. Those marked **proposed** are defaults awaiting his decision.
+
+1. Playlists: resolve at projection level only, or keep the eager rewrite? **Proposed:** resolve at projection level.
+2. Undo after the blob has been removed? **Decided:** a merge never deletes the blob; it moves it to the archive (§10), so an undo can restore the file from `archive/` (the relative layout makes that a plain move back). Only after `mdma library archive empty` is the audio gone, and then the §8 caveat applies.
+3. Does ACID guarantee monotonic timestamps? **Proposed:** ACID clamps timestamps to be monotonic.
+4. Legacy restamped carried values (the ItemId display on already-merged items): repair them or accept them? **Proposed:** leave the legacy restamped values.
+5. Interim full reload on `Replaces` retraction, or the origin-tagged un-fold right away? **Proposed:** the interim full reload.
 
 ## Related
 

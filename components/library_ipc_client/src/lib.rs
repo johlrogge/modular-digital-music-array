@@ -511,6 +511,19 @@ impl LibraryClient {
         })?)
     }
 
+    /// List the files that merges moved to the archive.
+    pub fn archive_list(&self) -> Result<ArchiveListing, ClientError> {
+        interpret_archive_listing(self.request(&LibraryRequest::ArchiveList)?)
+    }
+
+    /// Permanently delete the archive's files archived at or before `up_to` (RFC 3339,
+    /// as listed); `None` deletes everything.
+    pub fn archive_empty(&self, up_to: Option<&str>) -> Result<ArchiveEmptyReport, ClientError> {
+        interpret_archive_emptied(self.request(&LibraryRequest::ArchiveEmpty {
+            up_to: up_to.map(str::to_owned),
+        })?)
+    }
+
     /// Start the identity-hash backfill (or learn that one is already running).
     pub fn identity_backfill(
         &self,
@@ -552,6 +565,30 @@ pub fn interpret_dedup_merged(response: LibraryResponse) -> Result<DedupApplyRep
         LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
         _ => Err(ClientError::Protocol(ProtocolError::Internal {
             message: "Unexpected response to DedupMerge".to_string(),
+        })),
+    }
+}
+
+/// Interpret the answer to `ArchiveList`.
+pub fn interpret_archive_listing(response: LibraryResponse) -> Result<ArchiveListing, ClientError> {
+    match response {
+        LibraryResponse::ArchiveListing(listing) => Ok(listing),
+        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+        _ => Err(ClientError::Protocol(ProtocolError::Internal {
+            message: "Unexpected response to ArchiveList".to_string(),
+        })),
+    }
+}
+
+/// Interpret the answer to `ArchiveEmpty`.
+pub fn interpret_archive_emptied(
+    response: LibraryResponse,
+) -> Result<ArchiveEmptyReport, ClientError> {
+    match response {
+        LibraryResponse::ArchiveEmptied(report) => Ok(report),
+        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+        _ => Err(ClientError::Protocol(ProtocolError::Internal {
+            message: "Unexpected response to ArchiveEmpty".to_string(),
         })),
     }
 }

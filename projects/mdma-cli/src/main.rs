@@ -11,8 +11,9 @@ use colored::Colorize;
 use event_protocol::{from_topic_message, PlaybackEvent, TOPIC_PLAYBACK};
 use gateway_client::{AdminRequest, AdminResponse, GatewayClient};
 use library_ipc_client::{
-    ClientError, ConfirmationReason, ContentHash, DedupApplyReport, DedupDisposition, DedupGroup,
-    DedupMember, InboxPath, ProtocolError, TrackInfo,
+    ArchiveEmptyReport, ArchiveListing, ClientError, ConfirmationReason, ContentHash,
+    DedupApplyReport, DedupDisposition, DedupGroup, DedupMember, InboxPath, ProtocolError,
+    TrackInfo,
 };
 use library_search::{
     parse_date_query, parse_numeric_query, parse_role_query, parse_string_query, TrackQuery,
@@ -35,6 +36,7 @@ use source_protocol::{
     ImportJobStatus, ImportPhase, ImportSyncProgress, SourceError, SourceRequest, SourceResponse,
 };
 use std::path::Path;
+use storage_primitives::ByteSize;
 use track_formatter::{
     format_track_line as format_track_line_shared, render_for_user, short_hash, ViewColumn,
     ALL_COLUMNS,
@@ -896,7 +898,8 @@ enum LibraryCommands {
     /// copies come from one purchase and none is deleted) first, then those that need
     /// your confirmation. The newest copy is kept; its blob stays, the other copies'
     /// facts are folded into it (latest value per attribute wins), playlists are
-    /// rewritten, and the other copies' audio files are deleted.
+    /// rewritten, and the other copies' audio files are moved to the archive (see
+    /// `mdma library archive`), not deleted.
     ///
     /// Needs identity hashes: run `mdma library identity backfill` first.
     #[command(args_conflicts_with_subcommands = true)]
@@ -908,14 +911,37 @@ enum LibraryCommands {
         #[command(subcommand)]
         command: Option<DedupCommands>,
     },
+
+    /// List the files that duplicate merges moved to the archive.
+    ///
+    /// A merge never deletes the other copies' audio files and cover art: it moves
+    /// them to `archive/` in the music directory, keeping their layout. Shows how
+    /// many files the archive holds, their total size, and for each its hash, size
+    /// and when it was archived. `mdma library archive empty` deletes them for good.
+    Archive {
+        #[command(subcommand)]
+        command: Option<ArchiveCommands>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ArchiveCommands {
+    /// Permanently delete everything in the archive.
+    ///
+    /// Shows what the archive holds and asks for confirmation. This cannot be undone.
+    Empty {
+        /// Do not ask for confirmation
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 enum DedupCommands {
     /// Merge tracks you have confirmed to be duplicates into a winner.
     ///
-    /// The other tracks' audio files are deleted. All tracks must be in one duplicate
-    /// group as listed by `mdma library dedup`.
+    /// The other tracks' audio files are moved to the archive. All tracks must be in
+    /// one duplicate group as listed by `mdma library dedup`.
     Merge {
         /// The track to keep (prefix accepted, git-style)
         winner: String,
@@ -2514,8 +2540,8 @@ fn format_dedup_groups(groups: &[DedupGroup]) -> String {
 
 fn format_dedup_applied(r: &DedupApplyReport) -> String {
     let mut out = format!(
-        "Merged {} track(s), removed {} blob(s)",
-        r.merged, r.blobs_removed
+        "Merged {} track(s), archived {} blob(s)",
+        r.merged, r.blobs_archived
     );
     for e in &r.errors {
         out.push_str(&format!("\n  error: {e}"));
@@ -2599,7 +2625,7 @@ fn handle_dedup_merge(
             }
         }
         print!(
-            "Merge {} track(s) into {winner}? Their audio files are deleted. [y/N] ",
+            "Merge {} track(s) into {winner}? Their audio files are moved to the archive. [y/N] ",
             losers.len()
         );
         std::io::Write::flush(&mut std::io::stdout())?;
@@ -2615,6 +2641,117 @@ fn handle_dedup_merge(
     match client.dedup_merge(&ContentHash::new(winner), &loser_hashes) {
         Ok(report) => {
             println!("{}", format_dedup_applied(&report));
+            if !report.errors.is_empty() {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// The archive as the user sees it: a summary line, then a line per file.
+fn format_archive_listing(l: &ArchiveListing) -> String {
+    if l.entries.is_empty() {
+        return "The archive is empty".to_string();
+    }
+    let mut out = format!(
+        "Archive: {} file(s), {}\n",
+        l.entries.len(),
+        ByteSize::new(l.total_bytes)
+    );
+    for e in &l.entries {
+        let hash = e.hash.get(..12).unwrap_or(&e.hash);
+        let at = e
+            .archived_at
+            .as_deref()
+            .map(|a| a.get(..10).unwrap_or(a))
+            .unwrap_or("?");
+        out.push_str(&format!(
+            "  {hash:<12}  {:>9}  archived {at}  {}\n",
+            ByteSize::new(e.size_bytes).to_string(),
+            e.path
+        ));
+    }
+    out.trim_end().to_string()
+}
+
+fn archive_empty_prompt(l: &ArchiveListing) -> String {
+    format!(
+        "Permanently delete {} file(s) ({}) from the archive? This cannot be undone. [y/N] ",
+        l.entries.len(),
+        ByteSize::new(l.total_bytes)
+    )
+}
+
+/// The newest `archived_at` in `l` (the listing is oldest first): what a confirmed
+/// emptying may delete, so files archived after the listing survive. A listing
+/// without any time falls back to the epoch (deletes nothing newer than "unknown").
+fn archive_cutoff(l: &ArchiveListing) -> String {
+    l.entries
+        .iter()
+        .rev()
+        .find_map(|e| e.archived_at.clone())
+        .unwrap_or_else(|| "1970-01-01T00:00:00+00:00".to_owned())
+}
+
+fn format_archive_emptied(r: &ArchiveEmptyReport) -> String {
+    let mut out = format!(
+        "Deleted {} file(s), freed {}",
+        r.files_deleted,
+        ByteSize::new(r.bytes_freed)
+    );
+    for e in &r.errors {
+        out.push_str(&format!("\n  error: {e}"));
+    }
+    out
+}
+
+fn handle_archive_list(client: &LibraryBackend) -> Result<()> {
+    match client.archive_list() {
+        Ok(l) => {
+            println!("{}", format_archive_listing(&l));
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_archive_empty(client: &LibraryBackend, yes: bool) -> Result<()> {
+    // `--yes` without a listing deletes everything; after a prompt, only what was shown.
+    let mut up_to = None;
+    if !yes {
+        let listing = match client.archive_list() {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        };
+        println!("{}\n", format_archive_listing(&listing));
+        if listing.entries.is_empty() {
+            return Ok(());
+        }
+        print!("{}", archive_empty_prompt(&listing));
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !is_yes(&answer) {
+            println!("Aborted");
+            return Ok(());
+        }
+        up_to = Some(archive_cutoff(&listing));
+    }
+
+    match client.archive_empty(up_to.as_deref()) {
+        Ok(report) => {
+            println!("{}", format_archive_emptied(&report));
             if !report.errors.is_empty() {
                 std::process::exit(1);
             }
@@ -6173,6 +6310,10 @@ fn main() -> Result<()> {
                         yes,
                     }) => handle_dedup_merge(&lib, winner, losers, *yes),
                 },
+                LibraryCommands::Archive { command } => match command {
+                    None => handle_archive_list(&lib),
+                    Some(ArchiveCommands::Empty { yes }) => handle_archive_empty(&lib, *yes),
+                },
                 LibraryCommands::Track { command } => match command {
                     TrackCommands::Delete { hash } => handle_track_delete(&lib, hash),
                     TrackCommands::Restore { hash } => handle_track_restore(&lib, hash),
@@ -8838,12 +8979,107 @@ mod tests {
     fn dedup_applied_summary_lists_errors() {
         let r = DedupApplyReport {
             merged: 2,
-            blobs_removed: 1,
+            blobs_archived: 1,
             errors: vec!["boom".into()],
         };
         assert_eq!(
             format_dedup_applied(&r),
-            "Merged 2 track(s), removed 1 blob(s)\n  error: boom"
+            "Merged 2 track(s), archived 1 blob(s)\n  error: boom"
+        );
+    }
+
+    // ── archive ───────────────────────────────────────────────────────────────
+
+    fn archive_command(args: &[&str]) -> Option<ArchiveCommands> {
+        let mut argv = vec!["mdma", "library", "archive"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(&argv)
+            .unwrap_or_else(|e| panic!("{argv:?}: {e}"))
+            .command
+        {
+            Commands::Library {
+                command: LibraryCommands::Archive { command },
+            } => command,
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn archive_lists_by_default_and_empties_with_a_subcommand() {
+        assert!(archive_command(&[]).is_none());
+        assert!(matches!(
+            archive_command(&["empty"]),
+            Some(ArchiveCommands::Empty { yes: false })
+        ));
+        assert!(matches!(
+            archive_command(&["empty", "--yes"]),
+            Some(ArchiveCommands::Empty { yes: true })
+        ));
+        assert!(matches!(
+            archive_command(&["empty", "-y"]),
+            Some(ArchiveCommands::Empty { yes: true })
+        ));
+        assert!(Cli::try_parse_from(["mdma", "library", "archive", "empty", "x"]).is_err());
+        assert!(Cli::try_parse_from(["mdma", "library", "archive", "--yes"]).is_err());
+    }
+
+    fn archive_listing_of_two() -> ArchiveListing {
+        let entry = |hash: &str, size: u64, at: &str| library_ipc_client::ArchiveEntry {
+            path: format!("blobs/{}/{hash}.flac", &hash[..2]),
+            hash: hash.into(),
+            size_bytes: size,
+            archived_at: Some(at.into()),
+        };
+        ArchiveListing {
+            entries: vec![
+                entry("abcdef0123456789", 3_000_000, "2026-09-01T10:00:00+00:00"),
+                entry("fedcba98", 2_000_000, "2026-09-02T10:00:00+00:00"),
+            ],
+            total_bytes: 5_000_000,
+        }
+    }
+
+    #[test]
+    fn archive_listing_shows_count_total_and_each_entry() {
+        let text = format_archive_listing(&archive_listing_of_two());
+        assert!(text.starts_with("Archive: 2 file(s), 5 MB\n"), "{text}");
+        assert!(text.contains("abcdef012345  "), "{text}");
+        assert!(text.contains("3 MB"), "{text}");
+        assert!(text.contains("archived 2026-09-01"), "{text}");
+        assert!(text.contains("blobs/ab/abcdef0123456789.flac"), "{text}");
+        assert!(text.contains("fedcba98  "), "{text}");
+        assert_eq!(
+            format_archive_listing(&ArchiveListing::default()),
+            "The archive is empty"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_emptying_is_cut_off_at_the_newest_listed_time() {
+        assert_eq!(
+            archive_cutoff(&archive_listing_of_two()),
+            "2026-09-02T10:00:00+00:00"
+        );
+        assert_eq!(
+            archive_cutoff(&ArchiveListing::default()),
+            "1970-01-01T00:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn archive_empty_asks_with_the_count_and_size_and_reports_the_result() {
+        assert_eq!(
+            archive_empty_prompt(&archive_listing_of_two()),
+            "Permanently delete 2 file(s) (5 MB) from the archive? This cannot be undone. [y/N] "
+        );
+        let r = ArchiveEmptyReport {
+            files_deleted: 2,
+            bytes_freed: 5_000_000,
+            errors: vec!["boom".into()],
+        };
+        assert_eq!(
+            format_archive_emptied(&r),
+            "Deleted 2 file(s), freed 5 MB\n  error: boom"
         );
     }
 

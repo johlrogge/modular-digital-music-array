@@ -6031,6 +6031,7 @@ dependencies = [
  "reqwest",
  "serde_json",
  "source-protocol",
+ "storage_primitives",
  "tempfile",
  "terminal_size",
  "track-formatter",

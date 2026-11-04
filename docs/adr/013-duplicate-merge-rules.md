@@ -62,18 +62,18 @@ The Bandcamp source never writes `Replaces`. Two paths re-download without linki
 2. Assert the carried facts and `Replaces` on the winner, with source tool `mdma-dedup`.
 3. `retract_all_entity_facts(loser)`.
 4. Eagerly rewrite playlists from loser to winner. Lazy `PlaylistGet` repair is unchanged.
-5. Remove the loser's blob from `/music/blobs`, and its extracted cover art if no live track references it. Only do this once steps 2–3 are durable in ACID.
+5. Move the loser's blob from `/music/blobs`, and its extracted cover art if no live track references it, to `/music/archive/`, keeping the relative layout (`archive/blobs/...`, `archive/cover-art/...`). The move is a `rename`; a name already taken in the archive is never overwritten, the file gets a numbered name instead. Only do this once steps 2–3 are durable in ACID. A merge never deletes a file: the archive is emptied only by the explicit command `mdma library archive empty` (`mdma library archive` lists it).
 
 For groups of more than two, merge each loser into the winner in turn.
 
-Blob removal is product behaviour. It is unrelated to operator rules about `/music`.
+Archiving is product behaviour. It is unrelated to operator rules about `/music`.
 
 **Crash safety.**
-- Facts are written first and files deleted after.
+- Facts are written first and files moved to the archive after.
 - A merge is idempotent: carried values that are already present are not re-asserted, and `Replaces` is deduplicated.
 - A crash before step 3 leaves the group detectable, and a rerun completes it.
 - A crash after step 3 leaves a merge orphan: a blob with no live facts whose hash appears in a live `Replaces` fact from `mdma-dedup`.
-- An idempotent cleanup deletes merge orphans only, re-checking liveness immediately before each deletion. It runs with `dedup --apply` and after an ingest merge.
+- An idempotent cleanup archives (moves, never deletes) merge orphans only, re-checking liveness immediately before each move. It runs with `dedup --apply` and after an ingest merge. Emptying the archive is always an explicit user command and is confined to `archive/`.
 - Other `NoLiveFacts` orphans, including ADR-004 replace leftovers, are not touched.
 - **Retire gate.** Every path that retires an entity (`retract_all_entity_facts`: ADR-004 replace, the merge in step 3) and every out-of-band writer that asserts facts on existing entities (e.g. the identity backfill) serialises on one `retire_gate` in the library service. A writer re-checks liveness under the gate right before writing, so it cannot resurrect an entity retired concurrently. Lock order: `retire_gate` before the projection cursor.
 
@@ -106,7 +106,7 @@ Blob removal is product behaviour. It is unrelated to operator rules about `/mus
 - The AddedAt projection change lives in MDMA (library_service on develop, library_projection on the offline branch). stainless-facts may later provide a generic LatestWins fold strategy for it (johlrogge/stainless_facts issue).
 - The protocol additions (dedup scan/apply) change `library_ipc_protocol`. Per ADR-004, gateway, library and console are redeployed together.
 - A backfill is required before the scan is meaningful. Costs on a Pi 5: AudioHash about 4 s/GB, PcmHash about 36 s/GB. Both stay explicit and low priority.
-- Blob deletion is irreversible and depends on the merge being correct. That is why automatic merges require exact identity plus a common ItemId.
+- A merge is recoverable at the file level: the loser's files sit in the archive until the user empties it. Emptying is irreversible, and automatic merges still require exact identity plus a common ItemId.
 - ADR-012 was accepted on 2026-11-03, so PcmHash facts may be written (backfill `--pcm`); its preimage is now frozen and any change requires a new version.
 - PcmHash groups within one ItemId can differ in container, so the kept blob may be WAV rather than FLAC. The samples are identical by definition.
 - The projection resolves play events through the `Replaces` chain, so last-played / play counts on a merged or replaced track include its predecessors' plays. Events keyed by short hashes (#86) must resolve to the full hash before this lookup.

@@ -2,11 +2,13 @@
 
 use crate::error::map_gw_to_lib_error;
 use library_ipc_client::{
-    content_to_hashes, interpret_dedup_merged, interpret_dedup_scan, interpret_identity_backfill,
-    interpret_identity_backfill_status, ClientError, ContentHash, DedupApplyReport,
-    DedupScanReport, FactType, IdentityBackfillStart, IdentityBackfillStatus, InboxPath,
-    IngestAllItem, IngestResult, IngestSource, LibraryClient, LibraryRequest, LibraryResponse,
-    MusicValue, OrphanInfo, PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
+    content_to_hashes, interpret_archive_emptied, interpret_archive_listing,
+    interpret_dedup_merged, interpret_dedup_scan, interpret_identity_backfill,
+    interpret_identity_backfill_status, ArchiveEmptyReport, ArchiveListing, ClientError,
+    ContentHash, DedupApplyReport, DedupScanReport, FactType, IdentityBackfillStart,
+    IdentityBackfillStatus, InboxPath, IngestAllItem, IngestResult, IngestSource, LibraryClient,
+    LibraryRequest, LibraryResponse, MusicValue, OrphanInfo, PlaylistName, ProtocolError,
+    ServiceStatus, TrackInfo, TrackQuery,
 };
 use playlist_import::PlaylistWriteOps;
 
@@ -372,6 +374,29 @@ impl LibraryBackend {
                 interpret_dedup_merged(self.request(&LibraryRequest::DedupMerge {
                     winner: winner.clone(),
                     losers: losers.to_vec(),
+                })?)
+            }
+        }
+    }
+
+    /// List the files that merges moved to the archive.
+    pub fn archive_list(&self) -> Result<ArchiveListing, ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.archive_list(),
+            LibraryBackend::Gateway(_) => {
+                interpret_archive_listing(self.request(&LibraryRequest::ArchiveList)?)
+            }
+        }
+    }
+
+    /// Permanently delete the archive's files archived at or before `up_to` (RFC 3339,
+    /// as listed); `None` deletes everything.
+    pub fn archive_empty(&self, up_to: Option<&str>) -> Result<ArchiveEmptyReport, ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.archive_empty(up_to),
+            LibraryBackend::Gateway(_) => {
+                interpret_archive_emptied(self.request(&LibraryRequest::ArchiveEmpty {
+                    up_to: up_to.map(str::to_owned),
                 })?)
             }
         }

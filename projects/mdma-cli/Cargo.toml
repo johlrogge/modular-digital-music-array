@@ -32,7 +32,8 @@ gateway-client = { workspace = true }
 rekordbox-roundtrip = { path = "../../components/rekordbox_roundtrip" }
 rekordbox-xml = { path = "../../components/rekordbox_xml" }
 playlist-import = { workspace = true }
-track-formatter = { path = "../../components/track_formatter" }
+storage_primitives = { path = "../../components/storage_primitives" }
+track-formatter ={ path = "../../components/track_formatter" }
 track-matcher = { path = "../../components/track_matcher" }
 music-facts = { workspace = true }
 chrono = { workspace = true }

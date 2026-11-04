@@ -393,6 +393,22 @@ pub enum LibraryRequest {
         winner: ContentHash,
         losers: Vec<ContentHash>,
     },
+
+    // -------------------------------------------------------------------------
+    // Archive of merged duplicates' files (ADR-013)
+    // -------------------------------------------------------------------------
+    /// List what the archive holds: the blobs and cover art that merges moved out
+    /// of the library instead of deleting them.
+    ArchiveList,
+
+    /// Permanently delete the archive's files. The only way files leave it.
+    ArchiveEmpty {
+        /// Delete only files archived at or before this time (RFC 3339, the format of
+        /// `ArchiveEntry::archived_at`), so a confirmed emptying deletes only files
+        /// archived at or before the listed time. `None` deletes everything.
+        #[serde(default)]
+        up_to: Option<String>,
+    },
 }
 
 // ============================================================================
@@ -499,6 +515,12 @@ pub enum LibraryResponse {
 
     /// Answer to `DedupMerge`.
     DedupMerged(DedupApplyReport),
+
+    /// Answer to `ArchiveList`.
+    ArchiveListing(ArchiveListing),
+
+    /// Answer to `ArchiveEmpty`.
+    ArchiveEmptied(ArchiveEmptyReport),
 
     /// Error response.
     Error(ProtocolError),
@@ -704,9 +726,11 @@ impl DedupGroup {
 pub struct DedupApplyReport {
     /// Tracks merged away (losers retired).
     pub merged: usize,
-    /// Blob files deleted, including merge orphans cleaned up.
-    pub blobs_removed: usize,
-    /// One message per failed merge or file removal.
+    /// Blob files moved to the archive (never deleted), including merge orphans
+    /// cleaned up. Called `blobs_removed` before files were archived instead of deleted.
+    #[serde(alias = "blobs_removed")]
+    pub blobs_archived: usize,
+    /// One message per failed merge or file archiving.
     pub errors: Vec<String>,
 }
 
@@ -717,6 +741,35 @@ pub struct DedupScanReport {
     pub groups: Vec<DedupGroup>,
     /// Present when the scan was run with `apply`.
     pub applied: Option<DedupApplyReport>,
+}
+
+/// One file in the archive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveEntry {
+    /// Path relative to the archive, e.g. `blobs/ab/abcd....flac`.
+    pub path: String,
+    /// The content hash key the file is named after (collision suffix stripped).
+    pub hash: String,
+    pub size_bytes: u64,
+    /// When the file was archived (its mtime, set when it was moved), RFC 3339.
+    pub archived_at: Option<String>,
+}
+
+/// Answer to `ArchiveList`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveListing {
+    /// Oldest first.
+    pub entries: Vec<ArchiveEntry>,
+    pub total_bytes: u64,
+}
+
+/// Answer to `ArchiveEmpty`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveEmptyReport {
+    pub files_deleted: usize,
+    pub bytes_freed: u64,
+    /// One message per file that could not be deleted.
+    pub errors: Vec<String>,
 }
 
 /// Why a track is an orphan (shown in orphan/GC workflows).
@@ -823,7 +876,7 @@ mod tests {
             ],
             applied: Some(DedupApplyReport {
                 merged: 1,
-                blobs_removed: 1,
+                blobs_archived: 1,
                 errors: vec!["boom".into()],
             }),
         };
@@ -838,6 +891,20 @@ mod tests {
             LibraryResponse::DedupMerged(back) => assert_eq!(back, applied),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_apply_report_from_before_the_archive_still_decodes() {
+        let old = r#"{"merged":2,"blobs_removed":3,"errors":["boom"]}"#;
+        let report: DedupApplyReport = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            report,
+            DedupApplyReport {
+                merged: 2,
+                blobs_archived: 3,
+                errors: vec!["boom".into()],
+            }
+        );
     }
 
     #[test]
@@ -857,6 +924,47 @@ mod tests {
                 assert_eq!(winner.as_str(), "sha256:a");
                 assert_eq!(losers.len(), 1);
             }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn archive_messages_roundtrip() {
+        for req in [
+            LibraryRequest::ArchiveList,
+            LibraryRequest::ArchiveEmpty { up_to: None },
+            LibraryRequest::ArchiveEmpty {
+                up_to: Some("2026-09-01T00:00:00.123456789+00:00".into()),
+            },
+        ] {
+            let json = serde_json::to_string(&req).unwrap();
+            let back = serde_json::from_str::<LibraryRequest>(&json).unwrap();
+            assert_eq!(format!("{back:?}"), format!("{req:?}"));
+        }
+        let listing = ArchiveListing {
+            entries: vec![ArchiveEntry {
+                path: "blobs/ab/abcd.flac".into(),
+                hash: "abcd".into(),
+                size_bytes: 12,
+                archived_at: Some("2026-09-01T00:00:00+00:00".into()),
+            }],
+            total_bytes: 12,
+        };
+        let json =
+            serde_json::to_string(&LibraryResponse::ArchiveListing(listing.clone())).unwrap();
+        match serde_json::from_str::<LibraryResponse>(&json).unwrap() {
+            LibraryResponse::ArchiveListing(back) => assert_eq!(back, listing),
+            other => panic!("unexpected {other:?}"),
+        }
+        let emptied = ArchiveEmptyReport {
+            files_deleted: 2,
+            bytes_freed: 24,
+            errors: vec!["boom".into()],
+        };
+        let json =
+            serde_json::to_string(&LibraryResponse::ArchiveEmptied(emptied.clone())).unwrap();
+        match serde_json::from_str::<LibraryResponse>(&json).unwrap() {
+            LibraryResponse::ArchiveEmptied(back) => assert_eq!(back, emptied),
             other => panic!("unexpected {other:?}"),
         }
     }
