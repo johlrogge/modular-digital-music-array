@@ -23,6 +23,8 @@ result-*
 *.wav
 *.mp3
 *.aiff
+# PcmHash reference fixtures are checked in (ADR-012); see components/audio_hash/testdata/pcm/README.md
+!components/audio_hash/testdata/pcm/fixtures/*
 
 # Test data files
 *.jsonl

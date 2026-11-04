@@ -9,17 +9,30 @@ use crate::{AudioHashError, Container};
 
 const C: Container = Container::Flac;
 
-// A single-element Vec of a Range is exactly what we mean here.
-#[allow(clippy::single_range_in_vec_init)]
+/// Byte ranges of a FLAC file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FlacLayout {
+    /// STREAMINFO payload, when it is the first metadata block (type 0,
+    /// length 34). `None` for files that lack this: AudioHash v1 does not
+    /// need STREAMINFO and stays lenient, so consumers that do must check.
+    pub streaminfo: Option<Range<u64>>,
+    /// Encoded frames, excluding trailing tags.
+    pub audio: Range<u64>,
+}
+
+const STREAMINFO_LEN: u64 = 34;
+
 pub(crate) fn layout<R: Read + Seek>(
     r: &mut R,
     file_len: u64,
-) -> Result<Vec<Range<u64>>, AudioHashError> {
+) -> Result<FlacLayout, AudioHashError> {
     let mut pos = head_id3v2_len(r, file_len)?;
     if file_len.saturating_sub(pos) < 4 || read_at::<_, 4>(r, pos)? != *b"fLaC" {
         return Err(C.malformed("missing fLaC marker"));
     }
     pos += 4;
+    let mut streaminfo = None;
+    let mut first = true;
     loop {
         if file_len.saturating_sub(pos) < 4 {
             return Err(C.malformed("metadata block header truncated"));
@@ -30,6 +43,10 @@ pub(crate) fn layout<R: Read + Seek>(
             return Err(C.malformed("invalid metadata block type"));
         }
         let len = u64::from(be_u24(&h, 1));
+        if first && h[0] & 0x7F == 0 && len == STREAMINFO_LEN {
+            streaminfo = Some(pos + 4..pos + 4 + len);
+        }
+        first = false;
         pos = pos
             .checked_add(4 + len)
             .filter(|p| *p <= file_len)
@@ -50,18 +67,21 @@ pub(crate) fn layout<R: Read + Seek>(
     if sync[0] != 0xFF || sync[1] & 0xFE != 0xF8 {
         return Err(C.malformed("no frame sync after metadata"));
     }
-    Ok(vec![audio_start..end])
+    Ok(FlacLayout {
+        streaminfo,
+        audio: audio_start..end,
+    })
 }
 
 #[cfg(test)]
-#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
     use crate::fixtures::*;
     use pretty_assertions::assert_eq;
+    use std::io::Cursor;
 
-    fn lay(b: &[u8]) -> Result<Vec<Range<u64>>, AudioHashError> {
-        lay_with(layout, b)
+    fn lay(b: &[u8]) -> Result<FlacLayout, AudioHashError> {
+        layout(&mut Cursor::new(b.to_vec()), b.len() as u64)
     }
 
     fn malformed(b: &[u8]) -> bool {
@@ -140,8 +160,29 @@ mod tests {
         let mut b = id3v2(5, false);
         b.extend(flac(&[streaminfo(), vorbis(10)], &frames));
         b.extend(id3v1());
+        let si_start = 15 + 4 + 4;
         let start = 15 + 4 + (4 + 34) + (4 + 10);
         let end = start + frames.len();
-        assert_eq!(lay(&b).unwrap(), vec![start as u64..end as u64]);
+        assert_eq!(
+            lay(&b).unwrap(),
+            FlacLayout {
+                streaminfo: Some(si_start as u64..(si_start + 34) as u64),
+                audio: start as u64..end as u64,
+            }
+        );
+    }
+
+    #[test]
+    fn streaminfo_not_first_is_accepted_by_v1_without_range() {
+        // v1 has always accepted this; it must keep doing so.
+        let f = flac_frames(2);
+        let b = flac(&[vorbis(10), streaminfo()], &f);
+        let l = lay(&b).unwrap();
+        assert_eq!(l.streaminfo, None);
+        assert_eq!(l.audio.end - l.audio.start, f.len() as u64);
+        assert!(crate::audio_hash_reader(Cursor::new(&b)).is_ok());
+        // wrong STREAMINFO length is likewise tolerated
+        let b = flac(&[(0, vec![0; 10])], &f);
+        assert_eq!(lay(&b).unwrap().streaminfo, None);
     }
 }

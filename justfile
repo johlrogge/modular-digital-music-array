@@ -2,6 +2,12 @@
 # -Wl,--fix-cortex-a53-843419 flag passed by newer rustc (see script header).
 export CARGO_ZIGBUILD_ZIG_PATH := `realpath scripts/ci/zig-filter.sh`
 
+# Project ssh config (holds stage hosts + known_hosts); used if present
+deploy_ssh_config := env_var('HOME') + "/.metadev/projects/modular-digital-music-array/.ssh/config"
+
+# Shared ssh/scp options for deploy recipes: never prompt, fail fast
+deploy_ssh_opts := "-4 -o BatchMode=yes -o ConnectTimeout=10" + if path_exists(deploy_ssh_config) == "true" { " -F " + deploy_ssh_config } else { "" }
+
 default:
     just --list
 
@@ -821,10 +827,10 @@ library-cross:
 
 # Internal: deploy a standard MDMA service to the provisioned Pi
 [group('dev')]
-_deploy-svc svc bin *extra_scp:
+_deploy-svc svc bin host *extra_scp:
     #!/usr/bin/env bash
     set -euo pipefail
-    HOST="${PI_HOST:-mdma-johlyroger.local}"
+    HOST="{{host}}"
     SSH_KEY="$HOME/.ssh/mdma_pi"
     BINARY="target/aarch64-unknown-linux-gnu/release/{{bin}}"
     RUN_SCRIPT="void-packages/srcpkgs/{{svc}}/files/{{svc}}/run"
@@ -833,9 +839,10 @@ _deploy-svc svc bin *extra_scp:
     echo "Deploying {{svc}} to $HOST..."
 
     # Upload binary, run script, and any extra files
-    scp -4 -i "$SSH_KEY" "$BINARY" "$RUN_SCRIPT" {{extra_scp}} "admin@${HOST}:/tmp/"
+    SSH_OPTS=({{deploy_ssh_opts}} -i "$SSH_KEY")
+    scp "${SSH_OPTS[@]}" "$BINARY" "$RUN_SCRIPT" {{extra_scp}} "admin@${HOST}:/tmp/"
 
-    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo sv stop {{svc}} 2>/dev/null || true
+    ssh "${SSH_OPTS[@]}" "admin@${HOST}" 'sudo sv stop {{svc}} 2>/dev/null || true
         sudo mv /tmp/{{bin}} /usr/bin/
         sudo chmod +x /usr/bin/{{bin}}
         sudo mkdir -p /etc/sv/{{svc}}/log /var/log/{{svc}} /run/mdma
@@ -852,30 +859,30 @@ _deploy-svc svc bin *extra_scp:
     # Run post-install hook if it exists
     if [ -f "$POST_INSTALL" ]; then
         echo "Running post-install for {{svc}}..."
-        ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'bash -s' < "$POST_INSTALL"
+        ssh "${SSH_OPTS[@]}" "admin@${HOST}" 'bash -s' < "$POST_INSTALL"
     fi
 
     echo "{{svc}} deployed!"
 
 # Deploy console to Pi
 [group('dev')]
-deploy-console: console-cross
-    @just _deploy-svc mdma-console mdma-console
+deploy-console host=env_var_or_default("PI_HOST", "mdma-johlyroger.local"): console-cross
+    @just _deploy-svc mdma-console mdma-console {{host}}
 
 # Deploy library to Pi
 [group('dev')]
-deploy-library: library-cross
-    @just _deploy-svc mdma-library mdma-library
+deploy-library host=env_var_or_default("PI_HOST", "mdma-johlyroger.local"): library-cross
+    @just _deploy-svc mdma-library mdma-library {{host}}
 
 # Deploy playback to Pi
 [group('dev')]
-deploy-playback: playback-cross
-    @just _deploy-svc mdma-playback mdma-playback
+deploy-playback host=env_var_or_default("PI_HOST", "mdma-johlyroger.local"): playback-cross
+    @just _deploy-svc mdma-playback mdma-playback {{host}}
 
 # Deploy audio source to Pi
 [group('dev')]
-deploy-audio: audio-cross
-    @just _deploy-svc mdma-audio mdma-audio
+deploy-audio host=env_var_or_default("PI_HOST", "mdma-johlyroger.local"): audio-cross
+    @just _deploy-svc mdma-audio mdma-audio {{host}}
 
 # Cross-compile gateway for aarch64 (dev profile workspace)
 [group('build')]
@@ -907,6 +914,21 @@ acid-cross:
     file target/aarch64-unknown-linux-gnu/release/mdma-acid
     ls -lh target/aarch64-unknown-linux-gnu/release/mdma-acid
 
+# Cross-compile the PcmHash benchmark example for aarch64 (production profile)
+[group('build')]
+pcm-bench-cross:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building pcm_bench for aarch64..."
+    cargo polylith cargo --profile production zigbuild --release --target aarch64-unknown-linux-gnu.2.38 \
+        -p audio-hash --example pcm_bench
+    echo ""
+    echo "pcm_bench built!"
+    file target/aarch64-unknown-linux-gnu/release/examples/pcm_bench
+    ls -lh target/aarch64-unknown-linux-gnu/release/examples/pcm_bench
+
 # Cross-compile bandcamp for aarch64 (dev profile workspace)
 [group('build')]
 bandcamp-cross:
@@ -924,8 +946,8 @@ bandcamp-cross:
 
 # Deploy gateway to Pi (single external TCP port)
 [group('dev')]
-deploy-gateway: gateway-cross
-    @just _deploy-svc mdma-gateway mdma-gateway
+deploy-gateway host=env_var_or_default("PI_HOST", "mdma-johlyroger.local"): gateway-cross
+    @just _deploy-svc mdma-gateway mdma-gateway {{host}}
 
 # Cross-compile CLI for aarch64 (dev profile workspace)
 [group('build')]
@@ -944,19 +966,20 @@ cli-cross:
 
 # Deploy CLI (mdma) to Pi - installs as /usr/bin/mdma, no service required
 [group('dev')]
-deploy-cli: cli-cross
+deploy-cli host=env_var_or_default("PI_HOST", "mdma-johlyroger.local"): cli-cross
     #!/usr/bin/env bash
     set -euo pipefail
 
-    HOST="${PI_HOST:-mdma-johlyroger.local}"
+    HOST="{{host}}"
     BINARY="target/aarch64-unknown-linux-gnu/release/mdma"
     SSH_KEY="$HOME/.ssh/mdma_pi"
 
     echo "Deploying mdma CLI to $HOST..."
 
-    scp -4 -i "$SSH_KEY" "$BINARY" "admin@${HOST}:/tmp/"
+    SSH_OPTS=({{deploy_ssh_opts}} -i "$SSH_KEY")
+    scp "${SSH_OPTS[@]}" "$BINARY" "admin@${HOST}:/tmp/"
 
-    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo mv /tmp/mdma /usr/bin/mdma
+    ssh "${SSH_OPTS[@]}" "admin@${HOST}" 'sudo mv /tmp/mdma /usr/bin/mdma
         sudo chmod +x /usr/bin/mdma
         mdma --version'
 
@@ -965,13 +988,13 @@ deploy-cli: cli-cross
 
 # Deploy bandcamp service to Pi (includes conf file)
 [group('dev')]
-deploy-bandcamp: bandcamp-cross
-    @just _deploy-svc mdma-bandcamp mdma-bandcamp "void-packages/srcpkgs/mdma-bandcamp/files/rootfs/etc/mdma/bandcamp.conf.example"
+deploy-bandcamp host=env_var_or_default("PI_HOST", "mdma-johlyroger.local"): bandcamp-cross
+    @just _deploy-svc mdma-bandcamp mdma-bandcamp {{host}} "void-packages/srcpkgs/mdma-bandcamp/files/rootfs/etc/mdma/bandcamp.conf.example"
 
 # Deploy acid service to Pi
 [group('dev')]
-deploy-acid: acid-cross
-    @just _deploy-svc mdma-acid mdma-acid
+deploy-acid host=env_var_or_default("PI_HOST", "mdma-johlyroger.local"): acid-cross
+    @just _deploy-svc mdma-acid mdma-acid {{host}}
 
 # Cross-compile admin service for aarch64 (dev profile workspace)
 [group('build')]
@@ -990,8 +1013,8 @@ admin-cross:
 
 # Deploy admin service to Pi
 [group('dev')]
-deploy-admin: admin-cross
-    @just _deploy-svc mdma-admin mdma-admin
+deploy-admin host=env_var_or_default("PI_HOST", "mdma-johlyroger.local"): admin-cross
+    @just _deploy-svc mdma-admin mdma-admin {{host}}
 
 # Cross-compile TUI for aarch64 (dev profile workspace)
 [group('build')]
@@ -1010,19 +1033,20 @@ tui-cross:
 
 # Deploy TUI (mdma-tui) to Pi - installs as /usr/bin/mdma-tui, no service required
 [group('dev')]
-deploy-tui: tui-cross
+deploy-tui host=env_var_or_default("PI_HOST", "mdma-johlyroger.local"): tui-cross
     #!/usr/bin/env bash
     set -euo pipefail
 
-    HOST="${PI_HOST:-mdma-johlyroger.local}"
+    HOST="{{host}}"
     BINARY="target/aarch64-unknown-linux-gnu/release/mdma-tui"
     SSH_KEY="$HOME/.ssh/mdma_pi"
 
     echo "Deploying mdma-tui to $HOST..."
 
-    scp -4 -i "$SSH_KEY" "$BINARY" "admin@${HOST}:/tmp/"
+    SSH_OPTS=({{deploy_ssh_opts}} -i "$SSH_KEY")
+    scp "${SSH_OPTS[@]}" "$BINARY" "admin@${HOST}:/tmp/"
 
-    ssh -4 -i "$SSH_KEY" "admin@${HOST}" 'sudo mv /tmp/mdma-tui /usr/bin/mdma-tui
+    ssh "${SSH_OPTS[@]}" "admin@${HOST}" 'sudo mv /tmp/mdma-tui /usr/bin/mdma-tui
         sudo chmod +x /usr/bin/mdma-tui
         mdma-tui --help 2>&1 | head -1 || true'
 

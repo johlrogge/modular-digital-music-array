@@ -40,6 +40,9 @@ in
     sshpass
     gh
     gitflow               # Git-flow branching workflow
+    # Fixture regeneration for components/audio_hash/testdata/pcm (ADR-012)
+    flac                  # libFLAC command-line tools
+    sox
   ] ++ lib.optionals (!isCI && pkgs.stdenv.isLinux) [
     # Bevy (dj-workspace) graphics stack — laptop-only, Linux only.
     # pkg-config and alsa-lib are already in ci-base.nix; do not duplicate.
@@ -205,7 +208,7 @@ in
 
     echo ""
     echo "Commands:  mdma --help | mdma-tui"
-    echo "           mdma source list|sync|status|downloads"
+    echo "           mdma source list | mdma source <name> sync|status|downloads"
     echo "           mdma-volume <0-1>  mdma-status"
     echo "           just --list"
 

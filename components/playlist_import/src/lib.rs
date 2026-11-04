@@ -1,6 +1,6 @@
 //! Playlist import: match a source playlist against the library and write it.
 //!
-//! Shared by `mdma bandcamp import-playlist` and the rekordbox import (CLI) and
+//! Shared by `mdma source <name> import-playlist` and the rekordbox import (CLI) and
 //! by the bandcamp service. Library access goes through the existing seams:
 //! [`track_matcher::TrackLookup`] (via [`LibraryTrackLookup`]) for reads and
 //! [`PlaylistWriteOps`] for writes.

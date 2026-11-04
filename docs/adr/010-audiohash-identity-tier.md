@@ -23,7 +23,7 @@ ContentHash (SHA-256 of the whole file) is the entity key (ADR-003, ADR-004). Re
   - **WAV:** walk RIFF chunks; the payload of the *first* `fmt ` chunk, then the payload of the *first* `data` chunk; later duplicates and all other chunks are ignored. The odd-size pad byte is skipped, not hashed. A `data` size of `0xFFFFFFFF` means the payload runs to EOF; a size of 0 means an empty payload.
   - **M4A/MP4:** walk top-level boxes; every `mdat` payload in file order. The payload excludes the 8-byte header (16 bytes when size==1, 64-bit largesize); size==0 means the box runs to EOF. Empty `mdat` boxes still contribute `u64_le(0)`.
 - **Empty audio** → error, no fact: FLAC/MP3 range empty after stripping; WAV `data` payload empty; MP4 no `mdat`, or all `mdat` payloads empty.
-- Computed by a new `audio_hash` component with std + sha2 only. Never via a decoder or demuxer.
+- Computed by a new `audio_hash` component with std + sha2 only. Never via a decoder or demuxer. (This applies to the v1 algorithm; the same component also hosts the decoder-based PcmHash of ADR-012.)
 - Failure (unsupported, malformed, empty audio) → no fact; ingest continues.
 - Backfill is explicit (CLI/IPC request), never synchronous at service startup.
 
@@ -52,4 +52,5 @@ ContentHash (SHA-256 of the whole file) is the entity key (ADR-003, ADR-004). Re
 
 - ADR-003 — content hash as entity key; work-identity model deferred
 - ADR-004 — FactAggregator projection; redeploy-together rule for `MusicValue` changes
+- ADR-012 — PcmHash, the lossless decoded-sample tier
 - Issue #55 (tiered track identity, tier 1)

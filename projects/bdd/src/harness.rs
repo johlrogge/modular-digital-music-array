@@ -140,7 +140,6 @@ pub fn boot_test_env(tracks: &[SeedTrack]) -> TestEnv {
         "ipc:///tmp/mdma-bdd-acid-nonexistent.sock",
     )
     .expect("failed to create service");
-    let library_service = Arc::new(library_service);
 
     // Choose unique IPC addresses (avoid collisions between parallel tests)
     let id = std::process::id();

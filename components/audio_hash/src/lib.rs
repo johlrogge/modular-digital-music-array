@@ -12,9 +12,14 @@ use std::path::Path;
 use music_primitives::AudioHash;
 use sha2::{Digest, Sha256};
 
+pub use pcm::{pcm_hash, pcm_hash_reader, PcmHashError};
+
+mod aiff;
 mod flac;
+mod iff;
 mod mp3;
 mod mp4;
+mod pcm;
 mod sniff;
 mod tags;
 mod wav;
@@ -31,11 +36,14 @@ pub enum Container {
     Mp3,
     Wav,
     Mp4,
+    /// Recognised by sniffing only; AudioHash v1 does not support it.
+    Aiff,
 }
 
 impl Container {
     fn tag(self) -> [u8; 4] {
         match self {
+            Container::Aiff => *b"aif\0",
             Container::Flac => *b"flac",
             Container::Mp3 => *b"mp3\0",
             Container::Wav => *b"wav\0",
@@ -76,10 +84,14 @@ pub fn audio_hash_reader<R: Read + Seek>(mut r: R) -> Result<AudioHash, AudioHas
     let file_len = r.seek(SeekFrom::End(0))?;
     let container = sniff::sniff(&mut r, file_len)?;
     let ranges = match container {
-        Container::Flac => flac::layout(&mut r, file_len)?,
+        Container::Flac => vec![flac::layout(&mut r, file_len)?.audio],
         Container::Mp3 => mp3::layout(&mut r, file_len)?,
-        Container::Wav => wav::layout(&mut r, file_len)?,
+        Container::Wav => {
+            let l = wav::layout(&mut r, file_len)?;
+            vec![l.fmt, l.data]
+        }
         Container::Mp4 => mp4::layout(&mut r, file_len)?,
+        Container::Aiff => return Err(AudioHashError::UnsupportedContainer),
     };
     hash_ranges(&mut r, container, &ranges)
 }
@@ -190,6 +202,16 @@ mod tests {
         junk.extend(b"fLaC");
         assert!(matches!(
             audio_hash_reader(Cursor::new(junk)),
+            Err(AudioHashError::UnsupportedContainer)
+        ));
+    }
+
+    #[test]
+    fn aiff_is_unsupported_through_public_api() {
+        let mut aiff = b"FORM\0\0\0\x04AIFF".to_vec();
+        aiff.extend([0u8; 64]);
+        assert!(matches!(
+            audio_hash_reader(Cursor::new(aiff)),
             Err(AudioHashError::UnsupportedContainer)
         ));
     }

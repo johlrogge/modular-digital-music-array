@@ -79,7 +79,7 @@ sudo sv restart mdma-bandcamp
 Check that the Bandcamp source is running and authenticated:
 
 ```bash
-mdma source status bandcamp
+mdma source bandcamp status
 ```
 
 Expected output shows the source as `running` with a valid session.

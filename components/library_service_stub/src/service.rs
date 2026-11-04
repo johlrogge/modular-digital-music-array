@@ -131,7 +131,39 @@ impl LibraryService {
     ///
     /// Reads `facts.jsonl` from `metadata_dir` and builds an in-memory index.
     /// `_acid_socket` is accepted for API compatibility but ignored.
+    ///
+    /// Returns an `Arc`, like the real `library_service::LibraryService`, so a caller
+    /// compiles unchanged against either.
     pub fn new(
+        music_dir: PathBuf,
+        metadata_dir: PathBuf,
+        acid_socket: &str,
+    ) -> Result<Arc<Self>, ServiceError> {
+        Self::build(music_dir, metadata_dir, acid_socket).map(Arc::new)
+    }
+
+    /// Same as [`new`](Self::new); the events socket is accepted for API
+    /// compatibility with the real service and ignored.
+    pub fn new_with_events(
+        music_dir: PathBuf,
+        metadata_dir: PathBuf,
+        acid_socket: &str,
+        _acid_events_socket: &str,
+    ) -> Result<Arc<Self>, ServiceError> {
+        Self::new(music_dir, metadata_dir, acid_socket)
+    }
+
+    /// Number of indexed tracks (same accessor as the real service).
+    pub fn tracks_count(&self) -> usize {
+        self.tracks_count
+    }
+
+    /// Number of facts read at startup (same accessor as the real service).
+    pub fn facts_count(&self) -> usize {
+        self.facts_count
+    }
+
+    fn build(
         _music_dir: PathBuf,
         metadata_dir: PathBuf,
         _acid_socket: &str,
@@ -344,9 +376,17 @@ impl LibraryService {
             LibraryRequest::IngestFile { .. }
             | LibraryRequest::DeleteInboxFile { .. }
             | LibraryRequest::IngestAll
+            | LibraryRequest::IdentityBackfill { .. }
             | LibraryRequest::ReindexCovers => LibraryResponse::Error(ProtocolError::Internal {
                 message: "ingestion not supported in stub".to_string(),
             }),
+
+            // The stub never runs a backfill, so there is nothing to report or cancel.
+            LibraryRequest::GetIdentityBackfillStatus | LibraryRequest::CancelIdentityBackfill => {
+                LibraryResponse::IdentityBackfillStatus(
+                    library_ipc_protocol::IdentityBackfillStatus::Idle,
+                )
+            }
 
             LibraryRequest::WriteBookmark { .. } => LibraryResponse::BookmarkWritten,
 
@@ -408,6 +448,28 @@ impl LibraryService {
                 LibraryResponse::Error(ProtocolError::Internal {
                     message: "TrackReplace not supported in stub".to_string(),
                 })
+            }
+
+            // The stub holds no identity facts, so a scan finds no duplicates (and
+            // `apply` has nothing to do); merging is unsupported like replace.
+            LibraryRequest::DedupScan { apply } => {
+                LibraryResponse::DedupScan(library_ipc_protocol::DedupScanReport {
+                    groups: vec![],
+                    applied: apply.then(library_ipc_protocol::DedupApplyReport::default),
+                })
+            }
+
+            LibraryRequest::DedupMerge { .. } => LibraryResponse::Error(ProtocolError::Internal {
+                message: "DedupMerge not supported in stub".to_string(),
+            }),
+
+            // The stub archives nothing: the listing is empty and emptying is a no-op.
+            LibraryRequest::ArchiveList => {
+                LibraryResponse::ArchiveListing(library_ipc_protocol::ArchiveListing::default())
+            }
+
+            LibraryRequest::ArchiveEmpty { .. } => {
+                LibraryResponse::ArchiveEmptied(library_ipc_protocol::ArchiveEmptyReport::default())
             }
 
             LibraryRequest::TrackOrphans => {
@@ -608,11 +670,15 @@ pub fn run_ipc_server(svc: Arc<LibraryService>, address: &str) -> Result<(), Ser
     Ok(())
 }
 
+/// The stub has no ACID stream to follow; present so callers of the real
+/// `library_service::service::spawn_fact_subscriber` compile unchanged.
+pub fn spawn_fact_subscriber(_service: Arc<LibraryService>) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn empty_service() -> LibraryService {
+    fn empty_service() -> Arc<LibraryService> {
         LibraryService::new(
             PathBuf::from("/nonexistent"),
             PathBuf::from("/nonexistent"),
@@ -631,6 +697,25 @@ mod tests {
                 names.iter().map(|n| n.as_str().to_string()).collect()
             }
             other => panic!("expected PlaylistNames, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn archive_is_empty_and_emptying_it_is_a_no_op() {
+        let svc = empty_service();
+        match svc.handle_request(LibraryRequest::ArchiveList) {
+            LibraryResponse::ArchiveListing(l) => {
+                assert!(l.entries.is_empty());
+                assert_eq!(l.total_bytes, 0);
+            }
+            other => panic!("expected ArchiveListing, got {other:?}"),
+        }
+        match svc.handle_request(LibraryRequest::ArchiveEmpty { up_to: None }) {
+            LibraryResponse::ArchiveEmptied(r) => {
+                assert_eq!((r.files_deleted, r.bytes_freed), (0, 0));
+                assert!(r.errors.is_empty());
+            }
+            other => panic!("expected ArchiveEmptied, got {other:?}"),
         }
     }
 

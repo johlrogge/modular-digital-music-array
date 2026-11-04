@@ -306,6 +306,22 @@ pub enum LibraryRequest {
     /// Re-extract cover art for tracks that don't have a CoverArtPath fact yet.
     ReindexCovers,
 
+    /// Start the explicit identity-hash backfill (AudioHash, and PcmHash when
+    /// `include_pcm`) for tracks that lack the requested hash fact.
+    ///
+    /// Runs on a low-priority background worker in the library service and never
+    /// blocks other requests. If a run is already in progress it is left alone and
+    /// the response says so. Poll with `GetIdentityBackfillStatus`.
+    IdentityBackfill { include_pcm: bool },
+
+    /// Report progress of the identity-hash backfill.
+    GetIdentityBackfillStatus,
+
+    /// Ask a running identity-hash backfill to stop after the track in hand.
+    /// Progress is kept, and a later `IdentityBackfill` resumes (tracks that already
+    /// carry the hash are skipped). Answered with the current status.
+    CancelIdentityBackfill,
+
     /// Write a bookmark fact for a track.
     WriteBookmark {
         hash: ContentHash,
@@ -361,6 +377,38 @@ pub enum LibraryRequest {
 
     /// List hidden tracks (deleted or superseded).
     TrackOrphans,
+
+    // -------------------------------------------------------------------------
+    // Duplicate detection and merge (ADR-013)
+    // -------------------------------------------------------------------------
+    /// Find duplicate tracks: groups of live tracks with equal AudioHash v1 or equal
+    /// PcmHash v1. With `apply`, the automatic groups (one purchase, nothing
+    /// soft-deleted) are merged and the merge-orphan cleanup runs; the answer then
+    /// lists the groups that are left (the ones needing confirmation).
+    DedupScan { apply: bool },
+
+    /// Merge the `losers` into `winner` (a user-confirmed group). All of them must
+    /// belong to one duplicate group as `DedupScan` finds it. Short hashes accepted.
+    DedupMerge {
+        winner: ContentHash,
+        losers: Vec<ContentHash>,
+    },
+
+    // -------------------------------------------------------------------------
+    // Archive of merged duplicates' files (ADR-013)
+    // -------------------------------------------------------------------------
+    /// List what the archive holds: the blobs and cover art that merges moved out
+    /// of the library instead of deleting them.
+    ArchiveList,
+
+    /// Permanently delete the archive's files. The only way files leave it.
+    ArchiveEmpty {
+        /// Delete only files archived at or before this time (RFC 3339, the format of
+        /// `ArchiveEntry::archived_at`), so a confirmed emptying deletes only files
+        /// archived at or before the listed time. `None` deletes everything.
+        #[serde(default)]
+        up_to: Option<String>,
+    },
 }
 
 // ============================================================================
@@ -455,6 +503,24 @@ pub enum LibraryResponse {
 
     /// List of hidden (deleted or superseded) tracks.
     OrphansList(Vec<OrphanInfo>),
+
+    /// Answer to `IdentityBackfill`.
+    IdentityBackfillStarted(IdentityBackfillStart),
+
+    /// Answer to `GetIdentityBackfillStatus` and `CancelIdentityBackfill`.
+    IdentityBackfillStatus(IdentityBackfillStatus),
+
+    /// Answer to `DedupScan`.
+    DedupScan(DedupScanReport),
+
+    /// Answer to `DedupMerge`.
+    DedupMerged(DedupApplyReport),
+
+    /// Answer to `ArchiveList`.
+    ArchiveListing(ArchiveListing),
+
+    /// Answer to `ArchiveEmpty`.
+    ArchiveEmptied(ArchiveEmptyReport),
 
     /// Error response.
     Error(ProtocolError),
@@ -557,6 +623,155 @@ pub struct IngestAllItem {
     pub result: IngestResult,
 }
 
+/// Progress counters of one identity-hash backfill run.
+///
+/// `total` counts the tracks that lacked a requested hash when the run started
+/// (tracks that already carry it are left out, which makes a run resumable).
+/// `done` counts tracks handled so far: written, `failed` and `skipped` alike.
+/// `skipped` are tracks retired or already hashed by someone else between planning
+/// and writing; nothing is written for them and they are not errors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityBackfillProgress {
+    pub include_pcm: bool,
+    pub total: usize,
+    pub done: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub last_error: Option<String>,
+}
+
+/// State and progress of the identity-hash backfill worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum IdentityBackfillStatus {
+    /// No backfill has run since the service started.
+    Idle,
+    /// A worker is processing tracks.
+    Running(IdentityBackfillProgress),
+    /// The last run finished (individual tracks may still have failed).
+    Done(IdentityBackfillProgress),
+    /// The last run was cancelled; progress is kept and a new run resumes.
+    Cancelled(IdentityBackfillProgress),
+}
+
+/// Answer to `IdentityBackfill`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "start", rename_all = "snake_case")]
+pub enum IdentityBackfillStart {
+    /// A new run was started.
+    Started(IdentityBackfillProgress),
+    /// A run is already in progress and was left untouched.
+    AlreadyRunning(IdentityBackfillProgress),
+}
+
+/// One track of a duplicate group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DedupMember {
+    pub hash: ContentHash,
+    pub title: Option<String>,
+    pub album: Option<String>,
+    /// ISO 8601 datetime the track was (last) added to the library.
+    pub added: Option<String>,
+    /// Source item id (e.g. the Bandcamp purchase), if the track has one.
+    pub item_id: Option<String>,
+    /// Soft-deleted (ADR-003).
+    pub deleted: bool,
+}
+
+/// Why a duplicate group is not merged automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfirmationReason {
+    /// Members come from different source items (different releases or purchases).
+    DifferentItemIds,
+    /// At least one member has no source item id.
+    NoItemId,
+    /// At least one member is soft-deleted.
+    SoftDeleted,
+}
+
+/// Whether a duplicate group is merged by `DedupScan { apply: true }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "disposition", rename_all = "snake_case")]
+pub enum DedupDisposition {
+    /// All members share one ItemId and none is soft-deleted.
+    Automatic,
+    /// Only a user-confirmed `DedupMerge` merges the group.
+    NeedsConfirmation { reasons: Vec<ConfirmationReason> },
+}
+
+/// A set of live tracks that are duplicates of each other (ADR-013).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DedupGroup {
+    /// Every member, newest AddedAt first (ties by hash): the winner comes first.
+    pub members: Vec<DedupMember>,
+    /// The member that survives a merge: latest AddedAt, ties to the lowest hash.
+    pub winner: ContentHash,
+    pub disposition: DedupDisposition,
+}
+
+impl DedupGroup {
+    pub fn is_automatic(&self) -> bool {
+        self.disposition == DedupDisposition::Automatic
+    }
+
+    /// The members that a merge removes.
+    pub fn losers(&self) -> impl Iterator<Item = &DedupMember> {
+        self.members.iter().filter(|m| m.hash != self.winner)
+    }
+}
+
+/// What a dedup merge did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DedupApplyReport {
+    /// Tracks merged away (losers retired).
+    pub merged: usize,
+    /// Blob files moved to the archive (never deleted), including merge orphans
+    /// cleaned up. Called `blobs_removed` before files were archived instead of deleted.
+    #[serde(alias = "blobs_removed")]
+    pub blobs_archived: usize,
+    /// One message per failed merge or file archiving.
+    pub errors: Vec<String>,
+}
+
+/// Answer to `DedupScan`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DedupScanReport {
+    /// Duplicate groups, automatic ones first. With `apply`, the groups left after merging.
+    pub groups: Vec<DedupGroup>,
+    /// Present when the scan was run with `apply`.
+    pub applied: Option<DedupApplyReport>,
+}
+
+/// One file in the archive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveEntry {
+    /// Path relative to the archive, e.g. `blobs/ab/abcd....flac`.
+    pub path: String,
+    /// The content hash key the file is named after (collision suffix stripped).
+    pub hash: String,
+    pub size_bytes: u64,
+    /// When the file was archived (its mtime, set when it was moved), RFC 3339.
+    pub archived_at: Option<String>,
+}
+
+/// Answer to `ArchiveList`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveListing {
+    /// Oldest first.
+    pub entries: Vec<ArchiveEntry>,
+    pub total_bytes: u64,
+}
+
+/// Answer to `ArchiveEmpty`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveEmptyReport {
+    pub files_deleted: usize,
+    pub bytes_freed: u64,
+    /// One message per file that could not be deleted.
+    pub errors: Vec<String>,
+}
+
 /// Why a track is an orphan (shown in orphan/GC workflows).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "reason")]
@@ -585,6 +800,186 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
+
+    fn progress() -> IdentityBackfillProgress {
+        IdentityBackfillProgress {
+            include_pcm: true,
+            total: 5,
+            done: 3,
+            failed: 1,
+            skipped: 1,
+            last_error: Some("boom".into()),
+        }
+    }
+
+    #[test]
+    fn identity_backfill_status_roundtrips_and_is_tagged_by_state() {
+        for status in [
+            IdentityBackfillStatus::Idle,
+            IdentityBackfillStatus::Running(progress()),
+            IdentityBackfillStatus::Done(progress()),
+            IdentityBackfillStatus::Cancelled(progress()),
+        ] {
+            let json =
+                serde_json::to_string(&LibraryResponse::IdentityBackfillStatus(status.clone()))
+                    .unwrap();
+            match serde_json::from_str::<LibraryResponse>(&json).unwrap() {
+                LibraryResponse::IdentityBackfillStatus(back) => assert_eq!(back, status),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        let json = serde_json::to_value(IdentityBackfillStatus::Running(progress())).unwrap();
+        assert_eq!(json["state"], "running");
+        assert_eq!(json["total"], 5);
+    }
+
+    #[test]
+    fn identity_backfill_start_roundtrips() {
+        for start in [
+            IdentityBackfillStart::Started(progress()),
+            IdentityBackfillStart::AlreadyRunning(progress()),
+        ] {
+            let json =
+                serde_json::to_string(&LibraryResponse::IdentityBackfillStarted(start.clone()))
+                    .unwrap();
+            match serde_json::from_str::<LibraryResponse>(&json).unwrap() {
+                LibraryResponse::IdentityBackfillStarted(back) => assert_eq!(back, start),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    fn dedup_group(disposition: DedupDisposition) -> DedupGroup {
+        let member = |h: &str| DedupMember {
+            hash: ContentHash::new(h),
+            title: Some("Espansione".into()),
+            album: None,
+            added: Some("2026-09-01T00:00:00+00:00".into()),
+            item_id: Some("p387309426".into()),
+            deleted: false,
+        };
+        DedupGroup {
+            members: vec![member("sha256:a"), member("sha256:b")],
+            winner: ContentHash::new("sha256:a"),
+            disposition,
+        }
+    }
+
+    #[test]
+    fn dedup_responses_roundtrip() {
+        let report = DedupScanReport {
+            groups: vec![
+                dedup_group(DedupDisposition::Automatic),
+                dedup_group(DedupDisposition::NeedsConfirmation {
+                    reasons: vec![ConfirmationReason::DifferentItemIds],
+                }),
+            ],
+            applied: Some(DedupApplyReport {
+                merged: 1,
+                blobs_archived: 1,
+                errors: vec!["boom".into()],
+            }),
+        };
+        let json = serde_json::to_string(&LibraryResponse::DedupScan(report.clone())).unwrap();
+        match serde_json::from_str::<LibraryResponse>(&json).unwrap() {
+            LibraryResponse::DedupScan(back) => assert_eq!(back, report),
+            other => panic!("unexpected {other:?}"),
+        }
+        let applied = DedupApplyReport::default();
+        let json = serde_json::to_string(&LibraryResponse::DedupMerged(applied.clone())).unwrap();
+        match serde_json::from_str::<LibraryResponse>(&json).unwrap() {
+            LibraryResponse::DedupMerged(back) => assert_eq!(back, applied),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_apply_report_from_before_the_archive_still_decodes() {
+        let old = r#"{"merged":2,"blobs_removed":3,"errors":["boom"]}"#;
+        let report: DedupApplyReport = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            report,
+            DedupApplyReport {
+                merged: 2,
+                blobs_archived: 3,
+                errors: vec!["boom".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn dedup_requests_roundtrip() {
+        let json = serde_json::to_string(&LibraryRequest::DedupScan { apply: true }).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<LibraryRequest>(&json).unwrap(),
+            LibraryRequest::DedupScan { apply: true }
+        ));
+        let req = LibraryRequest::DedupMerge {
+            winner: ContentHash::new("sha256:a"),
+            losers: vec![ContentHash::new("sha256:b")],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        match serde_json::from_str::<LibraryRequest>(&json).unwrap() {
+            LibraryRequest::DedupMerge { winner, losers } => {
+                assert_eq!(winner.as_str(), "sha256:a");
+                assert_eq!(losers.len(), 1);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn archive_messages_roundtrip() {
+        for req in [
+            LibraryRequest::ArchiveList,
+            LibraryRequest::ArchiveEmpty { up_to: None },
+            LibraryRequest::ArchiveEmpty {
+                up_to: Some("2026-09-01T00:00:00.123456789+00:00".into()),
+            },
+        ] {
+            let json = serde_json::to_string(&req).unwrap();
+            let back = serde_json::from_str::<LibraryRequest>(&json).unwrap();
+            assert_eq!(format!("{back:?}"), format!("{req:?}"));
+        }
+        let listing = ArchiveListing {
+            entries: vec![ArchiveEntry {
+                path: "blobs/ab/abcd.flac".into(),
+                hash: "abcd".into(),
+                size_bytes: 12,
+                archived_at: Some("2026-09-01T00:00:00+00:00".into()),
+            }],
+            total_bytes: 12,
+        };
+        let json =
+            serde_json::to_string(&LibraryResponse::ArchiveListing(listing.clone())).unwrap();
+        match serde_json::from_str::<LibraryResponse>(&json).unwrap() {
+            LibraryResponse::ArchiveListing(back) => assert_eq!(back, listing),
+            other => panic!("unexpected {other:?}"),
+        }
+        let emptied = ArchiveEmptyReport {
+            files_deleted: 2,
+            bytes_freed: 24,
+            errors: vec!["boom".into()],
+        };
+        let json =
+            serde_json::to_string(&LibraryResponse::ArchiveEmptied(emptied.clone())).unwrap();
+        match serde_json::from_str::<LibraryResponse>(&json).unwrap() {
+            LibraryResponse::ArchiveEmptied(back) => assert_eq!(back, emptied),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dedup_group_knows_its_losers_and_disposition() {
+        let g = dedup_group(DedupDisposition::Automatic);
+        assert!(g.is_automatic());
+        let losers: Vec<_> = g.losers().map(|m| m.hash.as_str()).collect();
+        assert_eq!(losers, vec!["sha256:b"]);
+        assert!(!dedup_group(DedupDisposition::NeedsConfirmation {
+            reasons: vec![ConfirmationReason::SoftDeleted]
+        })
+        .is_automatic());
+    }
 
     #[rstest]
     #[case("track.flac")]

@@ -4,19 +4,23 @@
 use std::io::{Read, Seek};
 use std::ops::Range;
 
-use crate::tags::{le_u32, read_at};
+use crate::iff::{self, Endian, Unbounded};
+use crate::tags::read_at;
 use crate::{AudioHashError, Container};
 
 const C: Container = Container::Wav;
 
-/// A `data` size of this value means "runs to end of file" (streamed WAV).
-/// A size of 0 is a literally empty payload.
-const UNBOUNDED_DATA: u64 = 0xFFFF_FFFF;
+/// Byte ranges of a WAV file's `fmt ` and `data` payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WavLayout {
+    pub fmt: Range<u64>,
+    pub data: Range<u64>,
+}
 
 pub(crate) fn layout<R: Read + Seek>(
     r: &mut R,
     file_len: u64,
-) -> Result<Vec<Range<u64>>, AudioHashError> {
+) -> Result<WavLayout, AudioHashError> {
     if file_len < 12 {
         return Err(C.malformed("shorter than RIFF header"));
     }
@@ -28,40 +32,28 @@ pub(crate) fn layout<R: Read + Seek>(
         return Err(C.malformed("not a RIFF/WAVE file"));
     }
 
-    let mut fmt: Option<Range<u64>> = None;
-    let mut data: Option<Range<u64>> = None;
-    let mut pos = 12u64;
-    while (fmt.is_none() || data.is_none()) && file_len.saturating_sub(pos) >= 8 {
-        let h: [u8; 8] = read_at(r, pos)?;
-        let size = u64::from(le_u32(&h, 4));
-        let payload = pos + 8;
-        let is_data = &h[0..4] == b"data";
-        let end = if is_data && size == UNBOUNDED_DATA {
-            file_len
-        } else {
-            payload + size
-        };
-        if end > file_len {
-            return Err(C.malformed(if is_data {
-                "data chunk truncated"
-            } else {
-                "chunk extends past end of file"
-            }));
-        }
-        match &h[0..4] {
-            b"fmt " if fmt.is_none() => fmt = Some(payload..end),
-            b"data" if data.is_none() => data = Some(payload..end),
-            _ => {}
-        }
-        pos = end + (end - payload) % 2;
-    }
+    // A `data` size of 0xFFFFFFFF means "runs to end of file" (streamed WAV).
+    // A size of 0 is a literally empty payload.
+    let data_chunk = Unbounded {
+        id: *b"data",
+        truncated: "data chunk truncated",
+    };
+    let [fmt, data] = iff::walk(
+        r,
+        file_len,
+        C,
+        Endian::Little,
+        12,
+        [b"fmt ", b"data"],
+        Some(&data_chunk),
+    )?;
 
     let fmt = fmt.ok_or_else(|| C.malformed("missing fmt chunk"))?;
     let data = data.ok_or_else(|| C.malformed("missing data chunk"))?;
     if data.is_empty() {
         return Err(AudioHashError::NoAudio);
     }
-    Ok(vec![fmt, data])
+    Ok(WavLayout { fmt, data })
 }
 
 #[cfg(test)]
@@ -70,8 +62,8 @@ mod tests {
     use crate::fixtures::*;
     use pretty_assertions::assert_eq;
 
-    fn lay(b: &[u8]) -> Result<Vec<Range<u64>>, AudioHashError> {
-        lay_with(layout, b)
+    fn lay(b: &[u8]) -> Result<WavLayout, AudioHashError> {
+        layout(&mut std::io::Cursor::new(b.to_vec()), b.len() as u64)
     }
 
     fn pcm() -> Vec<u8> {
@@ -119,7 +111,7 @@ mod tests {
         // odd-sized data keeps its exact length (pad excluded)
         let odd_data = riff(&[fmt_chunk(1), chunk(b"data", &[9, 9, 9])]);
         let r = lay(&odd_data).unwrap();
-        assert_eq!(r[1].end - r[1].start, 3);
+        assert_eq!(r.data.end - r.data.start, 3);
 
         // 0xFFFFFFFF means "to EOF"
         let unbounded = riff(&[fmt_chunk(1), chunk_sized(b"data", 0xFFFF_FFFF, &pcm())]);
@@ -168,10 +160,10 @@ mod tests {
         let data_start = fmt_start + 16 + 8;
         assert_eq!(
             lay(&b).unwrap(),
-            vec![
-                fmt_start as u64..(fmt_start + 16) as u64,
-                data_start as u64..(data_start + 64) as u64
-            ]
+            WavLayout {
+                fmt: fmt_start as u64..(fmt_start + 16) as u64,
+                data: data_start as u64..(data_start + 64) as u64,
+            }
         );
     }
 }

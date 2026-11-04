@@ -77,8 +77,6 @@ async fn main() -> Result<()> {
         "Loaded library from facts"
     );
 
-    let library = std::sync::Arc::new(library);
-
     // Spawn background ACID fact subscriber for incremental index updates
     spawn_fact_subscriber(std::sync::Arc::clone(&library));
 

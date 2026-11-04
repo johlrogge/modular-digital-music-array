@@ -10,7 +10,11 @@ use color_eyre::Result;
 use colored::Colorize;
 use event_protocol::{from_topic_message, PlaybackEvent, TOPIC_PLAYBACK};
 use gateway_client::{AdminRequest, AdminResponse, GatewayClient};
-use library_ipc_client::{ClientError, ContentHash, InboxPath, ProtocolError, TrackInfo};
+use library_ipc_client::{
+    ArchiveEmptyReport, ArchiveListing, ClientError, ConfirmationReason, ContentHash,
+    DedupApplyReport, DedupDisposition, DedupGroup, DedupMember, InboxPath, ProtocolError,
+    TrackInfo,
+};
 use library_search::{
     parse_date_query, parse_numeric_query, parse_role_query, parse_string_query, TrackQuery,
 };
@@ -32,6 +36,7 @@ use source_protocol::{
     ImportJobStatus, ImportPhase, ImportSyncProgress, SourceError, SourceRequest, SourceResponse,
 };
 use std::path::Path;
+use storage_primitives::ByteSize;
 use track_formatter::{
     format_track_line as format_track_line_shared, render_for_user, short_hash, ViewColumn,
     ALL_COLUMNS,
@@ -201,15 +206,19 @@ enum Commands {
     },
 
     /// Music source management
+    #[command(
+        override_usage = "mdma source list\n       mdma source <SOURCE-NAME> <COMMAND>",
+        after_help = "Per-source commands: mdma source <SOURCE-NAME> <COMMAND>\n\n\
+                      Commands:\n  \
+                      sync, status, downloads, cancel, pause, resume, resync,\n  \
+                      check-item, check-updates, playlists, import-playlist, import-status\n\n\
+                      Example: mdma source bandcamp sync\n\
+                      Run 'mdma source <SOURCE-NAME> --help' for details.\n\
+                      'list' is reserved and cannot be a source name."
+    )]
     Source {
         #[command(subcommand)]
-        command: SourceCommands,
-    },
-
-    /// Bandcamp playlist commands
-    Bandcamp {
-        #[command(subcommand)]
-        command: BandcampCommands,
+        command: SourceTop,
     },
 
     /// Playback control commands
@@ -528,17 +537,87 @@ enum InboxCommands {
     IngestAll,
 }
 
+/// Top level of `mdma source`: the global `list`, or `<source-name> <command>`.
+///
+/// `<source-name>` comes first, so it cannot be a positional of the group
+/// (it would collide with `list`). Anything that is not `list` is captured as
+/// an external subcommand and re-parsed as a [`SourceInvocation`], which keeps
+/// full clap help and validation for the per-source commands. `list` is
+/// therefore reserved and cannot be used as a source name.
 #[derive(Subcommand, Debug)]
-enum BandcampCommands {
-    /// List your Bandcamp playlists
+enum SourceTop {
+    /// List available music sources
+    List,
+
+    /// `<SOURCE-NAME> <COMMAND>`: run a command on a source (see `mdma source <SOURCE-NAME> --help`)
+    #[command(external_subcommand)]
+    Named(Vec<String>),
+}
+
+/// The per-source commands: `mdma source <source-name> <command> [args]`.
+#[derive(Parser, Debug)]
+#[command(
+    arg_required_else_help = true,
+    subcommand_required = true,
+    about = "Commands for one music source"
+)]
+struct SourceInvocation {
+    #[command(subcommand)]
+    command: SourceCommands,
+}
+
+#[derive(Subcommand, Debug, PartialEq)]
+enum SourceCommands {
+    /// Sync the source (download new items)
+    Sync,
+
+    /// Show source status
+    Status,
+
+    /// List downloads for the source
+    Downloads,
+
+    /// Cancel a download
+    Cancel {
+        /// Download ID to cancel
+        id: String,
+    },
+
+    /// Pause all downloads for the source
+    Pause,
+
+    /// Resume downloads for the source
+    Resume,
+
+    /// Force re-sync of a specific item (bypasses dedup)
+    Resync {
+        /// Source-specific item identifier (e.g. "p123456" for bandcamp)
+        identifier: String,
+    },
+
+    /// Check if a specific item has changed upstream
+    CheckItem {
+        /// Source-specific item identifier
+        identifier: String,
+    },
+
+    /// Check the whole source collection for stale items
+    CheckUpdates {
+        /// Auto-apply resync for any stale items found
+        #[arg(long)]
+        apply: bool,
+    },
+
+    /// List the source's playlists (for sources that support playlists)
     Playlists,
 
-    /// Import a Bandcamp playlist as an MDMA playlist (definitive matches only)
+    /// Import a source playlist as an MDMA playlist (definitive matches only;
+    /// for sources that support playlists)
     ImportPlaylist {
         /// Playlist slug or URL
         playlist: String,
 
-        /// MDMA playlist name (default: sanitised Bandcamp title)
+        /// MDMA playlist name (default: sanitised source title)
         #[arg(long)]
         name: Option<String>,
 
@@ -551,77 +630,30 @@ enum BandcampCommands {
         no_wait: bool,
     },
 
-    /// Show the current or last playlist import job (follows it while running)
+    /// Show the current or last playlist import job, following it while running
+    /// (for sources that support playlists)
     ImportStatus,
 }
 
-#[derive(Subcommand, Debug)]
-enum SourceCommands {
-    /// List available music sources
-    List,
+/// Parse the arguments captured by [`SourceTop::Named`]: `<name> <command> ...`.
+fn parse_source_args(args: &[String]) -> Result<(String, SourceCommands), clap::Error> {
+    let (name, rest) = args
+        .split_first()
+        .expect("external subcommand always has a name");
+    let argv = std::iter::once(format!("mdma source {name}")).chain(rest.iter().cloned());
+    let invocation = SourceInvocation::try_parse_from(argv)?;
+    Ok((name.clone(), invocation.command))
+}
 
-    /// Sync a music source (download new items)
-    Sync {
-        /// Source name (e.g. bandcamp)
-        name: String,
-    },
-
-    /// Show source status
-    Status {
-        /// Source name (e.g. bandcamp)
-        name: String,
-    },
-
-    /// List downloads for a source
-    Downloads {
-        /// Source name (e.g. bandcamp)
-        name: String,
-    },
-
-    /// Cancel a download
-    Cancel {
-        /// Source name
-        name: String,
-        /// Download ID to cancel
-        id: String,
-    },
-
-    /// Pause all downloads for a source
-    Pause {
-        /// Source name
-        name: String,
-    },
-
-    /// Resume downloads for a source
-    Resume {
-        /// Source name
-        name: String,
-    },
-
-    /// Force re-sync of a specific item (bypasses dedup)
-    Resync {
-        /// Source name (e.g. bandcamp)
-        name: String,
-        /// Source-specific item identifier (e.g. "p123456" for bandcamp)
-        identifier: String,
-    },
-
-    /// Check if a specific item has changed upstream
-    CheckItem {
-        /// Source name (e.g. bandcamp)
-        name: String,
-        /// Source-specific item identifier
-        identifier: String,
-    },
-
-    /// Check the whole source collection for stale items
-    CheckUpdates {
-        /// Source name
-        name: String,
-        /// Auto-apply resync for any stale items found
-        #[arg(long)]
-        apply: bool,
-    },
+/// Print a parse error (with a `mdma source list` hint) and exit.
+fn exit_source_parse_error(e: clap::Error) -> ! {
+    let failed = e.use_stderr();
+    let code = e.exit_code();
+    let _ = e.print();
+    if failed {
+        eprintln!("\nHint: 'mdma source list' shows the available sources");
+    }
+    std::process::exit(code);
 }
 
 #[derive(Subcommand, Debug)]
@@ -853,6 +885,97 @@ enum LibraryCommands {
         #[command(subcommand)]
         command: TrackCommands,
     },
+
+    /// Compute track identity hashes (used to find duplicates)
+    Identity {
+        #[command(subcommand)]
+        command: IdentityCommands,
+    },
+
+    /// Find duplicate tracks (the same audio with different tags or files) and merge them.
+    ///
+    /// Without options, lists the groups: those that can be merged automatically (all
+    /// copies come from one purchase and none is deleted) first, then those that need
+    /// your confirmation. The newest copy is kept; its blob stays, the other copies'
+    /// facts are folded into it (latest value per attribute wins), playlists are
+    /// rewritten, and the other copies' audio files are moved to the archive (see
+    /// `mdma library archive`), not deleted.
+    ///
+    /// Needs identity hashes: run `mdma library identity backfill` first.
+    #[command(args_conflicts_with_subcommands = true)]
+    Dedup {
+        /// Merge the automatic groups (the others are only listed)
+        #[arg(long)]
+        apply: bool,
+
+        #[command(subcommand)]
+        command: Option<DedupCommands>,
+    },
+
+    /// List the files that duplicate merges moved to the archive.
+    ///
+    /// A merge never deletes the other copies' audio files and cover art: it moves
+    /// them to `archive/` in the music directory, keeping their layout. Shows how
+    /// many files the archive holds, their total size, and for each its hash, size
+    /// and when it was archived. `mdma library archive empty` deletes them for good.
+    Archive {
+        #[command(subcommand)]
+        command: Option<ArchiveCommands>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ArchiveCommands {
+    /// Permanently delete everything in the archive.
+    ///
+    /// Shows what the archive holds and asks for confirmation. This cannot be undone.
+    Empty {
+        /// Do not ask for confirmation
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DedupCommands {
+    /// Merge tracks you have confirmed to be duplicates into a winner.
+    ///
+    /// The other tracks' audio files are moved to the archive. All tracks must be in
+    /// one duplicate group as listed by `mdma library dedup`.
+    Merge {
+        /// The track to keep (prefix accepted, git-style)
+        winner: String,
+        /// The duplicates to merge into it (prefixes accepted)
+        #[arg(required = true)]
+        losers: Vec<String>,
+        /// Do not ask for confirmation
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum IdentityCommands {
+    /// Compute identity hashes for tracks that don't have them yet.
+    ///
+    /// New tracks get an AudioHash when they are ingested; this covers the tracks
+    /// already in the library. It runs as a low-priority background job in the
+    /// library service and can be re-run: tracks that already have the hash are
+    /// skipped. By default the command follows the job until it finishes.
+    Backfill {
+        /// Also compute PcmHash (decodes every lossless track; slow)
+        #[arg(long)]
+        pcm: bool,
+        /// Start the job and return immediately
+        #[arg(long)]
+        no_wait: bool,
+    },
+
+    /// Show progress of the identity-hash backfill
+    Status,
+
+    /// Stop a running identity-hash backfill (progress is kept; run backfill again to resume)
+    Cancel,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1012,9 +1135,9 @@ fn connect_source(cli: &Cli, name: &str) -> SourceClient {
     connect_source_or_exit(cli, name, None)
 }
 
-/// Request timeout for `mdma bandcamp playlists`: listing makes several
-/// rate-limited Bandcamp requests, well beyond the default 5s.
-const BANDCAMP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Request timeout for `mdma source playlists`: listing may make several
+/// rate-limited upstream requests (e.g. Bandcamp), well beyond the default 5s.
+const SOURCE_LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Connect to a source, with the default request timeout or a custom one.
 fn connect_source_or_exit(
@@ -1036,6 +1159,7 @@ fn connect_source_or_exit(
             if gateway.is_none() {
                 eprintln!("Is mdma-{} running?", name);
             }
+            eprintln!("Hint: 'mdma source list' shows the available sources");
             std::process::exit(1);
         }
     }
@@ -2235,6 +2359,432 @@ fn handle_library_reindex_covers(client: &LibraryBackend) -> Result<()> {
     Ok(())
 }
 
+const IDENTITY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Consecutive failed status polls before `identity backfill` stops following.
+const IDENTITY_POLL_MAX_FAILURES: u32 = 5;
+
+fn format_identity_status(status: &library_ipc_client::IdentityBackfillStatus) -> String {
+    use library_ipc_client::IdentityBackfillStatus as S;
+    let (label, p) = match status {
+        S::Idle => {
+            return "No identity backfill has run since the library service started".to_string()
+        }
+        S::Running(p) => ("Running", p),
+        S::Done(p) => ("Done", p),
+        S::Cancelled(p) => ("Cancelled", p),
+    };
+    let hashes = if p.include_pcm {
+        "AudioHash + PcmHash"
+    } else {
+        "AudioHash"
+    };
+    let mut line = format!("{label} ({hashes}): {}/{} tracks", p.done, p.total);
+    if p.failed > 0 {
+        line.push_str(&format!(", {} failed", p.failed));
+    }
+    if p.skipped > 0 {
+        line.push_str(&format!(", {} skipped", p.skipped));
+    }
+    if let Some(err) = &p.last_error {
+        line.push_str(&format!(" (last error: {err})"));
+    }
+    line
+}
+
+/// What to tell the user when a backfill is already running. The running job keeps
+/// its own mode, so say so when it differs from what was just asked for.
+fn identity_already_running_message(running_pcm: bool, requested_pcm: bool) -> String {
+    let mode = |pcm| {
+        if pcm {
+            "AudioHash + PcmHash"
+        } else {
+            "AudioHash"
+        }
+    };
+    let mut msg = "An identity backfill is already running; not starting another.".to_string();
+    if running_pcm != requested_pcm {
+        msg.push_str(&format!(
+            " The running job computes {}, not the requested {}.",
+            mode(running_pcm),
+            mode(requested_pcm)
+        ));
+    }
+    msg
+}
+
+fn handle_identity_backfill(client: &LibraryBackend, pcm: bool, no_wait: bool) -> Result<()> {
+    use library_ipc_client::IdentityBackfillStart;
+    match client.identity_backfill(pcm) {
+        Ok(IdentityBackfillStart::Started(p)) => {
+            println!("Identity backfill started: {} tracks to process", p.total)
+        }
+        Ok(IdentityBackfillStart::AlreadyRunning(p)) => {
+            println!("{}", identity_already_running_message(p.include_pcm, pcm))
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+    if no_wait {
+        println!("Check progress with 'mdma library identity status'");
+        return Ok(());
+    }
+
+    let mut last_printed = String::new();
+    let mut failures = 0;
+    loop {
+        match client.identity_backfill_status() {
+            Ok(s) => {
+                failures = 0;
+                let line = format_identity_status(&s);
+                if line != last_printed {
+                    println!("{}", line);
+                    last_printed = line;
+                }
+                if !matches!(s, library_ipc_client::IdentityBackfillStatus::Running(_)) {
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                failures += 1;
+                if failures >= IDENTITY_POLL_MAX_FAILURES {
+                    eprintln!(
+                        "Lost contact with the library service ({e}); \
+                         check later with 'mdma library identity status'"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        std::thread::sleep(IDENTITY_POLL_INTERVAL);
+    }
+}
+
+fn handle_identity_status(client: &LibraryBackend) -> Result<()> {
+    match client.identity_backfill_status() {
+        Ok(s) => {
+            println!("{}", format_identity_status(&s));
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn dedup_reason_text(reason: ConfirmationReason) -> &'static str {
+    match reason {
+        ConfirmationReason::DifferentItemIds => "different purchases (item ids)",
+        ConfirmationReason::NoItemId => "a copy has no item id",
+        ConfirmationReason::SoftDeleted => "a copy is deleted",
+    }
+}
+
+fn format_dedup_member(role: &str, m: &DedupMember) -> String {
+    let title = m.title.as_deref().unwrap_or("Unknown");
+    let album = m
+        .album
+        .as_deref()
+        .map(|a| format!("  [{a}]"))
+        .unwrap_or_default();
+    let added = m
+        .added
+        .as_deref()
+        .map(|a| a.get(..10).unwrap_or(a))
+        .unwrap_or("?");
+    let item = m.item_id.as_deref().unwrap_or("-");
+    let deleted = if m.deleted { "  (deleted)" } else { "" };
+    format!(
+        "  {role:<5}  {}  {title}{album}  added {added}  item {item}{deleted}",
+        short_hash(&m.hash)
+    )
+}
+
+/// The groups as the user sees them: automatic ones first, each member on a line
+/// (`keep` is the winner), and the command that confirms a group that needs it.
+fn format_dedup_groups(groups: &[DedupGroup]) -> String {
+    if groups.is_empty() {
+        return "No duplicates found".to_string();
+    }
+    let mut ordered: Vec<&DedupGroup> = groups.iter().collect();
+    ordered.sort_by_key(|g| !g.is_automatic());
+
+    let mut out = String::new();
+    for g in ordered {
+        match &g.disposition {
+            DedupDisposition::Automatic => out.push_str("Automatic (merged by --apply)\n"),
+            DedupDisposition::NeedsConfirmation { reasons } => {
+                let why: Vec<&str> = reasons.iter().map(|r| dedup_reason_text(*r)).collect();
+                out.push_str(&format!("Needs confirmation: {}\n", why.join(", ")));
+            }
+        }
+        for m in &g.members {
+            let role = if m.hash == g.winner { "keep" } else { "merge" };
+            out.push_str(&format_dedup_member(role, m));
+            out.push('\n');
+        }
+        if !g.is_automatic() {
+            let losers: Vec<&str> = g.losers().map(|m| short_hash(&m.hash)).collect();
+            out.push_str(&format!(
+                "  confirm with: mdma library dedup merge {} {}\n",
+                short_hash(&g.winner),
+                losers.join(" ")
+            ));
+        }
+        out.push('\n');
+    }
+    out.trim_end().to_string()
+}
+
+fn format_dedup_applied(r: &DedupApplyReport) -> String {
+    let mut out = format!(
+        "Merged {} track(s), archived {} blob(s)",
+        r.merged, r.blobs_archived
+    );
+    for e in &r.errors {
+        out.push_str(&format!("\n  error: {e}"));
+    }
+    out
+}
+
+/// The group that has a member starting with `partial` (a git-style hash prefix):
+/// `Ok(None)` when no group does, an error when more than one group does.
+fn find_dedup_group<'a>(
+    groups: &'a [DedupGroup],
+    partial: &str,
+) -> std::result::Result<Option<&'a DedupGroup>, String> {
+    let clean = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
+    let partial = clean(partial);
+    let mut matching = groups.iter().filter(|g| {
+        g.members
+            .iter()
+            .any(|m| clean(m.hash.as_str()).starts_with(&partial))
+    });
+    let found = matching.next();
+    if matching.next().is_some() {
+        return Err(format!("'{partial}' matches more than one duplicate group"));
+    }
+    Ok(found)
+}
+
+fn is_yes(answer: &str) -> bool {
+    matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+fn handle_dedup(client: &LibraryBackend, apply: bool) -> Result<()> {
+    let report = match client.dedup_scan(apply) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let failed = report
+        .applied
+        .as_ref()
+        .is_some_and(|a| !a.errors.is_empty());
+    if let Some(applied) = &report.applied {
+        println!("{}", format_dedup_applied(applied));
+        if !report.groups.is_empty() {
+            println!("\nLeft for your confirmation:");
+        }
+    }
+    // After `--apply` an empty list is already said by the summary.
+    if !apply || !report.groups.is_empty() {
+        println!("{}", format_dedup_groups(&report.groups));
+    }
+    if failed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn handle_dedup_merge(
+    client: &LibraryBackend,
+    winner: &str,
+    losers: &[String],
+    yes: bool,
+) -> Result<()> {
+    if !yes {
+        if let Ok(report) = client.dedup_scan(false) {
+            // Every prefix must name at most one group before anything is confirmed.
+            let mut shown = None;
+            for prefix in std::iter::once(winner).chain(losers.iter().map(String::as_str)) {
+                match find_dedup_group(&report.groups, prefix) {
+                    Ok(group) => shown = shown.or(group),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            if let Some(group) = shown {
+                println!("{}\n", format_dedup_groups(std::slice::from_ref(group)));
+            }
+        }
+        print!(
+            "Merge {} track(s) into {winner}? Their audio files are moved to the archive. [y/N] ",
+            losers.len()
+        );
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !is_yes(&answer) {
+            println!("Aborted");
+            return Ok(());
+        }
+    }
+
+    let loser_hashes: Vec<ContentHash> = losers.iter().map(ContentHash::new).collect();
+    match client.dedup_merge(&ContentHash::new(winner), &loser_hashes) {
+        Ok(report) => {
+            println!("{}", format_dedup_applied(&report));
+            if !report.errors.is_empty() {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// The archive as the user sees it: a summary line, then a line per file.
+fn format_archive_listing(l: &ArchiveListing) -> String {
+    if l.entries.is_empty() {
+        return "The archive is empty".to_string();
+    }
+    let mut out = format!(
+        "Archive: {} file(s), {}\n",
+        l.entries.len(),
+        ByteSize::new(l.total_bytes)
+    );
+    for e in &l.entries {
+        let hash = e.hash.get(..12).unwrap_or(&e.hash);
+        let at = e
+            .archived_at
+            .as_deref()
+            .map(|a| a.get(..10).unwrap_or(a))
+            .unwrap_or("?");
+        out.push_str(&format!(
+            "  {hash:<12}  {:>9}  archived {at}  {}\n",
+            ByteSize::new(e.size_bytes).to_string(),
+            e.path
+        ));
+    }
+    out.trim_end().to_string()
+}
+
+fn archive_empty_prompt(l: &ArchiveListing) -> String {
+    format!(
+        "Permanently delete {} file(s) ({}) from the archive? This cannot be undone. [y/N] ",
+        l.entries.len(),
+        ByteSize::new(l.total_bytes)
+    )
+}
+
+/// The newest `archived_at` in `l` (the listing is oldest first): what a confirmed
+/// emptying may delete, so files archived after the listing survive. A listing
+/// without any time falls back to the epoch (deletes nothing newer than "unknown").
+fn archive_cutoff(l: &ArchiveListing) -> String {
+    l.entries
+        .iter()
+        .rev()
+        .find_map(|e| e.archived_at.clone())
+        .unwrap_or_else(|| "1970-01-01T00:00:00+00:00".to_owned())
+}
+
+fn format_archive_emptied(r: &ArchiveEmptyReport) -> String {
+    let mut out = format!(
+        "Deleted {} file(s), freed {}",
+        r.files_deleted,
+        ByteSize::new(r.bytes_freed)
+    );
+    for e in &r.errors {
+        out.push_str(&format!("\n  error: {e}"));
+    }
+    out
+}
+
+fn handle_archive_list(client: &LibraryBackend) -> Result<()> {
+    match client.archive_list() {
+        Ok(l) => {
+            println!("{}", format_archive_listing(&l));
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_archive_empty(client: &LibraryBackend, yes: bool) -> Result<()> {
+    // `--yes` without a listing deletes everything; after a prompt, only what was shown.
+    let mut up_to = None;
+    if !yes {
+        let listing = match client.archive_list() {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        };
+        println!("{}\n", format_archive_listing(&listing));
+        if listing.entries.is_empty() {
+            return Ok(());
+        }
+        print!("{}", archive_empty_prompt(&listing));
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !is_yes(&answer) {
+            println!("Aborted");
+            return Ok(());
+        }
+        up_to = Some(archive_cutoff(&listing));
+    }
+
+    match client.archive_empty(up_to.as_deref()) {
+        Ok(report) => {
+            println!("{}", format_archive_emptied(&report));
+            if !report.errors.is_empty() {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_identity_cancel(client: &LibraryBackend) -> Result<()> {
+    use library_ipc_client::IdentityBackfillStatus;
+    match client.identity_backfill_cancel() {
+        Ok(IdentityBackfillStatus::Running(_)) => {
+            println!(
+                "Cancelling after the current track; progress is kept. \
+                 Run 'mdma library identity backfill' again to resume."
+            );
+            Ok(())
+        }
+        Ok(s) => {
+            println!("Nothing to cancel. {}", format_identity_status(&s));
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
 // =============================================================================
 // Bookmark Command Handlers
 // =============================================================================
@@ -2653,7 +3203,7 @@ fn handle_source_check_updates(
     } else {
         println!("Run with --apply to resync stale items, or resync individually with:");
         for id in &stale_ids {
-            println!("  mdma source resync {} {}", name, id);
+            println!("  {}", resync_command(name, id));
         }
     }
 
@@ -4431,14 +4981,25 @@ fn sanitized_name_or_exit(raw: &str, flag: &str) -> String {
 }
 
 // =============================================================================
-// Source playlist import (mdma bandcamp import-playlist)
+// Source playlists (mdma source playlists / import-playlist / import-status)
 // =============================================================================
 
-/// Name of the source service the `mdma bandcamp` commands talk to.
-const BANDCAMP_SOURCE: &str = "bandcamp";
+/// Message for a source that answers `SourceError::Unsupported`.
+fn unsupported_message(source: &str, feature: &str) -> String {
+    format!("source '{}' does not support {}", source, feature)
+}
 
-fn handle_bandcamp_playlists(client: &SourceClient) -> Result<()> {
-    match client.request(BANDCAMP_SOURCE, &SourceRequest::ListPlaylists) {
+/// Report a source error; `Unsupported` gets a friendly message naming the source.
+fn handle_playlist_source_error(source: &str, feature: &str, err: &SourceError) -> ! {
+    if matches!(err, SourceError::Unsupported { .. }) {
+        eprintln!("{}", unsupported_message(source, feature));
+        std::process::exit(1);
+    }
+    handle_source_error(err)
+}
+
+fn handle_source_playlists(client: &SourceClient, source: &str) -> Result<()> {
+    match client.request(source, &SourceRequest::ListPlaylists) {
         Ok(SourceResponse::Playlists(playlists)) => {
             if playlists.is_empty() {
                 println!("No playlists found");
@@ -4471,22 +5032,34 @@ fn handle_bandcamp_playlists(client: &SourceClient) -> Result<()> {
             }
             Ok(())
         }
-        Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
+        Ok(SourceResponse::Error(e)) => handle_playlist_source_error(source, "playlists", &e),
         Ok(_) => handle_source_error(&"Unexpected response"),
         Err(e) => handle_source_error(&e),
     }
 }
 
+/// The command hinted at to follow an import job (name first, as parsed).
+fn import_status_command(source: &str) -> String {
+    format!("mdma source {} import-status", source)
+}
+
+/// The command hinted at to force-resync one item.
+fn resync_command(source: &str, identifier: &str) -> String {
+    format!("mdma source {} resync {}", source, identifier)
+}
+
 /// Message for a refused import: another job holds the single import slot.
-fn import_not_started_message(running_job_id: u64) -> String {
+fn import_not_started_message(source: &str, running_job_id: u64) -> String {
     format!(
-        "Import NOT started: job {} is already running (see 'mdma bandcamp import-status')",
-        running_job_id
+        "Import NOT started: job {} is already running (see '{}')",
+        running_job_id,
+        import_status_command(source)
     )
 }
 
-fn handle_bandcamp_import_playlist(
+fn handle_source_import_playlist(
     client: &SourceClient,
+    source: &str,
     playlist: &str,
     name: &Option<String>,
     dry_run: bool,
@@ -4496,7 +5069,7 @@ fn handle_bandcamp_import_playlist(
     let explicit_name = name.as_deref().map(|n| sanitized_name_or_exit(n, "--name"));
 
     let job_id = match client.request(
-        BANDCAMP_SOURCE,
+        source,
         &SourceRequest::ImportPlaylist {
             playlist: playlist.to_string(),
             name: explicit_name,
@@ -4510,23 +5083,23 @@ fn handle_bandcamp_import_playlist(
         Ok(SourceResponse::Error(SourceError::ImportInProgress { job_id })) => {
             // The running job may be a different playlist or a dry run, so
             // following it would report someone else's result as ours.
-            eprintln!("{}", import_not_started_message(job_id));
+            eprintln!("{}", import_not_started_message(source, job_id));
             std::process::exit(1);
         }
-        Ok(SourceResponse::Error(e)) => handle_source_error(&e),
+        Ok(SourceResponse::Error(e)) => handle_playlist_source_error(source, "playlist import", &e),
         Ok(_) => handle_source_error(&"Unexpected response"),
         Err(e) => handle_source_error(&e),
     };
 
     if no_wait {
-        println!("Check progress with 'mdma bandcamp import-status'");
+        println!("Check progress with '{}'", import_status_command(source));
         return Ok(());
     }
-    follow_import_job(client, job_id)
+    follow_import_job(client, source, job_id)
 }
 
-fn handle_bandcamp_import_status(client: &SourceClient) -> Result<()> {
-    match client.request(BANDCAMP_SOURCE, &SourceRequest::GetImportStatus) {
+fn handle_source_import_status(client: &SourceClient, source: &str) -> Result<()> {
+    match client.request(source, &SourceRequest::GetImportStatus) {
         Ok(SourceResponse::ImportStatus(None)) => {
             println!("No import job");
             Ok(())
@@ -4536,10 +5109,10 @@ fn handle_bandcamp_import_status(client: &SourceClient) -> Result<()> {
                 finish_import(&status)
             } else {
                 println!("Import job {} is running", status.job_id);
-                follow_import_job(client, status.job_id)
+                follow_import_job(client, source, status.job_id)
             }
         }
-        Ok(SourceResponse::Error(e)) => handle_source_error(&e),
+        Ok(SourceResponse::Error(e)) => handle_playlist_source_error(source, "playlist import", &e),
         Ok(_) => handle_source_error(&"Unexpected response"),
         Err(e) => handle_source_error(&e),
     }
@@ -4675,11 +5248,11 @@ fn finish_import(status: &ImportJobStatus) -> Result<()> {
 }
 
 /// Poll the server until `job_id` finishes, then print its report.
-fn follow_import_job(client: &SourceClient, job_id: u64) -> Result<()> {
+fn follow_import_job(client: &SourceClient, source: &str, job_id: u64) -> Result<()> {
     let mut poller = ImportPoller::new(job_id);
     let mut last_error: Option<String> = None;
     loop {
-        let input = match client.request(BANDCAMP_SOURCE, &SourceRequest::GetImportStatus) {
+        let input = match client.request(source, &SourceRequest::GetImportStatus) {
             Ok(SourceResponse::ImportStatus(s)) => PollInput::Status(s),
             Ok(SourceResponse::Error(e)) => {
                 last_error = Some(e.to_string());
@@ -4704,9 +5277,10 @@ fn follow_import_job(client: &SourceClient, job_id: u64) -> Result<()> {
             PollFlow::GiveUp => {
                 eprintln!(
                     "Lost contact with the import job {} ({}); \
-                     check later with 'mdma bandcamp import-status'",
+                     check later with '{}'",
                     job_id,
-                    last_error.unwrap_or_else(|| "no status for the job".to_string())
+                    last_error.unwrap_or_else(|| "no status for the job".to_string()),
+                    import_status_command(source)
                 );
                 std::process::exit(1);
             }
@@ -5412,6 +5986,53 @@ fn sockets_given(matches: &clap::ArgMatches) -> bool {
     })
 }
 
+/// Run one per-source command against the source `name`.
+fn run_source_command(cli: &Cli, name: &str, command: &SourceCommands) -> Result<()> {
+    match command {
+        SourceCommands::Playlists => {
+            let client = connect_source_or_exit(cli, name, Some(SOURCE_LISTING_TIMEOUT));
+            handle_source_playlists(&client, name)
+        }
+        _ => {
+            let client = connect_source(cli, name);
+            match command {
+                SourceCommands::Sync => handle_source_sync(&client, name),
+                SourceCommands::Status => handle_source_status(&client, name),
+                SourceCommands::Downloads => handle_source_downloads(&client, name),
+                SourceCommands::Cancel { id } => handle_source_cancel(&client, name, id.clone()),
+                SourceCommands::Pause => handle_source_pause(&client, name),
+                SourceCommands::Resume => handle_source_resume(&client, name),
+                SourceCommands::Resync { identifier } => {
+                    handle_source_resync(&client, name, identifier)
+                }
+                SourceCommands::CheckItem { identifier } => {
+                    handle_source_check_item(&client, name, identifier)
+                }
+                SourceCommands::CheckUpdates { apply } => {
+                    handle_source_check_updates(cli, &client, name, *apply)
+                }
+                // Import requests return immediately (the job runs server-side),
+                // so the default request timeout is enough for start and polls.
+                SourceCommands::ImportPlaylist {
+                    playlist,
+                    name: import_name,
+                    dry_run,
+                    no_wait,
+                } => handle_source_import_playlist(
+                    &client,
+                    name,
+                    playlist,
+                    import_name,
+                    *dry_run,
+                    *no_wait,
+                ),
+                SourceCommands::ImportStatus => handle_source_import_status(&client, name),
+                SourceCommands::Playlists => unreachable!("handled above"),
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     color_eyre::install()?;
 
@@ -5475,67 +6096,12 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::Bandcamp { command } => match command {
-            BandcampCommands::Playlists => {
-                let client =
-                    connect_source_or_exit(&cli, BANDCAMP_SOURCE, Some(BANDCAMP_REQUEST_TIMEOUT));
-                handle_bandcamp_playlists(&client)
-            }
-            // Import requests return immediately (the job runs server-side),
-            // so the default request timeout is enough for start and polls.
-            BandcampCommands::ImportPlaylist {
-                playlist,
-                name,
-                dry_run,
-                no_wait,
-            } => {
-                let client = connect_source(&cli, BANDCAMP_SOURCE);
-                handle_bandcamp_import_playlist(&client, playlist, name, *dry_run, *no_wait)
-            }
-            BandcampCommands::ImportStatus => {
-                let client = connect_source(&cli, BANDCAMP_SOURCE);
-                handle_bandcamp_import_status(&client)
-            }
-        },
-
         Commands::Source { command } => match command {
-            SourceCommands::List => handle_source_list(&cli),
-            SourceCommands::Sync { name } => {
-                let client = connect_source(&cli, name);
-                handle_source_sync(&client, name)
-            }
-            SourceCommands::Status { name } => {
-                let client = connect_source(&cli, name);
-                handle_source_status(&client, name)
-            }
-            SourceCommands::Downloads { name } => {
-                let client = connect_source(&cli, name);
-                handle_source_downloads(&client, name)
-            }
-            SourceCommands::Cancel { name, id } => {
-                let client = connect_source(&cli, name);
-                handle_source_cancel(&client, name, id.clone())
-            }
-            SourceCommands::Pause { name } => {
-                let client = connect_source(&cli, name);
-                handle_source_pause(&client, name)
-            }
-            SourceCommands::Resume { name } => {
-                let client = connect_source(&cli, name);
-                handle_source_resume(&client, name)
-            }
-            SourceCommands::Resync { name, identifier } => {
-                let client = connect_source(&cli, name);
-                handle_source_resync(&client, name, identifier)
-            }
-            SourceCommands::CheckItem { name, identifier } => {
-                let client = connect_source(&cli, name);
-                handle_source_check_item(&client, name, identifier)
-            }
-            SourceCommands::CheckUpdates { name, apply } => {
-                let client = connect_source(&cli, name);
-                handle_source_check_updates(&cli, &client, name, *apply)
-            }
+            SourceTop::List => handle_source_list(&cli),
+            SourceTop::Named(args) => match parse_source_args(args) {
+                Ok((name, command)) => run_source_command(&cli, &name, &command),
+                Err(e) => exit_source_parse_error(e),
+            },
         },
 
         // Library commands - connect to library service
@@ -5729,6 +6295,25 @@ fn main() -> Result<()> {
             let lib = connect_library(&cli);
             match command {
                 LibraryCommands::ReindexCovers => handle_library_reindex_covers(&lib),
+                LibraryCommands::Identity { command } => match command {
+                    IdentityCommands::Backfill { pcm, no_wait } => {
+                        handle_identity_backfill(&lib, *pcm, *no_wait)
+                    }
+                    IdentityCommands::Status => handle_identity_status(&lib),
+                    IdentityCommands::Cancel => handle_identity_cancel(&lib),
+                },
+                LibraryCommands::Dedup { apply, command } => match command {
+                    None => handle_dedup(&lib, *apply),
+                    Some(DedupCommands::Merge {
+                        winner,
+                        losers,
+                        yes,
+                    }) => handle_dedup_merge(&lib, winner, losers, *yes),
+                },
+                LibraryCommands::Archive { command } => match command {
+                    None => handle_archive_list(&lib),
+                    Some(ArchiveCommands::Empty { yes }) => handle_archive_empty(&lib, *yes),
+                },
                 LibraryCommands::Track { command } => match command {
                     TrackCommands::Delete { hash } => handle_track_delete(&lib, hash),
                     TrackCommands::Restore { hash } => handle_track_restore(&lib, hash),
@@ -5831,8 +6416,211 @@ mod tests {
     #[test]
     fn refused_import_message_says_not_started_and_names_the_running_job() {
         assert_eq!(
-            import_not_started_message(7),
-            "Import NOT started: job 7 is already running (see 'mdma bandcamp import-status')"
+            import_not_started_message("bandcamp", 7),
+            "Import NOT started: job 7 is already running (see 'mdma source bandcamp import-status')"
+        );
+    }
+
+    /// Parse a hinted command line with the real parser, as a user pasting it would.
+    fn parse_hinted(command: &str) -> (String, SourceCommands) {
+        let words: Vec<String> = command.split_whitespace().map(String::from).collect();
+        assert_eq!(&words[..2], ["mdma", "source"], "{command}");
+        let cli = Cli::try_parse_from(&words).unwrap_or_else(|e| panic!("{command}: {e}"));
+        match cli.command {
+            Commands::Source {
+                command: SourceTop::Named(args),
+            } => parse_source_args(&args).unwrap_or_else(|e| panic!("{command}: {e}")),
+            other => panic!("{command}: unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_status_hint_parses_to_import_status_for_that_source() {
+        for src in ["bandcamp", "beatport"] {
+            let (name, command) = parse_hinted(&import_status_command(src));
+            assert_eq!(name, src);
+            assert_eq!(command, SourceCommands::ImportStatus);
+            // The refusal message embeds the same hint.
+            assert!(import_not_started_message(src, 1).contains(&import_status_command(src)));
+        }
+    }
+
+    #[test]
+    fn resync_hint_parses_to_resync_for_that_source() {
+        let (name, command) = parse_hinted(&resync_command("bandcamp", "p123"));
+        assert_eq!(name, "bandcamp");
+        assert_eq!(
+            command,
+            SourceCommands::Resync {
+                identifier: "p123".into()
+            }
+        );
+    }
+
+    fn parse_source(args: &[&str]) -> Result<(String, SourceCommands), clap::Error> {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        parse_source_args(&args)
+    }
+
+    #[test]
+    fn every_per_source_command_parses_with_the_name_first() {
+        let cases: Vec<(Vec<&str>, SourceCommands)> = vec![
+            (vec!["bandcamp", "sync"], SourceCommands::Sync),
+            (vec!["bandcamp", "status"], SourceCommands::Status),
+            (vec!["bandcamp", "downloads"], SourceCommands::Downloads),
+            (
+                vec!["bandcamp", "cancel", "d1"],
+                SourceCommands::Cancel { id: "d1".into() },
+            ),
+            (vec!["bandcamp", "pause"], SourceCommands::Pause),
+            (vec!["bandcamp", "resume"], SourceCommands::Resume),
+            (
+                vec!["bandcamp", "resync", "p1"],
+                SourceCommands::Resync {
+                    identifier: "p1".into(),
+                },
+            ),
+            (
+                vec!["bandcamp", "check-item", "p1"],
+                SourceCommands::CheckItem {
+                    identifier: "p1".into(),
+                },
+            ),
+            (
+                vec!["bandcamp", "check-updates", "--apply"],
+                SourceCommands::CheckUpdates { apply: true },
+            ),
+            (vec!["bandcamp", "playlists"], SourceCommands::Playlists),
+            (
+                vec![
+                    "bandcamp",
+                    "import-playlist",
+                    "my-list",
+                    "--name",
+                    "x",
+                    "--dry-run",
+                    "--no-wait",
+                ],
+                SourceCommands::ImportPlaylist {
+                    playlist: "my-list".into(),
+                    name: Some("x".into()),
+                    dry_run: true,
+                    no_wait: true,
+                },
+            ),
+            (
+                vec!["bandcamp", "import-status"],
+                SourceCommands::ImportStatus,
+            ),
+        ];
+        for (args, expected) in cases {
+            let (name, command) = parse_source(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            assert_eq!(name, "bandcamp");
+            assert_eq!(command, expected, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn import_playlist_defaults_have_no_flags_set() {
+        let (_, command) = parse_source(&["bandcamp", "import-playlist", "p"]).unwrap();
+        assert_eq!(
+            command,
+            SourceCommands::ImportPlaylist {
+                playlist: "p".into(),
+                name: None,
+                dry_run: false,
+                no_wait: false,
+            }
+        );
+    }
+
+    #[test]
+    fn source_list_parses_as_the_global_command() {
+        let cli = Cli::try_parse_from(["mdma", "source", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Source {
+                command: SourceTop::List
+            }
+        ));
+    }
+
+    #[test]
+    fn source_name_then_command_reaches_named() {
+        let cli = Cli::try_parse_from(["mdma", "source", "bandcamp", "sync"]).unwrap();
+        match cli.command {
+            Commands::Source {
+                command: SourceTop::Named(args),
+            } => assert_eq!(args, vec!["bandcamp", "sync"]),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_per_source_command_fails() {
+        let e = parse_source(&["bandcamp", "frobnicate"]).unwrap_err();
+        assert!(e.use_stderr());
+    }
+
+    #[test]
+    fn source_name_without_command_fails() {
+        let e = parse_source(&["bandcamp"]).unwrap_err();
+        assert!(e.use_stderr() || e.kind() != clap::error::ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn old_name_last_order_is_rejected() {
+        // `mdma source sync bandcamp` reads `sync` as the source name.
+        assert!(parse_source(&["sync", "bandcamp"]).is_err());
+    }
+
+    #[test]
+    fn bandcamp_command_group_is_gone() {
+        assert!(Cli::try_parse_from(["mdma", "bandcamp", "playlists"]).is_err());
+    }
+
+    #[test]
+    fn source_help_lists_list_and_explains_the_name_first_form() {
+        let e = Cli::try_parse_from(["mdma", "source", "--help"]).unwrap_err();
+        assert_eq!(e.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = e.to_string();
+        assert!(help.contains("list"), "{help}");
+        assert!(help.contains("<SOURCE-NAME> <COMMAND>"), "{help}");
+    }
+
+    #[test]
+    fn per_source_help_lists_the_commands() {
+        let e = parse_source(&["bandcamp", "--help"]).unwrap_err();
+        assert_eq!(e.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = e.to_string();
+        for cmd in [
+            "sync",
+            "status",
+            "downloads",
+            "cancel",
+            "pause",
+            "resume",
+            "resync",
+            "check-item",
+            "check-updates",
+            "playlists",
+            "import-playlist",
+            "import-status",
+        ] {
+            assert!(help.contains(cmd), "missing {cmd} in {help}");
+        }
+        assert!(help.contains("mdma source bandcamp"), "{help}");
+    }
+
+    #[test]
+    fn unsupported_message_names_the_source_and_feature() {
+        assert_eq!(
+            unsupported_message("beatport", "playlist import"),
+            "source 'beatport' does not support playlist import"
+        );
+        assert_eq!(
+            unsupported_message("beatport", "playlists"),
+            "source 'beatport' does not support playlists"
         );
     }
 
@@ -7965,6 +8753,370 @@ mod tests {
                 command: AdminCommands::Reboot { force: false },
             } => {}
             other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    // ── identity clap parsing ─────────────────────────────────────────────────
+
+    #[test]
+    fn identity_backfill_parses_flags() {
+        for (args, want_pcm, want_no_wait) in [
+            (
+                vec!["mdma", "library", "identity", "backfill"],
+                false,
+                false,
+            ),
+            (
+                vec!["mdma", "library", "identity", "backfill", "--pcm"],
+                true,
+                false,
+            ),
+            (
+                vec![
+                    "mdma",
+                    "library",
+                    "identity",
+                    "backfill",
+                    "--pcm",
+                    "--no-wait",
+                ],
+                true,
+                true,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            match cli.command {
+                Commands::Library {
+                    command:
+                        LibraryCommands::Identity {
+                            command: IdentityCommands::Backfill { pcm, no_wait },
+                        },
+                } => assert_eq!((pcm, no_wait), (want_pcm, want_no_wait)),
+                other => panic!("unexpected command: {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn identity_status_parses() {
+        let cli = Cli::try_parse_from(["mdma", "library", "identity", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Library {
+                command: LibraryCommands::Identity {
+                    command: IdentityCommands::Status
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn already_running_message_names_the_mode_only_when_it_differs() {
+        let same = identity_already_running_message(true, true);
+        assert!(!same.contains("requested"), "{same}");
+        let differs = identity_already_running_message(false, true);
+        assert!(
+            differs.contains("computes AudioHash, not the requested AudioHash + PcmHash"),
+            "{differs}"
+        );
+    }
+
+    #[test]
+    fn identity_cancel_parses() {
+        let cli = Cli::try_parse_from(["mdma", "library", "identity", "cancel"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Library {
+                command: LibraryCommands::Identity {
+                    command: IdentityCommands::Cancel
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn identity_status_formats_progress_failures_and_skips() {
+        use library_ipc_client::{IdentityBackfillProgress, IdentityBackfillStatus};
+        let p = IdentityBackfillProgress {
+            include_pcm: true,
+            total: 10,
+            done: 10,
+            failed: 2,
+            skipped: 1,
+            last_error: Some("boom".into()),
+        };
+        assert_eq!(
+            format_identity_status(&IdentityBackfillStatus::Done(p.clone())),
+            "Done (AudioHash + PcmHash): 10/10 tracks, 2 failed, 1 skipped (last error: boom)"
+        );
+        assert!(
+            format_identity_status(&IdentityBackfillStatus::Cancelled(p)).starts_with("Cancelled")
+        );
+        assert!(format_identity_status(&IdentityBackfillStatus::Idle).starts_with("No identity"));
+    }
+
+    // ── dedup ─────────────────────────────────────────────────────────────────
+
+    fn dedup_args(args: &[&str]) -> (bool, Option<DedupCommands>) {
+        let mut argv = vec!["mdma", "library", "dedup"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(&argv)
+            .unwrap_or_else(|e| panic!("{argv:?}: {e}"))
+            .command
+        {
+            Commands::Library {
+                command: LibraryCommands::Dedup { apply, command },
+            } => (apply, command),
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dedup_lists_by_default_and_applies_with_the_flag() {
+        assert!(matches!(dedup_args(&[]), (false, None)));
+        assert!(matches!(dedup_args(&["--apply"]), (true, None)));
+    }
+
+    #[test]
+    fn dedup_merge_takes_a_winner_losers_and_yes() {
+        match dedup_args(&["merge", "abc123", "def456", "0a1b2c"]) {
+            (
+                false,
+                Some(DedupCommands::Merge {
+                    winner,
+                    losers,
+                    yes,
+                }),
+            ) => {
+                assert_eq!(winner, "abc123");
+                assert_eq!(losers, vec!["def456", "0a1b2c"]);
+                assert!(!yes);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(matches!(
+            dedup_args(&["merge", "--yes", "a", "b"]),
+            (false, Some(DedupCommands::Merge { yes: true, .. }))
+        ));
+        assert!(matches!(
+            dedup_args(&["merge", "-y", "a", "b"]),
+            (false, Some(DedupCommands::Merge { yes: true, .. }))
+        ));
+    }
+
+    #[test]
+    fn dedup_merge_needs_a_loser_and_does_not_mix_with_apply() {
+        assert!(Cli::try_parse_from(["mdma", "library", "dedup", "merge", "abc"]).is_err());
+        assert!(Cli::try_parse_from(["mdma", "library", "dedup", "merge"]).is_err());
+        assert!(
+            Cli::try_parse_from(["mdma", "library", "dedup", "--apply", "merge", "a", "b"])
+                .is_err()
+        );
+    }
+
+    fn dedup_member(hash: &str, item: Option<&str>) -> DedupMember {
+        DedupMember {
+            hash: ContentHash::new(format!("sha256:{hash}")),
+            title: Some("Espansione".into()),
+            album: Some("Part 3 & 4".into()),
+            added: Some("2026-09-01T10:00:00+00:00".into()),
+            item_id: item.map(str::to_owned),
+            deleted: false,
+        }
+    }
+
+    fn dedup_group(winner: &str, loser: &str, disposition: DedupDisposition) -> DedupGroup {
+        DedupGroup {
+            members: vec![
+                dedup_member(winner, Some("p1")),
+                dedup_member(loser, Some("p1")),
+            ],
+            winner: ContentHash::new(format!("sha256:{winner}")),
+            disposition,
+        }
+    }
+
+    #[test]
+    fn dedup_listing_puts_automatic_groups_first_and_says_how_to_confirm_the_rest() {
+        let groups = [
+            dedup_group(
+                "bbbbbbbbbbbbbbbb",
+                "cccccccccccccccc",
+                DedupDisposition::NeedsConfirmation {
+                    reasons: vec![ConfirmationReason::DifferentItemIds],
+                },
+            ),
+            dedup_group(
+                "aaaaaaaaaaaaaaaa",
+                "dddddddddddddddd",
+                DedupDisposition::Automatic,
+            ),
+        ];
+
+        let text = format_dedup_groups(&groups);
+
+        let auto = text.find("Automatic").unwrap();
+        let confirm = text
+            .find("Needs confirmation: different purchases")
+            .unwrap();
+        assert!(auto < confirm, "{text}");
+        assert!(text.contains("keep   aaaaaaaaaaaa"), "{text}");
+        assert!(text.contains("merge  dddddddddddd"), "{text}");
+        assert!(text.contains("added 2026-09-01"), "{text}");
+        assert!(
+            text.contains("confirm with: mdma library dedup merge bbbbbbbbbbbb cccccccccccc"),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("confirm with").count(),
+            1,
+            "automatic groups need no confirmation: {text}"
+        );
+        assert_eq!(format_dedup_groups(&[]), "No duplicates found");
+    }
+
+    #[test]
+    fn dedup_applied_summary_lists_errors() {
+        let r = DedupApplyReport {
+            merged: 2,
+            blobs_archived: 1,
+            errors: vec!["boom".into()],
+        };
+        assert_eq!(
+            format_dedup_applied(&r),
+            "Merged 2 track(s), archived 1 blob(s)\n  error: boom"
+        );
+    }
+
+    // ── archive ───────────────────────────────────────────────────────────────
+
+    fn archive_command(args: &[&str]) -> Option<ArchiveCommands> {
+        let mut argv = vec!["mdma", "library", "archive"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(&argv)
+            .unwrap_or_else(|e| panic!("{argv:?}: {e}"))
+            .command
+        {
+            Commands::Library {
+                command: LibraryCommands::Archive { command },
+            } => command,
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn archive_lists_by_default_and_empties_with_a_subcommand() {
+        assert!(archive_command(&[]).is_none());
+        assert!(matches!(
+            archive_command(&["empty"]),
+            Some(ArchiveCommands::Empty { yes: false })
+        ));
+        assert!(matches!(
+            archive_command(&["empty", "--yes"]),
+            Some(ArchiveCommands::Empty { yes: true })
+        ));
+        assert!(matches!(
+            archive_command(&["empty", "-y"]),
+            Some(ArchiveCommands::Empty { yes: true })
+        ));
+        assert!(Cli::try_parse_from(["mdma", "library", "archive", "empty", "x"]).is_err());
+        assert!(Cli::try_parse_from(["mdma", "library", "archive", "--yes"]).is_err());
+    }
+
+    fn archive_listing_of_two() -> ArchiveListing {
+        let entry = |hash: &str, size: u64, at: &str| library_ipc_client::ArchiveEntry {
+            path: format!("blobs/{}/{hash}.flac", &hash[..2]),
+            hash: hash.into(),
+            size_bytes: size,
+            archived_at: Some(at.into()),
+        };
+        ArchiveListing {
+            entries: vec![
+                entry("abcdef0123456789", 3_000_000, "2026-09-01T10:00:00+00:00"),
+                entry("fedcba98", 2_000_000, "2026-09-02T10:00:00+00:00"),
+            ],
+            total_bytes: 5_000_000,
+        }
+    }
+
+    #[test]
+    fn archive_listing_shows_count_total_and_each_entry() {
+        let text = format_archive_listing(&archive_listing_of_two());
+        assert!(text.starts_with("Archive: 2 file(s), 5 MB\n"), "{text}");
+        assert!(text.contains("abcdef012345  "), "{text}");
+        assert!(text.contains("3 MB"), "{text}");
+        assert!(text.contains("archived 2026-09-01"), "{text}");
+        assert!(text.contains("blobs/ab/abcdef0123456789.flac"), "{text}");
+        assert!(text.contains("fedcba98  "), "{text}");
+        assert_eq!(
+            format_archive_listing(&ArchiveListing::default()),
+            "The archive is empty"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_emptying_is_cut_off_at_the_newest_listed_time() {
+        assert_eq!(
+            archive_cutoff(&archive_listing_of_two()),
+            "2026-09-02T10:00:00+00:00"
+        );
+        assert_eq!(
+            archive_cutoff(&ArchiveListing::default()),
+            "1970-01-01T00:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn archive_empty_asks_with_the_count_and_size_and_reports_the_result() {
+        assert_eq!(
+            archive_empty_prompt(&archive_listing_of_two()),
+            "Permanently delete 2 file(s) (5 MB) from the archive? This cannot be undone. [y/N] "
+        );
+        let r = ArchiveEmptyReport {
+            files_deleted: 2,
+            bytes_freed: 5_000_000,
+            errors: vec!["boom".into()],
+        };
+        assert_eq!(
+            format_archive_emptied(&r),
+            "Deleted 2 file(s), freed 5 MB\n  error: boom"
+        );
+    }
+
+    #[test]
+    fn dedup_group_is_found_by_a_hash_prefix_with_or_without_sha256() {
+        let groups = [dedup_group(
+            "abcdef0123",
+            "fedcba9876",
+            DedupDisposition::Automatic,
+        )];
+        assert!(find_dedup_group(&groups, "abcd").unwrap().is_some());
+        assert!(find_dedup_group(&groups, "sha256:FEDC").unwrap().is_some());
+        assert!(find_dedup_group(&groups, "0000").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_hash_prefix_that_matches_two_groups_is_an_error() {
+        let groups = [
+            dedup_group("abcdef0123", "fedcba9876", DedupDisposition::Automatic),
+            dedup_group("abcd001122", "112233aabb", DedupDisposition::Automatic),
+        ];
+        assert!(find_dedup_group(&groups, "abcd").is_err());
+        // Long enough to tell them apart, and a prefix of two members of one group.
+        assert_eq!(
+            find_dedup_group(&groups, "abcdef").unwrap().unwrap().winner,
+            groups[0].winner
+        );
+        assert!(find_dedup_group(&groups, "112").unwrap().is_some());
+    }
+
+    #[test]
+    fn only_yes_confirms_a_merge() {
+        for yes in ["y", "Y", "yes", " YES \n"] {
+            assert!(is_yes(yes), "{yes:?}");
+        }
+        for no in ["", "n", "no", "maybe", "\n"] {
+            assert!(!is_yes(no), "{no:?}");
         }
     }
 
