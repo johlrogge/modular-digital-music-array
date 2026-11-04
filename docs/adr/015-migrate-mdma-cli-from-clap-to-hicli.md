@@ -62,6 +62,15 @@ positionals last.
 - Completions: hidden `generate-completions <bash|zsh|fish>` printing `hicli::completion_script`.
 - Errors: command errors map to exit 1 with the message chain; parse errors exit 2. Remaining
   `process::exit` calls are kept through the migration and converted afterwards.
+- Argument type naming:
+  - `<X>Arg` / `Opt<X>Arg` is a value parsed from a single argv token through `FromStr` (Opt wraps
+    `Option<XArg>`, because hicli has no `Arg` impl for `Option`/`Vec`; every optional command parameter is an
+    `Opt<X>Arg`, lists live in multi-value `*Args` structs).
+  - Switches (`Yes`, `Force`, `Apply`, `ApplyUpdates`) and values combined from several arguments
+    (`SortDirection`, `ContainsMode`, `ViewColumns`) are named for the domain concept.
+  - `*Cli` structs are clap parse-only and disappear in P2.3; `*Args` structs carry several values and survive
+    as Bpaf structs.
+  - Free text with no domain rule stays `XArg(String)` with a `// Stays a String: <reason>` comment.
 
 ## Known hicli gaps we accept
 
