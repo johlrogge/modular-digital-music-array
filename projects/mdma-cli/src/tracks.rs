@@ -1,4 +1,4 @@
-use crate::args::{OptTrackArg, TrackArg};
+use crate::args::TrackArg;
 use crate::ctx::Ctx;
 use crate::output::{
     format_track_line, handle_error, handle_playback_error, print_tracks, terminal_width,
@@ -23,44 +23,37 @@ pub(crate) struct LimitArg(pub Option<usize>);
 #[derive(clap::Args, Debug)]
 pub(crate) struct GetCli {
     /// Content hash (full or partial, with or without sha256: prefix)
-    pub(crate) hash: String,
+    pub(crate) hash: TrackArg,
 }
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct FactsCli {
     /// Content hash (full or partial, with or without sha256: prefix)
-    pub(crate) hash: String,
+    pub(crate) hash: TrackArg,
 }
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct SortArgs {
     /// Sort ascending (A→Z, low→high)
     #[arg(short = 'a')]
-    ascending: bool,
+    pub(crate) ascending: bool,
 
     /// Sort descending (Z→A, high→low)
     #[arg(short = 'd')]
-    descending: bool,
+    pub(crate) descending: bool,
 
     /// Field to sort by
     #[arg(value_enum)]
-    field: SortField,
+    pub(crate) field: SortField,
 }
 
-// What `mdma bookmark` parses; converted into `BookmarkArgs` by the dispatch.
 #[derive(clap::Args, Debug)]
 pub(crate) struct BookmarkCli {
     /// Optional scope — associate bookmark with a named set
     #[arg(long)]
     pub(crate) scope: Option<String>,
     /// Content hash of track to bookmark (defaults to now-playing if omitted)
-    pub(crate) hash: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BookmarkArgs {
-    pub(crate) scope: Option<String>,
-    pub(crate) hash: OptTrackArg,
+    pub(crate) hash: Option<TrackArg>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -149,14 +142,14 @@ impl std::str::FromStr for SortField {
 
 /// Direction of a sort, built from the mutually exclusive `-a` / `-d` flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SortDirection {
+pub(crate) enum SortDirection {
     Ascending,
     Descending,
 }
 
 impl SortDirection {
     /// `None` unless exactly one of the flags is set.
-    fn from_flags(ascending: bool, descending: bool) -> Option<Self> {
+    pub(crate) fn from_flags(ascending: bool, descending: bool) -> Option<Self> {
         match (ascending, descending) {
             (true, false) => Some(SortDirection::Ascending),
             (false, true) => Some(SortDirection::Descending),
@@ -305,17 +298,8 @@ fn compare_optional<T: Ord>(
     }
 }
 
-pub(crate) fn sort(args: SortArgs, ctx: &Ctx) -> Result<()> {
-    let SortArgs {
-        ascending,
-        descending,
-        field,
-    } = args;
+pub(crate) fn sort(field: SortField, direction: SortDirection, ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
-    let Some(direction) = SortDirection::from_flags(ascending, descending) else {
-        eprintln!("Specify exactly one of -a (ascending) or -d (descending)");
-        std::process::exit(1);
-    };
 
     let hashes = hashes_arg_or_stdin(None);
     let mut tracks = resolve_tracks_skip_errors(&library, hashes);
@@ -365,15 +349,11 @@ pub(crate) fn sort(args: SortArgs, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn bookmark(args: BookmarkArgs, ctx: &Ctx) -> Result<()> {
-    let BookmarkArgs {
-        scope,
-        hash: OptTrackArg(hash),
-    } = args;
+pub(crate) fn bookmark(scope: Option<String>, hash: Option<TrackArg>, ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
     let playback = ctx.playback();
     let content_hash = match hash {
-        Some(h) => h,
+        Some(TrackArg(h)) => h,
         None => match playback.now_playing() {
             Ok(Some(h)) => h,
             Ok(None) => {
@@ -465,11 +445,6 @@ pub(crate) fn view(columns: ViewColumns, ctx: &Ctx) -> Result<()> {
 
     let ViewColumns(columns) = columns;
     let library = ctx.library();
-
-    if columns.is_empty() {
-        eprintln!("No fields selected. Use --hash, --artist, --title, and/or --duration.");
-        std::process::exit(1);
-    }
 
     // Read hashes from stdin (same format as `mdma playlist append` / `mdma search` output).
     let hashes = read_hashes();

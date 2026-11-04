@@ -28,7 +28,6 @@ mod transfer;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use color_eyre::Result;
 use ctx::{Ctx, Globals};
-use library_ipc_client::ContentHash;
 
 #[derive(Parser, Debug)]
 #[command(name = "mdma")]
@@ -231,6 +230,32 @@ fn globals_from(cli: &Cli, matches: &clap::ArgMatches) -> Globals {
     }
 }
 
+/// The direction of `mdma sort`: exactly one of `-a` / `-d`.
+fn sort_direction(
+    args: &tracks::SortArgs,
+) -> std::result::Result<tracks::SortDirection, clap::Error> {
+    tracks::SortDirection::from_flags(args.ascending, args.descending).ok_or_else(|| {
+        args::usage_error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "Specify exactly one of -a (ascending) or -d (descending)",
+        )
+    })
+}
+
+/// The columns of `mdma view`, in the order their flags were typed; at least one.
+fn view_columns(
+    matches: &clap::ArgMatches,
+) -> std::result::Result<tracks::ViewColumns, clap::Error> {
+    let columns = tracks::view_columns_from_matches(matches);
+    if columns.is_empty() {
+        return Err(args::usage_error(
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "No fields selected. Use --hash, --artist, --title, and/or --duration.",
+        ));
+    }
+    Ok(tracks::ViewColumns(columns))
+}
+
 fn main() -> Result<()> {
     color_eyre::install()?;
 
@@ -246,18 +271,17 @@ fn main() -> Result<()> {
         Commands::Ping => tracks::ping(&ctx),
         Commands::Status => tracks::status(&ctx),
         Commands::List(tracks::ListCli { limit }) => tracks::list(tracks::LimitArg(limit), &ctx),
-        Commands::Get(tracks::GetCli { hash }) => {
-            tracks::get(args::TrackArg(ContentHash::new(hash)), &ctx)
-        }
-        Commands::Facts(tracks::FactsCli { hash }) => {
-            tracks::facts(args::TrackArg(ContentHash::new(hash)), &ctx)
-        }
+        Commands::Get(tracks::GetCli { hash }) => tracks::get(hash, &ctx),
+        Commands::Facts(tracks::FactsCli { hash }) => tracks::facts(hash, &ctx),
         Commands::Search(cli) => search::dispatch(cli, &ctx),
         Commands::Inbox { command } => inbox::dispatch(command, &ctx),
         Commands::Source { command } => source::dispatch(command, &ctx),
         Commands::Playback { command } => playback::dispatch(command, &ctx),
         Commands::Queue { command } => queue::dispatch(command, &ctx),
-        Commands::Sort(args) => tracks::sort(args, &ctx),
+        Commands::Sort(args) => {
+            let direction = sort_direction(&args).unwrap_or_else(|e| e.exit());
+            tracks::sort(args.field, direction, &ctx)
+        }
         Commands::Subscribe(subscribe::SubscribeCli { topic }) => {
             subscribe::subscribe(subscribe::TopicArg(topic), &ctx)
         }
@@ -266,13 +290,9 @@ fn main() -> Result<()> {
         Commands::Rekordbox { command } => rekordbox::dispatch(command, &ctx),
         Commands::Playlist { command } => playlist::dispatch(command, &ctx),
         Commands::Library { command } => library::dispatch(command, &ctx),
-        Commands::Bookmark(tracks::BookmarkCli { scope, hash }) => tracks::bookmark(
-            tracks::BookmarkArgs {
-                scope,
-                hash: args::OptTrackArg(hash.map(ContentHash::new)),
-            },
-            &ctx,
-        ),
+        Commands::Bookmark(tracks::BookmarkCli { scope, hash }) => {
+            tracks::bookmark(scope, hash, &ctx)
+        }
         Commands::Bookmarks => tracks::bookmarks(&ctx),
         Commands::Fact { command } => fact::dispatch(command, &ctx),
         Commands::View(_) => {
@@ -282,8 +302,8 @@ fn main() -> Result<()> {
                 eprintln!("internal error: expected 'view' subcommand matches");
                 std::process::exit(1);
             });
-            let columns = tracks::view_columns_from_matches(view_matches);
-            tracks::view(tracks::ViewColumns(columns), &ctx)
+            let columns = view_columns(view_matches).unwrap_or_else(|e| e.exit());
+            tracks::view(columns, &ctx)
         }
         Commands::GenerateCompletions(completions::CompletionsCli { shell }) => {
             completions::generate(completions::ShellArg(shell))
@@ -331,6 +351,82 @@ mod tests {
         std::env::set_var("MDMA_PLAYBACK_SOCKET", "ipc:///tmp/pb.sock");
         assert!(given(&["ping"]));
         std::env::remove_var("MDMA_PLAYBACK_SOCKET");
+    }
+
+    fn parse_err(args: &[&str]) -> clap::Error {
+        let mut argv = vec!["mdma"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).expect_err("should be rejected")
+    }
+
+    #[test]
+    fn hash_arguments_are_validated_at_parse_time() {
+        for cmd in ["get", "facts", "bookmark"] {
+            for bad in ["abcd123", "ABCD1234", "sha256:abc", "xyz"] {
+                let e = parse_err(&[cmd, bad]);
+                assert_eq!(
+                    e.kind(),
+                    clap::error::ErrorKind::ValueValidation,
+                    "{cmd} {bad}"
+                );
+                assert_eq!(e.exit_code(), 2, "{cmd} {bad}");
+            }
+            for good in ["abcd1234", "sha256:abcd1234", "0123456789abcdef"] {
+                assert!(
+                    Cli::try_parse_from(["mdma", cmd, good]).is_ok(),
+                    "{cmd} {good}"
+                );
+            }
+        }
+        assert!(Cli::try_parse_from(["mdma", "bookmark"]).is_ok());
+        assert!(Cli::try_parse_from(["mdma", "bookmark", "--scope", "x", "abcd1234"]).is_ok());
+    }
+
+    fn sort_args(args: &[&str]) -> tracks::SortArgs {
+        let mut argv = vec!["mdma", "sort"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv).expect("valid args").command {
+            Commands::Sort(a) => a,
+            other => panic!("expected sort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sort_needs_exactly_one_direction() {
+        assert_eq!(
+            sort_direction(&sort_args(&["title", "-a"])).unwrap(),
+            tracks::SortDirection::Ascending
+        );
+        assert_eq!(
+            sort_direction(&sort_args(&["title", "-d"])).unwrap(),
+            tracks::SortDirection::Descending
+        );
+        for flags in [&["title", "-a", "-d"][..], &["title"][..]] {
+            let e = sort_direction(&sort_args(flags)).unwrap_err();
+            assert_eq!(e.exit_code(), 2, "{flags:?}");
+            assert!(e
+                .to_string()
+                .contains("Specify exactly one of -a (ascending) or -d (descending)"));
+        }
+    }
+
+    #[test]
+    fn view_needs_at_least_one_column() {
+        let matches = Cli::command()
+            .try_get_matches_from(["mdma", "view"])
+            .unwrap();
+        let e = view_columns(matches.subcommand_matches("view").unwrap()).unwrap_err();
+        assert_eq!(e.exit_code(), 2);
+        assert!(e
+            .to_string()
+            .contains("No fields selected. Use --hash, --artist, --title, and/or --duration."));
+
+        let matches = Cli::command()
+            .try_get_matches_from(["mdma", "view", "--title", "--hash"])
+            .unwrap();
+        let tracks::ViewColumns(cols) =
+            view_columns(matches.subcommand_matches("view").unwrap()).unwrap();
+        assert_eq!(cols.len(), 2);
     }
 
     #[test]

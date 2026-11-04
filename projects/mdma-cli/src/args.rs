@@ -92,9 +92,11 @@ impl FromStr for ExistingFileArg {
 }
 
 /// Report a cross-argument usage error the way clap does (message, usage, exit 2).
-#[allow(dead_code)] // wired in P2.1.A
-pub(crate) fn usage_error(kind: clap::error::ErrorKind, msg: impl std::fmt::Display) -> ! {
-    crate::Cli::command().error(kind, msg).exit()
+pub(crate) fn usage_error(
+    kind: clap::error::ErrorKind,
+    msg: impl std::fmt::Display,
+) -> clap::Error {
+    crate::Cli::command().error(kind, msg)
 }
 
 pub(crate) fn parse_playlist_name(name: &str) -> library_ipc_client::PlaylistName {
