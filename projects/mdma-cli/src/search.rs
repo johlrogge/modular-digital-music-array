@@ -5,9 +5,10 @@ use color_eyre::Result;
 use library_ipc_client::TrackInfo;
 use library_search::{
     parse_date_query, parse_duration_query, parse_key_query, parse_numeric_query, parse_role_query,
-    parse_string_query, DurationQuery, KeyQuery, NumericQuery, ParseError, TrackQuery,
+    parse_string_query, DateQuery, DurationQuery, KeyQuery, NumericQuery, ParseError, TrackQuery,
 };
 use mdma_client::LibraryBackend;
+use music_facts::{EnergyLevel, TrackRole};
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
@@ -19,7 +20,7 @@ pub(crate) enum Command {
     ///   mdma search fact-values-for genre | dmenu | xargs -I{} mdma search --genre {}
     FactValuesFor {
         /// Fact type to inspect (e.g. MainGenre, Label, Key, Source, BPM, StyleDescriptor)
-        fact_type: String,
+        fact_type: FactTypeArg,
     },
 }
 
@@ -83,17 +84,17 @@ pub(crate) struct SearchArgs {
     #[arg(long)]
     no_stdin: bool,
 
-    /// Filter by last started date. Format: N/A, >2026-02, <2026, 2026-01..2026-06
-    #[arg(long, allow_hyphen_values = true)]
-    started: Option<String>,
+    /// Filter by last started date. Format: N/A, >2026-02, <2026, 2026-01..2026-06 (dash-leading values: --started=-7)
+    #[arg(long)]
+    started: Option<DateArg>,
 
-    /// Filter by last stopped date. Same format as --started.
-    #[arg(long, allow_hyphen_values = true)]
-    stopped: Option<String>,
+    /// Filter by last stopped date. Same format as --started (dash-leading values: --stopped=-7).
+    #[arg(long)]
+    stopped: Option<DateArg>,
 
-    /// Filter by date added to library. Uses date expression syntax: ~/+1/15 (15th next month), -7 (7 days ago), ^ (1st of month), $ (end of month). Ranges: -7..~ (last 7 days to today).
-    #[arg(long, allow_hyphen_values = true)]
-    added: Option<String>,
+    /// Filter by date added to library. Uses date expression syntax: ~/+1/15 (15th next month), --added=-7 (7 days ago), ^ (1st of month), $ (end of month). Ranges: --added=-7..~ (last 7 days to today).
+    #[arg(long)]
+    added: Option<DateArg>,
 
     /// Filter by playback history. `never` matches tracks with no started fact (never played).
     /// When combined with --started, --played=never takes precedence.
@@ -102,11 +103,11 @@ pub(crate) struct SearchArgs {
 
     /// Filter by DJ role. Accepted values: opener, build-up, peak, banger, cool-down, closer, filler
     #[arg(long)]
-    role: Option<String>,
+    role: Option<RoleArg>,
 
     /// Filter by energy level (1-10). Formats: 7  5..8  7+-2
     #[arg(long)]
-    energy: Option<String>,
+    energy: Option<EnergyArg>,
 
     /// Invert the search results — return tracks that do NOT match the filters.
     #[arg(long)]
@@ -120,6 +121,65 @@ pub(crate) struct SearchArgs {
 /// A fact type name (e.g. MainGenre, Label, Key).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FactTypeArg(pub library_ipc_client::FactType);
+
+impl std::str::FromStr for FactTypeArg {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(FactTypeArg(library_ipc_client::FactType::new(
+            s.to_string(),
+        )))
+    }
+}
+
+/// A date filter (e.g. `-7`, `>2026-02`, `2026-01..2026-06`, `N/A`).
+#[derive(Debug, Clone)]
+pub(crate) struct DateArg(pub DateQuery);
+
+impl std::str::FromStr for DateArg {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        parse_date_query(s).map(DateArg)
+    }
+}
+
+/// A DJ role filter (e.g. `peak`, `cool-down`).
+#[derive(Debug, Clone)]
+pub(crate) struct RoleArg(pub TrackRole);
+
+impl std::str::FromStr for RoleArg {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        parse_role_query(s).map(RoleArg)
+    }
+}
+
+/// An energy filter whose every bound is a valid `EnergyLevel` (e.g. `7`, `5..8`, `7+-2`).
+#[derive(Debug, Clone)]
+pub(crate) struct EnergyArg(pub NumericQuery);
+
+impl std::str::FromStr for EnergyArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let query = parse_numeric_query(s).map_err(|e| e.to_string())?;
+        let bounds = match &query {
+            NumericQuery::Exact(v) => vec![*v],
+            NumericQuery::Range(lo, hi) => vec![*lo, *hi],
+            NumericQuery::Tolerance { value, .. } => vec![*value],
+        };
+        for bound in bounds {
+            let whole = bound.fract() == 0.0 && (0.0..=255.0).contains(&bound);
+            let level = whole.then_some(bound as u8).ok_or_else(|| {
+                format!("invalid energy '{s}': {bound} is not a whole level 1..=10")
+            })?;
+            EnergyLevel::new(level).map_err(|e| format!("invalid energy '{s}': {e}"))?;
+        }
+        Ok(EnergyArg(query))
+    }
+}
 
 /// A BPM filter (e.g. `128`, `128+-4`, `124..132`).
 #[derive(Debug, Clone)]
@@ -175,10 +235,7 @@ pub(crate) fn dispatch(cli: SearchCli, ctx: &Ctx) -> Result<()> {
         subcommand,
     } = cli;
     match subcommand {
-        Some(Command::FactValuesFor { fact_type }) => fact_values_for(
-            FactTypeArg(library_ipc_client::FactType::new(fact_type)),
-            ctx,
-        ),
+        Some(Command::FactValuesFor { fact_type }) => fact_values_for(fact_type, ctx),
         None => query(args, ctx),
     }
 }
@@ -272,27 +329,12 @@ struct SearchFilters {
     duration: Option<DurationArg>,
     year: Option<YearArg>,
     source: Option<String>,
-    started: Option<String>,
-    stopped: Option<String>,
-    added: Option<String>,
+    started: Option<DateArg>,
+    stopped: Option<DateArg>,
+    added: Option<DateArg>,
     played: Option<PlayedFilter>,
-    role: Option<String>,
-    energy: Option<String>,
-}
-
-/// Parse the value given for `flag`, if any; an invalid one is reported
-/// (`Invalid <flag> value: <error>`) and exits 1.
-fn parse_or_exit<T, E: std::fmt::Display>(
-    value: Option<String>,
-    flag: &str,
-    parse: impl Fn(&str) -> std::result::Result<T, E>,
-) -> Option<T> {
-    value.map(|s| {
-        parse(&s).unwrap_or_else(|e| {
-            eprintln!("Invalid {} value: {}", flag, e);
-            std::process::exit(1);
-        })
-    })
+    role: Option<RoleArg>,
+    energy: Option<EnergyArg>,
 }
 
 /// Build a TrackQuery from the search filters.
@@ -312,23 +354,19 @@ fn build_track_query(filters: SearchFilters) -> TrackQuery {
         duration,
         year,
         source,
-        started: started_str,
-        stopped: stopped_str,
-        added: added_str,
+        started,
+        stopped,
+        added,
         played,
-        role: role_str,
-        energy: energy_str,
+        role,
+        energy,
     } = filters;
     let started = if matches!(played, Some(PlayedFilter::Never)) {
         // --played=never is a shortcut for started=N/A and overrides any --started value.
-        Some(library_search::DateQuery::NA)
+        Some(DateQuery::NA)
     } else {
-        parse_or_exit(started_str, "--started", parse_date_query)
+        started.map(|DateArg(q)| q)
     };
-    let stopped = parse_or_exit(stopped_str, "--stopped", parse_date_query);
-    let added = parse_or_exit(added_str, "--added", parse_date_query);
-    let role = parse_or_exit(role_str, "--role", parse_role_query);
-    let energy = parse_or_exit(energy_str, "--energy", parse_numeric_query);
     TrackQuery {
         any_text: any_text.map(|s| parse_string_query(&s)),
         artist: artist.map(|s| parse_string_query(&s)),
@@ -343,10 +381,10 @@ fn build_track_query(filters: SearchFilters) -> TrackQuery {
         year: year.map(|YearArg(q)| q),
         source,
         started,
-        stopped,
-        added,
-        role,
-        energy,
+        stopped: stopped.map(|DateArg(q)| q),
+        added: added.map(|DateArg(q)| q),
+        role: role.map(|RoleArg(r)| r),
+        energy: energy.map(|EnergyArg(q)| q),
         not: false,
     }
 }
@@ -483,24 +521,90 @@ mod tests {
     // ── Date arg hyphen-value parsing ────────────────────────────────────────
 
     #[test]
-    fn search_added_hyphen_value_parses() {
-        // `mdma search --added -7` must not be rejected by clap as an unknown flag.
-        let result = Cli::try_parse_from(["mdma", "search", "--added", "-7"]);
+    fn search_added_equals_hyphen_value_parses() {
+        let result = Cli::try_parse_from(["mdma", "search", "--added=-7"]);
         assert!(
             result.is_ok(),
-            "clap rejected --added -7: {}",
+            "clap rejected --added=-7: {}",
             result.unwrap_err()
         );
     }
 
     #[test]
-    fn search_started_hyphen_value_parses() {
-        let result = Cli::try_parse_from(["mdma", "search", "--started", "-7"]);
+    fn search_started_equals_hyphen_value_parses() {
+        let result = Cli::try_parse_from(["mdma", "search", "--started=-7"]);
         assert!(
             result.is_ok(),
-            "clap rejected --started -7: {}",
+            "clap rejected --started=-7: {}",
             result.unwrap_err()
         );
+    }
+
+    #[test]
+    fn search_added_separate_hyphen_value_is_usage_error() {
+        let err = Cli::try_parse_from(["mdma", "search", "--added", "-7"]).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn search_added_range_parses() {
+        let result = Cli::try_parse_from(["mdma", "search", "--added=-7..~"]);
+        assert!(result.is_ok(), "{}", result.unwrap_err());
+    }
+
+    #[test]
+    fn search_added_garbage_is_parse_error() {
+        let err = Cli::try_parse_from(["mdma", "search", "--added=garbage"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn search_started_and_stopped_garbage_are_parse_errors() {
+        for flag in ["--started=garbage", "--stopped=garbage"] {
+            let err = Cli::try_parse_from(["mdma", "search", flag]).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{flag}"
+            );
+        }
+    }
+
+    // ── role / energy parsing ────────────────────────────────────────────────
+
+    #[test]
+    fn search_role_parses_and_rejects() {
+        let args = parse_search(&["--role", "peak"]).unwrap();
+        assert!(args.role.is_some());
+        let err = parse_search(&["--role", "dancer"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(err.to_string().contains("invalid role 'dancer'"));
+    }
+
+    #[test]
+    fn search_energy_accepts_values_in_range() {
+        for v in ["1", "7", "10", "5..8", "1..10", "7+-2"] {
+            assert!(parse_search(&["--energy", v]).is_ok(), "rejected {v}");
+        }
+    }
+
+    #[test]
+    fn search_energy_rejects_out_of_range_and_garbage() {
+        for v in ["0", "11", "0..5", "5..11", "11+-1", "7.5", "loud"] {
+            let err = parse_search(&["--energy", v]).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "accepted {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn fact_type_arg_parses_any_name() {
+        let arg: FactTypeArg = "MainGenre".parse().unwrap();
+        assert_eq!(arg.0.as_str(), "MainGenre");
     }
 
     #[test]
@@ -691,7 +795,6 @@ mod tests {
 
     #[test]
     fn search_played_never_maps_to_started_na() {
-        use library_search::DateQuery;
         let result = Cli::try_parse_from(["mdma", "search", "--played", "never"]);
         assert!(
             result.is_ok(),
@@ -712,10 +815,9 @@ mod tests {
 
     #[test]
     fn search_played_never_overrides_started() {
-        use library_search::DateQuery;
         // When --played=never and --started are both given, --played=never wins.
         let query = build_track_query(SearchFilters {
-            started: Some("-7".to_string()),
+            started: Some("-7".parse().unwrap()),
             played: Some(PlayedFilter::Never),
             ..Default::default()
         });
