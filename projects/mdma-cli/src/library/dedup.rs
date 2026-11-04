@@ -3,42 +3,12 @@ use crate::ctx::Ctx;
 use crate::library::Yes;
 use crate::stdin::confirm;
 use bpaf::Bpaf;
-use clap::Subcommand;
 use color_eyre::Result;
 use hicli::Arg;
 use library_ipc_client::{
     ConfirmationReason, ContentHash, DedupApplyReport, DedupDisposition, DedupGroup, DedupMember,
 };
 use track_formatter::short_hash;
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum Command {
-    /// Merge tracks you have confirmed to be duplicates into a winner.
-    ///
-    /// The other tracks' audio files are moved to the archive. All tracks must be in
-    /// one duplicate group as listed by `mdma library dedup`.
-    Merge {
-        /// The track to keep (prefix accepted, git-style)
-        winner: TrackArg,
-        /// The duplicates to merge into it (prefixes accepted)
-        #[arg(required = true)]
-        losers: Vec<TrackArg>,
-        /// Do not ask for confirmation
-        #[arg(long, short = 'y')]
-        yes: bool,
-    },
-}
-
-/// What `mdma library dedup` takes: the listing's `--apply`, or a subcommand.
-#[derive(clap::Args, Debug)]
-pub(crate) struct DedupCli {
-    /// Merge the automatic groups (the others are only listed)
-    #[arg(long)]
-    apply: bool,
-
-    #[command(subcommand)]
-    command: Option<Command>,
-}
 
 /// Whether the listing also merges the automatic groups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,28 +33,6 @@ pub(crate) struct MergeArgs {
         some("at least one duplicate to merge is required")
     )]
     pub(crate) losers: Vec<TrackArg>,
-}
-
-impl MergeArgs {
-    fn new(yes: bool, winner: TrackArg, losers: Vec<TrackArg>) -> Self {
-        Self {
-            yes: Yes(yes),
-            winner,
-            losers,
-        }
-    }
-}
-
-pub(crate) fn dispatch(args: DedupCli, ctx: &Ctx) -> Result<()> {
-    let DedupCli { apply, command } = args;
-    match command {
-        None => scan(Apply(apply), ctx),
-        Some(Command::Merge {
-            winner,
-            losers,
-            yes,
-        }) => merge(MergeArgs::new(yes, winner, losers), ctx),
-    }
 }
 
 fn dedup_reason_text(reason: ConfirmationReason) -> &'static str {
@@ -286,9 +234,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::library;
     use crate::test_support::run_arg;
-    use crate::Commands;
 
     #[test]
     fn apply_arg_parser_is_a_switch() {
@@ -329,52 +275,36 @@ mod tests {
 
     // ── dedup ─────────────────────────────────────────────────────────────────
 
-    fn dedup_args(args: &[&str]) -> (bool, Option<MergeArgs>) {
+    /// The path `mdma library dedup <args>` reaches.
+    fn dedup_path(args: &[&str]) -> Vec<&'static str> {
         let mut argv = vec!["library", "dedup"];
         argv.extend_from_slice(args);
-        match parses(&argv) {
-            Commands::Library {
-                command: library::Command::Dedup(DedupCli { apply, command }),
-            } => (
-                apply,
-                command.map(
-                    |Command::Merge {
-                         winner,
-                         losers,
-                         yes,
-                     }| MergeArgs::new(yes, winner, losers),
-                ),
-            ),
-            other => panic!("unexpected command: {:?}", other),
-        }
+        parses(&argv)
     }
 
     #[test]
     fn dedup_lists_by_default_and_applies_with_the_flag() {
-        assert!(matches!(dedup_args(&[]), (false, None)));
-        assert!(matches!(dedup_args(&["--apply"]), (true, None)));
+        assert_eq!(dedup_path(&[]), ["library", "dedup"]);
+        assert_eq!(dedup_path(&["--apply"]), ["library", "dedup"]);
     }
 
     #[test]
     fn dedup_merge_takes_a_winner_losers_and_yes() {
         assert_eq!(
-            dedup_args(&["merge", "abc12345", "def45678", "0a1b2c3d"]),
-            (
-                false,
-                Some(MergeArgs {
-                    yes: Yes(false),
-                    winner: TrackArg(ContentHash::new("abc12345")),
-                    losers: vec![
-                        TrackArg(ContentHash::new("def45678")),
-                        TrackArg(ContentHash::new("0a1b2c3d"))
-                    ],
-                })
-            )
+            dedup_path(&["merge", "abc12345", "def45678", "0a1b2c3d"]),
+            ["library", "dedup", "merge"]
         );
         for flag in ["--yes", "-y"] {
-            let (apply, merge) = dedup_args(&["merge", flag, "aaaaaaaa", "bbbbbbbb"]);
-            assert!(!apply);
-            assert_eq!(merge.map(|m| m.yes), Some(Yes(true)));
+            assert_eq!(
+                dedup_path(&["merge", flag, "aaaaaaaa", "bbbbbbbb"]),
+                ["library", "dedup", "merge"]
+            );
+            assert_eq!(
+                run_arg::<MergeArgs>(&[flag, "aaaaaaaa", "bbbbbbbb"])
+                    .unwrap()
+                    .yes,
+                Yes(true)
+            );
         }
     }
 
@@ -391,6 +321,7 @@ mod tests {
     fn dedup_merge_hashes_must_be_valid_hashes() {
         let merge =
             |winner: &str, loser: &str| parse(&["library", "dedup", "merge", winner, loser]);
+        // (`parse` keeps only whether the command line is accepted.)
         for bad in ["abcd123", "ABCD1234"] {
             usage_error(&["library", "dedup", "merge", bad, "bbbbbbbb"]);
             usage_error(&["library", "dedup", "merge", "aaaaaaaa", bad]);

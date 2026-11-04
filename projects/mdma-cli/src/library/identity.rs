@@ -1,48 +1,14 @@
 use crate::ctx::Ctx;
-use bpaf::{Bpaf, Parser};
-use clap::Subcommand;
+use bpaf::Bpaf;
 use color_eyre::Result;
 use hicli::Arg;
 
-#[derive(Subcommand, Debug)]
-pub(crate) enum Command {
-    /// Compute identity hashes for tracks that don't have them yet.
-    ///
-    /// New tracks get an AudioHash when they are ingested; this covers the tracks
-    /// already in the library. It runs as a low-priority background job in the
-    /// library service and can be re-run: tracks that already have the hash are
-    /// skipped. By default the command follows the job until it finishes.
-    Backfill(BackfillArgs),
-
-    /// Show progress of the identity-hash backfill
-    Status,
-
-    /// Stop a running identity-hash backfill (progress is kept; run backfill again to resume)
-    Cancel,
-}
-
-#[derive(clap::Args, Debug, PartialEq, Bpaf)]
+#[derive(Debug, PartialEq, Bpaf, Arg)]
 pub(crate) struct BackfillArgs {
     /// Also compute PcmHash (decodes every lossless track; slow)
-    #[arg(long)]
     pcm: bool,
     /// Start the job and return immediately
-    #[arg(long)]
     no_wait: bool,
-}
-
-impl Arg for BackfillArgs {
-    fn parser() -> impl Parser<Self> {
-        backfill_args()
-    }
-}
-
-pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
-    match command {
-        Command::Backfill(args) => backfill(args, ctx),
-        Command::Status => status(ctx),
-        Command::Cancel => cancel(ctx),
-    }
 }
 
 const IDENTITY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -201,52 +167,36 @@ pub(crate) fn cancel(ctx: &Ctx) -> Result<()> {
 mod tests {
     use super::*;
 
-    use crate::test_support::parses;
+    use crate::test_support::{parses, run_arg};
 
     use pretty_assertions::assert_eq;
 
-    use crate::library;
-    use crate::Commands;
-
-    // ── identity clap parsing ─────────────────────────────────────────────────
+    // ── identity parsing ──────────────────────────────────────────────────────
 
     #[test]
     fn identity_backfill_parses_flags() {
         for (args, pcm, no_wait) in [
-            (vec!["library", "identity", "backfill"], false, false),
-            (
-                vec!["library", "identity", "backfill", "--pcm"],
-                true,
-                false,
-            ),
-            (
-                vec!["library", "identity", "backfill", "--pcm", "--no-wait"],
-                true,
-                true,
-            ),
+            (vec![], false, false),
+            (vec!["--pcm"], true, false),
+            (vec!["--pcm", "--no-wait"], true, true),
         ] {
-            match parses(&args) {
-                Commands::Library {
-                    command:
-                        library::Command::Identity {
-                            command: Command::Backfill(parsed),
-                        },
-                } => assert_eq!(parsed, BackfillArgs { pcm, no_wait }),
-                other => panic!("unexpected command: {:?}", other),
-            }
+            assert_eq!(
+                run_arg::<BackfillArgs>(&args),
+                Ok(BackfillArgs { pcm, no_wait }),
+                "{args:?}"
+            );
+            let mut argv = vec!["library", "identity", "backfill"];
+            argv.extend(&args);
+            assert_eq!(parses(&argv), ["library", "identity", "backfill"]);
         }
     }
 
     #[test]
     fn identity_status_parses() {
-        assert!(matches!(
+        assert_eq!(
             parses(&["library", "identity", "status"]),
-            Commands::Library {
-                command: library::Command::Identity {
-                    command: Command::Status
-                }
-            }
-        ));
+            ["library", "identity", "status"]
+        );
     }
 
     #[test]
@@ -262,14 +212,10 @@ mod tests {
 
     #[test]
     fn identity_cancel_parses() {
-        assert!(matches!(
+        assert_eq!(
             parses(&["library", "identity", "cancel"]),
-            Commands::Library {
-                command: library::Command::Identity {
-                    command: Command::Cancel
-                }
-            }
-        ));
+            ["library", "identity", "cancel"]
+        );
     }
 
     #[test]

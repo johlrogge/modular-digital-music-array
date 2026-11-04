@@ -7,13 +7,6 @@ use mdma_client::LibraryBackend;
 use nng::options::Options;
 use track_formatter::short_hash;
 
-#[derive(clap::Args, Debug)]
-pub(crate) struct SubscribeCli {
-    /// Topic filter (e.g. "playback/track_started"). Default: all playback events.
-    #[arg(long)]
-    pub(crate) topic: Option<String>,
-}
-
 /// Topic filter for events (all playback events when `None`).
 // Stays a String: a topic is a free-form subscription prefix with no domain rule.
 #[derive(Debug, Clone, PartialEq, Eq)]

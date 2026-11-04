@@ -1,29 +1,9 @@
 use crate::ctx::Ctx;
 use crate::library::Yes;
 use crate::stdin::confirm;
-use clap::Subcommand;
 use color_eyre::Result;
 use library_ipc_client::{ArchiveEmptyReport, ArchiveListing};
 use storage_primitives::ByteSize;
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum Command {
-    /// Permanently delete everything in the archive.
-    ///
-    /// Shows what the archive holds and asks for confirmation. This cannot be undone.
-    Empty {
-        /// Do not ask for confirmation
-        #[arg(long, short = 'y')]
-        yes: bool,
-    },
-}
-
-pub(crate) fn dispatch(command: Option<Command>, ctx: &Ctx) -> Result<()> {
-    match command {
-        None => list(ctx),
-        Some(Command::Empty { yes }) => empty(Yes(yes), ctx),
-    }
-}
 
 /// The archive as the user sees it: a summary line, then a line per file.
 fn format_archive_listing(l: &ArchiveListing) -> String {
@@ -151,37 +131,21 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::library;
-    use crate::Commands;
-
     // ── archive ───────────────────────────────────────────────────────────────
 
-    fn archive_command(args: &[&str]) -> Option<Command> {
+    /// The path `mdma library archive <args>` reaches.
+    fn archive_path(args: &[&str]) -> Vec<&'static str> {
         let mut argv = vec!["library", "archive"];
         argv.extend_from_slice(args);
-        match parses(&argv) {
-            Commands::Library {
-                command: library::Command::Archive { command },
-            } => command,
-            other => panic!("unexpected command: {:?}", other),
-        }
+        parses(&argv)
     }
 
     #[test]
     fn archive_lists_by_default_and_empties_with_a_subcommand() {
-        assert!(archive_command(&[]).is_none());
-        assert!(matches!(
-            archive_command(&["empty"]),
-            Some(Command::Empty { yes: false })
-        ));
-        assert!(matches!(
-            archive_command(&["empty", "--yes"]),
-            Some(Command::Empty { yes: true })
-        ));
-        assert!(matches!(
-            archive_command(&["empty", "-y"]),
-            Some(Command::Empty { yes: true })
-        ));
+        assert_eq!(archive_path(&[]), ["library", "archive"]);
+        for args in [&["empty"][..], &["empty", "--yes"], &["empty", "-y"]] {
+            assert_eq!(archive_path(args), ["library", "archive", "empty"]);
+        }
         usage_error(&["library", "archive", "empty", "x"]);
         usage_error(&["library", "archive", "--yes"]);
     }

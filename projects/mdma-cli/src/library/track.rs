@@ -1,60 +1,8 @@
 use crate::args::TrackArg;
 use crate::ctx::Ctx;
 use bpaf::Bpaf;
-use clap::Subcommand;
 use color_eyre::Result;
 use hicli::Arg;
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum Command {
-    /// Soft-delete a track (hidden from default views; file retained; recoverable).
-    ///
-    /// The track is hidden from list/search results. To undo, use `mdma library track restore <hash>`.
-    Delete {
-        /// Content hash of the track (prefix accepted, git-style).
-        hash: TrackArg,
-    },
-
-    /// Restore a soft-deleted track (retracts the Deleted fact).
-    Restore {
-        /// Content hash of the track (prefix accepted, git-style).
-        hash: TrackArg,
-    },
-
-    /// Hard-replace an old track with a new file.
-    ///
-    /// Ingests the new file (path must be on the device running the library service),
-    /// fully retracts all facts for the old track (the old hash stops resolving — gone
-    /// from search and list, not merely hidden), records a Replaces provenance link on
-    /// the new track, and rewrites every playlist that referenced the old track.
-    /// Playlists that still point at the old hash self-heal on read by following the
-    /// replacement chain (multi-step chains are followed automatically).
-    ///
-    /// Note: <new-file> must be a path accessible by the library service on the device.
-    /// Place the new file in the inbox directory or another device-local path first.
-    Replace {
-        /// Content hash of the old track (prefix accepted, git-style).
-        old_hash: TrackArg,
-        /// Path to the new audio file on the device running the library service.
-        // A path on the service's device, so not checked here and not an ExistingFileArg.
-        new_file: String,
-    },
-
-    /// List blobs on disk that no live track references (GC candidate list, read-only).
-    ///
-    /// Reports hard-replace leftovers (reason: "no live facts") and soft-deleted tracks
-    /// (reason: "deleted"). Use `mdma library track delete`/`restore` for soft-delete management.
-    Orphans,
-}
-
-pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
-    match command {
-        Command::Delete { hash } => delete(hash, ctx),
-        Command::Restore { hash } => restore(hash, ctx),
-        Command::Replace { old_hash, new_file } => replace(ReplaceArgs { old_hash, new_file }, ctx),
-        Command::Orphans => orphans(ctx),
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Bpaf, Arg)]
 pub(crate) struct ReplaceArgs {
@@ -184,10 +132,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use super::Command;
     use crate::args::TrackArg;
-    use crate::library;
-    use crate::Commands;
     use library_ipc_client::ContentHash;
 
     #[test]
@@ -206,58 +151,36 @@ mod tests {
         assert!(run_arg::<ReplaceArgs>(&["abc12345"]).is_err());
     }
 
-    // ── track lifecycle clap parsing ──────────────────────────────────────────
+    // ── track lifecycle parsing ───────────────────────────────────────────────
 
     #[test]
     fn track_delete_parses_correctly() {
-        match parses(&["library", "track", "delete", "abc12345"]) {
-            Commands::Library {
-                command:
-                    library::Command::Track {
-                        command: Command::Delete { hash },
-                    },
-            } => {
-                assert_eq!(hash, TrackArg(ContentHash::new("abc12345")));
-            }
-            other => panic!("unexpected command: {:?}", other),
-        }
+        assert_eq!(
+            parses(&["library", "track", "delete", "abc12345"]),
+            ["library", "track", "delete"]
+        );
     }
 
     #[test]
     fn track_restore_parses_correctly() {
-        match parses(&["library", "track", "restore", "abc12345"]) {
-            Commands::Library {
-                command:
-                    library::Command::Track {
-                        command: Command::Restore { hash },
-                    },
-            } => {
-                assert_eq!(hash, TrackArg(ContentHash::new("abc12345")));
-            }
-            other => panic!("unexpected command: {:?}", other),
-        }
+        assert_eq!(
+            parses(&["library", "track", "restore", "abc12345"]),
+            ["library", "track", "restore"]
+        );
     }
 
     #[test]
     fn track_replace_parses_correctly() {
-        match parses(&[
-            "library",
-            "track",
-            "replace",
-            "abc12345",
-            "/music/inbox/new.flac",
-        ]) {
-            Commands::Library {
-                command:
-                    library::Command::Track {
-                        command: Command::Replace { old_hash, new_file },
-                    },
-            } => {
-                assert_eq!(old_hash, TrackArg(ContentHash::new("abc12345")));
-                assert_eq!(new_file, "/music/inbox/new.flac");
-            }
-            other => panic!("unexpected command: {:?}", other),
-        }
+        assert_eq!(
+            parses(&[
+                "library",
+                "track",
+                "replace",
+                "abc12345",
+                "/music/inbox/new.flac",
+            ]),
+            ["library", "track", "replace"]
+        );
     }
 
     #[test]
@@ -277,14 +200,9 @@ mod tests {
 
     #[test]
     fn track_orphans_parses_correctly() {
-        match parses(&["library", "track", "orphans"]) {
-            Commands::Library {
-                command:
-                    library::Command::Track {
-                        command: Command::Orphans,
-                    },
-            } => {}
-            other => panic!("unexpected command: {:?}", other),
-        }
+        assert_eq!(
+            parses(&["library", "track", "orphans"]),
+            ["library", "track", "orphans"]
+        );
     }
 }

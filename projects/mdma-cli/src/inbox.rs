@@ -1,41 +1,10 @@
 use crate::args::impl_arg;
 use crate::ctx::Ctx;
 use crate::output::handle_error;
-use clap::Subcommand;
 use color_eyre::Result;
 use library_ipc_client::{InboxPath, InboxPathError};
 use std::str::FromStr;
 use track_formatter::short_hash;
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum Command {
-    /// List files in inbox
-    List,
-
-    /// Delete a file from inbox without ingesting
-    Delete {
-        /// File name in inbox
-        filename: InboxFileArg,
-    },
-
-    /// Ingest a specific file from inbox
-    Ingest {
-        /// File name in inbox
-        filename: InboxFileArg,
-    },
-
-    /// Ingest all files in inbox
-    IngestAll,
-}
-
-pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
-    match command {
-        Command::List => list(ctx),
-        Command::Delete { filename } => delete(filename, ctx),
-        Command::Ingest { filename } => ingest(filename, ctx),
-        Command::IngestAll => ingest_all(ctx),
-    }
-}
 
 /// File name in the inbox, validated by `InboxPath` at parse time.
 #[derive(Debug, Clone, PartialEq, Eq)]

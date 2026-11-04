@@ -8,40 +8,12 @@ use crate::ctx::Ctx;
 use crate::output::handle_source_error;
 use crate::source::import::{finish_import, follow_import_job, is_terminal_phase};
 use bpaf::Bpaf;
-use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use hicli::Arg;
 use mdma_client::SourceClient;
 use source_protocol::{SourceError, SourceRequest, SourceResponse};
 use std::convert::Infallible;
 use std::str::FromStr;
-
-/// Top level of `mdma source`: the global `list`, or `<source-name> <command>`.
-///
-/// `<source-name>` comes first, so it cannot be a positional of the group
-/// (it would collide with `list`). Anything that is not `list` is captured as
-/// an external subcommand and re-parsed as a [`SourceInvocation`], which keeps
-/// full clap help and validation for the per-source commands. `list` is
-/// therefore reserved and cannot be used as a source name.
-#[derive(Subcommand, Debug)]
-pub(crate) enum Command {
-    /// List available music sources
-    List,
-
-    /// `<SOURCE-NAME> <COMMAND>`: run a command on a source (see `mdma source <SOURCE-NAME> --help`)
-    #[command(external_subcommand)]
-    Named(Vec<String>),
-}
-
-pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
-    match command {
-        Command::List => list(ctx),
-        Command::Named(args) => match parse_source_args(&args) {
-            Ok((source, command)) => run_source_command(source, command, ctx),
-            Err(e) => exit_source_parse_error(e),
-        },
-    }
-}
 
 /// The music source a per-source command runs against.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,123 +87,21 @@ impl FromStr for SourcePlaylistArg {
     }
 }
 
-// Both clap and bpaf read the field docs; `playlist` takes its help from its
-// `Arg` impl for bpaf (the same text).
-#[derive(clap::Args, Debug, PartialEq, Bpaf)]
+// `playlist` takes its help from its `Arg` impl.
+#[derive(Debug, PartialEq, Bpaf, Arg)]
 pub(crate) struct ImportPlaylistArgs {
     /// MDMA playlist name (default: sanitised source title)
-    #[arg(long)]
     #[bpaf(argument("NAME"))]
     name: Option<SanitizedPlaylistName>,
 
     /// Show the report without syncing or writing the playlist
-    #[arg(long)]
     dry_run: bool,
 
     /// Print the job id and exit once the import has started
-    #[arg(long)]
     no_wait: bool,
 
-    /// Playlist slug or URL
     #[bpaf(external(SourcePlaylistArg::parser))]
     playlist: SourcePlaylistArg,
-}
-
-impl Arg for ImportPlaylistArgs {
-    fn parser() -> impl bpaf::Parser<Self> {
-        import_playlist_args()
-    }
-}
-
-/// The per-source commands: `mdma source <source-name> <command> [args]`.
-#[derive(Parser, Debug)]
-#[command(
-    arg_required_else_help = true,
-    subcommand_required = true,
-    about = "Commands for one music source"
-)]
-struct SourceInvocation {
-    #[command(subcommand)]
-    command: SourceCommand,
-}
-
-#[derive(Subcommand, Debug, PartialEq)]
-enum SourceCommand {
-    /// Sync the source (download new items)
-    Sync,
-
-    /// Show source status
-    Status,
-
-    /// List downloads for the source
-    Downloads,
-
-    /// Cancel a download
-    Cancel {
-        /// Download ID to cancel
-        id: DownloadArg,
-    },
-
-    /// Pause all downloads for the source
-    Pause,
-
-    /// Resume downloads for the source
-    Resume,
-
-    /// Force re-sync of a specific item (bypasses dedup)
-    Resync {
-        /// Source-specific item identifier (e.g. "p123456" for bandcamp)
-        identifier: ItemIdArg,
-    },
-
-    /// Check if a specific item has changed upstream
-    CheckItem {
-        /// Source-specific item identifier
-        identifier: ItemIdArg,
-    },
-
-    /// Check the whole source collection for stale items
-    CheckUpdates {
-        /// Auto-apply resync for any stale items found
-        #[arg(long)]
-        apply: bool,
-    },
-
-    /// List the source's playlists (for sources that support playlists)
-    Playlists,
-
-    /// Import a source playlist as an MDMA playlist (definitive matches only;
-    /// for sources that support playlists)
-    ImportPlaylist {
-        #[command(flatten)]
-        args: ImportPlaylistArgs,
-    },
-
-    /// Show the current or last playlist import job, following it while running
-    /// (for sources that support playlists)
-    ImportStatus,
-}
-
-/// Parse the arguments captured by [`Command::Named`]: `<name> <command> ...`.
-fn parse_source_args(args: &[String]) -> Result<(SourceArg, SourceCommand), clap::Error> {
-    let (name, rest) = args
-        .split_first()
-        .expect("external subcommand always has a name");
-    let argv = std::iter::once(format!("mdma source {name}")).chain(rest.iter().cloned());
-    let invocation = SourceInvocation::try_parse_from(argv)?;
-    let source = name.parse::<SourceArg>().unwrap_or_else(|e| match e {});
-    Ok((source, invocation.command))
-}
-
-/// Print a parse error (with a `mdma source list` hint) and exit.
-fn exit_source_parse_error(e: clap::Error) -> ! {
-    let failed = e.use_stderr();
-    let code = e.exit_code();
-    let _ = e.print();
-    if failed {
-        eprintln!("\nHint: 'mdma source list' shows the available sources");
-    }
-    std::process::exit(code);
 }
 
 /// Request timeout for `mdma source playlists`: listing may make several
@@ -806,31 +676,11 @@ pub(crate) fn import_status(source: SourceArg, ctx: &Ctx) -> Result<()> {
     }
 }
 
-/// Run one per-source command against the source `name`.
-fn run_source_command(source: SourceArg, command: SourceCommand, ctx: &Ctx) -> Result<()> {
-    match command {
-        SourceCommand::Sync => sync(source, ctx),
-        SourceCommand::Status => status(source, ctx),
-        SourceCommand::Downloads => downloads(source, ctx),
-        SourceCommand::Cancel { id } => cancel(source, id, ctx),
-        SourceCommand::Pause => pause(source, ctx),
-        SourceCommand::Resume => resume(source, ctx),
-        SourceCommand::Resync { identifier } => resync(source, identifier, ctx),
-        SourceCommand::CheckItem { identifier } => check_item(source, identifier, ctx),
-        SourceCommand::CheckUpdates { apply } => check_updates(source, ApplyUpdates(apply), ctx),
-        SourceCommand::Playlists => playlists(source, ctx),
-        SourceCommand::ImportPlaylist { args } => import_playlist(source, args, ctx),
-        SourceCommand::ImportStatus => import_status(source, ctx),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use color_eyre::Result;
-
-    use crate::test_support::{parse, parses, run_arg, usage_error};
+    use crate::test_support::{help, parses, run_arg, usage_error};
 
     #[test]
     fn source_positional_arg_parsers_read_one_word() {
@@ -869,8 +719,6 @@ mod tests {
     use playlist_import::sanitize_playlist_name;
     use pretty_assertions::assert_eq;
 
-    use crate::Commands;
-
     #[test]
     fn source_value_args_parse_any_text() {
         assert_eq!(
@@ -881,7 +729,10 @@ mod tests {
             "d1".parse::<DownloadArg>().unwrap(),
             DownloadArg(source_protocol::DownloadId::new("d1"))
         );
-        assert_eq!("p123".parse::<ItemIdArg>().unwrap(), item("p123"));
+        assert_eq!(
+            "p123".parse::<ItemIdArg>().unwrap(),
+            ItemIdArg("p123".to_string())
+        );
     }
 
     #[test]
@@ -892,24 +743,20 @@ mod tests {
         );
     }
 
-    /// Parse a hinted command line with the real parser, as a user pasting it would.
-    fn parse_hinted(command: &str) -> (SourceArg, SourceCommand) {
+    /// The path a hinted command line reaches, as a user pasting it would.
+    fn hinted_path(command: &str) -> Vec<&'static str> {
         let words: Vec<&str> = command.split_whitespace().collect();
         assert_eq!(&words[..2], ["mdma", "source"], "{command}");
-        match parses(&words[1..]) {
-            Commands::Source {
-                command: Command::Named(args),
-            } => parse_source_args(&args).unwrap_or_else(|e| panic!("{command}: {e}")),
-            other => panic!("{command}: unexpected {other:?}"),
-        }
+        parses(&words[1..])
     }
 
     #[test]
     fn import_status_hint_parses_to_import_status_for_that_source() {
         for src in ["bandcamp", "beatport"] {
-            let (name, command) = parse_hinted(&import_status_command(src));
-            assert_eq!(name.as_str(), src);
-            assert_eq!(command, SourceCommand::ImportStatus);
+            assert_eq!(
+                hinted_path(&import_status_command(src)),
+                ["source", "import-status"]
+            );
             // The refusal message embeds the same hint.
             assert!(import_not_started_message(src, 1).contains(&import_status_command(src)));
         }
@@ -917,56 +764,28 @@ mod tests {
 
     #[test]
     fn resync_hint_parses_to_resync_for_that_source() {
-        let (name, command) = parse_hinted(&resync_command("bandcamp", "p123"));
-        assert_eq!(name.as_str(), "bandcamp");
         assert_eq!(
-            command,
-            SourceCommand::Resync {
-                identifier: item("p123")
-            }
+            hinted_path(&resync_command("bandcamp", "p123")),
+            ["source", "resync"]
         );
-    }
-
-    fn item(s: &str) -> ItemIdArg {
-        ItemIdArg(s.to_string())
-    }
-
-    fn parse_source(args: &[&str]) -> Result<(SourceArg, SourceCommand), clap::Error> {
-        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        parse_source_args(&args)
     }
 
     #[test]
     fn every_per_source_command_parses_with_the_name_first() {
-        let cases: Vec<(Vec<&str>, SourceCommand)> = vec![
-            (vec!["bandcamp", "sync"], SourceCommand::Sync),
-            (vec!["bandcamp", "status"], SourceCommand::Status),
-            (vec!["bandcamp", "downloads"], SourceCommand::Downloads),
-            (
-                vec!["bandcamp", "cancel", "d1"],
-                SourceCommand::Cancel {
-                    id: DownloadArg(source_protocol::DownloadId::new("d1")),
-                },
-            ),
-            (vec!["bandcamp", "pause"], SourceCommand::Pause),
-            (vec!["bandcamp", "resume"], SourceCommand::Resume),
-            (
-                vec!["bandcamp", "resync", "p1"],
-                SourceCommand::Resync {
-                    identifier: item("p1"),
-                },
-            ),
-            (
-                vec!["bandcamp", "check-item", "p1"],
-                SourceCommand::CheckItem {
-                    identifier: item("p1"),
-                },
-            ),
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            (vec!["bandcamp", "sync"], "sync"),
+            (vec!["bandcamp", "status"], "status"),
+            (vec!["bandcamp", "downloads"], "downloads"),
+            (vec!["bandcamp", "cancel", "d1"], "cancel"),
+            (vec!["bandcamp", "pause"], "pause"),
+            (vec!["bandcamp", "resume"], "resume"),
+            (vec!["bandcamp", "resync", "p1"], "resync"),
+            (vec!["bandcamp", "check-item", "p1"], "check-item"),
             (
                 vec!["bandcamp", "check-updates", "--apply"],
-                SourceCommand::CheckUpdates { apply: true },
+                "check-updates",
             ),
-            (vec!["bandcamp", "playlists"], SourceCommand::Playlists),
+            (vec!["bandcamp", "playlists"], "playlists"),
             (
                 vec![
                     "bandcamp",
@@ -977,101 +796,85 @@ mod tests {
                     "--dry-run",
                     "--no-wait",
                 ],
-                SourceCommand::ImportPlaylist {
-                    args: ImportPlaylistArgs {
-                        playlist: SourcePlaylistArg("my-list".into()),
-                        name: Some("x".parse().unwrap()),
-                        dry_run: true,
-                        no_wait: true,
-                    },
-                },
+                "import-playlist",
             ),
-            (
-                vec!["bandcamp", "import-status"],
-                SourceCommand::ImportStatus,
-            ),
+            (vec!["bandcamp", "import-status"], "import-status"),
         ];
-        for (args, expected) in cases {
-            let (name, command) = parse_source(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
-            assert_eq!(name.as_str(), "bandcamp");
-            assert_eq!(command, expected, "{args:?}");
+        for (args, command) in cases {
+            let mut argv = vec!["source"];
+            argv.extend(&args);
+            assert_eq!(
+                parses(&argv),
+                ["source", command],
+                "{args:?} (curried: the path leaves the source name out)"
+            );
         }
     }
 
     #[test]
-    fn import_playlist_defaults_have_no_flags_set() {
-        let (_, command) = parse_source(&["bandcamp", "import-playlist", "p"]).unwrap();
+    fn import_playlist_args_are_read_in_any_order() {
         assert_eq!(
-            command,
-            SourceCommand::ImportPlaylist {
-                args: ImportPlaylistArgs {
-                    playlist: SourcePlaylistArg("p".into()),
-                    name: None,
-                    dry_run: false,
-                    no_wait: false,
-                },
-            }
+            run_arg::<ImportPlaylistArgs>(&["my-list", "--name", "x", "--dry-run", "--no-wait"]),
+            Ok(ImportPlaylistArgs {
+                playlist: SourcePlaylistArg("my-list".into()),
+                name: Some("x".parse().unwrap()),
+                dry_run: true,
+                no_wait: true,
+            })
+        );
+    }
+
+    #[test]
+    fn import_playlist_defaults_have_no_flags_set() {
+        assert_eq!(
+            run_arg::<ImportPlaylistArgs>(&["p"]),
+            Ok(ImportPlaylistArgs {
+                playlist: SourcePlaylistArg("p".into()),
+                name: None,
+                dry_run: false,
+                no_wait: false,
+            })
         );
     }
 
     #[test]
     fn import_playlist_name_is_sanitized_at_parse_time() {
-        let (_, command) =
-            parse_source(&["bandcamp", "import-playlist", "p", "--name", "a/b"]).unwrap();
-        match command {
-            SourceCommand::ImportPlaylist { args } => {
-                let name = args.name.expect("name given");
-                assert!(name.change_note().is_some());
-                assert_eq!(name.name().as_str(), sanitize_playlist_name("a/b"));
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+        let args = run_arg::<ImportPlaylistArgs>(&["p", "--name", "a/b"]).unwrap();
+        let name = args.name.expect("name given");
+        assert!(name.change_note().is_some());
+        assert_eq!(name.name().as_str(), sanitize_playlist_name("a/b"));
     }
 
     #[test]
     fn import_playlist_name_that_sanitizes_to_empty_is_a_usage_error() {
-        let e = parse_source(&["bandcamp", "import-playlist", "p", "--name", ""]).unwrap_err();
-        assert_eq!(e.kind(), clap::error::ErrorKind::ValueValidation);
-        assert_eq!(e.exit_code(), 2);
-        assert!(e.to_string().contains("name sanitizes to empty"), "{e}");
+        let e = usage_error(&["source", "bandcamp", "import-playlist", "p", "--name", ""]);
+        assert!(e.contains("name sanitizes to empty"), "{e}");
     }
 
     #[test]
     fn source_list_parses_as_the_global_command() {
-        assert!(matches!(
-            parses(&["source", "list"]),
-            Commands::Source {
-                command: Command::List
-            }
-        ));
+        assert_eq!(parses(&["source", "list"]), ["source", "list"]);
     }
 
     #[test]
-    fn source_name_then_command_reaches_named() {
-        match parses(&["source", "bandcamp", "sync"]) {
-            Commands::Source {
-                command: Command::Named(args),
-            } => assert_eq!(args, vec!["bandcamp", "sync"]),
-            other => panic!("unexpected: {other:?}"),
-        }
+    fn source_name_then_command_reaches_the_command() {
+        assert_eq!(parses(&["source", "bandcamp", "sync"]), ["source", "sync"]);
     }
 
     #[test]
     fn unknown_per_source_command_fails() {
-        let e = parse_source(&["bandcamp", "frobnicate"]).unwrap_err();
-        assert!(e.use_stderr());
+        usage_error(&["source", "bandcamp", "frobnicate"]);
     }
 
     #[test]
     fn source_name_without_command_fails() {
-        let e = parse_source(&["bandcamp"]).unwrap_err();
-        assert!(e.use_stderr() || e.kind() != clap::error::ErrorKind::DisplayHelp);
+        usage_error(&["source", "bandcamp"]);
     }
 
     #[test]
     fn old_name_last_order_is_rejected() {
         // `mdma source sync bandcamp` reads `sync` as the source name.
-        assert!(parse_source(&["sync", "bandcamp"]).is_err());
+        usage_error(&["source", "sync", "bandcamp"]);
     }
 
     #[test]
@@ -1081,18 +884,15 @@ mod tests {
 
     #[test]
     fn source_help_lists_list_and_explains_the_name_first_form() {
-        let e = parse(&["source", "--help"]).unwrap_err();
-        assert_eq!(e.kind(), clap::error::ErrorKind::DisplayHelp);
-        let help = e.to_string();
+        let help = help(&["source", "--help"]);
         assert!(help.contains("list"), "{help}");
-        assert!(help.contains("<SOURCE-NAME> <COMMAND>"), "{help}");
+        assert!(help.contains("SOURCE-NAME"), "{help}");
     }
 
     #[test]
     fn per_source_help_lists_the_commands() {
-        let e = parse_source(&["bandcamp", "--help"]).unwrap_err();
-        assert_eq!(e.kind(), clap::error::ErrorKind::DisplayHelp);
-        let help = e.to_string();
+        // `source bandcamp --help` shows the group page (accepted).
+        let help = help(&["source", "bandcamp", "--help"]);
         for cmd in [
             "sync",
             "status",

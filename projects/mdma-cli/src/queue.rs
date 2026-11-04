@@ -1,68 +1,12 @@
-use crate::args::{OptTrackArg, TrackArg};
+use crate::args::OptTrackArg;
 use crate::ctx::Ctx;
 use crate::output::{format_track_line, handle_playback_error, render_track_table};
 use crate::stdin::{hashes_arg_or_stdin, hashes_in, require_stdin_hashes};
-use clap::Subcommand;
 use color_eyre::Result;
 use colored::Colorize;
 use library_ipc_client::{ContentHash, TrackInfo};
 use mdma_client::SourceName;
 use track_formatter::short_hash;
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum Command {
-    /// Prepend a track to the front of the queue (plays next).
-    /// Hash may be omitted; if so, reads "{hash}  {display}" from stdin (dmenu output).
-    Next {
-        /// Content hash (full or partial). Omit to read from stdin.
-        hash: Option<TrackArg>,
-    },
-
-    /// Append a track to the end of the queue.
-    /// Hash may be omitted; if so, reads "{hash}  {display}" from stdin (dmenu output).
-    Append {
-        /// Content hash (full or partial). Omit to read from stdin.
-        hash: Option<TrackArg>,
-    },
-
-    /// Show the current queue
-    List,
-
-    /// Clear the queue
-    Clear,
-
-    /// Remove track(s) from the queue by hash.
-    /// Hash may be omitted; if so, reads one hash per line from stdin.
-    Remove {
-        /// Content hash (full or partial). Omit to read from stdin.
-        hash: Option<TrackArg>,
-    },
-
-    /// Atomically replace the entire queue from stdin.
-    /// Reads playlist-format lines (8–12 char hex hash as first token).
-    ///
-    /// Examples:
-    ///   mdma search --genre=Techno | shuf | mdma queue replace
-    ///   cat friday.plist | mdma queue replace
-    ///   mdma queue list | mdma sort bpm -a | mdma queue replace
-    Replace,
-
-    /// Edit the queue in $EDITOR (falls back to vi).
-    /// Opens the current queue as a playlist file; save to apply changes.
-    Edit,
-}
-
-pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
-    match command {
-        Command::Next { hash } => next(OptTrackArg(hash), ctx),
-        Command::Append { hash } => append(OptTrackArg(hash), ctx),
-        Command::List => list(ctx),
-        Command::Clear => clear(ctx),
-        Command::Remove { hash } => remove(OptTrackArg(hash), ctx),
-        Command::Replace => replace(ctx),
-        Command::Edit => edit(ctx),
-    }
-}
 
 /// Prepend a track to the front of the queue (plays next)
 ///
@@ -284,14 +228,12 @@ pub(crate) fn edit(ctx: &Ctx) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::test_support::{parse, usage_error};
-    use clap::error::ErrorKind;
 
     #[test]
     fn queue_hash_arguments_are_validated_at_parse_time() {
         for sub in ["next", "append", "remove"] {
             let err = usage_error(&["queue", sub, "nothex"]);
-            assert_eq!(err.kind(), ErrorKind::ValueValidation, "{sub}");
-            assert!(err.to_string().contains("not a content hash"), "{sub}");
+            assert!(err.contains("not a content hash"), "{sub}");
             usage_error(&["queue", sub, "ABCD1234"]);
             assert!(parse(&["queue", sub, "abcd1234"]).is_ok());
             assert!(parse(&["queue", sub, "sha256:abcd1234"]).is_ok());

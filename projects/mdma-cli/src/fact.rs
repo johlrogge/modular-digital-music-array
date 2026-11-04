@@ -1,48 +1,14 @@
-use crate::args::{choice, choice_names, parse_choice, usage_error, Choice, TrackArg};
+use crate::args::{choice, choice_names, parse_choice, Choice, TrackArg};
 use crate::ctx::Ctx;
 use crate::output::handle_error;
 use bpaf::{construct, long, Parser};
 use chrono::NaiveDate;
-use clap::Subcommand;
 use color_eyre::Result;
 use hicli::Arg;
 use music_facts::{
     Album, Artist, Bpm, DiscNumber, EnergyLevel, Isrc, Key, MusicValue, Title, TrackNumber,
     TrackRole, Year,
 };
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum Command {
-    /// Add or update a fact on a track.
-    ///
-    /// Stainless-facts replace semantics: the most recent fact for a given field wins
-    /// for non-collection types. Note this does NOT auto-retract the previous value;
-    /// retract explicitly first if you want to clean history.
-    Add {
-        /// Track content hash (prefix accepted, git-style).
-        hash: TrackArg,
-        /// Field name to add. Tab-completion shows supported fields.
-        #[arg(long, value_enum)]
-        field: FactField,
-        /// Value for the field.
-        #[arg(long)]
-        value: String,
-    },
-    /// Retract an existing fact from a track.
-    ///
-    /// Required for collection-type fields (each value is independent).
-    /// For scalar fields, retract removes that value from history.
-    Retract {
-        /// Track content hash (prefix accepted, git-style).
-        hash: TrackArg,
-        /// Field name to retract.
-        #[arg(long, value_enum)]
-        field: FactField,
-        /// Value to retract (must match the existing fact's value).
-        #[arg(long)]
-        value: String,
-    },
-}
 
 /// The value of a fact as typed, with the domain value it parses to for its field.
 #[derive(Debug, Clone, PartialEq)]
@@ -65,19 +31,6 @@ pub(crate) struct FactArgs {
     field: FactField,
     value: FactValueArg,
     hash: TrackArg,
-}
-
-impl FactArgs {
-    /// Checks the value against the field; a bad value is a usage error (exit 2).
-    fn new(
-        field: FactField,
-        value: String,
-        hash: TrackArg,
-    ) -> std::result::Result<Self, clap::Error> {
-        let value = FactValueArg::new(field, value)
-            .map_err(|msg| usage_error(clap::error::ErrorKind::ValueValidation, msg))?;
-        Ok(Self { field, value, hash })
-    }
 }
 
 impl Arg for FactArgs {
@@ -105,24 +58,11 @@ impl Arg for FactArgs {
     }
 }
 
-pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
-    match command {
-        Command::Add { hash, field, value } => add(
-            FactArgs::new(field, value, hash).unwrap_or_else(|e| e.exit()),
-            ctx,
-        ),
-        Command::Retract { hash, field, value } => retract(
-            FactArgs::new(field, value, hash).unwrap_or_else(|e| e.exit()),
-            ctx,
-        ),
-    }
-}
-
 /// Metadata fields that can be added or retracted by the user.
 ///
 /// Internal/derived fields (FilePath, Source, ItemId, audio properties, play events,
 /// AddedAt, cover art) are intentionally excluded — they are managed automatically.
-#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FactField {
     Title,
     Artist,
@@ -374,18 +314,11 @@ mod tests {
     }
 
     #[test]
-    fn fact_value_is_checked_against_the_field() {
-        let hash = "abcd1234".parse::<TrackArg>().unwrap();
-        let err = FactArgs::new(FactField::Year, "twenty".into(), hash.clone()).unwrap_err();
-        assert_eq!(err.exit_code(), 2);
-        assert!(
-            err.to_string()
-                .contains("invalid integer for Year 'twenty'"),
-            "{err}"
-        );
-        let ok = FactArgs::new(FactField::Year, "2024".into(), hash).unwrap();
-        assert_eq!(ok.value.raw, "2024");
-        assert!(matches!(ok.value.value, MusicValue::Year(_)));
+    fn fact_value_is_checked_against_the_field_at_parse_time() {
+        for verb in ["add", "retract"] {
+            let e = usage_error(&fact_argv(verb, "abcd1234", "twenty", "year"));
+            assert!(e.contains("invalid integer for Year 'twenty'"), "{e}");
+        }
     }
 
     #[test]

@@ -2,95 +2,11 @@ use crate::args::{impl_arg, OptPlaylistArg, PlaylistArg};
 use crate::ctx::Ctx;
 use crate::stdin::{hashes_in, read_hashes, read_stdin_to_string};
 use bpaf::{construct, long, Bpaf, Parser};
-use clap::Subcommand;
 use color_eyre::Result;
 use colored::Colorize;
 use hicli::Arg;
 use library_ipc_client::{ClientError, ContentHash, LibraryResponse, PlaylistName};
 use std::num::NonZeroUsize;
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum Command {
-    /// List all playlists
-    List,
-
-    /// Get playlist content (pipe to mdma queue replace to load).
-    /// If name is omitted, reads playlist names from stdin (first whitespace-delimited
-    /// token per line — handles both bare names and enriched `playlist list` output).
-    Get {
-        /// Playlist name. Omit to read names from stdin.
-        name: Option<PlaylistArg>,
-    },
-
-    /// Print the name of every playlist that contains any of the tracks piped in on stdin.
-    /// Reads track lines from stdin (8–12 char hex hash as first token).
-    /// Output: one playlist name per match; pipe to `sort -u` to deduplicate.
-    Contains {
-        /// Print playlist only if it contains ALL input tracks
-        #[arg(long, conflicts_with_all = ["at_least", "no"])]
-        all: bool,
-        /// Print playlist only if it contains at least N input tracks
-        #[arg(long, conflicts_with_all = ["all", "no"])]
-        at_least: Option<AtLeastArg>,
-        /// Print playlist only if it contains NONE of the input tracks
-        #[arg(long, conflicts_with_all = ["all", "at_least"])]
-        no: bool,
-    },
-
-    /// Create a new playlist from stdin (fails if it already exists)
-    New {
-        /// Playlist name
-        name: PlaylistArg,
-    },
-
-    /// Append stdin to an existing playlist
-    Append {
-        /// Playlist name
-        name: PlaylistArg,
-    },
-
-    /// Replace playlist content from stdin
-    Replace {
-        /// Playlist name
-        name: PlaylistArg,
-    },
-
-    /// Edit playlist in $EDITOR
-    Edit {
-        /// Playlist name
-        name: PlaylistArg,
-    },
-
-    /// Remove a playlist
-    Remove {
-        /// Playlist name
-        name: PlaylistArg,
-    },
-
-    /// Rename a playlist
-    Rename {
-        /// Current playlist name
-        from: PlaylistArg,
-        /// New playlist name
-        to: PlaylistArg,
-    },
-}
-
-pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
-    match command {
-        Command::List => list(ctx),
-        Command::Get { name } => get(OptPlaylistArg(name), ctx),
-        Command::Contains { all, at_least, no } => {
-            contains(ContainsMode::from_flags(all, at_least, no), ctx)
-        }
-        Command::New { name } => new(name, ctx),
-        Command::Append { name } => append(name, ctx),
-        Command::Replace { name } => replace(name, ctx),
-        Command::Edit { name } => edit(name, ctx),
-        Command::Remove { name } => remove(name, ctx),
-        Command::Rename { from, to } => rename(RenameArgs { from, to }, ctx),
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Bpaf, Arg)]
 pub(crate) struct RenameArgs {
@@ -149,20 +65,6 @@ pub(crate) enum ContainsMode {
 }
 
 impl ContainsMode {
-    /// Build the mode from the `contains` flags. Clap guarantees at most one
-    /// is set (they conflict) and that `--at-least` is non-zero.
-    fn from_flags(all: bool, at_least: Option<AtLeastArg>, no: bool) -> Self {
-        if no {
-            Self::None
-        } else if all {
-            Self::All
-        } else if let Some(AtLeastArg(n)) = at_least {
-            Self::AtLeast(n)
-        } else {
-            Self::Any
-        }
-    }
-
     /// Returns `(threshold, invert)` for matching against `input_len` tracks.
     fn threshold(self, input_len: usize) -> (usize, bool) {
         match self {
@@ -513,7 +415,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::test_support::{parses, run_arg, usage_error};
-    use crate::Commands;
 
     #[test]
     fn rename_args_parser_reads_from_and_to() {
@@ -566,26 +467,14 @@ mod tests {
             .collect()
     }
 
-    /// Parse `mdma playlist <args>`.
-    fn playlist(args: &[&str]) -> Command {
-        match parses(&argv(args)) {
-            Commands::Playlist { command } => command,
-            other => panic!("expected playlist command, got {other:?}"),
-        }
+    /// The path `mdma playlist <args>` reaches.
+    fn playlist(args: &[&str]) -> Vec<&'static str> {
+        parses(&argv(args))
     }
 
     /// `mdma playlist <args>` must be rejected as a usage error.
-    fn playlist_usage_error(args: &[&str]) -> clap::Error {
+    fn playlist_usage_error(args: &[&str]) -> String {
         usage_error(&argv(args))
-    }
-
-    fn mode(args: &[&str]) -> ContainsMode {
-        let mut full = vec!["contains"];
-        full.extend_from_slice(args);
-        match playlist(&full) {
-            Command::Contains { all, at_least, no } => ContainsMode::from_flags(all, at_least, no),
-            other => panic!("expected contains, got {other:?}"),
-        }
     }
 
     #[test]
@@ -600,22 +489,17 @@ mod tests {
 
     #[test]
     fn valid_playlist_names_are_accepted() {
-        assert!(matches!(
-            playlist(&["new", "my-list_1"]),
-            Command::New { name } if name.0.to_string() == "my-list_1"
-        ));
-        assert!(matches!(playlist(&["get"]), Command::Get { name: None }));
-        assert!(matches!(
-            playlist(&["get", "mix"]),
-            Command::Get { name: Some(_) }
-        ));
-        match playlist(&["rename", "a", "b"]) {
-            Command::Rename { from, to } => {
-                assert_eq!(from.0.to_string(), "a");
-                assert_eq!(to.0.to_string(), "b");
-            }
-            other => panic!("expected rename, got {other:?}"),
-        }
+        assert_eq!(playlist(&["new", "my-list_1"]), ["playlist", "new"]);
+        assert_eq!(playlist(&["get"]), ["playlist", "get"]);
+        assert_eq!(playlist(&["get", "mix"]), ["playlist", "get"]);
+        assert_eq!(playlist(&["rename", "a", "b"]), ["playlist", "rename"]);
+        assert_eq!(
+            run_arg::<PlaylistArg>(&["my-list_1"])
+                .unwrap()
+                .0
+                .to_string(),
+            "my-list_1"
+        );
     }
 
     #[test]
@@ -630,8 +514,7 @@ mod tests {
         for bad in ["0", "abc", "1.5", ""] {
             let err = playlist_usage_error(&["contains", "--at-least", bad]);
             assert!(
-                err.to_string()
-                    .contains("must be a whole number of at least 1"),
+                err.contains("must be a whole number of at least 1"),
                 "{bad}: {err}"
             );
         }
@@ -639,12 +522,11 @@ mod tests {
 
     #[test]
     fn contains_flags_build_the_right_mode() {
-        assert_eq!(mode(&[]), ContainsMode::Any);
-        assert_eq!(mode(&["--all"]), ContainsMode::All);
-        assert_eq!(mode(&["--no"]), ContainsMode::None);
+        assert_eq!(playlist(&["contains"]), ["playlist", "contains"]);
+        assert_eq!(run_arg::<ContainsMode>(&[]), Ok(ContainsMode::Any));
         assert_eq!(
-            mode(&["--at-least", "2"]),
-            ContainsMode::AtLeast(NonZeroUsize::new(2).unwrap())
+            run_arg::<ContainsMode>(&["--at-least", "2"]),
+            Ok(ContainsMode::AtLeast(NonZeroUsize::new(2).unwrap()))
         );
     }
 

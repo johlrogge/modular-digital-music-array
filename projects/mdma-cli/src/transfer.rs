@@ -9,18 +9,14 @@ use mdma_client::IngestSource;
 use std::path::Path;
 use track_formatter::short_hash;
 
-// Both clap and bpaf read the field docs; `ssh_key` and `file` take their help
-// from their `Arg` impls for bpaf (the same text).
-#[derive(clap::Args, Debug, Bpaf)]
+// `ssh_key` and `file` take their help from their `Arg` impls.
+#[derive(Debug, Bpaf, Arg)]
 pub(crate) struct UploadArgs {
-    /// SSH key for SCP transfer
-    #[arg(long, default_value = DEFAULT_SSH_KEY, env = "MDMA_SSH_KEY")]
     #[bpaf(external(SshKeyArg::parser))]
     ssh_key: SshKeyArg,
 
     // Stays a String: no domain rule, the Pi's account name.
     /// SSH user on the Pi
-    #[arg(long, default_value = "mdma", env = "MDMA_SSH_USER")]
     #[bpaf(
         long,
         env("MDMA_SSH_USER"),
@@ -32,7 +28,6 @@ pub(crate) struct UploadArgs {
 
     // Stays a String: no domain rule, a path on the remote Pi (not checked locally).
     /// Remote inbox directory
-    #[arg(long, default_value = "/music/inbox/", env = "MDMA_INBOX_DIR")]
     #[bpaf(
         long,
         env("MDMA_INBOX_DIR"),
@@ -42,16 +37,8 @@ pub(crate) struct UploadArgs {
     )]
     inbox_dir: String,
 
-    /// Path to file (audio file or ZIP archive)
-    #[arg(value_hint = clap::ValueHint::FilePath)]
     #[bpaf(external(UploadFileArg::parser))]
     file: UploadFileArg,
-}
-
-impl Arg for UploadArgs {
-    fn parser() -> impl Parser<Self> {
-        upload_args()
-    }
 }
 
 /// What an uploaded file holds, by its magic bytes.
@@ -93,51 +80,16 @@ impl Arg for UploadFileArg {
     }
 }
 
-#[derive(clap::Args, Debug)]
+// `formats` reads the three format options together (and rejects mixing
+// `--format` with the per-category options) and takes its help from its `Arg` impl.
+#[derive(Debug, PartialEq, Bpaf, Arg)]
 pub(crate) struct ExportArgs {
-    /// Output format for ALL tracks (original, aiff or wav). Default: original.
-    /// Conflicts with --lossless-format and --lossy-format.
-    #[arg(long, value_enum, conflicts_with_all = ["lossless_format", "lossy_format"])]
-    format: Option<ExportFormat>,
+    #[bpaf(external(ExportFormats::parser))]
+    formats: ExportFormats,
 
-    /// Target format for lossless sources (flac, wav, aiff).
-    /// Lossy sources pass through unchanged.
-    #[arg(long, value_enum)]
-    lossless_format: Option<ExportFormat>,
-
-    /// Target format for lossy sources (mp3, ogg, opus).
-    /// Lossless sources pass through unchanged.
-    #[arg(long, value_enum)]
-    lossy_format: Option<ExportFormat>,
-
-    /// Output directory (created if it doesn't exist)
-    #[arg(long, default_value = "./export/")]
+    /// Output directory (created if it doesn't exist). Default: ./export/
+    #[bpaf(argument("OUTPUT"), fallback(std::path::PathBuf::from("./export/")))]
     output: std::path::PathBuf,
-}
-
-// Not a bpaf derive: the clap fields hold the three format options apart, while
-// the parser reads them together as `ExportFormats` (which also rejects mixing
-// `--format` with the per-category options).
-impl Arg for ExportArgs {
-    fn parser() -> impl Parser<Self> {
-        let formats = <ExportFormats as Arg>::parser();
-        let output = long("output")
-            .help("Output directory (created if it doesn't exist). Default: ./export/")
-            .argument::<std::path::PathBuf>("OUTPUT")
-            .fallback(std::path::PathBuf::from("./export/"));
-        construct!(formats, output).map(|(formats, output)| {
-            let (format, lossless_format, lossy_format) = match formats {
-                ExportFormats::All(format) => (Some(format), None, None),
-                ExportFormats::PerCategory { lossless, lossy } => (None, lossless, lossy),
-            };
-            Self {
-                format,
-                lossless_format,
-                lossy_format,
-                output,
-            }
-        })
-    }
 }
 
 /// Which export format applies to which tracks.
@@ -776,20 +728,8 @@ fn resolve_export_format(blob_path: Option<&str>, formats: &ExportFormats) -> Ex
 ///   mdma search --artist CBL | mdma export --lossless-format aiff --lossy-format wav
 #[hicli::command]
 pub(crate) fn export(args: ExportArgs, ctx: &Ctx) -> Result<()> {
-    let ExportArgs {
-        format,
-        lossless_format,
-        lossy_format,
-        output,
-    } = args;
+    let ExportArgs { formats, output } = args;
     let library = ctx.library();
-    let formats = match format {
-        Some(fmt) => ExportFormats::All(fmt),
-        None => ExportFormats::PerCategory {
-            lossless: lossless_format,
-            lossy: lossy_format,
-        },
-    };
 
     let (node, node_ip) = ctx.require_node();
 
@@ -863,7 +803,7 @@ pub(crate) fn export(args: ExportArgs, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExportFormat {
     /// Transfer the file without conversion (default)
     Original,
@@ -917,8 +857,7 @@ impl std::str::FromStr for ExportFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{parses, run_arg, track, usage_error};
-    use crate::Commands;
+    use crate::test_support::{run_arg, track, usage_error};
 
     use pretty_assertions::assert_eq;
 
@@ -968,6 +907,27 @@ mod tests {
             .run_inner(&[] as &[&str])
             .ok();
         assert_eq!(parsed, Some(SshKeyArg(std::path::PathBuf::from(KEY))));
+    }
+
+    #[test]
+    fn export_args_read_formats_and_output() {
+        assert_eq!(
+            run_arg::<ExportArgs>(&["--format", "wav", "--output", "out"]).unwrap(),
+            ExportArgs {
+                formats: ExportFormats::All(ExportFormat::Wav),
+                output: std::path::PathBuf::from("out"),
+            }
+        );
+        assert_eq!(
+            run_arg::<ExportArgs>(&[]).unwrap(),
+            ExportArgs {
+                formats: ExportFormats::PerCategory {
+                    lossless: None,
+                    lossy: None
+                },
+                output: std::path::PathBuf::from("./export/"),
+            }
+        );
     }
 
     #[test]
@@ -1026,13 +986,12 @@ mod tests {
     const KEY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
 
     fn upload_file(file: &str) -> UploadFileArg {
-        match parses(&["upload", "--ssh-key", KEY, file]) {
-            Commands::Upload(args) => args.file,
-            other => panic!("not upload: {other:?}"),
-        }
+        run_arg::<UploadArgs>(&["--ssh-key", KEY, file])
+            .unwrap_or_else(|e| panic!("upload {file}: {e}"))
+            .file
     }
 
-    fn upload_usage_error(file: &str) -> clap::Error {
+    fn upload_usage_error(file: &str) -> String {
         usage_error(&["upload", "--ssh-key", KEY, file])
     }
 
@@ -1044,21 +1003,6 @@ mod tests {
         );
         assert!("/definitely/not/a/key".parse::<SshKeyArg>().is_err());
         assert!(env!("CARGO_MANIFEST_DIR").parse::<SshKeyArg>().is_err());
-    }
-
-    #[test]
-    fn a_missing_default_ssh_key_is_a_usage_error() {
-        // clap parses default values through the value parser, so a default
-        // that is not an existing file fails like a typed value would.
-        let cmd = clap::Command::new("t").arg(
-            clap::Arg::new("key")
-                .long("key")
-                .default_value("/definitely/not/a/default/key")
-                .value_parser(clap::value_parser!(SshKeyArg)),
-        );
-        let err = cmd.try_get_matches_from(["t"]).unwrap_err();
-        assert_eq!(err.exit_code(), 2);
-        assert!(err.to_string().contains("does not exist"), "{err}");
     }
 
     #[test]
@@ -1100,8 +1044,7 @@ mod tests {
     fn upload_rejects_a_missing_file() {
         let err = upload_usage_error("/definitely/not/here.flac");
         assert!(
-            err.to_string()
-                .contains("file '/definitely/not/here.flac' does not exist"),
+            err.contains("file '/definitely/not/here.flac' does not exist"),
             "message: {err}"
         );
     }
@@ -1110,7 +1053,7 @@ mod tests {
     fn upload_rejects_unsupported_file_types() {
         let file = file_with(b"just some text");
         let err = upload_usage_error(file.path().to_str().unwrap());
-        assert!(err.to_string().contains("Unsupported file type"), "{err}");
+        assert!(err.contains("Unsupported file type"), "{err}");
     }
 
     #[test]

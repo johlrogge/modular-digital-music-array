@@ -1,33 +1,7 @@
 use crate::args::impl_arg;
 use crate::ctx::Ctx;
-use clap::Subcommand;
 use color_eyre::Result;
 use gateway_client::{AdminRequest, AdminResponse, GatewayClient};
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum Command {
-    /// Service mode subcommands (EEPROM boot order)
-    ServiceMode {
-        #[command(subcommand)]
-        command: service_mode::Command,
-    },
-    /// Report whether the host can safely reboot into its installed kernel
-    BootHealth,
-    /// Reboot the host (refused if the boot partition looks unhealthy)
-    Reboot {
-        /// Reboot even if the boot-health check fails
-        #[arg(long)]
-        force: bool,
-    },
-}
-
-pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
-    match command {
-        Command::ServiceMode { command } => service_mode::dispatch(command, ctx),
-        Command::BootHealth => boot_health(ctx),
-        Command::Reboot { force } => reboot(Force(force), ctx),
-    }
-}
 
 /// Send an admin request and hand the response to `accept`. A response it
 /// declines, an error response, or a failed request is reported and exits 1.
@@ -64,24 +38,6 @@ fn admin_call_ok(admin: &GatewayClient, request: &AdminRequest) {
 #[hicli::group]
 mod service_mode {
     use super::*;
-
-    #[derive(Subcommand, Debug)]
-    pub(crate) enum Command {
-        /// Show current EEPROM boot order, armed state, and PCIE_PROBE
-        Status,
-        /// Arm service mode: next reboot will boot from SD (beacon)
-        Enable,
-        /// Disarm service mode: restore NVMe-first boot order
-        Disable,
-    }
-
-    pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
-        match command {
-            Command::Status => status(ctx),
-            Command::Enable => enable(ctx),
-            Command::Disable => disable(ctx),
-        }
-    }
 
     /// Show current EEPROM boot order, armed state, and PCIE_PROBE
     #[hicli::command]
@@ -190,10 +146,7 @@ mod tests {
 
     use crate::test_support::{parses, run_arg};
 
-    use super::service_mode;
-    use super::Command;
     use super::Force;
-    use crate::Commands;
 
     #[test]
     fn force_arg_parser_is_a_switch() {
@@ -202,64 +155,26 @@ mod tests {
         assert!(run_arg::<Force>(&["--forse"]).is_err());
     }
 
-    // ── admin service-mode clap parsing ──────────────────────────────────────
+    // ── admin command parsing ────────────────────────────────────────────────
 
     #[test]
-    fn admin_service_mode_enable_parses_correctly() {
-        match parses(&["admin", "service-mode", "enable"]) {
-            Commands::Admin {
-                command:
-                    Command::ServiceMode {
-                        command: service_mode::Command::Enable,
-                    },
-            } => {}
-            other => panic!("unexpected command: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn admin_service_mode_status_parses_correctly() {
-        match parses(&["admin", "service-mode", "status"]) {
-            Commands::Admin {
-                command:
-                    Command::ServiceMode {
-                        command: service_mode::Command::Status,
-                    },
-            } => {}
-            other => panic!("unexpected command: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn admin_service_mode_disable_parses_correctly() {
-        match parses(&["admin", "service-mode", "disable"]) {
-            Commands::Admin {
-                command:
-                    Command::ServiceMode {
-                        command: service_mode::Command::Disable,
-                    },
-            } => {}
-            other => panic!("unexpected command: {:?}", other),
+    fn admin_service_mode_commands_parse_correctly() {
+        for sub in ["status", "enable", "disable"] {
+            assert_eq!(
+                parses(&["admin", "service-mode", sub]),
+                ["admin", "service-mode", sub]
+            );
         }
     }
 
     #[test]
     fn admin_boot_health_parses_correctly() {
-        match parses(&["admin", "boot-health"]) {
-            Commands::Admin {
-                command: Command::BootHealth,
-            } => {}
-            other => panic!("unexpected command: {:?}", other),
-        }
+        assert_eq!(parses(&["admin", "boot-health"]), ["admin", "boot-health"]);
     }
 
     #[test]
     fn admin_reboot_parses_correctly() {
-        match parses(&["admin", "reboot"]) {
-            Commands::Admin {
-                command: Command::Reboot { force: false },
-            } => {}
-            other => panic!("unexpected command: {:?}", other),
-        }
+        assert_eq!(parses(&["admin", "reboot"]), ["admin", "reboot"]);
+        assert_eq!(parses(&["admin", "reboot", "--force"]), ["admin", "reboot"]);
     }
 }

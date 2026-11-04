@@ -3,7 +3,6 @@ use crate::ctx::Ctx;
 use crate::output::{handle_error, print_tracks};
 use crate::stdin::read_hashes;
 use bpaf::{long, Bpaf, Parser};
-use clap::Subcommand;
 use color_eyre::Result;
 use hicli::Arg;
 use library_ipc_client::{ContentHash, TrackInfo};
@@ -14,138 +13,81 @@ use library_search::{
 use mdma_client::LibraryBackend;
 use music_facts::{EnergyLevel, TrackRole};
 
-#[derive(Subcommand, Debug)]
-pub(crate) enum Command {
-    /// List all distinct values stored for a fact type.
-    ///
-    /// Examples:
-    ///   mdma search fact-values-for genre
-    ///   mdma search fact-values-for label | grep -i "ost"
-    ///   mdma search fact-values-for genre | dmenu | xargs -I{} mdma search --genre {}
-    FactValuesFor {
-        /// Fact type to inspect (e.g. MainGenre, Label, Key, Source, BPM, StyleDescriptor)
-        fact_type: FactTypeArg,
-    },
-}
-
-// `mdma search`: a track query, or a subcommand.
-#[derive(clap::Args, Debug)]
-pub(crate) struct SearchCli {
-    #[command(flatten)]
-    pub(crate) query: SearchArgs,
-
-    #[command(subcommand)]
-    pub(crate) subcommand: Option<Command>,
-}
-
-// Both clap and bpaf read the field docs; the typed filters take their help from
-// their `Arg` impls instead (the same text), so their docs serve clap alone.
-#[derive(clap::Args, Debug, Default, Bpaf)]
+// The typed filters take their help from their `Arg` impls, so their field docs
+// are not shown.
+#[derive(Debug, Default, Bpaf, Arg)]
 pub(crate) struct SearchArgs {
     /// Filter by artist name
-    #[arg(long)]
     #[bpaf(argument("ARTIST"))]
     artist: Option<String>,
 
     /// Filter by track title
-    #[arg(long)]
     #[bpaf(argument("TITLE"))]
     title: Option<String>,
 
     /// Filter by album name
-    #[arg(long)]
     #[bpaf(argument("ALBUM"))]
     album: Option<String>,
 
     /// Filter by label name
-    #[arg(long)]
     #[bpaf(argument("LABEL"))]
     label: Option<String>,
 
     /// Filter by main genre (e.g. "Electronic", "Techno")
-    #[arg(long)]
     #[bpaf(argument("GENRE"))]
     genre: Option<String>,
 
     /// Filter by style descriptor — matches if any descriptor matches
-    #[arg(long)]
     #[bpaf(argument("STYLE"))]
     style: Option<String>,
 
-    /// Filter by BPM. Formats: 128  128+-4  124..132  128+2  128-2
-    #[arg(long)]
     #[bpaf(external(BpmArg::parser), optional)]
     bpm: Option<BpmArg>,
 
-    /// Filter by musical key. Formats: Am  "A minor"  8B  8B+-1  8B+-1~
-    #[arg(long)]
     #[bpaf(external(KeyArg::parser), optional)]
     key: Option<KeyArg>,
 
-    /// Filter by duration. Formats: 7m  7m15s  >5m  <8m  6m..8m
-    #[arg(long)]
     #[bpaf(external(DurationArg::parser), optional)]
     duration: Option<DurationArg>,
 
-    /// Filter by release year. Formats: 2022  2019..2022
-    #[arg(long)]
     #[bpaf(external(YearArg::parser), optional)]
     year: Option<YearArg>,
 
     /// Filter by source (bandcamp, beatport, upload)
-    #[arg(long)]
     #[bpaf(argument("SOURCE"))]
     source: Option<String>,
 
     /// Ignore stdin (don't read piped hashes as intersection filter)
-    #[arg(long)]
     no_stdin: bool,
 
     /// Filter by last started date. Format: N/A, >2026-02, <2026, 2026-01..2026-06 (dash-leading values: --started=-7)
-    #[arg(long)]
     #[bpaf(long("started"), argument("STARTED"))]
     started: Option<DateArg>,
 
     /// Filter by last stopped date. Same format as --started (dash-leading values: --stopped=-7).
-    #[arg(long)]
     #[bpaf(long("stopped"), argument("STOPPED"))]
     stopped: Option<DateArg>,
 
     /// Filter by date added to library. Uses date expression syntax: ~/+1/15 (15th next month), --added=-7 (7 days ago), ^ (1st of month), $ (end of month). Ranges: --added=-7..~ (last 7 days to today).
-    #[arg(long)]
     #[bpaf(long("added"), argument("ADDED"))]
     added: Option<DateArg>,
 
-    /// Filter by playback history. `never` matches tracks with no started fact (never played).
-    /// When combined with --started, --played=never takes precedence.
-    #[arg(long)]
     #[bpaf(external(PlayedFilter::parser), optional)]
     played: Option<PlayedFilter>,
 
-    /// Filter by DJ role. Accepted values: opener, build-up, peak, banger, cool-down, closer, filler
-    #[arg(long)]
     #[bpaf(external(RoleArg::parser), optional)]
     role: Option<RoleArg>,
 
-    /// Filter by energy level (1-10). Formats: 7  5..8  7+-2
-    #[arg(long)]
     #[bpaf(external(EnergyArg::parser), optional)]
     energy: Option<EnergyArg>,
 
     /// Invert the search results — return tracks that do NOT match the filters.
-    #[arg(long)]
     not: bool,
 
     /// Free-text query applied to all text fields (title, artist, album, label, genre).
     /// Supports CamelCase initialism (CarbBased) and /regex/ syntax.
     #[bpaf(positional("QUERY"))]
     query: Option<String>,
-}
-
-impl Arg for SearchArgs {
-    fn parser() -> impl Parser<Self> {
-        search_args()
-    }
 }
 
 /// A fact type name (e.g. MainGenre, Label, Key).
@@ -315,17 +257,6 @@ impl Arg for PlayedFilter {
     }
 }
 
-pub(crate) fn dispatch(cli: SearchCli, ctx: &Ctx) -> Result<()> {
-    let SearchCli {
-        query: args,
-        subcommand,
-    } = cli;
-    match subcommand {
-        Some(Command::FactValuesFor { fact_type }) => fact_values_for(fact_type, ctx),
-        None => query(args, ctx),
-    }
-}
-
 /// Search for tracks by filter or free text
 #[hicli::command(default)]
 pub(crate) fn query(args: SearchArgs, ctx: &Ctx) -> Result<()> {
@@ -336,7 +267,7 @@ pub(crate) fn query(args: SearchArgs, ctx: &Ctx) -> Result<()> {
 }
 
 /// Filter by playback history.
-#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlayedFilter {
     /// Tracks that have never been played (started fact is absent).
     Never,
@@ -532,7 +463,7 @@ pub(crate) fn fact_values_for(fact_type: FactTypeArg, ctx: &Ctx) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{parse, parses, track, usage_error};
+    use crate::test_support::{parses, track, usage_error};
 
     use pretty_assertions::assert_eq;
 
@@ -637,17 +568,16 @@ mod tests {
     #[test]
     fn search_added_garbage_is_parse_error() {
         let err = usage_error(&["search", "--added=garbage"]);
-        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(err.contains("invalid date query 'garbage'"), "{err}");
     }
 
     #[test]
     fn search_started_and_stopped_garbage_are_parse_errors() {
         for flag in ["--started=garbage", "--stopped=garbage"] {
             let err = usage_error(&["search", flag]);
-            assert_eq!(
-                err.kind(),
-                clap::error::ErrorKind::ValueValidation,
-                "{flag}"
+            assert!(
+                err.contains("invalid date query 'garbage'"),
+                "{flag}: {err}"
             );
         }
     }
@@ -659,8 +589,7 @@ mod tests {
         let args = parse_search(&["--role", "peak"]).unwrap();
         assert!(args.role.is_some());
         let err = parse_search(&["--role", "dancer"]).unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
-        assert!(err.to_string().contains("invalid role 'dancer'"));
+        assert!(err.contains("invalid role 'dancer'"), "{err}");
     }
 
     #[test]
@@ -673,12 +602,8 @@ mod tests {
     #[test]
     fn search_energy_rejects_out_of_range_and_garbage() {
         for v in ["0", "11", "0..5", "5..11", "11+-1", "7.5", "loud"] {
-            let err = parse_search(&["--energy", v]).unwrap_err();
-            assert_eq!(
-                err.kind(),
-                clap::error::ErrorKind::ValueValidation,
-                "accepted {v}"
-            );
+            let err = parse_search(&["--energy", v]);
+            assert!(err.is_err(), "accepted {v}");
         }
     }
 
@@ -695,14 +620,8 @@ mod tests {
 
     // ── bpm / key / duration / year parsing ──────────────────────────────────
 
-    fn parse_search(args: &[&str]) -> Result<SearchArgs, clap::Error> {
-        let argv: Vec<&str> = std::iter::once("search")
-            .chain(args.iter().copied())
-            .collect();
-        parse(&argv).map(|command| match command {
-            crate::Commands::Search(search) => search.query,
-            other => panic!("expected search command, got {other:?}"),
-        })
+    fn parse_search(args: &[&str]) -> Result<SearchArgs, String> {
+        run_arg::<SearchArgs>(args)
     }
 
     #[test]
@@ -718,8 +637,7 @@ mod tests {
     #[test]
     fn search_bpm_invalid_is_parse_error() {
         let err = parse_search(&["--bpm", "fast"]).unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
-        assert!(err.to_string().contains("invalid numeric query 'fast'"));
+        assert!(err.contains("invalid numeric query 'fast'"), "{err}");
     }
 
     #[test]
@@ -735,10 +653,7 @@ mod tests {
     #[test]
     fn search_year_invalid_is_parse_error() {
         let err = parse_search(&["--year", "last-year"]).unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
-        assert!(err
-            .to_string()
-            .contains("invalid numeric query 'last-year'"));
+        assert!(err.contains("invalid numeric query 'last-year'"), "{err}");
     }
 
     #[test]
@@ -750,8 +665,7 @@ mod tests {
     #[test]
     fn search_key_invalid_is_parse_error() {
         let err = parse_search(&["--key", "H#"]).unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
-        assert!(err.to_string().contains("invalid key query 'H#'"));
+        assert!(err.contains("invalid key query 'H#'"), "{err}");
     }
 
     #[test]
@@ -770,8 +684,7 @@ mod tests {
     #[test]
     fn search_duration_invalid_is_parse_error() {
         let err = parse_search(&["--duration", "long"]).unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
-        assert!(err.to_string().contains("invalid duration query 'long'"));
+        assert!(err.contains("invalid duration query 'long'"), "{err}");
     }
 
     #[test]

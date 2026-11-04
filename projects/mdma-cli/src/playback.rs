@@ -1,61 +1,9 @@
 use crate::args::impl_arg;
 use crate::ctx::Ctx;
 use crate::output::{handle_error, handle_playback_error};
-use clap::Subcommand;
 use color_eyre::Result;
 use mdma_client::Deck;
 use track_formatter::short_hash;
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum Command {
-    /// Start playback from the queue (use `mdma queue append <hash>` to enqueue tracks)
-    Start,
-
-    /// Stop playback on deck A
-    Stop,
-
-    /// Pause playback on deck A (keeps the current track loaded; resume to continue)
-    Pause,
-
-    /// Resume playback on deck A after a pause
-    Resume,
-
-    /// Skip to the next track in the queue
-    Skip,
-
-    /// Show what is currently playing
-    Now,
-
-    /// Show the current session ID (a session spans from first play to queue empty)
-    Session,
-
-    /// List available audio output devices
-    Outputs,
-
-    /// Select an audio output device by name
-    SetOutput {
-        /// Device name as shown by `mdma playback outputs`
-        name: OutputNameArg,
-    },
-
-    /// Show the currently selected audio output
-    GetOutput,
-}
-
-pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
-    match command {
-        Command::Start => start(ctx),
-        Command::Stop => stop(ctx),
-        Command::Pause => pause(ctx),
-        Command::Resume => resume(ctx),
-        Command::Skip => skip(ctx),
-        Command::Now => now(ctx),
-        Command::Session => session(ctx),
-        Command::Outputs => outputs(ctx),
-        Command::SetOutput { name } => set_output(name, ctx),
-        Command::GetOutput => get_output(ctx),
-    }
-}
 
 /// Start playback from the queue (use `mdma queue append <hash>` to enqueue tracks)
 #[hicli::command]

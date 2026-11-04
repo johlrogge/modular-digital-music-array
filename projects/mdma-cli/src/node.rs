@@ -439,30 +439,6 @@ pub fn resolve_startup(explicit: Option<&NodeSpec>, local_ipc: bool) -> Target {
     }
 }
 
-#[derive(clap::Subcommand, Debug)]
-pub(crate) enum Command {
-    /// List MDMA nodes on the network (* marks the remembered node)
-    List,
-    /// Remember a node (by name or id; prompts when omitted)
-    Select {
-        /// Node name or id
-        name: Option<String>,
-    },
-    /// Forget the remembered node
-    Forget,
-    /// Show which node commands would use, and why
-    Show,
-}
-
-pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> color_eyre::Result<()> {
-    match command {
-        Command::List => list(ctx),
-        Command::Select { name } => select(OptNodeQueryArg(name), ctx),
-        Command::Forget => forget(ctx),
-        Command::Show => show(ctx),
-    }
-}
-
 /// List MDMA nodes on the network (* marks the remembered node)
 #[hicli::command]
 pub(crate) fn list(_ctx: &Ctx) -> color_eyre::Result<()> {

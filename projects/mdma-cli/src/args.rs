@@ -8,8 +8,7 @@ use playlist_import::sanitize_playlist_name;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-/// The one place an `Arg` impl for a plain argument type is spelled out. The
-/// forms (metavars and help match what clap shows today):
+/// The one place an `Arg` impl for a plain argument type is spelled out. The forms:
 ///
 /// - `T, positional "META", "help"`: a positional that parses through `FromStr`.
 /// - `T, long "x" [, short 'c'], "META", "help"`: an option with a value.
@@ -97,8 +96,7 @@ macro_rules! impl_arg {
 }
 pub(crate) use impl_arg;
 
-/// A value that is one of a fixed set of names (what clap's `ValueEnum` gave us).
-/// Implement this and the argument gets its parse error, its list of names and
+/// A value that is one of a fixed set of names. Implement this and the argument gets its parse error, its list of names and
 /// tab completion from [`choice`].
 pub(crate) trait Choice: Copy + 'static {
     /// Every value, in the order they are listed.
@@ -171,9 +169,8 @@ impl FromStr for TrackArg {
     }
 }
 
-// The Arg impls spell the arguments as clap does today (metavar = the clap
-// field name uppercased, same help). A type used under other names (`winner`,
-// `from`, ...) is a field of a multi-value args struct instead.
+// A type used under other names (`winner`, `from`, ...) is a field of a
+// multi-value args struct instead.
 impl_arg!(
     TrackArg,
     positional "HASH",
@@ -285,15 +282,6 @@ impl ExistingFileArg {
     }
 }
 
-/// Report a cross-argument usage error the way clap does (message, usage, exit 2).
-pub(crate) fn usage_error(
-    kind: clap::error::ErrorKind,
-    msg: impl std::fmt::Display,
-) -> clap::Error {
-    use clap::CommandFactory;
-    crate::Cli::command().error(kind, msg)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,28 +335,6 @@ mod tests {
             .unwrap_err()
             .unwrap_stderr();
         assert!(message.contains("unknown shade 'pink'"), "{message}");
-    }
-
-    /// Every `Choice` that clap's `ValueEnum` also derives agrees with it, so
-    /// the clap help and the hicli parser list the same names (dropped with clap).
-    fn assert_agrees_with_value_enum<T>()
-    where
-        T: Choice + clap::ValueEnum + std::fmt::Debug + PartialEq,
-    {
-        let clap_names: Vec<String> = T::value_variants()
-            .iter()
-            .map(|v| v.to_possible_value().unwrap().get_name().to_string())
-            .collect();
-        assert_eq!(choice_names::<T>(), clap_names);
-        assert_eq!(T::ALL, T::value_variants());
-    }
-
-    #[test]
-    fn choices_agree_with_clap_value_enums() {
-        assert_agrees_with_value_enum::<crate::tracks::SortField>();
-        assert_agrees_with_value_enum::<crate::fact::FactField>();
-        assert_agrees_with_value_enum::<crate::search::PlayedFilter>();
-        assert_agrees_with_value_enum::<crate::transfer::ExportFormat>();
     }
 
     #[test]

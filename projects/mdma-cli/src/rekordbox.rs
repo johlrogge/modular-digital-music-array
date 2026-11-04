@@ -6,7 +6,6 @@ use crate::transfer::{
     export_extension, path_cost, DownloadOutcome, ExportFormat, MAX_LOCATION_URI_BYTES,
 };
 use bpaf::{long, Bpaf, Parser};
-use clap::Subcommand;
 use color_eyre::Result;
 use hicli::Arg;
 use library_ipc_client::{ContentHash, TrackInfo};
@@ -14,100 +13,6 @@ use music_facts::MusicValue;
 use playlist_import::{format_write_outcome, write_playlist, LibraryTrackLookup};
 use rekordbox_xml::{parse_xml, RekordboxTrack};
 use track_matcher::{CandidateTrack, MatchResult};
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum Command {
-    /// Export tracks to Rekordbox-compatible XML + audio files.
-    ///
-    /// Pass one or more --playlist flags to export named playlists.
-    /// When no --playlist is given, hashes are read from stdin instead.
-    /// Stdin input is ignored when --playlist is provided.
-    Export {
-        /// MDMA playlist(s) to export. Repeat for multiple: --playlist A --playlist B.
-        /// If none given, falls back to stdin input (existing behaviour).
-        #[arg(long)]
-        playlist: Vec<PlaylistArg>,
-        /// Output directory. Defaults to ~/Music/mdma_rekordbox.
-        #[arg(long)]
-        output: Option<std::path::PathBuf>,
-        /// Audio format (defaults to original)
-        #[arg(long, value_enum)]
-        format: Option<ExportFormat>,
-        /// Force a fresh XML and re-download everything (discards incremental sync).
-        /// Also skips grandfathering of existing paths: tracks whose paths exceed
-        /// the rekordbox Location budget get new, shortened paths (rekordbox will
-        /// see them as new tracks and cues are lost).
-        #[arg(long)]
-        replace: bool,
-    },
-
-    /// Import tracks and playlists from a Rekordbox XML file.
-    ///
-    /// Matches Rekordbox tracks to MDMA library tracks by metadata,
-    /// creates playlists, and optionally enriches BPM/Key facts.
-    ///
-    /// Examples:
-    ///   mdma rekordbox import rekordbox.xml
-    ///   mdma rekordbox import rekordbox.xml --playlist imported-set
-    ///   mdma rekordbox import rekordbox.xml --enrich --dry-run
-    Import {
-        /// Path to rekordbox.xml file
-        #[arg(value_hint = clap::ValueHint::FilePath)]
-        path: ExistingFileArg,
-
-        /// Create an MDMA playlist with matched tracks.
-        /// Invalid characters (spaces, special chars) are replaced with `-`.
-        #[arg(long)]
-        playlist: Option<SanitizedPlaylistName>,
-
-        /// Import all playlists found in the XML as MDMA playlists
-        #[arg(long)]
-        all_playlists: bool,
-
-        /// Update BPM and Key facts from Rekordbox data for matched tracks
-        #[arg(long)]
-        enrich: bool,
-
-        /// Show what would happen without making changes
-        #[arg(long)]
-        dry_run: bool,
-    },
-}
-
-pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
-    match command {
-        Command::Export {
-            playlist,
-            output,
-            format,
-            replace,
-        } => export(
-            RekordboxExportArgs {
-                playlist,
-                output,
-                format,
-                replace,
-            },
-            ctx,
-        ),
-        Command::Import {
-            path,
-            playlist,
-            all_playlists,
-            enrich,
-            dry_run,
-        } => import(
-            RekordboxImportArgs {
-                playlist,
-                all_playlists,
-                enrich,
-                dry_run,
-                path,
-            },
-            ctx,
-        ),
-    }
-}
 
 /// `--format` of `rekordbox export`.
 fn export_format_option() -> impl Parser<ExportFormat> {
@@ -1021,7 +926,6 @@ mod tests {
     // ── argv parsing ─────────────────────────────────────────────────────────────
 
     use crate::test_support::{parses, run_arg, usage_error};
-    use crate::Commands;
 
     #[test]
     fn export_args_parser_reads_playlists_output_format_and_replace() {
@@ -1091,18 +995,11 @@ mod tests {
         assert!(run_arg::<super::RekordboxImportArgs>(&[]).is_err());
     }
 
-    fn rekordbox_command(argv: &[&str]) -> super::Command {
-        match parses(argv) {
-            Commands::Rekordbox { command } => command,
-            other => panic!("not rekordbox: {other:?}"),
-        }
-    }
-
     #[test]
     fn export_playlist_names_are_validated_at_parse_time() {
         for bad in ["has space", "a/b", ""] {
             let err = usage_error(&["rekordbox", "export", "--playlist", bad]);
-            assert!(err.to_string().contains("--playlist"), "{bad:?}: {err}");
+            assert!(err.contains("couldn't parse"), "{bad:?}: {err}");
         }
         // One bad name among good ones is still rejected.
         usage_error(&[
@@ -1117,33 +1014,30 @@ mod tests {
 
     #[test]
     fn export_accepts_valid_playlist_names() {
-        match rekordbox_command(&[
-            "rekordbox",
-            "export",
-            "--playlist",
-            "set-1",
-            "--playlist",
-            "set_2",
-        ]) {
-            super::Command::Export { playlist, .. } => {
-                let names: Vec<&str> = playlist.iter().map(|p| p.0.as_str()).collect();
-                assert_eq!(names, ["set-1", "set_2"]);
-            }
-            other => panic!("not export: {other:?}"),
-        }
+        assert_eq!(
+            parses(&[
+                "rekordbox",
+                "export",
+                "--playlist",
+                "set-1",
+                "--playlist",
+                "set_2",
+            ]),
+            ["rekordbox", "export"]
+        );
     }
 
     #[test]
     fn import_rejects_a_missing_file() {
         let err = usage_error(&["rekordbox", "import", "/definitely/not/here.xml"]);
-        assert!(err.to_string().contains("does not exist"), "message: {err}");
+        assert!(err.contains("does not exist"), "message: {err}");
     }
 
     #[test]
     fn import_rejects_a_directory() {
         let dir = tempfile::tempdir().unwrap();
         let err = usage_error(&["rekordbox", "import", dir.path().to_str().unwrap()]);
-        assert!(err.to_string().contains("is not a file"), "message: {err}");
+        assert!(err.contains("is not a file"), "message: {err}");
     }
 
     #[test]
@@ -1152,10 +1046,7 @@ mod tests {
         let path = file.path().to_str().unwrap();
         for bad in ["", "///", " "] {
             let err = usage_error(&["rekordbox", "import", path, "--playlist", bad]);
-            assert!(
-                err.to_string().contains("name sanitizes to empty"),
-                "{bad:?}: {err}"
-            );
+            assert!(err.contains("name sanitizes to empty"), "{bad:?}: {err}");
         }
     }
 
@@ -1163,20 +1054,16 @@ mod tests {
     fn import_accepts_existing_file_and_sanitizes_playlist() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let path = file.path().to_str().unwrap();
-        match rekordbox_command(&["rekordbox", "import", path, "--playlist", "My Set!"]) {
-            super::Command::Import {
-                path: p, playlist, ..
-            } => {
-                assert_eq!(p.0, file.path());
-                let playlist = playlist.unwrap();
-                assert_eq!(
-                    playlist.change_note().as_deref(),
-                    Some("Note: playlist name sanitized from 'My Set!' to 'My-Set'")
-                );
-                assert_eq!(playlist.name().as_str(), "My-Set");
-            }
-            other => panic!("not import: {other:?}"),
-        }
+        let argv = ["rekordbox", "import", path, "--playlist", "My Set!"];
+        assert_eq!(parses(&argv), ["rekordbox", "import"]);
+        let args = run_arg::<super::RekordboxImportArgs>(&["--playlist", "My Set!", path]).unwrap();
+        assert_eq!(args.path.0, file.path());
+        let playlist = args.playlist.unwrap();
+        assert_eq!(
+            playlist.change_note().as_deref(),
+            Some("Note: playlist name sanitized from 'My Set!' to 'My-Set'")
+        );
+        assert_eq!(playlist.name().as_str(), "My-Set");
     }
 
     // ── case-insensitive location URI matching ───────────────────────────────────

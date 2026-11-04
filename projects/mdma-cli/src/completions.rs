@@ -1,13 +1,5 @@
 use crate::args::impl_arg;
-use crate::Cli;
-use clap::CommandFactory;
 use color_eyre::Result;
-
-#[derive(clap::Args, Debug)]
-pub(crate) struct CompletionsCli {
-    #[arg(value_enum)]
-    pub(crate) shell: clap_complete::Shell,
-}
 
 /// The shell to generate completions for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,22 +29,9 @@ pub(crate) fn generate_completions(shell: ShellArg) -> Result<()> {
     Ok(())
 }
 
-/// Clap's completion script (clap drives `main` until the tree is flipped).
-pub(crate) fn generate_clap(shell: clap_complete::Shell) -> Result<()> {
-    generate_clap_completions(shell, &mut std::io::stdout());
-    Ok(())
-}
-
-fn generate_clap_completions(shell: clap_complete::Shell, out: &mut dyn std::io::Write) {
-    let mut cmd = Cli::command();
-    clap_complete::generate(shell, &mut cmd, "mdma", out);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── Shell completions ─────────────────────────────────────────────────────
 
     #[test]
     fn shell_arg_parser_reads_a_shell_name() {
@@ -70,18 +49,15 @@ mod tests {
     }
 
     #[test]
-    fn generate_completions_bash_produces_nonempty_output() {
-        // The generate_clap_completions function must produce a non-empty bash script.
-        let mut buf = Vec::new();
-        generate_clap_completions(clap_complete::Shell::Bash, &mut buf);
-        let output = String::from_utf8(buf).expect("completion output is valid UTF-8");
+    fn bash_completion_script_is_nonempty_and_names_the_binary() {
+        let output = hicli::completion_script(hicli::Shell::Bash, "mdma");
         assert!(
             !output.is_empty(),
-            "bash completion output must not be empty"
+            "bash completion script must not be empty"
         );
         assert!(
             output.contains("mdma"),
-            "bash completion output must reference the binary name 'mdma'"
+            "bash completion script must reference the binary name 'mdma'"
         );
     }
 }
