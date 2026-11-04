@@ -102,27 +102,18 @@ pub fn parse_hash_from_line(line: &str) -> Option<String> {
         return None;
     }
     let token = line.split_whitespace().next()?;
-    // Accept sha256: prefixed full hashes
-    if token.starts_with("sha256:") {
-        let hex_part = token.strip_prefix("sha256:")?;
-        if hex_part.len() >= 8
-            && hex_part
-                .chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
-        {
-            return Some(token.to_string());
-        }
-        return None;
-    }
-    // Accept plain hex tokens of 8+ chars (short or full)
-    if token.len() >= 8
-        && token
+    is_hash_token(token).then(|| token.to_string())
+}
+
+/// The one rule for what counts as a content-hash token, shared by stdin
+/// parsing and argv parsing: at least 8 lowercase hex characters, optionally
+/// prefixed with `sha256:`.
+pub fn is_hash_token(token: &str) -> bool {
+    let hex = token.strip_prefix("sha256:").unwrap_or(token);
+    hex.len() >= 8
+        && hex
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
-    {
-        return Some(token.to_string());
-    }
-    None
 }
 
 #[cfg(test)]
@@ -191,6 +182,19 @@ mod tests {
         // The hash must survive the round-trip through parse_hash_from_line.
         let result = parse_hash_from_line("a1b2c3d4  # [unavailable: track not found]");
         assert_eq!(result, Some("a1b2c3d4".to_string()));
+    }
+
+    #[test]
+    fn hash_token_rule() {
+        use crate::stdin::is_hash_token;
+        assert!(is_hash_token("abcd1234"));
+        assert!(is_hash_token("sha256:abcd1234"));
+        assert!(!is_hash_token("abcd123"));
+        assert!(!is_hash_token("sha256:abcd123"));
+        assert!(!is_hash_token("ABCD1234"));
+        assert!(!is_hash_token("sha256:"));
+        assert!(!is_hash_token("ghijklmn"));
+        assert!(!is_hash_token(""));
     }
 
     #[test]

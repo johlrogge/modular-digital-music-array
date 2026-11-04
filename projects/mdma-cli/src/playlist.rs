@@ -1,4 +1,4 @@
-use crate::args::parse_playlist_name;
+use crate::args::{parse_playlist_name, OptPlaylistArg, PlaylistArg};
 use crate::ctx::Ctx;
 use crate::stdin::{hashes_in, read_hashes, read_stdin_to_string};
 use clap::Subcommand;
@@ -77,44 +77,26 @@ pub(crate) enum Command {
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
     match command {
         Command::List => list(ctx),
-        Command::Get { name } => get(OptPlaylistArg(name), ctx),
+        // Names are still clap Strings; validated here until wired in P2.1.D.
+        Command::Get { name } => get(
+            OptPlaylistArg(name.as_deref().map(parse_playlist_name)),
+            ctx,
+        ),
         Command::Contains { all, at_least, no } => {
             contains(ContainsArgs { all, at_least, no }, ctx)
         }
-        Command::New { name } => new(PlaylistArg(name), ctx),
-        Command::Append { name } => append(PlaylistArg(name), ctx),
-        Command::Replace { name } => replace(PlaylistArg(name), ctx),
-        Command::Edit { name } => edit(PlaylistArg(name), ctx),
-        Command::Remove { name } => remove(PlaylistArg(name), ctx),
+        Command::New { name } => new(PlaylistArg(parse_playlist_name(&name)), ctx),
+        Command::Append { name } => append(PlaylistArg(parse_playlist_name(&name)), ctx),
+        Command::Replace { name } => replace(PlaylistArg(parse_playlist_name(&name)), ctx),
+        Command::Edit { name } => edit(PlaylistArg(parse_playlist_name(&name)), ctx),
+        Command::Remove { name } => remove(PlaylistArg(parse_playlist_name(&name)), ctx),
         Command::Rename { from, to } => rename(
             RenameArgs {
-                from: PlaylistArg(from),
-                to: PlaylistArg(to),
+                from: PlaylistArg(parse_playlist_name(&from)),
+                to: PlaylistArg(parse_playlist_name(&to)),
             },
             ctx,
         ),
-    }
-}
-
-/// Name of an MDMA playlist as typed. Validated into a `PlaylistName` after
-/// the library connection is made, so invalid names keep failing at the same
-/// point as before (phase-2 parse-time candidate).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PlaylistArg(pub String);
-
-impl PlaylistArg {
-    fn name(&self) -> PlaylistName {
-        parse_playlist_name(&self.0)
-    }
-}
-
-/// Optional name of an MDMA playlist.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OptPlaylistArg(pub Option<String>);
-
-impl OptPlaylistArg {
-    fn name(&self) -> Option<PlaylistName> {
-        self.0.as_deref().map(parse_playlist_name)
     }
 }
 
@@ -253,7 +235,7 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
 pub(crate) fn get(name: OptPlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     let library = ctx.library();
-    match name.name() {
+    match name.0 {
         Some(pname) => {
             let content = expect_library(
                 library.request(&LibraryRequest::PlaylistGet { name: pname }),
@@ -277,7 +259,7 @@ pub(crate) fn get(name: OptPlaylistArg, ctx: &Ctx) -> Result<()> {
                 std::process::exit(1);
             }
             for n in names {
-                let pname = PlaylistArg(n).name();
+                let pname = parse_playlist_name(&n);
                 let content = expect_library(
                     library.request(&LibraryRequest::PlaylistGet { name: pname }),
                     playlist_content,
@@ -353,48 +335,48 @@ pub(crate) fn contains(args: ContainsArgs, ctx: &Ctx) -> Result<()> {
 pub(crate) fn new(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     let library = ctx.library();
-    let pname = name.name();
+    let PlaylistArg(pname) = name;
     let content = read_stdin_to_string();
     expect_library(
         library.request(&LibraryRequest::PlaylistNew {
-            name: pname,
+            name: pname.clone(),
             content,
         }),
         playlist_content,
     );
-    eprintln!("Created playlist '{}'", name.0);
+    eprintln!("Created playlist '{}'", pname);
     Ok(())
 }
 
 pub(crate) fn append(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     let library = ctx.library();
-    let pname = name.name();
+    let PlaylistArg(pname) = name;
     let content = read_stdin_to_string();
     expect_library(
         library.request(&LibraryRequest::PlaylistAppend {
-            name: pname,
+            name: pname.clone(),
             content,
         }),
         playlist_content,
     );
-    eprintln!("Appended to playlist '{}'", name.0);
+    eprintln!("Appended to playlist '{}'", pname);
     Ok(())
 }
 
 pub(crate) fn replace(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     let library = ctx.library();
-    let pname = name.name();
+    let PlaylistArg(pname) = name;
     let content = read_stdin_to_string();
     expect_library(
         library.request(&LibraryRequest::PlaylistReplace {
-            name: pname,
+            name: pname.clone(),
             content,
         }),
         playlist_content,
     );
-    eprintln!("Replaced playlist '{}'", name.0);
+    eprintln!("Replaced playlist '{}'", pname);
     Ok(())
 }
 
@@ -402,7 +384,7 @@ pub(crate) fn edit(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{LibraryRequest, LibraryResponse, ProtocolError};
 
     let library = ctx.library();
-    let pname = name.name();
+    let PlaylistArg(pname) = name;
 
     // 1. Get current content (or start empty if not found)
     let current = match library.request(&LibraryRequest::PlaylistGet {
@@ -426,27 +408,27 @@ pub(crate) fn edit(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     // 3. Replace
     expect_library(
         library.request(&LibraryRequest::PlaylistReplace {
-            name: pname,
+            name: pname.clone(),
             content: new_content,
         }),
         playlist_content,
     );
-    eprintln!("Updated playlist '{}'", name.0);
+    eprintln!("Updated playlist '{}'", pname);
     Ok(())
 }
 
 pub(crate) fn rename(args: RenameArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{LibraryRequest, LibraryResponse};
     let library = ctx.library();
-    let from_name = args.from.name();
-    let to_name = args.to.name();
+    let PlaylistArg(from_name) = args.from;
+    let PlaylistArg(to_name) = args.to;
     let response = library.request(&LibraryRequest::PlaylistRename {
-        from: from_name,
-        to: to_name,
+        from: from_name.clone(),
+        to: to_name.clone(),
     });
     match response {
         Ok(LibraryResponse::Pong) => {
-            eprintln!("Renamed playlist '{}' to '{}'", args.from.0, args.to.0);
+            eprintln!("Renamed playlist '{}' to '{}'", from_name, to_name);
         }
         Ok(LibraryResponse::Error(e)) => {
             eprintln!("Error: {}", e);
@@ -463,11 +445,13 @@ pub(crate) fn rename(args: RenameArgs, ctx: &Ctx) -> Result<()> {
 pub(crate) fn remove(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{LibraryRequest, LibraryResponse};
     let library = ctx.library();
-    let pname = name.name();
-    let response = library.request(&LibraryRequest::PlaylistRemove { name: pname });
+    let PlaylistArg(pname) = name;
+    let response = library.request(&LibraryRequest::PlaylistRemove {
+        name: pname.clone(),
+    });
     match response {
         Ok(LibraryResponse::Pong) => {
-            eprintln!("Removed playlist '{}'", name.0);
+            eprintln!("Removed playlist '{}'", pname);
         }
         Ok(LibraryResponse::Error(e)) => {
             eprintln!("Error: {}", e);
