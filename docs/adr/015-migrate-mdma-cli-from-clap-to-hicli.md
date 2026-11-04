@@ -27,8 +27,9 @@ positionals last.
    read from stdin. Concrete rules:
    - A track hash on argv follows the stdin rule: at least 8 lowercase hex characters, optional `sha256:`
      prefix; anything else is a usage error.
-   - `--node` (and MDMA_NODE) is parsed strictly as `host[:port]` by a `NodeSpec` type in the node_discovery
-     component; a bad port is an error instead of silently becoming part of the host.
+   - `--node` is parsed strictly as `host[:port]` by a `NodeSpec` type in the node_discovery component; a
+     bad port is a usage error instead of silently becoming part of the host. MDMA_NODE uses the same
+     parser but is not a usage error (see Mapping).
    - `--energy` is bounded to 1–10, the range of the existing `EnergyLevel` domain type.
 3. **Standard option parsing only.** No special case for values starting with `-` (clap's
    `allow_hyphen_values` on `--started/--stopped/--added` is removed). A leading-dash value is written
@@ -52,7 +53,9 @@ positionals last.
 
 - Globals: `#[derive(Bpaf)] Globals` — socket/playback_socket `Option<String>` + env (None = defaulted,
   default applied in Ctx::new); sources_dir env + fallback; `--node` has no env (MDMA_NODE is read by
-  node.rs, ADR-009). `mk_ctx = |g| Ok(Ctx::new(g))`; the node stays lazily resolved.
+  node.rs, ADR-009). MDMA_NODE goes through the same NodeSpec parser but is validated lazily, only when a
+  command resolves a node; a bad value is a runtime error naming the variable (exit 1), not a usage error,
+  because it is environment rather than argv. `mk_ctx = |g| Ok(Ctx::new(g))`; the node stays lazily resolved.
 - `source`: `#[group(args = SourceArg)]`, `list` a fixed sibling, per-source commands `#[command(curried)]`.
 - Defaults: `search` → `query` (default) + `fact-values-for`; `library dedup` → `scan` (default, --apply) +
   `merge`; `library archive` → `list` (default) + `empty`. Prose of a default lives on its group.
