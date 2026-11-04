@@ -1,8 +1,8 @@
 # Package metadata for mdma-admin (not an xbps-src build template; see
 # void-packages/srcpkgs/beacon/template for the contract).
 pkgname=mdma-admin
-version=0.35.0
-revision=2
+version=0.36.0
+revision=1
 archs="aarch64"
 # Used by migrate-bootfs: tar, diff, findmnt/blkid/mount/umount, xbps-*
 # acpid handles the Pi 5 power key via the stock /etc/acpi/handler.sh

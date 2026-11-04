@@ -65,6 +65,17 @@ mdma source bandcamp import-playlist my-playlist --dry-run
 mdma source bandcamp import-playlist my-playlist --no-wait
 mdma source bandcamp import-status
 
+# Compute AudioHash (and PcmHash with --pcm) for existing tracks — new in 0.36.0
+mdma library identity backfill --pcm
+mdma library identity status
+
+# Find and merge duplicates; merged-away files go to /music/archive — new in 0.36.0
+mdma library dedup
+mdma library dedup --apply
+mdma library dedup merge <winner> <loser> -y
+mdma library archive
+mdma library archive empty --yes
+
 # Subscribe to live events (now playing, queue changes)
 mdma subscribe
 ```
@@ -159,7 +170,11 @@ Cross-compile and deploy to a Raspberry Pi:
 ```bash
 just beacon-cross       # cross-compile beacon for aarch64
 just deploy-dev         # build and deploy all services to welcome-to-mdma.local
+just deploy-library     # deploy one service; optional host, defaults to prod (PI_HOST)
+just deploy-library mdma-stage.local
 ```
+
+Deploy recipes use the project ssh config with BatchMode, so they never hang on a host-key prompt.
 
 From the laptop on the same network, the CLI finds nodes on its own:
 
@@ -187,7 +202,7 @@ Copy `scripts/install-mdma-macos.sh` from this repo to your Mac and run it. It r
 bash install-mdma-macos.sh
 
 # Install a specific tag
-bash install-mdma-macos.sh v0.35.0
+bash install-mdma-macos.sh v0.36.0
 
 # Install to a user-writable location (no sudo)
 MDMA_INSTALL_DIR=~/.local/bin bash install-mdma-macos.sh
@@ -205,6 +220,28 @@ cp profiles/dev/target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.36.0
+
+### Identity backfill, duplicate merge and archive
+
+`mdma library identity backfill [--pcm] [--no-wait]`, `status` and `cancel` compute AudioHash, and PcmHash on request, for existing tracks, at low priority. AudioHash is now computed at ingest.
+
+PcmHash v1 (ADR-012) is a container-independent identity hash over decoded lossless samples (FLAC, WAV, AIFF); `--pcm` computes it.
+
+`mdma library dedup` lists duplicate groups: automatic, or needs confirmation with reasons (ADR-013). `--apply` merges the automatic groups; `mdma library dedup merge <winner> <loser>... [-y]` merges a confirmed group. Latest fact wins per attribute, the newest copy is kept, ItemIds are unioned, and play history follows `Replaces`. A re-downloaded copy of the same purchase with the same audio now merges automatically at ingest.
+
+Merged-away files go to `/music/archive/`, never deleted directly. `mdma library archive` lists them; `mdma library archive empty [--yes]` is the only way to delete them permanently, and it deletes only what was listed.
+
+Bandcamp sync defers, and resync and check refuse, when the library is unreachable, instead of re-downloading everything. `just deploy-<svc> [host]` takes an optional host (default prod / `PI_HOST`) and never hangs on a host-key prompt.
+
+Provisioned nodes now run socklog as the syslog daemon; logs go under `/var/log/socklog/`. avahi-daemon is enabled on upgrade, which fixes mDNS discovery on nodes where it was missing.
+
+ADR-012 is accepted, ADR-013 is new, and ADR-014 (merge by fold) is proposed.
+
+**Upgrade notes:** BREAKING. The library IPC protocol changed (dedup and archive messages; `blobs_removed` renamed `blobs_archived`). Library, gateway, console and CLI must be upgraded together: upgrade all mdma-* packages together, by name. See CHANGELOG.md.
 
 ---
 
