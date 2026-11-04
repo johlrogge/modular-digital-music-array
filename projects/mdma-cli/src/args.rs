@@ -43,10 +43,6 @@ impl FromStr for PlaylistArg {
     }
 }
 
-/// Optional name of an MDMA playlist (clap fields should use `Option<PlaylistArg>`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OptPlaylistArg(pub Option<PlaylistName>);
-
 /// A playlist name for an imported playlist: sanitised on parse. Keeps the
 /// raw text so commands can note when it was changed.
 #[derive(Debug, Clone, PartialEq, Eq)]

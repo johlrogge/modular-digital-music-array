@@ -3,6 +3,7 @@ use crate::output::handle_error;
 use clap::Subcommand;
 use color_eyre::Result;
 use library_ipc_client::InboxPath;
+use std::str::FromStr;
 use track_formatter::short_hash;
 
 #[derive(Subcommand, Debug)]
@@ -13,13 +14,13 @@ pub(crate) enum Command {
     /// Delete a file from inbox without ingesting
     Delete {
         /// File name in inbox
-        filename: String,
+        filename: InboxFileArg,
     },
 
     /// Ingest a specific file from inbox
     Ingest {
         /// File name in inbox
-        filename: String,
+        filename: InboxFileArg,
     },
 
     /// Ingest all files in inbox
@@ -29,27 +30,21 @@ pub(crate) enum Command {
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
     match command {
         Command::List => list(ctx),
-        Command::Delete { filename } => delete(InboxFileArg(filename), ctx),
-        Command::Ingest { filename } => ingest(InboxFileArg(filename), ctx),
+        Command::Delete { filename } => delete(filename, ctx),
+        Command::Ingest { filename } => ingest(filename, ctx),
         Command::IngestAll => ingest_all(ctx),
     }
 }
 
-/// File name in the inbox as typed. Validated into an `InboxPath` after the
-/// library connection is made, so invalid names keep failing at the same
-/// point as before (phase-2 parse-time candidate).
+/// File name in the inbox, validated by `InboxPath` at parse time.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct InboxFileArg(pub String);
+pub(crate) struct InboxFileArg(pub InboxPath);
 
-impl InboxFileArg {
-    fn path(&self) -> InboxPath {
-        match InboxPath::new(&self.0) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("Invalid filename: {}", e);
-                std::process::exit(1);
-            }
-        }
+impl FromStr for InboxFileArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        InboxPath::new(s).map(Self).map_err(|e| e.to_string())
     }
 }
 
@@ -76,7 +71,7 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
 
 pub(crate) fn delete(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
-    let path = file.path();
+    let InboxFileArg(path) = file;
 
     match library.delete_inbox_file(&path) {
         Ok(result) => {
@@ -96,9 +91,9 @@ pub(crate) fn delete(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
 
 pub(crate) fn ingest(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
-    let path = file.path();
+    let InboxFileArg(path) = file;
 
-    println!("Ingesting: {}", file.0);
+    println!("Ingesting: {}", path.as_str());
 
     match library.ingest_file(&path) {
         Ok(result) => {
@@ -163,5 +158,28 @@ pub(crate) fn ingest_all(ctx: &Ctx) -> Result<()> {
             Ok(())
         }
         Err(e) => handle_error(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn invalid_inbox_file_is_a_usage_error() {
+        for sub in ["delete", "ingest"] {
+            for bad in ["/abs/file.mp3", "../escape.mp3"] {
+                let err = Cli::try_parse_from(["mdma", "inbox", sub, bad]).unwrap_err();
+                assert_eq!(err.exit_code(), 2, "{sub} {bad}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn valid_inbox_file_is_accepted() {
+        for sub in ["delete", "ingest"] {
+            assert!(Cli::try_parse_from(["mdma", "inbox", sub, "dir/track.mp3"]).is_ok());
+        }
     }
 }

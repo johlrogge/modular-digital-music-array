@@ -1,4 +1,4 @@
-use crate::args::{parse_playlist_name, OptPlaylistArg, PlaylistArg};
+use crate::args::PlaylistArg;
 use crate::ctx::Ctx;
 use crate::stdin::{hashes_in, read_hashes, read_stdin_to_string};
 use clap::Subcommand;
@@ -17,7 +17,7 @@ pub(crate) enum Command {
     /// token per line — handles both bare names and enriched `playlist list` output).
     Get {
         /// Playlist name. Omit to read names from stdin.
-        name: Option<String>,
+        name: Option<PlaylistArg>,
     },
 
     /// Print the name of every playlist that contains any of the tracks piped in on stdin.
@@ -25,92 +25,91 @@ pub(crate) enum Command {
     /// Output: one playlist name per match; pipe to `sort -u` to deduplicate.
     Contains {
         /// Print playlist only if it contains ALL input tracks
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["at_least", "no"])]
         all: bool,
         /// Print playlist only if it contains at least N input tracks
-        #[arg(long)]
-        at_least: Option<usize>,
+        #[arg(long, conflicts_with_all = ["all", "no"])]
+        at_least: Option<AtLeastArg>,
         /// Print playlist only if it contains NONE of the input tracks
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["all", "at_least"])]
         no: bool,
     },
 
     /// Create a new playlist from stdin (fails if it already exists)
     New {
         /// Playlist name
-        name: String,
+        name: PlaylistArg,
     },
 
     /// Append stdin to an existing playlist
     Append {
         /// Playlist name
-        name: String,
+        name: PlaylistArg,
     },
 
     /// Replace playlist content from stdin
     Replace {
         /// Playlist name
-        name: String,
+        name: PlaylistArg,
     },
 
     /// Edit playlist in $EDITOR
     Edit {
         /// Playlist name
-        name: String,
+        name: PlaylistArg,
     },
 
     /// Remove a playlist
     Remove {
         /// Playlist name
-        name: String,
+        name: PlaylistArg,
     },
 
     /// Rename a playlist
     Rename {
         /// Current playlist name
-        from: String,
+        from: PlaylistArg,
         /// New playlist name
-        to: String,
+        to: PlaylistArg,
     },
 }
 
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
     match command {
         Command::List => list(ctx),
-        // Names are still clap Strings; validated here until wired in P2.1.D.
-        Command::Get { name } => get(
-            OptPlaylistArg(name.as_deref().map(parse_playlist_name)),
-            ctx,
-        ),
+        Command::Get { name } => get(name, ctx),
         Command::Contains { all, at_least, no } => {
-            contains(ContainsArgs { all, at_least, no }, ctx)
+            contains(ContainsMode::from_flags(all, at_least, no), ctx)
         }
-        Command::New { name } => new(PlaylistArg(parse_playlist_name(&name)), ctx),
-        Command::Append { name } => append(PlaylistArg(parse_playlist_name(&name)), ctx),
-        Command::Replace { name } => replace(PlaylistArg(parse_playlist_name(&name)), ctx),
-        Command::Edit { name } => edit(PlaylistArg(parse_playlist_name(&name)), ctx),
-        Command::Remove { name } => remove(PlaylistArg(parse_playlist_name(&name)), ctx),
-        Command::Rename { from, to } => rename(
-            RenameArgs {
-                from: PlaylistArg(parse_playlist_name(&from)),
-                to: PlaylistArg(parse_playlist_name(&to)),
-            },
-            ctx,
-        ),
+        Command::New { name } => new(name, ctx),
+        Command::Append { name } => append(name, ctx),
+        Command::Replace { name } => replace(name, ctx),
+        Command::Edit { name } => edit(name, ctx),
+        Command::Remove { name } => remove(name, ctx),
+        Command::Rename { from, to } => rename(RenameArgs { from, to }, ctx),
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ContainsArgs {
-    pub(crate) all: bool,
-    pub(crate) at_least: Option<usize>,
-    pub(crate) no: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RenameArgs {
     pub(crate) from: PlaylistArg,
     pub(crate) to: PlaylistArg,
+}
+
+/// Minimum number of matching tracks for `--at-least`: a whole number, at least 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AtLeastArg(pub NonZeroUsize);
+
+impl std::str::FromStr for AtLeastArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse::<usize>()
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .map(Self)
+            .ok_or_else(|| "must be a whole number of at least 1".to_string())
+    }
 }
 
 /// Which playlists `playlist contains` prints, relative to the piped-in tracks.
@@ -123,24 +122,17 @@ pub(crate) enum ContainsMode {
 }
 
 impl ContainsMode {
-    /// Build the mode from the `contains` flags, or return the error message
-    /// to print when they are mutually exclusive or `--at-least` is 0.
-    fn from_flags(args: &ContainsArgs) -> std::result::Result<Self, &'static str> {
-        let flag_count =
-            usize::from(args.all) + usize::from(args.at_least.is_some()) + usize::from(args.no);
-        if flag_count > 1 {
-            return Err("Error: --all, --at-least, and --no are mutually exclusive.");
-        }
-        if args.no {
-            Ok(Self::None)
-        } else if args.all {
-            Ok(Self::All)
-        } else if let Some(n) = args.at_least {
-            NonZeroUsize::new(n)
-                .map(Self::AtLeast)
-                .ok_or("Error: --at-least requires a value of at least 1.")
+    /// Build the mode from the `contains` flags. Clap guarantees at most one
+    /// is set (they conflict) and that `--at-least` is non-zero.
+    fn from_flags(all: bool, at_least: Option<AtLeastArg>, no: bool) -> Self {
+        if no {
+            Self::None
+        } else if all {
+            Self::All
+        } else if let Some(AtLeastArg(n)) = at_least {
+            Self::AtLeast(n)
         } else {
-            Ok(Self::Any)
+            Self::Any
         }
     }
 
@@ -232,11 +224,11 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn get(name: OptPlaylistArg, ctx: &Ctx) -> Result<()> {
+pub(crate) fn get(name: Option<PlaylistArg>, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     let library = ctx.library();
-    match name.0 {
-        Some(pname) => {
+    match name {
+        Some(PlaylistArg(pname)) => {
             let content = expect_library(
                 library.request(&LibraryRequest::PlaylistGet { name: pname }),
                 playlist_content,
@@ -259,7 +251,10 @@ pub(crate) fn get(name: OptPlaylistArg, ctx: &Ctx) -> Result<()> {
                 std::process::exit(1);
             }
             for n in names {
-                let pname = parse_playlist_name(&n);
+                let pname = PlaylistName::new(&n).unwrap_or_else(|e| {
+                    eprintln!("Invalid playlist name: {}", e);
+                    std::process::exit(1);
+                });
                 let content = expect_library(
                     library.request(&LibraryRequest::PlaylistGet { name: pname }),
                     playlist_content,
@@ -271,17 +266,11 @@ pub(crate) fn get(name: OptPlaylistArg, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn contains(args: ContainsArgs, ctx: &Ctx) -> Result<()> {
+pub(crate) fn contains(mode: ContainsMode, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     use std::collections::HashSet;
 
     let library = ctx.library();
-
-    // Validate the filter flags
-    let mode = ContainsMode::from_flags(&args).unwrap_or_else(|message| {
-        eprintln!("{}", message);
-        std::process::exit(1);
-    });
 
     // 1. Read hashes from stdin
     let input_hashes = read_hashes();
@@ -471,8 +460,94 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    fn flags(all: bool, at_least: Option<usize>, no: bool) -> ContainsArgs {
-        ContainsArgs { all, at_least, no }
+    use crate::{Cli, Commands};
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Result<Command, clap::Error> {
+        let mut argv = vec!["mdma", "playlist"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).map(|cli| match cli.command {
+            Commands::Playlist { command } => command,
+            other => panic!("expected playlist command, got {other:?}"),
+        })
+    }
+
+    fn mode(args: &[&str]) -> ContainsMode {
+        let mut full = vec!["contains"];
+        full.extend_from_slice(args);
+        match parse(&full).unwrap() {
+            Command::Contains { all, at_least, no } => ContainsMode::from_flags(all, at_least, no),
+            other => panic!("expected contains, got {other:?}"),
+        }
+    }
+
+    fn assert_usage_error(args: &[&str]) {
+        let err = parse(args).unwrap_err();
+        assert_eq!(err.exit_code(), 2, "{err}");
+    }
+
+    #[test]
+    fn invalid_playlist_name_is_a_usage_error() {
+        for cmd in ["new", "append", "replace", "edit", "remove", "get"] {
+            assert_usage_error(&[cmd, "has space"]);
+            assert_usage_error(&[cmd, "a/b"]);
+        }
+        assert_usage_error(&["rename", "bad name", "ok"]);
+        assert_usage_error(&["rename", "ok", "bad/name"]);
+    }
+
+    #[test]
+    fn valid_playlist_names_are_accepted() {
+        assert!(matches!(
+            parse(&["new", "my-list_1"]).unwrap(),
+            Command::New { name } if name.0.to_string() == "my-list_1"
+        ));
+        assert!(matches!(
+            parse(&["get"]).unwrap(),
+            Command::Get { name: None }
+        ));
+        assert!(matches!(
+            parse(&["get", "mix"]).unwrap(),
+            Command::Get { name: Some(_) }
+        ));
+        match parse(&["rename", "a", "b"]).unwrap() {
+            Command::Rename { from, to } => {
+                assert_eq!(from.0.to_string(), "a");
+                assert_eq!(to.0.to_string(), "b");
+            }
+            other => panic!("expected rename, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn contains_conflicting_flags_are_a_usage_error() {
+        assert_usage_error(&["contains", "--all", "--no"]);
+        assert_usage_error(&["contains", "--all", "--at-least", "2"]);
+        assert_usage_error(&["contains", "--no", "--at-least", "2"]);
+    }
+
+    #[test]
+    fn contains_zero_at_least_is_a_usage_error() {
+        for bad in ["0", "abc", "1.5", ""] {
+            let err = parse(&["contains", "--at-least", bad]).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{bad}: {err}");
+            assert!(
+                err.to_string()
+                    .contains("must be a whole number of at least 1"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn contains_flags_build_the_right_mode() {
+        assert_eq!(mode(&[]), ContainsMode::Any);
+        assert_eq!(mode(&["--all"]), ContainsMode::All);
+        assert_eq!(mode(&["--no"]), ContainsMode::None);
+        assert_eq!(
+            mode(&["--at-least", "2"]),
+            ContainsMode::AtLeast(NonZeroUsize::new(2).unwrap())
+        );
     }
 
     #[test]
@@ -494,45 +569,5 @@ mod tests {
     #[test]
     fn contains_threshold_no_flag_inverts() {
         assert_eq!(ContainsMode::None.threshold(4), (1, true));
-    }
-
-    #[test]
-    fn contains_mode_from_flags() {
-        assert_eq!(
-            ContainsMode::from_flags(&flags(false, None, false)),
-            Ok(ContainsMode::Any)
-        );
-        assert_eq!(
-            ContainsMode::from_flags(&flags(true, None, false)),
-            Ok(ContainsMode::All)
-        );
-        assert_eq!(
-            ContainsMode::from_flags(&flags(false, None, true)),
-            Ok(ContainsMode::None)
-        );
-        assert_eq!(
-            ContainsMode::from_flags(&flags(false, Some(2), false)),
-            Ok(ContainsMode::AtLeast(NonZeroUsize::new(2).unwrap()))
-        );
-    }
-
-    #[test]
-    fn contains_mode_rejects_mutually_exclusive_flags() {
-        assert_eq!(
-            ContainsMode::from_flags(&flags(true, None, true)),
-            Err("Error: --all, --at-least, and --no are mutually exclusive.")
-        );
-        assert_eq!(
-            ContainsMode::from_flags(&flags(false, Some(0), true)),
-            Err("Error: --all, --at-least, and --no are mutually exclusive.")
-        );
-    }
-
-    #[test]
-    fn contains_mode_rejects_zero_at_least() {
-        assert_eq!(
-            ContainsMode::from_flags(&flags(false, Some(0), false)),
-            Err("Error: --at-least requires a value of at least 1.")
-        );
     }
 }
