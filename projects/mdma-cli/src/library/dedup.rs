@@ -17,10 +17,10 @@ pub(crate) enum Command {
     /// one duplicate group as listed by `mdma library dedup`.
     Merge {
         /// The track to keep (prefix accepted, git-style)
-        winner: String,
+        winner: TrackArg,
         /// The duplicates to merge into it (prefixes accepted)
         #[arg(required = true)]
-        losers: Vec<String>,
+        losers: Vec<TrackArg>,
         /// Do not ask for confirmation
         #[arg(long, short = 'y')]
         yes: bool,
@@ -50,14 +50,11 @@ pub(crate) struct MergeArgs {
 }
 
 impl MergeArgs {
-    fn new(yes: bool, winner: String, losers: Vec<String>) -> Self {
+    fn new(yes: bool, winner: TrackArg, losers: Vec<TrackArg>) -> Self {
         Self {
             yes: Yes(yes),
-            winner: TrackArg(ContentHash::new(winner)),
-            losers: losers
-                .into_iter()
-                .map(|loser| TrackArg(ContentHash::new(loser)))
-                .collect(),
+            winner,
+            losers,
         }
     }
 }
@@ -304,21 +301,21 @@ mod tests {
     #[test]
     fn dedup_merge_takes_a_winner_losers_and_yes() {
         assert_eq!(
-            dedup_args(&["merge", "abc123", "def456", "0a1b2c"]),
+            dedup_args(&["merge", "abc12345", "def45678", "0a1b2c3d"]),
             (
                 false,
                 Some(MergeArgs {
                     yes: Yes(false),
-                    winner: TrackArg(ContentHash::new("abc123")),
+                    winner: TrackArg(ContentHash::new("abc12345")),
                     losers: vec![
-                        TrackArg(ContentHash::new("def456")),
-                        TrackArg(ContentHash::new("0a1b2c"))
+                        TrackArg(ContentHash::new("def45678")),
+                        TrackArg(ContentHash::new("0a1b2c3d"))
                     ],
                 })
             )
         );
         for flag in ["--yes", "-y"] {
-            let (apply, merge) = dedup_args(&["merge", flag, "a", "b"]);
+            let (apply, merge) = dedup_args(&["merge", flag, "aaaaaaaa", "bbbbbbbb"]);
             assert!(!apply);
             assert_eq!(merge.map(|m| m.yes), Some(Yes(true)));
         }
@@ -326,12 +323,24 @@ mod tests {
 
     #[test]
     fn dedup_merge_needs_a_loser_and_does_not_mix_with_apply() {
-        assert!(Cli::try_parse_from(["mdma", "library", "dedup", "merge", "abc"]).is_err());
+        assert!(Cli::try_parse_from(["mdma", "library", "dedup", "merge", "abcdef12"]).is_err());
         assert!(Cli::try_parse_from(["mdma", "library", "dedup", "merge"]).is_err());
-        assert!(
-            Cli::try_parse_from(["mdma", "library", "dedup", "--apply", "merge", "a", "b"])
-                .is_err()
-        );
+        assert!(Cli::try_parse_from([
+            "mdma", "library", "dedup", "--apply", "merge", "aaaaaaaa", "bbbbbbbb"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn dedup_merge_hashes_must_be_valid_hashes() {
+        let merge = |winner: &str, loser: &str| {
+            Cli::try_parse_from(["mdma", "library", "dedup", "merge", winner, loser])
+        };
+        for bad in ["abcd123", "ABCD1234"] {
+            assert_eq!(merge(bad, "bbbbbbbb").unwrap_err().exit_code(), 2, "{bad}");
+            assert_eq!(merge("aaaaaaaa", bad).unwrap_err().exit_code(), 2, "{bad}");
+        }
+        assert!(merge("aaaaaaaa", "sha256:bbbbbbbb").is_ok());
     }
 
     fn dedup_member(hash: &str, item: Option<&str>) -> DedupMember {

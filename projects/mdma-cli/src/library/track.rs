@@ -2,7 +2,6 @@ use crate::args::TrackArg;
 use crate::ctx::Ctx;
 use clap::Subcommand;
 use color_eyre::Result;
-use library_ipc_client::ContentHash;
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
@@ -11,13 +10,13 @@ pub(crate) enum Command {
     /// The track is hidden from list/search results. To undo, use `mdma library track restore <hash>`.
     Delete {
         /// Content hash of the track (prefix accepted, git-style).
-        hash: String,
+        hash: TrackArg,
     },
 
     /// Restore a soft-deleted track (retracts the Deleted fact).
     Restore {
         /// Content hash of the track (prefix accepted, git-style).
-        hash: String,
+        hash: TrackArg,
     },
 
     /// Hard-replace an old track with a new file.
@@ -33,8 +32,9 @@ pub(crate) enum Command {
     /// Place the new file in the inbox directory or another device-local path first.
     Replace {
         /// Content hash of the old track (prefix accepted, git-style).
-        old_hash: String,
+        old_hash: TrackArg,
         /// Path to the new audio file on the device running the library service.
+        // A path on the service's device, so not checked here and not an ExistingFileArg.
         new_file: String,
     },
 
@@ -47,15 +47,9 @@ pub(crate) enum Command {
 
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
     match command {
-        Command::Delete { hash } => delete(TrackArg(ContentHash::new(hash)), ctx),
-        Command::Restore { hash } => restore(TrackArg(ContentHash::new(hash)), ctx),
-        Command::Replace { old_hash, new_file } => replace(
-            ReplaceArgs {
-                old_hash: TrackArg(ContentHash::new(old_hash)),
-                new_file,
-            },
-            ctx,
-        ),
+        Command::Delete { hash } => delete(hash, ctx),
+        Command::Restore { hash } => restore(hash, ctx),
+        Command::Replace { old_hash, new_file } => replace(ReplaceArgs { old_hash, new_file }, ctx),
         Command::Orphans => orphans(ctx),
     }
 }
@@ -164,14 +158,16 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::Command;
+    use crate::args::TrackArg;
     use crate::library;
     use crate::Commands;
+    use library_ipc_client::ContentHash;
 
     // ── track lifecycle clap parsing ──────────────────────────────────────────
 
     #[test]
     fn track_delete_parses_correctly() {
-        let result = Cli::try_parse_from(["mdma", "library", "track", "delete", "abc123"]);
+        let result = Cli::try_parse_from(["mdma", "library", "track", "delete", "abc12345"]);
         assert!(
             result.is_ok(),
             "clap rejected library track delete: {}",
@@ -185,7 +181,7 @@ mod tests {
                         command: Command::Delete { hash },
                     },
             } => {
-                assert_eq!(hash, "abc123");
+                assert_eq!(hash, TrackArg(ContentHash::new("abc12345")));
             }
             other => panic!("unexpected command: {:?}", other),
         }
@@ -193,7 +189,7 @@ mod tests {
 
     #[test]
     fn track_restore_parses_correctly() {
-        let result = Cli::try_parse_from(["mdma", "library", "track", "restore", "abc123"]);
+        let result = Cli::try_parse_from(["mdma", "library", "track", "restore", "abc12345"]);
         assert!(
             result.is_ok(),
             "clap rejected library track restore: {}",
@@ -207,7 +203,7 @@ mod tests {
                         command: Command::Restore { hash },
                     },
             } => {
-                assert_eq!(hash, "abc123");
+                assert_eq!(hash, TrackArg(ContentHash::new("abc12345")));
             }
             other => panic!("unexpected command: {:?}", other),
         }
@@ -220,7 +216,7 @@ mod tests {
             "library",
             "track",
             "replace",
-            "abc123",
+            "abc12345",
             "/music/inbox/new.flac",
         ]);
         assert!(
@@ -236,10 +232,26 @@ mod tests {
                         command: Command::Replace { old_hash, new_file },
                     },
             } => {
-                assert_eq!(old_hash, "abc123");
+                assert_eq!(old_hash, TrackArg(ContentHash::new("abc12345")));
                 assert_eq!(new_file, "/music/inbox/new.flac");
             }
             other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn track_hash_args_must_be_valid_hashes() {
+        for (verb, extra) in [
+            ("delete", None),
+            ("restore", None),
+            ("replace", Some("/music/inbox/new.flac")),
+        ] {
+            for bad in ["abc1234", "ABCD1234", "sha256:abc"] {
+                let mut argv = vec!["mdma", "library", "track", verb, bad];
+                argv.extend(extra);
+                let err = Cli::try_parse_from(argv).unwrap_err();
+                assert_eq!(err.exit_code(), 2, "{verb} {bad}");
+            }
         }
     }
 

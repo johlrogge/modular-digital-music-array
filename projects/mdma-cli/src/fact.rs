@@ -1,10 +1,9 @@
-use crate::args::TrackArg;
+use crate::args::{usage_error, TrackArg};
 use crate::ctx::Ctx;
 use crate::output::handle_error;
 use chrono::NaiveDate;
 use clap::Subcommand;
 use color_eyre::Result;
-use library_ipc_client::ContentHash;
 use music_facts::{
     Album, Artist, Bpm, DiscNumber, EnergyLevel, Isrc, Key, MusicValue, Title, TrackNumber,
     TrackRole, Year,
@@ -19,7 +18,7 @@ pub(crate) enum Command {
     /// retract explicitly first if you want to clean history.
     Add {
         /// Track content hash (prefix accepted, git-style).
-        hash: String,
+        hash: TrackArg,
         /// Field name to add. Tab-completion shows supported fields.
         #[arg(long, value_enum)]
         field: FactField,
@@ -33,7 +32,7 @@ pub(crate) enum Command {
     /// For scalar fields, retract removes that value from history.
     Retract {
         /// Track content hash (prefix accepted, git-style).
-        hash: String,
+        hash: TrackArg,
         /// Field name to retract.
         #[arg(long, value_enum)]
         field: FactField,
@@ -43,28 +42,52 @@ pub(crate) enum Command {
     },
 }
 
+/// The value of a fact as typed, with the domain value it parses to for its field.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FactValueArg {
+    raw: String,
+    value: MusicValue,
+}
+
+impl FactValueArg {
+    /// What counts as a valid value depends on the field, so this is a cross-argument check.
+    fn new(field: FactField, raw: String) -> std::result::Result<Self, String> {
+        let value = parse_field_value(field, &raw)?;
+        Ok(Self { raw, value })
+    }
+}
+
 /// A fact on a track, as named on the command line.
 #[derive(Debug)]
 pub(crate) struct FactArgs {
     field: FactField,
-    value: String,
+    value: FactValueArg,
     hash: TrackArg,
 }
 
 impl FactArgs {
-    fn new(field: FactField, value: String, hash: String) -> Self {
-        Self {
-            field,
-            value,
-            hash: TrackArg(ContentHash::new(hash)),
-        }
+    /// Checks the value against the field; a bad value is a usage error (exit 2).
+    fn new(
+        field: FactField,
+        value: String,
+        hash: TrackArg,
+    ) -> std::result::Result<Self, clap::Error> {
+        let value = FactValueArg::new(field, value)
+            .map_err(|msg| usage_error(clap::error::ErrorKind::ValueValidation, msg))?;
+        Ok(Self { field, value, hash })
     }
 }
 
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
     match command {
-        Command::Add { hash, field, value } => add(FactArgs::new(field, value, hash), ctx),
-        Command::Retract { hash, field, value } => retract(FactArgs::new(field, value, hash), ctx),
+        Command::Add { hash, field, value } => add(
+            FactArgs::new(field, value, hash).unwrap_or_else(|e| e.exit()),
+            ctx,
+        ),
+        Command::Retract { hash, field, value } => retract(
+            FactArgs::new(field, value, hash).unwrap_or_else(|e| e.exit()),
+            ctx,
+        ),
     }
 }
 
@@ -249,28 +272,16 @@ fn parse_field_value(field: FactField, raw: &str) -> Result<MusicValue, String> 
     }
 }
 
-/// Parse the value of a fact for its field, exiting with a diagnostic if it is invalid.
-fn parse_field_value_or_exit(field: FactField, raw: &str) -> MusicValue {
-    match parse_field_value(field, raw) {
-        Ok(v) => v,
-        Err(msg) => {
-            eprintln!("Error: {msg}");
-            std::process::exit(1);
-        }
-    }
-}
-
 pub(crate) fn add(args: FactArgs, ctx: &Ctx) -> Result<()> {
     let FactArgs {
         field,
-        value,
+        value: FactValueArg { raw, value },
         hash: TrackArg(hash),
     } = args;
     let library = ctx.library();
-    let music_value = parse_field_value_or_exit(field, &value);
-    match library.write_fact(&hash, music_value) {
+    match library.write_fact(&hash, value) {
         Ok(()) => {
-            println!("Added fact for {}: {:?} = {}", hash, field, value);
+            println!("Added fact for {}: {:?} = {}", hash, field, raw);
             Ok(())
         }
         Err(e) => handle_error(e),
@@ -280,14 +291,13 @@ pub(crate) fn add(args: FactArgs, ctx: &Ctx) -> Result<()> {
 pub(crate) fn retract(args: FactArgs, ctx: &Ctx) -> Result<()> {
     let FactArgs {
         field,
-        value,
+        value: FactValueArg { raw, value },
         hash: TrackArg(hash),
     } = args;
     let library = ctx.library();
-    let music_value = parse_field_value_or_exit(field, &value);
-    match library.retract_fact(&hash, music_value) {
+    match library.retract_fact(&hash, value) {
         Ok(()) => {
-            println!("Retracted fact for {}: {:?} = {}", hash, field, value);
+            println!("Retracted fact for {}: {:?} = {}", hash, field, raw);
             Ok(())
         }
         Err(e) => handle_error(e),
@@ -310,6 +320,44 @@ mod tests {
         }
         assert_eq!(FactField::value_variants().len(), FactField::ALL.len());
         assert!("nope".parse::<FactField>().is_err());
+    }
+
+    // ── argv parsing ──────────────────────────────────────────────────────────
+
+    use crate::Cli;
+    use clap::Parser;
+
+    fn fact_argv<'a>(verb: &'a str, hash: &'a str, value: &'a str, field: &'a str) -> Vec<&'a str> {
+        vec![
+            "mdma", "fact", verb, hash, "--field", field, "--value", value,
+        ]
+    }
+
+    #[test]
+    fn fact_hash_must_be_a_valid_hash() {
+        for verb in ["add", "retract"] {
+            for bad in ["abcd123", "ABCD1234"] {
+                let err = Cli::try_parse_from(fact_argv(verb, bad, "x", "title")).unwrap_err();
+                assert_eq!(err.exit_code(), 2, "{verb} {bad}");
+            }
+            let cli = Cli::try_parse_from(fact_argv(verb, "abcd1234", "x", "title"));
+            assert!(cli.is_ok(), "{verb}: {:?}", cli.err());
+        }
+    }
+
+    #[test]
+    fn fact_value_is_checked_against_the_field() {
+        let hash = "abcd1234".parse::<TrackArg>().unwrap();
+        let err = FactArgs::new(FactField::Year, "twenty".into(), hash.clone()).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(
+            err.to_string()
+                .contains("invalid integer for Year 'twenty'"),
+            "{err}"
+        );
+        let ok = FactArgs::new(FactField::Year, "2024".into(), hash).unwrap();
+        assert_eq!(ok.value.raw, "2024");
+        assert!(matches!(ok.value.value, MusicValue::Year(_)));
     }
 
     // ── parse_field_value ─────────────────────────────────────────────────────
