@@ -6,10 +6,6 @@ use source_protocol::{
     ImportJobStatus, ImportPhase, ImportSyncProgress, SourceRequest, SourceResponse,
 };
 
-// -----------------------------------------------------------------------------
-// Import job polling
-// -----------------------------------------------------------------------------
-
 const IMPORT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Consecutive failed polls tolerated before giving up (about a minute).

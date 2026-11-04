@@ -8,7 +8,6 @@ use crate::source::import::follow_import_job;
 use crate::source::import::is_terminal_phase;
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
-use mdma_client::SourceClient;
 use source_protocol::{SourceError, SourceRequest, SourceResponse};
 
 /// Top level of `mdma source`: the global `list`, or `<source-name> <command>`.
@@ -29,13 +28,41 @@ pub(crate) enum Command {
 }
 
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
-    match &command {
-        Command::List => handle_source_list(ctx),
-        Command::Named(args) => match parse_source_args(args) {
-            Ok((name, command)) => run_source_command(ctx, &name, &command),
+    match command {
+        Command::List => list(ctx),
+        Command::Named(args) => match parse_source_args(&args) {
+            Ok((name, command)) => {
+                run_source_command(SourceArg(mdma_client::SourceName::new(name)), command, ctx)
+            }
             Err(e) => exit_source_parse_error(e),
         },
     }
+}
+
+/// The music source a per-source command runs against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceArg(pub mdma_client::SourceName);
+
+/// Whether `check-updates` resyncs the stale items it finds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ApplyUpdates(pub bool);
+
+#[derive(clap::Args, Debug, PartialEq)]
+pub(crate) struct ImportPlaylistArgs {
+    /// Playlist slug or URL
+    playlist: String,
+
+    /// MDMA playlist name (default: sanitised source title)
+    #[arg(long)]
+    name: Option<String>,
+
+    /// Show the report without syncing or writing the playlist
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Print the job id and exit once the import has started
+    #[arg(long)]
+    no_wait: bool,
 }
 
 /// The per-source commands: `mdma source <source-name> <command> [args]`.
@@ -47,11 +74,11 @@ pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
 )]
 struct SourceInvocation {
     #[command(subcommand)]
-    command: SourceCommands,
+    command: SourceCommand,
 }
 
 #[derive(Subcommand, Debug, PartialEq)]
-enum SourceCommands {
+enum SourceCommand {
     /// Sync the source (download new items)
     Sync,
 
@@ -98,20 +125,8 @@ enum SourceCommands {
     /// Import a source playlist as an MDMA playlist (definitive matches only;
     /// for sources that support playlists)
     ImportPlaylist {
-        /// Playlist slug or URL
-        playlist: String,
-
-        /// MDMA playlist name (default: sanitised source title)
-        #[arg(long)]
-        name: Option<String>,
-
-        /// Show the report without syncing or writing the playlist
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Print the job id and exit once the import has started
-        #[arg(long)]
-        no_wait: bool,
+        #[command(flatten)]
+        args: ImportPlaylistArgs,
     },
 
     /// Show the current or last playlist import job, following it while running
@@ -120,7 +135,7 @@ enum SourceCommands {
 }
 
 /// Parse the arguments captured by [`Command::Named`]: `<name> <command> ...`.
-fn parse_source_args(args: &[String]) -> Result<(String, SourceCommands), clap::Error> {
+fn parse_source_args(args: &[String]) -> Result<(String, SourceCommand), clap::Error> {
     let (name, rest) = args
         .split_first()
         .expect("external subcommand always has a name");
@@ -144,11 +159,7 @@ fn exit_source_parse_error(e: clap::Error) -> ! {
 /// rate-limited upstream requests (e.g. Bandcamp), well beyond the default 5s.
 const SOURCE_LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-// =============================================================================
-// Source Command Handlers
-// =============================================================================
-
-fn handle_source_list(ctx: &Ctx) -> Result<()> {
+fn list(ctx: &Ctx) -> Result<()> {
     let gateway = ctx.gateway();
     let sources = match mdma_client::list_available_sources(gateway.as_deref(), ctx.sources_dir()) {
         Ok(s) => s,
@@ -167,7 +178,9 @@ fn handle_source_list(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-fn handle_source_sync(client: &SourceClient, name: &str) -> Result<()> {
+pub(crate) fn sync(source: SourceArg, ctx: &Ctx) -> Result<()> {
+    let name = source.0.as_str();
+    let client = ctx.source(name, None);
     println!("Syncing {}...", name);
     match client.request(name, &SourceRequest::Sync) {
         Ok(SourceResponse::SyncStarted {
@@ -184,35 +197,9 @@ fn handle_source_sync(client: &SourceClient, name: &str) -> Result<()> {
     }
 }
 
-fn handle_source_resync(client: &SourceClient, name: &str, identifier: &str) -> Result<()> {
-    println!("Requesting resync of {} from {}...", identifier, name);
-    match client.request(
-        name,
-        &SourceRequest::ResyncItem {
-            identifier: identifier.to_string(),
-        },
-    ) {
-        Ok(SourceResponse::ResyncQueued {
-            identifier,
-            tracks_queued,
-        }) => {
-            println!(
-                "Queued resync for {} ({} item queued)",
-                identifier, tracks_queued
-            );
-            Ok(())
-        }
-        Ok(SourceResponse::Error(SourceError::ItemNotFound { identifier: ref id })) => {
-            eprintln!("Item {} not found in your {} collection", id, name);
-            std::process::exit(1);
-        }
-        Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
-        Ok(_) => handle_source_error(&"Unexpected response"),
-        Err(e) => handle_source_error(&e),
-    }
-}
-
-fn handle_source_status(client: &SourceClient, name: &str) -> Result<()> {
+pub(crate) fn status(source: SourceArg, ctx: &Ctx) -> Result<()> {
+    let name = source.0.as_str();
+    let client = ctx.source(name, None);
     match client.request(name, &SourceRequest::GetStatus) {
         Ok(SourceResponse::Status(status)) => {
             println!("Source: {} v{}", status.name, status.version);
@@ -246,7 +233,9 @@ fn handle_source_status(client: &SourceClient, name: &str) -> Result<()> {
     }
 }
 
-fn handle_source_downloads(client: &SourceClient, name: &str) -> Result<()> {
+pub(crate) fn downloads(source: SourceArg, ctx: &Ctx) -> Result<()> {
+    let name = source.0.as_str();
+    let client = ctx.source(name, None);
     match client.request(name, &SourceRequest::ListDownloads) {
         Ok(SourceResponse::Downloads(downloads)) => {
             if downloads.is_empty() {
@@ -288,13 +277,10 @@ fn handle_source_downloads(client: &SourceClient, name: &str) -> Result<()> {
     }
 }
 
-fn handle_source_cancel(client: &SourceClient, name: &str, id: String) -> Result<()> {
-    match client.request(
-        name,
-        &SourceRequest::CancelDownload {
-            id: source_protocol::DownloadId::new(id.clone()),
-        },
-    ) {
+pub(crate) fn cancel(source: SourceArg, id: source_protocol::DownloadId, ctx: &Ctx) -> Result<()> {
+    let name = source.0.as_str();
+    let client = ctx.source(name, None);
+    match client.request(name, &SourceRequest::CancelDownload { id: id.clone() }) {
         Ok(SourceResponse::Cancelled { .. }) => {
             println!("Cancelled download: {}", id);
             Ok(())
@@ -305,7 +291,9 @@ fn handle_source_cancel(client: &SourceClient, name: &str, id: String) -> Result
     }
 }
 
-fn handle_source_pause(client: &SourceClient, name: &str) -> Result<()> {
+pub(crate) fn pause(source: SourceArg, ctx: &Ctx) -> Result<()> {
+    let name = source.0.as_str();
+    let client = ctx.source(name, None);
     match client.request(name, &SourceRequest::PauseAll) {
         Ok(SourceResponse::Paused) => {
             println!("Downloads paused");
@@ -317,7 +305,9 @@ fn handle_source_pause(client: &SourceClient, name: &str) -> Result<()> {
     }
 }
 
-fn handle_source_resume(client: &SourceClient, name: &str) -> Result<()> {
+pub(crate) fn resume(source: SourceArg, ctx: &Ctx) -> Result<()> {
+    let name = source.0.as_str();
+    let client = ctx.source(name, None);
     match client.request(name, &SourceRequest::ResumeAll) {
         Ok(SourceResponse::Resumed) => {
             println!("Downloads resumed");
@@ -329,13 +319,35 @@ fn handle_source_resume(client: &SourceClient, name: &str) -> Result<()> {
     }
 }
 
-fn handle_source_check_item(client: &SourceClient, name: &str, identifier: &str) -> Result<()> {
-    match client.request(
-        name,
-        &SourceRequest::CheckItem {
-            identifier: identifier.to_string(),
-        },
-    ) {
+pub(crate) fn resync(source: SourceArg, identifier: String, ctx: &Ctx) -> Result<()> {
+    let name = source.0.as_str();
+    let client = ctx.source(name, None);
+    println!("Requesting resync of {} from {}...", identifier, name);
+    match client.request(name, &SourceRequest::ResyncItem { identifier }) {
+        Ok(SourceResponse::ResyncQueued {
+            identifier,
+            tracks_queued,
+        }) => {
+            println!(
+                "Queued resync for {} ({} item queued)",
+                identifier, tracks_queued
+            );
+            Ok(())
+        }
+        Ok(SourceResponse::Error(SourceError::ItemNotFound { identifier: ref id })) => {
+            eprintln!("Item {} not found in your {} collection", id, name);
+            std::process::exit(1);
+        }
+        Ok(SourceResponse::Error(e)) => handle_source_error(&e.to_string()),
+        Ok(_) => handle_source_error(&"Unexpected response"),
+        Err(e) => handle_source_error(&e),
+    }
+}
+
+pub(crate) fn check_item(source: SourceArg, identifier: String, ctx: &Ctx) -> Result<()> {
+    let name = source.0.as_str();
+    let client = ctx.source(name, None);
+    match client.request(name, &SourceRequest::CheckItem { identifier }) {
         Ok(SourceResponse::ItemChecked {
             identifier,
             live_track_count,
@@ -365,12 +377,10 @@ fn handle_source_check_item(client: &SourceClient, name: &str, identifier: &str)
     }
 }
 
-fn handle_source_check_updates(
-    ctx: &Ctx,
-    source_client: &SourceClient,
-    name: &str,
-    apply: bool,
-) -> Result<()> {
+pub(crate) fn check_updates(source: SourceArg, apply: ApplyUpdates, ctx: &Ctx) -> Result<()> {
+    let name = source.0.as_str();
+    let apply = apply.0;
+    let source_client = ctx.source(name, None);
     // Fetch all ItemId values from the library for this source.
     // We use GetFactValues("ItemId") — returns all ItemId values the library knows about.
     let lib = ctx.library();
@@ -496,10 +506,6 @@ fn handle_source_check_updates(
     Ok(())
 }
 
-// =============================================================================
-// Source playlists (mdma source playlists / import-playlist / import-status)
-// =============================================================================
-
 /// Message for a source that answers `SourceError::Unsupported`.
 fn unsupported_message(source: &str, feature: &str) -> String {
     format!("source '{}' does not support {}", source, feature)
@@ -514,7 +520,9 @@ fn handle_playlist_source_error(source: &str, feature: &str, err: &SourceError) 
     handle_source_error(err)
 }
 
-fn handle_source_playlists(client: &SourceClient, source: &str) -> Result<()> {
+pub(crate) fn playlists(source: SourceArg, ctx: &Ctx) -> Result<()> {
+    let source = source.0.as_str();
+    let client = ctx.source(source, Some(SOURCE_LISTING_TIMEOUT));
     match client.request(source, &SourceRequest::ListPlaylists) {
         Ok(SourceResponse::Playlists(playlists)) => {
             if playlists.is_empty() {
@@ -573,21 +581,28 @@ fn import_not_started_message(source: &str, running_job_id: u64) -> String {
     )
 }
 
-fn handle_source_import_playlist(
-    client: &SourceClient,
-    source: &str,
-    playlist: &str,
-    name: &Option<String>,
-    dry_run: bool,
-    no_wait: bool,
+// Import requests return immediately (the job runs server-side), so the
+// default request timeout is enough for start and polls.
+pub(crate) fn import_playlist(
+    source: SourceArg,
+    args: ImportPlaylistArgs,
+    ctx: &Ctx,
 ) -> Result<()> {
+    let source = source.0.as_str();
+    let client = ctx.source(source, None);
+    let ImportPlaylistArgs {
+        playlist,
+        name,
+        dry_run,
+        no_wait,
+    } = args;
     // Validate --name before talking to the server
     let explicit_name = name.as_deref().map(|n| sanitized_name_or_exit(n, "--name"));
 
     let job_id = match client.request(
         source,
         &SourceRequest::ImportPlaylist {
-            playlist: playlist.to_string(),
+            playlist,
             name: explicit_name,
             dry_run,
         },
@@ -611,10 +626,12 @@ fn handle_source_import_playlist(
         println!("Check progress with '{}'", import_status_command(source));
         return Ok(());
     }
-    follow_import_job(client, source, job_id)
+    follow_import_job(&client, source, job_id)
 }
 
-fn handle_source_import_status(client: &SourceClient, source: &str) -> Result<()> {
+pub(crate) fn import_status(source: SourceArg, ctx: &Ctx) -> Result<()> {
+    let source = source.0.as_str();
+    let client = ctx.source(source, None);
     match client.request(source, &SourceRequest::GetImportStatus) {
         Ok(SourceResponse::ImportStatus(None)) => {
             println!("No import job");
@@ -625,7 +642,7 @@ fn handle_source_import_status(client: &SourceClient, source: &str) -> Result<()
                 finish_import(&status)
             } else {
                 println!("Import job {} is running", status.job_id);
-                follow_import_job(client, source, status.job_id)
+                follow_import_job(&client, source, status.job_id)
             }
         }
         Ok(SourceResponse::Error(e)) => handle_playlist_source_error(source, "playlist import", &e),
@@ -635,57 +652,22 @@ fn handle_source_import_status(client: &SourceClient, source: &str) -> Result<()
 }
 
 /// Run one per-source command against the source `name`.
-fn run_source_command(ctx: &Ctx, name: &str, command: &SourceCommands) -> Result<()> {
+fn run_source_command(source: SourceArg, command: SourceCommand, ctx: &Ctx) -> Result<()> {
     match command {
-        SourceCommands::Playlists => {
-            let client = ctx.source(name, Some(SOURCE_LISTING_TIMEOUT));
-            handle_source_playlists(&client, name)
-        }
-        _ => {
-            let client = ctx.source(name, None);
-            match command {
-                SourceCommands::Sync => handle_source_sync(&client, name),
-                SourceCommands::Status => handle_source_status(&client, name),
-                SourceCommands::Downloads => handle_source_downloads(&client, name),
-                SourceCommands::Cancel { id } => handle_source_cancel(&client, name, id.clone()),
-                SourceCommands::Pause => handle_source_pause(&client, name),
-                SourceCommands::Resume => handle_source_resume(&client, name),
-                SourceCommands::Resync { identifier } => {
-                    handle_source_resync(&client, name, identifier)
-                }
-                SourceCommands::CheckItem { identifier } => {
-                    handle_source_check_item(&client, name, identifier)
-                }
-                SourceCommands::CheckUpdates { apply } => {
-                    handle_source_check_updates(ctx, &client, name, *apply)
-                }
-                // Import requests return immediately (the job runs server-side),
-                // so the default request timeout is enough for start and polls.
-                SourceCommands::ImportPlaylist {
-                    playlist,
-                    name: import_name,
-                    dry_run,
-                    no_wait,
-                } => handle_source_import_playlist(
-                    &client,
-                    name,
-                    playlist,
-                    import_name,
-                    *dry_run,
-                    *no_wait,
-                ),
-                SourceCommands::ImportStatus => handle_source_import_status(&client, name),
-                SourceCommands::Playlists => unreachable!("handled above"),
-            }
-        }
+        SourceCommand::Sync => sync(source, ctx),
+        SourceCommand::Status => status(source, ctx),
+        SourceCommand::Downloads => downloads(source, ctx),
+        SourceCommand::Cancel { id } => cancel(source, source_protocol::DownloadId::new(id), ctx),
+        SourceCommand::Pause => pause(source, ctx),
+        SourceCommand::Resume => resume(source, ctx),
+        SourceCommand::Resync { identifier } => resync(source, identifier, ctx),
+        SourceCommand::CheckItem { identifier } => check_item(source, identifier, ctx),
+        SourceCommand::CheckUpdates { apply } => check_updates(source, ApplyUpdates(apply), ctx),
+        SourceCommand::Playlists => playlists(source, ctx),
+        SourceCommand::ImportPlaylist { args } => import_playlist(source, args, ctx),
+        SourceCommand::ImportStatus => import_status(source, ctx),
     }
 }
-
-// Adopted by a later chunk (per-command arg types); unused until then.
-#[allow(dead_code)]
-/// Name of a music source (not to be confused with `mdma_client::SourceName`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SourceName(pub String);
 
 #[cfg(test)]
 mod tests {
@@ -698,7 +680,6 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use super::Command as SourceTop;
     use crate::Commands;
 
     #[test]
@@ -710,13 +691,13 @@ mod tests {
     }
 
     /// Parse a hinted command line with the real parser, as a user pasting it would.
-    fn parse_hinted(command: &str) -> (String, SourceCommands) {
+    fn parse_hinted(command: &str) -> (String, SourceCommand) {
         let words: Vec<String> = command.split_whitespace().map(String::from).collect();
         assert_eq!(&words[..2], ["mdma", "source"], "{command}");
         let cli = Cli::try_parse_from(&words).unwrap_or_else(|e| panic!("{command}: {e}"));
         match cli.command {
             Commands::Source {
-                command: SourceTop::Named(args),
+                command: Command::Named(args),
             } => parse_source_args(&args).unwrap_or_else(|e| panic!("{command}: {e}")),
             other => panic!("{command}: unexpected {other:?}"),
         }
@@ -727,7 +708,7 @@ mod tests {
         for src in ["bandcamp", "beatport"] {
             let (name, command) = parse_hinted(&import_status_command(src));
             assert_eq!(name, src);
-            assert_eq!(command, SourceCommands::ImportStatus);
+            assert_eq!(command, SourceCommand::ImportStatus);
             // The refusal message embeds the same hint.
             assert!(import_not_started_message(src, 1).contains(&import_status_command(src)));
         }
@@ -739,46 +720,46 @@ mod tests {
         assert_eq!(name, "bandcamp");
         assert_eq!(
             command,
-            SourceCommands::Resync {
+            SourceCommand::Resync {
                 identifier: "p123".into()
             }
         );
     }
 
-    fn parse_source(args: &[&str]) -> Result<(String, SourceCommands), clap::Error> {
+    fn parse_source(args: &[&str]) -> Result<(String, SourceCommand), clap::Error> {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         parse_source_args(&args)
     }
 
     #[test]
     fn every_per_source_command_parses_with_the_name_first() {
-        let cases: Vec<(Vec<&str>, SourceCommands)> = vec![
-            (vec!["bandcamp", "sync"], SourceCommands::Sync),
-            (vec!["bandcamp", "status"], SourceCommands::Status),
-            (vec!["bandcamp", "downloads"], SourceCommands::Downloads),
+        let cases: Vec<(Vec<&str>, SourceCommand)> = vec![
+            (vec!["bandcamp", "sync"], SourceCommand::Sync),
+            (vec!["bandcamp", "status"], SourceCommand::Status),
+            (vec!["bandcamp", "downloads"], SourceCommand::Downloads),
             (
                 vec!["bandcamp", "cancel", "d1"],
-                SourceCommands::Cancel { id: "d1".into() },
+                SourceCommand::Cancel { id: "d1".into() },
             ),
-            (vec!["bandcamp", "pause"], SourceCommands::Pause),
-            (vec!["bandcamp", "resume"], SourceCommands::Resume),
+            (vec!["bandcamp", "pause"], SourceCommand::Pause),
+            (vec!["bandcamp", "resume"], SourceCommand::Resume),
             (
                 vec!["bandcamp", "resync", "p1"],
-                SourceCommands::Resync {
+                SourceCommand::Resync {
                     identifier: "p1".into(),
                 },
             ),
             (
                 vec!["bandcamp", "check-item", "p1"],
-                SourceCommands::CheckItem {
+                SourceCommand::CheckItem {
                     identifier: "p1".into(),
                 },
             ),
             (
                 vec!["bandcamp", "check-updates", "--apply"],
-                SourceCommands::CheckUpdates { apply: true },
+                SourceCommand::CheckUpdates { apply: true },
             ),
-            (vec!["bandcamp", "playlists"], SourceCommands::Playlists),
+            (vec!["bandcamp", "playlists"], SourceCommand::Playlists),
             (
                 vec![
                     "bandcamp",
@@ -789,16 +770,18 @@ mod tests {
                     "--dry-run",
                     "--no-wait",
                 ],
-                SourceCommands::ImportPlaylist {
-                    playlist: "my-list".into(),
-                    name: Some("x".into()),
-                    dry_run: true,
-                    no_wait: true,
+                SourceCommand::ImportPlaylist {
+                    args: ImportPlaylistArgs {
+                        playlist: "my-list".into(),
+                        name: Some("x".into()),
+                        dry_run: true,
+                        no_wait: true,
+                    },
                 },
             ),
             (
                 vec!["bandcamp", "import-status"],
-                SourceCommands::ImportStatus,
+                SourceCommand::ImportStatus,
             ),
         ];
         for (args, expected) in cases {
@@ -813,11 +796,13 @@ mod tests {
         let (_, command) = parse_source(&["bandcamp", "import-playlist", "p"]).unwrap();
         assert_eq!(
             command,
-            SourceCommands::ImportPlaylist {
-                playlist: "p".into(),
-                name: None,
-                dry_run: false,
-                no_wait: false,
+            SourceCommand::ImportPlaylist {
+                args: ImportPlaylistArgs {
+                    playlist: "p".into(),
+                    name: None,
+                    dry_run: false,
+                    no_wait: false,
+                },
             }
         );
     }
@@ -828,7 +813,7 @@ mod tests {
         assert!(matches!(
             cli.command,
             Commands::Source {
-                command: SourceTop::List
+                command: Command::List
             }
         ));
     }
@@ -838,7 +823,7 @@ mod tests {
         let cli = Cli::try_parse_from(["mdma", "source", "bandcamp", "sync"]).unwrap();
         match cli.command {
             Commands::Source {
-                command: SourceTop::Named(args),
+                command: Command::Named(args),
             } => assert_eq!(args, vec!["bandcamp", "sync"]),
             other => panic!("unexpected: {other:?}"),
         }
