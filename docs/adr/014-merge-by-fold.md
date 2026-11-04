@@ -98,7 +98,7 @@ Projection mechanics today:
   - both aggregates are re-resolved.
 - Facts logged against X after the fold go back to X (their origin is X).
 - Un-folding is a sequential operation on the log, so a full replay and incremental catch-up agree.
-- **Interim.** Until the origin-tagged un-fold exists, `catch_up` handles a retracted `Replaces` by rebuilding the projection from ACID: `load_from_acid_stream(None)` under the cursor lock, then swapping in fresh `tracks`, `fact_index` and `content_hashes`. This is rare and costs one full read.
+- **Undo is an in-memory rebuild only.** When `catch_up` sees a retracted `Replaces`, it rebuilds the affected entities (T, X and X's absorbed set) from their facts in the local ACID log. A full in-memory rebuild of the projection from the local log is an acceptable fallback. Nothing is re-fetched from sources (for example no Bandcamp re-download) and no files are touched.
 - **Undo restores the blob from the archive.** A merge moves X's blob to `archive/` (§10), so an undo moves it back. If the archive has been emptied, the undo restores X's metadata but not its audio, so X would come back live with a missing blob; the undo must then refuse or show X as file-missing (see Open questions, 2).
 
 ### 9. Play history
@@ -192,7 +192,7 @@ Projection mechanics today:
   The library and the replica must move together within each step. Downgrading after step 2 shows the duplicates again but loses no data.
 - **Existing data:**
   - **Phase 2 merges and ADR-004 replaces** fold the loser at its `Replaces`. The loser's later retract-all lines are redirected and remove the loser-origin entries (§7).
-  - **Restamped carried copies** stay on the head, so already-merged tracks project as they do today, including the ItemId display issue on those few items. Fix this with targeted user retractions or accept it (open question).
+  - **Restamped carried copies** stay on the head, so already-merged tracks project as they do today, including the ItemId display issue on those few items. These are left as they are (open question 4, decided); prod has had no merges.
   - **Inherited `Replaces`** are no-ops because of the absorbed set.
   - **Play events on retired losers** fold through their `Replaces`.
 - **Order of work:**
@@ -201,7 +201,7 @@ Projection mechanics today:
   3. Add the fold, the redirect map and the absorbed set as a map-level wrapper in MDMA. Move play events into the fold and delete `refresh_event_timestamps`.
   4. Switch the writers: one-write self-heal, `Replaces`-only merge and replace. Remove `plan_carry`.
   5. Upstream the wrapper once stainless_facts provides fold-entity-into-entity (johlrogge/stainless_facts#14).
-- **Clock dependence.** Latest-wins across entities relies on sane ACID timestamps. A Pi 5 without an RTC battery can boot with a wrong clock before NTP has synced, so ACID should keep timestamps monotonic (open question).
+- **Clock dependence.** Latest-wins across entities relies on ACID timestamps never going backwards. ACID guarantees this: each new fact gets a timestamp at or after the previous one, even if the system clock steps back, for example on a Pi 5 without an RTC battery before NTP has synced.
 - **Equivalence test.** The ADR-011 test is extended (§14). Removing `play_events` and `event_cursor` also simplifies the lock order.
 
 ## Open questions
@@ -210,9 +210,9 @@ Answers marked **decided** were given by Joakim. Those marked **proposed** are d
 
 1. Playlists: resolve at projection level only, or keep the eager rewrite? **Proposed:** resolve at projection level.
 2. Undo after the blob has been removed? **Decided:** a merge never deletes the blob; it moves it to the archive (§10), so an undo can restore the file from `archive/` (the relative layout makes that a plain move back). Only after `mdma library archive empty` is the audio gone, and then the §8 caveat applies.
-3. Does ACID guarantee monotonic timestamps? **Proposed:** ACID clamps timestamps to be monotonic.
-4. Legacy restamped carried values (the ItemId display on already-merged items): repair them or accept them? **Proposed:** leave the legacy restamped values.
-5. Interim full reload on `Replaces` retraction, or the origin-tagged un-fold right away? **Proposed:** the interim full reload.
+3. Does ACID guarantee monotonic timestamps? **Decided:** yes. ACID never lets timestamps go backwards: each new fact gets a timestamp at or after the previous one, even if the system clock steps back (see Consequences, Clock dependence).
+4. Legacy restamped carried values (the ItemId display on already-merged items): repair them or accept them? **Decided:** leave them. Stage2 is for experimenting and can be fixed later, and prod has had no merges.
+5. How is a `Replaces` retraction undone? **Decided:** an in-memory rebuild only. Rebuild the affected entities (T, X and X's absorbed set) from their facts in the local ACID log; a full in-memory rebuild from the local log is an acceptable fallback. Nothing is re-fetched from sources and no files are touched (§8).
 
 ## Related
 
