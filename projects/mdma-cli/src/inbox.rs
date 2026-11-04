@@ -3,7 +3,6 @@ use crate::output::handle_error;
 use clap::Subcommand;
 use color_eyre::Result;
 use library_ipc_client::InboxPath;
-use mdma_client::LibraryBackend;
 use track_formatter::short_hash;
 
 #[derive(Subcommand, Debug)]
@@ -28,16 +27,34 @@ pub(crate) enum Command {
 }
 
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
-    let client = ctx.library();
-    match &command {
-        Command::List => handle_inbox_list(&client),
-        Command::Delete { filename } => handle_inbox_delete(&client, filename.clone()),
-        Command::Ingest { filename } => handle_inbox_ingest(&client, filename.clone()),
-        Command::IngestAll => handle_inbox_ingest_all(&client),
+    match command {
+        Command::List => list(ctx),
+        Command::Delete { filename } => delete(InboxFile(filename), ctx),
+        Command::Ingest { filename } => ingest(InboxFile(filename), ctx),
+        Command::IngestAll => ingest_all(ctx),
     }
 }
 
-fn handle_inbox_list(client: &LibraryBackend) -> Result<()> {
+/// File name in the inbox as typed. Validated into an `InboxPath` after the
+/// library connection is made, so invalid names keep failing at the same
+/// point as before (phase-2 parse-time candidate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InboxFile(pub String);
+
+impl InboxFile {
+    fn path(&self) -> InboxPath {
+        match InboxPath::new(&self.0) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Invalid filename: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+fn list(ctx: &Ctx) -> Result<()> {
+    let client = ctx.library();
     match client.inbox_queue() {
         Ok(files) => {
             if files.is_empty() {
@@ -57,14 +74,9 @@ fn handle_inbox_list(client: &LibraryBackend) -> Result<()> {
     }
 }
 
-fn handle_inbox_delete(client: &LibraryBackend, filename: String) -> Result<()> {
-    let path = match InboxPath::new(&filename) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Invalid filename: {}", e);
-            std::process::exit(1);
-        }
-    };
+fn delete(file: InboxFile, ctx: &Ctx) -> Result<()> {
+    let client = ctx.library();
+    let path = file.path();
 
     match client.delete_inbox_file(&path) {
         Ok(result) => {
@@ -82,16 +94,11 @@ fn handle_inbox_delete(client: &LibraryBackend, filename: String) -> Result<()> 
     }
 }
 
-fn handle_inbox_ingest(client: &LibraryBackend, filename: String) -> Result<()> {
-    let path = match InboxPath::new(&filename) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Invalid filename: {}", e);
-            std::process::exit(1);
-        }
-    };
+fn ingest(file: InboxFile, ctx: &Ctx) -> Result<()> {
+    let client = ctx.library();
+    let path = file.path();
 
-    println!("Ingesting: {}", filename);
+    println!("Ingesting: {}", file.0);
 
     match client.ingest_file(&path) {
         Ok(result) => {
@@ -115,7 +122,8 @@ fn handle_inbox_ingest(client: &LibraryBackend, filename: String) -> Result<()> 
     }
 }
 
-fn handle_inbox_ingest_all(client: &LibraryBackend) -> Result<()> {
+fn ingest_all(ctx: &Ctx) -> Result<()> {
+    let client = ctx.library();
     println!("Ingesting all files in inbox...");
 
     match client.ingest_all() {

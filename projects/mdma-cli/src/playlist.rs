@@ -5,7 +5,7 @@ use clap::Subcommand;
 use color_eyre::Result;
 use colored::Colorize;
 use library_ipc_client::ContentHash;
-use mdma_client::LibraryBackend;
+use std::num::NonZeroUsize;
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
@@ -75,25 +75,97 @@ pub(crate) enum Command {
 }
 
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
-    let lib = ctx.library();
-    match &command {
-        Command::List => handle_playlist_list(&lib),
-        Command::Get { name } => handle_playlist_get(&lib, name),
+    match command {
+        Command::List => list(ctx),
+        Command::Get { name } => get(OptPlaylist(name), ctx),
         Command::Contains { all, at_least, no } => {
-            handle_playlist_contains(&lib, *all, *at_least, *no)
+            contains(ContainsArgs { all, at_least, no }, ctx)
         }
-        Command::New { name } => handle_playlist_new(&lib, name),
-        Command::Append { name } => handle_playlist_append(&lib, name),
-        Command::Replace { name } => handle_playlist_replace(&lib, name),
-        Command::Edit { name } => handle_playlist_edit(&lib, name),
-        Command::Remove { name } => handle_playlist_remove(&lib, name),
-        Command::Rename { from, to } => handle_playlist_rename(&lib, from, to),
+        Command::New { name } => new(Playlist(name), ctx),
+        Command::Append { name } => append(Playlist(name), ctx),
+        Command::Replace { name } => replace(Playlist(name), ctx),
+        Command::Edit { name } => edit(Playlist(name), ctx),
+        Command::Remove { name } => remove(Playlist(name), ctx),
+        Command::Rename { from, to } => rename(
+            RenameArgs {
+                from: Playlist(from),
+                to: Playlist(to),
+            },
+            ctx,
+        ),
     }
 }
 
-// =============================================================================
-// Playlist Helpers
-// =============================================================================
+/// Name of an MDMA playlist as typed. Validated into a `PlaylistName` after
+/// the library connection is made, so invalid names keep failing at the same
+/// point as before (phase-2 parse-time candidate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Playlist(pub String);
+
+impl Playlist {
+    fn name(&self) -> library_ipc_client::PlaylistName {
+        parse_playlist_name(&self.0)
+    }
+}
+
+/// Optional name of an MDMA playlist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OptPlaylist(pub Option<String>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContainsArgs {
+    pub(crate) all: bool,
+    pub(crate) at_least: Option<usize>,
+    pub(crate) no: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenameArgs {
+    pub(crate) from: Playlist,
+    pub(crate) to: Playlist,
+}
+
+/// Which playlists `playlist contains` prints, relative to the piped-in tracks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContainsMode {
+    Any,
+    All,
+    AtLeast(NonZeroUsize),
+    None,
+}
+
+impl ContainsMode {
+    /// Build the mode from the `contains` flags, or return the error message
+    /// to print when they are mutually exclusive or `--at-least` is 0.
+    fn from_flags(args: &ContainsArgs) -> std::result::Result<Self, &'static str> {
+        let flag_count =
+            usize::from(args.all) + usize::from(args.at_least.is_some()) + usize::from(args.no);
+        if flag_count > 1 {
+            return Err("Error: --all, --at-least, and --no are mutually exclusive.");
+        }
+        if args.no {
+            Ok(Self::None)
+        } else if args.all {
+            Ok(Self::All)
+        } else if let Some(n) = args.at_least {
+            NonZeroUsize::new(n)
+                .map(Self::AtLeast)
+                .ok_or("Error: --at-least requires a value of at least 1.")
+        } else {
+            Ok(Self::Any)
+        }
+    }
+
+    /// Returns `(threshold, invert)` for matching against `input_len` tracks.
+    fn threshold(self, input_len: usize) -> (usize, bool) {
+        match self {
+            Self::None => (1, true),
+            Self::All => (input_len, false),
+            Self::AtLeast(n) => (n.get(), false),
+            Self::Any => (1, false),
+        }
+    }
+}
 
 fn playlist_expect_content(
     response: std::result::Result<
@@ -143,13 +215,10 @@ fn playlist_expect_names(
     }
 }
 
-// =============================================================================
-// Playlist Command Handlers
-// =============================================================================
-
-fn handle_playlist_list(client: &LibraryBackend) -> Result<()> {
+fn list(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{DurationSeconds, LibraryRequest, LibraryResponse};
 
+    let client = ctx.library();
     let names = playlist_expect_names(client.request(&LibraryRequest::PlaylistList));
 
     for name in &names {
@@ -185,11 +254,12 @@ fn handle_playlist_list(client: &LibraryBackend) -> Result<()> {
     Ok(())
 }
 
-fn handle_playlist_get(client: &LibraryBackend, name: &Option<String>) -> Result<()> {
+fn get(name: OptPlaylist, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
-    match name {
+    let client = ctx.library();
+    match name.0 {
         Some(n) => {
-            let pname = parse_playlist_name(n);
+            let pname = parse_playlist_name(&n);
             let content = playlist_expect_content(
                 client.request(&LibraryRequest::PlaylistGet { name: pname }),
             );
@@ -222,48 +292,18 @@ fn handle_playlist_get(client: &LibraryBackend, name: &Option<String>) -> Result
     Ok(())
 }
 
-/// Resolve the match threshold and invert flag from the `contains` filter flags.
-/// Assumes mutual exclusivity and `at_least > 0` have already been validated.
-/// Returns `(threshold, invert)`.
-fn resolve_contains_threshold(
-    all: bool,
-    at_least: Option<usize>,
-    no: bool,
-    input_len: usize,
-) -> (usize, bool) {
-    if no {
-        (1, true)
-    } else if all {
-        (input_len, false)
-    } else if let Some(n) = at_least {
-        (n, false)
-    } else {
-        (1, false)
-    }
-}
-
-fn handle_playlist_contains(
-    client: &LibraryBackend,
-    all: bool,
-    at_least: Option<usize>,
-    no: bool,
-) -> Result<()> {
+fn contains(args: ContainsArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{LibraryRequest, LibraryResponse};
     use std::collections::HashSet;
     use std::io::BufRead;
 
-    // Validate mutually exclusive flags
-    let flag_count = usize::from(all) + usize::from(at_least.is_some()) + usize::from(no);
-    if flag_count > 1 {
-        eprintln!("Error: --all, --at-least, and --no are mutually exclusive.");
-        std::process::exit(1);
-    }
+    let client = ctx.library();
 
-    // Validate --at-least value
-    if let Some(0) = at_least {
-        eprintln!("Error: --at-least requires a value of at least 1.");
+    // Validate the filter flags
+    let mode = ContainsMode::from_flags(&args).unwrap_or_else(|message| {
+        eprintln!("{}", message);
         std::process::exit(1);
-    }
+    });
 
     // 1. Read hashes from stdin
     let input_hashes: Vec<String> = std::io::stdin()
@@ -279,7 +319,7 @@ fn handle_playlist_contains(
     }
 
     // 2. Determine threshold and invert
-    let (threshold, invert) = resolve_contains_threshold(all, at_least, no, input_hashes.len());
+    let (threshold, invert) = mode.threshold(input_hashes.len());
 
     let input_set: HashSet<&String> = input_hashes.iter().collect();
 
@@ -317,46 +357,50 @@ fn handle_playlist_contains(
     Ok(())
 }
 
-fn handle_playlist_new(client: &LibraryBackend, name: &str) -> Result<()> {
+fn new(name: Playlist, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
-    let pname = parse_playlist_name(name);
+    let client = ctx.library();
+    let pname = name.name();
     let content = read_stdin_to_string();
     playlist_expect_content(client.request(&LibraryRequest::PlaylistNew {
         name: pname,
         content,
     }));
-    eprintln!("Created playlist '{}'", name);
+    eprintln!("Created playlist '{}'", name.0);
     Ok(())
 }
 
-fn handle_playlist_append(client: &LibraryBackend, name: &str) -> Result<()> {
+fn append(name: Playlist, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
-    let pname = parse_playlist_name(name);
+    let client = ctx.library();
+    let pname = name.name();
     let content = read_stdin_to_string();
     playlist_expect_content(client.request(&LibraryRequest::PlaylistAppend {
         name: pname,
         content,
     }));
-    eprintln!("Appended to playlist '{}'", name);
+    eprintln!("Appended to playlist '{}'", name.0);
     Ok(())
 }
 
-fn handle_playlist_replace(client: &LibraryBackend, name: &str) -> Result<()> {
+fn replace(name: Playlist, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
-    let pname = parse_playlist_name(name);
+    let client = ctx.library();
+    let pname = name.name();
     let content = read_stdin_to_string();
     playlist_expect_content(client.request(&LibraryRequest::PlaylistReplace {
         name: pname,
         content,
     }));
-    eprintln!("Replaced playlist '{}'", name);
+    eprintln!("Replaced playlist '{}'", name.0);
     Ok(())
 }
 
-fn handle_playlist_edit(client: &LibraryBackend, name: &str) -> Result<()> {
+fn edit(name: Playlist, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{LibraryRequest, LibraryResponse, ProtocolError};
 
-    let pname = parse_playlist_name(name);
+    let client = ctx.library();
+    let pname = name.name();
 
     // 1. Get current content (or start empty if not found)
     let current = match client.request(&LibraryRequest::PlaylistGet {
@@ -375,7 +419,7 @@ fn handle_playlist_edit(client: &LibraryBackend, name: &str) -> Result<()> {
     };
 
     // 2. Write to temp file
-    let tmp_path = std::env::temp_dir().join(format!("mdma_playlist_{}.plist", name));
+    let tmp_path = std::env::temp_dir().join(format!("mdma_playlist_{}.plist", name.0));
     std::fs::write(&tmp_path, &current).unwrap_or_else(|e| {
         eprintln!("Failed to write temp file: {}", e);
         std::process::exit(1);
@@ -405,24 +449,25 @@ fn handle_playlist_edit(client: &LibraryBackend, name: &str) -> Result<()> {
         name: pname,
         content: new_content,
     }));
-    eprintln!("Updated playlist '{}'", name);
+    eprintln!("Updated playlist '{}'", name.0);
 
     // Cleanup
     let _ = std::fs::remove_file(&tmp_path);
     Ok(())
 }
 
-fn handle_playlist_rename(client: &LibraryBackend, from: &str, to: &str) -> Result<()> {
+fn rename(args: RenameArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{LibraryRequest, LibraryResponse};
-    let from_name = parse_playlist_name(from);
-    let to_name = parse_playlist_name(to);
+    let client = ctx.library();
+    let from_name = args.from.name();
+    let to_name = args.to.name();
     let response = client.request(&LibraryRequest::PlaylistRename {
         from: from_name,
         to: to_name,
     });
     match response {
         Ok(LibraryResponse::Pong) => {
-            eprintln!("Renamed playlist '{}' to '{}'", from, to);
+            eprintln!("Renamed playlist '{}' to '{}'", args.from.0, args.to.0);
         }
         Ok(LibraryResponse::Error(e)) => {
             eprintln!("Error: {}", e);
@@ -436,13 +481,14 @@ fn handle_playlist_rename(client: &LibraryBackend, from: &str, to: &str) -> Resu
     Ok(())
 }
 
-fn handle_playlist_remove(client: &LibraryBackend, name: &str) -> Result<()> {
+fn remove(name: Playlist, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{LibraryRequest, LibraryResponse};
-    let pname = parse_playlist_name(name);
+    let client = ctx.library();
+    let pname = name.name();
     let response = client.request(&LibraryRequest::PlaylistRemove { name: pname });
     match response {
         Ok(LibraryResponse::Pong) => {
-            eprintln!("Removed playlist '{}'", name);
+            eprintln!("Removed playlist '{}'", name.0);
         }
         Ok(LibraryResponse::Error(e)) => {
             eprintln!("Error: {}", e);
@@ -455,18 +501,6 @@ fn handle_playlist_remove(client: &LibraryBackend, name: &str) -> Result<()> {
     }
     Ok(())
 }
-
-// Adopted by a later chunk (per-command arg types); unused until then.
-#[allow(dead_code)]
-/// Name of an MDMA playlist.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Playlist(pub String);
-
-// Adopted by a later chunk (per-command arg types); unused until then.
-#[allow(dead_code)]
-/// Optional name of an MDMA playlist.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OptPlaylist(pub Option<String>);
 
 #[cfg(test)]
 mod tests {
@@ -474,29 +508,68 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    fn flags(all: bool, at_least: Option<usize>, no: bool) -> ContainsArgs {
+        ContainsArgs { all, at_least, no }
+    }
+
     #[test]
     fn contains_threshold_default_is_one_not_inverted() {
-        assert_eq!(
-            resolve_contains_threshold(false, None, false, 3),
-            (1, false)
-        );
+        assert_eq!(ContainsMode::Any.threshold(3), (1, false));
     }
 
     #[test]
     fn contains_threshold_all_uses_input_len() {
-        assert_eq!(resolve_contains_threshold(true, None, false, 5), (5, false));
+        assert_eq!(ContainsMode::All.threshold(5), (5, false));
     }
 
     #[test]
     fn contains_threshold_at_least_uses_given_value() {
-        assert_eq!(
-            resolve_contains_threshold(false, Some(3), false, 7),
-            (3, false)
-        );
+        let mode = ContainsMode::AtLeast(NonZeroUsize::new(3).unwrap());
+        assert_eq!(mode.threshold(7), (3, false));
     }
 
     #[test]
     fn contains_threshold_no_flag_inverts() {
-        assert_eq!(resolve_contains_threshold(false, None, true, 4), (1, true));
+        assert_eq!(ContainsMode::None.threshold(4), (1, true));
+    }
+
+    #[test]
+    fn contains_mode_from_flags() {
+        assert_eq!(
+            ContainsMode::from_flags(&flags(false, None, false)),
+            Ok(ContainsMode::Any)
+        );
+        assert_eq!(
+            ContainsMode::from_flags(&flags(true, None, false)),
+            Ok(ContainsMode::All)
+        );
+        assert_eq!(
+            ContainsMode::from_flags(&flags(false, None, true)),
+            Ok(ContainsMode::None)
+        );
+        assert_eq!(
+            ContainsMode::from_flags(&flags(false, Some(2), false)),
+            Ok(ContainsMode::AtLeast(NonZeroUsize::new(2).unwrap()))
+        );
+    }
+
+    #[test]
+    fn contains_mode_rejects_mutually_exclusive_flags() {
+        assert_eq!(
+            ContainsMode::from_flags(&flags(true, None, true)),
+            Err("Error: --all, --at-least, and --no are mutually exclusive.")
+        );
+        assert_eq!(
+            ContainsMode::from_flags(&flags(false, Some(0), true)),
+            Err("Error: --all, --at-least, and --no are mutually exclusive.")
+        );
+    }
+
+    #[test]
+    fn contains_mode_rejects_zero_at_least() {
+        assert_eq!(
+            ContainsMode::from_flags(&flags(false, Some(0), false)),
+            Err("Error: --at-least requires a value of at least 1.")
+        );
     }
 }
