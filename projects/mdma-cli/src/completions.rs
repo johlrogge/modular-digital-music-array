@@ -14,10 +14,6 @@ pub(crate) fn generate(args: Args) -> Result<()> {
     Ok(())
 }
 
-// =============================================================================
-// Shell Completions
-// =============================================================================
-
 fn generate_completions(shell: clap_complete::Shell, out: &mut dyn std::io::Write) {
     let mut cmd = Cli::command();
     clap_complete::generate(shell, &mut cmd, "mdma", out);

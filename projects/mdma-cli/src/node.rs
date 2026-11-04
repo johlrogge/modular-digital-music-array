@@ -10,11 +10,12 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::ctx::Ctx;
 use gateway_client::{GatewayClient, IdentifyError, NodeIdentity};
 use node_discovery::{
-    cache, resolve, select, DiscoveredNode, Effects, IdentityCheck, NodeCache, NodeKind,
-    RemoteTarget, Request, ResolveError, SelectEffects, SelectError, Source, Target, Unreachable,
-    VerifyError, BROWSE_TIMEOUT,
+    cache, resolve, DiscoveredNode, Effects, IdentityCheck, NodeCache, NodeKind, RemoteTarget,
+    Request, ResolveError, SelectEffects, SelectError, Source, Target, Unreachable, VerifyError,
+    BROWSE_TIMEOUT,
 };
 
 /// How long to wait for a gateway to answer an identify request.
@@ -23,10 +24,6 @@ const IDENTIFY_TIMEOUT: Duration = Duration::from_secs(1);
 /// Environment variable naming the node (split from `--node` so the two can be
 /// told apart).
 const NODE_ENV: &str = "MDMA_NODE";
-
-// =============================================================================
-// Pure parts
-// =============================================================================
 
 /// True when the CLI should talk to the local services over IPC instead of a
 /// gateway: sockets were given explicitly, or the library socket exists here.
@@ -316,10 +313,6 @@ pub fn identity_check(
     }
 }
 
-// =============================================================================
-// Effects
-// =============================================================================
-
 /// Ask the gateway at `ip:port` who it is; connecting and the answer are each
 /// bounded by [`IDENTIFY_TIMEOUT`].
 fn identify_at(ip: Ipv4Addr, port: u16) -> Result<IdentityCheck, Unreachable> {
@@ -370,10 +363,6 @@ fn real_effects() -> Effects<'static> {
         is_tty: is_tty(),
     }
 }
-
-// =============================================================================
-// Resolution
-// =============================================================================
 
 fn env_node() -> Option<String> {
     std::env::var(NODE_ENV).ok().filter(|v| !v.is_empty())
@@ -431,12 +420,33 @@ pub fn resolve_startup(explicit: Option<&str>, local_ipc: bool) -> Target {
     }
 }
 
-// =============================================================================
-// `mdma node` subcommands
-// =============================================================================
+#[derive(clap::Subcommand, Debug)]
+pub(crate) enum Command {
+    /// List MDMA nodes on the network (* marks the remembered node)
+    List,
+    /// Remember a node (by name or id; prompts when omitted)
+    Select {
+        /// Node name or id
+        name: Option<String>,
+    },
+    /// Forget the remembered node
+    Forget,
+    /// Show which node commands would use, and why
+    Show,
+}
+
+pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> color_eyre::Result<()> {
+    match command {
+        Command::List => list(ctx),
+        // Phase 2: a typed node name parsed by hicli; resolution matches on the raw text today.
+        Command::Select { name } => select(name, ctx),
+        Command::Forget => forget(ctx),
+        Command::Show => show(ctx),
+    }
+}
 
 /// `mdma node list`
-pub fn handle_list() -> color_eyre::Result<()> {
+pub(crate) fn list(_ctx: &Ctx) -> color_eyre::Result<()> {
     let nodes = node_discovery::browse(BROWSE_TIMEOUT);
     if nodes.is_empty() {
         println!("No MDMA nodes found on the network.");
@@ -451,14 +461,14 @@ pub fn handle_list() -> color_eyre::Result<()> {
 }
 
 /// `mdma node select [name|id]`
-pub fn handle_select(query: Option<&str>) -> color_eyre::Result<()> {
+pub(crate) fn select(query: Option<String>, _ctx: &Ctx) -> color_eyre::Result<()> {
     let nodes = node_discovery::browse(BROWSE_TIMEOUT);
     let mut effects = SelectEffects {
         identify_at: Box::new(identify_at),
         pick: Box::new(pick_interactive),
         is_tty: is_tty(),
     };
-    let entry = match select(nodes, query, &mut effects) {
+    let entry = match node_discovery::select(nodes, query.as_deref(), &mut effects) {
         Ok(entry) => entry,
         Err(e) => {
             eprintln!("{}", select_error_message(&e));
@@ -485,7 +495,7 @@ pub fn handle_select(query: Option<&str>) -> color_eyre::Result<()> {
 }
 
 /// `mdma node forget`
-pub fn handle_forget() -> color_eyre::Result<()> {
+pub(crate) fn forget(_ctx: &Ctx) -> color_eyre::Result<()> {
     let Some(path) = cache_path() else {
         println!("No config directory; nothing to forget.");
         return Ok(());
@@ -503,8 +513,11 @@ pub fn handle_forget() -> color_eyre::Result<()> {
 }
 
 /// `mdma node show`: resolve like any command would, but save nothing.
-pub fn handle_show(explicit: Option<&str>, local_ipc: bool) -> color_eyre::Result<()> {
-    match resolve(request(explicit, local_ipc), &mut real_effects()) {
+pub(crate) fn show(ctx: &Ctx) -> color_eyre::Result<()> {
+    match resolve(
+        request(ctx.node_flag(), ctx.local_ipc()),
+        &mut real_effects(),
+    ) {
         Ok(resolution) => {
             match &resolution.target {
                 Target::LocalIpc => println!("Local services over IPC (no node)"),
@@ -524,34 +537,6 @@ pub fn handle_show(explicit: Option<&str>, local_ipc: bool) -> color_eyre::Resul
             eprintln!("{}", resolve_error_message(&e));
             std::process::exit(1);
         }
-    }
-}
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[derive(clap::Subcommand, Debug)]
-pub(crate) enum Command {
-    /// List MDMA nodes on the network (* marks the remembered node)
-    List,
-    /// Remember a node (by name or id; prompts when omitted)
-    Select {
-        /// Node name or id
-        name: Option<String>,
-    },
-    /// Forget the remembered node
-    Forget,
-    /// Show which node commands would use, and why
-    Show,
-}
-
-pub(crate) fn dispatch(command: Command, ctx: &crate::ctx::Ctx) -> color_eyre::Result<()> {
-    match &command {
-        Command::List => handle_list(),
-        Command::Select { name } => handle_select(name.as_deref()),
-        Command::Forget => handle_forget(),
-        Command::Show => handle_show(ctx.node_flag(), ctx.local_ipc()),
     }
 }
 
