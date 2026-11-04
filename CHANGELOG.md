@@ -8,6 +8,17 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.36.1] — 2026-11-04
+
+### Fixed
+
+- **The library no longer skips early facts at startup.** About 370 lines written by the first releases are now read.
+  - `HasAlbumArt` stored as `true`/`false` is read as present/absent.
+  - The early play events `Played` and `Skipped` are read as `TrackStopped` (completed or skipped).
+  - This restores album-art flags and the earliest play history on existing libraries. The facts log is not rewritten, and new facts use the current format.
+
+---
+
 ## [0.36.0] — 2026-11-04
 
 ### Added

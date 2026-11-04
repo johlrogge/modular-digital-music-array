@@ -202,7 +202,7 @@ Copy `scripts/install-mdma-macos.sh` from this repo to your Mac and run it. It r
 bash install-mdma-macos.sh
 
 # Install a specific tag
-bash install-mdma-macos.sh v0.36.0
+bash install-mdma-macos.sh v0.36.1
 
 # Install to a user-writable location (no sudo)
 MDMA_INSTALL_DIR=~/.local/bin bash install-mdma-macos.sh
@@ -220,6 +220,14 @@ cp profiles/dev/target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.36.1
+
+### Early facts are no longer skipped at startup
+
+The library used to skip about 370 lines written by the first releases. They are now read: `HasAlbumArt` stored as `true`/`false` is read as present/absent, and the early play events `Played` and `Skipped` are read as `TrackStopped` (completed or skipped). This restores album-art flags and the earliest play history on existing libraries. The facts log is not rewritten, and new facts use the current format. See CHANGELOG.md.
 
 ---
 
