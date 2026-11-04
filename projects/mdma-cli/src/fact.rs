@@ -4,7 +4,6 @@ use chrono::NaiveDate;
 use clap::Subcommand;
 use color_eyre::Result;
 use library_ipc_client::ContentHash;
-use mdma_client::LibraryBackend;
 use music_facts::{
     Album, Artist, Bpm, DiscNumber, EnergyLevel, Isrc, Key, MusicValue, Title, TrackNumber,
     TrackRole, Year,
@@ -43,15 +42,18 @@ pub(crate) enum Command {
     },
 }
 
+/// A fact on a track, as named on the command line.
+#[derive(Debug)]
+pub(crate) struct FactArgs {
+    hash: String,
+    field: FactField,
+    value: String,
+}
+
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
-    let lib = ctx.library();
-    match &command {
-        Command::Add { hash, field, value } => {
-            handle_fact_add(&lib, hash.clone(), *field, value.clone())
-        }
-        Command::Retract { hash, field, value } => {
-            handle_fact_retract(&lib, hash.clone(), *field, value.clone())
-        }
+    match command {
+        Command::Add { hash, field, value } => add(FactArgs { hash, field, value }, ctx),
+        Command::Retract { hash, field, value } => retract(FactArgs { hash, field, value }, ctx),
     }
 }
 
@@ -59,7 +61,7 @@ pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
 ///
 /// Internal/derived fields (FilePath, Source, ItemId, audio properties, play events,
 /// AddedAt, cover art) are intentionally excluded — they are managed automatically.
-#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FactField {
     Title,
     Artist,
@@ -83,6 +85,77 @@ pub(crate) enum FactField {
     BandcampUrl,
     Role,
     Energy,
+}
+
+impl FactField {
+    const ALL: [FactField; 22] = [
+        FactField::Title,
+        FactField::Artist,
+        FactField::Album,
+        FactField::AlbumArtist,
+        FactField::TrackNumber,
+        FactField::DiscNumber,
+        FactField::Year,
+        FactField::Bpm,
+        FactField::Key,
+        FactField::MainGenre,
+        FactField::StyleDescriptor,
+        FactField::FullGenre,
+        FactField::Isrc,
+        FactField::Label,
+        FactField::RecordingYear,
+        FactField::RecordingDate,
+        FactField::Comment,
+        FactField::BeatportLabelUrl,
+        FactField::BeatportTrackUrl,
+        FactField::BandcampUrl,
+        FactField::Role,
+        FactField::Energy,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            FactField::Title => "title",
+            FactField::Artist => "artist",
+            FactField::Album => "album",
+            FactField::AlbumArtist => "album-artist",
+            FactField::TrackNumber => "track-number",
+            FactField::DiscNumber => "disc-number",
+            FactField::Year => "year",
+            FactField::Bpm => "bpm",
+            FactField::Key => "key",
+            FactField::MainGenre => "main-genre",
+            FactField::StyleDescriptor => "style-descriptor",
+            FactField::FullGenre => "full-genre",
+            FactField::Isrc => "isrc",
+            FactField::Label => "label",
+            FactField::RecordingYear => "recording-year",
+            FactField::RecordingDate => "recording-date",
+            FactField::Comment => "comment",
+            FactField::BeatportLabelUrl => "beatport-label-url",
+            FactField::BeatportTrackUrl => "beatport-track-url",
+            FactField::BandcampUrl => "bandcamp-url",
+            FactField::Role => "role",
+            FactField::Energy => "energy",
+        }
+    }
+}
+
+impl std::fmt::Display for FactField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for FactField {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|field| field.name() == s)
+            .ok_or_else(|| format!("unknown fact field '{s}'"))
+    }
 }
 
 /// Parse a raw string value into a `MusicValue` for the given `FactField`.
@@ -165,19 +238,21 @@ fn parse_field_value(field: FactField, raw: &str) -> Result<MusicValue, String> 
     }
 }
 
-fn handle_fact_add(
-    client: &LibraryBackend,
-    hash: String,
-    field: FactField,
-    value: String,
-) -> Result<()> {
-    let music_value = match parse_field_value(field, &value) {
+/// Parse the value of a fact for its field, exiting with a diagnostic if it is invalid.
+fn parse_field_value_or_exit(field: FactField, raw: &str) -> MusicValue {
+    match parse_field_value(field, raw) {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("Error: {msg}");
             std::process::exit(1);
         }
-    };
+    }
+}
+
+pub(crate) fn add(args: FactArgs, ctx: &Ctx) -> Result<()> {
+    let FactArgs { hash, field, value } = args;
+    let client = ctx.library();
+    let music_value = parse_field_value_or_exit(field, &value);
     let content_hash = ContentHash::new(hash.clone());
     match client.write_fact(&content_hash, music_value) {
         Ok(()) => {
@@ -188,19 +263,10 @@ fn handle_fact_add(
     }
 }
 
-fn handle_fact_retract(
-    client: &LibraryBackend,
-    hash: String,
-    field: FactField,
-    value: String,
-) -> Result<()> {
-    let music_value = match parse_field_value(field, &value) {
-        Ok(v) => v,
-        Err(msg) => {
-            eprintln!("Error: {msg}");
-            std::process::exit(1);
-        }
-    };
+pub(crate) fn retract(args: FactArgs, ctx: &Ctx) -> Result<()> {
+    let FactArgs { hash, field, value } = args;
+    let client = ctx.library();
+    let music_value = parse_field_value_or_exit(field, &value);
     let content_hash = ContentHash::new(hash.clone());
     match client.retract_fact(&content_hash, music_value) {
         Ok(()) => {
@@ -216,6 +282,18 @@ mod tests {
     use super::*;
 
     use music_facts::MusicValue;
+
+    #[test]
+    fn fact_field_matches_clap_value_enum() {
+        use clap::ValueEnum;
+        for v in FactField::value_variants() {
+            let name = v.to_possible_value().unwrap().get_name().to_string();
+            assert_eq!(name.parse::<FactField>(), Ok(*v));
+            assert_eq!(v.to_string(), name);
+        }
+        assert_eq!(FactField::value_variants().len(), FactField::ALL.len());
+        assert!("nope".parse::<FactField>().is_err());
+    }
 
     // ── parse_field_value ─────────────────────────────────────────────────────
 

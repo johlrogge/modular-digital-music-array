@@ -119,8 +119,8 @@ pub(crate) fn search(args: SearchArgs, ctx: &Ctx) -> Result<()> {
         genre,
         style,
         bpm,
-        key,
-        duration,
+        key: _,
+        duration: _,
         year,
         source,
         no_stdin,
@@ -132,52 +132,64 @@ pub(crate) fn search(args: SearchArgs, ctx: &Ctx) -> Result<()> {
         energy,
         not,
         subcommand,
-    } = &args;
+    } = args;
     let client = ctx.library();
-    if let Some(sub) = subcommand {
-        match sub {
-            Command::FactValuesFor { fact_type } => {
-                handle_fact_values_for(&client, fact_type.clone())
-            }
+    match subcommand {
+        Some(Command::FactValuesFor { fact_type }) => fact_values_for(&client, fact_type),
+        None => {
+            let mut track_query = build_track_query(SearchFilters {
+                any_text: query,
+                artist,
+                title,
+                album,
+                label,
+                genre,
+                style,
+                bpm,
+                year,
+                source,
+                started,
+                stopped,
+                added,
+                played,
+                role,
+                energy,
+            });
+            track_query.not = not;
+            search_tracks(&client, &track_query, no_stdin)
         }
-    } else {
-        let mut track_query = build_track_query(
-            query.clone(),
-            artist.clone(),
-            title.clone(),
-            album.clone(),
-            label.clone(),
-            genre.clone(),
-            style.clone(),
-            bpm.clone(),
-            key.clone(),
-            duration.clone(),
-            year.clone(),
-            source.clone(),
-            started.clone(),
-            stopped.clone(),
-            added.clone(),
-            played.clone(),
-            role.clone(),
-            energy.clone(),
-        );
-        track_query.not = *not;
-        handle_search(&client, &track_query, *no_stdin)
     }
 }
 
 /// Filter by playback history.
-#[derive(clap::ValueEnum, Debug, Clone)]
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlayedFilter {
     /// Tracks that have never been played (started fact is absent).
     Never,
 }
 
-/// Build a TrackQuery from individual CLI arguments.
-///
-/// Precedence: `--played=never` overrides any explicit `--started` value.
-#[allow(clippy::too_many_arguments)]
-fn build_track_query(
+impl std::fmt::Display for PlayedFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PlayedFilter::Never => f.write_str("never"),
+        }
+    }
+}
+
+impl std::str::FromStr for PlayedFilter {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "never" => Ok(PlayedFilter::Never),
+            _ => Err(format!("unknown played filter '{s}'")),
+        }
+    }
+}
+
+/// The raw search filters taken from the command line, before parsing into a `TrackQuery`.
+#[derive(Debug, Default)]
+struct SearchFilters {
     any_text: Option<String>,
     artist: Option<String>,
     title: Option<String>,
@@ -185,18 +197,39 @@ fn build_track_query(
     label: Option<String>,
     genre: Option<String>,
     style: Option<String>,
-    bpm_str: Option<String>,
-    _key_str: Option<String>,
-    _duration_str: Option<String>,
-    year_str: Option<String>,
+    bpm: Option<String>,
+    year: Option<String>,
     source: Option<String>,
-    started_str: Option<String>,
-    stopped_str: Option<String>,
-    added_str: Option<String>,
+    started: Option<String>,
+    stopped: Option<String>,
+    added: Option<String>,
     played: Option<PlayedFilter>,
-    role_str: Option<String>,
-    energy_str: Option<String>,
-) -> TrackQuery {
+    role: Option<String>,
+    energy: Option<String>,
+}
+
+/// Build a TrackQuery from the search filters.
+///
+/// Precedence: `--played=never` overrides any explicit `--started` value.
+fn build_track_query(filters: SearchFilters) -> TrackQuery {
+    let SearchFilters {
+        any_text,
+        artist,
+        title,
+        album,
+        label,
+        genre,
+        style,
+        bpm: bpm_str,
+        year: year_str,
+        source,
+        started: started_str,
+        stopped: stopped_str,
+        added: added_str,
+        played,
+        role: role_str,
+        energy: energy_str,
+    } = filters;
     let started = if matches!(played, Some(PlayedFilter::Never)) {
         // --played=never is a shortcut for started=N/A and overrides any --started value.
         Some(library_search::DateQuery::NA)
@@ -316,7 +349,7 @@ fn apply_stdin_filter(
     }
 }
 
-fn handle_search(client: &LibraryBackend, query: &TrackQuery, no_stdin: bool) -> Result<()> {
+fn search_tracks(client: &LibraryBackend, query: &TrackQuery, no_stdin: bool) -> Result<()> {
     use std::collections::HashSet;
     use std::io::{BufRead, IsTerminal};
 
@@ -361,7 +394,7 @@ fn handle_search(client: &LibraryBackend, query: &TrackQuery, no_stdin: bool) ->
     }
 }
 
-fn handle_fact_values_for(client: &LibraryBackend, fact_type: String) -> Result<()> {
+fn fact_values_for(client: &LibraryBackend, fact_type: String) -> Result<()> {
     use std::io::IsTerminal;
     match client.get_fact_values(&fact_type) {
         Ok(values) => {
@@ -502,6 +535,17 @@ mod tests {
     // ── --played=never filter ─────────────────────────────────────────────────
 
     #[test]
+    fn played_filter_matches_clap_value_enum() {
+        use clap::ValueEnum;
+        for v in PlayedFilter::value_variants() {
+            let name = v.to_possible_value().unwrap().get_name().to_string();
+            assert_eq!(name.parse::<PlayedFilter>(), Ok(*v));
+            assert_eq!(v.to_string(), name);
+        }
+        assert!("nope".parse::<PlayedFilter>().is_err());
+    }
+
+    #[test]
     fn search_played_never_maps_to_started_na() {
         use library_search::DateQuery;
         let result = Cli::try_parse_from(["mdma", "search", "--played", "never"]);
@@ -511,26 +555,10 @@ mod tests {
             result.unwrap_err()
         );
         // Build the query with played=never and no explicit --started
-        let query = build_track_query(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(PlayedFilter::Never),
-            None,
-            None,
-        );
+        let query = build_track_query(SearchFilters {
+            played: Some(PlayedFilter::Never),
+            ..Default::default()
+        });
         assert!(
             matches!(query.started, Some(DateQuery::NA)),
             "expected started == Some(DateQuery::NA), got {:?}",
@@ -542,26 +570,11 @@ mod tests {
     fn search_played_never_overrides_started() {
         use library_search::DateQuery;
         // When --played=never and --started are both given, --played=never wins.
-        let query = build_track_query(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("-7".to_string()),
-            None,
-            None,
-            Some(PlayedFilter::Never),
-            None,
-            None,
-        );
+        let query = build_track_query(SearchFilters {
+            started: Some("-7".to_string()),
+            played: Some(PlayedFilter::Never),
+            ..Default::default()
+        });
         assert!(
             matches!(query.started, Some(DateQuery::NA)),
             "expected --played=never to override --started, got {:?}",

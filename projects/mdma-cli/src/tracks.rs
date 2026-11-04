@@ -8,7 +8,6 @@ use crate::Cli;
 use clap::CommandFactory;
 use color_eyre::Result;
 use library_ipc_client::{ContentHash, TrackInfo};
-use mdma_client::{LibraryBackend, PlaybackBackend};
 use track_formatter::{render_for_user, short_hash, ViewColumn};
 
 #[derive(clap::Args, Debug)]
@@ -73,72 +72,7 @@ pub(crate) struct ViewArgs {
     duration: bool,
 }
 
-pub(crate) fn ping(ctx: &Ctx) -> Result<()> {
-    let client = ctx.library();
-    handle_ping(&client)
-}
-
-pub(crate) fn status(ctx: &Ctx) -> Result<()> {
-    let client = ctx.library();
-    handle_status(&client)
-}
-
-pub(crate) fn list(args: ListArgs, ctx: &Ctx) -> Result<()> {
-    let ListArgs { limit } = &args;
-    let client = ctx.library();
-    handle_list(&client, *limit)
-}
-
-pub(crate) fn get(args: GetArgs, ctx: &Ctx) -> Result<()> {
-    let GetArgs { hash } = &args;
-    let client = ctx.library();
-    handle_get(&client, hash.clone())
-}
-
-pub(crate) fn facts(args: FactsArgs, ctx: &Ctx) -> Result<()> {
-    let FactsArgs { hash } = &args;
-    let client = ctx.library();
-    handle_facts(&client, hash.clone())
-}
-
-pub(crate) fn sort(args: SortArgs, ctx: &Ctx) -> Result<()> {
-    let SortArgs {
-        field,
-        ascending,
-        descending,
-    } = &args;
-    let client = ctx.library();
-    handle_sort(&client, field.clone(), *ascending, *descending)
-}
-
-pub(crate) fn bookmark(args: BookmarkArgs, ctx: &Ctx) -> Result<()> {
-    let BookmarkArgs { hash, scope } = &args;
-    let lib = ctx.library();
-    let pb = ctx.playback();
-    handle_bookmark(&lib, Some(&pb), hash.clone(), scope.clone())
-}
-
-pub(crate) fn bookmarks(ctx: &Ctx) -> Result<()> {
-    let lib = ctx.library();
-    handle_bookmarks(&lib)
-}
-
-pub(crate) fn view(_args: ViewArgs, ctx: &Ctx) -> Result<()> {
-    // Re-parse argv via ArgMatches to recover the order the flags appeared.
-    // This implements Option A from the field-order spec: use indices_of on
-    // the raw matches for the `view` subcommand to sort boolean flags by
-    // their argv position.
-    let matches = Cli::command().get_matches();
-    let view_matches = matches.subcommand_matches("view").unwrap_or_else(|| {
-        eprintln!("internal error: expected 'view' subcommand matches");
-        std::process::exit(1);
-    });
-    let columns = view_columns_from_matches(view_matches);
-    let lib = ctx.library();
-    handle_view(&lib, columns)
-}
-
-#[derive(clap::ValueEnum, Debug, Clone)]
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SortField {
     Bpm,
     Title,
@@ -156,11 +90,77 @@ pub(crate) enum SortField {
     Stopped,
 }
 
-// =============================================================================
-// Command Handlers
-// =============================================================================
+impl SortField {
+    const ALL: [SortField; 10] = [
+        SortField::Bpm,
+        SortField::Title,
+        SortField::Artist,
+        SortField::Album,
+        SortField::Duration,
+        SortField::TrackNumber,
+        SortField::DiscNumber,
+        SortField::Added,
+        SortField::Started,
+        SortField::Stopped,
+    ];
 
-fn handle_ping(client: &LibraryBackend) -> Result<()> {
+    fn name(self) -> &'static str {
+        match self {
+            SortField::Bpm => "bpm",
+            SortField::Title => "title",
+            SortField::Artist => "artist",
+            SortField::Album => "album",
+            SortField::Duration => "duration",
+            SortField::TrackNumber => "track-number",
+            SortField::DiscNumber => "disc-number",
+            SortField::Added => "added",
+            SortField::Started => "started",
+            SortField::Stopped => "stopped",
+        }
+    }
+}
+
+impl std::fmt::Display for SortField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for SortField {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|field| field.name() == s)
+            .ok_or_else(|| format!("unknown sort field '{s}'"))
+    }
+}
+
+/// Direction of a sort, built from the mutually exclusive `-a` / `-d` flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+impl SortDirection {
+    /// `None` unless exactly one of the flags is set.
+    fn from_flags(ascending: bool, descending: bool) -> Option<Self> {
+        match (ascending, descending) {
+            (true, false) => Some(SortDirection::Ascending),
+            (false, true) => Some(SortDirection::Descending),
+            _ => None,
+        }
+    }
+
+    fn is_ascending(self) -> bool {
+        self == SortDirection::Ascending
+    }
+}
+
+pub(crate) fn ping(ctx: &Ctx) -> Result<()> {
+    let client = ctx.library();
     match client.ping() {
         Ok(()) => {
             println!("pong - service is alive");
@@ -170,7 +170,8 @@ fn handle_ping(client: &LibraryBackend) -> Result<()> {
     }
 }
 
-fn handle_status(client: &LibraryBackend) -> Result<()> {
+pub(crate) fn status(ctx: &Ctx) -> Result<()> {
+    let client = ctx.library();
     match client.status() {
         Ok(status) => {
             println!("MDMA Library Service v{}", status.version);
@@ -185,7 +186,9 @@ fn handle_status(client: &LibraryBackend) -> Result<()> {
     }
 }
 
-fn handle_list(client: &LibraryBackend, limit: Option<usize>) -> Result<()> {
+pub(crate) fn list(args: ListArgs, ctx: &Ctx) -> Result<()> {
+    let ListArgs { limit } = args;
+    let client = ctx.library();
     match client.list_tracks(limit) {
         Ok(tracks) => {
             if tracks.is_empty() {
@@ -209,8 +212,11 @@ fn handle_list(client: &LibraryBackend, limit: Option<usize>) -> Result<()> {
     }
 }
 
-fn handle_get(client: &LibraryBackend, hash: String) -> Result<()> {
-    let content_hash = ContentHash::new(hash);
+pub(crate) fn get(args: GetArgs, ctx: &Ctx) -> Result<()> {
+    let GetArgs { hash } = args;
+    let hash = TrackHash(hash);
+    let client = ctx.library();
+    let content_hash = hash.into_content_hash();
     match client.get_track(&content_hash) {
         Ok(track) => {
             println!("Track: {}", track.content_hash.as_str());
@@ -248,8 +254,11 @@ fn handle_get(client: &LibraryBackend, hash: String) -> Result<()> {
     }
 }
 
-fn handle_facts(client: &LibraryBackend, hash: String) -> Result<()> {
-    let content_hash = ContentHash::new(hash);
+pub(crate) fn facts(args: FactsArgs, ctx: &Ctx) -> Result<()> {
+    let FactsArgs { hash } = args;
+    let hash = TrackHash(hash);
+    let client = ctx.library();
+    let content_hash = hash.into_content_hash();
     match client.get_facts(&content_hash) {
         Ok((full_hash, facts)) => {
             println!("Facts for: {}", full_hash.as_str());
@@ -263,126 +272,110 @@ fn handle_facts(client: &LibraryBackend, hash: String) -> Result<()> {
     }
 }
 
-/// Resolve the ordered set of `ViewColumn`s from the raw `clap::ArgMatches` for the `view`
-/// subcommand.
+/// Compare two optional values treating `None` as negative-infinity (-∞).
 ///
-/// Clap boolean flags (`--hash`, `--artist`, `--title`, `--duration`) don't preserve
-/// insertion order in the derive API. We use `ArgMatches::indices_of` to recover the argv
-/// position of each flag that was actually set, then sort by position to honour the order the
-/// user typed them in. This implements `mdma view --title --hash` → title-first, hash-second.
-fn view_columns_from_matches(matches: &clap::ArgMatches) -> Vec<ViewColumn> {
-    // Collect (argv_index, column) pairs for every flag that was set.
-    let mut indexed: Vec<(usize, ViewColumn)> = Vec::new();
-    for (flag, col) in &[
-        ("hash", ViewColumn::Hash),
-        ("artist", ViewColumn::Artist),
-        ("title", ViewColumn::Title),
-        ("duration", ViewColumn::Duration),
-    ] {
-        if matches.get_flag(flag) {
-            // indices_of returns the positions at which the flag appeared in argv.
-            // Take the first (and only) position for a boolean flag.
-            if let Some(mut idxs) = matches.indices_of(flag) {
-                if let Some(idx) = idxs.next() {
-                    indexed.push((idx, *col));
-                }
-            }
-        }
+/// Semantics:
+/// - Ascending:  None first, then real values oldest→newest.
+/// - Descending: real values newest→oldest, None last.
+///
+/// This applies uniformly to Started, Stopped, and Added so that
+/// `mdma sort started -d` yields "most recently played first, never-played last".
+fn compare_optional<T: Ord>(
+    a: Option<T>,
+    b: Option<T>,
+    direction: SortDirection,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let ord = match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less, // None is -∞, smaller than any Some
+        (Some(_), None) => Ordering::Greater, // Some is larger than -∞
+        (Some(av), Some(bv)) => av.cmp(&bv),
+    };
+    if direction.is_ascending() {
+        ord
+    } else {
+        ord.reverse()
     }
-    indexed.sort_by_key(|(idx, _)| *idx);
-    indexed.into_iter().map(|(_, col)| col).collect()
 }
 
-fn handle_view(client: &LibraryBackend, columns: Vec<ViewColumn>) -> Result<()> {
-    use std::io::{BufRead, IsTerminal};
-
-    if columns.is_empty() {
-        eprintln!("No fields selected. Use --hash, --artist, --title, and/or --duration.");
+pub(crate) fn sort(args: SortArgs, ctx: &Ctx) -> Result<()> {
+    let SortArgs {
+        field,
+        ascending,
+        descending,
+    } = args;
+    let client = ctx.library();
+    let Some(direction) = SortDirection::from_flags(ascending, descending) else {
+        eprintln!("Specify exactly one of -a (ascending) or -d (descending)");
         std::process::exit(1);
-    }
-
-    // Read hashes from stdin (same format as `mdma playlist append` / `mdma search` output).
-    let hashes: Vec<String> = std::io::stdin()
-        .lock()
-        .lines()
-        .map_while(Result::ok)
-        .filter_map(|line| parse_hash_from_line(&line))
-        .collect();
-
-    if hashes.is_empty() {
-        if std::io::stdout().is_terminal() {
-            eprintln!("No hashes on stdin. Pipe `mdma search` output or a playlist.");
-        }
-        return Ok(());
-    }
-
-    // Look up TrackInfo for each hash, preserving order.
-    let mut tracks: Vec<TrackInfo> = Vec::with_capacity(hashes.len());
-    for hash in &hashes {
-        let content_hash = ContentHash::new(hash.clone());
-        match client.get_track(&content_hash) {
-            Ok(track) => tracks.push(track),
-            Err(e) => {
-                eprintln!("Warning: could not resolve {}: {}", hash, e);
-            }
-        }
-    }
-
-    if tracks.is_empty() {
-        if std::io::stdout().is_terminal() {
-            println!("No tracks found");
-        }
-        return Ok(());
-    }
-
-    // Always use the parameterized corsett renderer.
-    // TTY → real terminal width (corsett truncates as needed via RightEllipsis).
-    // Pipe/file → virtual fixed-large width so the 8-char hash stays intact and
-    //             content is not truncated (Joakim's uniqueness hypothesis).
-    let term_width = if std::io::stdout().is_terminal() {
-        terminal_width()
-    } else {
-        PIPE_TERM_WIDTH
     };
-    for line in render_for_user(&tracks, &columns, term_width, 0) {
-        println!("{}", line);
-    }
 
+    let hashes = hashes_arg_or_stdin(None);
+    let mut tracks = resolve_tracks_skip_errors(&client, hashes);
+
+    tracks.sort_by(|a, b| match field {
+        SortField::Bpm => compare_optional(a.bpm, b.bpm, direction),
+        SortField::Title => compare_optional(
+            a.title.as_deref().map(str::to_lowercase),
+            b.title.as_deref().map(str::to_lowercase),
+            direction,
+        ),
+        SortField::Artist => compare_optional(
+            a.artist.as_deref().map(str::to_lowercase),
+            b.artist.as_deref().map(str::to_lowercase),
+            direction,
+        ),
+        SortField::Album => compare_optional(
+            a.album.as_deref().map(str::to_lowercase),
+            b.album.as_deref().map(str::to_lowercase),
+            direction,
+        ),
+        SortField::Duration => compare_optional(
+            a.duration.map(|d| d.value()),
+            b.duration.map(|d| d.value()),
+            direction,
+        ),
+        SortField::TrackNumber => compare_optional(a.track_number, b.track_number, direction),
+        SortField::DiscNumber => compare_optional(a.disc_number, b.disc_number, direction),
+        SortField::Added => compare_optional(
+            a.added.as_deref().map(str::to_string),
+            b.added.as_deref().map(str::to_string),
+            direction,
+        ),
+        SortField::Started => compare_optional(
+            a.started.as_deref().map(str::to_string),
+            b.started.as_deref().map(str::to_string),
+            direction,
+        ),
+        SortField::Stopped => compare_optional(
+            a.stopped.as_deref().map(str::to_string),
+            b.stopped.as_deref().map(str::to_string),
+            direction,
+        ),
+    });
+
+    print_tracks(&tracks, &format!("Sorted ({} tracks)", tracks.len()));
     Ok(())
 }
 
-// =============================================================================
-// Bookmark Command Handlers
-// =============================================================================
-
-fn handle_bookmark(
-    library_client: &LibraryBackend,
-    playback_client: Option<&PlaybackBackend>,
-    hash: Option<String>,
-    scope: Option<String>,
-) -> Result<()> {
+pub(crate) fn bookmark(args: BookmarkArgs, ctx: &Ctx) -> Result<()> {
+    let BookmarkArgs { hash, scope } = args;
+    let lib = ctx.library();
+    let pb = ctx.playback();
     let content_hash = match hash {
         Some(h) => ContentHash::new(h),
-        None => {
-            let pb = match playback_client {
-                Some(p) => p,
-                None => {
-                    eprintln!("No hash provided and no playback client available");
-                    std::process::exit(1);
-                }
-            };
-            match pb.now_playing() {
-                Ok(Some(h)) => h,
-                Ok(None) => {
-                    eprintln!("Nothing is currently playing");
-                    std::process::exit(1);
-                }
-                Err(e) => handle_playback_error(e),
+        None => match pb.now_playing() {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                eprintln!("Nothing is currently playing");
+                std::process::exit(1);
             }
-        }
+            Err(e) => handle_playback_error(e),
+        },
     };
 
-    match library_client.write_bookmark(&content_hash, scope) {
+    match lib.write_bookmark(&content_hash, scope) {
         Ok(()) => {
             println!("Bookmarked.");
             Ok(())
@@ -391,7 +384,8 @@ fn handle_bookmark(
     }
 }
 
-fn handle_bookmarks(library_client: &LibraryBackend) -> Result<()> {
+pub(crate) fn bookmarks(ctx: &Ctx) -> Result<()> {
+    let library_client = ctx.library();
     let tracks = match library_client.list_tracks(None) {
         Ok(t) => t,
         Err(e) => handle_error(e),
@@ -424,97 +418,115 @@ fn handle_bookmarks(library_client: &LibraryBackend) -> Result<()> {
     Ok(())
 }
 
-/// Compare two optional values treating `None` as negative-infinity (-∞).
+/// Resolve the ordered set of `ViewColumn`s from the raw `clap::ArgMatches` for the `view`
+/// subcommand.
 ///
-/// Semantics:
-/// - Ascending  (`asc=true`):  None first, then real values oldest→newest.
-/// - Descending (`asc=false`): real values newest→oldest, None last.
-///
-/// This applies uniformly to Started, Stopped, and Added so that
-/// `mdma sort started -d` yields "most recently played first, never-played last".
-fn compare_optional<T: Ord>(a: Option<T>, b: Option<T>, asc: bool) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let ord = match (a, b) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Less, // None is -∞, smaller than any Some
-        (Some(_), None) => Ordering::Greater, // Some is larger than -∞
-        (Some(av), Some(bv)) => av.cmp(&bv),
-    };
-    if asc {
-        ord
-    } else {
-        ord.reverse()
+/// Clap boolean flags (`--hash`, `--artist`, `--title`, `--duration`) don't preserve
+/// insertion order in the derive API. We use `ArgMatches::indices_of` to recover the argv
+/// position of each flag that was actually set, then sort by position to honour the order the
+/// user typed them in. This implements `mdma view --title --hash` → title-first, hash-second.
+fn view_columns_from_matches(matches: &clap::ArgMatches) -> Vec<ViewColumn> {
+    // Collect (argv_index, column) pairs for every flag that was set.
+    let mut indexed: Vec<(usize, ViewColumn)> = Vec::new();
+    for (flag, col) in &[
+        ("hash", ViewColumn::Hash),
+        ("artist", ViewColumn::Artist),
+        ("title", ViewColumn::Title),
+        ("duration", ViewColumn::Duration),
+    ] {
+        if matches.get_flag(flag) {
+            // indices_of returns the positions at which the flag appeared in argv.
+            // Take the first (and only) position for a boolean flag.
+            if let Some(mut idxs) = matches.indices_of(flag) {
+                if let Some(idx) = idxs.next() {
+                    indexed.push((idx, *col));
+                }
+            }
+        }
     }
+    indexed.sort_by_key(|(idx, _)| *idx);
+    indexed.into_iter().map(|(_, col)| col).collect()
 }
 
-fn handle_sort(
-    client: &LibraryBackend,
-    field: SortField,
-    ascending: bool,
-    descending: bool,
-) -> Result<()> {
-    let direction_asc = match (ascending, descending) {
-        (true, false) => true,
-        (false, true) => false,
-        _ => {
-            eprintln!("Specify exactly one of -a (ascending) or -d (descending)");
-            std::process::exit(1);
-        }
-    };
+pub(crate) fn view(_args: ViewArgs, ctx: &Ctx) -> Result<()> {
+    use std::io::{BufRead, IsTerminal};
 
-    let hashes = hashes_arg_or_stdin(None);
-    let mut tracks = resolve_tracks_skip_errors(client, hashes);
-
-    tracks.sort_by(|a, b| match &field {
-        SortField::Bpm => compare_optional(a.bpm, b.bpm, direction_asc),
-        SortField::Title => compare_optional(
-            a.title.as_deref().map(str::to_lowercase),
-            b.title.as_deref().map(str::to_lowercase),
-            direction_asc,
-        ),
-        SortField::Artist => compare_optional(
-            a.artist.as_deref().map(str::to_lowercase),
-            b.artist.as_deref().map(str::to_lowercase),
-            direction_asc,
-        ),
-        SortField::Album => compare_optional(
-            a.album.as_deref().map(str::to_lowercase),
-            b.album.as_deref().map(str::to_lowercase),
-            direction_asc,
-        ),
-        SortField::Duration => compare_optional(
-            a.duration.map(|d| d.value()),
-            b.duration.map(|d| d.value()),
-            direction_asc,
-        ),
-        SortField::TrackNumber => compare_optional(a.track_number, b.track_number, direction_asc),
-        SortField::DiscNumber => compare_optional(a.disc_number, b.disc_number, direction_asc),
-        SortField::Added => compare_optional(
-            a.added.as_deref().map(str::to_string),
-            b.added.as_deref().map(str::to_string),
-            direction_asc,
-        ),
-        SortField::Started => compare_optional(
-            a.started.as_deref().map(str::to_string),
-            b.started.as_deref().map(str::to_string),
-            direction_asc,
-        ),
-        SortField::Stopped => compare_optional(
-            a.stopped.as_deref().map(str::to_string),
-            b.stopped.as_deref().map(str::to_string),
-            direction_asc,
-        ),
+    // Re-parse argv via ArgMatches to recover the order the flags appeared.
+    // This implements Option A from the field-order spec: use indices_of on
+    // the raw matches for the `view` subcommand to sort boolean flags by
+    // their argv position.
+    let matches = Cli::command().get_matches();
+    let view_matches = matches.subcommand_matches("view").unwrap_or_else(|| {
+        eprintln!("internal error: expected 'view' subcommand matches");
+        std::process::exit(1);
     });
+    let columns = view_columns_from_matches(view_matches);
+    let client = ctx.library();
 
-    print_tracks(&tracks, &format!("Sorted ({} tracks)", tracks.len()));
+    if columns.is_empty() {
+        eprintln!("No fields selected. Use --hash, --artist, --title, and/or --duration.");
+        std::process::exit(1);
+    }
+
+    // Read hashes from stdin (same format as `mdma playlist append` / `mdma search` output).
+    let hashes: Vec<String> = std::io::stdin()
+        .lock()
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| parse_hash_from_line(&line))
+        .collect();
+
+    if hashes.is_empty() {
+        if std::io::stdout().is_terminal() {
+            eprintln!("No hashes on stdin. Pipe `mdma search` output or a playlist.");
+        }
+        return Ok(());
+    }
+
+    // Look up TrackInfo for each hash, preserving order.
+    let mut tracks: Vec<TrackInfo> = Vec::with_capacity(hashes.len());
+    for hash in hashes {
+        let content_hash = ContentHash::new(hash.clone());
+        match client.get_track(&content_hash) {
+            Ok(track) => tracks.push(track),
+            Err(e) => {
+                eprintln!("Warning: could not resolve {}: {}", hash, e);
+            }
+        }
+    }
+
+    if tracks.is_empty() {
+        if std::io::stdout().is_terminal() {
+            println!("No tracks found");
+        }
+        return Ok(());
+    }
+
+    // Always use the parameterized corsett renderer.
+    // TTY → real terminal width (corsett truncates as needed via RightEllipsis).
+    // Pipe/file → virtual fixed-large width so the 8-char hash stays intact and
+    //             content is not truncated (Joakim's uniqueness hypothesis).
+    let term_width = if std::io::stdout().is_terminal() {
+        terminal_width()
+    } else {
+        PIPE_TERM_WIDTH
+    };
+    for line in render_for_user(&tracks, &columns, term_width, 0) {
+        println!("{}", line);
+    }
+
     Ok(())
 }
 
-// Adopted by a later chunk (per-command arg types); unused until then.
-#[allow(dead_code)]
 /// Content hash of a track (full or partial, with or without `sha256:` prefix).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackHash(pub String);
+
+impl TrackHash {
+    fn into_content_hash(self) -> ContentHash {
+        ContentHash::new(self.0)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -533,6 +545,33 @@ mod tests {
 
     use crate::Commands;
     use track_formatter::ALL_COLUMNS;
+
+    // ── SortField / SortDirection ─────────────────────────────────────────────
+
+    #[test]
+    fn sort_field_matches_clap_value_enum() {
+        use clap::ValueEnum;
+        for v in SortField::value_variants() {
+            let name = v.to_possible_value().unwrap().get_name().to_string();
+            assert_eq!(name.parse::<SortField>(), Ok(*v));
+            assert_eq!(v.to_string(), name);
+        }
+        assert!("nope".parse::<SortField>().is_err());
+    }
+
+    #[test]
+    fn sort_direction_requires_exactly_one_flag() {
+        assert_eq!(
+            SortDirection::from_flags(true, false),
+            Some(SortDirection::Ascending)
+        );
+        assert_eq!(
+            SortDirection::from_flags(false, true),
+            Some(SortDirection::Descending)
+        );
+        assert_eq!(SortDirection::from_flags(false, false), None);
+        assert_eq!(SortDirection::from_flags(true, true), None);
+    }
 
     // ── sort by started / stopped ─────────────────────────────────────────────
 
@@ -564,7 +603,7 @@ mod tests {
             compare_optional(
                 a.started.as_deref().map(str::to_string),
                 b.started.as_deref().map(str::to_string),
-                true,
+                SortDirection::Ascending,
             )
         });
         let hashes: Vec<_> = tracks.iter().map(|t| t.content_hash.as_str()).collect();
@@ -587,7 +626,7 @@ mod tests {
             compare_optional(
                 a.started.as_deref().map(str::to_string),
                 b.started.as_deref().map(str::to_string),
-                false,
+                SortDirection::Descending,
             )
         });
         let hashes: Vec<_> = tracks.iter().map(|t| t.content_hash.as_str()).collect();
@@ -610,7 +649,7 @@ mod tests {
             compare_optional(
                 a.stopped.as_deref().map(str::to_string),
                 b.stopped.as_deref().map(str::to_string),
-                false,
+                SortDirection::Descending,
             )
         });
         let hashes: Vec<_> = tracks.iter().map(|t| t.content_hash.as_str()).collect();
@@ -639,7 +678,7 @@ mod tests {
             compare_optional(
                 a.added.as_deref().map(str::to_string),
                 b.added.as_deref().map(str::to_string),
-                true,
+                SortDirection::Ascending,
             )
         });
         let hashes: Vec<_> = tracks.iter().map(|t| t.content_hash.as_str()).collect();
