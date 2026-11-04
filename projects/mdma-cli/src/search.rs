@@ -4,7 +4,8 @@ use clap::Subcommand;
 use color_eyre::Result;
 use library_ipc_client::TrackInfo;
 use library_search::{
-    parse_date_query, parse_numeric_query, parse_role_query, parse_string_query, TrackQuery,
+    parse_date_query, parse_duration_query, parse_key_query, parse_numeric_query, parse_role_query,
+    parse_string_query, DurationQuery, KeyQuery, NumericQuery, ParseError, TrackQuery,
 };
 use mdma_client::LibraryBackend;
 
@@ -60,19 +61,19 @@ pub(crate) struct SearchArgs {
 
     /// Filter by BPM. Formats: 128  128+-4  124..132  128+2  128-2
     #[arg(long)]
-    bpm: Option<String>,
+    bpm: Option<BpmArg>,
 
     /// Filter by musical key. Formats: Am  "A minor"  8B  8B+-1  8B+-1~
     #[arg(long)]
-    key: Option<String>,
+    key: Option<KeyArg>,
 
     /// Filter by duration. Formats: 7m  7m15s  >5m  <8m  6m..8m
     #[arg(long)]
-    duration: Option<String>,
+    duration: Option<DurationArg>,
 
     /// Filter by release year. Formats: 2022  2019..2022
     #[arg(long)]
-    year: Option<String>,
+    year: Option<YearArg>,
 
     /// Filter by source (bandcamp, beatport, upload)
     #[arg(long)]
@@ -120,6 +121,54 @@ pub(crate) struct SearchArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FactTypeArg(pub library_ipc_client::FactType);
 
+/// A BPM filter (e.g. `128`, `128+-4`, `124..132`).
+#[derive(Debug, Clone)]
+pub(crate) struct BpmArg(pub NumericQuery);
+
+impl std::str::FromStr for BpmArg {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        parse_numeric_query(s).map(BpmArg)
+    }
+}
+
+/// A release-year filter (e.g. `2022`, `2019..2022`).
+#[derive(Debug, Clone)]
+pub(crate) struct YearArg(pub NumericQuery);
+
+impl std::str::FromStr for YearArg {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        parse_numeric_query(s).map(YearArg)
+    }
+}
+
+/// A musical key filter (e.g. `Am`, `8B+-1`).
+#[derive(Debug, Clone)]
+pub(crate) struct KeyArg(pub KeyQuery);
+
+impl std::str::FromStr for KeyArg {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        parse_key_query(s).map(KeyArg)
+    }
+}
+
+/// A duration filter (e.g. `7m15s`, `>5m`, `6m..8m`).
+#[derive(Debug, Clone)]
+pub(crate) struct DurationArg(pub DurationQuery);
+
+impl std::str::FromStr for DurationArg {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        parse_duration_query(s).map(DurationArg)
+    }
+}
+
 pub(crate) fn dispatch(cli: SearchCli, ctx: &Ctx) -> Result<()> {
     let SearchCli {
         query: args,
@@ -143,8 +192,8 @@ pub(crate) fn query(args: SearchArgs, ctx: &Ctx) -> Result<()> {
         genre,
         style,
         bpm,
-        key: _,
-        duration: _,
+        key,
+        duration,
         year,
         source,
         no_stdin,
@@ -167,6 +216,8 @@ pub(crate) fn query(args: SearchArgs, ctx: &Ctx) -> Result<()> {
         genre,
         style,
         bpm,
+        key,
+        duration,
         year,
         source,
         started,
@@ -216,8 +267,10 @@ struct SearchFilters {
     label: Option<String>,
     genre: Option<String>,
     style: Option<String>,
-    bpm: Option<String>,
-    year: Option<String>,
+    bpm: Option<BpmArg>,
+    key: Option<KeyArg>,
+    duration: Option<DurationArg>,
+    year: Option<YearArg>,
     source: Option<String>,
     started: Option<String>,
     stopped: Option<String>,
@@ -254,8 +307,10 @@ fn build_track_query(filters: SearchFilters) -> TrackQuery {
         label,
         genre,
         style,
-        bpm: bpm_str,
-        year: year_str,
+        bpm,
+        key,
+        duration,
+        year,
         source,
         started: started_str,
         stopped: stopped_str,
@@ -282,10 +337,10 @@ fn build_track_query(filters: SearchFilters) -> TrackQuery {
         label: label.map(|s| parse_string_query(&s)),
         genre: genre.map(|s| parse_string_query(&s)),
         style: style.map(|s| parse_string_query(&s)),
-        bpm: bpm_str.and_then(|s| parse_numeric_query(&s).ok()),
-        key: None,      // key parsing deferred — key filter not yet wired up
-        duration: None, // duration parsing deferred
-        year: year_str.and_then(|s| parse_numeric_query(&s).ok()),
+        bpm: bpm.map(|BpmArg(q)| q),
+        key: key.map(|KeyArg(q)| q),
+        duration: duration.map(|DurationArg(q)| q),
+        year: year.map(|YearArg(q)| q),
         source,
         started,
         stopped,
@@ -456,6 +511,103 @@ mod tests {
             "clap rejected --stopped ~: {}",
             result.unwrap_err()
         );
+    }
+
+    // ── bpm / key / duration / year parsing ──────────────────────────────────
+
+    fn parse_search(args: &[&str]) -> Result<SearchArgs, clap::Error> {
+        let argv = ["mdma", "search"].into_iter().chain(args.iter().copied());
+        Cli::try_parse_from(argv).map(|cli| match cli.command {
+            crate::Commands::Search(search) => search.query,
+            other => panic!("expected search command, got {other:?}"),
+        })
+    }
+
+    #[test]
+    fn search_bpm_parses_into_numeric_query() {
+        let args = parse_search(&["--bpm", "124..132"]).unwrap();
+        assert!(
+            matches!(args.bpm, Some(BpmArg(NumericQuery::Range(lo, hi))) if lo == 124.0 && hi == 132.0),
+            "got {:?}",
+            args.bpm
+        );
+    }
+
+    #[test]
+    fn search_bpm_invalid_is_parse_error() {
+        let err = parse_search(&["--bpm", "fast"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(err.to_string().contains("invalid numeric query 'fast'"));
+    }
+
+    #[test]
+    fn search_year_parses_into_numeric_query() {
+        let args = parse_search(&["--year", "2022"]).unwrap();
+        assert!(
+            matches!(args.year, Some(YearArg(NumericQuery::Exact(y))) if y == 2022.0),
+            "got {:?}",
+            args.year
+        );
+    }
+
+    #[test]
+    fn search_year_invalid_is_parse_error() {
+        let err = parse_search(&["--year", "last-year"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(err
+            .to_string()
+            .contains("invalid numeric query 'last-year'"));
+    }
+
+    #[test]
+    fn search_key_parses_into_key_query() {
+        let args = parse_search(&["--key", "8B"]).unwrap();
+        assert!(args.key.is_some(), "got {:?}", args.key);
+    }
+
+    #[test]
+    fn search_key_invalid_is_parse_error() {
+        let err = parse_search(&["--key", "H#"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(err.to_string().contains("invalid key query 'H#'"));
+    }
+
+    #[test]
+    fn search_duration_parses_into_duration_query() {
+        let args = parse_search(&["--duration", ">5m"]).unwrap();
+        assert!(
+            matches!(
+                args.duration,
+                Some(DurationArg(DurationQuery::AtLeast(300)))
+            ),
+            "got {:?}",
+            args.duration
+        );
+    }
+
+    #[test]
+    fn search_duration_invalid_is_parse_error() {
+        let err = parse_search(&["--duration", "long"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(err.to_string().contains("invalid duration query 'long'"));
+    }
+
+    #[test]
+    fn search_key_and_duration_reach_the_built_query() {
+        let args = parse_search(&["--key", "8B", "--duration", "<8m", "--bpm", "128"]).unwrap();
+        let query = build_track_query(SearchFilters {
+            bpm: args.bpm,
+            key: args.key,
+            duration: args.duration,
+            ..Default::default()
+        });
+        assert!(query.key.is_some(), "key dropped from query");
+        assert!(
+            matches!(query.duration, Some(DurationQuery::AtMost(480))),
+            "got {:?}",
+            query.duration
+        );
+        assert!(query.bpm.is_some(), "bpm dropped from query");
     }
 
     // ── apply_stdin_filter tests ─────────────────────────────────────────────
