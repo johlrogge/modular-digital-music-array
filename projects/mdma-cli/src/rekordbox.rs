@@ -1,4 +1,4 @@
-use crate::args::{parse_playlist_name, sanitized_name_or_exit};
+use crate::args::{ExistingFileArg, PlaylistArg, SanitizedPlaylistNameArg};
 use crate::ctx::Ctx;
 use crate::stdin::{read_hashes, resolve_tracks_skip_errors};
 use crate::transfer::{
@@ -9,9 +9,7 @@ use clap::Subcommand;
 use color_eyre::Result;
 use library_ipc_client::{ContentHash, TrackInfo};
 use music_facts::MusicValue;
-use playlist_import::{
-    format_write_outcome, sanitize_playlist_name, write_playlist, LibraryTrackLookup,
-};
+use playlist_import::{format_write_outcome, write_playlist, LibraryTrackLookup};
 use rekordbox_xml::{parse_xml, RekordboxTrack};
 use track_matcher::{CandidateTrack, MatchResult};
 
@@ -26,7 +24,7 @@ pub(crate) enum Command {
         /// MDMA playlist(s) to export. Repeat for multiple: --playlist A --playlist B.
         /// If none given, falls back to stdin input (existing behaviour).
         #[arg(long)]
-        playlist: Vec<String>,
+        playlist: Vec<PlaylistArg>,
         /// Output directory. Defaults to ~/Music/mdma_rekordbox.
         #[arg(long)]
         output: Option<std::path::PathBuf>,
@@ -52,12 +50,13 @@ pub(crate) enum Command {
     ///   mdma rekordbox import rekordbox.xml --enrich --dry-run
     Import {
         /// Path to rekordbox.xml file
-        path: std::path::PathBuf,
+        #[arg(value_hint = clap::ValueHint::FilePath)]
+        path: ExistingFileArg,
 
         /// Create an MDMA playlist with matched tracks.
         /// Invalid characters (spaces, special chars) are replaced with `-`.
         #[arg(long)]
-        playlist: Option<String>,
+        playlist: Option<SanitizedPlaylistNameArg>,
 
         /// Import all playlists found in the XML as MDMA playlists
         #[arg(long)]
@@ -108,26 +107,24 @@ pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
     }
 }
 
-/// Values of `rekordbox export`. `playlist` names are kept as typed: they are
-/// validated into `PlaylistName`s after the node is resolved, so invalid names
-/// keep failing at the same point as before (phase-2 parse-time candidate).
+/// Values of `rekordbox export`; playlist names are validated at parse time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RekordboxExportArgs {
-    pub(crate) playlist: Vec<String>,
+    pub(crate) playlist: Vec<PlaylistArg>,
     pub(crate) output: Option<std::path::PathBuf>,
     pub(crate) format: Option<ExportFormat>,
     pub(crate) replace: bool,
 }
 
-/// Values of `rekordbox import`. `playlist` is kept as typed: it is sanitised
-/// only after the XML has been read and matched (phase-2 parse-time candidate).
+/// Values of `rekordbox import`; the file must exist and the playlist name is
+/// sanitised, both at parse time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RekordboxImportArgs {
-    pub(crate) playlist: Option<String>,
+    pub(crate) playlist: Option<SanitizedPlaylistNameArg>,
     pub(crate) all_playlists: bool,
     pub(crate) enrich: bool,
     pub(crate) dry_run: bool,
-    pub(crate) path: std::path::PathBuf,
+    pub(crate) path: ExistingFileArg,
 }
 
 /// Build a single `RekordboxTrack` from MDMA metadata and file facts.
@@ -256,11 +253,11 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
     // When stdin mode, one entry with empty name.
     let hashes_per_playlist: Vec<(String, Vec<ContentHash>)> = if !playlists.is_empty() {
         let mut result = Vec::with_capacity(playlists.len());
-        for pname in &playlists {
-            let name = parse_playlist_name(pname);
-            match library.playlist_get(&name) {
+        for PlaylistArg(name) in &playlists {
+            let pname = name.as_str();
+            match library.playlist_get(name) {
                 Ok(hashes) => {
-                    result.push((pname.clone(), hashes));
+                    result.push((pname.to_string(), hashes));
                 }
                 Err(e) => {
                     eprintln!("error: playlist '{}' not found: {}", pname, e);
@@ -565,7 +562,11 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
     } else if playlists.len() == 1 {
         eprintln!(
             "{}: {} tracks in playlist '{}' ({} new, {} already on disk).",
-            mode_prefix, total_desired, playlists[0], new_count, unchanged_count
+            mode_prefix,
+            total_desired,
+            playlists[0].0.as_str(),
+            new_count,
+            unchanged_count
         );
     } else {
         // Multi-playlist summary: show per-playlist track counts.
@@ -612,6 +613,7 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
 
     // 1. Read and parse XML file
+    let ExistingFileArg(path) = path;
     let content = std::fs::read_to_string(&path)
         .map_err(|e| color_eyre::eyre::eyre!("Failed to read {}: {}", path.display(), e))?;
 
@@ -711,9 +713,16 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
         .collect();
 
     // 6. Create --playlist if requested
-    if let Some(pname) = playlist {
-        let sanitized = sanitized_name_or_exit(&pname, "--playlist");
-        let name = parse_playlist_name(&sanitized);
+    if let Some(arg) = playlist {
+        if arg.was_changed() {
+            eprintln!(
+                "Note: playlist name sanitized from '{}' to '{}'",
+                arg.raw,
+                arg.sanitized()
+            );
+        }
+        let sanitized = arg.sanitized();
+        let name = &arg.name;
         let hashes: Vec<ContentHash> = matched.iter().map(|(_, h)| h.clone()).collect();
 
         if dry_run {
@@ -723,9 +732,9 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
                 hashes.len()
             );
         } else {
-            let created = write_playlist(&library, &name, &hashes)
+            let created = write_playlist(&library, name, &hashes)
                 .map_err(|e| color_eyre::eyre::eyre!("Failed to write playlist: {}", e))?;
-            print_write_outcome(&sanitized, hashes.len(), created);
+            print_write_outcome(sanitized, hashes.len(), created);
         }
     }
 
@@ -746,15 +755,14 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
                 continue;
             }
 
-            let sanitized = sanitize_playlist_name(&rb_playlist.name);
-
-            if sanitized.is_empty() {
-                eprintln!(
-                    "Skipping playlist '{}': name sanitizes to empty",
-                    rb_playlist.name
-                );
-                continue;
-            }
+            let target = match SanitizedPlaylistNameArg::new(&rb_playlist.name) {
+                Ok(t) => t,
+                Err(reason) => {
+                    eprintln!("Skipping playlist '{}': {}", rb_playlist.name, reason);
+                    continue;
+                }
+            };
+            let sanitized = target.sanitized();
 
             if dry_run {
                 println!(
@@ -764,9 +772,8 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
                     resolved.len()
                 );
             } else {
-                let name = parse_playlist_name(&sanitized);
-                match write_playlist(&library, &name, &resolved) {
-                    Ok(created) => print_write_outcome(&sanitized, resolved.len(), created),
+                match write_playlist(&library, &target.name, &resolved) {
+                    Ok(created) => print_write_outcome(sanitized, resolved.len(), created),
                     Err(e) => {
                         eprintln!("Failed to write playlist '{}': {}", sanitized, e)
                     }
@@ -960,6 +967,107 @@ mod tests {
     use super::playlist_locations;
     use library_ipc_client::ContentHash;
     use pretty_assertions::assert_eq;
+
+    // ── argv parsing ─────────────────────────────────────────────────────────────
+
+    use crate::{Cli, Commands};
+    use clap::Parser;
+
+    fn parse(argv: &[&str]) -> Result<Commands, clap::Error> {
+        Cli::try_parse_from(std::iter::once("mdma").chain(argv.iter().copied()))
+            .map(|cli| cli.command)
+    }
+
+    fn rekordbox_command(argv: &[&str]) -> super::Command {
+        match parse(argv).unwrap() {
+            Commands::Rekordbox { command } => command,
+            other => panic!("not rekordbox: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_playlist_names_are_validated_at_parse_time() {
+        for bad in ["has space", "a/b", ""] {
+            let err = parse(&["rekordbox", "export", "--playlist", bad]).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{bad:?}");
+            assert!(err.to_string().contains("--playlist"), "{bad:?}: {err}");
+        }
+        // One bad name among good ones is still rejected.
+        let err = parse(&[
+            "rekordbox",
+            "export",
+            "--playlist",
+            "good",
+            "--playlist",
+            "not good",
+        ])
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn export_accepts_valid_playlist_names() {
+        match rekordbox_command(&[
+            "rekordbox",
+            "export",
+            "--playlist",
+            "set-1",
+            "--playlist",
+            "set_2",
+        ]) {
+            super::Command::Export { playlist, .. } => {
+                let names: Vec<&str> = playlist.iter().map(|p| p.0.as_str()).collect();
+                assert_eq!(names, ["set-1", "set_2"]);
+            }
+            other => panic!("not export: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_rejects_a_missing_file() {
+        let err = parse(&["rekordbox", "import", "/definitely/not/here.xml"]).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("does not exist"), "message: {err}");
+    }
+
+    #[test]
+    fn import_rejects_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = parse(&["rekordbox", "import", dir.path().to_str().unwrap()]).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("is not a file"), "message: {err}");
+    }
+
+    #[test]
+    fn import_playlist_that_sanitizes_to_nothing_is_rejected() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        for bad in ["", "///", " "] {
+            let err = parse(&["rekordbox", "import", path, "--playlist", bad]).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{bad:?}");
+            assert!(
+                err.to_string().contains("name sanitizes to empty"),
+                "{bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn import_accepts_existing_file_and_sanitizes_playlist() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        match rekordbox_command(&["rekordbox", "import", path, "--playlist", "My Set!"]) {
+            super::Command::Import {
+                path: p, playlist, ..
+            } => {
+                assert_eq!(p.0, file.path());
+                let playlist = playlist.unwrap();
+                assert_eq!(playlist.raw, "My Set!");
+                assert_eq!(playlist.sanitized(), "My-Set");
+            }
+            other => panic!("not import: {other:?}"),
+        }
+    }
 
     // ── case-insensitive location URI matching ───────────────────────────────────
 

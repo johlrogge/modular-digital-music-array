@@ -46,30 +46,47 @@ impl FromStr for PlaylistArg {
 /// A playlist name for an imported playlist: sanitised on parse. Keeps the
 /// raw text so commands can note when it was changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // wired in P2.1.C / P2.1.F
 pub(crate) struct SanitizedPlaylistNameArg {
     pub(crate) raw: String,
-    pub(crate) sanitized: String,
+    pub(crate) name: PlaylistName,
+}
+
+impl SanitizedPlaylistNameArg {
+    /// Sanitise `raw` into a playlist name. The error is the reason only
+    /// (callers add context), so argv and XML names share this one path.
+    pub(crate) fn new(raw: &str) -> Result<Self, String> {
+        let sanitized = sanitize_playlist_name(raw);
+        if sanitized.is_empty() {
+            return Err("name sanitizes to empty".to_string());
+        }
+        let name = PlaylistName::new(&sanitized).map_err(|e| e.to_string())?;
+        Ok(Self {
+            raw: raw.to_string(),
+            name,
+        })
+    }
+
+    /// The sanitised name as text.
+    pub(crate) fn sanitized(&self) -> &str {
+        self.name.as_str()
+    }
+
+    /// Whether sanitising changed the text.
+    pub(crate) fn was_changed(&self) -> bool {
+        self.sanitized() != self.raw
+    }
 }
 
 impl FromStr for SanitizedPlaylistNameArg {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let sanitized = sanitize_playlist_name(s);
-        if sanitized.is_empty() {
-            return Err(format!("'{s}': name sanitizes to empty"));
-        }
-        Ok(Self {
-            raw: s.to_string(),
-            sanitized,
-        })
+        Self::new(s).map_err(|reason| format!("'{s}': {reason}"))
     }
 }
 
 /// Path of a file that exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // wired in P2.1.F
 pub(crate) struct ExistingFileArg(pub PathBuf);
 
 impl FromStr for ExistingFileArg {
@@ -93,30 +110,6 @@ pub(crate) fn usage_error(
     msg: impl std::fmt::Display,
 ) -> clap::Error {
     crate::Cli::command().error(kind, msg)
-}
-
-pub(crate) fn parse_playlist_name(name: &str) -> library_ipc_client::PlaylistName {
-    library_ipc_client::PlaylistName::new(name).unwrap_or_else(|e| {
-        eprintln!("Invalid playlist name: {}", e);
-        std::process::exit(1);
-    })
-}
-
-/// Sanitise a user-supplied playlist name for `flag`, exiting if nothing is left.
-/// Prints a note when the name was changed.
-pub(crate) fn sanitized_name_or_exit(raw: &str, flag: &str) -> String {
-    let sanitized = sanitize_playlist_name(raw);
-    if sanitized.is_empty() {
-        eprintln!("Invalid {} '{}': name sanitizes to empty", flag, raw);
-        std::process::exit(1);
-    }
-    if sanitized != raw {
-        eprintln!(
-            "Note: playlist name sanitized from '{}' to '{}'",
-            raw, sanitized
-        );
-    }
-    sanitized
 }
 
 #[cfg(test)]
@@ -165,9 +158,11 @@ mod tests {
     fn sanitized_name_keeps_raw_and_sanitized() {
         let arg: SanitizedPlaylistNameArg = "Good Name".parse().unwrap();
         assert_eq!(arg.raw, "Good Name");
-        assert_eq!(arg.sanitized, sanitize_playlist_name("Good Name"));
+        assert_eq!(arg.sanitized(), sanitize_playlist_name("Good Name"));
+        assert!(arg.was_changed());
         let plain: SanitizedPlaylistNameArg = "plain".parse().unwrap();
-        assert_eq!(plain.raw, plain.sanitized);
+        assert_eq!(plain.raw, plain.sanitized());
+        assert!(!plain.was_changed());
     }
 
     #[test]

@@ -674,13 +674,14 @@ pub(crate) fn import_playlist(
     } = args;
     // --name was validated and sanitised at parse time
     let explicit_name = playlist_name.map(|n| {
-        if n.sanitized != n.raw {
+        if n.was_changed() {
             eprintln!(
                 "Note: playlist name sanitized from '{}' to '{}'",
-                n.raw, n.sanitized
+                n.raw,
+                n.sanitized()
             );
         }
-        n.sanitized
+        n.sanitized().to_string()
     });
 
     let request = SourceRequest::ImportPlaylist {
@@ -921,7 +922,7 @@ mod tests {
             SourceCommand::ImportPlaylist { args } => {
                 let name = args.name.expect("name given");
                 assert_eq!(name.raw, "a/b");
-                assert_eq!(name.sanitized, sanitize_playlist_name("a/b"));
+                assert_eq!(name.sanitized(), sanitize_playlist_name("a/b"));
             }
             other => panic!("unexpected: {other:?}"),
         }

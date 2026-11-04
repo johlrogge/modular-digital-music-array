@@ -21,7 +21,44 @@ pub(crate) struct UploadArgs {
     inbox_dir: String,
 
     /// Path to file (audio file or ZIP archive)
-    file: std::path::PathBuf,
+    #[arg(value_hint = clap::ValueHint::FilePath)]
+    file: UploadFileArg,
+}
+
+/// What an uploaded file holds, by its magic bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadKind {
+    /// A ZIP archive of audio files.
+    Zip,
+    /// A single audio file (FLAC, MP3, WAV or AIFF).
+    Audio,
+}
+
+/// An existing file that is an audio file or a ZIP archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UploadFileArg {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) kind: UploadKind,
+}
+
+impl std::str::FromStr for UploadFileArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let path = std::path::PathBuf::from(s);
+        if !path.exists() {
+            return Err(format!("File not found: {}", path.display()));
+        }
+        let kind = match inbox_utils::detect_file_type(&path) {
+            Some("zip") => UploadKind::Zip,
+            Some("flac" | "mp3" | "wav" | "aiff") => UploadKind::Audio,
+            _ => return Err(
+                "Unsupported file type. Expected audio file (FLAC, MP3, WAV, AIFF) or ZIP archive."
+                    .to_string(),
+            ),
+        };
+        Ok(Self { path, kind })
+    }
 }
 
 #[derive(clap::Args, Debug)]
@@ -110,13 +147,12 @@ pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<()> {
         file,
     } = args;
 
-    // 1. Validate file exists
-    if !file.exists() {
-        eprintln!("File not found: {}", file.display());
-        std::process::exit(1);
-    }
+    let UploadFileArg {
+        path: file,
+        kind: file_type,
+    } = file;
 
-    // 2. Host to scp to: the resolved node, by IP when known
+    // 1. Host to scp to: the resolved node, by IP when known
     let hostname = match ctx.remote_host() {
         Some((host, ip)) => ip.map_or(host, |ip| ip.to_string()),
         None => {
@@ -127,13 +163,10 @@ pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<()> {
 
     let key_path = expand_tilde(&ssh_key);
 
-    // 3. Detect file type
-    let file_type = inbox_utils::detect_file_type(&file);
-
-    // 4. Collect audio files to upload
+    // 2. Collect audio files to upload
     let temp_dir = tempfile::tempdir()?;
     let audio_files: Vec<std::path::PathBuf> = match file_type {
-        Some("zip") => {
+        UploadKind::Zip => {
             println!("Extracting ZIP archive...");
             let extracted = inbox_utils::extract_zip(&file, temp_dir.path())?;
             if extracted.is_empty() {
@@ -143,25 +176,17 @@ pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<()> {
             println!("Found {} audio file(s)", extracted.len());
             extracted
         }
-        Some("flac" | "mp3" | "wav" | "aiff") => {
-            vec![file]
-        }
-        _ => {
-            eprintln!(
-                "Unsupported file type. Expected audio file (FLAC, MP3, WAV, AIFF) or ZIP archive."
-            );
-            std::process::exit(1);
-        }
+        UploadKind::Audio => vec![file],
     };
 
-    // 5. SCP each file to the Pi's inbox
+    // 3. SCP each file to the Pi's inbox
     for audio_file in &audio_files {
         let filename = audio_file.file_name().unwrap_or_default().to_string_lossy();
         println!("Uploading: {}", filename);
         scp_file(audio_file, &ssh_user, &hostname, &inbox_dir, &key_path)?;
     }
 
-    // 6. Ingest each file via the library service
+    // 4. Ingest each file via the library service
     let library = ctx.library();
     let mut success_count = 0;
     let mut fail_count = 0;
@@ -741,6 +766,60 @@ mod tests {
     use crate::test_support::track;
 
     use pretty_assertions::assert_eq;
+
+    // ── upload file argument ─────────────────────────────────────────────────
+
+    use crate::{Cli, Commands};
+    use clap::Parser;
+
+    fn parse_upload(file: &str) -> Result<UploadFileArg, clap::Error> {
+        match Cli::try_parse_from(["mdma", "upload", file])?.command {
+            Commands::Upload(args) => Ok(args.file),
+            other => panic!("not upload: {other:?}"),
+        }
+    }
+
+    fn file_with(bytes: &[u8]) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(bytes).unwrap();
+        f
+    }
+
+    #[test]
+    fn upload_rejects_a_missing_file() {
+        let err = parse_upload("/definitely/not/here.flac").unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(
+            err.to_string()
+                .contains("File not found: /definitely/not/here.flac"),
+            "message: {err}"
+        );
+    }
+
+    #[test]
+    fn upload_rejects_unsupported_file_types() {
+        let file = file_with(b"just some text");
+        let err = parse_upload(file.path().to_str().unwrap()).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("Unsupported file type"), "{err}");
+    }
+
+    #[test]
+    fn upload_accepts_audio_and_zip_by_magic_bytes() {
+        for (magic, kind) in [
+            (&b"fLaC"[..], UploadKind::Audio),
+            (b"ID3\x03", UploadKind::Audio),
+            (b"RIFF", UploadKind::Audio),
+            (b"FORM", UploadKind::Audio),
+            (b"PK\x03\x04", UploadKind::Zip),
+        ] {
+            let file = file_with(magic);
+            let arg = parse_upload(file.path().to_str().unwrap()).unwrap();
+            assert_eq!(arg.kind, kind, "{magic:?}");
+            assert_eq!(arg.path, file.path());
+        }
+    }
 
     // ── Export helpers ────────────────────────────────────────────────────────
 
