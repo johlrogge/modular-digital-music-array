@@ -73,8 +73,8 @@ impl FromStr for DownloadArg {
 }
 
 /// A source-specific item identifier (e.g. "p123456" for bandcamp).
+// Stays a String: no domain rule, the source interprets it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-// stays a String: no domain rule, the source interprets it
 pub(crate) struct ItemIdArg(pub String);
 
 impl FromStr for ItemIdArg {
@@ -86,8 +86,8 @@ impl FromStr for ItemIdArg {
 }
 
 /// A source playlist to import: a slug or a URL.
+// Stays a String: no domain rule, the source interprets it (slug or URL).
 #[derive(Debug, Clone, PartialEq, Eq)]
-// stays a String: no domain rule, the source interprets it (slug or URL)
 pub(crate) struct SourcePlaylistArg(pub String);
 
 impl FromStr for SourcePlaylistArg {
@@ -771,10 +771,9 @@ fn run_source_command(source: SourceArg, command: SourceCommand, ctx: &Ctx) -> R
 mod tests {
     use super::*;
 
-    use clap::Parser;
     use color_eyre::Result;
 
-    use crate::Cli;
+    use crate::test_support::{parse, parses, usage_error};
 
     use playlist_import::sanitize_playlist_name;
     use pretty_assertions::assert_eq;
@@ -804,10 +803,9 @@ mod tests {
 
     /// Parse a hinted command line with the real parser, as a user pasting it would.
     fn parse_hinted(command: &str) -> (SourceArg, SourceCommand) {
-        let words: Vec<String> = command.split_whitespace().map(String::from).collect();
+        let words: Vec<&str> = command.split_whitespace().collect();
         assert_eq!(&words[..2], ["mdma", "source"], "{command}");
-        let cli = Cli::try_parse_from(&words).unwrap_or_else(|e| panic!("{command}: {e}"));
-        match cli.command {
+        match parses(&words[1..]) {
             Commands::Source {
                 command: Command::Named(args),
             } => parse_source_args(&args).unwrap_or_else(|e| panic!("{command}: {e}")),
@@ -949,9 +947,8 @@ mod tests {
 
     #[test]
     fn source_list_parses_as_the_global_command() {
-        let cli = Cli::try_parse_from(["mdma", "source", "list"]).unwrap();
         assert!(matches!(
-            cli.command,
+            parses(&["source", "list"]),
             Commands::Source {
                 command: Command::List
             }
@@ -960,8 +957,7 @@ mod tests {
 
     #[test]
     fn source_name_then_command_reaches_named() {
-        let cli = Cli::try_parse_from(["mdma", "source", "bandcamp", "sync"]).unwrap();
-        match cli.command {
+        match parses(&["source", "bandcamp", "sync"]) {
             Commands::Source {
                 command: Command::Named(args),
             } => assert_eq!(args, vec!["bandcamp", "sync"]),
@@ -989,12 +985,12 @@ mod tests {
 
     #[test]
     fn bandcamp_command_group_is_gone() {
-        assert!(Cli::try_parse_from(["mdma", "bandcamp", "playlists"]).is_err());
+        usage_error(&["bandcamp", "playlists"]);
     }
 
     #[test]
     fn source_help_lists_list_and_explains_the_name_first_form() {
-        let e = Cli::try_parse_from(["mdma", "source", "--help"]).unwrap_err();
+        let e = parse(&["source", "--help"]).unwrap_err();
         assert_eq!(e.kind(), clap::error::ErrorKind::DisplayHelp);
         let help = e.to_string();
         assert!(help.contains("list"), "{help}");

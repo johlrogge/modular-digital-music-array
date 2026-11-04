@@ -57,6 +57,7 @@ pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReplaceArgs {
     pub(crate) old_hash: TrackArg,
+    // Stays a String: it is a path on the library service's device, not checked locally.
     /// Path on the device running the library service, so not a local `PathBuf`.
     pub(crate) new_file: String,
 }
@@ -151,9 +152,7 @@ pub(crate) fn orphans(ctx: &Ctx) -> Result<()> {
 #[cfg(test)]
 mod tests {
 
-    use clap::Parser;
-
-    use crate::Cli;
+    use crate::test_support::{parses, usage_error};
 
     use pretty_assertions::assert_eq;
 
@@ -167,14 +166,7 @@ mod tests {
 
     #[test]
     fn track_delete_parses_correctly() {
-        let result = Cli::try_parse_from(["mdma", "library", "track", "delete", "abc12345"]);
-        assert!(
-            result.is_ok(),
-            "clap rejected library track delete: {}",
-            result.unwrap_err()
-        );
-        let cli = result.unwrap();
-        match cli.command {
+        match parses(&["library", "track", "delete", "abc12345"]) {
             Commands::Library {
                 command:
                     library::Command::Track {
@@ -189,14 +181,7 @@ mod tests {
 
     #[test]
     fn track_restore_parses_correctly() {
-        let result = Cli::try_parse_from(["mdma", "library", "track", "restore", "abc12345"]);
-        assert!(
-            result.is_ok(),
-            "clap rejected library track restore: {}",
-            result.unwrap_err()
-        );
-        let cli = result.unwrap();
-        match cli.command {
+        match parses(&["library", "track", "restore", "abc12345"]) {
             Commands::Library {
                 command:
                     library::Command::Track {
@@ -211,21 +196,13 @@ mod tests {
 
     #[test]
     fn track_replace_parses_correctly() {
-        let result = Cli::try_parse_from([
-            "mdma",
+        match parses(&[
             "library",
             "track",
             "replace",
             "abc12345",
             "/music/inbox/new.flac",
-        ]);
-        assert!(
-            result.is_ok(),
-            "clap rejected library track replace: {}",
-            result.unwrap_err()
-        );
-        let cli = result.unwrap();
-        match cli.command {
+        ]) {
             Commands::Library {
                 command:
                     library::Command::Track {
@@ -247,24 +224,16 @@ mod tests {
             ("replace", Some("/music/inbox/new.flac")),
         ] {
             for bad in ["abc1234", "ABCD1234", "sha256:abc"] {
-                let mut argv = vec!["mdma", "library", "track", verb, bad];
+                let mut argv = vec!["library", "track", verb, bad];
                 argv.extend(extra);
-                let err = Cli::try_parse_from(argv).unwrap_err();
-                assert_eq!(err.exit_code(), 2, "{verb} {bad}");
+                usage_error(&argv);
             }
         }
     }
 
     #[test]
     fn track_orphans_parses_correctly() {
-        let result = Cli::try_parse_from(["mdma", "library", "track", "orphans"]);
-        assert!(
-            result.is_ok(),
-            "clap rejected library track orphans: {}",
-            result.unwrap_err()
-        );
-        let cli = result.unwrap();
-        match cli.command {
+        match parses(&["library", "track", "orphans"]) {
             Commands::Library {
                 command:
                     library::Command::Track {

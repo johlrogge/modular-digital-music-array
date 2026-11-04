@@ -254,14 +254,12 @@ pub(crate) fn merge(args: MergeArgs, ctx: &Ctx) -> Result<()> {
 mod tests {
     use super::*;
 
-    use clap::Parser;
-
     use library_ipc_client::{
         ConfirmationReason, ContentHash, DedupApplyReport, DedupDisposition, DedupGroup,
         DedupMember,
     };
 
-    use crate::Cli;
+    use crate::test_support::{parse, parses, usage_error};
 
     use pretty_assertions::assert_eq;
 
@@ -271,12 +269,9 @@ mod tests {
     // ── dedup ─────────────────────────────────────────────────────────────────
 
     fn dedup_args(args: &[&str]) -> (bool, Option<MergeArgs>) {
-        let mut argv = vec!["mdma", "library", "dedup"];
+        let mut argv = vec!["library", "dedup"];
         argv.extend_from_slice(args);
-        match Cli::try_parse_from(&argv)
-            .unwrap_or_else(|e| panic!("{argv:?}: {e}"))
-            .command
-        {
+        match parses(&argv) {
             Commands::Library {
                 command: library::Command::Dedup(DedupCli { apply, command }),
             } => (
@@ -324,22 +319,20 @@ mod tests {
 
     #[test]
     fn dedup_merge_needs_a_loser_and_does_not_mix_with_apply() {
-        assert!(Cli::try_parse_from(["mdma", "library", "dedup", "merge", "abcdef12"]).is_err());
-        assert!(Cli::try_parse_from(["mdma", "library", "dedup", "merge"]).is_err());
-        assert!(Cli::try_parse_from([
-            "mdma", "library", "dedup", "--apply", "merge", "aaaaaaaa", "bbbbbbbb"
-        ])
-        .is_err());
+        usage_error(&["library", "dedup", "merge", "abcdef12"]);
+        usage_error(&["library", "dedup", "merge"]);
+        usage_error(&[
+            "library", "dedup", "--apply", "merge", "aaaaaaaa", "bbbbbbbb",
+        ]);
     }
 
     #[test]
     fn dedup_merge_hashes_must_be_valid_hashes() {
-        let merge = |winner: &str, loser: &str| {
-            Cli::try_parse_from(["mdma", "library", "dedup", "merge", winner, loser])
-        };
+        let merge =
+            |winner: &str, loser: &str| parse(&["library", "dedup", "merge", winner, loser]);
         for bad in ["abcd123", "ABCD1234"] {
-            assert_eq!(merge(bad, "bbbbbbbb").unwrap_err().exit_code(), 2, "{bad}");
-            assert_eq!(merge("aaaaaaaa", bad).unwrap_err().exit_code(), 2, "{bad}");
+            usage_error(&["library", "dedup", "merge", bad, "bbbbbbbb"]);
+            usage_error(&["library", "dedup", "merge", "aaaaaaaa", bad]);
         }
         assert!(merge("aaaaaaaa", "sha256:bbbbbbbb").is_ok());
     }

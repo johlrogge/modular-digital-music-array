@@ -1,4 +1,4 @@
-use crate::args::PlaylistArg;
+use crate::args::{OptPlaylistArg, PlaylistArg};
 use crate::ctx::Ctx;
 use crate::stdin::{hashes_in, read_hashes, read_stdin_to_string};
 use clap::Subcommand;
@@ -77,7 +77,7 @@ pub(crate) enum Command {
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
     match command {
         Command::List => list(ctx),
-        Command::Get { name } => get(name, ctx),
+        Command::Get { name } => get(OptPlaylistArg(name), ctx),
         Command::Contains { all, at_least, no } => {
             contains(ContainsMode::from_flags(all, at_least, no), ctx)
         }
@@ -224,8 +224,9 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn get(name: Option<PlaylistArg>, ctx: &Ctx) -> Result<()> {
+pub(crate) fn get(name: OptPlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
+    let OptPlaylistArg(name) = name;
     let library = ctx.library();
     match name {
         Some(PlaylistArg(pname)) => {
@@ -460,57 +461,59 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::{Cli, Commands};
-    use clap::Parser;
+    use crate::test_support::{parses, usage_error};
+    use crate::Commands;
 
-    fn parse(args: &[&str]) -> Result<Command, clap::Error> {
-        let mut argv = vec!["mdma", "playlist"];
-        argv.extend_from_slice(args);
-        Cli::try_parse_from(argv).map(|cli| match cli.command {
+    fn argv<'a>(args: &[&'a str]) -> Vec<&'a str> {
+        std::iter::once("playlist")
+            .chain(args.iter().copied())
+            .collect()
+    }
+
+    /// Parse `mdma playlist <args>`.
+    fn playlist(args: &[&str]) -> Command {
+        match parses(&argv(args)) {
             Commands::Playlist { command } => command,
             other => panic!("expected playlist command, got {other:?}"),
-        })
+        }
+    }
+
+    /// `mdma playlist <args>` must be rejected as a usage error.
+    fn playlist_usage_error(args: &[&str]) -> clap::Error {
+        usage_error(&argv(args))
     }
 
     fn mode(args: &[&str]) -> ContainsMode {
         let mut full = vec!["contains"];
         full.extend_from_slice(args);
-        match parse(&full).unwrap() {
+        match playlist(&full) {
             Command::Contains { all, at_least, no } => ContainsMode::from_flags(all, at_least, no),
             other => panic!("expected contains, got {other:?}"),
         }
     }
 
-    fn assert_usage_error(args: &[&str]) {
-        let err = parse(args).unwrap_err();
-        assert_eq!(err.exit_code(), 2, "{err}");
-    }
-
     #[test]
     fn invalid_playlist_name_is_a_usage_error() {
         for cmd in ["new", "append", "replace", "edit", "remove", "get"] {
-            assert_usage_error(&[cmd, "has space"]);
-            assert_usage_error(&[cmd, "a/b"]);
+            playlist_usage_error(&[cmd, "has space"]);
+            playlist_usage_error(&[cmd, "a/b"]);
         }
-        assert_usage_error(&["rename", "bad name", "ok"]);
-        assert_usage_error(&["rename", "ok", "bad/name"]);
+        playlist_usage_error(&["rename", "bad name", "ok"]);
+        playlist_usage_error(&["rename", "ok", "bad/name"]);
     }
 
     #[test]
     fn valid_playlist_names_are_accepted() {
         assert!(matches!(
-            parse(&["new", "my-list_1"]).unwrap(),
+            playlist(&["new", "my-list_1"]),
             Command::New { name } if name.0.to_string() == "my-list_1"
         ));
+        assert!(matches!(playlist(&["get"]), Command::Get { name: None }));
         assert!(matches!(
-            parse(&["get"]).unwrap(),
-            Command::Get { name: None }
-        ));
-        assert!(matches!(
-            parse(&["get", "mix"]).unwrap(),
+            playlist(&["get", "mix"]),
             Command::Get { name: Some(_) }
         ));
-        match parse(&["rename", "a", "b"]).unwrap() {
+        match playlist(&["rename", "a", "b"]) {
             Command::Rename { from, to } => {
                 assert_eq!(from.0.to_string(), "a");
                 assert_eq!(to.0.to_string(), "b");
@@ -521,16 +524,15 @@ mod tests {
 
     #[test]
     fn contains_conflicting_flags_are_a_usage_error() {
-        assert_usage_error(&["contains", "--all", "--no"]);
-        assert_usage_error(&["contains", "--all", "--at-least", "2"]);
-        assert_usage_error(&["contains", "--no", "--at-least", "2"]);
+        playlist_usage_error(&["contains", "--all", "--no"]);
+        playlist_usage_error(&["contains", "--all", "--at-least", "2"]);
+        playlist_usage_error(&["contains", "--no", "--at-least", "2"]);
     }
 
     #[test]
     fn contains_zero_at_least_is_a_usage_error() {
         for bad in ["0", "abc", "1.5", ""] {
-            let err = parse(&["contains", "--at-least", bad]).unwrap_err();
-            assert_eq!(err.exit_code(), 2, "{bad}: {err}");
+            let err = playlist_usage_error(&["contains", "--at-least", bad]);
             assert!(
                 err.to_string()
                     .contains("must be a whole number of at least 1"),

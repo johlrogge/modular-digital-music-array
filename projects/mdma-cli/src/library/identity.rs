@@ -182,9 +182,7 @@ pub(crate) fn cancel(ctx: &Ctx) -> Result<()> {
 mod tests {
     use super::*;
 
-    use clap::Parser;
-
-    use crate::Cli;
+    use crate::test_support::parses;
 
     use pretty_assertions::assert_eq;
 
@@ -196,31 +194,19 @@ mod tests {
     #[test]
     fn identity_backfill_parses_flags() {
         for (args, pcm, no_wait) in [
+            (vec!["library", "identity", "backfill"], false, false),
             (
-                vec!["mdma", "library", "identity", "backfill"],
-                false,
-                false,
-            ),
-            (
-                vec!["mdma", "library", "identity", "backfill", "--pcm"],
+                vec!["library", "identity", "backfill", "--pcm"],
                 true,
                 false,
             ),
             (
-                vec![
-                    "mdma",
-                    "library",
-                    "identity",
-                    "backfill",
-                    "--pcm",
-                    "--no-wait",
-                ],
+                vec!["library", "identity", "backfill", "--pcm", "--no-wait"],
                 true,
                 true,
             ),
         ] {
-            let cli = Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
-            match cli.command {
+            match parses(&args) {
                 Commands::Library {
                     command:
                         library::Command::Identity {
@@ -234,9 +220,8 @@ mod tests {
 
     #[test]
     fn identity_status_parses() {
-        let cli = Cli::try_parse_from(["mdma", "library", "identity", "status"]).unwrap();
         assert!(matches!(
-            cli.command,
+            parses(&["library", "identity", "status"]),
             Commands::Library {
                 command: library::Command::Identity {
                     command: Command::Status
@@ -258,9 +243,8 @@ mod tests {
 
     #[test]
     fn identity_cancel_parses() {
-        let cli = Cli::try_parse_from(["mdma", "library", "identity", "cancel"]).unwrap();
         assert!(matches!(
-            cli.command,
+            parses(&["library", "identity", "cancel"]),
             Commands::Library {
                 command: library::Command::Identity {
                     command: Command::Cancel

@@ -163,15 +163,13 @@ pub(crate) fn ingest_all(ctx: &Ctx) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::Cli;
-    use clap::Parser;
+    use crate::test_support::{parse, usage_error};
 
     #[test]
     fn invalid_inbox_file_is_a_usage_error() {
         for sub in ["delete", "ingest"] {
             for bad in ["/abs/file.mp3", "../escape.mp3"] {
-                let err = Cli::try_parse_from(["mdma", "inbox", sub, bad]).unwrap_err();
-                assert_eq!(err.exit_code(), 2, "{sub} {bad}: {err}");
+                usage_error(&["inbox", sub, bad]);
             }
         }
     }
@@ -179,7 +177,7 @@ mod tests {
     #[test]
     fn valid_inbox_file_is_accepted() {
         for sub in ["delete", "ingest"] {
-            assert!(Cli::try_parse_from(["mdma", "inbox", sub, "dir/track.mp3"]).is_ok());
+            assert!(parse(&["inbox", sub, "dir/track.mp3"]).is_ok());
         }
     }
 }

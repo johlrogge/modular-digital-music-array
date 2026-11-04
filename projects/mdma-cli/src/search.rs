@@ -432,11 +432,7 @@ pub(crate) fn fact_values_for(fact_type: FactTypeArg, ctx: &Ctx) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::track;
-
-    use clap::Parser;
-
-    use crate::Cli;
+    use crate::test_support::{parse, parses, track, usage_error};
 
     use pretty_assertions::assert_eq;
 
@@ -444,47 +440,34 @@ mod tests {
 
     #[test]
     fn search_added_equals_hyphen_value_parses() {
-        let result = Cli::try_parse_from(["mdma", "search", "--added=-7"]);
-        assert!(
-            result.is_ok(),
-            "clap rejected --added=-7: {}",
-            result.unwrap_err()
-        );
+        parses(&["search", "--added=-7"]);
     }
 
     #[test]
     fn search_started_equals_hyphen_value_parses() {
-        let result = Cli::try_parse_from(["mdma", "search", "--started=-7"]);
-        assert!(
-            result.is_ok(),
-            "clap rejected --started=-7: {}",
-            result.unwrap_err()
-        );
+        parses(&["search", "--started=-7"]);
     }
 
     #[test]
     fn search_added_separate_hyphen_value_is_usage_error() {
-        let err = Cli::try_parse_from(["mdma", "search", "--added", "-7"]).unwrap_err();
-        assert_eq!(err.exit_code(), 2);
+        usage_error(&["search", "--added", "-7"]);
     }
 
     #[test]
     fn search_added_range_parses() {
-        let result = Cli::try_parse_from(["mdma", "search", "--added=-7..~"]);
-        assert!(result.is_ok(), "{}", result.unwrap_err());
+        parses(&["search", "--added=-7..~"]);
     }
 
     #[test]
     fn search_added_garbage_is_parse_error() {
-        let err = Cli::try_parse_from(["mdma", "search", "--added=garbage"]).unwrap_err();
+        let err = usage_error(&["search", "--added=garbage"]);
         assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
-        assert_eq!(err.exit_code(), 2);
     }
 
     #[test]
     fn search_started_and_stopped_garbage_are_parse_errors() {
         for flag in ["--started=garbage", "--stopped=garbage"] {
-            let err = Cli::try_parse_from(["mdma", "search", flag]).unwrap_err();
+            let err = usage_error(&["search", flag]);
             assert_eq!(
                 err.kind(),
                 clap::error::ErrorKind::ValueValidation,
@@ -531,19 +514,16 @@ mod tests {
 
     #[test]
     fn search_stopped_tilde_parses() {
-        let result = Cli::try_parse_from(["mdma", "search", "--stopped", "~"]);
-        assert!(
-            result.is_ok(),
-            "clap rejected --stopped ~: {}",
-            result.unwrap_err()
-        );
+        parses(&["search", "--stopped", "~"]);
     }
 
     // ── bpm / key / duration / year parsing ──────────────────────────────────
 
     fn parse_search(args: &[&str]) -> Result<SearchArgs, clap::Error> {
-        let argv = ["mdma", "search"].into_iter().chain(args.iter().copied());
-        Cli::try_parse_from(argv).map(|cli| match cli.command {
+        let argv: Vec<&str> = std::iter::once("search")
+            .chain(args.iter().copied())
+            .collect();
+        parse(&argv).map(|command| match command {
             crate::Commands::Search(search) => search.query,
             other => panic!("expected search command, got {other:?}"),
         })
@@ -705,12 +685,7 @@ mod tests {
 
     #[test]
     fn search_played_never_maps_to_started_na() {
-        let result = Cli::try_parse_from(["mdma", "search", "--played", "never"]);
-        assert!(
-            result.is_ok(),
-            "clap rejected --played never: {}",
-            result.unwrap_err()
-        );
+        parses(&["search", "--played", "never"]);
         // Build the query with played=never and no explicit --started
         let query = build_track_query(SearchArgs {
             played: Some(PlayedFilter::Never),

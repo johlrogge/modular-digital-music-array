@@ -966,16 +966,11 @@ mod tests {
 
     // ── argv parsing ─────────────────────────────────────────────────────────────
 
-    use crate::{Cli, Commands};
-    use clap::Parser;
-
-    fn parse(argv: &[&str]) -> Result<Commands, clap::Error> {
-        Cli::try_parse_from(std::iter::once("mdma").chain(argv.iter().copied()))
-            .map(|cli| cli.command)
-    }
+    use crate::test_support::{parses, usage_error};
+    use crate::Commands;
 
     fn rekordbox_command(argv: &[&str]) -> super::Command {
-        match parse(argv).unwrap() {
+        match parses(argv) {
             Commands::Rekordbox { command } => command,
             other => panic!("not rekordbox: {other:?}"),
         }
@@ -984,21 +979,18 @@ mod tests {
     #[test]
     fn export_playlist_names_are_validated_at_parse_time() {
         for bad in ["has space", "a/b", ""] {
-            let err = parse(&["rekordbox", "export", "--playlist", bad]).unwrap_err();
-            assert_eq!(err.exit_code(), 2, "{bad:?}");
+            let err = usage_error(&["rekordbox", "export", "--playlist", bad]);
             assert!(err.to_string().contains("--playlist"), "{bad:?}: {err}");
         }
         // One bad name among good ones is still rejected.
-        let err = parse(&[
+        usage_error(&[
             "rekordbox",
             "export",
             "--playlist",
             "good",
             "--playlist",
             "not good",
-        ])
-        .unwrap_err();
-        assert_eq!(err.exit_code(), 2);
+        ]);
     }
 
     #[test]
@@ -1021,16 +1013,14 @@ mod tests {
 
     #[test]
     fn import_rejects_a_missing_file() {
-        let err = parse(&["rekordbox", "import", "/definitely/not/here.xml"]).unwrap_err();
-        assert_eq!(err.exit_code(), 2);
+        let err = usage_error(&["rekordbox", "import", "/definitely/not/here.xml"]);
         assert!(err.to_string().contains("does not exist"), "message: {err}");
     }
 
     #[test]
     fn import_rejects_a_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let err = parse(&["rekordbox", "import", dir.path().to_str().unwrap()]).unwrap_err();
-        assert_eq!(err.exit_code(), 2);
+        let err = usage_error(&["rekordbox", "import", dir.path().to_str().unwrap()]);
         assert!(err.to_string().contains("is not a file"), "message: {err}");
     }
 
@@ -1039,8 +1029,7 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let path = file.path().to_str().unwrap();
         for bad in ["", "///", " "] {
-            let err = parse(&["rekordbox", "import", path, "--playlist", bad]).unwrap_err();
-            assert_eq!(err.exit_code(), 2, "{bad:?}");
+            let err = usage_error(&["rekordbox", "import", path, "--playlist", bad]);
             assert!(
                 err.to_string().contains("name sanitizes to empty"),
                 "{bad:?}: {err}"

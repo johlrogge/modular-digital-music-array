@@ -324,24 +324,19 @@ mod tests {
 
     // ── argv parsing ──────────────────────────────────────────────────────────
 
-    use crate::Cli;
-    use clap::Parser;
+    use crate::test_support::{parses, usage_error};
 
     fn fact_argv<'a>(verb: &'a str, hash: &'a str, value: &'a str, field: &'a str) -> Vec<&'a str> {
-        vec![
-            "mdma", "fact", verb, hash, "--field", field, "--value", value,
-        ]
+        vec!["fact", verb, hash, "--field", field, "--value", value]
     }
 
     #[test]
     fn fact_hash_must_be_a_valid_hash() {
         for verb in ["add", "retract"] {
             for bad in ["abcd123", "ABCD1234"] {
-                let err = Cli::try_parse_from(fact_argv(verb, bad, "x", "title")).unwrap_err();
-                assert_eq!(err.exit_code(), 2, "{verb} {bad}");
+                usage_error(&fact_argv(verb, bad, "x", "title"));
             }
-            let cli = Cli::try_parse_from(fact_argv(verb, "abcd1234", "x", "title"));
-            assert!(cli.is_ok(), "{verb}: {:?}", cli.err());
+            parses(&fact_argv(verb, "abcd1234", "x", "title"));
         }
     }
 

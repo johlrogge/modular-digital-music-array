@@ -1,6 +1,30 @@
 //! Test helpers shared by several modules' tests.
 
+use crate::{Cli, Commands};
+use clap::Parser;
 use library_ipc_client::{ContentHash, TrackInfo};
+
+/// Parse `args` (without the program name) as an `mdma` command line.
+pub(crate) fn parse_cli(args: &[&str]) -> Result<Cli, clap::Error> {
+    Cli::try_parse_from(std::iter::once("mdma").chain(args.iter().copied()))
+}
+
+/// Parse `args` (without the program name), keeping only the command.
+pub(crate) fn parse(args: &[&str]) -> Result<Commands, clap::Error> {
+    parse_cli(args).map(|cli| cli.command)
+}
+
+/// Parse `args`, which must be a valid command line.
+pub(crate) fn parses(args: &[&str]) -> Commands {
+    parse(args).unwrap_or_else(|e| panic!("{args:?} should parse: {e}"))
+}
+
+/// Parse `args`, which must be rejected as a usage error (exit code 2).
+pub(crate) fn usage_error(args: &[&str]) -> clap::Error {
+    let err = parse(args).expect_err("should be rejected");
+    assert_eq!(err.exit_code(), 2, "{args:?}");
+    err
+}
 
 /// Strip ANSI escape codes from a string.
 pub(crate) fn strip_ansi(s: &str) -> String {

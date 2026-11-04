@@ -139,11 +139,9 @@ pub(crate) fn empty(yes: Yes, ctx: &Ctx) -> Result<()> {
 mod tests {
     use super::*;
 
-    use clap::Parser;
-
     use library_ipc_client::{ArchiveEmptyReport, ArchiveListing};
 
-    use crate::Cli;
+    use crate::test_support::{parses, usage_error};
 
     use pretty_assertions::assert_eq;
 
@@ -153,12 +151,9 @@ mod tests {
     // ── archive ───────────────────────────────────────────────────────────────
 
     fn archive_command(args: &[&str]) -> Option<Command> {
-        let mut argv = vec!["mdma", "library", "archive"];
+        let mut argv = vec!["library", "archive"];
         argv.extend_from_slice(args);
-        match Cli::try_parse_from(&argv)
-            .unwrap_or_else(|e| panic!("{argv:?}: {e}"))
-            .command
-        {
+        match parses(&argv) {
             Commands::Library {
                 command: library::Command::Archive { command },
             } => command,
@@ -181,8 +176,8 @@ mod tests {
             archive_command(&["empty", "-y"]),
             Some(Command::Empty { yes: true })
         ));
-        assert!(Cli::try_parse_from(["mdma", "library", "archive", "empty", "x"]).is_err());
-        assert!(Cli::try_parse_from(["mdma", "library", "archive", "--yes"]).is_err());
+        usage_error(&["library", "archive", "empty", "x"]);
+        usage_error(&["library", "archive", "--yes"]);
     }
 
     fn archive_listing_of_two() -> ArchiveListing {

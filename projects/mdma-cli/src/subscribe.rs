@@ -16,10 +16,10 @@ pub(crate) struct SubscribeCli {
 /// Topic filter for events (all playback events when `None`).
 // Stays a String: a topic is a free-form subscription prefix with no domain rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TopicArg(pub Option<String>);
+pub(crate) struct OptTopicArg(pub Option<String>);
 
-pub(crate) fn subscribe(topic: TopicArg, ctx: &Ctx) -> Result<()> {
-    let TopicArg(topic) = topic;
+pub(crate) fn subscribe(topic: OptTopicArg, ctx: &Ctx) -> Result<()> {
+    let OptTopicArg(topic) = topic;
     // Event gateway of the resolved node (tcp://<ip>:5556)
     let addr = match ctx.event_gateway() {
         Some(a) => a,

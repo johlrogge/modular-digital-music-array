@@ -170,9 +170,7 @@ mod service_mode {
 #[cfg(test)]
 mod tests {
 
-    use clap::Parser;
-
-    use crate::Cli;
+    use crate::test_support::parses;
 
     use super::service_mode;
     use super::Command;
@@ -182,14 +180,7 @@ mod tests {
 
     #[test]
     fn admin_service_mode_enable_parses_correctly() {
-        let result = Cli::try_parse_from(["mdma", "admin", "service-mode", "enable"]);
-        assert!(
-            result.is_ok(),
-            "clap rejected admin service-mode enable: {}",
-            result.unwrap_err()
-        );
-        let cli = result.unwrap();
-        match cli.command {
+        match parses(&["admin", "service-mode", "enable"]) {
             Commands::Admin {
                 command:
                     Command::ServiceMode {
@@ -202,14 +193,7 @@ mod tests {
 
     #[test]
     fn admin_service_mode_status_parses_correctly() {
-        let result = Cli::try_parse_from(["mdma", "admin", "service-mode", "status"]);
-        assert!(
-            result.is_ok(),
-            "clap rejected admin service-mode status: {}",
-            result.unwrap_err()
-        );
-        let cli = result.unwrap();
-        match cli.command {
+        match parses(&["admin", "service-mode", "status"]) {
             Commands::Admin {
                 command:
                     Command::ServiceMode {
@@ -222,14 +206,7 @@ mod tests {
 
     #[test]
     fn admin_service_mode_disable_parses_correctly() {
-        let result = Cli::try_parse_from(["mdma", "admin", "service-mode", "disable"]);
-        assert!(
-            result.is_ok(),
-            "clap rejected admin service-mode disable: {}",
-            result.unwrap_err()
-        );
-        let cli = result.unwrap();
-        match cli.command {
+        match parses(&["admin", "service-mode", "disable"]) {
             Commands::Admin {
                 command:
                     Command::ServiceMode {
@@ -242,8 +219,7 @@ mod tests {
 
     #[test]
     fn admin_boot_health_parses_correctly() {
-        let cli = Cli::try_parse_from(["mdma", "admin", "boot-health"]).unwrap();
-        match cli.command {
+        match parses(&["admin", "boot-health"]) {
             Commands::Admin {
                 command: Command::BootHealth,
             } => {}
@@ -253,14 +229,7 @@ mod tests {
 
     #[test]
     fn admin_reboot_parses_correctly() {
-        let result = Cli::try_parse_from(["mdma", "admin", "reboot"]);
-        assert!(
-            result.is_ok(),
-            "clap rejected admin reboot: {}",
-            result.unwrap_err()
-        );
-        let cli = result.unwrap();
-        match cli.command {
+        match parses(&["admin", "reboot"]) {
             Commands::Admin {
                 command: Command::Reboot { force: false },
             } => {}

@@ -1,24 +1,41 @@
-use crate::args::TrackArg;
+use crate::args::{OptTrackArg, TrackArg};
 use crate::ctx::Ctx;
 use crate::output::{
     format_track_line, handle_error, handle_playback_error, print_tracks, terminal_width,
     PIPE_TERM_WIDTH,
 };
-use crate::stdin::{hashes_arg_or_stdin, read_hashes, resolve_tracks_skip_errors};
+use crate::stdin::{read_hashes, require_stdin_hashes, resolve_tracks_skip_errors};
 use color_eyre::Result;
 use library_ipc_client::TrackInfo;
+use std::num::NonZeroUsize;
 use track_formatter::{render_for_user, short_hash, ViewColumn};
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct ListCli {
     /// Maximum number of tracks to show
     #[arg(short, long)]
-    pub(crate) limit: Option<usize>,
+    pub(crate) limit: Option<LimitArg>,
+}
+
+/// A track count of at least 1 (a limit of 0 would show nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LimitArg(pub NonZeroUsize);
+
+impl std::str::FromStr for LimitArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        s.parse::<usize>()
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .map(Self)
+            .ok_or_else(|| format!("'{s}' must be a whole number of at least 1"))
+    }
 }
 
 /// Maximum number of tracks to show (all when `None`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LimitArg(pub Option<usize>);
+pub(crate) struct OptLimitArg(pub Option<LimitArg>);
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct GetCli {
@@ -56,6 +73,11 @@ pub(crate) struct BookmarkCli {
     pub(crate) hash: Option<TrackArg>,
 }
 
+/// Scope to associate a bookmark with (none: unscoped).
+// Stays a String: a scope is a free-form name with no domain rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OptScopeArg(pub Option<String>);
+
 #[derive(clap::Args, Debug)]
 pub(crate) struct ViewCli {
     /// Show the 12-character content hash
@@ -73,6 +95,62 @@ pub(crate) struct ViewCli {
     /// Show the track duration
     #[arg(long)]
     duration: bool,
+}
+
+/// The columns `mdma view` shows, in the order their flags were typed; at least one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ViewColumns(pub Vec<ViewColumn>);
+
+impl ViewColumns {
+    /// Resolve the columns from the raw `clap::ArgMatches` of the `view` subcommand.
+    ///
+    /// Clap boolean flags (`--hash`, `--artist`, `--title`, `--duration`) don't preserve
+    /// insertion order in the derive API. We use `ArgMatches::indices_of` to recover the argv
+    /// position of each flag that was actually set, then sort by position to honour the order
+    /// the user typed them in. This implements `mdma view --title --hash` → title-first,
+    /// hash-second. Selecting no column is a usage error.
+    pub(crate) fn from_matches(
+        matches: &clap::ArgMatches,
+    ) -> std::result::Result<Self, clap::Error> {
+        // Collect (argv_index, column) pairs for every flag that was set.
+        let mut indexed: Vec<(usize, ViewColumn)> = Vec::new();
+        for (flag, col) in &[
+            ("hash", ViewColumn::Hash),
+            ("artist", ViewColumn::Artist),
+            ("title", ViewColumn::Title),
+            ("duration", ViewColumn::Duration),
+        ] {
+            if matches.get_flag(flag) {
+                // indices_of returns the positions at which the flag appeared in argv.
+                // Take the first (and only) position for a boolean flag.
+                if let Some(mut idxs) = matches.indices_of(flag) {
+                    if let Some(idx) = idxs.next() {
+                        indexed.push((idx, *col));
+                    }
+                }
+            }
+        }
+        if indexed.is_empty() {
+            return Err(crate::args::usage_error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "No fields selected. Use --hash, --artist, --title, and/or --duration.",
+            ));
+        }
+        indexed.sort_by_key(|(idx, _)| *idx);
+        Ok(Self(indexed.into_iter().map(|(_, col)| col).collect()))
+    }
+}
+
+impl SortArgs {
+    /// The direction of `mdma sort`: exactly one of `-a` / `-d`.
+    pub(crate) fn direction(&self) -> std::result::Result<SortDirection, clap::Error> {
+        SortDirection::from_flags(self.ascending, self.descending).ok_or_else(|| {
+            crate::args::usage_error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "Specify exactly one of -a (ascending) or -d (descending)",
+            )
+        })
+    }
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,7 +227,7 @@ pub(crate) enum SortDirection {
 
 impl SortDirection {
     /// `None` unless exactly one of the flags is set.
-    pub(crate) fn from_flags(ascending: bool, descending: bool) -> Option<Self> {
+    fn from_flags(ascending: bool, descending: bool) -> Option<Self> {
         match (ascending, descending) {
             (true, false) => Some(SortDirection::Ascending),
             (false, true) => Some(SortDirection::Descending),
@@ -189,10 +267,10 @@ pub(crate) fn status(ctx: &Ctx) -> Result<()> {
     }
 }
 
-pub(crate) fn list(limit: LimitArg, ctx: &Ctx) -> Result<()> {
-    let LimitArg(limit) = limit;
+pub(crate) fn list(limit: OptLimitArg, ctx: &Ctx) -> Result<()> {
+    let OptLimitArg(limit) = limit;
     let library = ctx.library();
-    match library.list_tracks(limit) {
+    match library.list_tracks(limit.map(|LimitArg(n)| n.get())) {
         Ok(tracks) => {
             if tracks.is_empty() {
                 println!("No tracks in library");
@@ -298,10 +376,10 @@ fn compare_optional<T: Ord>(
     }
 }
 
-pub(crate) fn sort(field: SortField, direction: SortDirection, ctx: &Ctx) -> Result<()> {
+pub(crate) fn sort(direction: SortDirection, field: SortField, ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
 
-    let hashes = hashes_arg_or_stdin(None);
+    let hashes = require_stdin_hashes();
     let mut tracks = resolve_tracks_skip_errors(&library, hashes);
 
     tracks.sort_by(|a, b| match field {
@@ -349,7 +427,9 @@ pub(crate) fn sort(field: SortField, direction: SortDirection, ctx: &Ctx) -> Res
     Ok(())
 }
 
-pub(crate) fn bookmark(scope: Option<String>, hash: Option<TrackArg>, ctx: &Ctx) -> Result<()> {
+pub(crate) fn bookmark(scope: OptScopeArg, hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
+    let OptScopeArg(scope) = scope;
+    let OptTrackArg(hash) = hash;
     let library = ctx.library();
     let playback = ctx.playback();
     let content_hash = match hash {
@@ -405,41 +485,6 @@ pub(crate) fn bookmarks(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the ordered set of `ViewColumn`s from the raw `clap::ArgMatches` for the `view`
-/// subcommand.
-///
-/// Clap boolean flags (`--hash`, `--artist`, `--title`, `--duration`) don't preserve
-/// insertion order in the derive API. We use `ArgMatches::indices_of` to recover the argv
-/// position of each flag that was actually set, then sort by position to honour the order the
-/// user typed them in. This implements `mdma view --title --hash` → title-first, hash-second.
-pub(crate) fn view_columns_from_matches(matches: &clap::ArgMatches) -> Vec<ViewColumn> {
-    // Collect (argv_index, column) pairs for every flag that was set.
-    let mut indexed: Vec<(usize, ViewColumn)> = Vec::new();
-    for (flag, col) in &[
-        ("hash", ViewColumn::Hash),
-        ("artist", ViewColumn::Artist),
-        ("title", ViewColumn::Title),
-        ("duration", ViewColumn::Duration),
-    ] {
-        if matches.get_flag(flag) {
-            // indices_of returns the positions at which the flag appeared in argv.
-            // Take the first (and only) position for a boolean flag.
-            if let Some(mut idxs) = matches.indices_of(flag) {
-                if let Some(idx) = idxs.next() {
-                    indexed.push((idx, *col));
-                }
-            }
-        }
-    }
-    indexed.sort_by_key(|(idx, _)| *idx);
-    indexed.into_iter().map(|(_, col)| col).collect()
-}
-
-/// The columns `mdma view` shows, in the order their flags were typed
-/// (see [`view_columns_from_matches`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ViewColumns(pub Vec<ViewColumn>);
-
 pub(crate) fn view(columns: ViewColumns, ctx: &Ctx) -> Result<()> {
     use std::io::IsTerminal;
 
@@ -493,9 +538,9 @@ pub(crate) fn view(columns: ViewColumns, ctx: &Ctx) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::*;
+    use crate::test_support::{parses, strip_ansi, track, usage_error};
 
-    use clap::{CommandFactory, Parser};
+    use clap::CommandFactory;
 
     use library_ipc_client::TrackInfo;
 
@@ -522,17 +567,51 @@ mod tests {
     }
 
     #[test]
-    fn sort_direction_requires_exactly_one_flag() {
+    fn list_limit_must_be_at_least_one() {
+        let e = usage_error(&["list", "--limit", "0"]);
+        assert!(e
+            .to_string()
+            .contains("'0' must be a whole number of at least 1"));
+        usage_error(&["list", "--limit", "-1"]);
+        usage_error(&["list", "--limit", "x"]);
+        match parses(&["list", "-l", "3"]) {
+            crate::Commands::List(ListCli { limit }) => {
+                assert_eq!(limit.map(|LimitArg(n)| n.get()), Some(3))
+            }
+            other => panic!("expected list, got {other:?}"),
+        }
+        assert!(matches!(
+            parses(&["list"]),
+            crate::Commands::List(ListCli { limit: None })
+        ));
+    }
+
+    fn sort_args(args: &[&str]) -> SortArgs {
+        let mut argv = vec!["sort"];
+        argv.extend_from_slice(args);
+        match parses(&argv) {
+            Commands::Sort(a) => a,
+            other => panic!("expected sort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sort_needs_exactly_one_direction() {
         assert_eq!(
-            SortDirection::from_flags(true, false),
-            Some(SortDirection::Ascending)
+            sort_args(&["title", "-a"]).direction().unwrap(),
+            SortDirection::Ascending
         );
         assert_eq!(
-            SortDirection::from_flags(false, true),
-            Some(SortDirection::Descending)
+            sort_args(&["title", "-d"]).direction().unwrap(),
+            SortDirection::Descending
         );
-        assert_eq!(SortDirection::from_flags(false, false), None);
-        assert_eq!(SortDirection::from_flags(true, true), None);
+        for flags in [&["title", "-a", "-d"][..], &["title"][..]] {
+            let e = sort_args(flags).direction().unwrap_err();
+            assert_eq!(e.exit_code(), 2, "{flags:?}");
+            assert!(e
+                .to_string()
+                .contains("Specify exactly one of -a (ascending) or -d (descending)"));
+        }
     }
 
     // ── sort by started / stopped ─────────────────────────────────────────────
@@ -670,25 +749,12 @@ mod tests {
 
     #[test]
     fn view_clap_parses_hash_artist_title_duration() {
-        let result = Cli::try_parse_from([
-            "mdma",
-            "view",
-            "--hash",
-            "--artist",
-            "--title",
-            "--duration",
-        ]);
-        assert!(
-            result.is_ok(),
-            "clap rejected view --hash --artist --title --duration: {}",
-            result.unwrap_err()
-        );
         if let Commands::View(ViewCli {
             hash,
             artist,
             title,
             duration,
-        }) = result.unwrap().command
+        }) = parses(&["view", "--hash", "--artist", "--title", "--duration"])
         {
             assert!(hash);
             assert!(artist);
@@ -701,18 +767,12 @@ mod tests {
 
     #[test]
     fn view_clap_parses_subset_of_flags() {
-        let result = Cli::try_parse_from(["mdma", "view", "--title", "--hash"]);
-        assert!(
-            result.is_ok(),
-            "clap rejected view --title --hash: {}",
-            result.unwrap_err()
-        );
         if let Commands::View(ViewCli {
             hash,
             artist,
             title,
             duration,
-        }) = result.unwrap().command
+        }) = parses(&["view", "--title", "--hash"])
         {
             assert!(title);
             assert!(hash);
@@ -726,12 +786,7 @@ mod tests {
     #[test]
     fn view_clap_no_flags_parses_ok() {
         // All flags are optional; no flags is valid.
-        let result = Cli::try_parse_from(["mdma", "view"]);
-        assert!(
-            result.is_ok(),
-            "clap rejected view with no flags: {}",
-            result.unwrap_err()
-        );
+        parses(&["view"]);
     }
 
     // ── render_for_user: single-column ────────────────────
@@ -908,39 +963,42 @@ mod tests {
         );
     }
 
-    // ── view_columns_from_matches ────────────────────────────────────────────────
+    // ── ViewColumns::from_matches ────────────────────────────────────────────────
+
+    /// The `view` subcommand's matches for `mdma view <flags>`.
+    fn view_matches(flags: &[&str]) -> clap::ArgMatches {
+        let argv = ["mdma", "view"].into_iter().chain(flags.iter().copied());
+        let matches = Cli::command()
+            .try_get_matches_from(argv)
+            .expect("valid view args");
+        matches
+            .subcommand_matches("view")
+            .expect("view subcommand")
+            .clone()
+    }
+
+    fn view_columns(flags: &[&str]) -> Vec<ViewColumn> {
+        ViewColumns::from_matches(&view_matches(flags)).unwrap().0
+    }
 
     #[test]
     fn view_columns_from_matches_hash_artist_order() {
         // Simulate `mdma view --hash --artist` → Hash before Artist.
-        let matches = Cli::command().get_matches_from(["mdma", "view", "--hash", "--artist"]);
-        let view_matches = matches.subcommand_matches("view").unwrap();
-        let cols = view_columns_from_matches(view_matches);
+        let cols = view_columns(&["--hash", "--artist"]);
         assert_eq!(cols, vec![ViewColumn::Hash, ViewColumn::Artist]);
     }
 
     #[test]
     fn view_columns_from_matches_title_hash_order() {
         // Simulate `mdma view --title --hash` → Title before Hash.
-        let matches = Cli::command().get_matches_from(["mdma", "view", "--title", "--hash"]);
-        let view_matches = matches.subcommand_matches("view").unwrap();
-        let cols = view_columns_from_matches(view_matches);
+        let cols = view_columns(&["--title", "--hash"]);
         assert_eq!(cols, vec![ViewColumn::Title, ViewColumn::Hash]);
     }
 
     #[test]
     fn view_columns_from_matches_all_four_preserves_order() {
         // Simulate `mdma view --hash --artist --title --duration` → canonical order.
-        let matches = Cli::command().get_matches_from([
-            "mdma",
-            "view",
-            "--hash",
-            "--artist",
-            "--title",
-            "--duration",
-        ]);
-        let view_matches = matches.subcommand_matches("view").unwrap();
-        let cols = view_columns_from_matches(view_matches);
+        let cols = view_columns(&["--hash", "--artist", "--title", "--duration"]);
         assert_eq!(
             cols,
             vec![
@@ -953,19 +1011,19 @@ mod tests {
     }
 
     #[test]
-    fn view_columns_from_matches_duration_first() {
-        // Simulate `mdma view --duration --title` → Duration before Title.
-        let matches = Cli::command().get_matches_from(["mdma", "view", "--duration", "--title"]);
-        let view_matches = matches.subcommand_matches("view").unwrap();
-        let cols = view_columns_from_matches(view_matches);
-        assert_eq!(cols, vec![ViewColumn::Duration, ViewColumn::Title]);
+    fn view_columns_from_matches_no_flags_is_a_usage_error() {
+        let e = ViewColumns::from_matches(&view_matches(&[])).unwrap_err();
+        assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert_eq!(e.exit_code(), 2);
+        assert!(e
+            .to_string()
+            .contains("No fields selected. Use --hash, --artist, --title, and/or --duration."));
     }
 
     #[test]
-    fn view_columns_from_matches_no_flags_empty() {
-        let matches = Cli::command().get_matches_from(["mdma", "view"]);
-        let view_matches = matches.subcommand_matches("view").unwrap();
-        let cols = view_columns_from_matches(view_matches);
-        assert!(cols.is_empty(), "no flags → empty columns list");
+    fn view_columns_from_matches_duration_first() {
+        // Simulate `mdma view --duration --title` → Duration before Title.
+        let cols = view_columns(&["--duration", "--title"]);
+        assert_eq!(cols, vec![ViewColumn::Duration, ViewColumn::Title]);
     }
 }

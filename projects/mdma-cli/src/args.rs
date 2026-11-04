@@ -26,6 +26,10 @@ impl FromStr for TrackArg {
     }
 }
 
+/// An optional [`TrackArg`] (none: the command reads hashes from stdin or has a default).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OptTrackArg(pub Option<TrackArg>);
+
 /// Name of an MDMA playlist, validated by `PlaylistName`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlaylistArg(pub PlaylistName);
@@ -37,6 +41,10 @@ impl FromStr for PlaylistArg {
         PlaylistName::new(s).map(Self)
     }
 }
+
+/// An optional [`PlaylistArg`] (none: the command reads names from stdin).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OptPlaylistArg(pub Option<PlaylistArg>);
 
 /// A playlist name for an imported playlist: sanitised on parse. Keeps the
 /// raw text so commands can note when it was changed.

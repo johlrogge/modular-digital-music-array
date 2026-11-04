@@ -13,14 +13,14 @@ pub(crate) struct UploadArgs {
     #[arg(long, default_value = "~/.ssh/mdma_pi", env = "MDMA_SSH_KEY")]
     ssh_key: SshKeyArg,
 
+    // Stays a String: no domain rule, the Pi's account name.
     /// SSH user on the Pi
     #[arg(long, default_value = "mdma", env = "MDMA_SSH_USER")]
-    // stays a String: no domain rule, the Pi's account name
     ssh_user: String,
 
+    // Stays a String: no domain rule, a path on the remote Pi (not checked locally).
     /// Remote inbox directory
     #[arg(long, default_value = "/music/inbox/", env = "MDMA_INBOX_DIR")]
-    // stays a String: no domain rule, a path on the remote Pi (not checked locally)
     inbox_dir: String,
 
     /// Path to file (audio file or ZIP archive)
@@ -98,7 +98,7 @@ pub(crate) enum ExportFormats {
 
 /// Path of an existing SSH key file; a leading `~/` is expanded to the home directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SshKeyArg(pub(crate) std::path::PathBuf);
+pub(crate) struct SshKeyArg(pub std::path::PathBuf);
 
 impl std::str::FromStr for SshKeyArg {
     type Err = String;
@@ -781,30 +781,32 @@ impl std::str::FromStr for ExportFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::track;
+    use crate::test_support::{parses, track, usage_error};
+    use crate::Commands;
 
     use pretty_assertions::assert_eq;
 
     // ── upload file argument ─────────────────────────────────────────────────
 
-    use crate::{Cli, Commands};
-    use clap::Parser;
+    /// An existing key file, so the default key location does not matter.
+    const KEY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
 
-    fn parse_upload(file: &str) -> Result<UploadFileArg, clap::Error> {
-        // an existing key file, so the default key location does not matter
-        let key = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
-        match Cli::try_parse_from(["mdma", "upload", "--ssh-key", key, file])?.command {
-            Commands::Upload(args) => Ok(args.file),
+    fn upload_file(file: &str) -> UploadFileArg {
+        match parses(&["upload", "--ssh-key", KEY, file]) {
+            Commands::Upload(args) => args.file,
             other => panic!("not upload: {other:?}"),
         }
     }
 
+    fn upload_usage_error(file: &str) -> clap::Error {
+        usage_error(&["upload", "--ssh-key", KEY, file])
+    }
+
     #[test]
     fn ssh_key_must_be_an_existing_file() {
-        let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
         assert_eq!(
-            manifest.parse::<SshKeyArg>(),
-            Ok(SshKeyArg(std::path::PathBuf::from(manifest)))
+            KEY.parse::<SshKeyArg>(),
+            Ok(SshKeyArg(std::path::PathBuf::from(KEY)))
         );
         assert!("/definitely/not/a/key".parse::<SshKeyArg>().is_err());
         assert!(env!("CARGO_MANIFEST_DIR").parse::<SshKeyArg>().is_err());
@@ -862,8 +864,7 @@ mod tests {
 
     #[test]
     fn upload_rejects_a_missing_file() {
-        let err = parse_upload("/definitely/not/here.flac").unwrap_err();
-        assert_eq!(err.exit_code(), 2);
+        let err = upload_usage_error("/definitely/not/here.flac");
         assert!(
             err.to_string()
                 .contains("file '/definitely/not/here.flac' does not exist"),
@@ -874,8 +875,7 @@ mod tests {
     #[test]
     fn upload_rejects_unsupported_file_types() {
         let file = file_with(b"just some text");
-        let err = parse_upload(file.path().to_str().unwrap()).unwrap_err();
-        assert_eq!(err.exit_code(), 2);
+        let err = upload_usage_error(file.path().to_str().unwrap());
         assert!(err.to_string().contains("Unsupported file type"), "{err}");
     }
 
@@ -889,7 +889,7 @@ mod tests {
             (b"PK\x03\x04", UploadKind::Zip),
         ] {
             let file = file_with(magic);
-            let arg = parse_upload(file.path().to_str().unwrap()).unwrap();
+            let arg = upload_file(file.path().to_str().unwrap());
             assert_eq!(arg.kind, kind, "{magic:?}");
             assert_eq!(arg.path, file.path());
         }

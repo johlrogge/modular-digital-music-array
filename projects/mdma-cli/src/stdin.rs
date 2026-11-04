@@ -3,6 +3,7 @@
 //! A command connects (and so resolves the node, which may prompt on stdin)
 //! before it reads stdin.
 
+use crate::args::{OptTrackArg, TrackArg};
 use library_ipc_client::{ContentHash, TrackInfo};
 use mdma_client::LibraryBackend;
 
@@ -52,19 +53,24 @@ pub fn read_hashes() -> Vec<ContentHash> {
     hashes_from_lines(std::io::stdin().lock().lines().map_while(Result::ok))
 }
 
-/// Return the provided hash as a single-element vec, or read ALL lines from stdin and
-/// extract valid hashes (8+ lowercase hex chars, or sha256:-prefixed full hashes, as first token).
-pub fn hashes_arg_or_stdin(hash: Option<ContentHash>) -> Vec<ContentHash> {
+/// Read ALL lines from stdin and extract valid hashes (8+ lowercase hex chars, or
+/// sha256:-prefixed full hashes, as first token); exits 1 when there are none.
+pub fn require_stdin_hashes() -> Vec<ContentHash> {
+    let hashes = read_hashes();
+    if hashes.is_empty() {
+        eprintln!("No hash provided and stdin was empty");
+        std::process::exit(1);
+    }
+    hashes
+}
+
+/// Return the provided hash as a single-element vec, or the hashes from stdin
+/// (see [`require_stdin_hashes`]).
+pub fn hashes_arg_or_stdin(hash: OptTrackArg) -> Vec<ContentHash> {
+    let OptTrackArg(hash) = hash;
     match hash {
-        Some(h) => vec![h],
-        None => {
-            let hashes = read_hashes();
-            if hashes.is_empty() {
-                eprintln!("No hash provided and stdin was empty");
-                std::process::exit(1);
-            }
-            hashes
-        }
+        Some(TrackArg(h)) => vec![h],
+        None => require_stdin_hashes(),
     }
 }
 
