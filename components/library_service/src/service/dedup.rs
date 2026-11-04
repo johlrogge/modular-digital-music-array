@@ -251,6 +251,28 @@ struct ScanTrack {
     identities: Vec<String>,
 }
 
+impl From<&IndexedTrackInfo> for ScanTrack {
+    fn from(t: &IndexedTrackInfo) -> Self {
+        ScanTrack {
+            hash: t.content_hash.clone(),
+            title: t.title.clone(),
+            album: t.album.clone(),
+            added_at: t.added_at,
+            item_id: t.item_id.clone(),
+            item_ids: t.item_ids().map(str::to_owned).collect(),
+            deleted: t.is_hidden(),
+            identities: t
+                .audio_hashes()
+                .map(|h| format!("audio:{h}"))
+                .chain(t.provenance.iter().filter_map(|(v, _)| match v {
+                    MusicValue::PcmHash(h) => Some(format!("pcm:{}", h.as_str())),
+                    _ => None,
+                }))
+                .collect(),
+        }
+    }
+}
+
 /// Connected components (of two or more tracks) of the "shares an identity key" relation.
 fn duplicate_components(tracks: &[ScanTrack]) -> Vec<Vec<usize>> {
     fn find(parent: &mut [usize], mut i: usize) -> usize {
@@ -360,24 +382,7 @@ impl LibraryService {
             .lock()
             .unwrap()
             .iter()
-            .map(|t| ScanTrack {
-                hash: t.content_hash.clone(),
-                title: t.title.clone(),
-                album: t.album.clone(),
-                added_at: t.added_at,
-                item_id: t.item_id.clone(),
-                item_ids: t.item_ids().map(str::to_owned).collect(),
-                deleted: t.is_hidden(),
-                identities: t
-                    .provenance
-                    .iter()
-                    .filter_map(|(v, _)| match v {
-                        MusicValue::AudioHash(h) => Some(format!("audio:{}", h.as_str())),
-                        MusicValue::PcmHash(h) => Some(format!("pcm:{}", h.as_str())),
-                        _ => None,
-                    })
-                    .collect(),
-            })
+            .map(ScanTrack::from)
             .collect();
 
         let mut groups: Vec<DedupGroup> = duplicate_components(&tracks)
@@ -390,6 +395,91 @@ impl LibraryService {
                 .then_with(|| a.winner.as_str().cmp(b.winner.as_str()))
         });
         groups
+    }
+
+    /// Self-healing merge at ingest (ADR-013): once `new` holds an AudioHash v1, group
+    /// it with every other live (not soft-deleted) track that shares an AudioHash,
+    /// using the scan's own grouping rule (`build_group`), and merge the group only if
+    /// the scan would merge it automatically. The winner is the group's newest copy,
+    /// per the scan rule: on a fresh ingest that is the new copy, but an old copy that
+    /// has just gained an ItemId can lose to a newer one. PcmHash-only matches and
+    /// soft-deleted copies are left for the scan.
+    ///
+    /// Call it after the facts of `new` are durable and projected, and again whenever
+    /// an ItemId lands on an existing track, so the order of the two does not matter.
+    /// Ingests without an ItemId (`track replace`, uploads, Beatport) reach it too but
+    /// never merge: such a group always needs confirmation (`NoItemId`). It holds no
+    /// lock when it calls `merge_group` (which takes the retire gate itself): the
+    /// group is decided under `tracks` alone. A failure is logged and never reaches
+    /// the caller: the scan picks the group up later.
+    ///
+    /// Returns the hash that is live afterwards: the winner if a merge happened,
+    /// otherwise `new`.
+    pub(super) fn self_heal_after_ingest(&self, new: &ContentHash) -> ContentHash {
+        let Some((winner, losers)) = self.self_heal_group(new) else {
+            return new.clone();
+        };
+
+        let mut report = self.merge_group(&winner, &losers);
+        if report.merged > 0 {
+            self.cleanup_merge_orphans(&mut report);
+        }
+        if report.errors.is_empty() {
+            tracing::info!(
+                winner = %winner.as_str(),
+                merged = report.merged,
+                blobs_removed = report.blobs_removed,
+                "Ingest merged a re-downloaded copy into its predecessor"
+            );
+        } else {
+            tracing::warn!(
+                winner = %winner.as_str(),
+                errors = ?report.errors,
+                "Ingest self-heal merge failed; the dedup scan will pick the group up"
+            );
+        }
+        if report.merged > 0 {
+            winner
+        } else {
+            new.clone()
+        }
+    }
+
+    /// The winner and losers of the automatic duplicate group `new` belongs to, if any.
+    fn self_heal_group(&self, new: &ContentHash) -> Option<(ContentHash, Vec<ContentHash>)> {
+        let key = hash_key(new.as_str());
+        let tracks = self.tracks.lock().unwrap();
+        let entry = tracks
+            .iter()
+            .find(|t| hash_key(t.content_hash.as_str()) == key)
+            .filter(|t| !t.is_hidden())?;
+
+        let new_audio: BTreeSet<&str> = entry.audio_hashes().collect();
+        if new_audio.is_empty() {
+            return None;
+        }
+
+        let scan: Vec<ScanTrack> = std::iter::once(entry)
+            .chain(
+                tracks
+                    .iter()
+                    .filter(|t| hash_key(t.content_hash.as_str()) != key && !t.is_hidden())
+                    .filter(|t| t.audio_hashes().any(|h| new_audio.contains(h))),
+            )
+            .map(ScanTrack::from)
+            .collect();
+        drop(tracks);
+        if scan.len() < 2 {
+            return None;
+        }
+
+        let component: Vec<usize> = (0..scan.len()).collect();
+        let group = build_group(&scan, &component);
+        if !group.is_automatic() {
+            return None;
+        }
+        let losers: Vec<ContentHash> = group.losers().map(|m| m.hash.clone()).collect();
+        Some((group.winner, losers))
     }
 
     /// Handle `DedupScan`. With `apply`, merge the automatic groups and run the

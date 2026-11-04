@@ -3,7 +3,7 @@
 use super::dedup::{dedup_fact_source, live_facts};
 use super::tests::{
     identity_facts_in_acid, make_empty_service, make_service_with_playlists_dir, replaces_targets,
-    retire, run_backfill, user_source, write_test_wav,
+    retire, run_backfill, user_source, write_test_wav, FIXTURE_S16_L8, FIXTURE_S16_L8_TAGS,
 };
 use super::*;
 use crate::ipc::{
@@ -1386,4 +1386,300 @@ fn tagliabue_prerelease_and_release_merge_into_one_track() {
     assert!(gone(&service, &prerelease));
     assert!(!blob_file(&service, &prerelease).exists());
     assert!(blob_file(&service, &release).exists());
+}
+
+// ---------------------------------------------------------------------------
+// Self-healing merge at ingest (ADR-013, "Where it runs")
+// ---------------------------------------------------------------------------
+
+/// Ingest `bytes` the way Bandcamp does: the ItemId travels with the request.
+fn ingest_item(
+    service: &LibraryService,
+    name: &str,
+    bytes: &[u8],
+    item: Option<&str>,
+) -> ContentHash {
+    let inbox = service.music_dir.join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    let path = inbox.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    let source = item.map(|item_id| IngestSource::Bandcamp {
+        item_id: item_id.into(),
+        artist_url: None,
+    });
+    service
+        .ingest_file_internal(&path, source.as_ref())
+        .unwrap()
+}
+
+fn old_blob(service: &LibraryService, h: &ContentHash) -> std::path::PathBuf {
+    service
+        .music_dir
+        .join(blob_path_for(h.as_str(), Path::new("x.flac")).unwrap())
+}
+
+#[test]
+fn ingest_merges_a_new_copy_into_the_live_copy_of_the_same_purchase() {
+    let (service, _d, _acid) = make_empty_service();
+    let old = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8_TAGS, Some("p1"));
+    assert!(old_blob(&service, &old).exists());
+
+    let new = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8, Some("p1"));
+
+    assert_ne!(old, new);
+    assert!(gone(&service, &old), "the old copy is retired");
+    assert!(service.get_track(&new).is_ok(), "the new copy wins");
+    assert_eq!(track_count(&service, "p1"), 1);
+    assert!(replaces_targets(&service, &new).contains(&old.as_str().to_owned()));
+    assert!(
+        !old_blob(&service, &old).exists(),
+        "the old blob is removed"
+    );
+    assert!(old_blob(&service, &new).exists());
+}
+
+#[test]
+fn ingest_does_not_merge_across_item_ids() {
+    let (service, _d, _acid) = make_empty_service();
+    let old = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8_TAGS, Some("p1"));
+    let new = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8, Some("p2"));
+
+    assert!(service.get_track(&old).is_ok());
+    assert!(service.get_track(&new).is_ok());
+    assert!(old_blob(&service, &old).exists());
+    assert!(replaces_targets(&service, &new).is_empty());
+}
+
+#[test]
+fn ingest_does_not_merge_when_either_side_has_no_item_id() {
+    let (service, _d, _acid) = make_empty_service();
+    let plain_old = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8_TAGS, None);
+    let new = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8, Some("p1"));
+    assert!(service.get_track(&plain_old).is_ok());
+    assert!(service.get_track(&new).is_ok());
+    assert!(replaces_targets(&service, &new).is_empty());
+
+    let (service, _d, _acid) = make_empty_service();
+    let old = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8_TAGS, Some("p1"));
+    let plain_new = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8, None);
+    assert!(service.get_track(&old).is_ok());
+    assert!(service.get_track(&plain_new).is_ok());
+    assert!(replaces_targets(&service, &plain_new).is_empty());
+}
+
+#[test]
+fn ingest_leaves_a_soft_deleted_copy_for_the_scan() {
+    let (service, _d, _acid) = make_empty_service();
+    let old = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8_TAGS, Some("p1"));
+    let deleted = service.handle_track_delete(&old);
+    assert!(
+        matches!(deleted, LibraryResponse::TrackDeleted),
+        "{deleted:?}"
+    );
+
+    let new = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8, Some("p1"));
+
+    assert!(replaces_targets(&service, &new).is_empty());
+    assert!(old_blob(&service, &old).exists(), "the blob is kept");
+    assert!(service.is_live(&old), "the track is not retired");
+}
+
+#[test]
+fn an_item_id_that_arrives_after_the_audio_hash_still_merges() {
+    let (service, _d, _acid) = make_empty_service();
+    let old = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8_TAGS, Some("p1"));
+    // The new copy lands first, with its AudioHash but no ItemId: no merge yet.
+    let new = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8, None);
+    assert!(service.get_track(&old).is_ok());
+
+    // The same file arrives again, now carrying the purchase.
+    let again = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8, Some("p1"));
+
+    assert_eq!(again, new, "identical bytes keep their content hash");
+    assert!(gone(&service, &old));
+    assert_eq!(track_count(&service, "p1"), 1);
+    assert!(replaces_targets(&service, &new).contains(&old.as_str().to_owned()));
+}
+
+#[test]
+fn ingesting_identical_bytes_again_is_a_no_op() {
+    let (service, _d, _acid) = make_empty_service();
+    let first = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8, Some("p1"));
+    let second = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8, Some("p1"));
+
+    assert_eq!(first, second);
+    assert!(service.get_track(&first).is_ok());
+    assert!(old_blob(&service, &first).exists());
+    assert!(replaces_targets(&service, &first).is_empty());
+}
+
+#[test]
+fn ingest_carries_a_user_fact_that_only_the_old_copy_has() {
+    let (service, _d, _acid) = make_empty_service();
+    let old = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8_TAGS, Some("p1"));
+    write(&service, &old, vec![usr(bpm(128.0))]);
+
+    let new = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8, Some("p1"));
+
+    assert!(gone(&service, &old));
+    assert_eq!(count_in_acid(&service, &new, &bpm(128.0)), 1);
+    assert_eq!(
+        service.get_track(&new).unwrap().bpm.map(|b| b.as_f32()),
+        Some(128.0)
+    );
+}
+
+fn upload(service: &LibraryService, name: &str, bytes: &[u8]) -> ContentHash {
+    let inbox = service.music_dir.join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    let path = inbox.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    service
+        .ingest_file_internal(&path, Some(&IngestSource::Upload))
+        .unwrap()
+}
+
+#[test]
+fn the_heal_does_not_merge_a_track_that_holds_two_item_ids_with_copies_of_each() {
+    let (service, _d, _acid) = make_empty_service();
+    // `new` holds X and Y from an earlier confirmed merge; C1 has X, C2 has Y.
+    let c1 = seed(&service, "c1", base(1, Some("x"), 1));
+    let c2 = seed(&service, "c2", base(1, Some("y"), 2));
+    let mut facts = base(1, Some("x"), 10);
+    facts.push(src(MusicValue::ItemId("y".into())));
+    let new = seed(&service, "new", facts);
+
+    service.self_heal_after_ingest(&new);
+
+    // The scan sees no ItemId common to all three (DifferentItemIds).
+    assert!(service.is_live(&c1));
+    assert!(service.is_live(&c2));
+    assert!(service.is_live(&new));
+    assert!(replaces_targets(&service, &new).is_empty());
+}
+
+#[test]
+fn the_newest_copy_wins_when_an_old_copy_gains_the_item_id_of_a_newer_one() {
+    let (service, _d, _acid) = make_empty_service();
+    let a = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8_TAGS, None);
+    let b = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8, Some("p1"));
+    assert!(service.get_track(&a).is_ok());
+    assert!(service.get_track(&b).is_ok());
+
+    // A's bytes arrive again, now carrying the purchase.
+    let again = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8_TAGS, Some("p1"));
+
+    assert_eq!(again, b, "ingest returns the winner's hash");
+    assert!(gone(&service, &a), "the older copy loses");
+    assert!(service.get_track(&b).is_ok(), "the newer copy wins");
+    assert!(!old_blob(&service, &a).exists());
+    assert!(old_blob(&service, &b).exists());
+    assert!(replaces_targets(&service, &b).contains(&a.as_str().to_owned()));
+}
+
+#[test]
+fn an_item_id_lands_on_a_track_that_already_has_a_source_and_the_heal_runs() {
+    let (service, _d, _acid) = make_empty_service();
+    let old = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8_TAGS, Some("p1"));
+    // First seen as an upload: a Source, but no ItemId.
+    let up = upload(&service, "A - Song.flac", FIXTURE_S16_L8);
+    assert!(service.get_track(&old).is_ok());
+    assert!(service.get_track(&up).is_ok());
+
+    // Bandcamp delivers the same bytes with the purchase.
+    let again = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8, Some("p1"));
+
+    assert_eq!(again, up);
+    assert!(gone(&service, &old), "the heal ran and merged the old copy");
+    assert_eq!(track_count(&service, "p1"), 1);
+}
+
+#[test]
+fn track_replace_is_unaffected_by_the_self_heal() {
+    let (service, _d, _acid) = make_empty_service();
+    let inbox = service.music_dir.join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    let old_path = inbox.join("A - Song.flac");
+    std::fs::write(&old_path, FIXTURE_S16_L8_TAGS).unwrap();
+    let old = service.ingest_file_internal(&old_path, None).unwrap();
+    let new_path = inbox.join("A - Song (new).flac");
+    std::fs::write(&new_path, FIXTURE_S16_L8).unwrap();
+
+    let resp = service.handle_request(LibraryRequest::TrackReplace {
+        old_hash: old.clone(),
+        new_file_path: new_path.to_string_lossy().to_string(),
+    });
+
+    let LibraryResponse::TrackReplaced { new_hash, .. } = resp else {
+        panic!("expected TrackReplaced, got {resp:?}");
+    };
+    assert_ne!(new_hash, old);
+    assert!(gone(&service, &old));
+    assert!(service.get_track(&new_hash).is_ok());
+    let replaced = replaces_targets(&service, &new_hash);
+    assert_eq!(
+        replaced.iter().filter(|h| *h == old.as_str()).count(),
+        1,
+        "{replaced:?}"
+    );
+}
+
+#[test]
+fn the_heal_merges_two_old_copies_of_one_purchase_and_carries_from_both() {
+    let (service, _d, _acid) = make_empty_service();
+    let o1 = seed_with_blob(&service, "o1", base(1, Some("p1"), 1));
+    let o2 = seed_with_blob(&service, "o2", base(1, Some("p1"), 2));
+    write(&service, &o1, vec![usr(bpm(128.0))]);
+    write(
+        &service,
+        &o2,
+        vec![usr(MusicValue::Key(
+            Key::from_traditional("A Minor").unwrap(),
+        ))],
+    );
+    let new = seed_with_blob(&service, "new", base(1, Some("p1"), 10));
+
+    service.self_heal_after_ingest(&new);
+
+    assert!(gone(&service, &o1));
+    assert!(gone(&service, &o2));
+    assert!(service.get_track(&new).is_ok());
+    let replaced = replaces_targets(&service, &new);
+    assert!(replaced.contains(&o1.as_str().to_owned()), "{replaced:?}");
+    assert!(replaced.contains(&o2.as_str().to_owned()), "{replaced:?}");
+    assert_eq!(count_in_acid(&service, &new, &bpm(128.0)), 1);
+    assert_eq!(
+        count_in_acid(
+            &service,
+            &new,
+            &MusicValue::Key(Key::from_traditional("A Minor").unwrap())
+        ),
+        1
+    );
+    assert!(!blob_file(&service, &o1).exists());
+    assert!(!blob_file(&service, &o2).exists());
+}
+
+#[test]
+fn a_failed_self_heal_merge_does_not_fail_the_ingest() {
+    let (service, _d, _acid) = make_empty_service();
+    let old = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8_TAGS, Some("p1"));
+
+    // The old copy is retired after the candidates were found, so the merge refuses.
+    let weak = Arc::downgrade(&service);
+    let victim = old.clone();
+    *service.merge_pre_write_hook.lock().unwrap() = Some(Box::new(move || {
+        if let Some(service) = weak.upgrade() {
+            retire(&service, &victim).unwrap();
+        }
+    }));
+
+    let new = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8, Some("p1"));
+
+    assert!(
+        service.get_track(&new).is_ok(),
+        "the ingest still succeeded"
+    );
+    assert!(old_blob(&service, &new).exists());
+    assert!(replaces_targets(&service, &new).is_empty());
 }

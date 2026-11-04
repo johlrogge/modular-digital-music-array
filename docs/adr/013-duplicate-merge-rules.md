@@ -79,7 +79,7 @@ Blob removal is product behaviour. It is unrelated to operator rules about `/mus
 
 **Where it runs.**
 - **Explicit `dedup` scan** (CLI/IPC). It lists automatic and confirmation groups. `--apply` merges the automatic groups only.
-- **Self-healing at ingest.** Once AudioHash v1 is computed for a new track, it is merged with any live track that shares its source ItemId (against any of the live track's ItemIds) and AudioHash. The new copy wins. PcmHash-only matches are left for the scan.
+- **Self-healing at ingest.** Once AudioHash v1 is computed for a new track, it is merged with any live, not soft-deleted track that shares its source ItemId (against any of the live track's ItemIds) and AudioHash. The decision uses the same grouping rule as the scan. The newest copy wins (the scan's rule; on ingest that is the new copy, unless an older copy has just gained the ItemId of a newer one, in which case the newer one wins). PcmHash-only matches are left for the scan.
 
 **Hardening of the Bandcamp source.**
 - `queue_item_forcibly`/resync must not ignore a failed `retract_source_facts` or an unreachable library. It returns an error and does not queue.

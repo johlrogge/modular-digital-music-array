@@ -348,6 +348,14 @@ impl IndexedTrackInfo {
         })
     }
 
+    /// Every AudioHash this track holds, as the hash string (version prefix included).
+    fn audio_hashes(&self) -> impl Iterator<Item = &str> {
+        self.provenance.iter().filter_map(|(v, _)| match v {
+            MusicValue::AudioHash(h) => Some(h.as_str()),
+            _ => None,
+        })
+    }
+
     /// Returns true if this track is hidden from default views.
     fn is_hidden(&self) -> bool {
         self.deleted_at.is_some()
@@ -3286,24 +3294,47 @@ impl LibraryService {
 
             // Append source facts that don't exist yet for this track
             let fact_source = library_fact_source();
-            let new_facts = Self::source_facts(source, &fact_source);
+            let mut new_facts = Self::source_facts(source, &fact_source);
             if !new_facts.is_empty() {
-                // Check if this track already has a Source fact
-                let needs_source = {
+                // Keep only the facts the track does not hold yet: an ItemId it lacks,
+                // and a Source only if it has none.
+                let gained_item_id = {
                     let tracks = self.tracks.lock().unwrap();
-                    tracks
+                    match tracks
                         .iter()
                         .find(|t| t.content_hash.as_str() == content_hash.as_str())
-                        .map(|t| t.source.is_none())
-                        .unwrap_or(false)
+                    {
+                        Some(t) => {
+                            new_facts.retain(|(v, _)| match v {
+                                MusicValue::ItemId(id) => {
+                                    !t.item_ids().any(|held| held == id.as_str())
+                                }
+                                MusicValue::Source(_) => t.source.is_none(),
+                                _ => true,
+                            });
+                            new_facts
+                                .iter()
+                                .any(|(v, _)| matches!(v, MusicValue::ItemId(_)))
+                        }
+                        None => {
+                            new_facts.clear();
+                            false
+                        }
+                    }
                 };
 
-                if needs_source && self.write_and_project(&content_hash, &new_facts).is_ok() {
+                if !new_facts.is_empty()
+                    && self.write_and_project(&content_hash, &new_facts).is_ok()
+                {
                     tracing::info!(
                         hash = %content_hash.as_str(),
                         facts = new_facts.len(),
                         "Appended source facts to existing track"
                     );
+                    // A new ItemId may be the last piece the self-heal was waiting for.
+                    if gained_item_id {
+                        return Ok(self.self_heal_after_ingest(&content_hash));
+                    }
                 }
             }
 
@@ -3345,7 +3376,8 @@ impl LibraryService {
         // RELATIVE (blobs/<2ch>/<hash>.<ext>), identical to every other projection.
         self.write_and_project(&content_hash, &facts)?;
 
-        Ok(content_hash)
+        // AudioHash and ItemId are durable together now. Never fails the ingest.
+        Ok(self.self_heal_after_ingest(&content_hash))
     }
 }
 
@@ -8409,9 +8441,9 @@ mod tests {
     // Identity hashes: ingest and explicit backfill
     // =========================================================================
 
-    const FIXTURE_S16_L8: &[u8] =
+    pub(super) const FIXTURE_S16_L8: &[u8] =
         include_bytes!("../../audio_hash/testdata/pcm/fixtures/s16_l8.flac");
-    const FIXTURE_S16_L8_TAGS: &[u8] =
+    pub(super) const FIXTURE_S16_L8_TAGS: &[u8] =
         include_bytes!("../../audio_hash/testdata/pcm/fixtures/s16_l8_tags.flac");
 
     /// Identity facts (AudioHash, PcmHash) stored in ACID for `hash`.
