@@ -2,7 +2,7 @@ use crate::ctx::Ctx;
 use crate::output::handle_error;
 use clap::Subcommand;
 use color_eyre::Result;
-use library_ipc_client::InboxPath;
+use library_ipc_client::{InboxPath, InboxPathError};
 use std::str::FromStr;
 use track_formatter::short_hash;
 
@@ -41,10 +41,10 @@ pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
 pub(crate) struct InboxFileArg(pub InboxPath);
 
 impl FromStr for InboxFileArg {
-    type Err = String;
+    type Err = InboxPathError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        InboxPath::new(s).map(Self).map_err(|e| e.to_string())
+        InboxPath::new(s).map(Self)
     }
 }
 

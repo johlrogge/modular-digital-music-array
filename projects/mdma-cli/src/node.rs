@@ -456,7 +456,6 @@ pub(crate) enum Command {
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> color_eyre::Result<()> {
     match command {
         Command::List => list(ctx),
-        // Phase 2: a typed node name parsed by hicli; resolution matches on the raw text today.
         Command::Select { name } => select(OptNodeQueryArg(name), ctx),
         Command::Forget => forget(ctx),
         Command::Show => show(ctx),

@@ -725,7 +725,7 @@ mod tests {
 
     #[test]
     fn view_clap_no_flags_parses_ok() {
-        // All flags are optional; no flags is valid (handle_view will reject at runtime).
+        // All flags are optional; no flags is valid.
         let result = Cli::try_parse_from(["mdma", "view"]);
         assert!(
             result.is_ok(),

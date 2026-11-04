@@ -1,6 +1,6 @@
 mod import;
 
-use crate::args::SanitizedPlaylistNameArg;
+use crate::args::SanitizedPlaylistName;
 use crate::ctx::Ctx;
 use crate::output::handle_source_error;
 use crate::source::import::{finish_import, follow_import_job, is_terminal_phase};
@@ -74,9 +74,23 @@ impl FromStr for DownloadArg {
 
 /// A source-specific item identifier (e.g. "p123456" for bandcamp).
 #[derive(Debug, Clone, PartialEq, Eq)]
+// stays a String: no domain rule, the source interprets it
 pub(crate) struct ItemIdArg(pub String);
 
 impl FromStr for ItemIdArg {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
+    }
+}
+
+/// A source playlist to import: a slug or a URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+// stays a String: no domain rule, the source interprets it (slug or URL)
+pub(crate) struct SourcePlaylistArg(pub String);
+
+impl FromStr for SourcePlaylistArg {
     type Err = Infallible;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
@@ -88,7 +102,7 @@ impl FromStr for ItemIdArg {
 pub(crate) struct ImportPlaylistArgs {
     /// MDMA playlist name (default: sanitised source title)
     #[arg(long)]
-    name: Option<SanitizedPlaylistNameArg>,
+    name: Option<SanitizedPlaylistName>,
 
     /// Show the report without syncing or writing the playlist
     #[arg(long)]
@@ -99,7 +113,7 @@ pub(crate) struct ImportPlaylistArgs {
     no_wait: bool,
 
     /// Playlist slug or URL
-    playlist: String,
+    playlist: SourcePlaylistArg,
 }
 
 /// The per-source commands: `mdma source <source-name> <command> [args]`.
@@ -674,16 +688,13 @@ pub(crate) fn import_playlist(
     } = args;
     // --name was validated and sanitised at parse time
     let explicit_name = playlist_name.map(|n| {
-        if n.was_changed() {
-            eprintln!(
-                "Note: playlist name sanitized from '{}' to '{}'",
-                n.raw,
-                n.sanitized()
-            );
+        if let Some(note) = n.change_note() {
+            eprintln!("{note}");
         }
-        n.sanitized().to_string()
+        n.name().as_str().to_string()
     });
 
+    let SourcePlaylistArg(playlist) = playlist;
     let request = SourceRequest::ImportPlaylist {
         playlist,
         name: explicit_name,
@@ -879,7 +890,7 @@ mod tests {
                 ],
                 SourceCommand::ImportPlaylist {
                     args: ImportPlaylistArgs {
-                        playlist: "my-list".into(),
+                        playlist: SourcePlaylistArg("my-list".into()),
                         name: Some("x".parse().unwrap()),
                         dry_run: true,
                         no_wait: true,
@@ -905,7 +916,7 @@ mod tests {
             command,
             SourceCommand::ImportPlaylist {
                 args: ImportPlaylistArgs {
-                    playlist: "p".into(),
+                    playlist: SourcePlaylistArg("p".into()),
                     name: None,
                     dry_run: false,
                     no_wait: false,
@@ -921,8 +932,8 @@ mod tests {
         match command {
             SourceCommand::ImportPlaylist { args } => {
                 let name = args.name.expect("name given");
-                assert_eq!(name.raw, "a/b");
-                assert_eq!(name.sanitized(), sanitize_playlist_name("a/b"));
+                assert!(name.change_note().is_some());
+                assert_eq!(name.name().as_str(), sanitize_playlist_name("a/b"));
             }
             other => panic!("unexpected: {other:?}"),
         }

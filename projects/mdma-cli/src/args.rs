@@ -2,7 +2,7 @@
 
 use crate::stdin::is_hash_token;
 use clap::CommandFactory;
-use library_ipc_client::{ContentHash, PlaylistName};
+use library_ipc_client::{ContentHash, PlaylistName, PlaylistNameError};
 use playlist_import::sanitize_playlist_name;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -31,22 +31,22 @@ impl FromStr for TrackArg {
 pub(crate) struct PlaylistArg(pub PlaylistName);
 
 impl FromStr for PlaylistArg {
-    type Err = String;
+    type Err = PlaylistNameError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        PlaylistName::new(s).map(Self).map_err(|e| e.to_string())
+        PlaylistName::new(s).map(Self)
     }
 }
 
 /// A playlist name for an imported playlist: sanitised on parse. Keeps the
 /// raw text so commands can note when it was changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SanitizedPlaylistNameArg {
-    pub(crate) raw: String,
-    pub(crate) name: PlaylistName,
+pub(crate) struct SanitizedPlaylistName {
+    raw: String,
+    name: PlaylistName,
 }
 
-impl SanitizedPlaylistNameArg {
+impl SanitizedPlaylistName {
     /// Sanitise `raw` into a playlist name. The error is the reason only
     /// (callers add context), so argv and XML names share this one path.
     pub(crate) fn new(raw: &str) -> Result<Self, String> {
@@ -61,18 +61,24 @@ impl SanitizedPlaylistNameArg {
         })
     }
 
-    /// The sanitised name as text.
-    pub(crate) fn sanitized(&self) -> &str {
-        self.name.as_str()
+    /// The sanitised name.
+    pub(crate) fn name(&self) -> &PlaylistName {
+        &self.name
     }
 
-    /// Whether sanitising changed the text.
-    pub(crate) fn was_changed(&self) -> bool {
-        self.sanitized() != self.raw
+    /// A note for the user when sanitising changed the text.
+    pub(crate) fn change_note(&self) -> Option<String> {
+        (self.name.as_str() != self.raw).then(|| {
+            format!(
+                "Note: playlist name sanitized from '{}' to '{}'",
+                self.raw,
+                self.name.as_str()
+            )
+        })
     }
 }
 
-impl FromStr for SanitizedPlaylistNameArg {
+impl FromStr for SanitizedPlaylistName {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -88,13 +94,19 @@ impl FromStr for ExistingFileArg {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let path = PathBuf::from(s);
+        Self::new(PathBuf::from(s))
+    }
+}
+
+impl ExistingFileArg {
+    /// Check that `path` is an existing file.
+    pub(crate) fn new(path: PathBuf) -> Result<Self, String> {
         if path.is_file() {
             Ok(Self(path))
         } else if path.exists() {
-            Err(format!("'{s}' is not a file"))
+            Err(format!("'{}' is not a file", path.display()))
         } else {
-            Err(format!("file '{s}' does not exist"))
+            Err(format!("file '{}' does not exist", path.display()))
         }
     }
 }
@@ -141,8 +153,8 @@ mod tests {
     #[test]
     fn playlist_arg_validates_through_playlist_name() {
         assert_eq!(
-            "my-list_1".parse::<PlaylistArg>(),
-            Ok(PlaylistArg(PlaylistName::new("my-list_1").unwrap()))
+            "my-list_1".parse::<PlaylistArg>().unwrap(),
+            PlaylistArg(PlaylistName::new("my-list_1").unwrap())
         );
         assert!("".parse::<PlaylistArg>().is_err());
         assert!("has space".parse::<PlaylistArg>().is_err());
@@ -151,21 +163,29 @@ mod tests {
 
     #[test]
     fn sanitized_name_keeps_raw_and_sanitized() {
-        let arg: SanitizedPlaylistNameArg = "Good Name".parse().unwrap();
-        assert_eq!(arg.raw, "Good Name");
-        assert_eq!(arg.sanitized(), sanitize_playlist_name("Good Name"));
-        assert!(arg.was_changed());
-        let plain: SanitizedPlaylistNameArg = "plain".parse().unwrap();
-        assert_eq!(plain.raw, plain.sanitized());
-        assert!(!plain.was_changed());
+        let arg: SanitizedPlaylistName = "Good Name".parse().unwrap();
+        assert_eq!(arg.name().as_str(), sanitize_playlist_name("Good Name"));
+        assert_eq!(
+            arg.change_note().as_deref(),
+            Some(
+                format!(
+                    "Note: playlist name sanitized from 'Good Name' to '{}'",
+                    arg.name().as_str()
+                )
+                .as_str()
+            )
+        );
+        let plain: SanitizedPlaylistName = "plain".parse().unwrap();
+        assert_eq!(plain.name().as_str(), "plain");
+        assert_eq!(plain.change_note(), None);
     }
 
     #[test]
     fn sanitized_name_rejects_empty_result() {
-        assert!("".parse::<SanitizedPlaylistNameArg>().is_err());
+        assert!("".parse::<SanitizedPlaylistName>().is_err());
         let all_bad = "///";
         if sanitize_playlist_name(all_bad).is_empty() {
-            assert!(all_bad.parse::<SanitizedPlaylistNameArg>().is_err());
+            assert!(all_bad.parse::<SanitizedPlaylistName>().is_err());
         }
     }
 

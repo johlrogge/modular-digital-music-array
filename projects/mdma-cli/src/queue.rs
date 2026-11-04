@@ -168,10 +168,6 @@ pub(crate) fn remove(hash: Option<TrackArg>, ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback();
     let content_hashes = hashes_arg_or_stdin(hash.map(|TrackArg(h)| h));
 
-    if content_hashes.is_empty() {
-        return Ok(());
-    }
-
     match playback.queue_remove(content_hashes) {
         Ok(removed) if removed > 0 => {
             println!("Removed {} track(s) from queue", removed);

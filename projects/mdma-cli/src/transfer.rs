@@ -1,3 +1,4 @@
+use crate::args::ExistingFileArg;
 use crate::ctx::Ctx;
 use crate::stdin::{read_hashes, resolve_tracks_skip_errors};
 use color_eyre::Result;
@@ -10,14 +11,16 @@ use track_formatter::short_hash;
 pub(crate) struct UploadArgs {
     /// SSH key for SCP transfer
     #[arg(long, default_value = "~/.ssh/mdma_pi", env = "MDMA_SSH_KEY")]
-    ssh_key: String,
+    ssh_key: SshKeyArg,
 
     /// SSH user on the Pi
     #[arg(long, default_value = "mdma", env = "MDMA_SSH_USER")]
+    // stays a String: no domain rule, the Pi's account name
     ssh_user: String,
 
     /// Remote inbox directory
     #[arg(long, default_value = "/music/inbox/", env = "MDMA_INBOX_DIR")]
+    // stays a String: no domain rule, a path on the remote Pi (not checked locally)
     inbox_dir: String,
 
     /// Path to file (audio file or ZIP archive)
@@ -45,10 +48,7 @@ impl std::str::FromStr for UploadFileArg {
     type Err = String;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        let path = std::path::PathBuf::from(s);
-        if !path.exists() {
-            return Err(format!("File not found: {}", path.display()));
-        }
+        let ExistingFileArg(path) = s.parse()?;
         let kind = match inbox_utils::detect_file_type(&path) {
             Some("zip") => UploadKind::Zip,
             Some("flac" | "mp3" | "wav" | "aiff") => UploadKind::Audio,
@@ -96,14 +96,32 @@ pub(crate) enum ExportFormats {
     },
 }
 
+/// Path of an existing SSH key file; a leading `~/` is expanded to the home directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SshKeyArg(pub(crate) std::path::PathBuf);
+
+impl std::str::FromStr for SshKeyArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let ExistingFileArg(path) = ExistingFileArg::new(expand_tilde(s))?;
+        Ok(Self(path))
+    }
+}
+
 /// Expand `~` to the user's home directory.
 fn expand_tilde(path: &str) -> std::path::PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return std::path::PathBuf::from(home).join(rest);
-        }
+    expand_tilde_with(path, std::env::var("HOME").ok().as_deref())
+}
+
+/// [`expand_tilde`] with the home directory given. An unset or empty home
+/// leaves `~/` as typed (it never becomes a path relative to the working
+/// directory).
+fn expand_tilde_with(path: &str, home: Option<&str>) -> std::path::PathBuf {
+    match (path.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) if !home.is_empty() => std::path::PathBuf::from(home).join(rest),
+        _ => std::path::PathBuf::from(path),
     }
-    std::path::PathBuf::from(path)
 }
 
 /// SCP a local file to a remote destination.
@@ -161,7 +179,7 @@ pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<()> {
         }
     };
 
-    let key_path = expand_tilde(&ssh_key);
+    let SshKeyArg(key_path) = ssh_key;
 
     // 2. Collect audio files to upload
     let temp_dir = tempfile::tempdir()?;
@@ -773,9 +791,65 @@ mod tests {
     use clap::Parser;
 
     fn parse_upload(file: &str) -> Result<UploadFileArg, clap::Error> {
-        match Cli::try_parse_from(["mdma", "upload", file])?.command {
+        // an existing key file, so the default key location does not matter
+        let key = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        match Cli::try_parse_from(["mdma", "upload", "--ssh-key", key, file])?.command {
             Commands::Upload(args) => Ok(args.file),
             other => panic!("not upload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ssh_key_must_be_an_existing_file() {
+        let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        assert_eq!(
+            manifest.parse::<SshKeyArg>(),
+            Ok(SshKeyArg(std::path::PathBuf::from(manifest)))
+        );
+        assert!("/definitely/not/a/key".parse::<SshKeyArg>().is_err());
+        assert!(env!("CARGO_MANIFEST_DIR").parse::<SshKeyArg>().is_err());
+    }
+
+    #[test]
+    fn a_missing_default_ssh_key_is_a_usage_error() {
+        // clap parses default values through the value parser, so a default
+        // that is not an existing file fails like a typed value would.
+        let cmd = clap::Command::new("t").arg(
+            clap::Arg::new("key")
+                .long("key")
+                .default_value("/definitely/not/a/default/key")
+                .value_parser(clap::value_parser!(SshKeyArg)),
+        );
+        let err = cmd.try_get_matches_from(["t"]).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn tilde_expands_only_against_a_non_empty_home() {
+        use std::path::PathBuf;
+        assert_eq!(
+            expand_tilde_with("~/.ssh/k", Some("/h")),
+            PathBuf::from("/h/.ssh/k")
+        );
+        for home in [None, Some("")] {
+            assert_eq!(
+                expand_tilde_with("~/.ssh/k", home),
+                PathBuf::from("~/.ssh/k")
+            );
+        }
+        assert_eq!(expand_tilde_with("/k", Some("/h")), PathBuf::from("/k"));
+    }
+
+    #[test]
+    fn ssh_key_expands_a_leading_tilde() {
+        // Cargo sets no HOME guarantee, so only check when it is set.
+        if let Some(home) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) {
+            let err = "~/definitely/not/a/key".parse::<SshKeyArg>().unwrap_err();
+            assert!(
+                err.contains(&format!("{home}/definitely/not/a/key")),
+                "{err}"
+            );
         }
     }
 
@@ -792,7 +866,7 @@ mod tests {
         assert_eq!(err.exit_code(), 2);
         assert!(
             err.to_string()
-                .contains("File not found: /definitely/not/here.flac"),
+                .contains("file '/definitely/not/here.flac' does not exist"),
             "message: {err}"
         );
     }

@@ -298,10 +298,9 @@ fn main() -> Result<()> {
         Commands::View(_) => {
             // The column order is the order the flags were typed, which only the
             // raw matches know.
-            let view_matches = matches.subcommand_matches("view").unwrap_or_else(|| {
-                eprintln!("internal error: expected 'view' subcommand matches");
-                std::process::exit(1);
-            });
+            let view_matches = matches
+                .subcommand_matches("view")
+                .expect("Commands::View implies view matches");
             let columns = view_columns(view_matches).unwrap_or_else(|e| e.exit());
             tracks::view(columns, &ctx)
         }

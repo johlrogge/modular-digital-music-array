@@ -108,7 +108,7 @@ impl std::str::FromStr for AtLeastArg {
             .ok()
             .and_then(NonZeroUsize::new)
             .map(Self)
-            .ok_or_else(|| "must be a whole number of at least 1".to_string())
+            .ok_or_else(|| format!("'{s}' must be a whole number of at least 1"))
     }
 }
 

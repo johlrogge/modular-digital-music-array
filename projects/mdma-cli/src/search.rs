@@ -1,8 +1,9 @@
 use crate::ctx::Ctx;
 use crate::output::{handle_error, print_tracks};
+use crate::stdin::read_hashes;
 use clap::Subcommand;
 use color_eyre::Result;
-use library_ipc_client::TrackInfo;
+use library_ipc_client::{ContentHash, TrackInfo};
 use library_search::{
     parse_date_query, parse_duration_query, parse_key_query, parse_numeric_query, parse_role_query,
     parse_string_query, DateQuery, DurationQuery, KeyQuery, NumericQuery, ParseError, TrackQuery,
@@ -34,7 +35,7 @@ pub(crate) struct SearchCli {
     pub(crate) subcommand: Option<Command>,
 }
 
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args, Debug, Default)]
 pub(crate) struct SearchArgs {
     /// Filter by artist name
     #[arg(long)]
@@ -241,50 +242,9 @@ pub(crate) fn dispatch(cli: SearchCli, ctx: &Ctx) -> Result<()> {
 }
 
 pub(crate) fn query(args: SearchArgs, ctx: &Ctx) -> Result<()> {
-    let SearchArgs {
-        artist,
-        title,
-        album,
-        label,
-        genre,
-        style,
-        bpm,
-        key,
-        duration,
-        year,
-        source,
-        no_stdin,
-        started,
-        stopped,
-        added,
-        played,
-        role,
-        energy,
-        not,
-        query,
-    } = args;
     let library = ctx.library();
-    let mut track_query = build_track_query(SearchFilters {
-        any_text: query,
-        artist,
-        title,
-        album,
-        label,
-        genre,
-        style,
-        bpm,
-        key,
-        duration,
-        year,
-        source,
-        started,
-        stopped,
-        added,
-        played,
-        role,
-        energy,
-    });
-    track_query.not = not;
+    let no_stdin = args.no_stdin;
+    let track_query = build_track_query(args);
     search_tracks(&library, &track_query, no_stdin)
 }
 
@@ -314,35 +274,11 @@ impl std::str::FromStr for PlayedFilter {
     }
 }
 
-/// The raw search filters taken from the command line, before parsing into a `TrackQuery`.
-#[derive(Debug, Default)]
-struct SearchFilters {
-    any_text: Option<String>,
-    artist: Option<String>,
-    title: Option<String>,
-    album: Option<String>,
-    label: Option<String>,
-    genre: Option<String>,
-    style: Option<String>,
-    bpm: Option<BpmArg>,
-    key: Option<KeyArg>,
-    duration: Option<DurationArg>,
-    year: Option<YearArg>,
-    source: Option<String>,
-    started: Option<DateArg>,
-    stopped: Option<DateArg>,
-    added: Option<DateArg>,
-    played: Option<PlayedFilter>,
-    role: Option<RoleArg>,
-    energy: Option<EnergyArg>,
-}
-
-/// Build a TrackQuery from the search filters.
+/// Build a TrackQuery from the search arguments (`--no-stdin` is not part of the query).
 ///
 /// Precedence: `--played=never` overrides any explicit `--started` value.
-fn build_track_query(filters: SearchFilters) -> TrackQuery {
-    let SearchFilters {
-        any_text,
+fn build_track_query(args: SearchArgs) -> TrackQuery {
+    let SearchArgs {
         artist,
         title,
         album,
@@ -354,13 +290,16 @@ fn build_track_query(filters: SearchFilters) -> TrackQuery {
         duration,
         year,
         source,
+        no_stdin: _,
         started,
         stopped,
         added,
         played,
         role,
         energy,
-    } = filters;
+        not,
+        query: any_text,
+    } = args;
     let started = if matches!(played, Some(PlayedFilter::Never)) {
         // --played=never is a shortcut for started=N/A and overrides any --started value.
         Some(DateQuery::NA)
@@ -385,20 +324,20 @@ fn build_track_query(filters: SearchFilters) -> TrackQuery {
         added: added.map(|DateArg(q)| q),
         role: role.map(|RoleArg(r)| r),
         energy: energy.map(|EnergyArg(q)| q),
-        not: false,
+        not,
     }
 }
 
-/// Returns true if a track's content hash matches any token in the set.
+/// Returns true if a track's content hash matches any hash in `set`.
 ///
-/// Both the track hash and the token are stripped of the "sha256:" prefix before
-/// comparison, and a prefix match is used (like `git log <short-hash>`).
-fn hash_matches(track_hash: &str, set: &std::collections::HashSet<String>) -> bool {
-    let clean = track_hash.strip_prefix("sha256:").unwrap_or(track_hash);
-    set.iter().any(|token| {
-        let token_clean = token.strip_prefix("sha256:").unwrap_or(token.as_str());
-        clean.starts_with(token_clean)
-    })
+/// Both the track hash and the piped hash are stripped of the "sha256:" prefix
+/// before comparison, and a prefix match is used (like `git log <short-hash>`).
+fn hash_matches(track_hash: &ContentHash, set: &[ContentHash]) -> bool {
+    fn strip(h: &ContentHash) -> &str {
+        h.as_str().strip_prefix("sha256:").unwrap_or(h.as_str())
+    }
+    let clean = strip(track_hash);
+    set.iter().any(|piped| clean.starts_with(strip(piped)))
 }
 
 /// Apply a stdin hash filter to a list of tracks.
@@ -411,40 +350,25 @@ fn hash_matches(track_hash: &str, set: &std::collections::HashSet<String>) -> bo
 ///   with `.not = false` so that the library returns a candidate set (not nothing).
 fn apply_stdin_filter(
     tracks: Vec<TrackInfo>,
-    stdin: Option<&std::collections::HashSet<String>>,
+    stdin: Option<&[ContentHash]>,
     not: bool,
 ) -> Vec<TrackInfo> {
     match stdin {
         None => tracks,
-        Some(set) => {
-            if not {
-                tracks
-                    .into_iter()
-                    .filter(|t| !hash_matches(t.content_hash.as_str(), set))
-                    .collect()
-            } else {
-                tracks
-                    .into_iter()
-                    .filter(|t| hash_matches(t.content_hash.as_str(), set))
-                    .collect()
-            }
-        }
+        Some(set) => tracks
+            .into_iter()
+            .filter(|t| hash_matches(&t.content_hash, set) != not)
+            .collect(),
     }
 }
 
 fn search_tracks(library: &LibraryBackend, query: &TrackQuery, no_stdin: bool) -> Result<()> {
-    use std::collections::HashSet;
-    use std::io::{BufRead, IsTerminal};
+    use std::io::IsTerminal;
 
-    // When stdin is piped (and --no-stdin is not set), read all hashes as an intersection filter.
-    let stdin_filter: Option<HashSet<String>> = if !no_stdin && !std::io::stdin().is_terminal() {
-        let tokens = std::io::stdin()
-            .lock()
-            .lines()
-            .map_while(Result::ok)
-            .filter_map(|line| line.split_whitespace().next().map(|t| t.to_string()))
-            .collect();
-        Some(tokens)
+    // When stdin is piped (and --no-stdin is not set), read the hashes in it (the same
+    // rule as hashes given as arguments) as an intersection filter.
+    let stdin_filter: Option<Vec<ContentHash>> = if !no_stdin && !std::io::stdin().is_terminal() {
+        Some(read_hashes())
     } else {
         None
     };
@@ -461,7 +385,7 @@ fn search_tracks(library: &LibraryBackend, query: &TrackQuery, no_stdin: bool) -
 
     match library.search(&effective_query) {
         Ok(tracks) => {
-            let tracks = apply_stdin_filter(tracks, stdin_filter.as_ref(), effective_not);
+            let tracks = apply_stdin_filter(tracks, stdin_filter.as_deref(), effective_not);
 
             if tracks.is_empty() && std::io::stdout().is_terminal() {
                 println!("No tracks found");
@@ -511,8 +435,6 @@ mod tests {
     use crate::test_support::track;
 
     use clap::Parser;
-
-    use library_ipc_client::TrackInfo;
 
     use crate::Cli;
 
@@ -699,12 +621,7 @@ mod tests {
     #[test]
     fn search_key_and_duration_reach_the_built_query() {
         let args = parse_search(&["--key", "8B", "--duration", "<8m", "--bpm", "128"]).unwrap();
-        let query = build_track_query(SearchFilters {
-            bpm: args.bpm,
-            key: args.key,
-            duration: args.duration,
-            ..Default::default()
-        });
+        let query = build_track_query(args);
         assert!(query.key.is_some(), "key dropped from query");
         assert!(
             matches!(query.duration, Some(DurationQuery::AtMost(480))),
@@ -716,38 +633,34 @@ mod tests {
 
     // ── apply_stdin_filter tests ─────────────────────────────────────────────
 
-    fn make_track_with_hash(hash: &str) -> TrackInfo {
-        TrackInfo { ..track(hash) }
-    }
-
-    fn hash_set(hashes: &[&str]) -> std::collections::HashSet<String> {
-        hashes.iter().map(|s| s.to_string()).collect()
+    fn hash_set(hashes: &[&str]) -> Vec<ContentHash> {
+        hashes.iter().map(|s| ContentHash::new(*s)).collect()
     }
 
     #[test]
     fn search_not_with_stdin_excludes_piped_hashes() {
-        // stdin = {h1, h2}, library returns {h1, h2, h3, h4}, --not returns [h3, h4]
+        // stdin = {a1, a2}, library returns {a1, a2, a3, a4}, --not returns [a3, a4]
         let tracks = vec![
-            make_track_with_hash("sha256:h1aaaaaa"),
-            make_track_with_hash("sha256:h2aaaaaa"),
-            make_track_with_hash("sha256:h3aaaaaa"),
-            make_track_with_hash("sha256:h4aaaaaa"),
+            track("sha256:a1aaaaaa"),
+            track("sha256:a2aaaaaa"),
+            track("sha256:a3aaaaaa"),
+            track("sha256:a4aaaaaa"),
         ];
-        let stdin = hash_set(&["sha256:h1aaaaaa", "sha256:h2aaaaaa"]);
+        let stdin = hash_set(&["sha256:a1aaaaaa", "sha256:a2aaaaaa"]);
         let result = apply_stdin_filter(tracks, Some(&stdin), true);
         let hashes: Vec<_> = result.iter().map(|t| t.content_hash.as_str()).collect();
-        assert_eq!(hashes, ["sha256:h3aaaaaa", "sha256:h4aaaaaa"]);
+        assert_eq!(hashes, ["sha256:a3aaaaaa", "sha256:a4aaaaaa"]);
     }
 
     #[test]
     fn search_not_with_stdin_prefix_match_excludes() {
         // stdin token is a short prefix (no sha256: prefix on token)
         let tracks = vec![
-            make_track_with_hash("sha256:abcdef1234"),
-            make_track_with_hash("sha256:deadbeef56"),
-            make_track_with_hash("sha256:cafebabe78"),
+            track("sha256:abcdef1234"),
+            track("sha256:deadbeef56"),
+            track("sha256:cafebabe78"),
         ];
-        let stdin = hash_set(&["abcdef", "deadbe"]);
+        let stdin = hash_set(&["abcdef12", "deadbeef"]);
         let result = apply_stdin_filter(tracks, Some(&stdin), true);
         let hashes: Vec<_> = result.iter().map(|t| t.content_hash.as_str()).collect();
         assert_eq!(hashes, ["sha256:cafebabe78"]);
@@ -757,23 +670,20 @@ mod tests {
     fn search_stdin_without_not_intersects() {
         // Sanity: stdin + no --not still intersects
         let tracks = vec![
-            make_track_with_hash("sha256:h1aaaaaa"),
-            make_track_with_hash("sha256:h2aaaaaa"),
-            make_track_with_hash("sha256:h3aaaaaa"),
+            track("sha256:a1aaaaaa"),
+            track("sha256:a2aaaaaa"),
+            track("sha256:a3aaaaaa"),
         ];
-        let stdin = hash_set(&["sha256:h1aaaaaa", "sha256:h2aaaaaa"]);
+        let stdin = hash_set(&["sha256:a1aaaaaa", "sha256:a2aaaaaa"]);
         let result = apply_stdin_filter(tracks, Some(&stdin), false);
         let hashes: Vec<_> = result.iter().map(|t| t.content_hash.as_str()).collect();
-        assert_eq!(hashes, ["sha256:h1aaaaaa", "sha256:h2aaaaaa"]);
+        assert_eq!(hashes, ["sha256:a1aaaaaa", "sha256:a2aaaaaa"]);
     }
 
     #[test]
     fn search_no_stdin_preserves_not_behavior() {
         // Without stdin, apply_stdin_filter returns tracks unchanged regardless of `not`
-        let tracks = vec![
-            make_track_with_hash("sha256:h1aaaaaa"),
-            make_track_with_hash("sha256:h2aaaaaa"),
-        ];
+        let tracks = vec![track("sha256:a1aaaaaa"), track("sha256:a2aaaaaa")];
         let result = apply_stdin_filter(tracks.clone(), None, true);
         assert_eq!(result.len(), 2, "pass-through when no stdin, not=true");
         let result2 = apply_stdin_filter(tracks, None, false);
@@ -802,7 +712,7 @@ mod tests {
             result.unwrap_err()
         );
         // Build the query with played=never and no explicit --started
-        let query = build_track_query(SearchFilters {
+        let query = build_track_query(SearchArgs {
             played: Some(PlayedFilter::Never),
             ..Default::default()
         });
@@ -816,7 +726,7 @@ mod tests {
     #[test]
     fn search_played_never_overrides_started() {
         // When --played=never and --started are both given, --played=never wins.
-        let query = build_track_query(SearchFilters {
+        let query = build_track_query(SearchArgs {
             started: Some("-7".parse().unwrap()),
             played: Some(PlayedFilter::Never),
             ..Default::default()

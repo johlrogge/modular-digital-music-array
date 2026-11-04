@@ -34,7 +34,7 @@ pub(crate) enum Command {
     /// Select an audio output device by name
     SetOutput {
         /// Device name as shown by `mdma playback outputs`
-        name: String,
+        name: OutputNameArg,
     },
 
     /// Show the currently selected audio output
@@ -51,7 +51,7 @@ pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
         Command::Now => now(ctx),
         Command::Session => session(ctx),
         Command::Outputs => outputs(ctx),
-        Command::SetOutput { name } => set_output(OutputNameArg(name), ctx),
+        Command::SetOutput { name } => set_output(name, ctx),
         Command::GetOutput => get_output(ctx),
     }
 }
@@ -178,6 +178,14 @@ pub(crate) fn outputs(ctx: &Ctx) -> Result<()> {
 // Stays a String: device names have no domain rule; the service reports unknown ones.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OutputNameArg(pub String);
+
+impl std::str::FromStr for OutputNameArg {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
+    }
+}
 
 pub(crate) fn set_output(name: OutputNameArg, ctx: &Ctx) -> Result<()> {
     let OutputNameArg(name) = name;

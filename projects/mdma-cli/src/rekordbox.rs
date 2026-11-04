@@ -1,4 +1,4 @@
-use crate::args::{ExistingFileArg, PlaylistArg, SanitizedPlaylistNameArg};
+use crate::args::{ExistingFileArg, PlaylistArg, SanitizedPlaylistName};
 use crate::ctx::Ctx;
 use crate::stdin::{read_hashes, resolve_tracks_skip_errors};
 use crate::transfer::{
@@ -56,7 +56,7 @@ pub(crate) enum Command {
         /// Create an MDMA playlist with matched tracks.
         /// Invalid characters (spaces, special chars) are replaced with `-`.
         #[arg(long)]
-        playlist: Option<SanitizedPlaylistNameArg>,
+        playlist: Option<SanitizedPlaylistName>,
 
         /// Import all playlists found in the XML as MDMA playlists
         #[arg(long)]
@@ -120,7 +120,7 @@ pub(crate) struct RekordboxExportArgs {
 /// sanitised, both at parse time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RekordboxImportArgs {
-    pub(crate) playlist: Option<SanitizedPlaylistNameArg>,
+    pub(crate) playlist: Option<SanitizedPlaylistName>,
     pub(crate) all_playlists: bool,
     pub(crate) enrich: bool,
     pub(crate) dry_run: bool,
@@ -714,15 +714,11 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
 
     // 6. Create --playlist if requested
     if let Some(arg) = playlist {
-        if arg.was_changed() {
-            eprintln!(
-                "Note: playlist name sanitized from '{}' to '{}'",
-                arg.raw,
-                arg.sanitized()
-            );
+        if let Some(note) = arg.change_note() {
+            eprintln!("{note}");
         }
-        let sanitized = arg.sanitized();
-        let name = &arg.name;
+        let name = arg.name();
+        let sanitized = name.as_str();
         let hashes: Vec<ContentHash> = matched.iter().map(|(_, h)| h.clone()).collect();
 
         if dry_run {
@@ -755,14 +751,14 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
                 continue;
             }
 
-            let target = match SanitizedPlaylistNameArg::new(&rb_playlist.name) {
+            let target = match SanitizedPlaylistName::new(&rb_playlist.name) {
                 Ok(t) => t,
                 Err(reason) => {
                     eprintln!("Skipping playlist '{}': {}", rb_playlist.name, reason);
                     continue;
                 }
             };
-            let sanitized = target.sanitized();
+            let sanitized = target.name().as_str();
 
             if dry_run {
                 println!(
@@ -772,7 +768,7 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
                     resolved.len()
                 );
             } else {
-                match write_playlist(&library, &target.name, &resolved) {
+                match write_playlist(&library, target.name(), &resolved) {
                     Ok(created) => print_write_outcome(sanitized, resolved.len(), created),
                     Err(e) => {
                         eprintln!("Failed to write playlist '{}': {}", sanitized, e)
@@ -1062,8 +1058,11 @@ mod tests {
             } => {
                 assert_eq!(p.0, file.path());
                 let playlist = playlist.unwrap();
-                assert_eq!(playlist.raw, "My Set!");
-                assert_eq!(playlist.sanitized(), "My-Set");
+                assert_eq!(
+                    playlist.change_note().as_deref(),
+                    Some("Note: playlist name sanitized from 'My Set!' to 'My-Set'")
+                );
+                assert_eq!(playlist.name().as_str(), "My-Set");
             }
             other => panic!("not import: {other:?}"),
         }

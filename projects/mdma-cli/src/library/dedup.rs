@@ -150,14 +150,18 @@ fn format_dedup_applied(r: &DedupApplyReport) -> String {
 /// `Ok(None)` when no group does, an error when more than one group does.
 fn find_dedup_group<'a>(
     groups: &'a [DedupGroup],
-    partial: &str,
+    partial: &ContentHash,
 ) -> std::result::Result<Option<&'a DedupGroup>, String> {
-    let clean = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
-    let partial = clean(partial);
+    // `partial` is already lowercase hex (a parsed `TrackArg`); only the
+    // service's member hashes need normalising.
+    fn strip(h: &str) -> &str {
+        h.strip_prefix("sha256:").unwrap_or(h)
+    }
+    let partial = strip(partial.as_str());
     let mut matching = groups.iter().filter(|g| {
         g.members
             .iter()
-            .any(|m| clean(m.hash.as_str()).starts_with(&partial))
+            .any(|m| strip(m.hash.as_str()).to_lowercase().starts_with(partial))
     });
     let found = matching.next();
     if matching.next().is_some() {
@@ -208,10 +212,7 @@ pub(crate) fn merge(args: MergeArgs, ctx: &Ctx) -> Result<()> {
         if let Ok(report) = library.dedup_scan(false) {
             // Every prefix must name at most one group before anything is confirmed.
             let mut shown = None;
-            for prefix in std::iter::once(&winner)
-                .chain(&losers)
-                .map(ContentHash::as_str)
-            {
+            for prefix in std::iter::once(&winner).chain(&losers) {
                 match find_dedup_group(&report.groups, prefix) {
                     Ok(group) => shown = shown.or(group),
                     Err(e) => {
@@ -424,9 +425,15 @@ mod tests {
             "fedcba9876",
             DedupDisposition::Automatic,
         )];
-        assert!(find_dedup_group(&groups, "abcd").unwrap().is_some());
-        assert!(find_dedup_group(&groups, "sha256:FEDC").unwrap().is_some());
-        assert!(find_dedup_group(&groups, "0000").unwrap().is_none());
+        assert!(find_dedup_group(&groups, &hash("abcd")).unwrap().is_some());
+        assert!(find_dedup_group(&groups, &hash("sha256:fedc"))
+            .unwrap()
+            .is_some());
+        assert!(find_dedup_group(&groups, &hash("0000")).unwrap().is_none());
+    }
+
+    fn hash(s: &str) -> ContentHash {
+        ContentHash::new(s)
     }
 
     #[test]
@@ -435,12 +442,15 @@ mod tests {
             dedup_group("abcdef0123", "fedcba9876", DedupDisposition::Automatic),
             dedup_group("abcd001122", "112233aabb", DedupDisposition::Automatic),
         ];
-        assert!(find_dedup_group(&groups, "abcd").is_err());
+        assert!(find_dedup_group(&groups, &hash("abcd")).is_err());
         // Long enough to tell them apart, and a prefix of two members of one group.
         assert_eq!(
-            find_dedup_group(&groups, "abcdef").unwrap().unwrap().winner,
+            find_dedup_group(&groups, &hash("abcdef"))
+                .unwrap()
+                .unwrap()
+                .winner,
             groups[0].winner
         );
-        assert!(find_dedup_group(&groups, "112").unwrap().is_some());
+        assert!(find_dedup_group(&groups, &hash("112")).unwrap().is_some());
     }
 }
