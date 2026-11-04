@@ -28,6 +28,8 @@ result-*
 
 # Test data files
 *.jsonl
+# Legacy fact-format fixtures are checked in (0.36.1 hotfix)
+!components/music_facts/tests/fixtures/*.jsonl
 
 # Disk images and archives
 *.qcow2

@@ -125,9 +125,25 @@ impl fmt::Display for CueKind {
 ///
 /// Each variant represents a single fact that can be asserted or retracted
 /// about a track. Facts are stored in the stainless-facts stream.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "t", content = "v")]
-pub enum MusicValue {
+///
+/// The derived tagged representation lives on the private `MusicValueDef`
+/// mirror (generated from the same variant list by `music_value_enum!`), so no
+/// public derived `deserialize` exists that could bypass [`rewrite_legacy`].
+/// `Deserialize` additionally accepts legacy wire forms; serialization always
+/// emits the current format.
+macro_rules! music_value_enum {
+    ($($body:tt)*) => {
+        /// All possible metadata values for a music track (see module docs).
+        #[derive(Debug, Clone, PartialEq)]
+        pub enum MusicValue { $($body)* }
+
+        #[derive(Serialize, Deserialize)]
+        #[serde(remote = "MusicValue", tag = "t", content = "v")]
+        enum MusicValueDef { $($body)* }
+    };
+}
+
+music_value_enum! {
     // ========================================================================
     // File Location & Identity
     // ========================================================================
@@ -343,6 +359,45 @@ pub enum MusicValue {
 
     /// Track soft-deleted: hidden from default views, file/blob retained, recoverable.
     Deleted { timestamp: DateTime<Utc> },
+}
+
+impl Serialize for MusicValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        MusicValueDef::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MusicValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut raw = serde_json::Value::deserialize(deserializer)?;
+        rewrite_legacy(&mut raw);
+        MusicValueDef::deserialize(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Rewrites legacy `{"t":..,"v":..}` wire forms into today's format in place.
+///
+/// - `HasAlbumArt` boolean (first scans, 0.1.0): `true` -> `"Present"`, `false` -> `"Absent"`.
+/// - `Played` (early play event, written on natural track end) -> `TrackStopped(OnCompletion)`.
+/// - `Skipped` (early play event, written on manual stop) -> `TrackStopped(OnSkip)`.
+///
+/// The mapping is a pure function of the legacy form, so a legacy assert and
+/// its retract decode to the same value.
+fn rewrite_legacy(raw: &mut serde_json::Value) {
+    use serde_json::Value;
+    let Some(obj) = raw.as_object_mut() else {
+        return;
+    };
+    let replacement = match (obj.get("t").and_then(Value::as_str), obj.get("v")) {
+        (Some("HasAlbumArt"), Some(Value::Bool(b))) => {
+            ("HasAlbumArt", if *b { "Present" } else { "Absent" })
+        }
+        (Some("Played"), _) => ("TrackStopped", "OnCompletion"),
+        (Some("Skipped"), _) => ("TrackStopped", "OnSkip"),
+        _ => return,
+    };
+    obj.insert("t".into(), Value::String(replacement.0.into()));
+    obj.insert("v".into(), Value::String(replacement.1.into()));
 }
 
 impl MusicValue {
@@ -649,6 +704,69 @@ mod tests {
         let legacy = r#"{"t":"TrackStopped","v":"2026-01-15T10:00:00Z"}"#;
         let v: MusicValue = serde_json::from_str(legacy).unwrap();
         assert_eq!(v, MusicValue::TrackStopped(StopReason::OnRequest));
+    }
+
+    // Legacy wire forms from early logs (hotfix 0.36.1)
+
+    #[rstest]
+    #[case(
+        r#"{"t":"HasAlbumArt","v":true}"#,
+        MusicValue::HasAlbumArt(AlbumArtPresence::Present)
+    )]
+    #[case(
+        r#"{"t":"HasAlbumArt","v":false}"#,
+        MusicValue::HasAlbumArt(AlbumArtPresence::Absent)
+    )]
+    #[case(
+        r#"{"t":"Played","v":"2026-02-23T10:42:50.582788665Z"}"#,
+        MusicValue::TrackStopped(StopReason::OnCompletion)
+    )]
+    #[case(
+        r#"{"t":"Skipped","v":"2026-02-22T22:14:31.757504057Z"}"#,
+        MusicValue::TrackStopped(StopReason::OnSkip)
+    )]
+    fn legacy_forms_decode_to_current_values(#[case] json: &str, #[case] expected: MusicValue) {
+        let v: MusicValue = serde_json::from_str(json).unwrap();
+        assert_eq!(v, expected);
+        // Re-serializing a legacy-decoded value never emits the legacy form.
+        let out = serde_json::to_string(&v).unwrap();
+        assert_eq!(serde_json::from_str::<MusicValue>(&out).unwrap(), expected);
+    }
+
+    #[test]
+    fn legacy_values_serialize_in_current_format() {
+        let v: MusicValue = serde_json::from_str(r#"{"t":"HasAlbumArt","v":true}"#).unwrap();
+        assert_eq!(
+            serde_json::to_string(&v).unwrap(),
+            r#"{"t":"HasAlbumArt","v":"Present"}"#
+        );
+        let v: MusicValue =
+            serde_json::from_str(r#"{"t":"Skipped","v":"2026-02-22T22:14:31Z"}"#).unwrap();
+        assert_eq!(
+            serde_json::to_string(&v).unwrap(),
+            r#"{"t":"TrackStopped","v":"OnSkip"}"#
+        );
+    }
+
+    #[test]
+    fn current_format_unchanged() {
+        for (v, json) in [
+            (
+                MusicValue::HasAlbumArt(AlbumArtPresence::Present),
+                r#"{"t":"HasAlbumArt","v":"Present"}"#,
+            ),
+            (
+                MusicValue::HasAlbumArt(AlbumArtPresence::Absent),
+                r#"{"t":"HasAlbumArt","v":"Absent"}"#,
+            ),
+            (
+                MusicValue::TrackStopped(StopReason::OnCompletion),
+                r#"{"t":"TrackStopped","v":"OnCompletion"}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&v).unwrap(), json);
+            assert_eq!(serde_json::from_str::<MusicValue>(json).unwrap(), v);
+        }
     }
 
     #[test]
