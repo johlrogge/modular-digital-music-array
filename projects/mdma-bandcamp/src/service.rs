@@ -172,6 +172,7 @@ const IMPORT_DOWNLOAD_POLL: Duration = Duration::from_secs(2);
 const IMPORT_DOWNLOAD_LIMIT: Duration = Duration::from_secs(30 * 60);
 
 /// What a collection sync queued.
+#[derive(Debug)]
 struct SyncOutcome {
     total_items: usize,
     /// Ids of the items that are missing from the library and now queued or
@@ -180,6 +181,33 @@ struct SyncOutcome {
     queued_ids: Vec<String>,
     /// How many of `queued_ids` this sync queued itself.
     newly_queued: usize,
+}
+
+/// Why a collection sync queued nothing.
+#[derive(Debug)]
+enum SyncError {
+    /// The library did not answer: without it the whole collection would
+    /// look new, so the sync is deferred (ADR-013).
+    LibraryUnavailable(String),
+    Source(SourceError),
+}
+
+impl From<SourceError> for SyncError {
+    fn from(e: SourceError) -> Self {
+        SyncError::Source(e)
+    }
+}
+
+impl SyncError {
+    /// The error as reported to the requester.
+    fn into_source(self) -> SourceError {
+        match self {
+            SyncError::LibraryUnavailable(reason) => SourceError::SyncFailed {
+                message: format!("library unavailable, sync deferred: {reason}"),
+            },
+            SyncError::Source(e) => e,
+        }
+    }
 }
 
 /// Whether the job is still doing work (not Done or Failed).
@@ -246,42 +274,33 @@ pub(crate) fn should_skip_by_work_identity(
 /// matching track so later syncs short-circuit).
 ///
 /// Makes blocking library calls for every item: run it in `spawn_blocking`
-/// and never with a service lock held. When the library is unreachable every
-/// item is kept (the download cache is the fallback dedup).
+/// and never with a service lock held. When the library is unreachable, or
+/// cannot answer the ItemId query, the sync is deferred (an error): without
+/// the library the whole collection would look new (ADR-013).
 fn drop_items_known_to_library(
     library_socket: &str,
     collection: Vec<CollectionItem>,
-) -> Vec<CollectionItem> {
-    let lib_client = match LibraryClient::connect(library_socket) {
-        Ok(client) => client,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                socket = %library_socket,
-                "Library not available, falling back to cache-only dedup"
-            );
-            return collection;
-        }
+) -> Result<Vec<CollectionItem>, SyncError> {
+    let deferred = |e: &dyn std::fmt::Display| {
+        tracing::warn!(error = %e, socket = %library_socket, "Library unavailable, sync deferred");
+        SyncError::LibraryUnavailable(e.to_string())
     };
+    let lib_client = LibraryClient::connect(library_socket).map_err(|e| deferred(&e))?;
 
     // Primary dedup: ItemIds the library already knows.
     let all_item_ids: Vec<String> = collection
         .iter()
         .map(|i| i.id.as_str().to_string())
         .collect();
-    let library_known: HashSet<String> = match lib_client.has_facts("ItemId", all_item_ids) {
-        Ok(existing) => {
-            tracing::info!(
-                count = existing.len(),
-                "Library reports items already ingested"
-            );
-            existing.into_iter().collect()
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to query library, falling back to cache only");
-            HashSet::new()
-        }
-    };
+    let library_known: HashSet<String> = lib_client
+        .has_facts("ItemId", all_item_ids)
+        .map_err(|e| deferred(&e))?
+        .into_iter()
+        .collect();
+    tracing::info!(
+        count = library_known.len(),
+        "Library reports items already ingested"
+    );
 
     let mut unknown = Vec::new();
     for item in collection {
@@ -335,7 +354,7 @@ fn drop_items_known_to_library(
         }
         unknown.push(item);
     }
-    unknown
+    Ok(unknown)
 }
 
 /// Pure helper: determine whether a bandcamp item is stale based on track counts.
@@ -510,6 +529,32 @@ impl BandcampService {
         }
     }
 
+    /// Check that the library answers. The calls block, so they run on the
+    /// blocking pool.
+    async fn ping_library(&self) -> Result<(), String> {
+        let socket = self.library_socket.clone();
+        tokio::task::spawn_blocking(move || {
+            LibraryClient::connect(&socket)
+                .and_then(|client| client.ping())
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("library check task failed: {e}"))?
+    }
+
+    /// The number of tracks the library stores for a Bandcamp item.
+    async fn stored_track_count(&self, item_id: &str) -> Result<usize, String> {
+        let socket = self.library_socket.clone();
+        let item_id = item_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            LibraryClient::connect(&socket)
+                .and_then(|client| client.get_track_count_for_item_id(&item_id))
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("library query task failed: {e}"))?
+    }
+
     /// Handle a request asynchronously
     pub async fn handle_request(self: &Arc<Self>, request: SourceRequest) -> SourceResponse {
         tracing::debug!(?request, "Handling request");
@@ -638,22 +683,36 @@ impl BandcampService {
 
     /// Force-queue an item, bypassing library and cache dedup.
     ///
-    /// Retracts existing library facts and evicts the cache entry (best-effort),
-    /// then queues the item by the common rule (`enqueue_items`).
-    async fn queue_item_forcibly(&self, item: CollectionItem) -> Result<(), ServiceError> {
-        // Best-effort: retract library facts
-        if let Some(lib_client) = self.try_library_client() {
-            match lib_client.retract_source_facts(item.id.as_str(), "bandcamp") {
-                Ok(()) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        item_id = %item.id.as_str(),
-                        "Failed to retract library facts — continuing anyway"
-                    );
+    /// Retracts existing library facts, evicts the cache entry (best-effort),
+    /// then queues the item by the common rule (`enqueue_items`). If the
+    /// library is unreachable or the retract fails nothing is evicted or
+    /// queued and an error is returned: re-downloading without retracting
+    /// creates duplicates (ADR-013).
+    async fn queue_item_forcibly(&self, item: CollectionItem) -> Result<(), SourceError> {
+        let item_id = item.id.as_str().to_string();
+        let socket = self.library_socket.clone();
+        let retract_id = item_id.clone();
+        // Blocking library calls: run on the blocking pool.
+        tokio::task::spawn_blocking(move || -> Result<(), SourceError> {
+            let client = LibraryClient::connect(&socket).map_err(|e| {
+                tracing::warn!(error = %e, %socket, "Library unavailable, resync refused");
+                SourceError::SyncFailed {
+                    message: format!("library unavailable, resync of {retract_id} refused: {e}"),
                 }
-            }
-        }
+            })?;
+            client
+                .retract_source_facts(&retract_id, "bandcamp")
+                .map_err(|e| {
+                    tracing::error!(error = %e, item_id = %retract_id, "Failed to retract, resync refused");
+                    SourceError::SyncFailed {
+                        message: format!("retract failed, resync of {retract_id} refused: {e}"),
+                    }
+                })
+        })
+        .await
+        .map_err(|e| SourceError::Internal {
+            message: format!("retract task failed: {e}"),
+        })??;
 
         // Best-effort: evict cache entry
         match self.cache.lock().forget_item(item.id.as_str()) {
@@ -674,7 +733,17 @@ impl BandcampService {
     }
 
     /// Handle a forced resync of a specific item by identifier.
+    ///
+    /// The library is checked first: a refused resync must not cost a
+    /// Bandcamp request.
     async fn handle_resync(&self, identifier: String) -> SourceResponse {
+        if let Err(reason) = self.ping_library().await {
+            tracing::warn!(%identifier, %reason, "Library unavailable, resync refused");
+            return SourceResponse::Error(SourceError::SyncFailed {
+                message: format!("library unavailable, resync of {identifier} refused: {reason}"),
+            });
+        }
+
         let client = match self.client() {
             Ok(c) => c,
             Err(e) => return SourceResponse::Error(e),
@@ -703,9 +772,7 @@ impl BandcampService {
         };
 
         if let Err(e) = self.queue_item_forcibly(item).await {
-            return SourceResponse::Error(SourceError::Internal {
-                message: e.to_string(),
-            });
+            return SourceResponse::Error(e);
         }
 
         SourceResponse::ResyncQueued {
@@ -716,7 +783,22 @@ impl BandcampService {
 
     /// Handle a check-item request: fetch live track count from bandcamp and compare
     /// against the library's stored count for the given item identifier.
+    ///
+    /// The stored count comes first: without the library every item would
+    /// look stale, so an unavailable library is an error, and it costs no
+    /// Bandcamp request.
     async fn handle_check_item(&self, identifier: String) -> SourceResponse {
+        let stored_track_count = match self.stored_track_count(&identifier).await {
+            Ok(count) => count,
+            Err(reason) => {
+                tracing::warn!(item_id = %identifier, %reason, "CheckItem: library unavailable");
+                return SourceResponse::Error(SourceError::CheckFailed {
+                    identifier,
+                    reason: format!("library unavailable: {reason}"),
+                });
+            }
+        };
+
         let client = match self.client() {
             Ok(c) => c,
             Err(e) => return SourceResponse::Error(e),
@@ -760,27 +842,6 @@ impl BandcampService {
 
         let live_track_count = details.tracks.len();
 
-        // Query library for stored track count
-        let stored_track_count = if let Some(lib_client) = self.try_library_client() {
-            match lib_client.get_track_count_for_item_id(&identifier) {
-                Ok(count) => count,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        item_id = %identifier,
-                        "CheckItem: failed to query library track count, defaulting to 0"
-                    );
-                    0
-                }
-            }
-        } else {
-            tracing::warn!(
-                item_id = %identifier,
-                "CheckItem: library not available, defaulting stored_track_count to 0"
-            );
-            0
-        };
-
         let stale = classify_check_result(live_track_count, stored_track_count);
 
         if stored_track_count > live_track_count {
@@ -808,13 +869,19 @@ impl BandcampService {
                 total_items: outcome.total_items,
                 new_items: outcome.newly_queued,
             },
-            Err(e) => SourceResponse::Error(e),
+            Err(e) => SourceResponse::Error(e.into_source()),
         }
     }
 
     /// Fetch the collection and queue the items that are new.
-    /// Returns the ids of the items it queued.
-    async fn queue_collection_sync(&self) -> Result<SyncOutcome, SourceError> {
+    /// Returns the ids of the items it queued. The library is checked first:
+    /// if it is unavailable the sync is deferred without a Bandcamp request.
+    async fn queue_collection_sync(&self) -> Result<SyncOutcome, SyncError> {
+        if let Err(reason) = self.ping_library().await {
+            tracing::warn!(%reason, "Library unavailable, sync deferred");
+            return Err(SyncError::LibraryUnavailable(reason));
+        }
+
         // Try to load client (also reloads cookies)
         let client = self.client()?;
 
@@ -833,10 +900,20 @@ impl BandcampService {
                 tracing::error!(error = %e, "Failed to fetch collection");
                 return Err(SourceError::SyncFailed {
                     message: e.to_string(),
-                });
+                }
+                .into());
             }
         };
 
+        self.queue_new_collection_items(collection).await
+    }
+
+    /// Queue the items of a fetched collection that are new to the library
+    /// and the download cache.
+    async fn queue_new_collection_items(
+        &self,
+        collection: Vec<CollectionItem>,
+    ) -> Result<SyncOutcome, SyncError> {
         let total_items = collection.len();
         tracing::info!(total = total_items, "Fetched collection");
 
@@ -847,9 +924,11 @@ impl BandcampService {
         let unknown =
             tokio::task::spawn_blocking(move || drop_items_known_to_library(&socket, collection))
                 .await
-                .map_err(|e| SourceError::SyncFailed {
-                    message: format!("library dedup task failed: {e}"),
-                })?;
+                .map_err(|e| {
+                    SyncError::Source(SourceError::SyncFailed {
+                        message: format!("library dedup task failed: {e}"),
+                    })
+                })??;
 
         let (queued_ids, newly_queued) = self.enqueue_new_items(unknown);
 
@@ -1061,6 +1140,12 @@ impl BandcampService {
     /// at once and the import carries on to the rematch with what the library
     /// has (as it does after a timeout or failed downloads); the report lists
     /// what is still missing, and the queued downloads resume with the queue.
+    ///
+    /// If the sync is deferred because the library is unavailable, the
+    /// import likewise carries on without the rematch: it writes the
+    /// first-pass definitive matches and finishes, with `sync` recorded as
+    /// nothing queued and no end reason, and the missing tracks reported as
+    /// missing. Other sync errors fail the job.
     async fn import_steps(
         &self,
         job_id: u64,
@@ -1090,19 +1175,39 @@ impl BandcampService {
         // A dry run never syncs: it reports what the library has now.
         if !dry_run && has_owned_missing(&tracks, &outcomes) {
             self.set_import_phase(job_id, ImportPhase::Syncing);
-            let queued = self
-                .queue_collection_sync()
-                .await
-                .map_err(|e| e.to_string())?
-                .queued_ids;
-            self.wait_for_downloads(job_id, &queued, IMPORT_DOWNLOAD_POLL, IMPORT_DOWNLOAD_LIMIT)
-                .await;
+            match self.queue_collection_sync().await {
+                Ok(sync) => {
+                    self.wait_for_downloads(
+                        job_id,
+                        &sync.queued_ids,
+                        IMPORT_DOWNLOAD_POLL,
+                        IMPORT_DOWNLOAD_LIMIT,
+                    )
+                    .await;
 
-            self.set_import_phase(job_id, ImportPhase::Rematching);
-            outcomes = self.match_import_tracks(&tracks).await?;
-            self.update_import(job_id, |status| {
-                status.tracks = to_import_reports(&tracks, &outcomes)
-            });
+                    self.set_import_phase(job_id, ImportPhase::Rematching);
+                    outcomes = self.match_import_tracks(&tracks).await?;
+                    self.update_import(job_id, |status| {
+                        status.tracks = to_import_reports(&tracks, &outcomes)
+                    });
+                }
+                Err(SyncError::LibraryUnavailable(reason)) => {
+                    // Carry on with the first-pass matches; the report lists
+                    // the rest as missing. The status has no field for the
+                    // reason: a sync that never waited is `sync` with
+                    // nothing queued and no end reason.
+                    tracing::warn!(%reason, "Import sync deferred, library unavailable");
+                    self.update_import(job_id, |status| {
+                        status.sync = Some(ImportSyncProgress {
+                            queued: 0,
+                            completed: 0,
+                            failed: 0,
+                            ended: None,
+                        })
+                    });
+                }
+                Err(SyncError::Source(e)) => return Err(e.to_string()),
+            }
         }
 
         let hashes = matched_hashes(&outcomes);
@@ -2295,37 +2400,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn forced_resync_does_not_queue_an_in_flight_item_twice() {
-        let dir = tempfile::tempdir().unwrap();
-        let service = make_service(dir.path(), dir.path().join("missing.json"));
-        service
-            .download_queue
-            .lock()
-            .push_back(queued_download("q", InternalDownloadState::Queued));
-        service.active_downloads.lock().insert(
-            "busy".to_string(),
-            queued_download("busy", InternalDownloadState::Downloading),
-        );
-        service.active_downloads.lock().insert(
-            "old".to_string(),
-            queued_download("old", InternalDownloadState::Completed),
-        );
-
-        for id in ["q", "busy", "old"] {
-            service
-                .queue_item_forcibly(make_collection_item(id, "Artist", "Album"))
-                .await
-                .unwrap();
-        }
-
-        let queue = service.download_queue.lock();
-        let queued: Vec<&str> = queue.iter().map(|d| d.item.id.as_str()).collect();
-        assert_eq!(queued, vec!["q", "old"], "in-flight items not duplicated");
-        assert!(!service.active_downloads.lock().contains_key("old"));
-        assert!(service.active_downloads.lock().contains_key("busy"));
-    }
-
     #[test]
     fn enqueue_replaces_finished_entries_from_earlier_runs() {
         let dir = tempfile::tempdir().unwrap();
@@ -2507,9 +2581,6 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::sync(SourceRequest::Sync)]
-    #[case::resync(SourceRequest::ResyncItem { identifier: "x".to_string() })]
-    #[case::check(SourceRequest::CheckItem { identifier: "x".to_string() })]
     #[case::list_playlists(SourceRequest::ListPlaylists)]
     #[case::get_playlist(SourceRequest::GetPlaylist { playlist: "x".to_string() })]
     #[tokio::test]
@@ -2626,14 +2697,12 @@ mod tests {
             metadata_dir: &std::path::Path,
             socket_path: &std::path::Path,
         ) -> std::thread::JoinHandle<()> {
-            let svc = Arc::new(
-                LibraryService::new(
-                    metadata_dir.to_path_buf(),
-                    metadata_dir.to_path_buf(),
-                    "ipc:///dev/null",
-                )
-                .expect("failed to create stub library"),
-            );
+            let svc = LibraryService::new(
+                metadata_dir.to_path_buf(),
+                metadata_dir.to_path_buf(),
+                "ipc:///dev/null",
+            )
+            .expect("failed to create stub library");
             let addr = format!("ipc://{}", socket_path.display());
             std::thread::spawn(move || {
                 run_ipc_server(svc, &addr).ok();
@@ -2790,6 +2859,25 @@ mod tests {
             (temp, service, client)
         }
 
+        /// With the library up, a request that needs Bandcamp but has no
+        /// cookies is NotAuthenticated (the library is asked first).
+        #[rstest::rstest]
+        #[case::sync(SourceRequest::Sync)]
+        #[case::resync(SourceRequest::ResyncItem { identifier: "x".to_string() })]
+        #[case::check(SourceRequest::CheckItem { identifier: "x".to_string() })]
+        #[tokio::test]
+        async fn request_without_cookies_and_library_up_is_not_authenticated(
+            #[case] request: SourceRequest,
+        ) {
+            let (_temp, service, _client) = service_with_library("nocookies.sock");
+            match service.handle_request(request).await {
+                SourceResponse::Error(SourceError::NotAuthenticated { message }) => {
+                    assert!(message.contains("not configured"), "got: {message}");
+                }
+                other => panic!("expected NotAuthenticated error, got {other:?}"),
+            }
+        }
+
         #[tokio::test]
         async fn import_with_nothing_missing_writes_playlist_and_finishes_done() {
             let (_temp, service, client) = service_with_library("import-happy.sock");
@@ -2927,7 +3015,7 @@ mod tests {
                 make_collection_item("p_3", "Somebody Else", "Other Album"),
             ];
 
-            let unknown = drop_items_known_to_library(&socket, items);
+            let unknown = drop_items_known_to_library(&socket, items).expect("library is up");
 
             let ids: Vec<&str> = unknown.iter().map(|i| i.id.as_str()).collect();
             assert_eq!(ids, vec!["p_3"]);
@@ -2938,10 +3026,292 @@ mod tests {
         }
 
         #[test]
-        fn drop_items_known_to_library_keeps_everything_when_library_is_down() {
+        fn drop_items_known_to_library_defers_when_library_is_down() {
             let items = vec![make_collection_item("p_1", "A", "B")];
-            let kept = drop_items_known_to_library("ipc:///nonexistent/library.sock", items);
-            assert_eq!(kept.len(), 1);
+            let result = drop_items_known_to_library("ipc:///nonexistent/library.sock", items);
+            assert!(result.is_err(), "unreachable library must defer");
+        }
+
+        /// A library that accepts connections but answers every request with
+        /// a protocol error. Returns its address; the server thread is leaked.
+        fn start_failing_library(dir: &std::path::Path) -> String {
+            let addr = format!("ipc://{}", dir.join("failing.sock").display());
+            let socket = nng::Socket::new(nng::Protocol::Rep0).expect("rep socket");
+            socket.listen(&addr).expect("listen");
+            std::thread::spawn(move || {
+                while socket.recv().is_ok() {
+                    let reply = serde_json::to_vec(&library_ipc_client::LibraryResponse::Error(
+                        library_ipc_client::ProtocolError::Internal {
+                            message: "boom".to_string(),
+                        },
+                    ))
+                    .expect("serialize");
+                    if socket.send(nng::Message::from(&reply[..])).is_err() {
+                        break;
+                    }
+                }
+            });
+            addr
+        }
+
+        /// A library that relays every request to the real one at `upstream`
+        /// except `Ping`, which it answers with a protocol error.
+        fn start_pingless_library(dir: &std::path::Path, upstream: &str) -> String {
+            let addr = format!("ipc://{}", dir.join("pingless.sock").display());
+            let socket = nng::Socket::new(nng::Protocol::Rep0).expect("rep socket");
+            socket.listen(&addr).expect("listen");
+            let relay = nng::Socket::new(nng::Protocol::Req0).expect("req socket");
+            relay.dial(upstream).expect("dial upstream");
+            std::thread::spawn(move || {
+                while let Ok(request) = socket.recv() {
+                    let is_ping = matches!(
+                        serde_json::from_slice(&request),
+                        Ok(library_ipc_client::LibraryRequest::Ping)
+                    );
+                    let reply = if is_ping {
+                        let error = library_ipc_client::LibraryResponse::Error(
+                            library_ipc_client::ProtocolError::Internal {
+                                message: "no ping".to_string(),
+                            },
+                        );
+                        nng::Message::from(&serde_json::to_vec(&error).expect("serialize")[..])
+                    } else {
+                        relay
+                            .send(request)
+                            .map_err(|(_, e)| e)
+                            .expect("relay request");
+                        relay.recv().expect("relay reply")
+                    };
+                    if socket.send(reply).is_err() {
+                        break;
+                    }
+                }
+            });
+            addr
+        }
+
+        fn cached_service(library_socket: &str) -> (tempfile::TempDir, Arc<BandcampService>) {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let service = make_service_with_library(
+                temp.path(),
+                temp.path().join("missing.json"),
+                library_socket,
+            );
+            service
+                .cache
+                .lock()
+                .mark_downloaded("key", "p_9")
+                .expect("seed cache");
+            (temp, service)
+        }
+
+        fn assert_forced_resync_refused(service: &Arc<BandcampService>) {
+            let err = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(
+                    service.queue_item_forcibly(make_collection_item("p_9", "Artist", "Album")),
+                )
+                .expect_err("resync must fail");
+            assert!(
+                matches!(err, SourceError::SyncFailed { .. }),
+                "unexpected error: {err:?}"
+            );
+            assert!(service.download_queue.lock().is_empty(), "nothing queued");
+            assert!(
+                service.cache.lock().is_item_downloaded("p_9"),
+                "cache entry intact"
+            );
+        }
+
+        #[test]
+        fn forced_resync_with_library_unreachable_errors_and_changes_nothing() {
+            let (_temp, service) = cached_service("ipc:///nonexistent/library.sock");
+            assert_forced_resync_refused(&service);
+        }
+
+        #[test]
+        fn forced_resync_with_failing_retract_errors_and_changes_nothing() {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let addr = start_failing_library(dir.path());
+            let (_temp, service) = cached_service(&addr);
+            assert_forced_resync_refused(&service);
+        }
+
+        #[test]
+        fn forced_resync_with_library_up_evicts_cache_and_queues() {
+            let (_temp, service, _client) = service_with_library("resync-ok.sock");
+            service.cache.lock().mark_downloaded("key", "p_1").unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(
+                    service.queue_item_forcibly(make_collection_item("p_1", "Artist", "Album")),
+                )
+                .expect("resync");
+            assert_eq!(service.download_queue.lock().len(), 1);
+            assert!(!service.cache.lock().is_item_downloaded("p_1"));
+        }
+
+        #[tokio::test]
+        async fn forced_resync_does_not_queue_an_in_flight_item_twice() {
+            let (_temp, service, _client) = service_with_library("resync-inflight.sock");
+            service
+                .download_queue
+                .lock()
+                .push_back(queued_download("q", InternalDownloadState::Queued));
+            service.active_downloads.lock().insert(
+                "busy".to_string(),
+                queued_download("busy", InternalDownloadState::Downloading),
+            );
+            service.active_downloads.lock().insert(
+                "old".to_string(),
+                queued_download("old", InternalDownloadState::Completed),
+            );
+
+            for id in ["q", "busy", "old"] {
+                service
+                    .queue_item_forcibly(make_collection_item(id, "Artist", "Album"))
+                    .await
+                    .unwrap();
+            }
+
+            let queue = service.download_queue.lock();
+            let queued: Vec<&str> = queue.iter().map(|d| d.item.id.as_str()).collect();
+            assert_eq!(queued, vec!["q", "old"], "in-flight items not duplicated");
+            assert!(!service.active_downloads.lock().contains_key("old"));
+            assert!(service.active_downloads.lock().contains_key("busy"));
+        }
+
+        #[tokio::test]
+        async fn check_item_with_library_down_is_an_error_not_stale() {
+            // No cookies either: the library is asked before Bandcamp is.
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let service = make_service(dir.path(), dir.path().join("missing.json"));
+
+            let response = service.handle_check_item("p_1".to_string()).await;
+
+            match response {
+                SourceResponse::Error(SourceError::CheckFailed { identifier, reason }) => {
+                    assert_eq!(identifier, "p_1");
+                    assert!(reason.contains("library unavailable"), "reason: {reason}");
+                }
+                _ => panic!("expected CheckFailed"),
+            }
+        }
+
+        #[tokio::test]
+        async fn resync_with_library_down_is_refused_before_bandcamp_is_asked() {
+            // No cookies: reaching the Bandcamp client would be NotAuthenticated.
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let service = make_service(dir.path(), dir.path().join("missing.json"));
+
+            let response = service.handle_resync("p_1".to_string()).await;
+
+            match response {
+                SourceResponse::Error(SourceError::SyncFailed { message }) => {
+                    assert!(
+                        message.contains("library unavailable"),
+                        "message: {message}"
+                    )
+                }
+                _ => panic!("expected SyncFailed"),
+            }
+        }
+
+        #[tokio::test]
+        async fn import_with_sync_deferred_writes_first_pass_matches_and_finishes() {
+            let (temp, upstream, client) = service_with_library("import-upstream.sock");
+            let addr = start_pingless_library(temp.path(), &upstream.library_socket);
+            let service =
+                make_service_with_library(temp.path(), temp.path().join("missing.json"), &addr);
+            let job_id = service.begin_import_job(false).unwrap();
+            // The second track is owned but missing, so the import wants a sync.
+            let playlist = source_playlist(vec![
+                source_track(1, "Carbon Based Lifeforms", "Interloper", true),
+                source_track(2, "Nobody", "Nothing", true),
+            ]);
+
+            service
+                .run_import(job_id, playlist, "my-set", None, false)
+                .await;
+
+            let status = import_status(&service);
+            assert_eq!(
+                status.phase,
+                ImportPhase::Done(ImportResult::Written(ImportWritten {
+                    created: true,
+                    tracks: 1
+                }))
+            );
+            assert_eq!(
+                status.sync,
+                Some(ImportSyncProgress {
+                    queued: 0,
+                    completed: 0,
+                    failed: 0,
+                    ended: None
+                }),
+                "sync recorded as never waited"
+            );
+            assert_eq!(
+                status.tracks[1].outcome,
+                source_protocol::ImportTrackOutcome::Missing { not_owned: false }
+            );
+            let written = client
+                .playlist_get(&PlaylistName::new("My-Set").unwrap())
+                .expect("playlist was written");
+            assert_eq!(written.len(), 1);
+        }
+
+        fn run_sync(
+            service: &Arc<BandcampService>,
+            items: Vec<CollectionItem>,
+        ) -> Result<SyncOutcome, SyncError> {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(service.queue_new_collection_items(items))
+        }
+
+        fn assert_sync_deferred(service: &Arc<BandcampService>) {
+            let items = vec![make_collection_item("p_7", "Nobody", "Nothing")];
+            let err = run_sync(service, items).expect_err("sync must defer");
+            match err {
+                SyncError::LibraryUnavailable(_) => {
+                    let message = err.into_source().to_string();
+                    assert!(message.contains("sync deferred"), "message: {message}")
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+            assert!(service.download_queue.lock().is_empty(), "nothing queued");
+        }
+
+        #[test]
+        fn sync_with_library_unreachable_defers_and_queues_nothing() {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let service = make_service(dir.path(), dir.path().join("missing.json"));
+            assert_sync_deferred(&service);
+        }
+
+        #[test]
+        fn sync_with_failing_has_facts_defers_and_queues_nothing() {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let addr = start_failing_library(dir.path());
+            let service = make_service_with_library(dir.path(), dir.path().join("m.json"), &addr);
+            assert_sync_deferred(&service);
+        }
+
+        #[test]
+        fn sync_with_library_up_skips_known_item_ids_and_queues_the_rest() {
+            let (_temp, service, _client) = service_with_library("sync-ok.sock");
+            let items = vec![
+                make_collection_item("p_1", "Carbon Based Lifeforms", "Interloper"),
+                make_collection_item("p_3", "Somebody Else", "Other Album"),
+            ];
+            let outcome = run_sync(&service, items).expect("sync");
+            assert_eq!(outcome.total_items, 2);
+            assert_eq!(outcome.queued_ids, vec!["p_3".to_string()]);
         }
 
         #[tokio::test]

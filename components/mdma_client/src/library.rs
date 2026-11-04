@@ -2,9 +2,13 @@
 
 use crate::error::map_gw_to_lib_error;
 use library_ipc_client::{
-    content_to_hashes, ClientError, ContentHash, FactType, InboxPath, IngestAllItem, IngestResult,
-    IngestSource, LibraryClient, LibraryRequest, LibraryResponse, MusicValue, OrphanInfo,
-    PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
+    content_to_hashes, interpret_archive_emptied, interpret_archive_listing,
+    interpret_dedup_merged, interpret_dedup_scan, interpret_identity_backfill,
+    interpret_identity_backfill_status, ArchiveEmptyReport, ArchiveListing, ClientError,
+    ContentHash, DedupApplyReport, DedupScanReport, FactType, IdentityBackfillStart,
+    IdentityBackfillStatus, InboxPath, IngestAllItem, IngestResult, IngestSource, LibraryClient,
+    LibraryRequest, LibraryResponse, MusicValue, OrphanInfo, PlaylistName, ProtocolError,
+    ServiceStatus, TrackInfo, TrackQuery,
 };
 use playlist_import::PlaylistWriteOps;
 
@@ -345,6 +349,89 @@ impl LibraryBackend {
             LibraryBackend::Gateway(_) => {
                 interpret_orphans_list(self.request(&LibraryRequest::TrackOrphans)?)
             }
+        }
+    }
+
+    /// Find duplicate tracks; with `apply`, merge the automatic groups.
+    pub fn dedup_scan(&self, apply: bool) -> Result<DedupScanReport, ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.dedup_scan(apply),
+            LibraryBackend::Gateway(_) => {
+                interpret_dedup_scan(self.request(&LibraryRequest::DedupScan { apply })?)
+            }
+        }
+    }
+
+    /// Merge `losers` into `winner` (a user-confirmed duplicate group).
+    pub fn dedup_merge(
+        &self,
+        winner: &ContentHash,
+        losers: &[ContentHash],
+    ) -> Result<DedupApplyReport, ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.dedup_merge(winner, losers),
+            LibraryBackend::Gateway(_) => {
+                interpret_dedup_merged(self.request(&LibraryRequest::DedupMerge {
+                    winner: winner.clone(),
+                    losers: losers.to_vec(),
+                })?)
+            }
+        }
+    }
+
+    /// List the files that merges moved to the archive.
+    pub fn archive_list(&self) -> Result<ArchiveListing, ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.archive_list(),
+            LibraryBackend::Gateway(_) => {
+                interpret_archive_listing(self.request(&LibraryRequest::ArchiveList)?)
+            }
+        }
+    }
+
+    /// Permanently delete the archive's files archived at or before `up_to` (RFC 3339,
+    /// as listed); `None` deletes everything.
+    pub fn archive_empty(&self, up_to: Option<&str>) -> Result<ArchiveEmptyReport, ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.archive_empty(up_to),
+            LibraryBackend::Gateway(_) => {
+                interpret_archive_emptied(self.request(&LibraryRequest::ArchiveEmpty {
+                    up_to: up_to.map(str::to_owned),
+                })?)
+            }
+        }
+    }
+
+    /// Start the identity-hash backfill (or learn that one is already running).
+    pub fn identity_backfill(
+        &self,
+        include_pcm: bool,
+    ) -> Result<IdentityBackfillStart, ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.identity_backfill(include_pcm),
+            LibraryBackend::Gateway(_) => interpret_identity_backfill(
+                self.request(&LibraryRequest::IdentityBackfill { include_pcm })?,
+            ),
+        }
+    }
+
+    /// Report progress of the identity-hash backfill.
+    pub fn identity_backfill_status(&self) -> Result<IdentityBackfillStatus, ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.identity_backfill_status(),
+            LibraryBackend::Gateway(_) => interpret_identity_backfill_status(
+                self.request(&LibraryRequest::GetIdentityBackfillStatus)?,
+            ),
+        }
+    }
+
+    /// Ask a running identity-hash backfill to stop; returns the current status.
+    pub fn identity_backfill_cancel(&self) -> Result<IdentityBackfillStatus, ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.identity_backfill_cancel(),
+            LibraryBackend::Gateway(_) => interpret_identity_backfill_status(
+                self.request(&LibraryRequest::CancelIdentityBackfill)?,
+            ),
         }
     }
 }

@@ -296,6 +296,18 @@ User-authored metadata written as facts through ACID:
 
 ---
 
+### 16. Tiered Track Identity and Duplicate Merge (#55)
+
+**Why:** The same audio can exist as several tracks (retag, re-download, prerelease → full release), splitting play history and making playlist import ambiguous.
+
+- Tier 1 AudioHash v1 (ADR-010), tier 1b PcmHash v1 (ADR-012): explicit backfill
+- Merge rules (ADR-013): latest wins per attribute, newest blob kept, auto-merge only within the same ItemId, cross-release duplicates listed for confirmation
+- `mdma library dedup` scan + `--apply`; self-healing merge at ingest
+- AddedAt projection becomes latest-wins
+- Bandcamp hardening: no silent re-download on failed retract or unreachable library
+
+---
+
 ## Post-Beta: Party Modes (placeholder — needs design discussion)
 
 See `documents/vision/The_Art_of_Shared_Listening_-_Party_Modes_Marketing_Copy.md` for initial thinking.

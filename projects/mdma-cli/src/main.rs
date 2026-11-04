@@ -10,7 +10,11 @@ use color_eyre::Result;
 use colored::Colorize;
 use event_protocol::{from_topic_message, PlaybackEvent, TOPIC_PLAYBACK};
 use gateway_client::{AdminRequest, AdminResponse, GatewayClient};
-use library_ipc_client::{ClientError, ContentHash, InboxPath, ProtocolError, TrackInfo};
+use library_ipc_client::{
+    ArchiveEmptyReport, ArchiveListing, ClientError, ConfirmationReason, ContentHash,
+    DedupApplyReport, DedupDisposition, DedupGroup, DedupMember, InboxPath, ProtocolError,
+    TrackInfo,
+};
 use library_search::{
     parse_date_query, parse_numeric_query, parse_role_query, parse_string_query, TrackQuery,
 };
@@ -32,6 +36,7 @@ use source_protocol::{
     ImportJobStatus, ImportPhase, ImportSyncProgress, SourceError, SourceRequest, SourceResponse,
 };
 use std::path::Path;
+use storage_primitives::ByteSize;
 use track_formatter::{
     format_track_line as format_track_line_shared, render_for_user, short_hash, ViewColumn,
     ALL_COLUMNS,
@@ -880,6 +885,97 @@ enum LibraryCommands {
         #[command(subcommand)]
         command: TrackCommands,
     },
+
+    /// Compute track identity hashes (used to find duplicates)
+    Identity {
+        #[command(subcommand)]
+        command: IdentityCommands,
+    },
+
+    /// Find duplicate tracks (the same audio with different tags or files) and merge them.
+    ///
+    /// Without options, lists the groups: those that can be merged automatically (all
+    /// copies come from one purchase and none is deleted) first, then those that need
+    /// your confirmation. The newest copy is kept; its blob stays, the other copies'
+    /// facts are folded into it (latest value per attribute wins), playlists are
+    /// rewritten, and the other copies' audio files are moved to the archive (see
+    /// `mdma library archive`), not deleted.
+    ///
+    /// Needs identity hashes: run `mdma library identity backfill` first.
+    #[command(args_conflicts_with_subcommands = true)]
+    Dedup {
+        /// Merge the automatic groups (the others are only listed)
+        #[arg(long)]
+        apply: bool,
+
+        #[command(subcommand)]
+        command: Option<DedupCommands>,
+    },
+
+    /// List the files that duplicate merges moved to the archive.
+    ///
+    /// A merge never deletes the other copies' audio files and cover art: it moves
+    /// them to `archive/` in the music directory, keeping their layout. Shows how
+    /// many files the archive holds, their total size, and for each its hash, size
+    /// and when it was archived. `mdma library archive empty` deletes them for good.
+    Archive {
+        #[command(subcommand)]
+        command: Option<ArchiveCommands>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ArchiveCommands {
+    /// Permanently delete everything in the archive.
+    ///
+    /// Shows what the archive holds and asks for confirmation. This cannot be undone.
+    Empty {
+        /// Do not ask for confirmation
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DedupCommands {
+    /// Merge tracks you have confirmed to be duplicates into a winner.
+    ///
+    /// The other tracks' audio files are moved to the archive. All tracks must be in
+    /// one duplicate group as listed by `mdma library dedup`.
+    Merge {
+        /// The track to keep (prefix accepted, git-style)
+        winner: String,
+        /// The duplicates to merge into it (prefixes accepted)
+        #[arg(required = true)]
+        losers: Vec<String>,
+        /// Do not ask for confirmation
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum IdentityCommands {
+    /// Compute identity hashes for tracks that don't have them yet.
+    ///
+    /// New tracks get an AudioHash when they are ingested; this covers the tracks
+    /// already in the library. It runs as a low-priority background job in the
+    /// library service and can be re-run: tracks that already have the hash are
+    /// skipped. By default the command follows the job until it finishes.
+    Backfill {
+        /// Also compute PcmHash (decodes every lossless track; slow)
+        #[arg(long)]
+        pcm: bool,
+        /// Start the job and return immediately
+        #[arg(long)]
+        no_wait: bool,
+    },
+
+    /// Show progress of the identity-hash backfill
+    Status,
+
+    /// Stop a running identity-hash backfill (progress is kept; run backfill again to resume)
+    Cancel,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2261,6 +2357,432 @@ fn handle_library_reindex_covers(client: &LibraryBackend) -> Result<()> {
         }
     }
     Ok(())
+}
+
+const IDENTITY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Consecutive failed status polls before `identity backfill` stops following.
+const IDENTITY_POLL_MAX_FAILURES: u32 = 5;
+
+fn format_identity_status(status: &library_ipc_client::IdentityBackfillStatus) -> String {
+    use library_ipc_client::IdentityBackfillStatus as S;
+    let (label, p) = match status {
+        S::Idle => {
+            return "No identity backfill has run since the library service started".to_string()
+        }
+        S::Running(p) => ("Running", p),
+        S::Done(p) => ("Done", p),
+        S::Cancelled(p) => ("Cancelled", p),
+    };
+    let hashes = if p.include_pcm {
+        "AudioHash + PcmHash"
+    } else {
+        "AudioHash"
+    };
+    let mut line = format!("{label} ({hashes}): {}/{} tracks", p.done, p.total);
+    if p.failed > 0 {
+        line.push_str(&format!(", {} failed", p.failed));
+    }
+    if p.skipped > 0 {
+        line.push_str(&format!(", {} skipped", p.skipped));
+    }
+    if let Some(err) = &p.last_error {
+        line.push_str(&format!(" (last error: {err})"));
+    }
+    line
+}
+
+/// What to tell the user when a backfill is already running. The running job keeps
+/// its own mode, so say so when it differs from what was just asked for.
+fn identity_already_running_message(running_pcm: bool, requested_pcm: bool) -> String {
+    let mode = |pcm| {
+        if pcm {
+            "AudioHash + PcmHash"
+        } else {
+            "AudioHash"
+        }
+    };
+    let mut msg = "An identity backfill is already running; not starting another.".to_string();
+    if running_pcm != requested_pcm {
+        msg.push_str(&format!(
+            " The running job computes {}, not the requested {}.",
+            mode(running_pcm),
+            mode(requested_pcm)
+        ));
+    }
+    msg
+}
+
+fn handle_identity_backfill(client: &LibraryBackend, pcm: bool, no_wait: bool) -> Result<()> {
+    use library_ipc_client::IdentityBackfillStart;
+    match client.identity_backfill(pcm) {
+        Ok(IdentityBackfillStart::Started(p)) => {
+            println!("Identity backfill started: {} tracks to process", p.total)
+        }
+        Ok(IdentityBackfillStart::AlreadyRunning(p)) => {
+            println!("{}", identity_already_running_message(p.include_pcm, pcm))
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+    if no_wait {
+        println!("Check progress with 'mdma library identity status'");
+        return Ok(());
+    }
+
+    let mut last_printed = String::new();
+    let mut failures = 0;
+    loop {
+        match client.identity_backfill_status() {
+            Ok(s) => {
+                failures = 0;
+                let line = format_identity_status(&s);
+                if line != last_printed {
+                    println!("{}", line);
+                    last_printed = line;
+                }
+                if !matches!(s, library_ipc_client::IdentityBackfillStatus::Running(_)) {
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                failures += 1;
+                if failures >= IDENTITY_POLL_MAX_FAILURES {
+                    eprintln!(
+                        "Lost contact with the library service ({e}); \
+                         check later with 'mdma library identity status'"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        std::thread::sleep(IDENTITY_POLL_INTERVAL);
+    }
+}
+
+fn handle_identity_status(client: &LibraryBackend) -> Result<()> {
+    match client.identity_backfill_status() {
+        Ok(s) => {
+            println!("{}", format_identity_status(&s));
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn dedup_reason_text(reason: ConfirmationReason) -> &'static str {
+    match reason {
+        ConfirmationReason::DifferentItemIds => "different purchases (item ids)",
+        ConfirmationReason::NoItemId => "a copy has no item id",
+        ConfirmationReason::SoftDeleted => "a copy is deleted",
+    }
+}
+
+fn format_dedup_member(role: &str, m: &DedupMember) -> String {
+    let title = m.title.as_deref().unwrap_or("Unknown");
+    let album = m
+        .album
+        .as_deref()
+        .map(|a| format!("  [{a}]"))
+        .unwrap_or_default();
+    let added = m
+        .added
+        .as_deref()
+        .map(|a| a.get(..10).unwrap_or(a))
+        .unwrap_or("?");
+    let item = m.item_id.as_deref().unwrap_or("-");
+    let deleted = if m.deleted { "  (deleted)" } else { "" };
+    format!(
+        "  {role:<5}  {}  {title}{album}  added {added}  item {item}{deleted}",
+        short_hash(&m.hash)
+    )
+}
+
+/// The groups as the user sees them: automatic ones first, each member on a line
+/// (`keep` is the winner), and the command that confirms a group that needs it.
+fn format_dedup_groups(groups: &[DedupGroup]) -> String {
+    if groups.is_empty() {
+        return "No duplicates found".to_string();
+    }
+    let mut ordered: Vec<&DedupGroup> = groups.iter().collect();
+    ordered.sort_by_key(|g| !g.is_automatic());
+
+    let mut out = String::new();
+    for g in ordered {
+        match &g.disposition {
+            DedupDisposition::Automatic => out.push_str("Automatic (merged by --apply)\n"),
+            DedupDisposition::NeedsConfirmation { reasons } => {
+                let why: Vec<&str> = reasons.iter().map(|r| dedup_reason_text(*r)).collect();
+                out.push_str(&format!("Needs confirmation: {}\n", why.join(", ")));
+            }
+        }
+        for m in &g.members {
+            let role = if m.hash == g.winner { "keep" } else { "merge" };
+            out.push_str(&format_dedup_member(role, m));
+            out.push('\n');
+        }
+        if !g.is_automatic() {
+            let losers: Vec<&str> = g.losers().map(|m| short_hash(&m.hash)).collect();
+            out.push_str(&format!(
+                "  confirm with: mdma library dedup merge {} {}\n",
+                short_hash(&g.winner),
+                losers.join(" ")
+            ));
+        }
+        out.push('\n');
+    }
+    out.trim_end().to_string()
+}
+
+fn format_dedup_applied(r: &DedupApplyReport) -> String {
+    let mut out = format!(
+        "Merged {} track(s), archived {} blob(s)",
+        r.merged, r.blobs_archived
+    );
+    for e in &r.errors {
+        out.push_str(&format!("\n  error: {e}"));
+    }
+    out
+}
+
+/// The group that has a member starting with `partial` (a git-style hash prefix):
+/// `Ok(None)` when no group does, an error when more than one group does.
+fn find_dedup_group<'a>(
+    groups: &'a [DedupGroup],
+    partial: &str,
+) -> std::result::Result<Option<&'a DedupGroup>, String> {
+    let clean = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
+    let partial = clean(partial);
+    let mut matching = groups.iter().filter(|g| {
+        g.members
+            .iter()
+            .any(|m| clean(m.hash.as_str()).starts_with(&partial))
+    });
+    let found = matching.next();
+    if matching.next().is_some() {
+        return Err(format!("'{partial}' matches more than one duplicate group"));
+    }
+    Ok(found)
+}
+
+fn is_yes(answer: &str) -> bool {
+    matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+fn handle_dedup(client: &LibraryBackend, apply: bool) -> Result<()> {
+    let report = match client.dedup_scan(apply) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let failed = report
+        .applied
+        .as_ref()
+        .is_some_and(|a| !a.errors.is_empty());
+    if let Some(applied) = &report.applied {
+        println!("{}", format_dedup_applied(applied));
+        if !report.groups.is_empty() {
+            println!("\nLeft for your confirmation:");
+        }
+    }
+    // After `--apply` an empty list is already said by the summary.
+    if !apply || !report.groups.is_empty() {
+        println!("{}", format_dedup_groups(&report.groups));
+    }
+    if failed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn handle_dedup_merge(
+    client: &LibraryBackend,
+    winner: &str,
+    losers: &[String],
+    yes: bool,
+) -> Result<()> {
+    if !yes {
+        if let Ok(report) = client.dedup_scan(false) {
+            // Every prefix must name at most one group before anything is confirmed.
+            let mut shown = None;
+            for prefix in std::iter::once(winner).chain(losers.iter().map(String::as_str)) {
+                match find_dedup_group(&report.groups, prefix) {
+                    Ok(group) => shown = shown.or(group),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            if let Some(group) = shown {
+                println!("{}\n", format_dedup_groups(std::slice::from_ref(group)));
+            }
+        }
+        print!(
+            "Merge {} track(s) into {winner}? Their audio files are moved to the archive. [y/N] ",
+            losers.len()
+        );
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !is_yes(&answer) {
+            println!("Aborted");
+            return Ok(());
+        }
+    }
+
+    let loser_hashes: Vec<ContentHash> = losers.iter().map(ContentHash::new).collect();
+    match client.dedup_merge(&ContentHash::new(winner), &loser_hashes) {
+        Ok(report) => {
+            println!("{}", format_dedup_applied(&report));
+            if !report.errors.is_empty() {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// The archive as the user sees it: a summary line, then a line per file.
+fn format_archive_listing(l: &ArchiveListing) -> String {
+    if l.entries.is_empty() {
+        return "The archive is empty".to_string();
+    }
+    let mut out = format!(
+        "Archive: {} file(s), {}\n",
+        l.entries.len(),
+        ByteSize::new(l.total_bytes)
+    );
+    for e in &l.entries {
+        let hash = e.hash.get(..12).unwrap_or(&e.hash);
+        let at = e
+            .archived_at
+            .as_deref()
+            .map(|a| a.get(..10).unwrap_or(a))
+            .unwrap_or("?");
+        out.push_str(&format!(
+            "  {hash:<12}  {:>9}  archived {at}  {}\n",
+            ByteSize::new(e.size_bytes).to_string(),
+            e.path
+        ));
+    }
+    out.trim_end().to_string()
+}
+
+fn archive_empty_prompt(l: &ArchiveListing) -> String {
+    format!(
+        "Permanently delete {} file(s) ({}) from the archive? This cannot be undone. [y/N] ",
+        l.entries.len(),
+        ByteSize::new(l.total_bytes)
+    )
+}
+
+/// The newest `archived_at` in `l` (the listing is oldest first): what a confirmed
+/// emptying may delete, so files archived after the listing survive. A listing
+/// without any time falls back to the epoch (deletes nothing newer than "unknown").
+fn archive_cutoff(l: &ArchiveListing) -> String {
+    l.entries
+        .iter()
+        .rev()
+        .find_map(|e| e.archived_at.clone())
+        .unwrap_or_else(|| "1970-01-01T00:00:00+00:00".to_owned())
+}
+
+fn format_archive_emptied(r: &ArchiveEmptyReport) -> String {
+    let mut out = format!(
+        "Deleted {} file(s), freed {}",
+        r.files_deleted,
+        ByteSize::new(r.bytes_freed)
+    );
+    for e in &r.errors {
+        out.push_str(&format!("\n  error: {e}"));
+    }
+    out
+}
+
+fn handle_archive_list(client: &LibraryBackend) -> Result<()> {
+    match client.archive_list() {
+        Ok(l) => {
+            println!("{}", format_archive_listing(&l));
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_archive_empty(client: &LibraryBackend, yes: bool) -> Result<()> {
+    // `--yes` without a listing deletes everything; after a prompt, only what was shown.
+    let mut up_to = None;
+    if !yes {
+        let listing = match client.archive_list() {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        };
+        println!("{}\n", format_archive_listing(&listing));
+        if listing.entries.is_empty() {
+            return Ok(());
+        }
+        print!("{}", archive_empty_prompt(&listing));
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !is_yes(&answer) {
+            println!("Aborted");
+            return Ok(());
+        }
+        up_to = Some(archive_cutoff(&listing));
+    }
+
+    match client.archive_empty(up_to.as_deref()) {
+        Ok(report) => {
+            println!("{}", format_archive_emptied(&report));
+            if !report.errors.is_empty() {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_identity_cancel(client: &LibraryBackend) -> Result<()> {
+    use library_ipc_client::IdentityBackfillStatus;
+    match client.identity_backfill_cancel() {
+        Ok(IdentityBackfillStatus::Running(_)) => {
+            println!(
+                "Cancelling after the current track; progress is kept. \
+                 Run 'mdma library identity backfill' again to resume."
+            );
+            Ok(())
+        }
+        Ok(s) => {
+            println!("Nothing to cancel. {}", format_identity_status(&s));
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 // =============================================================================
@@ -5773,6 +6295,25 @@ fn main() -> Result<()> {
             let lib = connect_library(&cli);
             match command {
                 LibraryCommands::ReindexCovers => handle_library_reindex_covers(&lib),
+                LibraryCommands::Identity { command } => match command {
+                    IdentityCommands::Backfill { pcm, no_wait } => {
+                        handle_identity_backfill(&lib, *pcm, *no_wait)
+                    }
+                    IdentityCommands::Status => handle_identity_status(&lib),
+                    IdentityCommands::Cancel => handle_identity_cancel(&lib),
+                },
+                LibraryCommands::Dedup { apply, command } => match command {
+                    None => handle_dedup(&lib, *apply),
+                    Some(DedupCommands::Merge {
+                        winner,
+                        losers,
+                        yes,
+                    }) => handle_dedup_merge(&lib, winner, losers, *yes),
+                },
+                LibraryCommands::Archive { command } => match command {
+                    None => handle_archive_list(&lib),
+                    Some(ArchiveCommands::Empty { yes }) => handle_archive_empty(&lib, *yes),
+                },
                 LibraryCommands::Track { command } => match command {
                     TrackCommands::Delete { hash } => handle_track_delete(&lib, hash),
                     TrackCommands::Restore { hash } => handle_track_restore(&lib, hash),
@@ -8212,6 +8753,370 @@ mod tests {
                 command: AdminCommands::Reboot { force: false },
             } => {}
             other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    // ── identity clap parsing ─────────────────────────────────────────────────
+
+    #[test]
+    fn identity_backfill_parses_flags() {
+        for (args, want_pcm, want_no_wait) in [
+            (
+                vec!["mdma", "library", "identity", "backfill"],
+                false,
+                false,
+            ),
+            (
+                vec!["mdma", "library", "identity", "backfill", "--pcm"],
+                true,
+                false,
+            ),
+            (
+                vec![
+                    "mdma",
+                    "library",
+                    "identity",
+                    "backfill",
+                    "--pcm",
+                    "--no-wait",
+                ],
+                true,
+                true,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            match cli.command {
+                Commands::Library {
+                    command:
+                        LibraryCommands::Identity {
+                            command: IdentityCommands::Backfill { pcm, no_wait },
+                        },
+                } => assert_eq!((pcm, no_wait), (want_pcm, want_no_wait)),
+                other => panic!("unexpected command: {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn identity_status_parses() {
+        let cli = Cli::try_parse_from(["mdma", "library", "identity", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Library {
+                command: LibraryCommands::Identity {
+                    command: IdentityCommands::Status
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn already_running_message_names_the_mode_only_when_it_differs() {
+        let same = identity_already_running_message(true, true);
+        assert!(!same.contains("requested"), "{same}");
+        let differs = identity_already_running_message(false, true);
+        assert!(
+            differs.contains("computes AudioHash, not the requested AudioHash + PcmHash"),
+            "{differs}"
+        );
+    }
+
+    #[test]
+    fn identity_cancel_parses() {
+        let cli = Cli::try_parse_from(["mdma", "library", "identity", "cancel"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Library {
+                command: LibraryCommands::Identity {
+                    command: IdentityCommands::Cancel
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn identity_status_formats_progress_failures_and_skips() {
+        use library_ipc_client::{IdentityBackfillProgress, IdentityBackfillStatus};
+        let p = IdentityBackfillProgress {
+            include_pcm: true,
+            total: 10,
+            done: 10,
+            failed: 2,
+            skipped: 1,
+            last_error: Some("boom".into()),
+        };
+        assert_eq!(
+            format_identity_status(&IdentityBackfillStatus::Done(p.clone())),
+            "Done (AudioHash + PcmHash): 10/10 tracks, 2 failed, 1 skipped (last error: boom)"
+        );
+        assert!(
+            format_identity_status(&IdentityBackfillStatus::Cancelled(p)).starts_with("Cancelled")
+        );
+        assert!(format_identity_status(&IdentityBackfillStatus::Idle).starts_with("No identity"));
+    }
+
+    // ── dedup ─────────────────────────────────────────────────────────────────
+
+    fn dedup_args(args: &[&str]) -> (bool, Option<DedupCommands>) {
+        let mut argv = vec!["mdma", "library", "dedup"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(&argv)
+            .unwrap_or_else(|e| panic!("{argv:?}: {e}"))
+            .command
+        {
+            Commands::Library {
+                command: LibraryCommands::Dedup { apply, command },
+            } => (apply, command),
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dedup_lists_by_default_and_applies_with_the_flag() {
+        assert!(matches!(dedup_args(&[]), (false, None)));
+        assert!(matches!(dedup_args(&["--apply"]), (true, None)));
+    }
+
+    #[test]
+    fn dedup_merge_takes_a_winner_losers_and_yes() {
+        match dedup_args(&["merge", "abc123", "def456", "0a1b2c"]) {
+            (
+                false,
+                Some(DedupCommands::Merge {
+                    winner,
+                    losers,
+                    yes,
+                }),
+            ) => {
+                assert_eq!(winner, "abc123");
+                assert_eq!(losers, vec!["def456", "0a1b2c"]);
+                assert!(!yes);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(matches!(
+            dedup_args(&["merge", "--yes", "a", "b"]),
+            (false, Some(DedupCommands::Merge { yes: true, .. }))
+        ));
+        assert!(matches!(
+            dedup_args(&["merge", "-y", "a", "b"]),
+            (false, Some(DedupCommands::Merge { yes: true, .. }))
+        ));
+    }
+
+    #[test]
+    fn dedup_merge_needs_a_loser_and_does_not_mix_with_apply() {
+        assert!(Cli::try_parse_from(["mdma", "library", "dedup", "merge", "abc"]).is_err());
+        assert!(Cli::try_parse_from(["mdma", "library", "dedup", "merge"]).is_err());
+        assert!(
+            Cli::try_parse_from(["mdma", "library", "dedup", "--apply", "merge", "a", "b"])
+                .is_err()
+        );
+    }
+
+    fn dedup_member(hash: &str, item: Option<&str>) -> DedupMember {
+        DedupMember {
+            hash: ContentHash::new(format!("sha256:{hash}")),
+            title: Some("Espansione".into()),
+            album: Some("Part 3 & 4".into()),
+            added: Some("2026-09-01T10:00:00+00:00".into()),
+            item_id: item.map(str::to_owned),
+            deleted: false,
+        }
+    }
+
+    fn dedup_group(winner: &str, loser: &str, disposition: DedupDisposition) -> DedupGroup {
+        DedupGroup {
+            members: vec![
+                dedup_member(winner, Some("p1")),
+                dedup_member(loser, Some("p1")),
+            ],
+            winner: ContentHash::new(format!("sha256:{winner}")),
+            disposition,
+        }
+    }
+
+    #[test]
+    fn dedup_listing_puts_automatic_groups_first_and_says_how_to_confirm_the_rest() {
+        let groups = [
+            dedup_group(
+                "bbbbbbbbbbbbbbbb",
+                "cccccccccccccccc",
+                DedupDisposition::NeedsConfirmation {
+                    reasons: vec![ConfirmationReason::DifferentItemIds],
+                },
+            ),
+            dedup_group(
+                "aaaaaaaaaaaaaaaa",
+                "dddddddddddddddd",
+                DedupDisposition::Automatic,
+            ),
+        ];
+
+        let text = format_dedup_groups(&groups);
+
+        let auto = text.find("Automatic").unwrap();
+        let confirm = text
+            .find("Needs confirmation: different purchases")
+            .unwrap();
+        assert!(auto < confirm, "{text}");
+        assert!(text.contains("keep   aaaaaaaaaaaa"), "{text}");
+        assert!(text.contains("merge  dddddddddddd"), "{text}");
+        assert!(text.contains("added 2026-09-01"), "{text}");
+        assert!(
+            text.contains("confirm with: mdma library dedup merge bbbbbbbbbbbb cccccccccccc"),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("confirm with").count(),
+            1,
+            "automatic groups need no confirmation: {text}"
+        );
+        assert_eq!(format_dedup_groups(&[]), "No duplicates found");
+    }
+
+    #[test]
+    fn dedup_applied_summary_lists_errors() {
+        let r = DedupApplyReport {
+            merged: 2,
+            blobs_archived: 1,
+            errors: vec!["boom".into()],
+        };
+        assert_eq!(
+            format_dedup_applied(&r),
+            "Merged 2 track(s), archived 1 blob(s)\n  error: boom"
+        );
+    }
+
+    // ── archive ───────────────────────────────────────────────────────────────
+
+    fn archive_command(args: &[&str]) -> Option<ArchiveCommands> {
+        let mut argv = vec!["mdma", "library", "archive"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(&argv)
+            .unwrap_or_else(|e| panic!("{argv:?}: {e}"))
+            .command
+        {
+            Commands::Library {
+                command: LibraryCommands::Archive { command },
+            } => command,
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn archive_lists_by_default_and_empties_with_a_subcommand() {
+        assert!(archive_command(&[]).is_none());
+        assert!(matches!(
+            archive_command(&["empty"]),
+            Some(ArchiveCommands::Empty { yes: false })
+        ));
+        assert!(matches!(
+            archive_command(&["empty", "--yes"]),
+            Some(ArchiveCommands::Empty { yes: true })
+        ));
+        assert!(matches!(
+            archive_command(&["empty", "-y"]),
+            Some(ArchiveCommands::Empty { yes: true })
+        ));
+        assert!(Cli::try_parse_from(["mdma", "library", "archive", "empty", "x"]).is_err());
+        assert!(Cli::try_parse_from(["mdma", "library", "archive", "--yes"]).is_err());
+    }
+
+    fn archive_listing_of_two() -> ArchiveListing {
+        let entry = |hash: &str, size: u64, at: &str| library_ipc_client::ArchiveEntry {
+            path: format!("blobs/{}/{hash}.flac", &hash[..2]),
+            hash: hash.into(),
+            size_bytes: size,
+            archived_at: Some(at.into()),
+        };
+        ArchiveListing {
+            entries: vec![
+                entry("abcdef0123456789", 3_000_000, "2026-09-01T10:00:00+00:00"),
+                entry("fedcba98", 2_000_000, "2026-09-02T10:00:00+00:00"),
+            ],
+            total_bytes: 5_000_000,
+        }
+    }
+
+    #[test]
+    fn archive_listing_shows_count_total_and_each_entry() {
+        let text = format_archive_listing(&archive_listing_of_two());
+        assert!(text.starts_with("Archive: 2 file(s), 5 MB\n"), "{text}");
+        assert!(text.contains("abcdef012345  "), "{text}");
+        assert!(text.contains("3 MB"), "{text}");
+        assert!(text.contains("archived 2026-09-01"), "{text}");
+        assert!(text.contains("blobs/ab/abcdef0123456789.flac"), "{text}");
+        assert!(text.contains("fedcba98  "), "{text}");
+        assert_eq!(
+            format_archive_listing(&ArchiveListing::default()),
+            "The archive is empty"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_emptying_is_cut_off_at_the_newest_listed_time() {
+        assert_eq!(
+            archive_cutoff(&archive_listing_of_two()),
+            "2026-09-02T10:00:00+00:00"
+        );
+        assert_eq!(
+            archive_cutoff(&ArchiveListing::default()),
+            "1970-01-01T00:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn archive_empty_asks_with_the_count_and_size_and_reports_the_result() {
+        assert_eq!(
+            archive_empty_prompt(&archive_listing_of_two()),
+            "Permanently delete 2 file(s) (5 MB) from the archive? This cannot be undone. [y/N] "
+        );
+        let r = ArchiveEmptyReport {
+            files_deleted: 2,
+            bytes_freed: 5_000_000,
+            errors: vec!["boom".into()],
+        };
+        assert_eq!(
+            format_archive_emptied(&r),
+            "Deleted 2 file(s), freed 5 MB\n  error: boom"
+        );
+    }
+
+    #[test]
+    fn dedup_group_is_found_by_a_hash_prefix_with_or_without_sha256() {
+        let groups = [dedup_group(
+            "abcdef0123",
+            "fedcba9876",
+            DedupDisposition::Automatic,
+        )];
+        assert!(find_dedup_group(&groups, "abcd").unwrap().is_some());
+        assert!(find_dedup_group(&groups, "sha256:FEDC").unwrap().is_some());
+        assert!(find_dedup_group(&groups, "0000").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_hash_prefix_that_matches_two_groups_is_an_error() {
+        let groups = [
+            dedup_group("abcdef0123", "fedcba9876", DedupDisposition::Automatic),
+            dedup_group("abcd001122", "112233aabb", DedupDisposition::Automatic),
+        ];
+        assert!(find_dedup_group(&groups, "abcd").is_err());
+        // Long enough to tell them apart, and a prefix of two members of one group.
+        assert_eq!(
+            find_dedup_group(&groups, "abcdef").unwrap().unwrap().winner,
+            groups[0].winner
+        );
+        assert!(find_dedup_group(&groups, "112").unwrap().is_some());
+    }
+
+    #[test]
+    fn only_yes_confirms_a_merge() {
+        for yes in ["y", "Y", "yes", " YES \n"] {
+            assert!(is_yes(yes), "{yes:?}");
+        }
+        for no in ["", "n", "no", "maybe", "\n"] {
+            assert!(!is_yes(no), "{no:?}");
         }
     }
 
