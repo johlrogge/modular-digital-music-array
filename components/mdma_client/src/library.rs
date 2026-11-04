@@ -2,8 +2,9 @@
 
 use crate::error::map_gw_to_lib_error;
 use library_ipc_client::{
-    content_to_hashes, interpret_identity_backfill, interpret_identity_backfill_status,
-    ClientError, ContentHash, FactType, IdentityBackfillStart, IdentityBackfillStatus, InboxPath,
+    content_to_hashes, interpret_dedup_merged, interpret_dedup_scan, interpret_identity_backfill,
+    interpret_identity_backfill_status, ClientError, ContentHash, DedupApplyReport,
+    DedupScanReport, FactType, IdentityBackfillStart, IdentityBackfillStatus, InboxPath,
     IngestAllItem, IngestResult, IngestSource, LibraryClient, LibraryRequest, LibraryResponse,
     MusicValue, OrphanInfo, PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
 };
@@ -345,6 +346,33 @@ impl LibraryBackend {
             LibraryBackend::Direct(c) => c.track_orphans(),
             LibraryBackend::Gateway(_) => {
                 interpret_orphans_list(self.request(&LibraryRequest::TrackOrphans)?)
+            }
+        }
+    }
+
+    /// Find duplicate tracks; with `apply`, merge the automatic groups.
+    pub fn dedup_scan(&self, apply: bool) -> Result<DedupScanReport, ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.dedup_scan(apply),
+            LibraryBackend::Gateway(_) => {
+                interpret_dedup_scan(self.request(&LibraryRequest::DedupScan { apply })?)
+            }
+        }
+    }
+
+    /// Merge `losers` into `winner` (a user-confirmed duplicate group).
+    pub fn dedup_merge(
+        &self,
+        winner: &ContentHash,
+        losers: &[ContentHash],
+    ) -> Result<DedupApplyReport, ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.dedup_merge(winner, losers),
+            LibraryBackend::Gateway(_) => {
+                interpret_dedup_merged(self.request(&LibraryRequest::DedupMerge {
+                    winner: winner.clone(),
+                    losers: losers.to_vec(),
+                })?)
             }
         }
     }

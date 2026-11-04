@@ -62,7 +62,8 @@ pub struct LibraryService {
     /// (the fact subscriber or a writer that just wrote to ACID).
     ///
     /// Lock order: `retire_gate` -> `cursor` -> `tracks` -> `fact_index` ->
-    /// `content_hashes`. `identity_backfill` is independent: take it alone and never
+    /// `content_hashes`; `event_cursor` -> `tracks` -> `play_events`
+    /// (`refresh_event_timestamps`). `identity_backfill` is independent: take it alone and never
     /// together with another lock in this list.
     /// No projection lock may be held while calling `catch_up`.
     cursor: Mutex<Option<String>>,
@@ -76,6 +77,12 @@ pub struct LibraryService {
     /// The assumption is that such retractions never occur in production.  If they
     /// become meaningful, a full scan from None would be required.
     event_cursor: Mutex<Option<String>>,
+    /// Latest start and stop recorded under every entity key (normalised hash) seen
+    /// by `refresh_event_timestamps`, retired entities included: a track's play
+    /// history is its own plus that of every hash it replaces (ADR-013).
+    ///
+    /// Lock order: taken after `tracks`, alone or inside it; nothing is taken while holding it.
+    play_events: Mutex<HashMap<String, PlayTimes>>,
     /// Address of the ACID request socket (used by background subscriber thread).
     acid_socket: String,
     /// Address of the ACID events pub/sub socket.
@@ -95,26 +102,71 @@ pub struct LibraryService {
     /// retract set and would leave the entity alive on that fact alone (identity
     /// facts are provenance-tracked).
     ///
-    /// Every retire path (`retract_all_entity_facts`, and the phase-2 duplicate merge
-    /// of ADR-013) must hold it for its whole body, catch-up included. Every
+    /// Every retire path must hold it for its whole body, catch-up included:
+    /// `retract_all_entity_facts_locked` runs under it, and `merge_into` (ADR-013)
+    /// holds it from its check that winner and loser are live until the loser is
+    /// retired, i.e. across the winner's `Replaces` write too, so a winner retired
+    /// meanwhile is refused rather than resurrected by that write. The mutex is not
+    /// reentrant: a holder retires through `retract_all_entity_facts_locked`. Every
     /// out-of-band writer that targets entities chosen from a snapshot (the identity
     /// backfill) must hold it from its liveness re-check until its write returns.
+    /// The guard (`MutexGuard<RetireToken>`) is passed to the functions that need
+    /// the gate, so the compiler proves their callers hold this mutex.
     /// Lock order: before `cursor`; see there.
-    retire_gate: Mutex<()>,
+    retire_gate: Mutex<gate::RetireToken>,
     /// Test-only: called by the backfill worker after hashing a track and before
     /// the liveness check + write, to inject a concurrent change at that point.
     #[cfg(test)]
     identity_write_hook: Mutex<Option<IdentityWriteHook>>,
-    /// Test-only: called inside `retract_all_entity_facts` right after it has read
+    /// Test-only: called inside `retract_all_entity_facts_locked` (under `retire_gate`) right after it has read
     /// the entity's facts and before it retracts them.
     #[cfg(test)]
     retire_mid_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Test-only: called by `merge_into` after its checks and before it writes the
+    /// winner's facts, to inject a concurrent change at that point.
+    #[cfg(test)]
+    merge_pre_write_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 #[cfg(test)]
 type IdentityWriteHook = Box<dyn Fn(&LibraryService, &ContentHash) + Send + Sync>;
 
 mod backfill;
+mod dedup;
+#[cfg(test)]
+mod dedup_tests;
+
+/// The payload of `retire_gate`. It can only be made by `new_gate`, so a
+/// `MutexGuard<RetireToken>` is proof of holding the real gate.
+mod gate {
+    use std::sync::Mutex;
+
+    pub(super) struct RetireToken(());
+
+    pub(super) fn new_gate() -> Mutex<RetireToken> {
+        Mutex::new(RetireToken(()))
+    }
+}
+use gate::RetireToken;
+
+/// Proof that the caller holds `retire_gate`.
+type RetireGuard<'a> = std::sync::MutexGuard<'a, RetireToken>;
+
+/// The files a retired track owned, relative to `music_dir`. Captured before the
+/// retire removes the track's index entry.
+#[derive(Debug, Default)]
+struct RetiredFiles {
+    blob: Option<PathBuf>,
+    cover_art: Option<PathBuf>,
+}
+
+/// What `merge_into` did.
+#[derive(Debug)]
+struct MergeOutcome {
+    playlists_rewritten: usize,
+    /// The loser's files, to be removed once the merge is durable.
+    retired: RetiredFiles,
+}
 
 /// Write handle given to the closure of `write_batch_and_project_with`; the only
 /// thing it can do is write facts.
@@ -286,6 +338,16 @@ fn blob_path_for(content_hash: &str, file_path: &std::path::Path) -> Option<Path
 }
 
 impl IndexedTrackInfo {
+    /// Every ItemId this track holds. A confirmed merge unions them, so anything that
+    /// matches on an ItemId must use this set, never the last-wins scalar `item_id`
+    /// (which is for display).
+    fn item_ids(&self) -> impl Iterator<Item = &str> {
+        self.provenance.iter().filter_map(|(v, _)| match v {
+            MusicValue::ItemId(id) => Some(id.as_str()),
+            _ => None,
+        })
+    }
+
     /// Returns true if this track is hidden from default views.
     fn is_hidden(&self) -> bool {
         self.deleted_at.is_some()
@@ -812,6 +874,80 @@ fn update_if_more_recent(
     }
 }
 
+/// Normalised form of a content hash for comparisons: no `sha256:` prefix, lowercase.
+fn hash_key(h: &str) -> String {
+    h.strip_prefix("sha256:").unwrap_or(h).to_lowercase()
+}
+
+/// One line of an entity's fact stream, or `None` for a line that is not a fact.
+fn parse_fact_line(
+    line: &str,
+) -> Option<stainless_facts::Fact<ContentHash, MusicValue, music_facts::FactSource>> {
+    serde_json::from_str(line).ok()
+}
+
+/// Latest start and stop recorded under one entity key.
+#[derive(Clone, Copy, Default)]
+struct PlayTimes {
+    started: Option<chrono::DateTime<chrono::Utc>>,
+    stopped: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// `key` followed by every hash it transitively replaces. `replaces` maps a live
+/// track's key to the keys it replaces; a cycle ends the walk.
+fn replaces_lineage(key: &str, replaces: &HashMap<String, Vec<String>>) -> Vec<String> {
+    let mut seen = vec![key.to_owned()];
+    let mut queue = vec![key.to_owned()];
+    while let Some(k) = queue.pop() {
+        for replaced in replaces.get(&k).into_iter().flatten() {
+            if !seen.contains(replaced) {
+                seen.push(replaced.clone());
+                queue.push(replaced.clone());
+            }
+        }
+    }
+    seen
+}
+
+/// The shortest key length that is a full hash, not one of the short forms.
+const SHORT_KEY_MAX: usize = 12;
+
+/// For every 8- and 12-character prefix, how many of `full_keys` start with it.
+fn short_prefix_counts<'a>(full_keys: impl Iterator<Item = &'a str>) -> HashMap<&'a str, usize> {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for key in full_keys.filter(|k| k.len() > SHORT_KEY_MAX) {
+        for prefix in [key.get(..8), key.get(..12)].into_iter().flatten() {
+            *counts.entry(prefix).or_default() += 1;
+        }
+    }
+    counts
+}
+
+/// The play events recorded for `key`: under the full hash, and under the 12- and
+/// 8-character short forms older playback wrote (#86). A short form counts only when
+/// `key` is the single full key it is a prefix of (`prefix_counts`), the same rule
+/// `resolve_hash` applies: an ambiguous short key belongs to nobody.
+fn play_times_for<'a>(
+    events: &'a HashMap<String, PlayTimes>,
+    key: &str,
+    prefix_counts: &HashMap<&str, usize>,
+) -> Vec<&'a PlayTimes> {
+    let shorts = if key.len() > SHORT_KEY_MAX {
+        [key.get(..12), key.get(..8)]
+    } else {
+        [None, None]
+    };
+    std::iter::once(key)
+        .chain(
+            shorts
+                .into_iter()
+                .flatten()
+                .filter(|k| prefix_counts.get(k) == Some(&1)),
+        )
+        .filter_map(|k| events.get(k))
+        .collect()
+}
+
 /// Wrap an ACID client failure as a protocol-level internal error.
 fn acid_error(e: acid_client::ClientError) -> ProtocolError {
     ProtocolError::Internal {
@@ -913,16 +1049,19 @@ impl LibraryService {
             content_hashes: Mutex::new(loaded.content_hashes),
             cursor: Mutex::new(final_cursor),
             event_cursor: Mutex::new(None),
+            play_events: Mutex::new(HashMap::new()),
             acid_socket: acid_socket.to_string(),
             acid_events_socket: acid_events_socket.to_string(),
             self_ref: self_ref.clone(),
             identity_backfill: Mutex::new(crate::ipc::IdentityBackfillStatus::Idle),
             identity_cancel: std::sync::atomic::AtomicBool::new(false),
-            retire_gate: Mutex::new(()),
+            retire_gate: gate::new_gate(),
             #[cfg(test)]
             identity_write_hook: Mutex::new(None),
             #[cfg(test)]
             retire_mid_hook: Mutex::new(None),
+            #[cfg(test)]
+            merge_pre_write_hook: Mutex::new(None),
         });
 
         // Backfill Format facts for tracks that don't have one yet
@@ -1952,11 +2091,19 @@ impl LibraryService {
             } => self.handle_track_replace(&old_hash, &new_file_path),
 
             LibraryRequest::TrackOrphans => self.handle_track_orphans(),
+
+            LibraryRequest::DedupScan { apply } => {
+                LibraryResponse::DedupScan(self.dedup_scan(apply))
+            }
+
+            LibraryRequest::DedupMerge { winner, losers } => {
+                self.dedup_merge_request(&winner, &losers)
+            }
         }
     }
 
     /// Scan the in-memory track index and return every ContentHash whose
-    /// `item_id` field matches `item_id`.
+    /// ItemId set contains `item_id` (a merged track holds several).
     ///
     /// Linear scan over the in-memory index — acceptable at current library scale.
     fn content_hashes_for_item_id(&self, item_id: &str) -> Vec<ContentHash> {
@@ -1964,7 +2111,7 @@ impl LibraryService {
             .lock()
             .unwrap()
             .iter()
-            .filter(|t| t.item_id.as_deref() == Some(item_id))
+            .filter(|t| t.item_ids().any(|id| id == item_id))
             .map(|t| t.content_hash.clone())
             .collect()
     }
@@ -1984,7 +2131,8 @@ impl LibraryService {
     ///
     /// Retire safety: this retracts only facts with the given source and does not
     /// take `retire_gate`. It must never be what empties an entity; any path that can
-    /// leave an entity with no live facts has to go through `retract_all_entity_facts`.
+    /// leave an entity with no live facts has to go through
+    /// `retract_all_entity_facts_locked` under `retire_gate`.
     fn retract_source_facts(&self, item_id: &str, source_name: &str) -> LibraryResponse {
         use music_facts::FactSource;
 
@@ -2016,12 +2164,7 @@ impl LibraryService {
 
             let retractable: Vec<(MusicValue, FactSource)> = lines
                 .iter()
-                .filter_map(|line| {
-                    serde_json::from_str::<
-                        stainless_facts::Fact<ContentHash, MusicValue, FactSource>,
-                    >(line)
-                    .ok()
-                })
+                .filter_map(|line| parse_fact_line(line))
                 .filter(|f| {
                     f.operation() == stainless_facts::Operation::Assert
                         && origin_matches_source_name(&f.source().origin, source_name)
@@ -2107,11 +2250,7 @@ impl LibraryService {
         let fact = MusicValue::Deleted {
             timestamp: chrono::Utc::now(),
         };
-        let source = music_facts::FactSource::new(
-            "mdma",
-            env!("CARGO_PKG_VERSION"),
-            music_facts::FactOrigin::User,
-        );
+        let source = dedup::user_fact_source();
         match self.write_and_project(&full_hash, &[(fact, source)]) {
             Ok(_) => LibraryResponse::TrackDeleted,
             Err(e) => LibraryResponse::Error(acid_error(e)),
@@ -2145,11 +2284,7 @@ impl LibraryService {
         };
 
         let fact = MusicValue::Deleted { timestamp };
-        let source = music_facts::FactSource::new(
-            "mdma",
-            env!("CARGO_PKG_VERSION"),
-            music_facts::FactOrigin::User,
-        );
+        let source = dedup::user_fact_source();
         match self.retract_and_project(&full_hash, &[(fact, source)]) {
             Ok(_) => LibraryResponse::TrackRestored,
             Err(e) => LibraryResponse::Error(acid_error(e)),
@@ -2165,13 +2300,15 @@ impl LibraryService {
     /// The projection then drops the entry so `resolve_hash` returns TrackNotFound.
     ///
     /// Returns `Ok(retracted_count)` on success, or an error string on ACID failure.
-    pub(crate) fn retract_all_entity_facts(&self, hash: &ContentHash) -> Result<usize, String> {
-        use music_facts::FactSource;
-
-        // Hold the gate for the whole retire: read, retract and the catch-up inside
-        // `retract_and_project`. See `retire_gate`.
-        let _gate = self.retire_gate.lock().unwrap();
-
+    ///
+    /// The caller must hold `retire_gate` for the whole retire (read, retract and the
+    /// catch-up inside `retract_and_project`); the guard is the proof. The mutex is
+    /// not reentrant. Production retires only through `merge_into`.
+    fn retract_all_entity_facts_locked(
+        &self,
+        _gate: &RetireGuard<'_>,
+        hash: &ContentHash,
+    ) -> Result<usize, String> {
         // Read all fact lines for this entity from ACID
         let lines = self
             .acid_client
@@ -2183,19 +2320,13 @@ impl LibraryService {
             hook();
         }
 
-        // Collect all (value, source) pairs from Assert operations.
-        // We retract exactly the asserted (value, source) pairs so the provenance
-        // retraction logic in apply_fact_to_track correctly matches and removes them.
-        let to_retract: Vec<(MusicValue, FactSource)> = lines
-            .iter()
-            .filter_map(|line| {
-                serde_json::from_str::<stainless_facts::Fact<ContentHash, MusicValue, FactSource>>(
-                    line,
-                )
-                .ok()
-            })
-            .filter(|f| f.operation() == stainless_facts::Operation::Assert)
-            .map(|f| (f.value().clone(), f.source().clone()))
+        // Collect the (value, source) pairs still asserted. We retract exactly those
+        // so the provenance retraction logic in apply_fact_to_track correctly
+        // matches and removes them; pairs an earlier retraction cancelled are not
+        // retracted again.
+        let to_retract: Vec<(MusicValue, music_facts::FactSource)> = dedup::live_facts(&lines)
+            .into_iter()
+            .map(|f| (f.value, f.source))
             .collect();
 
         if to_retract.is_empty() {
@@ -2235,12 +2366,6 @@ impl LibraryService {
             Err(e) => return LibraryResponse::Error(e),
         };
 
-        // GATHER BEFORE RETRACT: collect all Replaces(X) facts from old_hash's
-        // in-memory provenance NOW, before retract_all_entity_facts removes the entry.
-        // These ancestors will be forward-inherited onto the new track so that a
-        // playlist pointing at any generation in the chain finds the current track.
-        let inherited_ancestors = self.gather_ancestor_replaces(&old_full);
-
         // Ingest the new file
         let new_path = std::path::PathBuf::from(new_file_path);
         let new_hash = match self.ingest_file_internal(&new_path, None) {
@@ -2252,70 +2377,183 @@ impl LibraryService {
             }
         };
 
-        if let Err(e) = self.assert_replaces_facts(&new_hash, &old_full, inherited_ancestors) {
-            return LibraryResponse::Error(e);
-        }
-
-        // Hard-retract ALL facts for the old hash so it stops resolving.
-        // This is the crux: after this, resolve_hash(old_hash) → TrackNotFound.
-        if let Err(e) = self.retract_all_entity_facts(&old_full) {
-            return LibraryResponse::Error(ProtocolError::Internal {
-                message: format!("Failed to retract old track facts: {}", e),
-            });
-        }
-
-        // Rewrite playlists server-side (eager: old → new)
-        let playlists_rewritten = self.rewrite_playlists_replace_hash(&old_full, &new_hash);
-
-        LibraryResponse::TrackReplaced {
-            new_hash,
-            playlists_rewritten,
+        let source = dedup::user_fact_source();
+        match self.merge_into(&new_hash, &old_full, &source, Vec::new()) {
+            Ok(outcome) => LibraryResponse::TrackReplaced {
+                new_hash,
+                playlists_rewritten: outcome.playlists_rewritten,
+            },
+            Err(e) => LibraryResponse::Error(e),
         }
     }
 
-    /// Assert `Replaces(old_hash)` plus all forward-inherited ancestors on the NEW track.
+    /// Retire `loser` into `winner`, both existing tracks (ADR-004 hard replace,
+    /// generalised by ADR-013). In this order:
     ///
-    /// Dedup: the new track itself is never in the ancestor set (it was just ingested),
-    /// but two independent chains could theoretically produce duplicates — deduplicate
-    /// by hash string to avoid asserting the same Replaces fact twice.
+    /// Steps 1 to 3 run under the retire gate, taken once: both tracks must still be
+    /// live (else the merge is refused), and nothing in the body takes the gate again.
+    ///
+    /// 1. GATHER BEFORE RETRACT: the loser's `Replaces(X)` ancestors and the files it
+    ///    owns are read from the index now, before retracting removes the entry.
+    /// 2. The winner is asserted `carry`, `Replaces(loser)` and the forward-inherited
+    ///    ancestors (`write_merge_facts`).
+    /// 3. `retract_all_entity_facts_locked(loser)` hard-retracts the loser so it
+    ///    stops resolving. A retire that fails leaves the loser alive and the whole
+    ///    merge safely repeatable.
+    /// 4. Playlists are rewritten loser -> winner.
+    /// 5. Play history is re-projected, so the winner shows the loser's plays.
+    ///
+    /// Files are not touched: the caller removes `MergeOutcome::retired` once this
+    /// returned `Ok`, i.e. once the facts are durable. `source` is the `FactSource`
+    /// of `Replaces(loser)`.
+    fn merge_into(
+        &self,
+        winner: &ContentHash,
+        loser: &ContentHash,
+        source: &music_facts::FactSource,
+        carry: Vec<(MusicValue, music_facts::FactSource)>,
+    ) -> Result<MergeOutcome, ProtocolError> {
+        if hash_key(winner.as_str()) == hash_key(loser.as_str()) {
+            return Err(ProtocolError::Internal {
+                message: format!("cannot merge {winner} into itself"),
+            });
+        }
+
+        #[cfg(test)]
+        if let Some(hook) = self.merge_pre_write_hook.lock().unwrap().as_ref() {
+            hook();
+        }
+
+        let retired = {
+            // Held from the liveness check to the end of the retire, so neither
+            // track can be retired in between and `Replaces` cannot resurrect a
+            // winner that is gone. See `retire_gate`.
+            let gate = self.retire_gate.lock().unwrap();
+            for track in [winner, loser] {
+                if !self.is_live(track) {
+                    return Err(ProtocolError::Internal {
+                        message: format!("{track} is no longer in the library"),
+                    });
+                }
+            }
+
+            // Playlists pointing at any generation of the chain must find the winner.
+            let ancestors = self.ancestor_replaces(loser);
+            let retired = self.retired_files(loser);
+
+            self.write_merge_facts(&gate, winner, loser, ancestors, source, carry)?;
+
+            // The crux: after this, resolve_hash(loser) -> TrackNotFound.
+            self.retract_all_entity_facts_locked(&gate, loser)
+                .map_err(|e| ProtocolError::Internal {
+                    message: format!("Failed to retract old track facts: {}", e),
+                })?;
+            retired
+        };
+
+        // Neither of these takes the gate (it is not reentrant), and neither needs it.
+        let playlists_rewritten = self.rewrite_playlists_replace_hash(loser, winner);
+        self.refresh_event_timestamps();
+
+        Ok(MergeOutcome {
+            playlists_rewritten,
+            retired,
+        })
+    }
+
+    /// Assert `carry`, `Replaces(loser)` and the loser's forward-inherited ancestors
+    /// on the winner, in one write.
+    ///
+    /// The winner never replaces itself (a revert A -> B -> A has A among B's
+    /// ancestors), and a `Replaces` it already holds is not asserted again, so
+    /// repeating a merge that crashed before its retire adds nothing twice.
+    fn write_merge_facts(
+        &self,
+        _gate: &RetireGuard<'_>,
+        winner: &ContentHash,
+        loser: &ContentHash,
+        ancestors: Vec<(ContentHash, music_facts::FactSource)>,
+        source: &music_facts::FactSource,
+        carry: Vec<(MusicValue, music_facts::FactSource)>,
+    ) -> Result<(), ProtocolError> {
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(hash_key(winner.as_str()));
+        {
+            let tracks = self.tracks.lock().unwrap();
+            if let Some(entry) = tracks
+                .iter()
+                .find(|t| hash_key(t.content_hash.as_str()) == hash_key(winner.as_str()))
+            {
+                for (v, _) in &entry.provenance {
+                    if let MusicValue::Replaces(held) = v {
+                        seen.insert(hash_key(held.as_str()));
+                    }
+                }
+            }
+        }
+
+        let mut facts = carry;
+        // Replaces(loser) first, then every ancestor the loser had replaced.
+        let links = std::iter::once((loser.clone(), source.clone())).chain(ancestors);
+        for (replaced, replaced_source) in links {
+            if seen.insert(hash_key(replaced.as_str())) {
+                facts.push((MusicValue::Replaces(replaced), replaced_source));
+            }
+        }
+        if facts.is_empty() {
+            return Ok(());
+        }
+
+        // Read-your-writes (issue #44): the write is projected immediately, through
+        // the same path the subscriber uses, so back-to-back replaces see each other.
+        self.write_and_project(winner, &facts)
+            .map(|_| ())
+            .map_err(|e| ProtocolError::Internal {
+                message: format!("Failed to assert Replaces facts: {}", e),
+            })
+    }
+
+    /// `write_merge_facts` for a plain ADR-004 replace: no carried facts, and every
+    /// link under the same user source.
+    #[cfg(test)]
     fn assert_replaces_facts(
         &self,
         new_hash: &ContentHash,
         old_full: &ContentHash,
         inherited_ancestors: Vec<ContentHash>,
     ) -> Result<(), ProtocolError> {
-        let source = music_facts::FactSource::new(
-            "mdma",
-            env!("CARGO_PKG_VERSION"),
-            music_facts::FactOrigin::User,
-        );
-        let mut seen_replaces: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut replaces_facts: Vec<(MusicValue, music_facts::FactSource)> = Vec::new();
+        let source = dedup::user_fact_source();
+        let ancestors = inherited_ancestors
+            .into_iter()
+            .map(|h| (h, source.clone()))
+            .collect();
+        let gate = self.retire_gate.lock().unwrap();
+        self.write_merge_facts(&gate, new_hash, old_full, ancestors, &source, Vec::new())
+    }
 
-        // A track never replaces itself: on a revert (A -> B -> A) the new track A
-        // is among B's inherited ancestors and must be skipped.
-        seen_replaces.insert(new_hash.as_str().to_lowercase());
+    /// Whether `hash` is an indexed track (hidden ones included).
+    fn is_live(&self, hash: &ContentHash) -> bool {
+        let key = hash_key(hash.as_str());
+        self.tracks
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|t| hash_key(t.content_hash.as_str()) == key)
+    }
 
-        // Always assert Replaces(old_hash) first
-        seen_replaces.insert(old_full.as_str().to_lowercase());
-        replaces_facts.push((MusicValue::Replaces(old_full.clone()), source.clone()));
-
-        // Then forward-inherit every ancestor that old_hash previously replaced
-        for ancestor in inherited_ancestors {
-            let key = ancestor.as_str().to_lowercase();
-            if seen_replaces.insert(key) {
-                replaces_facts.push((MusicValue::Replaces(ancestor), source.clone()));
-            }
-        }
-
-        // Read-your-writes (issue #44): the write is projected immediately, through
-        // the same path the subscriber uses, so back-to-back replaces see each other.
-        self.write_and_project(new_hash, &replaces_facts)
-            .map_err(|e| ProtocolError::Internal {
-                message: format!("Failed to assert Replaces facts: {}", e),
-            })?;
-
-        Ok(())
+    /// The blob and cover art of the indexed track `hash` (paths relative to `music_dir`).
+    fn retired_files(&self, hash: &ContentHash) -> RetiredFiles {
+        let key = hash_key(hash.as_str());
+        self.tracks
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| hash_key(t.content_hash.as_str()) == key)
+            .map(|t| RetiredFiles {
+                blob: (!t.blob_path.as_os_str().is_empty()).then(|| t.blob_path.clone()),
+                cover_art: t.cover_art_path.clone(),
+            })
+            .unwrap_or_default()
     }
 
     /// Rewrite all playlists: replace every line whose first token matches old_hash with new_hash.
@@ -2331,11 +2569,7 @@ impl LibraryService {
         use std::io::Write;
 
         let playlists_dir = self.metadata_dir.join("playlists");
-        let old_clean = old_hash
-            .as_str()
-            .strip_prefix("sha256:")
-            .unwrap_or(old_hash.as_str())
-            .to_lowercase();
+        let old_clean = hash_key(old_hash.as_str());
         let new_token = new_hash.as_str().to_string();
 
         let entries = match std::fs::read_dir(&playlists_dir) {
@@ -2362,10 +2596,7 @@ impl LibraryService {
                 .map(|line| {
                     // First whitespace-delimited field is the hash token
                     let token = line.split_whitespace().next().unwrap_or("");
-                    let token_clean = token
-                        .strip_prefix("sha256:")
-                        .unwrap_or(token)
-                        .to_lowercase();
+                    let token_clean = hash_key(token);
 
                     // A line matches if the stored token is a prefix of the old full hash,
                     // or the full hash starts with the stored token (short-hash support)
@@ -2417,7 +2648,7 @@ impl LibraryService {
     ///
     /// - `OrphanReason::NoLiveFacts` — a blob exists on disk whose content hash
     ///   has no live entry in the in-memory index.  This is the hard-replace
-    ///   leftover: `retract_all_entity_facts` removed the index entry but did
+    ///   leftover: `retract_all_entity_facts_locked` removed the index entry but did
     ///   not delete the blob file.  Primary GC candidate.
     ///
     /// A live (not hidden) track is never an orphan, even if a blob is present.
@@ -2766,22 +2997,28 @@ impl LibraryService {
     /// stream is scanned.  Subsequent calls only read new facts appended since the
     /// previous refresh (incremental / delta reads).
     ///
-    /// NOTE: retractions of TrackStarted/TrackStopped are not handled.  The assumption
-    /// is that such retractions never occur in production.  If they become meaningful a
-    /// full scan from cursor=None would be required instead of the incremental approach.
+    /// Only assertions are plays. A retraction is not one: retiring a track retracts
+    /// its play events too (with the retraction's own, later, timestamp), and those
+    /// must neither count as plays nor erase the originals. A user retracting a
+    /// single play event is not handled; it never happens in production.
+    ///
+    /// A track's play history includes the plays recorded on every hash it
+    /// transitively replaces, with their original timestamps (ADR-013), so a merged
+    /// or replaced track keeps its predecessors' history. Events keyed by the short
+    /// hashes older playback wrote (#86) resolve to the full hash. Every event seen
+    /// is remembered in `play_events`, whether or not its entity is still live, and
+    /// the lineage is re-applied on every refresh so a `Replaces` asserted after the
+    /// events were read takes effect too.
     fn refresh_event_timestamps(&self) {
         const PAGE_SIZE: usize = 10_000;
 
-        // Take the current cursor position before we start reading.
-        let start_cursor = self.event_cursor.lock().unwrap().clone();
-        let mut current_cursor = start_cursor;
+        // Held for the whole refresh, like `cursor` in `catch_up_with`: concurrent
+        // refreshes must not read (and merge) the same lines twice.
+        let mut event_cursor = self.event_cursor.lock().unwrap();
+        let mut current_cursor = event_cursor.clone();
 
-        // Collect the most-recent TrackStarted/TrackStopped timestamp per content hash.
-        // We build an intermediate map so the tracks lock is held only at the end.
-        let mut last_started: HashMap<String, Option<chrono::DateTime<chrono::Utc>>> =
-            HashMap::new();
-        let mut last_stopped: HashMap<String, Option<chrono::DateTime<chrono::Utc>>> =
-            HashMap::new();
+        // The play events since the last refresh, per normalised entity key.
+        let mut delta: HashMap<String, PlayTimes> = HashMap::new();
 
         loop {
             let chunk = match self
@@ -2799,27 +3036,20 @@ impl LibraryService {
             };
 
             for line in &chunk.lines {
-                let fact = match serde_json::from_str::<
-                    stainless_facts::Fact<ContentHash, MusicValue, music_facts::FactSource>,
-                >(line)
-                {
-                    Ok(f) => f,
-                    Err(_) => continue,
+                let Some(fact) = parse_fact_line(line) else {
+                    continue;
                 };
 
-                let entity = fact.entity().as_str().to_owned();
+                if fact.operation() != stainless_facts::Operation::Assert {
+                    continue;
+                }
+                let times = delta.entry(hash_key(fact.entity().as_str()));
                 match fact.value() {
                     MusicValue::TrackStarted(_) => {
-                        update_if_more_recent(
-                            last_started.entry(entity).or_insert(None),
-                            *fact.timestamp(),
-                        );
+                        update_if_more_recent(&mut times.or_default().started, *fact.timestamp());
                     }
                     MusicValue::TrackStopped(_) => {
-                        update_if_more_recent(
-                            last_stopped.entry(entity).or_insert(None),
-                            *fact.timestamp(),
-                        );
+                        update_if_more_recent(&mut times.or_default().stopped, *fact.timestamp());
                     }
                     _ => {}
                 }
@@ -2833,17 +3063,58 @@ impl LibraryService {
         }
 
         // Advance the stored cursor so the next call only reads new facts.
-        *self.event_cursor.lock().unwrap() = current_cursor;
+        *event_cursor = current_cursor;
 
-        // Apply collected timestamps to the in-memory index.
         let mut tracks = self.tracks.lock().unwrap();
-        for track in tracks.iter_mut() {
-            let hash = track.content_hash.as_str();
-            if let Some(Some(ts)) = last_started.get(hash) {
-                track.last_started = Some(*ts);
+        let mut events = self.play_events.lock().unwrap();
+        for (key, new) in delta {
+            let seen = events.entry(key).or_default();
+            if let Some(ts) = new.started {
+                update_if_more_recent(&mut seen.started, ts);
             }
-            if let Some(Some(ts)) = last_stopped.get(hash) {
-                track.last_stopped = Some(*ts);
+            if let Some(ts) = new.stopped {
+                update_if_more_recent(&mut seen.stopped, ts);
+            }
+        }
+
+        // Apply each track's lineage (itself and what it replaces) to the index.
+        let replaces: HashMap<String, Vec<String>> = tracks
+            .iter()
+            .map(|t| {
+                let replaced = t
+                    .provenance
+                    .iter()
+                    .filter_map(|(v, _)| match v {
+                        MusicValue::Replaces(h) => Some(hash_key(h.as_str())),
+                        _ => None,
+                    })
+                    .collect();
+                (hash_key(t.content_hash.as_str()), replaced)
+            })
+            .collect();
+        // A short key is resolved only when exactly one full key (live track, replaced
+        // hash or full-length event key) starts with it.
+        let prefix_counts = short_prefix_counts(
+            replaces
+                .keys()
+                .chain(replaces.values().flatten())
+                .chain(events.keys())
+                .map(String::as_str)
+                .collect::<HashSet<_>>()
+                .into_iter(),
+        );
+        for track in tracks.iter_mut() {
+            let lineage = replaces_lineage(&hash_key(track.content_hash.as_str()), &replaces);
+            for times in lineage
+                .iter()
+                .flat_map(|key| play_times_for(&events, key, &prefix_counts))
+            {
+                if let Some(ts) = times.started {
+                    update_if_more_recent(&mut track.last_started, ts);
+                }
+                if let Some(ts) = times.stopped {
+                    update_if_more_recent(&mut track.last_stopped, ts);
+                }
             }
         }
     }
@@ -3090,36 +3361,44 @@ impl LibraryService {
     /// The returned vec is deduplicated. An empty vec means `hash` was never
     /// itself a replacement (first-generation track).
     ///
-    /// Used by `handle_track_replace` to forward-inherit the chain: when C
+    /// Used by `merge_into` to forward-inherit the chain: when C
     /// replaces B, C must also claim every hash that B had replaced (e.g. A),
     /// so that a playlist still pointing at A can find its way to C even after
-    /// B is fully retracted.
-    pub(crate) fn gather_ancestor_replaces(&self, hash: &ContentHash) -> Vec<ContentHash> {
-        let normalize = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
-        let target_clean = normalize(hash.as_str());
+    /// B is fully retracted. Each ancestor comes with the `FactSource` of the
+    /// `Replaces` fact it was read from, which the inheriting fact keeps.
+    fn ancestor_replaces(&self, hash: &ContentHash) -> Vec<(ContentHash, music_facts::FactSource)> {
+        let target_clean = hash_key(hash.as_str());
 
         let tracks = self.tracks.lock().unwrap();
         let entry = match tracks
             .iter()
-            .find(|t| normalize(t.content_hash.as_str()) == target_clean)
+            .find(|t| hash_key(t.content_hash.as_str()) == target_clean)
         {
             Some(e) => e,
             None => return Vec::new(),
         };
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut result: Vec<ContentHash> = Vec::new();
+        let mut result: Vec<(ContentHash, music_facts::FactSource)> = Vec::new();
 
-        for (v, _) in &entry.provenance {
+        for (v, source) in &entry.provenance {
             if let MusicValue::Replaces(old) = v {
-                let old_clean = normalize(old.as_str());
-                if seen.insert(old_clean) {
-                    result.push(old.clone());
+                if seen.insert(hash_key(old.as_str())) {
+                    result.push((old.clone(), source.clone()));
                 }
             }
         }
 
         result
+    }
+
+    /// The hashes `hash` directly replaced (see `ancestor_replaces`).
+    #[cfg(test)]
+    pub(crate) fn gather_ancestor_replaces(&self, hash: &ContentHash) -> Vec<ContentHash> {
+        self.ancestor_replaces(hash)
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect()
     }
 
     /// Follow the reverse-Replaces chain from `hash` to find the live successor.
@@ -3731,7 +4010,7 @@ mod tests {
 
     /// An in-process ACID server plus the private directory it stores facts in.
     /// Dropping it stops the server first (field order), then removes the directory.
-    struct AcidGuard {
+    pub(super) struct AcidGuard {
         _handle: acid_service::ServerHandle,
         _dir: tempfile::TempDir,
     }
@@ -3768,7 +4047,7 @@ mod tests {
     ///
     /// Returns `(service, metadata_dir, acid_handle)`. Callers must keep
     /// `_acid` alive for the duration of the test; dropping it shuts the server down.
-    fn make_empty_service() -> (Arc<LibraryService>, tempfile::TempDir, AcidGuard) {
+    pub(super) fn make_empty_service() -> (Arc<LibraryService>, tempfile::TempDir, AcidGuard) {
         let music_dir = tempfile::tempdir().unwrap();
         let metadata_dir = tempfile::tempdir().unwrap();
         let (acid_handle, facts_addr, events_addr) = spawn_acid_server();
@@ -3782,7 +4061,8 @@ mod tests {
         (service, metadata_dir, acid_handle)
     }
 
-    fn make_service_with_playlists_dir() -> (Arc<LibraryService>, tempfile::TempDir, AcidGuard) {
+    pub(super) fn make_service_with_playlists_dir(
+    ) -> (Arc<LibraryService>, tempfile::TempDir, AcidGuard) {
         let music_dir = tempfile::tempdir().unwrap();
         let metadata_dir = tempfile::tempdir().unwrap();
         // create the playlists sub-directory
@@ -7601,8 +7881,8 @@ mod tests {
         );
 
         // Act: retract all facts for old hash via the internal mechanism
-        let result = service.retract_all_entity_facts(&old_hash);
-        assert!(result.is_ok(), "retract_all_entity_facts must succeed");
+        let result = retire(&service, &old_hash);
+        assert!(result.is_ok(), "retire must succeed");
 
         // Post-condition: after retraction, the old hash's ACID facts are all Retracted
         let verifier = AcidClient::connect(&facts_addr).unwrap();
@@ -7680,9 +7960,7 @@ mod tests {
         );
 
         // Retract all facts
-        service
-            .retract_all_entity_facts(&old_hash)
-            .expect("retract_all_entity_facts must succeed");
+        retire(&service, &old_hash).expect("retire must succeed");
 
         // After retraction, resolve_hash must fail (entry removed from index)
         let result = service.resolve_hash(&old_hash);
@@ -7977,7 +8255,7 @@ mod tests {
         }
     }
 
-    fn replaces_targets(service: &LibraryService, hash: &ContentHash) -> Vec<String> {
+    pub(super) fn replaces_targets(service: &LibraryService, hash: &ContentHash) -> Vec<String> {
         let tracks = service.tracks.lock().unwrap();
         tracks
             .iter()
@@ -8072,7 +8350,7 @@ mod tests {
 
     /// Minimal valid 16-bit mono PCM WAV (0.1 s). `seed` varies the samples so
     /// every test file has a distinct content hash.
-    fn write_test_wav(path: &std::path::Path, seed: i16) {
+    pub(super) fn write_test_wav(path: &std::path::Path, seed: i16) {
         let samples: Vec<i16> = (0..4410i32)
             .map(|i| ((i % 100) as i16).wrapping_mul(seed))
             .collect();
@@ -8096,8 +8374,14 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    fn user_source() -> FactSource {
+    pub(super) fn user_source() -> FactSource {
         FactSource::new("mdma", "test", FactOrigin::User)
+    }
+
+    /// Hard-retire `h` the way production does: under `retire_gate`.
+    pub(super) fn retire(s: &LibraryService, h: &ContentHash) -> Result<usize, String> {
+        let gate = s.retire_gate.lock().unwrap();
+        s.retract_all_entity_facts_locked(&gate, h)
     }
 
     /// Write a Title for `hash` to ACID and project it, creating the track.
@@ -8131,7 +8415,10 @@ mod tests {
         include_bytes!("../../audio_hash/testdata/pcm/fixtures/s16_l8_tags.flac");
 
     /// Identity facts (AudioHash, PcmHash) stored in ACID for `hash`.
-    fn identity_facts_in_acid(service: &LibraryService, hash: &ContentHash) -> Vec<MusicValue> {
+    pub(super) fn identity_facts_in_acid(
+        service: &LibraryService,
+        hash: &ContentHash,
+    ) -> Vec<MusicValue> {
         service
             .acid_client
             .read_entity(hash.as_str())
@@ -8225,7 +8512,10 @@ mod tests {
     }
 
     /// Like `run_backfill_to_end`, but the run must have completed.
-    fn run_backfill(service: &LibraryService, include_pcm: bool) -> IdentityBackfillProgress {
+    pub(super) fn run_backfill(
+        service: &LibraryService,
+        include_pcm: bool,
+    ) -> IdentityBackfillProgress {
         match run_backfill_to_end(service, include_pcm) {
             IdentityBackfillStatus::Done(p) => p,
             other => panic!("expected Done, got {other:?}"),
@@ -8298,7 +8588,7 @@ mod tests {
         let (service, _dir, _acid) = make_empty_service();
         let hash = seed_blob_track(&service, "retired0000001", FIXTURE_S16_L8);
         *service.identity_write_hook.lock().unwrap() = Some(Box::new(|svc, h| {
-            svc.retract_all_entity_facts(h).unwrap();
+            retire(svc, h).unwrap();
         }));
 
         let status = run_backfill(&service, false);
@@ -8346,7 +8636,7 @@ mod tests {
         let (service, _dir, _acid) = make_empty_service();
         let hash = seed_blob_track(&service, "retfail0000001", corrupt_flac());
         *service.identity_write_hook.lock().unwrap() = Some(Box::new(|svc, h| {
-            svc.retract_all_entity_facts(h).unwrap();
+            retire(svc, h).unwrap();
         }));
         let status = run_backfill(&service, false);
         assert_eq!(
@@ -8360,7 +8650,7 @@ mod tests {
     /// be undone by a backfill write landing in that window. The write would not be
     /// in the retire's retract set, so the entity would survive on AudioHash alone.
     ///
-    /// Deterministic: the retire thread parks inside `retract_all_entity_facts`
+    /// Deterministic: the retire thread parks inside `retract_all_entity_facts_locked`
     /// after its read; the backfill is started while it is parked; then the retire
     /// is released. With the retire gate the worker waits for the retire to finish
     /// and then sees the entity gone.
@@ -8373,16 +8663,22 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let release_rx = Mutex::new(release_rx);
         *service.retire_mid_hook.lock().unwrap() = Some(Box::new(move || {
-            parked_tx.send(()).unwrap();
-            release_rx.lock().unwrap().recv().unwrap();
+            let _ = parked_tx.send(());
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(30));
         }));
 
         let retire = {
             let service = Arc::clone(&service);
             let hash = hash.clone();
-            std::thread::spawn(move || service.retract_all_entity_facts(&hash).unwrap())
+            std::thread::spawn(move || retire(&service, &hash).unwrap())
         };
-        parked_rx.recv().unwrap(); // the retire has read the entity and is parked
+        // the retire has read the entity and is parked
+        parked_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("retire never reached its hook");
 
         let started =
             service.handle_request(LibraryRequest::IdentityBackfill { include_pcm: false });
@@ -8651,7 +8947,7 @@ mod tests {
         let hash = ContentHash::new("sha256:orphan_play_0001");
         let (service, _metadata_dir, _acid) = make_empty_service();
         seed_track(&service, &hash, "Playing");
-        service.retract_all_entity_facts(&hash).unwrap();
+        retire(&service, &hash).unwrap();
         assert!(service.resolve_hash(&hash).is_err());
 
         service
@@ -8695,7 +8991,7 @@ mod tests {
                 ],
             )
             .unwrap();
-        service.retract_all_entity_facts(&hash).unwrap();
+        retire(&service, &hash).unwrap();
         assert!(service.resolve_hash(&hash).is_err());
         service
             .write_and_project(
@@ -8744,7 +9040,7 @@ mod tests {
         service
             .assert_replaces_facts(&hash_b, &hash_a, vec![])
             .unwrap();
-        service.retract_all_entity_facts(&hash_a).unwrap();
+        retire(&service, &hash_a).unwrap();
 
         // Revert: A comes back, replacing B (which inherited A as an ancestor).
         let inherited = service.gather_ancestor_replaces(&hash_b);
@@ -8773,7 +9069,7 @@ mod tests {
             let inherited = service.gather_ancestor_replaces(old);
             seed_track(&service, new, title);
             service.assert_replaces_facts(new, old, inherited).unwrap();
-            service.retract_all_entity_facts(old).unwrap();
+            retire(&service, old).unwrap();
         }
         service.catch_up().unwrap();
 
@@ -8822,7 +9118,7 @@ mod tests {
         let hash = ContentHash::new("sha256:ghost_0001");
         let (service, _metadata_dir, _acid) = make_empty_service();
         seed_track(&service, &hash, "Ghost");
-        service.retract_all_entity_facts(&hash).unwrap();
+        retire(&service, &hash).unwrap();
         assert!(service.resolve_hash(&hash).is_err());
 
         let lines = service.acid_client.read_entity(hash.as_str()).unwrap();
@@ -8856,7 +9152,7 @@ mod tests {
         let title_type = FactType::new("Title");
         assert!(service.fact_index.lock().unwrap()[&title_type].contains("Indexed Title"));
 
-        service.retract_all_entity_facts(&hash).unwrap();
+        retire(&service, &hash).unwrap();
 
         let fact_index = service.fact_index.lock().unwrap();
         assert!(fact_index

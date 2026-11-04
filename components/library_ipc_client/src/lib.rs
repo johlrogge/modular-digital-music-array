@@ -494,6 +494,23 @@ impl LibraryClient {
         }
     }
 
+    /// Find duplicate tracks; with `apply`, merge the automatic groups.
+    pub fn dedup_scan(&self, apply: bool) -> Result<DedupScanReport, ClientError> {
+        interpret_dedup_scan(self.request(&LibraryRequest::DedupScan { apply })?)
+    }
+
+    /// Merge `losers` into `winner` (a user-confirmed duplicate group).
+    pub fn dedup_merge(
+        &self,
+        winner: &ContentHash,
+        losers: &[ContentHash],
+    ) -> Result<DedupApplyReport, ClientError> {
+        interpret_dedup_merged(self.request(&LibraryRequest::DedupMerge {
+            winner: winner.clone(),
+            losers: losers.to_vec(),
+        })?)
+    }
+
     /// Start the identity-hash backfill (or learn that one is already running).
     pub fn identity_backfill(
         &self,
@@ -514,6 +531,28 @@ impl LibraryClient {
     /// Ask a running identity-hash backfill to stop; returns the current status.
     pub fn identity_backfill_cancel(&self) -> Result<IdentityBackfillStatus, ClientError> {
         interpret_identity_backfill_status(self.request(&LibraryRequest::CancelIdentityBackfill)?)
+    }
+}
+
+/// Interpret the answer to `DedupScan`.
+pub fn interpret_dedup_scan(response: LibraryResponse) -> Result<DedupScanReport, ClientError> {
+    match response {
+        LibraryResponse::DedupScan(report) => Ok(report),
+        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+        _ => Err(ClientError::Protocol(ProtocolError::Internal {
+            message: "Unexpected response to DedupScan".to_string(),
+        })),
+    }
+}
+
+/// Interpret the answer to `DedupMerge`.
+pub fn interpret_dedup_merged(response: LibraryResponse) -> Result<DedupApplyReport, ClientError> {
+    match response {
+        LibraryResponse::DedupMerged(report) => Ok(report),
+        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+        _ => Err(ClientError::Protocol(ProtocolError::Internal {
+            message: "Unexpected response to DedupMerge".to_string(),
+        })),
     }
 }
 

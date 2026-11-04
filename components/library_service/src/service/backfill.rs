@@ -165,6 +165,7 @@ impl LibraryService {
     /// `retire_gate`, otherwise the answer can be stale by the time it writes.
     fn recheck_identity_facts(
         &self,
+        _gate: &super::RetireGuard<'_>,
         hash: &ContentHash,
         facts: Vec<(MusicValue, music_facts::FactSource)>,
     ) -> Recheck {
@@ -250,8 +251,8 @@ impl LibraryService {
                 // gone in ACID but still indexed, and that failure is logged.
                 let had_facts = !computed.facts.is_empty();
                 let (retired, to_write_empty, write_error) = {
-                    let _gate = self.retire_gate.lock().unwrap();
-                    match self.recheck_identity_facts(&w.hash, computed.facts) {
+                    let gate = self.retire_gate.lock().unwrap();
+                    match self.recheck_identity_facts(&gate, &w.hash, computed.facts) {
                         Recheck::Retired => (true, true, None),
                         Recheck::Write(to_write) if to_write.is_empty() => (false, true, None),
                         Recheck::Write(to_write) => {

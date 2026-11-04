@@ -34,8 +34,8 @@ The Bandcamp source never writes `Replaces`. Two paths re-download without linki
 - A group is a connected component of that relation.
 
 **Automatic vs confirmed.**
-- A group is merged automatically only if every member shares the same source ItemId (same purchase) and no member is soft-deleted (ADR-003).
-- Every other group (different ItemId, no ItemId, or a soft-deleted member) is listed for user confirmation and never merged automatically (ADR-010 l.45).
+- A group is merged automatically only if every member has at least one ItemId, one ItemId is common to all members (same purchase), and no member is soft-deleted (ADR-003). ItemId is a set, since a merged track holds the union of its members' ItemIds.
+- Every other group (no common ItemId, no ItemId, or a soft-deleted member) is listed for user confirmation and never merged automatically (ADR-010 l.45).
 - A user-confirmed merge uses the same operation as an automatic one.
 
 **Winner.**
@@ -51,7 +51,7 @@ The Bandcamp source never writes `Replaces`. Two paths re-download without linki
   - If the winner already holds it, nothing is written. Otherwise it is asserted on the winner with its original `FactSource`.
   - Values that lose on an attribute are not carried over.
 - **Origin** has no precedence: user and source facts compete on timestamp only. Copied facts keep their original `FactSource`, so a later `retract_source_facts(bandcamp)` still removes only Bandcamp-origin facts.
-- **Multi-valued attributes** (StyleDescriptor, cue points, Bookmarked per scope): the union of the members' values.
+- **Multi-valued attributes** (StyleDescriptor, cue points, Bookmarked per scope, ItemId): the union of the members' values. ItemId is united so that every purchase stays known to the source: a retired copy's ItemId would otherwise vanish from the index and the source would download it again on every sync.
 - **File-derived attributes** are always the winner's and are never copied: FilePath, Format, DurationSeconds, Bitrate, FileSizeBytes, HasAlbumArt, EncoderSoftware, EncodedBy, CoverArtPath, AudioHash, PcmHash.
 - **AddedAt: latest wins, generally.** This applies to MDMA's projection of AddedAt for every track, not only in merges. There is no "first seen" and no list of values. The projection rule changes from keep-first (service.rs:357) to keep-latest.
 - **Replaces:** the winner asserts `Replaces(loser)` plus every `Replaces(X)` the loser carried (ADR-004 forward inheritance), deduplicated and never pointing at itself.
@@ -79,7 +79,7 @@ Blob removal is product behaviour. It is unrelated to operator rules about `/mus
 
 **Where it runs.**
 - **Explicit `dedup` scan** (CLI/IPC). It lists automatic and confirmation groups. `--apply` merges the automatic groups only.
-- **Self-healing at ingest.** Once AudioHash v1 is computed for a new track, it is merged with any live track that shares its source ItemId and AudioHash. The new copy wins. PcmHash-only matches are left for the scan.
+- **Self-healing at ingest.** Once AudioHash v1 is computed for a new track, it is merged with any live track that shares its source ItemId (against any of the live track's ItemIds) and AudioHash. The new copy wins. PcmHash-only matches are left for the scan.
 
 **Hardening of the Bandcamp source.**
 - `queue_item_forcibly`/resync must not ignore a failed `retract_source_facts` or an unreachable library. It returns an error and does not queue.
@@ -89,7 +89,7 @@ Blob removal is product behaviour. It is unrelated to operator rules about `/mus
 
 - Latest-per-attribute matches the existing single-entity projection, where the last assertion wins. A merged track therefore behaves as if it had always been one entity: the newest tags win, and user work that exists only on an older copy survives.
 - Keeping the newest blob keeps the file on disk consistent with the newest facts, which matters for export and Rekordbox.
-- Same ItemId plus exact identity is the narrowest condition under which the copies are certainly the same product. Different releases carry release context that must not be silently discarded (ADR-010).
+- A common ItemId plus exact identity is the narrowest condition under which the copies are certainly the same product. Different releases carry release context that must not be silently discarded (ADR-010).
 - Reusing ADR-004 keeps one replace model, one playlist repair path and one ancestry rule.
 
 ## Alternatives considered
@@ -106,7 +106,7 @@ Blob removal is product behaviour. It is unrelated to operator rules about `/mus
 - The AddedAt projection change lives in MDMA (library_service on develop, library_projection on the offline branch). stainless-facts may later provide a generic LatestWins fold strategy for it (johlrogge/stainless_facts issue).
 - The protocol additions (dedup scan/apply) change `library_ipc_protocol`. Per ADR-004, gateway, library and console are redeployed together.
 - A backfill is required before the scan is meaningful. Costs on a Pi 5: AudioHash about 4 s/GB, PcmHash about 36 s/GB. Both stay explicit and low priority.
-- Blob deletion is irreversible and depends on the merge being correct. That is why automatic merges require exact identity plus the same ItemId.
+- Blob deletion is irreversible and depends on the merge being correct. That is why automatic merges require exact identity plus a common ItemId.
 - ADR-012 was accepted on 2026-11-03, so PcmHash facts may be written (backfill `--pcm`); its preimage is now frozen and any change requires a new version.
 - PcmHash groups within one ItemId can differ in container, so the kept blob may be WAV rather than FLAC. The samples are identical by definition.
 - The projection resolves play events through the `Replaces` chain, so last-played / play counts on a merged or replaced track include its predecessors' plays. Events keyed by short hashes (#86) must resolve to the full hash before this lookup.

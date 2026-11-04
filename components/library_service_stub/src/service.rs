@@ -450,6 +450,19 @@ impl LibraryService {
                 })
             }
 
+            // The stub holds no identity facts, so a scan finds no duplicates (and
+            // `apply` has nothing to do); merging is unsupported like replace.
+            LibraryRequest::DedupScan { apply } => {
+                LibraryResponse::DedupScan(library_ipc_protocol::DedupScanReport {
+                    groups: vec![],
+                    applied: apply.then(library_ipc_protocol::DedupApplyReport::default),
+                })
+            }
+
+            LibraryRequest::DedupMerge { .. } => LibraryResponse::Error(ProtocolError::Internal {
+                message: "DedupMerge not supported in stub".to_string(),
+            }),
+
             LibraryRequest::TrackOrphans => {
                 let tracks = self.tracks.lock().unwrap();
                 let orphans: Vec<OrphanInfo> = tracks
