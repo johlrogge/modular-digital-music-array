@@ -6,14 +6,45 @@ All notable changes to MDMA are documented here.
 
 ## [Unreleased]
 
+---
+
+## [0.36.0] — 2026-11-04
+
+### Added
+
+- **Identity backfill.** `mdma library identity backfill [--pcm] [--no-wait]`, `status` and `cancel` compute AudioHash, and PcmHash on request, for existing tracks. It runs at low priority. AudioHash is now also computed at ingest.
+- **PcmHash v1 (ADR-012).** A container-independent identity hash over decoded lossless samples (FLAC, WAV, AIFF). Compute it with `mdma library identity backfill --pcm`.
+- **System logging.** Provisioned nodes now run socklog (`socklog-unix`) as the syslog daemon on `/dev/log`. Logs go under `/var/log/socklog/` (#89).
+- **avahi-daemon is enabled on upgrade** (mdma-admin INSTALL), which fixes mDNS discovery on nodes where it was missing (#80).
+- **Duplicate scan and merge (ADR-013).**
+  - `mdma library dedup` lists duplicate groups: automatic, or needs confirmation with reasons.
+  - `mdma library dedup --apply` merges the automatic groups.
+  - `mdma library dedup merge <winner> <loser>... [-y]` merges a confirmed group.
+  - Rules: latest fact wins per attribute, the newest copy is kept, ItemIds are unioned, and play history follows `Replaces`.
+- **Self-healing at ingest.** A re-downloaded copy of the same purchase with the same audio merges automatically.
+- **Archive.** Merged-away files go to `/music/archive/` and are never deleted directly.
+  - `mdma library archive` lists them.
+  - `mdma library archive empty [--yes]` is the only way to delete them permanently. It deletes only what was listed.
+- **Deploy recipes.** `just deploy-<svc> [host]` takes an optional host; it defaults to prod (`PI_HOST`). Recipes use the project ssh config with BatchMode, so they never hang on a host-key prompt.
+
 ### Changed
 
+- **Bandcamp hardening.** Sync defers, and resync and check refuse, when the library is unreachable, instead of re-downloading everything.
+- **BREAKING: library IPC protocol.** Dedup and archive messages were added, and `blobs_removed` was renamed `blobs_archived`.
 - **`mdma source` now takes the source name first: `mdma source <source-name> <command>`.** This applies to every per-source command: `sync`, `status`, `downloads`, `cancel`, `pause`, `resume`, `resync`, `check-item`, `check-updates`. For example, `mdma source sync bandcamp` is now `mdma source bandcamp sync`. `mdma source list` is unchanged, and `list` can't be used as a source name.
 - **The `mdma bandcamp` command group moved under `mdma source`, with no deprecated alias.**
   - `mdma bandcamp playlists` is now `mdma source <name> playlists`.
   - `mdma bandcamp import-playlist <slug-or-url> [--name N] [--dry-run] [--no-wait]` is now `mdma source <name> import-playlist <slug-or-url> [--name N] [--dry-run] [--no-wait]`.
   - `mdma bandcamp import-status` is now `mdma source <name> import-status`.
   - A source without playlist support answers "source '<name>' does not support playlists" (or "... playlist import") and the command exits 1.
+
+### Docs
+
+- ADR-012 (PcmHash identity tier) is accepted. ADR-013 (duplicate merge rules) is added. ADR-014 (merge by fold) is proposed.
+
+### Upgrade notes
+
+The library IPC protocol changed. Library, gateway, console and CLI must be upgraded together: upgrade all mdma-* packages together, by name.
 
 ---
 
