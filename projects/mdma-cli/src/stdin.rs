@@ -100,3 +100,81 @@ pub fn parse_hash_from_line(line: &str) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+
+    use crate::stdin::{is_yes, parse_hash_from_line};
+
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn parse_hash_from_plain_hash_line() {
+        // Plain hash with no surrounding text
+        let result = parse_hash_from_line("abcd1234ef567890");
+        assert_eq!(result, Some("abcd1234ef567890".to_string()));
+    }
+
+    #[test]
+    fn parse_hash_from_search_output_line() {
+        // Canonical playlist line format: {short_hash}  {Artist} - {Title}  [{duration}]
+        let result = parse_hash_from_line("abcd1234  Carbon Based Lifeforms - Init  [8:28]");
+        assert_eq!(result, Some("abcd1234".to_string()));
+    }
+
+    #[test]
+    fn parse_hash_from_sha256_prefixed_line() {
+        // Full sha256: prefixed hash on its own line
+        let result = parse_hash_from_line(
+            "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        );
+        assert_eq!(
+            result,
+            Some(
+                "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn parse_hash_from_empty_line_returns_none() {
+        let result = parse_hash_from_line("");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_hash_from_comment_line_returns_none() {
+        // Lines starting with # are comments
+        let result = parse_hash_from_line("# this is a comment");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_hash_from_uppercase_returns_none() {
+        assert!(parse_hash_from_line("ABCDEF1234567890").is_none());
+    }
+
+    #[test]
+    fn parse_hash_from_short_token_returns_none() {
+        assert!(parse_hash_from_line("abcd12").is_none());
+    }
+
+    #[test]
+    fn parse_hash_from_unavailable_comment_line() {
+        // Queue edit writes unresolvable tracks as: {short_hash}  # [unavailable: error]
+        // The hash must survive the round-trip through parse_hash_from_line.
+        let result = parse_hash_from_line("a1b2c3d4  # [unavailable: track not found]");
+        assert_eq!(result, Some("a1b2c3d4".to_string()));
+    }
+
+    #[test]
+    fn only_yes_confirms_a_merge() {
+        for yes in ["y", "Y", "yes", " YES \n"] {
+            assert!(is_yes(yes), "{yes:?}");
+        }
+        for no in ["", "n", "no", "maybe", "\n"] {
+            assert!(!is_yes(no), "{no:?}");
+        }
+    }
+}

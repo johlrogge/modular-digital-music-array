@@ -531,6 +531,30 @@ pub fn handle_show(explicit: Option<&str>, local_ipc: bool) -> color_eyre::Resul
 // Tests
 // =============================================================================
 
+#[derive(clap::Subcommand, Debug)]
+pub(crate) enum Command {
+    /// List MDMA nodes on the network (* marks the remembered node)
+    List,
+    /// Remember a node (by name or id; prompts when omitted)
+    Select {
+        /// Node name or id
+        name: Option<String>,
+    },
+    /// Forget the remembered node
+    Forget,
+    /// Show which node commands would use, and why
+    Show,
+}
+
+pub(crate) fn dispatch(command: Command, ctx: &crate::ctx::Ctx) -> color_eyre::Result<()> {
+    match &command {
+        Command::List => handle_list(),
+        Command::Select { name } => handle_select(name.as_deref()),
+        Command::Forget => handle_forget(),
+        Command::Show => handle_show(ctx.node_flag(), ctx.local_ipc()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
