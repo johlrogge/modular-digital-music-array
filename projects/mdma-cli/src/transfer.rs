@@ -2,7 +2,7 @@ use crate::ctx::Ctx;
 use crate::stdin::{parse_hash_from_line, resolve_tracks_skip_errors};
 use color_eyre::Result;
 use library_ipc_client::TrackInfo;
-use mdma_client::{IngestSource, LibraryBackend};
+use mdma_client::IngestSource;
 use std::path::Path;
 use track_formatter::short_hash;
 
@@ -46,30 +46,18 @@ pub(crate) struct ExportArgs {
     output: std::path::PathBuf,
 }
 
-pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<()> {
-    let UploadArgs {
-        file,
-        ssh_key,
-        ssh_user,
-        inbox_dir,
-    } = &args;
-    handle_upload(ctx, file, ssh_key, ssh_user, inbox_dir)
+/// Which export format applies to which tracks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExportFormats {
+    /// `--format` (or nothing at all): one format for every track.
+    All(ExportFormat),
+    /// `--lossless-format` / `--lossy-format`: per source category, `None`
+    /// passes that category through unchanged.
+    PerCategory {
+        lossless: Option<ExportFormat>,
+        lossy: Option<ExportFormat>,
+    },
 }
-
-pub(crate) fn export(args: ExportArgs, ctx: &Ctx) -> Result<()> {
-    let ExportArgs {
-        format,
-        lossless_format,
-        lossy_format,
-        output,
-    } = &args;
-    let lib = ctx.library();
-    handle_export(ctx, &lib, format, lossless_format, lossy_format, output)
-}
-
-// =============================================================================
-// Upload Command Handler
-// =============================================================================
 
 /// Expand `~` to the user's home directory.
 fn expand_tilde(path: &str) -> std::path::PathBuf {
@@ -112,14 +100,15 @@ fn scp_file(
     Ok(())
 }
 
-fn handle_upload(
-    ctx: &Ctx,
-    file: &Path,
-    ssh_key: &str,
-    ssh_user: &str,
-    inbox_dir: &str,
-) -> Result<()> {
+pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::InboxPath;
+
+    let UploadArgs {
+        file,
+        ssh_key,
+        ssh_user,
+        inbox_dir,
+    } = args;
 
     // 1. Validate file exists
     if !file.exists() {
@@ -136,17 +125,17 @@ fn handle_upload(
         }
     };
 
-    let key_path = expand_tilde(ssh_key);
+    let key_path = expand_tilde(&ssh_key);
 
     // 3. Detect file type
-    let file_type = inbox_utils::detect_file_type(file);
+    let file_type = inbox_utils::detect_file_type(&file);
 
     // 4. Collect audio files to upload
     let temp_dir = tempfile::tempdir()?;
     let audio_files: Vec<std::path::PathBuf> = match file_type {
         Some("zip") => {
             println!("Extracting ZIP archive...");
-            let extracted = inbox_utils::extract_zip(file, temp_dir.path())?;
+            let extracted = inbox_utils::extract_zip(&file, temp_dir.path())?;
             if extracted.is_empty() {
                 eprintln!("No audio files found in ZIP archive");
                 std::process::exit(1);
@@ -155,7 +144,7 @@ fn handle_upload(
             extracted
         }
         Some("flac" | "mp3" | "wav" | "aiff") => {
-            vec![file.to_path_buf()]
+            vec![file]
         }
         _ => {
             eprintln!(
@@ -169,7 +158,7 @@ fn handle_upload(
     for audio_file in &audio_files {
         let filename = audio_file.file_name().unwrap_or_default().to_string_lossy();
         println!("Uploading: {}", filename);
-        scp_file(audio_file, ssh_user, &hostname, inbox_dir, &key_path)?;
+        scp_file(audio_file, &ssh_user, &hostname, &inbox_dir, &key_path)?;
     }
 
     // 6. Ingest each file via the library service
@@ -221,10 +210,6 @@ fn handle_upload(
     }
     Ok(())
 }
-
-// =============================================================================
-// Export Command Helpers
-// =============================================================================
 
 /// Build the export URL for a track given an MDMA node hostname.
 fn export_url_from_node(node: &str, hash: &str, format: &str) -> String {
@@ -587,16 +572,12 @@ pub(crate) fn download_tracks(
 /// 1. `--format` — applies to all tracks unconditionally.
 /// 2. `--lossless-format` / `--lossy-format` — applied per source category.
 /// 3. No flags — defaults to `ExportFormat::Original` (pass-through).
-fn resolve_export_format(
-    blob_path: Option<&str>,
-    format: &Option<ExportFormat>,
-    lossless_format: &Option<ExportFormat>,
-    lossy_format: &Option<ExportFormat>,
-) -> ExportFormat {
+fn resolve_export_format(blob_path: Option<&str>, formats: &ExportFormats) -> ExportFormat {
     // If --format is given, use it for everything.
-    if let Some(fmt) = format {
-        return *fmt;
-    }
+    let (lossless_format, lossy_format) = match formats {
+        ExportFormats::All(fmt) => return *fmt,
+        ExportFormats::PerCategory { lossless, lossy } => (lossless, lossy),
+    };
 
     // If neither category flag is given, default to Original.
     if lossless_format.is_none() && lossy_format.is_none() {
@@ -620,15 +601,23 @@ fn resolve_export_format(
     }
 }
 
-fn handle_export(
-    ctx: &Ctx,
-    library: &LibraryBackend,
-    format: &Option<ExportFormat>,
-    lossless_format: &Option<ExportFormat>,
-    lossy_format: &Option<ExportFormat>,
-    output: &std::path::Path,
-) -> Result<()> {
+pub(crate) fn export(args: ExportArgs, ctx: &Ctx) -> Result<()> {
     use std::io::BufRead;
+
+    let ExportArgs {
+        format,
+        lossless_format,
+        lossy_format,
+        output,
+    } = args;
+    let library = ctx.library();
+    let formats = match format {
+        Some(fmt) => ExportFormats::All(fmt),
+        None => ExportFormats::PerCategory {
+            lossless: lossless_format,
+            lossy: lossy_format,
+        },
+    };
 
     let (node, node_ip) = ctx.require_node();
 
@@ -647,7 +636,7 @@ fn handle_export(
     }
 
     // Resolve each hash (short or full) to a full TrackInfo via the library
-    let tracks = resolve_tracks_skip_errors(library, raw_hashes);
+    let tracks = resolve_tracks_skip_errors(&library, raw_hashes);
 
     if tracks.is_empty() {
         eprintln!("No tracks could be resolved. Aborting.");
@@ -660,15 +649,8 @@ fn handle_export(
         &node,
         &tracks,
         &http,
-        |track| {
-            resolve_export_format(
-                track.blob_path.as_deref(),
-                format,
-                lossless_format,
-                lossy_format,
-            )
-        },
-        |track, ext| export_dest_path(output, track, ext),
+        |track| resolve_export_format(track.blob_path.as_deref(), &formats),
+        |track, ext| export_dest_path(&output, track, ext),
     );
 
     // Summary
@@ -738,6 +720,27 @@ impl ExportFormat {
             Self::Original => "original",
             Self::Aiff => "aiff",
             Self::Wav => "wav",
+        }
+    }
+}
+
+impl std::fmt::Display for ExportFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.format_param())
+    }
+}
+
+impl std::str::FromStr for ExportFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "original" => Ok(Self::Original),
+            "aiff" => Ok(Self::Aiff),
+            "wav" => Ok(Self::Wav),
+            _ => Err(format!(
+                "unknown export format '{s}' (expected original, aiff or wav)"
+            )),
         }
     }
 }
@@ -1108,20 +1111,22 @@ mod tests {
 
     // ── resolve_export_format ────────────────────────────────────────────────
 
+    fn per_category(lossless: Option<ExportFormat>, lossy: Option<ExportFormat>) -> ExportFormats {
+        ExportFormats::PerCategory { lossless, lossy }
+    }
+
     #[test]
     fn resolve_format_with_format_flag_overrides_everything() {
         let result = resolve_export_format(
             Some("ab/abc123.flac"),
-            &Some(ExportFormat::Wav),
-            &None,
-            &None,
+            &ExportFormats::All(ExportFormat::Wav),
         );
         assert_eq!(result, ExportFormat::Wav);
     }
 
     #[test]
     fn resolve_format_no_flags_defaults_to_original() {
-        let result = resolve_export_format(Some("ab/abc123.flac"), &None, &None, &None);
+        let result = resolve_export_format(Some("ab/abc123.flac"), &per_category(None, None));
         assert_eq!(result, ExportFormat::Original);
     }
 
@@ -1129,9 +1134,7 @@ mod tests {
     fn resolve_format_lossless_flag_converts_flac() {
         let result = resolve_export_format(
             Some("ab/abc123.flac"),
-            &None,
-            &Some(ExportFormat::Aiff),
-            &None,
+            &per_category(Some(ExportFormat::Aiff), None),
         );
         assert_eq!(result, ExportFormat::Aiff);
     }
@@ -1140,9 +1143,7 @@ mod tests {
     fn resolve_format_lossless_flag_passes_through_mp3() {
         let result = resolve_export_format(
             Some("ab/abc123.mp3"),
-            &None,
-            &Some(ExportFormat::Aiff),
-            &None,
+            &per_category(Some(ExportFormat::Aiff), None),
         );
         assert_eq!(result, ExportFormat::Original);
     }
@@ -1151,9 +1152,7 @@ mod tests {
     fn resolve_format_lossy_flag_converts_mp3() {
         let result = resolve_export_format(
             Some("ab/abc123.mp3"),
-            &None,
-            &None,
-            &Some(ExportFormat::Wav),
+            &per_category(None, Some(ExportFormat::Wav)),
         );
         assert_eq!(result, ExportFormat::Wav);
     }
@@ -1162,9 +1161,7 @@ mod tests {
     fn resolve_format_lossy_flag_passes_through_flac() {
         let result = resolve_export_format(
             Some("ab/abc123.flac"),
-            &None,
-            &None,
-            &Some(ExportFormat::Wav),
+            &per_category(None, Some(ExportFormat::Wav)),
         );
         assert_eq!(result, ExportFormat::Original);
     }
@@ -1172,20 +1169,11 @@ mod tests {
     #[test]
     fn resolve_format_both_category_flags() {
         // lossless → aiff, lossy → wav
-        let lossless = resolve_export_format(
-            Some("ab/abc123.flac"),
-            &None,
-            &Some(ExportFormat::Aiff),
-            &Some(ExportFormat::Wav),
-        );
+        let both = per_category(Some(ExportFormat::Aiff), Some(ExportFormat::Wav));
+        let lossless = resolve_export_format(Some("ab/abc123.flac"), &both);
         assert_eq!(lossless, ExportFormat::Aiff);
 
-        let lossy = resolve_export_format(
-            Some("ab/abc123.mp3"),
-            &None,
-            &Some(ExportFormat::Aiff),
-            &Some(ExportFormat::Wav),
-        );
+        let lossy = resolve_export_format(Some("ab/abc123.mp3"), &both);
         assert_eq!(lossy, ExportFormat::Wav);
     }
 
@@ -1193,9 +1181,7 @@ mod tests {
     fn resolve_format_unknown_extension_passes_through() {
         let result = resolve_export_format(
             Some("ab/abc123.txt"),
-            &None,
-            &Some(ExportFormat::Aiff),
-            &Some(ExportFormat::Wav),
+            &per_category(Some(ExportFormat::Aiff), Some(ExportFormat::Wav)),
         );
         assert_eq!(result, ExportFormat::Original);
     }
@@ -1204,9 +1190,7 @@ mod tests {
     fn resolve_format_no_blob_path_with_category_flags_passes_through() {
         let result = resolve_export_format(
             None,
-            &None,
-            &Some(ExportFormat::Aiff),
-            &Some(ExportFormat::Wav),
+            &per_category(Some(ExportFormat::Aiff), Some(ExportFormat::Wav)),
         );
         assert_eq!(result, ExportFormat::Original);
     }
@@ -1226,5 +1210,20 @@ mod tests {
     #[test]
     fn export_format_wav_extension_is_wav() {
         assert_eq!(ExportFormat::Wav.static_extension(), Some("wav"));
+    }
+
+    #[test]
+    fn export_format_parse_and_display_match_clap_value_enum() {
+        use clap::ValueEnum;
+        for v in ExportFormat::value_variants() {
+            let name = v.to_possible_value().unwrap().get_name().to_string();
+            assert_eq!(name.parse::<ExportFormat>(), Ok(*v));
+            assert_eq!(v.to_string(), name);
+        }
+    }
+
+    #[test]
+    fn export_format_rejects_unknown_name() {
+        assert!("flac".parse::<ExportFormat>().is_err());
     }
 }

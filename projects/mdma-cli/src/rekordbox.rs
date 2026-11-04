@@ -14,7 +14,6 @@ use crate::transfer::MAX_LOCATION_URI_BYTES;
 use clap::Subcommand;
 use color_eyre::Result;
 use library_ipc_client::{ContentHash, TrackInfo};
-use mdma_client::LibraryBackend;
 use music_facts::MusicValue;
 use playlist_import::{
     format_write_outcome, sanitize_playlist_name, write_playlist, LibraryTrackLookup,
@@ -81,41 +80,61 @@ pub(crate) enum Command {
 }
 
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
-    let lib = ctx.library();
-    match &command {
+    match command {
         Command::Export {
             playlist,
             output,
             format,
             replace,
-        } => {
-            let resolved_output = output.clone().unwrap_or_else(|| {
-                dirs::audio_dir()
-                    .map(|p| p.join("mdma_rekordbox"))
-                    .unwrap_or_else(|| std::path::PathBuf::from("./rekordbox-export/"))
-            });
-            handle_rekordbox_export(
-                ctx,
-                &lib,
+        } => export(
+            RekordboxExportArgs {
                 playlist,
-                &resolved_output,
-                format.as_ref(),
-                *replace,
-            )
-        }
+                output,
+                format,
+                replace,
+            },
+            ctx,
+        ),
         Command::Import {
             path,
             playlist,
             all_playlists,
             enrich,
             dry_run,
-        } => handle_rekordbox_import(ctx, &lib, path, playlist, *all_playlists, *enrich, *dry_run),
+        } => import(
+            RekordboxImportArgs {
+                path,
+                playlist,
+                all_playlists,
+                enrich,
+                dry_run,
+            },
+            ctx,
+        ),
     }
 }
 
-// =============================================================================
-// Rekordbox Export
-// =============================================================================
+/// Values of `rekordbox export`. `playlist` names are kept as typed: they are
+/// validated into `PlaylistName`s after the node is resolved, so invalid names
+/// keep failing at the same point as before (phase-2 parse-time candidate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RekordboxExportArgs {
+    pub(crate) playlist: Vec<String>,
+    pub(crate) output: Option<std::path::PathBuf>,
+    pub(crate) format: Option<ExportFormat>,
+    pub(crate) replace: bool,
+}
+
+/// Values of `rekordbox import`. `playlist` is kept as typed: it is sanitised
+/// only after the XML has been read and matched (phase-2 parse-time candidate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RekordboxImportArgs {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) playlist: Option<String>,
+    pub(crate) all_playlists: bool,
+    pub(crate) enrich: bool,
+    pub(crate) dry_run: bool,
+}
 
 /// Build a single `RekordboxTrack` from MDMA metadata and file facts.
 ///
@@ -195,16 +214,46 @@ fn build_rekordbox_track(
     }
 }
 
-fn handle_rekordbox_export(
-    ctx: &Ctx,
-    library: &LibraryBackend,
-    playlists: &[String],
-    output: &std::path::Path,
-    format: Option<&ExportFormat>,
-    replace: bool,
-) -> Result<()> {
+/// Locations to list in a playlist: the `hashes` that resolve to a location
+/// which made it into `refreshed_locations`. Unresolved hashes (failed
+/// downloads) are dropped.
+///
+/// Normalises case at the lookup boundary only; the URI written to
+/// rekordbox.xml preserves its original case.
+fn playlist_locations(
+    hashes: &[String],
+    hash_to_location: &std::collections::HashMap<String, String>,
+    refreshed_locations: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    hashes
+        .iter()
+        .filter_map(|h| {
+            let loc = hash_to_location.get(h)?;
+            if refreshed_locations.contains(&loc.to_lowercase()) {
+                Some(loc.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
     use std::collections::HashSet;
     use std::io::BufRead;
+
+    let RekordboxExportArgs {
+        playlist: playlists,
+        output,
+        format,
+        replace,
+    } = args;
+    let library = ctx.library();
+    let output = output.unwrap_or_else(|| {
+        dirs::audio_dir()
+            .map(|p| p.join("mdma_rekordbox"))
+            .unwrap_or_else(|| std::path::PathBuf::from("./rekordbox-export/"))
+    });
 
     let (node, node_ip) = ctx.require_node();
 
@@ -214,7 +263,7 @@ fn handle_rekordbox_export(
     // When stdin mode, one entry with empty name.
     let hashes_per_playlist: Vec<(String, Vec<String>)> = if !playlists.is_empty() {
         let mut result = Vec::with_capacity(playlists.len());
-        for pname in playlists {
+        for pname in &playlists {
             let name = parse_playlist_name(pname);
             match library.playlist_get(&name) {
                 Ok(hashes) => {
@@ -263,7 +312,7 @@ fn handle_rekordbox_export(
     }
 
     // Resolve each unique hash to full TrackInfo
-    let tracks = resolve_tracks_skip_errors(library, all_hashes);
+    let tracks = resolve_tracks_skip_errors(&library, all_hashes);
     if tracks.is_empty() {
         eprintln!("No tracks could be resolved. Aborting.");
         std::process::exit(1);
@@ -272,7 +321,7 @@ fn handle_rekordbox_export(
     let http = build_http_client(&node, node_ip)?;
 
     // Create output directory early so we can canonicalise it for stable paths
-    if let Err(e) = std::fs::create_dir_all(output) {
+    if let Err(e) = std::fs::create_dir_all(&output) {
         return Err(color_eyre::eyre::eyre!(
             "Failed to create output directory: {}",
             e
@@ -283,7 +332,7 @@ fn handle_rekordbox_export(
         .unwrap_or_else(|_| output.to_path_buf());
 
     // Resolve format: only --format (no lossless/lossy split for rekordbox export)
-    let format_owned = format.cloned().unwrap_or(ExportFormat::Original);
+    let format_owned = format.unwrap_or(ExportFormat::Original);
 
     // Load existing XML for incremental sync (skip when --replace). Loaded
     // before planning destinations: its entries keep their paths even when
@@ -504,24 +553,9 @@ fn handle_rekordbox_export(
     // Unresolved hashes (failed downloads) are dropped.
     let playlist_updates: Vec<rekordbox_xml::PlaylistUpdate> = hashes_per_playlist
         .iter()
-        .map(|(pname, hs)| {
-            let locations: Vec<String> = hs
-                .iter()
-                .filter_map(|h| {
-                    let loc = hash_to_location.get(h)?;
-                    // Normalise case at the lookup boundary only; the URI written to
-                    // rekordbox.xml preserves its original case.
-                    if refreshed_locations.contains(&loc.to_lowercase()) {
-                        Some(loc.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            rekordbox_xml::PlaylistUpdate {
-                name: pname.clone(),
-                locations,
-            }
+        .map(|(pname, hs)| rekordbox_xml::PlaylistUpdate {
+            name: pname.clone(),
+            locations: playlist_locations(hs, &hash_to_location, &refreshed_locations),
         })
         .collect();
 
@@ -572,37 +606,29 @@ fn handle_rekordbox_export(
     );
     eprintln!("XML written to: {}", xml_path.display());
 
-    if fail_count > 0 {
-        eprintln!("{} download(s) failed.", fail_count);
-        std::process::exit(1);
-    }
-
     Ok(())
 }
-
-// =============================================================================
-// Rekordbox Import
-// =============================================================================
 
 /// Report the outcome of [`write_playlist`], warning after a replace.
 fn print_write_outcome(name: &str, track_count: usize, created: bool) {
     println!("{}", format_write_outcome(name, track_count, created));
 }
 
-fn handle_rekordbox_import(
-    _ctx: &Ctx,
-    library: &LibraryBackend,
-    path: &std::path::Path,
-    playlist: &Option<String>,
-    all_playlists: bool,
-    enrich: bool,
-    dry_run: bool,
-) -> Result<()> {
+pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{Bpm, Key};
     use std::collections::HashMap;
 
+    let RekordboxImportArgs {
+        path,
+        playlist,
+        all_playlists,
+        enrich,
+        dry_run,
+    } = args;
+    let library = ctx.library();
+
     // 1. Read and parse XML file
-    let content = std::fs::read_to_string(path)
+    let content = std::fs::read_to_string(&path)
         .map_err(|e| color_eyre::eyre::eyre!("Failed to read {}: {}", path.display(), e))?;
 
     let parsed = parse_xml(&content)
@@ -702,7 +728,7 @@ fn handle_rekordbox_import(
 
     // 6. Create --playlist if requested
     if let Some(pname) = playlist {
-        let sanitized = sanitized_name_or_exit(pname, "--playlist");
+        let sanitized = sanitized_name_or_exit(&pname, "--playlist");
         let name = parse_playlist_name(&sanitized);
         let hashes: Vec<ContentHash> = matched.iter().map(|(_, h)| h.clone()).collect();
 
@@ -713,7 +739,7 @@ fn handle_rekordbox_import(
                 hashes.len()
             );
         } else {
-            let created = write_playlist(library, &name, &hashes)
+            let created = write_playlist(&library, &name, &hashes)
                 .map_err(|e| color_eyre::eyre::eyre!("Failed to write playlist: {}", e))?;
             print_write_outcome(&sanitized, hashes.len(), created);
         }
@@ -755,7 +781,7 @@ fn handle_rekordbox_import(
                 );
             } else {
                 let name = parse_playlist_name(&sanitized);
-                match write_playlist(library, &name, &resolved) {
+                match write_playlist(&library, &name, &resolved) {
                     Ok(created) => print_write_outcome(&sanitized, resolved.len(), created),
                     Err(e) => {
                         eprintln!("Failed to write playlist '{}': {}", sanitized, e)
@@ -947,7 +973,7 @@ fn handle_rekordbox_import(
 
 #[cfg(test)]
 mod tests {
-
+    use super::playlist_locations;
     use pretty_assertions::assert_eq;
 
     // ── case-insensitive location URI matching ───────────────────────────────────
@@ -958,10 +984,10 @@ mod tests {
     /// `HashSet<&str>`, so the case-mismatched probe returned false and the track
     /// was silently dropped from the playlist.
     ///
-    /// This test exercises the production code: it builds a `refreshed` vec whose
-    /// location uses lowercase, and a `hash_to_location` map whose location uses
-    /// mixed-case (as produced by the existing-XML round-trip), then asserts that
-    /// the playlist update's locations vector is non-empty.
+    /// This test exercises `playlist_locations`: it builds a `refreshed_locations`
+    /// set whose location uses lowercase, and a `hash_to_location` map whose
+    /// location uses mixed-case (as produced by the existing-XML round-trip), then
+    /// asserts that the playlist's locations vector is non-empty.
     #[test]
     fn rekordbox_export_associates_tracks_when_locations_differ_in_case() {
         // The existing XML round-trip canonicalises to a mixed-case URI.
@@ -982,21 +1008,8 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        // Simulate the playlist filter as it exists in the production path.
-        // This is the FIXED version — it normalises case at the lookup boundary.
         let hashes = [hash.to_string()];
-        let locations: Vec<String> = hashes
-            .iter()
-            .filter_map(|h| {
-                let loc = hash_to_location.get(h)?;
-                // Fixed: probe with lowercased key.
-                if refreshed_locations.contains(&loc.to_lowercase()) {
-                    Some(loc.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let locations = playlist_locations(&hashes, &hash_to_location, &refreshed_locations);
 
         assert_eq!(
             locations,
