@@ -14,7 +14,7 @@ pub(crate) struct SubscribeArgs {
 }
 
 pub(crate) fn subscribe(args: SubscribeArgs, ctx: &Ctx) -> Result<()> {
-    let SubscribeArgs { topic } = &args;
+    let SubscribeArgs { topic } = args;
     // Event gateway of the resolved node (tcp://<ip>:5556)
     let addr = match ctx.event_gateway() {
         Some(a) => a,
@@ -25,14 +25,10 @@ pub(crate) fn subscribe(args: SubscribeArgs, ctx: &Ctx) -> Result<()> {
         }
     };
     let lib = ctx.library();
-    handle_subscribe(&addr, topic.as_deref(), Some(&lib))
+    listen(&addr, topic.as_deref(), Some(&lib))
 }
 
-// =============================================================================
-// Subscribe Command Handler
-// =============================================================================
-
-fn handle_subscribe(
+fn listen(
     event_gateway: &str,
     topic: Option<&str>,
     library: Option<&LibraryBackend>,

@@ -2,7 +2,7 @@ use crate::ctx::Ctx;
 use crate::output::{handle_error, handle_playback_error};
 use clap::Subcommand;
 use color_eyre::Result;
-use mdma_client::{Deck, LibraryBackend, PlaybackBackend};
+use mdma_client::Deck;
 use track_formatter::short_hash;
 
 #[derive(Subcommand, Debug)]
@@ -42,34 +42,22 @@ pub(crate) enum Command {
 }
 
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
-    let pb = ctx.playback();
-    match &command {
-        Command::Start => handle_playback_start(&pb),
-        Command::Stop => handle_playback_stop(&pb),
-        Command::Pause => handle_playback_pause(&pb),
-        Command::Resume => handle_playback_resume(&pb),
-        Command::Skip => handle_playback_skip(&pb),
-        Command::Now => {
-            use std::io::IsTerminal;
-            if std::io::stdout().is_terminal() {
-                let lib = ctx.library();
-                handle_playback_now(&pb, Some(&lib))
-            } else {
-                handle_playback_now(&pb, None)
-            }
-        }
-        Command::Session => handle_playback_session(&pb),
-        Command::Outputs => handle_playback_outputs(&pb),
-        Command::SetOutput { name } => handle_playback_set_output(&pb, name),
-        Command::GetOutput => handle_playback_get_output(&pb),
+    match command {
+        Command::Start => start(ctx),
+        Command::Stop => stop(ctx),
+        Command::Pause => pause(ctx),
+        Command::Resume => resume(ctx),
+        Command::Skip => skip(ctx),
+        Command::Now => now(ctx),
+        Command::Session => session(ctx),
+        Command::Outputs => outputs(ctx),
+        Command::SetOutput { name } => set_output(name, ctx),
+        Command::GetOutput => get_output(ctx),
     }
 }
 
-// =============================================================================
-// Playback Command Handlers
-// =============================================================================
-
-fn handle_playback_start(media_client: &PlaybackBackend) -> Result<()> {
+pub(crate) fn start(ctx: &Ctx) -> Result<()> {
+    let media_client = ctx.playback();
     if let Err(e) = media_client.play_queue() {
         handle_playback_error(e);
     }
@@ -77,10 +65,51 @@ fn handle_playback_start(media_client: &PlaybackBackend) -> Result<()> {
     Ok(())
 }
 
-fn handle_playback_now(
-    media_client: &PlaybackBackend,
-    library_client: Option<&LibraryBackend>,
-) -> Result<()> {
+pub(crate) fn stop(ctx: &Ctx) -> Result<()> {
+    let media_client = ctx.playback();
+    if let Err(e) = media_client.stop(Deck::A) {
+        handle_playback_error(e);
+    }
+
+    println!("Stopped");
+    Ok(())
+}
+
+pub(crate) fn pause(ctx: &Ctx) -> Result<()> {
+    let media_client = ctx.playback();
+    if let Err(e) = media_client.pause(Deck::A) {
+        handle_playback_error(e);
+    }
+
+    println!("Paused");
+    Ok(())
+}
+
+pub(crate) fn resume(ctx: &Ctx) -> Result<()> {
+    let media_client = ctx.playback();
+    if let Err(e) = media_client.resume(Deck::A) {
+        handle_playback_error(e);
+    }
+
+    println!("Resumed");
+    Ok(())
+}
+
+pub(crate) fn skip(ctx: &Ctx) -> Result<()> {
+    let media_client = ctx.playback();
+    if let Err(e) = media_client.skip() {
+        handle_playback_error(e);
+    }
+
+    println!("Skipped");
+    Ok(())
+}
+
+pub(crate) fn now(ctx: &Ctx) -> Result<()> {
+    use std::io::IsTerminal;
+    let media_client = ctx.playback();
+    // The library is only consulted on a terminal, where the track is shown in full.
+    let library_client = std::io::stdout().is_terminal().then(|| ctx.library());
     let hash = match media_client.now_playing() {
         Ok(h) => h,
         Err(e) => handle_playback_error(e),
@@ -110,7 +139,8 @@ fn handle_playback_now(
     Ok(())
 }
 
-fn handle_playback_session(media_client: &PlaybackBackend) -> Result<()> {
+pub(crate) fn session(ctx: &Ctx) -> Result<()> {
+    let media_client = ctx.playback();
     match media_client.session() {
         Ok(Some(id)) => {
             println!("{}", id);
@@ -123,7 +153,8 @@ fn handle_playback_session(media_client: &PlaybackBackend) -> Result<()> {
     Ok(())
 }
 
-fn handle_playback_outputs(media_client: &PlaybackBackend) -> Result<()> {
+pub(crate) fn outputs(ctx: &Ctx) -> Result<()> {
+    let media_client = ctx.playback();
     let sinks = match media_client.list_audio_outputs() {
         Ok(s) => s,
         Err(e) => handle_playback_error(e),
@@ -143,8 +174,9 @@ fn handle_playback_outputs(media_client: &PlaybackBackend) -> Result<()> {
     Ok(())
 }
 
-fn handle_playback_set_output(media_client: &PlaybackBackend, name: &str) -> Result<()> {
-    let cfg = match media_client.set_audio_output(name.to_string()) {
+pub(crate) fn set_output(name: String, ctx: &Ctx) -> Result<()> {
+    let media_client = ctx.playback();
+    let cfg = match media_client.set_audio_output(name) {
         Ok(c) => c,
         Err(e) => handle_playback_error(e),
     };
@@ -157,7 +189,8 @@ fn handle_playback_set_output(media_client: &PlaybackBackend, name: &str) -> Res
     Ok(())
 }
 
-fn handle_playback_get_output(media_client: &PlaybackBackend) -> Result<()> {
+pub(crate) fn get_output(ctx: &Ctx) -> Result<()> {
+    let media_client = ctx.playback();
     let cfg = match media_client.get_audio_output() {
         Ok(c) => c,
         Err(e) => handle_playback_error(e),
@@ -168,41 +201,5 @@ fn handle_playback_get_output(media_client: &PlaybackBackend) -> Result<()> {
         .map(|r| r.to_string())
         .unwrap_or_else(|| "?".to_string());
     println!("{} ({}Hz)", device, rate);
-    Ok(())
-}
-
-fn handle_playback_stop(media_client: &PlaybackBackend) -> Result<()> {
-    if let Err(e) = media_client.stop(Deck::A) {
-        handle_playback_error(e);
-    }
-
-    println!("Stopped");
-    Ok(())
-}
-
-fn handle_playback_skip(media_client: &PlaybackBackend) -> Result<()> {
-    if let Err(e) = media_client.skip() {
-        handle_playback_error(e);
-    }
-
-    println!("Skipped");
-    Ok(())
-}
-
-fn handle_playback_pause(media_client: &PlaybackBackend) -> Result<()> {
-    if let Err(e) = media_client.pause(Deck::A) {
-        handle_playback_error(e);
-    }
-
-    println!("Paused");
-    Ok(())
-}
-
-fn handle_playback_resume(media_client: &PlaybackBackend) -> Result<()> {
-    if let Err(e) = media_client.resume(Deck::A) {
-        handle_playback_error(e);
-    }
-
-    println!("Resumed");
     Ok(())
 }

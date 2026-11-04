@@ -5,7 +5,7 @@ use clap::Subcommand;
 use color_eyre::Result;
 use colored::Colorize;
 use library_ipc_client::{ContentHash, TrackInfo};
-use mdma_client::{LibraryBackend, PlaybackBackend, SourceName};
+use mdma_client::SourceName;
 use track_formatter::short_hash;
 
 #[derive(Subcommand, Debug)]
@@ -52,28 +52,20 @@ pub(crate) enum Command {
 }
 
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
-    let lib = ctx.library();
-    let pb = ctx.playback();
-    match &command {
-        Command::Next { hash } => handle_queue_next(&lib, &pb, hashes_arg_or_stdin(hash.clone())),
-        Command::Append { hash } => {
-            handle_queue_append(&lib, &pb, hashes_arg_or_stdin(hash.clone()))
-        }
-        Command::List => handle_queue_list(&pb, &lib),
-        Command::Clear => handle_queue_clear(&pb),
-        Command::Remove { hash } => {
-            handle_queue_remove(&lib, &pb, hashes_arg_or_stdin(hash.clone()))
-        }
-        Command::Replace => handle_queue_replace(&lib, &pb, hashes_arg_or_stdin(None)),
-        Command::Edit => handle_queue_edit(&lib, &pb),
+    match command {
+        Command::Next { hash } => next(OptTrackHash(hash), ctx),
+        Command::Append { hash } => append(OptTrackHash(hash), ctx),
+        Command::List => list(ctx),
+        Command::Clear => clear(ctx),
+        Command::Remove { hash } => remove(OptTrackHash(hash), ctx),
+        Command::Replace => replace(ctx),
+        Command::Edit => edit(ctx),
     }
 }
 
-fn handle_queue_next(
-    _library_client: &LibraryBackend,
-    media_client: &PlaybackBackend,
-    hashes: Vec<String>,
-) -> Result<()> {
+pub(crate) fn next(hash: OptTrackHash, ctx: &Ctx) -> Result<()> {
+    let media_client = ctx.playback();
+    let hashes = hashes_arg_or_stdin(hash.0);
     let count = hashes.len();
     // Prepend in reverse so the first hash ends up at the front of the queue.
     for hash in hashes.into_iter().rev() {
@@ -86,11 +78,9 @@ fn handle_queue_next(
     Ok(())
 }
 
-fn handle_queue_append(
-    _library_client: &LibraryBackend,
-    media_client: &PlaybackBackend,
-    hashes: Vec<String>,
-) -> Result<()> {
+pub(crate) fn append(hash: OptTrackHash, ctx: &Ctx) -> Result<()> {
+    let media_client = ctx.playback();
+    let hashes = hashes_arg_or_stdin(hash.0);
     let count = hashes.len();
     for hash in hashes {
         let content_hash = ContentHash::new(hash);
@@ -102,10 +92,9 @@ fn handle_queue_append(
     Ok(())
 }
 
-fn handle_queue_list(
-    media_client: &PlaybackBackend,
-    library_client: &LibraryBackend,
-) -> Result<()> {
+pub(crate) fn list(ctx: &Ctx) -> Result<()> {
+    let library_client = ctx.library();
+    let media_client = ctx.playback();
     let hashes = match media_client.queue_list() {
         Ok(h) => h,
         Err(e) => handle_playback_error(e),
@@ -176,11 +165,9 @@ fn handle_queue_list(
     Ok(())
 }
 
-fn handle_queue_remove(
-    _library_client: &LibraryBackend,
-    media_client: &PlaybackBackend,
-    hashes: Vec<String>,
-) -> Result<()> {
+pub(crate) fn remove(hash: OptTrackHash, ctx: &Ctx) -> Result<()> {
+    let media_client = ctx.playback();
+    let hashes = hashes_arg_or_stdin(hash.0);
     let content_hashes: Vec<ContentHash> = hashes.into_iter().map(ContentHash::new).collect();
 
     if content_hashes.is_empty() {
@@ -197,7 +184,8 @@ fn handle_queue_remove(
     Ok(())
 }
 
-fn handle_queue_clear(media_client: &PlaybackBackend) -> Result<()> {
+pub(crate) fn clear(ctx: &Ctx) -> Result<()> {
+    let media_client = ctx.playback();
     if let Err(e) = media_client.queue_clear() {
         handle_playback_error(e);
     }
@@ -205,11 +193,9 @@ fn handle_queue_clear(media_client: &PlaybackBackend) -> Result<()> {
     Ok(())
 }
 
-fn handle_queue_replace(
-    _library_client: &LibraryBackend,
-    media_client: &PlaybackBackend,
-    hashes: Vec<String>,
-) -> Result<()> {
+pub(crate) fn replace(ctx: &Ctx) -> Result<()> {
+    let media_client = ctx.playback();
+    let hashes = hashes_arg_or_stdin(None);
     let entries: Vec<(ContentHash, SourceName)> = hashes
         .into_iter()
         .map(|hash| (ContentHash::new(hash), SourceName::audio()))
@@ -222,10 +208,9 @@ fn handle_queue_replace(
     Ok(())
 }
 
-fn handle_queue_edit(
-    library_client: &LibraryBackend,
-    media_client: &PlaybackBackend,
-) -> Result<()> {
+pub(crate) fn edit(ctx: &Ctx) -> Result<()> {
+    let library_client = ctx.library();
+    let media_client = ctx.playback();
     // 1. Get current queue hashes.
     let hashes = match media_client.queue_list() {
         Ok(h) => h,
@@ -307,8 +292,6 @@ fn handle_queue_edit(
     Ok(())
 }
 
-// Adopted by a later chunk (per-command arg types); unused until then.
-#[allow(dead_code)]
 /// Optional content hash of a track.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OptTrackHash(pub Option<String>);
