@@ -212,6 +212,8 @@ fn playlist_names(
     }
 }
 
+/// List all playlists
+#[hicli::command]
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{DurationSeconds, LibraryRequest};
 
@@ -251,6 +253,11 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Get playlist content (pipe to mdma queue replace to load)
+///
+/// If name is omitted, reads playlist names from stdin (first whitespace-delimited
+/// token per line - handles both bare names and enriched `playlist list` output).
+#[hicli::command]
 pub(crate) fn get(name: OptPlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     let OptPlaylistArg(name) = name;
@@ -294,6 +301,11 @@ pub(crate) fn get(name: OptPlaylistArg, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Print the name of every playlist that contains any of the tracks piped in on stdin
+///
+/// Reads track lines from stdin (8-12 char hex hash as first token).
+/// Output: one playlist name per match; pipe to `sort -u` to deduplicate.
+#[hicli::command]
 pub(crate) fn contains(mode: ContainsMode, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     use std::collections::HashSet;
@@ -349,6 +361,8 @@ pub(crate) fn contains(mode: ContainsMode, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Create a new playlist from stdin (fails if it already exists)
+#[hicli::command]
 pub(crate) fn new(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     let library = ctx.library();
@@ -365,6 +379,8 @@ pub(crate) fn new(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Append stdin to an existing playlist
+#[hicli::command]
 pub(crate) fn append(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     let library = ctx.library();
@@ -381,6 +397,8 @@ pub(crate) fn append(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Replace playlist content from stdin
+#[hicli::command]
 pub(crate) fn replace(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     let library = ctx.library();
@@ -397,6 +415,8 @@ pub(crate) fn replace(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Edit playlist in $EDITOR
+#[hicli::command]
 pub(crate) fn edit(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{LibraryRequest, LibraryResponse, ProtocolError};
 
@@ -434,18 +454,18 @@ pub(crate) fn edit(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn rename(args: RenameArgs, ctx: &Ctx) -> Result<()> {
+/// Remove a playlist
+#[hicli::command]
+pub(crate) fn remove(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{LibraryRequest, LibraryResponse};
     let library = ctx.library();
-    let PlaylistArg(from_name) = args.from;
-    let PlaylistArg(to_name) = args.to;
-    let response = library.request(&LibraryRequest::PlaylistRename {
-        from: from_name.clone(),
-        to: to_name.clone(),
+    let PlaylistArg(pname) = name;
+    let response = library.request(&LibraryRequest::PlaylistRemove {
+        name: pname.clone(),
     });
     match response {
         Ok(LibraryResponse::Pong) => {
-            eprintln!("Renamed playlist '{}' to '{}'", from_name, to_name);
+            eprintln!("Removed playlist '{}'", pname);
         }
         Ok(LibraryResponse::Error(e)) => {
             eprintln!("Error: {}", e);
@@ -459,16 +479,20 @@ pub(crate) fn rename(args: RenameArgs, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn remove(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
+/// Rename a playlist
+#[hicli::command]
+pub(crate) fn rename(args: RenameArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{LibraryRequest, LibraryResponse};
     let library = ctx.library();
-    let PlaylistArg(pname) = name;
-    let response = library.request(&LibraryRequest::PlaylistRemove {
-        name: pname.clone(),
+    let PlaylistArg(from_name) = args.from;
+    let PlaylistArg(to_name) = args.to;
+    let response = library.request(&LibraryRequest::PlaylistRename {
+        from: from_name.clone(),
+        to: to_name.clone(),
     });
     match response {
         Ok(LibraryResponse::Pong) => {
-            eprintln!("Removed playlist '{}'", pname);
+            eprintln!("Renamed playlist '{}' to '{}'", from_name, to_name);
         }
         Ok(LibraryResponse::Error(e)) => {
             eprintln!("Error: {}", e);

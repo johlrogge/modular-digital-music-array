@@ -1,3 +1,4 @@
+use crate::args::impl_arg;
 use crate::Cli;
 use clap::CommandFactory;
 use color_eyre::Result;
@@ -10,22 +11,39 @@ pub(crate) struct CompletionsCli {
 
 /// The shell to generate completions for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ShellArg(pub clap_complete::Shell);
+pub(crate) struct ShellArg(pub hicli::Shell);
 
-impl hicli::Arg for ShellArg {
-    fn parser() -> impl bpaf::Parser<Self> {
-        use bpaf::Parser as _;
-        bpaf::positional::<clap_complete::Shell>("SHELL").map(Self)
+impl std::str::FromStr for ShellArg {
+    type Err = hicli::UnknownShell;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        s.parse().map(Self)
     }
 }
 
-pub(crate) fn generate(shell: ShellArg) -> Result<()> {
-    let ShellArg(shell) = shell;
-    generate_completions(shell, &mut std::io::stdout());
+impl_arg!(
+    ShellArg,
+    positional "SHELL",
+    "Shell to generate completions for (bash, zsh or fish)"
+);
+
+/// Generate shell completions
+#[hicli::command(hide)]
+pub(crate) fn generate_completions(shell: ShellArg) -> Result<()> {
+    print!(
+        "{}",
+        hicli::completion_script(shell.0, env!("CARGO_BIN_NAME"))
+    );
     Ok(())
 }
 
-fn generate_completions(shell: clap_complete::Shell, out: &mut dyn std::io::Write) {
+/// Clap's completion script (clap drives `main` until the tree is flipped).
+pub(crate) fn generate_clap(shell: clap_complete::Shell) -> Result<()> {
+    generate_clap_completions(shell, &mut std::io::stdout());
+    Ok(())
+}
+
+fn generate_clap_completions(shell: clap_complete::Shell, out: &mut dyn std::io::Write) {
     let mut cmd = Cli::command();
     clap_complete::generate(shell, &mut cmd, "mdma", out);
 }
@@ -41,11 +59,11 @@ mod tests {
         use crate::test_support::run_arg;
         assert_eq!(
             run_arg::<ShellArg>(&["bash"]),
-            Ok(ShellArg(clap_complete::Shell::Bash))
+            Ok(ShellArg(hicli::Shell::Bash))
         );
         assert_eq!(
             run_arg::<ShellArg>(&["zsh"]),
-            Ok(ShellArg(clap_complete::Shell::Zsh))
+            Ok(ShellArg(hicli::Shell::Zsh))
         );
         assert!(run_arg::<ShellArg>(&["tcsh"]).is_err());
         assert!(run_arg::<ShellArg>(&[]).is_err());
@@ -53,9 +71,9 @@ mod tests {
 
     #[test]
     fn generate_completions_bash_produces_nonempty_output() {
-        // The generate_completions function must produce a non-empty bash script.
+        // The generate_clap_completions function must produce a non-empty bash script.
         let mut buf = Vec::new();
-        generate_completions(clap_complete::Shell::Bash, &mut buf);
+        generate_clap_completions(clap_complete::Shell::Bash, &mut buf);
         let output = String::from_utf8(buf).expect("completion output is valid UTF-8");
         assert!(
             !output.is_empty(),

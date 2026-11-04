@@ -1,6 +1,8 @@
 use crate::ctx::Ctx;
+use bpaf::{Bpaf, Parser};
 use clap::Subcommand;
 use color_eyre::Result;
+use hicli::Arg;
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
@@ -19,7 +21,7 @@ pub(crate) enum Command {
     Cancel,
 }
 
-#[derive(clap::Args, Debug, PartialEq)]
+#[derive(clap::Args, Debug, PartialEq, Bpaf)]
 pub(crate) struct BackfillArgs {
     /// Also compute PcmHash (decodes every lossless track; slow)
     #[arg(long)]
@@ -27,6 +29,12 @@ pub(crate) struct BackfillArgs {
     /// Start the job and return immediately
     #[arg(long)]
     no_wait: bool,
+}
+
+impl Arg for BackfillArgs {
+    fn parser() -> impl Parser<Self> {
+        backfill_args()
+    }
 }
 
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
@@ -91,6 +99,13 @@ fn identity_already_running_message(running_pcm: bool, requested_pcm: bool) -> S
     msg
 }
 
+/// Compute identity hashes for tracks that don't have them yet
+///
+/// New tracks get an AudioHash when they are ingested; this covers the tracks
+/// already in the library. It runs as a low-priority background job in the
+/// library service and can be re-run: tracks that already have the hash are
+/// skipped. By default the command follows the job until it finishes.
+#[hicli::command]
 pub(crate) fn backfill(args: BackfillArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::IdentityBackfillStart;
     let BackfillArgs { pcm, no_wait } = args;
@@ -142,6 +157,8 @@ pub(crate) fn backfill(args: BackfillArgs, ctx: &Ctx) -> Result<()> {
     }
 }
 
+/// Show progress of the identity-hash backfill
+#[hicli::command]
 pub(crate) fn status(ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
     match library.identity_backfill_status() {
@@ -156,6 +173,8 @@ pub(crate) fn status(ctx: &Ctx) -> Result<()> {
     }
 }
 
+/// Stop a running identity-hash backfill (progress is kept; run backfill again to resume)
+#[hicli::command]
 pub(crate) fn cancel(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::IdentityBackfillStatus;
     let library = ctx.library();

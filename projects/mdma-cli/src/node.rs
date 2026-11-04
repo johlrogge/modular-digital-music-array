@@ -463,7 +463,8 @@ pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> color_eyre::Result<()> {
     }
 }
 
-/// `mdma node list`
+/// List MDMA nodes on the network (* marks the remembered node)
+#[hicli::command]
 pub(crate) fn list(_ctx: &Ctx) -> color_eyre::Result<()> {
     let nodes = node_discovery::browse(BROWSE_TIMEOUT);
     if nodes.is_empty() {
@@ -485,7 +486,8 @@ pub(crate) struct OptNodeQueryArg(pub Option<String>);
 
 impl_arg!(OptNodeQueryArg, optional_text positional "NAME", "Node name or id");
 
-/// `mdma node select [name|id]`
+/// Remember a node (by name or id; prompts when omitted)
+#[hicli::command]
 pub(crate) fn select(query: OptNodeQueryArg, _ctx: &Ctx) -> color_eyre::Result<()> {
     let OptNodeQueryArg(query) = query;
     let nodes = node_discovery::browse(BROWSE_TIMEOUT);
@@ -520,7 +522,8 @@ pub(crate) fn select(query: OptNodeQueryArg, _ctx: &Ctx) -> color_eyre::Result<(
     Ok(())
 }
 
-/// `mdma node forget`
+/// Forget the remembered node
+#[hicli::command]
 pub(crate) fn forget(_ctx: &Ctx) -> color_eyre::Result<()> {
     let Some(path) = cache_path() else {
         println!("No config directory; nothing to forget.");
@@ -538,7 +541,10 @@ pub(crate) fn forget(_ctx: &Ctx) -> color_eyre::Result<()> {
     Ok(())
 }
 
-/// `mdma node show`: resolve like any command would, but save nothing.
+/// Show which node commands would use, and why
+///
+/// Resolves the node like any command would, but saves nothing.
+#[hicli::command]
 pub(crate) fn show(ctx: &Ctx) -> color_eyre::Result<()> {
     match resolve(
         request(ctx.node_flag(), ctx.local_ipc()),

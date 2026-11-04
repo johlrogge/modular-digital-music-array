@@ -267,6 +267,12 @@ fn playlist_locations(
         .collect()
 }
 
+/// Export tracks to Rekordbox-compatible XML + audio files
+///
+/// Pass one or more --playlist flags to export named playlists.
+/// When no --playlist is given, hashes are read from stdin instead.
+/// Stdin input is ignored when --playlist is provided.
+#[hicli::command]
 pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
     use std::collections::HashSet;
 
@@ -637,6 +643,16 @@ fn print_write_outcome(name: &str, track_count: usize, created: bool) {
     println!("{}", format_write_outcome(name, track_count, created));
 }
 
+/// Import tracks and playlists from a Rekordbox XML file
+///
+/// Matches Rekordbox tracks to MDMA library tracks by metadata,
+/// creates playlists, and optionally enriches BPM/Key facts.
+///
+/// Examples:
+///   mdma rekordbox import rekordbox.xml
+///   mdma rekordbox import rekordbox.xml --playlist imported-set
+///   mdma rekordbox import rekordbox.xml --enrich --dry-run
+#[hicli::command]
 pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{Bpm, Key};
     use std::collections::HashMap;

@@ -297,6 +297,12 @@ fn parse_field_value(field: FactField, raw: &str) -> Result<MusicValue, String> 
     }
 }
 
+/// Add or update a fact on a track
+///
+/// Stainless-facts replace semantics: the most recent fact for a given field wins
+/// for non-collection types. Note this does NOT auto-retract the previous value;
+/// retract explicitly first if you want to clean history.
+#[hicli::command]
 pub(crate) fn add(args: FactArgs, ctx: &Ctx) -> Result<()> {
     let FactArgs {
         field,
@@ -313,6 +319,11 @@ pub(crate) fn add(args: FactArgs, ctx: &Ctx) -> Result<()> {
     }
 }
 
+/// Retract an existing fact from a track
+///
+/// Required for collection-type fields (each value is independent).
+/// For scalar fields, retract removes that value from history.
+#[hicli::command]
 pub(crate) fn retract(args: FactArgs, ctx: &Ctx) -> Result<()> {
     let FactArgs {
         field,

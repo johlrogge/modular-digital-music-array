@@ -26,6 +26,8 @@ impl_arg!(
     "Topic filter (e.g. \"playback/track_started\"). Default: all playback events."
 );
 
+/// Subscribe to real-time events from the playback system
+#[hicli::command]
 pub(crate) fn subscribe(topic: OptTopicArg, ctx: &Ctx) -> Result<()> {
     let OptTopicArg(topic) = topic;
     // Event gateway of the resolved node (tcp://<ip>:5556)

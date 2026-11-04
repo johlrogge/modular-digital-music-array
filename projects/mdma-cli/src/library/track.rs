@@ -67,6 +67,10 @@ pub(crate) struct ReplaceArgs {
     pub(crate) new_file: String,
 }
 
+/// Soft-delete a track (hidden from default views; file retained; recoverable)
+///
+/// The track is hidden from list/search results. To undo, use `mdma library track restore <hash>`.
+#[hicli::command]
 pub(crate) fn delete(hash: TrackArg, ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
     let TrackArg(ch) = hash;
@@ -85,6 +89,8 @@ pub(crate) fn delete(hash: TrackArg, ctx: &Ctx) -> Result<()> {
     }
 }
 
+/// Restore a soft-deleted track (retracts the Deleted fact)
+#[hicli::command]
 pub(crate) fn restore(hash: TrackArg, ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
     let TrackArg(ch) = hash;
@@ -100,6 +106,18 @@ pub(crate) fn restore(hash: TrackArg, ctx: &Ctx) -> Result<()> {
     }
 }
 
+/// Hard-replace an old track with a new file
+///
+/// Ingests the new file (path must be on the device running the library service),
+/// fully retracts all facts for the old track (the old hash stops resolving - gone
+/// from search and list, not merely hidden), records a Replaces provenance link on
+/// the new track, and rewrites every playlist that referenced the old track.
+/// Playlists that still point at the old hash self-heal on read by following the
+/// replacement chain (multi-step chains are followed automatically).
+///
+/// Note: NEW_FILE must be a path accessible by the library service on the device.
+/// Place the new file in the inbox directory or another device-local path first.
+#[hicli::command]
 pub(crate) fn replace(args: ReplaceArgs, ctx: &Ctx) -> Result<()> {
     let ReplaceArgs {
         old_hash: TrackArg(old_hash),
@@ -119,6 +137,11 @@ pub(crate) fn replace(args: ReplaceArgs, ctx: &Ctx) -> Result<()> {
     }
 }
 
+/// List blobs on disk that no live track references (GC candidate list, read-only)
+///
+/// Reports hard-replace leftovers (reason: "no live facts") and soft-deleted tracks
+/// (reason: "deleted"). Use `mdma library track delete`/`restore` for soft-delete management.
+#[hicli::command]
 pub(crate) fn orphans(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::OrphanReason;
 

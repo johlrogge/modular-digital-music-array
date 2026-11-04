@@ -1,8 +1,3 @@
-mod archive;
-mod dedup;
-mod identity;
-mod track;
-
 use crate::args::impl_arg;
 use crate::ctx::Ctx;
 use clap::Subcommand;
@@ -64,6 +59,12 @@ pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
     }
 }
 
+/// Re-extract and store cover art for tracks that don't have a CoverArtPath fact yet
+///
+/// Reads embedded artwork from each track's audio blob and writes the image to
+/// `/music/cover-art/<hash>.<ext>`. Only tracks without an existing CoverArtPath
+/// fact are processed.
+#[hicli::command]
 pub(crate) fn reindex_covers(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{LibraryRequest, LibraryResponse};
     let library = ctx.library();
@@ -89,6 +90,37 @@ pub(crate) fn reindex_covers(ctx: &Ctx) -> Result<()> {
     }
     Ok(())
 }
+
+/// Manage individual tracks (replace, delete, restore, list orphans)
+#[hicli::group]
+mod track;
+
+/// Compute track identity hashes (used to find duplicates)
+#[hicli::group]
+mod identity;
+
+/// Find duplicate tracks (the same audio with different tags or files) and merge them
+///
+/// Without options, lists the groups: those that can be merged automatically (all
+/// copies come from one purchase and none is deleted) first, then those that need
+/// your confirmation. The newest copy is kept; its blob stays, the other copies'
+/// facts are folded into it (latest value per attribute wins), playlists are
+/// rewritten, and the other copies' audio files are moved to the archive (see
+/// `mdma library archive`), not deleted.
+///
+/// Needs identity hashes: run `mdma library identity backfill` first.
+#[hicli::group]
+mod dedup;
+
+/// List the files that duplicate merges moved to the archive
+///
+/// A merge never deletes the other copies' audio files and cover art: it moves
+/// them to `archive/` in the music directory, keeping their layout. Shows how
+/// many files the archive holds, their total size, and for each its hash, size
+/// and when it was archived. `mdma library archive empty` deletes them for good.
+/// Without a subcommand, `mdma library archive` runs the listing.
+#[hicli::group]
+mod archive;
 
 /// Do not ask for confirmation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

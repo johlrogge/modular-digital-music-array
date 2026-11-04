@@ -1,7 +1,7 @@
 use crate::args::{choice, choice_names, parse_choice, Choice, ExistingFileArg};
 use crate::ctx::Ctx;
 use crate::stdin::{read_hashes, resolve_tracks_skip_errors};
-use bpaf::{construct, long, positional, Parser};
+use bpaf::{construct, long, positional, Bpaf, Parser};
 use color_eyre::Result;
 use hicli::{complete_files, Arg};
 use library_ipc_client::TrackInfo;
@@ -9,25 +9,49 @@ use mdma_client::IngestSource;
 use std::path::Path;
 use track_formatter::short_hash;
 
-#[derive(clap::Args, Debug)]
+// Both clap and bpaf read the field docs; `ssh_key` and `file` take their help
+// from their `Arg` impls for bpaf (the same text).
+#[derive(clap::Args, Debug, Bpaf)]
 pub(crate) struct UploadArgs {
     /// SSH key for SCP transfer
     #[arg(long, default_value = DEFAULT_SSH_KEY, env = "MDMA_SSH_KEY")]
+    #[bpaf(external(SshKeyArg::parser))]
     ssh_key: SshKeyArg,
 
     // Stays a String: no domain rule, the Pi's account name.
     /// SSH user on the Pi
     #[arg(long, default_value = "mdma", env = "MDMA_SSH_USER")]
+    #[bpaf(
+        long,
+        env("MDMA_SSH_USER"),
+        argument("SSH_USER"),
+        fallback("mdma".to_string()),
+        display_fallback
+    )]
     ssh_user: String,
 
     // Stays a String: no domain rule, a path on the remote Pi (not checked locally).
     /// Remote inbox directory
     #[arg(long, default_value = "/music/inbox/", env = "MDMA_INBOX_DIR")]
+    #[bpaf(
+        long,
+        env("MDMA_INBOX_DIR"),
+        argument("INBOX_DIR"),
+        fallback("/music/inbox/".to_string()),
+        display_fallback
+    )]
     inbox_dir: String,
 
     /// Path to file (audio file or ZIP archive)
     #[arg(value_hint = clap::ValueHint::FilePath)]
+    #[bpaf(external(UploadFileArg::parser))]
     file: UploadFileArg,
+}
+
+impl Arg for UploadArgs {
+    fn parser() -> impl Parser<Self> {
+        upload_args()
+    }
 }
 
 /// What an uploaded file holds, by its magic bytes.
@@ -89,6 +113,31 @@ pub(crate) struct ExportArgs {
     /// Output directory (created if it doesn't exist)
     #[arg(long, default_value = "./export/")]
     output: std::path::PathBuf,
+}
+
+// Not a bpaf derive: the clap fields hold the three format options apart, while
+// the parser reads them together as `ExportFormats` (which also rejects mixing
+// `--format` with the per-category options).
+impl Arg for ExportArgs {
+    fn parser() -> impl Parser<Self> {
+        let formats = <ExportFormats as Arg>::parser();
+        let output = long("output")
+            .help("Output directory (created if it doesn't exist). Default: ./export/")
+            .argument::<std::path::PathBuf>("OUTPUT")
+            .fallback(std::path::PathBuf::from("./export/"));
+        construct!(formats, output).map(|(formats, output)| {
+            let (format, lossless_format, lossy_format) = match formats {
+                ExportFormats::All(format) => (Some(format), None, None),
+                ExportFormats::PerCategory { lossless, lossy } => (None, lossless, lossy),
+            };
+            Self {
+                format,
+                lossless_format,
+                lossy_format,
+                output,
+            }
+        })
+    }
 }
 
 /// Which export format applies to which tracks.
@@ -227,6 +276,8 @@ fn scp_file(
     Ok(())
 }
 
+/// Upload a file (audio or ZIP of audio) to the library
+#[hicli::command]
 pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::InboxPath;
 
@@ -713,6 +764,17 @@ fn resolve_export_format(blob_path: Option<&str>, formats: &ExportFormats) -> Ex
     }
 }
 
+/// Export tracks from the library to local files
+///
+/// Reads content hashes from stdin (one per line, pipe-friendly).
+/// Compatible with search output: `mdma search --artist CBL | mdma export`
+///
+/// Examples:
+///   mdma search --artist CBL | mdma export
+///   mdma search --artist CBL | mdma export --format aiff
+///   mdma search --artist CBL | mdma export --format wav --output ./archive/
+///   mdma search --artist CBL | mdma export --lossless-format aiff --lossy-format wav
+#[hicli::command]
 pub(crate) fn export(args: ExportArgs, ctx: &Ctx) -> Result<()> {
     let ExportArgs {
         format,

@@ -1,11 +1,16 @@
+// hicli emits `#[path = "source.rs"]` for the group, which makes this file a
+// mod-rs file, so the plain `mod import;` would be looked up in `src/`.
+#[path = "source/import.rs"]
 mod import;
 
 use crate::args::{impl_arg, SanitizedPlaylistName};
 use crate::ctx::Ctx;
 use crate::output::handle_source_error;
 use crate::source::import::{finish_import, follow_import_job, is_terminal_phase};
+use bpaf::Bpaf;
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
+use hicli::Arg;
 use mdma_client::SourceClient;
 use source_protocol::{SourceError, SourceRequest, SourceResponse};
 use std::convert::Infallible;
@@ -110,10 +115,13 @@ impl FromStr for SourcePlaylistArg {
     }
 }
 
-#[derive(clap::Args, Debug, PartialEq)]
+// Both clap and bpaf read the field docs; `playlist` takes its help from its
+// `Arg` impl for bpaf (the same text).
+#[derive(clap::Args, Debug, PartialEq, Bpaf)]
 pub(crate) struct ImportPlaylistArgs {
     /// MDMA playlist name (default: sanitised source title)
     #[arg(long)]
+    #[bpaf(argument("NAME"))]
     name: Option<SanitizedPlaylistName>,
 
     /// Show the report without syncing or writing the playlist
@@ -125,7 +133,14 @@ pub(crate) struct ImportPlaylistArgs {
     no_wait: bool,
 
     /// Playlist slug or URL
+    #[bpaf(external(SourcePlaylistArg::parser))]
     playlist: SourcePlaylistArg,
+}
+
+impl Arg for ImportPlaylistArgs {
+    fn parser() -> impl bpaf::Parser<Self> {
+        import_playlist_args()
+    }
 }
 
 /// The per-source commands: `mdma source <source-name> <command> [args]`.
@@ -223,6 +238,8 @@ fn exit_source_parse_error(e: clap::Error) -> ! {
 /// rate-limited upstream requests (e.g. Bandcamp), well beyond the default 5s.
 const SOURCE_LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// List available music sources
+#[hicli::command]
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     let gateway = ctx.gateway();
     let sources = match mdma_client::list_available_sources(gateway.as_deref(), ctx.sources_dir()) {
@@ -270,6 +287,8 @@ fn item_not_found(identifier: &str, source: &str) -> ! {
     std::process::exit(1);
 }
 
+/// Sync the source (download new items)
+#[hicli::command(curried)]
 pub(crate) fn sync(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
     let source = ctx.source(name, None);
@@ -292,6 +311,8 @@ pub(crate) fn sync(source: SourceArg, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Show source status
+#[hicli::command(curried)]
 pub(crate) fn status(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
     let source = ctx.source(name, None);
@@ -330,6 +351,8 @@ pub(crate) fn status(source: SourceArg, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// List downloads for the source
+#[hicli::command(curried)]
 pub(crate) fn downloads(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
     let source = ctx.source(name, None);
@@ -377,6 +400,8 @@ pub(crate) fn downloads(source: SourceArg, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Cancel a download
+#[hicli::command(curried)]
 pub(crate) fn cancel(source: SourceArg, id: DownloadArg, ctx: &Ctx) -> Result<()> {
     let DownloadArg(id) = id;
     let name = source.as_str();
@@ -390,6 +415,8 @@ pub(crate) fn cancel(source: SourceArg, id: DownloadArg, ctx: &Ctx) -> Result<()
     Ok(())
 }
 
+/// Pause all downloads for the source
+#[hicli::command(curried)]
 pub(crate) fn pause(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
     let source = ctx.source(name, None);
@@ -406,6 +433,8 @@ pub(crate) fn pause(source: SourceArg, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Resume downloads for the source
+#[hicli::command(curried)]
 pub(crate) fn resume(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
     let source = ctx.source(name, None);
@@ -422,6 +451,8 @@ pub(crate) fn resume(source: SourceArg, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Force re-sync of a specific item (bypasses dedup)
+#[hicli::command(curried)]
 pub(crate) fn resync(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) -> Result<()> {
     let ItemIdArg(identifier) = identifier;
     let name = source.as_str();
@@ -446,6 +477,8 @@ pub(crate) fn resync(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) -> Res
     Ok(())
 }
 
+/// Check if a specific item has changed upstream
+#[hicli::command(curried)]
 pub(crate) fn check_item(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) -> Result<()> {
     let ItemIdArg(identifier) = identifier;
     let name = source.as_str();
@@ -475,6 +508,8 @@ pub(crate) fn check_item(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) ->
     Ok(())
 }
 
+/// Check the whole source collection for stale items
+#[hicli::command(curried)]
 pub(crate) fn check_updates(source: SourceArg, apply: ApplyUpdates, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
     let apply = apply.0;
@@ -618,6 +653,8 @@ fn handle_playlist_source_error(source: &str, feature: &str, err: &SourceError) 
     handle_source_error(err)
 }
 
+/// List the source's playlists (for sources that support playlists)
+#[hicli::command(curried)]
 pub(crate) fn playlists(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
     let source = ctx.source(name, Some(SOURCE_LISTING_TIMEOUT));
@@ -685,6 +722,10 @@ fn import_not_started_message(source: &str, running_job_id: u64) -> String {
 
 // Import requests return immediately (the job runs server-side), so the
 // default request timeout is enough for start and polls.
+/// Import a source playlist as an MDMA playlist
+///
+/// Definitive matches only; for sources that support playlists.
+#[hicli::command(curried)]
 pub(crate) fn import_playlist(
     source: SourceArg,
     args: ImportPlaylistArgs,
@@ -732,6 +773,10 @@ pub(crate) fn import_playlist(
     follow_import_job(&source, name, job_id)
 }
 
+/// Show the current or last playlist import job, following it while running
+///
+/// For sources that support playlists.
+#[hicli::command(curried)]
 pub(crate) fn import_status(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
     let source = ctx.source(name, None);

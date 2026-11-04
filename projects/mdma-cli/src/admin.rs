@@ -60,42 +60,8 @@ fn admin_call_ok(admin: &GatewayClient, request: &AdminRequest) {
     });
 }
 
-/// Print the boot-health verdict; exit 1 when a reboot would not be safe.
-pub(crate) fn boot_health(ctx: &Ctx) -> Result<()> {
-    let admin = ctx.admin();
-    let verdict = admin_call(
-        &admin,
-        &AdminRequest::BootHealth,
-        |response| match response {
-            AdminResponse::BootHealth { verdict } => Ok(verdict),
-            other => Err(other),
-        },
-    );
-    println!("Boot health: {verdict}");
-    if !verdict.allows_reboot() {
-        std::process::exit(1);
-    }
-    Ok(())
-}
-
-/// Reboot even if the boot-health check fails.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Force(pub bool);
-
-impl_arg!(
-    Force,
-    switch "force",
-    "Reboot even if the boot-health check fails"
-);
-
-pub(crate) fn reboot(force: Force, ctx: &Ctx) -> Result<()> {
-    let Force(force) = force;
-    let admin = ctx.admin();
-    admin_call_ok(&admin, &AdminRequest::Reboot { force });
-    println!("Reboot initiated. Connection will drop within ~2 seconds.");
-    Ok(())
-}
-
+/// Service mode subcommands (EEPROM boot order)
+#[hicli::group]
 mod service_mode {
     use super::*;
 
@@ -117,6 +83,8 @@ mod service_mode {
         }
     }
 
+    /// Show current EEPROM boot order, armed state, and PCIE_PROBE
+    #[hicli::command]
     pub(crate) fn status(ctx: &Ctx) -> Result<()> {
         let admin = ctx.admin();
         let (boot_order, service_mode_armed, pcie_probe) = admin_call(
@@ -155,6 +123,8 @@ mod service_mode {
         Ok(())
     }
 
+    /// Arm service mode: next reboot will boot from SD (beacon)
+    #[hicli::command]
     pub(crate) fn enable(ctx: &Ctx) -> Result<()> {
         let admin = ctx.admin();
         admin_call_ok(&admin, &AdminRequest::ServiceModeEnable);
@@ -166,12 +136,53 @@ mod service_mode {
         Ok(())
     }
 
+    /// Disarm service mode: restore NVMe-first boot order
+    #[hicli::command]
     pub(crate) fn disable(ctx: &Ctx) -> Result<()> {
         let admin = ctx.admin();
         admin_call_ok(&admin, &AdminRequest::ServiceModeDisable);
         println!("Service mode disarmed. NVMe-first boot order restored.");
         Ok(())
     }
+}
+
+/// Report whether the host can safely reboot into its installed kernel
+#[hicli::command]
+pub(crate) fn boot_health(ctx: &Ctx) -> Result<()> {
+    let admin = ctx.admin();
+    let verdict = admin_call(
+        &admin,
+        &AdminRequest::BootHealth,
+        |response| match response {
+            AdminResponse::BootHealth { verdict } => Ok(verdict),
+            other => Err(other),
+        },
+    );
+    println!("Boot health: {verdict}");
+    if !verdict.allows_reboot() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Reboot even if the boot-health check fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Force(pub bool);
+
+impl_arg!(
+    Force,
+    switch "force",
+    "Reboot even if the boot-health check fails"
+);
+
+/// Reboot the host (refused if the boot partition looks unhealthy)
+#[hicli::command]
+pub(crate) fn reboot(force: Force, ctx: &Ctx) -> Result<()> {
+    let Force(force) = force;
+    let admin = ctx.admin();
+    admin_call_ok(&admin, &AdminRequest::Reboot { force });
+    println!("Reboot initiated. Connection will drop within ~2 seconds.");
+    Ok(())
 }
 
 #[cfg(test)]

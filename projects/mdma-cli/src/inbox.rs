@@ -51,6 +51,8 @@ impl FromStr for InboxFileArg {
 
 impl_arg!(InboxFileArg, positional "FILENAME", "File name in inbox");
 
+/// List files in inbox
+#[hicli::command]
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
     match library.inbox_queue() {
@@ -72,6 +74,8 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     }
 }
 
+/// Delete a file from inbox without ingesting
+#[hicli::command]
 pub(crate) fn delete(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
     let InboxFileArg(path) = file;
@@ -92,6 +96,8 @@ pub(crate) fn delete(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
     }
 }
 
+/// Ingest a specific file from inbox
+#[hicli::command]
 pub(crate) fn ingest(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
     let InboxFileArg(path) = file;
@@ -120,6 +126,8 @@ pub(crate) fn ingest(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
     }
 }
 
+/// Ingest all files in inbox
+#[hicli::command]
 pub(crate) fn ingest_all(ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
     println!("Ingesting all files in inbox...");

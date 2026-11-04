@@ -186,6 +186,8 @@ fn find_dedup_group<'a>(
     Ok(found)
 }
 
+/// List duplicate groups, or merge the automatic ones with --apply
+#[hicli::command(default)]
 pub(crate) fn scan(apply: Apply, ctx: &Ctx) -> Result<()> {
     let Apply(apply) = apply;
     let library = ctx.library();
@@ -216,6 +218,11 @@ pub(crate) fn scan(apply: Apply, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Merge tracks you have confirmed to be duplicates into a winner
+///
+/// The other tracks' audio files are moved to the archive. All tracks must be in
+/// one duplicate group as listed by `mdma library dedup`.
+#[hicli::command]
 pub(crate) fn merge(args: MergeArgs, ctx: &Ctx) -> Result<()> {
     let MergeArgs {
         yes: Yes(yes),

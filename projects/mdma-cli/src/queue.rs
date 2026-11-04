@@ -64,6 +64,10 @@ pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
     }
 }
 
+/// Prepend a track to the front of the queue (plays next)
+///
+/// Hash may be omitted; if so, reads "{hash}  {display}" from stdin (dmenu output).
+#[hicli::command]
 pub(crate) fn next(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback();
     let hashes = hashes_arg_or_stdin(hash);
@@ -78,6 +82,10 @@ pub(crate) fn next(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Append a track to the end of the queue
+///
+/// Hash may be omitted; if so, reads "{hash}  {display}" from stdin (dmenu output).
+#[hicli::command]
 pub(crate) fn append(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback();
     let hashes = hashes_arg_or_stdin(hash);
@@ -91,6 +99,8 @@ pub(crate) fn append(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Show the current queue
+#[hicli::command]
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
     let playback = ctx.playback();
@@ -164,6 +174,21 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Clear the queue
+#[hicli::command]
+pub(crate) fn clear(ctx: &Ctx) -> Result<()> {
+    let playback = ctx.playback();
+    if let Err(e) = playback.queue_clear() {
+        handle_playback_error(e);
+    }
+    println!("Queue cleared");
+    Ok(())
+}
+
+/// Remove track(s) from the queue by hash
+///
+/// Hash may be omitted; if so, reads one hash per line from stdin.
+#[hicli::command]
 pub(crate) fn remove(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback();
     let content_hashes = hashes_arg_or_stdin(hash);
@@ -178,15 +203,15 @@ pub(crate) fn remove(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn clear(ctx: &Ctx) -> Result<()> {
-    let playback = ctx.playback();
-    if let Err(e) = playback.queue_clear() {
-        handle_playback_error(e);
-    }
-    println!("Queue cleared");
-    Ok(())
-}
-
+/// Atomically replace the entire queue from stdin
+///
+/// Reads playlist-format lines (8-12 char hex hash as first token).
+///
+/// Examples:
+///   mdma search --genre=Techno | shuf | mdma queue replace
+///   cat friday.plist | mdma queue replace
+///   mdma queue list | mdma sort bpm -a | mdma queue replace
+#[hicli::command]
 pub(crate) fn replace(ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback();
     let hashes = require_stdin_hashes();
@@ -202,6 +227,10 @@ pub(crate) fn replace(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Edit the queue in $EDITOR (falls back to vi)
+///
+/// Opens the current queue as a playlist file; save to apply changes.
+#[hicli::command]
 pub(crate) fn edit(ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
     let playback = ctx.playback();

@@ -308,6 +308,8 @@ impl SortDirection {
     }
 }
 
+/// Check if the service is running
+#[hicli::command]
 pub(crate) fn ping(ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
     match library.ping() {
@@ -319,6 +321,8 @@ pub(crate) fn ping(ctx: &Ctx) -> Result<()> {
     }
 }
 
+/// Get service status
+#[hicli::command]
 pub(crate) fn status(ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
     match library.status() {
@@ -335,6 +339,8 @@ pub(crate) fn status(ctx: &Ctx) -> Result<()> {
     }
 }
 
+/// List tracks in library
+#[hicli::command]
 pub(crate) fn list(limit: OptLimitArg, ctx: &Ctx) -> Result<()> {
     let OptLimitArg(limit) = limit;
     let library = ctx.library();
@@ -361,6 +367,8 @@ pub(crate) fn list(limit: OptLimitArg, ctx: &Ctx) -> Result<()> {
     }
 }
 
+/// Get a specific track by hash (supports partial hashes like git)
+#[hicli::command]
 pub(crate) fn get(hash: TrackArg, ctx: &Ctx) -> Result<()> {
     let TrackArg(content_hash) = hash;
     let library = ctx.library();
@@ -401,6 +409,8 @@ pub(crate) fn get(hash: TrackArg, ctx: &Ctx) -> Result<()> {
     }
 }
 
+/// Show all facts for a track
+#[hicli::command]
 pub(crate) fn facts(hash: TrackArg, ctx: &Ctx) -> Result<()> {
     let TrackArg(content_hash) = hash;
     let library = ctx.library();
@@ -444,6 +454,18 @@ fn compare_optional<T: Ord>(
     }
 }
 
+/// Sort hashes from stdin by a track metadata field
+///
+/// Reads one hash per line from stdin, outputs sorted hashes.
+/// Stable sort: chain multiple invocations for multi-key sort (right-to-left priority).
+/// For started and stopped, a missing value counts as -inf: ascending puts never-played
+/// first, descending puts never-played last.
+///
+/// Examples:
+///   mdma search --artist=CBL | mdma sort title -a
+///   mdma queue list | mdma sort bpm -d | mdma queue append
+///   cat friday.plist | mdma sort title -a | mdma sort artist -a > sorted.plist
+#[hicli::command]
 pub(crate) fn sort(direction: SortDirection, field: SortField, ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
 
@@ -495,6 +517,8 @@ pub(crate) fn sort(direction: SortDirection, field: SortField, ctx: &Ctx) -> Res
     Ok(())
 }
 
+/// Bookmark the currently playing track, or a specific track by hash
+#[hicli::command]
 pub(crate) fn bookmark(scope: OptScopeArg, hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
     let OptScopeArg(scope) = scope;
     let OptTrackArg(hash) = hash;
@@ -521,6 +545,8 @@ pub(crate) fn bookmark(scope: OptScopeArg, hash: OptTrackArg, ctx: &Ctx) -> Resu
     }
 }
 
+/// List all bookmarked tracks
+#[hicli::command]
 pub(crate) fn bookmarks(ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
     let tracks = match library.list_tracks(None) {
@@ -553,6 +579,18 @@ pub(crate) fn bookmarks(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Display selected fields for tracks read from stdin
+///
+/// Reads hashes from stdin (one per line), looks up TrackInfo for each hash,
+/// and renders a colored, columnized table with the selected fields.
+///
+/// Field order in the output matches the order the flags appear on the command line.
+///
+/// Examples:
+///   mdma search --artist CBL | mdma view --hash --artist --title
+///   mdma search --genre Techno | mdma view --title --duration
+///   cat friday.plist | mdma view --hash --artist --title --duration
+#[hicli::command]
 pub(crate) fn view(columns: ViewColumns, ctx: &Ctx) -> Result<()> {
     use std::io::IsTerminal;
 

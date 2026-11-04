@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use bpaf::Bpaf;
 use gateway_client::GatewayClient;
 use mdma_client::{LibraryBackend, PlaybackBackend, SourceClient};
 use node_discovery::{NodeSpec, Target};
@@ -18,15 +19,32 @@ use crate::node;
 pub const DEFAULT_LIBRARY_SOCKET: &str = "ipc:///run/mdma/library.sock";
 pub const DEFAULT_PLAYBACK_SOCKET: &str = "ipc:///run/mdma/playback.sock";
 
-/// The global options, as given on the command line or in the environment.
-///
-/// `socket` and `playback_socket` are `None` when left at their defaults, so
-/// that "given explicitly" can be told apart from "defaulted".
-#[derive(Debug, Clone)]
+// The global options, as given on the command line or in the environment.
+//
+// `socket` and `playback_socket` are `None` when left at their defaults, so
+// that "given explicitly" can be told apart from "defaulted".
+#[derive(Debug, Clone, Bpaf)]
 pub struct Globals {
+    /// Node hostname (e.g. mdma-909.local), optionally with a port. Also read from
+    /// MDMA_NODE. Without either, the remembered or discovered node is used.
+    #[bpaf(long, argument("NODE"))]
     pub node: Option<NodeSpec>,
+    /// Library IPC socket address (direct mode, ignored when --node is set).
+    /// Default: ipc:///run/mdma/library.sock
+    #[bpaf(long, env("MDMA_LIBRARY_SOCKET"), argument("SOCKET"))]
     pub socket: Option<String>,
+    /// Playback server socket address (direct mode, ignored when --node is set).
+    /// Default: ipc:///run/mdma/playback.sock
+    #[bpaf(long, env("MDMA_PLAYBACK_SOCKET"), argument("PLAYBACK_SOCKET"))]
     pub playback_socket: Option<String>,
+    /// Sources directory for direct mode (contains *.sock files)
+    #[bpaf(
+        long,
+        env("MDMA_SOURCES_DIR"),
+        argument("SOURCES_DIR"),
+        fallback("/run/mdma/sources".to_string()),
+        display_fallback
+    )]
     pub sources_dir: String,
 }
 

@@ -57,6 +57,8 @@ pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
     }
 }
 
+/// Start playback from the queue (use `mdma queue append <hash>` to enqueue tracks)
+#[hicli::command]
 pub(crate) fn start(ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback();
     if let Err(e) = playback.play_queue() {
@@ -66,6 +68,8 @@ pub(crate) fn start(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Stop playback on deck A
+#[hicli::command]
 pub(crate) fn stop(ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback();
     if let Err(e) = playback.stop(Deck::A) {
@@ -76,6 +80,8 @@ pub(crate) fn stop(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Pause playback on deck A (keeps the current track loaded; resume to continue)
+#[hicli::command]
 pub(crate) fn pause(ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback();
     if let Err(e) = playback.pause(Deck::A) {
@@ -86,6 +92,8 @@ pub(crate) fn pause(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Resume playback on deck A after a pause
+#[hicli::command]
 pub(crate) fn resume(ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback();
     if let Err(e) = playback.resume(Deck::A) {
@@ -96,6 +104,8 @@ pub(crate) fn resume(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Skip to the next track in the queue
+#[hicli::command]
 pub(crate) fn skip(ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback();
     if let Err(e) = playback.skip() {
@@ -106,6 +116,8 @@ pub(crate) fn skip(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Show what is currently playing
+#[hicli::command]
 pub(crate) fn now(ctx: &Ctx) -> Result<()> {
     use std::io::IsTerminal;
     let playback = ctx.playback();
@@ -140,6 +152,8 @@ pub(crate) fn now(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Show the current session ID (a session spans from first play to queue empty)
+#[hicli::command]
 pub(crate) fn session(ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback();
     match playback.session() {
@@ -154,6 +168,8 @@ pub(crate) fn session(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// List available audio output devices
+#[hicli::command]
 pub(crate) fn outputs(ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback();
     let sinks = match playback.list_audio_outputs() {
@@ -194,6 +210,8 @@ impl_arg!(
     "Device name as shown by `mdma playback outputs`"
 );
 
+/// Select an audio output device by name
+#[hicli::command]
 pub(crate) fn set_output(name: OutputNameArg, ctx: &Ctx) -> Result<()> {
     let OutputNameArg(name) = name;
     let playback = ctx.playback();
@@ -210,6 +228,8 @@ pub(crate) fn set_output(name: OutputNameArg, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Show the currently selected audio output
+#[hicli::command]
 pub(crate) fn get_output(ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback();
     let cfg = match playback.get_audio_output() {

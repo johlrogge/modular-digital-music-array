@@ -2,21 +2,65 @@
 //!
 //! Connects to services via gateway (single address) or direct IPC.
 
+/// Admin commands (service mode, reboot)
+#[hicli::group]
 mod admin;
 mod args;
 mod completions;
 mod ctx;
 mod editor;
+/// Add or retract metadata facts on a track
+#[hicli::group]
 mod fact;
+/// Inbox management commands
+#[hicli::group]
 mod inbox;
+/// Library maintenance commands
+#[hicli::group]
 mod library;
+/// Find and choose the MDMA node to talk to
+#[hicli::group]
 mod node;
 mod output;
+/// Playback control commands
+#[hicli::group]
 mod playback;
+/// Manage playlists
+#[hicli::group]
 mod playlist;
+/// Queue management (feeds deck A)
+#[hicli::group]
 mod queue;
+/// Export tracks for Pioneer Rekordbox
+///
+/// Downloads audio files and generates rekordbox.xml for import
+/// via Rekordbox File -> Import Library.
+///
+/// Examples:
+///   mdma rekordbox export --playlist my-set
+///   mdma search --artist CBL | mdma rekordbox export
+#[hicli::group]
 mod rekordbox;
+/// Search for tracks
+///
+/// Filter with options such as --artist, --bpm or --key, or give a free-text query
+/// that is applied to all text fields. Hashes piped on stdin restrict the search to
+/// those tracks (--no-stdin ignores them); --not inverts the result.
+#[hicli::group]
 mod search;
+/// Music source management
+///
+/// Per-source commands: mdma source <SOURCE-NAME> <COMMAND>
+///
+/// Commands: sync, status, downloads, cancel, pause, resume, resync, check-item,
+/// check-updates, playlists, import-playlist, import-status.
+/// Run 'mdma source <SOURCE-NAME> --help' for details.
+/// 'list' is reserved and cannot be a source name.
+///
+/// Examples:
+///   mdma source list
+///   mdma source bandcamp sync
+#[hicli::group(args = crate::source::SourceArg)]
 mod source;
 mod stdin;
 mod subscribe;
@@ -230,6 +274,23 @@ fn globals_from(cli: &Cli, matches: &clap::ArgMatches) -> Globals {
     }
 }
 
+// The hicli command tree, declared beside clap's until `main` runs it.
+#[allow(dead_code)] // wired into main in step 2
+fn app() -> hicli::App<ctx::Globals, ctx::Ctx> {
+    hicli::app! {
+        globals: ctx::globals(),
+        commands: [
+            tracks::ping, tracks::status, tracks::list, tracks::get, tracks::facts,
+            search, inbox, source, playback, queue, tracks::sort, subscribe::subscribe,
+            transfer::upload, transfer::export, rekordbox, playlist, library,
+            tracks::bookmark, tracks::bookmarks, fact, tracks::view,
+            completions::generate_completions, admin, node,
+        ]
+    }
+    .about("MDMA CLI - Control the music services")
+    .version(env!("CARGO_PKG_VERSION"))
+}
+
 fn main() -> Result<()> {
     color_eyre::install()?;
 
@@ -280,7 +341,7 @@ fn main() -> Result<()> {
             tracks::view(columns, &ctx)
         }
         Commands::GenerateCompletions(completions::CompletionsCli { shell }) => {
-            completions::generate(completions::ShellArg(shell))
+            completions::generate_clap(shell)
         }
         Commands::Admin { command } => admin::dispatch(command, &ctx),
         Commands::Node { command } => node::dispatch(command, &ctx),
@@ -356,6 +417,229 @@ mod tests {
             let cli = parse_cli(&["--node", good, "node", "show"]).unwrap();
             let spec = cli.node.unwrap();
             assert_eq!((spec.host(), spec.port()), ("host", port), "{good}");
+        }
+    }
+
+    /// The command path `argv` reaches in the hicli tree.
+    fn app_path(argv: &[&str]) -> Vec<&'static str> {
+        match app().parse(argv.iter().copied()) {
+            Ok((_, invocation)) => invocation.path().to_vec(),
+            Err(e) => panic!("{argv:?} should parse: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn app_parses_the_smoke_list() {
+        let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        let zip = tempfile::NamedTempFile::new().expect("temp file");
+        std::fs::write(zip.path(), b"PK\x03\x04").expect("write zip magic");
+        let zip = zip.path().to_str().expect("utf-8 path").to_string();
+
+        let smoke: Vec<(Vec<&str>, Vec<&str>)> = vec![
+            (vec!["ping"], vec!["ping"]),
+            (vec!["status"], vec!["status"]),
+            (vec!["list"], vec!["list"]),
+            (vec!["list", "--limit", "3"], vec!["list"]),
+            (vec!["get", "abcd1234"], vec!["get"]),
+            (vec!["facts", "abcd1234"], vec!["facts"]),
+            (vec!["search"], vec!["search"]),
+            (vec!["search", "--artist", "CBL", "jazz"], vec!["search"]),
+            (
+                vec!["search", "fact-values-for", "genre"],
+                vec!["search", "fact-values-for"],
+            ),
+            (vec!["inbox", "list"], vec!["inbox", "list"]),
+            (vec!["inbox", "delete", "a.mp3"], vec!["inbox", "delete"]),
+            (vec!["inbox", "ingest", "a.mp3"], vec!["inbox", "ingest"]),
+            (vec!["inbox", "ingest-all"], vec!["inbox", "ingest-all"]),
+            (vec!["source", "list"], vec!["source", "list"]),
+            (vec!["source", "bandcamp", "sync"], vec!["source", "sync"]),
+            (
+                vec!["source", "bandcamp", "import-playlist", "--dry-run", "slug"],
+                vec!["source", "import-playlist"],
+            ),
+            (vec!["playback", "start"], vec!["playback", "start"]),
+            (vec!["playback", "stop"], vec!["playback", "stop"]),
+            (vec!["playback", "pause"], vec!["playback", "pause"]),
+            (vec!["playback", "resume"], vec!["playback", "resume"]),
+            (vec!["playback", "skip"], vec!["playback", "skip"]),
+            (vec!["playback", "now"], vec!["playback", "now"]),
+            (vec!["playback", "session"], vec!["playback", "session"]),
+            (vec!["playback", "outputs"], vec!["playback", "outputs"]),
+            (
+                vec!["playback", "set-output", "dev"],
+                vec!["playback", "set-output"],
+            ),
+            (
+                vec!["playback", "get-output"],
+                vec!["playback", "get-output"],
+            ),
+            (vec!["queue", "next"], vec!["queue", "next"]),
+            (vec!["queue", "append", "abcd1234"], vec!["queue", "append"]),
+            (vec!["queue", "list"], vec!["queue", "list"]),
+            (vec!["queue", "clear"], vec!["queue", "clear"]),
+            (vec!["queue", "remove"], vec!["queue", "remove"]),
+            (vec!["queue", "replace"], vec!["queue", "replace"]),
+            (vec!["queue", "edit"], vec!["queue", "edit"]),
+            (vec!["sort", "title", "-a"], vec!["sort"]),
+            (vec!["subscribe"], vec!["subscribe"]),
+            (
+                vec!["upload", "--ssh-key", manifest, zip.as_str()],
+                vec!["upload"],
+            ),
+            (
+                vec!["export", "--format", "wav", "--output", "out"],
+                vec!["export"],
+            ),
+            (
+                vec!["rekordbox", "export", "--playlist", "set"],
+                vec!["rekordbox", "export"],
+            ),
+            (
+                vec!["rekordbox", "import", manifest],
+                vec!["rekordbox", "import"],
+            ),
+            (vec!["playlist", "list"], vec!["playlist", "list"]),
+            (vec!["playlist", "get"], vec!["playlist", "get"]),
+            (
+                vec!["playlist", "contains", "--all"],
+                vec!["playlist", "contains"],
+            ),
+            (vec!["playlist", "new", "set"], vec!["playlist", "new"]),
+            (
+                vec!["playlist", "append", "set"],
+                vec!["playlist", "append"],
+            ),
+            (
+                vec!["playlist", "replace", "set"],
+                vec!["playlist", "replace"],
+            ),
+            (vec!["playlist", "edit", "set"], vec!["playlist", "edit"]),
+            (
+                vec!["playlist", "remove", "set"],
+                vec!["playlist", "remove"],
+            ),
+            (
+                vec!["playlist", "rename", "old", "new"],
+                vec!["playlist", "rename"],
+            ),
+            (
+                vec!["library", "reindex-covers"],
+                vec!["library", "reindex-covers"],
+            ),
+            (
+                vec!["library", "track", "delete", "abcd1234"],
+                vec!["library", "track", "delete"],
+            ),
+            (
+                vec!["library", "track", "restore", "abcd1234"],
+                vec!["library", "track", "restore"],
+            ),
+            (
+                vec!["library", "track", "replace", "abcd1234", "/tmp/new.flac"],
+                vec!["library", "track", "replace"],
+            ),
+            (
+                vec!["library", "track", "orphans"],
+                vec!["library", "track", "orphans"],
+            ),
+            (
+                vec!["library", "identity", "backfill", "--pcm"],
+                vec!["library", "identity", "backfill"],
+            ),
+            (
+                vec!["library", "identity", "status"],
+                vec!["library", "identity", "status"],
+            ),
+            (
+                vec!["library", "identity", "cancel"],
+                vec!["library", "identity", "cancel"],
+            ),
+            (vec!["library", "dedup"], vec!["library", "dedup"]),
+            (
+                vec!["library", "dedup", "--apply"],
+                vec!["library", "dedup"],
+            ),
+            (
+                vec!["library", "dedup", "merge", "abcd1234", "bcde2345"],
+                vec!["library", "dedup", "merge"],
+            ),
+            (vec!["library", "archive"], vec!["library", "archive"]),
+            (
+                vec!["library", "archive", "empty", "-y"],
+                vec!["library", "archive", "empty"],
+            ),
+            (vec!["bookmark"], vec!["bookmark"]),
+            (
+                vec!["bookmark", "--scope", "friday", "abcd1234"],
+                vec!["bookmark"],
+            ),
+            (vec!["bookmarks"], vec!["bookmarks"]),
+            (
+                vec![
+                    "fact", "add", "--field", "year", "--value", "2020", "abcd1234",
+                ],
+                vec!["fact", "add"],
+            ),
+            (
+                vec![
+                    "fact", "retract", "--field", "year", "--value", "2020", "abcd1234",
+                ],
+                vec!["fact", "retract"],
+            ),
+            (vec!["view", "--title", "--hash"], vec!["view"]),
+            (
+                vec!["generate-completions", "bash"],
+                vec!["generate-completions"],
+            ),
+            (
+                vec!["admin", "service-mode", "status"],
+                vec!["admin", "service-mode", "status"],
+            ),
+            (
+                vec!["admin", "service-mode", "enable"],
+                vec!["admin", "service-mode", "enable"],
+            ),
+            (
+                vec!["admin", "service-mode", "disable"],
+                vec!["admin", "service-mode", "disable"],
+            ),
+            (vec!["admin", "boot-health"], vec!["admin", "boot-health"]),
+            (vec!["admin", "reboot", "--force"], vec!["admin", "reboot"]),
+            (vec!["node", "list"], vec!["node", "list"]),
+            (vec!["node", "select", "host"], vec!["node", "select"]),
+            (vec!["node", "forget"], vec!["node", "forget"]),
+            (
+                vec!["--node", "host:5555", "node", "show"],
+                vec!["node", "show"],
+            ),
+        ];
+        for (argv, path) in smoke {
+            assert_eq!(app_path(&argv), path, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn app_rejects() {
+        let rejected: &[&[&str]] = &[
+            &["sort", "title"],
+            &["sort", "title", "-a", "-d"],
+            &["view"],
+            &["playlist", "contains", "--all", "--no"],
+            &["export", "--format", "wav", "--lossy-format", "wav"],
+            &["library", "archive", "--yes"],
+            &["library", "dedup", "merge", "aaaaaaaa"],
+            &["search", "--added", "-7"],
+            &["get", "xyz"],
+            &["bandcamp", "playlists"],
+        ];
+        for argv in rejected {
+            match app().parse(argv.iter().copied()) {
+                Ok((_, invocation)) => {
+                    panic!("{argv:?} should be rejected, got {:?}", invocation.path())
+                }
+                Err(e) => assert_eq!(hicli::exit_code_for(&e), 2, "{argv:?}"),
+            }
         }
     }
 

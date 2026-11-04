@@ -2,7 +2,7 @@ use crate::args::{choice, impl_arg, parse_choice, Choice};
 use crate::ctx::Ctx;
 use crate::output::{handle_error, print_tracks};
 use crate::stdin::read_hashes;
-use bpaf::{long, Parser};
+use bpaf::{long, Bpaf, Parser};
 use clap::Subcommand;
 use color_eyre::Result;
 use hicli::Arg;
@@ -38,50 +38,63 @@ pub(crate) struct SearchCli {
     pub(crate) subcommand: Option<Command>,
 }
 
-#[derive(clap::Args, Debug, Default)]
+// Both clap and bpaf read the field docs; the typed filters take their help from
+// their `Arg` impls instead (the same text), so their docs serve clap alone.
+#[derive(clap::Args, Debug, Default, Bpaf)]
 pub(crate) struct SearchArgs {
     /// Filter by artist name
     #[arg(long)]
+    #[bpaf(argument("ARTIST"))]
     artist: Option<String>,
 
     /// Filter by track title
     #[arg(long)]
+    #[bpaf(argument("TITLE"))]
     title: Option<String>,
 
     /// Filter by album name
     #[arg(long)]
+    #[bpaf(argument("ALBUM"))]
     album: Option<String>,
 
     /// Filter by label name
     #[arg(long)]
+    #[bpaf(argument("LABEL"))]
     label: Option<String>,
 
     /// Filter by main genre (e.g. "Electronic", "Techno")
     #[arg(long)]
+    #[bpaf(argument("GENRE"))]
     genre: Option<String>,
 
     /// Filter by style descriptor — matches if any descriptor matches
     #[arg(long)]
+    #[bpaf(argument("STYLE"))]
     style: Option<String>,
 
     /// Filter by BPM. Formats: 128  128+-4  124..132  128+2  128-2
     #[arg(long)]
+    #[bpaf(external(BpmArg::parser), optional)]
     bpm: Option<BpmArg>,
 
     /// Filter by musical key. Formats: Am  "A minor"  8B  8B+-1  8B+-1~
     #[arg(long)]
+    #[bpaf(external(KeyArg::parser), optional)]
     key: Option<KeyArg>,
 
     /// Filter by duration. Formats: 7m  7m15s  >5m  <8m  6m..8m
     #[arg(long)]
+    #[bpaf(external(DurationArg::parser), optional)]
     duration: Option<DurationArg>,
 
     /// Filter by release year. Formats: 2022  2019..2022
     #[arg(long)]
+    #[bpaf(external(YearArg::parser), optional)]
     year: Option<YearArg>,
 
     /// Filter by source (bandcamp, beatport, upload)
     #[arg(long)]
+    #[bpaf(argument("SOURCE"))]
     source: Option<String>,
 
     /// Ignore stdin (don't read piped hashes as intersection filter)
@@ -90,27 +103,33 @@ pub(crate) struct SearchArgs {
 
     /// Filter by last started date. Format: N/A, >2026-02, <2026, 2026-01..2026-06 (dash-leading values: --started=-7)
     #[arg(long)]
+    #[bpaf(long("started"), argument("STARTED"))]
     started: Option<DateArg>,
 
     /// Filter by last stopped date. Same format as --started (dash-leading values: --stopped=-7).
     #[arg(long)]
+    #[bpaf(long("stopped"), argument("STOPPED"))]
     stopped: Option<DateArg>,
 
     /// Filter by date added to library. Uses date expression syntax: ~/+1/15 (15th next month), --added=-7 (7 days ago), ^ (1st of month), $ (end of month). Ranges: --added=-7..~ (last 7 days to today).
     #[arg(long)]
+    #[bpaf(long("added"), argument("ADDED"))]
     added: Option<DateArg>,
 
     /// Filter by playback history. `never` matches tracks with no started fact (never played).
     /// When combined with --started, --played=never takes precedence.
     #[arg(long)]
+    #[bpaf(external(PlayedFilter::parser), optional)]
     played: Option<PlayedFilter>,
 
     /// Filter by DJ role. Accepted values: opener, build-up, peak, banger, cool-down, closer, filler
     #[arg(long)]
+    #[bpaf(external(RoleArg::parser), optional)]
     role: Option<RoleArg>,
 
     /// Filter by energy level (1-10). Formats: 7  5..8  7+-2
     #[arg(long)]
+    #[bpaf(external(EnergyArg::parser), optional)]
     energy: Option<EnergyArg>,
 
     /// Invert the search results — return tracks that do NOT match the filters.
@@ -119,7 +138,14 @@ pub(crate) struct SearchArgs {
 
     /// Free-text query applied to all text fields (title, artist, album, label, genre).
     /// Supports CamelCase initialism (CarbBased) and /regex/ syntax.
+    #[bpaf(positional("QUERY"))]
     query: Option<String>,
+}
+
+impl Arg for SearchArgs {
+    fn parser() -> impl Parser<Self> {
+        search_args()
+    }
 }
 
 /// A fact type name (e.g. MainGenre, Label, Key).
@@ -300,6 +326,8 @@ pub(crate) fn dispatch(cli: SearchCli, ctx: &Ctx) -> Result<()> {
     }
 }
 
+/// Search for tracks by filter or free text
+#[hicli::command(default)]
 pub(crate) fn query(args: SearchArgs, ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
     let no_stdin = args.no_stdin;
@@ -466,6 +494,13 @@ fn search_tracks(library: &LibraryBackend, query: &TrackQuery, no_stdin: bool) -
     }
 }
 
+/// List all distinct values stored for a fact type
+///
+/// Examples:
+///   mdma search fact-values-for genre
+///   mdma search fact-values-for label | grep -i "ost"
+///   mdma search fact-values-for genre | dmenu | xargs -I{} mdma search --genre {}
+#[hicli::command]
 pub(crate) fn fact_values_for(fact_type: FactTypeArg, ctx: &Ctx) -> Result<()> {
     use std::io::IsTerminal;
     let FactTypeArg(fact_type) = fact_type;

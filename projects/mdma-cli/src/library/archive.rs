@@ -82,6 +82,8 @@ fn format_archive_emptied(r: &ArchiveEmptyReport) -> String {
     out
 }
 
+/// List the files that duplicate merges moved to the archive
+#[hicli::command(default)]
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
     match library.archive_list() {
@@ -96,6 +98,10 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     }
 }
 
+/// Permanently delete everything in the archive
+///
+/// Shows what the archive holds and asks for confirmation. This cannot be undone.
+#[hicli::command]
 pub(crate) fn empty(yes: Yes, ctx: &Ctx) -> Result<()> {
     let Yes(yes) = yes;
     let library = ctx.library();
