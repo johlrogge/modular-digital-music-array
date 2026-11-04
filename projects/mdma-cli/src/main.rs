@@ -36,7 +36,7 @@ struct Cli {
     /// Node hostname (e.g. mdma-909.local), optionally with a port. Also read from
     /// MDMA_NODE. Without either, the remembered or discovered node is used.
     #[arg(long)]
-    node: Option<String>,
+    node: Option<node_discovery::NodeSpec>,
 
     /// Library IPC socket address (direct mode, ignored when --node is set)
     #[arg(
@@ -427,6 +427,20 @@ mod tests {
         let tracks::ViewColumns(cols) =
             view_columns(matches.subcommand_matches("view").unwrap()).unwrap();
         assert_eq!(cols.len(), 2);
+    }
+
+    #[test]
+    fn node_flag_is_checked_at_parse_time() {
+        for bad in ["host:notaport", "host:0", "host:99999", "", ":5555"] {
+            let e =
+                crate::Cli::try_parse_from(["mdma", "--node", bad, "node", "show"]).unwrap_err();
+            assert_eq!(e.exit_code(), 2, "{bad:?}");
+        }
+        for (good, port) in [("host", None), ("host:5555", Some(5555))] {
+            let cli = crate::Cli::try_parse_from(["mdma", "--node", good, "node", "show"]).unwrap();
+            let spec = cli.node.unwrap();
+            assert_eq!((spec.host(), spec.port()), ("host", port), "{good}");
+        }
     }
 
     #[test]

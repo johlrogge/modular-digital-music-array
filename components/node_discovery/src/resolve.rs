@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crate::browse::DiscoveredNode;
 use crate::cache::NodeCache;
+use crate::spec::NodeSpec;
 use crate::verify::{verify_candidate, VerifyError};
 
 /// Gateway port used when none is given.
@@ -61,9 +62,9 @@ pub struct Effects<'a> {
 #[derive(Debug, Clone, Default)]
 pub struct Request {
     /// `--node`
-    pub explicit: Option<String>,
+    pub explicit: Option<NodeSpec>,
     /// `MDMA_NODE`
-    pub env: Option<String>,
+    pub env: Option<NodeSpec>,
     pub local_ipc: bool,
 }
 
@@ -137,10 +138,10 @@ pub fn resolve(request: Request, effects: &mut Effects<'_>) -> Result<Resolution
     } = request;
 
     if let Some(spec) = explicit {
-        return Ok(named(&spec, Source::Explicit));
+        return Ok(named(spec, Source::Explicit));
     }
     if let Some(spec) = env {
-        return Ok(named(&spec, Source::Env));
+        return Ok(named(spec, Source::Env));
     }
     if local_ipc {
         return Ok(Resolution {
@@ -155,19 +156,12 @@ pub fn resolve(request: Request, effects: &mut Effects<'_>) -> Result<Resolution
 }
 
 /// An explicit/env target: `host` or `host:port`. The cache is left alone.
-fn named(spec: &str, source: Source) -> Resolution {
-    let (host, port) = match spec.rsplit_once(':') {
-        Some((h, p)) => match p.parse::<u16>() {
-            Ok(port) => (h, port),
-            Err(_) => (spec, DEFAULT_PORT),
-        },
-        None => (spec, DEFAULT_PORT),
-    };
+fn named(spec: NodeSpec, source: Source) -> Resolution {
     Resolution {
         target: Target::Remote(RemoteTarget {
-            host: host.to_string(),
+            host: spec.host().to_string(),
             ip: None,
-            port,
+            port: spec.port().unwrap_or(DEFAULT_PORT),
             source,
         }),
         cache_update: None,
@@ -505,8 +499,8 @@ mod tests {
     #[test]
     fn explicit_beats_env_and_never_loads_the_cache() {
         let r = Request {
-            explicit: Some("a.local".into()),
-            env: Some("b.local".into()),
+            explicit: Some("a.local".parse().unwrap()),
+            env: Some("b.local".parse().unwrap()),
             local_ipc: true,
         };
         let w = World::cached();
@@ -520,7 +514,7 @@ mod tests {
     #[test]
     fn explicit_host_with_port() {
         let r = Request {
-            explicit: Some("a.local:6000".into()),
+            explicit: Some("a.local:6000".parse().unwrap()),
             ..Request::default()
         };
         let res = World::new().run(r).unwrap();
@@ -533,7 +527,7 @@ mod tests {
     #[test]
     fn env_beats_local_ipc_and_never_loads_the_cache() {
         let r = Request {
-            env: Some("b.local".into()),
+            env: Some("b.local".parse().unwrap()),
             local_ipc: true,
             ..Request::default()
         };

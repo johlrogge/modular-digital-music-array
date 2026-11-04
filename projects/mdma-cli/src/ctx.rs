@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use gateway_client::GatewayClient;
 use mdma_client::{LibraryBackend, PlaybackBackend, SourceClient};
-use node_discovery::Target;
+use node_discovery::{NodeSpec, Target};
 
 use crate::node;
 
@@ -24,7 +24,7 @@ pub const DEFAULT_PLAYBACK_SOCKET: &str = "ipc:///run/mdma/playback.sock";
 /// that "given explicitly" can be told apart from "defaulted".
 #[derive(Debug, Clone)]
 pub struct Globals {
-    pub node: Option<String>,
+    pub node: Option<NodeSpec>,
     pub socket: Option<String>,
     pub playback_socket: Option<String>,
     pub sources_dir: String,
@@ -69,12 +69,12 @@ impl Ctx {
     /// choices and exits with advice on failure.
     pub fn target(&self) -> &Target {
         self.target
-            .get_or_init(|| node::resolve_startup(self.globals.node.as_deref(), self.local_ipc))
+            .get_or_init(|| node::resolve_startup(self.globals.node.as_ref(), self.local_ipc))
     }
 
     /// The `--node` flag, as given.
-    pub fn node_flag(&self) -> Option<&str> {
-        self.globals.node.as_deref()
+    pub fn node_flag(&self) -> Option<&NodeSpec> {
+        self.globals.node.as_ref()
     }
 
     /// Whether the local services are to be reached over IPC.

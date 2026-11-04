@@ -13,9 +13,9 @@ use std::time::Duration;
 use crate::ctx::Ctx;
 use gateway_client::{GatewayClient, IdentifyError, NodeIdentity};
 use node_discovery::{
-    cache, resolve, DiscoveredNode, Effects, IdentityCheck, NodeCache, NodeKind, RemoteTarget,
-    Request, ResolveError, SelectEffects, SelectError, Source, Target, Unreachable, VerifyError,
-    BROWSE_TIMEOUT,
+    cache, resolve, DiscoveredNode, Effects, IdentityCheck, NodeCache, NodeKind, NodeSpec,
+    RemoteTarget, Request, ResolveError, SelectEffects, SelectError, Source, Target, Unreachable,
+    VerifyError, BROWSE_TIMEOUT,
 };
 
 /// How long to wait for a gateway to answer an identify request.
@@ -364,8 +364,20 @@ fn real_effects() -> Effects<'static> {
     }
 }
 
-fn env_node() -> Option<String> {
-    std::env::var(NODE_ENV).ok().filter(|v| !v.is_empty())
+/// `MDMA_NODE`. Empty counts as unset, so `MDMA_NODE= mdma ...` overrides a
+/// value exported by the environment (devenv sets one).
+fn parse_env_node(value: Option<&str>) -> Result<Option<NodeSpec>, String> {
+    match value.filter(|v| !v.is_empty()) {
+        None => Ok(None),
+        Some(v) => v
+            .parse()
+            .map(Some)
+            .map_err(|e| format!("error: invalid {NODE_ENV}: {e}")),
+    }
+}
+
+fn env_node() -> Result<Option<NodeSpec>, String> {
+    parse_env_node(std::env::var(NODE_ENV).ok().as_deref())
 }
 
 fn cache_path() -> Option<PathBuf> {
@@ -390,17 +402,23 @@ fn save_cache(update: &NodeCache) {
     }
 }
 
-fn request(explicit: Option<&str>, local_ipc: bool) -> Request {
+/// The resolution request; a bad `MDMA_NODE` prints the error and exits 1,
+/// like an unresolvable node does.
+fn request(explicit: Option<&NodeSpec>, local_ipc: bool) -> Request {
+    let env = env_node().unwrap_or_else(|message| {
+        eprintln!("{message}");
+        std::process::exit(1);
+    });
     Request {
-        explicit: explicit.filter(|s| !s.is_empty()).map(String::from),
-        env: env_node(),
+        explicit: explicit.cloned(),
+        env,
         local_ipc,
     }
 }
 
 /// Resolve the node once at startup, remembering it when the resolver says
 /// so. Prints a note for implicit choices and exits with advice on failure.
-pub fn resolve_startup(explicit: Option<&str>, local_ipc: bool) -> Target {
+pub fn resolve_startup(explicit: Option<&NodeSpec>, local_ipc: bool) -> Target {
     match resolve(request(explicit, local_ipc), &mut real_effects()) {
         Ok(resolution) => {
             if let Some(update) = &resolution.cache_update {
@@ -550,6 +568,32 @@ pub(crate) fn show(ctx: &Ctx) -> color_eyre::Result<()> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn env_node_unset_or_empty_is_not_given() {
+        assert_eq!(parse_env_node(None), Ok(None));
+        assert_eq!(parse_env_node(Some("")), Ok(None));
+    }
+
+    #[test]
+    fn env_node_is_parsed_as_host_and_port() {
+        let spec = parse_env_node(Some("mdma.local:6000")).unwrap().unwrap();
+        assert_eq!((spec.host(), spec.port()), ("mdma.local", Some(6000)));
+        let spec = parse_env_node(Some("mdma.local")).unwrap().unwrap();
+        assert_eq!((spec.host(), spec.port()), ("mdma.local", None));
+    }
+
+    #[test]
+    fn bad_env_node_names_the_variable() {
+        assert_eq!(
+            parse_env_node(Some("mdma.local:nope")),
+            Err(
+                "error: invalid MDMA_NODE: invalid port 'nope' in node 'mdma.local:nope', \
+                 expected 1-65535"
+                    .to_string()
+            )
+        );
+    }
 
     fn stage() -> DiscoveredNode {
         DiscoveredNode {
