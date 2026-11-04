@@ -1,9 +1,9 @@
 use crate::ctx::Ctx;
+use crate::library::Yes;
 use crate::stdin::is_yes;
 use clap::Subcommand;
 use color_eyre::Result;
 use library_ipc_client::{ArchiveEmptyReport, ArchiveListing};
-use mdma_client::LibraryBackend;
 use storage_primitives::ByteSize;
 
 #[derive(Subcommand, Debug)]
@@ -19,10 +19,9 @@ pub(crate) enum Command {
 }
 
 pub(crate) fn dispatch(command: Option<Command>, ctx: &Ctx) -> Result<()> {
-    let lib = ctx.library();
-    match &command {
-        None => handle_archive_list(&lib),
-        Some(Command::Empty { yes }) => handle_archive_empty(&lib, *yes),
+    match command {
+        None => list(ctx),
+        Some(Command::Empty { yes }) => empty(Yes(yes), ctx),
     }
 }
 
@@ -83,7 +82,8 @@ fn format_archive_emptied(r: &ArchiveEmptyReport) -> String {
     out
 }
 
-fn handle_archive_list(client: &LibraryBackend) -> Result<()> {
+pub(crate) fn list(ctx: &Ctx) -> Result<()> {
+    let client = ctx.library();
     match client.archive_list() {
         Ok(l) => {
             println!("{}", format_archive_listing(&l));
@@ -96,7 +96,9 @@ fn handle_archive_list(client: &LibraryBackend) -> Result<()> {
     }
 }
 
-fn handle_archive_empty(client: &LibraryBackend, yes: bool) -> Result<()> {
+pub(crate) fn empty(yes: Yes, ctx: &Ctx) -> Result<()> {
+    let Yes(yes) = yes;
+    let client = ctx.library();
     // `--yes` without a listing deletes everything; after a prompt, only what was shown.
     let mut up_to = None;
     if !yes {
@@ -149,13 +151,12 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use super::Command as ArchiveCommands;
-    use crate::library::Command as LibraryCommands;
+    use crate::library;
     use crate::Commands;
 
     // ── archive ───────────────────────────────────────────────────────────────
 
-    fn archive_command(args: &[&str]) -> Option<ArchiveCommands> {
+    fn archive_command(args: &[&str]) -> Option<Command> {
         let mut argv = vec!["mdma", "library", "archive"];
         argv.extend_from_slice(args);
         match Cli::try_parse_from(&argv)
@@ -163,7 +164,7 @@ mod tests {
             .command
         {
             Commands::Library {
-                command: LibraryCommands::Archive { command },
+                command: library::Command::Archive { command },
             } => command,
             other => panic!("unexpected command: {:?}", other),
         }
@@ -174,15 +175,15 @@ mod tests {
         assert!(archive_command(&[]).is_none());
         assert!(matches!(
             archive_command(&["empty"]),
-            Some(ArchiveCommands::Empty { yes: false })
+            Some(Command::Empty { yes: false })
         ));
         assert!(matches!(
             archive_command(&["empty", "--yes"]),
-            Some(ArchiveCommands::Empty { yes: true })
+            Some(Command::Empty { yes: true })
         ));
         assert!(matches!(
             archive_command(&["empty", "-y"]),
-            Some(ArchiveCommands::Empty { yes: true })
+            Some(Command::Empty { yes: true })
         ));
         assert!(Cli::try_parse_from(["mdma", "library", "archive", "empty", "x"]).is_err());
         assert!(Cli::try_parse_from(["mdma", "library", "archive", "--yes"]).is_err());

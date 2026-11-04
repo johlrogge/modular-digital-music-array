@@ -6,7 +6,6 @@ mod track;
 use crate::ctx::Ctx;
 use clap::Subcommand;
 use color_eyre::Result;
-use mdma_client::LibraryBackend;
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
@@ -40,14 +39,7 @@ pub(crate) enum Command {
     ///
     /// Needs identity hashes: run `mdma library identity backfill` first.
     #[command(args_conflicts_with_subcommands = true)]
-    Dedup {
-        /// Merge the automatic groups (the others are only listed)
-        #[arg(long)]
-        apply: bool,
-
-        #[command(subcommand)]
-        command: Option<dedup::Command>,
-    },
+    Dedup(dedup::Args),
 
     /// List the files that duplicate merges moved to the archive.
     ///
@@ -63,23 +55,17 @@ pub(crate) enum Command {
 
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
     match command {
-        Command::ReindexCovers => {
-            let lib = ctx.library();
-            handle_library_reindex_covers(&lib)
-        }
-        Command::Identity { command } => identity::dispatch(command, ctx),
-        Command::Dedup { apply, command } => dedup::dispatch(apply, command, ctx),
-        Command::Archive { command } => archive::dispatch(command, ctx),
+        Command::ReindexCovers => reindex_covers(ctx),
         Command::Track { command } => track::dispatch(command, ctx),
+        Command::Identity { command } => identity::dispatch(command, ctx),
+        Command::Dedup(args) => dedup::dispatch(args, ctx),
+        Command::Archive { command } => archive::dispatch(command, ctx),
     }
 }
 
-// =============================================================================
-// Library Maintenance Command Handlers
-// =============================================================================
-
-fn handle_library_reindex_covers(client: &LibraryBackend) -> Result<()> {
+pub(crate) fn reindex_covers(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{LibraryRequest, LibraryResponse};
+    let client = ctx.library();
     let response = client.request(&LibraryRequest::ReindexCovers);
     match response {
         Ok(LibraryResponse::IngestResult(result)) => match result {
@@ -103,8 +89,6 @@ fn handle_library_reindex_covers(client: &LibraryBackend) -> Result<()> {
     Ok(())
 }
 
-// Adopted by a later chunk (per-command arg types); unused until then.
-#[allow(dead_code)]
 /// Do not ask for confirmation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Yes(pub bool);

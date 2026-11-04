@@ -2,7 +2,6 @@ use crate::ctx::Ctx;
 use clap::Subcommand;
 use color_eyre::Result;
 use library_ipc_client::ContentHash;
-use mdma_client::LibraryBackend;
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
@@ -46,26 +45,39 @@ pub(crate) enum Command {
 }
 
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
-    let lib = ctx.library();
-    match &command {
-        Command::Delete { hash } => handle_track_delete(&lib, hash),
-        Command::Restore { hash } => handle_track_restore(&lib, hash),
-        Command::Replace { old_hash, new_file } => handle_track_replace(&lib, old_hash, new_file),
-        Command::Orphans => handle_track_orphans(&lib),
+    match command {
+        Command::Delete { hash } => delete(TrackArg(ContentHash::new(hash)), ctx),
+        Command::Restore { hash } => restore(TrackArg(ContentHash::new(hash)), ctx),
+        Command::Replace { old_hash, new_file } => replace(
+            ReplaceArgs {
+                old_hash: TrackArg(ContentHash::new(old_hash)),
+                new_file,
+            },
+            ctx,
+        ),
+        Command::Orphans => orphans(ctx),
     }
 }
 
-// =============================================================================
-// Track Lifecycle Handlers
-// =============================================================================
+/// Content hash of a track, as typed (a prefix is accepted; the service resolves it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrackArg(pub ContentHash);
 
-fn handle_track_delete(lib: &LibraryBackend, hash: &str) -> Result<()> {
-    let ch = ContentHash::new(hash);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReplaceArgs {
+    pub(crate) old_hash: TrackArg,
+    /// Path on the device running the library service, so not a local `PathBuf`.
+    pub(crate) new_file: String,
+}
+
+pub(crate) fn delete(hash: TrackArg, ctx: &Ctx) -> Result<()> {
+    let lib = ctx.library();
+    let TrackArg(ch) = hash;
     match lib.track_delete(&ch) {
         Ok(()) => {
             println!(
                 "soft-deleted; recover with `mdma library track restore {}`",
-                hash
+                ch
             );
             Ok(())
         }
@@ -76,8 +88,9 @@ fn handle_track_delete(lib: &LibraryBackend, hash: &str) -> Result<()> {
     }
 }
 
-fn handle_track_restore(lib: &LibraryBackend, hash: &str) -> Result<()> {
-    let ch = ContentHash::new(hash);
+pub(crate) fn restore(hash: TrackArg, ctx: &Ctx) -> Result<()> {
+    let lib = ctx.library();
+    let TrackArg(ch) = hash;
     match lib.track_restore(&ch) {
         Ok(()) => {
             println!("track restored");
@@ -90,9 +103,13 @@ fn handle_track_restore(lib: &LibraryBackend, hash: &str) -> Result<()> {
     }
 }
 
-fn handle_track_replace(lib: &LibraryBackend, old_hash: &str, new_file: &str) -> Result<()> {
-    let ch = ContentHash::new(old_hash);
-    match lib.track_replace(&ch, new_file) {
+pub(crate) fn replace(args: ReplaceArgs, ctx: &Ctx) -> Result<()> {
+    let ReplaceArgs {
+        old_hash: TrackArg(old_hash),
+        new_file,
+    } = args;
+    let lib = ctx.library();
+    match lib.track_replace(&old_hash, &new_file) {
         Ok((new_hash, playlists)) => {
             println!("{} -> {}", old_hash, new_hash.as_str());
             println!("{} playlist(s) rewritten", playlists);
@@ -105,9 +122,10 @@ fn handle_track_replace(lib: &LibraryBackend, old_hash: &str, new_file: &str) ->
     }
 }
 
-fn handle_track_orphans(lib: &LibraryBackend) -> Result<()> {
+pub(crate) fn orphans(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::OrphanReason;
 
+    let lib = ctx.library();
     match lib.track_orphans() {
         Ok(orphans) => {
             if orphans.is_empty() {
@@ -148,8 +166,8 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use super::Command as TrackCommands;
-    use crate::library::Command as LibraryCommands;
+    use super::Command;
+    use crate::library;
     use crate::Commands;
 
     // ── track lifecycle clap parsing ──────────────────────────────────────────
@@ -166,8 +184,8 @@ mod tests {
         match cli.command {
             Commands::Library {
                 command:
-                    LibraryCommands::Track {
-                        command: TrackCommands::Delete { hash },
+                    library::Command::Track {
+                        command: Command::Delete { hash },
                     },
             } => {
                 assert_eq!(hash, "abc123");
@@ -188,8 +206,8 @@ mod tests {
         match cli.command {
             Commands::Library {
                 command:
-                    LibraryCommands::Track {
-                        command: TrackCommands::Restore { hash },
+                    library::Command::Track {
+                        command: Command::Restore { hash },
                     },
             } => {
                 assert_eq!(hash, "abc123");
@@ -217,8 +235,8 @@ mod tests {
         match cli.command {
             Commands::Library {
                 command:
-                    LibraryCommands::Track {
-                        command: TrackCommands::Replace { old_hash, new_file },
+                    library::Command::Track {
+                        command: Command::Replace { old_hash, new_file },
                     },
             } => {
                 assert_eq!(old_hash, "abc123");
@@ -240,8 +258,8 @@ mod tests {
         match cli.command {
             Commands::Library {
                 command:
-                    LibraryCommands::Track {
-                        command: TrackCommands::Orphans,
+                    library::Command::Track {
+                        command: Command::Orphans,
                     },
             } => {}
             other => panic!("unexpected command: {:?}", other),

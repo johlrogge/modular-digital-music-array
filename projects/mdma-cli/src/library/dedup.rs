@@ -1,11 +1,11 @@
 use crate::ctx::Ctx;
+use crate::library::Yes;
 use crate::stdin::is_yes;
 use clap::Subcommand;
 use color_eyre::Result;
 use library_ipc_client::{
     ConfirmationReason, ContentHash, DedupApplyReport, DedupDisposition, DedupGroup, DedupMember,
 };
-use mdma_client::LibraryBackend;
 use track_formatter::short_hash;
 
 #[derive(Subcommand, Debug)]
@@ -26,15 +26,47 @@ pub(crate) enum Command {
     },
 }
 
-pub(crate) fn dispatch(apply: bool, command: Option<Command>, ctx: &Ctx) -> Result<()> {
-    let lib = ctx.library();
-    match &command {
-        None => handle_dedup(&lib, apply),
+/// What `mdma library dedup` takes: the listing's `--apply`, or a subcommand.
+#[derive(clap::Args, Debug)]
+pub(crate) struct Args {
+    /// Merge the automatic groups (the others are only listed)
+    #[arg(long)]
+    apply: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Whether the listing also merges the automatic groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Apply(pub bool);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MergeArgs {
+    pub(crate) winner: ContentHash,
+    pub(crate) losers: Vec<ContentHash>,
+    pub(crate) yes: Yes,
+}
+
+impl MergeArgs {
+    fn new(winner: String, losers: Vec<String>, yes: bool) -> Self {
+        Self {
+            winner: ContentHash::new(winner),
+            losers: losers.into_iter().map(ContentHash::new).collect(),
+            yes: Yes(yes),
+        }
+    }
+}
+
+pub(crate) fn dispatch(args: Args, ctx: &Ctx) -> Result<()> {
+    let Args { apply, command } = args;
+    match command {
+        None => scan(Apply(apply), ctx),
         Some(Command::Merge {
             winner,
             losers,
             yes,
-        }) => handle_dedup_merge(&lib, winner, losers, *yes),
+        }) => merge(MergeArgs::new(winner, losers, yes), ctx),
     }
 }
 
@@ -133,7 +165,9 @@ fn find_dedup_group<'a>(
     Ok(found)
 }
 
-fn handle_dedup(client: &LibraryBackend, apply: bool) -> Result<()> {
+pub(crate) fn scan(apply: Apply, ctx: &Ctx) -> Result<()> {
+    let Apply(apply) = apply;
+    let client = ctx.library();
     let report = match client.dedup_scan(apply) {
         Ok(r) => r,
         Err(e) => {
@@ -161,17 +195,21 @@ fn handle_dedup(client: &LibraryBackend, apply: bool) -> Result<()> {
     Ok(())
 }
 
-fn handle_dedup_merge(
-    client: &LibraryBackend,
-    winner: &str,
-    losers: &[String],
-    yes: bool,
-) -> Result<()> {
+pub(crate) fn merge(args: MergeArgs, ctx: &Ctx) -> Result<()> {
+    let MergeArgs {
+        winner,
+        losers,
+        yes: Yes(yes),
+    } = args;
+    let client = ctx.library();
     if !yes {
         if let Ok(report) = client.dedup_scan(false) {
             // Every prefix must name at most one group before anything is confirmed.
             let mut shown = None;
-            for prefix in std::iter::once(winner).chain(losers.iter().map(String::as_str)) {
+            for prefix in std::iter::once(&winner)
+                .chain(&losers)
+                .map(ContentHash::as_str)
+            {
                 match find_dedup_group(&report.groups, prefix) {
                     Ok(group) => shown = shown.or(group),
                     Err(e) => {
@@ -197,8 +235,7 @@ fn handle_dedup_merge(
         }
     }
 
-    let loser_hashes: Vec<ContentHash> = losers.iter().map(ContentHash::new).collect();
-    match client.dedup_merge(&ContentHash::new(winner), &loser_hashes) {
+    match client.dedup_merge(&winner, &losers) {
         Ok(report) => {
             println!("{}", format_dedup_applied(&report));
             if !report.errors.is_empty() {
@@ -228,13 +265,12 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use super::Command as DedupCommands;
-    use crate::library::Command as LibraryCommands;
+    use crate::library;
     use crate::Commands;
 
     // ── dedup ─────────────────────────────────────────────────────────────────
 
-    fn dedup_args(args: &[&str]) -> (bool, Option<DedupCommands>) {
+    fn dedup_args(args: &[&str]) -> (bool, Option<MergeArgs>) {
         let mut argv = vec!["mdma", "library", "dedup"];
         argv.extend_from_slice(args);
         match Cli::try_parse_from(&argv)
@@ -242,8 +278,17 @@ mod tests {
             .command
         {
             Commands::Library {
-                command: LibraryCommands::Dedup { apply, command },
-            } => (apply, command),
+                command: library::Command::Dedup(Args { apply, command }),
+            } => (
+                apply,
+                command.map(
+                    |Command::Merge {
+                         winner,
+                         losers,
+                         yes,
+                     }| MergeArgs::new(winner, losers, yes),
+                ),
+            ),
             other => panic!("unexpected command: {:?}", other),
         }
     }
@@ -256,29 +301,22 @@ mod tests {
 
     #[test]
     fn dedup_merge_takes_a_winner_losers_and_yes() {
-        match dedup_args(&["merge", "abc123", "def456", "0a1b2c"]) {
+        assert_eq!(
+            dedup_args(&["merge", "abc123", "def456", "0a1b2c"]),
             (
                 false,
-                Some(DedupCommands::Merge {
-                    winner,
-                    losers,
-                    yes,
-                }),
-            ) => {
-                assert_eq!(winner, "abc123");
-                assert_eq!(losers, vec!["def456", "0a1b2c"]);
-                assert!(!yes);
-            }
-            other => panic!("unexpected: {other:?}"),
+                Some(MergeArgs {
+                    winner: ContentHash::new("abc123"),
+                    losers: vec![ContentHash::new("def456"), ContentHash::new("0a1b2c")],
+                    yes: Yes(false),
+                })
+            )
+        );
+        for flag in ["--yes", "-y"] {
+            let (apply, merge) = dedup_args(&["merge", flag, "a", "b"]);
+            assert!(!apply);
+            assert_eq!(merge.map(|m| m.yes), Some(Yes(true)));
         }
-        assert!(matches!(
-            dedup_args(&["merge", "--yes", "a", "b"]),
-            (false, Some(DedupCommands::Merge { yes: true, .. }))
-        ));
-        assert!(matches!(
-            dedup_args(&["merge", "-y", "a", "b"]),
-            (false, Some(DedupCommands::Merge { yes: true, .. }))
-        ));
     }
 
     #[test]

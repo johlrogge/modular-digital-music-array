@@ -1,7 +1,6 @@
 use crate::ctx::Ctx;
 use clap::Subcommand;
 use color_eyre::Result;
-use mdma_client::LibraryBackend;
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
@@ -11,14 +10,7 @@ pub(crate) enum Command {
     /// already in the library. It runs as a low-priority background job in the
     /// library service and can be re-run: tracks that already have the hash are
     /// skipped. By default the command follows the job until it finishes.
-    Backfill {
-        /// Also compute PcmHash (decodes every lossless track; slow)
-        #[arg(long)]
-        pcm: bool,
-        /// Start the job and return immediately
-        #[arg(long)]
-        no_wait: bool,
-    },
+    Backfill(BackfillArgs),
 
     /// Show progress of the identity-hash backfill
     Status,
@@ -27,12 +19,21 @@ pub(crate) enum Command {
     Cancel,
 }
 
+#[derive(clap::Args, Debug, PartialEq)]
+pub(crate) struct BackfillArgs {
+    /// Also compute PcmHash (decodes every lossless track; slow)
+    #[arg(long)]
+    pcm: bool,
+    /// Start the job and return immediately
+    #[arg(long)]
+    no_wait: bool,
+}
+
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
-    let lib = ctx.library();
-    match &command {
-        Command::Backfill { pcm, no_wait } => handle_identity_backfill(&lib, *pcm, *no_wait),
-        Command::Status => handle_identity_status(&lib),
-        Command::Cancel => handle_identity_cancel(&lib),
+    match command {
+        Command::Backfill(args) => backfill(args, ctx),
+        Command::Status => status(ctx),
+        Command::Cancel => cancel(ctx),
     }
 }
 
@@ -90,8 +91,10 @@ fn identity_already_running_message(running_pcm: bool, requested_pcm: bool) -> S
     msg
 }
 
-fn handle_identity_backfill(client: &LibraryBackend, pcm: bool, no_wait: bool) -> Result<()> {
+pub(crate) fn backfill(args: BackfillArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::IdentityBackfillStart;
+    let BackfillArgs { pcm, no_wait } = args;
+    let client = ctx.library();
     match client.identity_backfill(pcm) {
         Ok(IdentityBackfillStart::Started(p)) => {
             println!("Identity backfill started: {} tracks to process", p.total)
@@ -139,7 +142,8 @@ fn handle_identity_backfill(client: &LibraryBackend, pcm: bool, no_wait: bool) -
     }
 }
 
-fn handle_identity_status(client: &LibraryBackend) -> Result<()> {
+pub(crate) fn status(ctx: &Ctx) -> Result<()> {
+    let client = ctx.library();
     match client.identity_backfill_status() {
         Ok(s) => {
             println!("{}", format_identity_status(&s));
@@ -152,8 +156,9 @@ fn handle_identity_status(client: &LibraryBackend) -> Result<()> {
     }
 }
 
-fn handle_identity_cancel(client: &LibraryBackend) -> Result<()> {
+pub(crate) fn cancel(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::IdentityBackfillStatus;
+    let client = ctx.library();
     match client.identity_backfill_cancel() {
         Ok(IdentityBackfillStatus::Running(_)) => {
             println!(
@@ -183,15 +188,14 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use super::Command as IdentityCommands;
-    use crate::library::Command as LibraryCommands;
+    use crate::library;
     use crate::Commands;
 
     // ── identity clap parsing ─────────────────────────────────────────────────
 
     #[test]
     fn identity_backfill_parses_flags() {
-        for (args, want_pcm, want_no_wait) in [
+        for (args, pcm, no_wait) in [
             (
                 vec!["mdma", "library", "identity", "backfill"],
                 false,
@@ -219,10 +223,10 @@ mod tests {
             match cli.command {
                 Commands::Library {
                     command:
-                        LibraryCommands::Identity {
-                            command: IdentityCommands::Backfill { pcm, no_wait },
+                        library::Command::Identity {
+                            command: Command::Backfill(parsed),
                         },
-                } => assert_eq!((pcm, no_wait), (want_pcm, want_no_wait)),
+                } => assert_eq!(parsed, BackfillArgs { pcm, no_wait }),
                 other => panic!("unexpected command: {:?}", other),
             }
         }
@@ -234,8 +238,8 @@ mod tests {
         assert!(matches!(
             cli.command,
             Commands::Library {
-                command: LibraryCommands::Identity {
-                    command: IdentityCommands::Status
+                command: library::Command::Identity {
+                    command: Command::Status
                 }
             }
         ));
@@ -258,8 +262,8 @@ mod tests {
         assert!(matches!(
             cli.command,
             Commands::Library {
-                command: LibraryCommands::Identity {
-                    command: IdentityCommands::Cancel
+                command: library::Command::Identity {
+                    command: Command::Cancel
                 }
             }
         ));
