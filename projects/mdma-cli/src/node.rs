@@ -461,6 +461,7 @@ pub(crate) fn list(_ctx: &Ctx) -> color_eyre::Result<()> {
 }
 
 /// A node name or id as typed, matched against the discovered nodes (none: prompt).
+// Stays a String: any text is a valid query; no match is reported by the resolver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OptNodeQueryArg(pub Option<String>);
 

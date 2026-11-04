@@ -26,11 +26,6 @@ impl FromStr for TrackArg {
     }
 }
 
-/// Optional content hash of a track; commands read stdin when it is omitted.
-// Prefer `Option<TrackArg>` in clap fields; this goes away when the call sites switch.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OptTrackArg(pub Option<ContentHash>);
-
 /// Name of an MDMA playlist, validated by `PlaylistName`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlaylistArg(pub PlaylistName);

@@ -14,6 +14,7 @@ pub(crate) struct SubscribeCli {
 }
 
 /// Topic filter for events (all playback events when `None`).
+// Stays a String: a topic is a free-form subscription prefix with no domain rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TopicArg(pub Option<String>);
 

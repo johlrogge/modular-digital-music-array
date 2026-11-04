@@ -1,4 +1,4 @@
-use crate::args::OptTrackArg;
+use crate::args::TrackArg;
 use crate::ctx::Ctx;
 use crate::output::{format_track_line, handle_playback_error, render_track_table};
 use crate::stdin::{hashes_arg_or_stdin, hashes_in};
@@ -15,14 +15,14 @@ pub(crate) enum Command {
     /// Hash may be omitted; if so, reads "{hash}  {display}" from stdin (dmenu output).
     Next {
         /// Content hash (full or partial). Omit to read from stdin.
-        hash: Option<String>,
+        hash: Option<TrackArg>,
     },
 
     /// Append a track to the end of the queue.
     /// Hash may be omitted; if so, reads "{hash}  {display}" from stdin (dmenu output).
     Append {
         /// Content hash (full or partial). Omit to read from stdin.
-        hash: Option<String>,
+        hash: Option<TrackArg>,
     },
 
     /// Show the current queue
@@ -35,7 +35,7 @@ pub(crate) enum Command {
     /// Hash may be omitted; if so, reads one hash per line from stdin.
     Remove {
         /// Content hash (full or partial). Omit to read from stdin.
-        hash: Option<String>,
+        hash: Option<TrackArg>,
     },
 
     /// Atomically replace the entire queue from stdin.
@@ -54,19 +54,19 @@ pub(crate) enum Command {
 
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
     match command {
-        Command::Next { hash } => next(OptTrackArg(hash.map(ContentHash::new)), ctx),
-        Command::Append { hash } => append(OptTrackArg(hash.map(ContentHash::new)), ctx),
+        Command::Next { hash } => next(hash, ctx),
+        Command::Append { hash } => append(hash, ctx),
         Command::List => list(ctx),
         Command::Clear => clear(ctx),
-        Command::Remove { hash } => remove(OptTrackArg(hash.map(ContentHash::new)), ctx),
+        Command::Remove { hash } => remove(hash, ctx),
         Command::Replace => replace(ctx),
         Command::Edit => edit(ctx),
     }
 }
 
-pub(crate) fn next(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
+pub(crate) fn next(hash: Option<TrackArg>, ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback();
-    let hashes = hashes_arg_or_stdin(hash.0);
+    let hashes = hashes_arg_or_stdin(hash.map(|TrackArg(h)| h));
     let count = hashes.len();
     // Prepend in reverse so the first hash ends up at the front of the queue.
     for content_hash in hashes.into_iter().rev() {
@@ -78,9 +78,9 @@ pub(crate) fn next(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn append(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
+pub(crate) fn append(hash: Option<TrackArg>, ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback();
-    let hashes = hashes_arg_or_stdin(hash.0);
+    let hashes = hashes_arg_or_stdin(hash.map(|TrackArg(h)| h));
     let count = hashes.len();
     for content_hash in hashes {
         if let Err(e) = playback.queue_append(content_hash, SourceName::audio()) {
@@ -164,9 +164,9 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn remove(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
+pub(crate) fn remove(hash: Option<TrackArg>, ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback();
-    let content_hashes = hashes_arg_or_stdin(hash.0);
+    let content_hashes = hashes_arg_or_stdin(hash.map(|TrackArg(h)| h));
 
     if content_hashes.is_empty() {
         return Ok(());
@@ -254,4 +254,26 @@ pub(crate) fn edit(ctx: &Ctx) -> Result<()> {
     }
     println!("Queue updated: {} tracks", count);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Cli;
+    use clap::error::ErrorKind;
+    use clap::Parser;
+
+    #[test]
+    fn queue_hash_arguments_are_validated_at_parse_time() {
+        for sub in ["next", "append", "remove"] {
+            let err = Cli::try_parse_from(["mdma", "queue", sub, "nothex"]).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ValueValidation, "{sub}");
+            assert_eq!(err.exit_code(), 2, "{sub}");
+            assert!(err.to_string().contains("not a content hash"), "{sub}");
+            assert!(Cli::try_parse_from(["mdma", "queue", sub, "ABCD1234"]).is_err());
+            assert!(Cli::try_parse_from(["mdma", "queue", sub, "abcd1234"]).is_ok());
+            assert!(Cli::try_parse_from(["mdma", "queue", sub, "sha256:abcd1234"]).is_ok());
+            // Omitted: read from stdin.
+            assert!(Cli::try_parse_from(["mdma", "queue", sub]).is_ok());
+        }
+    }
 }

@@ -175,6 +175,7 @@ pub(crate) fn outputs(ctx: &Ctx) -> Result<()> {
 }
 
 /// An audio output device name as shown by `mdma playback outputs`.
+// Stays a String: device names have no domain rule; the service reports unknown ones.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OutputNameArg(pub String);
 
