@@ -4,8 +4,10 @@ use crate::args::SanitizedPlaylistName;
 use crate::ctx::Ctx;
 use crate::output::handle_source_error;
 use crate::source::import::{finish_import, follow_import_job, is_terminal_phase};
+use bpaf::{long, positional, Parser as _};
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
+use hicli::Arg;
 use mdma_client::SourceClient;
 use source_protocol::{SourceError, SourceRequest, SourceResponse};
 use std::convert::Infallible;
@@ -50,6 +52,12 @@ impl FromStr for SourceArg {
     }
 }
 
+impl Arg for SourceArg {
+    fn parser() -> impl bpaf::Parser<Self> {
+        positional::<Self>("SOURCE-NAME").help("Music source name")
+    }
+}
+
 impl SourceArg {
     pub(crate) fn as_str(&self) -> &str {
         self.0.as_str()
@@ -60,6 +68,15 @@ impl SourceArg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ApplyUpdates(pub bool);
 
+impl Arg for ApplyUpdates {
+    fn parser() -> impl bpaf::Parser<Self> {
+        long("apply")
+            .help("Auto-apply resync for any stale items found")
+            .switch()
+            .map(Self)
+    }
+}
+
 /// A download of a source, as listed by `downloads`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DownloadArg(pub source_protocol::DownloadId);
@@ -69,6 +86,25 @@ impl FromStr for DownloadArg {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         Ok(Self(source_protocol::DownloadId::new(s)))
+    }
+}
+
+impl Arg for DownloadArg {
+    fn parser() -> impl bpaf::Parser<Self> {
+        positional::<Self>("ID").help("Download ID to cancel")
+    }
+}
+
+impl Arg for ItemIdArg {
+    fn parser() -> impl bpaf::Parser<Self> {
+        positional::<Self>("IDENTIFIER")
+            .help("Source-specific item identifier (e.g. \"p123456\" for bandcamp)")
+    }
+}
+
+impl Arg for SourcePlaylistArg {
+    fn parser() -> impl bpaf::Parser<Self> {
+        positional::<Self>("PLAYLIST").help("Playlist slug or URL")
     }
 }
 
@@ -773,7 +809,41 @@ mod tests {
 
     use color_eyre::Result;
 
-    use crate::test_support::{parse, parses, usage_error};
+    use crate::test_support::{parse, parses, run_arg, usage_error};
+
+    #[test]
+    fn source_positional_arg_parsers_read_one_word() {
+        assert_eq!(
+            run_arg::<SourceArg>(&["bandcamp"]),
+            Ok(SourceArg(mdma_client::SourceName::new("bandcamp")))
+        );
+        assert_eq!(
+            run_arg::<DownloadArg>(&["d-1"]),
+            Ok(DownloadArg(source_protocol::DownloadId::new("d-1")))
+        );
+        assert_eq!(
+            run_arg::<ItemIdArg>(&["p123456"]),
+            Ok(ItemIdArg("p123456".to_string()))
+        );
+        assert_eq!(
+            run_arg::<SourcePlaylistArg>(&["my-slug"]),
+            Ok(SourcePlaylistArg("my-slug".to_string()))
+        );
+        assert!(run_arg::<SourceArg>(&[]).is_err());
+        assert!(run_arg::<DownloadArg>(&[]).is_err());
+        assert!(run_arg::<ItemIdArg>(&[]).is_err());
+        assert!(run_arg::<SourcePlaylistArg>(&[]).is_err());
+    }
+
+    #[test]
+    fn apply_updates_arg_parser_is_a_switch() {
+        assert_eq!(run_arg::<ApplyUpdates>(&[]), Ok(ApplyUpdates(false)));
+        assert_eq!(
+            run_arg::<ApplyUpdates>(&["--apply"]),
+            Ok(ApplyUpdates(true))
+        );
+        assert!(run_arg::<ApplyUpdates>(&["--aply"]).is_err());
+    }
 
     use playlist_import::sanitize_playlist_name;
     use pretty_assertions::assert_eq;

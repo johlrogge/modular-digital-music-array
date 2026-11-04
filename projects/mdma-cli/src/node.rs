@@ -482,6 +482,16 @@ pub(crate) fn list(_ctx: &Ctx) -> color_eyre::Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OptNodeQueryArg(pub Option<String>);
 
+impl hicli::Arg for OptNodeQueryArg {
+    fn parser() -> impl bpaf::Parser<Self> {
+        use bpaf::Parser as _;
+        bpaf::positional::<String>("NAME")
+            .help("Node name or id")
+            .optional()
+            .map(Self)
+    }
+}
+
 /// `mdma node select [name|id]`
 pub(crate) fn select(query: OptNodeQueryArg, _ctx: &Ctx) -> color_eyre::Result<()> {
     let OptNodeQueryArg(query) = query;
@@ -566,7 +576,17 @@ pub(crate) fn show(ctx: &Ctx) -> color_eyre::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::run_arg;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn node_query_arg_parser_is_an_optional_positional() {
+        assert_eq!(run_arg::<OptNodeQueryArg>(&[]), Ok(OptNodeQueryArg(None)));
+        assert_eq!(
+            run_arg::<OptNodeQueryArg>(&["johlyroger"]),
+            Ok(OptNodeQueryArg(Some("johlyroger".to_string())))
+        );
+    }
 
     #[test]
     fn env_node_unset_or_empty_is_not_given() {

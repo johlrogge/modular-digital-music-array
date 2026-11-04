@@ -1,7 +1,9 @@
 use crate::args::ExistingFileArg;
 use crate::ctx::Ctx;
 use crate::stdin::{read_hashes, resolve_tracks_skip_errors};
+use bpaf::{long, positional, Parser};
 use color_eyre::Result;
+use hicli::{complete_files, Arg};
 use library_ipc_client::TrackInfo;
 use mdma_client::IngestSource;
 use std::path::Path;
@@ -61,6 +63,12 @@ impl std::str::FromStr for UploadFileArg {
     }
 }
 
+impl Arg for UploadFileArg {
+    fn parser() -> impl Parser<Self> {
+        complete_files(positional::<Self>("FILE").help("Path to file (audio file or ZIP archive)"))
+    }
+}
+
 #[derive(clap::Args, Debug)]
 pub(crate) struct ExportArgs {
     /// Output format for ALL tracks (original, aiff or wav). Default: original.
@@ -106,6 +114,20 @@ impl std::str::FromStr for SshKeyArg {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         let ExistingFileArg(path) = ExistingFileArg::new(expand_tilde(s))?;
         Ok(Self(path))
+    }
+}
+
+impl Arg for SshKeyArg {
+    /// `--ssh-key`, from `MDMA_SSH_KEY` or `~/.ssh/mdma_pi` when not given; the
+    /// default is checked like a typed value.
+    fn parser() -> impl Parser<Self> {
+        long("ssh-key")
+            .env("MDMA_SSH_KEY")
+            .help("SSH key for SCP transfer")
+            .argument::<String>("SSH_KEY")
+            .fallback("~/.ssh/mdma_pi".to_string())
+            .display_fallback()
+            .parse(|s| s.parse::<Self>())
     }
 }
 
@@ -781,10 +803,36 @@ impl std::str::FromStr for ExportFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{parses, track, usage_error};
+    use crate::test_support::{parses, run_arg, track, usage_error};
     use crate::Commands;
 
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn upload_file_arg_parser_checks_the_file() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"fLaC").unwrap();
+        let path = file.path().to_str().unwrap();
+        let arg = run_arg::<UploadFileArg>(&[path]).unwrap();
+        assert_eq!(arg.kind, UploadKind::Audio);
+        assert_eq!(arg.path, file.path());
+
+        let err = run_arg::<UploadFileArg>(&["/definitely/not/here.flac"]).unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(run_arg::<UploadFileArg>(&[]).is_err());
+    }
+
+    #[test]
+    fn ssh_key_arg_parser_checks_the_key_file() {
+        let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        assert_eq!(
+            run_arg::<SshKeyArg>(&["--ssh-key", manifest]),
+            Ok(SshKeyArg(std::path::PathBuf::from(manifest)))
+        );
+        let err = run_arg::<SshKeyArg>(&["--ssh-key", "/definitely/not/here"]).unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
+    }
 
     // ── upload file argument ─────────────────────────────────────────────────
 

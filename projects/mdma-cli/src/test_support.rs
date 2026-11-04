@@ -1,6 +1,7 @@
 //! Test helpers shared by several modules' tests.
 
 use crate::{Cli, Commands};
+use bpaf::Parser as _;
 use clap::Parser;
 use library_ipc_client::{ContentHash, TrackInfo};
 
@@ -24,6 +25,18 @@ pub(crate) fn usage_error(args: &[&str]) -> clap::Error {
     let err = parse(args).expect_err("should be rejected");
     assert_eq!(err.exit_code(), 2, "{args:?}");
     err
+}
+
+/// Run the [`hicli::Arg`] parser of `T` over `args`; an error is bpaf's message
+/// (which wraps long lines, so its whitespace is collapsed to single spaces).
+pub(crate) fn run_arg<T: hicli::Arg>(args: &[&str]) -> Result<T, String> {
+    <T as hicli::Arg>::parser()
+        .to_options()
+        .run_inner(args)
+        .map_err(|failure| {
+            let message = failure.unwrap_stderr();
+            message.split_whitespace().collect::<Vec<_>>().join(" ")
+        })
 }
 
 /// Strip ANSI escape codes from a string.

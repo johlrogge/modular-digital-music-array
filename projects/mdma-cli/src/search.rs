@@ -1,8 +1,10 @@
 use crate::ctx::Ctx;
 use crate::output::{handle_error, print_tracks};
 use crate::stdin::read_hashes;
+use bpaf::{long, positional, Parser};
 use clap::Subcommand;
 use color_eyre::Result;
+use hicli::Arg;
 use library_ipc_client::{ContentHash, TrackInfo};
 use library_search::{
     parse_date_query, parse_duration_query, parse_key_query, parse_numeric_query, parse_role_query,
@@ -230,6 +232,73 @@ impl std::str::FromStr for DurationArg {
     }
 }
 
+// The filter options are spelled as in `SearchArgs`. `DateArg` has no `Arg`
+// impl: it is `--started`, `--stopped` and `--added` (one type, three spellings),
+// so those are fields of the search args struct instead.
+
+impl Arg for FactTypeArg {
+    fn parser() -> impl Parser<Self> {
+        positional::<Self>("FACT_TYPE")
+            .help("Fact type to inspect (e.g. MainGenre, Label, Key, Source, BPM, StyleDescriptor)")
+    }
+}
+
+impl Arg for BpmArg {
+    fn parser() -> impl Parser<Self> {
+        long("bpm")
+            .help("Filter by BPM. Formats: 128  128+-4  124..132  128+2  128-2")
+            .argument::<Self>("BPM")
+    }
+}
+
+impl Arg for KeyArg {
+    fn parser() -> impl Parser<Self> {
+        long("key")
+            .help("Filter by musical key. Formats: Am  \"A minor\"  8B  8B+-1  8B+-1~")
+            .argument::<Self>("KEY")
+    }
+}
+
+impl Arg for DurationArg {
+    fn parser() -> impl Parser<Self> {
+        long("duration")
+            .help("Filter by duration. Formats: 7m  7m15s  >5m  <8m  6m..8m")
+            .argument::<Self>("DURATION")
+    }
+}
+
+impl Arg for YearArg {
+    fn parser() -> impl Parser<Self> {
+        long("year")
+            .help("Filter by release year. Formats: 2022  2019..2022")
+            .argument::<Self>("YEAR")
+    }
+}
+
+impl Arg for RoleArg {
+    fn parser() -> impl Parser<Self> {
+        long("role")
+            .help("Filter by DJ role. Accepted values: opener, build-up, peak, banger, cool-down, closer, filler")
+            .argument::<Self>("ROLE")
+    }
+}
+
+impl Arg for EnergyArg {
+    fn parser() -> impl Parser<Self> {
+        long("energy")
+            .help("Filter by energy level (1-10). Formats: 7  5..8  7+-2")
+            .argument::<Self>("ENERGY")
+    }
+}
+
+impl Arg for PlayedFilter {
+    fn parser() -> impl Parser<Self> {
+        long("played")
+            .help("Filter by playback history. `never` matches tracks with no started fact (never played). When combined with --started, --played=never takes precedence.")
+            .argument::<Self>("PLAYED")
+    }
+}
+
 pub(crate) fn dispatch(cli: SearchCli, ctx: &Ctx) -> Result<()> {
     let SearchCli {
         query: args,
@@ -435,6 +504,79 @@ mod tests {
     use crate::test_support::{parse, parses, track, usage_error};
 
     use pretty_assertions::assert_eq;
+
+    // ── hicli Arg parsers ────────────────────────────────────────────────────
+
+    use crate::test_support::run_arg;
+
+    #[test]
+    fn fact_type_arg_parser_reads_a_positional() {
+        assert_eq!(
+            run_arg::<FactTypeArg>(&["MainGenre"]),
+            Ok(FactTypeArg(library_ipc_client::FactType::new(
+                "MainGenre".to_string()
+            )))
+        );
+        assert!(run_arg::<FactTypeArg>(&[]).is_err());
+    }
+
+    #[test]
+    fn numeric_filter_parsers_are_named_options() {
+        assert!(matches!(
+            run_arg::<BpmArg>(&["--bpm", "128"]),
+            Ok(BpmArg(NumericQuery::Exact(v))) if v == 128.0
+        ));
+        assert!(matches!(
+            run_arg::<YearArg>(&["--year=2019..2022"]),
+            Ok(YearArg(NumericQuery::Range(..)))
+        ));
+        assert!(matches!(
+            run_arg::<EnergyArg>(&["--energy", "7"]),
+            Ok(EnergyArg(NumericQuery::Exact(v))) if v == 7.0
+        ));
+        assert!(run_arg::<BpmArg>(&[]).is_err());
+    }
+
+    #[test]
+    fn invalid_filters_carry_the_from_str_message() {
+        let reason = "garbage".parse::<BpmArg>().unwrap_err().to_string();
+        let err = run_arg::<BpmArg>(&["--bpm", "garbage"]).unwrap_err();
+        assert!(err.contains(&reason), "{err}");
+        let reason = "garbage".parse::<YearArg>().unwrap_err().to_string();
+        let err = run_arg::<YearArg>(&["--year", "garbage"]).unwrap_err();
+        assert!(err.contains(&reason), "{err}");
+        let reason = "garbage".parse::<KeyArg>().unwrap_err().to_string();
+        let err = run_arg::<KeyArg>(&["--key", "garbage"]).unwrap_err();
+        assert!(err.contains(&reason), "{err}");
+        let reason = "garbage".parse::<DurationArg>().unwrap_err().to_string();
+        let err = run_arg::<DurationArg>(&["--duration", "garbage"]).unwrap_err();
+        assert!(err.contains(&reason), "{err}");
+        let reason = "garbage".parse::<RoleArg>().unwrap_err().to_string();
+        let err = run_arg::<RoleArg>(&["--role", "garbage"]).unwrap_err();
+        assert!(err.contains(&reason), "{err}");
+        let err = run_arg::<EnergyArg>(&["--energy", "11"]).unwrap_err();
+        assert!(err.contains("invalid energy '11'"), "{err}");
+    }
+
+    #[test]
+    fn key_duration_and_role_parsers_accept_valid_values() {
+        assert!(run_arg::<KeyArg>(&["--key", "Am"]).is_ok());
+        assert!(run_arg::<DurationArg>(&["--duration", ">5m"]).is_ok());
+        assert!(matches!(
+            run_arg::<RoleArg>(&["--role", "peak"]),
+            Ok(RoleArg(TrackRole::Peak))
+        ));
+    }
+
+    #[test]
+    fn played_filter_parser_accepts_only_never() {
+        assert_eq!(
+            run_arg::<PlayedFilter>(&["--played", "never"]),
+            Ok(PlayedFilter::Never)
+        );
+        let err = run_arg::<PlayedFilter>(&["--played", "always"]).unwrap_err();
+        assert!(err.contains("unknown played filter 'always'"), "{err}");
+    }
 
     // ── Date arg hyphen-value parsing ────────────────────────────────────────
 

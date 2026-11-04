@@ -4,8 +4,10 @@ mod identity;
 mod track;
 
 use crate::ctx::Ctx;
+use bpaf::{short, Parser};
 use clap::Subcommand;
 use color_eyre::Result;
+use hicli::Arg;
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
@@ -92,3 +94,27 @@ pub(crate) fn reindex_covers(ctx: &Ctx) -> Result<()> {
 /// Do not ask for confirmation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Yes(pub bool);
+
+impl Arg for Yes {
+    fn parser() -> impl Parser<Self> {
+        short('y')
+            .long("yes")
+            .help("Do not ask for confirmation")
+            .switch()
+            .map(Self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::run_arg;
+
+    #[test]
+    fn yes_arg_parser_is_a_switch() {
+        assert_eq!(run_arg::<Yes>(&[]), Ok(Yes(false)));
+        assert_eq!(run_arg::<Yes>(&["--yes"]), Ok(Yes(true)));
+        assert_eq!(run_arg::<Yes>(&["-y"]), Ok(Yes(true)));
+        assert!(run_arg::<Yes>(&["--maybe"]).is_err());
+    }
+}

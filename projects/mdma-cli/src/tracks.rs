@@ -5,7 +5,9 @@ use crate::output::{
     PIPE_TERM_WIDTH,
 };
 use crate::stdin::{read_hashes, require_stdin_hashes, resolve_tracks_skip_errors};
+use bpaf::{construct, long, positional, short, Parser};
 use color_eyre::Result;
+use hicli::Arg;
 use library_ipc_client::TrackInfo;
 use std::num::NonZeroUsize;
 use track_formatter::{render_for_user, short_hash, ViewColumn};
@@ -33,9 +35,24 @@ impl std::str::FromStr for LimitArg {
     }
 }
 
+impl Arg for LimitArg {
+    fn parser() -> impl Parser<Self> {
+        short('l')
+            .long("limit")
+            .help("Maximum number of tracks to show")
+            .argument::<Self>("LIMIT")
+    }
+}
+
 /// Maximum number of tracks to show (all when `None`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OptLimitArg(pub Option<LimitArg>);
+
+impl Arg for OptLimitArg {
+    fn parser() -> impl Parser<Self> {
+        <LimitArg as Arg>::parser().optional().map(Self)
+    }
+}
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct GetCli {
@@ -77,6 +94,16 @@ pub(crate) struct BookmarkCli {
 // Stays a String: a scope is a free-form name with no domain rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OptScopeArg(pub Option<String>);
+
+impl Arg for OptScopeArg {
+    fn parser() -> impl Parser<Self> {
+        long("scope")
+            .help("Optional scope — associate bookmark with a named set")
+            .argument::<String>("SCOPE")
+            .optional()
+            .map(Self)
+    }
+}
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct ViewCli {
@@ -138,6 +165,61 @@ impl ViewColumns {
         }
         indexed.sort_by_key(|(idx, _)| *idx);
         Ok(Self(indexed.into_iter().map(|(_, col)| col).collect()))
+    }
+}
+
+/// One `view` column flag.
+fn column_flag(
+    name: &'static str,
+    help: &'static str,
+    column: ViewColumn,
+) -> impl Parser<ViewColumn> {
+    long(name).help(help).req_flag(column)
+}
+
+impl Arg for ViewColumns {
+    /// One or more column flags; the columns come in the order the flags were
+    /// typed, and a flag given twice is an error.
+    fn parser() -> impl Parser<Self> {
+        let hash = column_flag(
+            "hash",
+            "Show the 12-character content hash",
+            ViewColumn::Hash,
+        );
+        let artist = column_flag("artist", "Show the artist name", ViewColumn::Artist);
+        let title = column_flag("title", "Show the track title", ViewColumn::Title);
+        let duration = column_flag("duration", "Show the track duration", ViewColumn::Duration);
+        construct!([hash, artist, title, duration])
+            .some("No fields selected. Use --hash, --artist, --title, and/or --duration.")
+            .parse(|columns| {
+                match columns
+                    .iter()
+                    .enumerate()
+                    .find(|(i, column)| columns[..*i].contains(column))
+                {
+                    Some((_, column)) => Err(format!("{column:?} column given more than once")),
+                    None => Ok(Self(columns)),
+                }
+            })
+    }
+}
+
+impl Arg for SortField {
+    fn parser() -> impl Parser<Self> {
+        positional::<Self>("FIELD").help("Field to sort by")
+    }
+}
+
+impl Arg for SortDirection {
+    /// Exactly one of `-a` / `-d`.
+    fn parser() -> impl Parser<Self> {
+        let ascending = short('a')
+            .help("Sort ascending (A→Z, low→high)")
+            .req_flag(Self::Ascending);
+        let descending = short('d')
+            .help("Sort descending (Z→A, high→low)")
+            .req_flag(Self::Descending);
+        construct!([ascending, descending])
     }
 }
 
@@ -552,6 +634,88 @@ mod tests {
 
     use crate::Commands;
     use track_formatter::ALL_COLUMNS;
+
+    // ── hicli Arg parsers ─────────────────────────────────────────────────────
+
+    use crate::test_support::run_arg;
+
+    #[test]
+    fn limit_arg_parsers_read_a_non_zero_count() {
+        let three = LimitArg(NonZeroUsize::new(3).unwrap());
+        assert_eq!(run_arg::<LimitArg>(&["--limit", "3"]), Ok(three));
+        assert_eq!(run_arg::<LimitArg>(&["-l", "3"]), Ok(three));
+        assert_eq!(
+            run_arg::<OptLimitArg>(&["--limit", "3"]),
+            Ok(OptLimitArg(Some(three)))
+        );
+        assert_eq!(run_arg::<OptLimitArg>(&[]), Ok(OptLimitArg(None)));
+        let err = run_arg::<OptLimitArg>(&["--limit", "0"]).unwrap_err();
+        assert!(
+            err.contains("must be a whole number of at least 1"),
+            "{err}"
+        );
+        assert!(run_arg::<LimitArg>(&[]).is_err());
+    }
+
+    #[test]
+    fn opt_scope_arg_parser_is_an_optional_option() {
+        assert_eq!(run_arg::<OptScopeArg>(&[]), Ok(OptScopeArg(None)));
+        assert_eq!(
+            run_arg::<OptScopeArg>(&["--scope", "friday"]),
+            Ok(OptScopeArg(Some("friday".to_string())))
+        );
+    }
+
+    #[test]
+    fn sort_field_parser_reads_a_positional_field() {
+        assert_eq!(run_arg::<SortField>(&["bpm"]), Ok(SortField::Bpm));
+        assert_eq!(
+            run_arg::<SortField>(&["track-number"]),
+            Ok(SortField::TrackNumber)
+        );
+        let err = run_arg::<SortField>(&["nope"]).unwrap_err();
+        assert!(err.contains("unknown sort field 'nope'"), "{err}");
+    }
+
+    #[test]
+    fn sort_direction_parser_wants_exactly_one_flag() {
+        assert_eq!(
+            run_arg::<SortDirection>(&["-a"]),
+            Ok(SortDirection::Ascending)
+        );
+        assert_eq!(
+            run_arg::<SortDirection>(&["-d"]),
+            Ok(SortDirection::Descending)
+        );
+        assert!(run_arg::<SortDirection>(&[]).is_err());
+        assert!(run_arg::<SortDirection>(&["-a", "-d"]).is_err());
+        assert!(run_arg::<SortDirection>(&["-d", "-a"]).is_err());
+    }
+
+    #[test]
+    fn view_columns_parser_keeps_argv_order() {
+        assert_eq!(
+            run_arg::<ViewColumns>(&["--hash", "--title"]),
+            Ok(ViewColumns(vec![ViewColumn::Hash, ViewColumn::Title]))
+        );
+        assert_eq!(
+            run_arg::<ViewColumns>(&["--duration", "--artist", "--hash", "--title"]),
+            Ok(ViewColumns(vec![
+                ViewColumn::Duration,
+                ViewColumn::Artist,
+                ViewColumn::Hash,
+                ViewColumn::Title,
+            ]))
+        );
+    }
+
+    #[test]
+    fn view_columns_parser_rejects_none_and_duplicates() {
+        let err = run_arg::<ViewColumns>(&[]).unwrap_err();
+        assert!(err.contains("No fields selected"), "{err}");
+        let err = run_arg::<ViewColumns>(&["--hash", "--hash"]).unwrap_err();
+        assert!(err.contains("more than once"), "{err}");
+    }
 
     // ── SortField / SortDirection ─────────────────────────────────────────────
 

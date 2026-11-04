@@ -2,8 +2,10 @@ use crate::args::TrackArg;
 use crate::ctx::Ctx;
 use crate::library::Yes;
 use crate::stdin::confirm;
+use bpaf::{long, Parser};
 use clap::Subcommand;
 use color_eyre::Result;
+use hicli::Arg;
 use library_ipc_client::{
     ConfirmationReason, ContentHash, DedupApplyReport, DedupDisposition, DedupGroup, DedupMember,
 };
@@ -41,6 +43,15 @@ pub(crate) struct DedupCli {
 /// Whether the listing also merges the automatic groups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Apply(pub bool);
+
+impl Arg for Apply {
+    fn parser() -> impl Parser<Self> {
+        long("apply")
+            .help("Merge the automatic groups (the others are only listed)")
+            .switch()
+            .map(Self)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MergeArgs {
@@ -264,7 +275,15 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::library;
+    use crate::test_support::run_arg;
     use crate::Commands;
+
+    #[test]
+    fn apply_arg_parser_is_a_switch() {
+        assert_eq!(run_arg::<Apply>(&[]), Ok(Apply(false)));
+        assert_eq!(run_arg::<Apply>(&["--apply"]), Ok(Apply(true)));
+        assert!(run_arg::<Apply>(&["--appply"]).is_err());
+    }
 
     // ── dedup ─────────────────────────────────────────────────────────────────
 

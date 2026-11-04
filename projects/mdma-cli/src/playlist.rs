@@ -1,9 +1,11 @@
 use crate::args::{OptPlaylistArg, PlaylistArg};
 use crate::ctx::Ctx;
 use crate::stdin::{hashes_in, read_hashes, read_stdin_to_string};
+use bpaf::{construct, long, Parser};
 use clap::Subcommand;
 use color_eyre::Result;
 use colored::Colorize;
+use hicli::Arg;
 use library_ipc_client::{ClientError, ContentHash, LibraryResponse, PlaylistName};
 use std::num::NonZeroUsize;
 
@@ -109,6 +111,28 @@ impl std::str::FromStr for AtLeastArg {
             .and_then(NonZeroUsize::new)
             .map(Self)
             .ok_or_else(|| format!("'{s}' must be a whole number of at least 1"))
+    }
+}
+
+impl Arg for AtLeastArg {
+    fn parser() -> impl Parser<Self> {
+        long("at-least")
+            .help("Print playlist only if it contains at least N input tracks")
+            .argument::<Self>("AT_LEAST")
+    }
+}
+
+impl Arg for ContainsMode {
+    /// At most one of `--all`, `--at-least N`, `--no`; none means any.
+    fn parser() -> impl Parser<Self> {
+        let all = long("all")
+            .help("Print playlist only if it contains ALL input tracks")
+            .req_flag(Self::All);
+        let at_least = <AtLeastArg as Arg>::parser().map(|AtLeastArg(n)| Self::AtLeast(n));
+        let no = long("no")
+            .help("Print playlist only if it contains NONE of the input tracks")
+            .req_flag(Self::None);
+        construct!([all, at_least, no]).fallback(Self::Any)
     }
 }
 
@@ -461,8 +485,39 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::test_support::{parses, usage_error};
+    use crate::test_support::{parses, run_arg, usage_error};
     use crate::Commands;
+
+    #[test]
+    fn at_least_arg_parser_reads_a_non_zero_count() {
+        let two = AtLeastArg(NonZeroUsize::new(2).unwrap());
+        assert_eq!(run_arg::<AtLeastArg>(&["--at-least", "2"]), Ok(two));
+        let err = run_arg::<AtLeastArg>(&["--at-least", "0"]).unwrap_err();
+        assert!(
+            err.contains("must be a whole number of at least 1"),
+            "{err}"
+        );
+        assert!(run_arg::<AtLeastArg>(&[]).is_err());
+    }
+
+    #[test]
+    fn contains_mode_parser_picks_at_most_one_mode() {
+        let three = NonZeroUsize::new(3).unwrap();
+        assert_eq!(run_arg::<ContainsMode>(&[]), Ok(ContainsMode::Any));
+        assert_eq!(run_arg::<ContainsMode>(&["--all"]), Ok(ContainsMode::All));
+        assert_eq!(run_arg::<ContainsMode>(&["--no"]), Ok(ContainsMode::None));
+        assert_eq!(
+            run_arg::<ContainsMode>(&["--at-least", "3"]),
+            Ok(ContainsMode::AtLeast(three))
+        );
+        assert!(run_arg::<ContainsMode>(&["--all", "--no"]).is_err());
+        assert!(run_arg::<ContainsMode>(&["--all", "--at-least", "3"]).is_err());
+        let err = run_arg::<ContainsMode>(&["--at-least", "0"]).unwrap_err();
+        assert!(
+            err.contains("must be a whole number of at least 1"),
+            "{err}"
+        );
+    }
 
     fn argv<'a>(args: &[&'a str]) -> Vec<&'a str> {
         std::iter::once("playlist")

@@ -187,6 +187,12 @@ impl std::str::FromStr for OutputNameArg {
     }
 }
 
+impl hicli::Arg for OutputNameArg {
+    fn parser() -> impl bpaf::Parser<Self> {
+        bpaf::positional::<Self>("NAME").help("Device name as shown by `mdma playback outputs`")
+    }
+}
+
 pub(crate) fn set_output(name: OutputNameArg, ctx: &Ctx) -> Result<()> {
     let OutputNameArg(name) = name;
     let playback = ctx.playback();
@@ -216,4 +222,19 @@ pub(crate) fn get_output(ctx: &Ctx) -> Result<()> {
         .unwrap_or_else(|| "?".to_string());
     println!("{} ({}Hz)", device, rate);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OutputNameArg;
+    use crate::test_support::run_arg;
+
+    #[test]
+    fn output_name_arg_parser_reads_a_positional() {
+        assert_eq!(
+            run_arg::<OutputNameArg>(&["alsa_output.usb"]),
+            Ok(OutputNameArg("alsa_output.usb".to_string()))
+        );
+        assert!(run_arg::<OutputNameArg>(&[]).is_err());
+    }
 }

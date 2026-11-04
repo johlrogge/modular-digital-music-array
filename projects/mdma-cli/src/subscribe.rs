@@ -18,6 +18,17 @@ pub(crate) struct SubscribeCli {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OptTopicArg(pub Option<String>);
 
+impl hicli::Arg for OptTopicArg {
+    fn parser() -> impl bpaf::Parser<Self> {
+        use bpaf::Parser as _;
+        bpaf::long("topic")
+            .help("Topic filter (e.g. \"playback/track_started\"). Default: all playback events.")
+            .argument::<String>("TOPIC")
+            .optional()
+            .map(Self)
+    }
+}
+
 pub(crate) fn subscribe(topic: OptTopicArg, ctx: &Ctx) -> Result<()> {
     let OptTopicArg(topic) = topic;
     // Event gateway of the resolved node (tcp://<ip>:5556)
@@ -170,5 +181,21 @@ fn print_event_human(event: &PlaybackEvent, library: Option<&LibraryBackend>) {
                 id.to_string().bright_black()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OptTopicArg;
+    use crate::test_support::run_arg;
+
+    #[test]
+    fn topic_arg_parser_is_an_optional_option() {
+        assert_eq!(run_arg::<OptTopicArg>(&[]), Ok(OptTopicArg(None)));
+        assert_eq!(
+            run_arg::<OptTopicArg>(&["--topic", "playback/track_started"]),
+            Ok(OptTopicArg(Some("playback/track_started".to_string())))
+        );
+        assert!(run_arg::<OptTopicArg>(&["--topic"]).is_err());
     }
 }

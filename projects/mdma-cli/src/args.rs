@@ -1,7 +1,9 @@
 //! Argument helpers shared by several command modules.
 
 use crate::stdin::is_hash_token;
+use bpaf::{positional, Parser};
 use clap::CommandFactory;
+use hicli::{complete_files, Arg};
 use library_ipc_client::{ContentHash, PlaylistName, PlaylistNameError};
 use playlist_import::sanitize_playlist_name;
 use std::path::PathBuf;
@@ -26,9 +28,28 @@ impl FromStr for TrackArg {
     }
 }
 
+// The Arg impls spell the arguments as clap does today (metavar = the clap
+// field name uppercased, same help). A type used under other names (`winner`,
+// `from`, ...) is a field of a multi-value args struct instead.
+impl Arg for TrackArg {
+    fn parser() -> impl Parser<Self> {
+        positional::<Self>("HASH")
+            .help("Content hash (full or partial, with or without sha256: prefix)")
+    }
+}
+
 /// An optional [`TrackArg`] (none: the command reads hashes from stdin or has a default).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OptTrackArg(pub Option<TrackArg>);
+
+impl Arg for OptTrackArg {
+    fn parser() -> impl Parser<Self> {
+        positional::<TrackArg>("HASH")
+            .help("Content hash (full or partial). Omit to read from stdin.")
+            .optional()
+            .map(Self)
+    }
+}
 
 /// Name of an MDMA playlist, validated by `PlaylistName`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,9 +63,24 @@ impl FromStr for PlaylistArg {
     }
 }
 
+impl Arg for PlaylistArg {
+    fn parser() -> impl Parser<Self> {
+        positional::<Self>("NAME").help("Playlist name")
+    }
+}
+
 /// An optional [`PlaylistArg`] (none: the command reads names from stdin).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OptPlaylistArg(pub Option<PlaylistArg>);
+
+impl Arg for OptPlaylistArg {
+    fn parser() -> impl Parser<Self> {
+        positional::<PlaylistArg>("NAME")
+            .help("Playlist name. Omit to read names from stdin.")
+            .optional()
+            .map(Self)
+    }
+}
 
 /// A playlist name for an imported playlist: sanitised on parse. Keeps the
 /// raw text so commands can note when it was changed.
@@ -106,6 +142,12 @@ impl FromStr for ExistingFileArg {
     }
 }
 
+impl Arg for ExistingFileArg {
+    fn parser() -> impl Parser<Self> {
+        complete_files(positional::<Self>("PATH").help("Path to rekordbox.xml file"))
+    }
+}
+
 impl ExistingFileArg {
     /// Check that `path` is an existing file.
     pub(crate) fn new(path: PathBuf) -> Result<Self, String> {
@@ -130,7 +172,60 @@ pub(crate) fn usage_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::run_arg;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn track_arg_parser_reads_a_positional_hash() {
+        assert_eq!(
+            run_arg::<TrackArg>(&["abcd1234"]),
+            Ok(TrackArg(ContentHash::new("abcd1234")))
+        );
+        let err = run_arg::<TrackArg>(&["xyz"]).unwrap_err();
+        assert!(err.contains("is not a content hash"), "{err}");
+        assert!(run_arg::<TrackArg>(&[]).is_err());
+    }
+
+    #[test]
+    fn opt_track_arg_parser_may_be_omitted() {
+        assert_eq!(run_arg::<OptTrackArg>(&[]), Ok(OptTrackArg(None)));
+        assert_eq!(
+            run_arg::<OptTrackArg>(&["abcd1234"]),
+            Ok(OptTrackArg(Some(TrackArg(ContentHash::new("abcd1234")))))
+        );
+        let err = run_arg::<OptTrackArg>(&["xyz"]).unwrap_err();
+        assert!(err.contains("is not a content hash"), "{err}");
+    }
+
+    #[test]
+    fn playlist_arg_parsers_validate_the_name() {
+        let name = PlaylistName::new("my-list").unwrap();
+        assert_eq!(
+            run_arg::<PlaylistArg>(&["my-list"]),
+            Ok(PlaylistArg(name.clone()))
+        );
+        assert_eq!(
+            run_arg::<OptPlaylistArg>(&["my-list"]),
+            Ok(OptPlaylistArg(Some(PlaylistArg(name))))
+        );
+        assert_eq!(run_arg::<OptPlaylistArg>(&[]), Ok(OptPlaylistArg(None)));
+        let reason = PlaylistName::new("has space").unwrap_err().to_string();
+        let err = run_arg::<PlaylistArg>(&["has space"]).unwrap_err();
+        assert!(err.contains(&reason), "{err}");
+        assert!(run_arg::<OptPlaylistArg>(&["a/b"]).is_err());
+        assert!(run_arg::<PlaylistArg>(&[]).is_err());
+    }
+
+    #[test]
+    fn existing_file_arg_parser_requires_an_existing_file() {
+        let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        assert_eq!(
+            run_arg::<ExistingFileArg>(&[manifest]),
+            Ok(ExistingFileArg(PathBuf::from(manifest)))
+        );
+        let err = run_arg::<ExistingFileArg>(&["/definitely/not/here.mp3"]).unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
+    }
 
     #[test]
     fn track_arg_accepts_short_and_prefixed_hashes() {

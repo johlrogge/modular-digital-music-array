@@ -12,6 +12,13 @@ pub(crate) struct CompletionsCli {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ShellArg(pub clap_complete::Shell);
 
+impl hicli::Arg for ShellArg {
+    fn parser() -> impl bpaf::Parser<Self> {
+        use bpaf::Parser as _;
+        bpaf::positional::<clap_complete::Shell>("SHELL").map(Self)
+    }
+}
+
 pub(crate) fn generate(shell: ShellArg) -> Result<()> {
     let ShellArg(shell) = shell;
     generate_completions(shell, &mut std::io::stdout());
@@ -28,6 +35,21 @@ mod tests {
     use super::*;
 
     // ── Shell completions ─────────────────────────────────────────────────────
+
+    #[test]
+    fn shell_arg_parser_reads_a_shell_name() {
+        use crate::test_support::run_arg;
+        assert_eq!(
+            run_arg::<ShellArg>(&["bash"]),
+            Ok(ShellArg(clap_complete::Shell::Bash))
+        );
+        assert_eq!(
+            run_arg::<ShellArg>(&["zsh"]),
+            Ok(ShellArg(clap_complete::Shell::Zsh))
+        );
+        assert!(run_arg::<ShellArg>(&["tcsh"]).is_err());
+        assert!(run_arg::<ShellArg>(&[]).is_err());
+    }
 
     #[test]
     fn generate_completions_bash_produces_nonempty_output() {

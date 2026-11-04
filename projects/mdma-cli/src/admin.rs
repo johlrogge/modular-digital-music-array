@@ -1,7 +1,9 @@
 use crate::ctx::Ctx;
+use bpaf::{long, Parser};
 use clap::Subcommand;
 use color_eyre::Result;
 use gateway_client::{AdminRequest, AdminResponse, GatewayClient};
+use hicli::Arg;
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
@@ -80,6 +82,15 @@ pub(crate) fn boot_health(ctx: &Ctx) -> Result<()> {
 /// Reboot even if the boot-health check fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Force(pub bool);
+
+impl Arg for Force {
+    fn parser() -> impl Parser<Self> {
+        long("force")
+            .help("Reboot even if the boot-health check fails")
+            .switch()
+            .map(Self)
+    }
+}
 
 pub(crate) fn reboot(force: Force, ctx: &Ctx) -> Result<()> {
     let Force(force) = force;
@@ -170,11 +181,19 @@ mod service_mode {
 #[cfg(test)]
 mod tests {
 
-    use crate::test_support::parses;
+    use crate::test_support::{parses, run_arg};
 
     use super::service_mode;
     use super::Command;
+    use super::Force;
     use crate::Commands;
+
+    #[test]
+    fn force_arg_parser_is_a_switch() {
+        assert_eq!(run_arg::<Force>(&[]), Ok(Force(false)));
+        assert_eq!(run_arg::<Force>(&["--force"]), Ok(Force(true)));
+        assert!(run_arg::<Force>(&["--forse"]).is_err());
+    }
 
     // ── admin service-mode clap parsing ──────────────────────────────────────
 

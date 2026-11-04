@@ -48,6 +48,12 @@ impl FromStr for InboxFileArg {
     }
 }
 
+impl hicli::Arg for InboxFileArg {
+    fn parser() -> impl bpaf::Parser<Self> {
+        bpaf::positional::<Self>("FILENAME").help("File name in inbox")
+    }
+}
+
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     let library = ctx.library();
     match library.inbox_queue() {
@@ -163,7 +169,21 @@ pub(crate) fn ingest_all(ctx: &Ctx) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_support::{parse, usage_error};
+    use super::InboxFileArg;
+    use crate::test_support::{parse, run_arg, usage_error};
+    use library_ipc_client::InboxPath;
+
+    #[test]
+    fn inbox_file_arg_parser_validates_the_path() {
+        assert_eq!(
+            run_arg::<InboxFileArg>(&["song.mp3"]),
+            Ok(InboxFileArg(InboxPath::new("song.mp3").unwrap()))
+        );
+        let reason = InboxPath::new("../escape.mp3").unwrap_err().to_string();
+        let err = run_arg::<InboxFileArg>(&["../escape.mp3"]).unwrap_err();
+        assert!(err.contains(&reason), "{err}");
+        assert!(run_arg::<InboxFileArg>(&[]).is_err());
+    }
 
     #[test]
     fn invalid_inbox_file_is_a_usage_error() {
