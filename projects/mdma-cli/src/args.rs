@@ -2,12 +2,155 @@
 
 use crate::stdin::is_hash_token;
 use bpaf::{positional, Parser};
-use clap::CommandFactory;
-use hicli::{complete_files, Arg};
+use hicli::{complete_files, complete_with, Arg};
 use library_ipc_client::{ContentHash, PlaylistName, PlaylistNameError};
 use playlist_import::sanitize_playlist_name;
 use std::path::PathBuf;
 use std::str::FromStr;
+
+/// The one place an `Arg` impl for a plain argument type is spelled out. The
+/// forms (metavars and help match what clap shows today):
+///
+/// - `T, positional "META", "help"`: a positional that parses through `FromStr`.
+/// - `T, long "x" [, short 'c'], "META", "help"`: an option with a value.
+/// - `T, switch "x" [, short 'c'], "help"`: a switch on a `T(bool)`.
+/// - `OptT, optional T`: `OptT(Option<T>)`, optional version of `T`'s parser.
+/// - `OptT, optional_text long "x", "META", "help"` and
+///   `OptT, optional_text positional "META", "help"`: `OptT(Option<String>)`
+///   (a free-form text with no domain type to name).
+macro_rules! impl_arg {
+    ($ty:ty, positional $meta:literal, $help:literal) => {
+        impl hicli::Arg for $ty {
+            fn parser() -> impl bpaf::Parser<Self> {
+                bpaf::positional::<Self>($meta).help($help)
+            }
+        }
+    };
+    ($ty:ty, long $long:literal, $meta:literal, $help:literal) => {
+        impl hicli::Arg for $ty {
+            fn parser() -> impl bpaf::Parser<Self> {
+                bpaf::long($long).help($help).argument::<Self>($meta)
+            }
+        }
+    };
+    ($ty:ty, long $long:literal, short $short:literal, $meta:literal, $help:literal) => {
+        impl hicli::Arg for $ty {
+            fn parser() -> impl bpaf::Parser<Self> {
+                bpaf::short($short)
+                    .long($long)
+                    .help($help)
+                    .argument::<Self>($meta)
+            }
+        }
+    };
+    ($ty:ty, switch $long:literal, $help:literal) => {
+        impl hicli::Arg for $ty {
+            fn parser() -> impl bpaf::Parser<Self> {
+                use bpaf::Parser as _;
+                bpaf::long($long).help($help).switch().map(Self)
+            }
+        }
+    };
+    ($ty:ty, switch $long:literal, short $short:literal, $help:literal) => {
+        impl hicli::Arg for $ty {
+            fn parser() -> impl bpaf::Parser<Self> {
+                use bpaf::Parser as _;
+                bpaf::short($short)
+                    .long($long)
+                    .help($help)
+                    .switch()
+                    .map(Self)
+            }
+        }
+    };
+    ($ty:ty, optional_text long $long:literal, $meta:literal, $help:literal) => {
+        impl hicli::Arg for $ty {
+            fn parser() -> impl bpaf::Parser<Self> {
+                use bpaf::Parser as _;
+                bpaf::long($long)
+                    .help($help)
+                    .argument::<String>($meta)
+                    .optional()
+                    .map(Self)
+            }
+        }
+    };
+    ($ty:ty, optional_text positional $meta:literal, $help:literal) => {
+        impl hicli::Arg for $ty {
+            fn parser() -> impl bpaf::Parser<Self> {
+                use bpaf::Parser as _;
+                bpaf::positional::<String>($meta)
+                    .help($help)
+                    .optional()
+                    .map(Self)
+            }
+        }
+    };
+    ($ty:ty, optional $base:ty) => {
+        impl hicli::Arg for $ty {
+            fn parser() -> impl bpaf::Parser<Self> {
+                use bpaf::Parser as _;
+                <$base as hicli::Arg>::parser().optional().map(Self)
+            }
+        }
+    };
+}
+pub(crate) use impl_arg;
+
+/// A value that is one of a fixed set of names (what clap's `ValueEnum` gave us).
+/// Implement this and the argument gets its parse error, its list of names and
+/// tab completion from [`choice`].
+pub(crate) trait Choice: Copy + 'static {
+    /// Every value, in the order they are listed.
+    const ALL: &'static [Self];
+    /// What the value is, for the "unknown ..." message (`sort field`).
+    const WHAT: &'static str;
+    /// The name the user types.
+    fn name(self) -> &'static str;
+}
+
+/// The value named `s`.
+pub(crate) fn parse_choice<T: Choice>(s: &str) -> Result<T, String> {
+    T::ALL
+        .iter()
+        .copied()
+        .find(|value| value.name() == s)
+        .ok_or_else(|| {
+            format!(
+                "unknown {} '{s}' (expected {})",
+                T::WHAT,
+                names_as_alternatives(&choice_names::<T>())
+            )
+        })
+}
+
+/// `a`, `a or b`, `a, b or c`.
+fn names_as_alternatives(names: &[&str]) -> String {
+    match names.split_last() {
+        None => String::new(),
+        Some((last, [])) => (*last).to_string(),
+        Some((last, init)) => format!("{} or {last}", init.join(", ")),
+    }
+}
+
+/// Every name of `T`, in order.
+pub(crate) fn choice_names<T: Choice>() -> Vec<&'static str> {
+    T::ALL.iter().map(|value| value.name()).collect()
+}
+
+/// Read a `T` from the word `word` parses. Completion happens on the word
+/// (which parses while half-typed); a validated type is never completed on
+/// the empty word.
+pub(crate) fn choice<T: Choice>(word: impl Parser<String>) -> impl Parser<T> {
+    complete_with(word, |typed: &String| {
+        choice_names::<T>()
+            .into_iter()
+            .filter(|name| name.starts_with(typed.as_str()))
+            .map(|name| (name.to_string(), None))
+            .collect()
+    })
+    .parse(|word| parse_choice::<T>(&word))
+}
 
 /// Content hash of a track, as typed (a prefix is accepted; the service resolves it).
 /// Follows the stdin rule: at least 8 lowercase hex characters, optional `sha256:` prefix.
@@ -31,25 +174,17 @@ impl FromStr for TrackArg {
 // The Arg impls spell the arguments as clap does today (metavar = the clap
 // field name uppercased, same help). A type used under other names (`winner`,
 // `from`, ...) is a field of a multi-value args struct instead.
-impl Arg for TrackArg {
-    fn parser() -> impl Parser<Self> {
-        positional::<Self>("HASH")
-            .help("Content hash (full or partial, with or without sha256: prefix)")
-    }
-}
+impl_arg!(
+    TrackArg,
+    positional "HASH",
+    "Content hash (full or partial, with or without sha256: prefix)"
+);
 
 /// An optional [`TrackArg`] (none: the command reads hashes from stdin or has a default).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OptTrackArg(pub Option<TrackArg>);
 
-impl Arg for OptTrackArg {
-    fn parser() -> impl Parser<Self> {
-        positional::<TrackArg>("HASH")
-            .help("Content hash (full or partial). Omit to read from stdin.")
-            .optional()
-            .map(Self)
-    }
-}
+impl_arg!(OptTrackArg, optional TrackArg);
 
 /// Name of an MDMA playlist, validated by `PlaylistName`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,24 +198,13 @@ impl FromStr for PlaylistArg {
     }
 }
 
-impl Arg for PlaylistArg {
-    fn parser() -> impl Parser<Self> {
-        positional::<Self>("NAME").help("Playlist name")
-    }
-}
+impl_arg!(PlaylistArg, positional "NAME", "Playlist name");
 
 /// An optional [`PlaylistArg`] (none: the command reads names from stdin).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OptPlaylistArg(pub Option<PlaylistArg>);
 
-impl Arg for OptPlaylistArg {
-    fn parser() -> impl Parser<Self> {
-        positional::<PlaylistArg>("NAME")
-            .help("Playlist name. Omit to read names from stdin.")
-            .optional()
-            .map(Self)
-    }
-}
+impl_arg!(OptPlaylistArg, optional PlaylistArg);
 
 /// A playlist name for an imported playlist: sanitised on parse. Keeps the
 /// raw text so commands can note when it was changed.
@@ -144,7 +268,7 @@ impl FromStr for ExistingFileArg {
 
 impl Arg for ExistingFileArg {
     fn parser() -> impl Parser<Self> {
-        complete_files(positional::<Self>("PATH").help("Path to rekordbox.xml file"))
+        complete_files(positional::<Self>("PATH").help("Path to an existing file"))
     }
 }
 
@@ -166,6 +290,7 @@ pub(crate) fn usage_error(
     kind: clap::error::ErrorKind,
     msg: impl std::fmt::Display,
 ) -> clap::Error {
+    use clap::CommandFactory;
     crate::Cli::command().error(kind, msg)
 }
 
@@ -174,6 +299,77 @@ mod tests {
     use super::*;
     use crate::test_support::run_arg;
     use pretty_assertions::assert_eq;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Shade {
+        Light,
+        DarkBlue,
+    }
+
+    impl Choice for Shade {
+        const ALL: &'static [Self] = &[Shade::Light, Shade::DarkBlue];
+        const WHAT: &'static str = "shade";
+
+        fn name(self) -> &'static str {
+            match self {
+                Shade::Light => "light",
+                Shade::DarkBlue => "dark-blue",
+            }
+        }
+    }
+
+    #[test]
+    fn parse_choice_finds_a_value_by_name() {
+        assert_eq!(parse_choice::<Shade>("light"), Ok(Shade::Light));
+        assert_eq!(parse_choice::<Shade>("dark-blue"), Ok(Shade::DarkBlue));
+        assert_eq!(
+            parse_choice::<Shade>("Light"),
+            Err("unknown shade 'Light' (expected light or dark-blue)".to_string())
+        );
+        assert_eq!(names_as_alternatives(&["a"]), "a");
+        assert_eq!(names_as_alternatives(&["a", "b", "c"]), "a, b or c");
+    }
+
+    #[test]
+    fn choice_names_follow_the_order_of_all() {
+        assert_eq!(choice_names::<Shade>(), vec!["light", "dark-blue"]);
+    }
+
+    #[test]
+    fn choice_parser_reads_a_name_and_names_the_what_when_unknown() {
+        let parser = || choice::<Shade>(positional::<String>("SHADE")).to_options();
+        assert_eq!(
+            parser().run_inner(&["dark-blue"][..]).ok(),
+            Some(Shade::DarkBlue)
+        );
+        let message = parser()
+            .run_inner(&["pink"][..])
+            .unwrap_err()
+            .unwrap_stderr();
+        assert!(message.contains("unknown shade 'pink'"), "{message}");
+    }
+
+    /// Every `Choice` that clap's `ValueEnum` also derives agrees with it, so
+    /// the clap help and the hicli parser list the same names (dropped with clap).
+    fn assert_agrees_with_value_enum<T>()
+    where
+        T: Choice + clap::ValueEnum + std::fmt::Debug + PartialEq,
+    {
+        let clap_names: Vec<String> = T::value_variants()
+            .iter()
+            .map(|v| v.to_possible_value().unwrap().get_name().to_string())
+            .collect();
+        assert_eq!(choice_names::<T>(), clap_names);
+        assert_eq!(T::ALL, T::value_variants());
+    }
+
+    #[test]
+    fn choices_agree_with_clap_value_enums() {
+        assert_agrees_with_value_enum::<crate::tracks::SortField>();
+        assert_agrees_with_value_enum::<crate::fact::FactField>();
+        assert_agrees_with_value_enum::<crate::search::PlayedFilter>();
+        assert_agrees_with_value_enum::<crate::transfer::ExportFormat>();
+    }
 
     #[test]
     fn track_arg_parser_reads_a_positional_hash() {

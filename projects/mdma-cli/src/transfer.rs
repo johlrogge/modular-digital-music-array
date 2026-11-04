@@ -1,7 +1,7 @@
-use crate::args::ExistingFileArg;
+use crate::args::{choice, choice_names, parse_choice, Choice, ExistingFileArg};
 use crate::ctx::Ctx;
 use crate::stdin::{read_hashes, resolve_tracks_skip_errors};
-use bpaf::{long, positional, Parser};
+use bpaf::{construct, long, positional, Parser};
 use color_eyre::Result;
 use hicli::{complete_files, Arg};
 use library_ipc_client::TrackInfo;
@@ -12,7 +12,7 @@ use track_formatter::short_hash;
 #[derive(clap::Args, Debug)]
 pub(crate) struct UploadArgs {
     /// SSH key for SCP transfer
-    #[arg(long, default_value = "~/.ssh/mdma_pi", env = "MDMA_SSH_KEY")]
+    #[arg(long, default_value = DEFAULT_SSH_KEY, env = "MDMA_SSH_KEY")]
     ssh_key: SshKeyArg,
 
     // Stays a String: no domain rule, the Pi's account name.
@@ -104,6 +104,52 @@ pub(crate) enum ExportFormats {
     },
 }
 
+impl Arg for ExportFormats {
+    /// `--format`, or `--lossless-format` / `--lossy-format`; mixing them is an
+    /// error, and none at all passes every category through (`PerCategory`).
+    fn parser() -> impl Parser<Self> {
+        let all = choice::<ExportFormat>(
+            long("format")
+                .help(
+                    format!(
+                        "Output format for ALL tracks ({}). Default: original. Conflicts with --lossless-format and --lossy-format.",
+                        choice_names::<ExportFormat>().join(", ")
+                    )
+                    .as_str(),
+                )
+                .argument::<String>("FORMAT"),
+        )
+        .optional();
+        let lossless = choice::<ExportFormat>(
+            long("lossless-format")
+                .help("Target format for lossless sources (flac, wav, aiff). Lossy sources pass through unchanged.")
+                .argument::<String>("LOSSLESS_FORMAT"),
+        )
+        .optional();
+        let lossy = choice::<ExportFormat>(
+            long("lossy-format")
+                .help("Target format for lossy sources (mp3, ogg, opus). Lossless sources pass through unchanged.")
+                .argument::<String>("LOSSY_FORMAT"),
+        )
+        .optional();
+        // Not `construct!([all, per_category])`: when the first alternative
+        // fails on a bad name, bpaf would fall through to the second and report
+        // "`--format` is not expected" instead of the bad name.
+        construct!(all, lossless, lossy).parse(|(all, lossless, lossy)| {
+            match (all, lossless, lossy) {
+                (Some(format), None, None) => Ok(Self::All(format)),
+                (None, lossless, lossy) => Ok(Self::PerCategory { lossless, lossy }),
+                (Some(_), _, _) => {
+                    Err("--format conflicts with --lossless-format and --lossy-format")
+                }
+            }
+        })
+    }
+}
+
+/// The key `--ssh-key` falls back to.
+pub(crate) const DEFAULT_SSH_KEY: &str = "~/.ssh/mdma_pi";
+
 /// Path of an existing SSH key file; a leading `~/` is expanded to the home directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SshKeyArg(pub std::path::PathBuf);
@@ -117,17 +163,21 @@ impl std::str::FromStr for SshKeyArg {
     }
 }
 
+/// `--ssh-key`, from the environment variable `env` or else `default`; the
+/// default is checked like a typed value.
+fn ssh_key_option(env: &'static str, default: &'static str) -> impl Parser<SshKeyArg> {
+    long("ssh-key")
+        .env(env)
+        .help("SSH key for SCP transfer")
+        .argument::<String>("SSH_KEY")
+        .fallback(default.to_string())
+        .display_fallback()
+        .parse(|s| s.parse::<SshKeyArg>())
+}
+
 impl Arg for SshKeyArg {
-    /// `--ssh-key`, from `MDMA_SSH_KEY` or `~/.ssh/mdma_pi` when not given; the
-    /// default is checked like a typed value.
     fn parser() -> impl Parser<Self> {
-        long("ssh-key")
-            .env("MDMA_SSH_KEY")
-            .help("SSH key for SCP transfer")
-            .argument::<String>("SSH_KEY")
-            .fallback("~/.ssh/mdma_pi".to_string())
-            .display_fallback()
-            .parse(|s| s.parse::<Self>())
+        ssh_key_option("MDMA_SSH_KEY", DEFAULT_SSH_KEY)
     }
 }
 
@@ -779,9 +829,18 @@ impl ExportFormat {
     }
 }
 
+impl Choice for ExportFormat {
+    const ALL: &'static [Self] = &[Self::Original, Self::Aiff, Self::Wav];
+    const WHAT: &'static str = "export format";
+
+    fn name(self) -> &'static str {
+        self.format_param()
+    }
+}
+
 impl std::fmt::Display for ExportFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.format_param())
+        f.write_str(self.name())
     }
 }
 
@@ -789,14 +848,7 @@ impl std::str::FromStr for ExportFormat {
     type Err = String;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "original" => Ok(Self::Original),
-            "aiff" => Ok(Self::Aiff),
-            "wav" => Ok(Self::Wav),
-            _ => Err(format!(
-                "unknown export format '{s}' (expected original, aiff or wav)"
-            )),
-        }
+        parse_choice(s)
     }
 }
 
@@ -832,6 +884,78 @@ mod tests {
         );
         let err = run_arg::<SshKeyArg>(&["--ssh-key", "/definitely/not/here"]).unwrap_err();
         assert!(err.contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_default_ssh_key_fails_like_a_typed_value() {
+        let message = ssh_key_option(
+            "MDMA_TEST_SSH_KEY_NEVER_SET",
+            "/definitely/not/a/default/key",
+        )
+        .to_options()
+        .run_inner(&[] as &[&str])
+        .unwrap_err()
+        .unwrap_stderr();
+        assert!(message.contains("does not exist"), "{message}");
+    }
+
+    #[test]
+    fn ssh_key_option_falls_back_to_an_existing_default() {
+        let parsed = ssh_key_option("MDMA_TEST_SSH_KEY_NEVER_SET", KEY)
+            .to_options()
+            .run_inner(&[] as &[&str])
+            .ok();
+        assert_eq!(parsed, Some(SshKeyArg(std::path::PathBuf::from(KEY))));
+    }
+
+    #[test]
+    fn export_formats_parser_reads_one_format_for_all() {
+        assert_eq!(
+            run_arg::<ExportFormats>(&["--format", "wav"]),
+            Ok(ExportFormats::All(ExportFormat::Wav))
+        );
+    }
+
+    #[test]
+    fn export_formats_parser_reads_per_category_formats() {
+        assert_eq!(
+            run_arg::<ExportFormats>(&[]),
+            Ok(ExportFormats::PerCategory {
+                lossless: None,
+                lossy: None
+            })
+        );
+        assert_eq!(
+            run_arg::<ExportFormats>(&["--lossy-format", "aiff"]),
+            Ok(ExportFormats::PerCategory {
+                lossless: None,
+                lossy: Some(ExportFormat::Aiff)
+            })
+        );
+        assert_eq!(
+            run_arg::<ExportFormats>(&["--lossless-format", "wav", "--lossy-format", "aiff"]),
+            Ok(ExportFormats::PerCategory {
+                lossless: Some(ExportFormat::Wav),
+                lossy: Some(ExportFormat::Aiff)
+            })
+        );
+    }
+
+    #[test]
+    fn export_formats_parser_rejects_mixing_and_unknown_names() {
+        for args in [
+            ["--format", "wav", "--lossy-format", "wav"],
+            ["--lossy-format", "wav", "--format", "wav"],
+            ["--format", "wav", "--lossless-format", "wav"],
+        ] {
+            let err = run_arg::<ExportFormats>(&args).unwrap_err();
+            assert!(err.contains("--format conflicts with"), "{err}");
+        }
+        let err = run_arg::<ExportFormats>(&["--format", "flac"]).unwrap_err();
+        assert!(
+            err.contains("unknown export format 'flac' (expected original, aiff or wav)"),
+            "{err}"
+        );
     }
 
     // ── upload file argument ─────────────────────────────────────────────────
@@ -1402,12 +1526,10 @@ mod tests {
     }
 
     #[test]
-    fn export_format_parse_and_display_match_clap_value_enum() {
-        use clap::ValueEnum;
-        for v in ExportFormat::value_variants() {
-            let name = v.to_possible_value().unwrap().get_name().to_string();
-            assert_eq!(name.parse::<ExportFormat>(), Ok(*v));
-            assert_eq!(v.to_string(), name);
+    fn export_format_names_round_trip() {
+        for v in ExportFormat::ALL {
+            assert_eq!(v.name().parse::<ExportFormat>(), Ok(*v));
+            assert_eq!(v.to_string(), v.name());
         }
     }
 

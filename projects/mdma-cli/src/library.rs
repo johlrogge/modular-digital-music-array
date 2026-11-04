@@ -3,11 +3,10 @@ mod dedup;
 mod identity;
 mod track;
 
+use crate::args::impl_arg;
 use crate::ctx::Ctx;
-use bpaf::{short, Parser};
 use clap::Subcommand;
 use color_eyre::Result;
-use hicli::Arg;
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
@@ -95,15 +94,7 @@ pub(crate) fn reindex_covers(ctx: &Ctx) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Yes(pub bool);
 
-impl Arg for Yes {
-    fn parser() -> impl Parser<Self> {
-        short('y')
-            .long("yes")
-            .help("Do not ask for confirmation")
-            .switch()
-            .map(Self)
-    }
-}
+impl_arg!(Yes, switch "yes", short 'y', "Do not ask for confirmation");
 
 #[cfg(test)]
 mod tests {

@@ -1,3 +1,4 @@
+use crate::args::impl_arg;
 use crate::ctx::Ctx;
 use crate::output::handle_error;
 use clap::Subcommand;
@@ -48,11 +49,7 @@ impl FromStr for InboxFileArg {
     }
 }
 
-impl hicli::Arg for InboxFileArg {
-    fn parser() -> impl bpaf::Parser<Self> {
-        bpaf::positional::<Self>("FILENAME").help("File name in inbox")
-    }
-}
+impl_arg!(InboxFileArg, positional "FILENAME", "File name in inbox");
 
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     let library = ctx.library();

@@ -1,8 +1,8 @@
-use crate::args::TrackArg;
+use crate::args::{impl_arg, TrackArg};
 use crate::ctx::Ctx;
 use crate::library::Yes;
 use crate::stdin::confirm;
-use bpaf::{long, Parser};
+use bpaf::Bpaf;
 use clap::Subcommand;
 use color_eyre::Result;
 use hicli::Arg;
@@ -44,19 +44,24 @@ pub(crate) struct DedupCli {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Apply(pub bool);
 
-impl Arg for Apply {
-    fn parser() -> impl Parser<Self> {
-        long("apply")
-            .help("Merge the automatic groups (the others are only listed)")
-            .switch()
-            .map(Self)
-    }
-}
+impl_arg!(
+    Apply,
+    switch "apply",
+    "Merge the automatic groups (the others are only listed)"
+);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Bpaf, Arg)]
 pub(crate) struct MergeArgs {
+    #[bpaf(external(Yes::parser))]
     pub(crate) yes: Yes,
+    /// The track to keep (prefix accepted, git-style)
+    #[bpaf(positional("WINNER"))]
     pub(crate) winner: TrackArg,
+    /// The duplicates to merge into it (prefixes accepted)
+    #[bpaf(
+        positional("LOSERS"),
+        some("at least one duplicate to merge is required")
+    )]
     pub(crate) losers: Vec<TrackArg>,
 }
 
@@ -283,6 +288,36 @@ mod tests {
         assert_eq!(run_arg::<Apply>(&[]), Ok(Apply(false)));
         assert_eq!(run_arg::<Apply>(&["--apply"]), Ok(Apply(true)));
         assert!(run_arg::<Apply>(&["--appply"]).is_err());
+    }
+
+    #[test]
+    fn merge_args_parser_reads_winner_losers_and_yes() {
+        let hash = |h: &str| TrackArg(ContentHash::new(h));
+        assert_eq!(
+            run_arg::<MergeArgs>(&["abc12345", "def45678", "0a1b2c3d"]),
+            Ok(MergeArgs {
+                yes: Yes(false),
+                winner: hash("abc12345"),
+                losers: vec![hash("def45678"), hash("0a1b2c3d")],
+            })
+        );
+        assert_eq!(
+            run_arg::<MergeArgs>(&["-y", "abc12345", "def45678"]),
+            Ok(MergeArgs {
+                yes: Yes(true),
+                winner: hash("abc12345"),
+                losers: vec![hash("def45678")],
+            })
+        );
+    }
+
+    #[test]
+    fn merge_args_parser_wants_a_loser_and_valid_hashes() {
+        assert!(run_arg::<MergeArgs>(&[]).is_err());
+        let err = run_arg::<MergeArgs>(&["abc12345"]).unwrap_err();
+        assert!(err.contains("at least one duplicate"), "{err}");
+        let err = run_arg::<MergeArgs>(&["abc12345", "nothash"]).unwrap_err();
+        assert!(err.contains("is not a content hash"), "{err}");
     }
 
     // ── dedup ─────────────────────────────────────────────────────────────────

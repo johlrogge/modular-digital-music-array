@@ -1,3 +1,4 @@
+use crate::args::impl_arg;
 use crate::ctx::Ctx;
 use color_eyre::Result;
 use colored::Colorize;
@@ -18,16 +19,12 @@ pub(crate) struct SubscribeCli {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OptTopicArg(pub Option<String>);
 
-impl hicli::Arg for OptTopicArg {
-    fn parser() -> impl bpaf::Parser<Self> {
-        use bpaf::Parser as _;
-        bpaf::long("topic")
-            .help("Topic filter (e.g. \"playback/track_started\"). Default: all playback events.")
-            .argument::<String>("TOPIC")
-            .optional()
-            .map(Self)
-    }
-}
+impl_arg!(
+    OptTopicArg,
+    optional_text long "topic",
+    "TOPIC",
+    "Topic filter (e.g. \"playback/track_started\"). Default: all playback events."
+);
 
 pub(crate) fn subscribe(topic: OptTopicArg, ctx: &Ctx) -> Result<()> {
     let OptTopicArg(topic) = topic;

@@ -1,13 +1,11 @@
 mod import;
 
-use crate::args::SanitizedPlaylistName;
+use crate::args::{impl_arg, SanitizedPlaylistName};
 use crate::ctx::Ctx;
 use crate::output::handle_source_error;
 use crate::source::import::{finish_import, follow_import_job, is_terminal_phase};
-use bpaf::{long, positional, Parser as _};
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
-use hicli::Arg;
 use mdma_client::SourceClient;
 use source_protocol::{SourceError, SourceRequest, SourceResponse};
 use std::convert::Infallible;
@@ -52,11 +50,7 @@ impl FromStr for SourceArg {
     }
 }
 
-impl Arg for SourceArg {
-    fn parser() -> impl bpaf::Parser<Self> {
-        positional::<Self>("SOURCE-NAME").help("Music source name")
-    }
-}
+impl_arg!(SourceArg, positional "SOURCE-NAME", "Music source name");
 
 impl SourceArg {
     pub(crate) fn as_str(&self) -> &str {
@@ -68,14 +62,11 @@ impl SourceArg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ApplyUpdates(pub bool);
 
-impl Arg for ApplyUpdates {
-    fn parser() -> impl bpaf::Parser<Self> {
-        long("apply")
-            .help("Auto-apply resync for any stale items found")
-            .switch()
-            .map(Self)
-    }
-}
+impl_arg!(
+    ApplyUpdates,
+    switch "apply",
+    "Auto-apply resync for any stale items found"
+);
 
 /// A download of a source, as listed by `downloads`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,24 +80,9 @@ impl FromStr for DownloadArg {
     }
 }
 
-impl Arg for DownloadArg {
-    fn parser() -> impl bpaf::Parser<Self> {
-        positional::<Self>("ID").help("Download ID to cancel")
-    }
-}
-
-impl Arg for ItemIdArg {
-    fn parser() -> impl bpaf::Parser<Self> {
-        positional::<Self>("IDENTIFIER")
-            .help("Source-specific item identifier (e.g. \"p123456\" for bandcamp)")
-    }
-}
-
-impl Arg for SourcePlaylistArg {
-    fn parser() -> impl bpaf::Parser<Self> {
-        positional::<Self>("PLAYLIST").help("Playlist slug or URL")
-    }
-}
+impl_arg!(DownloadArg, positional "ID", "Download ID to cancel");
+impl_arg!(ItemIdArg, positional "IDENTIFIER", "Source-specific item identifier");
+impl_arg!(SourcePlaylistArg, positional "PLAYLIST", "Playlist slug or URL");
 
 /// A source-specific item identifier (e.g. "p123456" for bandcamp).
 // Stays a String: no domain rule, the source interprets it.

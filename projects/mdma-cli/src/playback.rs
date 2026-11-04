@@ -1,3 +1,4 @@
+use crate::args::impl_arg;
 use crate::ctx::Ctx;
 use crate::output::{handle_error, handle_playback_error};
 use clap::Subcommand;
@@ -187,11 +188,11 @@ impl std::str::FromStr for OutputNameArg {
     }
 }
 
-impl hicli::Arg for OutputNameArg {
-    fn parser() -> impl bpaf::Parser<Self> {
-        bpaf::positional::<Self>("NAME").help("Device name as shown by `mdma playback outputs`")
-    }
-}
+impl_arg!(
+    OutputNameArg,
+    positional "NAME",
+    "Device name as shown by `mdma playback outputs`"
+);
 
 pub(crate) fn set_output(name: OutputNameArg, ctx: &Ctx) -> Result<()> {
     let OutputNameArg(name) = name;

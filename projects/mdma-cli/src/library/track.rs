@@ -1,7 +1,9 @@
 use crate::args::TrackArg;
 use crate::ctx::Ctx;
+use bpaf::Bpaf;
 use clap::Subcommand;
 use color_eyre::Result;
+use hicli::Arg;
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
@@ -54,11 +56,14 @@ pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Bpaf, Arg)]
 pub(crate) struct ReplaceArgs {
+    /// Content hash of the old track (prefix accepted, git-style).
+    #[bpaf(positional("OLD_HASH"))]
     pub(crate) old_hash: TrackArg,
     // Stays a String: it is a path on the library service's device, not checked locally.
-    /// Path on the device running the library service, so not a local `PathBuf`.
+    /// Path to the new audio file on the device running the library service.
+    #[bpaf(positional("NEW_FILE"))]
     pub(crate) new_file: String,
 }
 
@@ -161,6 +166,22 @@ mod tests {
     use crate::library;
     use crate::Commands;
     use library_ipc_client::ContentHash;
+
+    #[test]
+    fn replace_args_parser_reads_old_hash_and_new_file() {
+        use super::ReplaceArgs;
+        use crate::test_support::run_arg;
+        assert_eq!(
+            run_arg::<ReplaceArgs>(&["abc12345", "/inbox/new.flac"]),
+            Ok(ReplaceArgs {
+                old_hash: TrackArg(ContentHash::new("abc12345")),
+                new_file: "/inbox/new.flac".to_string(),
+            })
+        );
+        let err = run_arg::<ReplaceArgs>(&["nothash", "/inbox/new.flac"]).unwrap_err();
+        assert!(err.contains("is not a content hash"), "{err}");
+        assert!(run_arg::<ReplaceArgs>(&["abc12345"]).is_err());
+    }
 
     // ── track lifecycle clap parsing ──────────────────────────────────────────
 

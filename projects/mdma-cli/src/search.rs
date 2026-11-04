@@ -1,7 +1,8 @@
+use crate::args::{choice, impl_arg, parse_choice, Choice};
 use crate::ctx::Ctx;
 use crate::output::{handle_error, print_tracks};
 use crate::stdin::read_hashes;
-use bpaf::{long, positional, Parser};
+use bpaf::{long, Parser};
 use clap::Subcommand;
 use color_eyre::Result;
 use hicli::Arg;
@@ -236,66 +237,55 @@ impl std::str::FromStr for DurationArg {
 // impl: it is `--started`, `--stopped` and `--added` (one type, three spellings),
 // so those are fields of the search args struct instead.
 
-impl Arg for FactTypeArg {
-    fn parser() -> impl Parser<Self> {
-        positional::<Self>("FACT_TYPE")
-            .help("Fact type to inspect (e.g. MainGenre, Label, Key, Source, BPM, StyleDescriptor)")
-    }
-}
-
-impl Arg for BpmArg {
-    fn parser() -> impl Parser<Self> {
-        long("bpm")
-            .help("Filter by BPM. Formats: 128  128+-4  124..132  128+2  128-2")
-            .argument::<Self>("BPM")
-    }
-}
-
-impl Arg for KeyArg {
-    fn parser() -> impl Parser<Self> {
-        long("key")
-            .help("Filter by musical key. Formats: Am  \"A minor\"  8B  8B+-1  8B+-1~")
-            .argument::<Self>("KEY")
-    }
-}
-
-impl Arg for DurationArg {
-    fn parser() -> impl Parser<Self> {
-        long("duration")
-            .help("Filter by duration. Formats: 7m  7m15s  >5m  <8m  6m..8m")
-            .argument::<Self>("DURATION")
-    }
-}
-
-impl Arg for YearArg {
-    fn parser() -> impl Parser<Self> {
-        long("year")
-            .help("Filter by release year. Formats: 2022  2019..2022")
-            .argument::<Self>("YEAR")
-    }
-}
-
-impl Arg for RoleArg {
-    fn parser() -> impl Parser<Self> {
-        long("role")
-            .help("Filter by DJ role. Accepted values: opener, build-up, peak, banger, cool-down, closer, filler")
-            .argument::<Self>("ROLE")
-    }
-}
-
-impl Arg for EnergyArg {
-    fn parser() -> impl Parser<Self> {
-        long("energy")
-            .help("Filter by energy level (1-10). Formats: 7  5..8  7+-2")
-            .argument::<Self>("ENERGY")
-    }
-}
+impl_arg!(
+    FactTypeArg,
+    positional "FACT_TYPE",
+    "Fact type to inspect (e.g. MainGenre, Label, Key, Source, BPM, StyleDescriptor)"
+);
+impl_arg!(
+    BpmArg,
+    long "bpm",
+    "BPM",
+    "Filter by BPM. Formats: 128  128+-4  124..132  128+2  128-2"
+);
+impl_arg!(
+    KeyArg,
+    long "key",
+    "KEY",
+    "Filter by musical key. Formats: Am  \"A minor\"  8B  8B+-1  8B+-1~"
+);
+impl_arg!(
+    DurationArg,
+    long "duration",
+    "DURATION",
+    "Filter by duration. Formats: 7m  7m15s  >5m  <8m  6m..8m"
+);
+impl_arg!(
+    YearArg,
+    long "year",
+    "YEAR",
+    "Filter by release year. Formats: 2022  2019..2022"
+);
+impl_arg!(
+    RoleArg,
+    long "role",
+    "ROLE",
+    "Filter by DJ role. Accepted values: opener, build-up, peak, banger, cool-down, closer, filler"
+);
+impl_arg!(
+    EnergyArg,
+    long "energy",
+    "ENERGY",
+    "Filter by energy level (1-10). Formats: 7  5..8  7+-2"
+);
 
 impl Arg for PlayedFilter {
     fn parser() -> impl Parser<Self> {
-        long("played")
-            .help("Filter by playback history. `never` matches tracks with no started fact (never played). When combined with --started, --played=never takes precedence.")
-            .argument::<Self>("PLAYED")
+        choice(
+            long("played")
+                .help("Filter by playback history. `never` matches tracks with no started fact (never played). When combined with --started, --played=never takes precedence.")
+                .argument::<String>("PLAYED"),
+        )
     }
 }
 
@@ -324,11 +314,20 @@ pub(crate) enum PlayedFilter {
     Never,
 }
 
+impl Choice for PlayedFilter {
+    const ALL: &'static [Self] = &[PlayedFilter::Never];
+    const WHAT: &'static str = "played filter";
+
+    fn name(self) -> &'static str {
+        match self {
+            PlayedFilter::Never => "never",
+        }
+    }
+}
+
 impl std::fmt::Display for PlayedFilter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PlayedFilter::Never => f.write_str("never"),
-        }
+        f.write_str(self.name())
     }
 }
 
@@ -336,10 +335,7 @@ impl std::str::FromStr for PlayedFilter {
     type Err = String;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "never" => Ok(PlayedFilter::Never),
-            _ => Err(format!("unknown played filter '{s}'")),
-        }
+        parse_choice(s)
     }
 }
 
@@ -575,7 +571,10 @@ mod tests {
             Ok(PlayedFilter::Never)
         );
         let err = run_arg::<PlayedFilter>(&["--played", "always"]).unwrap_err();
-        assert!(err.contains("unknown played filter 'always'"), "{err}");
+        assert!(
+            err.contains("unknown played filter 'always' (expected never)"),
+            "{err}"
+        );
     }
 
     // ── Date arg hyphen-value parsing ────────────────────────────────────────
@@ -815,12 +814,10 @@ mod tests {
     // ── --played=never filter ─────────────────────────────────────────────────
 
     #[test]
-    fn played_filter_matches_clap_value_enum() {
-        use clap::ValueEnum;
-        for v in PlayedFilter::value_variants() {
-            let name = v.to_possible_value().unwrap().get_name().to_string();
-            assert_eq!(name.parse::<PlayedFilter>(), Ok(*v));
-            assert_eq!(v.to_string(), name);
+    fn played_filter_names_round_trip() {
+        for v in PlayedFilter::ALL {
+            assert_eq!(v.name().parse::<PlayedFilter>(), Ok(*v));
+            assert_eq!(v.to_string(), v.name());
         }
         assert!("nope".parse::<PlayedFilter>().is_err());
     }

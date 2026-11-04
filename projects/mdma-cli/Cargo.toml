@@ -15,7 +15,7 @@ client = { path = "../../bases/client" }
 clap = { version = "4.5", features = ["derive", "env"] }
 clap_complete = "4"
 hicli = "0.2"
-bpaf = "0.9"
+bpaf = { version = "0.9", features = ["derive"] }
 color-eyre = "0.6"
 event-protocol = { path = "../../components/event_protocol" }
 inbox-utils = { path = "../../components/inbox_utils" }

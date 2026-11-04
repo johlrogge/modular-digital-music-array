@@ -10,6 +10,7 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::args::impl_arg;
 use crate::ctx::Ctx;
 use gateway_client::{GatewayClient, IdentifyError, NodeIdentity};
 use node_discovery::{
@@ -482,15 +483,7 @@ pub(crate) fn list(_ctx: &Ctx) -> color_eyre::Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OptNodeQueryArg(pub Option<String>);
 
-impl hicli::Arg for OptNodeQueryArg {
-    fn parser() -> impl bpaf::Parser<Self> {
-        use bpaf::Parser as _;
-        bpaf::positional::<String>("NAME")
-            .help("Node name or id")
-            .optional()
-            .map(Self)
-    }
-}
+impl_arg!(OptNodeQueryArg, optional_text positional "NAME", "Node name or id");
 
 /// `mdma node select [name|id]`
 pub(crate) fn select(query: OptNodeQueryArg, _ctx: &Ctx) -> color_eyre::Result<()> {

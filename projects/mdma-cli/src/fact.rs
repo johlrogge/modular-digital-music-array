@@ -1,9 +1,11 @@
-use crate::args::{usage_error, TrackArg};
+use crate::args::{choice, choice_names, parse_choice, usage_error, Choice, TrackArg};
 use crate::ctx::Ctx;
 use crate::output::handle_error;
+use bpaf::{construct, long, Parser};
 use chrono::NaiveDate;
 use clap::Subcommand;
 use color_eyre::Result;
+use hicli::Arg;
 use music_facts::{
     Album, Artist, Bpm, DiscNumber, EnergyLevel, Isrc, Key, MusicValue, Title, TrackNumber,
     TrackRole, Year,
@@ -78,6 +80,31 @@ impl FactArgs {
     }
 }
 
+impl Arg for FactArgs {
+    /// `<HASH> --field <FIELD> --value <VALUE>`; the value is checked against
+    /// the field, so a bad value is a parse error. `add` and `retract` share it.
+    fn parser() -> impl Parser<Self> {
+        let field = choice::<FactField>(
+            long("field")
+                .help(
+                    format!(
+                        "Field name, one of: {}. Tab-completion shows supported fields.",
+                        choice_names::<FactField>().join(", ")
+                    )
+                    .as_str(),
+                )
+                .argument::<String>("FIELD"),
+        );
+        let value = long("value")
+            .help("Value for the field (to retract: must match the existing fact's value).")
+            .argument::<String>("VALUE");
+        let fact = construct!(field, value)
+            .parse(|(field, raw)| FactValueArg::new(field, raw).map(|value| (field, value)));
+        let hash = <TrackArg as Arg>::parser();
+        construct!(fact, hash).map(|((field, value), hash)| Self { field, value, hash })
+    }
+}
+
 pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
     match command {
         Command::Add { hash, field, value } => add(
@@ -121,8 +148,8 @@ pub(crate) enum FactField {
     Energy,
 }
 
-impl FactField {
-    const ALL: [FactField; 22] = [
+impl Choice for FactField {
+    const ALL: &'static [Self] = &[
         FactField::Title,
         FactField::Artist,
         FactField::Album,
@@ -146,6 +173,7 @@ impl FactField {
         FactField::Role,
         FactField::Energy,
     ];
+    const WHAT: &'static str = "fact field";
 
     fn name(self) -> &'static str {
         match self {
@@ -185,10 +213,7 @@ impl std::str::FromStr for FactField {
     type Err = String;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        Self::ALL
-            .into_iter()
-            .find(|field| field.name() == s)
-            .ok_or_else(|| format!("unknown fact field '{s}'"))
+        parse_choice(s)
     }
 }
 
@@ -311,14 +336,11 @@ mod tests {
     use music_facts::MusicValue;
 
     #[test]
-    fn fact_field_matches_clap_value_enum() {
-        use clap::ValueEnum;
-        for v in FactField::value_variants() {
-            let name = v.to_possible_value().unwrap().get_name().to_string();
-            assert_eq!(name.parse::<FactField>(), Ok(*v));
-            assert_eq!(v.to_string(), name);
+    fn fact_field_names_round_trip() {
+        for v in FactField::ALL {
+            assert_eq!(v.name().parse::<FactField>(), Ok(*v));
+            assert_eq!(v.to_string(), v.name());
         }
-        assert_eq!(FactField::value_variants().len(), FactField::ALL.len());
         assert!("nope".parse::<FactField>().is_err());
     }
 
@@ -353,6 +375,33 @@ mod tests {
         let ok = FactArgs::new(FactField::Year, "2024".into(), hash).unwrap();
         assert_eq!(ok.value.raw, "2024");
         assert!(matches!(ok.value.value, MusicValue::Year(_)));
+    }
+
+    #[test]
+    fn fact_args_parser_reads_field_value_and_hash() {
+        use crate::test_support::run_arg;
+        let args =
+            run_arg::<FactArgs>(&["--field", "year", "--value", "2024", "abcd1234"]).unwrap();
+        assert_eq!(args.field, FactField::Year);
+        assert_eq!(args.value.raw, "2024");
+        assert!(matches!(args.value.value, MusicValue::Year(_)));
+        assert_eq!(args.hash, "abcd1234".parse::<TrackArg>().unwrap());
+    }
+
+    #[test]
+    fn fact_args_parser_checks_the_value_against_the_field() {
+        use crate::test_support::run_arg;
+        let err =
+            run_arg::<FactArgs>(&["--field", "year", "--value", "twenty", "abcd1234"]).unwrap_err();
+        assert!(err.contains("invalid integer for Year 'twenty'"), "{err}");
+        let err =
+            run_arg::<FactArgs>(&["--field", "nope", "--value", "x", "abcd1234"]).unwrap_err();
+        assert!(
+            err.contains("unknown fact field 'nope' (expected title, artist,"),
+            "{err}"
+        );
+        assert!(err.contains("bandcamp-url, role or energy)"), "{err}");
+        assert!(run_arg::<FactArgs>(&["--field", "year", "--value", "1"]).is_err());
     }
 
     // ── parse_field_value ─────────────────────────────────────────────────────

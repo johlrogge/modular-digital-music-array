@@ -1,9 +1,8 @@
+use crate::args::impl_arg;
 use crate::ctx::Ctx;
-use bpaf::{long, Parser};
 use clap::Subcommand;
 use color_eyre::Result;
 use gateway_client::{AdminRequest, AdminResponse, GatewayClient};
-use hicli::Arg;
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
@@ -83,14 +82,11 @@ pub(crate) fn boot_health(ctx: &Ctx) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Force(pub bool);
 
-impl Arg for Force {
-    fn parser() -> impl Parser<Self> {
-        long("force")
-            .help("Reboot even if the boot-health check fails")
-            .switch()
-            .map(Self)
-    }
-}
+impl_arg!(
+    Force,
+    switch "force",
+    "Reboot even if the boot-health check fails"
+);
 
 pub(crate) fn reboot(force: Force, ctx: &Ctx) -> Result<()> {
     let Force(force) = force;

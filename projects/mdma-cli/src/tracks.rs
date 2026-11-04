@@ -1,4 +1,4 @@
-use crate::args::{OptTrackArg, TrackArg};
+use crate::args::{choice, choice_names, impl_arg, parse_choice, Choice, OptTrackArg, TrackArg};
 use crate::ctx::Ctx;
 use crate::output::{
     format_track_line, handle_error, handle_playback_error, print_tracks, terminal_width,
@@ -35,24 +35,13 @@ impl std::str::FromStr for LimitArg {
     }
 }
 
-impl Arg for LimitArg {
-    fn parser() -> impl Parser<Self> {
-        short('l')
-            .long("limit")
-            .help("Maximum number of tracks to show")
-            .argument::<Self>("LIMIT")
-    }
-}
+impl_arg!(LimitArg, long "limit", short 'l', "LIMIT", "Maximum number of tracks to show");
 
 /// Maximum number of tracks to show (all when `None`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OptLimitArg(pub Option<LimitArg>);
 
-impl Arg for OptLimitArg {
-    fn parser() -> impl Parser<Self> {
-        <LimitArg as Arg>::parser().optional().map(Self)
-    }
-}
+impl_arg!(OptLimitArg, optional LimitArg);
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct GetCli {
@@ -95,15 +84,12 @@ pub(crate) struct BookmarkCli {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OptScopeArg(pub Option<String>);
 
-impl Arg for OptScopeArg {
-    fn parser() -> impl Parser<Self> {
-        long("scope")
-            .help("Optional scope — associate bookmark with a named set")
-            .argument::<String>("SCOPE")
-            .optional()
-            .map(Self)
-    }
-}
+impl_arg!(
+    OptScopeArg,
+    optional_text long "scope",
+    "SCOPE",
+    "Optional scope — associate bookmark with a named set"
+);
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct ViewCli {
@@ -206,7 +192,9 @@ impl Arg for ViewColumns {
 
 impl Arg for SortField {
     fn parser() -> impl Parser<Self> {
-        positional::<Self>("FIELD").help("Field to sort by")
+        let field = positional::<String>("FIELD")
+            .help(format!("Field to sort by: {}", choice_names::<Self>().join(", ")).as_str());
+        choice(field)
     }
 }
 
@@ -253,8 +241,8 @@ pub(crate) enum SortField {
     Stopped,
 }
 
-impl SortField {
-    const ALL: [SortField; 10] = [
+impl Choice for SortField {
+    const ALL: &'static [Self] = &[
         SortField::Bpm,
         SortField::Title,
         SortField::Artist,
@@ -266,6 +254,7 @@ impl SortField {
         SortField::Started,
         SortField::Stopped,
     ];
+    const WHAT: &'static str = "sort field";
 
     fn name(self) -> &'static str {
         match self {
@@ -293,10 +282,7 @@ impl std::str::FromStr for SortField {
     type Err = String;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        Self::ALL
-            .into_iter()
-            .find(|field| field.name() == s)
-            .ok_or_else(|| format!("unknown sort field '{s}'"))
+        parse_choice(s)
     }
 }
 
@@ -674,7 +660,14 @@ mod tests {
             Ok(SortField::TrackNumber)
         );
         let err = run_arg::<SortField>(&["nope"]).unwrap_err();
-        assert!(err.contains("unknown sort field 'nope'"), "{err}");
+        assert!(
+            err.contains("unknown sort field 'nope' (expected bpm, title,"),
+            "{err}"
+        );
+        assert!(
+            err.contains("disc-number, added, started or stopped)"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -720,12 +713,10 @@ mod tests {
     // ── SortField / SortDirection ─────────────────────────────────────────────
 
     #[test]
-    fn sort_field_matches_clap_value_enum() {
-        use clap::ValueEnum;
-        for v in SortField::value_variants() {
-            let name = v.to_possible_value().unwrap().get_name().to_string();
-            assert_eq!(name.parse::<SortField>(), Ok(*v));
-            assert_eq!(v.to_string(), name);
+    fn sort_field_names_round_trip() {
+        for v in SortField::ALL {
+            assert_eq!(v.name().parse::<SortField>(), Ok(*v));
+            assert_eq!(v.to_string(), v.name());
         }
         assert!("nope".parse::<SortField>().is_err());
     }

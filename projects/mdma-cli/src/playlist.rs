@@ -1,7 +1,7 @@
-use crate::args::{OptPlaylistArg, PlaylistArg};
+use crate::args::{impl_arg, OptPlaylistArg, PlaylistArg};
 use crate::ctx::Ctx;
 use crate::stdin::{hashes_in, read_hashes, read_stdin_to_string};
-use bpaf::{construct, long, Parser};
+use bpaf::{construct, long, Bpaf, Parser};
 use clap::Subcommand;
 use color_eyre::Result;
 use colored::Colorize;
@@ -92,9 +92,13 @@ pub(crate) fn dispatch(command: Command, ctx: &Ctx) -> Result<()> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Bpaf, Arg)]
 pub(crate) struct RenameArgs {
+    /// Current playlist name
+    #[bpaf(positional("FROM"))]
     pub(crate) from: PlaylistArg,
+    /// New playlist name
+    #[bpaf(positional("TO"))]
     pub(crate) to: PlaylistArg,
 }
 
@@ -114,13 +118,12 @@ impl std::str::FromStr for AtLeastArg {
     }
 }
 
-impl Arg for AtLeastArg {
-    fn parser() -> impl Parser<Self> {
-        long("at-least")
-            .help("Print playlist only if it contains at least N input tracks")
-            .argument::<Self>("AT_LEAST")
-    }
-}
+impl_arg!(
+    AtLeastArg,
+    long "at-least",
+    "AT_LEAST",
+    "Print playlist only if it contains at least N input tracks"
+);
 
 impl Arg for ContainsMode {
     /// At most one of `--all`, `--at-least N`, `--no`; none means any.
@@ -487,6 +490,20 @@ mod tests {
 
     use crate::test_support::{parses, run_arg, usage_error};
     use crate::Commands;
+
+    #[test]
+    fn rename_args_parser_reads_from_and_to() {
+        let name = |n: &str| PlaylistArg(PlaylistName::new(n).unwrap());
+        assert_eq!(
+            run_arg::<RenameArgs>(&["old", "new"]),
+            Ok(RenameArgs {
+                from: name("old"),
+                to: name("new"),
+            })
+        );
+        assert!(run_arg::<RenameArgs>(&["old"]).is_err());
+        assert!(run_arg::<RenameArgs>(&["old", "has space"]).is_err());
+    }
 
     #[test]
     fn at_least_arg_parser_reads_a_non_zero_count() {
