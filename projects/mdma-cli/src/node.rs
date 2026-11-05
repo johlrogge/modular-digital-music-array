@@ -10,9 +10,11 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::args::impl_arg;
+use crate::ctx::Ctx;
 use gateway_client::{GatewayClient, IdentifyError, NodeIdentity};
 use node_discovery::{
-    cache, resolve, select, DiscoveredNode, Effects, IdentityCheck, NodeCache, NodeKind,
+    cache, resolve, DiscoveredNode, Effects, IdentityCheck, NodeCache, NodeKind, NodeSpec,
     RemoteTarget, Request, ResolveError, SelectEffects, SelectError, Source, Target, Unreachable,
     VerifyError, BROWSE_TIMEOUT,
 };
@@ -23,10 +25,6 @@ const IDENTIFY_TIMEOUT: Duration = Duration::from_secs(1);
 /// Environment variable naming the node (split from `--node` so the two can be
 /// told apart).
 const NODE_ENV: &str = "MDMA_NODE";
-
-// =============================================================================
-// Pure parts
-// =============================================================================
 
 /// True when the CLI should talk to the local services over IPC instead of a
 /// gateway: sockets were given explicitly, or the library socket exists here.
@@ -316,10 +314,6 @@ pub fn identity_check(
     }
 }
 
-// =============================================================================
-// Effects
-// =============================================================================
-
 /// Ask the gateway at `ip:port` who it is; connecting and the answer are each
 /// bounded by [`IDENTIFY_TIMEOUT`].
 fn identify_at(ip: Ipv4Addr, port: u16) -> Result<IdentityCheck, Unreachable> {
@@ -371,12 +365,20 @@ fn real_effects() -> Effects<'static> {
     }
 }
 
-// =============================================================================
-// Resolution
-// =============================================================================
+/// `MDMA_NODE`. Empty counts as unset, so `MDMA_NODE= mdma ...` overrides a
+/// value exported by the environment (devenv sets one).
+fn parse_env_node(value: Option<&str>) -> Result<Option<NodeSpec>, String> {
+    match value.filter(|v| !v.is_empty()) {
+        None => Ok(None),
+        Some(v) => v
+            .parse()
+            .map(Some)
+            .map_err(|e| format!("error: invalid {NODE_ENV}: {e}")),
+    }
+}
 
-fn env_node() -> Option<String> {
-    std::env::var(NODE_ENV).ok().filter(|v| !v.is_empty())
+fn env_node() -> Result<Option<NodeSpec>, String> {
+    parse_env_node(std::env::var(NODE_ENV).ok().as_deref())
 }
 
 fn cache_path() -> Option<PathBuf> {
@@ -401,17 +403,23 @@ fn save_cache(update: &NodeCache) {
     }
 }
 
-fn request(explicit: Option<&str>, local_ipc: bool) -> Request {
+/// The resolution request; a bad `MDMA_NODE` prints the error and exits 1,
+/// like an unresolvable node does.
+fn request(explicit: Option<&NodeSpec>, local_ipc: bool) -> Request {
+    let env = env_node().unwrap_or_else(|message| {
+        eprintln!("{message}");
+        std::process::exit(1);
+    });
     Request {
-        explicit: explicit.filter(|s| !s.is_empty()).map(String::from),
-        env: env_node(),
+        explicit: explicit.cloned(),
+        env,
         local_ipc,
     }
 }
 
 /// Resolve the node once at startup, remembering it when the resolver says
 /// so. Prints a note for implicit choices and exits with advice on failure.
-pub fn resolve_startup(explicit: Option<&str>, local_ipc: bool) -> Target {
+pub fn resolve_startup(explicit: Option<&NodeSpec>, local_ipc: bool) -> Target {
     match resolve(request(explicit, local_ipc), &mut real_effects()) {
         Ok(resolution) => {
             if let Some(update) = &resolution.cache_update {
@@ -431,12 +439,9 @@ pub fn resolve_startup(explicit: Option<&str>, local_ipc: bool) -> Target {
     }
 }
 
-// =============================================================================
-// `mdma node` subcommands
-// =============================================================================
-
-/// `mdma node list`
-pub fn handle_list() -> color_eyre::Result<()> {
+/// List MDMA nodes on the network (* marks the remembered node)
+#[hicli::command]
+pub(crate) fn list(_ctx: &Ctx) -> color_eyre::Result<()> {
     let nodes = node_discovery::browse(BROWSE_TIMEOUT);
     if nodes.is_empty() {
         println!("No MDMA nodes found on the network.");
@@ -450,15 +455,24 @@ pub fn handle_list() -> color_eyre::Result<()> {
     Ok(())
 }
 
-/// `mdma node select [name|id]`
-pub fn handle_select(query: Option<&str>) -> color_eyre::Result<()> {
+/// A node name or id as typed, matched against the discovered nodes (none: prompt).
+// Stays a String: any text is a valid query; no match is reported by the resolver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OptNodeQueryArg(pub Option<String>);
+
+impl_arg!(OptNodeQueryArg, optional_text positional "NAME", "Node name or id");
+
+/// Remember a node (by name or id; prompts when omitted)
+#[hicli::command]
+pub(crate) fn select(query: OptNodeQueryArg, _ctx: &Ctx) -> color_eyre::Result<()> {
+    let OptNodeQueryArg(query) = query;
     let nodes = node_discovery::browse(BROWSE_TIMEOUT);
     let mut effects = SelectEffects {
         identify_at: Box::new(identify_at),
         pick: Box::new(pick_interactive),
         is_tty: is_tty(),
     };
-    let entry = match select(nodes, query, &mut effects) {
+    let entry = match node_discovery::select(nodes, query.as_deref(), &mut effects) {
         Ok(entry) => entry,
         Err(e) => {
             eprintln!("{}", select_error_message(&e));
@@ -484,8 +498,9 @@ pub fn handle_select(query: Option<&str>) -> color_eyre::Result<()> {
     Ok(())
 }
 
-/// `mdma node forget`
-pub fn handle_forget() -> color_eyre::Result<()> {
+/// Forget the remembered node
+#[hicli::command]
+pub(crate) fn forget(_ctx: &Ctx) -> color_eyre::Result<()> {
     let Some(path) = cache_path() else {
         println!("No config directory; nothing to forget.");
         return Ok(());
@@ -502,9 +517,15 @@ pub fn handle_forget() -> color_eyre::Result<()> {
     Ok(())
 }
 
-/// `mdma node show`: resolve like any command would, but save nothing.
-pub fn handle_show(explicit: Option<&str>, local_ipc: bool) -> color_eyre::Result<()> {
-    match resolve(request(explicit, local_ipc), &mut real_effects()) {
+/// Show which node commands would use, and why
+///
+/// Resolves the node like any command would, but saves nothing.
+#[hicli::command]
+pub(crate) fn show(ctx: &Ctx) -> color_eyre::Result<()> {
+    match resolve(
+        request(ctx.node_flag(), ctx.local_ipc()),
+        &mut real_effects(),
+    ) {
         Ok(resolution) => {
             match &resolution.target {
                 Target::LocalIpc => println!("Local services over IPC (no node)"),
@@ -527,14 +548,46 @@ pub fn handle_show(explicit: Option<&str>, local_ipc: bool) -> color_eyre::Resul
     }
 }
 
-// =============================================================================
-// Tests
-// =============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::run_arg;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn node_query_arg_parser_is_an_optional_positional() {
+        assert_eq!(run_arg::<OptNodeQueryArg>(&[]), Ok(OptNodeQueryArg(None)));
+        assert_eq!(
+            run_arg::<OptNodeQueryArg>(&["johlyroger"]),
+            Ok(OptNodeQueryArg(Some("johlyroger".to_string())))
+        );
+    }
+
+    #[test]
+    fn env_node_unset_or_empty_is_not_given() {
+        assert_eq!(parse_env_node(None), Ok(None));
+        assert_eq!(parse_env_node(Some("")), Ok(None));
+    }
+
+    #[test]
+    fn env_node_is_parsed_as_host_and_port() {
+        let spec = parse_env_node(Some("mdma.local:6000")).unwrap().unwrap();
+        assert_eq!((spec.host(), spec.port()), ("mdma.local", Some(6000)));
+        let spec = parse_env_node(Some("mdma.local")).unwrap().unwrap();
+        assert_eq!((spec.host(), spec.port()), ("mdma.local", None));
+    }
+
+    #[test]
+    fn bad_env_node_names_the_variable() {
+        assert_eq!(
+            parse_env_node(Some("mdma.local:nope")),
+            Err(
+                "error: invalid MDMA_NODE: invalid port 'nope' in node 'mdma.local:nope', \
+                 expected 1-65535"
+                    .to_string()
+            )
+        );
+    }
 
     fn stage() -> DiscoveredNode {
         DiscoveredNode {

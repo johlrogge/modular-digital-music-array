@@ -8,9 +8,9 @@
 # USAGE
 # =====
 #
-#   mdma-now-playing.sh <gateway-address>
+#   mdma-now-playing.sh <node>
 #
-#   Example: mdma-now-playing.sh tcp://mdma-909.local:5555
+#   Example: mdma-now-playing.sh mdma-909.local
 #
 # INSTALLATION
 # ============
@@ -24,11 +24,11 @@
 #
 #      [module/mdma]
 #      type = custom/script
-#      exec = /path/to/mdma-now-playing.sh tcp://mdma-909.local:5555
+#      exec = /path/to/mdma-now-playing.sh mdma-909.local
 #      tail = true
-#      click-left = /path/to/mdma playback play --gateway tcp://mdma-909.local:5555
-#      click-middle = /path/to/mdma playback stop --gateway tcp://mdma-909.local:5555 && /path/to/mdma playback play --gateway tcp://mdma-909.local:5555
-#      click-right = /path/to/mdma playback stop --gateway tcp://mdma-909.local:5555
+#      click-left = /path/to/mdma --node mdma-909.local playback start
+#      click-middle = /path/to/mdma --node mdma-909.local playback skip
+#      click-right = /path/to/mdma --node mdma-909.local playback stop
 #
 # 3. Add 'mdma' to your bar's modules list:
 #
@@ -37,22 +37,22 @@
 # REQUIREMENTS
 # ============
 #
-# - mdma CLI (install with: cargo install --path bases/mdma_cli)
+# - mdma CLI (build with: cargo polylith cargo --profile production build -p mdma-cli)
 # - jq for JSON parsing
 #
 # CLICK ACTIONS
 # =============
 #
 # Left click:   Start playback (play from queue)
-# Middle click: Skip to next track (stop + play)
+# Middle click: Skip to next track
 # Right click:  Stop playback
 
 set -euo pipefail
 
-GATEWAY="${1:?Usage: mdma-now-playing.sh <gateway-address>}"
+NODE="${1:?Usage: mdma-now-playing.sh <node>}"
 
 export PATH="$HOME/.cargo/bin:$PATH"
-export MDMA_GATEWAY="$GATEWAY"
+export MDMA_NODE="$NODE"
 
 MAX_LEN=50
 
@@ -60,7 +60,7 @@ MAX_LEN=50
 resolve_track() {
     local hash="$1"
     local info
-    info=$(echo "$hash" | mdma search 2>/dev/null | head -1) || true
+    info=$(echo "$hash" | mdma search 2>/dev/null | head -n 1) || true
     if [[ -n "$info" ]]; then
         # Pipe format: {8-char_hash}  {artist} - {title}  [{duration}]
         local rest="${info#*  }"

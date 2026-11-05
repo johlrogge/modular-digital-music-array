@@ -2497,6 +2497,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "bpaf"
+version = "0.9.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "597e81e56404b7a3e26ef7b449f82a4b7a661ae76c3cac692b42d6bad06a0fbe"
+dependencies = [
+ "bpaf_derive",
+]
+
+[[package]]
+name = "bpaf_derive"
+version = "0.5.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f7e98cee839b19076cb3ce1afdb62bb182e04ff5f71f70188827002fae91094"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "bstr"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2790,15 +2810,6 @@ dependencies = [
  "clap_lex",
  "strsim",
  "terminal_size",
-]
-
-[[package]]
-name = "clap_complete"
-version = "4.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ff7a1dccbdd8b078c2bdebff47e404615151534d5043da397ec50286816f9cb"
-dependencies = [
- "clap",
 ]
 
 [[package]]
@@ -4743,6 +4754,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
+name = "hicli"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70840d1070aff6e609085a2581355fe5a20fff0e5f983e0577b2be180c1b865a"
+dependencies = [
+ "bpaf",
+ "hicli-macros",
+ "strsim",
+]
+
+[[package]]
+name = "hicli-macros"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f05387f93a3d8fb99e5ddb5010425a0380d5129cbd6165fa4b024a000e14479"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "hmac"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6007,15 +6040,15 @@ name = "mdma-cli"
 version = "0.36.1"
 dependencies = [
  "audio-transcoder",
+ "bpaf",
  "chrono",
- "clap",
- "clap_complete",
  "client",
  "color-eyre",
  "colored",
  "dirs",
  "event-protocol",
  "gateway-client",
+ "hicli",
  "inbox-utils",
  "library-ipc-client",
  "library-search",
