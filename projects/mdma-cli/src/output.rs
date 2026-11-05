@@ -76,45 +76,104 @@ pub fn print_tracks(tracks: &[TrackInfo], header: &str) {
     }
 }
 
-/// Handle library client errors uniformly
-pub fn handle_error(err: ClientError) -> ! {
-    match err {
-        ClientError::Protocol(ProtocolError::TrackNotFound { hash }) => {
-            eprintln!("Track not found: {}", hash);
-        }
-        ClientError::Protocol(ProtocolError::InboxFileNotFound { path }) => {
-            eprintln!("Inbox file not found: {}", path);
-        }
-        ClientError::Protocol(e) => {
-            eprintln!("Error: {}", e);
-        }
-        ClientError::Transport(nng_transport::NngClientError::Connection(e)) => {
-            eprintln!("Connection failed: {}", e);
-            eprintln!("Is mdma-library running?");
-        }
-        e => {
-            eprintln!("Error: {}", e);
+/// An error message as a value: its text, and whether the old `handle_*`
+/// printing put an `Error: ` in front of it. The text itself never carries
+/// that prefix, since hicli adds `Error: ` to every failure it prints.
+struct Message {
+    prefixed: bool,
+    text: String,
+}
+
+impl Message {
+    fn prefixed(text: String) -> Self {
+        Self {
+            prefixed: true,
+            text,
         }
     }
+
+    fn plain(text: String) -> Self {
+        Self {
+            prefixed: false,
+            text,
+        }
+    }
+
+    /// What the `handle_*` functions print to stderr.
+    fn printed(&self) -> String {
+        if self.prefixed {
+            format!("Error: {}", self.text)
+        } else {
+            self.text.clone()
+        }
+    }
+
+    // Unused outside tests until the commands return errors instead of exiting.
+    #[allow(dead_code)]
+    fn into_report(self) -> color_eyre::Report {
+        color_eyre::eyre::eyre!("{}", self.text)
+    }
+}
+
+fn library_message(err: ClientError) -> Message {
+    match err {
+        ClientError::Protocol(ProtocolError::TrackNotFound { hash }) => {
+            Message::plain(format!("Track not found: {}", hash))
+        }
+        ClientError::Protocol(ProtocolError::InboxFileNotFound { path }) => {
+            Message::plain(format!("Inbox file not found: {}", path))
+        }
+        ClientError::Protocol(e) => Message::prefixed(e.to_string()),
+        ClientError::Transport(nng_transport::NngClientError::Connection(e)) => Message::plain(
+            format!("Connection failed: {}\nIs mdma-library running?", e),
+        ),
+        e => Message::prefixed(e.to_string()),
+    }
+}
+
+fn playback_message(err: PlaybackClientError) -> Message {
+    match err {
+        PlaybackClientError::Connection(e) => Message::plain(format!(
+            "Connection failed: {}\nIs mdma-playback running?",
+            e
+        )),
+        e => Message::prefixed(e.to_string()),
+    }
+}
+
+/// The message for a library client error (without hicli's `Error: ` prefix).
+// The builders are unused outside tests until the commands return errors instead of exiting.
+#[allow(dead_code)]
+pub fn library_error(err: ClientError) -> color_eyre::Report {
+    library_message(err).into_report()
+}
+
+/// The message for a source error (without hicli's `Error: ` prefix).
+#[allow(dead_code)]
+pub fn source_error(err: &dyn std::fmt::Display) -> color_eyre::Report {
+    Message::prefixed(err.to_string()).into_report()
+}
+
+/// The message for a playback client error (without hicli's `Error: ` prefix).
+#[allow(dead_code)]
+pub fn playback_error(err: PlaybackClientError) -> color_eyre::Report {
+    playback_message(err).into_report()
+}
+
+/// Handle library client errors uniformly
+pub fn handle_error(err: ClientError) -> ! {
+    eprintln!("{}", library_message(err).printed());
     std::process::exit(1);
 }
 
 /// Handle source errors uniformly
 pub fn handle_source_error(err: &dyn std::fmt::Display) -> ! {
-    eprintln!("Error: {}", err);
+    eprintln!("{}", Message::prefixed(err.to_string()).printed());
     std::process::exit(1);
 }
 
 pub fn handle_playback_error(err: PlaybackClientError) -> ! {
-    match err {
-        PlaybackClientError::Connection(e) => {
-            eprintln!("Connection failed: {}", e);
-            eprintln!("Is mdma-playback running?");
-        }
-        e => {
-            eprintln!("Error: {}", e);
-        }
-    }
+    eprintln!("{}", playback_message(err).printed());
     std::process::exit(1);
 }
 
@@ -250,6 +309,107 @@ mod tests {
         // tests) the result will be the actual terminal width, which is fine —
         // we only care that 100 is never returned as the hard-coded default.
         assert_ne!(w, 100, "terminal_width() must not fall back to 100");
+    }
+
+    // ── error messages as values ────────────────────────────────────────────────
+
+    use super::{library_error, playback_error, source_error};
+    use super::{library_message, playback_message};
+    use library_ipc_client::{ClientError, ProtocolError};
+    use mdma_client::PlaybackClientError;
+    use nng_transport::{ConnectionError, NngClientError};
+
+    fn lib_text(err: ClientError) -> String {
+        failure_text::<()>(Err(library_error(err)))
+    }
+
+    fn lib_printed(err: ClientError) -> String {
+        library_message(err).printed()
+    }
+
+    fn connection_failed() -> ConnectionError {
+        ConnectionError::ConnectionFailed("refused".to_string())
+    }
+
+    #[test]
+    fn library_track_not_found_text() {
+        let err = || {
+            ClientError::Protocol(ProtocolError::TrackNotFound {
+                hash: "sha256:aa".to_string(),
+            })
+        };
+        assert_eq!(lib_text(err()), "Track not found: sha256:aa");
+        assert_eq!(lib_printed(err()), "Track not found: sha256:aa");
+    }
+
+    #[test]
+    fn library_inbox_file_not_found_text() {
+        let err = || {
+            ClientError::Protocol(ProtocolError::InboxFileNotFound {
+                path: "a/b.mp3".to_string(),
+            })
+        };
+        assert_eq!(lib_text(err()), "Inbox file not found: a/b.mp3");
+        assert_eq!(lib_printed(err()), "Inbox file not found: a/b.mp3");
+    }
+
+    #[test]
+    fn library_protocol_text_is_prefixed_when_printed() {
+        let err = || {
+            ClientError::Protocol(ProtocolError::PlaylistNotFound {
+                name: "mix".to_string(),
+            })
+        };
+        assert_eq!(lib_text(err()), "playlist not found: mix");
+        assert_eq!(lib_printed(err()), "Error: playlist not found: mix");
+    }
+
+    #[test]
+    fn library_connection_text_has_two_lines() {
+        let err = || ClientError::Transport(NngClientError::Connection(connection_failed()));
+        let text = "Connection failed: Connection failed: refused\nIs mdma-library running?";
+        assert_eq!(lib_text(err()), text);
+        assert_eq!(lib_printed(err()), text);
+    }
+
+    #[test]
+    fn library_fallback_text_is_prefixed_when_printed() {
+        let err = || ClientError::Transport(NngClientError::Service("boom".to_string()));
+        assert_eq!(lib_text(err()), "service error: boom");
+        assert_eq!(lib_printed(err()), "Error: service error: boom");
+    }
+
+    #[test]
+    fn playback_connection_text_has_two_lines() {
+        let err = || PlaybackClientError::Connection(connection_failed());
+        let text = "Connection failed: Connection failed: refused\nIs mdma-playback running?";
+        assert_eq!(failure_text::<()>(Err(playback_error(err()))), text);
+        assert_eq!(playback_message(err()).printed(), text);
+    }
+
+    #[test]
+    fn playback_fallback_text_is_prefixed_when_printed() {
+        let err = || PlaybackClientError::Service("boom".to_string());
+        assert_eq!(
+            failure_text::<()>(Err(playback_error(err()))),
+            "service error: boom"
+        );
+        assert_eq!(
+            playback_message(err()).printed(),
+            "Error: service error: boom"
+        );
+    }
+
+    #[test]
+    fn source_text_is_prefixed_when_printed() {
+        assert_eq!(
+            failure_text::<()>(Err(source_error(&"no such source"))),
+            "no such source"
+        );
+        assert_eq!(
+            super::Message::prefixed("no such source".to_string()).printed(),
+            "Error: no such source"
+        );
     }
 
     // ── mdma search output stability: render_track_table_inner unchanged ────────

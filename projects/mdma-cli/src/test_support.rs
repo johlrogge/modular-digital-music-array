@@ -53,6 +53,13 @@ pub(crate) fn run_arg<T: hicli::Arg>(args: &[&str]) -> Result<T, String> {
         .map_err(|failure| flat(&failure.unwrap_stderr()))
 }
 
+/// The text hicli would print (after its `Error: ` prefix) for a failed command result.
+pub(crate) fn failure_text<T>(r: color_eyre::Result<T>) -> String {
+    hicli::Failure::from(r.err().expect("an error"))
+        .message()
+        .to_owned()
+}
+
 /// `message` with its whitespace collapsed to single spaces.
 fn flat(message: &str) -> String {
     message.split_whitespace().collect::<Vec<_>>().join(" ")
