@@ -1,6 +1,6 @@
 use crate::args::impl_arg;
 use crate::ctx::Ctx;
-use crate::output::{handle_error, handle_playback_error};
+use crate::output::{library_error, playback_error};
 use color_eyre::Result;
 use mdma_client::Deck;
 use track_formatter::short_hash;
@@ -9,9 +9,7 @@ use track_formatter::short_hash;
 #[hicli::command]
 pub(crate) fn start(ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;
-    if let Err(e) = playback.play_queue() {
-        handle_playback_error(e);
-    }
+    playback.play_queue().map_err(playback_error)?;
     println!("Playing from queue");
     Ok(())
 }
@@ -20,9 +18,7 @@ pub(crate) fn start(ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn stop(ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;
-    if let Err(e) = playback.stop(Deck::A) {
-        handle_playback_error(e);
-    }
+    playback.stop(Deck::A).map_err(playback_error)?;
 
     println!("Stopped");
     Ok(())
@@ -32,9 +28,7 @@ pub(crate) fn stop(ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn pause(ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;
-    if let Err(e) = playback.pause(Deck::A) {
-        handle_playback_error(e);
-    }
+    playback.pause(Deck::A).map_err(playback_error)?;
 
     println!("Paused");
     Ok(())
@@ -44,9 +38,7 @@ pub(crate) fn pause(ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn resume(ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;
-    if let Err(e) = playback.resume(Deck::A) {
-        handle_playback_error(e);
-    }
+    playback.resume(Deck::A).map_err(playback_error)?;
 
     println!("Resumed");
     Ok(())
@@ -56,9 +48,7 @@ pub(crate) fn resume(ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn skip(ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;
-    if let Err(e) = playback.skip() {
-        handle_playback_error(e);
-    }
+    playback.skip().map_err(playback_error)?;
 
     println!("Skipped");
     Ok(())
@@ -74,10 +64,7 @@ pub(crate) fn now(ctx: &Ctx) -> Result<()> {
         .is_terminal()
         .then(|| ctx.library())
         .transpose()?;
-    let hash = match playback.now_playing() {
-        Ok(h) => h,
-        Err(e) => handle_playback_error(e),
-    };
+    let hash = playback.now_playing().map_err(playback_error)?;
     match hash {
         None => {
             eprintln!("Nothing playing");
@@ -86,10 +73,7 @@ pub(crate) fn now(ctx: &Ctx) -> Result<()> {
         Some(h) => match library {
             None => println!("{}", h.as_str()),
             Some(library) => {
-                let track = match library.get_track(&h) {
-                    Ok(t) => t,
-                    Err(e) => handle_error(e),
-                };
+                let track = library.get_track(&h).map_err(library_error)?;
                 let artist = track.artist.as_deref().unwrap_or("-");
                 let title = track.title.as_deref().unwrap_or("-");
                 let duration = track
@@ -114,7 +98,7 @@ pub(crate) fn session(ctx: &Ctx) -> Result<()> {
         Ok(None) => {
             println!("No active session");
         }
-        Err(e) => handle_playback_error(e),
+        Err(e) => return Err(playback_error(e)),
     }
     Ok(())
 }
@@ -123,10 +107,7 @@ pub(crate) fn session(ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn outputs(ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;
-    let sinks = match playback.list_audio_outputs() {
-        Ok(s) => s,
-        Err(e) => handle_playback_error(e),
-    };
+    let sinks = playback.list_audio_outputs().map_err(playback_error)?;
     println!("{:<40} {:<40} MAX RATE", "NAME", "DESCRIPTION");
     println!("{}", "-".repeat(90));
     for sink in &sinks {
@@ -166,10 +147,7 @@ impl_arg!(
 pub(crate) fn set_output(name: OutputNameArg, ctx: &Ctx) -> Result<()> {
     let OutputNameArg(name) = name;
     let playback = ctx.playback()?;
-    let cfg = match playback.set_audio_output(name) {
-        Ok(c) => c,
-        Err(e) => handle_playback_error(e),
-    };
+    let cfg = playback.set_audio_output(name).map_err(playback_error)?;
     let device = cfg.device_name.as_deref().unwrap_or("auto");
     let rate = cfg
         .sample_rate
@@ -183,10 +161,7 @@ pub(crate) fn set_output(name: OutputNameArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn get_output(ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;
-    let cfg = match playback.get_audio_output() {
-        Ok(c) => c,
-        Err(e) => handle_playback_error(e),
-    };
+    let cfg = playback.get_audio_output().map_err(playback_error)?;
     let device = cfg.device_name.as_deref().unwrap_or("auto");
     let rate = cfg
         .sample_rate

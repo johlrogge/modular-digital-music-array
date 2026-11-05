@@ -1,6 +1,6 @@
 use crate::args::{choice, impl_arg, parse_choice, Choice};
 use crate::ctx::Ctx;
-use crate::output::{handle_error, print_tracks};
+use crate::output::{library_error, print_tracks};
 use crate::stdin::read_hashes;
 use bpaf::{long, Bpaf, Parser};
 use color_eyre::Result;
@@ -421,7 +421,7 @@ fn search_tracks(library: &LibraryBackend, query: &TrackQuery, no_stdin: bool) -
             );
             Ok(())
         }
-        Err(e) => handle_error(e),
+        Err(e) => Err(library_error(e)),
     }
 }
 
@@ -456,7 +456,7 @@ pub(crate) fn fact_values_for(fact_type: FactTypeArg, ctx: &Ctx) -> Result<()> {
             }
             Ok(())
         }
-        Err(e) => handle_error(e),
+        Err(e) => Err(library_error(e)),
     }
 }
 

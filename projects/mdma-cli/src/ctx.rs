@@ -13,10 +13,13 @@ use bpaf::Bpaf;
 use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use gateway_client::GatewayClient;
+use library_ipc_client::ClientError;
 use mdma_client::{LibraryBackend, PlaybackBackend, SourceClient};
+use nng_transport::NngClientError;
 use node_discovery::{NodeSpec, Target};
 
 use crate::node;
+use crate::output::connect_failure;
 
 pub const DEFAULT_LIBRARY_SOCKET: &str = "ipc:///run/mdma/library.sock";
 pub const DEFAULT_PLAYBACK_SOCKET: &str = "ipc:///run/mdma/playback.sock";
@@ -149,7 +152,7 @@ impl Ctx {
             .as_deref()
             .unwrap_or(DEFAULT_LIBRARY_SOCKET);
         LibraryBackend::connect(gateway.as_deref(), socket)
-            .map_err(|e| connect_failed("library", &e, gateway.is_none()))
+            .map_err(|e| library_connect_failed(&e, gateway.is_none()))
     }
 
     /// Connect to the playback backend (gateway or direct).
@@ -183,7 +186,11 @@ impl Ctx {
             } else {
                 String::new()
             };
-            eyre!("{e}{running}\nHint: 'mdma source list' shows the available sources")
+            let what = format!("source '{name}'");
+            eyre!(
+                "{}{running}\nHint: 'mdma source list' shows the available sources",
+                connect_text(&what, &e)
+            )
         })
     }
 
@@ -197,16 +204,33 @@ impl Ctx {
     /// Fails with a message when there is no gateway to connect to (local IPC).
     pub fn admin(&self) -> Result<GatewayClient> {
         let gateway = self.gateway()?.ok_or_else(|| eyre!(ADMIN_NEEDS_GATEWAY))?;
-        GatewayClient::connect(&gateway).map_err(|e| eyre!("Failed to connect to gateway: {e}"))
+        GatewayClient::connect(&gateway).map_err(|e| connect_failed("gateway", &e, false))
     }
 }
 
-/// "Failed to connect to <what>: <error>", plus a hint when talking directly.
-fn connect_failed(what: &str, err: &dyn std::fmt::Display, direct: bool) -> color_eyre::Report {
+/// One layer of text for a failed connect: see [`connect_failure`].
+fn connect_text(what: &str, err: &NngClientError) -> String {
+    match err {
+        NngClientError::Connection(e) => connect_failure(what, e),
+        other => format!("Failed to connect to {what}: {other}"),
+    }
+}
+
+/// "Failed to connect to <what> at <address>: <error>", plus a hint when talking directly.
+fn connect_failed(what: &str, err: &NngClientError, direct: bool) -> color_eyre::Report {
+    let text = connect_text(what, err);
     if direct {
-        eyre!("Failed to connect to {what}: {err}\nIs mdma-{what} running?")
+        eyre!("{text}\nIs mdma-{what} running?")
     } else {
-        eyre!("Failed to connect to {what}: {err}")
+        eyre!("{text}")
+    }
+}
+
+/// Like [`connect_failed`] for the library client's error, which wraps the transport's.
+fn library_connect_failed(err: &ClientError, direct: bool) -> color_eyre::Report {
+    match err {
+        ClientError::Transport(e) => connect_failed("library", e, direct),
+        other => eyre!("Failed to connect to library: {other}"),
     }
 }
 
@@ -311,8 +335,7 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "Failed to connect to library: connection error: Connection failed: \
-                 Failed to connect to ipc://{}/none.sock: Connection refused\n\
+                "Failed to connect to library at ipc://{}/none.sock: Connection refused\n\
                  Is mdma-library running?",
                 dir.path().display()
             )
@@ -326,8 +349,7 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "Failed to connect to playback: connection error: Connection failed: \
-                 Failed to connect to ipc://{}/none-playback.sock: Connection refused\n\
+                "Failed to connect to playback at ipc://{}/none-playback.sock: Connection refused\n\
                  Is mdma-playback running?",
                 dir.path().display()
             )
@@ -341,8 +363,8 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "connection error: Connection failed: \
-                 Failed to connect to ipc://{}/bandcamp.sock: Connection refused\n\
+                "Failed to connect to source 'bandcamp' at ipc://{}/bandcamp.sock: \
+                 Connection refused\n\
                  Is mdma-bandcamp running?\n\
                  Hint: 'mdma source list' shows the available sources",
                 dir.path().display()
@@ -369,10 +391,7 @@ mod tests {
         let ctx = Ctx::with_target(globals(), target);
         assert_eq!(
             failure_text(ctx.library()),
-            format!(
-                "Failed to connect to library: connection error: Connection failed: \
-                 Failed to connect to tcp://127.0.0.1:{port}: Connection refused"
-            )
+            format!("Failed to connect to library at tcp://127.0.0.1:{port}: Connection refused")
         );
     }
 

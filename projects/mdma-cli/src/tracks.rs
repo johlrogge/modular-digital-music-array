@@ -1,8 +1,7 @@
 use crate::args::{choice, choice_names, impl_arg, parse_choice, Choice, OptTrackArg, TrackArg};
 use crate::ctx::Ctx;
 use crate::output::{
-    format_track_line, handle_error, handle_playback_error, print_tracks, terminal_width,
-    PIPE_TERM_WIDTH,
+    format_track_line, library_error, playback_error, print_tracks, terminal_width, PIPE_TERM_WIDTH,
 };
 use crate::stdin::{read_hashes, require_stdin_hashes, resolve_tracks_skip_errors};
 use bpaf::{construct, long, positional, short, Parser};
@@ -194,7 +193,7 @@ pub(crate) fn ping(ctx: &Ctx) -> Result<()> {
             println!("pong - service is alive");
             Ok(())
         }
-        Err(e) => handle_error(e),
+        Err(e) => Err(library_error(e)),
     }
 }
 
@@ -212,7 +211,7 @@ pub(crate) fn status(ctx: &Ctx) -> Result<()> {
             println!("Uptime:          {} seconds", status.uptime_seconds);
             Ok(())
         }
-        Err(e) => handle_error(e),
+        Err(e) => Err(library_error(e)),
     }
 }
 
@@ -240,7 +239,7 @@ pub(crate) fn list(limit: OptLimitArg, ctx: &Ctx) -> Result<()> {
             }
             Ok(())
         }
-        Err(e) => handle_error(e),
+        Err(e) => Err(library_error(e)),
     }
 }
 
@@ -282,7 +281,7 @@ pub(crate) fn get(hash: TrackArg, ctx: &Ctx) -> Result<()> {
             }
             Ok(())
         }
-        Err(e) => handle_error(e),
+        Err(e) => Err(library_error(e)),
     }
 }
 
@@ -300,7 +299,7 @@ pub(crate) fn facts(hash: TrackArg, ctx: &Ctx) -> Result<()> {
             }
             Ok(())
         }
-        Err(e) => handle_error(e),
+        Err(e) => Err(library_error(e)),
     }
 }
 
@@ -409,7 +408,7 @@ pub(crate) fn bookmark(scope: OptScopeArg, hash: OptTrackArg, ctx: &Ctx) -> Resu
                 eprintln!("Nothing is currently playing");
                 std::process::exit(1);
             }
-            Err(e) => handle_playback_error(e),
+            Err(e) => return Err(playback_error(e)),
         },
     };
 
@@ -418,7 +417,7 @@ pub(crate) fn bookmark(scope: OptScopeArg, hash: OptTrackArg, ctx: &Ctx) -> Resu
             println!("Bookmarked.");
             Ok(())
         }
-        Err(e) => handle_error(e),
+        Err(e) => Err(library_error(e)),
     }
 }
 
@@ -428,7 +427,7 @@ pub(crate) fn bookmarks(ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
     let tracks = match library.list_tracks(None) {
         Ok(t) => t,
-        Err(e) => handle_error(e),
+        Err(e) => return Err(library_error(e)),
     };
 
     let bookmarked: Vec<TrackInfo> = tracks

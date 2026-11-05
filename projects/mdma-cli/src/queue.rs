@@ -1,6 +1,6 @@
 use crate::args::OptTrackArg;
 use crate::ctx::Ctx;
-use crate::output::{format_track_line, handle_playback_error, render_track_table};
+use crate::output::{format_track_line, playback_error, render_track_table};
 use crate::stdin::{hashes_arg_or_stdin, hashes_in, require_stdin_hashes};
 use color_eyre::Result;
 use colored::Colorize;
@@ -18,9 +18,9 @@ pub(crate) fn next(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
     let count = hashes.len();
     // Prepend in reverse so the first hash ends up at the front of the queue.
     for content_hash in hashes.into_iter().rev() {
-        if let Err(e) = playback.queue_next(content_hash, SourceName::audio()) {
-            handle_playback_error(e);
-        }
+        playback
+            .queue_next(content_hash, SourceName::audio())
+            .map_err(playback_error)?;
     }
     println!("Queued {} track(s) next", count);
     Ok(())
@@ -35,9 +35,9 @@ pub(crate) fn append(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
     let hashes = hashes_arg_or_stdin(hash);
     let count = hashes.len();
     for content_hash in hashes {
-        if let Err(e) = playback.queue_append(content_hash, SourceName::audio()) {
-            handle_playback_error(e);
-        }
+        playback
+            .queue_append(content_hash, SourceName::audio())
+            .map_err(playback_error)?;
     }
     println!("Appended {} track(s) to queue", count);
     Ok(())
@@ -48,10 +48,7 @@ pub(crate) fn append(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
     let playback = ctx.playback()?;
-    let hashes = match playback.queue_list() {
-        Ok(h) => h,
-        Err(e) => handle_playback_error(e),
-    };
+    let hashes = playback.queue_list().map_err(playback_error)?;
 
     if hashes.is_empty() {
         use std::io::IsTerminal;
@@ -122,9 +119,7 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn clear(ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;
-    if let Err(e) = playback.queue_clear() {
-        handle_playback_error(e);
-    }
+    playback.queue_clear().map_err(playback_error)?;
     println!("Queue cleared");
     Ok(())
 }
@@ -142,7 +137,7 @@ pub(crate) fn remove(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
             println!("Removed {} track(s) from queue", removed);
         }
         Ok(_) => {}
-        Err(e) => handle_playback_error(e),
+        Err(e) => return Err(playback_error(e)),
     }
     Ok(())
 }
@@ -164,9 +159,7 @@ pub(crate) fn replace(ctx: &Ctx) -> Result<()> {
         .map(|hash| (hash, SourceName::audio()))
         .collect();
     let count = entries.len();
-    if let Err(e) = playback.queue_replace(entries) {
-        handle_playback_error(e);
-    }
+    playback.queue_replace(entries).map_err(playback_error)?;
     println!("Queue replaced: {} tracks", count);
     Ok(())
 }
@@ -179,10 +172,7 @@ pub(crate) fn edit(ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
     let playback = ctx.playback()?;
     // 1. Get current queue hashes.
-    let hashes = match playback.queue_list() {
-        Ok(h) => h,
-        Err(e) => handle_playback_error(e),
-    };
+    let hashes = playback.queue_list().map_err(playback_error)?;
 
     // 2. Look up each track for display info. Unresolvable entries are written as
     //    plain-hash comment lines so they survive the edit round-trip unchanged.
@@ -218,9 +208,7 @@ pub(crate) fn edit(ctx: &Ctx) -> Result<()> {
         .map(|hash| (hash, SourceName::audio()))
         .collect();
     let count = entries.len();
-    if let Err(e) = playback.queue_replace(entries) {
-        handle_playback_error(e);
-    }
+    playback.queue_replace(entries).map_err(playback_error)?;
     println!("Queue updated: {} tracks", count);
     Ok(())
 }

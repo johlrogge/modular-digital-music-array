@@ -2,9 +2,10 @@ mod import;
 
 use crate::args::{impl_arg, SanitizedPlaylistName};
 use crate::ctx::Ctx;
-use crate::output::handle_source_error;
+use crate::output::source_error;
 use crate::source::import::{finish_import, follow_import_job, is_terminal_phase};
 use bpaf::Bpaf;
+use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use hicli::Arg;
 use mdma_client::SourceClient;
@@ -126,32 +127,61 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// Send `request` to the source `name` and hand the response to `accept`. A
-/// response it declines (an error response or an unexpected one) or a failed
-/// request is reported and exits 1. The declined response is boxed because
-/// `SourceResponse` is large.
+/// Interpret a source's reply: `accept` takes the response it wants. A response
+/// it declines is an error response, which `on_error` turns into the failure,
+/// or an unexpected one; a failed request is a failure too. The declined
+/// response is boxed because `SourceResponse` is large.
+fn interpret_source<T>(
+    reply: std::result::Result<SourceResponse, impl std::fmt::Display>,
+    on_error: impl FnOnce(SourceError) -> color_eyre::Report,
+    accept: impl FnOnce(SourceResponse) -> std::result::Result<T, Box<SourceResponse>>,
+) -> Result<T> {
+    match reply {
+        Ok(response) => accept(response).map_err(|declined| match *declined {
+            SourceResponse::Error(e) => on_error(e),
+            _ => source_error(&"Unexpected response"),
+        }),
+        Err(e) => Err(source_error(&e)),
+    }
+}
+
+/// Send `request` to the source `name` and interpret the reply with
+/// [`interpret_source`]; error responses are reported as they are.
 fn source_call<T>(
     source: &SourceClient,
     name: &str,
     request: &SourceRequest,
     accept: impl FnOnce(SourceResponse) -> std::result::Result<T, Box<SourceResponse>>,
-) -> T {
-    match source.request(name, request) {
-        Ok(response) => accept(response).unwrap_or_else(|declined| match *declined {
-            SourceResponse::Error(e) => handle_source_error(&e),
-            _ => handle_source_error(&"Unexpected response"),
-        }),
-        Err(e) => handle_source_error(&e),
-    }
+) -> Result<T> {
+    source_call_with(source, name, request, |e| source_error(&e), accept)
 }
 
-/// Report an item the source does not have and exit 1.
-fn item_not_found(identifier: &str, source: &str) -> ! {
-    eprintln!(
+/// Like [`source_call`], with `on_error` deciding how an error response is reported.
+fn source_call_with<T>(
+    source: &SourceClient,
+    name: &str,
+    request: &SourceRequest,
+    on_error: impl FnOnce(SourceError) -> color_eyre::Report,
+    accept: impl FnOnce(SourceResponse) -> std::result::Result<T, Box<SourceResponse>>,
+) -> Result<T> {
+    interpret_source(source.request(name, request), on_error, accept)
+}
+
+/// The failure for an item the source does not have.
+fn item_not_found(identifier: &str, source: &str) -> color_eyre::Report {
+    eyre!(
         "Item {} not found in your {} collection",
-        identifier, source
-    );
-    std::process::exit(1);
+        identifier,
+        source
+    )
+}
+
+/// Report an item-level source error: `ItemNotFound` names the item and source.
+fn item_error(name: &str, err: SourceError) -> color_eyre::Report {
+    match err {
+        SourceError::ItemNotFound { identifier } => item_not_found(&identifier, name),
+        other => source_error(&other),
+    }
 }
 
 /// Sync the source (download new items)
@@ -172,7 +202,7 @@ pub(crate) fn sync(source: SourceArg, ctx: &Ctx) -> Result<()> {
                 } => Ok((total_items, new_items)),
                 other => Err(Box::new(other)),
             },
-        );
+        )?;
     println!("Sync started for {}", name);
     println!("Total items: {}, New items: {}", total_items, new_items);
     Ok(())
@@ -191,7 +221,7 @@ pub(crate) fn status(source: SourceArg, ctx: &Ctx) -> Result<()> {
             SourceResponse::Status(status) => Ok(status),
             other => Err(Box::new(other)),
         },
-    );
+    )?;
     println!("Source: {} v{}", status.name, status.version);
     println!("{}", "=".repeat(40));
     println!(
@@ -232,7 +262,7 @@ pub(crate) fn downloads(source: SourceArg, ctx: &Ctx) -> Result<()> {
                 SourceResponse::Downloads(downloads) => Ok(downloads),
                 other => Err(Box::new(other)),
             },
-        );
+        )?;
     if downloads.is_empty() {
         println!("No downloads in progress");
         return Ok(());
@@ -277,7 +307,7 @@ pub(crate) fn cancel(source: SourceArg, id: DownloadArg, ctx: &Ctx) -> Result<()
     source_call(&source, name, &request, |response| match response {
         SourceResponse::Cancelled { .. } => Ok(()),
         other => Err(Box::new(other)),
-    });
+    })?;
     println!("Cancelled download: {}", id);
     Ok(())
 }
@@ -295,7 +325,7 @@ pub(crate) fn pause(source: SourceArg, ctx: &Ctx) -> Result<()> {
             SourceResponse::Paused => Ok(()),
             other => Err(Box::new(other)),
         },
-    );
+    )?;
     println!("Downloads paused");
     Ok(())
 }
@@ -313,7 +343,7 @@ pub(crate) fn resume(source: SourceArg, ctx: &Ctx) -> Result<()> {
             SourceResponse::Resumed => Ok(()),
             other => Err(Box::new(other)),
         },
-    );
+    )?;
     println!("Downloads resumed");
     Ok(())
 }
@@ -326,17 +356,19 @@ pub(crate) fn resync(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) -> Res
     let source = ctx.source(name, None)?;
     println!("Requesting resync of {} from {}...", identifier, name);
     let request = SourceRequest::ResyncItem { identifier };
-    let (identifier, tracks_queued) =
-        source_call(&source, name, &request, |response| match response {
+    let (identifier, tracks_queued) = source_call_with(
+        &source,
+        name,
+        &request,
+        |e| item_error(name, e),
+        |response| match response {
             SourceResponse::ResyncQueued {
                 identifier,
                 tracks_queued,
             } => Ok((identifier, tracks_queued)),
-            SourceResponse::Error(SourceError::ItemNotFound { identifier }) => {
-                item_not_found(&identifier, name)
-            }
             other => Err(Box::new(other)),
-        });
+        },
+    )?;
     println!(
         "Queued resync for {} ({} item queued)",
         identifier, tracks_queued
@@ -351,19 +383,21 @@ pub(crate) fn check_item(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) ->
     let name = source.as_str();
     let source = ctx.source(name, None)?;
     let request = SourceRequest::CheckItem { identifier };
-    let (identifier, live_track_count, stored_track_count, stale) =
-        source_call(&source, name, &request, |response| match response {
+    let (identifier, live_track_count, stored_track_count, stale) = source_call_with(
+        &source,
+        name,
+        &request,
+        |e| item_error(name, e),
+        |response| match response {
             SourceResponse::ItemChecked {
                 identifier,
                 live_track_count,
                 stored_track_count,
                 stale,
             } => Ok((identifier, live_track_count, stored_track_count, stale)),
-            SourceResponse::Error(SourceError::ItemNotFound { identifier }) => {
-                item_not_found(&identifier, name)
-            }
             other => Err(Box::new(other)),
-        });
+        },
+    )?;
     if stale {
         println!(
             "STALE {}: live={} stored={}",
@@ -511,13 +545,12 @@ fn unsupported_message(source: &str, feature: &str) -> String {
     format!("source '{}' does not support {}", source, feature)
 }
 
-/// Report a source error; `Unsupported` gets a friendly message naming the source.
-fn handle_playlist_source_error(source: &str, feature: &str, err: &SourceError) -> ! {
+/// The failure for a source error; `Unsupported` gets a friendly message naming the source.
+fn playlist_source_error(source: &str, feature: &str, err: &SourceError) -> color_eyre::Report {
     if matches!(err, SourceError::Unsupported { .. }) {
-        eprintln!("{}", unsupported_message(source, feature));
-        std::process::exit(1);
+        return eyre!("{}", unsupported_message(source, feature));
     }
-    handle_source_error(err)
+    source_error(err)
 }
 
 /// List the source's playlists
@@ -527,17 +560,16 @@ fn handle_playlist_source_error(source: &str, feature: &str, err: &SourceError) 
 pub(crate) fn playlists(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
     let source = ctx.source(name, Some(SOURCE_LISTING_TIMEOUT))?;
-    let playlists =
-        source_call(
-            &source,
-            name,
-            &SourceRequest::ListPlaylists,
-            |response| match response {
-                SourceResponse::Playlists(playlists) => Ok(playlists),
-                SourceResponse::Error(e) => handle_playlist_source_error(name, "playlists", &e),
-                other => Err(Box::new(other)),
-            },
-        );
+    let playlists = source_call_with(
+        &source,
+        name,
+        &SourceRequest::ListPlaylists,
+        |e| playlist_source_error(name, "playlists", &e),
+        |response| match response {
+            SourceResponse::Playlists(playlists) => Ok(playlists),
+            other => Err(Box::new(other)),
+        },
+    )?;
     if playlists.is_empty() {
         println!("No playlists found");
         return Ok(());
@@ -622,17 +654,23 @@ pub(crate) fn import_playlist(
         name: explicit_name,
         dry_run,
     };
-    let job_id = source_call(&source, name, &request, |response| match response {
-        SourceResponse::ImportStarted { job_id } => Ok(job_id),
-        SourceResponse::Error(SourceError::ImportInProgress { job_id }) => {
+    let job_id = source_call_with(
+        &source,
+        name,
+        &request,
+        |e| match e {
             // The running job may be a different playlist or a dry run, so
             // following it would report someone else's result as ours.
-            eprintln!("{}", import_not_started_message(name, job_id));
-            std::process::exit(1);
-        }
-        SourceResponse::Error(e) => handle_playlist_source_error(name, "playlist import", &e),
-        other => Err(Box::new(other)),
-    });
+            SourceError::ImportInProgress { job_id } => {
+                eyre!("{}", import_not_started_message(name, job_id))
+            }
+            e => playlist_source_error(name, "playlist import", &e),
+        },
+        |response| match response {
+            SourceResponse::ImportStarted { job_id } => Ok(job_id),
+            other => Err(Box::new(other)),
+        },
+    )?;
     println!("Import started (job {})", job_id);
 
     if no_wait {
@@ -649,19 +687,16 @@ pub(crate) fn import_playlist(
 pub(crate) fn import_status(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
     let source = ctx.source(name, None)?;
-    let status =
-        source_call(
-            &source,
-            name,
-            &SourceRequest::GetImportStatus,
-            |response| match response {
-                SourceResponse::ImportStatus(status) => Ok(status),
-                SourceResponse::Error(e) => {
-                    handle_playlist_source_error(name, "playlist import", &e)
-                }
-                other => Err(Box::new(other)),
-            },
-        );
+    let status = source_call_with(
+        &source,
+        name,
+        &SourceRequest::GetImportStatus,
+        |e| playlist_source_error(name, "playlist import", &e),
+        |response| match response {
+            SourceResponse::ImportStatus(status) => Ok(status),
+            other => Err(Box::new(other)),
+        },
+    )?;
     match status {
         None => {
             println!("No import job");
@@ -930,6 +965,85 @@ mod tests {
         assert_eq!(
             unsupported_message("beatport", "playlists"),
             "source 'beatport' does not support playlists"
+        );
+    }
+
+    // ── interpreting a source's reply ───────────────────────────────────────────
+
+    use crate::test_support::failure_text;
+
+    fn paused(response: SourceResponse) -> std::result::Result<(), Box<SourceResponse>> {
+        match response {
+            SourceResponse::Paused => Ok(()),
+            other => Err(Box::new(other)),
+        }
+    }
+
+    fn interpret(reply: std::result::Result<SourceResponse, &str>) -> Result<()> {
+        interpret_source(reply, |e| source_error(&e), paused)
+    }
+
+    #[test]
+    fn an_accepted_response_is_the_result() {
+        assert!(interpret(Ok(SourceResponse::Paused)).is_ok());
+    }
+
+    #[test]
+    fn an_error_response_gives_its_message() {
+        let reply = SourceResponse::Error(SourceError::NotAuthenticated {
+            message: "login first".to_string(),
+        });
+        assert_eq!(
+            failure_text(interpret(Ok(reply))),
+            "not authenticated: login first"
+        );
+    }
+
+    #[test]
+    fn an_unexpected_response_is_reported() {
+        assert_eq!(
+            failure_text(interpret(Ok(SourceResponse::Resumed))),
+            "Unexpected response"
+        );
+    }
+
+    #[test]
+    fn a_failed_request_gives_its_error() {
+        assert_eq!(
+            failure_text(interpret(Err("socket closed"))),
+            "socket closed"
+        );
+    }
+
+    #[test]
+    fn on_error_decides_how_an_error_response_is_reported() {
+        let reply = SourceResponse::Error(SourceError::ItemNotFound {
+            identifier: "p1".to_string(),
+        });
+        let result = interpret_source(Ok::<_, &str>(reply), |e| item_error("bandcamp", e), paused);
+        assert_eq!(
+            failure_text(result),
+            "Item p1 not found in your bandcamp collection"
+        );
+    }
+
+    #[test]
+    fn an_unsupported_source_error_names_the_source_and_feature() {
+        let err = SourceError::unsupported("ListPlaylists");
+        assert_eq!(
+            failure_text::<()>(Err(playlist_source_error("beatport", "playlists", &err))),
+            "source 'beatport' does not support playlists"
+        );
+    }
+
+    #[test]
+    fn another_playlist_source_error_is_reported_as_it_is() {
+        let err = SourceError::Internal {
+            message: "boom".to_string(),
+        };
+        assert_eq!(
+            failure_text::<()>(Err(playlist_source_error("beatport", "playlists", &err))),
+            "internal error: boom"
         );
     }
 }

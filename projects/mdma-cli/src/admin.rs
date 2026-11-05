@@ -1,37 +1,42 @@
 use crate::args::impl_arg;
 use crate::ctx::Ctx;
+use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use gateway_client::{AdminRequest, AdminResponse, GatewayClient};
 
-/// Send an admin request and hand the response to `accept`. A response it
-/// declines, an error response, or a failed request is reported and exits 1.
+/// Interpret an admin reply: `accept` takes the response it wants. An error
+/// response, a response it declines, or a failed request is the failure.
+fn interpret_admin<T>(
+    reply: std::result::Result<AdminResponse, impl std::fmt::Display>,
+    accept: impl FnOnce(AdminResponse) -> std::result::Result<T, AdminResponse>,
+) -> Result<T> {
+    match reply {
+        Ok(AdminResponse::Error { message }) => Err(eyre!("{}", message)),
+        Ok(response) => accept(response).map_err(|other| eyre!("unexpected response: {:?}", other)),
+        Err(e) => Err(eyre!("request failed: {}", e)),
+    }
+}
+
+/// Send an admin request and interpret the reply with [`interpret_admin`].
 fn admin_call<T>(
     admin: &GatewayClient,
     request: &AdminRequest,
     accept: impl FnOnce(AdminResponse) -> std::result::Result<T, AdminResponse>,
-) -> T {
-    match admin.admin_request(request) {
-        Ok(AdminResponse::Error { message }) => {
-            eprintln!("error: {}", message);
-            std::process::exit(1);
-        }
-        Ok(response) => accept(response).unwrap_or_else(|other| {
-            eprintln!("unexpected response: {:?}", other);
-            std::process::exit(1);
-        }),
-        Err(e) => {
-            eprintln!("request failed: {}", e);
-            std::process::exit(1);
-        }
+) -> Result<T> {
+    interpret_admin(admin.admin_request(request), accept)
+}
+
+/// The response a request answered with a plain `Ok` must be.
+fn accept_ok(response: AdminResponse) -> std::result::Result<(), AdminResponse> {
+    match response {
+        AdminResponse::Ok => Ok(()),
+        other => Err(other),
     }
 }
 
 /// Like [`admin_call`] for requests that are answered with a plain `Ok`.
-fn admin_call_ok(admin: &GatewayClient, request: &AdminRequest) {
-    admin_call(admin, request, |response| match response {
-        AdminResponse::Ok => Ok(()),
-        other => Err(other),
-    });
+fn admin_call_ok(admin: &GatewayClient, request: &AdminRequest) -> Result<()> {
+    admin_call(admin, request, accept_ok)
 }
 
 /// Service mode subcommands (EEPROM boot order)
@@ -54,7 +59,7 @@ mod service_mode {
                 } => Ok((boot_order, service_mode_armed, pcie_probe)),
                 other => Err(other),
             },
-        );
+        )?;
         let boot_label = if service_mode_armed {
             "SD-first"
         } else if boot_order.is_empty() {
@@ -83,7 +88,7 @@ mod service_mode {
     #[hicli::command]
     pub(crate) fn enable(ctx: &Ctx) -> Result<()> {
         let admin = ctx.admin()?;
-        admin_call_ok(&admin, &AdminRequest::ServiceModeEnable);
+        admin_call_ok(&admin, &AdminRequest::ServiceModeEnable)?;
         println!("Service mode armed.");
         println!(
             "Reboot the device with `mdma admin reboot` (or `sudo reboot`) \
@@ -96,7 +101,7 @@ mod service_mode {
     #[hicli::command]
     pub(crate) fn disable(ctx: &Ctx) -> Result<()> {
         let admin = ctx.admin()?;
-        admin_call_ok(&admin, &AdminRequest::ServiceModeDisable);
+        admin_call_ok(&admin, &AdminRequest::ServiceModeDisable)?;
         println!("Service mode disarmed. NVMe-first boot order restored.");
         Ok(())
     }
@@ -113,7 +118,7 @@ pub(crate) fn boot_health(ctx: &Ctx) -> Result<()> {
             AdminResponse::BootHealth { verdict } => Ok(verdict),
             other => Err(other),
         },
-    );
+    )?;
     println!("Boot health: {verdict}");
     if !verdict.allows_reboot() {
         std::process::exit(1);
@@ -136,7 +141,7 @@ impl_arg!(
 pub(crate) fn reboot(force: Force, ctx: &Ctx) -> Result<()> {
     let Force(force) = force;
     let admin = ctx.admin()?;
-    admin_call_ok(&admin, &AdminRequest::Reboot { force });
+    admin_call_ok(&admin, &AdminRequest::Reboot { force })?;
     println!("Reboot initiated. Connection will drop within ~2 seconds.");
     Ok(())
 }
@@ -144,9 +149,47 @@ pub(crate) fn reboot(force: Force, ctx: &Ctx) -> Result<()> {
 #[cfg(test)]
 mod tests {
 
-    use crate::test_support::{parses, run_arg};
+    use crate::test_support::{failure_text, parses, run_arg};
 
-    use super::Force;
+    use super::{accept_ok, interpret_admin, Force};
+    use gateway_client::AdminResponse;
+
+    // ── interpreting an admin reply ─────────────────────────────────────────
+
+    #[test]
+    fn an_accepted_admin_response_is_the_result() {
+        let reply = Ok::<_, &str>(AdminResponse::Ok);
+        assert!(interpret_admin(reply, accept_ok).is_ok());
+    }
+
+    #[test]
+    fn an_admin_error_response_gives_its_message() {
+        let reply = Ok::<_, &str>(AdminResponse::Error {
+            message: "boot partition unhealthy".to_string(),
+        });
+        assert_eq!(
+            failure_text(interpret_admin(reply, accept_ok)),
+            "boot partition unhealthy"
+        );
+    }
+
+    #[test]
+    fn a_declined_admin_response_is_unexpected() {
+        let reply = Ok::<_, &str>(AdminResponse::Pong);
+        assert_eq!(
+            failure_text(interpret_admin(reply, accept_ok)),
+            "unexpected response: Pong"
+        );
+    }
+
+    #[test]
+    fn a_failed_admin_request_says_so() {
+        let reply = Err::<AdminResponse, _>("timed out");
+        assert_eq!(
+            failure_text(interpret_admin(reply, accept_ok)),
+            "request failed: timed out"
+        );
+    }
 
     #[test]
     fn force_arg_parser_is_a_switch() {

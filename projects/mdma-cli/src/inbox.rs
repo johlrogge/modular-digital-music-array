@@ -1,6 +1,6 @@
 use crate::args::impl_arg;
 use crate::ctx::Ctx;
-use crate::output::handle_error;
+use crate::output::library_error;
 use color_eyre::Result;
 use library_ipc_client::{InboxPath, InboxPathError};
 use std::str::FromStr;
@@ -39,7 +39,7 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
             }
             Ok(())
         }
-        Err(e) => handle_error(e),
+        Err(e) => Err(library_error(e)),
     }
 }
 
@@ -61,7 +61,7 @@ pub(crate) fn delete(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
             }
             Ok(())
         }
-        Err(e) => handle_error(e),
+        Err(e) => Err(library_error(e)),
     }
 }
 
@@ -91,7 +91,7 @@ pub(crate) fn ingest(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
             }
             Ok(())
         }
-        Err(e) => handle_error(e),
+        Err(e) => Err(library_error(e)),
     }
 }
 
@@ -137,7 +137,7 @@ pub(crate) fn ingest_all(ctx: &Ctx) -> Result<()> {
             }
             Ok(())
         }
-        Err(e) => handle_error(e),
+        Err(e) => Err(library_error(e)),
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::args::{choice, choice_names, parse_choice, Choice, TrackArg};
 use crate::ctx::Ctx;
-use crate::output::handle_error;
+use crate::output::library_error;
 use bpaf::{construct, long, Parser};
 use chrono::NaiveDate;
 use color_eyre::Result;
@@ -255,7 +255,7 @@ pub(crate) fn add(args: FactArgs, ctx: &Ctx) -> Result<()> {
             println!("Added fact for {}: {:?} = {}", hash, field, raw);
             Ok(())
         }
-        Err(e) => handle_error(e),
+        Err(e) => Err(library_error(e)),
     }
 }
 
@@ -276,7 +276,7 @@ pub(crate) fn retract(args: FactArgs, ctx: &Ctx) -> Result<()> {
             println!("Retracted fact for {}: {:?} = {}", hash, field, raw);
             Ok(())
         }
-        Err(e) => handle_error(e),
+        Err(e) => Err(library_error(e)),
     }
 }
 
