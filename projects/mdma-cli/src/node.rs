@@ -927,9 +927,10 @@ mod tests {
 
     #[test]
     fn transport_failure_is_unreachable() {
-        let err = gateway_client::ClientError::Connection(
-            nng_transport::ConnectionError::ConnectionFailed("refused".into()),
-        );
+        let err = gateway_client::ClientError::Connection(nng_transport::ConnectionError::Dial {
+            address: "tcp://10.0.0.2:5555".into(),
+            cause: nng::Error::ConnectionRefused,
+        });
         assert_eq!(
             identity_check(Err(IdentifyError::Client(err))),
             Err(Unreachable)

@@ -17,8 +17,18 @@ pub enum ConnectionError {
     #[error("NNG error: {0}")]
     Nng(#[from] nng::Error),
 
-    #[error("Connection failed: {0}")]
-    ConnectionFailed(String),
+    /// Dialing `address` failed. The Display text carries the cause, so the
+    /// variant deliberately has no `#[source]`: a chain walker (hicli joins the
+    /// eyre chain with ": ") would otherwise print the cause twice.
+    #[error("{address}: {cause}")]
+    Dial { address: String, cause: nng::Error },
+
+    /// Setting a socket timeout option (`send` or `recv`) failed.
+    #[error("failed to set socket {option} timeout: {cause}")]
+    SocketOption {
+        option: &'static str,
+        cause: nng::Error,
+    },
 
     #[error("DNS resolution failed: {0}")]
     DnsResolution(String),
@@ -72,12 +82,18 @@ pub fn connect_with_timeout(
 
 fn new_req_socket(timeout: Duration) -> Result<nng::Socket, ConnectionError> {
     let socket = nng::Socket::new(nng::Protocol::Req0)?;
-    socket.set_opt::<SendTimeout>(Some(timeout)).map_err(|e| {
-        ConnectionError::ConnectionFailed(format!("Failed to set send timeout: {}", e))
-    })?;
-    socket.set_opt::<RecvTimeout>(Some(timeout)).map_err(|e| {
-        ConnectionError::ConnectionFailed(format!("Failed to set recv timeout: {}", e))
-    })?;
+    socket
+        .set_opt::<SendTimeout>(Some(timeout))
+        .map_err(|cause| ConnectionError::SocketOption {
+            option: "send",
+            cause,
+        })?;
+    socket
+        .set_opt::<RecvTimeout>(Some(timeout))
+        .map_err(|cause| ConnectionError::SocketOption {
+            option: "recv",
+            cause,
+        })?;
     Ok(socket)
 }
 
@@ -88,8 +104,9 @@ fn dial(socket: &nng::Socket, address: &str, background: bool) -> Result<(), Con
     } else {
         socket.dial(&resolved_address)
     };
-    result.map_err(|e| {
-        ConnectionError::ConnectionFailed(format!("Failed to connect to {}: {}", address, e))
+    result.map_err(|cause| ConnectionError::Dial {
+        address: address.to_string(),
+        cause,
     })
 }
 
@@ -337,7 +354,7 @@ where
 /// JSON serialization errors, and service-level errors (e.g. command rejected).
 #[derive(Debug, thiserror::Error)]
 pub enum NngClientError {
-    #[error("connection error: {0}")]
+    #[error(transparent)]
     Connection(#[from] ConnectionError),
 
     #[error("nng error: {0}")]
@@ -363,9 +380,28 @@ mod tests {
 
     #[test]
     fn nng_client_error_from_connection_error() {
-        let conn_err = ConnectionError::ConnectionFailed("test".to_string());
+        let conn_err = ConnectionError::Dial {
+            address: "ipc:///run/x.sock".to_string(),
+            cause: nng::Error::ConnectionRefused,
+        };
         let client_err: NngClientError = conn_err.into();
-        assert!(client_err.to_string().contains("connection error"));
+        assert_eq!(
+            client_err.to_string(),
+            "ipc:///run/x.sock: Connection refused"
+        );
+    }
+
+    #[test]
+    fn dial_failure_reports_the_cause_once() {
+        use std::error::Error;
+        let addr = format!(
+            "ipc://{}/nng-transport-none.sock",
+            std::env::temp_dir().display()
+        );
+        let err = connect(&addr).unwrap_err();
+        assert!(matches!(err, ConnectionError::Dial { .. }));
+        assert_eq!(err.to_string(), format!("{addr}: Connection refused"));
+        assert!(err.source().is_none(), "the cause is in the Display text");
     }
 
     #[test]

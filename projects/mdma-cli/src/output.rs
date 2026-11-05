@@ -79,17 +79,14 @@ pub fn print_tracks(tracks: &[TrackInfo], header: &str) {
 }
 
 /// Why connecting to `what` failed, as one layer: `Failed to connect to
-/// <what> at <address>: <OS error>`. The connection error already names the
-/// address (`Failed to connect to <address>: <OS error>`), so that is taken
-/// from it rather than stacked under the error's own wording.
+/// <what> at <address>: <OS error>` for a failed dial, else `Failed to connect
+/// to <what>: <error>`.
 pub fn connect_failure(what: &str, err: &ConnectionError) -> String {
-    let cause = match err {
-        ConnectionError::ConnectionFailed(cause) => cause.clone(),
-        other => other.to_string(),
-    };
-    match cause.strip_prefix("Failed to connect to ") {
-        Some(address_and_cause) => format!("Failed to connect to {what} at {address_and_cause}"),
-        None => format!("Failed to connect to {what}: {cause}"),
+    match err {
+        ConnectionError::Dial { address, cause } => {
+            format!("Failed to connect to {what} at {address}: {cause}")
+        }
+        other => format!("Failed to connect to {what}: {other}"),
     }
 }
 
@@ -279,13 +276,14 @@ mod tests {
     }
 
     fn connection_failed() -> ConnectionError {
-        ConnectionError::ConnectionFailed("refused".to_string())
+        ConnectionError::DnsResolution("refused".to_string())
     }
 
     fn refused_at(address: &str) -> ConnectionError {
-        ConnectionError::ConnectionFailed(format!(
-            "Failed to connect to {address}: Connection refused"
-        ))
+        ConnectionError::Dial {
+            address: address.to_string(),
+            cause: nng::Error::ConnectionRefused,
+        }
     }
 
     #[test]
@@ -317,7 +315,7 @@ mod tests {
         let err = ClientError::Transport(NngClientError::Connection(connection_failed()));
         assert_eq!(
             lib_text(err),
-            "Failed to connect to library: refused\nIs mdma-library running?"
+            "Failed to connect to library: DNS resolution failed: refused\nIs mdma-library running?"
         );
     }
 
@@ -344,7 +342,7 @@ mod tests {
         let err = PlaybackClientError::Connection(connection_failed());
         assert_eq!(
             failure_text::<()>(Err(playback_error(err))),
-            "Failed to connect to playback: refused\nIs mdma-playback running?"
+            "Failed to connect to playback: DNS resolution failed: refused\nIs mdma-playback running?"
         );
     }
 
