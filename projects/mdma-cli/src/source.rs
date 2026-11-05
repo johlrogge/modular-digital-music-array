@@ -523,7 +523,9 @@ fn handle_playlist_source_error(source: &str, feature: &str, err: &SourceError) 
     handle_source_error(err)
 }
 
-/// List the source's playlists (for sources that support playlists)
+/// List the source's playlists
+///
+/// Only for sources that support playlists.
 #[hicli::command(curried)]
 pub(crate) fn playlists(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
@@ -594,7 +596,7 @@ fn import_not_started_message(source: &str, running_job_id: u64) -> String {
 // default request timeout is enough for start and polls.
 /// Import a source playlist as an MDMA playlist
 ///
-/// Definitive matches only; for sources that support playlists.
+/// Definitive matches only. Only for sources that support playlists.
 #[hicli::command(curried)]
 pub(crate) fn import_playlist(
     source: SourceArg,
@@ -645,7 +647,7 @@ pub(crate) fn import_playlist(
 
 /// Show the current or last playlist import job, following it while running
 ///
-/// For sources that support playlists.
+/// Only for sources that support playlists.
 #[hicli::command(curried)]
 pub(crate) fn import_status(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
