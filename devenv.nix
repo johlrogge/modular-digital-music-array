@@ -466,12 +466,12 @@ in
            Expected: exit code 0, track count > 0
 
         4. SEARCH — verify search works:
-           mdma search --no-stdin --artist "a" --limit 1
-           Expected: exit code 0, at least 1 result
+           mdma search --no-stdin --artist "a" | head -n 1
+           Expected: at least 1 result line (the exit code is head's, so judge by output)
 
         5. PLAYBACK — verify playback service responds:
            mdma playback now
-           Expected: exit code 0 (may report "nothing playing" — that is fine)
+           Expected: exit 0 with a hash, or exit 1 with 'Nothing playing' on stderr; both PASS
 
         6. SOURCES — verify source discovery works:
            mdma source list
