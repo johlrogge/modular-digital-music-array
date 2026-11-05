@@ -618,6 +618,8 @@ mod tests {
         assert!(err.contains("No fields selected"), "{err}");
         let err = run_arg::<ViewColumns>(&["--hash", "--hash"]).unwrap_err();
         assert!(err.contains("more than once"), "{err}");
+        let err = run_arg::<ViewColumns>(&["--hash", "--title", "--hash"]).unwrap_err();
+        assert!(err.contains("more than once"), "{err}");
     }
 
     // ── SortField / SortDirection ─────────────────────────────────────────────

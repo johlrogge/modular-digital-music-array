@@ -44,20 +44,24 @@ mod tests {
             run_arg::<ShellArg>(&["zsh"]),
             Ok(ShellArg(hicli::Shell::Zsh))
         );
+        assert_eq!(
+            run_arg::<ShellArg>(&["fish"]),
+            Ok(ShellArg(hicli::Shell::Fish))
+        );
         assert!(run_arg::<ShellArg>(&["tcsh"]).is_err());
         assert!(run_arg::<ShellArg>(&[]).is_err());
     }
 
     #[test]
-    fn bash_completion_script_is_nonempty_and_names_the_binary() {
-        let output = hicli::completion_script(hicli::Shell::Bash, "mdma");
-        assert!(
-            !output.is_empty(),
-            "bash completion script must not be empty"
-        );
-        assert!(
-            output.contains("mdma"),
-            "bash completion script must reference the binary name 'mdma'"
-        );
+    fn completion_scripts_are_nonempty_and_name_the_binary() {
+        let bin = env!("CARGO_BIN_NAME");
+        for shell in [hicli::Shell::Bash, hicli::Shell::Zsh, hicli::Shell::Fish] {
+            let output = hicli::completion_script(shell, bin);
+            assert!(!output.is_empty(), "{shell:?} script must not be empty");
+            assert!(
+                output.contains(bin),
+                "{shell:?} script must reference the binary name '{bin}'"
+            );
+        }
     }
 }

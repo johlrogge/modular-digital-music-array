@@ -383,12 +383,23 @@ mod tests {
     }
 
     #[test]
-    fn version_exits_zero_and_a_bad_hash_exits_two() {
+    fn run_exits_zero_for_version_and_two_for_any_parse_failure() {
         let run = |args: &[&str]| {
             app().run_with_args(args.iter().copied(), |globals| Ok(Ctx::new(globals)))
         };
         assert_eq!(run(&["--version"]), 0);
         assert_eq!(run(&["get", "xyz"]), 2);
+        assert_eq!(run(&["frobnicate"]), 2);
+    }
+
+    #[test]
+    fn version_flag_reports_the_package_version() {
+        // run_with_args prints to the real stdout, so the text is read from the
+        // parse outcome.
+        assert_eq!(
+            help(&["--version"]).trim(),
+            format!("Version: {}", env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]
