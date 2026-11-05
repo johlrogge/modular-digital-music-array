@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use crate::args::impl_arg;
 use crate::ctx::Ctx;
+use color_eyre::eyre::eyre;
 use gateway_client::{GatewayClient, IdentifyError, NodeIdentity};
 use node_discovery::{
     cache, resolve, DiscoveredNode, Effects, IdentityCheck, NodeCache, NodeKind, NodeSpec,
@@ -365,6 +366,9 @@ fn real_effects() -> Effects<'static> {
     }
 }
 
+/// How the error for a bad `MDMA_NODE` starts.
+pub const INVALID_ENV_NODE: &str = "invalid MDMA_NODE";
+
 /// `MDMA_NODE`. Empty counts as unset, so `MDMA_NODE= mdma ...` overrides a
 /// value exported by the environment (devenv sets one).
 fn parse_env_node(value: Option<&str>) -> Result<Option<NodeSpec>, String> {
@@ -373,7 +377,7 @@ fn parse_env_node(value: Option<&str>) -> Result<Option<NodeSpec>, String> {
         Some(v) => v
             .parse()
             .map(Some)
-            .map_err(|e| format!("error: invalid {NODE_ENV}: {e}")),
+            .map_err(|e| format!("{INVALID_ENV_NODE}: {e}")),
     }
 }
 
@@ -403,24 +407,21 @@ fn save_cache(update: &NodeCache) {
     }
 }
 
-/// The resolution request; a bad `MDMA_NODE` prints the error and exits 1,
-/// like an unresolvable node does.
-fn request(explicit: Option<&NodeSpec>, local_ipc: bool) -> Request {
-    let env = env_node().unwrap_or_else(|message| {
-        eprintln!("{message}");
-        std::process::exit(1);
-    });
-    Request {
+/// The resolution request; a bad `MDMA_NODE` is an error.
+fn request(explicit: Option<&NodeSpec>, local_ipc: bool) -> color_eyre::Result<Request> {
+    let env = env_node().map_err(|message| eyre!("{message}"))?;
+    Ok(Request {
         explicit: explicit.cloned(),
         env,
         local_ipc,
-    }
+    })
 }
 
 /// Resolve the node once at startup, remembering it when the resolver says
-/// so. Prints a note for implicit choices and exits with advice on failure.
-pub fn resolve_startup(explicit: Option<&NodeSpec>, local_ipc: bool) -> Target {
-    match resolve(request(explicit, local_ipc), &mut real_effects()) {
+/// so. Prints a note for implicit choices; fails with advice when no node
+/// can be resolved.
+pub fn resolve_startup(explicit: Option<&NodeSpec>, local_ipc: bool) -> color_eyre::Result<Target> {
+    match resolve(request(explicit, local_ipc)?, &mut real_effects()) {
         Ok(resolution) => {
             if let Some(update) = &resolution.cache_update {
                 save_cache(update);
@@ -430,12 +431,9 @@ pub fn resolve_startup(explicit: Option<&NodeSpec>, local_ipc: bool) -> Target {
                     eprintln!("{note}");
                 }
             }
-            resolution.target
+            Ok(resolution.target)
         }
-        Err(e) => {
-            eprintln!("{}", resolve_error_message(&e));
-            std::process::exit(1);
-        }
+        Err(e) => Err(eyre!("{}", resolve_error_message(&e))),
     }
 }
 
@@ -523,7 +521,7 @@ pub(crate) fn forget(_ctx: &Ctx) -> color_eyre::Result<()> {
 #[hicli::command]
 pub(crate) fn show(ctx: &Ctx) -> color_eyre::Result<()> {
     match resolve(
-        request(ctx.node_flag(), ctx.local_ipc()),
+        request(ctx.node_flag(), ctx.local_ipc())?,
         &mut real_effects(),
     ) {
         Ok(resolution) => {
@@ -582,10 +580,28 @@ mod tests {
         assert_eq!(
             parse_env_node(Some("mdma.local:nope")),
             Err(
-                "error: invalid MDMA_NODE: invalid port 'nope' in node 'mdma.local:nope', \
+                "invalid MDMA_NODE: invalid port 'nope' in node 'mdma.local:nope', \
                  expected 1-65535"
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn resolving_with_a_bad_env_node_fails_naming_the_variable() {
+        // One test, because it touches a process-wide environment variable (which
+        // devenv sets, so it is put back).
+        let _env = crate::test_support::node_env_lock();
+        let original = std::env::var_os(NODE_ENV);
+        std::env::set_var(NODE_ENV, "mdma.local:nope");
+        let result = resolve_startup(None, false);
+        match original {
+            Some(value) => std::env::set_var(NODE_ENV, value),
+            None => std::env::remove_var(NODE_ENV),
+        }
+        assert_eq!(
+            crate::test_support::failure_text(result),
+            "invalid MDMA_NODE: invalid port 'nope' in node 'mdma.local:nope', expected 1-65535"
         );
     }
 

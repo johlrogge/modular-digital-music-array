@@ -194,7 +194,7 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
             .unwrap_or_else(|| std::path::PathBuf::from("./rekordbox-export/"))
     });
 
-    let (node, node_ip) = ctx.require_node();
+    let (node, node_ip) = ctx.require_node()?;
 
     // Collect hashes per playlist, or from stdin when no playlists given.
     //

@@ -108,7 +108,7 @@ const SOURCE_LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// List available music sources
 #[hicli::command]
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
-    let gateway = ctx.gateway();
+    let gateway = ctx.gateway()?;
     let sources = match mdma_client::list_available_sources(gateway.as_deref(), ctx.sources_dir()) {
         Ok(s) => s,
         Err(e) => {

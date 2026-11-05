@@ -246,7 +246,7 @@ pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<()> {
     } = file;
 
     // 1. Host to scp to: the resolved node, by IP when known
-    let hostname = match ctx.remote_host() {
+    let hostname = match ctx.remote_host()? {
         Some((host, ip)) => ip.map_or(host, |ip| ip.to_string()),
         None => {
             eprintln!("Upload requires --node or MDMA_NODE to determine the Pi hostname");
@@ -731,7 +731,7 @@ pub(crate) fn export(args: ExportArgs, ctx: &Ctx) -> Result<()> {
     let ExportArgs { formats, output } = args;
     let library = ctx.library();
 
-    let (node, node_ip) = ctx.require_node();
+    let (node, node_ip) = ctx.require_node()?;
 
     // Read hashes from stdin
     let raw_hashes = read_hashes();

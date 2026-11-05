@@ -24,7 +24,7 @@ impl_arg!(
 pub(crate) fn subscribe(topic: OptTopicArg, ctx: &Ctx) -> Result<()> {
     let OptTopicArg(topic) = topic;
     // Event gateway of the resolved node (tcp://<ip>:5556)
-    let addr = match ctx.event_gateway() {
+    let addr = match ctx.event_gateway()? {
         Some(a) => a,
         None => {
             eprintln!("Subscribe needs a remote node.");

@@ -10,6 +10,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use bpaf::Bpaf;
+use color_eyre::eyre::eyre;
+use color_eyre::Result;
 use gateway_client::GatewayClient;
 use mdma_client::{LibraryBackend, PlaybackBackend, SourceClient};
 use node_discovery::{NodeSpec, Target};
@@ -48,6 +50,25 @@ pub struct Globals {
     pub sources_dir: String,
 }
 
+/// Why admin commands fail without a gateway (without hicli's `Error: ` prefix).
+const ADMIN_NEEDS_GATEWAY: &str =
+    "admin commands need a gateway; use --node (or MDMA_NODE) to name the node";
+
+/// Bridge for the connecting methods, which still exit (until they return
+/// `Result`): print a node resolution failure as it always was, and exit 1.
+fn gateway_or_exit(gateway: Result<Option<String>>) -> Option<String> {
+    gateway.unwrap_or_else(|e| {
+        let text = e.to_string();
+        // A bad MDMA_NODE used to carry an `error: ` prefix; the other failures did not.
+        if text.starts_with(node::INVALID_ENV_NODE) {
+            eprintln!("error: {text}");
+        } else {
+            eprintln!("{text}");
+        }
+        std::process::exit(1);
+    })
+}
+
 pub struct Ctx {
     globals: Globals,
     local_ipc: bool,
@@ -84,10 +105,14 @@ impl Ctx {
     }
 
     /// The node to talk to, resolved on first use. Prints a note for implicit
-    /// choices and exits with advice on failure.
-    pub fn target(&self) -> &Target {
-        self.target
-            .get_or_init(|| node::resolve_startup(self.globals.node.as_ref(), self.local_ipc))
+    /// choices and fails with advice when no node can be resolved.
+    pub fn target(&self) -> Result<&Target> {
+        // `OnceLock::get_or_try_init` is unstable.
+        if let Some(target) = self.target.get() {
+            return Ok(target);
+        }
+        let resolved = node::resolve_startup(self.globals.node.as_ref(), self.local_ipc)?;
+        Ok(self.target.get_or_init(|| resolved))
     }
 
     /// The `--node` flag, as given.
@@ -102,41 +127,37 @@ impl Ctx {
 
     /// The effective gateway address of the resolved node: `tcp://<ip>:<port>`.
     /// `None` for local IPC, where callers fall back to direct IPC.
-    pub fn gateway(&self) -> Option<String> {
-        node::client_config(Some(self.target())).gateway_addr()
+    pub fn gateway(&self) -> Result<Option<String>> {
+        Ok(node::client_config(Some(self.target()?)).gateway_addr())
     }
 
     /// The effective event gateway address: `tcp://<ip>:5556`.
     /// `None` for local IPC.
-    pub fn event_gateway(&self) -> Option<String> {
-        node::client_config(Some(self.target())).event_addr()
+    pub fn event_gateway(&self) -> Result<Option<String>> {
+        Ok(node::client_config(Some(self.target()?)).event_addr())
     }
 
     /// Host and IP of the resolved node, for tools that are not NNG (scp, HTTP).
     /// `None` for local IPC.
-    pub fn remote_host(&self) -> Option<(String, Option<Ipv4Addr>)> {
-        node::remote_host(Some(self.target()))
+    pub fn remote_host(&self) -> Result<Option<(String, Option<Ipv4Addr>)>> {
+        Ok(node::remote_host(Some(self.target()?)))
     }
 
     /// Require a remote node and return its hostname and, when known, its IP.
     ///
-    /// Prints an error and exits when the CLI talks to local services over IPC.
-    pub fn require_node(&self) -> (String, Option<Ipv4Addr>) {
-        match self.remote_host() {
-            Some(remote) => remote,
-            None => {
-                eprintln!("No remote node to talk to.");
-                eprintln!(
-                    "Set --node or MDMA_NODE to the hostname of your MDMA device (e.g. mdma-909.local)"
-                );
-                std::process::exit(1);
-            }
-        }
+    /// Fails when the CLI talks to local services over IPC.
+    pub fn require_node(&self) -> Result<(String, Option<Ipv4Addr>)> {
+        self.remote_host()?.ok_or_else(|| {
+            eyre!(
+                "No remote node to talk to.\n\
+                 Set --node or MDMA_NODE to the hostname of your MDMA device (e.g. mdma-909.local)"
+            )
+        })
     }
 
     /// Connect to the library backend (gateway or direct).
     pub fn library(&self) -> LibraryBackend {
-        let gateway = self.gateway();
+        let gateway = gateway_or_exit(self.gateway());
         let socket = self
             .globals
             .socket
@@ -156,7 +177,7 @@ impl Ctx {
 
     /// Connect to the playback backend (gateway or direct).
     pub fn playback(&self) -> PlaybackBackend {
-        let gateway = self.gateway();
+        let gateway = gateway_or_exit(self.gateway());
         let socket = self
             .globals
             .playback_socket
@@ -177,7 +198,7 @@ impl Ctx {
     /// Connect to a source, via gateway or direct IPC, with the default request
     /// timeout or a custom one.
     pub fn source(&self, name: &str, timeout: Option<Duration>) -> SourceClient {
-        let gateway = self.gateway();
+        let gateway = gateway_or_exit(self.gateway());
         let connected = match timeout {
             Some(t) => SourceClient::connect_with_timeout(
                 gateway.as_deref(),
@@ -209,10 +230,8 @@ impl Ctx {
     ///
     /// Exits with a message when there is no gateway to connect to (local IPC).
     pub fn admin(&self) -> GatewayClient {
-        let gateway = self.gateway().unwrap_or_else(|| {
-            eprintln!(
-                "error: admin commands need a gateway; use --node (or MDMA_NODE) to name the node"
-            );
+        let gateway = gateway_or_exit(self.gateway()).unwrap_or_else(|| {
+            eprintln!("error: {ADMIN_NEEDS_GATEWAY}");
             std::process::exit(1);
         });
         match GatewayClient::connect(&gateway) {
@@ -228,6 +247,7 @@ impl Ctx {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::failure_text;
     use pretty_assertions::assert_eq;
 
     fn globals() -> Globals {
@@ -252,10 +272,33 @@ mod tests {
     fn gateway_uses_resolved_target() {
         // The resolved target's IP and port give the gateway address
         let ctx = Ctx::with_target(globals(), remote(Ipv4Addr::new(192, 168, 0, 9)));
-        assert_eq!(ctx.gateway(), Some("tcp://192.168.0.9:5555".to_string()));
         assert_eq!(
-            ctx.event_gateway(),
+            ctx.gateway().unwrap(),
+            Some("tcp://192.168.0.9:5555".to_string())
+        );
+        assert_eq!(
+            ctx.event_gateway().unwrap(),
             Some("tcp://192.168.0.9:5556".to_string())
+        );
+    }
+
+    #[test]
+    fn require_node_fails_for_local_ipc() {
+        let ctx = Ctx::with_target(globals(), Target::LocalIpc);
+        assert_eq!(
+            failure_text(ctx.require_node()),
+            "No remote node to talk to.\n\
+             Set --node or MDMA_NODE to the hostname of your MDMA device (e.g. mdma-909.local)"
+        );
+    }
+
+    #[test]
+    fn require_node_gives_the_remote_host() {
+        let ip = Ipv4Addr::new(192, 168, 0, 9);
+        let ctx = Ctx::with_target(globals(), remote(ip));
+        assert_eq!(
+            ctx.require_node().unwrap(),
+            ("mdma-909.local".to_string(), Some(ip))
         );
     }
 
@@ -263,8 +306,8 @@ mod tests {
     fn gateway_is_none_for_local_ipc() {
         // A local IPC target means no gateway
         let ctx = Ctx::with_target(globals(), Target::LocalIpc);
-        assert_eq!(ctx.gateway(), None);
-        assert_eq!(ctx.event_gateway(), None);
+        assert_eq!(ctx.gateway().unwrap(), None);
+        assert_eq!(ctx.event_gateway().unwrap(), None);
     }
 
     #[test]
@@ -274,6 +317,6 @@ mod tests {
         let ctx = Ctx::new(globals());
         assert!(ctx.target.get().is_none());
         let ctx = Ctx::with_target(globals(), Target::LocalIpc);
-        assert_eq!(ctx.target(), &Target::LocalIpc);
+        assert_eq!(ctx.target().unwrap(), &Target::LocalIpc);
     }
 }

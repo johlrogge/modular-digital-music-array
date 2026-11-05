@@ -53,6 +53,13 @@ pub(crate) fn run_arg<T: hicli::Arg>(args: &[&str]) -> Result<T, String> {
         .map_err(|failure| flat(&failure.unwrap_stderr()))
 }
 
+/// Held by every test that sets `MDMA_NODE`: the environment is process-wide
+/// and tests run in parallel.
+pub(crate) fn node_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The text hicli would print (after its `Error: ` prefix) for a failed command result.
 pub(crate) fn failure_text<T>(r: color_eyre::Result<T>) -> String {
     hicli::Failure::from(r.err().expect("an error"))
