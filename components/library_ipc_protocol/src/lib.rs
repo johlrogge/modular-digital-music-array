@@ -241,6 +241,10 @@ pub enum LibraryRequest {
     /// List all tracks (optionally limited).
     ListTracks { limit: Option<usize> },
 
+    /// List every visible track that carries a live bookmark, scoped or not.
+    /// Answered with `LibraryResponse::Tracks`.
+    ListBookmarked,
+
     /// Get a specific track by content hash (supports partial hashes).
     GetTrack { hash: ContentHash },
 
@@ -1098,6 +1102,14 @@ mod tests {
         } else {
             panic!("unexpected variant");
         }
+    }
+
+    #[test]
+    fn list_bookmarked_request_roundtrip() {
+        let json = serde_json::to_string(&LibraryRequest::ListBookmarked).unwrap();
+        assert_eq!(json, r#"{"type":"ListBookmarked"}"#);
+        let decoded: LibraryRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, LibraryRequest::ListBookmarked));
     }
 
     #[test]

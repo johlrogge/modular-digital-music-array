@@ -53,6 +53,8 @@ struct IndexedTrack {
     role: Option<TrackRole>,
     /// Energy level 1–10.
     energy: Option<EnergyLevel>,
+    /// Set by a loaded `Bookmarked` fact or `WriteBookmark` (assert-only, like cues).
+    bookmarked: bool,
 }
 
 impl IndexedTrack {
@@ -253,16 +255,11 @@ impl LibraryService {
             }
 
             LibraryRequest::ListTracks { limit } => {
-                let tracks = self.tracks.lock().unwrap();
-                let iter = tracks
-                    .iter()
-                    .filter(|t| !t.is_hidden())
-                    .map(|t| t.to_track_info());
-                let results: Vec<TrackInfo> = match limit {
-                    Some(n) => iter.take(n).collect(),
-                    None => iter.collect(),
-                };
-                LibraryResponse::Tracks(results)
+                LibraryResponse::Tracks(self.tracks_where(|_| true, limit))
+            }
+
+            LibraryRequest::ListBookmarked => {
+                LibraryResponse::Tracks(self.tracks_where(|t| t.bookmarked, None))
             }
 
             LibraryRequest::GetTrack { hash } => match self.get_track(&hash) {
@@ -388,7 +385,20 @@ impl LibraryService {
                 )
             }
 
-            LibraryRequest::WriteBookmark { .. } => LibraryResponse::BookmarkWritten,
+            LibraryRequest::WriteBookmark { hash, .. } => {
+                let full_hash = match self.resolve_hash(&hash) {
+                    Ok(h) => h,
+                    Err(e) => return LibraryResponse::Error(e),
+                };
+                let mut tracks = self.tracks.lock().unwrap();
+                if let Some(t) = tracks
+                    .iter_mut()
+                    .find(|t| t.content_hash == full_hash.as_str())
+                {
+                    t.bookmarked = true;
+                }
+                LibraryResponse::BookmarkWritten
+            }
 
             LibraryRequest::WriteFact { hash, fact } => {
                 // Store the fact in the fact_index so has_facts probes work in tests.
@@ -497,6 +507,23 @@ impl LibraryService {
                     .collect();
                 LibraryResponse::OrphansList(orphans)
             }
+        }
+    }
+
+    /// Visible tracks that match `filter` (hidden tracks excluded), optionally limited.
+    fn tracks_where(
+        &self,
+        filter: impl Fn(&IndexedTrack) -> bool,
+        limit: Option<usize>,
+    ) -> Vec<TrackInfo> {
+        let tracks = self.tracks.lock().unwrap();
+        let iter = tracks
+            .iter()
+            .filter(|t| !t.is_hidden() && filter(t))
+            .map(|t| t.to_track_info());
+        match limit {
+            Some(n) => iter.take(n).collect(),
+            None => iter.collect(),
         }
     }
 
@@ -641,6 +668,7 @@ fn apply_fact(entry: &mut IndexedTrack, value: &MusicValue) {
         }
         MusicValue::Role(v) => entry.role = Some(*v),
         MusicValue::Energy(v) => entry.energy = Some(*v),
+        MusicValue::Bookmarked { .. } => entry.bookmarked = true,
         _ => {} // ignore all other facts (key, format, cover art, timestamps, etc.)
     }
 }
@@ -698,6 +726,80 @@ mod tests {
             }
             other => panic!("expected PlaylistNames, got {other:?}"),
         }
+    }
+
+    fn service_with_tracks(hashes: &[&str]) -> Arc<LibraryService> {
+        let svc = empty_service();
+        svc.tracks
+            .lock()
+            .unwrap()
+            .extend(hashes.iter().map(|h| IndexedTrack::new(h)));
+        svc
+    }
+
+    fn bookmarked(svc: &LibraryService) -> Vec<String> {
+        match svc.handle_request(LibraryRequest::ListBookmarked) {
+            LibraryResponse::Tracks(tracks) => tracks
+                .iter()
+                .map(|t| t.content_hash.as_str().to_owned())
+                .collect(),
+            other => panic!("expected Tracks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_bookmark_makes_list_bookmarked_return_the_track() {
+        let svc = service_with_tracks(&["sha256:aaaa", "sha256:bbbb"]);
+        assert!(bookmarked(&svc).is_empty());
+        let resp = svc.handle_request(LibraryRequest::WriteBookmark {
+            hash: ContentHash::new("aaaa"),
+            scope: Some("my-set".to_string()),
+        });
+        assert!(matches!(resp, LibraryResponse::BookmarkWritten), "{resp:?}");
+        assert_eq!(bookmarked(&svc), vec!["sha256:aaaa".to_string()]);
+    }
+
+    #[test]
+    fn write_bookmark_rejects_an_unknown_track_like_the_real_service() {
+        let svc = service_with_tracks(&["sha256:aaaa"]);
+        let resp = svc.handle_request(LibraryRequest::WriteBookmark {
+            hash: ContentHash::new("ffff"),
+            scope: None,
+        });
+        assert!(
+            matches!(
+                resp,
+                LibraryResponse::Error(ProtocolError::TrackNotFound { .. })
+            ),
+            "{resp:?}"
+        );
+        assert!(bookmarked(&svc).is_empty());
+    }
+
+    #[test]
+    fn list_bookmarked_excludes_hidden_tracks() {
+        let svc = service_with_tracks(&["sha256:aaaa"]);
+        svc.handle_request(LibraryRequest::WriteBookmark {
+            hash: ContentHash::new("aaaa"),
+            scope: None,
+        });
+        svc.handle_request(LibraryRequest::TrackDelete {
+            hash: ContentHash::new("sha256:aaaa"),
+        });
+        assert!(bookmarked(&svc).is_empty());
+    }
+
+    #[test]
+    fn a_loaded_bookmark_fact_marks_the_track() {
+        let mut entry = IndexedTrack::new("sha256:aaaa");
+        apply_fact(
+            &mut entry,
+            &MusicValue::Bookmarked {
+                scope: None,
+                timestamp: chrono::Utc::now(),
+            },
+        );
+        assert!(entry.bookmarked);
     }
 
     #[test]

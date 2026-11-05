@@ -65,9 +65,10 @@ impl LibraryBackend {
     pub fn list_tracks(&self, limit: Option<usize>) -> Result<Vec<TrackInfo>, ClientError> {
         match self {
             LibraryBackend::Direct(c) => c.list_tracks(limit),
-            LibraryBackend::Gateway(_) => {
-                interpret_tracks(self.request(&LibraryRequest::ListTracks { limit })?)
-            }
+            LibraryBackend::Gateway(_) => interpret_tracks(
+                self.request(&LibraryRequest::ListTracks { limit })?,
+                "ListTracks",
+            ),
         }
     }
 
@@ -273,6 +274,14 @@ impl LibraryBackend {
         }
     }
 
+    /// List every visible track that carries a live bookmark, in one request.
+    pub fn list_bookmarked(&self) -> Result<Vec<TrackInfo>, ClientError> {
+        interpret_tracks(
+            self.request(&LibraryRequest::ListBookmarked)?,
+            "ListBookmarked",
+        )
+    }
+
     /// Write a bookmark fact for a track.
     pub fn write_bookmark(
         &self,
@@ -476,11 +485,14 @@ fn interpret_status(response: LibraryResponse) -> Result<ServiceStatus, ClientEr
     }
 }
 
-fn interpret_tracks(response: LibraryResponse) -> Result<Vec<TrackInfo>, ClientError> {
+fn interpret_tracks(
+    response: LibraryResponse,
+    operation: &str,
+) -> Result<Vec<TrackInfo>, ClientError> {
     match response {
         LibraryResponse::Tracks(tracks) => Ok(tracks),
         LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
-        _ => Err(unexpected("ListTracks")),
+        _ => Err(unexpected(operation)),
     }
 }
 
@@ -662,6 +674,12 @@ mod tests {
         let content = "sha256:abc  Artist - Title  [3:45]";
         let result = content_to_hashes(content);
         assert_eq!(result, vec![ContentHash::new("sha256:abc")]);
+    }
+
+    #[test]
+    fn interpret_tracks_names_the_operation_on_an_unexpected_response() {
+        let err = interpret_tracks(LibraryResponse::BookmarkWritten, "ListBookmarked").unwrap_err();
+        assert!(err.to_string().contains("ListBookmarked"), "{err}");
     }
 
     #[test]

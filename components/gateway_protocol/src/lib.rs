@@ -168,6 +168,22 @@ mod tests {
     }
 
     #[test]
+    fn library_list_bookmarked_request_roundtrip() {
+        let req = GatewayRequest::Library {
+            request: LibraryRequest::ListBookmarked,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"service\":\"library\""));
+        let parsed: GatewayRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            GatewayRequest::Library {
+                request: LibraryRequest::ListBookmarked
+            }
+        ));
+    }
+
+    #[test]
     fn playback_request_roundtrip() {
         let req = GatewayRequest::Playback {
             request: Command::QueueList,
