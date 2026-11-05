@@ -6050,6 +6050,7 @@ dependencies = [
  "gateway-client",
  "hicli",
  "inbox-utils",
+ "libc",
  "library-ipc-client",
  "library-search",
  "mdma-client",
