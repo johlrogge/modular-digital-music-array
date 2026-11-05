@@ -83,6 +83,9 @@ fn app() -> hicli::App<ctx::Globals, ctx::Ctx> {
             completions::generate_completions, admin, node,
         ]
     }
+    // Fixed, so usage reads `mdma ...` however the binary was invoked (a
+    // symlink, `cargo test`) and the tests see what `run` prints.
+    .bin_name("mdma")
     .about("MDMA CLI - Control the music services")
     .version(env!("CARGO_PKG_VERSION"))
 }

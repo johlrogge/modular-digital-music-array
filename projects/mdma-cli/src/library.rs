@@ -61,7 +61,6 @@ mod dedup;
 /// them to `archive/` in the music directory, keeping their layout. Shows how
 /// many files the archive holds, their total size, and for each its hash, size
 /// and when it was archived. `mdma library archive empty` deletes them for good.
-/// Without a subcommand, `mdma library archive` runs the listing.
 #[hicli::group]
 mod archive;
 

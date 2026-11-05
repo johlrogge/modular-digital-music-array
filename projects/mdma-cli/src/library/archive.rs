@@ -127,7 +127,7 @@ mod tests {
 
     use library_ipc_client::{ArchiveEmptyReport, ArchiveListing};
 
-    use crate::test_support::{parses, usage_error};
+    use crate::test_support::{help, parses, usage_error};
 
     use pretty_assertions::assert_eq;
 
@@ -148,6 +148,20 @@ mod tests {
         }
         usage_error(&["library", "archive", "empty", "x"]);
         usage_error(&["library", "archive", "--yes"]);
+    }
+
+    #[test]
+    fn archive_help_shows_the_default_listing_and_command_usage() {
+        let help = help(&["library", "archive", "--help"]);
+        assert!(
+            help.contains("Usage: mdma library archive [COMMAND ...]"),
+            "{help}"
+        );
+        assert!(
+            help.contains("List the files that duplicate merges moved to the archive"),
+            "{help}"
+        );
+        assert!(help.contains("empty"), "{help}");
     }
 
     fn archive_listing_of_two() -> ArchiveListing {

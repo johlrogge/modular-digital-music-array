@@ -74,8 +74,11 @@ positionals last.
 
 ## Known hicli gaps we accept
 
-- #19 a default with no options is invisible in help (archive list) — mentioned in the group doc.
-- #20, #21, #22, #23 (cosmetic help/test-macro issues).
+hicli 0.3.0 fixed #19 (a default without options is shown in help), #20 and #21 (positional items in help,
+usage lines name the binary), #27 and #28.
+
+- #22, #23 (cosmetic help/test-macro issues).
+- #26: errors do not name the flag.
 - No per-source help page; a typo of a sibling before a default reads as the default's query.
 
 ## Alternatives considered

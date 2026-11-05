@@ -867,7 +867,17 @@ mod tests {
 
     #[test]
     fn source_name_without_command_fails() {
-        usage_error(&["source", "bandcamp"]);
+        let e = usage_error(&["source", "bandcamp"]);
+        assert!(e.contains("expected a command after `bandcamp`"), "{e}");
+    }
+
+    #[test]
+    fn misspelled_per_source_command_gets_a_suggestion() {
+        let e = usage_error(&["source", "bandcamp", "snyc"]);
+        assert!(
+            e.contains("no such command after `bandcamp`: `snyc`, did you mean `sync`?"),
+            "{e}"
+        );
     }
 
     #[test]
