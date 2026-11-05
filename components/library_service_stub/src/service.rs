@@ -53,13 +53,19 @@ struct IndexedTrack {
     role: Option<TrackRole>,
     /// Energy level 1–10.
     energy: Option<EnergyLevel>,
-    /// Set by a loaded `Bookmarked` fact or `WriteBookmark` (assert-only, like cues).
-    bookmarked: bool,
+    /// Live `Bookmarked` values, from loaded facts and `WriteBookmark`. A loaded
+    /// retract removes the matching value, as the real service's provenance does.
+    /// Retracts of every other fact are skipped, not applied.
+    bookmarks: Vec<MusicValue>,
 }
 
 impl IndexedTrack {
     fn is_hidden(&self) -> bool {
         self.deleted_at.is_some()
+    }
+
+    fn is_bookmarked(&self) -> bool {
+        !self.bookmarks.is_empty()
     }
 }
 
@@ -221,7 +227,10 @@ impl LibraryService {
                     .insert(value_str);
 
                 // Apply fact to the indexed track
-                apply_fact(entry, fact.value());
+                match fact.operation() {
+                    stainless_facts::Operation::Assert => apply_fact(entry, fact.value()),
+                    stainless_facts::Operation::Retract => retract_fact(entry, fact.value()),
+                }
             }
         }
 
@@ -259,7 +268,7 @@ impl LibraryService {
             }
 
             LibraryRequest::ListBookmarked => {
-                LibraryResponse::Tracks(self.tracks_where(|t| t.bookmarked, None))
+                LibraryResponse::Tracks(self.tracks_where(IndexedTrack::is_bookmarked, None))
             }
 
             LibraryRequest::GetTrack { hash } => match self.get_track(&hash) {
@@ -385,7 +394,7 @@ impl LibraryService {
                 )
             }
 
-            LibraryRequest::WriteBookmark { hash, .. } => {
+            LibraryRequest::WriteBookmark { hash, scope } => {
                 let full_hash = match self.resolve_hash(&hash) {
                     Ok(h) => h,
                     Err(e) => return LibraryResponse::Error(e),
@@ -395,7 +404,10 @@ impl LibraryService {
                     .iter_mut()
                     .find(|t| t.content_hash == full_hash.as_str())
                 {
-                    t.bookmarked = true;
+                    t.bookmarks.push(MusicValue::Bookmarked {
+                        scope,
+                        timestamp: chrono::Utc::now(),
+                    });
                 }
                 LibraryResponse::BookmarkWritten
             }
@@ -611,13 +623,7 @@ impl LibraryService {
 
     /// Search tracks against a `TrackQuery` (hidden tracks excluded).
     fn search_tracks(&self, query: &TrackQuery) -> Vec<TrackInfo> {
-        let tracks = self.tracks.lock().unwrap();
-        tracks
-            .iter()
-            .filter(|t| !t.is_hidden())
-            .filter(|t| matches_query(query, &t.as_fields()))
-            .map(|t| t.to_track_info())
-            .collect()
+        self.tracks_where(|t| matches_query(query, &t.as_fields()), None)
     }
 }
 
@@ -668,8 +674,18 @@ fn apply_fact(entry: &mut IndexedTrack, value: &MusicValue) {
         }
         MusicValue::Role(v) => entry.role = Some(*v),
         MusicValue::Energy(v) => entry.energy = Some(*v),
-        MusicValue::Bookmarked { .. } => entry.bookmarked = true,
+        MusicValue::Bookmarked { .. } => entry.bookmarks.push(value.clone()),
         _ => {} // ignore all other facts (key, format, cover art, timestamps, etc.)
+    }
+}
+
+/// Apply a loaded retraction. Only bookmarks honour it: the first equal value is
+/// removed. Every other retraction is skipped.
+fn retract_fact(entry: &mut IndexedTrack, value: &MusicValue) {
+    if let MusicValue::Bookmarked { .. } = value {
+        if let Some(i) = entry.bookmarks.iter().position(|b| b == value) {
+            entry.bookmarks.remove(i);
+        }
     }
 }
 
@@ -779,27 +795,78 @@ mod tests {
     #[test]
     fn list_bookmarked_excludes_hidden_tracks() {
         let svc = service_with_tracks(&["sha256:aaaa"]);
-        svc.handle_request(LibraryRequest::WriteBookmark {
+        let resp = svc.handle_request(LibraryRequest::WriteBookmark {
             hash: ContentHash::new("aaaa"),
             scope: None,
         });
+        assert!(matches!(resp, LibraryResponse::BookmarkWritten), "{resp:?}");
         svc.handle_request(LibraryRequest::TrackDelete {
             hash: ContentHash::new("sha256:aaaa"),
         });
         assert!(bookmarked(&svc).is_empty());
     }
 
+    /// Build a stub from a facts.jsonl holding `facts` (one entity), in a fresh
+    /// temp dir that is removed afterwards.
+    fn service_from_facts(
+        test: &str,
+        facts: &[(MusicValue, stainless_facts::Operation)],
+    ) -> Arc<LibraryService> {
+        use music_facts::{FactOrigin, FactSource};
+        use stainless_facts::{Fact, FactStreamWriter};
+
+        let dir = std::env::temp_dir().join(format!("mdma-stub-{test}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let hash = ContentHash::new("sha256:aaaa");
+        let ts = chrono::Utc::now();
+        let batch: Vec<Fact<ContentHash, MusicValue, FactSource>> = facts
+            .iter()
+            .map(|(v, op)| Fact::new(hash.clone(), v.clone(), ts, source.clone(), *op))
+            .collect();
+        FactStreamWriter::open(dir.join("facts.jsonl"))
+            .unwrap()
+            .write_batch(&batch)
+            .unwrap();
+        let svc = LibraryService::new(
+            PathBuf::from("/nonexistent"),
+            dir.clone(),
+            "ipc:///dev/null",
+        )
+        .expect("stub from facts");
+        std::fs::remove_dir_all(&dir).unwrap();
+        svc
+    }
+
+    fn a_bookmark() -> MusicValue {
+        MusicValue::Bookmarked {
+            scope: None,
+            timestamp: chrono::DateTime::from_timestamp(1_767_225_600, 0).unwrap(),
+        }
+    }
+
     #[test]
     fn a_loaded_bookmark_fact_marks_the_track() {
-        let mut entry = IndexedTrack::new("sha256:aaaa");
-        apply_fact(
-            &mut entry,
-            &MusicValue::Bookmarked {
-                scope: None,
-                timestamp: chrono::Utc::now(),
-            },
+        use stainless_facts::Operation;
+        let svc = service_from_facts("bookmark-assert", &[(a_bookmark(), Operation::Assert)]);
+        assert_eq!(bookmarked(&svc), vec!["sha256:aaaa".to_string()]);
+    }
+
+    #[test]
+    fn a_loaded_bookmark_retract_unmarks_the_track() {
+        use stainless_facts::Operation;
+        let svc = service_from_facts(
+            "bookmark-retract",
+            &[
+                (
+                    MusicValue::Title(music_facts::Title::new("Kept")),
+                    Operation::Assert,
+                ),
+                (a_bookmark(), Operation::Assert),
+                (a_bookmark(), Operation::Retract),
+            ],
         );
-        assert!(entry.bookmarked);
+        assert!(bookmarked(&svc).is_empty());
     }
 
     #[test]

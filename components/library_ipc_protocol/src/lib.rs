@@ -242,7 +242,7 @@ pub enum LibraryRequest {
     ListTracks { limit: Option<usize> },
 
     /// List every visible track that carries a live bookmark, scoped or not.
-    /// Answered with `LibraryResponse::Tracks`.
+    /// Answered with `LibraryResponse::Tracks`, order unspecified.
     ListBookmarked,
 
     /// Get a specific track by content hash (supports partial hashes).
