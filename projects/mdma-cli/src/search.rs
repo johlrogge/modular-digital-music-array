@@ -260,7 +260,7 @@ impl Arg for PlayedFilter {
 /// Search for tracks by filter or free text
 #[hicli::command(default)]
 pub(crate) fn query(args: SearchArgs, ctx: &Ctx) -> Result<()> {
-    let library = ctx.library();
+    let library = ctx.library()?;
     let no_stdin = args.no_stdin;
     let track_query = build_track_query(args);
     search_tracks(&library, &track_query, no_stdin)
@@ -435,7 +435,7 @@ fn search_tracks(library: &LibraryBackend, query: &TrackQuery, no_stdin: bool) -
 pub(crate) fn fact_values_for(fact_type: FactTypeArg, ctx: &Ctx) -> Result<()> {
     use std::io::IsTerminal;
     let FactTypeArg(fact_type) = fact_type;
-    let library = ctx.library();
+    let library = ctx.library()?;
     match library.get_fact_values(fact_type.as_str()) {
         Ok(values) => {
             if std::io::stdout().is_terminal() {

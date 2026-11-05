@@ -187,7 +187,7 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
         format,
         replace,
     } = args;
-    let library = ctx.library();
+    let library = ctx.library()?;
     let output = output.unwrap_or_else(|| {
         dirs::audio_dir()
             .map(|p| p.join("mdma_rekordbox"))
@@ -569,7 +569,7 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
         dry_run,
         path,
     } = args;
-    let library = ctx.library();
+    let library = ctx.library()?;
 
     // 1. Read and parse XML file
     let ExistingFileArg(path) = path;

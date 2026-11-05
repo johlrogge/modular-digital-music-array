@@ -138,7 +138,7 @@ fn find_dedup_group<'a>(
 #[hicli::command(default)]
 pub(crate) fn scan(apply: Apply, ctx: &Ctx) -> Result<()> {
     let Apply(apply) = apply;
-    let library = ctx.library();
+    let library = ctx.library()?;
     let report = match library.dedup_scan(apply) {
         Ok(r) => r,
         Err(e) => {
@@ -178,7 +178,7 @@ pub(crate) fn merge(args: MergeArgs, ctx: &Ctx) -> Result<()> {
         losers,
     } = args;
     let losers: Vec<ContentHash> = losers.into_iter().map(|TrackArg(h)| h).collect();
-    let library = ctx.library();
+    let library = ctx.library()?;
     if !yes {
         if let Ok(report) = library.dedup_scan(false) {
             // Every prefix must name at most one group before anything is confirmed.

@@ -20,7 +20,7 @@ pub(crate) struct ReplaceArgs {
 /// The track is hidden from list/search results. To undo, use `mdma library track restore <hash>`.
 #[hicli::command]
 pub(crate) fn delete(hash: TrackArg, ctx: &Ctx) -> Result<()> {
-    let library = ctx.library();
+    let library = ctx.library()?;
     let TrackArg(ch) = hash;
     match library.track_delete(&ch) {
         Ok(()) => {
@@ -40,7 +40,7 @@ pub(crate) fn delete(hash: TrackArg, ctx: &Ctx) -> Result<()> {
 /// Restore a soft-deleted track (retracts the Deleted fact)
 #[hicli::command]
 pub(crate) fn restore(hash: TrackArg, ctx: &Ctx) -> Result<()> {
-    let library = ctx.library();
+    let library = ctx.library()?;
     let TrackArg(ch) = hash;
     match library.track_restore(&ch) {
         Ok(()) => {
@@ -71,7 +71,7 @@ pub(crate) fn replace(args: ReplaceArgs, ctx: &Ctx) -> Result<()> {
         old_hash: TrackArg(old_hash),
         new_file,
     } = args;
-    let library = ctx.library();
+    let library = ctx.library()?;
     match library.track_replace(&old_hash, &new_file) {
         Ok((new_hash, playlists)) => {
             println!("{} -> {}", old_hash, new_hash.as_str());
@@ -93,7 +93,7 @@ pub(crate) fn replace(args: ReplaceArgs, ctx: &Ctx) -> Result<()> {
 pub(crate) fn orphans(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::OrphanReason;
 
-    let library = ctx.library();
+    let library = ctx.library()?;
     match library.track_orphans() {
         Ok(orphans) => {
             if orphans.is_empty() {

@@ -119,7 +119,7 @@ fn playlist_names(
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{DurationSeconds, LibraryRequest};
 
-    let library = ctx.library();
+    let library = ctx.library()?;
     let names = expect_library(
         library.request(&LibraryRequest::PlaylistList),
         playlist_names,
@@ -163,7 +163,7 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
 pub(crate) fn get(name: OptPlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     let OptPlaylistArg(name) = name;
-    let library = ctx.library();
+    let library = ctx.library()?;
     match name {
         Some(PlaylistArg(pname)) => {
             let content = expect_library(
@@ -212,7 +212,7 @@ pub(crate) fn contains(mode: ContainsMode, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     use std::collections::HashSet;
 
-    let library = ctx.library();
+    let library = ctx.library()?;
 
     // 1. Read hashes from stdin
     let input_hashes = read_hashes();
@@ -267,7 +267,7 @@ pub(crate) fn contains(mode: ContainsMode, ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn new(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
-    let library = ctx.library();
+    let library = ctx.library()?;
     let PlaylistArg(pname) = name;
     let content = read_stdin_to_string();
     expect_library(
@@ -285,7 +285,7 @@ pub(crate) fn new(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn append(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
-    let library = ctx.library();
+    let library = ctx.library()?;
     let PlaylistArg(pname) = name;
     let content = read_stdin_to_string();
     expect_library(
@@ -303,7 +303,7 @@ pub(crate) fn append(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn replace(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
-    let library = ctx.library();
+    let library = ctx.library()?;
     let PlaylistArg(pname) = name;
     let content = read_stdin_to_string();
     expect_library(
@@ -322,7 +322,7 @@ pub(crate) fn replace(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
 pub(crate) fn edit(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{LibraryRequest, LibraryResponse, ProtocolError};
 
-    let library = ctx.library();
+    let library = ctx.library()?;
     let PlaylistArg(pname) = name;
 
     // 1. Get current content (or start empty if not found)
@@ -360,7 +360,7 @@ pub(crate) fn edit(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn remove(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{LibraryRequest, LibraryResponse};
-    let library = ctx.library();
+    let library = ctx.library()?;
     let PlaylistArg(pname) = name;
     let response = library.request(&LibraryRequest::PlaylistRemove {
         name: pname.clone(),
@@ -385,7 +385,7 @@ pub(crate) fn remove(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn rename(args: RenameArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{LibraryRequest, LibraryResponse};
-    let library = ctx.library();
+    let library = ctx.library()?;
     let PlaylistArg(from_name) = args.from;
     let PlaylistArg(to_name) = args.to;
     let response = library.request(&LibraryRequest::PlaylistRename {

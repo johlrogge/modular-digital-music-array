@@ -405,6 +405,16 @@ mod tests {
     }
 
     #[test]
+    fn run_exits_one_when_the_service_cannot_be_reached() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = format!("ipc://{}/none.sock", dir.path().display());
+        let code = app().run_with_args(["--socket", socket.as_str(), "ping"], |globals| {
+            Ok(Ctx::with_target(globals, node_discovery::Target::LocalIpc))
+        });
+        assert_eq!(code, 1);
+    }
+
+    #[test]
     fn version_flag_reports_the_package_version() {
         // run_with_args prints to the real stdout, so the text is read from the
         // parse outcome.

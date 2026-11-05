@@ -75,7 +75,7 @@ fn identity_already_running_message(running_pcm: bool, requested_pcm: bool) -> S
 pub(crate) fn backfill(args: BackfillArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::IdentityBackfillStart;
     let BackfillArgs { pcm, no_wait } = args;
-    let library = ctx.library();
+    let library = ctx.library()?;
     match library.identity_backfill(pcm) {
         Ok(IdentityBackfillStart::Started(p)) => {
             println!("Identity backfill started: {} tracks to process", p.total)
@@ -126,7 +126,7 @@ pub(crate) fn backfill(args: BackfillArgs, ctx: &Ctx) -> Result<()> {
 /// Show progress of the identity-hash backfill
 #[hicli::command]
 pub(crate) fn status(ctx: &Ctx) -> Result<()> {
-    let library = ctx.library();
+    let library = ctx.library()?;
     match library.identity_backfill_status() {
         Ok(s) => {
             println!("{}", format_identity_status(&s));
@@ -143,7 +143,7 @@ pub(crate) fn status(ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn cancel(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::IdentityBackfillStatus;
-    let library = ctx.library();
+    let library = ctx.library()?;
     match library.identity_backfill_cancel() {
         Ok(IdentityBackfillStatus::Running(_)) => {
             println!(

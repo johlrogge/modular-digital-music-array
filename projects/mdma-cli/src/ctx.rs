@@ -54,21 +54,6 @@ pub struct Globals {
 const ADMIN_NEEDS_GATEWAY: &str =
     "admin commands need a gateway; use --node (or MDMA_NODE) to name the node";
 
-/// Bridge for the connecting methods, which still exit (until they return
-/// `Result`): print a node resolution failure as it always was, and exit 1.
-fn gateway_or_exit(gateway: Result<Option<String>>) -> Option<String> {
-    gateway.unwrap_or_else(|e| {
-        let text = e.to_string();
-        // A bad MDMA_NODE used to carry an `error: ` prefix; the other failures did not.
-        if text.starts_with(node::INVALID_ENV_NODE) {
-            eprintln!("error: {text}");
-        } else {
-            eprintln!("{text}");
-        }
-        std::process::exit(1);
-    })
-}
-
 pub struct Ctx {
     globals: Globals,
     local_ipc: bool,
@@ -156,49 +141,33 @@ impl Ctx {
     }
 
     /// Connect to the library backend (gateway or direct).
-    pub fn library(&self) -> LibraryBackend {
-        let gateway = gateway_or_exit(self.gateway());
+    pub fn library(&self) -> Result<LibraryBackend> {
+        let gateway = self.gateway()?;
         let socket = self
             .globals
             .socket
             .as_deref()
             .unwrap_or(DEFAULT_LIBRARY_SOCKET);
-        match LibraryBackend::connect(gateway.as_deref(), socket) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("Failed to connect to library: {}", e);
-                if gateway.is_none() {
-                    eprintln!("Is mdma-library running?");
-                }
-                std::process::exit(1);
-            }
-        }
+        LibraryBackend::connect(gateway.as_deref(), socket)
+            .map_err(|e| connect_failed("library", &e, gateway.is_none()))
     }
 
     /// Connect to the playback backend (gateway or direct).
-    pub fn playback(&self) -> PlaybackBackend {
-        let gateway = gateway_or_exit(self.gateway());
+    pub fn playback(&self) -> Result<PlaybackBackend> {
+        let gateway = self.gateway()?;
         let socket = self
             .globals
             .playback_socket
             .as_deref()
             .unwrap_or(DEFAULT_PLAYBACK_SOCKET);
-        match PlaybackBackend::connect(gateway.as_deref(), socket) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("Failed to connect to playback: {}", e);
-                if gateway.is_none() {
-                    eprintln!("Is mdma-playback running?");
-                }
-                std::process::exit(1);
-            }
-        }
+        PlaybackBackend::connect(gateway.as_deref(), socket)
+            .map_err(|e| connect_failed("playback", &e, gateway.is_none()))
     }
 
     /// Connect to a source, via gateway or direct IPC, with the default request
     /// timeout or a custom one.
-    pub fn source(&self, name: &str, timeout: Option<Duration>) -> SourceClient {
-        let gateway = gateway_or_exit(self.gateway());
+    pub fn source(&self, name: &str, timeout: Option<Duration>) -> Result<SourceClient> {
+        let gateway = self.gateway()?;
         let connected = match timeout {
             Some(t) => SourceClient::connect_with_timeout(
                 gateway.as_deref(),
@@ -208,17 +177,14 @@ impl Ctx {
             ),
             None => SourceClient::connect(gateway.as_deref(), &self.globals.sources_dir, name),
         };
-        match connected {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("{}", e);
-                if gateway.is_none() {
-                    eprintln!("Is mdma-{} running?", name);
-                }
-                eprintln!("Hint: 'mdma source list' shows the available sources");
-                std::process::exit(1);
-            }
-        }
+        connected.map_err(|e| {
+            let running = if gateway.is_none() {
+                format!("\nIs mdma-{name} running?")
+            } else {
+                String::new()
+            };
+            eyre!("{e}{running}\nHint: 'mdma source list' shows the available sources")
+        })
     }
 
     /// The directory holding the source sockets (direct mode).
@@ -228,19 +194,19 @@ impl Ctx {
 
     /// Connect to the admin service via gateway.
     ///
-    /// Exits with a message when there is no gateway to connect to (local IPC).
-    pub fn admin(&self) -> GatewayClient {
-        let gateway = gateway_or_exit(self.gateway()).unwrap_or_else(|| {
-            eprintln!("error: {ADMIN_NEEDS_GATEWAY}");
-            std::process::exit(1);
-        });
-        match GatewayClient::connect(&gateway) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Failed to connect to gateway: {}", e);
-                std::process::exit(1);
-            }
-        }
+    /// Fails with a message when there is no gateway to connect to (local IPC).
+    pub fn admin(&self) -> Result<GatewayClient> {
+        let gateway = self.gateway()?.ok_or_else(|| eyre!(ADMIN_NEEDS_GATEWAY))?;
+        GatewayClient::connect(&gateway).map_err(|e| eyre!("Failed to connect to gateway: {e}"))
+    }
+}
+
+/// "Failed to connect to <what>: <error>", plus a hint when talking directly.
+fn connect_failed(what: &str, err: &dyn std::fmt::Display, direct: bool) -> color_eyre::Report {
+    if direct {
+        eyre!("Failed to connect to {what}: {err}\nIs mdma-{what} running?")
+    } else {
+        eyre!("Failed to connect to {what}: {err}")
     }
 }
 
@@ -308,6 +274,106 @@ mod tests {
         let ctx = Ctx::with_target(globals(), Target::LocalIpc);
         assert_eq!(ctx.gateway().unwrap(), None);
         assert_eq!(ctx.event_gateway().unwrap(), None);
+    }
+
+    fn local_ctx_in(dir: &tempfile::TempDir) -> Ctx {
+        let dir = dir.path().to_str().expect("utf-8 path");
+        Ctx::with_target(
+            Globals {
+                node: None,
+                socket: Some(format!("ipc://{dir}/none.sock")),
+                playback_socket: Some(format!("ipc://{dir}/none-playback.sock")),
+                sources_dir: dir.to_string(),
+            },
+            Target::LocalIpc,
+        )
+    }
+
+    /// A node on this machine that refuses connections: a port that was bound, then freed.
+    fn dead_node() -> Target {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind a free port")
+            .local_addr()
+            .expect("local address")
+            .port();
+        Target::Remote(node_discovery::RemoteTarget {
+            host: "localhost".to_string(),
+            ip: Some(Ipv4Addr::LOCALHOST),
+            port,
+            source: node_discovery::Source::Cache,
+        })
+    }
+
+    #[test]
+    fn library_connect_failure_over_ipc_says_what_to_start() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let text = failure_text(local_ctx_in(&dir).library());
+        assert_eq!(
+            text,
+            format!(
+                "Failed to connect to library: connection error: Connection failed: \
+                 Failed to connect to ipc://{}/none.sock: Connection refused\n\
+                 Is mdma-library running?",
+                dir.path().display()
+            )
+        );
+    }
+
+    #[test]
+    fn playback_connect_failure_over_ipc_says_what_to_start() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let text = failure_text(local_ctx_in(&dir).playback());
+        assert_eq!(
+            text,
+            format!(
+                "Failed to connect to playback: connection error: Connection failed: \
+                 Failed to connect to ipc://{}/none-playback.sock: Connection refused\n\
+                 Is mdma-playback running?",
+                dir.path().display()
+            )
+        );
+    }
+
+    #[test]
+    fn source_connect_failure_names_the_source() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let text = failure_text(local_ctx_in(&dir).source("bandcamp", None));
+        assert_eq!(
+            text,
+            format!(
+                "connection error: Connection failed: \
+                 Failed to connect to ipc://{}/bandcamp.sock: Connection refused\n\
+                 Is mdma-bandcamp running?\n\
+                 Hint: 'mdma source list' shows the available sources",
+                dir.path().display()
+            )
+        );
+    }
+
+    #[test]
+    fn admin_needs_a_gateway_over_ipc() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert_eq!(
+            failure_text(local_ctx_in(&dir).admin()),
+            "admin commands need a gateway; use --node (or MDMA_NODE) to name the node"
+        );
+    }
+
+    #[test]
+    fn library_connect_failure_to_a_dead_node_has_no_ipc_hint() {
+        let target = dead_node();
+        let Target::Remote(remote) = &target else {
+            unreachable!("dead_node is remote")
+        };
+        let port = remote.port;
+        let ctx = Ctx::with_target(globals(), target);
+        assert_eq!(
+            failure_text(ctx.library()),
+            format!(
+                "Failed to connect to library: connection error: Connection failed: \
+                 Failed to connect to tcp://127.0.0.1:{port}: Connection refused"
+            )
+        );
     }
 
     #[test]

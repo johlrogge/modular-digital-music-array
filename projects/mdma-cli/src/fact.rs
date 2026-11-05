@@ -249,7 +249,7 @@ pub(crate) fn add(args: FactArgs, ctx: &Ctx) -> Result<()> {
         value: FactValueArg { raw, value },
         hash: TrackArg(hash),
     } = args;
-    let library = ctx.library();
+    let library = ctx.library()?;
     match library.write_fact(&hash, value) {
         Ok(()) => {
             println!("Added fact for {}: {:?} = {}", hash, field, raw);
@@ -270,7 +270,7 @@ pub(crate) fn retract(args: FactArgs, ctx: &Ctx) -> Result<()> {
         value: FactValueArg { raw, value },
         hash: TrackArg(hash),
     } = args;
-    let library = ctx.library();
+    let library = ctx.library()?;
     match library.retract_fact(&hash, value) {
         Ok(()) => {
             println!("Retracted fact for {}: {:?} = {}", hash, field, raw);

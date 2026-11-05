@@ -188,7 +188,7 @@ impl SortDirection {
 /// Check if the service is running
 #[hicli::command]
 pub(crate) fn ping(ctx: &Ctx) -> Result<()> {
-    let library = ctx.library();
+    let library = ctx.library()?;
     match library.ping() {
         Ok(()) => {
             println!("pong - service is alive");
@@ -201,7 +201,7 @@ pub(crate) fn ping(ctx: &Ctx) -> Result<()> {
 /// Get service status
 #[hicli::command]
 pub(crate) fn status(ctx: &Ctx) -> Result<()> {
-    let library = ctx.library();
+    let library = ctx.library()?;
     match library.status() {
         Ok(status) => {
             println!("MDMA Library Service v{}", status.version);
@@ -220,7 +220,7 @@ pub(crate) fn status(ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn list(limit: OptLimitArg, ctx: &Ctx) -> Result<()> {
     let OptLimitArg(limit) = limit;
-    let library = ctx.library();
+    let library = ctx.library()?;
     match library.list_tracks(limit.map(|LimitArg(n)| n.get())) {
         Ok(tracks) => {
             if tracks.is_empty() {
@@ -248,7 +248,7 @@ pub(crate) fn list(limit: OptLimitArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn get(hash: TrackArg, ctx: &Ctx) -> Result<()> {
     let TrackArg(content_hash) = hash;
-    let library = ctx.library();
+    let library = ctx.library()?;
     match library.get_track(&content_hash) {
         Ok(track) => {
             println!("Track: {}", track.content_hash.as_str());
@@ -290,7 +290,7 @@ pub(crate) fn get(hash: TrackArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn facts(hash: TrackArg, ctx: &Ctx) -> Result<()> {
     let TrackArg(content_hash) = hash;
-    let library = ctx.library();
+    let library = ctx.library()?;
     match library.get_facts(&content_hash) {
         Ok((full_hash, facts)) => {
             println!("Facts for: {}", full_hash.as_str());
@@ -344,7 +344,7 @@ fn compare_optional<T: Ord>(
 ///   cat friday.plist | mdma sort title -a | mdma sort artist -a > sorted.plist
 #[hicli::command]
 pub(crate) fn sort(direction: SortDirection, field: SortField, ctx: &Ctx) -> Result<()> {
-    let library = ctx.library();
+    let library = ctx.library()?;
 
     let hashes = require_stdin_hashes();
     let mut tracks = resolve_tracks_skip_errors(&library, hashes);
@@ -399,8 +399,8 @@ pub(crate) fn sort(direction: SortDirection, field: SortField, ctx: &Ctx) -> Res
 pub(crate) fn bookmark(scope: OptScopeArg, hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
     let OptScopeArg(scope) = scope;
     let OptTrackArg(hash) = hash;
-    let library = ctx.library();
-    let playback = ctx.playback();
+    let library = ctx.library()?;
+    let playback = ctx.playback()?;
     let content_hash = match hash {
         Some(TrackArg(h)) => h,
         None => match playback.now_playing() {
@@ -425,7 +425,7 @@ pub(crate) fn bookmark(scope: OptScopeArg, hash: OptTrackArg, ctx: &Ctx) -> Resu
 /// List all bookmarked tracks
 #[hicli::command]
 pub(crate) fn bookmarks(ctx: &Ctx) -> Result<()> {
-    let library = ctx.library();
+    let library = ctx.library()?;
     let tracks = match library.list_tracks(None) {
         Ok(t) => t,
         Err(e) => handle_error(e),
@@ -472,7 +472,7 @@ pub(crate) fn view(columns: ViewColumns, ctx: &Ctx) -> Result<()> {
     use std::io::IsTerminal;
 
     let ViewColumns(columns) = columns;
-    let library = ctx.library();
+    let library = ctx.library()?;
 
     // Read hashes from stdin (same format as `mdma playlist append` / `mdma search` output).
     let hashes = read_hashes();

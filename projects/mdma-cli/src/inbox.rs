@@ -23,7 +23,7 @@ impl_arg!(InboxFileArg, positional "FILENAME", "File name in inbox");
 /// List files in inbox
 #[hicli::command]
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
-    let library = ctx.library();
+    let library = ctx.library()?;
     match library.inbox_queue() {
         Ok(files) => {
             if files.is_empty() {
@@ -46,7 +46,7 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
 /// Delete a file from inbox without ingesting
 #[hicli::command]
 pub(crate) fn delete(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
-    let library = ctx.library();
+    let library = ctx.library()?;
     let InboxFileArg(path) = file;
 
     match library.delete_inbox_file(&path) {
@@ -68,7 +68,7 @@ pub(crate) fn delete(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
 /// Ingest a specific file from inbox
 #[hicli::command]
 pub(crate) fn ingest(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
-    let library = ctx.library();
+    let library = ctx.library()?;
     let InboxFileArg(path) = file;
 
     println!("Ingesting: {}", path.as_str());
@@ -98,7 +98,7 @@ pub(crate) fn ingest(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
 /// Ingest all files in inbox
 #[hicli::command]
 pub(crate) fn ingest_all(ctx: &Ctx) -> Result<()> {
-    let library = ctx.library();
+    let library = ctx.library()?;
     println!("Ingesting all files in inbox...");
 
     match library.ingest_all() {

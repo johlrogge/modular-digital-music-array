@@ -42,7 +42,7 @@ mod service_mode {
     /// Show current EEPROM boot order, armed state, and PCIE_PROBE
     #[hicli::command]
     pub(crate) fn status(ctx: &Ctx) -> Result<()> {
-        let admin = ctx.admin();
+        let admin = ctx.admin()?;
         let (boot_order, service_mode_armed, pcie_probe) = admin_call(
             &admin,
             &AdminRequest::ServiceModeStatus,
@@ -82,7 +82,7 @@ mod service_mode {
     /// Arm service mode: next reboot will boot from SD (beacon)
     #[hicli::command]
     pub(crate) fn enable(ctx: &Ctx) -> Result<()> {
-        let admin = ctx.admin();
+        let admin = ctx.admin()?;
         admin_call_ok(&admin, &AdminRequest::ServiceModeEnable);
         println!("Service mode armed.");
         println!(
@@ -95,7 +95,7 @@ mod service_mode {
     /// Disarm service mode: restore NVMe-first boot order
     #[hicli::command]
     pub(crate) fn disable(ctx: &Ctx) -> Result<()> {
-        let admin = ctx.admin();
+        let admin = ctx.admin()?;
         admin_call_ok(&admin, &AdminRequest::ServiceModeDisable);
         println!("Service mode disarmed. NVMe-first boot order restored.");
         Ok(())
@@ -105,7 +105,7 @@ mod service_mode {
 /// Report whether the host can safely reboot into its installed kernel
 #[hicli::command]
 pub(crate) fn boot_health(ctx: &Ctx) -> Result<()> {
-    let admin = ctx.admin();
+    let admin = ctx.admin()?;
     let verdict = admin_call(
         &admin,
         &AdminRequest::BootHealth,
@@ -135,7 +135,7 @@ impl_arg!(
 #[hicli::command]
 pub(crate) fn reboot(force: Force, ctx: &Ctx) -> Result<()> {
     let Force(force) = force;
-    let admin = ctx.admin();
+    let admin = ctx.admin()?;
     admin_call_ok(&admin, &AdminRequest::Reboot { force });
     println!("Reboot initiated. Connection will drop within ~2 seconds.");
     Ok(())

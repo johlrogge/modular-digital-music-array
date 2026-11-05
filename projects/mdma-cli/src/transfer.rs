@@ -280,7 +280,7 @@ pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<()> {
     }
 
     // 4. Ingest each file via the library service
-    let library = ctx.library();
+    let library = ctx.library()?;
     let mut success_count = 0;
     let mut fail_count = 0;
 
@@ -729,7 +729,7 @@ fn resolve_export_format(blob_path: Option<&str>, formats: &ExportFormats) -> Ex
 #[hicli::command]
 pub(crate) fn export(args: ExportArgs, ctx: &Ctx) -> Result<()> {
     let ExportArgs { formats, output } = args;
-    let library = ctx.library();
+    let library = ctx.library()?;
 
     let (node, node_ip) = ctx.require_node()?;
 

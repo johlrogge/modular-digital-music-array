@@ -32,7 +32,7 @@ pub(crate) fn subscribe(topic: OptTopicArg, ctx: &Ctx) -> Result<()> {
             std::process::exit(1);
         }
     };
-    let library = ctx.library();
+    let library = ctx.library()?;
     listen(&addr, topic.as_deref(), Some(&library))
 }
 

@@ -158,7 +158,7 @@ fn item_not_found(identifier: &str, source: &str) -> ! {
 #[hicli::command(curried)]
 pub(crate) fn sync(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
-    let source = ctx.source(name, None);
+    let source = ctx.source(name, None)?;
     println!("Syncing {}...", name);
     let (total_items, new_items) =
         source_call(
@@ -182,7 +182,7 @@ pub(crate) fn sync(source: SourceArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command(curried)]
 pub(crate) fn status(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
-    let source = ctx.source(name, None);
+    let source = ctx.source(name, None)?;
     let status = source_call(
         &source,
         name,
@@ -222,7 +222,7 @@ pub(crate) fn status(source: SourceArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command(curried)]
 pub(crate) fn downloads(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
-    let source = ctx.source(name, None);
+    let source = ctx.source(name, None)?;
     let downloads =
         source_call(
             &source,
@@ -272,7 +272,7 @@ pub(crate) fn downloads(source: SourceArg, ctx: &Ctx) -> Result<()> {
 pub(crate) fn cancel(source: SourceArg, id: DownloadArg, ctx: &Ctx) -> Result<()> {
     let DownloadArg(id) = id;
     let name = source.as_str();
-    let source = ctx.source(name, None);
+    let source = ctx.source(name, None)?;
     let request = SourceRequest::CancelDownload { id: id.clone() };
     source_call(&source, name, &request, |response| match response {
         SourceResponse::Cancelled { .. } => Ok(()),
@@ -286,7 +286,7 @@ pub(crate) fn cancel(source: SourceArg, id: DownloadArg, ctx: &Ctx) -> Result<()
 #[hicli::command(curried)]
 pub(crate) fn pause(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
-    let source = ctx.source(name, None);
+    let source = ctx.source(name, None)?;
     source_call(
         &source,
         name,
@@ -304,7 +304,7 @@ pub(crate) fn pause(source: SourceArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command(curried)]
 pub(crate) fn resume(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
-    let source = ctx.source(name, None);
+    let source = ctx.source(name, None)?;
     source_call(
         &source,
         name,
@@ -323,7 +323,7 @@ pub(crate) fn resume(source: SourceArg, ctx: &Ctx) -> Result<()> {
 pub(crate) fn resync(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) -> Result<()> {
     let ItemIdArg(identifier) = identifier;
     let name = source.as_str();
-    let source = ctx.source(name, None);
+    let source = ctx.source(name, None)?;
     println!("Requesting resync of {} from {}...", identifier, name);
     let request = SourceRequest::ResyncItem { identifier };
     let (identifier, tracks_queued) =
@@ -349,7 +349,7 @@ pub(crate) fn resync(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) -> Res
 pub(crate) fn check_item(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) -> Result<()> {
     let ItemIdArg(identifier) = identifier;
     let name = source.as_str();
-    let source = ctx.source(name, None);
+    let source = ctx.source(name, None)?;
     let request = SourceRequest::CheckItem { identifier };
     let (identifier, live_track_count, stored_track_count, stale) =
         source_call(&source, name, &request, |response| match response {
@@ -380,10 +380,10 @@ pub(crate) fn check_item(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) ->
 pub(crate) fn check_updates(source: SourceArg, apply: ApplyUpdates, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
     let apply = apply.0;
-    let source = ctx.source(name, None);
+    let source = ctx.source(name, None)?;
     // Fetch all ItemId values from the library for this source.
     // We use GetFactValues("ItemId") — returns all ItemId values the library knows about.
-    let library = ctx.library();
+    let library = ctx.library()?;
     let all_item_ids = match library.request(&library_ipc_client::LibraryRequest::GetFactValues {
         fact_type: library_ipc_client::FactType::new("ItemId"),
     }) {
@@ -526,7 +526,7 @@ fn handle_playlist_source_error(source: &str, feature: &str, err: &SourceError) 
 #[hicli::command(curried)]
 pub(crate) fn playlists(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
-    let source = ctx.source(name, Some(SOURCE_LISTING_TIMEOUT));
+    let source = ctx.source(name, Some(SOURCE_LISTING_TIMEOUT))?;
     let playlists =
         source_call(
             &source,
@@ -601,7 +601,7 @@ pub(crate) fn import_playlist(
     ctx: &Ctx,
 ) -> Result<()> {
     let name = source.as_str();
-    let source = ctx.source(name, None);
+    let source = ctx.source(name, None)?;
     let ImportPlaylistArgs {
         name: playlist_name,
         dry_run,
@@ -648,7 +648,7 @@ pub(crate) fn import_playlist(
 #[hicli::command(curried)]
 pub(crate) fn import_status(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
-    let source = ctx.source(name, None);
+    let source = ctx.source(name, None)?;
     let status =
         source_call(
             &source,

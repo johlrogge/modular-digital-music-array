@@ -10,7 +10,7 @@ use color_eyre::Result;
 #[hicli::command]
 pub(crate) fn reindex_covers(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{LibraryRequest, LibraryResponse};
-    let library = ctx.library();
+    let library = ctx.library()?;
     let response = library.request(&LibraryRequest::ReindexCovers);
     match response {
         Ok(LibraryResponse::IngestResult(result)) => match result {
