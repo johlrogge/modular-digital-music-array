@@ -1,6 +1,3 @@
-// hicli emits `#[path = "source.rs"]` for the group, which makes this file a
-// mod-rs file, so the plain `mod import;` would be looked up in `src/`.
-#[path = "source/import.rs"]
 mod import;
 
 use crate::args::{impl_arg, SanitizedPlaylistName};
