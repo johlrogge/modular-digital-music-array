@@ -6,6 +6,24 @@ All notable changes to MDMA are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: mdma-cli now parses with hicli 0.2; clap is removed (ADR-015).**
+  - Bad argument values are rejected while parsing, with exit code 2, before anything connects. Runtime failures (node unreachable, service error) exit 1.
+  - The parser's error text replaces the old custom messages.
+  - A bad `MDMA_NODE` is reported only when a node is needed. It exits 1 and names the variable.
+  - `--node` (and `MDMA_NODE`) is `host[:port]`, port 1-65535; anything else is a usage error.
+  - Track hashes on argv follow the stdin rule: at least 8 lowercase hex characters, optional `sha256:` prefix.
+  - `search`: `--bpm` and `--year` reject bad values, `--key` and `--duration` now work, `--energy` must be 1-10.
+  - Date options (`--added`, `--started`, `--stopped`) are date expressions. A value starting with a dash must be glued: `--added=-7`. `--added -7` as two words is rejected.
+  - `mdma help <cmd>` is gone; use `mdma <cmd> --help`. `source NAME --help` shows the source group's page.
+  - `--version` prints `Version: x.y.z`.
+  - Completions come from the hidden `mdma generate-completions <bash|zsh|fish>`. elvish and PowerShell completions are dropped. Regenerate any installed completion scripts.
+
+### Fixed
+
+- `queue edit` and `playlist edit` use a unique temp file.
+
 ---
 
 ## [0.36.1] — 2026-11-04

@@ -43,14 +43,14 @@ mdma search --artist CBL | mdma playlist contains --all
 mdma bookmark
 
 # Bookmark a specific track by content hash, associated with a named set
-mdma bookmark sha256:abc123 --scope "friday-night-picks"
+mdma bookmark sha256:abc12345 --scope "friday-night-picks"
 
 # List all bookmarked tracks
 mdma bookmarks
 
 # Hand-tag role and energy — new in 0.25.0
-mdma fact set sha256:abc123 role banger
-mdma fact set sha256:abc123 energy 9
+mdma fact set sha256:abc12345 role banger
+mdma fact set sha256:abc12345 energy 9
 
 # Import Rekordbox XML and land beat-grid / memory-cue facts — new in 0.25.0
 mdma rekordbox import --enrich rekordbox.xml
@@ -191,6 +191,23 @@ export MDMA_NODE="mdma-909.local"
 mdma ping
 ```
 
+`--node` and `MDMA_NODE` take `host[:port]` (port 1-65535). A bad `--node` is a usage error (exit 2). A bad `MDMA_NODE` is reported only when a command needs a node; it exits 1 and names the variable.
+
+### Help, errors and completions
+
+```bash
+mdma search --help      # help for one command (there is no `mdma help <cmd>`)
+mdma source bandcamp --help   # `source NAME --help` shows the source group's page
+mdma --version          # prints "Version: x.y.z"
+
+# Shell completions: bash, zsh or fish
+mdma generate-completions bash > ~/.local/share/bash-completion/completions/mdma
+```
+
+`generate-completions` is hidden from `--help`. elvish and PowerShell completions are no longer provided. Regenerate any completion script you installed earlier.
+
+Bad argument values are rejected while parsing, before anything connects, with the parser's error text and exit code 2. Runtime failures (node unreachable, service error) exit 1. Track hashes on the command line need at least 8 lowercase hex characters, with an optional `sha256:` prefix. A date option value that starts with a dash must be glued to the flag: `--added=-7` (`--added -7` is rejected).
+
 ---
 
 ## Installing on macOS
@@ -222,6 +239,12 @@ cp profiles/dev/target/release/mdma /usr/local/bin/
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ---
+
+## Unreleased
+
+### Breaking: mdma-cli moves from clap to hicli 0.2 (ADR-015)
+
+Bad argument values are now usage errors (exit 2, parser's error text) raised before anything connects; runtime failures exit 1. Scripts that parse the old messages or depend on the loosened values below need updating. See CHANGELOG.md for the full list.
 
 ## What's new in 0.36.1
 
