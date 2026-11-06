@@ -1,11 +1,12 @@
 use crate::args::{choice, choice_names, ExistingFileArg, PlaylistArg, SanitizedPlaylistName};
 use crate::ctx::Ctx;
-use crate::stdin::{require_stdin_hashes_or_usage, resolve_tracks_skip_errors};
+use crate::stdin::{require_stdin_hashes_or_usage, resolve_tracks_or_abort};
 use crate::transfer::{
     build_http_client, download_tracks, existing_location_set, export_dest_path_checked,
     export_extension, path_cost, DownloadOutcome, ExportFormat, MAX_LOCATION_URI_BYTES,
 };
 use bpaf::{long, Bpaf, Parser};
+use color_eyre::eyre::{bail, eyre};
 use color_eyre::Result;
 use hicli::Arg;
 use library_ipc_client::{ContentHash, TrackInfo};
@@ -204,15 +205,10 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
         let mut result = Vec::with_capacity(playlists.len());
         for PlaylistArg(name) in &playlists {
             let pname = name.as_str();
-            match library.playlist_get(name) {
-                Ok(hashes) => {
-                    result.push((pname.to_string(), hashes));
-                }
-                Err(e) => {
-                    eprintln!("error: playlist '{}' not found: {}", pname, e);
-                    std::process::exit(1);
-                }
-            }
+            let hashes = library
+                .playlist_get(name)
+                .map_err(|e| eyre!("playlist '{}' not found: {}", pname, e))?;
+            result.push((pname.to_string(), hashes));
         }
         result
     } else {
@@ -235,26 +231,17 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
     }
 
     if all_hashes.is_empty() {
-        return Err(color_eyre::eyre::eyre!(
-            "All specified playlists are empty."
-        ));
+        bail!("All specified playlists are empty.");
     }
 
     // Resolve each unique hash to full TrackInfo
-    let tracks = resolve_tracks_skip_errors(&library, all_hashes);
-    if tracks.is_empty() {
-        eprintln!("No tracks could be resolved. Aborting.");
-        std::process::exit(1);
-    }
+    let tracks = resolve_tracks_or_abort(&library, all_hashes)?;
 
     let http = build_http_client(&node, node_ip)?;
 
     // Create output directory early so we can canonicalise it for stable paths
     if let Err(e) = std::fs::create_dir_all(&output) {
-        return Err(color_eyre::eyre::eyre!(
-            "Failed to create output directory: {}",
-            e
-        ));
+        bail!("Failed to create output directory: {}", e);
     }
     let output_canon = output
         .canonicalize()
@@ -272,10 +259,10 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
             Ok(bytes) => match rekordbox_xml::parse_xml(&bytes) {
                 Ok(lib) => Some(lib),
                 Err(err) => {
-                    return Err(color_eyre::eyre::eyre!(
+                    bail!(
                         "failed to parse existing rekordbox.xml: {}. Inspect the file or re-run with --replace to regenerate.",
                         err
-                    ));
+                    );
                 }
             },
             Err(e) => {
@@ -457,16 +444,14 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
     // Abort before touching the XML if any download failed; leave the last-good
     // XML in place so the user can re-run after fixing the problem.
     if fail_count > 0 {
-        eprintln!(
-            "error: {} download(s) failed — XML not written. Re-run to retry.",
+        bail!(
+            "{} download(s) failed — XML not written. Re-run to retry.",
             fail_count
         );
-        std::process::exit(1);
     }
 
     if refreshed.is_empty() {
-        eprintln!("No tracks available. Aborting XML generation.");
-        std::process::exit(1);
+        bail!("No tracks available. Aborting XML generation.");
     }
 
     // Build a set of locations that actually made it into refreshed.
@@ -495,7 +480,7 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
 
     let xml = merged.to_xml();
     std::fs::write(&xml_path, xml.as_bytes())
-        .map_err(|e| color_eyre::eyre::eyre!("Failed to write rekordbox.xml: {}", e))?;
+        .map_err(|e| eyre!("Failed to write rekordbox.xml: {}", e))?;
 
     eprintln!();
     let mode_prefix = if replace { "Replace" } else { "Sync" };
@@ -573,10 +558,9 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
     // 1. Read and parse XML file
     let ExistingFileArg(path) = path;
     let content = std::fs::read_to_string(&path)
-        .map_err(|e| color_eyre::eyre::eyre!("Failed to read {}: {}", path.display(), e))?;
+        .map_err(|e| eyre!("Failed to read {}: {}", path.display(), e))?;
 
-    let parsed = parse_xml(&content)
-        .map_err(|e| color_eyre::eyre::eyre!("Failed to parse rekordbox XML: {}", e))?;
+    let parsed = parse_xml(&content).map_err(|e| eyre!("Failed to parse rekordbox XML: {}", e))?;
 
     if parsed.tracks.is_empty() {
         eprintln!("No tracks found in {}", path.display());
@@ -687,7 +671,7 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
             );
         } else {
             let created = write_playlist(&library, name, &hashes)
-                .map_err(|e| color_eyre::eyre::eyre!("Failed to write playlist: {}", e))?;
+                .map_err(|e| eyre!("Failed to write playlist: {}", e))?;
             print_write_outcome(sanitized, hashes.len(), created);
         }
     }

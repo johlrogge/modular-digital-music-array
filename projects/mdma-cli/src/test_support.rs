@@ -60,6 +60,31 @@ pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Global options as given by none of the flags or variables.
+pub(crate) fn globals() -> Globals {
+    Globals {
+        node: None,
+        socket: None,
+        playback_socket: None,
+        sources_dir: "/run/mdma/sources".to_string(),
+    }
+}
+
+/// A context for the local services (IPC), with no node to resolve. Its sockets
+/// and sources directory do not exist, so no test can reach a real local service.
+pub(crate) fn local_ctx() -> Ctx {
+    let nowhere = "/nonexistent/mdma-test";
+    Ctx::with_target(
+        Globals {
+            node: None,
+            socket: Some(format!("ipc://{nowhere}/library.sock")),
+            playback_socket: Some(format!("ipc://{nowhere}/playback.sock")),
+            sources_dir: format!("{nowhere}/sources"),
+        },
+        node_discovery::Target::LocalIpc,
+    )
+}
+
 /// A node on this machine that refuses connections: a port that was bound,
 /// then freed. The target, and its port.
 pub(crate) fn dead_node() -> (node_discovery::Target, u16) {

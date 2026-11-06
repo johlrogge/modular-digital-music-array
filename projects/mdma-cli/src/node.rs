@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use crate::args::impl_arg;
 use crate::ctx::Ctx;
-use color_eyre::eyre::eyre;
+use color_eyre::eyre::{bail, eyre};
 use gateway_client::{GatewayClient, IdentifyError, NodeIdentity};
 use node_discovery::{
     cache, resolve, DiscoveredNode, Effects, IdentityCheck, NodeCache, NodeKind, NodeSpec,
@@ -470,21 +470,12 @@ pub(crate) fn select(query: OptNodeQueryArg, _ctx: &Ctx) -> color_eyre::Result<(
         pick: Box::new(pick_interactive),
         is_tty: is_tty(),
     };
-    let entry = match node_discovery::select(nodes, query.as_deref(), &mut effects) {
-        Ok(entry) => entry,
-        Err(e) => {
-            eprintln!("{}", select_error_message(&e));
-            std::process::exit(1);
-        }
-    };
+    let entry = node_discovery::select(nodes, query.as_deref(), &mut effects)
+        .map_err(|e| eyre!("{}", select_error_message(&e)))?;
     let Some(path) = cache_path() else {
-        eprintln!("No config directory is available to remember the node in.");
-        std::process::exit(1);
+        bail!("No config directory is available to remember the node in.");
     };
-    if let Err(e) = cache::save(&path, &entry) {
-        eprintln!("Could not remember node: {e}");
-        std::process::exit(1);
-    }
+    cache::save(&path, &entry).map_err(|e| eyre!("Could not remember node: {e}"))?;
     println!(
         "Selected {} ({}, {}:{}), saved to {}",
         entry.name,
@@ -504,10 +495,7 @@ pub(crate) fn forget(_ctx: &Ctx) -> color_eyre::Result<()> {
         return Ok(());
     };
     let previous = load_cache();
-    if let Err(e) = cache::forget(&path) {
-        eprintln!("Could not forget node: {e}");
-        std::process::exit(1);
-    }
+    cache::forget(&path).map_err(|e| eyre!("Could not forget node: {e}"))?;
     match previous {
         Some(c) => println!("Forgot {} ({})", c.name, c.id),
         None => println!("No remembered node."),
@@ -520,30 +508,24 @@ pub(crate) fn forget(_ctx: &Ctx) -> color_eyre::Result<()> {
 /// Resolves the node like any command would, but saves nothing.
 #[hicli::command]
 pub(crate) fn show(ctx: &Ctx) -> color_eyre::Result<()> {
-    match resolve(
+    let resolution = resolve(
         request(ctx.node_flag(), ctx.local_ipc())?,
         &mut real_effects(),
-    ) {
-        Ok(resolution) => {
-            match &resolution.target {
-                Target::LocalIpc => println!("Local services over IPC (no node)"),
-                Target::Remote(t) => {
-                    println!("Node:   {}", t.host);
-                    println!(
-                        "IP:     {}",
-                        t.ip.map_or("-".to_string(), |ip| ip.to_string())
-                    );
-                    println!("Port:   {}", t.port);
-                    println!("Source: {}", source_description(&t.source));
-                }
-            }
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("{}", resolve_error_message(&e));
-            std::process::exit(1);
+    )
+    .map_err(|e| eyre!("{}", resolve_error_message(&e)))?;
+    match &resolution.target {
+        Target::LocalIpc => println!("Local services over IPC (no node)"),
+        Target::Remote(t) => {
+            println!("Node:   {}", t.host);
+            println!(
+                "IP:     {}",
+                t.ip.map_or("-".to_string(), |ip| ip.to_string())
+            );
+            println!("Port:   {}", t.port);
+            println!("Source: {}", source_description(&t.source));
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]

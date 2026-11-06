@@ -5,7 +5,6 @@ use color_eyre::eyre::eyre;
 use colored::Colorize;
 use gateway_client::AdminResponse;
 use library_ipc_client::{ClientError, LibraryResponse, ProtocolError, TrackInfo};
-use mdma_client::PlaybackClientError;
 use nng_transport::ConnectionError;
 use source_protocol::{SourceError, SourceResponse};
 use track_formatter::{
@@ -128,14 +127,19 @@ pub fn library_error(err: ClientError) -> color_eyre::Report {
     eyre!("{}", text)
 }
 
-/// The failure for a source error (without hicli's `Error: ` prefix).
-pub fn source_error(err: &dyn std::fmt::Display) -> color_eyre::Report {
-    eyre!("{}", err)
+/// The failure whose message is exactly `err`'s text (without hicli's `Error: ` prefix).
+pub fn display_error(err: impl std::fmt::Display) -> color_eyre::Report {
+    eyre!("{err}")
 }
 
-/// The failure for a playback client error (without hicli's `Error: ` prefix).
-pub fn playback_error(err: PlaybackClientError) -> color_eyre::Report {
-    eyre!("{}", err)
+/// The failure for polling `what` and getting no answer any more: `check_with` is
+/// the command that shows the outcome later.
+pub fn lost_contact(
+    what: &str,
+    cause: &dyn std::fmt::Display,
+    check_with: &str,
+) -> color_eyre::Report {
+    eyre!("Lost contact with {what} ({cause}); check later with '{check_with}'")
 }
 
 /// Interpret an admin reply: `accept` takes the response it wants (`None`
@@ -311,8 +315,8 @@ mod tests {
     // ── error messages as values ────────────────────────────────────────────────
 
     use super::{
-        connect_failure, interpret_admin, interpret_library, interpret_source, library_error,
-        playback_error, request_failed, source_error, source_label, unexpected_response,
+        connect_failure, display_error, interpret_admin, interpret_library, interpret_source,
+        library_error, lost_contact, request_failed, source_label, unexpected_response,
     };
     use gateway_client::AdminResponse;
     use library_ipc_client::{ClientError, LibraryResponse, ProtocolError};
@@ -362,19 +366,23 @@ mod tests {
     }
 
     #[test]
-    fn playback_fallback_text_is_the_error() {
+    fn display_error_text_is_the_error() {
         let err = PlaybackClientError::Service("boom".to_string());
         assert_eq!(
-            failure_text::<()>(Err(playback_error(err))),
+            failure_text::<()>(Err(display_error(err))),
             "service error: boom"
+        );
+        assert_eq!(
+            failure_text::<()>(Err(display_error("no such source"))),
+            "no such source"
         );
     }
 
     #[test]
-    fn source_text_is_the_error() {
+    fn lost_contact_says_what_why_and_how_to_check() {
         assert_eq!(
-            failure_text::<()>(Err(source_error(&"no such source"))),
-            "no such source"
+            failure_text::<()>(Err(lost_contact("the job", &"timed out", "mdma status"))),
+            "Lost contact with the job (timed out); check later with 'mdma status'"
         );
     }
 
@@ -463,7 +471,7 @@ mod tests {
     }
 
     fn interpret(reply: Result<SourceResponse, &str>) -> color_eyre::Result<()> {
-        interpret_source("bandcamp", reply, |e| source_error(&e), paused)
+        interpret_source("bandcamp", reply, display_error, paused)
     }
 
     #[test]

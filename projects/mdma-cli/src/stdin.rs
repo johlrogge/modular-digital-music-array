@@ -4,7 +4,7 @@
 //! before it reads stdin.
 
 use crate::args::{OptTrackArg, TrackArg};
-use color_eyre::eyre::eyre;
+use color_eyre::eyre::{bail, eyre};
 use color_eyre::Result;
 use library_ipc_client::{ContentHash, TrackInfo};
 use mdma_client::LibraryBackend;
@@ -131,6 +131,21 @@ pub(crate) fn resolve_tracks_skip_errors(
         .collect()
 }
 
+/// Like [`resolve_tracks_skip_errors`], but an error when none could be resolved.
+pub(crate) fn resolve_tracks_or_abort(
+    library: &LibraryBackend,
+    hashes: Vec<ContentHash>,
+) -> Result<Vec<TrackInfo>> {
+    require_tracks(resolve_tracks_skip_errors(library, hashes))
+}
+
+fn require_tracks(tracks: Vec<TrackInfo>) -> Result<Vec<TrackInfo>> {
+    if tracks.is_empty() {
+        bail!("No tracks could be resolved. Aborting.");
+    }
+    Ok(tracks)
+}
+
 /// Extract a content hash from a line of text.
 ///
 /// Handles multiple formats:
@@ -167,9 +182,9 @@ mod tests {
     use crate::args::{OptTrackArg, TrackArg};
     use crate::stdin::{
         hashes_arg_or_reader, hashes_in, hashes_or_usage, is_yes, no_hash_provided,
-        parse_hash_from_line, read_all, require_hashes,
+        parse_hash_from_line, read_all, require_hashes, require_tracks,
     };
-    use crate::test_support::failure_text;
+    use crate::test_support::{failure_text, track};
     use library_ipc_client::ContentHash;
 
     use pretty_assertions::assert_eq;
@@ -340,6 +355,15 @@ mod tests {
             hashes_or_usage("abcd1234\n".as_bytes(), &["Usage: a"]).unwrap(),
             vec![ContentHash::new("abcd1234")]
         );
+    }
+
+    #[test]
+    fn no_resolved_tracks_is_an_error() {
+        assert_eq!(
+            failure_text(require_tracks(vec![])),
+            "No tracks could be resolved. Aborting."
+        );
+        assert_eq!(require_tracks(vec![track("abcd1234")]).unwrap().len(), 1);
     }
 
     #[test]

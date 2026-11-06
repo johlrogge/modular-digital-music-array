@@ -2,7 +2,7 @@ mod import;
 
 use crate::args::{impl_arg, SanitizedPlaylistName};
 use crate::ctx::Ctx;
-use crate::output::{interpret_source, source_error, source_label};
+use crate::output::{display_error, interpret_library, interpret_source, source_label};
 use crate::source::import::{finish_import, follow_import_job, is_terminal_phase};
 use bpaf::Bpaf;
 use color_eyre::eyre::eyre;
@@ -110,13 +110,8 @@ const SOURCE_LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 #[hicli::command]
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     let gateway = ctx.gateway()?;
-    let sources = match mdma_client::list_available_sources(gateway.as_deref(), ctx.sources_dir()) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("{}", e);
-            std::process::exit(1);
-        }
-    };
+    let sources = mdma_client::list_available_sources(gateway.as_deref(), ctx.sources_dir())
+        .map_err(display_error)?;
     if sources.is_empty() {
         println!("No sources available");
     } else {
@@ -135,7 +130,7 @@ fn source_call<T>(
     request: &SourceRequest,
     accept: impl FnOnce(SourceResponse) -> Option<T>,
 ) -> Result<T> {
-    source_call_with(source, name, request, |e| source_error(&e), accept)
+    source_call_with(source, name, request, display_error, accept)
 }
 
 /// Like [`source_call`], with `on_error` deciding how an error response is reported.
@@ -162,7 +157,7 @@ fn item_not_found(source: &str, identifier: &str) -> color_eyre::Report {
 fn item_error(source: &str, err: SourceError) -> color_eyre::Report {
     match err {
         SourceError::ItemNotFound { identifier } => item_not_found(source, &identifier),
-        other => source_error(&other),
+        other => display_error(other),
     }
 }
 
@@ -400,23 +395,15 @@ pub(crate) fn check_updates(source: SourceArg, apply: ApplyUpdates, ctx: &Ctx) -
     // Fetch all ItemId values from the library for this source.
     // We use GetFactValues("ItemId") — returns all ItemId values the library knows about.
     let library = ctx.library()?;
-    let all_item_ids = match library.request(&library_ipc_client::LibraryRequest::GetFactValues {
-        fact_type: library_ipc_client::FactType::new("ItemId"),
-    }) {
-        Ok(library_ipc_client::LibraryResponse::FactValues(values)) => values,
-        Ok(library_ipc_client::LibraryResponse::Error(e)) => {
-            eprintln!("Library error: {}", e);
-            std::process::exit(1);
-        }
-        Ok(_) => {
-            eprintln!("Unexpected response from library");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("Failed to connect to library: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let all_item_ids = interpret_library(
+        library.request(&library_ipc_client::LibraryRequest::GetFactValues {
+            fact_type: library_ipc_client::FactType::new("ItemId"),
+        }),
+        |response| match response {
+            library_ipc_client::LibraryResponse::FactValues(values) => Some(values),
+            _ => None,
+        },
+    )?;
 
     if all_item_ids.is_empty() {
         println!("No items in library.");
@@ -532,7 +519,7 @@ fn playlist_source_error(source: &str, feature: &str, err: &SourceError) -> colo
     if matches!(err, SourceError::Unsupported { .. }) {
         return eyre!("{}", unsupported_message(source, feature));
     }
-    source_error(err)
+    display_error(err)
 }
 
 /// List the source's playlists

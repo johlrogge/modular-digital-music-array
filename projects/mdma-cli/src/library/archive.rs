@@ -1,5 +1,6 @@
 use crate::ctx::Ctx;
 use crate::library::Yes;
+use crate::output::display_error;
 use crate::stdin::confirm;
 use color_eyre::Result;
 use library_ipc_client::{ArchiveEmptyReport, ArchiveListing};
@@ -66,16 +67,9 @@ fn format_archive_emptied(r: &ArchiveEmptyReport) -> String {
 #[hicli::command(default)]
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
-    match library.archive_list() {
-        Ok(l) => {
-            println!("{}", format_archive_listing(&l));
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-    }
+    let listing = library.archive_list().map_err(display_error)?;
+    println!("{}", format_archive_listing(&listing));
+    Ok(())
 }
 
 /// Permanently delete everything in the archive
@@ -88,13 +82,7 @@ pub(crate) fn empty(yes: Yes, ctx: &Ctx) -> Result<()> {
     // `--yes` without a listing deletes everything; after a prompt, only what was shown.
     let mut up_to = None;
     if !yes {
-        let listing = match library.archive_list() {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
-        };
+        let listing = library.archive_list().map_err(display_error)?;
         println!("{}\n", format_archive_listing(&listing));
         if listing.entries.is_empty() {
             return Ok(());
@@ -106,19 +94,14 @@ pub(crate) fn empty(yes: Yes, ctx: &Ctx) -> Result<()> {
         up_to = Some(archive_cutoff(&listing));
     }
 
-    match library.archive_empty(up_to.as_deref()) {
-        Ok(report) => {
-            println!("{}", format_archive_emptied(&report));
-            if !report.errors.is_empty() {
-                std::process::exit(1);
-            }
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
+    let report = library
+        .archive_empty(up_to.as_deref())
+        .map_err(display_error)?;
+    println!("{}", format_archive_emptied(&report));
+    if !report.errors.is_empty() {
+        std::process::exit(1);
     }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@ use crate::ctx::Ctx;
 use crate::output::interpret_library;
 use crate::stdin::{hashes_in, read_stdin_to_string, require_stdin_hashes_or_usage};
 use bpaf::{construct, long, Bpaf, Parser};
+use color_eyre::eyre::{bail, eyre};
 use color_eyre::Result;
 use colored::Colorize;
 use hicli::Arg;
@@ -91,6 +92,31 @@ fn playlist_names(response: LibraryResponse) -> Option<Vec<PlaylistName>> {
     }
 }
 
+/// The first whitespace-delimited token of each line of `reader`; an error when there are none.
+fn require_names(reader: impl std::io::BufRead) -> Result<Vec<String>> {
+    let names: Vec<String> = reader
+        .lines()
+        .map_while(std::result::Result::ok)
+        .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+        .collect();
+    if names.is_empty() {
+        bail!("No playlist name provided and stdin was empty");
+    }
+    Ok(names)
+}
+
+fn parse_playlist_name(name: &str) -> Result<PlaylistName> {
+    PlaylistName::new(name).map_err(|e| eyre!("Invalid playlist name: {}", e))
+}
+
+/// A reply of `Pong`.
+fn accept_pong(response: LibraryResponse) -> Option<()> {
+    match response {
+        LibraryResponse::Pong => Some(()),
+        _ => None,
+    }
+}
+
 /// List all playlists
 #[hicli::command]
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
@@ -150,25 +176,9 @@ pub(crate) fn get(name: OptPlaylistArg, ctx: &Ctx) -> Result<()> {
             print!("{}", content);
         }
         None => {
-            use std::io::BufRead;
-            let names: Vec<String> = std::io::stdin()
-                .lock()
-                .lines()
-                .map_while(Result::ok)
-                .filter_map(|line| {
-                    let first = line.split_whitespace().next()?;
-                    Some(first.to_string())
-                })
-                .collect();
-            if names.is_empty() {
-                eprintln!("No playlist name provided and stdin was empty");
-                std::process::exit(1);
-            }
+            let names = require_names(std::io::stdin().lock())?;
             for n in names {
-                let pname = PlaylistName::new(&n).unwrap_or_else(|e| {
-                    eprintln!("Invalid playlist name: {}", e);
-                    std::process::exit(1);
-                });
+                let pname = parse_playlist_name(&n)?;
                 let content = interpret_library(
                     library.request(&LibraryRequest::PlaylistGet { name: pname }),
                     playlist_content,
@@ -301,16 +311,8 @@ pub(crate) fn edit(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     let current = match library.request(&LibraryRequest::PlaylistGet {
         name: pname.clone(),
     }) {
-        Ok(LibraryResponse::PlaylistContent(c)) => c,
         Ok(LibraryResponse::Error(ProtocolError::PlaylistNotFound { .. })) => String::new(),
-        Ok(LibraryResponse::Error(e)) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-        _ => {
-            eprintln!("Unexpected response");
-            std::process::exit(1);
-        }
+        reply => interpret_library(reply, playlist_content)?,
     };
 
     // 2. Edit a temp file in $EDITOR
@@ -331,52 +333,34 @@ pub(crate) fn edit(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
 /// Remove a playlist
 #[hicli::command]
 pub(crate) fn remove(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
-    use library_ipc_client::{LibraryRequest, LibraryResponse};
+    use library_ipc_client::LibraryRequest;
     let library = ctx.library()?;
     let PlaylistArg(pname) = name;
-    let response = library.request(&LibraryRequest::PlaylistRemove {
-        name: pname.clone(),
-    });
-    match response {
-        Ok(LibraryResponse::Pong) => {
-            eprintln!("Removed playlist '{}'", pname);
-        }
-        Ok(LibraryResponse::Error(e)) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-        _ => {
-            eprintln!("Unexpected response");
-            std::process::exit(1);
-        }
-    }
+    interpret_library(
+        library.request(&LibraryRequest::PlaylistRemove {
+            name: pname.clone(),
+        }),
+        accept_pong,
+    )?;
+    eprintln!("Removed playlist '{}'", pname);
     Ok(())
 }
 
 /// Rename a playlist
 #[hicli::command]
 pub(crate) fn rename(args: RenameArgs, ctx: &Ctx) -> Result<()> {
-    use library_ipc_client::{LibraryRequest, LibraryResponse};
+    use library_ipc_client::LibraryRequest;
     let library = ctx.library()?;
     let PlaylistArg(from_name) = args.from;
     let PlaylistArg(to_name) = args.to;
-    let response = library.request(&LibraryRequest::PlaylistRename {
-        from: from_name.clone(),
-        to: to_name.clone(),
-    });
-    match response {
-        Ok(LibraryResponse::Pong) => {
-            eprintln!("Renamed playlist '{}' to '{}'", from_name, to_name);
-        }
-        Ok(LibraryResponse::Error(e)) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-        _ => {
-            eprintln!("Unexpected response");
-            std::process::exit(1);
-        }
-    }
+    interpret_library(
+        library.request(&LibraryRequest::PlaylistRename {
+            from: from_name.clone(),
+            to: to_name.clone(),
+        }),
+        accept_pong,
+    )?;
+    eprintln!("Renamed playlist '{}' to '{}'", from_name, to_name);
     Ok(())
 }
 
@@ -387,6 +371,36 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::test_support::{parses, run_arg, usage_error};
+
+    use crate::test_support::failure_text;
+
+    #[test]
+    fn get_reads_the_first_token_of_each_stdin_line() {
+        assert_eq!(
+            require_names("mix  3 tracks [1:00]\n\n  other\n".as_bytes()).unwrap(),
+            ["mix", "other"]
+        );
+    }
+
+    #[test]
+    fn get_without_a_name_and_with_empty_stdin_is_an_error() {
+        assert_eq!(
+            failure_text(require_names("\n  \n".as_bytes())),
+            "No playlist name provided and stdin was empty"
+        );
+    }
+
+    #[test]
+    fn get_with_an_invalid_name_is_an_error() {
+        assert_eq!(parse_playlist_name("mix").unwrap().to_string(), "mix");
+        assert_eq!(
+            failure_text(parse_playlist_name("a/b")),
+            format!(
+                "Invalid playlist name: {}",
+                PlaylistName::new("a/b").unwrap_err()
+            )
+        );
+    }
 
     #[test]
     fn rename_args_parser_reads_from_and_to() {

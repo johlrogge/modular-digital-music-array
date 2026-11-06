@@ -1,10 +1,11 @@
 use crate::args::{choice, choice_names, impl_arg, parse_choice, Choice, OptTrackArg, TrackArg};
 use crate::ctx::Ctx;
 use crate::output::{
-    format_track_line, library_error, playback_error, print_tracks, terminal_width, PIPE_TERM_WIDTH,
+    display_error, format_track_line, library_error, print_tracks, terminal_width, PIPE_TERM_WIDTH,
 };
 use crate::stdin::{read_hashes, require_stdin_hashes, resolve_tracks_skip_errors};
 use bpaf::{construct, long, positional, short, Parser};
+use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use hicli::Arg;
 use library_ipc_client::TrackInfo;
@@ -384,13 +385,10 @@ pub(crate) fn bookmark(scope: OptScopeArg, hash: OptTrackArg, ctx: &Ctx) -> Resu
     let playback = ctx.playback()?;
     let content_hash = match hash {
         Some(TrackArg(h)) => h,
-        None => match playback.now_playing().map_err(playback_error)? {
-            Some(h) => h,
-            None => {
-                eprintln!("Nothing is currently playing");
-                std::process::exit(1);
-            }
-        },
+        None => playback
+            .now_playing()
+            .map_err(display_error)?
+            .ok_or_else(|| eyre!("Nothing is currently playing"))?,
     };
 
     library

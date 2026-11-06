@@ -1,6 +1,7 @@
 use crate::args::{impl_arg, TrackArg};
 use crate::ctx::Ctx;
 use crate::library::Yes;
+use crate::output::display_error;
 use crate::stdin::confirm;
 use bpaf::Bpaf;
 use color_eyre::Result;
@@ -139,13 +140,7 @@ fn find_dedup_group<'a>(
 pub(crate) fn scan(apply: Apply, ctx: &Ctx) -> Result<()> {
     let Apply(apply) = apply;
     let library = ctx.library()?;
-    let report = match library.dedup_scan(apply) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let report = library.dedup_scan(apply).map_err(display_error)?;
     let failed = report
         .applied
         .as_ref()
@@ -184,13 +179,8 @@ pub(crate) fn merge(args: MergeArgs, ctx: &Ctx) -> Result<()> {
             // Every prefix must name at most one group before anything is confirmed.
             let mut shown = None;
             for prefix in std::iter::once(&winner).chain(&losers) {
-                match find_dedup_group(&report.groups, prefix) {
-                    Ok(group) => shown = shown.or(group),
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        std::process::exit(1);
-                    }
-                }
+                let group = find_dedup_group(&report.groups, prefix).map_err(display_error)?;
+                shown = shown.or(group);
             }
             if let Some(group) = shown {
                 println!("{}\n", format_dedup_groups(std::slice::from_ref(group)));
@@ -206,19 +196,14 @@ pub(crate) fn merge(args: MergeArgs, ctx: &Ctx) -> Result<()> {
         }
     }
 
-    match library.dedup_merge(&winner, &losers) {
-        Ok(report) => {
-            println!("{}", format_dedup_applied(&report));
-            if !report.errors.is_empty() {
-                std::process::exit(1);
-            }
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
+    let report = library
+        .dedup_merge(&winner, &losers)
+        .map_err(display_error)?;
+    println!("{}", format_dedup_applied(&report));
+    if !report.errors.is_empty() {
+        std::process::exit(1);
     }
+    Ok(())
 }
 
 #[cfg(test)]

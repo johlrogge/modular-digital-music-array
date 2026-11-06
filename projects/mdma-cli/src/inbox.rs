@@ -1,6 +1,7 @@
 use crate::args::impl_arg;
 use crate::ctx::Ctx;
 use crate::output::library_error;
+use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use library_ipc_client::{InboxPath, InboxPathError};
 use std::str::FromStr;
@@ -48,12 +49,14 @@ pub(crate) fn delete(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
     use mdma_client::IngestResult;
     match library.delete_inbox_file(&path).map_err(library_error)? {
         IngestResult::Success { message, .. } => println!("{}", message),
-        IngestResult::Failure { message } => {
-            eprintln!("Failed: {}", message);
-            std::process::exit(1);
-        }
+        IngestResult::Failure { message } => return Err(ingest_failed(&message)),
     }
     Ok(())
+}
+
+/// The failure for a file the library could not ingest or delete.
+fn ingest_failed(message: &str) -> color_eyre::Report {
+    eyre!("Failed: {}", message)
 }
 
 /// Ingest a specific file from inbox
@@ -73,10 +76,7 @@ pub(crate) fn ingest(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
                 println!("Success: {}", message);
             }
         }
-        IngestResult::Failure { message } => {
-            eprintln!("Failed: {}", message);
-            std::process::exit(1);
-        }
+        IngestResult::Failure { message } => return Err(ingest_failed(&message)),
     }
     Ok(())
 }

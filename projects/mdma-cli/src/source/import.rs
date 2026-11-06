@@ -1,3 +1,4 @@
+use crate::output::lost_contact;
 use crate::source::import_status_command;
 use color_eyre::Result;
 use mdma_client::SourceClient;
@@ -158,18 +159,18 @@ pub(crate) fn follow_import_job(source: &SourceClient, name: &str, job_id: u64) 
         match step.flow {
             PollFlow::Continue => std::thread::sleep(IMPORT_POLL_INTERVAL),
             PollFlow::Finished(status) => return finish_import(&status),
-            PollFlow::GiveUp => {
-                eprintln!(
-                    "Lost contact with the import job {} ({}); \
-                     check later with '{}'",
-                    job_id,
-                    last_error.unwrap_or_else(|| "no status for the job".to_string()),
-                    import_status_command(name)
-                );
-                std::process::exit(1);
-            }
+            PollFlow::GiveUp => return Err(lost_import_job(name, job_id, last_error.as_deref())),
         }
     }
+}
+
+/// The failure for an import job whose status could not be polled any more.
+fn lost_import_job(name: &str, job_id: u64, last_error: Option<&str>) -> color_eyre::Report {
+    lost_contact(
+        &format!("the import job {job_id}"),
+        &last_error.unwrap_or("no status for the job"),
+        &import_status_command(name),
+    )
 }
 
 #[cfg(test)]
@@ -201,6 +202,23 @@ mod tests {
 
     fn done() -> ImportPhase {
         ImportPhase::Done(ImportResult::NothingMatched)
+    }
+
+    #[test]
+    fn lost_import_job_names_the_job_the_cause_and_how_to_check() {
+        let text = |cause| {
+            crate::test_support::failure_text::<()>(Err(lost_import_job("bandcamp", 7, cause)))
+        };
+        assert_eq!(
+            text(Some("timed out")),
+            "Lost contact with the import job 7 (timed out); \
+             check later with 'mdma source bandcamp import-status'"
+        );
+        assert_eq!(
+            text(None),
+            "Lost contact with the import job 7 (no status for the job); \
+             check later with 'mdma source bandcamp import-status'"
+        );
     }
 
     #[test]

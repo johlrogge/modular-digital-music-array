@@ -237,17 +237,8 @@ fn library_connect_failed(err: &ClientError, direct: bool) -> color_eyre::Report
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{dead_node, failure_text};
+    use crate::test_support::{dead_node, failure_text, globals};
     use pretty_assertions::assert_eq;
-
-    fn globals() -> Globals {
-        Globals {
-            node: None,
-            socket: None,
-            playback_socket: None,
-            sources_dir: "/run/mdma/sources".to_string(),
-        }
-    }
 
     fn remote(ip: Ipv4Addr) -> Target {
         Target::Remote(node_discovery::RemoteTarget {
@@ -404,6 +395,8 @@ mod tests {
     fn node_is_not_resolved_until_needed() {
         // Replaces the old "node commands do not need a resolved node": nothing
         // resolves a node on construction, only on first use of the target.
+        // The one deliberate use of `Ctx::new` in tests: it is what checks that
+        // `Ctx::new` is lazy. Every other test uses `Ctx::with_target`.
         let ctx = Ctx::new(globals());
         assert!(ctx.target.get().is_none());
         let ctx = Ctx::with_target(globals(), Target::LocalIpc);
