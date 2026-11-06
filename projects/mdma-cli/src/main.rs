@@ -397,7 +397,9 @@ mod tests {
     #[test]
     fn run_exits_zero_for_version_and_two_for_any_parse_failure() {
         let run = |args: &[&str]| {
-            app().run_with_args(args.iter().copied(), |globals| Ok(Ctx::new(globals)))
+            app().run_with_args(args.iter().copied(), |globals| {
+                Ok(Ctx::with_target(globals, node_discovery::Target::LocalIpc))
+            })
         };
         assert_eq!(run(&["--version"]), 0);
         assert_eq!(run(&["get", "xyz"]), 2);
@@ -410,6 +412,15 @@ mod tests {
         let socket = format!("ipc://{}/none.sock", dir.path().display());
         let code = app().run_with_args(["--socket", socket.as_str(), "ping"], |globals| {
             Ok(Ctx::with_target(globals, node_discovery::Target::LocalIpc))
+        });
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn run_exits_one_when_an_admin_command_cannot_reach_the_node() {
+        let (target, _) = crate::test_support::dead_node();
+        let code = app().run_with_args(["admin", "service-mode", "status"], move |globals| {
+            Ok(Ctx::with_target(globals, target))
         });
         assert_eq!(code, 1);
     }

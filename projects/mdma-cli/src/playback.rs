@@ -91,14 +91,9 @@ pub(crate) fn now(ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn session(ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;
-    match playback.session() {
-        Ok(Some(id)) => {
-            println!("{}", id);
-        }
-        Ok(None) => {
-            println!("No active session");
-        }
-        Err(e) => return Err(playback_error(e)),
+    match playback.session().map_err(playback_error)? {
+        Some(id) => println!("{}", id),
+        None => println!("No active session"),
     }
     Ok(())
 }

@@ -132,12 +132,11 @@ pub(crate) fn remove(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;
     let content_hashes = hashes_arg_or_stdin(hash);
 
-    match playback.queue_remove(content_hashes) {
-        Ok(removed) if removed > 0 => {
-            println!("Removed {} track(s) from queue", removed);
-        }
-        Ok(_) => {}
-        Err(e) => return Err(playback_error(e)),
+    let removed = playback
+        .queue_remove(content_hashes)
+        .map_err(playback_error)?;
+    if removed > 0 {
+        println!("Removed {} track(s) from queue", removed);
     }
     Ok(())
 }

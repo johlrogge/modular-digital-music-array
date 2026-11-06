@@ -250,13 +250,9 @@ pub(crate) fn add(args: FactArgs, ctx: &Ctx) -> Result<()> {
         hash: TrackArg(hash),
     } = args;
     let library = ctx.library()?;
-    match library.write_fact(&hash, value) {
-        Ok(()) => {
-            println!("Added fact for {}: {:?} = {}", hash, field, raw);
-            Ok(())
-        }
-        Err(e) => Err(library_error(e)),
-    }
+    library.write_fact(&hash, value).map_err(library_error)?;
+    println!("Added fact for {}: {:?} = {}", hash, field, raw);
+    Ok(())
 }
 
 /// Retract an existing fact from a track
@@ -271,13 +267,9 @@ pub(crate) fn retract(args: FactArgs, ctx: &Ctx) -> Result<()> {
         hash: TrackArg(hash),
     } = args;
     let library = ctx.library()?;
-    match library.retract_fact(&hash, value) {
-        Ok(()) => {
-            println!("Retracted fact for {}: {:?} = {}", hash, field, raw);
-            Ok(())
-        }
-        Err(e) => Err(library_error(e)),
-    }
+    library.retract_fact(&hash, value).map_err(library_error)?;
+    println!("Retracted fact for {}: {:?} = {}", hash, field, raw);
+    Ok(())
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@ mod import;
 
 use crate::args::{impl_arg, SanitizedPlaylistName};
 use crate::ctx::Ctx;
-use crate::output::source_error;
+use crate::output::{interpret_source, source_error, source_label};
 use crate::source::import::{finish_import, follow_import_job, is_terminal_phase};
 use bpaf::Bpaf;
 use color_eyre::eyre::eyre;
@@ -127,31 +127,13 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// Interpret a source's reply: `accept` takes the response it wants. A response
-/// it declines is an error response, which `on_error` turns into the failure,
-/// or an unexpected one; a failed request is a failure too. The declined
-/// response is boxed because `SourceResponse` is large.
-fn interpret_source<T>(
-    reply: std::result::Result<SourceResponse, impl std::fmt::Display>,
-    on_error: impl FnOnce(SourceError) -> color_eyre::Report,
-    accept: impl FnOnce(SourceResponse) -> std::result::Result<T, Box<SourceResponse>>,
-) -> Result<T> {
-    match reply {
-        Ok(response) => accept(response).map_err(|declined| match *declined {
-            SourceResponse::Error(e) => on_error(e),
-            _ => source_error(&"Unexpected response"),
-        }),
-        Err(e) => Err(source_error(&e)),
-    }
-}
-
 /// Send `request` to the source `name` and interpret the reply with
 /// [`interpret_source`]; error responses are reported as they are.
 fn source_call<T>(
     source: &SourceClient,
     name: &str,
     request: &SourceRequest,
-    accept: impl FnOnce(SourceResponse) -> std::result::Result<T, Box<SourceResponse>>,
+    accept: impl FnOnce(SourceResponse) -> Option<T>,
 ) -> Result<T> {
     source_call_with(source, name, request, |e| source_error(&e), accept)
 }
@@ -162,13 +144,13 @@ fn source_call_with<T>(
     name: &str,
     request: &SourceRequest,
     on_error: impl FnOnce(SourceError) -> color_eyre::Report,
-    accept: impl FnOnce(SourceResponse) -> std::result::Result<T, Box<SourceResponse>>,
+    accept: impl FnOnce(SourceResponse) -> Option<T>,
 ) -> Result<T> {
-    interpret_source(source.request(name, request), on_error, accept)
+    interpret_source(name, source.request(name, request), on_error, accept)
 }
 
 /// The failure for an item the source does not have.
-fn item_not_found(identifier: &str, source: &str) -> color_eyre::Report {
+fn item_not_found(source: &str, identifier: &str) -> color_eyre::Report {
     eyre!(
         "Item {} not found in your {} collection",
         identifier,
@@ -177,9 +159,9 @@ fn item_not_found(identifier: &str, source: &str) -> color_eyre::Report {
 }
 
 /// Report an item-level source error: `ItemNotFound` names the item and source.
-fn item_error(name: &str, err: SourceError) -> color_eyre::Report {
+fn item_error(source: &str, err: SourceError) -> color_eyre::Report {
     match err {
-        SourceError::ItemNotFound { identifier } => item_not_found(&identifier, name),
+        SourceError::ItemNotFound { identifier } => item_not_found(source, &identifier),
         other => source_error(&other),
     }
 }
@@ -199,8 +181,8 @@ pub(crate) fn sync(source: SourceArg, ctx: &Ctx) -> Result<()> {
                 SourceResponse::SyncStarted {
                     total_items,
                     new_items,
-                } => Ok((total_items, new_items)),
-                other => Err(Box::new(other)),
+                } => Some((total_items, new_items)),
+                _ => None,
             },
         )?;
     println!("Sync started for {}", name);
@@ -218,8 +200,8 @@ pub(crate) fn status(source: SourceArg, ctx: &Ctx) -> Result<()> {
         name,
         &SourceRequest::GetStatus,
         |response| match response {
-            SourceResponse::Status(status) => Ok(status),
-            other => Err(Box::new(other)),
+            SourceResponse::Status(status) => Some(status),
+            _ => None,
         },
     )?;
     println!("Source: {} v{}", status.name, status.version);
@@ -259,8 +241,8 @@ pub(crate) fn downloads(source: SourceArg, ctx: &Ctx) -> Result<()> {
             name,
             &SourceRequest::ListDownloads,
             |response| match response {
-                SourceResponse::Downloads(downloads) => Ok(downloads),
-                other => Err(Box::new(other)),
+                SourceResponse::Downloads(downloads) => Some(downloads),
+                _ => None,
             },
         )?;
     if downloads.is_empty() {
@@ -305,8 +287,8 @@ pub(crate) fn cancel(source: SourceArg, id: DownloadArg, ctx: &Ctx) -> Result<()
     let source = ctx.source(name, None)?;
     let request = SourceRequest::CancelDownload { id: id.clone() };
     source_call(&source, name, &request, |response| match response {
-        SourceResponse::Cancelled { .. } => Ok(()),
-        other => Err(Box::new(other)),
+        SourceResponse::Cancelled { .. } => Some(()),
+        _ => None,
     })?;
     println!("Cancelled download: {}", id);
     Ok(())
@@ -322,8 +304,8 @@ pub(crate) fn pause(source: SourceArg, ctx: &Ctx) -> Result<()> {
         name,
         &SourceRequest::PauseAll,
         |response| match response {
-            SourceResponse::Paused => Ok(()),
-            other => Err(Box::new(other)),
+            SourceResponse::Paused => Some(()),
+            _ => None,
         },
     )?;
     println!("Downloads paused");
@@ -340,8 +322,8 @@ pub(crate) fn resume(source: SourceArg, ctx: &Ctx) -> Result<()> {
         name,
         &SourceRequest::ResumeAll,
         |response| match response {
-            SourceResponse::Resumed => Ok(()),
-            other => Err(Box::new(other)),
+            SourceResponse::Resumed => Some(()),
+            _ => None,
         },
     )?;
     println!("Downloads resumed");
@@ -365,8 +347,8 @@ pub(crate) fn resync(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) -> Res
             SourceResponse::ResyncQueued {
                 identifier,
                 tracks_queued,
-            } => Ok((identifier, tracks_queued)),
-            other => Err(Box::new(other)),
+            } => Some((identifier, tracks_queued)),
+            _ => None,
         },
     )?;
     println!(
@@ -394,8 +376,8 @@ pub(crate) fn check_item(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) ->
                 live_track_count,
                 stored_track_count,
                 stale,
-            } => Ok((identifier, live_track_count, stored_track_count, stale)),
-            other => Err(Box::new(other)),
+            } => Some((identifier, live_track_count, stored_track_count, stale)),
+            _ => None,
         },
     )?;
     if stale {
@@ -542,7 +524,7 @@ pub(crate) fn check_updates(source: SourceArg, apply: ApplyUpdates, ctx: &Ctx) -
 
 /// Message for a source that answers `SourceError::Unsupported`.
 fn unsupported_message(source: &str, feature: &str) -> String {
-    format!("source '{}' does not support {}", source, feature)
+    format!("{} does not support {}", source_label(source), feature)
 }
 
 /// The failure for a source error; `Unsupported` gets a friendly message naming the source.
@@ -566,8 +548,8 @@ pub(crate) fn playlists(source: SourceArg, ctx: &Ctx) -> Result<()> {
         &SourceRequest::ListPlaylists,
         |e| playlist_source_error(name, "playlists", &e),
         |response| match response {
-            SourceResponse::Playlists(playlists) => Ok(playlists),
-            other => Err(Box::new(other)),
+            SourceResponse::Playlists(playlists) => Some(playlists),
+            _ => None,
         },
     )?;
     if playlists.is_empty() {
@@ -667,8 +649,8 @@ pub(crate) fn import_playlist(
             e => playlist_source_error(name, "playlist import", &e),
         },
         |response| match response {
-            SourceResponse::ImportStarted { job_id } => Ok(job_id),
-            other => Err(Box::new(other)),
+            SourceResponse::ImportStarted { job_id } => Some(job_id),
+            _ => None,
         },
     )?;
     println!("Import started (job {})", job_id);
@@ -693,8 +675,8 @@ pub(crate) fn import_status(source: SourceArg, ctx: &Ctx) -> Result<()> {
         &SourceRequest::GetImportStatus,
         |e| playlist_source_error(name, "playlist import", &e),
         |response| match response {
-            SourceResponse::ImportStatus(status) => Ok(status),
-            other => Err(Box::new(other)),
+            SourceResponse::ImportStatus(status) => Some(status),
+            _ => None,
         },
     )?;
     match status {
@@ -968,62 +950,29 @@ mod tests {
         );
     }
 
-    // ── interpreting a source's reply ───────────────────────────────────────────
+    // ── source error messages ───────────────────────────────────────────────────
 
     use crate::test_support::failure_text;
 
-    fn paused(response: SourceResponse) -> std::result::Result<(), Box<SourceResponse>> {
-        match response {
-            SourceResponse::Paused => Ok(()),
-            other => Err(Box::new(other)),
-        }
-    }
-
-    fn interpret(reply: std::result::Result<SourceResponse, &str>) -> Result<()> {
-        interpret_source(reply, |e| source_error(&e), paused)
-    }
-
     #[test]
-    fn an_accepted_response_is_the_result() {
-        assert!(interpret(Ok(SourceResponse::Paused)).is_ok());
-    }
-
-    #[test]
-    fn an_error_response_gives_its_message() {
-        let reply = SourceResponse::Error(SourceError::NotAuthenticated {
-            message: "login first".to_string(),
-        });
-        assert_eq!(
-            failure_text(interpret(Ok(reply))),
-            "not authenticated: login first"
-        );
-    }
-
-    #[test]
-    fn an_unexpected_response_is_reported() {
-        assert_eq!(
-            failure_text(interpret(Ok(SourceResponse::Resumed))),
-            "Unexpected response"
-        );
-    }
-
-    #[test]
-    fn a_failed_request_gives_its_error() {
-        assert_eq!(
-            failure_text(interpret(Err("socket closed"))),
-            "socket closed"
-        );
-    }
-
-    #[test]
-    fn on_error_decides_how_an_error_response_is_reported() {
-        let reply = SourceResponse::Error(SourceError::ItemNotFound {
+    fn an_item_not_found_error_names_the_item_and_source() {
+        let err = SourceError::ItemNotFound {
             identifier: "p1".to_string(),
-        });
-        let result = interpret_source(Ok::<_, &str>(reply), |e| item_error("bandcamp", e), paused);
+        };
         assert_eq!(
-            failure_text(result),
+            failure_text::<()>(Err(item_error("bandcamp", err))),
             "Item p1 not found in your bandcamp collection"
+        );
+    }
+
+    #[test]
+    fn another_item_error_is_reported_as_it_is() {
+        let err = SourceError::NotAuthenticated {
+            message: "login first".to_string(),
+        };
+        assert_eq!(
+            failure_text::<()>(Err(item_error("bandcamp", err))),
+            "not authenticated: login first"
         );
     }
 

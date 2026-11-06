@@ -1,10 +1,13 @@
 //! Output helpers: track formatting and tables, and uniform error reporting.
+//! It also interprets service replies into the error texts hicli prints.
 
 use color_eyre::eyre::eyre;
 use colored::Colorize;
-use library_ipc_client::{ClientError, ProtocolError, TrackInfo};
+use gateway_client::AdminResponse;
+use library_ipc_client::{ClientError, LibraryResponse, ProtocolError, TrackInfo};
 use mdma_client::PlaybackClientError;
-use nng_transport::{ConnectionError, NngClientError};
+use nng_transport::ConnectionError;
+use source_protocol::{SourceError, SourceResponse};
 use track_formatter::{
     format_track_line as format_track_line_shared, render_for_user, ALL_COLUMNS,
 };
@@ -86,8 +89,28 @@ pub fn connect_failure(what: &str, err: &ConnectionError) -> String {
         ConnectionError::Dial { address, cause } => {
             format!("Failed to connect to {what} at {address}: {cause}")
         }
-        other => format!("Failed to connect to {what}: {other}"),
+        other => connect_failure_text(what, other),
     }
+}
+
+/// `Failed to connect to <what>: <err>`, for a failure without a dialed address.
+pub fn connect_failure_text(what: &str, err: &dyn std::fmt::Display) -> String {
+    format!("Failed to connect to {what}: {err}")
+}
+
+/// How a source is named in messages: `source 'bandcamp'`.
+pub fn source_label(name: &str) -> String {
+    format!("source '{name}'")
+}
+
+/// The failure for a reply `what` sent that the command did not expect.
+pub fn unexpected_response(what: &str) -> color_eyre::Report {
+    eyre!("Unexpected response from {what}")
+}
+
+/// The failure for a request to `what` that got no reply.
+pub fn request_failed(what: &str, err: &dyn std::fmt::Display) -> color_eyre::Report {
+    eyre!("Request to {what} failed: {err}")
 }
 
 /// The failure for a library client error (without hicli's `Error: ` prefix).
@@ -100,12 +123,6 @@ pub fn library_error(err: ClientError) -> color_eyre::Report {
             format!("Inbox file not found: {}", path)
         }
         ClientError::Protocol(e) => e.to_string(),
-        ClientError::Transport(NngClientError::Connection(e)) => {
-            format!(
-                "{}\nIs mdma-library running?",
-                connect_failure("library", &e)
-            )
-        }
         e => e.to_string(),
     };
     eyre!("{}", text)
@@ -118,16 +135,52 @@ pub fn source_error(err: &dyn std::fmt::Display) -> color_eyre::Report {
 
 /// The failure for a playback client error (without hicli's `Error: ` prefix).
 pub fn playback_error(err: PlaybackClientError) -> color_eyre::Report {
-    let text = match err {
-        PlaybackClientError::Connection(e) => {
-            format!(
-                "{}\nIs mdma-playback running?",
-                connect_failure("playback", &e)
-            )
-        }
-        e => e.to_string(),
-    };
-    eyre!("{}", text)
+    eyre!("{}", err)
+}
+
+/// Interpret an admin reply: `accept` takes the response it wants (`None`
+/// declines). An error response, a declined response, or a failed request is
+/// the failure.
+pub fn interpret_admin<T>(
+    reply: Result<AdminResponse, impl std::fmt::Display>,
+    accept: impl FnOnce(AdminResponse) -> Option<T>,
+) -> color_eyre::Result<T> {
+    match reply {
+        Ok(AdminResponse::Error { message }) => Err(eyre!("{}", message)),
+        Ok(response) => accept(response).ok_or_else(|| unexpected_response("admin")),
+        Err(e) => Err(request_failed("admin", &e)),
+    }
+}
+
+/// Interpret a reply of the source `name`: `accept` takes the response it wants
+/// (`None` declines). An error response is turned into the failure by
+/// `on_error`; a declined response or a failed request is a failure too.
+pub fn interpret_source<T>(
+    name: &str,
+    reply: Result<SourceResponse, impl std::fmt::Display>,
+    on_error: impl FnOnce(SourceError) -> color_eyre::Report,
+    accept: impl FnOnce(SourceResponse) -> Option<T>,
+) -> color_eyre::Result<T> {
+    let what = source_label(name);
+    match reply {
+        Ok(SourceResponse::Error(e)) => Err(on_error(e)),
+        Ok(response) => accept(response).ok_or_else(|| unexpected_response(&what)),
+        Err(e) => Err(request_failed(&what, &e)),
+    }
+}
+
+/// Interpret a library reply: `accept` takes the response it wants (`None`
+/// declines). An error response, a declined response, or a failed request is
+/// the failure.
+pub fn interpret_library<T>(
+    reply: Result<LibraryResponse, impl std::fmt::Display>,
+    accept: impl FnOnce(LibraryResponse) -> Option<T>,
+) -> color_eyre::Result<T> {
+    match reply {
+        Ok(LibraryResponse::Error(e)) => Err(eyre!("{}", e)),
+        Ok(response) => accept(response).ok_or_else(|| unexpected_response("library")),
+        Err(e) => Err(request_failed("library", &e)),
+    }
 }
 
 #[cfg(test)]
@@ -266,17 +319,18 @@ mod tests {
 
     // ── error messages as values ────────────────────────────────────────────────
 
-    use super::{connect_failure, library_error, playback_error, source_error};
-    use library_ipc_client::{ClientError, ProtocolError};
+    use super::{
+        connect_failure, interpret_admin, interpret_library, interpret_source, library_error,
+        playback_error, request_failed, source_error, source_label, unexpected_response,
+    };
+    use gateway_client::AdminResponse;
+    use library_ipc_client::{ClientError, LibraryResponse, ProtocolError};
     use mdma_client::PlaybackClientError;
     use nng_transport::{ConnectionError, NngClientError};
+    use source_protocol::{SourceError, SourceResponse};
 
     fn lib_text(err: ClientError) -> String {
         failure_text::<()>(Err(library_error(err)))
-    }
-
-    fn connection_failed() -> ConnectionError {
-        ConnectionError::DnsResolution("refused".to_string())
     }
 
     fn refused_at(address: &str) -> ConnectionError {
@@ -311,39 +365,9 @@ mod tests {
     }
 
     #[test]
-    fn library_connection_text_has_a_hint_line() {
-        let err = ClientError::Transport(NngClientError::Connection(connection_failed()));
-        assert_eq!(
-            lib_text(err),
-            "Failed to connect to library: DNS resolution failed: refused\nIs mdma-library running?"
-        );
-    }
-
-    #[test]
-    fn library_connection_text_names_the_address_once() {
-        let err = ClientError::Transport(NngClientError::Connection(refused_at(
-            "ipc:///run/mdma/library.sock",
-        )));
-        assert_eq!(
-            lib_text(err),
-            "Failed to connect to library at ipc:///run/mdma/library.sock: Connection refused\n\
-             Is mdma-library running?"
-        );
-    }
-
-    #[test]
     fn library_fallback_text_is_the_error() {
         let err = ClientError::Transport(NngClientError::Service("boom".to_string()));
         assert_eq!(lib_text(err), "service error: boom");
-    }
-
-    #[test]
-    fn playback_connection_text_has_a_hint_line() {
-        let err = PlaybackClientError::Connection(connection_failed());
-        assert_eq!(
-            failure_text::<()>(Err(playback_error(err))),
-            "Failed to connect to playback: DNS resolution failed: refused\nIs mdma-playback running?"
-        );
     }
 
     #[test]
@@ -379,6 +403,166 @@ mod tests {
                 &ConnectionError::DnsResolution("no host".to_string())
             ),
             "Failed to connect to library: DNS resolution failed: no host"
+        );
+    }
+
+    #[test]
+    fn unexpected_response_names_who_sent_it() {
+        assert_eq!(
+            failure_text::<()>(Err(unexpected_response("library"))),
+            "Unexpected response from library"
+        );
+        assert_eq!(
+            failure_text::<()>(Err(unexpected_response(&source_label("bandcamp")))),
+            "Unexpected response from source 'bandcamp'"
+        );
+    }
+
+    #[test]
+    fn request_failed_names_who_was_asked_and_why() {
+        assert_eq!(
+            failure_text::<()>(Err(request_failed("admin", &"timed out"))),
+            "Request to admin failed: timed out"
+        );
+    }
+
+    // ── interpreting a reply ────────────────────────────────────────────────────
+
+    fn accept_ok(response: AdminResponse) -> Option<()> {
+        matches!(response, AdminResponse::Ok).then_some(())
+    }
+
+    #[test]
+    fn an_accepted_admin_response_is_the_result() {
+        let reply = Ok::<_, &str>(AdminResponse::Ok);
+        assert!(interpret_admin(reply, accept_ok).is_ok());
+    }
+
+    #[test]
+    fn an_admin_error_response_gives_its_message() {
+        let reply = Ok::<_, &str>(AdminResponse::Error {
+            message: "boot partition unhealthy".to_string(),
+        });
+        assert_eq!(
+            failure_text(interpret_admin(reply, accept_ok)),
+            "boot partition unhealthy"
+        );
+    }
+
+    #[test]
+    fn a_declined_admin_response_is_unexpected() {
+        let reply = Ok::<_, &str>(AdminResponse::Pong);
+        assert_eq!(
+            failure_text(interpret_admin(reply, accept_ok)),
+            "Unexpected response from admin"
+        );
+    }
+
+    #[test]
+    fn a_failed_admin_request_says_so() {
+        let reply = Err::<AdminResponse, _>("timed out");
+        assert_eq!(
+            failure_text(interpret_admin(reply, accept_ok)),
+            "Request to admin failed: timed out"
+        );
+    }
+
+    fn paused(response: SourceResponse) -> Option<()> {
+        matches!(response, SourceResponse::Paused).then_some(())
+    }
+
+    fn interpret(reply: Result<SourceResponse, &str>) -> color_eyre::Result<()> {
+        interpret_source("bandcamp", reply, |e| source_error(&e), paused)
+    }
+
+    #[test]
+    fn an_accepted_source_response_is_the_result() {
+        assert!(interpret(Ok(SourceResponse::Paused)).is_ok());
+    }
+
+    #[test]
+    fn a_source_error_response_gives_its_message() {
+        let reply = SourceResponse::Error(SourceError::NotAuthenticated {
+            message: "login first".to_string(),
+        });
+        assert_eq!(
+            failure_text(interpret(Ok(reply))),
+            "not authenticated: login first"
+        );
+    }
+
+    #[test]
+    fn a_declined_source_response_names_the_source() {
+        assert_eq!(
+            failure_text(interpret(Ok(SourceResponse::Resumed))),
+            "Unexpected response from source 'bandcamp'"
+        );
+    }
+
+    #[test]
+    fn a_failed_source_request_names_the_source() {
+        assert_eq!(
+            failure_text(interpret(Err("socket closed"))),
+            "Request to source 'bandcamp' failed: socket closed"
+        );
+    }
+
+    #[test]
+    fn on_error_decides_how_a_source_error_response_is_reported() {
+        let reply = SourceResponse::Error(SourceError::Internal {
+            message: "boom".to_string(),
+        });
+        let result = interpret_source(
+            "bandcamp",
+            Ok::<_, &str>(reply),
+            |_| color_eyre::eyre::eyre!("custom"),
+            paused,
+        );
+        assert_eq!(failure_text(result), "custom");
+    }
+
+    fn playlist_content(response: LibraryResponse) -> Option<String> {
+        match response {
+            LibraryResponse::PlaylistContent(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn interpret_library_gives_the_accepted_response() {
+        let reply = Ok::<_, &str>(LibraryResponse::PlaylistContent("a\nb\n".to_string()));
+        assert_eq!(
+            interpret_library(reply, playlist_content).unwrap(),
+            "a\nb\n"
+        );
+    }
+
+    #[test]
+    fn interpret_library_reports_an_error_response_as_its_message() {
+        let reply = Ok::<_, &str>(LibraryResponse::Error(ProtocolError::PlaylistNotFound {
+            name: "mix".to_string(),
+        }));
+        assert_eq!(
+            failure_text(interpret_library(reply, playlist_content)),
+            "playlist not found: mix"
+        );
+    }
+
+    #[test]
+    fn interpret_library_reports_a_declined_response() {
+        let reply = Ok::<_, &str>(LibraryResponse::Pong);
+        assert_eq!(
+            failure_text(interpret_library(reply, playlist_content)),
+            "Unexpected response from library"
+        );
+    }
+
+    #[test]
+    fn interpret_library_reports_a_failed_request() {
+        let reply = Err::<LibraryResponse, _>("socket closed");
+        assert_eq!(
+            failure_text(interpret_library(reply, playlist_content)),
+            "Request to library failed: socket closed"
         );
     }
 

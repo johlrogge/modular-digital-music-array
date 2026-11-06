@@ -19,7 +19,7 @@ use nng_transport::NngClientError;
 use node_discovery::{NodeSpec, Target};
 
 use crate::node;
-use crate::output::connect_failure;
+use crate::output::{connect_failure, connect_failure_text, source_label};
 
 pub const DEFAULT_LIBRARY_SOCKET: &str = "ipc:///run/mdma/library.sock";
 pub const DEFAULT_PLAYBACK_SOCKET: &str = "ipc:///run/mdma/playback.sock";
@@ -186,7 +186,7 @@ impl Ctx {
             } else {
                 String::new()
             };
-            let what = format!("source '{name}'");
+            let what = source_label(name);
             eyre!(
                 "{}{running}\nHint: 'mdma source list' shows the available sources",
                 connect_text(&what, &e)
@@ -212,7 +212,7 @@ impl Ctx {
 fn connect_text(what: &str, err: &NngClientError) -> String {
     match err {
         NngClientError::Connection(e) => connect_failure(what, e),
-        other => format!("Failed to connect to {what}: {other}"),
+        other => connect_failure_text(what, other),
     }
 }
 
@@ -230,14 +230,14 @@ fn connect_failed(what: &str, err: &NngClientError, direct: bool) -> color_eyre:
 fn library_connect_failed(err: &ClientError, direct: bool) -> color_eyre::Report {
     match err {
         ClientError::Transport(e) => connect_failed("library", e, direct),
-        other => eyre!("Failed to connect to library: {other}"),
+        other => eyre!("{}", connect_failure_text("library", other)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::failure_text;
+    use crate::test_support::{dead_node, failure_text};
     use pretty_assertions::assert_eq;
 
     fn globals() -> Globals {
@@ -313,21 +313,6 @@ mod tests {
         )
     }
 
-    /// A node on this machine that refuses connections: a port that was bound, then freed.
-    fn dead_node() -> Target {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("bind a free port")
-            .local_addr()
-            .expect("local address")
-            .port();
-        Target::Remote(node_discovery::RemoteTarget {
-            host: "localhost".to_string(),
-            ip: Some(Ipv4Addr::LOCALHOST),
-            port,
-            source: node_discovery::Source::Cache,
-        })
-    }
-
     #[test]
     fn library_connect_failure_over_ipc_says_what_to_start() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -383,15 +368,35 @@ mod tests {
 
     #[test]
     fn library_connect_failure_to_a_dead_node_has_no_ipc_hint() {
-        let target = dead_node();
-        let Target::Remote(remote) = &target else {
-            unreachable!("dead_node is remote")
-        };
-        let port = remote.port;
+        let (target, port) = dead_node();
         let ctx = Ctx::with_target(globals(), target);
         assert_eq!(
             failure_text(ctx.library()),
             format!("Failed to connect to library at tcp://127.0.0.1:{port}: Connection refused")
+        );
+    }
+
+    #[test]
+    fn source_connect_failure_to_a_dead_node_has_no_ipc_hint() {
+        let (target, port) = dead_node();
+        let ctx = Ctx::with_target(globals(), target);
+        assert_eq!(
+            failure_text(ctx.source("bandcamp", None)),
+            format!(
+                "Failed to connect to source 'bandcamp' at tcp://127.0.0.1:{port}: \
+                 Connection refused\n\
+                 Hint: 'mdma source list' shows the available sources"
+            )
+        );
+    }
+
+    #[test]
+    fn admin_connect_failure_to_a_dead_node_names_the_gateway() {
+        let (target, port) = dead_node();
+        let ctx = Ctx::with_target(globals(), target);
+        assert_eq!(
+            failure_text(ctx.admin()),
+            format!("Failed to connect to gateway at tcp://127.0.0.1:{port}: Connection refused")
         );
     }
 

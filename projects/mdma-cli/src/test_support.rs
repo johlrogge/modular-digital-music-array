@@ -60,6 +60,23 @@ pub(crate) fn node_env_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// A node on this machine that refuses connections: a port that was bound,
+/// then freed. The target, and its port.
+pub(crate) fn dead_node() -> (node_discovery::Target, u16) {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind a free port")
+        .local_addr()
+        .expect("local address")
+        .port();
+    let target = node_discovery::Target::Remote(node_discovery::RemoteTarget {
+        host: "localhost".to_string(),
+        ip: Some(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        source: node_discovery::Source::Cache,
+    });
+    (target, port)
+}
+
 /// The text hicli would print (after its `Error: ` prefix) for a failed command result.
 pub(crate) fn failure_text<T>(r: color_eyre::Result<T>) -> String {
     hicli::Failure::from(r.err().expect("an error"))

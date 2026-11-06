@@ -1,8 +1,8 @@
 use crate::args::{impl_arg, OptPlaylistArg, PlaylistArg};
 use crate::ctx::Ctx;
+use crate::output::interpret_library;
 use crate::stdin::{hashes_in, read_hashes, read_stdin_to_string};
 use bpaf::{construct, long, Bpaf, Parser};
-use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use colored::Colorize;
 use hicli::Arg;
@@ -77,32 +77,17 @@ impl ContainsMode {
     }
 }
 
-/// Interpret a library reply: `accept` takes the response it wants. An error
-/// response, a response it declines, or a failed request is the failure.
-fn expect_library<T>(
-    response: std::result::Result<LibraryResponse, impl std::fmt::Display>,
-    accept: impl FnOnce(LibraryResponse) -> std::result::Result<T, LibraryResponse>,
-) -> Result<T> {
+fn playlist_content(response: LibraryResponse) -> Option<String> {
     match response {
-        Ok(LibraryResponse::Error(e)) => Err(eyre!("{}", e)),
-        Ok(response) => accept(response).map_err(|_| eyre!("Unexpected response")),
-        Err(e) => Err(eyre!("Request failed: {}", e)),
+        LibraryResponse::PlaylistContent(c) => Some(c),
+        _ => None,
     }
 }
 
-fn playlist_content(response: LibraryResponse) -> std::result::Result<String, LibraryResponse> {
+fn playlist_names(response: LibraryResponse) -> Option<Vec<PlaylistName>> {
     match response {
-        LibraryResponse::PlaylistContent(c) => Ok(c),
-        other => Err(other),
-    }
-}
-
-fn playlist_names(
-    response: LibraryResponse,
-) -> std::result::Result<Vec<PlaylistName>, LibraryResponse> {
-    match response {
-        LibraryResponse::PlaylistNames(names) => Ok(names),
-        other => Err(other),
+        LibraryResponse::PlaylistNames(names) => Some(names),
+        _ => None,
     }
 }
 
@@ -112,7 +97,7 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{DurationSeconds, LibraryRequest};
 
     let library = ctx.library()?;
-    let names = expect_library(
+    let names = interpret_library(
         library.request(&LibraryRequest::PlaylistList),
         playlist_names,
     )?;
@@ -158,7 +143,7 @@ pub(crate) fn get(name: OptPlaylistArg, ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
     match name {
         Some(PlaylistArg(pname)) => {
-            let content = expect_library(
+            let content = interpret_library(
                 library.request(&LibraryRequest::PlaylistGet { name: pname }),
                 playlist_content,
             )?;
@@ -184,7 +169,7 @@ pub(crate) fn get(name: OptPlaylistArg, ctx: &Ctx) -> Result<()> {
                     eprintln!("Invalid playlist name: {}", e);
                     std::process::exit(1);
                 });
-                let content = expect_library(
+                let content = interpret_library(
                     library.request(&LibraryRequest::PlaylistGet { name: pname }),
                     playlist_content,
                 )?;
@@ -220,7 +205,7 @@ pub(crate) fn contains(mode: ContainsMode, ctx: &Ctx) -> Result<()> {
     let input_set: HashSet<&ContentHash> = input_hashes.iter().collect();
 
     // 3. Get all playlist names
-    let names = expect_library(
+    let names = interpret_library(
         library.request(&LibraryRequest::PlaylistList),
         playlist_names,
     )?;
@@ -262,7 +247,7 @@ pub(crate) fn new(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
     let PlaylistArg(pname) = name;
     let content = read_stdin_to_string();
-    expect_library(
+    interpret_library(
         library.request(&LibraryRequest::PlaylistNew {
             name: pname.clone(),
             content,
@@ -280,7 +265,7 @@ pub(crate) fn append(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
     let PlaylistArg(pname) = name;
     let content = read_stdin_to_string();
-    expect_library(
+    interpret_library(
         library.request(&LibraryRequest::PlaylistAppend {
             name: pname.clone(),
             content,
@@ -298,7 +283,7 @@ pub(crate) fn replace(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
     let PlaylistArg(pname) = name;
     let content = read_stdin_to_string();
-    expect_library(
+    interpret_library(
         library.request(&LibraryRequest::PlaylistReplace {
             name: pname.clone(),
             content,
@@ -337,7 +322,7 @@ pub(crate) fn edit(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     let new_content = crate::editor::edit_text("mdma-playlist-", &current);
 
     // 3. Replace
-    expect_library(
+    interpret_library(
         library.request(&LibraryRequest::PlaylistReplace {
             name: pname.clone(),
             content: new_content,
@@ -406,46 +391,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::test_support::{failure_text, parses, run_arg, usage_error};
-
-    // ── interpreting a library reply ────────────────────────────────────────────
-
-    #[test]
-    fn expect_library_gives_the_accepted_response() {
-        let reply = Ok::<_, &str>(LibraryResponse::PlaylistContent("a\nb\n".to_string()));
-        assert_eq!(expect_library(reply, playlist_content).unwrap(), "a\nb\n");
-    }
-
-    #[test]
-    fn expect_library_reports_an_error_response_as_its_message() {
-        let reply = Ok::<_, &str>(LibraryResponse::Error(
-            library_ipc_client::ProtocolError::PlaylistNotFound {
-                name: "mix".to_string(),
-            },
-        ));
-        assert_eq!(
-            failure_text(expect_library(reply, playlist_content)),
-            "playlist not found: mix"
-        );
-    }
-
-    #[test]
-    fn expect_library_reports_a_declined_response() {
-        let reply = Ok::<_, &str>(LibraryResponse::Pong);
-        assert_eq!(
-            failure_text(expect_library(reply, playlist_content)),
-            "Unexpected response"
-        );
-    }
-
-    #[test]
-    fn expect_library_reports_a_failed_request() {
-        let reply = Err::<LibraryResponse, _>("socket closed");
-        assert_eq!(
-            failure_text(expect_library(reply, playlist_content)),
-            "Request failed: socket closed"
-        );
-    }
+    use crate::test_support::{parses, run_arg, usage_error};
 
     #[test]
     fn rename_args_parser_reads_from_and_to() {

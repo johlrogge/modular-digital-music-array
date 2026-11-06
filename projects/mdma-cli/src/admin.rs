@@ -1,37 +1,21 @@
 use crate::args::impl_arg;
 use crate::ctx::Ctx;
-use color_eyre::eyre::eyre;
+use crate::output::interpret_admin;
 use color_eyre::Result;
 use gateway_client::{AdminRequest, AdminResponse, GatewayClient};
-
-/// Interpret an admin reply: `accept` takes the response it wants. An error
-/// response, a response it declines, or a failed request is the failure.
-fn interpret_admin<T>(
-    reply: std::result::Result<AdminResponse, impl std::fmt::Display>,
-    accept: impl FnOnce(AdminResponse) -> std::result::Result<T, AdminResponse>,
-) -> Result<T> {
-    match reply {
-        Ok(AdminResponse::Error { message }) => Err(eyre!("{}", message)),
-        Ok(response) => accept(response).map_err(|other| eyre!("unexpected response: {:?}", other)),
-        Err(e) => Err(eyre!("request failed: {}", e)),
-    }
-}
 
 /// Send an admin request and interpret the reply with [`interpret_admin`].
 fn admin_call<T>(
     admin: &GatewayClient,
     request: &AdminRequest,
-    accept: impl FnOnce(AdminResponse) -> std::result::Result<T, AdminResponse>,
+    accept: impl FnOnce(AdminResponse) -> Option<T>,
 ) -> Result<T> {
     interpret_admin(admin.admin_request(request), accept)
 }
 
 /// The response a request answered with a plain `Ok` must be.
-fn accept_ok(response: AdminResponse) -> std::result::Result<(), AdminResponse> {
-    match response {
-        AdminResponse::Ok => Ok(()),
-        other => Err(other),
-    }
+fn accept_ok(response: AdminResponse) -> Option<()> {
+    matches!(response, AdminResponse::Ok).then_some(())
 }
 
 /// Like [`admin_call`] for requests that are answered with a plain `Ok`.
@@ -56,8 +40,8 @@ mod service_mode {
                     boot_order,
                     service_mode_armed,
                     pcie_probe,
-                } => Ok((boot_order, service_mode_armed, pcie_probe)),
-                other => Err(other),
+                } => Some((boot_order, service_mode_armed, pcie_probe)),
+                _ => None,
             },
         )?;
         let boot_label = if service_mode_armed {
@@ -115,8 +99,8 @@ pub(crate) fn boot_health(ctx: &Ctx) -> Result<()> {
         &admin,
         &AdminRequest::BootHealth,
         |response| match response {
-            AdminResponse::BootHealth { verdict } => Ok(verdict),
-            other => Err(other),
+            AdminResponse::BootHealth { verdict } => Some(verdict),
+            _ => None,
         },
     )?;
     println!("Boot health: {verdict}");
@@ -149,47 +133,9 @@ pub(crate) fn reboot(force: Force, ctx: &Ctx) -> Result<()> {
 #[cfg(test)]
 mod tests {
 
-    use crate::test_support::{failure_text, parses, run_arg};
+    use crate::test_support::{parses, run_arg};
 
-    use super::{accept_ok, interpret_admin, Force};
-    use gateway_client::AdminResponse;
-
-    // ── interpreting an admin reply ─────────────────────────────────────────
-
-    #[test]
-    fn an_accepted_admin_response_is_the_result() {
-        let reply = Ok::<_, &str>(AdminResponse::Ok);
-        assert!(interpret_admin(reply, accept_ok).is_ok());
-    }
-
-    #[test]
-    fn an_admin_error_response_gives_its_message() {
-        let reply = Ok::<_, &str>(AdminResponse::Error {
-            message: "boot partition unhealthy".to_string(),
-        });
-        assert_eq!(
-            failure_text(interpret_admin(reply, accept_ok)),
-            "boot partition unhealthy"
-        );
-    }
-
-    #[test]
-    fn a_declined_admin_response_is_unexpected() {
-        let reply = Ok::<_, &str>(AdminResponse::Pong);
-        assert_eq!(
-            failure_text(interpret_admin(reply, accept_ok)),
-            "unexpected response: Pong"
-        );
-    }
-
-    #[test]
-    fn a_failed_admin_request_says_so() {
-        let reply = Err::<AdminResponse, _>("timed out");
-        assert_eq!(
-            failure_text(interpret_admin(reply, accept_ok)),
-            "request failed: timed out"
-        );
-    }
+    use super::Force;
 
     #[test]
     fn force_arg_parser_is_a_switch() {

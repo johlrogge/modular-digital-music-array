@@ -24,23 +24,19 @@ impl_arg!(InboxFileArg, positional "FILENAME", "File name in inbox");
 #[hicli::command]
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
-    match library.inbox_queue() {
-        Ok(files) => {
-            if files.is_empty() {
-                println!("Inbox is empty");
-                return Ok(());
-            }
-
-            println!("Inbox queue ({} files):", files.len());
-            println!("{}", "=".repeat(65));
-
-            for file in files {
-                println!("  {}", file.as_str());
-            }
-            Ok(())
-        }
-        Err(e) => Err(library_error(e)),
+    let files = library.inbox_queue().map_err(library_error)?;
+    if files.is_empty() {
+        println!("Inbox is empty");
+        return Ok(());
     }
+
+    println!("Inbox queue ({} files):", files.len());
+    println!("{}", "=".repeat(65));
+
+    for file in files {
+        println!("  {}", file.as_str());
+    }
+    Ok(())
 }
 
 /// Delete a file from inbox without ingesting
@@ -49,20 +45,15 @@ pub(crate) fn delete(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
     let InboxFileArg(path) = file;
 
-    match library.delete_inbox_file(&path) {
-        Ok(result) => {
-            use mdma_client::IngestResult;
-            match result {
-                IngestResult::Success { message, .. } => println!("{}", message),
-                IngestResult::Failure { message } => {
-                    eprintln!("Failed: {}", message);
-                    std::process::exit(1);
-                }
-            }
-            Ok(())
+    use mdma_client::IngestResult;
+    match library.delete_inbox_file(&path).map_err(library_error)? {
+        IngestResult::Success { message, .. } => println!("{}", message),
+        IngestResult::Failure { message } => {
+            eprintln!("Failed: {}", message);
+            std::process::exit(1);
         }
-        Err(e) => Err(library_error(e)),
     }
+    Ok(())
 }
 
 /// Ingest a specific file from inbox
@@ -73,26 +64,21 @@ pub(crate) fn ingest(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
 
     println!("Ingesting: {}", path.as_str());
 
-    match library.ingest_file(&path) {
-        Ok(result) => {
-            use mdma_client::IngestResult;
-            match result {
-                IngestResult::Success { hash, message } => {
-                    if let Some(h) = hash {
-                        println!("Success: {}", h.as_str());
-                    } else {
-                        println!("Success: {}", message);
-                    }
-                }
-                IngestResult::Failure { message } => {
-                    eprintln!("Failed: {}", message);
-                    std::process::exit(1);
-                }
+    use mdma_client::IngestResult;
+    match library.ingest_file(&path).map_err(library_error)? {
+        IngestResult::Success { hash, message } => {
+            if let Some(h) = hash {
+                println!("Success: {}", h.as_str());
+            } else {
+                println!("Success: {}", message);
             }
-            Ok(())
         }
-        Err(e) => Err(library_error(e)),
+        IngestResult::Failure { message } => {
+            eprintln!("Failed: {}", message);
+            std::process::exit(1);
+        }
     }
+    Ok(())
 }
 
 /// Ingest all files in inbox
@@ -101,44 +87,40 @@ pub(crate) fn ingest_all(ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
     println!("Ingesting all files in inbox...");
 
-    match library.ingest_all() {
-        Ok(results) => {
-            if results.is_empty() {
-                println!("Inbox is empty - nothing to ingest");
-                return Ok(());
-            }
+    let results = library.ingest_all().map_err(library_error)?;
+    if results.is_empty() {
+        println!("Inbox is empty - nothing to ingest");
+        return Ok(());
+    }
 
-            let mut success_count = 0;
-            let mut fail_count = 0;
+    let mut success_count = 0;
+    let mut fail_count = 0;
 
-            use mdma_client::IngestResult;
-            for item in results {
-                match item.result {
-                    IngestResult::Success { hash, .. } => {
-                        success_count += 1;
-                        if let Some(hash) = hash {
-                            println!("  OK: {} -> {}", item.path.as_str(), short_hash(&hash));
-                        } else {
-                            println!("  OK: {}", item.path.as_str());
-                        }
-                    }
-                    IngestResult::Failure { message } => {
-                        fail_count += 1;
-                        println!("  FAIL: {} - {}", item.path.as_str(), message);
-                    }
+    use mdma_client::IngestResult;
+    for item in results {
+        match item.result {
+            IngestResult::Success { hash, .. } => {
+                success_count += 1;
+                if let Some(hash) = hash {
+                    println!("  OK: {} -> {}", item.path.as_str(), short_hash(&hash));
+                } else {
+                    println!("  OK: {}", item.path.as_str());
                 }
             }
-
-            println!();
-            println!("Done: {} succeeded, {} failed", success_count, fail_count);
-
-            if fail_count > 0 {
-                std::process::exit(1);
+            IngestResult::Failure { message } => {
+                fail_count += 1;
+                println!("  FAIL: {} - {}", item.path.as_str(), message);
             }
-            Ok(())
         }
-        Err(e) => Err(library_error(e)),
     }
+
+    println!();
+    println!("Done: {} succeeded, {} failed", success_count, fail_count);
+
+    if fail_count > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

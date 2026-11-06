@@ -188,31 +188,23 @@ impl SortDirection {
 #[hicli::command]
 pub(crate) fn ping(ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
-    match library.ping() {
-        Ok(()) => {
-            println!("pong - service is alive");
-            Ok(())
-        }
-        Err(e) => Err(library_error(e)),
-    }
+    library.ping().map_err(library_error)?;
+    println!("pong - service is alive");
+    Ok(())
 }
 
 /// Get service status
 #[hicli::command]
 pub(crate) fn status(ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
-    match library.status() {
-        Ok(status) => {
-            println!("MDMA Library Service v{}", status.version);
-            println!("{}", "=".repeat(35));
-            println!("Tracks indexed:  {}", status.tracks_indexed);
-            println!("Facts count:     {}", status.facts_count);
-            println!("Inbox queue:     {} files", status.inbox_queue_size);
-            println!("Uptime:          {} seconds", status.uptime_seconds);
-            Ok(())
-        }
-        Err(e) => Err(library_error(e)),
-    }
+    let status = library.status().map_err(library_error)?;
+    println!("MDMA Library Service v{}", status.version);
+    println!("{}", "=".repeat(35));
+    println!("Tracks indexed:  {}", status.tracks_indexed);
+    println!("Facts count:     {}", status.facts_count);
+    println!("Inbox queue:     {} files", status.inbox_queue_size);
+    println!("Uptime:          {} seconds", status.uptime_seconds);
+    Ok(())
 }
 
 /// List tracks in library
@@ -220,27 +212,25 @@ pub(crate) fn status(ctx: &Ctx) -> Result<()> {
 pub(crate) fn list(limit: OptLimitArg, ctx: &Ctx) -> Result<()> {
     let OptLimitArg(limit) = limit;
     let library = ctx.library()?;
-    match library.list_tracks(limit.map(|LimitArg(n)| n.get())) {
-        Ok(tracks) => {
-            if tracks.is_empty() {
-                println!("No tracks in library");
-                return Ok(());
-            }
-
-            println!("Tracks in library ({}):", tracks.len());
-            println!("{}", "=".repeat(65));
-
-            for track in tracks {
-                println!(
-                    "{} | {}",
-                    short_hash(&track.content_hash),
-                    format_track_line(&track)
-                );
-            }
-            Ok(())
-        }
-        Err(e) => Err(library_error(e)),
+    let tracks = library
+        .list_tracks(limit.map(|LimitArg(n)| n.get()))
+        .map_err(library_error)?;
+    if tracks.is_empty() {
+        println!("No tracks in library");
+        return Ok(());
     }
+
+    println!("Tracks in library ({}):", tracks.len());
+    println!("{}", "=".repeat(65));
+
+    for track in tracks {
+        println!(
+            "{} | {}",
+            short_hash(&track.content_hash),
+            format_track_line(&track)
+        );
+    }
+    Ok(())
 }
 
 /// Get a specific track by hash (supports partial hashes like git)
@@ -248,41 +238,37 @@ pub(crate) fn list(limit: OptLimitArg, ctx: &Ctx) -> Result<()> {
 pub(crate) fn get(hash: TrackArg, ctx: &Ctx) -> Result<()> {
     let TrackArg(content_hash) = hash;
     let library = ctx.library()?;
-    match library.get_track(&content_hash) {
-        Ok(track) => {
-            println!("Track: {}", track.content_hash.as_str());
-            println!("{}", "=".repeat(65));
-            if let Some(title) = track.title {
-                println!("Title:    {}", title);
-            }
-            if let Some(artist) = track.artist {
-                println!("Artist:   {}", artist);
-            }
-            if let Some(album) = track.album {
-                println!("Album:    {}", album);
-            }
-            if let Some(duration) = track.duration {
-                println!("Duration: {}", duration);
-            }
-            if let Some(bpm) = track.bpm {
-                println!("BPM:      {}", bpm);
-            }
-            if let Some(key) = track.key {
-                println!("Key:      {}", key);
-            }
-            if let Some(role) = track.role {
-                println!("Role:     {}", role);
-            }
-            if let Some(energy) = track.energy {
-                println!("Energy:   {}", energy);
-            }
-            if let Some(path) = track.blob_path {
-                println!("Path:     {}", path);
-            }
-            Ok(())
-        }
-        Err(e) => Err(library_error(e)),
+    let track = library.get_track(&content_hash).map_err(library_error)?;
+    println!("Track: {}", track.content_hash.as_str());
+    println!("{}", "=".repeat(65));
+    if let Some(title) = track.title {
+        println!("Title:    {}", title);
     }
+    if let Some(artist) = track.artist {
+        println!("Artist:   {}", artist);
+    }
+    if let Some(album) = track.album {
+        println!("Album:    {}", album);
+    }
+    if let Some(duration) = track.duration {
+        println!("Duration: {}", duration);
+    }
+    if let Some(bpm) = track.bpm {
+        println!("BPM:      {}", bpm);
+    }
+    if let Some(key) = track.key {
+        println!("Key:      {}", key);
+    }
+    if let Some(role) = track.role {
+        println!("Role:     {}", role);
+    }
+    if let Some(energy) = track.energy {
+        println!("Energy:   {}", energy);
+    }
+    if let Some(path) = track.blob_path {
+        println!("Path:     {}", path);
+    }
+    Ok(())
 }
 
 /// Show all facts for a track
@@ -290,17 +276,13 @@ pub(crate) fn get(hash: TrackArg, ctx: &Ctx) -> Result<()> {
 pub(crate) fn facts(hash: TrackArg, ctx: &Ctx) -> Result<()> {
     let TrackArg(content_hash) = hash;
     let library = ctx.library()?;
-    match library.get_facts(&content_hash) {
-        Ok((full_hash, facts)) => {
-            println!("Facts for: {}", full_hash.as_str());
-            println!("{}", "=".repeat(65));
-            for (fact_type, fact_value) in facts {
-                println!("{:20} | {}", fact_type, fact_value);
-            }
-            Ok(())
-        }
-        Err(e) => Err(library_error(e)),
+    let (full_hash, facts) = library.get_facts(&content_hash).map_err(library_error)?;
+    println!("Facts for: {}", full_hash.as_str());
+    println!("{}", "=".repeat(65));
+    for (fact_type, fact_value) in facts {
+        println!("{:20} | {}", fact_type, fact_value);
     }
+    Ok(())
 }
 
 /// Compare two optional values treating `None` as negative-infinity (-∞).
@@ -402,33 +384,27 @@ pub(crate) fn bookmark(scope: OptScopeArg, hash: OptTrackArg, ctx: &Ctx) -> Resu
     let playback = ctx.playback()?;
     let content_hash = match hash {
         Some(TrackArg(h)) => h,
-        None => match playback.now_playing() {
-            Ok(Some(h)) => h,
-            Ok(None) => {
+        None => match playback.now_playing().map_err(playback_error)? {
+            Some(h) => h,
+            None => {
                 eprintln!("Nothing is currently playing");
                 std::process::exit(1);
             }
-            Err(e) => return Err(playback_error(e)),
         },
     };
 
-    match library.write_bookmark(&content_hash, scope) {
-        Ok(()) => {
-            println!("Bookmarked.");
-            Ok(())
-        }
-        Err(e) => Err(library_error(e)),
-    }
+    library
+        .write_bookmark(&content_hash, scope)
+        .map_err(library_error)?;
+    println!("Bookmarked.");
+    Ok(())
 }
 
 /// List all bookmarked tracks
 #[hicli::command]
 pub(crate) fn bookmarks(ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
-    let tracks = match library.list_tracks(None) {
-        Ok(t) => t,
-        Err(e) => return Err(library_error(e)),
-    };
+    let tracks = library.list_tracks(None).map_err(library_error)?;
 
     let bookmarked: Vec<TrackInfo> = tracks
         .into_iter()
