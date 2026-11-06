@@ -2,6 +2,8 @@
 //!
 //! Connects to services via gateway (single address) or direct IPC.
 
+#![deny(clippy::exit)]
+
 /// Admin commands (service mode, reboot)
 #[hicli::group]
 mod admin;

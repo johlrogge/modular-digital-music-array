@@ -60,8 +60,12 @@ positionals last.
 - Defaults: `search` → `query` (default) + `fact-values-for`; `library dedup` → `scan` (default, --apply) +
   `merge`; `library archive` → `list` (default) + `empty`. Prose of a default lives on its group.
 - Completions: hidden `generate-completions <bash|zsh|fish>` printing `hicli::completion_script`.
-- Errors: command errors map to exit 1 with the message chain; parse errors exit 2. Remaining
-  `process::exit` calls are kept through the migration and converted afterwards.
+- Errors: command errors map to exit 1 with the message chain; parse errors exit 2. The conversion of
+  `process::exit` to returned errors is done (P3):
+  - commands return `color_eyre::Result<()>`, or `Result<hicli::Success>` when a partial failure prints a
+    report and exits 1 via `Success::code(1)` (`output::success_unless`);
+  - errors are single `eyre!` strings without their own `Error: ` prefix, because hicli adds it;
+  - `#![deny(clippy::exit)]` in main.rs enforces this.
 - Argument type naming:
   - `<X>Arg` / `Opt<X>Arg` is a value parsed from a single argv token through `FromStr` (Opt wraps
     `Option<XArg>`, because hicli has no `Arg` impl for `Option`/`Vec`; every optional command parameter is an
