@@ -53,9 +53,9 @@ pub(crate) fn run_arg<T: hicli::Arg>(args: &[&str]) -> Result<T, String> {
         .map_err(|failure| flat(&failure.unwrap_stderr()))
 }
 
-/// Held by every test that sets `MDMA_NODE`: the environment is process-wide
-/// and tests run in parallel.
-pub(crate) fn node_env_lock() -> std::sync::MutexGuard<'static, ()> {
+/// Held by every test that sets an environment variable (`MDMA_NODE`, `EDITOR`,
+/// `COLUMNS`): the environment is process-wide and tests run in parallel.
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }

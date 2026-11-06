@@ -1,5 +1,7 @@
 //! Editing text in the user's `$EDITOR` (falls back to vi).
 
+use color_eyre::eyre::eyre;
+use color_eyre::Result;
 use std::io::Write;
 
 const SUFFIX: &str = ".plist";
@@ -19,38 +21,71 @@ fn create_temp(prefix: &str, initial: &str) -> std::io::Result<tempfile::NamedTe
 /// Write `initial` to a unique temp file named `<prefix><random>.plist`, open it
 /// in `$EDITOR`, and return the saved text. The file is removed afterwards.
 ///
-/// Exits 1 when the file cannot be written or read back, the editor cannot be
+/// Fails when the file cannot be written or read back, the editor cannot be
 /// launched, or it exits with a non-zero status.
-pub(crate) fn edit_text(prefix: &str, initial: &str) -> String {
-    let file = create_temp(prefix, initial).unwrap_or_else(|e| {
-        eprintln!("Failed to write temp file: {}", e);
-        std::process::exit(1);
-    });
+pub(crate) fn edit_text(prefix: &str, initial: &str) -> Result<String> {
+    let file = create_temp(prefix, initial).map_err(|e| eyre!("Failed to write temp file: {e}"))?;
     let path = file.path();
 
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
     let status = std::process::Command::new(&editor)
         .arg(path)
         .status()
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to launch editor '{}': {}", editor, e);
-            std::process::exit(1);
-        });
+        .map_err(|e| eyre!("Failed to launch editor '{editor}': {e}"))?;
     if !status.success() {
-        eprintln!("Editor exited with non-zero status");
-        std::process::exit(1);
+        return Err(eyre!("Editor exited with non-zero status"));
     }
 
     // Read by path: editors may replace the file, so the open handle can be stale.
-    std::fs::read_to_string(path).unwrap_or_else(|e| {
-        eprintln!("Failed to read temp file: {}", e);
-        std::process::exit(1);
-    })
+    std::fs::read_to_string(path).map_err(|e| eyre!("Failed to read temp file: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{env_lock, failure_text};
+
+    /// Puts `$EDITOR` back to what it was when dropped, even if the test panics.
+    struct RestoreEditor(Option<String>);
+
+    impl Drop for RestoreEditor {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("EDITOR", value),
+                None => std::env::remove_var("EDITOR"),
+            }
+        }
+    }
+
+    /// Run `f` with `$EDITOR` set to `editor`, restoring the previous value afterwards.
+    fn with_editor<T>(editor: &str, f: impl FnOnce() -> T) -> T {
+        let _lock = env_lock();
+        let _restore = RestoreEditor(std::env::var("EDITOR").ok());
+        std::env::set_var("EDITOR", editor);
+        f()
+    }
+
+    #[test]
+    fn editor_failing_is_an_error() {
+        let result = with_editor("false", || edit_text("mdma-test-", "x"));
+        assert_eq!(failure_text(result), "Editor exited with non-zero status");
+    }
+
+    #[test]
+    fn editor_that_cannot_launch_is_an_error() {
+        let result = with_editor("mdma-no-such-editor", || edit_text("mdma-test-", "x"));
+        let text = failure_text(result);
+        assert!(
+            text.starts_with("Failed to launch editor 'mdma-no-such-editor': "),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn unchanged_text_comes_back_when_the_editor_succeeds() {
+        let result = with_editor("true", || edit_text("mdma-test-", "hello\n"));
+        assert_eq!(result.unwrap(), "hello\n");
+    }
 
     #[test]
     fn concurrent_temp_files_get_distinct_paths() {

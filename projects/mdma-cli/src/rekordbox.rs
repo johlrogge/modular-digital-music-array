@@ -1,6 +1,6 @@
 use crate::args::{choice, choice_names, ExistingFileArg, PlaylistArg, SanitizedPlaylistName};
 use crate::ctx::Ctx;
-use crate::stdin::{read_hashes, resolve_tracks_skip_errors};
+use crate::stdin::{require_stdin_hashes_or_usage, resolve_tracks_skip_errors};
 use crate::transfer::{
     build_http_client, download_tracks, existing_location_set, export_dest_path_checked,
     export_extension, path_cost, DownloadOutcome, ExportFormat, MAX_LOCATION_URI_BYTES,
@@ -216,7 +216,11 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
         }
         result
     } else {
-        vec![("".to_string(), read_hashes())]
+        let hashes = require_stdin_hashes_or_usage(&[
+            "Usage: mdma search --artist CBL | mdma rekordbox export",
+            "       mdma rekordbox export --playlist my-set",
+        ])?;
+        vec![("".to_string(), hashes)]
     };
 
     // Union of all hashes, deduped while preserving first-occurrence order.
@@ -231,14 +235,9 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
     }
 
     if all_hashes.is_empty() {
-        if !playlists.is_empty() {
-            eprintln!("All specified playlists are empty.");
-        } else {
-            eprintln!("No hashes provided on stdin.");
-            eprintln!("Usage: mdma search --artist CBL | mdma rekordbox export");
-            eprintln!("       mdma rekordbox export --playlist my-set");
-        }
-        std::process::exit(1);
+        return Err(color_eyre::eyre::eyre!(
+            "All specified playlists are empty."
+        ));
     }
 
     // Resolve each unique hash to full TrackInfo

@@ -1,7 +1,7 @@
 use crate::args::{impl_arg, OptPlaylistArg, PlaylistArg};
 use crate::ctx::Ctx;
 use crate::output::interpret_library;
-use crate::stdin::{hashes_in, read_hashes, read_stdin_to_string};
+use crate::stdin::{hashes_in, read_stdin_to_string, require_stdin_hashes_or_usage};
 use bpaf::{construct, long, Bpaf, Parser};
 use color_eyre::Result;
 use colored::Colorize;
@@ -192,12 +192,7 @@ pub(crate) fn contains(mode: ContainsMode, ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
 
     // 1. Read hashes from stdin
-    let input_hashes = read_hashes();
-
-    if input_hashes.is_empty() {
-        eprintln!("No hashes provided on stdin.");
-        std::process::exit(1);
-    }
+    let input_hashes = require_stdin_hashes_or_usage(&[])?;
 
     // 2. Determine threshold and invert
     let (threshold, invert) = mode.threshold(input_hashes.len());
@@ -246,7 +241,7 @@ pub(crate) fn new(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     let library = ctx.library()?;
     let PlaylistArg(pname) = name;
-    let content = read_stdin_to_string();
+    let content = read_stdin_to_string()?;
     interpret_library(
         library.request(&LibraryRequest::PlaylistNew {
             name: pname.clone(),
@@ -264,7 +259,7 @@ pub(crate) fn append(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     let library = ctx.library()?;
     let PlaylistArg(pname) = name;
-    let content = read_stdin_to_string();
+    let content = read_stdin_to_string()?;
     interpret_library(
         library.request(&LibraryRequest::PlaylistAppend {
             name: pname.clone(),
@@ -282,7 +277,7 @@ pub(crate) fn replace(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     let library = ctx.library()?;
     let PlaylistArg(pname) = name;
-    let content = read_stdin_to_string();
+    let content = read_stdin_to_string()?;
     interpret_library(
         library.request(&LibraryRequest::PlaylistReplace {
             name: pname.clone(),
@@ -319,7 +314,7 @@ pub(crate) fn edit(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     };
 
     // 2. Edit a temp file in $EDITOR
-    let new_content = crate::editor::edit_text("mdma-playlist-", &current);
+    let new_content = crate::editor::edit_text("mdma-playlist-", &current)?;
 
     // 3. Replace
     interpret_library(

@@ -591,7 +591,7 @@ mod tests {
     fn resolving_with_a_bad_env_node_fails_naming_the_variable() {
         // One test, because it touches a process-wide environment variable (which
         // devenv sets, so it is put back).
-        let _env = crate::test_support::node_env_lock();
+        let _env = crate::test_support::env_lock();
         let original = std::env::var_os(NODE_ENV);
         std::env::set_var(NODE_ENV, "mdma.local:nope");
         let result = resolve_startup(None, false);

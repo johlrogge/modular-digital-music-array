@@ -146,7 +146,7 @@ mod tests {
         // MDMA_NODE is read separately so --node and the env var can be told apart.
         // One test, because it touches a process-wide environment variable (which
         // devenv sets, so it is put back).
-        let _env = crate::test_support::node_env_lock();
+        let _env = crate::test_support::env_lock();
         let original = std::env::var_os("MDMA_NODE");
         std::env::set_var("MDMA_NODE", "envhost");
         let (globals, _) = parse_cli(&["node", "show"]).expect("valid args");

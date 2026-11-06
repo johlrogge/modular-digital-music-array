@@ -327,7 +327,7 @@ fn compare_optional<T: Ord>(
 pub(crate) fn sort(direction: SortDirection, field: SortField, ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
 
-    let hashes = require_stdin_hashes();
+    let hashes = require_stdin_hashes()?;
     let mut tracks = resolve_tracks_skip_errors(&library, hashes);
 
     tracks.sort_by(|a, b| match field {

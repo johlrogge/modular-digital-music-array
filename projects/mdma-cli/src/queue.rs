@@ -14,7 +14,7 @@ use track_formatter::short_hash;
 #[hicli::command]
 pub(crate) fn next(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;
-    let hashes = hashes_arg_or_stdin(hash);
+    let hashes = hashes_arg_or_stdin(hash)?;
     let count = hashes.len();
     // Prepend in reverse so the first hash ends up at the front of the queue.
     for content_hash in hashes.into_iter().rev() {
@@ -32,7 +32,7 @@ pub(crate) fn next(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn append(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;
-    let hashes = hashes_arg_or_stdin(hash);
+    let hashes = hashes_arg_or_stdin(hash)?;
     let count = hashes.len();
     for content_hash in hashes {
         playback
@@ -130,7 +130,7 @@ pub(crate) fn clear(ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn remove(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;
-    let content_hashes = hashes_arg_or_stdin(hash);
+    let content_hashes = hashes_arg_or_stdin(hash)?;
 
     let removed = playback
         .queue_remove(content_hashes)
@@ -152,7 +152,7 @@ pub(crate) fn remove(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn replace(ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;
-    let hashes = require_stdin_hashes();
+    let hashes = require_stdin_hashes()?;
     let entries: Vec<(ContentHash, SourceName)> = hashes
         .into_iter()
         .map(|hash| (hash, SourceName::audio()))
@@ -196,7 +196,7 @@ pub(crate) fn edit(ctx: &Ctx) -> Result<()> {
         content.push('\n');
     }
     // 4. Launch $EDITOR (fallback to vi) and read back what was saved.
-    let edited = crate::editor::edit_text("mdma-queue-", &content);
+    let edited = crate::editor::edit_text("mdma-queue-", &content)?;
 
     // 5. Parse hashes using the standard filter.
     let edited_hashes = hashes_in(&edited);

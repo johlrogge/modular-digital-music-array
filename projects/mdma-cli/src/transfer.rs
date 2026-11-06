@@ -1,6 +1,6 @@
 use crate::args::{choice, choice_names, parse_choice, Choice, ExistingFileArg};
 use crate::ctx::Ctx;
-use crate::stdin::{read_hashes, resolve_tracks_skip_errors};
+use crate::stdin::{require_stdin_hashes_or_usage, resolve_tracks_skip_errors};
 use bpaf::{construct, long, positional, Bpaf, Parser};
 use color_eyre::Result;
 use hicli::{complete_files, Arg};
@@ -734,13 +734,8 @@ pub(crate) fn export(args: ExportArgs, ctx: &Ctx) -> Result<()> {
     let (node, node_ip) = ctx.require_node()?;
 
     // Read hashes from stdin
-    let raw_hashes = read_hashes();
-
-    if raw_hashes.is_empty() {
-        eprintln!("No hashes provided on stdin.");
-        eprintln!("Usage: mdma search --artist CBL | mdma export");
-        std::process::exit(1);
-    }
+    let raw_hashes =
+        require_stdin_hashes_or_usage(&["Usage: mdma search --artist CBL | mdma export"])?;
 
     // Resolve each hash (short or full) to a full TrackInfo via the library
     let tracks = resolve_tracks_skip_errors(&library, raw_hashes);
