@@ -1,5 +1,6 @@
 use crate::args::TrackArg;
 use crate::ctx::Ctx;
+use crate::output::display_error;
 use bpaf::Bpaf;
 use color_eyre::Result;
 use hicli::Arg;
@@ -20,38 +21,24 @@ pub(crate) struct ReplaceArgs {
 /// The track is hidden from list/search results. To undo, use `mdma library track restore <hash>`.
 #[hicli::command]
 pub(crate) fn delete(hash: TrackArg, ctx: &Ctx) -> Result<()> {
-    let library = ctx.library();
+    let library = ctx.library()?;
     let TrackArg(ch) = hash;
-    match library.track_delete(&ch) {
-        Ok(()) => {
-            println!(
-                "soft-deleted; recover with `mdma library track restore {}`",
-                ch
-            );
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        }
-    }
+    library.track_delete(&ch).map_err(display_error)?;
+    println!(
+        "soft-deleted; recover with `mdma library track restore {}`",
+        ch
+    );
+    Ok(())
 }
 
 /// Restore a soft-deleted track (retracts the Deleted fact)
 #[hicli::command]
 pub(crate) fn restore(hash: TrackArg, ctx: &Ctx) -> Result<()> {
-    let library = ctx.library();
+    let library = ctx.library()?;
     let TrackArg(ch) = hash;
-    match library.track_restore(&ch) {
-        Ok(()) => {
-            println!("track restored");
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        }
-    }
+    library.track_restore(&ch).map_err(display_error)?;
+    println!("track restored");
+    Ok(())
 }
 
 /// Hard-replace an old track with a new file
@@ -71,18 +58,13 @@ pub(crate) fn replace(args: ReplaceArgs, ctx: &Ctx) -> Result<()> {
         old_hash: TrackArg(old_hash),
         new_file,
     } = args;
-    let library = ctx.library();
-    match library.track_replace(&old_hash, &new_file) {
-        Ok((new_hash, playlists)) => {
-            println!("{} -> {}", old_hash, new_hash.as_str());
-            println!("{} playlist(s) rewritten", playlists);
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        }
-    }
+    let library = ctx.library()?;
+    let (new_hash, playlists) = library
+        .track_replace(&old_hash, &new_file)
+        .map_err(display_error)?;
+    println!("{} -> {}", old_hash, new_hash.as_str());
+    println!("{} playlist(s) rewritten", playlists);
+    Ok(())
 }
 
 /// List blobs on disk that no live track references (GC candidate list, read-only)
@@ -93,36 +75,27 @@ pub(crate) fn replace(args: ReplaceArgs, ctx: &Ctx) -> Result<()> {
 pub(crate) fn orphans(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::OrphanReason;
 
-    let library = ctx.library();
-    match library.track_orphans() {
-        Ok(orphans) => {
-            if orphans.is_empty() {
-                println!("no hidden tracks");
-                return Ok(());
-            }
-            for o in &orphans {
-                let hash_short = o
-                    .content_hash
-                    .as_str()
-                    .get(7..15)
-                    .unwrap_or(o.content_hash.as_str());
-                let artist = o.artist.as_deref().unwrap_or("Unknown");
-                let title = o.title.as_deref().unwrap_or("Unknown");
-                let reason = match &o.reason {
-                    OrphanReason::Deleted { timestamp } => format!("deleted at {}", timestamp),
-                    OrphanReason::NoLiveFacts => {
-                        "no live facts (hard-replace leftover)".to_string()
-                    }
-                };
-                println!("{}  {} - {}  [{}]", hash_short, artist, title, reason);
-            }
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        }
+    let library = ctx.library()?;
+    let orphans = library.track_orphans().map_err(display_error)?;
+    if orphans.is_empty() {
+        println!("no hidden tracks");
+        return Ok(());
     }
+    for o in &orphans {
+        let hash_short = o
+            .content_hash
+            .as_str()
+            .get(7..15)
+            .unwrap_or(o.content_hash.as_str());
+        let artist = o.artist.as_deref().unwrap_or("Unknown");
+        let title = o.title.as_deref().unwrap_or("Unknown");
+        let reason = match &o.reason {
+            OrphanReason::Deleted { timestamp } => format!("deleted at {}", timestamp),
+            OrphanReason::NoLiveFacts => "no live facts (hard-replace leftover)".to_string(),
+        };
+        println!("{}  {} - {}  [{}]", hash_short, artist, title, reason);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -53,6 +53,62 @@ pub(crate) fn run_arg<T: hicli::Arg>(args: &[&str]) -> Result<T, String> {
         .map_err(|failure| flat(&failure.unwrap_stderr()))
 }
 
+/// Held by every test that sets an environment variable (`MDMA_NODE`, `EDITOR`,
+/// `COLUMNS`): the environment is process-wide and tests run in parallel.
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Global options as given by none of the flags or variables.
+pub(crate) fn globals() -> Globals {
+    Globals {
+        node: None,
+        socket: None,
+        playback_socket: None,
+        sources_dir: "/run/mdma/sources".to_string(),
+    }
+}
+
+/// A context for the local services (IPC), with no node to resolve. Its sockets
+/// and sources directory do not exist, so no test can reach a real local service.
+pub(crate) fn local_ctx() -> Ctx {
+    let nowhere = "/nonexistent/mdma-test";
+    Ctx::with_target(
+        Globals {
+            node: None,
+            socket: Some(format!("ipc://{nowhere}/library.sock")),
+            playback_socket: Some(format!("ipc://{nowhere}/playback.sock")),
+            sources_dir: format!("{nowhere}/sources"),
+        },
+        node_discovery::Target::LocalIpc,
+    )
+}
+
+/// A node on this machine that refuses connections: a port that was bound,
+/// then freed. The target, and its port.
+pub(crate) fn dead_node() -> (node_discovery::Target, u16) {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind a free port")
+        .local_addr()
+        .expect("local address")
+        .port();
+    let target = node_discovery::Target::Remote(node_discovery::RemoteTarget {
+        host: "localhost".to_string(),
+        ip: Some(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        source: node_discovery::Source::Cache,
+    });
+    (target, port)
+}
+
+/// The text hicli would print (after its `Error: ` prefix) for a failed command result.
+pub(crate) fn failure_text<T>(r: color_eyre::Result<T>) -> String {
+    hicli::Failure::from(r.err().expect("an error"))
+        .message()
+        .to_owned()
+}
+
 /// `message` with its whitespace collapsed to single spaces.
 fn flat(message: &str) -> String {
     message.split_whitespace().collect::<Vec<_>>().join(" ")

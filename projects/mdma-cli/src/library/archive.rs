@@ -1,7 +1,9 @@
 use crate::ctx::Ctx;
 use crate::library::Yes;
+use crate::output::{display_error, success_unless};
 use crate::stdin::confirm;
 use color_eyre::Result;
+use hicli::Success;
 use library_ipc_client::{ArchiveEmptyReport, ArchiveListing};
 use storage_primitives::ByteSize;
 
@@ -65,60 +67,39 @@ fn format_archive_emptied(r: &ArchiveEmptyReport) -> String {
 /// List the files that duplicate merges moved to the archive
 #[hicli::command(default)]
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
-    let library = ctx.library();
-    match library.archive_list() {
-        Ok(l) => {
-            println!("{}", format_archive_listing(&l));
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-    }
+    let library = ctx.library()?;
+    let listing = library.archive_list().map_err(display_error)?;
+    println!("{}", format_archive_listing(&listing));
+    Ok(())
 }
 
 /// Permanently delete everything in the archive
 ///
 /// Shows what the archive holds and asks for confirmation. This cannot be undone.
 #[hicli::command]
-pub(crate) fn empty(yes: Yes, ctx: &Ctx) -> Result<()> {
+pub(crate) fn empty(yes: Yes, ctx: &Ctx) -> Result<Success> {
     let Yes(yes) = yes;
-    let library = ctx.library();
+    let library = ctx.library()?;
     // `--yes` without a listing deletes everything; after a prompt, only what was shown.
     let mut up_to = None;
     if !yes {
-        let listing = match library.archive_list() {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
-        };
+        let listing = library.archive_list().map_err(display_error)?;
         println!("{}\n", format_archive_listing(&listing));
         if listing.entries.is_empty() {
-            return Ok(());
+            return Ok(Success::OK);
         }
         if !confirm(&archive_empty_prompt(&listing))? {
             println!("Aborted");
-            return Ok(());
+            return Ok(Success::OK);
         }
         up_to = Some(archive_cutoff(&listing));
     }
 
-    match library.archive_empty(up_to.as_deref()) {
-        Ok(report) => {
-            println!("{}", format_archive_emptied(&report));
-            if !report.errors.is_empty() {
-                std::process::exit(1);
-            }
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-    }
+    let report = library
+        .archive_empty(up_to.as_deref())
+        .map_err(display_error)?;
+    println!("{}", format_archive_emptied(&report));
+    Ok(success_unless(!report.errors.is_empty()))
 }
 
 #[cfg(test)]

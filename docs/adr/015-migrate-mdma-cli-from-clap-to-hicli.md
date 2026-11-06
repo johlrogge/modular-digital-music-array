@@ -15,7 +15,7 @@ positionals last.
 
 ## Decision
 
-1. mdma-cli's parser is hicli 0.2; clap and clap_complete are removed.
+1. mdma-cli's parser is hicli (0.4 as of P3); clap and clap_complete are removed.
 2. **Parse-time validation for everything** ("make illegal states unrepresentable"): every command argument
    is a domain type constructed — validated — while parsing, so a command never receives an unconstructable
    value and bad input is a usage error (exit 2) before anything connects. Validate what the domain type
@@ -35,9 +35,12 @@ positionals last.
    `allow_hyphen_values` on `--started/--stopped/--added` is removed). A leading-dash value is written
    `--added=-7`; date expressions have plenty of non-dash forms.
 4. **Accepted losses:** elvish and PowerShell completions; `mdma help <cmd>`; the "mdma source list" hint
-   after a bad source; `--added -7` as two words. Also accepted: `--version` prints `Version: x`; help text
+   after a parse error (a connect failure still prints `Hint: 'mdma source list' shows the available
+   sources`); `--added -7` as two words. Also accepted: `--version` prints `Version: x`; help text
    is no longer clap's (semantically equivalent, re-baselined); `source NAME --help` shows the source
    group's page (hicli ADR-011 deferred); installed completion scripts must be regenerated.
+   The hicli 0.4.0 bump also changed `run` output: a blank line after `--help`/`--version`, usage lines
+   wrapped at 100 columns, colour on a TTY (off with `NO_COLOR`), and `Error: ` before failures.
 5. `queue edit` / `playlist edit` use a unique temp file (separate change).
 
 ### Layout
@@ -60,8 +63,12 @@ positionals last.
 - Defaults: `search` → `query` (default) + `fact-values-for`; `library dedup` → `scan` (default, --apply) +
   `merge`; `library archive` → `list` (default) + `empty`. Prose of a default lives on its group.
 - Completions: hidden `generate-completions <bash|zsh|fish>` printing `hicli::completion_script`.
-- Errors: command errors map to exit 1 with the message chain; parse errors exit 2. Remaining
-  `process::exit` calls are kept through the migration and converted afterwards.
+- Errors: command errors map to exit 1 with the message; parse errors exit 2. The conversion of
+  `process::exit` to returned errors is done (P3):
+  - commands return `color_eyre::Result<()>`, or `Result<hicli::Success>` when a partial failure prints a
+    report and exits 1 via `Success::code(1)` (`output::success_unless`);
+  - errors are single `eyre!` strings without their own `Error: ` prefix, because hicli adds it;
+  - `#![deny(clippy::exit)]` in main.rs enforces this.
 - Argument type naming:
   - `<X>Arg` / `Opt<X>Arg` is a value parsed from a single argv token through `FromStr` (Opt wraps
     `Option<XArg>`, because hicli has no `Arg` impl for `Option`/`Vec`; every optional command parameter is an
@@ -75,7 +82,8 @@ positionals last.
 ## Known hicli gaps we accept
 
 hicli 0.3.0 fixed #19 (a default without options is shown in help), #20 and #21 (positional items in help,
-usage lines name the binary), #27 and #28.
+usage lines name the binary), #27 and #28. hicli 0.4.0 fixed #29 (only the glued `--x=-7` is recommended) and
+#30 (usage lines wrap between items) and added #31 (colour on a TTY, `Error: ` prefix on failures).
 
 - #22, #23 (cosmetic help/test-macro issues).
 - #26: errors do not name the flag.

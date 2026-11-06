@@ -1,6 +1,6 @@
 use crate::args::{choice, choice_names, parse_choice, Choice, TrackArg};
 use crate::ctx::Ctx;
-use crate::output::handle_error;
+use crate::output::library_error;
 use bpaf::{construct, long, Parser};
 use chrono::NaiveDate;
 use color_eyre::Result;
@@ -249,14 +249,10 @@ pub(crate) fn add(args: FactArgs, ctx: &Ctx) -> Result<()> {
         value: FactValueArg { raw, value },
         hash: TrackArg(hash),
     } = args;
-    let library = ctx.library();
-    match library.write_fact(&hash, value) {
-        Ok(()) => {
-            println!("Added fact for {}: {:?} = {}", hash, field, raw);
-            Ok(())
-        }
-        Err(e) => handle_error(e),
-    }
+    let library = ctx.library()?;
+    library.write_fact(&hash, value).map_err(library_error)?;
+    println!("Added fact for {}: {:?} = {}", hash, field, raw);
+    Ok(())
 }
 
 /// Retract an existing fact from a track
@@ -270,14 +266,10 @@ pub(crate) fn retract(args: FactArgs, ctx: &Ctx) -> Result<()> {
         value: FactValueArg { raw, value },
         hash: TrackArg(hash),
     } = args;
-    let library = ctx.library();
-    match library.retract_fact(&hash, value) {
-        Ok(()) => {
-            println!("Retracted fact for {}: {:?} = {}", hash, field, raw);
-            Ok(())
-        }
-        Err(e) => handle_error(e),
-    }
+    let library = ctx.library()?;
+    library.retract_fact(&hash, value).map_err(library_error)?;
+    println!("Retracted fact for {}: {:?} = {}", hash, field, raw);
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,11 +1,13 @@
 use crate::args::{impl_arg, OptPlaylistArg, PlaylistArg};
 use crate::ctx::Ctx;
-use crate::stdin::{hashes_in, read_hashes, read_stdin_to_string};
+use crate::output::interpret_library;
+use crate::stdin::{hashes_in, read_stdin_to_string, require_stdin_hashes_or_usage};
 use bpaf::{construct, long, Bpaf, Parser};
+use color_eyre::eyre::{bail, eyre};
 use color_eyre::Result;
 use colored::Colorize;
 use hicli::Arg;
-use library_ipc_client::{ClientError, ContentHash, LibraryResponse, PlaylistName};
+use library_ipc_client::{ContentHash, LibraryResponse, PlaylistName};
 use std::num::NonZeroUsize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Bpaf, Arg)]
@@ -76,41 +78,42 @@ impl ContainsMode {
     }
 }
 
-/// Hand a library response to `accept`. An error response, a response it
-/// declines, or a failed request is reported and exits 1.
-fn expect_library<T>(
-    response: std::result::Result<LibraryResponse, ClientError>,
-    accept: impl FnOnce(LibraryResponse) -> std::result::Result<T, LibraryResponse>,
-) -> T {
+fn playlist_content(response: LibraryResponse) -> Option<String> {
     match response {
-        Ok(LibraryResponse::Error(e)) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-        Ok(response) => accept(response).unwrap_or_else(|_| {
-            eprintln!("Unexpected response");
-            std::process::exit(1);
-        }),
-        Err(e) => {
-            eprintln!("Request failed: {}", e);
-            std::process::exit(1);
-        }
+        LibraryResponse::PlaylistContent(c) => Some(c),
+        _ => None,
     }
 }
 
-fn playlist_content(response: LibraryResponse) -> std::result::Result<String, LibraryResponse> {
+fn playlist_names(response: LibraryResponse) -> Option<Vec<PlaylistName>> {
     match response {
-        LibraryResponse::PlaylistContent(c) => Ok(c),
-        other => Err(other),
+        LibraryResponse::PlaylistNames(names) => Some(names),
+        _ => None,
     }
 }
 
-fn playlist_names(
-    response: LibraryResponse,
-) -> std::result::Result<Vec<PlaylistName>, LibraryResponse> {
+/// The first whitespace-delimited token of each line of `reader`; an error when there are none.
+fn require_names(reader: impl std::io::BufRead) -> Result<Vec<String>> {
+    let names: Vec<String> = reader
+        .lines()
+        .map_while(std::result::Result::ok)
+        .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+        .collect();
+    if names.is_empty() {
+        bail!("No playlist name provided and stdin was empty");
+    }
+    Ok(names)
+}
+
+fn parse_playlist_name(name: &str) -> Result<PlaylistName> {
+    PlaylistName::new(name).map_err(|e| eyre!("Invalid playlist name: {}", e))
+}
+
+/// A reply of `Pong`.
+fn accept_pong(response: LibraryResponse) -> Option<()> {
     match response {
-        LibraryResponse::PlaylistNames(names) => Ok(names),
-        other => Err(other),
+        LibraryResponse::Pong => Some(()),
+        _ => None,
     }
 }
 
@@ -119,11 +122,11 @@ fn playlist_names(
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{DurationSeconds, LibraryRequest};
 
-    let library = ctx.library();
-    let names = expect_library(
+    let library = ctx.library()?;
+    let names = interpret_library(
         library.request(&LibraryRequest::PlaylistList),
         playlist_names,
-    );
+    )?;
 
     for name in &names {
         let content = match library.request(&LibraryRequest::PlaylistGet { name: name.clone() }) {
@@ -163,39 +166,23 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
 pub(crate) fn get(name: OptPlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     let OptPlaylistArg(name) = name;
-    let library = ctx.library();
+    let library = ctx.library()?;
     match name {
         Some(PlaylistArg(pname)) => {
-            let content = expect_library(
+            let content = interpret_library(
                 library.request(&LibraryRequest::PlaylistGet { name: pname }),
                 playlist_content,
-            );
+            )?;
             print!("{}", content);
         }
         None => {
-            use std::io::BufRead;
-            let names: Vec<String> = std::io::stdin()
-                .lock()
-                .lines()
-                .map_while(Result::ok)
-                .filter_map(|line| {
-                    let first = line.split_whitespace().next()?;
-                    Some(first.to_string())
-                })
-                .collect();
-            if names.is_empty() {
-                eprintln!("No playlist name provided and stdin was empty");
-                std::process::exit(1);
-            }
+            let names = require_names(std::io::stdin().lock())?;
             for n in names {
-                let pname = PlaylistName::new(&n).unwrap_or_else(|e| {
-                    eprintln!("Invalid playlist name: {}", e);
-                    std::process::exit(1);
-                });
-                let content = expect_library(
+                let pname = parse_playlist_name(&n)?;
+                let content = interpret_library(
                     library.request(&LibraryRequest::PlaylistGet { name: pname }),
                     playlist_content,
-                );
+                )?;
                 print!("{}", content);
             }
         }
@@ -212,15 +199,10 @@ pub(crate) fn contains(mode: ContainsMode, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     use std::collections::HashSet;
 
-    let library = ctx.library();
+    let library = ctx.library()?;
 
     // 1. Read hashes from stdin
-    let input_hashes = read_hashes();
-
-    if input_hashes.is_empty() {
-        eprintln!("No hashes provided on stdin.");
-        std::process::exit(1);
-    }
+    let input_hashes = require_stdin_hashes_or_usage(&[])?;
 
     // 2. Determine threshold and invert
     let (threshold, invert) = mode.threshold(input_hashes.len());
@@ -228,10 +210,10 @@ pub(crate) fn contains(mode: ContainsMode, ctx: &Ctx) -> Result<()> {
     let input_set: HashSet<&ContentHash> = input_hashes.iter().collect();
 
     // 3. Get all playlist names
-    let names = expect_library(
+    let names = interpret_library(
         library.request(&LibraryRequest::PlaylistList),
         playlist_names,
-    );
+    )?;
 
     // 4. For each playlist, count how many input hashes appear in it
     for pname in &names {
@@ -267,16 +249,16 @@ pub(crate) fn contains(mode: ContainsMode, ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn new(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
-    let library = ctx.library();
+    let library = ctx.library()?;
     let PlaylistArg(pname) = name;
-    let content = read_stdin_to_string();
-    expect_library(
+    let content = read_stdin_to_string()?;
+    interpret_library(
         library.request(&LibraryRequest::PlaylistNew {
             name: pname.clone(),
             content,
         }),
         playlist_content,
-    );
+    )?;
     eprintln!("Created playlist '{}'", pname);
     Ok(())
 }
@@ -285,16 +267,16 @@ pub(crate) fn new(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn append(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
-    let library = ctx.library();
+    let library = ctx.library()?;
     let PlaylistArg(pname) = name;
-    let content = read_stdin_to_string();
-    expect_library(
+    let content = read_stdin_to_string()?;
+    interpret_library(
         library.request(&LibraryRequest::PlaylistAppend {
             name: pname.clone(),
             content,
         }),
         playlist_content,
-    );
+    )?;
     eprintln!("Appended to playlist '{}'", pname);
     Ok(())
 }
@@ -303,16 +285,16 @@ pub(crate) fn append(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn replace(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
-    let library = ctx.library();
+    let library = ctx.library()?;
     let PlaylistArg(pname) = name;
-    let content = read_stdin_to_string();
-    expect_library(
+    let content = read_stdin_to_string()?;
+    interpret_library(
         library.request(&LibraryRequest::PlaylistReplace {
             name: pname.clone(),
             content,
         }),
         playlist_content,
-    );
+    )?;
     eprintln!("Replaced playlist '{}'", pname);
     Ok(())
 }
@@ -322,36 +304,28 @@ pub(crate) fn replace(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
 pub(crate) fn edit(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{LibraryRequest, LibraryResponse, ProtocolError};
 
-    let library = ctx.library();
+    let library = ctx.library()?;
     let PlaylistArg(pname) = name;
 
     // 1. Get current content (or start empty if not found)
     let current = match library.request(&LibraryRequest::PlaylistGet {
         name: pname.clone(),
     }) {
-        Ok(LibraryResponse::PlaylistContent(c)) => c,
         Ok(LibraryResponse::Error(ProtocolError::PlaylistNotFound { .. })) => String::new(),
-        Ok(LibraryResponse::Error(e)) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-        _ => {
-            eprintln!("Unexpected response");
-            std::process::exit(1);
-        }
+        reply => interpret_library(reply, playlist_content)?,
     };
 
     // 2. Edit a temp file in $EDITOR
-    let new_content = crate::editor::edit_text("mdma-playlist-", &current);
+    let new_content = crate::editor::edit_text("mdma-playlist-", &current)?;
 
     // 3. Replace
-    expect_library(
+    interpret_library(
         library.request(&LibraryRequest::PlaylistReplace {
             name: pname.clone(),
             content: new_content,
         }),
         playlist_content,
-    );
+    )?;
     eprintln!("Updated playlist '{}'", pname);
     Ok(())
 }
@@ -359,52 +333,34 @@ pub(crate) fn edit(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
 /// Remove a playlist
 #[hicli::command]
 pub(crate) fn remove(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
-    use library_ipc_client::{LibraryRequest, LibraryResponse};
-    let library = ctx.library();
+    use library_ipc_client::LibraryRequest;
+    let library = ctx.library()?;
     let PlaylistArg(pname) = name;
-    let response = library.request(&LibraryRequest::PlaylistRemove {
-        name: pname.clone(),
-    });
-    match response {
-        Ok(LibraryResponse::Pong) => {
-            eprintln!("Removed playlist '{}'", pname);
-        }
-        Ok(LibraryResponse::Error(e)) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-        _ => {
-            eprintln!("Unexpected response");
-            std::process::exit(1);
-        }
-    }
+    interpret_library(
+        library.request(&LibraryRequest::PlaylistRemove {
+            name: pname.clone(),
+        }),
+        accept_pong,
+    )?;
+    eprintln!("Removed playlist '{}'", pname);
     Ok(())
 }
 
 /// Rename a playlist
 #[hicli::command]
 pub(crate) fn rename(args: RenameArgs, ctx: &Ctx) -> Result<()> {
-    use library_ipc_client::{LibraryRequest, LibraryResponse};
-    let library = ctx.library();
+    use library_ipc_client::LibraryRequest;
+    let library = ctx.library()?;
     let PlaylistArg(from_name) = args.from;
     let PlaylistArg(to_name) = args.to;
-    let response = library.request(&LibraryRequest::PlaylistRename {
-        from: from_name.clone(),
-        to: to_name.clone(),
-    });
-    match response {
-        Ok(LibraryResponse::Pong) => {
-            eprintln!("Renamed playlist '{}' to '{}'", from_name, to_name);
-        }
-        Ok(LibraryResponse::Error(e)) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-        _ => {
-            eprintln!("Unexpected response");
-            std::process::exit(1);
-        }
-    }
+    interpret_library(
+        library.request(&LibraryRequest::PlaylistRename {
+            from: from_name.clone(),
+            to: to_name.clone(),
+        }),
+        accept_pong,
+    )?;
+    eprintln!("Renamed playlist '{}' to '{}'", from_name, to_name);
     Ok(())
 }
 
@@ -415,6 +371,36 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::test_support::{parses, run_arg, usage_error};
+
+    use crate::test_support::failure_text;
+
+    #[test]
+    fn get_reads_the_first_token_of_each_stdin_line() {
+        assert_eq!(
+            require_names("mix  3 tracks [1:00]\n\n  other\n".as_bytes()).unwrap(),
+            ["mix", "other"]
+        );
+    }
+
+    #[test]
+    fn get_without_a_name_and_with_empty_stdin_is_an_error() {
+        assert_eq!(
+            failure_text(require_names("\n  \n".as_bytes())),
+            "No playlist name provided and stdin was empty"
+        );
+    }
+
+    #[test]
+    fn get_with_an_invalid_name_is_an_error() {
+        assert_eq!(parse_playlist_name("mix").unwrap().to_string(), "mix");
+        assert_eq!(
+            failure_text(parse_playlist_name("a/b")),
+            format!(
+                "Invalid playlist name: {}",
+                PlaylistName::new("a/b").unwrap_err()
+            )
+        );
+    }
 
     #[test]
     fn rename_args_parser_reads_from_and_to() {

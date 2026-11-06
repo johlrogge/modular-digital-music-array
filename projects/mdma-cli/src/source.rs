@@ -2,11 +2,12 @@ mod import;
 
 use crate::args::{impl_arg, SanitizedPlaylistName};
 use crate::ctx::Ctx;
-use crate::output::handle_source_error;
+use crate::output::{display_error, interpret_library, interpret_source, source_label};
 use crate::source::import::{finish_import, follow_import_job, is_terminal_phase};
 use bpaf::Bpaf;
+use color_eyre::eyre::eyre;
 use color_eyre::Result;
-use hicli::Arg;
+use hicli::{Arg, Success};
 use mdma_client::SourceClient;
 use source_protocol::{SourceError, SourceRequest, SourceResponse};
 use std::convert::Infallible;
@@ -108,14 +109,9 @@ const SOURCE_LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// List available music sources
 #[hicli::command]
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
-    let gateway = ctx.gateway();
-    let sources = match mdma_client::list_available_sources(gateway.as_deref(), ctx.sources_dir()) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("{}", e);
-            std::process::exit(1);
-        }
-    };
+    let gateway = ctx.gateway()?;
+    let sources = mdma_client::list_available_sources(gateway.as_deref(), ctx.sources_dir())
+        .map_err(display_error)?;
     if sources.is_empty() {
         println!("No sources available");
     } else {
@@ -126,39 +122,50 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// Send `request` to the source `name` and hand the response to `accept`. A
-/// response it declines (an error response or an unexpected one) or a failed
-/// request is reported and exits 1. The declined response is boxed because
-/// `SourceResponse` is large.
+/// Send `request` to the source `name` and interpret the reply with
+/// [`interpret_source`]; error responses are reported as they are.
 fn source_call<T>(
     source: &SourceClient,
     name: &str,
     request: &SourceRequest,
-    accept: impl FnOnce(SourceResponse) -> std::result::Result<T, Box<SourceResponse>>,
-) -> T {
-    match source.request(name, request) {
-        Ok(response) => accept(response).unwrap_or_else(|declined| match *declined {
-            SourceResponse::Error(e) => handle_source_error(&e),
-            _ => handle_source_error(&"Unexpected response"),
-        }),
-        Err(e) => handle_source_error(&e),
-    }
+    accept: impl FnOnce(SourceResponse) -> Option<T>,
+) -> Result<T> {
+    source_call_with(source, name, request, display_error, accept)
 }
 
-/// Report an item the source does not have and exit 1.
-fn item_not_found(identifier: &str, source: &str) -> ! {
-    eprintln!(
+/// Like [`source_call`], with `on_error` deciding how an error response is reported.
+fn source_call_with<T>(
+    source: &SourceClient,
+    name: &str,
+    request: &SourceRequest,
+    on_error: impl FnOnce(SourceError) -> color_eyre::Report,
+    accept: impl FnOnce(SourceResponse) -> Option<T>,
+) -> Result<T> {
+    interpret_source(name, source.request(name, request), on_error, accept)
+}
+
+/// The failure for an item the source does not have.
+fn item_not_found(source: &str, identifier: &str) -> color_eyre::Report {
+    eyre!(
         "Item {} not found in your {} collection",
-        identifier, source
-    );
-    std::process::exit(1);
+        identifier,
+        source
+    )
+}
+
+/// Report an item-level source error: `ItemNotFound` names the item and source.
+fn item_error(source: &str, err: SourceError) -> color_eyre::Report {
+    match err {
+        SourceError::ItemNotFound { identifier } => item_not_found(source, &identifier),
+        other => display_error(other),
+    }
 }
 
 /// Sync the source (download new items)
 #[hicli::command(curried)]
 pub(crate) fn sync(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
-    let source = ctx.source(name, None);
+    let source = ctx.source(name, None)?;
     println!("Syncing {}...", name);
     let (total_items, new_items) =
         source_call(
@@ -169,10 +176,10 @@ pub(crate) fn sync(source: SourceArg, ctx: &Ctx) -> Result<()> {
                 SourceResponse::SyncStarted {
                     total_items,
                     new_items,
-                } => Ok((total_items, new_items)),
-                other => Err(Box::new(other)),
+                } => Some((total_items, new_items)),
+                _ => None,
             },
-        );
+        )?;
     println!("Sync started for {}", name);
     println!("Total items: {}, New items: {}", total_items, new_items);
     Ok(())
@@ -182,16 +189,16 @@ pub(crate) fn sync(source: SourceArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command(curried)]
 pub(crate) fn status(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
-    let source = ctx.source(name, None);
+    let source = ctx.source(name, None)?;
     let status = source_call(
         &source,
         name,
         &SourceRequest::GetStatus,
         |response| match response {
-            SourceResponse::Status(status) => Ok(status),
-            other => Err(Box::new(other)),
+            SourceResponse::Status(status) => Some(status),
+            _ => None,
         },
-    );
+    )?;
     println!("Source: {} v{}", status.name, status.version);
     println!("{}", "=".repeat(40));
     println!(
@@ -222,17 +229,17 @@ pub(crate) fn status(source: SourceArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command(curried)]
 pub(crate) fn downloads(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
-    let source = ctx.source(name, None);
+    let source = ctx.source(name, None)?;
     let downloads =
         source_call(
             &source,
             name,
             &SourceRequest::ListDownloads,
             |response| match response {
-                SourceResponse::Downloads(downloads) => Ok(downloads),
-                other => Err(Box::new(other)),
+                SourceResponse::Downloads(downloads) => Some(downloads),
+                _ => None,
             },
-        );
+        )?;
     if downloads.is_empty() {
         println!("No downloads in progress");
         return Ok(());
@@ -272,12 +279,12 @@ pub(crate) fn downloads(source: SourceArg, ctx: &Ctx) -> Result<()> {
 pub(crate) fn cancel(source: SourceArg, id: DownloadArg, ctx: &Ctx) -> Result<()> {
     let DownloadArg(id) = id;
     let name = source.as_str();
-    let source = ctx.source(name, None);
+    let source = ctx.source(name, None)?;
     let request = SourceRequest::CancelDownload { id: id.clone() };
     source_call(&source, name, &request, |response| match response {
-        SourceResponse::Cancelled { .. } => Ok(()),
-        other => Err(Box::new(other)),
-    });
+        SourceResponse::Cancelled { .. } => Some(()),
+        _ => None,
+    })?;
     println!("Cancelled download: {}", id);
     Ok(())
 }
@@ -286,16 +293,16 @@ pub(crate) fn cancel(source: SourceArg, id: DownloadArg, ctx: &Ctx) -> Result<()
 #[hicli::command(curried)]
 pub(crate) fn pause(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
-    let source = ctx.source(name, None);
+    let source = ctx.source(name, None)?;
     source_call(
         &source,
         name,
         &SourceRequest::PauseAll,
         |response| match response {
-            SourceResponse::Paused => Ok(()),
-            other => Err(Box::new(other)),
+            SourceResponse::Paused => Some(()),
+            _ => None,
         },
-    );
+    )?;
     println!("Downloads paused");
     Ok(())
 }
@@ -304,16 +311,16 @@ pub(crate) fn pause(source: SourceArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command(curried)]
 pub(crate) fn resume(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
-    let source = ctx.source(name, None);
+    let source = ctx.source(name, None)?;
     source_call(
         &source,
         name,
         &SourceRequest::ResumeAll,
         |response| match response {
-            SourceResponse::Resumed => Ok(()),
-            other => Err(Box::new(other)),
+            SourceResponse::Resumed => Some(()),
+            _ => None,
         },
-    );
+    )?;
     println!("Downloads resumed");
     Ok(())
 }
@@ -323,20 +330,22 @@ pub(crate) fn resume(source: SourceArg, ctx: &Ctx) -> Result<()> {
 pub(crate) fn resync(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) -> Result<()> {
     let ItemIdArg(identifier) = identifier;
     let name = source.as_str();
-    let source = ctx.source(name, None);
+    let source = ctx.source(name, None)?;
     println!("Requesting resync of {} from {}...", identifier, name);
     let request = SourceRequest::ResyncItem { identifier };
-    let (identifier, tracks_queued) =
-        source_call(&source, name, &request, |response| match response {
+    let (identifier, tracks_queued) = source_call_with(
+        &source,
+        name,
+        &request,
+        |e| item_error(name, e),
+        |response| match response {
             SourceResponse::ResyncQueued {
                 identifier,
                 tracks_queued,
-            } => Ok((identifier, tracks_queued)),
-            SourceResponse::Error(SourceError::ItemNotFound { identifier }) => {
-                item_not_found(&identifier, name)
-            }
-            other => Err(Box::new(other)),
-        });
+            } => Some((identifier, tracks_queued)),
+            _ => None,
+        },
+    )?;
     println!(
         "Queued resync for {} ({} item queued)",
         identifier, tracks_queued
@@ -349,21 +358,23 @@ pub(crate) fn resync(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) -> Res
 pub(crate) fn check_item(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) -> Result<()> {
     let ItemIdArg(identifier) = identifier;
     let name = source.as_str();
-    let source = ctx.source(name, None);
+    let source = ctx.source(name, None)?;
     let request = SourceRequest::CheckItem { identifier };
-    let (identifier, live_track_count, stored_track_count, stale) =
-        source_call(&source, name, &request, |response| match response {
+    let (identifier, live_track_count, stored_track_count, stale) = source_call_with(
+        &source,
+        name,
+        &request,
+        |e| item_error(name, e),
+        |response| match response {
             SourceResponse::ItemChecked {
                 identifier,
                 live_track_count,
                 stored_track_count,
                 stale,
-            } => Ok((identifier, live_track_count, stored_track_count, stale)),
-            SourceResponse::Error(SourceError::ItemNotFound { identifier }) => {
-                item_not_found(&identifier, name)
-            }
-            other => Err(Box::new(other)),
-        });
+            } => Some((identifier, live_track_count, stored_track_count, stale)),
+            _ => None,
+        },
+    )?;
     if stale {
         println!(
             "STALE {}: live={} stored={}",
@@ -380,27 +391,19 @@ pub(crate) fn check_item(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) ->
 pub(crate) fn check_updates(source: SourceArg, apply: ApplyUpdates, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
     let apply = apply.0;
-    let source = ctx.source(name, None);
+    let source = ctx.source(name, None)?;
     // Fetch all ItemId values from the library for this source.
     // We use GetFactValues("ItemId") — returns all ItemId values the library knows about.
-    let library = ctx.library();
-    let all_item_ids = match library.request(&library_ipc_client::LibraryRequest::GetFactValues {
-        fact_type: library_ipc_client::FactType::new("ItemId"),
-    }) {
-        Ok(library_ipc_client::LibraryResponse::FactValues(values)) => values,
-        Ok(library_ipc_client::LibraryResponse::Error(e)) => {
-            eprintln!("Library error: {}", e);
-            std::process::exit(1);
-        }
-        Ok(_) => {
-            eprintln!("Unexpected response from library");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("Failed to connect to library: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let library = ctx.library()?;
+    let all_item_ids = interpret_library(
+        library.request(&library_ipc_client::LibraryRequest::GetFactValues {
+            fact_type: library_ipc_client::FactType::new("ItemId"),
+        }),
+        |response| match response {
+            library_ipc_client::LibraryResponse::FactValues(values) => Some(values),
+            _ => None,
+        },
+    )?;
 
     if all_item_ids.is_empty() {
         println!("No items in library.");
@@ -508,16 +511,15 @@ pub(crate) fn check_updates(source: SourceArg, apply: ApplyUpdates, ctx: &Ctx) -
 
 /// Message for a source that answers `SourceError::Unsupported`.
 fn unsupported_message(source: &str, feature: &str) -> String {
-    format!("source '{}' does not support {}", source, feature)
+    format!("{} does not support {}", source_label(source), feature)
 }
 
-/// Report a source error; `Unsupported` gets a friendly message naming the source.
-fn handle_playlist_source_error(source: &str, feature: &str, err: &SourceError) -> ! {
+/// The failure for a source error; `Unsupported` gets a friendly message naming the source.
+fn playlist_source_error(source: &str, feature: &str, err: &SourceError) -> color_eyre::Report {
     if matches!(err, SourceError::Unsupported { .. }) {
-        eprintln!("{}", unsupported_message(source, feature));
-        std::process::exit(1);
+        return eyre!("{}", unsupported_message(source, feature));
     }
-    handle_source_error(err)
+    display_error(err)
 }
 
 /// List the source's playlists
@@ -526,18 +528,17 @@ fn handle_playlist_source_error(source: &str, feature: &str, err: &SourceError) 
 #[hicli::command(curried)]
 pub(crate) fn playlists(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
-    let source = ctx.source(name, Some(SOURCE_LISTING_TIMEOUT));
-    let playlists =
-        source_call(
-            &source,
-            name,
-            &SourceRequest::ListPlaylists,
-            |response| match response {
-                SourceResponse::Playlists(playlists) => Ok(playlists),
-                SourceResponse::Error(e) => handle_playlist_source_error(name, "playlists", &e),
-                other => Err(Box::new(other)),
-            },
-        );
+    let source = ctx.source(name, Some(SOURCE_LISTING_TIMEOUT))?;
+    let playlists = source_call_with(
+        &source,
+        name,
+        &SourceRequest::ListPlaylists,
+        |e| playlist_source_error(name, "playlists", &e),
+        |response| match response {
+            SourceResponse::Playlists(playlists) => Some(playlists),
+            _ => None,
+        },
+    )?;
     if playlists.is_empty() {
         println!("No playlists found");
         return Ok(());
@@ -599,9 +600,9 @@ pub(crate) fn import_playlist(
     source: SourceArg,
     args: ImportPlaylistArgs,
     ctx: &Ctx,
-) -> Result<()> {
+) -> Result<Success> {
     let name = source.as_str();
-    let source = ctx.source(name, None);
+    let source = ctx.source(name, None)?;
     let ImportPlaylistArgs {
         name: playlist_name,
         dry_run,
@@ -622,22 +623,28 @@ pub(crate) fn import_playlist(
         name: explicit_name,
         dry_run,
     };
-    let job_id = source_call(&source, name, &request, |response| match response {
-        SourceResponse::ImportStarted { job_id } => Ok(job_id),
-        SourceResponse::Error(SourceError::ImportInProgress { job_id }) => {
+    let job_id = source_call_with(
+        &source,
+        name,
+        &request,
+        |e| match e {
             // The running job may be a different playlist or a dry run, so
             // following it would report someone else's result as ours.
-            eprintln!("{}", import_not_started_message(name, job_id));
-            std::process::exit(1);
-        }
-        SourceResponse::Error(e) => handle_playlist_source_error(name, "playlist import", &e),
-        other => Err(Box::new(other)),
-    });
+            SourceError::ImportInProgress { job_id } => {
+                eyre!("{}", import_not_started_message(name, job_id))
+            }
+            e => playlist_source_error(name, "playlist import", &e),
+        },
+        |response| match response {
+            SourceResponse::ImportStarted { job_id } => Some(job_id),
+            _ => None,
+        },
+    )?;
     println!("Import started (job {})", job_id);
 
     if no_wait {
         println!("Check progress with '{}'", import_status_command(name));
-        return Ok(());
+        return Ok(Success::OK);
     }
     follow_import_job(&source, name, job_id)
 }
@@ -646,28 +653,25 @@ pub(crate) fn import_playlist(
 ///
 /// Only for sources that support playlists.
 #[hicli::command(curried)]
-pub(crate) fn import_status(source: SourceArg, ctx: &Ctx) -> Result<()> {
+pub(crate) fn import_status(source: SourceArg, ctx: &Ctx) -> Result<Success> {
     let name = source.as_str();
-    let source = ctx.source(name, None);
-    let status =
-        source_call(
-            &source,
-            name,
-            &SourceRequest::GetImportStatus,
-            |response| match response {
-                SourceResponse::ImportStatus(status) => Ok(status),
-                SourceResponse::Error(e) => {
-                    handle_playlist_source_error(name, "playlist import", &e)
-                }
-                other => Err(Box::new(other)),
-            },
-        );
+    let source = ctx.source(name, None)?;
+    let status = source_call_with(
+        &source,
+        name,
+        &SourceRequest::GetImportStatus,
+        |e| playlist_source_error(name, "playlist import", &e),
+        |response| match response {
+            SourceResponse::ImportStatus(status) => Some(status),
+            _ => None,
+        },
+    )?;
     match status {
         None => {
             println!("No import job");
-            Ok(())
+            Ok(Success::OK)
         }
-        Some(status) if is_terminal_phase(&status.phase) => finish_import(&status),
+        Some(status) if is_terminal_phase(&status.phase) => Ok(finish_import(&status)),
         Some(status) => {
             println!("Import job {} is running", status.job_id);
             follow_import_job(&source, name, status.job_id)
@@ -930,6 +934,52 @@ mod tests {
         assert_eq!(
             unsupported_message("beatport", "playlists"),
             "source 'beatport' does not support playlists"
+        );
+    }
+
+    // ── source error messages ───────────────────────────────────────────────────
+
+    use crate::test_support::failure_text;
+
+    #[test]
+    fn an_item_not_found_error_names_the_item_and_source() {
+        let err = SourceError::ItemNotFound {
+            identifier: "p1".to_string(),
+        };
+        assert_eq!(
+            failure_text::<()>(Err(item_error("bandcamp", err))),
+            "Item p1 not found in your bandcamp collection"
+        );
+    }
+
+    #[test]
+    fn another_item_error_is_reported_as_it_is() {
+        let err = SourceError::NotAuthenticated {
+            message: "login first".to_string(),
+        };
+        assert_eq!(
+            failure_text::<()>(Err(item_error("bandcamp", err))),
+            "not authenticated: login first"
+        );
+    }
+
+    #[test]
+    fn an_unsupported_source_error_names_the_source_and_feature() {
+        let err = SourceError::unsupported("ListPlaylists");
+        assert_eq!(
+            failure_text::<()>(Err(playlist_source_error("beatport", "playlists", &err))),
+            "source 'beatport' does not support playlists"
+        );
+    }
+
+    #[test]
+    fn another_playlist_source_error_is_reported_as_it_is() {
+        let err = SourceError::Internal {
+            message: "boom".to_string(),
+        };
+        assert_eq!(
+            failure_text::<()>(Err(playlist_source_error("beatport", "playlists", &err))),
+            "internal error: boom"
         );
     }
 }

@@ -4,19 +4,23 @@
 //! before it reads stdin.
 
 use crate::args::{OptTrackArg, TrackArg};
+use color_eyre::eyre::{bail, eyre};
+use color_eyre::Result;
 use library_ipc_client::{ContentHash, TrackInfo};
 use mdma_client::LibraryBackend;
+use std::io::BufRead;
 
-pub fn read_stdin_to_string() -> String {
-    use std::io::Read;
+/// All of stdin as text.
+pub(crate) fn read_stdin_to_string() -> Result<String> {
+    read_all(std::io::stdin())
+}
+
+fn read_all(mut reader: impl std::io::Read) -> Result<String> {
     let mut content = String::new();
-    std::io::stdin()
+    reader
         .read_to_string(&mut content)
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to read stdin: {}", e);
-            std::process::exit(1);
-        });
-    content
+        .map_err(|e| eyre!("Failed to read stdin: {e}"))?;
+    Ok(content)
 }
 
 fn is_yes(answer: &str) -> bool {
@@ -25,7 +29,7 @@ fn is_yes(answer: &str) -> bool {
 
 /// Print `prompt` (which ends in `[y/N] `) and read the answer from stdin:
 /// `true` only for y/yes.
-pub fn confirm(prompt: &str) -> std::io::Result<bool> {
+pub(crate) fn confirm(prompt: &str) -> std::io::Result<bool> {
     use std::io::Write;
     print!("{}", prompt);
     std::io::stdout().flush()?;
@@ -43,40 +47,75 @@ fn hashes_from_lines<L: AsRef<str>>(lines: impl Iterator<Item = L>) -> Vec<Conte
 }
 
 /// The hashes in `text`, one per line (e.g. playlist content).
-pub fn hashes_in(text: &str) -> Vec<ContentHash> {
+pub(crate) fn hashes_in(text: &str) -> Vec<ContentHash> {
     hashes_from_lines(text.lines())
 }
 
 /// Read ALL lines from stdin and extract the hashes in them (empty when there are none).
-pub fn read_hashes() -> Vec<ContentHash> {
-    use std::io::BufRead;
-    hashes_from_lines(std::io::stdin().lock().lines().map_while(Result::ok))
+pub(crate) fn read_hashes() -> Vec<ContentHash> {
+    hashes_from_reader(std::io::stdin().lock())
+}
+
+/// The hashes in the lines of `reader`; reading stops at the first unreadable line.
+fn hashes_from_reader(reader: impl BufRead) -> Vec<ContentHash> {
+    hashes_from_lines(reader.lines().map_while(std::result::Result::ok))
 }
 
 /// Read ALL lines from stdin and extract valid hashes (8+ lowercase hex chars, or
-/// sha256:-prefixed full hashes, as first token); exits 1 when there are none.
-pub fn require_stdin_hashes() -> Vec<ContentHash> {
-    let hashes = read_hashes();
+/// sha256:-prefixed full hashes, as first token); an error when there are none.
+pub(crate) fn require_stdin_hashes() -> Result<Vec<ContentHash>> {
+    require_hashes(std::io::stdin().lock(), no_hash_provided)
+}
+
+/// Like [`require_stdin_hashes`], but the error is "No hashes provided on stdin."
+/// followed by the `usage` lines.
+pub(crate) fn require_stdin_hashes_or_usage(usage: &[&str]) -> Result<Vec<ContentHash>> {
+    hashes_or_usage(std::io::stdin().lock(), usage)
+}
+
+fn hashes_or_usage(reader: impl BufRead, usage: &[&str]) -> Result<Vec<ContentHash>> {
+    require_hashes(reader, || no_hashes_on_stdin(usage))
+}
+
+/// The hashes in `reader`; `on_none` makes the error when there are none.
+fn require_hashes(
+    reader: impl BufRead,
+    on_none: impl FnOnce() -> color_eyre::Report,
+) -> Result<Vec<ContentHash>> {
+    let hashes = hashes_from_reader(reader);
     if hashes.is_empty() {
-        eprintln!("No hash provided and stdin was empty");
-        std::process::exit(1);
+        return Err(on_none());
     }
-    hashes
+    Ok(hashes)
+}
+
+fn no_hash_provided() -> color_eyre::Report {
+    eyre!("No hash provided and stdin was empty")
+}
+
+/// The "no hashes on stdin" error, with `usage` lines under it.
+fn no_hashes_on_stdin(usage: &[&str]) -> color_eyre::Report {
+    let lines = std::iter::once("No hashes provided on stdin.").chain(usage.iter().copied());
+    eyre!(lines.collect::<Vec<_>>().join("\n"))
 }
 
 /// Return the provided hash as a single-element vec, or the hashes from stdin
 /// (see [`require_stdin_hashes`]).
-pub fn hashes_arg_or_stdin(hash: OptTrackArg) -> Vec<ContentHash> {
+pub(crate) fn hashes_arg_or_stdin(hash: OptTrackArg) -> Result<Vec<ContentHash>> {
+    hashes_arg_or_reader(hash, std::io::stdin().lock())
+}
+
+fn hashes_arg_or_reader(hash: OptTrackArg, reader: impl BufRead) -> Result<Vec<ContentHash>> {
     let OptTrackArg(hash) = hash;
     match hash {
-        Some(TrackArg(h)) => vec![h],
-        None => require_stdin_hashes(),
+        Some(TrackArg(h)) => Ok(vec![h]),
+        None => require_hashes(reader, no_hash_provided),
     }
 }
 
 /// Resolve a list of hashes to `TrackInfo`, skipping any that the library
 /// cannot find and printing a warning for each skipped entry.
-pub fn resolve_tracks_skip_errors(
+pub(crate) fn resolve_tracks_skip_errors(
     library: &LibraryBackend,
     hashes: Vec<ContentHash>,
 ) -> Vec<TrackInfo> {
@@ -92,6 +131,21 @@ pub fn resolve_tracks_skip_errors(
         .collect()
 }
 
+/// Like [`resolve_tracks_skip_errors`], but an error when none could be resolved.
+pub(crate) fn resolve_tracks_or_abort(
+    library: &LibraryBackend,
+    hashes: Vec<ContentHash>,
+) -> Result<Vec<TrackInfo>> {
+    require_tracks(resolve_tracks_skip_errors(library, hashes))
+}
+
+fn require_tracks(tracks: Vec<TrackInfo>) -> Result<Vec<TrackInfo>> {
+    if tracks.is_empty() {
+        bail!("No tracks could be resolved. Aborting.");
+    }
+    Ok(tracks)
+}
+
 /// Extract a content hash from a line of text.
 ///
 /// Handles multiple formats:
@@ -102,7 +156,7 @@ pub fn resolve_tracks_skip_errors(
 ///
 /// Returns `None` for blank lines, comment lines (starting with `#`), and lines
 /// where the first token doesn't resemble a hash.
-pub fn parse_hash_from_line(line: &str) -> Option<String> {
+pub(crate) fn parse_hash_from_line(line: &str) -> Option<String> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
         return None;
@@ -114,7 +168,7 @@ pub fn parse_hash_from_line(line: &str) -> Option<String> {
 /// The one rule for what counts as a content-hash token, shared by stdin
 /// parsing and argv parsing: at least 8 lowercase hex characters, optionally
 /// prefixed with `sha256:`.
-pub fn is_hash_token(token: &str) -> bool {
+pub(crate) fn is_hash_token(token: &str) -> bool {
     let hex = token.strip_prefix("sha256:").unwrap_or(token);
     hex.len() >= 8
         && hex
@@ -125,7 +179,12 @@ pub fn is_hash_token(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
 
-    use crate::stdin::{hashes_in, is_yes, parse_hash_from_line};
+    use crate::args::{OptTrackArg, TrackArg};
+    use crate::stdin::{
+        hashes_arg_or_reader, hashes_in, hashes_or_usage, is_yes, no_hash_provided,
+        parse_hash_from_line, read_all, require_hashes, require_tracks,
+    };
+    use crate::test_support::{failure_text, track};
     use library_ipc_client::ContentHash;
 
     use pretty_assertions::assert_eq;
@@ -213,6 +272,98 @@ mod tests {
                 ContentHash::new("sha256:0123abcd")
             ]
         );
+    }
+
+    #[test]
+    fn required_hashes_are_read_in_order_skipping_blank_and_invalid_lines() {
+        let input = "\n   \nnot a hash\nabcd1234  Artist - Title\n# comment\nsha256:0123abcd\n";
+        assert_eq!(
+            require_hashes(input.as_bytes(), no_hash_provided).unwrap(),
+            vec![
+                ContentHash::new("abcd1234"),
+                ContentHash::new("sha256:0123abcd")
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_input_is_an_error() {
+        assert_eq!(
+            failure_text(require_hashes("".as_bytes(), no_hash_provided)),
+            "No hash provided and stdin was empty"
+        );
+    }
+
+    #[test]
+    fn input_without_valid_hashes_is_an_error() {
+        assert_eq!(
+            failure_text(require_hashes(
+                "\n\nABCDEF12\nshort\n".as_bytes(),
+                no_hash_provided
+            )),
+            "No hash provided and stdin was empty"
+        );
+    }
+
+    #[test]
+    fn a_hash_argument_wins_over_stdin() {
+        let arg = OptTrackArg(Some(TrackArg(ContentHash::new("abcd1234"))));
+        assert_eq!(
+            hashes_arg_or_reader(arg, "deadbeef\n".as_bytes()).unwrap(),
+            vec![ContentHash::new("abcd1234")]
+        );
+    }
+
+    #[test]
+    fn without_a_hash_argument_stdin_is_read() {
+        let arg = OptTrackArg(None);
+        assert_eq!(
+            hashes_arg_or_reader(arg, "deadbeef\n".as_bytes()).unwrap(),
+            vec![ContentHash::new("deadbeef")]
+        );
+        assert_eq!(
+            failure_text(hashes_arg_or_reader(OptTrackArg(None), "".as_bytes())),
+            "No hash provided and stdin was empty"
+        );
+    }
+
+    #[test]
+    fn stdin_text_is_read_whole() {
+        assert_eq!(read_all("a\n\nb".as_bytes()).unwrap(), "a\n\nb");
+    }
+
+    #[test]
+    fn unreadable_stdin_is_an_error() {
+        // Invalid UTF-8 cannot be read as text.
+        assert_eq!(
+            failure_text(read_all([0xff, 0xfe].as_slice())),
+            "Failed to read stdin: stream did not contain valid UTF-8"
+        );
+    }
+
+    #[test]
+    fn no_hashes_error_lists_its_usage_lines() {
+        assert_eq!(
+            failure_text(hashes_or_usage("".as_bytes(), &[])),
+            "No hashes provided on stdin."
+        );
+        assert_eq!(
+            failure_text(hashes_or_usage("\n".as_bytes(), &["Usage: a", "       b"])),
+            "No hashes provided on stdin.\nUsage: a\n       b"
+        );
+        assert_eq!(
+            hashes_or_usage("abcd1234\n".as_bytes(), &["Usage: a"]).unwrap(),
+            vec![ContentHash::new("abcd1234")]
+        );
+    }
+
+    #[test]
+    fn no_resolved_tracks_is_an_error() {
+        assert_eq!(
+            failure_text(require_tracks(vec![])),
+            "No tracks could be resolved. Aborting."
+        );
+        assert_eq!(require_tracks(vec![track("abcd1234")]).unwrap().len(), 1);
     }
 
     #[test]

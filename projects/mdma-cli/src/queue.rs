@@ -1,6 +1,6 @@
 use crate::args::OptTrackArg;
 use crate::ctx::Ctx;
-use crate::output::{format_track_line, handle_playback_error, render_track_table};
+use crate::output::{display_error, format_track_line, render_track_table};
 use crate::stdin::{hashes_arg_or_stdin, hashes_in, require_stdin_hashes};
 use color_eyre::Result;
 use colored::Colorize;
@@ -13,14 +13,14 @@ use track_formatter::short_hash;
 /// Hash may be omitted; if so, reads "{hash}  {display}" from stdin (dmenu output).
 #[hicli::command]
 pub(crate) fn next(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
-    let playback = ctx.playback();
-    let hashes = hashes_arg_or_stdin(hash);
+    let playback = ctx.playback()?;
+    let hashes = hashes_arg_or_stdin(hash)?;
     let count = hashes.len();
     // Prepend in reverse so the first hash ends up at the front of the queue.
     for content_hash in hashes.into_iter().rev() {
-        if let Err(e) = playback.queue_next(content_hash, SourceName::audio()) {
-            handle_playback_error(e);
-        }
+        playback
+            .queue_next(content_hash, SourceName::audio())
+            .map_err(display_error)?;
     }
     println!("Queued {} track(s) next", count);
     Ok(())
@@ -31,13 +31,13 @@ pub(crate) fn next(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
 /// Hash may be omitted; if so, reads "{hash}  {display}" from stdin (dmenu output).
 #[hicli::command]
 pub(crate) fn append(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
-    let playback = ctx.playback();
-    let hashes = hashes_arg_or_stdin(hash);
+    let playback = ctx.playback()?;
+    let hashes = hashes_arg_or_stdin(hash)?;
     let count = hashes.len();
     for content_hash in hashes {
-        if let Err(e) = playback.queue_append(content_hash, SourceName::audio()) {
-            handle_playback_error(e);
-        }
+        playback
+            .queue_append(content_hash, SourceName::audio())
+            .map_err(display_error)?;
     }
     println!("Appended {} track(s) to queue", count);
     Ok(())
@@ -46,12 +46,9 @@ pub(crate) fn append(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
 /// Show the current queue
 #[hicli::command]
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
-    let library = ctx.library();
-    let playback = ctx.playback();
-    let hashes = match playback.queue_list() {
-        Ok(h) => h,
-        Err(e) => handle_playback_error(e),
-    };
+    let library = ctx.library()?;
+    let playback = ctx.playback()?;
+    let hashes = playback.queue_list().map_err(display_error)?;
 
     if hashes.is_empty() {
         use std::io::IsTerminal;
@@ -121,10 +118,8 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
 /// Clear the queue
 #[hicli::command]
 pub(crate) fn clear(ctx: &Ctx) -> Result<()> {
-    let playback = ctx.playback();
-    if let Err(e) = playback.queue_clear() {
-        handle_playback_error(e);
-    }
+    let playback = ctx.playback()?;
+    playback.queue_clear().map_err(display_error)?;
     println!("Queue cleared");
     Ok(())
 }
@@ -134,15 +129,14 @@ pub(crate) fn clear(ctx: &Ctx) -> Result<()> {
 /// Hash may be omitted; if so, reads one hash per line from stdin.
 #[hicli::command]
 pub(crate) fn remove(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
-    let playback = ctx.playback();
-    let content_hashes = hashes_arg_or_stdin(hash);
+    let playback = ctx.playback()?;
+    let content_hashes = hashes_arg_or_stdin(hash)?;
 
-    match playback.queue_remove(content_hashes) {
-        Ok(removed) if removed > 0 => {
-            println!("Removed {} track(s) from queue", removed);
-        }
-        Ok(_) => {}
-        Err(e) => handle_playback_error(e),
+    let removed = playback
+        .queue_remove(content_hashes)
+        .map_err(display_error)?;
+    if removed > 0 {
+        println!("Removed {} track(s) from queue", removed);
     }
     Ok(())
 }
@@ -157,16 +151,14 @@ pub(crate) fn remove(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
 ///   mdma queue list | mdma sort bpm -a | mdma queue replace
 #[hicli::command]
 pub(crate) fn replace(ctx: &Ctx) -> Result<()> {
-    let playback = ctx.playback();
-    let hashes = require_stdin_hashes();
+    let playback = ctx.playback()?;
+    let hashes = require_stdin_hashes()?;
     let entries: Vec<(ContentHash, SourceName)> = hashes
         .into_iter()
         .map(|hash| (hash, SourceName::audio()))
         .collect();
     let count = entries.len();
-    if let Err(e) = playback.queue_replace(entries) {
-        handle_playback_error(e);
-    }
+    playback.queue_replace(entries).map_err(display_error)?;
     println!("Queue replaced: {} tracks", count);
     Ok(())
 }
@@ -176,13 +168,10 @@ pub(crate) fn replace(ctx: &Ctx) -> Result<()> {
 /// Opens the current queue as a playlist file; save to apply changes.
 #[hicli::command]
 pub(crate) fn edit(ctx: &Ctx) -> Result<()> {
-    let library = ctx.library();
-    let playback = ctx.playback();
+    let library = ctx.library()?;
+    let playback = ctx.playback()?;
     // 1. Get current queue hashes.
-    let hashes = match playback.queue_list() {
-        Ok(h) => h,
-        Err(e) => handle_playback_error(e),
-    };
+    let hashes = playback.queue_list().map_err(display_error)?;
 
     // 2. Look up each track for display info. Unresolvable entries are written as
     //    plain-hash comment lines so they survive the edit round-trip unchanged.
@@ -207,7 +196,7 @@ pub(crate) fn edit(ctx: &Ctx) -> Result<()> {
         content.push('\n');
     }
     // 4. Launch $EDITOR (fallback to vi) and read back what was saved.
-    let edited = crate::editor::edit_text("mdma-queue-", &content);
+    let edited = crate::editor::edit_text("mdma-queue-", &content)?;
 
     // 5. Parse hashes using the standard filter.
     let edited_hashes = hashes_in(&edited);
@@ -218,9 +207,7 @@ pub(crate) fn edit(ctx: &Ctx) -> Result<()> {
         .map(|hash| (hash, SourceName::audio()))
         .collect();
     let count = entries.len();
-    if let Err(e) = playback.queue_replace(entries) {
-        handle_playback_error(e);
-    }
+    playback.queue_replace(entries).map_err(display_error)?;
     println!("Queue updated: {} tracks", count);
     Ok(())
 }

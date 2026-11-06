@@ -1,5 +1,6 @@
 use crate::args::impl_arg;
 use crate::ctx::Ctx;
+use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use colored::Colorize;
 use event_protocol::{from_topic_message, PlaybackEvent, TOPIC_PLAYBACK};
@@ -24,16 +25,16 @@ impl_arg!(
 pub(crate) fn subscribe(topic: OptTopicArg, ctx: &Ctx) -> Result<()> {
     let OptTopicArg(topic) = topic;
     // Event gateway of the resolved node (tcp://<ip>:5556)
-    let addr = match ctx.event_gateway() {
-        Some(a) => a,
-        None => {
-            eprintln!("Subscribe needs a remote node.");
-            eprintln!("Set --node or MDMA_NODE to the hostname of your MDMA device");
-            std::process::exit(1);
-        }
-    };
-    let library = ctx.library();
+    let addr = ctx.event_gateway()?.ok_or_else(needs_remote_node)?;
+    let library = ctx.library()?;
     listen(&addr, topic.as_deref(), Some(&library))
+}
+
+fn needs_remote_node() -> color_eyre::Report {
+    eyre!(
+        "Subscribe needs a remote node.\n\
+         Set --node or MDMA_NODE to the hostname of your MDMA device"
+    )
 }
 
 fn listen(
@@ -178,8 +179,17 @@ fn print_event_human(event: &PlaybackEvent, library: Option<&LibraryBackend>) {
 
 #[cfg(test)]
 mod tests {
-    use super::OptTopicArg;
-    use crate::test_support::run_arg;
+    use super::{subscribe, OptTopicArg};
+    use crate::test_support::{failure_text, local_ctx, run_arg};
+
+    #[test]
+    fn subscribe_needs_a_remote_node() {
+        assert_eq!(
+            failure_text(subscribe(OptTopicArg(None), &local_ctx())),
+            "Subscribe needs a remote node.\n\
+             Set --node or MDMA_NODE to the hostname of your MDMA device"
+        );
+    }
 
     #[test]
     fn topic_arg_parser_is_an_optional_option() {

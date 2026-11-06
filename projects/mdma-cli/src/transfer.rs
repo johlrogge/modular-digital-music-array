@@ -1,9 +1,11 @@
 use crate::args::{choice, choice_names, parse_choice, Choice, ExistingFileArg};
 use crate::ctx::Ctx;
-use crate::stdin::{read_hashes, resolve_tracks_skip_errors};
+use crate::output::success_unless;
+use crate::stdin::{require_stdin_hashes_or_usage, resolve_tracks_or_abort};
 use bpaf::{construct, long, positional, Bpaf, Parser};
+use color_eyre::eyre::{bail, eyre};
 use color_eyre::Result;
-use hicli::{complete_files, Arg};
+use hicli::{complete_files, Arg, Success};
 use library_ipc_client::TrackInfo;
 use mdma_client::IngestSource;
 use std::path::Path;
@@ -219,18 +221,24 @@ fn scp_file(
         .status()?;
 
     if !status.success() {
-        eprintln!(
+        bail!(
             "SCP failed for {}",
             local_path.file_name().unwrap_or_default().to_string_lossy()
         );
-        std::process::exit(1);
     }
     Ok(())
 }
 
+/// The host to scp to: the resolved node, by IP when known.
+fn upload_host(ctx: &Ctx) -> Result<String> {
+    ctx.remote_host()?
+        .map(|(host, ip)| ip.map_or(host, |ip| ip.to_string()))
+        .ok_or_else(|| eyre!("Upload requires --node or MDMA_NODE to determine the Pi hostname"))
+}
+
 /// Upload a file (audio or ZIP of audio) to the library
 #[hicli::command]
-pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<()> {
+pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<Success> {
     use library_ipc_client::InboxPath;
 
     let UploadArgs {
@@ -246,13 +254,7 @@ pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<()> {
     } = file;
 
     // 1. Host to scp to: the resolved node, by IP when known
-    let hostname = match ctx.remote_host() {
-        Some((host, ip)) => ip.map_or(host, |ip| ip.to_string()),
-        None => {
-            eprintln!("Upload requires --node or MDMA_NODE to determine the Pi hostname");
-            std::process::exit(1);
-        }
-    };
+    let hostname = upload_host(ctx)?;
 
     let SshKeyArg(key_path) = ssh_key;
 
@@ -263,8 +265,7 @@ pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<()> {
             println!("Extracting ZIP archive...");
             let extracted = inbox_utils::extract_zip(&file, temp_dir.path())?;
             if extracted.is_empty() {
-                eprintln!("No audio files found in ZIP archive");
-                std::process::exit(1);
+                bail!("No audio files found in ZIP archive");
             }
             println!("Found {} audio file(s)", extracted.len());
             extracted
@@ -280,7 +281,7 @@ pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<()> {
     }
 
     // 4. Ingest each file via the library service
-    let library = ctx.library();
+    let library = ctx.library()?;
     let mut success_count = 0;
     let mut fail_count = 0;
 
@@ -323,10 +324,7 @@ pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<()> {
     println!();
     println!("Done: {} succeeded, {} failed", success_count, fail_count);
 
-    if fail_count > 0 {
-        std::process::exit(1);
-    }
-    Ok(())
+    Ok(success_unless(fail_count > 0))
 }
 
 /// Build the export URL for a track given an MDMA node hostname.
@@ -727,28 +725,18 @@ fn resolve_export_format(blob_path: Option<&str>, formats: &ExportFormats) -> Ex
 ///   mdma search --artist CBL | mdma export --format wav --output ./archive/
 ///   mdma search --artist CBL | mdma export --lossless-format aiff --lossy-format wav
 #[hicli::command]
-pub(crate) fn export(args: ExportArgs, ctx: &Ctx) -> Result<()> {
+pub(crate) fn export(args: ExportArgs, ctx: &Ctx) -> Result<Success> {
     let ExportArgs { formats, output } = args;
-    let library = ctx.library();
+    let library = ctx.library()?;
 
-    let (node, node_ip) = ctx.require_node();
+    let (node, node_ip) = ctx.require_node()?;
 
     // Read hashes from stdin
-    let raw_hashes = read_hashes();
-
-    if raw_hashes.is_empty() {
-        eprintln!("No hashes provided on stdin.");
-        eprintln!("Usage: mdma search --artist CBL | mdma export");
-        std::process::exit(1);
-    }
+    let raw_hashes =
+        require_stdin_hashes_or_usage(&["Usage: mdma search --artist CBL | mdma export"])?;
 
     // Resolve each hash (short or full) to a full TrackInfo via the library
-    let tracks = resolve_tracks_skip_errors(&library, raw_hashes);
-
-    if tracks.is_empty() {
-        eprintln!("No tracks could be resolved. Aborting.");
-        std::process::exit(1);
-    }
+    let tracks = resolve_tracks_or_abort(&library, raw_hashes)?;
 
     let http = build_http_client(&node, node_ip)?;
 
@@ -797,10 +785,9 @@ pub(crate) fn export(args: ExportArgs, ctx: &Ctx) -> Result<()> {
         }) {
             eprintln!("  {} — {}", r.track.content_hash, error);
         }
-        std::process::exit(1);
     }
 
-    Ok(())
+    Ok(success_unless(fail_count > 0))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -857,7 +844,15 @@ impl std::str::FromStr for ExportFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{run_arg, track, usage_error};
+    use crate::test_support::{failure_text, local_ctx, run_arg, track, usage_error};
+
+    #[test]
+    fn upload_needs_a_remote_node() {
+        assert_eq!(
+            failure_text(upload_host(&local_ctx())),
+            "Upload requires --node or MDMA_NODE to determine the Pi hostname"
+        );
+    }
 
     use pretty_assertions::assert_eq;
 

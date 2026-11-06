@@ -1,4 +1,5 @@
 use crate::ctx::Ctx;
+use crate::output::{display_error, lost_contact};
 use bpaf::Bpaf;
 use color_eyre::Result;
 use hicli::Arg;
@@ -65,6 +66,11 @@ fn identity_already_running_message(running_pcm: bool, requested_pcm: bool) -> S
     msg
 }
 
+/// The failure for a backfill whose status could not be polled any more.
+fn lost_contact_with_library(cause: &dyn std::fmt::Display) -> color_eyre::Report {
+    lost_contact("the library service", cause, "mdma library identity status")
+}
+
 /// Compute identity hashes for tracks that don't have them yet
 ///
 /// New tracks get an AudioHash when they are ingested; this covers the tracks
@@ -75,17 +81,13 @@ fn identity_already_running_message(running_pcm: bool, requested_pcm: bool) -> S
 pub(crate) fn backfill(args: BackfillArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::IdentityBackfillStart;
     let BackfillArgs { pcm, no_wait } = args;
-    let library = ctx.library();
-    match library.identity_backfill(pcm) {
-        Ok(IdentityBackfillStart::Started(p)) => {
+    let library = ctx.library()?;
+    match library.identity_backfill(pcm).map_err(display_error)? {
+        IdentityBackfillStart::Started(p) => {
             println!("Identity backfill started: {} tracks to process", p.total)
         }
-        Ok(IdentityBackfillStart::AlreadyRunning(p)) => {
+        IdentityBackfillStart::AlreadyRunning(p) => {
             println!("{}", identity_already_running_message(p.include_pcm, pcm))
-        }
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
         }
     }
     if no_wait {
@@ -111,11 +113,7 @@ pub(crate) fn backfill(args: BackfillArgs, ctx: &Ctx) -> Result<()> {
             Err(e) => {
                 failures += 1;
                 if failures >= IDENTITY_POLL_MAX_FAILURES {
-                    eprintln!(
-                        "Lost contact with the library service ({e}); \
-                         check later with 'mdma library identity status'"
-                    );
-                    std::process::exit(1);
+                    return Err(lost_contact_with_library(&e));
                 }
             }
         }
@@ -126,50 +124,43 @@ pub(crate) fn backfill(args: BackfillArgs, ctx: &Ctx) -> Result<()> {
 /// Show progress of the identity-hash backfill
 #[hicli::command]
 pub(crate) fn status(ctx: &Ctx) -> Result<()> {
-    let library = ctx.library();
-    match library.identity_backfill_status() {
-        Ok(s) => {
-            println!("{}", format_identity_status(&s));
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-    }
+    let library = ctx.library()?;
+    let status = library.identity_backfill_status().map_err(display_error)?;
+    println!("{}", format_identity_status(&status));
+    Ok(())
 }
 
 /// Stop a running identity-hash backfill (progress is kept; run backfill again to resume)
 #[hicli::command]
 pub(crate) fn cancel(ctx: &Ctx) -> Result<()> {
     use library_ipc_client::IdentityBackfillStatus;
-    let library = ctx.library();
-    match library.identity_backfill_cancel() {
-        Ok(IdentityBackfillStatus::Running(_)) => {
-            println!(
-                "Cancelling after the current track; progress is kept. \
-                 Run 'mdma library identity backfill' again to resume."
-            );
-            Ok(())
-        }
-        Ok(s) => {
-            println!("Nothing to cancel. {}", format_identity_status(&s));
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
+    let library = ctx.library()?;
+    match library.identity_backfill_cancel().map_err(display_error)? {
+        IdentityBackfillStatus::Running(_) => println!(
+            "Cancelling after the current track; progress is kept. \
+             Run 'mdma library identity backfill' again to resume."
+        ),
+        s => println!("Nothing to cancel. {}", format_identity_status(&s)),
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::test_support::{parses, run_arg};
+    use crate::test_support::{failure_text, parses, run_arg};
 
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn lost_contact_says_why_and_how_to_check() {
+        assert_eq!(
+            failure_text::<()>(Err(lost_contact_with_library(&"timed out"))),
+            "Lost contact with the library service (timed out); \
+             check later with 'mdma library identity status'"
+        );
+    }
 
     // ── identity parsing ──────────────────────────────────────────────────────
 

@@ -2503,6 +2503,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "597e81e56404b7a3e26ef7b449f82a4b7a661ae76c3cac692b42d6bad06a0fbe"
 dependencies = [
  "bpaf_derive",
+ "owo-colors",
+ "supports-color",
 ]
 
 [[package]]
@@ -4755,9 +4757,9 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "hicli"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70840d1070aff6e609085a2581355fe5a20fff0e5f983e0577b2be180c1b865a"
+checksum = "5804409a8b44736aae992472a7aa27de62bbb4e44e36cb6616287a5978fb14e4"
 dependencies = [
  "bpaf",
  "hicli-macros",
@@ -4766,9 +4768,9 @@ dependencies = [
 
 [[package]]
 name = "hicli-macros"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f05387f93a3d8fb99e5ddb5010425a0380d5129cbd6165fa4b024a000e14479"
+checksum = "e961355d1d155a01b8518e2d8447d02b2ffe40aaf446a3d270bfd54db856b249"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5296,6 +5298,12 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "is_ci"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7655c9839580ee829dfacba1d1278c2b7883e50a277ff7541299489d6bdfdc45"
 
 [[package]]
 name = "is_terminal_polyfill"
@@ -9089,6 +9097,15 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "supports-color"
+version = "3.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c64fc7232dd8d2e4ac5ce4ef302b1d81e0b80d055b9d77c7c4f51f6aa4c867d6"
+dependencies = [
+ "is_ci",
+]
 
 [[package]]
 name = "svg_fmt"

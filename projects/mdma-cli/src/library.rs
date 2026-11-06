@@ -1,5 +1,7 @@
 use crate::args::impl_arg;
 use crate::ctx::Ctx;
+use crate::output::interpret_library;
+use color_eyre::eyre::eyre;
 use color_eyre::Result;
 
 /// Re-extract and store cover art for tracks that don't have a CoverArtPath fact yet
@@ -9,27 +11,18 @@ use color_eyre::Result;
 /// fact are processed.
 #[hicli::command]
 pub(crate) fn reindex_covers(ctx: &Ctx) -> Result<()> {
-    use library_ipc_client::{LibraryRequest, LibraryResponse};
-    let library = ctx.library();
-    let response = library.request(&LibraryRequest::ReindexCovers);
-    match response {
-        Ok(LibraryResponse::IngestResult(result)) => match result {
-            library_ipc_client::IngestResult::Success { message, .. } => {
-                println!("{}", message);
-            }
-            library_ipc_client::IngestResult::Failure { message } => {
-                eprintln!("Error: {}", message);
-                std::process::exit(1);
-            }
+    use library_ipc_client::{IngestResult, LibraryRequest, LibraryResponse};
+    let library = ctx.library()?;
+    let result = interpret_library(
+        library.request(&LibraryRequest::ReindexCovers),
+        |r| match r {
+            LibraryResponse::IngestResult(result) => Some(result),
+            _ => None,
         },
-        Ok(LibraryResponse::Error(e)) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-        _ => {
-            eprintln!("Unexpected response");
-            std::process::exit(1);
-        }
+    )?;
+    match result {
+        IngestResult::Success { message, .. } => println!("{}", message),
+        IngestResult::Failure { message } => return Err(eyre!("{}", message)),
     }
     Ok(())
 }

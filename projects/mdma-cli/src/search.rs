@@ -1,6 +1,6 @@
 use crate::args::{choice, impl_arg, parse_choice, Choice};
 use crate::ctx::Ctx;
-use crate::output::{handle_error, print_tracks};
+use crate::output::{library_error, print_tracks};
 use crate::stdin::read_hashes;
 use bpaf::{long, Bpaf, Parser};
 use color_eyre::Result;
@@ -260,7 +260,7 @@ impl Arg for PlayedFilter {
 /// Search for tracks by filter or free text
 #[hicli::command(default)]
 pub(crate) fn query(args: SearchArgs, ctx: &Ctx) -> Result<()> {
-    let library = ctx.library();
+    let library = ctx.library()?;
     let no_stdin = args.no_stdin;
     let track_query = build_track_query(args);
     search_tracks(&library, &track_query, no_stdin)
@@ -407,22 +407,18 @@ fn search_tracks(library: &LibraryBackend, query: &TrackQuery, no_stdin: bool) -
         effective_query.not = false;
     }
 
-    match library.search(&effective_query) {
-        Ok(tracks) => {
-            let tracks = apply_stdin_filter(tracks, stdin_filter.as_deref(), effective_not);
+    let tracks = library.search(&effective_query).map_err(library_error)?;
+    let tracks = apply_stdin_filter(tracks, stdin_filter.as_deref(), effective_not);
 
-            if tracks.is_empty() && std::io::stdout().is_terminal() {
-                println!("No tracks found");
-                return Ok(());
-            }
-            print_tracks(
-                &tracks,
-                &format!("Search results ({} matches)", tracks.len()),
-            );
-            Ok(())
-        }
-        Err(e) => handle_error(e),
+    if tracks.is_empty() && std::io::stdout().is_terminal() {
+        println!("No tracks found");
+        return Ok(());
     }
+    print_tracks(
+        &tracks,
+        &format!("Search results ({} matches)", tracks.len()),
+    );
+    Ok(())
 }
 
 /// List all distinct values stored for a fact type
@@ -435,29 +431,27 @@ fn search_tracks(library: &LibraryBackend, query: &TrackQuery, no_stdin: bool) -
 pub(crate) fn fact_values_for(fact_type: FactTypeArg, ctx: &Ctx) -> Result<()> {
     use std::io::IsTerminal;
     let FactTypeArg(fact_type) = fact_type;
-    let library = ctx.library();
-    match library.get_fact_values(fact_type.as_str()) {
-        Ok(values) => {
-            if std::io::stdout().is_terminal() {
-                if values.is_empty() {
-                    println!("No values found for fact type '{}'", fact_type);
-                    return Ok(());
-                }
-                println!("Values for '{}' ({} distinct):", fact_type, values.len());
-                println!("{}", "=".repeat(65));
-                for v in values {
-                    println!("  {}", v);
-                }
-            } else {
-                // Pipe mode: one value per line — composable with dmenu, grep, etc.
-                for v in values {
-                    println!("{}", v);
-                }
-            }
-            Ok(())
+    let library = ctx.library()?;
+    let values = library
+        .get_fact_values(fact_type.as_str())
+        .map_err(library_error)?;
+    if std::io::stdout().is_terminal() {
+        if values.is_empty() {
+            println!("No values found for fact type '{}'", fact_type);
+            return Ok(());
         }
-        Err(e) => handle_error(e),
+        println!("Values for '{}' ({} distinct):", fact_type, values.len());
+        println!("{}", "=".repeat(65));
+        for v in values {
+            println!("  {}", v);
+        }
+    } else {
+        // Pipe mode: one value per line — composable with dmenu, grep, etc.
+        for v in values {
+            println!("{}", v);
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
