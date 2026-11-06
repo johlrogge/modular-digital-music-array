@@ -1,8 +1,9 @@
 use crate::args::impl_arg;
 use crate::ctx::Ctx;
-use crate::output::interpret_admin;
+use crate::output::{interpret_admin, success_unless};
 use color_eyre::Result;
 use gateway_client::{AdminRequest, AdminResponse, GatewayClient};
+use hicli::Success;
 
 /// Send an admin request and interpret the reply with [`interpret_admin`].
 fn admin_call<T>(
@@ -93,7 +94,7 @@ mod service_mode {
 
 /// Report whether the host can safely reboot into its installed kernel
 #[hicli::command]
-pub(crate) fn boot_health(ctx: &Ctx) -> Result<()> {
+pub(crate) fn boot_health(ctx: &Ctx) -> Result<Success> {
     let admin = ctx.admin()?;
     let verdict = admin_call(
         &admin,
@@ -104,10 +105,7 @@ pub(crate) fn boot_health(ctx: &Ctx) -> Result<()> {
         },
     )?;
     println!("Boot health: {verdict}");
-    if !verdict.allows_reboot() {
-        std::process::exit(1);
-    }
-    Ok(())
+    Ok(success_unless(!verdict.allows_reboot()))
 }
 
 /// Reboot even if the boot-health check fails.

@@ -1,6 +1,7 @@
-use crate::output::lost_contact;
+use crate::output::{lost_contact, success_unless};
 use crate::source::import_status_command;
 use color_eyre::Result;
+use hicli::Success;
 use mdma_client::SourceClient;
 use playlist_import::format_import_status;
 use source_protocol::{
@@ -121,19 +122,20 @@ impl ImportPoller {
     }
 }
 
-/// Print the final report; exit non-zero when the job failed.
-pub(crate) fn finish_import(status: &ImportJobStatus) -> Result<()> {
+/// Print the final report; the exit code is 1 when the job failed.
+pub(crate) fn finish_import(status: &ImportJobStatus) -> Success {
     let report = format_import_status(status);
-    if matches!(status.phase, ImportPhase::Failed { .. }) {
+    let failed = matches!(status.phase, ImportPhase::Failed { .. });
+    if failed {
         eprintln!("{}", report);
-        std::process::exit(1);
+    } else {
+        println!("{}", report);
     }
-    println!("{}", report);
-    Ok(())
+    success_unless(failed)
 }
 
 /// Poll the server until `job_id` finishes, then print its report.
-pub(crate) fn follow_import_job(source: &SourceClient, name: &str, job_id: u64) -> Result<()> {
+pub(crate) fn follow_import_job(source: &SourceClient, name: &str, job_id: u64) -> Result<Success> {
     let mut poller = ImportPoller::new(job_id);
     let mut last_error: Option<String> = None;
     loop {
@@ -158,7 +160,7 @@ pub(crate) fn follow_import_job(source: &SourceClient, name: &str, job_id: u64) 
         }
         match step.flow {
             PollFlow::Continue => std::thread::sleep(IMPORT_POLL_INTERVAL),
-            PollFlow::Finished(status) => return finish_import(&status),
+            PollFlow::Finished(status) => return Ok(finish_import(&status)),
             PollFlow::GiveUp => return Err(lost_import_job(name, job_id, last_error.as_deref())),
         }
     }
@@ -219,6 +221,19 @@ mod tests {
             "Lost contact with the import job 7 (no status for the job); \
              check later with 'mdma source bandcamp import-status'"
         );
+    }
+
+    #[test]
+    fn a_failed_import_ends_with_exit_code_one_and_a_finished_one_with_zero() {
+        let failed = job(
+            1,
+            ImportPhase::Failed {
+                message: "x".into(),
+            },
+            None,
+        );
+        assert_eq!(finish_import(&failed), Success::code(1));
+        assert_eq!(finish_import(&job(1, done(), None)), Success::OK);
     }
 
     #[test]

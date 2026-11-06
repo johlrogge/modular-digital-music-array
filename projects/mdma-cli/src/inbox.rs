@@ -1,8 +1,9 @@
 use crate::args::impl_arg;
 use crate::ctx::Ctx;
-use crate::output::library_error;
+use crate::output::{library_error, success_unless};
 use color_eyre::eyre::eyre;
 use color_eyre::Result;
+use hicli::Success;
 use library_ipc_client::{InboxPath, InboxPathError};
 use std::str::FromStr;
 use track_formatter::short_hash;
@@ -83,14 +84,14 @@ pub(crate) fn ingest(file: InboxFileArg, ctx: &Ctx) -> Result<()> {
 
 /// Ingest all files in inbox
 #[hicli::command]
-pub(crate) fn ingest_all(ctx: &Ctx) -> Result<()> {
+pub(crate) fn ingest_all(ctx: &Ctx) -> Result<Success> {
     let library = ctx.library()?;
     println!("Ingesting all files in inbox...");
 
     let results = library.ingest_all().map_err(library_error)?;
     if results.is_empty() {
         println!("Inbox is empty - nothing to ingest");
-        return Ok(());
+        return Ok(Success::OK);
     }
 
     let mut success_count = 0;
@@ -117,10 +118,7 @@ pub(crate) fn ingest_all(ctx: &Ctx) -> Result<()> {
     println!();
     println!("Done: {} succeeded, {} failed", success_count, fail_count);
 
-    if fail_count > 0 {
-        std::process::exit(1);
-    }
-    Ok(())
+    Ok(success_unless(fail_count > 0))
 }
 
 #[cfg(test)]

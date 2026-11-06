@@ -1,8 +1,9 @@
 use crate::ctx::Ctx;
 use crate::library::Yes;
-use crate::output::display_error;
+use crate::output::{display_error, success_unless};
 use crate::stdin::confirm;
 use color_eyre::Result;
+use hicli::Success;
 use library_ipc_client::{ArchiveEmptyReport, ArchiveListing};
 use storage_primitives::ByteSize;
 
@@ -76,7 +77,7 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
 ///
 /// Shows what the archive holds and asks for confirmation. This cannot be undone.
 #[hicli::command]
-pub(crate) fn empty(yes: Yes, ctx: &Ctx) -> Result<()> {
+pub(crate) fn empty(yes: Yes, ctx: &Ctx) -> Result<Success> {
     let Yes(yes) = yes;
     let library = ctx.library()?;
     // `--yes` without a listing deletes everything; after a prompt, only what was shown.
@@ -85,11 +86,11 @@ pub(crate) fn empty(yes: Yes, ctx: &Ctx) -> Result<()> {
         let listing = library.archive_list().map_err(display_error)?;
         println!("{}\n", format_archive_listing(&listing));
         if listing.entries.is_empty() {
-            return Ok(());
+            return Ok(Success::OK);
         }
         if !confirm(&archive_empty_prompt(&listing))? {
             println!("Aborted");
-            return Ok(());
+            return Ok(Success::OK);
         }
         up_to = Some(archive_cutoff(&listing));
     }
@@ -98,10 +99,7 @@ pub(crate) fn empty(yes: Yes, ctx: &Ctx) -> Result<()> {
         .archive_empty(up_to.as_deref())
         .map_err(display_error)?;
     println!("{}", format_archive_emptied(&report));
-    if !report.errors.is_empty() {
-        std::process::exit(1);
-    }
-    Ok(())
+    Ok(success_unless(!report.errors.is_empty()))
 }
 
 #[cfg(test)]

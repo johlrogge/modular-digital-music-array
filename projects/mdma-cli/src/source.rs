@@ -7,7 +7,7 @@ use crate::source::import::{finish_import, follow_import_job, is_terminal_phase}
 use bpaf::Bpaf;
 use color_eyre::eyre::eyre;
 use color_eyre::Result;
-use hicli::Arg;
+use hicli::{Arg, Success};
 use mdma_client::SourceClient;
 use source_protocol::{SourceError, SourceRequest, SourceResponse};
 use std::convert::Infallible;
@@ -600,7 +600,7 @@ pub(crate) fn import_playlist(
     source: SourceArg,
     args: ImportPlaylistArgs,
     ctx: &Ctx,
-) -> Result<()> {
+) -> Result<Success> {
     let name = source.as_str();
     let source = ctx.source(name, None)?;
     let ImportPlaylistArgs {
@@ -644,7 +644,7 @@ pub(crate) fn import_playlist(
 
     if no_wait {
         println!("Check progress with '{}'", import_status_command(name));
-        return Ok(());
+        return Ok(Success::OK);
     }
     follow_import_job(&source, name, job_id)
 }
@@ -653,7 +653,7 @@ pub(crate) fn import_playlist(
 ///
 /// Only for sources that support playlists.
 #[hicli::command(curried)]
-pub(crate) fn import_status(source: SourceArg, ctx: &Ctx) -> Result<()> {
+pub(crate) fn import_status(source: SourceArg, ctx: &Ctx) -> Result<Success> {
     let name = source.as_str();
     let source = ctx.source(name, None)?;
     let status = source_call_with(
@@ -669,9 +669,9 @@ pub(crate) fn import_status(source: SourceArg, ctx: &Ctx) -> Result<()> {
     match status {
         None => {
             println!("No import job");
-            Ok(())
+            Ok(Success::OK)
         }
-        Some(status) if is_terminal_phase(&status.phase) => finish_import(&status),
+        Some(status) if is_terminal_phase(&status.phase) => Ok(finish_import(&status)),
         Some(status) => {
             println!("Import job {} is running", status.job_id);
             follow_import_job(&source, name, status.job_id)

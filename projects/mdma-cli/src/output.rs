@@ -187,6 +187,16 @@ pub fn interpret_library<T>(
     }
 }
 
+/// How a command that printed a report of partial results ends: exit code 1
+/// when something `failed`, plain success otherwise. hicli prints nothing more.
+pub fn success_unless(failed: bool) -> hicli::Success {
+    if failed {
+        hicli::Success::code(1)
+    } else {
+        hicli::Success::OK
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -202,6 +212,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use track_formatter::ALL_COLUMNS;
+
+    // ── exit code of a partial-failure report ─────────────────────────────────
+
+    #[test]
+    fn a_report_with_failures_ends_with_exit_code_one() {
+        assert_eq!(super::success_unless(true), hicli::Success::code(1));
+        assert_eq!(super::success_unless(false), hicli::Success::OK);
+    }
 
     fn make_track(artist: &str, title: &str, duration_secs: u32) -> TrackInfo {
         use library_ipc_client::DurationSeconds;

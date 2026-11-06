@@ -1,10 +1,11 @@
 use crate::args::{choice, choice_names, parse_choice, Choice, ExistingFileArg};
 use crate::ctx::Ctx;
+use crate::output::success_unless;
 use crate::stdin::{require_stdin_hashes_or_usage, resolve_tracks_or_abort};
 use bpaf::{construct, long, positional, Bpaf, Parser};
 use color_eyre::eyre::{bail, eyre};
 use color_eyre::Result;
-use hicli::{complete_files, Arg};
+use hicli::{complete_files, Arg, Success};
 use library_ipc_client::TrackInfo;
 use mdma_client::IngestSource;
 use std::path::Path;
@@ -237,7 +238,7 @@ fn upload_host(ctx: &Ctx) -> Result<String> {
 
 /// Upload a file (audio or ZIP of audio) to the library
 #[hicli::command]
-pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<()> {
+pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<Success> {
     use library_ipc_client::InboxPath;
 
     let UploadArgs {
@@ -323,10 +324,7 @@ pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<()> {
     println!();
     println!("Done: {} succeeded, {} failed", success_count, fail_count);
 
-    if fail_count > 0 {
-        std::process::exit(1);
-    }
-    Ok(())
+    Ok(success_unless(fail_count > 0))
 }
 
 /// Build the export URL for a track given an MDMA node hostname.
@@ -727,7 +725,7 @@ fn resolve_export_format(blob_path: Option<&str>, formats: &ExportFormats) -> Ex
 ///   mdma search --artist CBL | mdma export --format wav --output ./archive/
 ///   mdma search --artist CBL | mdma export --lossless-format aiff --lossy-format wav
 #[hicli::command]
-pub(crate) fn export(args: ExportArgs, ctx: &Ctx) -> Result<()> {
+pub(crate) fn export(args: ExportArgs, ctx: &Ctx) -> Result<Success> {
     let ExportArgs { formats, output } = args;
     let library = ctx.library()?;
 
@@ -787,10 +785,9 @@ pub(crate) fn export(args: ExportArgs, ctx: &Ctx) -> Result<()> {
         }) {
             eprintln!("  {} — {}", r.track.content_hash, error);
         }
-        std::process::exit(1);
     }
 
-    Ok(())
+    Ok(success_unless(fail_count > 0))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
