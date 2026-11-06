@@ -1,5 +1,6 @@
 use crate::args::{choice, choice_names, ExistingFileArg, PlaylistArg, SanitizedPlaylistName};
 use crate::ctx::Ctx;
+use crate::output::library_error;
 use crate::stdin::{require_stdin_hashes_or_usage, resolve_tracks_or_abort};
 use crate::transfer::{
     build_http_client, download_tracks, existing_location_set, export_dest_path_checked,
@@ -205,9 +206,7 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
         let mut result = Vec::with_capacity(playlists.len());
         for PlaylistArg(name) in &playlists {
             let pname = name.as_str();
-            let hashes = library
-                .playlist_get(name)
-                .map_err(|e| eyre!("playlist '{}' not found: {}", pname, e))?;
+            let hashes = library.playlist_get(name).map_err(library_error)?;
             result.push((pname.to_string(), hashes));
         }
         result
@@ -643,7 +642,10 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
         for (t, hashes) in &ambiguous {
             eprintln!("  {} - {}", t.artist, t.name);
             for h in hashes.iter().take(3) {
-                eprintln!("    candidate: {}", &h.as_str()[..h.as_str().len().min(16)]);
+                eprintln!(
+                    "    candidate: {}",
+                    h.as_str().get(..16).unwrap_or(h.as_str())
+                );
             }
         }
     }
