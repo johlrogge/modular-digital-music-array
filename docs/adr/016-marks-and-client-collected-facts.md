@@ -55,7 +55,7 @@ Points marked **decided** were decided by Joakim. Everything else is **proposed*
 1. **Reuse `Bookmarked` as the mark fact. No new variant, no migration.**
    - `scope: None` is the *default mark*: today's bookmark. **Decided:** it is called "liked".
    - `scope: Some(name)` is the named mark `name`.
-   - A track holds at most one live mark per name, and the latest wins within a name (ADR-014 §3). A track may hold several different marks.
+   - Normally a track holds one live entry per name, and the latest wins within a name (ADR-014 §3). This is not an invariant (merges, older libraries). Readers treat any live entry as marked, and unmark retracts all of them. A track may hold several different marks.
    - Existing facts are already marks. The immutable log is never rewritten.
 2. **Mark names are validated at the edges, not in storage.**
    - `MarkName` is a newtype in music_facts: trimmed, non-empty, at most 64 characters, no control characters. It is otherwise lenient, following ADR-015's "names may be lenient".
@@ -63,21 +63,21 @@ Points marked **decided** were decided by Joakim. Everything else is **proposed*
      - Folding is `str::to_lowercase`. It is not Unicode case folding and not NFC normalisation, so canonically equivalent spellings are different marks.
      - Invisible format characters (such as zero-width spaces) are rejected too, as well as control characters.
    - `enum Mark { Default, Named(MarkName) }` maps to `Option<String>` on the fact.
-   - The protocol carries `Mark`/`MarkName`, and so do the CLI and TUI arguments. The CLI's arg newtype wraps `MarkName`.
+   - The protocol carries `Mark`/`MarkName`, and so do the CLI and TUI arguments. The CLI's arg newtype wraps `Mark`, not `MarkName`, because `liked` parses to the default mark.
    - `MusicValue::Bookmarked.scope` stays `Option<String>`, so reading history can never fail on an old free-text scope.
    - **Decided:** "liked" is reserved. `MarkName` rejects it. Typing `liked` on the CLI means the default mark, so no named mark can be called "liked".
-   - **Decided:** a legacy scope that isn't a valid mark name (e.g. empty, or over 64 characters) is still read and projected, and `marked` (`Any`) lists it. It cannot be written again, and it can be removed only with `mdma fact retract`.
+   - **Decided:** a legacy scope that isn't a valid mark name (e.g. empty, or over 64 characters) is still read and projected, and `marked` (`Any`) lists it. It cannot be written again. It can't yet be removed from the CLI; removal is a planned follow-up.
 3. **Protocol** (library_ipc_protocol):
    - **`WriteMark { hash, mark: Mark }`** replaces `WriteBookmark`.
      - **Decided:** `WriteBookmark` stays as a deprecated server-side alias for old clients, because prod's CLI and TUI use it. It is documented as deprecated but has no attribute.
      - **Decided:** re-marking a live mark is a no-op. Nothing is written, and the original time is kept. A macro pressed twice writes one fact.
-   - **`UnmarkTrack { hash, mark: Mark }`** retracts every live `Bookmarked` assertion with that name on the track's chain head, matching on (value, source).
+   - **`UnmarkTrack { hash, mark: Mark }`** retracts every live `Bookmarked` assertion with that name on the resolved track (no replaced-by redirect is followed), matching on (value, source).
      - That includes entries that came from merge losers (ADR-014 §7).
      - If the mark isn't live, it is a no-op.
    - **`ListMarked { filter: MarkFilter }`**, with `enum MarkFilter { Any, Only(Mark) }`, replaces `ListBookmarked` outright. The explicit `Any` avoids overloading `None` to mean both "the default mark" and "any mark".
 4. **Why reshape `ListBookmarked` now.** It isn't on prod and has no CLI user, so changing it today only means redeploying stage2. Once the #95 CLI ships against it, every later change needs a compatibility path for old nodes.
-5. **Old nodes.** A new client that sends `ListMarked` or `WriteMark` to an older library currently gets no reply (#97).
-   - #97 is fixed first: the library answers an unparseable request with an invalid-request error, following the same pattern as ADR-009 §4.
+5. **Old nodes.** A new client that sends `ListMarked` or `WriteMark` to an older library used to get no reply (#97, now fixed). Against an old *gateway*, the client sees the gateway's "Invalid request:" rejection (ADR-009), which maps to the same upgrade message.
+   - #97 was fixed first: the library answers an unparseable request with an invalid-request error, following the same pattern as ADR-009 §4.
    - **Decided:** when a node doesn't understand a request, the client says: "The node did not understand this request; it may be older than this CLI — upgrade the node."
    - There is no fallback, and never one to `ListBookmarked`: no silent fallback (ADR-001).
 6. **Macro buttons** are client configuration that maps a button to a `Mark`.
@@ -87,7 +87,7 @@ Points marked **decided** were decided by Joakim. Everything else is **proposed*
    - **Decided:** `mark` and `unmark` with no name act on the default mark ("liked").
    - **Decided:** `marked` with no name lists tracks with any mark (`MarkFilter::Any`). `marked liked` lists only the default mark.
    - **Decided:** `bookmark` and `bookmarks` are true CLI aliases of `mark` and `marked`. They take the same arguments. The old `--scope` option and the HASH argument are gone.
-   - **Decided (2026-11-09):** `mark` and `unmark` act on the tracks whose hashes arrive on stdin (pipe style, like `sort` and `view`). Piped means required: a non-TTY stdin with no hashes is an error ("No hashes provided on stdin."). The playing track is used only when stdin is a TTY.
+   - **Decided (2026-11-09):** `mark` and `unmark` act on the tracks whose hashes arrive on stdin (pipe style, like `sort` and `view`). Piped means required: a non-TTY stdin with no hashes is an error ("No hashes provided on stdin."). The playing track is used only when stdin is a TTY. A pipe that carries no hashes is therefore an error, e.g. `mdma marked x | mdma unmark x` when nothing is marked, or `ssh host mdma mark` without `-t`, where stdin isn't a terminal.
 
 ### 2. Client-collected facts
 
@@ -164,7 +164,8 @@ Points marked **decided** were decided by Joakim. Everything else is **proposed*
 - **Protocol changes:**
   - `WriteMark`, `UnmarkTrack`, `ListMarked` and `PushFacts` are added.
   - `ListBookmarked` is removed, and `WriteBookmark` is deprecated.
-  - Gateway, library, console, CLI and TUI are redeployed together (ADR-004).
+  - Upgrade the node first: gateway and library (and console) together, then the CLI and TUI (ADR-004). A new gateway in front of an old library would time out, which is why those two go together.
+  - Older CLIs and TUIs keep working against the new node through `WriteBookmark`: their scopes are lowercased, a repeat writes nothing, and an invalid scope gets an error. A new CLI against an old node shows the upgrade message.
   - Stage2 must be redeployed to drop `ListBookmarked`.
 - **The fact schema does not change** in phases 1–3.
 - **The replica branch's gateway write block** is relaxed for exactly one validated request type.
@@ -187,8 +188,8 @@ Points marked **decided** were decided by Joakim. Everything else is **proposed*
 
 ## Phasing
 
-0. Fix #97: the library replies to unparseable requests. **Implemented on feature/marks.**
-1. **Marks. Implemented on feature/marks.** Add `MarkName`/`Mark`, `WriteMark` and `UnmarkTrack`, and replace `ListBookmarked` with `ListMarked`. Move the CLI and TUI over. This unblocks the #95 CLI step. Deploy to stage2, then prod. Phase 1 is no longer blocked on open questions.
+0. Fix #97: the library replies to unparseable requests. **Implemented (phases 0–1).**
+1. **Marks. Implemented (phases 0–1).** Add `MarkName`/`Mark`, `WriteMark` and `UnmarkTrack`, and replace `ListBookmarked` with `ListMarked`. Move the CLI and TUI over. This unblocks the #95 CLI step. Deploy to stage2, then prod. Phase 1 is no longer blocked on open questions.
 2. **Read-only replica.** Rebase `feature/offline-library-replica` onto develop, bringing the ADR-014 fold into `library_projection`. Add a read-only replica and cursor per node.
 3. **Client push:** the outbox, `PushFacts`, a marks-only whitelist and content dedup.
 4. **Cross-node:** merging across nodes, only if Open questions 4 is answered yes.

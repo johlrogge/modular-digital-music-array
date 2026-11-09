@@ -12,15 +12,17 @@ All notable changes to MDMA are documented here.
   - `mdma mark [NAME]` and `mdma unmark [NAME]` act on the hashes piped on stdin. Run from a terminal without a pipe, they act on the playing track. A pipe with no hashes is an error ("No hashes provided on stdin.").
   - `mdma marked [NAME]` lists tracks with that mark, or with any mark when NAME is left out. `mdma marked liked` lists only the default mark.
   - Mark names are lowercase, 1-64 characters, with no control or invisible characters. "liked" is reserved for the default mark.
-  - Marks written before this release, with scopes that are not valid names, are still read, and `marked` lists them. Remove them with `mdma fact retract`.
+  - Marks written before this release, with scopes that are not valid names, are still read, and `marked` lists them. They can't yet be removed from the CLI; removal is a planned follow-up.
   - New library requests: `ListMarked { filter: Any | Only(mark) }`, `WriteMark` and `UnmarkTrack`. `UnmarkTrack` retracts every live entry of the mark, each with its own source.
 - **TUI:** `b` marks the playing track "liked". It reports "Marked liked" or "Already marked liked".
 
 ### Changed
 
 - **BREAKING: `mdma bookmark` and `mdma bookmarks` are now aliases of `mark` and `marked`.** The `--scope` option and the HASH argument are gone. Pipe hashes on stdin instead, and pass the mark name as NAME.
-- **BREAKING: `ListBookmarked` is removed** (it was never released). Use `ListMarked`. `WriteBookmark` stays as a deprecated alias of `WriteMark`. Rebuild and redeploy the gateway, library, console, CLI and TUI together.
-- **Old nodes.** A node that does not know a request now gives one error: "The node did not understand this request; it may be older than this CLI — upgrade the node." There is no fallback.
+- **BREAKING: `ListBookmarked` is removed** (it was never released). Use `ListMarked`. `WriteBookmark` stays as a deprecated alias of `WriteMark`.
+  - Upgrade the node first: gateway and library (and console) together, then the CLI and TUI. A new gateway in front of an old library would time out, which is why those go together.
+  - Older CLIs and TUIs keep working against the new node through `WriteBookmark`: their scopes are lowercased, a repeat writes nothing, and an invalid scope gets an error.
+- **Old nodes.** A node that does not know a request now gives one error: "The node did not understand this request; it may be older than this CLI — upgrade the node." There is no fallback. The TUI shows the same text with "TUI" in place of "CLI". A new CLI against an old node shows this message.
 - **Bookmark behaviour:**
   - `WriteBookmark` scopes are lowercased.
   - An empty, too-long or control/invisible scope is rejected with Internal.
