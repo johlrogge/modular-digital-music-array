@@ -402,17 +402,7 @@ pub(crate) fn bookmark(scope: OptScopeArg, hash: OptTrackArg, ctx: &Ctx) -> Resu
 #[hicli::command]
 pub(crate) fn bookmarks(ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
-    let tracks = library.list_tracks(None).map_err(library_error)?;
-
-    let bookmarked: Vec<TrackInfo> = tracks
-        .into_iter()
-        .filter(|track| match library.get_facts(&track.content_hash) {
-            Ok((_hash, facts)) => facts
-                .iter()
-                .any(|(fact_type, _value)| fact_type == "Bookmarked"),
-            Err(_) => false,
-        })
-        .collect();
+    let bookmarked = library.list_bookmarked().map_err(library_error)?;
 
     if bookmarked.is_empty() {
         use std::io::IsTerminal;
@@ -495,8 +485,6 @@ pub(crate) fn view(columns: ViewColumns, ctx: &Ctx) -> Result<()> {
 mod tests {
     use super::*;
     use crate::test_support::{parses, strip_ansi, track, usage_error};
-
-    use library_ipc_client::TrackInfo;
 
     use track_formatter::{render_for_user, ViewColumn};
 
