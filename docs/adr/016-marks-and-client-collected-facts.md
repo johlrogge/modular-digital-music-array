@@ -12,7 +12,7 @@ Builds on ADR-001 (ACID is the only writer), ADR-009 (node identity), ADR-011 (s
 - `MusicValue::Bookmarked { scope: Option<String>, timestamp: DateTime<Utc> }` (components/music_facts/src/value.rs:346-350).
   - `scope` is free text, and `None` means unscoped.
   - The value carries its own time.
-- ADR-013:54 unions `Bookmarked` on merge. ADR-014:58 refines that to one per scope, with the latest winning within a scope. Sameness is decided by scope (library_service/src/service/dedup.rs:148-155).
+- ADR-013:54 unions `Bookmarked` on merge. ADR-014:58 refines that to united by mark name. On a dedup merge the winner gains each mark name it lacks; a name it already holds keeps the winner's entry (library_service/src/service/dedup.rs:144-149).
 - `WriteBookmark { hash, scope }` is defined in library_ipc_protocol/src/lib.rs:330. Its handler (service.rs:2046-2064) stamps `Utc::now()` with source `FactSource { tool: "mdma", version, origin: User }`.
 - Clients:
   - the CLI's `mdma bookmark [--scope]` (projects/mdma-cli/src/tracks.rs:379);
@@ -55,7 +55,8 @@ Points marked **decided** were decided by Joakim. Everything else is **proposed*
 1. **Reuse `Bookmarked` as the mark fact. No new variant, no migration.**
    - `scope: None` is the *default mark*: today's bookmark. **Decided:** it is called "liked".
    - `scope: Some(name)` is the named mark `name`.
-   - Normally a track holds one live entry per name, and the latest wins within a name (ADR-014 §3). This is not an invariant (merges, older libraries). Readers treat any live entry as marked, and unmark retracts all of them. A track may hold several different marks.
+   - A track holds a set of marks. Each mark name is on or off independently, and names never override one another: a track can be both "banger" and "liked".
+   - Normally a name has one live entry. This is not an invariant (merges, older libraries): one name may have several live entries, and they count as one mark. Readers treat a name with any live entry as marked. Unmarking a name retracts every live entry of that name (each matched exactly by value and source) and leaves all other names untouched.
    - Existing facts are already marks. The immutable log is never rewritten.
 2. **Mark names are validated at the edges, not in storage.**
    - `MarkName` is a newtype in music_facts: trimmed, non-empty, at most 64 characters, no control characters. It is otherwise lenient, following ADR-015's "names may be lenient".
@@ -71,7 +72,7 @@ Points marked **decided** were decided by Joakim. Everything else is **proposed*
    - **`WriteMark { hash, mark: Mark }`** replaces `WriteBookmark`.
      - **Decided:** `WriteBookmark` stays as a deprecated server-side alias for old clients, because prod's CLI and TUI use it. It is documented as deprecated but has no attribute.
      - **Decided:** re-marking a live mark is a no-op. Nothing is written, and the original time is kept. A macro pressed twice writes one fact.
-   - **`UnmarkTrack { hash, mark: Mark }`** retracts every live `Bookmarked` assertion with that name on the resolved track (no replaced-by redirect is followed), matching on (value, source).
+   - **`UnmarkTrack { hash, mark: Mark }`** retracts every live `Bookmarked` assertion **with that name** on the resolved track (no replaced-by redirect is followed), matching on (value, source). Marks with other names are untouched.
      - That includes entries that came from merge losers (ADR-014 §7).
      - If the mark isn't live, it is a no-op.
    - **`ListMarked { filter: MarkFilter }`**, with `enum MarkFilter { Any, Only(Mark) }`, replaces `ListBookmarked` outright. The explicit `Any` avoids overloading `None` to mean both "the default mark" and "any mark".

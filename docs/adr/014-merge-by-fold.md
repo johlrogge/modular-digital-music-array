@@ -55,7 +55,7 @@ Projection mechanics today:
 ### 3. Fold strategies per attribute
 
 - **Latest:** every scalar (Title, Artist, Album, Bpm, Key, Energy, BeatGrid, Label, Source, …), and **AddedAt**.
-- **Union:** StyleDescriptor, MemoryCue, Bookmarked (one per scope, latest wins within a scope), ItemId, and the TrackStarted/TrackStopped events.
+- **Union:** StyleDescriptor, MemoryCue, Bookmarked (united by mark name; each name is present or absent independently; see ADR-016), ItemId, and the TrackStarted/TrackStopped events.
 - **Keep-target**, meaning the winner's own values stand and folded values are ignored: FilePath, Format, DurationSeconds, Bitrate, FileSizeBytes, HasAlbumArt, EncoderSoftware, EncodedBy, CoverArtPath, AudioHash, PcmHash, BitDepth, Channels, SampleRate.
 - **Not folded:**
   - Deleted, because a soft-delete belongs to the copy it hid;
