@@ -7,8 +7,8 @@ use library_ipc_client::{
     interpret_identity_backfill_status, ArchiveEmptyReport, ArchiveListing, ClientError,
     ContentHash, DedupApplyReport, DedupScanReport, FactType, IdentityBackfillStart,
     IdentityBackfillStatus, InboxPath, IngestAllItem, IngestResult, IngestSource, LibraryClient,
-    LibraryRequest, LibraryResponse, MarkFilter, MusicValue, OrphanInfo, PlaylistName,
-    ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
+    LibraryRequest, LibraryResponse, Mark, MarkFilter, MarkWrite, MusicValue, OrphanInfo,
+    PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
 };
 use playlist_import::PlaylistWriteOps;
 
@@ -304,6 +304,14 @@ impl LibraryBackend {
         })?)
     }
 
+    /// Apply `mark` to a track, unless the track already carries it live.
+    pub fn write_mark(&self, hash: &ContentHash, mark: &Mark) -> Result<MarkWrite, ClientError> {
+        interpret_mark_written(self.request(&LibraryRequest::WriteMark {
+            hash: hash.clone(),
+            mark: mark.clone(),
+        })?)
+    }
+
     /// Write a single fact for a track. Used for importing metadata from external sources.
     pub fn write_fact(&self, hash: &ContentHash, fact: MusicValue) -> Result<(), ClientError> {
         interpret_fact_written(self.request(&LibraryRequest::WriteFact {
@@ -596,6 +604,14 @@ fn interpret_bookmark_written(response: LibraryResponse) -> Result<(), ClientErr
     }
 }
 
+fn interpret_mark_written(response: LibraryResponse) -> Result<MarkWrite, ClientError> {
+    match response {
+        LibraryResponse::MarkWritten(outcome) => Ok(outcome),
+        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+        _ => Err(unexpected("WriteMark")),
+    }
+}
+
 fn interpret_fact_written(response: LibraryResponse) -> Result<(), ClientError> {
     match response {
         LibraryResponse::FactWritten => Ok(()),
@@ -724,6 +740,31 @@ mod tests {
     #[test]
     fn interpret_bookmark_written_unexpected_variant_is_err() {
         assert!(interpret_bookmark_written(LibraryResponse::Pong).is_err());
+    }
+
+    #[test]
+    fn interpret_mark_written_returns_the_outcome() {
+        for outcome in [MarkWrite::Written, MarkWrite::AlreadyLive] {
+            let got = interpret_mark_written(LibraryResponse::MarkWritten(outcome));
+            assert_eq!(got.unwrap(), outcome);
+        }
+    }
+
+    #[test]
+    fn interpret_mark_written_error_propagates() {
+        let err = LibraryResponse::Error(ProtocolError::Internal {
+            message: "fail".to_string(),
+        });
+        assert!(matches!(
+            interpret_mark_written(err),
+            Err(ClientError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn interpret_mark_written_names_the_operation_on_an_unexpected_response() {
+        let err = interpret_mark_written(LibraryResponse::BookmarkWritten).unwrap_err();
+        assert!(err.to_string().contains("WriteMark"), "{err}");
     }
 
     #[test]

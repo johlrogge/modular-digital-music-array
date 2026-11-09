@@ -347,10 +347,18 @@ pub enum LibraryRequest {
     CancelIdentityBackfill,
 
     /// Write a bookmark fact for a track.
+    ///
+    /// Deprecated; kept for old clients, use `WriteMark`. The server turns `scope`
+    /// into a mark, so it is an alias of `WriteMark` that always answers
+    /// `BookmarkWritten`.
     WriteBookmark {
         hash: ContentHash,
         scope: Option<String>,
     },
+
+    /// Apply a mark to a track, unless the track already carries it live.
+    /// Answered with `LibraryResponse::MarkWritten`.
+    WriteMark { hash: ContentHash, mark: Mark },
 
     /// Write a single fact for a track. Used for importing metadata from external sources.
     WriteFact { hash: ContentHash, fact: MusicValue },
@@ -497,6 +505,9 @@ pub enum LibraryResponse {
 
     /// Bookmark written successfully.
     BookmarkWritten,
+
+    /// Answer to `WriteMark`.
+    MarkWritten(MarkWrite),
 
     /// Fact written successfully.
     FactWritten,
@@ -686,6 +697,24 @@ pub enum IdentityBackfillStart {
     Started(IdentityBackfillProgress),
     /// A run is already in progress and was left untouched.
     AlreadyRunning(IdentityBackfillProgress),
+}
+
+/// The mark an old-client `WriteBookmark` scope stands for. A bad scope is an
+/// `Internal` error because old clients can't decode newer error variants.
+pub fn bookmark_scope_mark(scope: Option<&str>) -> Result<Mark, ProtocolError> {
+    Mark::from_scope(scope).map_err(|e| ProtocolError::Internal {
+        message: format!("invalid bookmark scope: {e}"),
+    })
+}
+
+/// Outcome of `WriteMark`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MarkWrite {
+    /// The mark was applied now.
+    Written,
+    /// The track already carried the mark live; nothing was written and the
+    /// original time is kept.
+    AlreadyLive,
 }
 
 /// One track of a duplicate group.
@@ -1217,6 +1246,85 @@ mod tests {
         assert!(
             matches!(err, ProtocolError::InvalidRequest { .. }),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn write_mark_wire_format_is_pinned() {
+        for (mark, expected) in [
+            (
+                Mark::Default,
+                r#"{"type":"WriteMark","hash":"sha256:abc","mark":"Default"}"#,
+            ),
+            (
+                named("banger"),
+                r#"{"type":"WriteMark","hash":"sha256:abc","mark":{"Named":"banger"}}"#,
+            ),
+        ] {
+            let json = serde_json::to_string(&LibraryRequest::WriteMark {
+                hash: ContentHash::new("sha256:abc"),
+                mark: mark.clone(),
+            })
+            .unwrap();
+            assert_eq!(json, expected);
+            match parse_request(json.as_bytes()).unwrap() {
+                LibraryRequest::WriteMark {
+                    hash,
+                    mark: decoded,
+                } => {
+                    assert_eq!(hash.as_str(), "sha256:abc");
+                    assert_eq!(decoded, mark);
+                }
+                other => panic!("unexpected variant {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn write_mark_with_an_invalid_mark_name_is_an_invalid_request() {
+        let err = parse_request(br#"{"type":"WriteMark","hash":"sha256:abc","mark":{"Named":""}}"#)
+            .unwrap_err();
+        assert!(
+            matches!(err, ProtocolError::InvalidRequest { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn mark_written_wire_format_is_pinned() {
+        for (outcome, expected) in [
+            (
+                MarkWrite::Written,
+                r#"{"type":"MarkWritten","data":"Written"}"#,
+            ),
+            (
+                MarkWrite::AlreadyLive,
+                r#"{"type":"MarkWritten","data":"AlreadyLive"}"#,
+            ),
+        ] {
+            let json = serde_json::to_string(&LibraryResponse::MarkWritten(outcome)).unwrap();
+            assert_eq!(json, expected);
+            match serde_json::from_str::<LibraryResponse>(&json).unwrap() {
+                LibraryResponse::MarkWritten(decoded) => assert_eq!(decoded, outcome),
+                other => panic!("unexpected variant {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn write_bookmark_wire_format_is_unchanged() {
+        let json = serde_json::to_string(&LibraryRequest::WriteBookmark {
+            hash: ContentHash::new("sha256:abc"),
+            scope: Some("Friday".to_owned()),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"WriteBookmark","hash":"sha256:abc","scope":"Friday"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&LibraryResponse::BookmarkWritten).unwrap(),
+            r#"{"type":"BookmarkWritten"}"#
         );
     }
 

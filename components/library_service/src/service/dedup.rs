@@ -28,11 +28,6 @@ pub(super) fn dedup_fact_source() -> FactSource {
     FactSource::new(DEDUP_TOOL, env!("CARGO_PKG_VERSION"), FactOrigin::Unknown)
 }
 
-/// The `FactSource` of facts a user action writes (ADR-004 replace, soft delete).
-pub(super) fn user_fact_source() -> FactSource {
-    FactSource::new("mdma", env!("CARGO_PKG_VERSION"), FactOrigin::User)
-}
-
 // =========================================================================
 // Fact rules (pure)
 // =========================================================================
