@@ -15,7 +15,7 @@ positionals last.
 
 ## Decision
 
-1. mdma-cli's parser is hicli (0.4 as of P3); clap and clap_complete are removed.
+1. mdma-cli's parser is hicli (0.5); clap and clap_complete are removed.
 2. **Parse-time validation for everything** ("make illegal states unrepresentable"): every command argument
    is a domain type constructed — validated — while parsing, so a command never receives an unconstructable
    value and bad input is a usage error (exit 2) before anything connects. Validate what the domain type
@@ -83,10 +83,13 @@ positionals last.
 
 hicli 0.3.0 fixed #19 (a default without options is shown in help), #20 and #21 (positional items in help,
 usage lines name the binary), #27 and #28. hicli 0.4.0 fixed #29 (only the glued `--x=-7` is recommended) and
-#30 (usage lines wrap between items) and added #31 (colour on a TTY, `Error: ` prefix on failures).
+#30 (usage lines wrap between items) and added #31 (colour on a TTY, `Error: ` prefix on failures). hicli 0.5.0 closed #22 (`cli!` splitting kebab-case words; mdma does not use `cli!`) and #23 (a doc
+comment on a one-field Arg newtype rendering as an empty heading; fixed for the spelled `#[derive(Arg)]`, and
+mdma has no one-field Bpaf-derived Arg newtypes, so it is not affected). 0.5 also makes two changes possible:
+`#[derive(Choice)]` could replace mdma's own `Choice` helpers, and a spelled `ShellArg` could complete shell
+names. Both change user-visible text, so they are separate decisions.
 
-- #22, #23 (cosmetic help/test-macro issues).
-- #26: errors do not name the flag.
+- #26: errors do not name the flag (on hold upstream pending a bpaf change).
 - No per-source help page; a typo of a sibling before a default reads as the default's query.
 
 ## Alternatives considered
