@@ -7,6 +7,7 @@ pub mod library;
 pub mod playback;
 pub mod source;
 
+pub use error::upgrade_node_text;
 pub use library::LibraryBackend;
 pub use playback::PlaybackBackend;
 pub use source::{list_available_sources, SourceClient};
@@ -14,8 +15,8 @@ pub use source::{list_available_sources, SourceClient};
 // Re-export key types so clients don't need to depend on individual protocol crates.
 pub use library_ipc_client::{
     ClientError as LibraryClientError, ContentHash, InboxPath, IngestAllItem, IngestResult,
-    IngestSource, LibraryRequest, LibraryResponse, PlaylistName, ProtocolError, ServiceStatus,
-    TrackInfo,
+    IngestSource, LibraryRequest, LibraryResponse, Mark, MarkFilter, MarkNameError, MarkWrite,
+    PlaylistName, ProtocolError, ServiceStatus, TrackInfo, Unmark,
 };
 pub use library_search::TrackQuery;
 pub use media_client::{

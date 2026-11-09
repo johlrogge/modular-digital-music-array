@@ -5,7 +5,10 @@
 //! - library-ipc-client (used by CLI and console)
 
 // Re-export types used in the protocol so clients don't need to depend on music-facts
-pub use music_facts::{Bpm, ContentHash, CueKind, DurationSeconds, Key, MusicValue};
+pub use music_facts::{
+    Bpm, ContentHash, CueKind, DurationSeconds, Key, Mark, MarkFilter, MarkName, MarkNameError,
+    MusicValue,
+};
 pub use music_primitives::{EnergyLevel, TrackRole};
 // Re-export query types so clients can use them without depending on library-search directly
 pub use library_search::{
@@ -13,6 +16,7 @@ pub use library_search::{
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::num::NonZeroUsize;
 use thiserror::Error;
 
 // ============================================================================
@@ -202,6 +206,19 @@ pub enum ProtocolError {
 
     #[error("invalid playlist name: {name}")]
     InvalidPlaylistName { name: String },
+
+    /// The request bytes could not be parsed as a `LibraryRequest`.
+    #[error("invalid request: {message}")]
+    InvalidRequest { message: String },
+}
+
+/// Parse one raw request. Bytes that do not parse give
+/// `ProtocolError::InvalidRequest`, so a request/reply server can still send
+/// the caller a reply.
+pub fn parse_request(bytes: &[u8]) -> Result<LibraryRequest, ProtocolError> {
+    serde_json::from_slice(bytes).map_err(|e| ProtocolError::InvalidRequest {
+        message: e.to_string(),
+    })
 }
 
 // ============================================================================
@@ -241,9 +258,9 @@ pub enum LibraryRequest {
     /// List all tracks (optionally limited).
     ListTracks { limit: Option<usize> },
 
-    /// List every visible track that carries a live bookmark, scoped or not.
+    /// List every visible track that carries a live mark admitted by `filter`.
     /// Answered with `LibraryResponse::Tracks`, order unspecified.
-    ListBookmarked,
+    ListMarked { filter: MarkFilter },
 
     /// Get a specific track by content hash (supports partial hashes).
     GetTrack { hash: ContentHash },
@@ -327,10 +344,22 @@ pub enum LibraryRequest {
     CancelIdentityBackfill,
 
     /// Write a bookmark fact for a track.
+    ///
+    /// Deprecated; kept for old clients, use `WriteMark`. The server turns `scope`
+    /// into a mark, so it is an alias of `WriteMark` that always answers
+    /// `BookmarkWritten`.
     WriteBookmark {
         hash: ContentHash,
         scope: Option<String>,
     },
+
+    /// Apply a mark to a track, unless the track already carries it live.
+    /// Answered with `LibraryResponse::MarkWritten`.
+    WriteMark { hash: ContentHash, mark: Mark },
+
+    /// Retract every live assertion of a mark on a track.
+    /// Answered with `LibraryResponse::TrackUnmarked`.
+    UnmarkTrack { hash: ContentHash, mark: Mark },
 
     /// Write a single fact for a track. Used for importing metadata from external sources.
     WriteFact { hash: ContentHash, fact: MusicValue },
@@ -477,6 +506,12 @@ pub enum LibraryResponse {
 
     /// Bookmark written successfully.
     BookmarkWritten,
+
+    /// Answer to `WriteMark`.
+    MarkWritten(MarkWrite),
+
+    /// Answer to `UnmarkTrack`.
+    TrackUnmarked(Unmark),
 
     /// Fact written successfully.
     FactWritten,
@@ -668,6 +703,34 @@ pub enum IdentityBackfillStart {
     AlreadyRunning(IdentityBackfillProgress),
 }
 
+/// The mark an old-client `WriteBookmark` scope stands for. A bad scope is an
+/// `Internal` error because old clients can't decode newer error variants.
+pub fn bookmark_scope_mark(scope: Option<&str>) -> Result<Mark, ProtocolError> {
+    Mark::from_scope(scope).map_err(|e| ProtocolError::Internal {
+        message: format!("invalid bookmark scope: {e}"),
+    })
+}
+
+/// Outcome of `WriteMark`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MarkWrite {
+    /// The mark was applied now.
+    Written,
+    /// The track already carried the mark live; nothing was written and the
+    /// original time is kept.
+    AlreadyLive,
+}
+
+/// Outcome of `UnmarkTrack`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Unmark {
+    /// The mark was live and has been retracted; `count` live assertions were
+    /// retracted (more than one when a merge or an older library carried several).
+    Retracted { count: NonZeroUsize },
+    /// The track did not carry the mark live; nothing was changed.
+    NotLive,
+}
+
 /// One track of a duplicate group.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DedupMember {
@@ -804,6 +867,52 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
+
+    fn invalid_message(result: Result<LibraryRequest, ProtocolError>) -> String {
+        match result {
+            Err(ProtocolError::InvalidRequest { message }) => message,
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_request_accepts_a_known_request() {
+        let req = parse_request(br#"{"type":"Ping"}"#);
+        assert!(matches!(req, Ok(LibraryRequest::Ping)), "{req:?}");
+    }
+
+    #[test]
+    fn parse_request_rejects_an_unknown_request_type() {
+        let result = parse_request(br#"{"type":"NoSuch"}"#);
+        assert!(invalid_message(result).contains("unknown variant"));
+    }
+
+    #[test]
+    fn parse_request_rejects_non_json() {
+        assert!(!invalid_message(parse_request(b"not json")).is_empty());
+    }
+
+    #[test]
+    fn parse_request_rejects_a_known_variant_failing_newtype_validation() {
+        let result = parse_request(br#"{"type":"IngestFile","path":"../x","source":null}"#);
+        assert!(!invalid_message(result).is_empty());
+    }
+
+    #[test]
+    fn invalid_request_roundtrips_and_displays() {
+        let err = ProtocolError::InvalidRequest {
+            message: "unknown variant `X`".into(),
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        let back: ProtocolError = serde_json::from_str(&json).unwrap();
+        match &back {
+            ProtocolError::InvalidRequest { message } => {
+                assert_eq!(message, "unknown variant `X`");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(back.to_string(), "invalid request: unknown variant `X`");
+    }
 
     fn progress() -> IdentityBackfillProgress {
         IdentityBackfillProgress {
@@ -1104,12 +1213,204 @@ mod tests {
         }
     }
 
+    fn named(s: &str) -> Mark {
+        Mark::Named(MarkName::parse(s).unwrap())
+    }
+
     #[test]
-    fn list_bookmarked_request_roundtrip() {
-        let json = serde_json::to_string(&LibraryRequest::ListBookmarked).unwrap();
-        assert_eq!(json, r#"{"type":"ListBookmarked"}"#);
-        let decoded: LibraryRequest = serde_json::from_str(&json).unwrap();
-        assert!(matches!(decoded, LibraryRequest::ListBookmarked));
+    fn list_marked_wire_format_is_pinned() {
+        for (filter, expected) in [
+            (MarkFilter::Any, r#"{"type":"ListMarked","filter":"Any"}"#),
+            (
+                MarkFilter::Only(Mark::Default),
+                r#"{"type":"ListMarked","filter":{"Only":"Default"}}"#,
+            ),
+            (
+                MarkFilter::Only(named("banger")),
+                r#"{"type":"ListMarked","filter":{"Only":{"Named":"banger"}}}"#,
+            ),
+        ] {
+            let json = serde_json::to_string(&LibraryRequest::ListMarked {
+                filter: filter.clone(),
+            })
+            .unwrap();
+            assert_eq!(json, expected);
+            match serde_json::from_str::<LibraryRequest>(&json).unwrap() {
+                LibraryRequest::ListMarked { filter: decoded } => assert_eq!(decoded, filter),
+                other => panic!("unexpected variant {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn list_marked_with_an_invalid_mark_name_is_an_invalid_request() {
+        let err =
+            parse_request(br#"{"type":"ListMarked","filter":{"Only":{"Named":""}}}"#).unwrap_err();
+        assert!(
+            matches!(err, ProtocolError::InvalidRequest { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn list_marked_with_the_default_name_spelled_out_is_an_invalid_request() {
+        // serde does not map "liked" to Default; only the "Default" variant does.
+        let err = parse_request(br#"{"type":"ListMarked","filter":{"Only":{"Named":"liked"}}}"#)
+            .unwrap_err();
+        assert!(
+            matches!(err, ProtocolError::InvalidRequest { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn write_mark_wire_format_is_pinned() {
+        for (mark, expected) in [
+            (
+                Mark::Default,
+                r#"{"type":"WriteMark","hash":"sha256:abc","mark":"Default"}"#,
+            ),
+            (
+                named("banger"),
+                r#"{"type":"WriteMark","hash":"sha256:abc","mark":{"Named":"banger"}}"#,
+            ),
+        ] {
+            let json = serde_json::to_string(&LibraryRequest::WriteMark {
+                hash: ContentHash::new("sha256:abc"),
+                mark: mark.clone(),
+            })
+            .unwrap();
+            assert_eq!(json, expected);
+            match parse_request(json.as_bytes()).unwrap() {
+                LibraryRequest::WriteMark {
+                    hash,
+                    mark: decoded,
+                } => {
+                    assert_eq!(hash.as_str(), "sha256:abc");
+                    assert_eq!(decoded, mark);
+                }
+                other => panic!("unexpected variant {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn write_mark_with_an_invalid_mark_name_is_an_invalid_request() {
+        let err = parse_request(br#"{"type":"WriteMark","hash":"sha256:abc","mark":{"Named":""}}"#)
+            .unwrap_err();
+        assert!(
+            matches!(err, ProtocolError::InvalidRequest { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn mark_written_wire_format_is_pinned() {
+        for (outcome, expected) in [
+            (
+                MarkWrite::Written,
+                r#"{"type":"MarkWritten","data":"Written"}"#,
+            ),
+            (
+                MarkWrite::AlreadyLive,
+                r#"{"type":"MarkWritten","data":"AlreadyLive"}"#,
+            ),
+        ] {
+            let json = serde_json::to_string(&LibraryResponse::MarkWritten(outcome)).unwrap();
+            assert_eq!(json, expected);
+            match serde_json::from_str::<LibraryResponse>(&json).unwrap() {
+                LibraryResponse::MarkWritten(decoded) => assert_eq!(decoded, outcome),
+                other => panic!("unexpected variant {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unmark_track_wire_format_is_pinned() {
+        for (mark, expected) in [
+            (
+                Mark::Default,
+                r#"{"type":"UnmarkTrack","hash":"sha256:abc","mark":"Default"}"#,
+            ),
+            (
+                named("banger"),
+                r#"{"type":"UnmarkTrack","hash":"sha256:abc","mark":{"Named":"banger"}}"#,
+            ),
+        ] {
+            let json = serde_json::to_string(&LibraryRequest::UnmarkTrack {
+                hash: ContentHash::new("sha256:abc"),
+                mark: mark.clone(),
+            })
+            .unwrap();
+            assert_eq!(json, expected);
+            match parse_request(json.as_bytes()).unwrap() {
+                LibraryRequest::UnmarkTrack {
+                    hash,
+                    mark: decoded,
+                } => {
+                    assert_eq!(hash.as_str(), "sha256:abc");
+                    assert_eq!(decoded, mark);
+                }
+                other => panic!("unexpected variant {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unmark_track_with_an_invalid_mark_name_is_an_invalid_request() {
+        let err =
+            parse_request(br#"{"type":"UnmarkTrack","hash":"sha256:abc","mark":{"Named":""}}"#)
+                .unwrap_err();
+        assert!(
+            matches!(err, ProtocolError::InvalidRequest { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn track_unmarked_wire_format_is_pinned() {
+        for (outcome, expected) in [
+            (
+                Unmark::Retracted {
+                    count: NonZeroUsize::new(2).unwrap(),
+                },
+                r#"{"type":"TrackUnmarked","data":{"Retracted":{"count":2}}}"#,
+            ),
+            (
+                Unmark::NotLive,
+                r#"{"type":"TrackUnmarked","data":"NotLive"}"#,
+            ),
+        ] {
+            let json = serde_json::to_string(&LibraryResponse::TrackUnmarked(outcome)).unwrap();
+            assert_eq!(json, expected);
+            match serde_json::from_str::<LibraryResponse>(&json).unwrap() {
+                LibraryResponse::TrackUnmarked(decoded) => assert_eq!(decoded, outcome),
+                other => panic!("unexpected variant {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn track_unmarked_with_a_zero_count_fails_to_decode() {
+        let json = r#"{"type":"TrackUnmarked","data":{"Retracted":{"count":0}}}"#;
+        assert!(serde_json::from_str::<LibraryResponse>(json).is_err());
+    }
+
+    #[test]
+    fn write_bookmark_wire_format_is_unchanged() {
+        let json = serde_json::to_string(&LibraryRequest::WriteBookmark {
+            hash: ContentHash::new("sha256:abc"),
+            scope: Some("Friday".to_owned()),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"WriteBookmark","hash":"sha256:abc","scope":"Friday"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&LibraryResponse::BookmarkWritten).unwrap(),
+            r#"{"type":"BookmarkWritten"}"#
+        );
     }
 
     #[test]

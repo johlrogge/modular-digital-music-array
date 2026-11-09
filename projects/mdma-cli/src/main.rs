@@ -81,7 +81,7 @@ fn app() -> hicli::App<ctx::Globals, ctx::Ctx> {
             tracks::ping, tracks::status, tracks::list, tracks::get, tracks::facts,
             search, inbox, source, playback, queue, tracks::sort, subscribe::subscribe,
             transfer::upload, transfer::export, rekordbox, playlist, library,
-            tracks::bookmark, tracks::bookmarks, fact, tracks::view,
+            tracks::mark, tracks::unmark, tracks::marked, fact, tracks::view,
             completions::generate_completions, admin, node,
         ]
     }
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn hash_arguments_are_validated_at_parse_time() {
-        for cmd in ["get", "facts", "bookmark"] {
+        for cmd in ["get", "facts"] {
             for bad in ["abcd123", "ABCD1234", "sha256:abc", "xyz"] {
                 let e = usage_error(&[cmd, bad]);
                 assert!(e.contains("not a content hash"), "{cmd} {bad}: {e}");
@@ -170,8 +170,6 @@ mod tests {
                 assert!(parse(&[cmd, good]).is_ok(), "{cmd} {good}");
             }
         }
-        assert!(parse(&["bookmark"]).is_ok());
-        assert!(parse(&["bookmark", "--scope", "x", "abcd1234"]).is_ok());
     }
 
     #[test]
@@ -327,12 +325,16 @@ mod tests {
                 vec!["library", "archive", "empty", "-y"],
                 vec!["library", "archive", "empty"],
             ),
-            (vec!["bookmark"], vec!["bookmark"]),
-            (
-                vec!["bookmark", "--scope", "friday", "abcd1234"],
-                vec!["bookmark"],
-            ),
-            (vec!["bookmarks"], vec!["bookmarks"]),
+            (vec!["mark"], vec!["mark"]),
+            (vec!["mark", "banger"], vec!["mark"]),
+            (vec!["mark", "liked"], vec!["mark"]),
+            (vec!["unmark"], vec!["unmark"]),
+            (vec!["unmark", "banger"], vec!["unmark"]),
+            (vec!["marked"], vec!["marked"]),
+            (vec!["marked", "banger"], vec!["marked"]),
+            (vec!["bookmark"], vec!["mark"]),
+            (vec!["bookmark", "banger"], vec!["mark"]),
+            (vec!["bookmarks"], vec!["marked"]),
             (
                 vec![
                     "fact", "add", "--field", "year", "--value", "2020", "abcd1234",
@@ -444,5 +446,6 @@ mod tests {
             assert!(top.contains(command), "missing {command} in {top}");
         }
         assert!(!top.contains("generate-completions"), "hidden: {top}");
+        assert!(!top.contains("bookmark"), "alias shown: {top}");
     }
 }

@@ -32,11 +32,10 @@ impl IpcServer {
         Ok(Self { socket })
     }
 
-    /// Receive a request (blocking)
-    pub fn recv(&self) -> Result<LibraryRequest, IpcError> {
-        let msg = self.socket.recv()?;
-        let request: LibraryRequest = serde_json::from_slice(&msg)?;
-        Ok(request)
+    /// Receive the raw bytes of a request (blocking). Parsing is left to
+    /// [`parse_request`] so an unparsable request still gets a reply.
+    pub fn recv_raw(&self) -> Result<nng::Message, IpcError> {
+        Ok(self.socket.recv()?)
     }
 
     /// Send a response

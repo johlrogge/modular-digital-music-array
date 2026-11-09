@@ -47,8 +47,9 @@ positionals last.
 
 - main.rs: `#[group] mod <g>;` per group, each carrying the group's doc comment; `fn app()` built with
   `app!{ globals: globals(), commands: [...] }` in today's order; `main` returns `app().run(mk_ctx)`.
-- Root commands (ping status list get facts sort bookmark bookmarks view) are `#[command]` fns in the plain
-  module tracks.rs, registered by path (`tracks::ping`); likewise subscribe::subscribe, transfer::upload,
+- Root commands (ping status list get facts sort mark unmark marked view) are `#[command]` fns in the plain
+  module tracks.rs, registered by path (`tracks::ping`). `bookmark` and `bookmarks` are hidden aliases of
+  `mark` and `marked` (ADR-016). Likewise subscribe::subscribe, transfer::upload,
   transfer::export, completions::generate_completions (hidden).
 - Nested groups are file groups: library/{track,identity,dedup,archive}.rs; admin's service_mode is inline.
 

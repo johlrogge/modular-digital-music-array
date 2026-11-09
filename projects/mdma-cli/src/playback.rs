@@ -3,7 +3,8 @@ use crate::ctx::Ctx;
 use crate::output::{display_error, library_error};
 use color_eyre::eyre::eyre;
 use color_eyre::Result;
-use mdma_client::Deck;
+use library_ipc_client::ContentHash;
+use mdma_client::{Deck, PlaybackBackend};
 use track_formatter::short_hash;
 
 /// Start playback from the queue (use `mdma queue append <hash>` to enqueue tracks)
@@ -55,6 +56,14 @@ pub(crate) fn skip(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// The hash of the track that is playing; an error when nothing is.
+pub(crate) fn playing_track(playback: &PlaybackBackend) -> Result<ContentHash> {
+    playback
+        .now_playing()
+        .map_err(display_error)?
+        .ok_or_else(|| eyre!("Nothing playing"))
+}
+
 /// Show what is currently playing
 #[hicli::command]
 pub(crate) fn now(ctx: &Ctx) -> Result<()> {
@@ -65,10 +74,7 @@ pub(crate) fn now(ctx: &Ctx) -> Result<()> {
         .is_terminal()
         .then(|| ctx.library())
         .transpose()?;
-    let h = playback
-        .now_playing()
-        .map_err(display_error)?
-        .ok_or_else(|| eyre!("Nothing playing"))?;
+    let h = playing_track(&playback)?;
     match library {
         None => println!("{}", h.as_str()),
         Some(library) => {

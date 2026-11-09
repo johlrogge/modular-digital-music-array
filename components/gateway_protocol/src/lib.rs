@@ -149,6 +149,7 @@ pub enum GatewayResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use library_ipc_protocol::MarkFilter;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -168,9 +169,11 @@ mod tests {
     }
 
     #[test]
-    fn library_list_bookmarked_request_roundtrip() {
+    fn library_list_marked_request_roundtrip() {
         let req = GatewayRequest::Library {
-            request: LibraryRequest::ListBookmarked,
+            request: LibraryRequest::ListMarked {
+                filter: MarkFilter::Any,
+            },
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"service\":\"library\""));
@@ -178,7 +181,9 @@ mod tests {
         assert!(matches!(
             parsed,
             GatewayRequest::Library {
-                request: LibraryRequest::ListBookmarked
+                request: LibraryRequest::ListMarked {
+                    filter: MarkFilter::Any
+                }
             }
         ));
     }

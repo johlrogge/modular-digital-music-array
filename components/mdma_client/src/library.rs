@@ -7,8 +7,8 @@ use library_ipc_client::{
     interpret_identity_backfill_status, ArchiveEmptyReport, ArchiveListing, ClientError,
     ContentHash, DedupApplyReport, DedupScanReport, FactType, IdentityBackfillStart,
     IdentityBackfillStatus, InboxPath, IngestAllItem, IngestResult, IngestSource, LibraryClient,
-    LibraryRequest, LibraryResponse, MusicValue, OrphanInfo, PlaylistName, ProtocolError,
-    ServiceStatus, TrackInfo, TrackQuery,
+    LibraryRequest, LibraryResponse, Mark, MarkFilter, MarkWrite, MusicValue, OrphanInfo,
+    PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery, Unmark,
 };
 use playlist_import::PlaylistWriteOps;
 
@@ -274,23 +274,29 @@ impl LibraryBackend {
         }
     }
 
-    /// List every visible track that carries a live bookmark, in one request.
-    pub fn list_bookmarked(&self) -> Result<Vec<TrackInfo>, ClientError> {
+    /// List every visible track that carries a live mark admitted by `filter`.
+    pub fn list_marked(&self, filter: &MarkFilter) -> Result<Vec<TrackInfo>, ClientError> {
         interpret_tracks(
-            self.request(&LibraryRequest::ListBookmarked)?,
-            "ListBookmarked",
+            self.request(&LibraryRequest::ListMarked {
+                filter: filter.clone(),
+            })?,
+            "ListMarked",
         )
     }
 
-    /// Write a bookmark fact for a track.
-    pub fn write_bookmark(
-        &self,
-        hash: &ContentHash,
-        scope: Option<String>,
-    ) -> Result<(), ClientError> {
-        interpret_bookmark_written(self.request(&LibraryRequest::WriteBookmark {
+    /// Apply `mark` to a track, unless the track already carries it live.
+    pub fn write_mark(&self, hash: &ContentHash, mark: &Mark) -> Result<MarkWrite, ClientError> {
+        interpret_mark_written(self.request(&LibraryRequest::WriteMark {
             hash: hash.clone(),
-            scope,
+            mark: mark.clone(),
+        })?)
+    }
+
+    /// Retract every live assertion of `mark` on a track.
+    pub fn unmark(&self, hash: &ContentHash, mark: &Mark) -> Result<Unmark, ClientError> {
+        interpret_track_unmarked(self.request(&LibraryRequest::UnmarkTrack {
+            hash: hash.clone(),
+            mark: mark.clone(),
         })?)
     }
 
@@ -578,11 +584,19 @@ fn interpret_playlist_ok(response: LibraryResponse) -> Result<(), ClientError> {
     }
 }
 
-fn interpret_bookmark_written(response: LibraryResponse) -> Result<(), ClientError> {
+fn interpret_mark_written(response: LibraryResponse) -> Result<MarkWrite, ClientError> {
     match response {
-        LibraryResponse::BookmarkWritten => Ok(()),
+        LibraryResponse::MarkWritten(outcome) => Ok(outcome),
         LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
-        _ => Err(unexpected("WriteBookmark")),
+        _ => Err(unexpected("WriteMark")),
+    }
+}
+
+fn interpret_track_unmarked(response: LibraryResponse) -> Result<Unmark, ClientError> {
+    match response {
+        LibraryResponse::TrackUnmarked(outcome) => Ok(outcome),
+        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+        _ => Err(unexpected("UnmarkTrack")),
     }
 }
 
@@ -678,8 +692,8 @@ mod tests {
 
     #[test]
     fn interpret_tracks_names_the_operation_on_an_unexpected_response() {
-        let err = interpret_tracks(LibraryResponse::BookmarkWritten, "ListBookmarked").unwrap_err();
-        assert!(err.to_string().contains("ListBookmarked"), "{err}");
+        let err = interpret_tracks(LibraryResponse::BookmarkWritten, "ListMarked").unwrap_err();
+        assert!(err.to_string().contains("ListMarked"), "{err}");
     }
 
     #[test]
@@ -699,21 +713,54 @@ mod tests {
     }
 
     #[test]
-    fn interpret_bookmark_written_ok() {
-        assert!(interpret_bookmark_written(LibraryResponse::BookmarkWritten).is_ok());
+    fn interpret_mark_written_returns_the_outcome() {
+        for outcome in [MarkWrite::Written, MarkWrite::AlreadyLive] {
+            let got = interpret_mark_written(LibraryResponse::MarkWritten(outcome));
+            assert_eq!(got.unwrap(), outcome);
+        }
     }
 
     #[test]
-    fn interpret_bookmark_written_error_propagates() {
+    fn interpret_mark_written_error_propagates() {
         let err = LibraryResponse::Error(ProtocolError::Internal {
             message: "fail".to_string(),
         });
-        assert!(interpret_bookmark_written(err).is_err());
+        assert!(matches!(
+            interpret_mark_written(err),
+            Err(ClientError::Protocol(_))
+        ));
     }
 
     #[test]
-    fn interpret_bookmark_written_unexpected_variant_is_err() {
-        assert!(interpret_bookmark_written(LibraryResponse::Pong).is_err());
+    fn interpret_mark_written_names_the_operation_on_an_unexpected_response() {
+        let err = interpret_mark_written(LibraryResponse::BookmarkWritten).unwrap_err();
+        assert!(err.to_string().contains("WriteMark"), "{err}");
+    }
+
+    #[test]
+    fn interpret_track_unmarked_returns_the_outcome() {
+        let two = std::num::NonZeroUsize::new(2).unwrap();
+        for outcome in [Unmark::Retracted { count: two }, Unmark::NotLive] {
+            let got = interpret_track_unmarked(LibraryResponse::TrackUnmarked(outcome));
+            assert_eq!(got.unwrap(), outcome);
+        }
+    }
+
+    #[test]
+    fn interpret_track_unmarked_error_propagates() {
+        let err = LibraryResponse::Error(ProtocolError::Internal {
+            message: "fail".to_string(),
+        });
+        assert!(matches!(
+            interpret_track_unmarked(err),
+            Err(ClientError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn interpret_track_unmarked_names_the_operation_on_an_unexpected_response() {
+        let err = interpret_track_unmarked(LibraryResponse::Pong).unwrap_err();
+        assert!(err.to_string().contains("UnmarkTrack"), "{err}");
     }
 
     #[test]

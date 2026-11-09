@@ -4,6 +4,8 @@
 //! before it reads stdin.
 
 use crate::args::{OptTrackArg, TrackArg};
+use crate::ctx::Ctx;
+use crate::playback::playing_track;
 use color_eyre::eyre::{bail, eyre};
 use color_eyre::Result;
 use library_ipc_client::{ContentHash, TrackInfo};
@@ -113,6 +115,34 @@ fn hashes_arg_or_reader(hash: OptTrackArg, reader: impl BufRead) -> Result<Vec<C
     }
 }
 
+/// The hashes piped on stdin (empty when it holds none); `None` when stdin is a
+/// terminal, i.e. nothing is piped.
+pub(crate) fn piped_hashes() -> Option<Vec<ContentHash>> {
+    use std::io::IsTerminal;
+    (!std::io::stdin().is_terminal()).then(read_hashes)
+}
+
+/// The tracks a command acts on: the hashes piped on stdin (a pipe without any
+/// is an error), else, when stdin is a terminal, the track that is playing.
+pub(crate) fn hashes_from_pipe_or_playing(ctx: &Ctx) -> Result<Vec<ContentHash>> {
+    hashes_or_playing(piped_hashes(), || playing_track(&ctx.playback()?))
+}
+
+/// `piped` when stdin is piped (`Some`; it must hold a hash), else the hash
+/// `playing` finds.
+fn hashes_or_playing(
+    piped: Option<Vec<ContentHash>>,
+    playing: impl FnOnce() -> Result<ContentHash>,
+) -> Result<Vec<ContentHash>> {
+    match piped {
+        Some(hashes) if hashes.is_empty() => Err(no_hashes_on_stdin(&[
+            "Usage: mdma search --artist CBL | mdma mark banger",
+        ])),
+        Some(hashes) => Ok(hashes),
+        None => Ok(vec![playing()?]),
+    }
+}
+
 /// Resolve a list of hashes to `TrackInfo`, skipping any that the library
 /// cannot find and printing a warning for each skipped entry.
 pub(crate) fn resolve_tracks_skip_errors(
@@ -180,9 +210,11 @@ pub(crate) fn is_hash_token(token: &str) -> bool {
 mod tests {
 
     use crate::args::{OptTrackArg, TrackArg};
+    use color_eyre::eyre::eyre;
+
     use crate::stdin::{
-        hashes_arg_or_reader, hashes_in, hashes_or_usage, is_yes, no_hash_provided,
-        parse_hash_from_line, read_all, require_hashes, require_tracks,
+        hashes_arg_or_reader, hashes_in, hashes_or_playing, hashes_or_usage, is_yes,
+        no_hash_provided, parse_hash_from_line, read_all, require_hashes, require_tracks,
     };
     use crate::test_support::{failure_text, track};
     use library_ipc_client::ContentHash;
@@ -324,6 +356,32 @@ mod tests {
         assert_eq!(
             failure_text(hashes_arg_or_reader(OptTrackArg(None), "".as_bytes())),
             "No hash provided and stdin was empty"
+        );
+    }
+
+    #[test]
+    fn piped_hashes_win_over_the_playing_track() {
+        let piped = vec![ContentHash::new("abcd1234")];
+        let hashes = hashes_or_playing(Some(piped.clone()), || panic!("not asked")).unwrap();
+        assert_eq!(hashes, piped);
+    }
+
+    #[test]
+    fn a_pipe_without_hashes_is_an_error_not_the_playing_track() {
+        assert_eq!(
+            failure_text(hashes_or_playing(Some(vec![]), || panic!("not asked"))),
+            "No hashes provided on stdin.\n\
+             Usage: mdma search --artist CBL | mdma mark banger"
+        );
+    }
+
+    #[test]
+    fn on_a_terminal_the_playing_track_is_used() {
+        let hashes = hashes_or_playing(None, || Ok(ContentHash::new("deadbeef"))).unwrap();
+        assert_eq!(hashes, vec![ContentHash::new("deadbeef")]);
+        assert_eq!(
+            failure_text(hashes_or_playing(None, || Err(eyre!("Nothing playing")))),
+            "Nothing playing"
         );
     }
 

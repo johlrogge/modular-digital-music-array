@@ -39,14 +39,18 @@ mdma playlist get friday-night | mdma queue replace
 # Find which playlists contain a track (or a set of tracks from stdin)
 mdma search --artist CBL | mdma playlist contains --all
 
-# Bookmark the currently playing track
-mdma bookmark
+# Mark the playing track "liked" (the default mark)
+mdma mark
 
-# Bookmark a specific track by content hash, associated with a named set
-mdma bookmark sha256:abc12345 --scope "friday-night-picks"
+# Mark tracks piped on stdin with a named mark
+mdma search --artist CBL | mdma mark banger
 
-# List all bookmarked tracks
-mdma bookmarks
+# Remove a mark (liked unless a name is given)
+mdma marked banger | mdma unmark banger
+
+# List tracks with any mark, or with one mark
+mdma marked
+mdma marked banger
 
 # Hand-tag role and energy — new in 0.25.0
 mdma fact set sha256:abc12345 role banger
@@ -128,7 +132,7 @@ This is a [Polylith](https://polylith.gitbook.io/polylith/) workspace. Deployabl
 | `mdma-tui` | Terminal UI — multi-pane tabs (nnn-style, `1`–`5`/`6`–`0`), field-aware search grammar (`:artist`, `:bpm`, `:added`, …), DJ shortcuts (`A`, `P`, `d`/`p`, `u`), modal keybindings, command palette, live queue sync, intelligent column compression |
 | `mdma-bandcamp` | Bandcamp source — collection sync into the library inbox, fan playlist listing/fetching, and background playlist import jobs for `mdma source bandcamp` |
 | `mdma-console` | Web management console — player controls, search, queue, upload, export |
-| `mdma-cli` | CLI — search, queue, playlists, playback, export, subscribe, bookmarks, Bandcamp playlist import, shell completions |
+| `mdma-cli` | CLI — search, queue, playlists, playback, export, subscribe, marks, Bandcamp playlist import, shell completions |
 | `dj-workspace` | Bevy GUI app (laptop-only, not packaged for Pi) — playlist browser and BPM/Key/Role/Energy candidate finder with sortable results; connects via gateway (`dj-workspace --node <host>`) |
 
 **Key components** (shared libraries):
@@ -245,6 +249,12 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 ### Breaking: mdma-cli moves from clap to hicli 0.2 (ADR-015)
 
 Bad argument values are now usage errors (exit 2, parser's error text) raised before anything connects; runtime failures exit 1. Scripts that parse the old messages or depend on the loosened values below need updating. See CHANGELOG.md for the full list.
+
+### Marks replace bookmarks (ADR-016)
+
+- **Marks** — `mdma mark [NAME]` marks the tracks whose hashes are piped on stdin; run from a terminal without a pipe, it marks the playing track. With no NAME it applies the default mark, "liked". `mdma unmark [NAME]` removes a mark the same way. `mdma marked [NAME]` lists tracks with that mark, or with any mark when NAME is left out; `mdma marked liked` lists only the default mark. Mark names are lowercase, 1-64 characters. Marks are stored as `Bookmarked` facts in the ACID store with `FactOrigin::User` provenance.
+- **Breaking: `bookmark` and `bookmarks` are now aliases of `mark` and `marked`.** The `--scope` option and the HASH argument are gone; pipe hashes on stdin instead.
+- **TUI mark keybinding** — in Playback mode, pressing `b` marks the playing track "liked". It reports "Marked liked" or "Already marked liked".
 
 ## What's new in 0.36.1
 

@@ -20,6 +20,16 @@ pub enum ClientError {
     Protocol(ProtocolError),
 }
 
+impl ClientError {
+    /// True when the node did not understand the request (it is older than this client).
+    pub fn is_unsupported_request(&self) -> bool {
+        matches!(
+            self,
+            ClientError::Protocol(ProtocolError::InvalidRequest { .. })
+        )
+    }
+}
+
 impl From<serde_json::Error> for ClientError {
     fn from(e: serde_json::Error) -> Self {
         ClientError::Transport(nng_transport::NngClientError::Serialization(e))
@@ -638,6 +648,22 @@ pub fn content_to_hashes(content: &str) -> Vec<ContentHash> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_request_is_unsupported_request() {
+        let err = ClientError::Protocol(ProtocolError::InvalidRequest {
+            message: "unknown variant".to_string(),
+        });
+        assert!(err.is_unsupported_request());
+    }
+
+    #[test]
+    fn other_protocol_error_is_not_unsupported_request() {
+        let err = ClientError::Protocol(ProtocolError::Internal {
+            message: "boom".to_string(),
+        });
+        assert!(!err.is_unsupported_request());
+    }
 
     #[test]
     fn client_error_display() {
