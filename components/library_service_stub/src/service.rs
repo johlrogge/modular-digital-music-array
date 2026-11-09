@@ -5,9 +5,9 @@
 //! ACID, ingestion, or file-system side effects.
 
 use crate::ipc::{
-    BeatGridInfo, Bpm, ContentHash, CueInfo, DurationSeconds, FactType, IpcServer, LibraryRequest,
-    LibraryResponse, OrphanInfo, OrphanReason, PlaylistName, ProtocolError, ServiceStatus,
-    TrackInfo, TrackQuery,
+    parse_request, BeatGridInfo, Bpm, ContentHash, CueInfo, DurationSeconds, FactType, IpcServer,
+    LibraryRequest, LibraryResponse, OrphanInfo, OrphanReason, PlaylistName, ProtocolError,
+    ServiceStatus, TrackInfo, TrackQuery,
 };
 use library_search::{matches_query, TrackFields};
 use music_facts::MusicValue;
@@ -697,9 +697,15 @@ pub fn run_ipc_server(svc: Arc<LibraryService>, address: &str) -> Result<(), Ser
     let server = IpcServer::bind(address)?;
 
     loop {
-        match server.recv() {
-            Ok(request) => {
-                let response = svc.handle_request(request);
+        match server.recv_raw() {
+            Ok(msg) => {
+                let response = match parse_request(&msg) {
+                    Ok(request) => svc.handle_request(request),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Stub: rejected unparsable request");
+                        LibraryResponse::Error(e)
+                    }
+                };
                 if let Err(e) = server.send(&response) {
                     tracing::error!(error = %e, "Stub: failed to send response");
                 }
@@ -729,6 +735,58 @@ mod tests {
             "ipc:///dev/null",
         )
         .expect("empty stub")
+    }
+
+    /// Send `payload` on `req` and decode the reply (2s timeout).
+    fn exchange(req: &nng::Socket, payload: &[u8]) -> LibraryResponse {
+        req.send(nng::Message::from(payload))
+            .map_err(|(_, e)| e)
+            .expect("send");
+        let reply = req.recv().expect("a reply within the timeout");
+        serde_json::from_slice(&reply).expect("reply is a LibraryResponse")
+    }
+
+    #[test]
+    fn unparsable_request_gets_an_error_reply_and_the_server_keeps_serving() {
+        use nng::options::{Options, RecvTimeout};
+        let address = format!(
+            "ipc://{}/stub-invalid-request-{}.sock",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let svc = empty_service();
+        let server_address = address.clone();
+        let server = std::thread::spawn(move || run_ipc_server(svc, &server_address));
+
+        let req = nng::Socket::new(nng::Protocol::Req0).expect("req socket");
+        req.set_opt::<RecvTimeout>(Some(std::time::Duration::from_secs(2)))
+            .expect("timeout");
+        // The server thread binds asynchronously; retry the dial briefly.
+        let mut dialed = false;
+        for _ in 0..50 {
+            if req.dial(&address).is_ok() {
+                dialed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if !dialed {
+            if server.is_finished() {
+                let outcome = server.join().expect("server thread panicked");
+                panic!("stub server exited before it could be dialed: {outcome:?}");
+            }
+            panic!("could not dial the stub server");
+        }
+
+        match exchange(&req, b"not json") {
+            LibraryResponse::Error(ProtocolError::InvalidRequest { .. }) => {}
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+        match exchange(&req, br#"{"type":"Ping"}"#) {
+            LibraryResponse::Pong => {}
+            other => panic!("expected Pong after garbage, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(address.trim_start_matches("ipc://"));
     }
 
     fn name(s: &str) -> PlaylistName {

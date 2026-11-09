@@ -202,6 +202,19 @@ pub enum ProtocolError {
 
     #[error("invalid playlist name: {name}")]
     InvalidPlaylistName { name: String },
+
+    /// The request bytes could not be parsed as a `LibraryRequest`.
+    #[error("invalid request: {message}")]
+    InvalidRequest { message: String },
+}
+
+/// Parse one raw request. Bytes that do not parse give
+/// `ProtocolError::InvalidRequest`, so a request/reply server can still send
+/// the caller a reply.
+pub fn parse_request(bytes: &[u8]) -> Result<LibraryRequest, ProtocolError> {
+    serde_json::from_slice(bytes).map_err(|e| ProtocolError::InvalidRequest {
+        message: e.to_string(),
+    })
 }
 
 // ============================================================================
@@ -804,6 +817,52 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
+
+    fn invalid_message(result: Result<LibraryRequest, ProtocolError>) -> String {
+        match result {
+            Err(ProtocolError::InvalidRequest { message }) => message,
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_request_accepts_a_known_request() {
+        let req = parse_request(br#"{"type":"Ping"}"#);
+        assert!(matches!(req, Ok(LibraryRequest::Ping)), "{req:?}");
+    }
+
+    #[test]
+    fn parse_request_rejects_an_unknown_request_type() {
+        let result = parse_request(br#"{"type":"NoSuch"}"#);
+        assert!(invalid_message(result).contains("unknown variant"));
+    }
+
+    #[test]
+    fn parse_request_rejects_non_json() {
+        assert!(!invalid_message(parse_request(b"not json")).is_empty());
+    }
+
+    #[test]
+    fn parse_request_rejects_a_known_variant_failing_newtype_validation() {
+        let result = parse_request(br#"{"type":"IngestFile","path":"../x","source":null}"#);
+        assert!(!invalid_message(result).is_empty());
+    }
+
+    #[test]
+    fn invalid_request_roundtrips_and_displays() {
+        let err = ProtocolError::InvalidRequest {
+            message: "unknown variant `X`".into(),
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        let back: ProtocolError = serde_json::from_str(&json).unwrap();
+        match &back {
+            ProtocolError::InvalidRequest { message } => {
+                assert_eq!(message, "unknown variant `X`");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(back.to_string(), "invalid request: unknown variant `X`");
+    }
 
     fn progress() -> IdentityBackfillProgress {
         IdentityBackfillProgress {

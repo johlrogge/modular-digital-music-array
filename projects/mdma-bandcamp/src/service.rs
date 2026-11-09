@@ -1463,7 +1463,7 @@ fn run_nng_bridge(
             Ok(r) => r,
             Err(e) => {
                 // Reply so the gateway doesn't stall until its timeout
-                tracing::error!(error = %e, "Failed to parse request");
+                tracing::warn!(error = %e, "Failed to parse request");
                 let reply = SourceResponse::Error(SourceError::unsupported(format!(
                     "unparseable request: {e}"
                 )));

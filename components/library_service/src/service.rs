@@ -4,9 +4,9 @@
 
 use crate::identity::{identity_facts_for_blob, IdentityOpts};
 use crate::ipc::{
-    BeatGridInfo, Bpm, ContentHash, CueInfo, DurationSeconds, FactType, InboxPath, IngestAllItem,
-    IngestResult, IngestSource, IpcServer, Key, LibraryRequest, LibraryResponse, OrphanInfo,
-    OrphanReason, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
+    parse_request, BeatGridInfo, Bpm, ContentHash, CueInfo, DurationSeconds, FactType, InboxPath,
+    IngestAllItem, IngestResult, IngestSource, IpcServer, Key, LibraryRequest, LibraryResponse,
+    OrphanInfo, OrphanReason, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
 };
 use crate::pipeline::{InboxFile, UploadSource};
 use acid_client::AcidClient;
@@ -3640,9 +3640,15 @@ pub fn run_ipc_server(service: Arc<LibraryService>, address: &str) -> Result<(),
     tracing::info!("IPC server running, waiting for requests...");
 
     loop {
-        match server.recv() {
-            Ok(request) => {
-                let response = service.handle_request(request);
+        match server.recv_raw() {
+            Ok(msg) => {
+                let response = match parse_request(&msg) {
+                    Ok(request) => service.handle_request(request),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Rejected unparsable request");
+                        LibraryResponse::Error(e)
+                    }
+                };
                 if let Err(e) = server.send(&response) {
                     tracing::error!(error = %e, "Failed to send response, sending error fallback");
                     let fallback = LibraryResponse::Error(ProtocolError::Internal {
