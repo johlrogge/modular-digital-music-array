@@ -372,10 +372,14 @@ impl IndexedTrackInfo {
     /// Returns true if this track holds a live mark admitted by `filter`. Reads
     /// provenance, so a retracted mark no longer counts.
     fn has_mark(&self, filter: &MarkFilter) -> bool {
-        self.provenance
-            .iter()
-            .filter_map(|(v, _)| v.stored_mark())
-            .any(|m| filter.admits(&m))
+        match filter {
+            MarkFilter::Only(mark) => self.live_marks(mark).next().is_some(),
+            MarkFilter::Any => self
+                .provenance
+                .iter()
+                .filter_map(|(v, _)| v.stored_mark())
+                .any(|m| filter.admits(&m)),
+        }
     }
 
     /// The live assertions of `mark` on this track, with their sources. The one

@@ -391,7 +391,7 @@ fn search_tracks(library: &LibraryBackend, query: &TrackQuery, no_stdin: bool) -
 
     // When stdin is piped (and --no-stdin is not set), read the hashes in it (the same
     // rule as hashes given as arguments) as an intersection filter.
-    let stdin_filter: Option<Vec<ContentHash>> = if no_stdin { None } else { piped_hashes()? };
+    let stdin_filter: Option<Vec<ContentHash>> = if no_stdin { None } else { piped_hashes() };
 
     // When stdin hashes are present and --not is set, we invert the intersection rather
     // than the library query: send the query without `.not` (so the library returns a

@@ -117,15 +117,15 @@ fn hashes_arg_or_reader(hash: OptTrackArg, reader: impl BufRead) -> Result<Vec<C
 
 /// The hashes piped on stdin (empty when it holds none); `None` when stdin is a
 /// terminal, i.e. nothing is piped.
-pub(crate) fn piped_hashes() -> Result<Option<Vec<ContentHash>>> {
+pub(crate) fn piped_hashes() -> Option<Vec<ContentHash>> {
     use std::io::IsTerminal;
-    Ok((!std::io::stdin().is_terminal()).then(read_hashes))
+    (!std::io::stdin().is_terminal()).then(read_hashes)
 }
 
 /// The tracks a command acts on: the hashes piped on stdin (a pipe without any
 /// is an error), else, when stdin is a terminal, the track that is playing.
 pub(crate) fn hashes_from_pipe_or_playing(ctx: &Ctx) -> Result<Vec<ContentHash>> {
-    hashes_or_playing(piped_hashes()?, || playing_track(&ctx.playback()?))
+    hashes_or_playing(piped_hashes(), || playing_track(&ctx.playback()?))
 }
 
 /// `piped` when stdin is piped (`Some`; it must hold a hash), else the hash
@@ -135,7 +135,9 @@ fn hashes_or_playing(
     playing: impl FnOnce() -> Result<ContentHash>,
 ) -> Result<Vec<ContentHash>> {
     match piped {
-        Some(hashes) if hashes.is_empty() => Err(no_hashes_on_stdin(&[])),
+        Some(hashes) if hashes.is_empty() => Err(no_hashes_on_stdin(&[
+            "Usage: mdma search --artist CBL | mdma mark banger",
+        ])),
         Some(hashes) => Ok(hashes),
         None => Ok(vec![playing()?]),
     }
@@ -368,7 +370,8 @@ mod tests {
     fn a_pipe_without_hashes_is_an_error_not_the_playing_track() {
         assert_eq!(
             failure_text(hashes_or_playing(Some(vec![]), || panic!("not asked"))),
-            "No hashes provided on stdin."
+            "No hashes provided on stdin.\n\
+             Usage: mdma search --artist CBL | mdma mark banger"
         );
     }
 

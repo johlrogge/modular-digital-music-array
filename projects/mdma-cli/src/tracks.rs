@@ -406,22 +406,24 @@ pub(crate) fn sort(direction: SortDirection, field: SortField, ctx: &Ctx) -> Res
 
 /// Run `act` on each of `hashes`, printing `{short_hash}  {line}` for each
 /// success to stdout and `{short_hash}  {error}` for each failure to stderr; the
-/// run fails when any track failed.
+/// run fails when any track failed. A node that does not understand the request
+/// ends the run at once with the upgrade text, printed once.
 fn for_each_track(
     hashes: Vec<ContentHash>,
     act: impl Fn(&ContentHash) -> Result<String, ClientError>,
-) -> hicli::Success {
+) -> Result<hicli::Success> {
     let mut failed = false;
     for hash in hashes {
         match act(&hash) {
             Ok(line) => println!("{}  {}", short_hash(&hash), line),
+            Err(e) if e.is_unsupported_request() => return Err(library_error(e)),
             Err(e) => {
                 failed = true;
                 eprintln!("{}  {}", short_hash(&hash), library_error(e));
             }
         }
     }
-    success_unless(failed)
+    Ok(success_unless(failed))
 }
 
 /// Mark tracks (liked unless NAME is given)
@@ -439,11 +441,11 @@ pub(crate) fn mark(name: OptMarkArg, ctx: &Ctx) -> Result<hicli::Success> {
     let mark = name.mark();
     let library = ctx.library()?;
     let hashes = hashes_from_pipe_or_playing(ctx)?;
-    Ok(for_each_track(hashes, |hash| {
+    for_each_track(hashes, |hash| {
         library
             .write_mark(hash, &mark)
             .map(|outcome| mark_outcome(&mark, outcome))
-    }))
+    })
 }
 
 /// Remove a mark from tracks (liked unless NAME is given)
@@ -459,11 +461,11 @@ pub(crate) fn unmark(name: OptMarkArg, ctx: &Ctx) -> Result<hicli::Success> {
     let mark = name.mark();
     let library = ctx.library()?;
     let hashes = hashes_from_pipe_or_playing(ctx)?;
-    Ok(for_each_track(hashes, |hash| {
+    for_each_track(hashes, |hash| {
         library
             .unmark(hash, &mark)
             .map(|outcome| unmark_outcome(&mark, outcome))
-    }))
+    })
 }
 
 /// List marked tracks
@@ -585,6 +587,26 @@ mod tests {
             "{err}"
         );
         assert!(run_arg::<LimitArg>(&[]).is_err());
+    }
+
+    #[test]
+    fn an_unsupported_request_stops_the_run_with_the_upgrade_text() {
+        use library_ipc_client::ProtocolError;
+        let calls = std::cell::Cell::new(0);
+        let result = for_each_track(
+            vec![ContentHash::new("aaaa"), ContentHash::new("bbbb")],
+            |_| {
+                calls.set(calls.get() + 1);
+                Err(ClientError::Protocol(ProtocolError::InvalidRequest {
+                    message: "unknown variant".to_string(),
+                }))
+            },
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            crate::test_support::failure_text(result),
+            mdma_client::upgrade_node_text("CLI")
+        );
     }
 
     fn named(name: &str) -> Mark {

@@ -579,9 +579,8 @@ impl LibraryService {
     /// Apply `mark` to a track unless the track already carries it live; then
     /// nothing is stored and the original time is kept.
     fn write_mark(&self, hash: &ContentHash, mark: &Mark) -> Result<MarkWrite, ProtocolError> {
-        let only_mark = MarkFilter::Only(mark.clone());
         self.try_with_track(hash, |track| {
-            if track.has_mark(&only_mark) {
+            if track.bookmarks.iter().any(|v| mark.matches(v)) {
                 return MarkWrite::AlreadyLive;
             }
             track.bookmarks.push(mark.fact_value(chrono::Utc::now()));
@@ -886,20 +885,20 @@ mod tests {
         }
     }
 
-    fn bookmarked(svc: &LibraryService) -> Vec<String> {
+    fn marked_any(svc: &LibraryService) -> Vec<String> {
         marked(svc, MarkFilter::Any)
     }
 
     #[test]
     fn write_bookmark_makes_list_marked_return_the_track() {
         let svc = service_with_tracks(&["sha256:aaaa", "sha256:bbbb"]);
-        assert!(bookmarked(&svc).is_empty());
+        assert!(marked_any(&svc).is_empty());
         let resp = svc.handle_request(LibraryRequest::WriteBookmark {
             hash: ContentHash::new("aaaa"),
             scope: Some("my-set".to_string()),
         });
         assert!(matches!(resp, LibraryResponse::BookmarkWritten), "{resp:?}");
-        assert_eq!(bookmarked(&svc), vec!["sha256:aaaa".to_string()]);
+        assert_eq!(marked_any(&svc), vec!["sha256:aaaa".to_string()]);
     }
 
     #[test]
@@ -916,7 +915,7 @@ mod tests {
             ),
             "{resp:?}"
         );
-        assert!(bookmarked(&svc).is_empty());
+        assert!(marked_any(&svc).is_empty());
     }
 
     fn marked(svc: &LibraryService, filter: MarkFilter) -> Vec<String> {
@@ -1329,7 +1328,7 @@ mod tests {
         svc.handle_request(LibraryRequest::TrackDelete {
             hash: ContentHash::new("sha256:aaaa"),
         });
-        assert!(bookmarked(&svc).is_empty());
+        assert!(marked_any(&svc).is_empty());
     }
 
     /// Build a stub from a facts.jsonl holding `facts` (`(hash, value, op)`),
@@ -1383,7 +1382,7 @@ mod tests {
             "bookmark-assert",
             &[("sha256:aaaa", a_bookmark(), Operation::Assert)],
         );
-        assert_eq!(bookmarked(&svc), vec!["sha256:aaaa".to_string()]);
+        assert_eq!(marked_any(&svc), vec!["sha256:aaaa".to_string()]);
     }
 
     #[test]
@@ -1401,7 +1400,7 @@ mod tests {
                 ("sha256:aaaa", a_bookmark(), Operation::Retract),
             ],
         );
-        assert!(bookmarked(&svc).is_empty());
+        assert!(marked_any(&svc).is_empty());
     }
 
     #[test]

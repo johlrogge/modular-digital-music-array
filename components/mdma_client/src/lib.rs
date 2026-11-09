@@ -7,6 +7,7 @@ pub mod library;
 pub mod playback;
 pub mod source;
 
+pub use error::upgrade_node_text;
 pub use library::LibraryBackend;
 pub use playback::PlaybackBackend;
 pub use source::{list_available_sources, SourceClient};

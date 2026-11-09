@@ -2,6 +2,15 @@
 
 use library_ipc_client::{ClientError, ProtocolError};
 
+/// The text shown when a node rejects a request it does not understand; `client`
+/// names the program that sent it (e.g. "CLI").
+pub fn upgrade_node_text(client: &str) -> String {
+    format!(
+        "The node did not understand this request; it may be older than this {client} \
+         — upgrade the node."
+    )
+}
+
 /// Map gateway client errors to library client errors.
 ///
 /// Gateway errors are the same underlying type as media client errors

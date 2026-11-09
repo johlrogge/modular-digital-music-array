@@ -5,7 +5,7 @@ use color_eyre::eyre::eyre;
 use colored::Colorize;
 use gateway_client::AdminResponse;
 use library_ipc_client::{ClientError, LibraryResponse, ProtocolError, TrackInfo};
-use mdma_client::{Mark, MarkFilter, MarkWrite, Unmark};
+use mdma_client::{upgrade_node_text, Mark, MarkFilter, MarkWrite, Unmark};
 use nng_transport::ConnectionError;
 use source_protocol::{SourceError, SourceResponse};
 use track_formatter::{
@@ -113,9 +113,6 @@ pub fn request_failed(what: &str, err: &dyn std::fmt::Display) -> color_eyre::Re
     eyre!("Request to {what} failed: {err}")
 }
 
-const UPGRADE_NODE_TEXT: &str =
-    "The node did not understand this request; it may be older than this CLI — upgrade the node.";
-
 /// The failure for a library client error (without hicli's `Error: ` prefix).
 pub fn library_error(err: ClientError) -> color_eyre::Report {
     let text = match err {
@@ -125,7 +122,7 @@ pub fn library_error(err: ClientError) -> color_eyre::Report {
         ClientError::Protocol(ProtocolError::InboxFileNotFound { path }) => {
             format!("Inbox file not found: {}", path)
         }
-        e if e.is_unsupported_request() => UPGRADE_NODE_TEXT.to_string(),
+        e if e.is_unsupported_request() => upgrade_node_text("CLI"),
         ClientError::Protocol(e) => e.to_string(),
         e => e.to_string(),
     };
@@ -425,7 +422,7 @@ mod tests {
     };
     use gateway_client::AdminResponse;
     use library_ipc_client::{ClientError, LibraryResponse, ProtocolError};
-    use mdma_client::PlaybackClientError;
+    use mdma_client::{upgrade_node_text, PlaybackClientError};
     use nng_transport::{ConnectionError, NngClientError};
     use source_protocol::{SourceError, SourceResponse};
 
@@ -469,7 +466,7 @@ mod tests {
         let err = ClientError::Protocol(ProtocolError::InvalidRequest {
             message: "unknown variant".to_string(),
         });
-        assert_eq!(lib_text(err), super::UPGRADE_NODE_TEXT);
+        assert_eq!(lib_text(err), upgrade_node_text("CLI"));
     }
 
     #[test]

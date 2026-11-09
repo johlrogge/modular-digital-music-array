@@ -5,20 +5,17 @@ use crate::pane::{AddPlayingTarget, PaneAction, PaneKind};
 use crate::playlist_pane::PlaylistPane;
 use crossterm::event::{KeyCode, KeyEvent};
 use mdma_client::{
-    ContentHash, Deck, LibraryClientError, Mark, MarkWrite, PlaybackBackend, PlaylistName,
-    SourceName,
+    upgrade_node_text, ContentHash, Deck, LibraryClientError, Mark, MarkWrite, PlaybackBackend,
+    PlaylistName, SourceName,
 };
 use std::rc::Rc;
-
-const UPGRADE_NODE_TEXT: &str =
-    "The node did not understand this request; it may be older than this TUI — upgrade the node.";
 
 /// Status line text for the outcome of marking the playing track with `mark`.
 fn mark_status(mark: &Mark, result: Result<MarkWrite, LibraryClientError>) -> String {
     match result {
         Ok(MarkWrite::Written) => format!("Marked {mark}"),
         Ok(MarkWrite::AlreadyLive) => format!("Already marked {mark}"),
-        Err(e) if e.is_unsupported_request() => UPGRADE_NODE_TEXT.to_string(),
+        Err(e) if e.is_unsupported_request() => upgrade_node_text("TUI"),
         Err(e) => format!("Mark failed: {e}"),
     }
 }
@@ -610,8 +607,9 @@ fn dispatch_pane_action(app: &mut App, action: PaneAction) {
 
 #[cfg(test)]
 mod tests {
-    use super::{mark_status, UPGRADE_NODE_TEXT};
+    use super::mark_status;
     use crate::selection::SelectionState;
+    use mdma_client::upgrade_node_text;
     use mdma_client::{LibraryClientError, Mark, MarkWrite, ProtocolError};
 
     #[test]
@@ -637,7 +635,10 @@ mod tests {
         let err = LibraryClientError::Protocol(ProtocolError::InvalidRequest {
             message: "unknown variant".to_string(),
         });
-        assert_eq!(mark_status(&Mark::Default, Err(err)), UPGRADE_NODE_TEXT);
+        assert_eq!(
+            mark_status(&Mark::Default, Err(err)),
+            upgrade_node_text("TUI")
+        );
     }
 
     #[test]

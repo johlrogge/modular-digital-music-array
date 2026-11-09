@@ -7,7 +7,7 @@
 // Re-export types used in the protocol so clients don't need to depend on music-facts
 pub use music_facts::{
     Bpm, ContentHash, CueKind, DurationSeconds, Key, Mark, MarkFilter, MarkName, MarkNameError,
-    MusicValue, StoredMark,
+    MusicValue,
 };
 pub use music_primitives::{EnergyLevel, TrackRole};
 // Re-export query types so clients can use them without depending on library-search directly
