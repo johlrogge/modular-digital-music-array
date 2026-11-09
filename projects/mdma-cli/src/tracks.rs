@@ -10,7 +10,8 @@ use crate::stdin::{
 use bpaf::{construct, long, positional, short, Parser};
 use color_eyre::Result;
 use hicli::Arg;
-use library_ipc_client::{ClientError, ContentHash, Mark, MarkFilter, MarkNameError, TrackInfo};
+use library_ipc_client::{ClientError, ContentHash, TrackInfo};
+use mdma_client::{Mark, MarkFilter, MarkNameError};
 use std::num::NonZeroUsize;
 use track_formatter::{render_for_user, short_hash, ViewColumn};
 

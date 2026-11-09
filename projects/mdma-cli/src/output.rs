@@ -4,9 +4,8 @@
 use color_eyre::eyre::eyre;
 use colored::Colorize;
 use gateway_client::AdminResponse;
-use library_ipc_client::{
-    ClientError, LibraryResponse, Mark, MarkFilter, MarkWrite, ProtocolError, TrackInfo, Unmark,
-};
+use library_ipc_client::{ClientError, LibraryResponse, ProtocolError, TrackInfo};
+use mdma_client::{Mark, MarkFilter, MarkWrite, Unmark};
 use nng_transport::ConnectionError;
 use source_protocol::{SourceError, SourceResponse};
 use track_formatter::{

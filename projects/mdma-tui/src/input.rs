@@ -4,8 +4,24 @@ use crate::now_playing::PlaybackStatus;
 use crate::pane::{AddPlayingTarget, PaneAction, PaneKind};
 use crate::playlist_pane::PlaylistPane;
 use crossterm::event::{KeyCode, KeyEvent};
-use mdma_client::{ContentHash, Deck, PlaybackBackend, PlaylistName, SourceName};
+use mdma_client::{
+    ContentHash, Deck, LibraryClientError, Mark, MarkWrite, PlaybackBackend, PlaylistName,
+    SourceName,
+};
 use std::rc::Rc;
+
+const UPGRADE_NODE_TEXT: &str =
+    "The node did not understand this request; it may be older than this TUI — upgrade the node.";
+
+/// Status line text for the outcome of marking the playing track with `mark`.
+fn mark_status(mark: &Mark, result: Result<MarkWrite, LibraryClientError>) -> String {
+    match result {
+        Ok(MarkWrite::Written) => format!("Marked {mark}"),
+        Ok(MarkWrite::AlreadyLive) => format!("Already marked {mark}"),
+        Err(e) if e.is_unsupported_request() => UPGRADE_NODE_TEXT.to_string(),
+        Err(e) => format!("Mark failed: {e}"),
+    }
+}
 
 /// Dispatch a key event to the application based on the current input mode.
 pub fn handle_key(app: &mut App, key: KeyEvent) {
@@ -353,10 +369,11 @@ fn handle_playback(app: &mut App, key: KeyEvent) {
             };
             match hash {
                 None => app.set_status("Nothing playing"),
-                Some(h) => match app.library.write_bookmark(&h, None) {
-                    Ok(()) => app.set_status("Bookmarked"),
-                    Err(e) => app.set_status(format!("Bookmark failed: {e}")),
-                },
+                Some(h) => {
+                    let mark = Mark::Default;
+                    let status = mark_status(&mark, app.library.write_mark(&h, &mark));
+                    app.set_status(status);
+                }
             }
         }
         KeyCode::Esc => {
@@ -593,7 +610,45 @@ fn dispatch_pane_action(app: &mut App, action: PaneAction) {
 
 #[cfg(test)]
 mod tests {
+    use super::{mark_status, UPGRADE_NODE_TEXT};
     use crate::selection::SelectionState;
+    use mdma_client::{LibraryClientError, Mark, MarkWrite, ProtocolError};
+
+    #[test]
+    fn mark_status_written_names_the_mark() {
+        let mark = Mark::Default;
+        assert_eq!(
+            mark_status(&mark, Ok(MarkWrite::Written)),
+            format!("Marked {mark}")
+        );
+    }
+
+    #[test]
+    fn mark_status_already_live_names_the_mark() {
+        let mark = Mark::Default;
+        assert_eq!(
+            mark_status(&mark, Ok(MarkWrite::AlreadyLive)),
+            format!("Already marked {mark}")
+        );
+    }
+
+    #[test]
+    fn mark_status_unsupported_request_says_upgrade_the_node() {
+        let err = LibraryClientError::Protocol(ProtocolError::InvalidRequest {
+            message: "unknown variant".to_string(),
+        });
+        assert_eq!(mark_status(&Mark::Default, Err(err)), UPGRADE_NODE_TEXT);
+    }
+
+    #[test]
+    fn mark_status_other_error_reports_mark_failed() {
+        let err = LibraryClientError::Protocol(ProtocolError::Internal {
+            message: "boom".to_string(),
+        });
+        let text = mark_status(&Mark::Default, Err(err));
+        assert!(text.starts_with("Mark failed: "), "{text}");
+        assert!(text.contains("boom"), "{text}");
+    }
 
     /// Simulate `apply_live_filter` for a given pattern against a fixed set of
     /// display strings.  Returns the visible data indices after applying the filter.
