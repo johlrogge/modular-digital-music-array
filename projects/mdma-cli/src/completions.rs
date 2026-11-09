@@ -6,7 +6,7 @@ use color_eyre::Result;
 pub(crate) struct ShellArg(pub hicli::Shell);
 
 impl std::str::FromStr for ShellArg {
-    type Err = hicli::UnknownShell;
+    type Err = hicli::UnknownChoice;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         s.parse().map(Self)
