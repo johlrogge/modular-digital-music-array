@@ -5,7 +5,10 @@
 //! - library-ipc-client (used by CLI and console)
 
 // Re-export types used in the protocol so clients don't need to depend on music-facts
-pub use music_facts::{Bpm, ContentHash, CueKind, DurationSeconds, Key, MusicValue};
+pub use music_facts::{
+    Bpm, ContentHash, CueKind, DurationSeconds, Key, Mark, MarkFilter, MarkName, MarkNameError,
+    MusicValue, StoredMark,
+};
 pub use music_primitives::{EnergyLevel, TrackRole};
 // Re-export query types so clients can use them without depending on library-search directly
 pub use library_search::{
@@ -257,6 +260,10 @@ pub enum LibraryRequest {
     /// List every visible track that carries a live bookmark, scoped or not.
     /// Answered with `LibraryResponse::Tracks`, order unspecified.
     ListBookmarked,
+
+    /// List every visible track that carries a live mark admitted by `filter`.
+    /// Answered with `LibraryResponse::Tracks`, order unspecified.
+    ListMarked { filter: MarkFilter },
 
     /// Get a specific track by content hash (supports partial hashes).
     GetTrack { hash: ContentHash },
@@ -1161,6 +1168,56 @@ mod tests {
         } else {
             panic!("unexpected variant");
         }
+    }
+
+    fn named(s: &str) -> Mark {
+        Mark::Named(MarkName::parse(s).unwrap())
+    }
+
+    #[test]
+    fn list_marked_wire_format_is_pinned() {
+        for (filter, expected) in [
+            (MarkFilter::Any, r#"{"type":"ListMarked","filter":"Any"}"#),
+            (
+                MarkFilter::Only(Mark::Default),
+                r#"{"type":"ListMarked","filter":{"Only":"Default"}}"#,
+            ),
+            (
+                MarkFilter::Only(named("banger")),
+                r#"{"type":"ListMarked","filter":{"Only":{"Named":"banger"}}}"#,
+            ),
+        ] {
+            let json = serde_json::to_string(&LibraryRequest::ListMarked {
+                filter: filter.clone(),
+            })
+            .unwrap();
+            assert_eq!(json, expected);
+            match serde_json::from_str::<LibraryRequest>(&json).unwrap() {
+                LibraryRequest::ListMarked { filter: decoded } => assert_eq!(decoded, filter),
+                other => panic!("unexpected variant {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn list_marked_with_an_invalid_mark_name_is_an_invalid_request() {
+        let err =
+            parse_request(br#"{"type":"ListMarked","filter":{"Only":{"Named":""}}}"#).unwrap_err();
+        assert!(
+            matches!(err, ProtocolError::InvalidRequest { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn list_marked_with_the_default_name_spelled_out_is_an_invalid_request() {
+        // serde does not map "liked" to Default; only the "Default" variant does.
+        let err = parse_request(br#"{"type":"ListMarked","filter":{"Only":{"Named":"liked"}}}"#)
+            .unwrap_err();
+        assert!(
+            matches!(err, ProtocolError::InvalidRequest { .. }),
+            "{err:?}"
+        );
     }
 
     #[test]

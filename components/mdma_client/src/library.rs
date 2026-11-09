@@ -7,8 +7,8 @@ use library_ipc_client::{
     interpret_identity_backfill_status, ArchiveEmptyReport, ArchiveListing, ClientError,
     ContentHash, DedupApplyReport, DedupScanReport, FactType, IdentityBackfillStart,
     IdentityBackfillStatus, InboxPath, IngestAllItem, IngestResult, IngestSource, LibraryClient,
-    LibraryRequest, LibraryResponse, MusicValue, OrphanInfo, PlaylistName, ProtocolError,
-    ServiceStatus, TrackInfo, TrackQuery,
+    LibraryRequest, LibraryResponse, MarkFilter, MusicValue, OrphanInfo, PlaylistName,
+    ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
 };
 use playlist_import::PlaylistWriteOps;
 
@@ -279,6 +279,16 @@ impl LibraryBackend {
         interpret_tracks(
             self.request(&LibraryRequest::ListBookmarked)?,
             "ListBookmarked",
+        )
+    }
+
+    /// List every visible track that carries a live mark admitted by `filter`.
+    pub fn list_marked(&self, filter: &MarkFilter) -> Result<Vec<TrackInfo>, ClientError> {
+        interpret_tracks(
+            self.request(&LibraryRequest::ListMarked {
+                filter: filter.clone(),
+            })?,
+            "ListMarked",
         )
     }
 

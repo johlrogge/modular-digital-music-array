@@ -140,7 +140,7 @@ impl Mark {
 
     /// Whether `value` is a bookmark carrying this mark. Legacy scopes never match.
     pub fn matches(&self, value: &MusicValue) -> bool {
-        matches!(value.stored_mark(), Some(StoredMark::Mark(m)) if m == *self)
+        value.stored_mark().is_some_and(|stored| stored.is(self))
     }
 }
 
@@ -180,6 +180,32 @@ impl<'a> StoredMark<'a> {
             Ok(mark) => StoredMark::Mark(mark),
             // An error implies `scope` was `Some`.
             Err(_) => StoredMark::Legacy(scope.unwrap_or_default()),
+        }
+    }
+}
+
+impl StoredMark<'_> {
+    /// Whether this stored mark is `mark`. Legacy scopes are never any mark.
+    pub fn is(&self, mark: &Mark) -> bool {
+        matches!(self, StoredMark::Mark(m) if m == mark)
+    }
+}
+
+/// Which marks a `ListMarked` request admits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MarkFilter {
+    /// Every mark, legacy free-text scopes included.
+    Any,
+    /// Exactly this mark; legacy scopes never match.
+    Only(Mark),
+}
+
+impl MarkFilter {
+    /// Whether a stored mark passes this filter.
+    pub fn admits(&self, stored: &StoredMark<'_>) -> bool {
+        match self {
+            MarkFilter::Any => true,
+            MarkFilter::Only(mark) => stored.is(mark),
         }
     }
 }
@@ -401,6 +427,33 @@ mod tests {
     fn fact_value_builds_the_expected_value() {
         assert_eq!(Mark::Default.fact_value(at()), bookmarked(None));
         assert_eq!(named("banger").fact_value(at()), bookmarked(Some("banger")));
+    }
+
+    #[test]
+    fn any_admits_every_stored_mark_including_legacy() {
+        assert!(MarkFilter::Any.admits(&StoredMark::Mark(Mark::Default)));
+        assert!(MarkFilter::Any.admits(&StoredMark::Mark(named("banger"))));
+        assert!(MarkFilter::Any.admits(&StoredMark::Legacy("")));
+    }
+
+    #[test]
+    fn only_admits_exactly_that_mark() {
+        let default = MarkFilter::Only(Mark::Default);
+        assert!(default.admits(&StoredMark::Mark(Mark::Default)));
+        assert!(!default.admits(&StoredMark::Mark(named("banger"))));
+        assert!(!default.admits(&StoredMark::Legacy("")));
+
+        let banger = MarkFilter::Only(named("banger"));
+        assert!(banger.admits(&StoredMark::Mark(named("banger"))));
+        assert!(!banger.admits(&StoredMark::Mark(Mark::Default)));
+        assert!(!banger.admits(&StoredMark::Legacy("a\nb")));
+    }
+
+    #[test]
+    fn stored_mark_is_only_the_same_mark() {
+        assert!(StoredMark::Mark(Mark::Default).is(&Mark::Default));
+        assert!(!StoredMark::Mark(Mark::Default).is(&named("banger")));
+        assert!(!StoredMark::Legacy("").is(&Mark::Default));
     }
 
     #[test]

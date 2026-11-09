@@ -6,8 +6,8 @@
 
 use crate::ipc::{
     parse_request, BeatGridInfo, Bpm, ContentHash, CueInfo, DurationSeconds, FactType, IpcServer,
-    LibraryRequest, LibraryResponse, OrphanInfo, OrphanReason, PlaylistName, ProtocolError,
-    ServiceStatus, TrackInfo, TrackQuery,
+    LibraryRequest, LibraryResponse, MarkFilter, OrphanInfo, OrphanReason, PlaylistName,
+    ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
 };
 use library_search::{matches_query, TrackFields};
 use music_facts::MusicValue;
@@ -64,8 +64,11 @@ impl IndexedTrack {
         self.deleted_at.is_some()
     }
 
-    fn is_bookmarked(&self) -> bool {
-        !self.bookmarks.is_empty()
+    fn has_mark(&self, filter: &MarkFilter) -> bool {
+        self.bookmarks
+            .iter()
+            .filter_map(MusicValue::stored_mark)
+            .any(|m| filter.admits(&m))
     }
 }
 
@@ -268,7 +271,11 @@ impl LibraryService {
             }
 
             LibraryRequest::ListBookmarked => {
-                LibraryResponse::Tracks(self.tracks_where(IndexedTrack::is_bookmarked, None))
+                LibraryResponse::Tracks(self.tracks_where(|t| t.has_mark(&MarkFilter::Any), None))
+            }
+
+            LibraryRequest::ListMarked { filter } => {
+                LibraryResponse::Tracks(self.tracks_where(|t| t.has_mark(&filter), None))
             }
 
             LibraryRequest::GetTrack { hash } => match self.get_track(&hash) {
@@ -811,14 +818,23 @@ mod tests {
         svc
     }
 
-    fn bookmarked(svc: &LibraryService) -> Vec<String> {
-        match svc.handle_request(LibraryRequest::ListBookmarked) {
-            LibraryResponse::Tracks(tracks) => tracks
-                .iter()
-                .map(|t| t.content_hash.as_str().to_owned())
-                .collect(),
+    /// The content hashes of a `Tracks` response, sorted.
+    fn sorted_hashes(resp: LibraryResponse) -> Vec<String> {
+        match resp {
+            LibraryResponse::Tracks(tracks) => {
+                let mut hashes: Vec<String> = tracks
+                    .iter()
+                    .map(|t| t.content_hash.as_str().to_owned())
+                    .collect();
+                hashes.sort();
+                hashes
+            }
             other => panic!("expected Tracks, got {other:?}"),
         }
+    }
+
+    fn bookmarked(svc: &LibraryService) -> Vec<String> {
+        sorted_hashes(svc.handle_request(LibraryRequest::ListBookmarked))
     }
 
     #[test]
@@ -850,6 +866,84 @@ mod tests {
         assert!(bookmarked(&svc).is_empty());
     }
 
+    fn marked(svc: &LibraryService, filter: MarkFilter) -> Vec<String> {
+        sorted_hashes(svc.handle_request(LibraryRequest::ListMarked { filter }))
+    }
+
+    fn named_mark(s: &str) -> music_facts::Mark {
+        music_facts::Mark::Named(music_facts::MarkName::parse(s).unwrap())
+    }
+
+    /// One track per mark kind: default, named (stored as "Banger"), legacy
+    /// (empty scope), plus a hidden and a retracted mark that must never show.
+    fn service_with_one_track_per_mark() -> Arc<LibraryService> {
+        use stainless_facts::Operation::{Assert, Retract};
+        let ts = chrono::DateTime::from_timestamp(1_767_225_600, 0).unwrap();
+        let mark = |scope: Option<&str>| MusicValue::Bookmarked {
+            scope: scope.map(str::to_owned),
+            timestamp: ts,
+        };
+        let svc = service_from_facts(
+            "marks",
+            &[
+                ("sha256:markdefault01", mark(None), Assert),
+                ("sha256:marknamed01", mark(Some("Banger")), Assert),
+                ("sha256:marklegacy01", mark(Some("")), Assert),
+                ("sha256:markhidden01", mark(None), Assert),
+                ("sha256:markretracted01", mark(Some("banger")), Assert),
+                ("sha256:markretracted01", mark(Some("banger")), Retract),
+            ],
+        );
+        let resp = svc.handle_request(LibraryRequest::TrackDelete {
+            hash: ContentHash::new("sha256:markhidden01"),
+        });
+        assert!(matches!(resp, LibraryResponse::TrackDeleted), "{resp:?}");
+        svc
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn list_marked_any_lists_default_named_and_legacy_marks() {
+        let svc = service_with_one_track_per_mark();
+        assert_eq!(
+            marked(&svc, MarkFilter::Any),
+            strs(&[
+                "sha256:markdefault01",
+                "sha256:marklegacy01",
+                "sha256:marknamed01"
+            ])
+        );
+    }
+
+    #[test]
+    fn list_marked_only_default_excludes_named_and_legacy_marks() {
+        let svc = service_with_one_track_per_mark();
+        assert_eq!(
+            marked(&svc, MarkFilter::Only(music_facts::Mark::Default)),
+            strs(&["sha256:markdefault01"])
+        );
+    }
+
+    #[test]
+    fn list_marked_only_named_matches_a_differently_cased_stored_scope() {
+        let svc = service_with_one_track_per_mark();
+        assert_eq!(
+            marked(&svc, MarkFilter::Only(named_mark("banger"))),
+            strs(&["sha256:marknamed01"])
+        );
+    }
+
+    #[test]
+    fn list_marked_excludes_hidden_and_retracted_marks() {
+        let svc = service_with_one_track_per_mark();
+        let any = marked(&svc, MarkFilter::Any);
+        assert!(!any.contains(&"sha256:markhidden01".to_owned()));
+        assert!(!any.contains(&"sha256:markretracted01".to_owned()));
+    }
+
     #[test]
     fn list_bookmarked_excludes_hidden_tracks() {
         let svc = service_with_tracks(&["sha256:aaaa"]);
@@ -864,23 +958,28 @@ mod tests {
         assert!(bookmarked(&svc).is_empty());
     }
 
-    /// Build a stub from a facts.jsonl holding `facts` (one entity), in a fresh
-    /// temp dir that is removed afterwards.
+    /// Build a stub from a facts.jsonl holding `facts` (`(hash, value, op)`),
+    /// in a fresh temp dir that is removed afterwards.
     fn service_from_facts(
         test: &str,
-        facts: &[(MusicValue, stainless_facts::Operation)],
+        facts: &[(&str, MusicValue, stainless_facts::Operation)],
     ) -> Arc<LibraryService> {
         use music_facts::{FactOrigin, FactSource};
         use stainless_facts::{Fact, FactStreamWriter};
 
-        let dir = std::env::temp_dir().join(format!("mdma-stub-{test}-{}", std::process::id()));
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Unique per call: tests sharing a `test` name run in parallel.
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("mdma-stub-{test}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
-        let hash = ContentHash::new("sha256:aaaa");
         let ts = chrono::Utc::now();
         let batch: Vec<Fact<ContentHash, MusicValue, FactSource>> = facts
             .iter()
-            .map(|(v, op)| Fact::new(hash.clone(), v.clone(), ts, source.clone(), *op))
+            .map(|(hash, v, op)| {
+                Fact::new(ContentHash::new(*hash), v.clone(), ts, source.clone(), *op)
+            })
             .collect();
         FactStreamWriter::open(dir.join("facts.jsonl"))
             .unwrap()
@@ -906,7 +1005,10 @@ mod tests {
     #[test]
     fn a_loaded_bookmark_fact_marks_the_track() {
         use stainless_facts::Operation;
-        let svc = service_from_facts("bookmark-assert", &[(a_bookmark(), Operation::Assert)]);
+        let svc = service_from_facts(
+            "bookmark-assert",
+            &[("sha256:aaaa", a_bookmark(), Operation::Assert)],
+        );
         assert_eq!(bookmarked(&svc), vec!["sha256:aaaa".to_string()]);
     }
 
@@ -917,11 +1019,12 @@ mod tests {
             "bookmark-retract",
             &[
                 (
+                    "sha256:aaaa",
                     MusicValue::Title(music_facts::Title::new("Kept")),
                     Operation::Assert,
                 ),
-                (a_bookmark(), Operation::Assert),
-                (a_bookmark(), Operation::Retract),
+                ("sha256:aaaa", a_bookmark(), Operation::Assert),
+                ("sha256:aaaa", a_bookmark(), Operation::Retract),
             ],
         );
         assert!(bookmarked(&svc).is_empty());

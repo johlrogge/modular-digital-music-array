@@ -6,7 +6,7 @@ use crate::identity::{identity_facts_for_blob, IdentityOpts};
 use crate::ipc::{
     parse_request, BeatGridInfo, Bpm, ContentHash, CueInfo, DurationSeconds, FactType, InboxPath,
     IngestAllItem, IngestResult, IngestSource, IpcServer, Key, LibraryRequest, LibraryResponse,
-    OrphanInfo, OrphanReason, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
+    MarkFilter, OrphanInfo, OrphanReason, ProtocolError, ServiceStatus, TrackInfo, TrackQuery,
 };
 use crate::pipeline::{InboxFile, UploadSource};
 use acid_client::AcidClient;
@@ -367,12 +367,13 @@ impl IndexedTrackInfo {
         self.deleted_at.is_some()
     }
 
-    /// Returns true if this track holds a live bookmark, scoped or not. Reads
-    /// provenance, so a retracted bookmark no longer counts.
-    fn is_bookmarked(&self) -> bool {
+    /// Returns true if this track holds a live mark admitted by `filter`. Reads
+    /// provenance, so a retracted mark no longer counts.
+    fn has_mark(&self, filter: &MarkFilter) -> bool {
         self.provenance
             .iter()
-            .any(|(v, _)| matches!(v, MusicValue::Bookmarked { .. }))
+            .filter_map(|(v, _)| v.stored_mark())
+            .any(|m| filter.admits(&m))
     }
 
     /// Derive `blob_path` from `raw_file_path` and `content_hash` if blob_path
@@ -1797,7 +1798,11 @@ impl LibraryService {
             }
 
             LibraryRequest::ListBookmarked => {
-                LibraryResponse::Tracks(self.tracks_where(IndexedTrackInfo::is_bookmarked, None))
+                LibraryResponse::Tracks(self.tracks_where(|t| t.has_mark(&MarkFilter::Any), None))
+            }
+
+            LibraryRequest::ListMarked { filter } => {
+                LibraryResponse::Tracks(self.tracks_where(|t| t.has_mark(&filter), None))
             }
 
             LibraryRequest::GetTrack { hash } => match self.get_track(&hash) {
@@ -6127,9 +6132,9 @@ mod tests {
         );
     }
 
-    /// Hashes returned by `ListBookmarked`, sorted.
-    fn bookmarked_hashes(service: &LibraryService) -> Vec<String> {
-        match service.handle_request(LibraryRequest::ListBookmarked) {
+    /// The content hashes of a `Tracks` response, sorted.
+    fn sorted_hashes(resp: LibraryResponse) -> Vec<String> {
+        match resp {
             LibraryResponse::Tracks(tracks) => {
                 let mut hashes: Vec<String> = tracks
                     .iter()
@@ -6140,6 +6145,11 @@ mod tests {
             }
             other => panic!("expected Tracks, got {other:?}"),
         }
+    }
+
+    /// Hashes returned by `ListBookmarked`, sorted.
+    fn bookmarked_hashes(service: &LibraryService) -> Vec<String> {
+        sorted_hashes(service.handle_request(LibraryRequest::ListBookmarked))
     }
 
     fn bookmark(scope: Option<&str>, ts: chrono::DateTime<Utc>) -> MusicValue {
@@ -6264,6 +6274,97 @@ mod tests {
             bookmarked_hashes(&service),
             vec![scoped.as_str().to_owned(), unscoped.as_str().to_owned()]
         );
+    }
+
+    /// Hashes returned by `ListMarked` with `filter`, sorted.
+    fn marked_hashes(service: &LibraryService, filter: MarkFilter) -> Vec<String> {
+        sorted_hashes(service.handle_request(LibraryRequest::ListMarked { filter }))
+    }
+
+    fn named_mark(s: &str) -> music_facts::Mark {
+        music_facts::Mark::Named(music_facts::MarkName::parse(s).unwrap())
+    }
+
+    /// A library with one track per mark kind: default, named ("Banger" as
+    /// stored, so it also covers case-insensitive matching), legacy-invalid
+    /// (empty scope), plus a hidden and a retracted mark that must never show.
+    fn service_with_one_track_per_mark() -> (Arc<LibraryService>, tempfile::TempDir) {
+        let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let ts2 = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+        let mut ops = Vec::new();
+        for (hash, scope) in [
+            ("sha256:markdefault01", None),
+            ("sha256:marknamed01", Some("Banger")),
+            ("sha256:marklegacy01", Some("")),
+            ("sha256:markhidden01", None),
+            ("sha256:markretracted01", Some("banger")),
+        ] {
+            let hash = ContentHash::new(hash);
+            ops.push((
+                hash.clone(),
+                MusicValue::Title(Title::new("T")),
+                ts,
+                Operation::Assert,
+            ));
+            ops.push((hash, bookmark(scope, ts), ts, Operation::Assert));
+        }
+        ops.push((
+            ContentHash::new("sha256:markhidden01"),
+            MusicValue::Deleted { timestamp: ts },
+            ts,
+            Operation::Assert,
+        ));
+        ops.push((
+            ContentHash::new("sha256:markretracted01"),
+            bookmark(Some("banger"), ts),
+            ts2,
+            Operation::Retract,
+        ));
+        let temp = write_facts_file_with_operations(&ops);
+        make_service_with_facts(temp.path())
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn list_marked_any_lists_default_named_and_legacy_marks() {
+        let (service, _dir) = service_with_one_track_per_mark();
+        assert_eq!(
+            marked_hashes(&service, MarkFilter::Any),
+            strs(&[
+                "sha256:markdefault01",
+                "sha256:marklegacy01",
+                "sha256:marknamed01"
+            ])
+        );
+    }
+
+    #[test]
+    fn list_marked_only_default_excludes_named_and_legacy_marks() {
+        let (service, _dir) = service_with_one_track_per_mark();
+        assert_eq!(
+            marked_hashes(&service, MarkFilter::Only(music_facts::Mark::Default)),
+            strs(&["sha256:markdefault01"])
+        );
+    }
+
+    #[test]
+    fn list_marked_only_named_matches_a_differently_cased_stored_scope() {
+        let (service, _dir) = service_with_one_track_per_mark();
+        assert_eq!(
+            marked_hashes(&service, MarkFilter::Only(named_mark("banger"))),
+            strs(&["sha256:marknamed01"])
+        );
+    }
+
+    #[test]
+    fn list_marked_excludes_hidden_and_retracted_marks() {
+        let (service, _dir) = service_with_one_track_per_mark();
+        let any = marked_hashes(&service, MarkFilter::Any);
+        assert!(!any.contains(&"sha256:markhidden01".to_owned()));
+        assert!(!any.contains(&"sha256:markretracted01".to_owned()));
     }
 
     /// search_tracks excludes hidden (deleted) tracks.
