@@ -20,7 +20,7 @@ Builds on ADR-001 (ACID is the only writer), ADR-009 (node identity), ADR-011 (s
 - There is no unbookmark. The only way to remove a bookmark is the generic `RetractFact`.
 - `ListBookmarked` (on develop, a3f655c) is `tracks_where(is_bookmarked)` and ignores scope (service.rs:370-376, 1799).
   - It is deployed on stage2 but not on prod.
-  - The CLI `bookmarks` command now uses it (f249d28), until phase 1 replaces it with `ListMarked`.
+  - The CLI `bookmarks` command used it (f249d28) until phase 1 replaced it with `ListMarked`.
 
 **Facts and the log.**
 - A fact is `stainless_facts::Fact<E,V,S>(entity, value, timestamp, source, Assert|Retract)`. The attribute is the serde tag of `MusicValue`.
@@ -60,6 +60,8 @@ Points marked **decided** were decided by Joakim. Everything else is **proposed*
 2. **Mark names are validated at the edges, not in storage.**
    - `MarkName` is a newtype in music_facts: trimmed, non-empty, at most 64 characters, no control characters. It is otherwise lenient, following ADR-015's "names may be lenient".
    - **Decided:** mark names fold to lowercase. "Banger" and "banger" are one mark. `MarkName` folds on construction, so new writes are always lowercase.
+     - Folding is `str::to_lowercase`. It is not Unicode case folding and not NFC normalisation, so canonically equivalent spellings are different marks.
+     - Invisible format characters (such as zero-width spaces) are rejected too, as well as control characters.
    - `enum Mark { Default, Named(MarkName) }` maps to `Option<String>` on the fact.
    - The protocol carries `Mark`/`MarkName`, and so do the CLI and TUI arguments. The CLI's arg newtype wraps `MarkName`.
    - `MusicValue::Bookmarked.scope` stays `Option<String>`, so reading history can never fail on an old free-text scope.
@@ -85,7 +87,7 @@ Points marked **decided** were decided by Joakim. Everything else is **proposed*
    - **Decided:** `mark` and `unmark` with no name act on the default mark ("liked").
    - **Decided:** `marked` with no name lists tracks with any mark (`MarkFilter::Any`). `marked liked` lists only the default mark.
    - **Decided:** `bookmark` and `bookmarks` are true CLI aliases of `mark` and `marked`. They take the same arguments. The old `--scope` option and the HASH argument are gone.
-   - **Decided:** `mark` and `unmark` act on the tracks whose hashes arrive on stdin (pipe style, like `sort` and `view`), or on the playing track when stdin is empty.
+   - **Decided (2026-11-09):** `mark` and `unmark` act on the tracks whose hashes arrive on stdin (pipe style, like `sort` and `view`). Piped means required: a non-TTY stdin with no hashes is an error ("No hashes provided on stdin."). The playing track is used only when stdin is a TTY.
 
 ### 2. Client-collected facts
 
@@ -185,8 +187,8 @@ Points marked **decided** were decided by Joakim. Everything else is **proposed*
 
 ## Phasing
 
-0. Fix #97: the library replies to unparseable requests.
-1. **Marks.** Add `MarkName`/`Mark`, `WriteMark` and `UnmarkTrack`, and replace `ListBookmarked` with `ListMarked`. Move the CLI and TUI over. This unblocks the #95 CLI step. Deploy to stage2, then prod. Phase 1 is no longer blocked on open questions.
+0. Fix #97: the library replies to unparseable requests. **Implemented on feature/marks.**
+1. **Marks. Implemented on feature/marks.** Add `MarkName`/`Mark`, `WriteMark` and `UnmarkTrack`, and replace `ListBookmarked` with `ListMarked`. Move the CLI and TUI over. This unblocks the #95 CLI step. Deploy to stage2, then prod. Phase 1 is no longer blocked on open questions.
 2. **Read-only replica.** Rebase `feature/offline-library-replica` onto develop, bringing the ADR-014 fold into `library_projection`. Add a read-only replica and cursor per node.
 3. **Client push:** the outbox, `PushFacts`, a marks-only whitelist and content dedup.
 4. **Cross-node:** merging across nodes, only if Open questions 4 is answered yes.
