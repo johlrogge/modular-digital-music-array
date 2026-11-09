@@ -1817,10 +1817,6 @@ impl LibraryService {
                 LibraryResponse::Tracks(tracks)
             }
 
-            LibraryRequest::ListBookmarked => {
-                LibraryResponse::Tracks(self.tracks_where(|t| t.has_mark(&MarkFilter::Any), None))
-            }
-
             LibraryRequest::ListMarked { filter } => {
                 LibraryResponse::Tracks(self.tracks_where(|t| t.has_mark(&filter), None))
             }
@@ -6225,133 +6221,11 @@ mod tests {
         }
     }
 
-    /// Hashes returned by `ListBookmarked`, sorted.
-    fn bookmarked_hashes(service: &LibraryService) -> Vec<String> {
-        sorted_hashes(service.handle_request(LibraryRequest::ListBookmarked))
-    }
-
     fn bookmark(scope: Option<&str>, ts: chrono::DateTime<Utc>) -> MusicValue {
         MusicValue::Bookmarked {
             scope: scope.map(str::to_owned),
             timestamp: ts,
         }
-    }
-
-    /// ListBookmarked returns only tracks with a live Bookmarked fact.
-    #[test]
-    fn list_bookmarked_returns_only_bookmarked_tracks() {
-        let marked = ContentHash::new("sha256:bookmarked01");
-        let plain = ContentHash::new("sha256:notbookmarked01");
-        let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let temp = write_facts_file_with_operations(&[
-            (
-                marked.clone(),
-                MusicValue::Title(Title::new("Marked")),
-                ts,
-                Operation::Assert,
-            ),
-            (marked.clone(), bookmark(None, ts), ts, Operation::Assert),
-            (
-                plain.clone(),
-                MusicValue::Title(Title::new("Plain")),
-                ts,
-                Operation::Assert,
-            ),
-        ]);
-        let (service, _metadata_dir) = make_service_with_facts(temp.path());
-
-        assert_eq!(
-            bookmarked_hashes(&service),
-            vec![marked.as_str().to_owned()]
-        );
-    }
-
-    /// ListBookmarked excludes hidden (deleted) tracks, like ListTracks.
-    #[test]
-    fn list_bookmarked_excludes_hidden_tracks() {
-        let hidden = ContentHash::new("sha256:bookmarkedhidden01");
-        let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let temp = write_facts_file_with_operations(&[
-            (
-                hidden.clone(),
-                MusicValue::Title(Title::new("Hidden")),
-                ts,
-                Operation::Assert,
-            ),
-            (hidden.clone(), bookmark(None, ts), ts, Operation::Assert),
-            (
-                hidden.clone(),
-                MusicValue::Deleted { timestamp: ts },
-                ts,
-                Operation::Assert,
-            ),
-        ]);
-        let (service, _metadata_dir) = make_service_with_facts(temp.path());
-
-        assert!(bookmarked_hashes(&service).is_empty());
-    }
-
-    /// A retracted bookmark no longer counts; the track itself stays live.
-    #[test]
-    fn list_bookmarked_excludes_retracted_bookmarks() {
-        let hash = ContentHash::new("sha256:bookmarkretracted01");
-        let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let ts2 = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
-        let temp = write_facts_file_with_operations(&[
-            (
-                hash.clone(),
-                MusicValue::Title(Title::new("Unmarked")),
-                ts,
-                Operation::Assert,
-            ),
-            (hash.clone(), bookmark(None, ts), ts, Operation::Assert),
-            (hash.clone(), bookmark(None, ts), ts2, Operation::Retract),
-        ]);
-        let (service, _metadata_dir) = make_service_with_facts(temp.path());
-
-        assert!(
-            service
-                .list_tracks(None)
-                .iter()
-                .any(|t| t.content_hash.as_str() == hash.as_str()),
-            "track must stay live after its bookmark is retracted"
-        );
-        assert!(bookmarked_hashes(&service).is_empty());
-    }
-
-    /// Scoped and unscoped bookmarks both count.
-    #[test]
-    fn list_bookmarked_counts_scoped_and_unscoped_bookmarks() {
-        let unscoped = ContentHash::new("sha256:bookmarkunscoped01");
-        let scoped = ContentHash::new("sha256:bookmarkscoped01");
-        let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let temp = write_facts_file_with_operations(&[
-            (
-                unscoped.clone(),
-                MusicValue::Title(Title::new("Any")),
-                ts,
-                Operation::Assert,
-            ),
-            (unscoped.clone(), bookmark(None, ts), ts, Operation::Assert),
-            (
-                scoped.clone(),
-                MusicValue::Title(Title::new("Set")),
-                ts,
-                Operation::Assert,
-            ),
-            (
-                scoped.clone(),
-                bookmark(Some("my-set"), ts),
-                ts,
-                Operation::Assert,
-            ),
-        ]);
-        let (service, _metadata_dir) = make_service_with_facts(temp.path());
-
-        assert_eq!(
-            bookmarked_hashes(&service),
-            vec![scoped.as_str().to_owned(), unscoped.as_str().to_owned()]
-        );
     }
 
     /// Hashes returned by `ListMarked` with `filter`, sorted.

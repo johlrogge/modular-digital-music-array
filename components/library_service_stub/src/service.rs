@@ -271,10 +271,6 @@ impl LibraryService {
                 LibraryResponse::Tracks(self.tracks_where(|_| true, limit))
             }
 
-            LibraryRequest::ListBookmarked => {
-                LibraryResponse::Tracks(self.tracks_where(|t| t.has_mark(&MarkFilter::Any), None))
-            }
-
             LibraryRequest::ListMarked { filter } => {
                 LibraryResponse::Tracks(self.tracks_where(|t| t.has_mark(&filter), None))
             }
@@ -891,11 +887,11 @@ mod tests {
     }
 
     fn bookmarked(svc: &LibraryService) -> Vec<String> {
-        sorted_hashes(svc.handle_request(LibraryRequest::ListBookmarked))
+        marked(svc, MarkFilter::Any)
     }
 
     #[test]
-    fn write_bookmark_makes_list_bookmarked_return_the_track() {
+    fn write_bookmark_makes_list_marked_return_the_track() {
         let svc = service_with_tracks(&["sha256:aaaa", "sha256:bbbb"]);
         assert!(bookmarked(&svc).is_empty());
         let resp = svc.handle_request(LibraryRequest::WriteBookmark {
@@ -1323,7 +1319,7 @@ mod tests {
     }
 
     #[test]
-    fn list_bookmarked_excludes_hidden_tracks() {
+    fn list_marked_excludes_hidden_tracks_marked_via_write_bookmark() {
         let svc = service_with_tracks(&["sha256:aaaa"]);
         let resp = svc.handle_request(LibraryRequest::WriteBookmark {
             hash: ContentHash::new("aaaa"),

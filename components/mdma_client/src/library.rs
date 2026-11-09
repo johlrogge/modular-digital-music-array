@@ -274,14 +274,6 @@ impl LibraryBackend {
         }
     }
 
-    /// List every visible track that carries a live bookmark, in one request.
-    pub fn list_bookmarked(&self) -> Result<Vec<TrackInfo>, ClientError> {
-        interpret_tracks(
-            self.request(&LibraryRequest::ListBookmarked)?,
-            "ListBookmarked",
-        )
-    }
-
     /// List every visible track that carries a live mark admitted by `filter`.
     pub fn list_marked(&self, filter: &MarkFilter) -> Result<Vec<TrackInfo>, ClientError> {
         interpret_tracks(
@@ -290,18 +282,6 @@ impl LibraryBackend {
             })?,
             "ListMarked",
         )
-    }
-
-    /// Write a bookmark fact for a track.
-    pub fn write_bookmark(
-        &self,
-        hash: &ContentHash,
-        scope: Option<String>,
-    ) -> Result<(), ClientError> {
-        interpret_bookmark_written(self.request(&LibraryRequest::WriteBookmark {
-            hash: hash.clone(),
-            scope,
-        })?)
     }
 
     /// Apply `mark` to a track, unless the track already carries it live.
@@ -604,14 +584,6 @@ fn interpret_playlist_ok(response: LibraryResponse) -> Result<(), ClientError> {
     }
 }
 
-fn interpret_bookmark_written(response: LibraryResponse) -> Result<(), ClientError> {
-    match response {
-        LibraryResponse::BookmarkWritten => Ok(()),
-        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
-        _ => Err(unexpected("WriteBookmark")),
-    }
-}
-
 fn interpret_mark_written(response: LibraryResponse) -> Result<MarkWrite, ClientError> {
     match response {
         LibraryResponse::MarkWritten(outcome) => Ok(outcome),
@@ -720,8 +692,8 @@ mod tests {
 
     #[test]
     fn interpret_tracks_names_the_operation_on_an_unexpected_response() {
-        let err = interpret_tracks(LibraryResponse::BookmarkWritten, "ListBookmarked").unwrap_err();
-        assert!(err.to_string().contains("ListBookmarked"), "{err}");
+        let err = interpret_tracks(LibraryResponse::BookmarkWritten, "ListMarked").unwrap_err();
+        assert!(err.to_string().contains("ListMarked"), "{err}");
     }
 
     #[test]
@@ -738,24 +710,6 @@ mod tests {
     #[test]
     fn interpret_ping_unexpected_variant_is_err() {
         assert!(interpret_ping(LibraryResponse::Tracks(vec![])).is_err());
-    }
-
-    #[test]
-    fn interpret_bookmark_written_ok() {
-        assert!(interpret_bookmark_written(LibraryResponse::BookmarkWritten).is_ok());
-    }
-
-    #[test]
-    fn interpret_bookmark_written_error_propagates() {
-        let err = LibraryResponse::Error(ProtocolError::Internal {
-            message: "fail".to_string(),
-        });
-        assert!(interpret_bookmark_written(err).is_err());
-    }
-
-    #[test]
-    fn interpret_bookmark_written_unexpected_variant_is_err() {
-        assert!(interpret_bookmark_written(LibraryResponse::Pong).is_err());
     }
 
     #[test]

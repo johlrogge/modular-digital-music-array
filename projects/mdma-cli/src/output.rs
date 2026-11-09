@@ -241,6 +241,7 @@ mod tests {
     use crate::test_support::*;
 
     use library_ipc_client::TrackInfo;
+    use mdma_client::{Mark, MarkFilter, MarkWrite, Unmark};
 
     use crate::output::terminal_width;
 
@@ -259,13 +260,12 @@ mod tests {
         assert_eq!(super::success_unless(false), hicli::Success::OK);
     }
 
-    fn banger() -> library_ipc_client::Mark {
+    fn banger() -> Mark {
         "banger".parse().expect("a valid mark")
     }
 
     #[test]
     fn mark_outcomes_name_the_mark() {
-        use library_ipc_client::{Mark, MarkWrite};
         assert_eq!(
             super::mark_outcome(&Mark::Default, MarkWrite::Written),
             "Marked liked."
@@ -282,7 +282,6 @@ mod tests {
 
     #[test]
     fn unmark_outcomes_name_the_mark() {
-        use library_ipc_client::{Mark, Unmark};
         let two = std::num::NonZeroUsize::new(2).unwrap();
         assert_eq!(
             super::unmark_outcome(&Mark::Default, Unmark::Retracted { count: two }),
@@ -296,7 +295,6 @@ mod tests {
 
     #[test]
     fn marked_texts_depend_on_the_filter() {
-        use library_ipc_client::MarkFilter;
         let only = MarkFilter::Only(banger());
         assert_eq!(
             super::marked_header(&MarkFilter::Any, 3),
