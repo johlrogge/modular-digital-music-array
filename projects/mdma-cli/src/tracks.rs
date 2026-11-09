@@ -1,14 +1,16 @@
-use crate::args::{choice, choice_names, impl_arg, parse_choice, Choice, OptTrackArg, TrackArg};
+use crate::args::{choice, choice_names, impl_arg, parse_choice, Choice, TrackArg};
 use crate::ctx::Ctx;
 use crate::output::{
-    display_error, format_track_line, library_error, print_tracks, terminal_width, PIPE_TERM_WIDTH,
+    format_track_line, library_error, mark_outcome, marked_header, no_marked_tracks, print_tracks,
+    success_unless, terminal_width, unmark_outcome, PIPE_TERM_WIDTH,
 };
-use crate::stdin::{read_hashes, require_stdin_hashes, resolve_tracks_skip_errors};
+use crate::stdin::{
+    hashes_from_pipe_or_playing, read_hashes, require_stdin_hashes, resolve_tracks_skip_errors,
+};
 use bpaf::{construct, long, positional, short, Parser};
-use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use hicli::Arg;
-use library_ipc_client::TrackInfo;
+use library_ipc_client::{ClientError, ContentHash, Mark, MarkFilter, MarkNameError, TrackInfo};
 use std::num::NonZeroUsize;
 use track_formatter::{render_for_user, short_hash, ViewColumn};
 
@@ -36,17 +38,42 @@ pub(crate) struct OptLimitArg(pub Option<LimitArg>);
 
 impl_arg!(OptLimitArg, optional LimitArg);
 
-/// Scope to associate a bookmark with (none: unscoped).
-// Stays a String: a scope is a free-form name with no domain rule.
+/// A mark, as typed: `liked` is the default mark, any other name a named mark.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OptScopeArg(pub Option<String>);
+pub(crate) struct MarkArg(pub Mark);
+
+impl std::str::FromStr for MarkArg {
+    type Err = MarkNameError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        s.parse().map(Self)
+    }
+}
 
 impl_arg!(
-    OptScopeArg,
-    optional_text long "scope",
-    "SCOPE",
-    "Optional scope — associate bookmark with a named set"
+    MarkArg,
+    positional "NAME",
+    "Mark name (`liked` is the default mark)"
 );
+
+/// An optional [`MarkArg`] (none: the default mark, or any mark when listing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OptMarkArg(pub Option<MarkArg>);
+
+impl_arg!(OptMarkArg, optional MarkArg);
+
+impl OptMarkArg {
+    /// The mark to apply: the one named, else the default mark.
+    fn mark(self) -> Mark {
+        self.0.map_or(Mark::Default, |MarkArg(mark)| mark)
+    }
+
+    /// The marks to list: the one named, else any.
+    fn filter(self) -> MarkFilter {
+        self.0
+            .map_or(MarkFilter::Any, |MarkArg(mark)| MarkFilter::Only(mark))
+    }
+}
 
 /// The columns `mdma view` shows, in the order their flags were typed; at least one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,46 +403,91 @@ pub(crate) fn sort(direction: SortDirection, field: SortField, ctx: &Ctx) -> Res
     Ok(())
 }
 
-/// Bookmark the currently playing track, or a specific track by hash
-#[hicli::command]
-pub(crate) fn bookmark(scope: OptScopeArg, hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
-    let OptScopeArg(scope) = scope;
-    let OptTrackArg(hash) = hash;
-    let library = ctx.library()?;
-    let playback = ctx.playback()?;
-    let content_hash = match hash {
-        Some(TrackArg(h)) => h,
-        None => playback
-            .now_playing()
-            .map_err(display_error)?
-            .ok_or_else(|| eyre!("Nothing is currently playing"))?,
-    };
-
-    library
-        .write_bookmark(&content_hash, scope)
-        .map_err(library_error)?;
-    println!("Bookmarked.");
-    Ok(())
+/// Run `act` on each of `hashes`, printing `{short_hash}  {line}` for each
+/// success to stdout and `{short_hash}  {error}` for each failure to stderr; the
+/// run fails when any track failed.
+fn for_each_track(
+    hashes: Vec<ContentHash>,
+    act: impl Fn(&ContentHash) -> Result<String, ClientError>,
+) -> hicli::Success {
+    let mut failed = false;
+    for hash in hashes {
+        match act(&hash) {
+            Ok(line) => println!("{}  {}", short_hash(&hash), line),
+            Err(e) => {
+                failed = true;
+                eprintln!("{}  {}", short_hash(&hash), library_error(e));
+            }
+        }
+    }
+    success_unless(failed)
 }
 
-/// List all bookmarked tracks
-#[hicli::command]
-pub(crate) fn bookmarks(ctx: &Ctx) -> Result<()> {
+/// Mark tracks (liked unless NAME is given)
+///
+/// Marks the tracks whose hashes are piped on stdin; run from a terminal without
+/// a pipe, marks the playing track. A track that already carries the mark is left
+/// as it is. Each output line starts with the track hash, so the output can be
+/// piped on.
+///
+/// Examples:
+///   mdma mark
+///   mdma search --artist CBL | mdma mark banger
+#[hicli::command(alias = "bookmark")]
+pub(crate) fn mark(name: OptMarkArg, ctx: &Ctx) -> Result<hicli::Success> {
+    let mark = name.mark();
     let library = ctx.library()?;
-    let bookmarked = library.list_bookmarked().map_err(library_error)?;
+    let hashes = hashes_from_pipe_or_playing(ctx)?;
+    Ok(for_each_track(hashes, |hash| {
+        library
+            .write_mark(hash, &mark)
+            .map(|outcome| mark_outcome(&mark, outcome))
+    }))
+}
 
-    if bookmarked.is_empty() {
+/// Remove a mark from tracks (liked unless NAME is given)
+///
+/// Unmarks the tracks whose hashes are piped on stdin; run from a terminal without
+/// a pipe, unmarks the playing track. A track without the mark is left as it is.
+///
+/// Examples:
+///   mdma unmark
+///   mdma marked banger | mdma unmark banger
+#[hicli::command]
+pub(crate) fn unmark(name: OptMarkArg, ctx: &Ctx) -> Result<hicli::Success> {
+    let mark = name.mark();
+    let library = ctx.library()?;
+    let hashes = hashes_from_pipe_or_playing(ctx)?;
+    Ok(for_each_track(hashes, |hash| {
+        library
+            .unmark(hash, &mark)
+            .map(|outcome| unmark_outcome(&mark, outcome))
+    }))
+}
+
+/// List marked tracks
+///
+/// Lists the tracks that carry the mark NAME, or any mark when NAME is left out;
+/// `mdma marked liked` lists only the default mark.
+///
+/// Examples:
+///   mdma marked
+///   mdma marked banger | mdma playlist new bangers
+#[hicli::command(alias = "bookmarks")]
+pub(crate) fn marked(name: OptMarkArg, ctx: &Ctx) -> Result<()> {
+    let filter = name.filter();
+    let library = ctx.library()?;
+    let tracks = library.list_marked(&filter).map_err(library_error)?;
+
+    if tracks.is_empty() {
         use std::io::IsTerminal;
         if std::io::stdout().is_terminal() {
-            println!("No bookmarked tracks");
+            println!("{}", no_marked_tracks(&filter));
         }
         return Ok(());
     }
 
-    print_tracks(
-        &bookmarked,
-        &format!("Bookmarked tracks ({})", bookmarked.len()),
-    );
+    print_tracks(&tracks, &marked_header(&filter, tracks.len()));
     Ok(())
 }
 
@@ -514,13 +586,65 @@ mod tests {
         assert!(run_arg::<LimitArg>(&[]).is_err());
     }
 
+    fn named(name: &str) -> Mark {
+        name.parse().expect("a valid mark")
+    }
+
     #[test]
-    fn opt_scope_arg_parser_is_an_optional_option() {
-        assert_eq!(run_arg::<OptScopeArg>(&[]), Ok(OptScopeArg(None)));
+    fn opt_mark_arg_parser_is_an_optional_positional_mark() {
+        assert_eq!(run_arg::<OptMarkArg>(&[]), Ok(OptMarkArg(None)));
         assert_eq!(
-            run_arg::<OptScopeArg>(&["--scope", "friday"]),
-            Ok(OptScopeArg(Some("friday".to_string())))
+            run_arg::<OptMarkArg>(&["Banger"]),
+            Ok(OptMarkArg(Some(MarkArg(named("banger")))))
         );
+        assert_eq!(
+            run_arg::<OptMarkArg>(&["LIKED"]),
+            Ok(OptMarkArg(Some(MarkArg(Mark::Default))))
+        );
+        let err = run_arg::<OptMarkArg>(&[""]).unwrap_err();
+        assert!(err.contains("mark name is empty"), "{err}");
+    }
+
+    #[test]
+    fn no_mark_name_means_the_default_mark_or_any_mark() {
+        assert_eq!(OptMarkArg(None).mark(), Mark::Default);
+        assert_eq!(OptMarkArg(None).filter(), MarkFilter::Any);
+        let banger = OptMarkArg(Some(MarkArg(named("banger"))));
+        assert_eq!(banger.clone().mark(), named("banger"));
+        assert_eq!(banger.filter(), MarkFilter::Only(named("banger")));
+    }
+
+    #[test]
+    fn mark_commands_reject_a_bad_name_as_a_usage_error() {
+        for cmd in ["mark", "unmark", "marked", "bookmark", "bookmarks"] {
+            assert!(
+                usage_error(&[cmd, ""]).contains("mark name is empty"),
+                "{cmd}"
+            );
+            let long = "x".repeat(65);
+            let e = usage_error(&[cmd, &long]);
+            assert!(e.contains("longer than 64 characters"), "{cmd}: {e}");
+        }
+    }
+
+    #[test]
+    fn mark_commands_without_a_connection_fail_cleanly() {
+        let ctx = crate::test_support::local_ctx();
+        for result in [
+            marked(OptMarkArg(None), &ctx),
+            marked(OptMarkArg(Some(MarkArg(Mark::Default))), &ctx),
+        ] {
+            assert!(result.is_err());
+        }
+        assert!(mark(OptMarkArg(None), &ctx).is_err());
+        assert!(unmark(OptMarkArg(None), &ctx).is_err());
+        for text in [
+            crate::test_support::failure_text(marked(OptMarkArg(None), &ctx)),
+            crate::test_support::failure_text(mark(OptMarkArg(None), &ctx)),
+            crate::test_support::failure_text(unmark(OptMarkArg(None), &ctx)),
+        ] {
+            assert!(text.starts_with("Failed to connect to library"), "{text}");
+        }
     }
 
     #[test]

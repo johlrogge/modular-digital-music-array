@@ -4,7 +4,9 @@
 use color_eyre::eyre::eyre;
 use colored::Colorize;
 use gateway_client::AdminResponse;
-use library_ipc_client::{ClientError, LibraryResponse, ProtocolError, TrackInfo};
+use library_ipc_client::{
+    ClientError, LibraryResponse, Mark, MarkFilter, MarkWrite, ProtocolError, TrackInfo, Unmark,
+};
 use nng_transport::ConnectionError;
 use source_protocol::{SourceError, SourceResponse};
 use track_formatter::{
@@ -131,6 +133,39 @@ pub fn library_error(err: ClientError) -> color_eyre::Report {
     eyre!("{}", text)
 }
 
+/// What `mdma mark` says about one track: `Marked liked.` or `Already marked liked.`
+pub fn mark_outcome(mark: &Mark, outcome: MarkWrite) -> String {
+    match outcome {
+        MarkWrite::Written => format!("Marked {mark}."),
+        MarkWrite::AlreadyLive => format!("Already marked {mark}."),
+    }
+}
+
+/// What `mdma unmark` says about one track: `Unmarked liked.` or `Not marked liked.`
+pub fn unmark_outcome(mark: &Mark, outcome: Unmark) -> String {
+    match outcome {
+        Unmark::Retracted { .. } => format!("Unmarked {mark}."),
+        Unmark::NotLive => format!("Not marked {mark}."),
+    }
+}
+
+/// The heading of `mdma marked`: `Marked tracks (3)` for any mark, `Tracks marked banger (3)`
+/// for one.
+pub fn marked_header(filter: &MarkFilter, count: usize) -> String {
+    match filter {
+        MarkFilter::Any => format!("Marked tracks ({count})"),
+        MarkFilter::Only(mark) => format!("Tracks marked {mark} ({count})"),
+    }
+}
+
+/// What `mdma marked` says on a terminal when no track matches `filter`.
+pub fn no_marked_tracks(filter: &MarkFilter) -> String {
+    match filter {
+        MarkFilter::Any => "No marked tracks".to_string(),
+        MarkFilter::Only(mark) => format!("No tracks marked {mark}"),
+    }
+}
+
 /// The failure whose message is exactly `err`'s text (without hicli's `Error: ` prefix).
 pub fn display_error(err: impl std::fmt::Display) -> color_eyre::Report {
     eyre!("{err}")
@@ -223,6 +258,57 @@ mod tests {
     fn a_report_with_failures_ends_with_exit_code_one() {
         assert_eq!(super::success_unless(true), hicli::Success::code(1));
         assert_eq!(super::success_unless(false), hicli::Success::OK);
+    }
+
+    fn banger() -> library_ipc_client::Mark {
+        "banger".parse().expect("a valid mark")
+    }
+
+    #[test]
+    fn mark_outcomes_name_the_mark() {
+        use library_ipc_client::{Mark, MarkWrite};
+        assert_eq!(
+            super::mark_outcome(&Mark::Default, MarkWrite::Written),
+            "Marked liked."
+        );
+        assert_eq!(
+            super::mark_outcome(&Mark::Default, MarkWrite::AlreadyLive),
+            "Already marked liked."
+        );
+        assert_eq!(
+            super::mark_outcome(&banger(), MarkWrite::Written),
+            "Marked banger."
+        );
+    }
+
+    #[test]
+    fn unmark_outcomes_name_the_mark() {
+        use library_ipc_client::{Mark, Unmark};
+        let two = std::num::NonZeroUsize::new(2).unwrap();
+        assert_eq!(
+            super::unmark_outcome(&Mark::Default, Unmark::Retracted { count: two }),
+            "Unmarked liked."
+        );
+        assert_eq!(
+            super::unmark_outcome(&banger(), Unmark::NotLive),
+            "Not marked banger."
+        );
+    }
+
+    #[test]
+    fn marked_texts_depend_on_the_filter() {
+        use library_ipc_client::MarkFilter;
+        let only = MarkFilter::Only(banger());
+        assert_eq!(
+            super::marked_header(&MarkFilter::Any, 3),
+            "Marked tracks (3)"
+        );
+        assert_eq!(super::marked_header(&only, 1), "Tracks marked banger (1)");
+        assert_eq!(
+            super::no_marked_tracks(&MarkFilter::Any),
+            "No marked tracks"
+        );
+        assert_eq!(super::no_marked_tracks(&only), "No tracks marked banger");
     }
 
     fn make_track(artist: &str, title: &str, duration_secs: u32) -> TrackInfo {

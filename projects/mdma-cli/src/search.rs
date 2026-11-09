@@ -1,7 +1,7 @@
 use crate::args::{choice, impl_arg, parse_choice, Choice};
 use crate::ctx::Ctx;
 use crate::output::{library_error, print_tracks};
-use crate::stdin::read_hashes;
+use crate::stdin::piped_hashes;
 use bpaf::{long, Bpaf, Parser};
 use color_eyre::Result;
 use hicli::Arg;
@@ -391,11 +391,7 @@ fn search_tracks(library: &LibraryBackend, query: &TrackQuery, no_stdin: bool) -
 
     // When stdin is piped (and --no-stdin is not set), read the hashes in it (the same
     // rule as hashes given as arguments) as an intersection filter.
-    let stdin_filter: Option<Vec<ContentHash>> = if !no_stdin && !std::io::stdin().is_terminal() {
-        Some(read_hashes())
-    } else {
-        None
-    };
+    let stdin_filter: Option<Vec<ContentHash>> = if no_stdin { None } else { piped_hashes()? };
 
     // When stdin hashes are present and --not is set, we invert the intersection rather
     // than the library query: send the query without `.not` (so the library returns a
