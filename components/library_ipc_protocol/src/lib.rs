@@ -16,6 +16,7 @@ pub use library_search::{
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::num::NonZeroUsize;
 use thiserror::Error;
 
 // ============================================================================
@@ -360,6 +361,10 @@ pub enum LibraryRequest {
     /// Answered with `LibraryResponse::MarkWritten`.
     WriteMark { hash: ContentHash, mark: Mark },
 
+    /// Retract every live assertion of a mark on a track.
+    /// Answered with `LibraryResponse::TrackUnmarked`.
+    UnmarkTrack { hash: ContentHash, mark: Mark },
+
     /// Write a single fact for a track. Used for importing metadata from external sources.
     WriteFact { hash: ContentHash, fact: MusicValue },
 
@@ -508,6 +513,9 @@ pub enum LibraryResponse {
 
     /// Answer to `WriteMark`.
     MarkWritten(MarkWrite),
+
+    /// Answer to `UnmarkTrack`.
+    TrackUnmarked(Unmark),
 
     /// Fact written successfully.
     FactWritten,
@@ -715,6 +723,16 @@ pub enum MarkWrite {
     /// The track already carried the mark live; nothing was written and the
     /// original time is kept.
     AlreadyLive,
+}
+
+/// Outcome of `UnmarkTrack`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Unmark {
+    /// The mark was live and has been retracted; `count` live assertions were
+    /// retracted (more than one when a merge or an older library carried several).
+    Retracted { count: NonZeroUsize },
+    /// The track did not carry the mark live; nothing was changed.
+    NotLive,
 }
 
 /// One track of a duplicate group.
@@ -1309,6 +1327,77 @@ mod tests {
                 other => panic!("unexpected variant {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn unmark_track_wire_format_is_pinned() {
+        for (mark, expected) in [
+            (
+                Mark::Default,
+                r#"{"type":"UnmarkTrack","hash":"sha256:abc","mark":"Default"}"#,
+            ),
+            (
+                named("banger"),
+                r#"{"type":"UnmarkTrack","hash":"sha256:abc","mark":{"Named":"banger"}}"#,
+            ),
+        ] {
+            let json = serde_json::to_string(&LibraryRequest::UnmarkTrack {
+                hash: ContentHash::new("sha256:abc"),
+                mark: mark.clone(),
+            })
+            .unwrap();
+            assert_eq!(json, expected);
+            match parse_request(json.as_bytes()).unwrap() {
+                LibraryRequest::UnmarkTrack {
+                    hash,
+                    mark: decoded,
+                } => {
+                    assert_eq!(hash.as_str(), "sha256:abc");
+                    assert_eq!(decoded, mark);
+                }
+                other => panic!("unexpected variant {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unmark_track_with_an_invalid_mark_name_is_an_invalid_request() {
+        let err =
+            parse_request(br#"{"type":"UnmarkTrack","hash":"sha256:abc","mark":{"Named":""}}"#)
+                .unwrap_err();
+        assert!(
+            matches!(err, ProtocolError::InvalidRequest { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn track_unmarked_wire_format_is_pinned() {
+        for (outcome, expected) in [
+            (
+                Unmark::Retracted {
+                    count: NonZeroUsize::new(2).unwrap(),
+                },
+                r#"{"type":"TrackUnmarked","data":{"Retracted":{"count":2}}}"#,
+            ),
+            (
+                Unmark::NotLive,
+                r#"{"type":"TrackUnmarked","data":"NotLive"}"#,
+            ),
+        ] {
+            let json = serde_json::to_string(&LibraryResponse::TrackUnmarked(outcome)).unwrap();
+            assert_eq!(json, expected);
+            match serde_json::from_str::<LibraryResponse>(&json).unwrap() {
+                LibraryResponse::TrackUnmarked(decoded) => assert_eq!(decoded, outcome),
+                other => panic!("unexpected variant {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn track_unmarked_with_a_zero_count_fails_to_decode() {
+        let json = r#"{"type":"TrackUnmarked","data":{"Retracted":{"count":0}}}"#;
+        assert!(serde_json::from_str::<LibraryResponse>(json).is_err());
     }
 
     #[test]
