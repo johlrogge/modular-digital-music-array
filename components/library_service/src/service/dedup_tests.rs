@@ -1,6 +1,6 @@
 //! Tests of the duplicate scan and merge (ADR-013), against an in-process ACID server.
 
-use super::dedup::{dedup_fact_source, live_facts};
+use super::dedup::{dedup_fact_source, live_facts, same_member};
 use super::tests::{
     identity_facts_in_acid, make_empty_service, make_service_with_playlists_dir, replaces_targets,
     retire, run_backfill, user_source, write_test_wav, FIXTURE_S16_L8, FIXTURE_S16_L8_TAGS,
@@ -368,6 +368,20 @@ fn an_older_loser_fact_does_not_override_the_winners_newer_one() {
         Some(120.0)
     );
     assert_eq!(count_in_acid(&service, &new, &bpm(128.0)), 0);
+}
+
+#[test]
+fn bookmarks_are_the_same_member_when_they_carry_the_same_mark() {
+    let bm = |scope: Option<&str>, d| MusicValue::Bookmarked {
+        scope: scope.map(str::to_owned),
+        timestamp: day(d),
+    };
+    assert!(same_member(&bm(Some("Banger"), 1), &bm(Some("banger"), 2)));
+    assert!(same_member(&bm(None, 1), &bm(Some("liked"), 2)));
+    assert!(!same_member(&bm(None, 1), &bm(Some("banger"), 1)));
+    // Legacy scopes compare by raw text.
+    assert!(same_member(&bm(Some(""), 1), &bm(Some(""), 2)));
+    assert!(!same_member(&bm(Some(""), 1), &bm(Some("  "), 1)));
 }
 
 #[test]

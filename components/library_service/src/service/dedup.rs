@@ -144,12 +144,11 @@ fn carry_rule(v: &MusicValue) -> CarryRule {
 }
 
 /// Members of a multi-valued attribute are the same when they are equal; a
-/// bookmark is the same bookmark when it has the same scope.
-fn same_member(a: &MusicValue, b: &MusicValue) -> bool {
-    match (a, b) {
-        (MusicValue::Bookmarked { scope: x, .. }, MusicValue::Bookmarked { scope: y, .. }) => {
-            x == y
-        }
+/// bookmark is the same bookmark when it carries the same mark (legacy scopes
+/// compare by their raw text).
+pub(super) fn same_member(a: &MusicValue, b: &MusicValue) -> bool {
+    match (a.stored_mark(), b.stored_mark()) {
+        (Some(x), Some(y)) => x == y,
         _ => a == b,
     }
 }
