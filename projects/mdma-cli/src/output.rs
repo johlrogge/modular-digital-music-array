@@ -112,6 +112,9 @@ pub fn request_failed(what: &str, err: &dyn std::fmt::Display) -> color_eyre::Re
     eyre!("Request to {what} failed: {err}")
 }
 
+const UPGRADE_NODE_TEXT: &str =
+    "The node did not understand this request; it may be older than this CLI — upgrade the node.";
+
 /// The failure for a library client error (without hicli's `Error: ` prefix).
 pub fn library_error(err: ClientError) -> color_eyre::Report {
     let text = match err {
@@ -121,6 +124,7 @@ pub fn library_error(err: ClientError) -> color_eyre::Report {
         ClientError::Protocol(ProtocolError::InboxFileNotFound { path }) => {
             format!("Inbox file not found: {}", path)
         }
+        e if e.is_unsupported_request() => UPGRADE_NODE_TEXT.to_string(),
         ClientError::Protocol(e) => e.to_string(),
         e => e.to_string(),
     };
@@ -375,6 +379,14 @@ mod tests {
             name: "mix".to_string(),
         });
         assert_eq!(lib_text(err), "playlist not found: mix");
+    }
+
+    #[test]
+    fn library_invalid_request_text_says_to_upgrade_the_node() {
+        let err = ClientError::Protocol(ProtocolError::InvalidRequest {
+            message: "unknown variant".to_string(),
+        });
+        assert_eq!(lib_text(err), super::UPGRADE_NODE_TEXT);
     }
 
     #[test]
