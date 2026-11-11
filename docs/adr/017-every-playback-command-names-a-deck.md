@@ -4,7 +4,7 @@
 
 Proposed, 2026-11-10
 
-Amends ADR-014 §9 (play events are asserts-only and unpaired; a merge keeps them, as §9 says, and the code now does the same) and makes a one-off exception to ADR-001's append-only log (§6). Builds on ADR-001 (append-only log), ADR-004 (readers redeploy together), ADR-009 (gateway compatibility) and ADR-016 §5 (upgrade message for old nodes). Adopts the identity rule of stainless_facts ADR-001 (johlrogge/stainless_facts#15). Related: the separate change that makes MDMA's fold source-blind.
+Amends ADR-014 §9 (play events are asserts-only and unpaired; a merge keeps them, as §9 says, and the code now does the same) and makes a one-off exception to ADR-001's append-only log (§6). Builds on ADR-001 (append-only log), ADR-004 (readers redeploy together), ADR-009 (gateway compatibility) and ADR-016 §5 (upgrade message for old nodes). Adopts the identity rule of stainless_facts ADR-001 (johlrogge/stainless_facts#15). Related: ADR-018 (a retract matches value and source identity).
 
 ## Context
 
@@ -156,8 +156,11 @@ Points marked **Decided** were decided by Joakim. Everything else is **Proposed*
 ### 6. Rewrite legacy plays in place (one-off migration)
 
 1. **Decided:** legacy plays are rewritten in place, while MDMA has no other users. One play shape in the code beats keeping two forever.
-2. **Scope.** Every line whose value tag is `TrackStarted`, `TrackStopped`, `Played` or `Skipped`, Assert and Retract alike. No other line changes. On stage2 that is 1,466 of 22,959 lines.
-3. **One line in, one line out.** Each line keeps its entity, ACID timestamp, source, operation and position; only the value changes. Line count and order are unchanged, so every `line:<n>` position still points at the same fact. Nothing persists such a position today:
+2. **Scope.** Two generic rules, applied in the same run because the log is rewritten only once (§6.10):
+   - **Plays.** Every line whose value tag is `TrackStarted`, `TrackStopped`, `Played` or `Skipped`, Assert and Retract alike, gets its value rewritten. On stage2 that is 1,466 of 22,959 lines.
+   - **Origin data (ADR-018).** Every line's `source.origin` is reduced to `{"type": <old type>}`: the `data` part is stripped. `tool`, `version` and `origin.type` are kept. The rule is the same for all lines and has no source-specific logic. On stage2 only FilesystemScan carries data (15,766 lines), but the tool does not know that.
+   - No other part of any line changes. Deserialization does not learn the old origin shapes.
+3. **One line in, one line out.** Each line keeps its entity, ACID timestamp, tool, version, origin type, operation and position; only the value (plays) and the origin data change. Line count and order are unchanged, so every `line:<n>` position still points at the same fact. Nothing persists such a position today:
    - the library keeps `cursor` and `event_cursor` in memory, starting from None (service.rs:72-82), and ignores the legacy `facts.cursor` file (service.rs:4714-4717);
    - ACID reads the file on every request (fact_store_file/src/storage.rs:56-80);
    - there are no replicas yet (ADR-016 §2).
@@ -194,7 +197,8 @@ Points marked **Decided** were decided by Joakim. Everything else is **Proposed*
    1. Stop ACID, library and playback. Writers that go through them fail meanwhile; nothing is lost.
    2. Back up `facts.jsonl` next to the original, and keep the backup.
    3. Run the migration tool, which writes a new file and verifies it:
-      - same line count, and non-play lines byte-identical;
+      - same line count; every line has the same entity, value (non-play lines), timestamp, operation, tool and version, with origin equal to `{"type": old.origin.type}`;
+      - no origin has a `data` key afterwards;
       - every new line parses;
       - (entity, tag, `at`) is unique among assertions;
       - every retract matched as reported (stage2: 28 of 28);
@@ -211,7 +215,7 @@ Points marked **Decided** were decided by Joakim. Everything else is **Proposed*
 
 - **One addressing rule for every command.** Today the deck is required on some commands, ignored on others and missing from the rest. A request for B that plays A is a charade.
 - **An optional deck plus bare-string acceptance** lets old CLIs, TUIs and consoles keep working against a new node, and makes the later tightening one visible step.
-- **Unique event values** follow from the adopted identity rule. An event can be retracted exactly, and history no longer depends on `FactSource`, which the source-blind fold ignores.
+- **Unique event values** follow from the adopted identity rule. An event can be retracted exactly, and history no longer depends on the version or origin payload in `FactSource`; a retract matches value and source identity (ADR-018).
 - **Isolated events** (decided) record only what happened: a start or a stop was sent. Legacy logs show why pairing is unsound: stops with no start, repeated starts without a stop, and bursts of stops for tracks that started days earlier.
 - **`at` as identity** (decided) needs no id type and no dependency. Uniqueness is only needed per node, because only playback writes play events.
 - **Plays survive a merge** (decided) because ADR-014 §9 says so, and a merge that erased a copy's history would lose what the user listened to. The 28 existing retracts are neutralised for the same reason.
@@ -257,7 +261,8 @@ Points marked **Decided** were decided by Joakim. Everything else is **Proposed*
 - **Compatibility:**
   - Old clients against a new node keep working (optional deck, bare strings).
   - A new client against an old node gets "Invalid request" or "invalid command". It shows ADR-016 §5's upgrade message, with no fallback.
-- **Log:** rewritten once, for play lines only (§6), with the same line count and positions. Append-only otherwise. One line per start or stop, as today.
+- **Unparseable lines are no longer silent.** The library warns and counts lines it cannot parse, at startup and while tailing. Today they are dropped without a word (`parse_fact_line` uses `.ok()`), so a broken deploy order would quietly empty the library. This ships in the same node release as the readers and the migration (Phasing 3).
+- **Log:** rewritten once, for play values and origin data (§6), with the same line count and positions. Append-only otherwise. One line per start or stop, as today.
 - **History:** no play leaves history. A merge keeps the merged-away copy's plays (§3.9), and the 28 existing merge retracts cancel nothing (§6.7). Old plays with no recorded reason read as `NotRecorded`, not `OnRequest`.
 - **Migration downtime:** ACID, library and playback stop on each node while the tool runs. A backup of `facts.jsonl` is kept.
 - **Tightening (phase 5) is breaking.** Clients that omit the deck, and bare-string commands, are rejected. Do it only after every deployed client sends the deck.
@@ -283,13 +288,12 @@ Points marked **Decided** were decided by Joakim. Everything else is **Proposed*
 3. **New play facts.**
    - Add `PlayStarted`, `PlayStopped`, the `NotRecorded` reasons and the tolerant read types for deck and reasons.
    - Playback writes `at` and `Deck::A`.
-   - In the same node release: the readers of the new shapes (see Consequences), `deck` on events, `retract_all_entity_facts_locked` skipping play events (§3.9) and the migration tool (§6). Legacy play code is removed.
+   - In the same node release: the readers of the new shapes (see Consequences), the warning and counting of unparseable lines (Consequences), `deck` on events, `retract_all_entity_facts_locked` skipping play events (§3.9) and the migration tool (§6). Legacy play code is removed.
    - Deploy per node: stop the services, migrate (§6.9), start the new release. Stage2 first, then prod.
 4. **Readers move into the ADR-014 fold.** Play events fold as a union keyed by (origin entity, value), with the origin entity in the key so that two copies' events never merge. Retracts are honoured, and the play count is added.
 5. **Later: tighten.** The deck becomes required, and bare-string and absent-deck forms are rejected. This is breaking and needs its own release note.
 
 ## Related
 
-- ADR-001, ADR-004, ADR-009, ADR-014 (§9 amended), ADR-016 (§5 upgrade message; §2 replica cursors)
+- ADR-001, ADR-004, ADR-009, ADR-014 (§9 amended), ADR-016 (§5 upgrade message; §2 replica cursors), ADR-018 (retract matching)
 - stainless_facts ADR-001: assertion identity is (entity, value) (johlrogge/stainless_facts#15)
-- The source-blind fold change (separate)
