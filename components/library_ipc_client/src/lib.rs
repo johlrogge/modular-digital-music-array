@@ -388,8 +388,9 @@ impl LibraryClient {
         }
     }
 
-    /// Retract all facts whose `FactSource.tool` matches `source_name` for every
-    /// content hash that has an `ItemId` fact equal to `item_id`.
+    /// Retract the live facts that the source named `source_name` wrote (matched
+    /// against the fact's origin) for every content hash that has an `ItemId` fact
+    /// equal to `item_id`. A value another origin also asserts stays (ADR-018).
     ///
     /// Retracted attributes: Album, Title, Artist, TrackNumber, Year.
     /// ItemId itself is intentionally NOT retracted.

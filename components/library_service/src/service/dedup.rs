@@ -41,8 +41,11 @@ pub(super) struct LiveFact {
 }
 
 /// The assertions of an entity that no later retraction has cancelled, in stream
-/// order. A retraction cancels the first assertion with the same value and source,
-/// exactly like the in-memory projection does.
+/// order. A retraction cancels every earlier assertion with an equal value and the
+/// same source (`FactSource::same_source`), through the same `remove_cancelled` the
+/// in-memory projection uses. That holds for provenance-tracked values only: in memory
+/// the retracts of TrackStarted, TrackStopped, FilePath and AddedAt are ignored,
+/// whereas this replay cancels them too.
 pub(super) fn live_facts(lines: &[String]) -> Vec<LiveFact> {
     let mut live: Vec<LiveFact> = Vec::new();
     for line in lines {
@@ -56,12 +59,7 @@ pub(super) fn live_facts(lines: &[String]) -> Vec<LiveFact> {
                 timestamp: *f.timestamp(),
             }),
             Operation::Retract => {
-                if let Some(i) = live
-                    .iter()
-                    .position(|l| &l.value == f.value() && &l.source == f.source())
-                {
-                    live.remove(i);
-                }
+                remove_cancelled(&mut live, f.value(), f.source(), |l| (&l.value, &l.source));
             }
         }
     }

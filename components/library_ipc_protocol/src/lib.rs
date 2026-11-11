@@ -367,8 +367,10 @@ pub enum LibraryRequest {
     /// Retract a single fact for a track. Used for removing manually-added metadata.
     RetractFact { hash: ContentHash, fact: MusicValue },
 
-    /// Retract all facts whose FactSource.source_name matches `source_name` for every
-    /// ContentHash that has an ItemId fact equal to `item_id`.
+    /// Retract the live Album, Title, Artist, TrackNumber and Year facts that the source
+    /// named `source_name` wrote (matched against the fact's origin) for every
+    /// ContentHash that has an ItemId fact equal to `item_id`. Another origin's
+    /// assertion of the same value stays (a retract matches value and source, ADR-018).
     RetractSourceFacts {
         item_id: String,
         source_name: String,
@@ -724,8 +726,9 @@ pub enum MarkWrite {
 /// Outcome of `UnmarkTrack`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Unmark {
-    /// The mark was live and has been retracted; `count` live assertions were
-    /// retracted (more than one when a merge or an older library carried several).
+    /// The mark was live and has been retracted; `count` retracts were written (more
+    /// than one when a merge or an older library carried several distinct values or
+    /// sources).
     Retracted { count: NonZeroUsize },
     /// The track did not carry the mark live; nothing was changed.
     NotLive,

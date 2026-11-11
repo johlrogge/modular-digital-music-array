@@ -588,12 +588,22 @@ impl LibraryService {
         })
     }
 
-    /// Remove every live assertion of `mark` from a track.
+    /// Remove every live assertion of `mark` from a track. `count` is the number of
+    /// distinct values removed, like the real service's one retract per value (the
+    /// stub keeps no sources).
     fn unmark(&self, hash: &ContentHash, mark: &Mark) -> Result<Unmark, ProtocolError> {
         self.try_with_track(hash, |track| {
-            let before = track.bookmarks.len();
-            track.bookmarks.retain(|v| !mark.matches(v));
-            NonZeroUsize::new(before - track.bookmarks.len())
+            let mut removed: Vec<MusicValue> = Vec::new();
+            track.bookmarks.retain(|v| {
+                if !mark.matches(v) {
+                    return true;
+                }
+                if !removed.contains(v) {
+                    removed.push(v.clone());
+                }
+                false
+            });
+            NonZeroUsize::new(removed.len())
                 .map_or(Unmark::NotLive, |count| Unmark::Retracted { count })
         })
     }
@@ -738,13 +748,12 @@ fn apply_fact(entry: &mut IndexedTrack, value: &MusicValue) {
     }
 }
 
-/// Apply a loaded retraction. Only bookmarks honour it: the first equal value is
-/// removed. Every other retraction is skipped.
+/// Apply a loaded retraction. Only bookmarks honour it: every equal value is removed. The real service also requires the same
+/// source (ADR-018); the stub keeps no sources, so it matches by value alone. Every
+/// other retraction is skipped.
 fn retract_fact(entry: &mut IndexedTrack, value: &MusicValue) {
     if let MusicValue::Bookmarked { .. } = value {
-        if let Some(i) = entry.bookmarks.iter().position(|b| b == value) {
-            entry.bookmarks.remove(i);
-        }
+        entry.bookmarks.retain(|b| b != value);
     }
 }
 

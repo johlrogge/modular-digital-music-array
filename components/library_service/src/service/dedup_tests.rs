@@ -385,6 +385,47 @@ fn bookmarks_are_the_same_member_when_they_carry_the_same_mark() {
 }
 
 #[test]
+fn live_facts_retract_cancels_every_equal_value_of_the_same_source_only() {
+    let h = hash("live_facts_retract");
+    let line = |source: FactSource, op| {
+        serde_json::to_string(&stainless_facts::Fact::new(
+            h.clone(),
+            album("X"),
+            day(1),
+            source,
+            op,
+        ))
+        .unwrap()
+    };
+    // s1 and s3 are two versions of one source, s2 is another source.
+    let s1 = FactSource::new("tool-1", "0.1.0", FactOrigin::Unknown);
+    let s2 = FactSource::new("tool-2", "1.0.0", FactOrigin::Unknown);
+    let s3 = FactSource::new("tool-1", "9.9.9", FactOrigin::Unknown);
+    let other = serde_json::to_string(&stainless_facts::Fact::new(
+        h.clone(),
+        album("Y"),
+        day(1),
+        s1.clone(),
+        stainless_facts::Operation::Assert,
+    ))
+    .unwrap();
+
+    let lines = vec![
+        line(s1.clone(), stainless_facts::Operation::Assert),
+        line(s1.clone(), stainless_facts::Operation::Assert),
+        line(s2.clone(), stainless_facts::Operation::Assert),
+        other,
+        line(s3, stainless_facts::Operation::Retract),
+    ];
+    let live: Vec<(MusicValue, FactSource)> = live_facts(&lines)
+        .into_iter()
+        .map(|l| (l.value, l.source))
+        .collect();
+    // Both tool-1 assertions of X are gone; tool-2's X and tool-1's Y stay.
+    assert_eq!(live, vec![(album("X"), s2), (album("Y"), s1)]);
+}
+
+#[test]
 fn multi_valued_facts_are_united_without_duplicates() {
     let (service, _d, _acid) = make_empty_service();
     let cue = |ms| MusicValue::MemoryCue {
