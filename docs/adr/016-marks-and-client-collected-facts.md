@@ -56,7 +56,7 @@ Points marked **decided** were decided by Joakim. Everything else is **proposed*
    - `scope: None` is the *default mark*: today's bookmark. **Decided:** it is called "liked".
    - `scope: Some(name)` is the named mark `name`.
    - A track holds a set of marks. Each mark name is on or off independently, and names never override one another: a track can be both "banger" and "liked".
-   - Normally a name has one live entry. This is not an invariant (merges, older libraries): one name may have several live entries, and they count as one mark. Readers treat a name with any live entry as marked. Unmarking a name retracts every live entry of that name (each matched exactly by value and source) and leaves all other names untouched.
+   - Normally a name has one live entry. This is not an invariant (merges, older libraries): one name may have several live entries, and they count as one mark. Readers treat a name with any live entry as marked. Unmarking a name retracts every live entry of that name (each matched by value and source identity (ADR-018)) and leaves all other names untouched.
    - Existing facts are already marks. The immutable log is never rewritten.
 2. **Mark names are validated at the edges, not in storage.**
    - `MarkName` is a newtype in music_facts: trimmed, non-empty, at most 64 characters, no control characters. It is otherwise lenient, following ADR-015's "names may be lenient".

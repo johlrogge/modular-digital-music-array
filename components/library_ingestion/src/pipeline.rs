@@ -7,7 +7,7 @@
 //! InboxFile → ValidatedAudio → ExtractedTrack → IndexedTrack
 //! ```
 
-use music_facts::{ContentHash, FactSource, MusicValue};
+use music_facts::{ContentHash, FactOrigin, FactSource, MusicValue};
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -47,6 +47,23 @@ pub enum UploadSource {
     BandcampDownload { artist_url: Option<String> },
     /// Extracted from Beatport zip
     BeatportZip { order_id: Option<String> },
+}
+
+impl UploadSource {
+    /// The origin this source declares for the facts of its ingest, if it declares
+    /// one. A Bandcamp download says so itself, so its origin is taken from the
+    /// request and never guessed from the path; the payload (`artist_url`) is left
+    /// empty on purpose, origin data is being phased out. This is the only place
+    /// that decision lives. `None` means undeclared: the tag facts then infer their
+    /// origin from the file (see `fact_generator`).
+    pub fn declared_origin(&self) -> Option<FactOrigin> {
+        match self {
+            UploadSource::BandcampDownload { .. } => Some(FactOrigin::bandcamp(None)),
+            UploadSource::NetworkShare
+            | UploadSource::HttpUpload
+            | UploadSource::BeatportZip { .. } => None,
+        }
+    }
 }
 
 /// Supported audio formats
@@ -156,9 +173,23 @@ pub struct ValidatedAudio {
 impl ValidatedAudio {
     /// Extract metadata from the audio file
     /// Consumes self, transferring ownership to ExtractedTrack
-    pub fn extract_metadata(self) -> Result<ExtractedTrack, IngestError> {
+    ///
+    /// `tool` and `version` identify the writer. The origin of the facts is decided
+    /// here from `self.source` (see `UploadSource::declared_origin`), not passed in.
+    pub fn extract_metadata(
+        self,
+        tool: &str,
+        version: &str,
+    ) -> Result<ExtractedTrack, IngestError> {
         // Only read metadata, not audio data
-        let facts = extract_facts(&self.path, &self.content_hash, self.format)?;
+        let facts = crate::fact_generator::generate_facts(
+            &self.path,
+            &self.content_hash,
+            self.format,
+            &self.source,
+            tool,
+            version,
+        )?;
 
         Ok(ExtractedTrack {
             path: self.path,
@@ -250,15 +281,6 @@ fn compute_hash(path: &std::path::Path) -> Result<ContentHash, IngestError> {
     let result = hasher.finalize();
     let hash_string = hex::encode(result);
     Ok(ContentHash::new(format!("sha256:{}", hash_string)))
-}
-
-/// Extract metadata facts from audio file
-fn extract_facts(
-    path: &std::path::Path,
-    content_hash: &ContentHash,
-    format: AudioFormat,
-) -> Result<Vec<(MusicValue, FactSource)>, IngestError> {
-    crate::fact_generator::generate_facts(path, content_hash, format)
 }
 
 /// Create human-readable symlink in by-artist directory

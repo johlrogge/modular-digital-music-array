@@ -114,4 +114,36 @@ impl FactSource {
             origin,
         }
     }
+
+    /// Whether `other` is the same source: the same `tool` and the same kind of
+    /// origin. `version` and the origin's payload (scan time, URLs, ids) are
+    /// ignored, because a new version of a source is not a different source.
+    ///
+    /// A retract cancels assertions of the same source this way (ADR-018), so a
+    /// fact written by an older version, or with a different scan time, can still
+    /// be retracted. The derived `PartialEq` stays the strict, field-by-field
+    /// comparison.
+    pub fn same_source(&self, other: &FactSource) -> bool {
+        self.tool == other.tool
+            && std::mem::discriminant(&self.origin) == std::mem::discriminant(&other.origin)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn same_source_ignores_version_and_origin_payload() {
+        let at = |h| Utc.with_ymd_and_hms(2026, 1, 1, h, 0, 0).unwrap();
+        let scan = |h| FactOrigin::FilesystemScan {
+            scan_time: at(h),
+            inferred_source: None,
+        };
+        let a = FactSource::new("tool", "1.0.0", scan(1));
+        assert!(a.same_source(&FactSource::new("tool", "2.0.0", scan(2))));
+        assert!(!a.same_source(&FactSource::new("other", "1.0.0", scan(1))));
+        assert!(!a.same_source(&FactSource::new("tool", "1.0.0", FactOrigin::User)));
+    }
 }

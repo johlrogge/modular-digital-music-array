@@ -10,7 +10,7 @@ use music_primitives::{Bpm, Key};
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::pipeline::{AudioFormat, IngestError};
+use crate::pipeline::{AudioFormat, IngestError, UploadSource};
 
 impl From<AudioFormat> for MusicFormat {
     fn from(fmt: AudioFormat) -> Self {
@@ -24,23 +24,32 @@ impl From<AudioFormat> for MusicFormat {
     }
 }
 
-/// Generate facts from audio file metadata
+/// Generate facts from audio file metadata, all stamped with one source: the writer's
+/// `tool` and `version`, and the origin decided here and nowhere else. An upload
+/// source that declares its origin (`UploadSource::declared_origin`) gives it;
+/// otherwise the origin is inferred from the file's path and comment, as a plain
+/// filesystem scan does.
 pub fn generate_facts(
     path: &Path,
     content_hash: &ContentHash,
     format: AudioFormat,
+    upload_source: &UploadSource,
+    tool: &str,
+    version: &str,
 ) -> Result<Vec<(MusicValue, FactSource)>, IngestError> {
     let metadata = extract_metadata(path).map_err(|e| IngestError::MetadataError(e.to_string()))?;
 
     let all_fields =
         discover_all_fields(path).map_err(|e| IngestError::MetadataError(e.to_string()))?;
 
-    let mut facts = generate_facts_from_metadata(content_hash, &metadata, &all_fields)?;
+    let origin = upload_source
+        .declared_origin()
+        .unwrap_or_else(|| FactOrigin::infer(&metadata.file_path, &metadata.comment));
+    let source = FactSource::new(tool, version, origin);
+    let mut facts = generate_facts_from_metadata(content_hash, &metadata, &all_fields, &source)?;
 
     // Add format fact
     let music_format = MusicFormat::from(format);
-    let origin = FactOrigin::infer(&metadata.file_path, &metadata.comment);
-    let source = FactSource::new("mdma-library", env!("CARGO_PKG_VERSION"), origin);
     facts.push((MusicValue::Format(music_format), source.clone()));
 
     // Record import timestamp
@@ -62,12 +71,11 @@ fn generate_facts_from_metadata(
     _content_hash: &ContentHash,
     metadata: &TrackMetadata,
     all_fields: &HashMap<String, String>,
+    source: &FactSource,
 ) -> Result<Vec<(MusicValue, FactSource)>, IngestError> {
     let mut facts = Vec::new();
 
-    // Infer origin from path and comment
-    let origin = FactOrigin::infer(&metadata.file_path, &metadata.comment);
-    let source = FactSource::new("mdma-library", env!("CARGO_PKG_VERSION"), origin);
+    let source = source.clone();
 
     // File location
     facts.push((
@@ -406,9 +414,17 @@ mod tests {
             "/music/inbox/01 - Yagya - Empty Streets.flac",
         );
         let hash = ContentHash::new("sha256:abc".to_string());
-        let facts =
-            generate_facts_from_metadata(&hash, &metadata, &std::collections::HashMap::new())
-                .unwrap();
+        let facts = generate_facts_from_metadata(
+            &hash,
+            &metadata,
+            &std::collections::HashMap::new(),
+            &FactSource::new(
+                "mdma-library",
+                "test",
+                FactOrigin::infer(&metadata.file_path, &metadata.comment),
+            ),
+        )
+        .unwrap();
         assert!(
             has_title(&facts, "Empty Streets"),
             "expected title 'Empty Streets'"
@@ -426,9 +442,17 @@ mod tests {
             "/music/inbox/Yagya - Don't Call - Reprise.flac",
         );
         let hash = ContentHash::new("sha256:abc".to_string());
-        let facts =
-            generate_facts_from_metadata(&hash, &metadata, &std::collections::HashMap::new())
-                .unwrap();
+        let facts = generate_facts_from_metadata(
+            &hash,
+            &metadata,
+            &std::collections::HashMap::new(),
+            &FactSource::new(
+                "mdma-library",
+                "test",
+                FactOrigin::infer(&metadata.file_path, &metadata.comment),
+            ),
+        )
+        .unwrap();
         assert!(
             has_title(&facts, "Don't Call - Reprise"),
             "expected title with internal dash"
@@ -440,9 +464,17 @@ mod tests {
     fn fallback_emits_only_title_when_no_dash() {
         let metadata = make_metadata(None, None, None, "/music/inbox/Empty Streets.wav");
         let hash = ContentHash::new("sha256:abc".to_string());
-        let facts =
-            generate_facts_from_metadata(&hash, &metadata, &std::collections::HashMap::new())
-                .unwrap();
+        let facts = generate_facts_from_metadata(
+            &hash,
+            &metadata,
+            &std::collections::HashMap::new(),
+            &FactSource::new(
+                "mdma-library",
+                "test",
+                FactOrigin::infer(&metadata.file_path, &metadata.comment),
+            ),
+        )
+        .unwrap();
         assert!(
             has_title(&facts, "Empty Streets"),
             "expected title 'Empty Streets'"
@@ -463,9 +495,17 @@ mod tests {
             "/music/inbox/Yagya - Empty Streets.wav",
         );
         let hash = ContentHash::new("sha256:abc".to_string());
-        let facts =
-            generate_facts_from_metadata(&hash, &metadata, &std::collections::HashMap::new())
-                .unwrap();
+        let facts = generate_facts_from_metadata(
+            &hash,
+            &metadata,
+            &std::collections::HashMap::new(),
+            &FactSource::new(
+                "mdma-library",
+                "test",
+                FactOrigin::infer(&metadata.file_path, &metadata.comment),
+            ),
+        )
+        .unwrap();
         // Embedded title should be used, filename fallback should not fire
         assert!(
             has_title(&facts, "Real Title"),
@@ -485,9 +525,17 @@ mod tests {
             "/music/inbox/Yagya - Empty Streets.wav",
         );
         let hash = ContentHash::new("sha256:abc".to_string());
-        let facts =
-            generate_facts_from_metadata(&hash, &metadata, &std::collections::HashMap::new())
-                .unwrap();
+        let facts = generate_facts_from_metadata(
+            &hash,
+            &metadata,
+            &std::collections::HashMap::new(),
+            &FactSource::new(
+                "mdma-library",
+                "test",
+                FactOrigin::infer(&metadata.file_path, &metadata.comment),
+            ),
+        )
+        .unwrap();
         // Artist is present, so fallback must not fire — no Title or extra Artist from filename
         assert!(
             has_artist(&facts, "Real Artist"),
