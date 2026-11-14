@@ -1,9 +1,10 @@
 //! Helpers for commands that take their input from stdin.
 //!
 //! A command connects (and so resolves the node, which may prompt on stdin)
-//! before it reads stdin.
+//! before it reads stdin. Stdin is read only when the command line says `-`:
+//! over ssh it is open but silent, and a read would wait forever.
 
-use crate::args::TrackArg;
+use crate::args::{HashInput, OrStdin, StdinDash};
 use crate::ctx::Ctx;
 use crate::playback::playing_track;
 use color_eyre::eyre::{bail, eyre};
@@ -30,14 +31,42 @@ fn is_yes(answer: &str) -> bool {
 }
 
 /// Print `prompt` (which ends in `[y/N] `) and read the answer from stdin:
-/// `true` only for y/yes.
-pub(crate) fn confirm(prompt: &str) -> std::io::Result<bool> {
+/// `true` only for y/yes. When stdin is not a terminal (over ssh it is open but
+/// silent) nothing is read: a usage error asks for `--yes` instead.
+pub(crate) fn confirm(prompt: &str) -> hicli::Outcome<bool> {
+    use std::io::IsTerminal;
+    confirm_from(
+        prompt,
+        std::io::stdin().is_terminal(),
+        std::io::stdin().lock(),
+    )
+}
+
+/// [`confirm`] with the terminal check and the input given. `reader` is read only
+/// when `interactive`.
+fn confirm_from(prompt: &str, interactive: bool, mut reader: impl BufRead) -> hicli::Outcome<bool> {
     use std::io::Write;
+    if !interactive {
+        return Err(hicli::Failure::usage(
+            "not a terminal: pass --yes to confirm",
+        ));
+    }
     print!("{}", prompt);
     std::io::stdout().flush()?;
     let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
+    reader.read_line(&mut answer)?;
     Ok(is_yes(&answer))
+}
+
+/// `hashes` without repeats, each at its first position. For set-like actions
+/// (add or retract a fact, delete, restore), where a repeat would only fail or
+/// say the same thing twice.
+pub(crate) fn dedup_hashes(hashes: Vec<ContentHash>) -> Vec<ContentHash> {
+    let mut seen = std::collections::HashSet::new();
+    hashes
+        .into_iter()
+        .filter(|hash| seen.insert(hash.clone()))
+        .collect()
 }
 
 /// The hashes in `lines`, in order (see [`parse_hash_from_line`]).
@@ -101,33 +130,41 @@ fn no_hashes_on_stdin(usage: &[&str]) -> color_eyre::Report {
     eyre!(lines.collect::<Vec<_>>().join("\n"))
 }
 
-/// Return the provided hash as a single-element vec, or the hashes from stdin
+/// The hash given, as a single-element vec, or (for `-`) the hashes from stdin
 /// (see [`require_stdin_hashes`]).
-pub(crate) fn hashes_arg_or_stdin(hash: Option<TrackArg>) -> Result<Vec<ContentHash>> {
-    hashes_arg_or_reader(hash, std::io::stdin().lock())
+pub(crate) fn hashes_of_input(input: HashInput) -> Result<Vec<ContentHash>> {
+    hashes_of_input_reader(input, std::io::stdin().lock())
 }
 
-fn hashes_arg_or_reader(hash: Option<TrackArg>, reader: impl BufRead) -> Result<Vec<ContentHash>> {
-    match hash {
-        Some(TrackArg(h)) => Ok(vec![h]),
-        None => require_hashes(reader, no_hash_provided),
+/// Only `-` reads `reader`.
+fn hashes_of_input_reader(input: HashInput, reader: impl BufRead) -> Result<Vec<ContentHash>> {
+    match input {
+        HashInput(OrStdin::Value(hash)) => Ok(vec![hash]),
+        HashInput(OrStdin::Stdin) => require_hashes(reader, no_hash_provided),
     }
 }
 
-/// The hashes piped on stdin (empty when it holds none); `None` when stdin is a
-/// terminal, i.e. nothing is piped.
-pub(crate) fn piped_hashes() -> Option<Vec<ContentHash>> {
-    use std::io::IsTerminal;
-    (!std::io::stdin().is_terminal()).then(read_hashes)
+/// The hashes on stdin (empty when it holds none) when the command line said `-`;
+/// `None`, with stdin left unread, when it did not.
+pub(crate) fn hashes_if_dash(dash: Option<StdinDash>) -> Option<Vec<ContentHash>> {
+    hashes_if_dash_from(dash, std::io::stdin().lock())
 }
 
-/// The tracks a command acts on: the hashes piped on stdin (a pipe without any
-/// is an error), else, when stdin is a terminal, the track that is playing.
-pub(crate) fn hashes_from_pipe_or_playing(ctx: &Ctx) -> Result<Vec<ContentHash>> {
-    hashes_or_playing(piped_hashes(), || playing_track(&ctx.playback()?))
+/// Only a `-` reads `reader`.
+fn hashes_if_dash_from(dash: Option<StdinDash>, reader: impl BufRead) -> Option<Vec<ContentHash>> {
+    dash.map(|_| hashes_from_reader(reader))
 }
 
-/// `piped` when stdin is piped (`Some`; it must hold a hash), else the hash
+/// The tracks a command acts on: the hashes on stdin when the command line said
+/// `-` (stdin without any is an error), else the track that is playing.
+pub(crate) fn hashes_from_dash_or_playing(
+    ctx: &Ctx,
+    dash: Option<StdinDash>,
+) -> Result<Vec<ContentHash>> {
+    hashes_or_playing(hashes_if_dash(dash), || playing_track(&ctx.playback()?))
+}
+
+/// `piped` when stdin was asked for (`Some`; it must hold a hash), else the hash
 /// `playing` finds.
 fn hashes_or_playing(
     piped: Option<Vec<ContentHash>>,
@@ -135,7 +172,7 @@ fn hashes_or_playing(
 ) -> Result<Vec<ContentHash>> {
     match piped {
         Some(hashes) if hashes.is_empty() => Err(no_hashes_on_stdin(&[
-            "Usage: mdma search --artist CBL | mdma mark banger",
+            "Usage: mdma search --artist CBL | mdma mark banger -",
         ])),
         Some(hashes) => Ok(hashes),
         None => Ok(vec![playing()?]),
@@ -208,12 +245,14 @@ pub(crate) fn is_hash_token(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
 
-    use crate::args::TrackArg;
+    use crate::args::{HashInput, OrStdin, StdinDash};
     use color_eyre::eyre::eyre;
+    use std::io::{BufRead, BufReader, Read};
 
     use crate::stdin::{
-        hashes_arg_or_reader, hashes_in, hashes_or_playing, hashes_or_usage, is_yes,
-        no_hash_provided, parse_hash_from_line, read_all, require_hashes, require_tracks,
+        confirm_from, dedup_hashes, hashes_if_dash_from, hashes_in, hashes_of_input_reader,
+        hashes_or_playing, hashes_or_usage, is_yes, no_hash_provided, parse_hash_from_line,
+        read_all, require_hashes, require_tracks,
     };
     use crate::test_support::{failure_text, track};
     use library_ipc_client::ContentHash;
@@ -336,24 +375,66 @@ mod tests {
         );
     }
 
+    /// Stdin as over ssh: open, and never sends anything or EOF. Reading it
+    /// would wait forever, so it panics instead.
+    struct Silent;
+
+    impl Read for Silent {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("stdin was read without a `-`");
+        }
+    }
+
+    fn silent() -> impl BufRead {
+        BufReader::new(Silent)
+    }
+
+    fn input_hash(hash: &str) -> HashInput {
+        HashInput(OrStdin::Value(ContentHash::new(hash)))
+    }
+
+    fn input_stdin() -> HashInput {
+        HashInput(OrStdin::Stdin)
+    }
+
     #[test]
-    fn a_hash_argument_wins_over_stdin() {
-        let arg = Some(TrackArg(ContentHash::new("abcd1234")));
+    fn a_hash_argument_does_not_read_stdin() {
         assert_eq!(
-            hashes_arg_or_reader(arg, "deadbeef\n".as_bytes()).unwrap(),
+            hashes_of_input_reader(input_hash("abcd1234"), silent()).unwrap(),
             vec![ContentHash::new("abcd1234")]
         );
     }
 
     #[test]
-    fn without_a_hash_argument_stdin_is_read() {
+    fn a_dash_reads_the_hashes_on_stdin() {
         assert_eq!(
-            hashes_arg_or_reader(None, "deadbeef\n".as_bytes()).unwrap(),
-            vec![ContentHash::new("deadbeef")]
+            hashes_of_input_reader(
+                input_stdin(),
+                "deadbeef\nabcd1234  Artist - Title\n".as_bytes()
+            )
+            .unwrap(),
+            vec![ContentHash::new("deadbeef"), ContentHash::new("abcd1234")]
         );
         assert_eq!(
-            failure_text(hashes_arg_or_reader(None, "".as_bytes())),
+            failure_text(hashes_of_input_reader(input_stdin(), "".as_bytes())),
             "No hash provided and stdin was empty"
+        );
+    }
+
+    #[test]
+    fn stdin_is_not_read_without_a_dash() {
+        assert_eq!(hashes_if_dash_from(None, silent()), None);
+    }
+
+    #[test]
+    fn a_dash_reads_the_hashes_on_stdin_even_when_there_are_none() {
+        assert_eq!(
+            hashes_if_dash_from(Some(StdinDash(())), "abcd1234\nnot a hash\n".as_bytes()),
+            Some(vec![ContentHash::new("abcd1234")])
+        );
+        assert_eq!(
+            hashes_if_dash_from(Some(StdinDash(())), std::io::empty()),
+            Some(vec![])
         );
     }
 
@@ -369,12 +450,12 @@ mod tests {
         assert_eq!(
             failure_text(hashes_or_playing(Some(vec![]), || panic!("not asked"))),
             "No hashes provided on stdin.\n\
-             Usage: mdma search --artist CBL | mdma mark banger"
+             Usage: mdma search --artist CBL | mdma mark banger -"
         );
     }
 
     #[test]
-    fn on_a_terminal_the_playing_track_is_used() {
+    fn without_a_dash_the_playing_track_is_used() {
         let hashes = hashes_or_playing(None, || Ok(ContentHash::new("deadbeef"))).unwrap();
         assert_eq!(hashes, vec![ContentHash::new("deadbeef")]);
         assert_eq!(
@@ -420,6 +501,34 @@ mod tests {
             "No tracks could be resolved. Aborting."
         );
         assert_eq!(require_tracks(vec![track("abcd1234")]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_duplicated_hash_is_acted_on_once_in_first_seen_order() {
+        let h = ContentHash::new;
+        assert_eq!(
+            dedup_hashes(vec![
+                h("bbbbbbbb"),
+                h("aaaaaaaa"),
+                h("bbbbbbbb"),
+                h("cccccccc")
+            ]),
+            vec![h("bbbbbbbb"), h("aaaaaaaa"), h("cccccccc")]
+        );
+    }
+
+    #[test]
+    fn confirm_does_not_read_stdin_unless_it_is_a_terminal() {
+        let failure = confirm_from("Sure? [y/N] ", false, silent()).unwrap_err();
+        assert_eq!(failure.code(), 2);
+        assert_eq!(failure.message(), "not a terminal: pass --yes to confirm");
+    }
+
+    #[test]
+    fn on_a_terminal_confirm_reads_the_answer() {
+        assert!(confirm_from("Sure? [y/N] ", true, "y\n".as_bytes()).unwrap());
+        assert!(!confirm_from("Sure? [y/N] ", true, "n\n".as_bytes()).unwrap());
+        assert!(!confirm_from("Sure? [y/N] ", true, "".as_bytes()).unwrap());
     }
 
     #[test]

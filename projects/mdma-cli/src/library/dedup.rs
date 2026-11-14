@@ -164,7 +164,7 @@ pub(crate) fn scan(args: ScanArgs, ctx: &Ctx) -> Result<Success> {
 /// The other tracks' audio files are moved to the archive. All tracks must be in
 /// one duplicate group as listed by `mdma library dedup`.
 #[hicli::command]
-pub(crate) fn merge(args: MergeArgs, ctx: &Ctx) -> Result<Success> {
+pub(crate) fn merge(args: MergeArgs, ctx: &Ctx) -> hicli::Outcome<Success> {
     let MergeArgs {
         yes: Yes(yes),
         winner: TrackArg(winner),

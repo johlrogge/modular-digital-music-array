@@ -54,7 +54,7 @@ Feature: CLI pipe composition
 
   Scenario: Sort by title ascending
     When I run mdma search --artist "Carbon Based"
-    And I pipe that through mdma sort title -a
+    And I pipe that through mdma sort title -a -
     Then the exit code should be 0
     And the output rows should be:
       | hash     | artist                 | title          | duration |
@@ -64,7 +64,7 @@ Feature: CLI pipe composition
 
   Scenario: Sort by bpm descending
     When I run mdma search --artist "Extrawelt"
-    And I pipe that through mdma sort bpm -d
+    And I pipe that through mdma sort bpm -d -
     Then the exit code should be 0
     And the output rows should be:
       | hash     | artist    | title       | duration |
@@ -73,8 +73,8 @@ Feature: CLI pipe composition
 
   Scenario: Chained stable sort (artist asc, then title asc)
     When I run mdma search --genre "Ambient"
-    And I pipe that through mdma sort title -a
-    And I pipe that through mdma sort artist -a
+    And I pipe that through mdma sort title -a -
+    And I pipe that through mdma sort artist -a -
     Then the exit code should be 0
     And the output rows should be:
       | hash     | artist                 | title          | duration |
@@ -86,8 +86,8 @@ Feature: CLI pipe composition
 
   Scenario: Search, sort, append to queue, then list queue
     When I run mdma search --artist "Extrawelt"
-    And I pipe that through mdma sort bpm -a
-    And I pipe that through mdma queue append
+    And I pipe that through mdma sort bpm -a -
+    And I pipe that through mdma queue append -
     Then the exit code should be 0
     When I run mdma queue list
     Then the exit code should be 0
@@ -98,7 +98,7 @@ Feature: CLI pipe composition
 
   Scenario: Queue clear via CLI
     When I run mdma search --artist "Extrawelt"
-    And I pipe that through mdma queue append
+    And I pipe that through mdma queue append -
     When I run mdma queue clear
     Then the exit code should be 0
     When I run mdma queue list
@@ -106,12 +106,12 @@ Feature: CLI pipe composition
 
   Scenario: Queue list, filter, remove
     When I run mdma search --genre "Techno"
-    And I pipe that through mdma queue append
+    And I pipe that through mdma queue append -
     When I run mdma queue list
     Then the output should contain 2 lines
     When I run mdma queue list
-    And I pipe that through mdma search --bpm "132"
-    And I pipe that through mdma queue remove
+    And I pipe that through mdma search --bpm "132" -
+    And I pipe that through mdma queue remove -
     When I run mdma queue list
     Then the output rows should be:
       | hash     | artist    | title     | duration |
@@ -120,7 +120,7 @@ Feature: CLI pipe composition
   # --- Stdin hash filtering ---
 
   Scenario: Stdin hash filtering intersects with search
-    When I pipe the following through mdma search --artist "Carbon Based":
+    When I pipe the following through mdma search --artist "Carbon Based" -:
       """
       a1b2c3d4  dummy line
       c9d0e1f2  another dummy

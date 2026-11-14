@@ -1,7 +1,7 @@
-use crate::args::TrackArg;
+use crate::args::{HashInput, StdinDash};
 use crate::ctx::Ctx;
 use crate::output::{display_error, format_track_line, render_track_table};
-use crate::stdin::{hashes_arg_or_stdin, hashes_in, require_stdin_hashes};
+use crate::stdin::{hashes_in, hashes_of_input, require_stdin_hashes};
 use color_eyre::Result;
 use colored::Colorize;
 use library_ipc_client::{ContentHash, TrackInfo};
@@ -10,11 +10,18 @@ use track_formatter::short_hash;
 
 /// Prepend a track to the front of the queue (plays next)
 ///
-/// Hash may be omitted; if so, reads "{hash}  {display}" from stdin (dmenu output).
+/// Give a hash, or `-` to read "{hash}  {display}" lines from stdin (dmenu output).
+///
+/// # Examples
+///
+/// ```sh
+/// mdma queue next abcd1234
+/// mdma search --artist CBL | dmenu | mdma queue next -
+/// ```
 #[hicli::command]
-pub(crate) fn next(hash: Option<TrackArg>, ctx: &Ctx) -> Result<()> {
+pub(crate) fn next(hash: HashInput, ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;
-    let hashes = hashes_arg_or_stdin(hash)?;
+    let hashes = hashes_of_input(hash)?;
     let count = hashes.len();
     // Prepend in reverse so the first hash ends up at the front of the queue.
     for content_hash in hashes.into_iter().rev() {
@@ -28,11 +35,18 @@ pub(crate) fn next(hash: Option<TrackArg>, ctx: &Ctx) -> Result<()> {
 
 /// Append a track to the end of the queue
 ///
-/// Hash may be omitted; if so, reads "{hash}  {display}" from stdin (dmenu output).
+/// Give a hash, or `-` to read "{hash}  {display}" lines from stdin (dmenu output).
+///
+/// # Examples
+///
+/// ```sh
+/// mdma queue append abcd1234
+/// mdma search --genre=Techno | mdma queue append -
+/// ```
 #[hicli::command]
-pub(crate) fn append(hash: Option<TrackArg>, ctx: &Ctx) -> Result<()> {
+pub(crate) fn append(hash: HashInput, ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;
-    let hashes = hashes_arg_or_stdin(hash)?;
+    let hashes = hashes_of_input(hash)?;
     let count = hashes.len();
     for content_hash in hashes {
         playback
@@ -126,11 +140,18 @@ pub(crate) fn clear(ctx: &Ctx) -> Result<()> {
 
 /// Remove track(s) from the queue by hash
 ///
-/// Hash may be omitted; if so, reads one hash per line from stdin.
+/// Give a hash, or `-` to read one hash per line from stdin.
+///
+/// # Examples
+///
+/// ```sh
+/// mdma queue remove abcd1234
+/// mdma queue list | dmenu | mdma queue remove -
+/// ```
 #[hicli::command]
-pub(crate) fn remove(hash: Option<TrackArg>, ctx: &Ctx) -> Result<()> {
+pub(crate) fn remove(hash: HashInput, ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;
-    let content_hashes = hashes_arg_or_stdin(hash)?;
+    let content_hashes = hashes_of_input(hash)?;
 
     let removed = playback
         .queue_remove(content_hashes)
@@ -143,17 +164,17 @@ pub(crate) fn remove(hash: Option<TrackArg>, ctx: &Ctx) -> Result<()> {
 
 /// Atomically replace the entire queue from stdin
 ///
-/// Reads playlist-format lines (8-12 char hex hash as first token).
+/// Give `-` to read playlist-format lines (8-12 char hex hash as first token).
 ///
 /// # Examples
 ///
 /// ```sh
-/// mdma search --genre=Techno | shuf | mdma queue replace
-/// cat friday.plist | mdma queue replace
-/// mdma queue list | mdma sort bpm -a | mdma queue replace
+/// mdma search --genre=Techno | shuf | mdma queue replace -
+/// cat friday.plist | mdma queue replace -
+/// mdma queue list | mdma sort bpm -a - | mdma queue replace -
 /// ```
 #[hicli::command]
-pub(crate) fn replace(ctx: &Ctx) -> Result<()> {
+pub(crate) fn replace(_stdin: StdinDash, ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;
     let hashes = require_stdin_hashes()?;
     let entries: Vec<(ContentHash, SourceName)> = hashes
@@ -227,8 +248,14 @@ mod tests {
             usage_error(&["queue", sub, "ABCD1234"]);
             assert!(parse(&["queue", sub, "abcd1234"]).is_ok());
             assert!(parse(&["queue", sub, "sha256:abcd1234"]).is_ok());
-            // Omitted: read from stdin.
-            assert!(parse(&["queue", sub]).is_ok());
+            // Stdin is read only when asked for with `-`.
+            assert!(parse(&["queue", sub, "-"]).is_ok(), "{sub} -");
+            // Omitted: nothing to act on (stdin is not read unasked).
+            let err = usage_error(&["queue", sub]);
+            assert!(err.contains("<HASH|->"), "{sub}: {err}");
+            // A hash and `-` do not mix.
+            usage_error(&["queue", sub, "-", "abcd1234"]);
+            usage_error(&["queue", sub, "abcd1234", "-"]);
         }
     }
 }

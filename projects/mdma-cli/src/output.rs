@@ -129,6 +129,20 @@ pub fn library_error(err: ClientError) -> color_eyre::Report {
     eyre!("{}", text)
 }
 
+/// Added to a mark/unmark line when the command acted on the playing track (no `-`),
+/// so a pipeline that forgot its `-` is noticed: ` (playing track: Artist – Title)`.
+/// Just ` (playing track)` when the track can't be looked up.
+pub fn playing_note(track: Option<&library_ipc_client::TrackInfo>) -> String {
+    match track {
+        Some(t) => format!(
+            " (playing track: {} – {})",
+            t.artist.as_deref().unwrap_or("Unknown artist"),
+            t.title.as_deref().unwrap_or("Unknown title")
+        ),
+        None => " (playing track)".to_string(),
+    }
+}
+
 /// What `mdma mark` says about one track: `Marked liked.` or `Already marked liked.`
 pub fn mark_outcome(mark: &Mark, outcome: MarkWrite) -> String {
     match outcome {
@@ -222,6 +236,59 @@ pub fn interpret_library<T>(
     }
 }
 
+/// Why one track of a bulk run failed: the library said so, or the action did
+/// (a retract that matched nothing).
+#[derive(Debug)]
+pub enum TrackFailure {
+    Client(ClientError),
+    Said(String),
+}
+
+impl From<ClientError> for TrackFailure {
+    fn from(e: ClientError) -> Self {
+        Self::Client(e)
+    }
+}
+
+/// Run `act` on each of `hashes`; a track that fails is reported on stderr as
+/// `{short_hash}  {error}` and the run goes on to the end, then exits 1. A node
+/// that does not understand the request ends the run at once with the upgrade
+/// text, printed once. `act` prints its own success output.
+pub fn each_track<E: Into<TrackFailure>>(
+    hashes: Vec<library_ipc_client::ContentHash>,
+    mut act: impl FnMut(&library_ipc_client::ContentHash) -> Result<(), E>,
+) -> color_eyre::Result<hicli::Success> {
+    let mut failed = false;
+    for hash in hashes {
+        match act(&hash).map_err(Into::into) {
+            Ok(()) => {}
+            Err(TrackFailure::Client(e)) if e.is_unsupported_request() => {
+                return Err(library_error(e))
+            }
+            Err(failure) => {
+                failed = true;
+                let text = match failure {
+                    TrackFailure::Client(e) => library_error(e).to_string(),
+                    TrackFailure::Said(text) => text,
+                };
+                eprintln!("{}  {}", track_formatter::short_hash(&hash), text);
+            }
+        }
+    }
+    Ok(success_unless(failed))
+}
+
+/// [`each_track`] where `act` returns one line to print per success, as
+/// `{short_hash}  {line}` on stdout.
+pub fn for_each_track<E: Into<TrackFailure>>(
+    hashes: Vec<library_ipc_client::ContentHash>,
+    act: impl Fn(&library_ipc_client::ContentHash) -> Result<String, E>,
+) -> color_eyre::Result<hicli::Success> {
+    each_track(hashes, |hash| {
+        act(hash).map(|line| println!("{}  {}", track_formatter::short_hash(hash), line))
+    })
+}
+
 /// How a command that printed a report of partial results ends: exit code 1
 /// when something `failed`, plain success otherwise. hicli prints nothing more.
 pub fn success_unless(failed: bool) -> hicli::Success {
@@ -259,6 +326,70 @@ mod tests {
 
     fn banger() -> Mark {
         "banger".parse().expect("a valid mark")
+    }
+
+    #[test]
+    fn a_failing_track_in_the_middle_does_not_stop_the_run() {
+        use library_ipc_client::{ContentHash, ProtocolError};
+        let seen = std::cell::RefCell::new(Vec::new());
+        let result = super::each_track(
+            vec![
+                ContentHash::new("aaaaaaaa"),
+                ContentHash::new("bbbbbbbb"),
+                ContentHash::new("cccccccc"),
+            ],
+            |hash| {
+                seen.borrow_mut().push(hash.as_str().to_string());
+                if hash.as_str() == "bbbbbbbb" {
+                    Err(library_ipc_client::ClientError::Protocol(
+                        ProtocolError::TrackNotFound {
+                            hash: hash.as_str().to_string(),
+                        },
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        // Every track was tried, and the run ends with exit code 1.
+        assert_eq!(seen.borrow().len(), 3);
+        assert_eq!(result.unwrap(), hicli::Success::code(1));
+    }
+
+    #[test]
+    fn a_run_where_every_track_works_ends_in_success() {
+        use library_ipc_client::{ClientError, ContentHash};
+        let result = super::each_track(vec![ContentHash::new("aaaaaaaa")], |_| {
+            Ok::<(), ClientError>(())
+        });
+        assert_eq!(result.unwrap(), hicli::Success::OK);
+    }
+
+    #[test]
+    fn a_track_that_missed_fails_the_run_with_its_own_text() {
+        use library_ipc_client::ContentHash;
+        let result = super::each_track(vec![ContentHash::new("aaaaaaaa")], |_| {
+            Err(super::TrackFailure::Said("no live Label = X".into()))
+        });
+        assert_eq!(result.unwrap(), hicli::Success::code(1));
+    }
+
+    #[test]
+    fn the_playing_track_is_named_after_a_mark() {
+        let t = TrackInfo {
+            artist: Some("Artist".into()),
+            title: Some("Title".into()),
+            ..track("abcd1234")
+        };
+        assert_eq!(
+            super::playing_note(Some(&t)),
+            " (playing track: Artist – Title)"
+        );
+        assert_eq!(
+            super::playing_note(Some(&track("abcd1234"))),
+            " (playing track: Unknown artist – Unknown title)"
+        );
+        assert_eq!(super::playing_note(None), " (playing track)");
     }
 
     #[test]

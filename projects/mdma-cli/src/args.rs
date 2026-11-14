@@ -1,6 +1,7 @@
 //! Argument helpers shared by several command modules.
 
 use crate::stdin::is_hash_token;
+use bpaf::{positional, Parser};
 use hicli::Arg;
 use library_ipc_client::{ContentHash, PlaylistName, PlaylistNameError};
 use playlist_import::sanitize_playlist_name;
@@ -38,6 +39,128 @@ pub(crate) fn parse_count(s: &str) -> Result<NonZeroUsize, &'static str> {
         .ok()
         .and_then(NonZeroUsize::new)
         .ok_or("must be a whole number of at least 1")
+}
+
+/// Read the input from stdin (only when `-` is given)
+///
+/// Stdin is never read unless the command line says `-`, so a command run over
+/// ssh (stdin open but silent) does not wait for input it was not given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Arg)]
+#[arg(positional = "-")]
+pub(crate) struct StdinDash(pub ());
+
+impl FromStr for StdinDash {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        (s == "-")
+            .then_some(Self(()))
+            .ok_or("expected `-` (read from stdin)")
+    }
+}
+
+/// One word of a positional that can be `-`: the dash, or a value.
+enum Word<T> {
+    Dash,
+    Value(T),
+}
+
+impl<T: FromStr> FromStr for Word<T> {
+    type Err = T::Err;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "-" {
+            Ok(Self::Dash)
+        } else {
+            s.parse().map(Self::Value)
+        }
+    }
+}
+
+/// An optional value and an optional `-`, in either order (`NAME -`, `- NAME`, `-`,
+/// `NAME`, or neither). Parsed together because a positional that rejected `-`
+/// would end the parse instead of leaving the `-` to the next one. At most one
+/// value and one `-`.
+///
+/// `usage` is how the usage line shows the pair (`[NAME] [-]`); the list of words
+/// would otherwise read as `[<NAME>]...`, as if repeatable.
+pub(crate) fn value_and_dash<T>(
+    metavar: &'static str,
+    usage: &'static str,
+    help: &'static str,
+) -> impl Parser<(Option<T>, Option<StdinDash>)>
+where
+    T: FromStr + 'static,
+    T::Err: std::fmt::Display,
+{
+    positional::<Word<T>>(metavar)
+        .help(help)
+        .many()
+        .custom_usage(usage)
+        .parse(|words| {
+            let (mut value, mut dash) = (None, None);
+            for word in words {
+                match word {
+                    Word::Dash if dash.is_none() => dash = Some(StdinDash(())),
+                    Word::Dash => return Err("`-` is given more than once"),
+                    Word::Value(v) if value.is_none() => value = Some(v),
+                    Word::Value(_) => return Err("more than one value is given"),
+                }
+            }
+            Ok((value, dash))
+        })
+}
+
+/// What a positional that can also be `-` holds: the value, or "read stdin".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OrStdin<T> {
+    Value(T),
+    Stdin,
+}
+
+impl<T> OrStdin<T> {
+    /// `-` is stdin; anything else is parsed as the value.
+    fn parse<E>(s: &str, value: impl FnOnce(&str) -> Result<T, E>) -> Result<Self, E> {
+        if s == "-" {
+            Ok(Self::Stdin)
+        } else {
+            value(s).map(Self::Value)
+        }
+    }
+}
+
+/// Content hash (as for HASH), or `-` to read hashes from stdin
+///
+/// Follows the stdin rule: at least 8 lowercase hex characters, optional `sha256:`
+/// prefix. Stdin is read only for `-`.
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(positional = "HASH|-")]
+pub(crate) struct HashInput(pub OrStdin<ContentHash>);
+
+impl FromStr for HashInput {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        OrStdin::parse(s, |s| s.parse::<TrackArg>().map(|TrackArg(hash)| hash)).map(Self)
+    }
+}
+
+/// Playlist name, or `-` to read playlist names from stdin
+///
+/// Stdin is read only for `-`, so a playlist cannot be named `-` here.
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(positional = "NAME|-")]
+pub(crate) struct PlaylistInput(pub OrStdin<PlaylistName>);
+
+impl FromStr for PlaylistInput {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        OrStdin::parse(s, |s| {
+            s.parse::<PlaylistArg>().map(|PlaylistArg(name)| name)
+        })
+        .map(Self)
+    }
 }
 
 /// Content hash (full or partial, with or without sha256: prefix)
@@ -174,6 +297,43 @@ mod tests {
         let err = run_arg::<TrackArg>(&["xyz"]).unwrap_err();
         assert!(err.contains("not a content hash"), "{err}");
         assert!(run_arg::<TrackArg>(&[]).is_err());
+    }
+
+    #[test]
+    fn stdin_dash_is_a_lone_dash() {
+        assert_eq!(run_arg::<StdinDash>(&["-"]), Ok(StdinDash(())));
+        assert!(run_arg::<StdinDash>(&["x"]).is_err());
+        assert!(run_arg::<StdinDash>(&["--"]).is_err());
+        assert!(run_arg::<StdinDash>(&[]).is_err());
+    }
+
+    #[test]
+    fn hash_input_is_a_hash_or_a_dash() {
+        let hash = ContentHash::new("abcd1234");
+        assert_eq!(
+            run_arg::<HashInput>(&["abcd1234"]),
+            Ok(HashInput(OrStdin::Value(hash)))
+        );
+        assert_eq!(run_arg::<HashInput>(&["-"]), Ok(HashInput(OrStdin::Stdin)));
+        let err = run_arg::<HashInput>(&["xyz"]).unwrap_err();
+        assert!(err.contains("not a content hash"), "{err}");
+        assert!(err.contains("`HASH|-`"), "{err}");
+        assert!(run_arg::<HashInput>(&[]).is_err());
+    }
+
+    #[test]
+    fn playlist_input_is_a_name_or_a_dash() {
+        let name = PlaylistName::new("my-list").unwrap();
+        assert_eq!(
+            run_arg::<PlaylistInput>(&["my-list"]),
+            Ok(PlaylistInput(OrStdin::Value(name)))
+        );
+        assert_eq!(
+            run_arg::<PlaylistInput>(&["-"]),
+            Ok(PlaylistInput(OrStdin::Stdin))
+        );
+        assert!(run_arg::<PlaylistInput>(&["a/b"]).is_err());
+        assert!(run_arg::<PlaylistInput>(&[]).is_err());
     }
 
     #[test]

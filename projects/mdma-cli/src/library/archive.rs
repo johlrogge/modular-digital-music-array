@@ -77,7 +77,7 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
 ///
 /// Shows what the archive holds and asks for confirmation. This cannot be undone.
 #[hicli::command]
-pub(crate) fn empty(yes: Yes, ctx: &Ctx) -> Result<Success> {
+pub(crate) fn empty(yes: Yes, ctx: &Ctx) -> hicli::Outcome<Success> {
     let Yes(yes) = yes;
     let library = ctx.library()?;
     // `--yes` without a listing deletes everything; after a prompt, only what was shown.

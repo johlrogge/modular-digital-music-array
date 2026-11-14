@@ -27,9 +27,9 @@ Feature: Queue list display width
 
   Scenario: Queue list at 65 columns fits within terminal width
     When I run mdma search --artist "Sunju Hargun"
-    And I pipe that through mdma queue append
+    And I pipe that through mdma queue append -
     When I run mdma search --artist "Carbon Based"
-    And I pipe that through mdma queue append
+    And I pipe that through mdma queue append -
     When in tty mode at 65 columns I run mdma queue list
     Then the exit code should be 0
     And the stripped output should contain "1."
@@ -38,9 +38,9 @@ Feature: Queue list display width
 
   Scenario: Queue list at 55 columns fits within terminal width
     When I run mdma search --artist "Sunju Hargun"
-    And I pipe that through mdma queue append
+    And I pipe that through mdma queue append -
     When I run mdma search --artist "Carbon Based"
-    And I pipe that through mdma queue append
+    And I pipe that through mdma queue append -
     When in tty mode at 55 columns I run mdma queue list
     Then the exit code should be 0
     And the stripped output should contain "1."

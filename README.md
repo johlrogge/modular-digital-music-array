@@ -23,30 +23,37 @@ mdma search --added "^week"
 
 # Compose with dmenu for keyboard-driven browsing
 mdma search fact-values-for Artist | dmenu | xargs -I{} mdma search --artist {}
-mdma search --artist CBL | dmenu | mdma queue append
+mdma search --artist CBL | dmenu | mdma queue append -
 
 # Pipe composition: search → sort → queue
-mdma search --artist CBL | mdma sort title -a | mdma queue append
+mdma search --artist CBL | mdma sort title -a - | mdma queue append -
 
 # Export a set of tracks as AIFF (e.g. for Rekordbox import)
-mdma search --bpm "128..132" --key "8A" | mdma export --lossless-format aiff --output ./rekordbox-prep/
+mdma search --bpm "128..132" --key "8A" | mdma export --lossless-format aiff --output ./rekordbox-prep/ -
 
 # Playlists — create, populate, and compose with pipes
-mdma playlist create friday-night
-mdma search --genre Techno | mdma playlist add friday-night
-mdma playlist get friday-night | mdma queue replace
+mdma search --genre Techno | mdma playlist new friday-night -
+mdma search --genre Techno | mdma playlist append friday-night -
+mdma playlist get friday-night | mdma queue replace -
 
 # Find which playlists contain a track (or a set of tracks from stdin)
-mdma search --artist CBL | mdma playlist contains --all
+mdma search --artist CBL | mdma playlist contains --all -
+
+# Stdin is read only when `-` is given, by every command; without it nothing is read
+mdma search --bpm 120..130 | mdma mark -
+mdma search --genre Techno | mdma search --year 2020..2024 -   # keep only tracks also on stdin
+mdma playlist list | dmenu | mdma playlist get -   # playlist names on stdin
+mdma search --artist CBL | mdma get -              # hashes on stdin: get, facts, fact add/retract,
+mdma search --artist CBL | mdma facts -            # library track delete/restore, queue next/append/remove
 
 # Mark the playing track "liked" (the default mark)
 mdma mark
 
 # Mark tracks piped on stdin with a named mark
-mdma search --artist CBL | mdma mark banger
+mdma search --artist CBL | mdma mark banger -
 
 # Remove a mark (liked unless a name is given)
-mdma marked banger | mdma unmark banger
+mdma marked banger | mdma unmark banger -
 
 # List tracks with any mark, or with one mark
 mdma marked

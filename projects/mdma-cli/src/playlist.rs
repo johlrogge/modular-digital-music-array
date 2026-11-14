@@ -1,4 +1,4 @@
-use crate::args::{parse_count, PlaylistArg};
+use crate::args::{parse_count, OrStdin, PlaylistArg, PlaylistInput, StdinDash};
 use crate::ctx::Ctx;
 use crate::output::interpret_library;
 use crate::stdin::{hashes_in, read_stdin_to_string, require_stdin_hashes_or_usage};
@@ -157,21 +157,28 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
 
 /// Get playlist content (pipe to mdma queue replace to load)
 ///
-/// If name is omitted, reads playlist names from stdin (first whitespace-delimited
+/// Give a name, or `-` to read playlist names from stdin (first whitespace-delimited
 /// token per line - handles both bare names and enriched `playlist list` output).
+///
+/// # Examples
+///
+/// ```sh
+/// mdma playlist get friday | mdma queue replace
+/// mdma playlist list | dmenu | mdma playlist get -
+/// ```
 #[hicli::command]
-pub(crate) fn get(name: Option<PlaylistArg>, ctx: &Ctx) -> Result<()> {
+pub(crate) fn get(name: PlaylistInput, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     let library = ctx.library()?;
-    match name {
-        Some(PlaylistArg(pname)) => {
+    match name.0 {
+        OrStdin::Value(pname) => {
             let content = interpret_library(
                 library.request(&LibraryRequest::PlaylistGet { name: pname }),
                 playlist_content,
             )?;
             print!("{}", content);
         }
-        None => {
+        OrStdin::Stdin => {
             let names = require_names(std::io::stdin().lock())?;
             for n in names {
                 let pname = parse_playlist_name(&n)?;
@@ -188,10 +195,17 @@ pub(crate) fn get(name: Option<PlaylistArg>, ctx: &Ctx) -> Result<()> {
 
 /// Print the name of every playlist that contains any of the tracks piped in on stdin
 ///
-/// Reads track lines from stdin (8-12 char hex hash as first token).
+/// Give `-` to read track lines from stdin (8-12 char hex hash as first token).
 /// Output: one playlist name per match; pipe to `sort -u` to deduplicate.
+///
+/// # Examples
+///
+/// ```sh
+/// mdma search --artist CBL | mdma playlist contains -
+/// mdma queue list | mdma playlist contains --all -
+/// ```
 #[hicli::command]
-pub(crate) fn contains(mode: ContainsMode, ctx: &Ctx) -> Result<()> {
+pub(crate) fn contains(mode: ContainsMode, _stdin: StdinDash, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     use std::collections::HashSet;
 
@@ -242,8 +256,16 @@ pub(crate) fn contains(mode: ContainsMode, ctx: &Ctx) -> Result<()> {
 }
 
 /// Create a new playlist from stdin (fails if it already exists)
+///
+/// Give `-` to read the playlist content from stdin.
+///
+/// # Examples
+///
+/// ```sh
+/// mdma search --genre=Techno | mdma playlist new techno -
+/// ```
 #[hicli::command]
-pub(crate) fn new(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
+pub(crate) fn new(name: PlaylistArg, _stdin: StdinDash, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     let library = ctx.library()?;
     let PlaylistArg(pname) = name;
@@ -260,8 +282,16 @@ pub(crate) fn new(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
 }
 
 /// Append stdin to an existing playlist
+///
+/// Give `-` to read the content to append from stdin.
+///
+/// # Examples
+///
+/// ```sh
+/// mdma search --artist CBL | mdma playlist append friday -
+/// ```
 #[hicli::command]
-pub(crate) fn append(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
+pub(crate) fn append(name: PlaylistArg, _stdin: StdinDash, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     let library = ctx.library()?;
     let PlaylistArg(pname) = name;
@@ -278,8 +308,16 @@ pub(crate) fn append(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
 }
 
 /// Replace playlist content from stdin
+///
+/// Give `-` to read the new content from stdin.
+///
+/// # Examples
+///
+/// ```sh
+/// mdma queue list | mdma playlist replace friday -
+/// ```
 #[hicli::command]
-pub(crate) fn replace(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
+pub(crate) fn replace(name: PlaylistArg, _stdin: StdinDash, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     let library = ctx.library()?;
     let PlaylistArg(pname) = name;
@@ -387,6 +425,17 @@ mod tests {
     }
 
     #[test]
+    fn get_reads_stdin_only_for_a_dash() {
+        assert_eq!(parses(&["playlist", "get", "mix"]), ["playlist", "get"]);
+        assert_eq!(parses(&["playlist", "get", "-"]), ["playlist", "get"]);
+        let err = usage_error(&["playlist", "get"]);
+        assert!(err.contains("<NAME|->"), "{err}");
+        // A name and `-` do not mix.
+        usage_error(&["playlist", "get", "-", "mix"]);
+        usage_error(&["playlist", "get", "mix", "-"]);
+    }
+
+    #[test]
     fn get_with_an_invalid_name_is_an_error() {
         assert_eq!(parse_playlist_name("mix").unwrap().to_string(), "mix");
         assert_eq!(
@@ -471,8 +520,8 @@ mod tests {
 
     #[test]
     fn valid_playlist_names_are_accepted() {
-        assert_eq!(playlist(&["new", "my-list_1"]), ["playlist", "new"]);
-        assert_eq!(playlist(&["get"]), ["playlist", "get"]);
+        assert_eq!(playlist(&["new", "my-list_1", "-"]), ["playlist", "new"]);
+        assert_eq!(playlist(&["get", "-"]), ["playlist", "get"]);
         assert_eq!(playlist(&["get", "mix"]), ["playlist", "get"]);
         assert_eq!(playlist(&["rename", "a", "b"]), ["playlist", "rename"]);
         assert_eq!(
@@ -504,7 +553,7 @@ mod tests {
 
     #[test]
     fn contains_flags_build_the_right_mode() {
-        assert_eq!(playlist(&["contains"]), ["playlist", "contains"]);
+        assert_eq!(playlist(&["contains", "-"]), ["playlist", "contains"]);
         assert_eq!(run_arg::<ContainsMode>(&[]), Ok(ContainsMode::Any));
         assert_eq!(
             run_arg::<ContainsMode>(&["--at-least", "2"]),

@@ -6,19 +6,34 @@ All notable changes to MDMA are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Bandcamp `check-item` and `check-updates` now read the live track count from the download page** (`track_count` for albums, 1 for single tracks). The count used to be always 0, so stale items were never found. When the count can't be determined, `check-item` reports an error instead of OK.
+- Release years from Bandcamp download pages are now parsed.
+
 ### Added
 
 - **Marks (ADR-016 phases 0-1).** A bookmark is now the default mark, "liked". Named marks such as "banger" or "opener" sit beside it.
-  - `mdma mark [NAME]` and `mdma unmark [NAME]` act on the hashes piped on stdin. Run from a terminal without a pipe, they act on the playing track. A pipe with no hashes is an error ("No hashes provided on stdin.").
+  - `mdma mark [NAME]` and `mdma unmark [NAME]` act on the hashes piped on stdin. Run from a terminal without a pipe, they act on the playing track. A pipe with no hashes is an error ("No hashes provided on stdin."). (Superseded below: stdin is now read only with `-`.)
   - `mdma marked [NAME]` lists tracks with that mark, or with any mark when NAME is left out. `mdma marked liked` lists only the default mark.
   - Mark names are lowercase, 1-64 characters, with no control or invisible characters. "liked" is reserved for the default mark.
   - Marks written before this release, with scopes that are not valid names, are still read, and `marked` lists them. They can't yet be removed from the CLI; removal is a planned follow-up.
   - New library requests: `ListMarked { filter: Any | Only(mark) }`, `WriteMark` and `UnmarkTrack`. `UnmarkTrack` retracts every live entry of the mark, each with its own source.
 - **TUI:** `b` marks the playing track "liked". It reports "Marked liked" or "Already marked liked".
+- **Hashes on stdin with `-`, for every command that takes track hashes:** `get <HASH|->`, `facts <HASH|->`, `fact add|retract <HASH|-> --field F --value V`, `library track delete|restore <HASH|->`. Each hash is acted on once (fact, delete, restore), one `<short-hash>  <outcome>` line per track on stdout. A track that fails (not found, or a retract that matched nothing) is reported on stderr with its hash, the rest still run, and the exit code is 1. `library dedup merge` and `library track replace` stay explicit: the winner/old hash matters.
 
 ### Changed
 
-- **BREAKING: `mdma bookmark` and `mdma bookmarks` are now aliases of `mark` and `marked`.** The `--scope` option and the HASH argument are gone. Pipe hashes on stdin instead, and pass the mark name as NAME.
+- **BREAKING: stdin is read only when `-` is given.** Over ssh, stdin is open but never sends EOF, so commands that waited for it hung. This supersedes the stdin and TTY behaviour described in the entries below.
+  - `search [QUERY] [-]`: `-` keeps only tracks among the hashes read from stdin (`--not` inverts).
+  - `mark [NAME] [-]` and `unmark [NAME] [-]`: `-` reads hashes from stdin. Without `-` they act on the playing track.
+  - `queue next|append|remove <HASH|->`, `playlist get <NAME|->`, and `rekordbox export` takes `--playlist X` or `-` (exactly one, a usage error otherwise).
+  - Commands that only took stdin now need `-` too, and are a usage error without it: `sort FIELD -a|-d -`, `view --hash|--artist|--title|--duration... -`, `queue replace -`, `export ... -`, `playlist new|append|replace NAME -`, `playlist contains [--all|--at-least N|--no] -`.
+  - `mark`/`unmark` without `-` print "(playing track: Artist – Title)" on each line, so a forgotten `-` in a pipeline shows.
+  - The `--yes` confirmations (`library dedup merge`, `library archive empty`) no longer read stdin when it is not a terminal: they exit 2 with "not a terminal: pass --yes to confirm".
+  - `--no-stdin` is a hidden no-op, kept for old scripts.
+  - Example: `mdma search --bpm 120..130 | mdma mark -`.
+- **BREAKING: `mdma bookmark` and `mdma bookmarks` are now aliases of `mark` and `marked`.** The `--scope` option and the HASH argument are gone. Pipe hashes on stdin with `-` instead (`mdma … | mdma mark NAME -`), and pass the mark name as NAME.
 - **BREAKING: `ListBookmarked` is removed** (it was never released). Use `ListMarked`. `WriteBookmark` stays as a deprecated alias of `WriteMark`.
   - Upgrade the node first: gateway and library (and console) together, then the CLI and TUI. A new gateway in front of an old library would time out, which is why those go together.
   - Older CLIs and TUIs keep working against the new node through `WriteBookmark`: their scopes are lowercased, a repeat writes nothing, and an invalid scope gets an error.

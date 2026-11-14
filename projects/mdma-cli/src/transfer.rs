@@ -1,4 +1,4 @@
-use crate::args::{ExistingFileArg, OutputDir};
+use crate::args::{ExistingFileArg, OutputDir, StdinDash};
 use crate::ctx::Ctx;
 use crate::origins::upload_source;
 use crate::output::success_unless;
@@ -726,19 +726,19 @@ fn resolve_export_format(blob_path: Option<&str>, formats: &ExportFormats) -> Ex
 
 /// Export tracks from the library to local files
 ///
-/// Reads content hashes from stdin (one per line, pipe-friendly).
-/// Compatible with search output: `mdma search --artist CBL | mdma export`
+/// Give `-` to read content hashes from stdin (one per line, pipe-friendly).
+/// Compatible with search output: `mdma search --artist CBL | mdma export -`
 ///
 /// # Examples
 ///
 /// ```sh
-/// mdma search --artist CBL | mdma export
-/// mdma search --artist CBL | mdma export --format aiff
-/// mdma search --artist CBL | mdma export --format wav --output ./archive/
-/// mdma search --artist CBL | mdma export --lossless-format aiff --lossy-format wav
+/// mdma search --artist CBL | mdma export -
+/// mdma search --artist CBL | mdma export --format aiff -
+/// mdma search --artist CBL | mdma export --format wav --output ./archive/ -
+/// mdma search --artist CBL | mdma export --lossless-format aiff --lossy-format wav -
 /// ```
 #[hicli::command]
-pub(crate) fn export(args: ExportArgs, ctx: &Ctx) -> Result<Success> {
+pub(crate) fn export(args: ExportArgs, _stdin: StdinDash, ctx: &Ctx) -> Result<Success> {
     let ExportArgs {
         formats,
         output: OutputDir(output),
@@ -750,7 +750,7 @@ pub(crate) fn export(args: ExportArgs, ctx: &Ctx) -> Result<Success> {
 
     // Read hashes from stdin
     let raw_hashes =
-        require_stdin_hashes_or_usage(&["Usage: mdma search --artist CBL | mdma export"])?;
+        require_stdin_hashes_or_usage(&["Usage: mdma search --artist CBL | mdma export -"])?;
 
     // Resolve each hash (short or full) to a full TrackInfo via the library
     let tracks = resolve_tracks_or_abort(&library, raw_hashes)?;

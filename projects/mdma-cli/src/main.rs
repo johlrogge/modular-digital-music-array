@@ -50,8 +50,17 @@ mod rekordbox;
 /// Search for tracks
 ///
 /// Filter with options such as --artist, --bpm or --key, or give a free-text query
-/// that is applied to all text fields. Hashes piped on stdin restrict the search to
-/// those tracks (--no-stdin ignores them); --not inverts the result.
+/// that is applied to all text fields. Give `-` to read hashes from stdin and keep
+/// only the tracks among them (stdin is read only for `-`; no hashes on stdin matches
+/// nothing, or everything with --not); --not inverts the result.
+///
+/// # Examples
+///
+/// ```sh
+/// mdma search --bpm 120..130
+/// mdma search --bpm 120..130 | mdma mark -
+/// mdma playlist get friday | mdma search --genre=Techno -
+/// ```
 #[hicli::group]
 mod search;
 /// Music source management
@@ -117,6 +126,53 @@ fn main() -> std::process::ExitCode {
 mod tests {
     use super::*;
     use crate::test_support::{help, parse, parse_cli, parses, usage_error};
+
+    /// Stdin is read only when `-` is given, by every command that reads it: each of
+    /// these is a usage error without the `-`, and parses with it.
+    #[test]
+    fn stdin_only_commands_need_a_dash() {
+        let cases: [&[&str]; 9] = [
+            &["sort", "title", "-a"],
+            &["view", "--hash"],
+            &["queue", "replace"],
+            &["export", "--format", "wav"],
+            &["playlist", "contains"],
+            &["playlist", "contains", "--all"],
+            &["playlist", "new", "set"],
+            &["playlist", "append", "set"],
+            &["playlist", "replace", "set"],
+        ];
+        for argv in cases {
+            let err = usage_error(argv);
+            assert!(err.contains('-'), "{argv:?}: {err}");
+            let mut with_dash = argv.to_vec();
+            with_dash.push("-");
+            parses(&with_dash);
+        }
+    }
+
+    /// Every command that takes track hashes accepts `-` for hashes on stdin.
+    #[test]
+    fn hash_commands_accept_a_dash_for_stdin() {
+        let cases: [&[&str]; 8] = [
+            &["get", "-"],
+            &["facts", "-"],
+            &["library", "track", "delete", "-"],
+            &["library", "track", "restore", "-"],
+            &["fact", "add", "--field", "title", "--value", "x", "-"],
+            &["fact", "retract", "--field", "title", "--value", "x", "-"],
+            &["fact", "add", "-", "--field", "title", "--value", "x"],
+            &["queue", "remove", "-"],
+        ];
+        for argv in cases {
+            parses(argv);
+        }
+        // Still a hash, still validated.
+        usage_error(&["get", "xyz"]);
+        // Nothing at all is a usage error that names both spellings.
+        let err = usage_error(&["get"]);
+        assert!(err.contains("<HASH|->"), "{err}");
+    }
 
     fn given(args: &[&str]) -> bool {
         let (globals, _) = parse_cli(args).expect("valid args");
@@ -246,21 +302,21 @@ mod tests {
                 vec!["playback", "get-output"],
                 vec!["playback", "get-output"],
             ),
-            (vec!["queue", "next"], vec!["queue", "next"]),
+            (vec!["queue", "next", "-"], vec!["queue", "next"]),
             (vec!["queue", "append", "abcd1234"], vec!["queue", "append"]),
             (vec!["queue", "list"], vec!["queue", "list"]),
             (vec!["queue", "clear"], vec!["queue", "clear"]),
-            (vec!["queue", "remove"], vec!["queue", "remove"]),
-            (vec!["queue", "replace"], vec!["queue", "replace"]),
+            (vec!["queue", "remove", "-"], vec!["queue", "remove"]),
+            (vec!["queue", "replace", "-"], vec!["queue", "replace"]),
             (vec!["queue", "edit"], vec!["queue", "edit"]),
-            (vec!["sort", "title", "-a"], vec!["sort"]),
+            (vec!["sort", "title", "-a", "-"], vec!["sort"]),
             (vec!["subscribe"], vec!["subscribe"]),
             (
                 vec!["upload", "--ssh-key", manifest, zip.as_str()],
                 vec!["upload"],
             ),
             (
-                vec!["export", "--format", "wav", "--output", "out"],
+                vec!["export", "--format", "wav", "--output", "out", "-"],
                 vec!["export"],
             ),
             (
@@ -268,22 +324,26 @@ mod tests {
                 vec!["rekordbox", "export"],
             ),
             (
+                vec!["rekordbox", "export", "-"],
+                vec!["rekordbox", "export"],
+            ),
+            (
                 vec!["rekordbox", "import", manifest],
                 vec!["rekordbox", "import"],
             ),
             (vec!["playlist", "list"], vec!["playlist", "list"]),
-            (vec!["playlist", "get"], vec!["playlist", "get"]),
+            (vec!["playlist", "get", "-"], vec!["playlist", "get"]),
             (
-                vec!["playlist", "contains", "--all"],
+                vec!["playlist", "contains", "--all", "-"],
                 vec!["playlist", "contains"],
             ),
-            (vec!["playlist", "new", "set"], vec!["playlist", "new"]),
+            (vec!["playlist", "new", "set", "-"], vec!["playlist", "new"]),
             (
-                vec!["playlist", "append", "set"],
+                vec!["playlist", "append", "set", "-"],
                 vec!["playlist", "append"],
             ),
             (
-                vec!["playlist", "replace", "set"],
+                vec!["playlist", "replace", "set", "-"],
                 vec!["playlist", "replace"],
             ),
             (vec!["playlist", "edit", "set"], vec!["playlist", "edit"]),
@@ -363,7 +423,7 @@ mod tests {
                 ],
                 vec!["fact", "retract"],
             ),
-            (vec!["view", "--title", "--hash"], vec!["view"]),
+            (vec!["view", "--title", "--hash", "-"], vec!["view"]),
             (
                 vec!["generate-completions", "bash"],
                 vec!["generate-completions"],
@@ -398,11 +458,11 @@ mod tests {
     #[test]
     fn app_rejects() {
         let rejected: &[&[&str]] = &[
-            &["sort", "title"],
-            &["sort", "title", "-a", "-d"],
-            &["view"],
-            &["playlist", "contains", "--all", "--no"],
-            &["export", "--format", "wav", "--lossy-format", "wav"],
+            &["sort", "title", "-"],
+            &["sort", "title", "-a", "-d", "-"],
+            &["view", "-"],
+            &["playlist", "contains", "--all", "--no", "-"],
+            &["export", "--format", "wav", "--lossy-format", "wav", "-"],
             &["library", "archive", "--yes"],
             &["library", "dedup", "merge", "aaaaaaaa"],
             &["search", "--added", "-7"],

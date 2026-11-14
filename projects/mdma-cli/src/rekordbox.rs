@@ -1,4 +1,6 @@
-use crate::args::{DryRun, ExistingFileArg, OutputDir, PlaylistArg, SanitizedPlaylistName};
+use crate::args::{
+    DryRun, ExistingFileArg, OutputDir, PlaylistArg, SanitizedPlaylistName, StdinDash,
+};
 use crate::ctx::Ctx;
 use crate::origins::rekordbox_source;
 use crate::output::library_error;
@@ -7,6 +9,7 @@ use crate::transfer::{
     build_http_client, download_tracks, existing_location_set, export_dest_path_checked,
     export_extension, path_cost, DownloadOutcome, ExportFormat, MAX_LOCATION_URI_BYTES,
 };
+use bpaf::{construct, Parser};
 use color_eyre::eyre::{bail, eyre};
 use color_eyre::Result;
 use hicli::Arg;
@@ -16,10 +19,35 @@ use playlist_import::{format_write_outcome, write_playlist, LibraryTrackLookup};
 use rekordbox_xml::{parse_xml, RekordboxTrack};
 use track_matcher::{CandidateTrack, MatchResult};
 
-/// MDMA playlist to export; repeat for several (reads hashes from stdin when none is given)
+/// MDMA playlist to export; repeat for several (or give `-` instead to read hashes from stdin)
 #[derive(Debug, Clone, PartialEq, Eq, Arg)]
 #[arg(long = "playlist", metavar = "PLAYLIST")]
 pub(crate) struct ExportPlaylists(pub Vec<PlaylistArg>);
+
+/// Where `rekordbox export` takes its tracks from: one or more playlists, or the
+/// hashes on stdin. Exactly one of the two, decided at parse time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExportSource {
+    /// At least one playlist.
+    Playlists(Vec<PlaylistArg>),
+    /// `-`: hashes read from stdin.
+    Stdin,
+}
+
+impl Arg for ExportSource {
+    /// `--playlist PLAYLIST ...` or `-`.
+    fn parser() -> impl Parser<Self> {
+        let playlists = <ExportPlaylists as Arg>::parser().parse(|ExportPlaylists(playlists)| {
+            if playlists.is_empty() {
+                Err("expected --playlist PLAYLIST or `-` (read hashes from stdin)")
+            } else {
+                Ok(Self::Playlists(playlists))
+            }
+        });
+        let stdin = <StdinDash as Arg>::parser().map(|_| Self::Stdin);
+        construct!([playlists, stdin])
+    }
+}
 
 /// Force a fresh XML and re-download everything (discards incremental sync). Also skips
 /// grandfathering of existing paths: tracks whose paths exceed the rekordbox Location
@@ -31,11 +59,11 @@ pub(crate) struct ReplaceXml(pub bool);
 // Values of `rekordbox export`; playlist names are validated at parse time.
 #[derive(Debug, Clone, PartialEq, Eq, Arg)]
 pub(crate) struct RekordboxExportArgs {
-    pub(crate) playlist: ExportPlaylists,
     /// Directory to write to (created if it doesn't exist; default: ~/Music/mdma_rekordbox)
     pub(crate) output: OutputDir,
     pub(crate) format: Option<ExportFormat>,
     pub(crate) replace: ReplaceXml,
+    pub(crate) source: ExportSource,
 }
 
 /// Create an MDMA playlist with the matched tracks. Invalid characters (spaces,
@@ -169,19 +197,30 @@ fn playlist_locations(
 
 /// Export tracks to Rekordbox-compatible XML + audio files
 ///
-/// Pass one or more --playlist flags to export named playlists.
-/// When no --playlist is given, hashes are read from stdin instead.
-/// Stdin input is ignored when --playlist is provided.
+/// Pass one or more --playlist flags to export named playlists, or `-` to read
+/// hashes from stdin (stdin is read only for `-`). Exactly one of the two.
+///
+/// # Examples
+///
+/// ```sh
+/// mdma rekordbox export --playlist my-set
+/// mdma search --artist CBL | mdma rekordbox export -
+/// ```
 #[hicli::command]
 pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
     use std::collections::HashSet;
 
     let RekordboxExportArgs {
-        playlist: ExportPlaylists(playlists),
         output: OutputDir(output),
         format,
         replace: ReplaceXml(replace),
+        source,
     } = args;
+    // No playlists means the hashes come from stdin (`-`).
+    let playlists = match source {
+        ExportSource::Playlists(playlists) => playlists,
+        ExportSource::Stdin => Vec::new(),
+    };
     let library = ctx.library()?;
     let output = output.unwrap_or_else(|| {
         dirs::audio_dir()
@@ -205,7 +244,7 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
         result
     } else {
         let hashes = require_stdin_hashes_or_usage(&[
-            "Usage: mdma search --artist CBL | mdma rekordbox export",
+            "Usage: mdma search --artist CBL | mdma rekordbox export -",
             "       mdma rekordbox export --playlist my-set",
         ])?;
         vec![("".to_string(), hashes)]
@@ -924,14 +963,17 @@ mod tests {
             "--replace",
         ])
         .unwrap();
-        let names: Vec<&str> = args.playlist.0.iter().map(|p| p.0.as_str()).collect();
+        let super::ExportSource::Playlists(playlists) = &args.source else {
+            panic!("playlists expected: {:?}", args.source);
+        };
+        let names: Vec<&str> = playlists.iter().map(|p| p.0.as_str()).collect();
         assert_eq!(names, ["set-1", "set_2"]);
         assert_eq!(args.output.0, Some(std::path::PathBuf::from("/tmp/out")));
         assert_eq!(args.format, Some(super::ExportFormat::Wav));
         assert!(args.replace.0);
 
-        let none = run_arg::<super::RekordboxExportArgs>(&[]).unwrap();
-        assert!(none.playlist.0.is_empty());
+        let none = run_arg::<super::RekordboxExportArgs>(&["-"]).unwrap();
+        assert_eq!(none.source, super::ExportSource::Stdin);
         assert_eq!(none.output.0, None);
         assert_eq!(none.format, None);
         assert!(!none.replace.0);
@@ -942,7 +984,7 @@ mod tests {
         let err = run_arg::<super::RekordboxExportArgs>(&["--playlist", "has space"]).unwrap_err();
         assert!(err.contains("invalid characters"), "{err}");
         assert!(err.contains("`--playlist`"), "{err}");
-        let err = run_arg::<super::RekordboxExportArgs>(&["--format", "flac"]).unwrap_err();
+        let err = run_arg::<super::RekordboxExportArgs>(&["--format", "flac", "-"]).unwrap_err();
         assert!(err.contains("`--format`"), "{err}");
         assert!(
             err.contains("expected `original`, `aiff` or `wav`"),
@@ -1013,6 +1055,42 @@ mod tests {
             ]),
             ["rekordbox", "export"]
         );
+    }
+
+    #[test]
+    fn export_reads_stdin_only_for_a_dash() {
+        assert_eq!(
+            parses(&["rekordbox", "export", "-"]),
+            ["rekordbox", "export"]
+        );
+        assert_eq!(
+            parses(&["rekordbox", "export", "--format", "wav", "-"]),
+            ["rekordbox", "export"]
+        );
+        usage_error(&["rekordbox", "export", "-", "-"]);
+        let dash = run_arg::<super::RekordboxExportArgs>(&["-"]).unwrap();
+        assert_eq!(dash.source, super::ExportSource::Stdin);
+    }
+
+    #[test]
+    fn export_needs_exactly_one_source_of_tracks() {
+        // One: playlists, or the dash.
+        assert_eq!(
+            parses(&["rekordbox", "export", "--playlist", "set"]),
+            ["rekordbox", "export"]
+        );
+        assert_eq!(
+            parses(&["rekordbox", "export", "--playlist", "a", "--playlist", "b"]),
+            ["rekordbox", "export"]
+        );
+        // Neither: a usage error naming both ways.
+        let neither = usage_error(&["rekordbox", "export"]);
+        assert!(neither.contains("--playlist"), "{neither}");
+        let neither = usage_error(&["rekordbox", "export", "--format", "wav"]);
+        assert!(neither.contains("--playlist"), "{neither}");
+        // Both: a usage error too, in either order.
+        usage_error(&["rekordbox", "export", "--playlist", "set", "-"]);
+        usage_error(&["rekordbox", "export", "-", "--playlist", "set"]);
     }
 
     #[test]

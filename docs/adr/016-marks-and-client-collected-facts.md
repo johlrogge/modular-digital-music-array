@@ -89,6 +89,7 @@ Points marked **decided** were decided by Joakim. Everything else is **proposed*
    - **Decided:** `marked` with no name lists tracks with any mark (`MarkFilter::Any`). `marked liked` lists only the default mark.
    - **Decided:** `bookmark` and `bookmarks` are true CLI aliases of `mark` and `marked`. They take the same arguments. The old `--scope` option and the HASH argument are gone.
    - **Decided (2026-11-09):** `mark` and `unmark` act on the tracks whose hashes arrive on stdin (pipe style, like `sort` and `view`). Piped means required: a non-TTY stdin with no hashes is an error ("No hashes provided on stdin."). The playing track is used only when stdin is a TTY. A pipe that carries no hashes is therefore an error, e.g. `mdma marked x | mdma unmark x` when nothing is marked, or `ssh host mdma mark` without `-t`, where stdin isn't a terminal.
+   - **Amended (2026-11-14):** stdin is now read only when `-` is given (`mark [NAME] -`, `unmark [NAME] -`); without `-` they act on the playing track. This avoids hangs over ssh, where stdin is open but never closes. The one rule now covers every command that reads stdin. Without `-`, each `mark`/`unmark` line ends with "(playing track: Artist – Title)", so a forgotten `-` in a pipeline is noticed. See the CHANGELOG.
 
 ### 2. Client-collected facts
 

@@ -473,8 +473,9 @@ in
         IMPORTANT: MDMA_NODE is already set in your environment. The mdma CLI derives
         the gateway address from it automatically. Do NOT set or export MDMA_GATEWAY.
         Run mdma commands directly (e.g. "mdma ping", NOT "MDMA_GATEWAY=... mdma ping").
-        IMPORTANT: Always use --no-stdin with `mdma search` to prevent it from waiting
-        for piped input. Without --no-stdin, search hangs when called from agents.
+        NOTE: mdma reads stdin only when you pass `-` (e.g. `mdma search ... | mdma mark -`),
+        so plain `mdma search` never waits for piped input. Do not pass `-` unless you pipe
+        hashes in. (--no-stdin is a hidden no-op kept for old scripts.)
 
         TOOL USAGE:
         - Pi SSH checks (sv status, logs): use mcp__ssh__ssh_run with host "pi"
@@ -495,7 +496,7 @@ in
            Expected: exit code 0, track count > 0
 
         4. SEARCH — verify search works:
-           mdma search --no-stdin --artist "a" | head -n 1
+           mdma search --artist "a" | head -n 1
            Expected: at least 1 result line (the exit code is head's, so judge by output)
 
         5. PLAYBACK — verify playback service responds:

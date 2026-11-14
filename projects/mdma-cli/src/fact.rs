@@ -1,9 +1,9 @@
-use crate::args::TrackArg;
+use crate::args::HashInput;
 use crate::ctx::Ctx;
-use crate::output::library_error;
+use crate::output::{for_each_track, TrackFailure};
+use crate::stdin::{dedup_hashes, hashes_of_input};
 use bpaf::{construct, Parser};
 use chrono::NaiveDate;
-use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use hicli::{Arg, Choice};
 use library_ipc_client::{USER_ORIGIN, USER_TOOL};
@@ -33,7 +33,7 @@ impl FactValueArg {
 pub(crate) struct FactArgs {
     field: FactField,
     value: FactValueArg,
-    hash: TrackArg,
+    hash: HashInput,
 }
 
 /// Value for the field (to retract: must match the existing fact's value)
@@ -45,7 +45,7 @@ pub(crate) struct RawValueArg(pub String);
 // Stays hand-written: the value is checked against the field, a rule that spans
 // two arguments.
 impl Arg for FactArgs {
-    /// `<HASH> --field <FIELD> --value <VALUE>`; the value is checked against
+    /// `<HASH|-> --field <FIELD> --value <VALUE>`; the value is checked against
     /// the field, so a bad value is a parse error. `add` and `retract` share it.
     fn parser() -> impl Parser<Self> {
         let field = <FactField as Arg>::parser();
@@ -53,7 +53,7 @@ impl Arg for FactArgs {
         let fact = construct!(field, value).parse(|(field, RawValueArg(raw))| {
             FactValueArg::new(field, raw).map(|value| (field, value))
         });
-        let hash = <TrackArg as Arg>::parser();
+        let hash = <HashInput as Arg>::parser();
         construct!(fact, hash).map(|((field, value), hash)| Self { field, value, hash })
     }
 }
@@ -167,20 +167,32 @@ fn parse_field_value(field: FactField, raw: &str) -> Result<MusicValue, String> 
 /// Stainless-facts replace semantics: the most recent fact for a given field wins
 /// for non-collection types. Note this does NOT auto-retract the previous value;
 /// retract explicitly first if you want to clean history.
+///
+/// Give `-` instead of a hash to add the fact to every track whose hash is read from
+/// stdin (each hash once). One line per track; a track that fails is reported on
+/// stderr, the rest still run, and the exit code is 1.
+///
+/// # Examples
+///
+/// ```sh
+/// mdma fact add abcd1234 --field main-genre --value Techno
+/// mdma search --artist CBL | mdma fact add - --field label --value Ultimae
+/// ```
 #[hicli::command]
-pub(crate) fn add(args: FactArgs, ctx: &Ctx) -> Result<()> {
+pub(crate) fn add(args: FactArgs, ctx: &Ctx) -> Result<hicli::Success> {
     let FactArgs {
         field,
         value: FactValueArg { raw, value },
-        hash: TrackArg(hash),
+        hash,
     } = args;
     let library = ctx.library()?;
+    let hashes = dedup_hashes(hashes_of_input(hash)?);
     let source = library_ipc_client::user_fact_source(env!("CARGO_PKG_VERSION"));
-    library
-        .write_fact_as(&hash, value, &source)
-        .map_err(library_error)?;
-    println!("Added fact for {}: {:?} = {}", hash, field, raw);
-    Ok(())
+    for_each_track(hashes, |hash| {
+        library
+            .write_fact_as(hash, value.clone(), &source)
+            .map(|()| format!("Added fact {:?} = {}", field, raw))
+    })
 }
 
 /// Origin kind of the fact to retract (default: User; Rekordbox for imported values, Upload for uploaded files' tags)
@@ -234,36 +246,42 @@ pub(crate) struct RetractArgs {
 /// Required for collection-type fields (each value is independent).
 /// For scalar fields, retract removes that value from history.
 /// A fact written by an import or an upload is retracted with the matching `--origin`.
+///
+/// Give `-` instead of a hash to retract the fact from every track whose hash is read
+/// from stdin (each hash once). One line per track; a track that had no such fact, or
+/// can't be found, is reported on stderr, the rest still run, and the exit code is 1.
+///
+/// # Examples
+///
+/// ```sh
+/// mdma fact retract abcd1234 --field main-genre --value Techno
+/// mdma search --label Ultimae | mdma fact retract - --field label --value Ultimae
+/// ```
 #[hicli::command]
-pub(crate) fn retract(args: RetractArgs, ctx: &Ctx) -> Result<()> {
+pub(crate) fn retract(args: RetractArgs, ctx: &Ctx) -> Result<hicli::Success> {
     let RetractArgs {
         origin,
         fact:
             FactArgs {
                 field,
                 value: FactValueArg { raw, value },
-                hash: TrackArg(hash),
+                hash,
             },
     } = args;
     let origin = origin.map_or_else(user_origin, |OriginArg(kind)| kind);
     let library = ctx.library()?;
+    let hashes = dedup_hashes(hashes_of_input(hash)?);
     let source = FactSource::new(USER_TOOL, env!("CARGO_PKG_VERSION"), origin.as_str());
-    if library
-        .retract_fact_as(&hash, value, &source)
-        .map_err(library_error)?
-    {
-        println!("Retracted fact for {}: {:?} = {}", hash, field, raw);
-        Ok(())
-    } else {
-        // A retract that matched nothing is a failure, so scripts can tell.
-        Err(eyre!(
-            "Nothing retracted for {}: no live {:?} = {} written by {}",
-            hash,
-            field,
-            raw,
-            origin
-        ))
-    }
+    // A retract that matched nothing is a failed line, so scripts can tell.
+    for_each_track(hashes, |hash| {
+        match library.retract_fact_as(hash, value.clone(), &source)? {
+            true => Ok(format!("Retracted fact {:?} = {}", field, raw)),
+            false => Err(TrackFailure::Said(format!(
+                "no live {:?} = {} written by {}",
+                field, raw, origin
+            ))),
+        }
+    })
 }
 
 #[cfg(test)]
@@ -361,7 +379,7 @@ mod tests {
         assert_eq!(args.field, FactField::Year);
         assert_eq!(args.value.raw, "2024");
         assert!(matches!(args.value.value, MusicValue::Year(_)));
-        assert_eq!(args.hash, "abcd1234".parse::<TrackArg>().unwrap());
+        assert_eq!(args.hash, "abcd1234".parse::<HashInput>().unwrap());
     }
 
     #[test]

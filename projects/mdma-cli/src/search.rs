@@ -1,6 +1,8 @@
+use crate::args::{value_and_dash, StdinDash};
 use crate::ctx::Ctx;
 use crate::output::{library_error, print_tracks};
-use crate::stdin::piped_hashes;
+use crate::stdin::hashes_if_dash;
+use bpaf::{construct, long, Parser};
 use color_eyre::Result;
 use hicli::{Arg, Candidate, Choice};
 use library_ipc_client::{ContentHash, TrackInfo};
@@ -23,7 +25,6 @@ pub(crate) struct SearchArgs {
     duration: Option<DurationArg>,
     year: Option<YearArg>,
     source: Option<SourceFilter>,
-    no_stdin: NoStdin,
     started: Option<StartedFilter>,
     stopped: Option<StoppedFilter>,
     added: Option<AddedFilter>,
@@ -31,7 +32,30 @@ pub(crate) struct SearchArgs {
     role: Option<RoleArg>,
     energy: Option<EnergyArg>,
     not: Invert,
+    input: SearchInput,
+}
+
+/// The positionals of `search`: a free-text query, and `-` to read hashes from stdin.
+#[derive(Debug, Default)]
+pub(crate) struct SearchInput {
     query: Option<QueryText>,
+    stdin: Option<StdinDash>,
+}
+
+impl Arg for SearchInput {
+    /// `[QUERY] [-]`, and a hidden `--no-stdin`: accepted and ignored (stdin is read
+    /// only for `-`), so scripts written when stdin was read implicitly keep working.
+    fn parser() -> impl Parser<Self> {
+        let no_stdin = long("no-stdin").switch().hide();
+        let positionals = value_and_dash::<QueryText>(
+            "QUERY",
+            "[QUERY] [-]",
+            "Free-text query applied to all text fields (title, artist, album, label, genre), \
+             e.g. CarbBased or /regex/, and/or `-` to read hashes from stdin to search among \
+             (no hashes on stdin matches nothing, or everything with --not); at most one of each",
+        );
+        construct!(no_stdin, positionals).map(|(_, (query, stdin))| Self { query, stdin })
+    }
 }
 
 // The filters wrap the query types of `library_search`, which parse themselves:
@@ -83,11 +107,6 @@ fn complete_known_sources(typed: &str) -> Vec<Candidate> {
         .collect()
 }
 
-/// Ignore stdin (don't read piped hashes as intersection filter)
-#[derive(Debug, Clone, Copy, Default, Arg)]
-#[arg(long = "no-stdin")]
-pub(crate) struct NoStdin(pub bool);
-
 /// Invert the search results: return tracks that do NOT match the filters
 #[derive(Debug, Clone, Copy, Default, Arg)]
 #[arg(long = "not")]
@@ -98,6 +117,17 @@ pub(crate) struct Invert(pub bool);
 #[derive(Debug, Clone, Arg)]
 #[arg(positional = "QUERY")]
 pub(crate) struct QueryText(pub StringQuery);
+
+impl FromStr for QueryText {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        if s == "-" {
+            return Err("`-` reads hashes from stdin; it is not a query");
+        }
+        Ok(Self(s.parse().unwrap_or_else(|never| match never {})))
+    }
+}
 
 /// Filter by last started date (format: N/A, >2026-02, <2026, 2026-01..2026-06; dash-leading values: --started=-7)
 #[derive(Debug, Clone, Arg)]
@@ -220,9 +250,9 @@ pub(crate) struct DurationArg(pub DurationQuery);
 #[hicli::command(default)]
 pub(crate) fn query(args: SearchArgs, ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
-    let NoStdin(no_stdin) = args.no_stdin;
+    let stdin = args.input.stdin;
     let track_query = build_track_query(args);
-    search_tracks(&library, &track_query, no_stdin)
+    search_tracks(&library, &track_query, hashes_if_dash(stdin))
 }
 
 /// Filter by playback history (takes precedence over --started); `never` matches
@@ -234,7 +264,7 @@ pub(crate) enum PlayedFilter {
     Never,
 }
 
-/// Build a TrackQuery from the search arguments (`--no-stdin` is not part of the query).
+/// Build a TrackQuery from the search arguments (`-` is not part of the query).
 ///
 /// Precedence: `--played=never` overrides any explicit `--started` value.
 fn build_track_query(args: SearchArgs) -> TrackQuery {
@@ -250,7 +280,6 @@ fn build_track_query(args: SearchArgs) -> TrackQuery {
         duration,
         year,
         source,
-        no_stdin: _,
         started,
         stopped,
         added,
@@ -258,7 +287,9 @@ fn build_track_query(args: SearchArgs) -> TrackQuery {
         role,
         energy,
         not,
-        query: any_text,
+        input: SearchInput {
+            query: any_text, ..
+        },
     } = args;
     let started = if matches!(played, Some(PlayedFilter::Never)) {
         // --played=never is a shortcut for started=N/A and overrides any --started value.
@@ -322,12 +353,14 @@ fn apply_stdin_filter(
     }
 }
 
-fn search_tracks(library: &LibraryBackend, query: &TrackQuery, no_stdin: bool) -> Result<()> {
+/// Search the library; `stdin_filter` holds the hashes read from stdin (asked for
+/// with `-`), if any, as an intersection filter.
+fn search_tracks(
+    library: &LibraryBackend,
+    query: &TrackQuery,
+    stdin_filter: Option<Vec<ContentHash>>,
+) -> Result<()> {
     use std::io::IsTerminal;
-
-    // When stdin is piped (and --no-stdin is not set), read the hashes in it (the same
-    // rule as hashes given as arguments) as an intersection filter.
-    let stdin_filter: Option<Vec<ContentHash>> = if no_stdin { None } else { piped_hashes() };
 
     // When stdin hashes are present and --not is set, we invert the intersection rather
     // than the library query: send the query without `.not` (so the library returns a
@@ -409,6 +442,70 @@ mod tests {
             )))
         );
         assert!(run_arg::<FactTypeArg>(&[]).is_err());
+    }
+
+    #[test]
+    fn search_reads_stdin_only_when_given_a_dash() {
+        assert_eq!(parses(&["search"]), ["search"]);
+        assert_eq!(parses(&["search", "-"]), ["search"]);
+        assert_eq!(parses(&["search", "jazz", "-"]), ["search"]);
+        assert_eq!(parses(&["search", "--bpm", "120..130", "-"]), ["search"]);
+        assert_eq!(parses(&["search", "-", "--bpm", "120..130"]), ["search"]);
+        // One dash, and nothing after it.
+        usage_error(&["search", "-", "-"]);
+    }
+
+    #[test]
+    fn usage_shows_one_optional_value_and_one_optional_dash() {
+        let flat = |t: String| t.split_whitespace().collect::<Vec<_>>().join(" ");
+        let search = flat(help(&["search", "--help"]));
+        assert!(search.contains("[--not] [QUERY] [-])"), "{search}");
+        assert!(
+            search.contains("no hashes on stdin matches nothing"),
+            "{search}"
+        );
+        for cmd in ["mark", "unmark"] {
+            let text = flat(help(&[cmd, "--help"]));
+            assert!(
+                text.contains(&format!("Usage: mdma {cmd} [NAME] [-]")),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dash_with_no_hashes_matches_nothing_or_everything_with_not() {
+        let tracks = vec![track("a1aaaaaa"), track("a2aaaaaa")];
+        assert_eq!(
+            apply_stdin_filter(tracks.clone(), Some(&[]), false).len(),
+            0
+        );
+        assert_eq!(apply_stdin_filter(tracks, Some(&[]), true).len(), 2);
+    }
+
+    #[test]
+    fn a_dash_is_not_a_search_query() {
+        assert!(run_arg::<QueryText>(&["-"]).is_err());
+        assert!(run_arg::<QueryText>(&["jazz"]).is_ok());
+    }
+
+    #[test]
+    fn no_stdin_is_still_accepted_but_hidden() {
+        assert_eq!(
+            parses(&["search", "--no-stdin", "--bpm", "128"]),
+            ["search"]
+        );
+        let text = help(&["search", "--help"]);
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(!text.contains("no-stdin"), "{text}");
+        assert!(
+            text.contains("Give `-` to read hashes from stdin"),
+            "{text}"
+        );
+        assert!(
+            text.contains("mdma search --bpm 120..130 | mdma mark -"),
+            "{text}"
+        );
     }
 
     #[test]

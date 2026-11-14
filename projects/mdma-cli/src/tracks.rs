@@ -1,16 +1,17 @@
-use crate::args::{parse_count, TrackArg};
+use crate::args::{parse_count, value_and_dash, HashInput, StdinDash};
 use crate::ctx::Ctx;
 use crate::output::{
-    format_track_line, library_error, mark_outcome, marked_header, no_marked_tracks, print_tracks,
-    success_unless, terminal_width, unmark_outcome, PIPE_TERM_WIDTH,
+    each_track, for_each_track, format_track_line, library_error, mark_outcome, marked_header,
+    no_marked_tracks, playing_note, print_tracks, terminal_width, unmark_outcome, PIPE_TERM_WIDTH,
 };
 use crate::stdin::{
-    hashes_from_pipe_or_playing, read_hashes, require_stdin_hashes, resolve_tracks_skip_errors,
+    hashes_from_dash_or_playing, hashes_of_input, read_hashes, require_stdin_hashes,
+    resolve_tracks_skip_errors,
 };
 use bpaf::{construct, long, short, Parser};
 use color_eyre::Result;
 use hicli::{Arg, Choice};
-use library_ipc_client::{ClientError, ContentHash, TrackInfo};
+use library_ipc_client::{ContentHash, TrackInfo};
 use mdma_client::{Mark, MarkFilter, MarkNameError};
 use std::num::NonZeroUsize;
 use track_formatter::{render_for_user, short_hash, ViewColumn};
@@ -34,10 +35,36 @@ impl std::str::FromStr for LimitArg {
 pub(crate) struct MarkArg(pub Mark);
 
 impl std::str::FromStr for MarkArg {
-    type Err = MarkNameError;
+    type Err = String;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        s.parse().map(Self)
+        if s == "-" {
+            return Err("`-` reads hashes from stdin; it is not a mark name".to_string());
+        }
+        s.parse()
+            .map(Self)
+            .map_err(|e: MarkNameError| e.to_string())
+    }
+}
+
+/// The mark `mark` and `unmark` act with, and whether to read the tracks from stdin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MarkInput {
+    pub(crate) name: Option<MarkArg>,
+    pub(crate) stdin: Option<StdinDash>,
+}
+
+impl Arg for MarkInput {
+    /// `[NAME] [-]`: the mark (the default mark when left out), and `-` to read the
+    /// tracks' hashes from stdin instead of acting on the playing track.
+    fn parser() -> impl Parser<Self> {
+        value_and_dash::<MarkArg>(
+            "NAME",
+            "[NAME] [-]",
+            "Mark name (`liked` is the default mark), and/or `-` to read track hashes from stdin; \
+             at most one of each",
+        )
+        .map(|(name, stdin)| Self { name, stdin })
     }
 }
 
@@ -206,11 +233,28 @@ pub(crate) fn list(limit: Option<LimitArg>, ctx: &Ctx) -> Result<()> {
 }
 
 /// Get a specific track by hash (supports partial hashes like git)
+///
+/// Give `-` to read hashes from stdin and show each track in turn. A hash that can't
+/// be found is reported on stderr, the rest are still shown, and the exit code is 1.
+///
+/// # Examples
+///
+/// ```sh
+/// mdma get abcd1234
+/// mdma search --artist CBL | mdma get -
+/// ```
 #[hicli::command]
-pub(crate) fn get(hash: TrackArg, ctx: &Ctx) -> Result<()> {
-    let TrackArg(content_hash) = hash;
+pub(crate) fn get(hash: HashInput, ctx: &Ctx) -> Result<hicli::Success> {
     let library = ctx.library()?;
-    let track = library.get_track(&content_hash).map_err(library_error)?;
+    let hashes = hashes_of_input(hash)?;
+    // A track that can't be found is reported and the rest are still shown.
+    each_track(hashes, |content_hash| {
+        library.get_track(content_hash).map(print_track_details)
+    })
+}
+
+/// Print every known detail of `track`.
+fn print_track_details(track: TrackInfo) {
     println!("Track: {}", track.content_hash.as_str());
     println!("{}", "=".repeat(65));
     if let Some(title) = track.title {
@@ -240,21 +284,33 @@ pub(crate) fn get(hash: TrackArg, ctx: &Ctx) -> Result<()> {
     if let Some(path) = track.blob_path {
         println!("Path:     {}", path);
     }
-    Ok(())
 }
 
 /// Show all facts for a track
+///
+/// Give `-` to read hashes from stdin and show the facts of each track in turn. A hash
+/// that can't be found is reported on stderr, the rest are still shown, and the exit
+/// code is 1.
+///
+/// # Examples
+///
+/// ```sh
+/// mdma facts abcd1234
+/// mdma search --artist CBL | mdma facts -
+/// ```
 #[hicli::command]
-pub(crate) fn facts(hash: TrackArg, ctx: &Ctx) -> Result<()> {
-    let TrackArg(content_hash) = hash;
+pub(crate) fn facts(hash: HashInput, ctx: &Ctx) -> Result<hicli::Success> {
     let library = ctx.library()?;
-    let (full_hash, facts) = library.get_facts(&content_hash).map_err(library_error)?;
-    println!("Facts for: {}", full_hash.as_str());
-    println!("{}", "=".repeat(65));
-    for (fact_type, fact_value) in facts {
-        println!("{:20} | {}", fact_type, fact_value);
-    }
-    Ok(())
+    let hashes = hashes_of_input(hash)?;
+    each_track(hashes, |content_hash| {
+        library.get_facts(content_hash).map(|(full_hash, facts)| {
+            println!("Facts for: {}", full_hash.as_str());
+            println!("{}", "=".repeat(65));
+            for (fact_type, fact_value) in facts {
+                println!("{:20} | {}", fact_type, fact_value);
+            }
+        })
+    })
 }
 
 /// Compare two optional values treating `None` as negative-infinity (-∞).
@@ -286,7 +342,7 @@ fn compare_optional<T: Ord>(
 
 /// Sort hashes from stdin by a track metadata field
 ///
-/// Reads one hash per line from stdin, outputs sorted hashes.
+/// Give `-` to read one hash per line from stdin; outputs sorted hashes.
 /// Stable sort: chain multiple invocations for multi-key sort (right-to-left priority).
 /// For started and stopped, a missing value counts as -inf: ascending puts never-played
 /// first, descending puts never-played last.
@@ -294,12 +350,17 @@ fn compare_optional<T: Ord>(
 /// # Examples
 ///
 /// ```sh
-/// mdma search --artist=CBL | mdma sort title -a
-/// mdma queue list | mdma sort bpm -d | mdma queue append
-/// cat friday.plist | mdma sort title -a | mdma sort artist -a > sorted.plist
+/// mdma search --artist=CBL | mdma sort title -a -
+/// mdma queue list | mdma sort bpm -d - | mdma queue append -
+/// cat friday.plist | mdma sort title -a - | mdma sort artist -a - > sorted.plist
 /// ```
 #[hicli::command]
-pub(crate) fn sort(direction: SortDirection, field: SortField, ctx: &Ctx) -> Result<()> {
+pub(crate) fn sort(
+    direction: SortDirection,
+    field: SortField,
+    _stdin: StdinDash,
+    ctx: &Ctx,
+) -> Result<()> {
     let library = ctx.library()?;
 
     let hashes = require_stdin_hashes()?;
@@ -350,74 +411,70 @@ pub(crate) fn sort(direction: SortDirection, field: SortField, ctx: &Ctx) -> Res
     Ok(())
 }
 
-/// Run `act` on each of `hashes`, printing `{short_hash}  {line}` for each
-/// success to stdout and `{short_hash}  {error}` for each failure to stderr; the
-/// run fails when any track failed. A node that does not understand the request
-/// ends the run at once with the upgrade text, printed once.
-fn for_each_track(
-    hashes: Vec<ContentHash>,
-    act: impl Fn(&ContentHash) -> Result<String, ClientError>,
-) -> Result<hicli::Success> {
-    let mut failed = false;
-    for hash in hashes {
-        match act(&hash) {
-            Ok(line) => println!("{}  {}", short_hash(&hash), line),
-            Err(e) if e.is_unsupported_request() => return Err(library_error(e)),
-            Err(e) => {
-                failed = true;
-                eprintln!("{}  {}", short_hash(&hash), library_error(e));
-            }
-        }
-    }
-    Ok(success_unless(failed))
-}
-
 /// Mark tracks (liked unless NAME is given)
 ///
-/// Marks the tracks whose hashes are piped on stdin; run from a terminal without
-/// a pipe, marks the playing track. A track that already carries the mark is left
-/// as it is. Each output line starts with the track hash, so the output can be
-/// piped on.
+/// Marks the playing track; with `-`, marks the tracks whose hashes are piped on
+/// stdin instead (stdin is read only for `-`; none on it is an error). A track that
+/// already carries the mark is left as it is. Each output line starts with the
+/// track hash, so the output can be piped on. Without `-` the line ends with
+/// "(playing track: Artist – Title)", so a forgotten `-` in a pipeline shows.
 ///
 /// # Examples
 ///
 /// ```sh
 /// mdma mark
-/// mdma search --artist CBL | mdma mark banger
+/// mdma search --bpm 120..130 | mdma mark -
+/// mdma search --artist CBL | mdma mark banger -
 /// ```
 #[hicli::command(alias = "bookmark")]
-pub(crate) fn mark(name: Option<MarkArg>, ctx: &Ctx) -> Result<hicli::Success> {
-    let mark = mark_or_default(name);
+pub(crate) fn mark(input: MarkInput, ctx: &Ctx) -> Result<hicli::Success> {
+    let mark = mark_or_default(input.name);
     let library = ctx.library()?;
-    let hashes = hashes_from_pipe_or_playing(ctx)?;
+    let playing = input.stdin.is_none();
+    let hashes = hashes_from_dash_or_playing(ctx, input.stdin)?;
     for_each_track(hashes, |hash| {
         library
             .write_mark(hash, &mark)
-            .map(|outcome| mark_outcome(&mark, outcome))
+            .map(|outcome| mark_outcome(&mark, outcome) + &note_if_playing(&library, hash, playing))
     })
 }
 
 /// Remove a mark from tracks (liked unless NAME is given)
 ///
-/// Unmarks the tracks whose hashes are piped on stdin; run from a terminal without
-/// a pipe, unmarks the playing track. A track without the mark is left as it is.
+/// Unmarks the playing track; with `-`, unmarks the tracks whose hashes are piped
+/// on stdin instead (stdin is read only for `-`; none on it is an error). A track
+/// without the mark is left as it is. Without `-` the output line ends with
+/// "(playing track: Artist – Title)", so a forgotten `-` in a pipeline shows.
 ///
 /// # Examples
 ///
 /// ```sh
 /// mdma unmark
-/// mdma marked banger | mdma unmark banger
+/// mdma marked banger | mdma unmark banger -
 /// ```
 #[hicli::command]
-pub(crate) fn unmark(name: Option<MarkArg>, ctx: &Ctx) -> Result<hicli::Success> {
-    let mark = mark_or_default(name);
+pub(crate) fn unmark(input: MarkInput, ctx: &Ctx) -> Result<hicli::Success> {
+    let mark = mark_or_default(input.name);
     let library = ctx.library()?;
-    let hashes = hashes_from_pipe_or_playing(ctx)?;
+    let playing = input.stdin.is_none();
+    let hashes = hashes_from_dash_or_playing(ctx, input.stdin)?;
     for_each_track(hashes, |hash| {
-        library
-            .unmark(hash, &mark)
-            .map(|outcome| unmark_outcome(&mark, outcome))
+        library.unmark(hash, &mark).map(|outcome| {
+            unmark_outcome(&mark, outcome) + &note_if_playing(&library, hash, playing)
+        })
     })
+}
+
+/// [`playing_note`] for `hash` when the command acted on the playing track, else nothing.
+fn note_if_playing(
+    library: &mdma_client::LibraryBackend,
+    hash: &ContentHash,
+    playing: bool,
+) -> String {
+    if !playing {
+        return String::new();
+    }
+    playing_note(library.get_track(hash).ok().as_ref())
 }
 
 /// List marked tracks
@@ -455,7 +512,7 @@ pub(crate) fn marked(name: Option<MarkArg>, ctx: &Ctx) -> Result<()> {
 
 /// Display selected fields for tracks read from stdin
 ///
-/// Reads hashes from stdin (one per line), looks up TrackInfo for each hash,
+/// Give `-` to read hashes from stdin (one per line), looks up TrackInfo for each hash,
 /// and renders a colored, columnized table with the selected fields.
 ///
 /// Field order in the output matches the order the flags appear on the command line.
@@ -463,12 +520,12 @@ pub(crate) fn marked(name: Option<MarkArg>, ctx: &Ctx) -> Result<()> {
 /// # Examples
 ///
 /// ```sh
-/// mdma search --artist CBL | mdma view --hash --artist --title
-/// mdma search --genre Techno | mdma view --title --duration
-/// cat friday.plist | mdma view --hash --artist --title --duration
+/// mdma search --artist CBL | mdma view --hash --artist --title -
+/// mdma search --genre Techno | mdma view --title --duration -
+/// cat friday.plist | mdma view --hash --artist --title --duration -
 /// ```
 #[hicli::command]
-pub(crate) fn view(columns: ViewColumns, ctx: &Ctx) -> Result<()> {
+pub(crate) fn view(columns: ViewColumns, _stdin: StdinDash, ctx: &Ctx) -> Result<()> {
     use std::io::IsTerminal;
 
     let ViewColumns(columns) = columns;
@@ -573,7 +630,7 @@ mod tests {
 
     #[test]
     fn an_unsupported_request_stops_the_run_with_the_upgrade_text() {
-        use library_ipc_client::ProtocolError;
+        use library_ipc_client::{ClientError, ProtocolError};
         let calls = std::cell::Cell::new(0);
         let result = for_each_track(
             vec![ContentHash::new("aaaa"), ContentHash::new("bbbb")],
@@ -637,12 +694,16 @@ mod tests {
         ] {
             assert!(result.is_err());
         }
-        assert!(mark(None, &ctx).is_err());
-        assert!(unmark(None, &ctx).is_err());
+        let nothing = || MarkInput {
+            name: None,
+            stdin: None,
+        };
+        assert!(mark(nothing(), &ctx).is_err());
+        assert!(unmark(nothing(), &ctx).is_err());
         for text in [
             crate::test_support::failure_text(marked(None, &ctx)),
-            crate::test_support::failure_text(mark(None, &ctx)),
-            crate::test_support::failure_text(unmark(None, &ctx)),
+            crate::test_support::failure_text(mark(nothing(), &ctx)),
+            crate::test_support::failure_text(unmark(nothing(), &ctx)),
         ] {
             assert!(text.starts_with("Failed to connect to library"), "{text}");
         }
@@ -763,15 +824,38 @@ mod tests {
     #[test]
     fn a_bad_hash_names_the_argument() {
         let e = usage_error(&["get", "xyz"]);
-        assert!(e.contains("`HASH`"), "{e}");
+        assert!(e.contains("`HASH|-`"), "{e}");
+        // Hash-only commands still name plain `HASH`.
+        let e = usage_error(&["library", "track", "replace", "xyz", "file.mp3"]);
+        assert!(e.contains("`OLD_HASH`"), "{e}");
     }
 
     #[test]
     fn sort_needs_exactly_one_direction() {
-        assert_eq!(parses(&["sort", "title", "-a"]), ["sort"]);
-        assert_eq!(parses(&["sort", "title", "-d"]), ["sort"]);
-        usage_error(&["sort", "title", "-a", "-d"]);
-        usage_error(&["sort", "title"]);
+        assert_eq!(parses(&["sort", "title", "-a", "-"]), ["sort"]);
+        assert_eq!(parses(&["sort", "title", "-d", "-"]), ["sort"]);
+        usage_error(&["sort", "title", "-a", "-d", "-"]);
+        usage_error(&["sort", "title", "-"]);
+    }
+
+    #[test]
+    fn mark_and_unmark_read_stdin_only_when_given_a_dash() {
+        for cmd in ["mark", "unmark"] {
+            assert_eq!(parses(&[cmd]), [cmd]);
+            assert_eq!(parses(&[cmd, "banger"]), [cmd]);
+            assert_eq!(parses(&[cmd, "-"]), [cmd], "{cmd} -");
+            assert_eq!(parses(&[cmd, "banger", "-"]), [cmd], "{cmd} banger -");
+            // One dash, and nothing after it.
+            usage_error(&[cmd, "-", "-"]);
+            usage_error(&[cmd, "banger", "-", "extra"]);
+        }
+    }
+
+    #[test]
+    fn a_mark_cannot_be_named_dash() {
+        // `-` is the stdin marker, never a mark name (the default mark has no name).
+        assert_eq!(super::mark_or_default(None), Mark::Default);
+        assert!(run_arg::<MarkArg>(&["-"]).is_err());
     }
 
     // ── sort by started / stopped ─────────────────────────────────────────────
@@ -909,8 +993,8 @@ mod tests {
 
     #[test]
     fn view_needs_at_least_one_column() {
-        assert_eq!(parses(&["view", "--title", "--hash"]), ["view"]);
-        let e = usage_error(&["view"]);
+        assert_eq!(parses(&["view", "--title", "--hash", "-"]), ["view"]);
+        let e = usage_error(&["view", "-"]);
         assert!(e.contains("No fields selected"), "{e}");
     }
 

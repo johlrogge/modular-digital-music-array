@@ -1,6 +1,7 @@
-use crate::args::TrackArg;
+use crate::args::{HashInput, TrackArg};
 use crate::ctx::Ctx;
-use crate::output::display_error;
+use crate::output::{display_error, for_each_track};
+use crate::stdin::{dedup_hashes, hashes_of_input};
 use color_eyre::Result;
 use hicli::Arg;
 
@@ -24,26 +25,48 @@ pub(crate) struct ReplaceArgs {
 /// Soft-delete a track (hidden from default views; file retained; recoverable)
 ///
 /// The track is hidden from list/search results. To undo, use `mdma library track restore <hash>`.
+/// Give `-` instead of a hash to soft-delete every track whose hash is read from stdin
+/// (each hash once). One line per track; a track that fails is reported on stderr, the
+/// rest still run, and the exit code is 1.
+///
+/// # Examples
+///
+/// ```sh
+/// mdma library track delete abcd1234
+/// mdma search --source upload --added=-1 | mdma library track delete -
+/// ```
 #[hicli::command]
-pub(crate) fn delete(hash: TrackArg, ctx: &Ctx) -> Result<()> {
+pub(crate) fn delete(hash: HashInput, ctx: &Ctx) -> Result<hicli::Success> {
     let library = ctx.library()?;
-    let TrackArg(ch) = hash;
-    library.track_delete(&ch).map_err(display_error)?;
-    println!(
-        "soft-deleted; recover with `mdma library track restore {}`",
-        ch
-    );
-    Ok(())
+    let hashes = dedup_hashes(hashes_of_input(hash)?);
+    for_each_track(hashes, |ch| {
+        library
+            .track_delete(ch)
+            .map(|()| "soft-deleted; recover with `mdma library track restore`".to_string())
+    })
 }
 
 /// Restore a soft-deleted track (retracts the Deleted fact)
+///
+/// Give `-` instead of a hash to restore every track whose hash is read from stdin
+/// (each hash once). One line per track; a track that fails is reported on stderr, the
+/// rest still run, and the exit code is 1.
+///
+/// # Examples
+///
+/// ```sh
+/// mdma library track restore abcd1234
+/// mdma library track orphans | mdma library track restore -
+/// ```
 #[hicli::command]
-pub(crate) fn restore(hash: TrackArg, ctx: &Ctx) -> Result<()> {
+pub(crate) fn restore(hash: HashInput, ctx: &Ctx) -> Result<hicli::Success> {
     let library = ctx.library()?;
-    let TrackArg(ch) = hash;
-    library.track_restore(&ch).map_err(display_error)?;
-    println!("track restored");
-    Ok(())
+    let hashes = dedup_hashes(hashes_of_input(hash)?);
+    for_each_track(hashes, |ch| {
+        library
+            .track_restore(ch)
+            .map(|()| "track restored".to_string())
+    })
 }
 
 /// Hard-replace an old track with a new file
