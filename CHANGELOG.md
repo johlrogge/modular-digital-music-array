@@ -6,6 +6,10 @@ All notable changes to MDMA are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **ACID fact log has an identity and `ReadStream` can pin the last line a client has** (ADR-021 phase 3), so a rewritten or replaced log answers `StreamDiverged` instead of looking like "nothing new". The gateway re-serialises typed ACID requests, so a mismatched gateway/ACID deploy fails closed (pinned reads report "node too old" instead of appending unverified lines); upgrade them together for availability, not correctness.
+
 ---
 
 ## [0.37.0] — 2026-11-14

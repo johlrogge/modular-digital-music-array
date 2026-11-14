@@ -80,6 +80,8 @@ impl FactStorage {
         Ok(StreamChunk {
             lines: chunk_lines,
             cursor: cursor_from_offset(new_offset),
+            epoch: None,
+            total_lines: None,
         })
     }
 

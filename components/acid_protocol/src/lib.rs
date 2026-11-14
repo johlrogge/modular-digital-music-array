@@ -41,6 +41,27 @@ pub fn offset_from_cursor(cursor: &str) -> Option<usize> {
     cursor.strip_prefix("line:")?.parse().ok()
 }
 
+/// Identifies a line of the log by position and content digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinePin {
+    /// 0-based line number.
+    pub line: usize,
+    /// Lowercase hex SHA-256 of the line's bytes, without the newline.
+    pub sha256: String,
+}
+
+/// Lowercase hex SHA-256 of a line's bytes (no newline).
+pub fn line_digest(line: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    Sha256::digest(line.as_bytes())
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
 // ============================================================================
 // Fact Entry
 // ============================================================================
@@ -77,9 +98,15 @@ pub enum AcidRequest {
     ///
     /// `cursor: None` means "start from the beginning".
     /// Pass the `cursor` from the previous `StreamChunk` to page forward.
+    ///
+    /// `expect` pins the last line the client already has (the line just before
+    /// `cursor`). If the log no longer has that line, the service answers
+    /// `StreamDiverged` instead of returning lines.
     ReadStream {
         cursor: Option<String>,
         limit: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect: Option<LinePin>,
     },
 
     /// Retract a batch of facts for an entity.
@@ -106,6 +133,12 @@ pub struct StreamChunk {
     /// Opaque cursor pointing past the last returned line.
     /// Pass this back in the next `ReadStream` request to continue paging.
     pub cursor: String,
+    /// Identity of the fact log. Changes when the log is replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<String>,
+    /// Number of lines currently in the log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_lines: Option<usize>,
 }
 
 /// All facts for a single entity, returned by `ReadEntity`.
@@ -132,6 +165,10 @@ pub enum AcidResponse {
 
     /// All facts for a requested entity.
     EntityFacts(EntityFacts),
+
+    /// The pinned line is missing or differs: the log was rewritten or replaced.
+    /// The client must resynchronise from the start.
+    StreamDiverged { epoch: String, total_lines: usize },
 
     /// Error response.
     Error { message: String },
@@ -220,12 +257,14 @@ mod tests {
         let req = AcidRequest::ReadStream {
             cursor: None,
             limit: 100,
+            expect: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"type\":\"ReadStream\""), "json was: {json}");
+        assert!(!json.contains("expect"), "json was: {json}");
         let parsed: AcidRequest = serde_json::from_str(&json).unwrap();
         match parsed {
-            AcidRequest::ReadStream { cursor, limit } => {
+            AcidRequest::ReadStream { cursor, limit, .. } => {
                 assert_eq!(cursor, None);
                 assert_eq!(limit, 100);
             }
@@ -238,16 +277,86 @@ mod tests {
         let req = AcidRequest::ReadStream {
             cursor: Some("line:42".to_string()),
             limit: 10,
+            expect: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: AcidRequest = serde_json::from_str(&json).unwrap();
         match parsed {
-            AcidRequest::ReadStream { cursor, limit } => {
+            AcidRequest::ReadStream { cursor, limit, .. } => {
                 assert_eq!(cursor.as_deref(), Some("line:42"));
                 assert_eq!(limit, 10);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn old_style_read_stream_without_expect_parses() {
+        let json = r#"{"type":"ReadStream","cursor":"line:3","limit":5}"#;
+        let parsed: AcidRequest = serde_json::from_str(json).unwrap();
+        match parsed {
+            AcidRequest::ReadStream { expect, limit, .. } => {
+                assert_eq!(expect, None);
+                assert_eq!(limit, 5);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_stream_with_expect_roundtrip() {
+        let req = AcidRequest::ReadStream {
+            cursor: Some("line:3".to_string()),
+            limit: 5,
+            expect: Some(LinePin {
+                line: 2,
+                sha256: line_digest("x"),
+            }),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: AcidRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            AcidRequest::ReadStream { expect, .. } => {
+                assert_eq!(expect.unwrap().line, 2);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn old_style_stream_chunk_without_epoch_parses() {
+        let json = r#"{"type":"StreamChunk","lines":["a"],"cursor":"line:1"}"#;
+        let parsed: AcidResponse = serde_json::from_str(json).unwrap();
+        match parsed {
+            AcidResponse::StreamChunk(c) => {
+                assert_eq!(c.epoch, None);
+                assert_eq!(c.total_lines, None);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_diverged_roundtrip() {
+        let resp = AcidResponse::StreamDiverged {
+            epoch: "abc".to_string(),
+            total_lines: 9,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"StreamDiverged\""), "json: {json}");
+        let parsed: AcidResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            AcidResponse::StreamDiverged { total_lines: 9, .. }
+        ));
+    }
+
+    #[test]
+    fn line_digest_is_lowercase_hex_sha256() {
+        assert_eq!(
+            line_digest("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     // ---- AcidResponse -------------------------------------------------------
@@ -278,6 +387,8 @@ mod tests {
         let chunk = StreamChunk {
             lines: vec!["line1".to_string(), "line2".to_string()],
             cursor: "line:2".to_string(),
+            epoch: None,
+            total_lines: None,
         };
         let resp = AcidResponse::StreamChunk(chunk);
         let json = serde_json::to_string(&resp).unwrap();

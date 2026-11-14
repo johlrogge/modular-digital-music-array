@@ -3,11 +3,14 @@
 //! - Root workspace: `fact_store_memory` (dev/test default)
 //! - Production builds: `fact_store_file` via `profiles/production.profile`
 
-use acid_protocol::{offset_from_cursor, AcidRequest, AcidResponse, EntityFacts};
+use acid_protocol::{
+    cursor_from_offset, line_digest, offset_from_cursor, AcidRequest, AcidResponse, EntityFacts,
+    StreamChunk,
+};
 use event_protocol::{acid_event_to_topic_message, AcidEvent};
 use fact_store::FactStorage;
 use nng::options::{Options, RecvTimeout, SendTimeout};
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
@@ -56,6 +59,8 @@ pub fn start(
         tracing::info!("ACID startup: replayed {replayed} facts");
     }
     let storage = Arc::new(storage);
+    let epoch = load_or_create_epoch(metadata_dir)?;
+    tracing::info!("ACID epoch: {epoch}");
 
     let shutdown = Arc::new(());
     let shutdown_clone = Arc::clone(&shutdown);
@@ -93,7 +98,7 @@ pub fn start(
                 _ => None,
             };
 
-            let response = handle_request(&request, &storage);
+            let response = handle_request(&request, &storage, &epoch, line_count);
 
             match (&write_entity, &response) {
                 (Some(entity), AcidResponse::WriteOk { facts_written }) => {
@@ -134,7 +139,40 @@ pub fn start(
     })
 }
 
-fn handle_request(request: &AcidRequest, storage: &FactStorage) -> AcidResponse {
+fn with_identity(mut chunk: StreamChunk, epoch: &str, total_lines: usize) -> AcidResponse {
+    chunk.epoch = Some(epoch.to_string());
+    chunk.total_lines = Some(total_lines);
+    AcidResponse::StreamChunk(chunk)
+}
+
+/// Read `metadata_dir/facts.epoch`, or create it with a random 128-bit hex id.
+///
+/// The epoch identifies the fact log: it is stable across restarts and changes
+/// only if the file is removed (the log was replaced).
+fn load_or_create_epoch(metadata_dir: &Path) -> io::Result<String> {
+    let path = metadata_dir.join("facts.epoch");
+    match std::fs::read_to_string(&path) {
+        Ok(s) if !s.trim().is_empty() => return Ok(s.trim().to_string()),
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let epoch: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::create_dir_all(metadata_dir)?;
+    let tmp = metadata_dir.join("facts.epoch.tmp");
+    std::fs::write(&tmp, &epoch)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(epoch)
+}
+
+fn handle_request(
+    request: &AcidRequest,
+    storage: &FactStorage,
+    epoch: &str,
+    total_lines: usize,
+) -> AcidResponse {
     match request {
         AcidRequest::Ping => AcidResponse::Pong,
 
@@ -148,17 +186,50 @@ fn handle_request(request: &AcidRequest, storage: &FactStorage) -> AcidResponse 
             }
         },
 
-        AcidRequest::ReadStream { cursor, limit } => {
+        AcidRequest::ReadStream {
+            cursor,
+            limit,
+            expect,
+        } => {
             let after_line = cursor.as_deref().and_then(offset_from_cursor).unwrap_or(0);
-            match storage.read_stream(after_line, *limit) {
-                Ok(chunk) => AcidResponse::StreamChunk(chunk),
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to read stream");
-                    AcidResponse::Error {
-                        message: e.to_string(),
-                    }
+            let read_error = |e: fact_store::StorageError| {
+                tracing::error!(error = %e, "Failed to read stream");
+                AcidResponse::Error {
+                    message: e.to_string(),
                 }
+            };
+            let Some(pin) = expect else {
+                return match storage.read_stream(after_line, *limit) {
+                    Ok(chunk) => with_identity(chunk, epoch, total_lines),
+                    Err(e) => read_error(e),
+                };
+            };
+            if after_line.checked_sub(1) != Some(pin.line) {
+                return AcidResponse::Error {
+                    message: format!(
+                        "expect.line {} does not match the line before cursor line:{after_line}",
+                        pin.line
+                    ),
+                };
             }
+            let mut chunk = match storage.read_stream(pin.line, limit.saturating_add(1)) {
+                Ok(chunk) => chunk,
+                Err(e) => return read_error(e),
+            };
+            let pinned_line_matches = chunk
+                .lines
+                .first()
+                .is_some_and(|l| line_digest(l) == pin.sha256);
+            if !pinned_line_matches {
+                return AcidResponse::StreamDiverged {
+                    epoch: epoch.to_string(),
+                    total_lines,
+                };
+            }
+            chunk.lines.remove(0);
+            chunk.lines.truncate(*limit);
+            chunk.cursor = cursor_from_offset(after_line + chunk.lines.len());
+            with_identity(chunk, epoch, total_lines)
         }
 
         AcidRequest::RetractFacts { entity, facts } => match storage.retract_facts(entity, facts) {
@@ -187,5 +258,153 @@ fn publish_acid_event(pub_sock: &nng::Socket, event: AcidEvent) {
     let bytes = acid_event_to_topic_message(&event);
     if let Err((_, e)) = pub_sock.send(nng::Message::from(&bytes[..])) {
         tracing::warn!(error = %e, "Failed to publish ACID event");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use acid_protocol::{line_digest, FactEntry, LinePin};
+
+    fn write_n(storage: &FactStorage, n: usize) {
+        for i in 0..n {
+            let facts = [FactEntry {
+                value_json: format!("\"v{i}\""),
+                source_json: r#""s""#.to_string(),
+            }];
+            storage.write_facts(&format!("entity:{i}"), &facts).unwrap();
+        }
+    }
+
+    fn read(
+        storage: &FactStorage,
+        cursor: Option<&str>,
+        limit: usize,
+        expect: Option<LinePin>,
+    ) -> AcidResponse {
+        let req = AcidRequest::ReadStream {
+            cursor: cursor.map(str::to_string),
+            limit,
+            expect,
+        };
+        handle_request(&req, storage, "epoch-1", storage.line_count())
+    }
+
+    fn pin_of(storage: &FactStorage, line: usize) -> LinePin {
+        let AcidResponse::StreamChunk(c) = read(storage, None, 1000, None) else {
+            panic!("expected chunk");
+        };
+        LinePin {
+            line,
+            sha256: line_digest(&c.lines[line]),
+        }
+    }
+
+    #[test]
+    fn epoch_is_stable_across_loads_of_same_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = load_or_create_epoch(dir.path()).unwrap();
+        let second = load_or_create_epoch(dir.path()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 32);
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn epoch_differs_between_dirs() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        assert_ne!(
+            load_or_create_epoch(a.path()).unwrap(),
+            load_or_create_epoch(b.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn unpinned_read_carries_epoch_and_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FactStorage::new(dir.path()).unwrap();
+        write_n(&storage, 3);
+        let AcidResponse::StreamChunk(c) = read(&storage, None, 2, None) else {
+            panic!("expected chunk");
+        };
+        assert_eq!(c.lines.len(), 2);
+        assert_eq!(c.cursor, "line:2");
+        assert_eq!(c.epoch.as_deref(), Some("epoch-1"));
+        assert_eq!(c.total_lines, Some(3));
+    }
+
+    #[test]
+    fn correct_pin_returns_following_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FactStorage::new(dir.path()).unwrap();
+        write_n(&storage, 5);
+        let pin = pin_of(&storage, 1);
+        let AcidResponse::StreamChunk(c) = read(&storage, Some("line:2"), 2, Some(pin)) else {
+            panic!("expected chunk");
+        };
+        assert_eq!(c.lines.len(), 2);
+        assert!(c.lines[0].contains("entity:2"));
+        assert!(c.lines[1].contains("entity:3"));
+        assert_eq!(c.cursor, "line:4");
+        assert_eq!(c.total_lines, Some(5));
+    }
+
+    #[test]
+    fn correct_pin_at_end_returns_empty_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FactStorage::new(dir.path()).unwrap();
+        write_n(&storage, 2);
+        let pin = pin_of(&storage, 1);
+        let AcidResponse::StreamChunk(c) = read(&storage, Some("line:2"), 10, Some(pin)) else {
+            panic!("expected chunk");
+        };
+        assert!(c.lines.is_empty());
+        assert_eq!(c.cursor, "line:2");
+    }
+
+    #[test]
+    fn wrong_digest_is_diverged() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FactStorage::new(dir.path()).unwrap();
+        write_n(&storage, 3);
+        let pin = LinePin {
+            line: 1,
+            sha256: line_digest("something else"),
+        };
+        match read(&storage, Some("line:2"), 10, Some(pin)) {
+            AcidResponse::StreamDiverged { epoch, total_lines } => {
+                assert_eq!(epoch, "epoch-1");
+                assert_eq!(total_lines, 3);
+            }
+            other => panic!("expected StreamDiverged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pin_past_end_is_diverged() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FactStorage::new(dir.path()).unwrap();
+        write_n(&storage, 2);
+        let pin = LinePin {
+            line: 5,
+            sha256: line_digest("gone"),
+        };
+        assert!(matches!(
+            read(&storage, Some("line:6"), 10, Some(pin)),
+            AcidResponse::StreamDiverged { total_lines: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn pin_not_matching_cursor_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FactStorage::new(dir.path()).unwrap();
+        write_n(&storage, 3);
+        let pin = pin_of(&storage, 0);
+        assert!(matches!(
+            read(&storage, Some("line:2"), 10, Some(pin)),
+            AcidResponse::Error { .. }
+        ));
     }
 }

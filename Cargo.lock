@@ -110,6 +110,7 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -121,6 +122,7 @@ dependencies = [
  "fact-store",
  "nng",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tracing",
 ]
