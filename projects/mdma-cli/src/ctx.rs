@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn library_connect_failure_to_a_dead_node_has_no_ipc_hint() {
-        let (target, port) = dead_node();
+        let (target, port, _guard) = dead_node();
         let ctx = Ctx::with_target(globals(), target);
         assert_eq!(
             failure_text(ctx.library()),
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn source_connect_failure_to_a_dead_node_has_no_ipc_hint() {
-        let (target, port) = dead_node();
+        let (target, port, _guard) = dead_node();
         let ctx = Ctx::with_target(globals(), target);
         assert_eq!(
             failure_text(ctx.source("bandcamp", None)),
@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn admin_connect_failure_to_a_dead_node_names_the_gateway() {
-        let (target, port) = dead_node();
+        let (target, port, _guard) = dead_node();
         let ctx = Ctx::with_target(globals(), target);
         assert_eq!(
             failure_text(ctx.admin()),
