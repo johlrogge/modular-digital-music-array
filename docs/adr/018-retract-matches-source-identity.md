@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted, 2026-11-11
+Accepted, 2026-11-11. Amended by ADR-020 (2026-11-11).
 
 Amends ADR-004 (retract matching: value + full `FactSource` becomes value + source identity). Builds on stainless_facts ADR-001 (johlrogge/stainless_facts#15). Related: ADR-013, ADR-017.
 

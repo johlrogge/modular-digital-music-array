@@ -110,7 +110,7 @@ impl FactWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use music_facts::{Artist, FactOrigin, Title};
+    use music_facts::{Artist, Title};
     use pretty_assertions::assert_eq;
     use tempfile::NamedTempFile;
 
@@ -118,7 +118,7 @@ mod tests {
     fn write_track_facts() {
         let temp = NamedTempFile::new().unwrap();
         let content_hash = ContentHash::new("sha256:abc123");
-        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("test", "1.0.0", "Unknown");
 
         let facts = vec![
             (MusicValue::Title(Title::new("Test Track")), source.clone()),
@@ -142,7 +142,7 @@ mod tests {
     fn write_track_retractions() {
         let temp = NamedTempFile::new().unwrap();
         let content_hash = ContentHash::new("sha256:abc123");
-        let source = FactSource::new("bandcamp", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("bandcamp", "1.0.0", "Unknown");
 
         let facts = vec![
             (MusicValue::Title(Title::new("Old Title")), source.clone()),

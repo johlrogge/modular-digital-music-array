@@ -1,5 +1,6 @@
 use crate::args::{choice, choice_names, parse_choice, Choice, ExistingFileArg};
 use crate::ctx::Ctx;
+use crate::origins::upload_source;
 use crate::output::success_unless;
 use crate::stdin::{require_stdin_hashes_or_usage, resolve_tracks_or_abort};
 use bpaf::{construct, long, positional, Bpaf, Parser};
@@ -7,7 +8,7 @@ use color_eyre::eyre::{bail, eyre};
 use color_eyre::Result;
 use hicli::{complete_files, Arg, Success};
 use library_ipc_client::TrackInfo;
-use mdma_client::IngestSource;
+use music_facts::MusicValue;
 use std::path::Path;
 use track_formatter::short_hash;
 
@@ -301,7 +302,11 @@ pub(crate) fn upload(args: UploadArgs, ctx: &Ctx) -> Result<Success> {
             }
         };
 
-        match library.ingest_file_with_source(&inbox_path, Some(IngestSource::Upload)) {
+        match library.ingest_file_as(
+            &inbox_path,
+            &upload_source(),
+            vec![MusicValue::Source("upload".to_string())],
+        ) {
             Ok(mdma_client::IngestResult::Success { hash, .. }) => {
                 let hash_str = hash
                     .as_ref()

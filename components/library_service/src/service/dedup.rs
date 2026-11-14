@@ -14,19 +14,12 @@ use crate::ipc::{
     DedupDisposition, DedupGroup, DedupMember, DedupScanReport,
 };
 use chrono::{DateTime, Utc};
-use music_facts::{FactOrigin, FactSource};
+use music_facts::FactSource;
 use stainless_facts::Operation;
 use std::collections::BTreeSet;
 use std::mem::{discriminant, Discriminant};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-
-/// `FactSource::tool` of the facts a dedup merge writes itself (`Replaces(loser)`).
-const DEDUP_TOOL: &str = "mdma-dedup";
-
-pub(super) fn dedup_fact_source() -> FactSource {
-    FactSource::new(DEDUP_TOOL, env!("CARGO_PKG_VERSION"), FactOrigin::Unknown)
-}
 
 // =========================================================================
 // Fact rules (pure)
@@ -622,7 +615,7 @@ impl LibraryService {
                 return report;
             }
         };
-        let source = dedup_fact_source();
+        let source = sources::dedup();
 
         for loser in losers {
             match self.merge_into(winner, loser, &source, carry.take().unwrap_or_default()) {
@@ -997,7 +990,9 @@ impl LibraryService {
             .iter()
             .flat_map(|t| t.provenance.iter())
             .filter_map(|(v, s)| match v {
-                MusicValue::Replaces(h) if s.tool == DEDUP_TOOL => Some(hash_key(h.as_str())),
+                MusicValue::Replaces(h) if s.tool == sources::DEDUP_TOOL => {
+                    Some(hash_key(h.as_str()))
+                }
                 _ => None,
             })
             .filter(|key| !live.contains(key))

@@ -4,7 +4,7 @@
 
 Proposed, 2026-11-11
 
-Depends on the planned client-owned fact sources ADR (not yet written) for import provenance (§7). Related: ADR-010, ADR-012, ADR-013 (dedup tiers), ADR-018 (source identity).
+Depends on ADR-020 (client-owned fact sources) for import provenance (§7). Related: ADR-010, ADR-012, ADR-013 (dedup tiers), ADR-018 (source identity).
 
 ## Context
 
@@ -66,12 +66,12 @@ Copy the stored format. Convert (via `components/audio_transcoder`) only formats
 - Eject (button, CLI or console): finish the current file, write the manifest, flush, unmount.
 - Detection: poll `/sys/block` in mdma-usb (no libudev dependency). A udev `RUN+=` notifier is the later alternative.
 
-### 7. Import from a stick (Decided; provenance depends on the planned ADR)
+### 7. Import from a stick (Decided; provenance depends on ADR-020)
 
 - Candidates are ingestible audio files on the stick that are not in the manifest and not under `/.mdma`.
 - A candidate whose content hash matches a library track is not imported. The AudioHash and PcmHash tiers (ADR-010/012/013) catch retags at ingest.
 - The user confirms the import. Files are copied to `/music/inbox/usb/<uuid>/…` and go through the existing inbox, the one ingest path that monitoring sees. Files on the stick are never moved or deleted.
-- **Open concern:** a plain inbox ingest writes facts under the library's own identity, so they would not carry a USB source. Under the planned client-owned fact sources ADR, the library must **not** gain an `IngestSource::Usb`. Instead mdma-usb states its own source (tool `mdma-usb`, with an origin kind it owns) in the ingest request's `writer` field, and the library treats it as opaque. Until that ADR lands, imports carry the library identity, and that is accepted.
+- **Provenance:** a plain inbox ingest writes facts under the library's own identity, so they would not carry a USB source. Under ADR-020, the library must **not** gain an `IngestSource::Usb`. Instead mdma-usb states its own source (tool `mdma-usb`, with an origin kind it owns) in the ingest request's `writer` field, and the library treats it as opaque.
 
 ### 8. Mounting is privileged and narrow
 
@@ -132,7 +132,7 @@ Playing from a guest's stick without syncing means indexing it and making it bro
 - **Accumulate instead of mirror.** Rejected by Joakim. The stick reflects the selection.
 - **Album tree plus M3U playlists.** Deferred: the car's M3U support is unproven (Phase 0).
 - **Import directly into the library, bypassing the inbox.** Rejected: a second ingest path.
-- **`IngestSource::Usb` in the library.** Rejected under the planned client-owned fact sources ADR: the library stays source-agnostic.
+- **`IngestSource::Usb` in the library.** Rejected under ADR-020: the library stays source-agnostic.
 - **udisks2 for mounting.** Rejected: brings in D-Bus and polkit when mdma-admin already exists.
 - **rpi_ws281x.** Rejected: no Pi 5 support.
 
@@ -142,7 +142,7 @@ Playing from a guest's stick without syncing means indexing it and making it bro
 - New project `mdma-usb`: an unprivileged service with a gateway route and a srcpkg.
 - `admin_ipc_protocol` and `mdma-admin` gain the narrow mount API.
 - Event bus: usb events (inserted, syncing, progress, importing, safe to remove, error).
-- Import provenance waits for the planned client-owned fact sources ADR.
+- Import provenance relies on ADR-020 (client-owned fact sources).
 
 ## Phasing
 
@@ -151,7 +151,7 @@ Playing from a guest's stick without syncing means indexing it and making it bro
 2. **Stored profiles and query sets:** settings file, `assign` and `show`, UUID binding.
 3. **Hotplug:** `/sys/block` watcher, auto-sync, auto-eject, console status and eject.
 4. **LED and button.**
-5. **Import:** after the planned client-owned fact sources ADR.
+5. **Import:** after ADR-020 is implemented.
 
 ## Open questions
 
@@ -168,4 +168,4 @@ Playing from a guest's stick without syncing means indexing it and making it bro
 ## Related
 
 - ADR-010, ADR-012, ADR-013 (dedup tiers that catch retagged imports)
-- ADR-018 (source identity); the planned client-owned fact sources ADR (import provenance)
+- ADR-018 (source identity); ADR-020 (client-owned fact sources, import provenance)

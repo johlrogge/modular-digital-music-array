@@ -7,7 +7,7 @@
 //! InboxFile → ValidatedAudio → ExtractedTrack → IndexedTrack
 //! ```
 
-use music_facts::{ContentHash, FactOrigin, FactSource, MusicValue};
+use music_facts::{ContentHash, FactSource, MusicValue};
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -34,36 +34,6 @@ pub enum IngestError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-}
-
-/// Source of the upload (for tracking provenance)
-#[derive(Debug, Clone)]
-pub enum UploadSource {
-    /// Dropped into inbox via SMB/NFS
-    NetworkShare,
-    /// Uploaded via HTTP
-    HttpUpload,
-    /// Downloaded from Bandcamp
-    BandcampDownload { artist_url: Option<String> },
-    /// Extracted from Beatport zip
-    BeatportZip { order_id: Option<String> },
-}
-
-impl UploadSource {
-    /// The origin this source declares for the facts of its ingest, if it declares
-    /// one. A Bandcamp download says so itself, so its origin is taken from the
-    /// request and never guessed from the path; the payload (`artist_url`) is left
-    /// empty on purpose, origin data is being phased out. This is the only place
-    /// that decision lives. `None` means undeclared: the tag facts then infer their
-    /// origin from the file (see `fact_generator`).
-    pub fn declared_origin(&self) -> Option<FactOrigin> {
-        match self {
-            UploadSource::BandcampDownload { .. } => Some(FactOrigin::bandcamp(None)),
-            UploadSource::NetworkShare
-            | UploadSource::HttpUpload
-            | UploadSource::BeatportZip { .. } => None,
-        }
-    }
 }
 
 /// Supported audio formats
@@ -119,13 +89,12 @@ impl AudioFormat {
 /// A file in the inbox, not yet validated
 pub struct InboxFile {
     pub path: PathBuf,
-    pub source: UploadSource,
 }
 
 impl InboxFile {
     /// Create from a path in the inbox
-    pub fn new(path: PathBuf, source: UploadSource) -> Self {
-        Self { path, source }
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
     }
 
     /// Validate the file and compute its hash
@@ -153,7 +122,6 @@ impl InboxFile {
             path: self.path,
             format,
             content_hash,
-            source: self.source,
         })
     }
 }
@@ -167,28 +135,26 @@ pub struct ValidatedAudio {
     pub path: PathBuf,
     pub format: AudioFormat,
     pub content_hash: ContentHash,
-    pub source: UploadSource,
 }
 
 impl ValidatedAudio {
     /// Extract metadata from the audio file
     /// Consumes self, transferring ownership to ExtractedTrack
     ///
-    /// `tool` and `version` identify the writer. The origin of the facts is decided
-    /// here from `self.source` (see `UploadSource::declared_origin`), not passed in.
+    /// `library` is the source of the facts the library computes (file path, format,
+    /// import time). `content` is the source of the facts the file's tags state.
     pub fn extract_metadata(
         self,
-        tool: &str,
-        version: &str,
+        library: &FactSource,
+        content: &FactSource,
     ) -> Result<ExtractedTrack, IngestError> {
         // Only read metadata, not audio data
         let facts = crate::fact_generator::generate_facts(
             &self.path,
             &self.content_hash,
             self.format,
-            &self.source,
-            tool,
-            version,
+            library,
+            content,
         )?;
 
         Ok(ExtractedTrack {
@@ -196,7 +162,6 @@ impl ValidatedAudio {
             format: self.format,
             content_hash: self.content_hash,
             facts,
-            source: self.source,
         })
     }
 }
@@ -211,7 +176,6 @@ pub struct ExtractedTrack {
     pub format: AudioFormat,
     pub content_hash: ContentHash,
     pub facts: Vec<(MusicValue, FactSource)>,
-    pub source: UploadSource,
 }
 
 impl ExtractedTrack {
@@ -383,7 +347,7 @@ mod tests {
         let wav_path = dir.path().join("track.wav");
         std::fs::write(&wav_path, b"RIFF fake wav data").unwrap();
 
-        let inbox = InboxFile::new(wav_path, UploadSource::HttpUpload);
+        let inbox = InboxFile::new(wav_path);
         let result = inbox.validate();
 
         // WAV is now ingestible; validate should NOT return NonIngestibleFormat
@@ -399,7 +363,7 @@ mod tests {
         let m4a_path = dir.path().join("track.m4a");
         std::fs::write(&m4a_path, b"\x00\x00\x00\x20ftyp fake m4a data").unwrap();
 
-        let inbox = InboxFile::new(m4a_path, UploadSource::HttpUpload);
+        let inbox = InboxFile::new(m4a_path);
         let result = inbox.validate();
 
         // M4A is ingestible; validate should NOT return NonIngestibleFormat
@@ -415,7 +379,7 @@ mod tests {
         let aiff_path = dir.path().join("track.aiff");
         std::fs::write(&aiff_path, b"FORM fake aiff data").unwrap();
 
-        let inbox = InboxFile::new(aiff_path, UploadSource::HttpUpload);
+        let inbox = InboxFile::new(aiff_path);
         let result = inbox.validate();
 
         match result {

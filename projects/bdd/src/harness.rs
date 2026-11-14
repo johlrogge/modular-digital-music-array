@@ -3,9 +3,7 @@
 use crate::playback_simulator::{start_playback_simulator, PlaybackState};
 use library_service::LibraryService;
 use mdma_client::{LibraryBackend, PlaybackBackend};
-use music_facts::{
-    Artist, Bpm, ContentHash, DurationSeconds, FactOrigin, FactSource, MusicValue, Title, Year,
-};
+use music_facts::{Artist, Bpm, ContentHash, DurationSeconds, FactSource, MusicValue, Title, Year};
 use stainless_facts::{Fact, FactStreamWriter, Operation};
 use std::sync::{Arc, Mutex};
 
@@ -42,7 +40,7 @@ fn seed_facts(metadata_dir: &std::path::Path, tracks: &[SeedTrack]) {
     let facts_path = metadata_dir.join("facts.jsonl");
     let mut writer = FactStreamWriter::open(&facts_path).expect("failed to open fact stream");
 
-    let source = FactSource::new("bdd-seed", "0.0.0", FactOrigin::Unknown);
+    let source = FactSource::new("bdd-seed", "0.0.0", "Unknown");
     let now = chrono::Utc::now();
 
     for (i, track) in tracks.iter().enumerate() {

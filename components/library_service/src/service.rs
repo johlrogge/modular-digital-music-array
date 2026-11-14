@@ -4,12 +4,13 @@
 
 use crate::identity::{identity_facts_for_blob, IdentityOpts};
 use crate::ipc::{
-    bookmark_scope_mark, parse_request, BeatGridInfo, Bpm, ContentHash, CueInfo, DurationSeconds,
-    FactType, InboxPath, IngestAllItem, IngestResult, IngestSource, IpcServer, Key, LibraryRequest,
-    LibraryResponse, Mark, MarkFilter, MarkWrite, OrphanInfo, OrphanReason, ProtocolError,
-    ServiceStatus, TrackInfo, TrackQuery, Unmark,
+    bookmark_scope_mark, parse_request, AttributeList, BeatGridInfo, Bpm, ContentHash, CueInfo,
+    DurationSeconds, FactType, InboxPath, IngestAllItem, IngestResult, IpcServer, Key,
+    LibraryRequest, LibraryResponse, Mark, MarkFilter, MarkWrite, OrphanInfo, OrphanReason,
+    ProtocolError, ServiceStatus, TrackInfo, TrackQuery, Unmark,
 };
-use crate::pipeline::{InboxFile, UploadSource};
+use crate::pipeline::InboxFile;
+use crate::sources;
 use acid_client::AcidClient;
 use event_protocol::{acid_event_from_topic_message, AcidEvent, TOPIC_ACID};
 use library_search::{matches_query, TrackFields};
@@ -44,6 +45,8 @@ pub struct LibraryService {
     start_time: Instant,
     tracks_indexed: AtomicUsize,
     facts_count: AtomicUsize,
+    /// Fact-log lines skipped since startup because they did not parse
+    unparseable_lines: AtomicUsize,
     /// In-memory index of tracks for fast search (rebuilt from facts on startup)
     tracks: Mutex<Vec<IndexedTrackInfo>>,
     /// ACID client for writing and reading facts
@@ -963,6 +966,8 @@ impl stainless_facts::FactAggregator<ContentHash, MusicValue, music_facts::FactS
 struct LoadResult {
     tracks: Vec<IndexedTrackInfo>,
     facts_count: usize,
+    /// Lines of the stream that were not facts and were skipped
+    unparseable_lines: usize,
     fact_index: HashMap<FactType, HashSet<String>>,
     content_hashes: HashSet<String>,
     /// Content hashes of tracks that already have a Format fact
@@ -985,11 +990,52 @@ fn hash_key(h: &str) -> String {
     h.strip_prefix("sha256:").unwrap_or(h).to_lowercase()
 }
 
-/// One line of an entity's fact stream, or `None` for a line that is not a fact.
+/// One line of a fact stream, or `None` for a line that is not a fact. Never dropped
+/// silently: a line this library cannot read (written by a newer one, say) is a fact
+/// it does not see.
 fn parse_fact_line(
     line: &str,
 ) -> Option<stainless_facts::Fact<ContentHash, MusicValue, music_facts::FactSource>> {
-    serde_json::from_str(line).ok()
+    match serde_json::from_str(line) {
+        Ok(fact) => Some(fact),
+        Err(e) => {
+            tracing::debug!(error = %e, "Skipping a fact-log line that does not parse");
+            None
+        }
+    }
+}
+
+/// Every fact among `lines`, and the number of lines that are not facts. Does not warn
+/// about the count: a caller that parses in pages warns once for all of them with
+/// `warn_unparseable`.
+fn parse_fact_lines_quietly(
+    lines: &[String],
+) -> (
+    Vec<stainless_facts::Fact<ContentHash, MusicValue, music_facts::FactSource>>,
+    usize,
+) {
+    let facts: Vec<_> = lines.iter().filter_map(|l| parse_fact_line(l)).collect();
+    let unparseable = lines.len() - facts.len();
+    (facts, unparseable)
+}
+
+/// [`parse_fact_lines_quietly`], warning about the count of lines that did not parse.
+fn parse_fact_lines(
+    lines: &[String],
+) -> (
+    Vec<stainless_facts::Fact<ContentHash, MusicValue, music_facts::FactSource>>,
+    usize,
+) {
+    let (facts, unparseable) = parse_fact_lines_quietly(lines);
+    warn_unparseable(unparseable);
+    (facts, unparseable)
+}
+
+/// Warn how many fact-log lines were skipped because they do not parse, if any.
+fn warn_unparseable(count: usize) {
+    if count > 0 {
+        tracing::warn!(count, "Fact-log lines skipped because they do not parse");
+    }
 }
 
 /// Latest start and stop recorded under one entity key.
@@ -1066,68 +1112,6 @@ fn format_fact_for_display(value: &MusicValue) -> (String, String) {
     (value.display_name().to_string(), value.to_string())
 }
 
-/// Returns true for the metadata attributes that a Bandcamp ingest writes and
-/// that are safe to retract during a resync.  ItemId and Source are identifiers
-/// and intentionally excluded.
-fn is_retractable_bandcamp_attribute(value: &MusicValue) -> bool {
-    matches!(
-        value,
-        MusicValue::Album(_)
-            | MusicValue::Title(_)
-            | MusicValue::Artist(_)
-            | MusicValue::TrackNumber(_)
-            | MusicValue::Year(_)
-    )
-}
-
-/// The `FactSource` the library service stamps on facts it derives itself
-/// (format, cover art, identity hashes, ingest provenance).
-fn library_fact_source() -> music_facts::FactSource {
-    music_facts::FactSource::new(
-        "mdma-library",
-        env!("CARGO_PKG_VERSION"),
-        music_facts::FactOrigin::Unknown,
-    )
-}
-
-/// The one `FactSource` of an ingest: the library's tool and version, and the origin
-/// the upload source declares (`UploadSource::declared_origin`), `Unknown` when it
-/// declares none. The service stamps it on the facts it derives itself (cover art,
-/// identity, Source, ItemId). The pipeline gets only its tool and version and decides
-/// the origin of the file's facts itself from the same upload source.
-fn ingest_fact_source(upload_source: &UploadSource) -> music_facts::FactSource {
-    let library = library_fact_source();
-    match upload_source.declared_origin() {
-        Some(origin) => music_facts::FactSource::new(library.tool, library.version, origin),
-        None => library,
-    }
-}
-
-/// The source of facts a user request writes.
-fn user_fact_source() -> music_facts::FactSource {
-    music_facts::FactSource::new(
-        "mdma",
-        env!("CARGO_PKG_VERSION"),
-        music_facts::FactOrigin::User,
-    )
-}
-
-/// Map a `FactOrigin` variant to its canonical source-name string.
-///
-/// This is the single source of truth for the `source_name` → `FactOrigin`
-/// mapping used in `retract_source_facts`. If a new origin is added to
-/// `FactOrigin`, add an arm here.
-fn origin_matches_source_name(origin: &music_facts::FactOrigin, source_name: &str) -> bool {
-    use music_facts::FactOrigin;
-    match origin {
-        FactOrigin::Bandcamp { .. } => source_name == "bandcamp",
-        FactOrigin::Beatport { .. } => source_name == "beatport",
-        FactOrigin::FilesystemScan { .. } => source_name == "filesystem",
-        FactOrigin::User => source_name == "user",
-        FactOrigin::Unknown => source_name == "unknown",
-    }
-}
-
 impl LibraryService {
     /// Create a new library service
     pub fn new(
@@ -1170,6 +1154,7 @@ impl LibraryService {
             start_time: Instant::now(),
             tracks_indexed: AtomicUsize::new(tracks_count),
             facts_count: AtomicUsize::new(loaded.facts_count),
+            unparseable_lines: AtomicUsize::new(loaded.unparseable_lines),
             tracks: Mutex::new(loaded.tracks),
             acid_client,
             album_cover_cache: Mutex::new(album_cover_cache),
@@ -1227,6 +1212,7 @@ impl LibraryService {
         // Phase 1: collect all raw fact lines from ACID (paged reads)
         let mut all_facts: Vec<Fact<ContentHash, MusicValue, music_facts::FactSource>> = Vec::new();
         let mut total = 0usize;
+        let mut unparseable = 0usize;
         let mut current_cursor = start_cursor;
         let final_cursor;
 
@@ -1245,19 +1231,10 @@ impl LibraryService {
             }
 
             let lines_count = chunk.lines.len();
-            for line in &chunk.lines {
-                match serde_json::from_str::<Fact<ContentHash, MusicValue, music_facts::FactSource>>(
-                    line,
-                ) {
-                    Ok(f) => {
-                        total += 1;
-                        all_facts.push(f);
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Failed to parse stream line during load");
-                    }
-                }
-            }
+            let (facts, skipped) = parse_fact_lines_quietly(&chunk.lines);
+            unparseable += skipped;
+            total += facts.len();
+            all_facts.extend(facts);
             current_cursor = Some(chunk.cursor.clone());
 
             if lines_count < PAGE_SIZE {
@@ -1266,6 +1243,7 @@ impl LibraryService {
             }
         }
 
+        warn_unparseable(unparseable);
         if total > 0 {
             tracing::info!("Loaded {} facts from ACID stream", total);
         }
@@ -1315,6 +1293,7 @@ impl LibraryService {
         let loaded = LoadResult {
             tracks: aggregated.into_values().collect(),
             facts_count: total,
+            unparseable_lines: unparseable,
             fact_index,
             content_hashes,
             has_format,
@@ -1343,6 +1322,7 @@ impl LibraryService {
                     return LoadResult {
                         tracks: vec![],
                         facts_count: 0,
+                        unparseable_lines: 0,
                         fact_index: HashMap::new(),
                         content_hashes: HashSet::new(),
                         has_format: HashSet::new(),
@@ -1436,6 +1416,7 @@ impl LibraryService {
         LoadResult {
             tracks: tracks_map.into_values().collect(),
             facts_count: total,
+            unparseable_lines: 0,
             fact_index,
             content_hashes,
             has_format,
@@ -1473,7 +1454,7 @@ impl LibraryService {
             "Backfilling Format facts for tracks"
         );
 
-        let source = library_fact_source();
+        let source = sources::derived();
 
         // The batch seam projects the written facts (index, fact_index, counters)
         // through the single path once the closure returns.
@@ -1585,7 +1566,7 @@ impl LibraryService {
             "Backfilling CoverArtPath facts for tracks"
         );
 
-        let fact_source = library_fact_source();
+        let fact_source = sources::derived();
 
         // Written facts are projected through the single path when the batch ends.
         let backfilled = self.write_batch_and_project_with(&self.acid_client, |w| {
@@ -1631,15 +1612,16 @@ impl LibraryService {
     /// the in-memory track index.
     ///
     /// Each line is a JSON-serialised `Fact<ContentHash, MusicValue, FactSource>`.
-    /// Unknown or malformed lines are silently skipped.
+    /// Lines that do not parse are warned about and skipped.
     pub fn apply_stream_lines(&self, lines: &[String]) {
-        use music_facts::FactSource;
-        use stainless_facts::Fact;
+        let (facts, unparseable) = parse_fact_lines(lines);
+        self.unparseable_lines
+            .fetch_add(unparseable, Ordering::Relaxed);
 
         let mut tracks = self.tracks.lock().unwrap();
         let mut fact_index = self.fact_index.lock().unwrap();
         let mut content_hashes = self.content_hashes.lock().unwrap();
-        let mut applied: usize = 0;
+        let applied = facts.len();
 
         // Build a temporary O(1) index: content_hash -> position in tracks Vec.
         // Built once per call to avoid O(n*m) linear scans. Entries are never
@@ -1650,16 +1632,7 @@ impl LibraryService {
             .map(|(i, t)| (t.content_hash.as_str().to_owned(), i))
             .collect();
 
-        for line in lines {
-            let fact: Fact<ContentHash, MusicValue, FactSource> = match serde_json::from_str(line) {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::debug!(error = %e, "Failed to parse stream line — skipping");
-                    continue;
-                }
-            };
-
-            applied += 1;
+        for fact in facts {
             let entity = fact.entity().as_str().to_owned();
             let is_retract = fact.operation() == stainless_facts::Operation::Retract;
 
@@ -1893,6 +1866,7 @@ impl LibraryService {
                     facts_count: self.facts_count.load(Ordering::Relaxed),
                     inbox_queue_size: self.get_inbox_queue_internal().len(),
                     uptime_seconds: self.start_time.elapsed().as_secs(),
+                    unparseable_lines: self.unparseable_lines.load(Ordering::Relaxed),
                 };
                 LibraryResponse::Status(status)
             }
@@ -1941,8 +1915,19 @@ impl LibraryService {
                 LibraryResponse::InboxQueue(queue)
             }
 
-            LibraryRequest::IngestFile { path, source } => {
-                let result = self.ingest_inbox_file(&path, source.as_ref());
+            LibraryRequest::IngestFile {
+                path,
+                writer,
+                facts,
+                ..
+            } => {
+                // Facts need a source that states them; the library does not guess one.
+                if writer.is_none() && !facts.is_empty() {
+                    return LibraryResponse::IngestResult(IngestResult::Failure {
+                        message: "IngestFile carries facts but no writer to state them".to_string(),
+                    });
+                }
+                let result = self.ingest_inbox_file(&path, writer.as_ref(), &facts);
                 LibraryResponse::IngestResult(result)
             }
 
@@ -2170,24 +2155,29 @@ impl LibraryService {
                 Err(e) => LibraryResponse::Error(e),
             },
 
-            LibraryRequest::WriteFact { hash, fact } => {
+            LibraryRequest::WriteFact { hash, fact, source } => {
                 let full_hash = match self.resolve_hash(&hash) {
                     Ok(h) => h,
                     Err(e) => return LibraryResponse::Error(e),
                 };
-                let source = user_fact_source();
+                let source = source.unwrap_or_else(sources::user_default);
                 match self.write_and_project(&full_hash, &[(fact, source)]) {
                     Ok(_) => LibraryResponse::FactWritten,
                     Err(e) => LibraryResponse::Error(acid_error(e)),
                 }
             }
 
-            LibraryRequest::RetractFact { hash, fact } => {
+            LibraryRequest::RetractFact { hash, fact, source } => {
                 let full_hash = match self.resolve_hash(&hash) {
                     Ok(h) => h,
                     Err(e) => return LibraryResponse::Error(e),
                 };
-                let source = user_fact_source();
+                let source = source.unwrap_or_else(sources::user_default);
+                match self.has_live_assertion(&full_hash, &fact, &source) {
+                    Ok(true) => {}
+                    Ok(false) => return LibraryResponse::NothingToRetract,
+                    Err(e) => return LibraryResponse::Error(acid_error(e)),
+                }
                 match self.retract_and_project(&full_hash, &[(fact, source)]) {
                     Ok(_) => LibraryResponse::FactRetracted,
                     Err(e) => LibraryResponse::Error(acid_error(e)),
@@ -2196,8 +2186,9 @@ impl LibraryService {
 
             LibraryRequest::RetractSourceFacts {
                 item_id,
-                source_name,
-            } => self.retract_source_facts(&item_id, &source_name),
+                source,
+                attributes,
+            } => self.retract_source_facts(&item_id, &source, &attributes),
 
             LibraryRequest::GetAlbumTitleByItemId { item_id } => {
                 LibraryResponse::AlbumTitleByItemId(self.get_album_title_by_item_id(&item_id))
@@ -2235,6 +2226,20 @@ impl LibraryService {
         }
     }
 
+    /// Whether the entity holds a live assertion of `fact` from `source`'s identity,
+    /// that is, whether a retract of it would cancel anything (ADR-018).
+    fn has_live_assertion(
+        &self,
+        hash: &ContentHash,
+        fact: &MusicValue,
+        source: &music_facts::FactSource,
+    ) -> Result<bool, acid_client::ClientError> {
+        let lines = self.acid_client.read_entity(hash.as_str())?;
+        Ok(dedup::live_facts(&lines)
+            .iter()
+            .any(|f| retract_matches(&f.value, &f.source, fact, source)))
+    }
+
     /// Scan the in-memory track index and return every ContentHash whose
     /// ItemId set contains `item_id` (a merged track holds several).
     ///
@@ -2249,13 +2254,10 @@ impl LibraryService {
             .collect()
     }
 
-    /// Retract bandcamp-sourced metadata facts for all tracks belonging to
-    /// `item_id`, whose origin kind is the one `source_name` names (see
-    /// `origin_matches_source_name`).
-    ///
-    /// Retracted attributes: Album, Title, Artist, TrackNumber, Year.
-    /// ItemId itself is intentionally NOT retracted — it is the stable identifier
-    /// used to correlate tracks across resyncs.
+    /// Retract the live facts of `attributes` that `source` wrote for all tracks
+    /// belonging to `item_id`. `source` matches on tool and origin kind; the
+    /// retracts are stamped with it. `attributes` is already known to be non-empty
+    /// and to name real attributes (`AttributeList`).
     ///
     /// Per-hash facts are read from ACID via `read_entity`, and retractions are
     /// sent to ACID via `retract_and_project`, which projects each retraction
@@ -2269,7 +2271,12 @@ impl LibraryService {
     /// take `retire_gate`. It must never be what empties an entity; any path that can
     /// leave an entity with no live facts has to go through
     /// `retract_all_entity_facts_locked` under `retire_gate`.
-    fn retract_source_facts(&self, item_id: &str, source_name: &str) -> LibraryResponse {
+    fn retract_source_facts(
+        &self,
+        item_id: &str,
+        source: &music_facts::FactSource,
+        attributes: &AttributeList,
+    ) -> LibraryResponse {
         use music_facts::FactSource;
 
         let hashes = self.content_hashes_for_item_id(item_id);
@@ -2278,11 +2285,9 @@ impl LibraryService {
             return LibraryResponse::SourceFactsRetracted;
         }
 
-        // For each hash, collect the (MusicValue, FactSource) retracts to write.
-        // We only retract the attributes that bandcamp writes during ingest:
-        // Album, Title, Artist, TrackNumber, Year, and only what `source_name`
-        // wrote. (Label, Genre, etc. from audio tags are written by mdma-library
-        // and may be shared with other sources.)
+        // For each hash, collect the (MusicValue, FactSource) retracts to write:
+        // only the requested attributes, and only what `source` wrote. (Attributes
+        // not asked for, and what other sources wrote, stay.)
         let mut all_retractions: Vec<(ContentHash, Vec<(MusicValue, FactSource)>)> = vec![];
 
         for hash in &hashes {
@@ -2303,11 +2308,8 @@ impl LibraryService {
             let retractable: Vec<(MusicValue, FactSource)> = distinct_retractions(
                 dedup::live_facts(&lines)
                     .into_iter()
-                    .filter(|f| {
-                        origin_matches_source_name(&f.source.origin, source_name)
-                            && is_retractable_bandcamp_attribute(&f.value)
-                    })
-                    .map(|f| (f.value, f.source)),
+                    .filter(|f| f.source.same_source(source) && attributes.contains(&f.value))
+                    .map(|f| (f.value, source.clone())),
             );
 
             if !retractable.is_empty() {
@@ -2337,7 +2339,8 @@ impl LibraryService {
 
         tracing::info!(
             item_id,
-            source_name,
+            tool = %source.tool,
+            origin = %source.origin.kind,
             facts_retracted = total_retracted,
             "Retracted source facts"
         );
@@ -2387,7 +2390,7 @@ impl LibraryService {
         let fact = MusicValue::Deleted {
             timestamp: chrono::Utc::now(),
         };
-        let source = user_fact_source();
+        let source = sources::user_default();
         match self.write_and_project(&full_hash, &[(fact, source)]) {
             Ok(_) => LibraryResponse::TrackDeleted,
             Err(e) => LibraryResponse::Error(acid_error(e)),
@@ -2421,7 +2424,7 @@ impl LibraryService {
         };
 
         let fact = MusicValue::Deleted { timestamp };
-        let source = user_fact_source();
+        let source = sources::user_default();
         match self.retract_and_project(&full_hash, &[(fact, source)]) {
             Ok(_) => LibraryResponse::TrackRestored,
             Err(e) => LibraryResponse::Error(acid_error(e)),
@@ -2508,7 +2511,7 @@ impl LibraryService {
 
         // Ingest the new file
         let new_path = std::path::PathBuf::from(new_file_path);
-        let new_hash = match self.ingest_file_internal(&new_path, None) {
+        let new_hash = match self.ingest_file_internal(&new_path, None, &[]) {
             Ok(h) => h,
             Err(e) => {
                 return LibraryResponse::Error(ProtocolError::IngestionFailed {
@@ -2517,7 +2520,7 @@ impl LibraryService {
             }
         };
 
-        let source = user_fact_source();
+        let source = sources::user_default();
         match self.merge_into(&new_hash, &old_full, &source, Vec::new()) {
             Ok(outcome) => LibraryResponse::TrackReplaced {
                 new_hash,
@@ -2662,7 +2665,7 @@ impl LibraryService {
         old_full: &ContentHash,
         inherited_ancestors: Vec<ContentHash>,
     ) -> Result<(), ProtocolError> {
-        let source = user_fact_source();
+        let source = sources::user_default();
         let ancestors = inherited_ancestors
             .into_iter()
             .map(|h| (h, source.clone()))
@@ -3016,7 +3019,7 @@ impl LibraryService {
             return Ok(MarkWrite::AlreadyLive);
         }
         let fact = mark.fact_value(chrono::Utc::now());
-        self.write_and_project(&full_hash, &[(fact, user_fact_source())])
+        self.write_and_project(&full_hash, &[(fact, sources::user_default())])
             .map_err(acid_error)?;
         Ok(MarkWrite::Written)
     }
@@ -3358,11 +3361,12 @@ impl LibraryService {
     fn ingest_inbox_file(
         &self,
         inbox_path: &InboxPath,
-        source: Option<&IngestSource>,
+        writer: Option<&music_facts::FactSource>,
+        facts: &[MusicValue],
     ) -> IngestResult {
         let path = self.resolve_inbox_path(inbox_path);
 
-        match self.ingest_file_internal(&path, source) {
+        match self.ingest_file_internal(&path, writer, facts) {
             Ok(hash) => IngestResult::Success {
                 hash: Some(hash),
                 message: "File ingested successfully".to_string(),
@@ -3401,55 +3405,23 @@ impl LibraryService {
         inbox_paths
             .into_iter()
             .map(|path| {
-                let result = self.ingest_inbox_file(&path, None);
+                let result = self.ingest_inbox_file(&path, None, &[]);
                 IngestAllItem { path, result }
             })
             .collect()
     }
 
-    /// Map protocol IngestSource to pipeline UploadSource
-    fn map_upload_source(source: Option<&IngestSource>) -> UploadSource {
-        match source {
-            Some(IngestSource::Bandcamp { artist_url, .. }) => UploadSource::BandcampDownload {
-                artist_url: artist_url.clone(),
-            },
-            Some(IngestSource::Beatport { order_id }) => UploadSource::BeatportZip {
-                order_id: order_id.clone(),
-            },
-            Some(IngestSource::Upload) | None => UploadSource::HttpUpload,
-        }
-    }
-
-    /// Generate provenance facts from IngestSource
-    fn source_facts(
-        source: Option<&IngestSource>,
-        fact_source: &music_facts::FactSource,
-    ) -> Vec<(MusicValue, music_facts::FactSource)> {
-        match source {
-            Some(IngestSource::Bandcamp { item_id, .. }) => vec![
-                (
-                    MusicValue::Source("bandcamp".to_string()),
-                    fact_source.clone(),
-                ),
-                (MusicValue::ItemId(item_id.clone()), fact_source.clone()),
-            ],
-            Some(IngestSource::Beatport { .. }) => vec![(
-                MusicValue::Source("beatport".to_string()),
-                fact_source.clone(),
-            )],
-            Some(IngestSource::Upload) => vec![(
-                MusicValue::Source("upload".to_string()),
-                fact_source.clone(),
-            )],
-            None => vec![],
-        }
-    }
-
     /// Ingest a file through the pipeline (internal, takes absolute path)
+    ///
+    /// What the library computes (file path, format, import time, cover art,
+    /// identity hashes) carries the library's own sources. The tags and the
+    /// client's own `facts` carry `writer`; with no writer, the library states the
+    /// tags itself as it reads them from the file.
     fn ingest_file_internal(
         &self,
         path: &PathBuf,
-        source: Option<&IngestSource>,
+        writer: Option<&music_facts::FactSource>,
+        facts: &[MusicValue],
     ) -> Result<ContentHash, ServiceError> {
         if !path.exists() {
             return Err(ServiceError::Io(std::io::Error::new(
@@ -3458,11 +3430,18 @@ impl LibraryService {
             )));
         }
 
+        // The sources of this ingest: what the library computes carries its own; the
+        // tags and the client's facts carry the writer's.
+        let scan_source = sources::scan();
+        let derived_source = sources::derived();
+        let content_source = writer.cloned().unwrap_or_else(|| scan_source.clone());
+        let provenance: Vec<(MusicValue, music_facts::FactSource)> = facts
+            .iter()
+            .map(|f| (f.clone(), content_source.clone()))
+            .collect();
+
         // Stage 1: Create inbox file
-        let upload_source = Self::map_upload_source(source);
-        // The one FactSource of this ingest, on every fact it writes.
-        let fact_source = ingest_fact_source(&upload_source);
-        let inbox = InboxFile::new(path.clone(), upload_source);
+        let inbox = InboxFile::new(path.clone());
 
         // Stage 2: Validate and compute hash
         let validated = inbox.validate()?;
@@ -3485,31 +3464,30 @@ impl LibraryService {
                 "Duplicate content hash, removing inbox file"
             );
 
-            // An ingest that declares its origin (a Bandcamp resync) may follow a
-            // retract of what that origin wrote earlier. Read the tags before the
-            // file goes, so what the track lost can be asserted again. Only
-            // provenance-tracked facts: FilePath and AddedAt describe the first
-            // import and must not be rewritten.
-            let tag_facts: Vec<(MusicValue, music_facts::FactSource)> =
-                if validated.source.declared_origin().is_some() {
-                    match validated.extract_metadata(&fact_source.tool, &fact_source.version) {
-                        Ok(extracted) => extracted
-                            .facts
-                            .into_iter()
-                            .filter(|(v, _)| is_provenance_tracked(v))
-                            .collect(),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Could not re-read tags of a duplicate");
-                            Vec::new()
-                        }
+            // An ingest with a writer (a client resync) may follow a retract of
+            // what that writer wrote earlier. Read the tags before the file goes, so
+            // what the track lost can be asserted again. Only provenance-tracked
+            // facts: FilePath and AddedAt describe the first import and must not be
+            // rewritten.
+            let tag_facts: Vec<(MusicValue, music_facts::FactSource)> = if writer.is_some() {
+                match validated.extract_metadata(&scan_source, &content_source) {
+                    Ok(extracted) => extracted
+                        .facts
+                        .into_iter()
+                        .filter(|(v, _)| is_provenance_tracked(v))
+                        .collect(),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Could not re-read tags of a duplicate");
+                        Vec::new()
                     }
-                } else {
-                    Vec::new()
-                };
+                }
+            } else {
+                Vec::new()
+            };
             let _ = std::fs::remove_file(path);
 
             // Append source facts that don't exist yet for this track
-            let mut new_facts = Self::source_facts(source, &fact_source);
+            let mut new_facts = provenance;
             new_facts.extend(tag_facts);
             if !new_facts.is_empty() {
                 // Keep only the facts the track does not hold yet: an ItemId it lacks,
@@ -3559,7 +3537,7 @@ impl LibraryService {
         }
 
         // Stage 3: Extract metadata
-        let extracted = validated.extract_metadata(&fact_source.tool, &fact_source.version)?;
+        let extracted = validated.extract_metadata(&scan_source, &content_source)?;
         let mut facts = extracted.facts.clone();
 
         // Stage 4: Import to blob storage
@@ -3571,17 +3549,18 @@ impl LibraryService {
         if let Some(ref rel_path) = cover_art_path {
             facts.push((
                 MusicValue::CoverArtPath(rel_path.to_string_lossy().to_string()),
-                fact_source.clone(),
+                derived_source.clone(),
             ));
         }
 
         // Identity: AudioHash v1 (PcmHash is left to the explicit backfill). A failure
         // is logged and simply yields no fact; ingest continues.
-        facts.extend(identity_facts_for_blob(&blob_path, IdentityOpts::INGEST, &fact_source).facts);
+        facts.extend(
+            identity_facts_for_blob(&blob_path, IdentityOpts::INGEST, &derived_source).facts,
+        );
 
-        // Add provenance facts from source metadata
-        let source_facts = Self::source_facts(source, &fact_source);
-        facts.extend(source_facts);
+        // Add the client's provenance facts
+        facts.extend(provenance);
 
         // Write facts via the fact store and project them through the single stream
         // path (the same one the fact subscriber uses). There is deliberately no
@@ -3956,16 +3935,14 @@ mod tests {
     use super::*;
     use crate::fact_writer::FactWriter;
     use chrono::{TimeZone, Utc};
-    use music_facts::{
-        ContentHash, FactOrigin, FactSource, MusicValue, StartReason, StopReason, Title,
-    };
+    use music_facts::{ContentHash, FactSource, MusicValue, StartReason, StopReason, Title};
     use pretty_assertions::assert_eq;
     use stainless_facts::{Fact, FactStreamWriter, Operation};
     use tempfile::NamedTempFile;
 
     fn write_facts_file(facts: &[(ContentHash, MusicValue)]) -> NamedTempFile {
         let temp = NamedTempFile::new().unwrap();
-        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("test", "1.0.0", "Unknown");
         let mut writer = FactWriter::open(temp.path()).unwrap();
 
         // Group by entity and write
@@ -3982,7 +3959,7 @@ mod tests {
         facts: &[(ContentHash, MusicValue, chrono::DateTime<Utc>)],
     ) -> NamedTempFile {
         let temp = NamedTempFile::new().unwrap();
-        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("test", "1.0.0", "Unknown");
         let mut writer = FactStreamWriter::open(temp.path()).unwrap();
 
         let fact_structs: Vec<Fact<ContentHash, MusicValue, FactSource>> = facts
@@ -4153,11 +4130,7 @@ mod tests {
         // Simulate playback service writing a TrackStarted fact via ACID after startup.
         // refresh_event_timestamps() now reads from the ACID stream incrementally, so
         // this write will be picked up on the next search_tracks call.
-        let source = music_facts::FactSource::new(
-            "test-playback",
-            "1.0.0",
-            music_facts::FactOrigin::Unknown,
-        );
+        let source = music_facts::FactSource::new("test-playback", "1.0.0", "Unknown");
         let external_client = AcidClient::connect(&facts_addr).unwrap();
         external_client
             .write_music_facts(
@@ -4676,11 +4649,11 @@ mod tests {
 
     #[test]
     fn apply_stream_lines_updates_index() {
-        use music_facts::{ContentHash, FactOrigin, FactSource, MusicValue, Title};
+        use music_facts::{ContentHash, FactSource, MusicValue, Title};
         use stainless_facts::{Fact, Operation};
 
         let hash = ContentHash::new("sha256:streamtest01");
-        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("test", "1.0.0", "Unknown");
         let now = chrono::Utc::now();
 
         let fact = Fact::new(
@@ -4800,7 +4773,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
 
         let hash = ContentHash::new("sha256:acidstreamtest01");
-        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("test", "1.0.0", "Unknown");
         acid_client
             .write_music_facts(
                 &hash,
@@ -5018,7 +4991,7 @@ mod tests {
         let before = service.search_tracks(&not_played_query);
         assert_eq!(before.len(), 2, "both tracks should be unplayed initially");
 
-        let source = FactSource::new("test-playback", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("test-playback", "1.0.0", "Unknown");
         let external_client = AcidClient::connect(&facts_addr).unwrap();
 
         // Step 1: play hash_a
@@ -5082,16 +5055,30 @@ mod tests {
         );
     }
 
+    /// A client's own source, as a client such as mdma-bandcamp states it. The library
+    /// knows nothing about it beyond its tool and origin kind.
+    fn client_source() -> FactSource {
+        FactSource::new("test-client", "0.0.0", "Client")
+    }
+
+    /// The attributes a client asks `RetractSourceFacts` to retract.
+    fn resync_attributes() -> AttributeList {
+        AttributeList::try_new(["Album", "Title", "Artist", "TrackNumber", "Year"]).unwrap()
+    }
+
+    /// The provenance facts a client states about the file it ingests.
+    fn client_facts() -> Vec<MusicValue> {
+        vec![
+            MusicValue::Source("test-client".to_string()),
+            MusicValue::ItemId("p42".to_string()),
+        ]
+    }
+
     #[test]
     fn retract_source_facts_removes_album_and_title_from_in_memory_track() {
-        // Arrange: a track with ItemId, Album and Title written by "mdma-library"
-        // with FactOrigin::Bandcamp — exactly as production sets it.
+        // Arrange: a track with ItemId, Album and Title written by a client's source
         let hash = ContentHash::new("sha256:retracttest01");
-        let source = FactSource::new(
-            "mdma-library",
-            "0.0.0",
-            FactOrigin::bandcamp(Some("https://artist.bandcamp.com".to_string())),
-        );
+        let source = client_source();
         let item_id = "p12345";
 
         let temp = {
@@ -5130,10 +5117,11 @@ mod tests {
             assert_eq!(t.title.as_deref(), Some("Old Title"));
         }
 
-        // Act: retract with "bandcamp" source_name — matches FactOrigin::Bandcamp
+        // Act: retract as the client's source
         let response = service.handle_request(LibraryRequest::RetractSourceFacts {
             item_id: item_id.to_string(),
-            source_name: "bandcamp".to_string(),
+            source: client_source(),
+            attributes: resync_attributes(),
         });
 
         // Assert response
@@ -5167,8 +5155,8 @@ mod tests {
     #[test]
     fn retract_source_facts_keeps_second_sources_album() {
         let hash = ContentHash::new("sha256:retract_two_sources");
-        let bandcamp = FactSource::new("mdma-library", "0.0.0", FactOrigin::bandcamp(None));
-        let other = FactSource::new("tagger", "1.0.0", FactOrigin::Unknown);
+        let bandcamp = client_source();
+        let other = FactSource::new("tagger", "1.0.0", "Unknown");
         let item_id = "p777";
 
         let temp = {
@@ -5196,7 +5184,8 @@ mod tests {
 
         let response = service.handle_request(LibraryRequest::RetractSourceFacts {
             item_id: item_id.to_string(),
-            source_name: "bandcamp".to_string(),
+            source: client_source(),
+            attributes: resync_attributes(),
         });
         assert!(matches!(response, LibraryResponse::SourceFactsRetracted));
 
@@ -5211,8 +5200,7 @@ mod tests {
     #[test]
     fn retract_source_facts_writes_retract_entries_to_acid() {
         let hash = ContentHash::new("sha256:retractfile01");
-        // Use Bandcamp origin + "bandcamp" source_name — matches production usage
-        let source = FactSource::new("mdma-library", "0.0.0", FactOrigin::bandcamp(None));
+        let source = client_source();
         let item_id = "p54321";
 
         let temp = {
@@ -5241,7 +5229,8 @@ mod tests {
 
         service.handle_request(LibraryRequest::RetractSourceFacts {
             item_id: item_id.to_string(),
-            source_name: "bandcamp".to_string(),
+            source: client_source(),
+            attributes: resync_attributes(),
         });
 
         // Verify Retract entries appear in ACID via read_entity
@@ -5267,19 +5256,15 @@ mod tests {
     }
 
     /// An assertion that an earlier retract already cancelled is not retracted again.
-    /// That retract came from a newer version of the same source with another origin
-    /// payload, which is still the same source.
+    /// That retract came from a newer version of the same source, which is still the
+    /// same source.
     #[test]
     fn retract_source_facts_skips_assertions_already_cancelled_by_a_newer_version() {
         use stainless_facts::Operation;
 
         let hash = ContentHash::new("sha256:retractfile_cancelled");
-        let bandcamp = FactSource::new("mdma-library", "0.0.0", FactOrigin::bandcamp(None));
-        let newer_bandcamp = FactSource::new(
-            "mdma-library",
-            "9.9.9",
-            FactOrigin::bandcamp(Some("https://artist.bandcamp.com".to_string())),
-        );
+        let bandcamp = client_source();
+        let newer_bandcamp = FactSource::new("test-client", "9.9.9", "Client");
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let album = || MusicValue::Album(music_facts::Album::new("Cancelled Album"));
         let fact =
@@ -5309,7 +5294,8 @@ mod tests {
         let (service, _metadata_dir, facts_addr) = make_service_with_facts_and_addr(temp.path());
         service.handle_request(LibraryRequest::RetractSourceFacts {
             item_id: "p777".to_string(),
-            source_name: "bandcamp".to_string(),
+            source: client_source(),
+            attributes: resync_attributes(),
         });
 
         let lines = AcidClient::connect(&facts_addr)
@@ -5335,32 +5321,58 @@ mod tests {
         );
     }
 
-    /// Through the real ingest path: every fact of a Bandcamp ingest carries origin
-    /// Bandcamp, so `RetractSourceFacts "bandcamp"` retracts its Title, Artist and
-    /// TrackNumber, while the Title the user also asserted survives.
+    /// The origin kind the library itself stamps on `value` when it ingests a file:
+    /// derived facts are `Unknown`, what it reads or measures is a `FilesystemScan`.
+    /// `None` for what a writer states (the tags and the client's own facts).
+    fn expected_library_origin(value: &MusicValue) -> Option<&'static str> {
+        match value {
+            MusicValue::CoverArtPath(_) | MusicValue::AudioHash(_) | MusicValue::PcmHash(_) => {
+                Some(sources::UNKNOWN_ORIGIN)
+            }
+            MusicValue::FilePath(_)
+            | MusicValue::Format(_)
+            | MusicValue::AddedAt(_)
+            | MusicValue::BitDepth(_)
+            | MusicValue::Channels(_)
+            | MusicValue::SampleRate(_)
+            | MusicValue::DurationSeconds(_)
+            | MusicValue::Bitrate(_)
+            | MusicValue::FileSizeBytes(_)
+            | MusicValue::HasAlbumArt(_) => Some(sources::SCAN_ORIGIN),
+            _ => None,
+        }
+    }
+
+    /// Through the real ingest path: the tags and the client's facts carry the
+    /// client's source, so a `RetractSourceFacts` as that source retracts the Title,
+    /// Artist and TrackNumber, while the Title the user also asserted survives. The
+    /// facts the library computes carry the library's own source.
     #[test]
-    fn bandcamp_ingest_then_retract_source_facts_retracts_what_bandcamp_wrote() {
+    fn client_ingest_then_retract_source_facts_retracts_what_the_client_wrote() {
         let (service, _metadata_dir, _acid) = make_empty_service();
         let inbox = service.music_dir.join("inbox");
         std::fs::create_dir_all(&inbox).unwrap();
         let path = inbox.join("03 - Real Artist - Real Title.wav");
         write_test_wav(&path, 3);
-        let ingest = IngestSource::Bandcamp {
-            item_id: "p42".to_string(),
-            artist_url: None,
-        };
-        let hash = service.ingest_file_internal(&path, Some(&ingest)).unwrap();
+        let hash = service
+            .ingest_file_internal(&path, Some(&client_source()), &client_facts())
+            .unwrap();
 
-        // Every ingest fact says Bandcamp, with no payload.
         let lines = service.acid_client.read_entity(hash.as_str()).unwrap();
         assert!(!lines.is_empty());
         for f in lines.iter().filter_map(|l| parse_fact_line(l)) {
-            assert_eq!(
-                f.source().origin,
-                FactOrigin::bandcamp(None),
-                "origin of {:?}",
-                f.value()
-            );
+            match expected_library_origin(f.value()) {
+                Some(origin) => {
+                    assert_eq!(f.source().tool, sources::LIBRARY_TOOL, "{:?}", f.value());
+                    assert_eq!(f.source().origin.kind, origin, "{:?}", f.value());
+                }
+                None => assert_eq!(
+                    f.source().identity(),
+                    client_source().identity(),
+                    "source of {:?}",
+                    f.value()
+                ),
+            }
         }
 
         // The user asserts the same Title.
@@ -5369,14 +5381,15 @@ mod tests {
                 &hash,
                 &[(
                     MusicValue::Title(Title::new("Real Title")),
-                    user_fact_source(),
+                    sources::user_default(),
                 )],
             )
             .unwrap();
 
         let response = service.handle_request(LibraryRequest::RetractSourceFacts {
             item_id: "p42".to_string(),
-            source_name: "bandcamp".to_string(),
+            source: client_source(),
+            attributes: resync_attributes(),
         });
         assert!(matches!(response, LibraryResponse::SourceFactsRetracted));
 
@@ -5390,18 +5403,222 @@ mod tests {
         assert_eq!(t.track_number, None);
     }
 
-    /// Ingest `03 - Real Artist - Real Title.wav` (same bytes every time) as a
-    /// Bandcamp download of item `p42`.
-    fn ingest_bandcamp_wav(service: &LibraryService) -> ContentHash {
+    /// The live ItemId fact of a track, with its source.
+    fn live_item_id_source(service: &LibraryService, hash: &ContentHash) -> Option<FactSource> {
+        let lines = service.acid_client.read_entity(hash.as_str()).unwrap();
+        dedup::live_facts(&lines)
+            .into_iter()
+            .find(|f| matches!(f.value, MusicValue::ItemId(_)))
+            .map(|f| f.source.clone())
+    }
+
+    /// A client-stated source on a WriteFact is written verbatim: tool, version and
+    /// origin kind are the client's.
+    #[test]
+    fn write_fact_with_a_client_stated_source_is_written_verbatim() {
+        let (service, _metadata_dir, _acid) = make_empty_service();
+        let hash = ContentHash::new("sha256:backfill_0001");
+        seed_track(&service, &hash, "Backfilled");
+        let stated = FactSource::new("test-client", "7.7.7", "Client");
+        let resp = service.handle_request(LibraryRequest::WriteFact {
+            hash: hash.clone(),
+            fact: MusicValue::ItemId("p77".to_string()),
+            source: Some(stated.clone()),
+        });
+        assert!(matches!(resp, LibraryResponse::FactWritten), "{resp:?}");
+
+        let source = live_item_id_source(&service, &hash).expect("ItemId is live");
+        assert_eq!(source, stated);
+    }
+
+    /// A WriteFact without a source is the user's, as before.
+    #[test]
+    fn write_fact_without_source_is_still_the_users() {
+        let (service, _metadata_dir, _acid) = make_empty_service();
+        let hash = ContentHash::new("sha256:backfill_0002");
+        seed_track(&service, &hash, "Plain");
+        service.handle_request(LibraryRequest::WriteFact {
+            hash: hash.clone(),
+            fact: MusicValue::ItemId("p78".to_string()),
+            source: None,
+        });
+
+        let source = live_item_id_source(&service, &hash).expect("ItemId is live");
+        assert_eq!(source.tool, "mdma");
+        assert_eq!(source.origin.kind, "User");
+    }
+
+    /// A RetractFact with a client-stated source cancels what that source asserted,
+    /// and leaves the same value another source asserted.
+    #[test]
+    fn retract_fact_with_a_stated_source_cancels_only_that_sources_assertion() {
+        let (service, _metadata_dir, _acid) = make_empty_service();
+        let hash = ContentHash::new("sha256:retract_stated_source");
+        seed_track(&service, &hash, "Shared");
+        let title = || MusicValue::Title(Title::new("Shared"));
+        service.handle_request(LibraryRequest::WriteFact {
+            hash: hash.clone(),
+            fact: title(),
+            source: Some(client_source()),
+        });
+
+        let resp = service.handle_request(LibraryRequest::RetractFact {
+            hash: hash.clone(),
+            fact: title(),
+            source: Some(client_source()),
+        });
+        assert!(matches!(resp, LibraryResponse::FactRetracted), "{resp:?}");
+
+        let lines = service.acid_client.read_entity(hash.as_str()).unwrap();
+        let live = dedup::live_facts(&lines);
+        assert!(
+            live.iter()
+                .all(|f| f.value != title() || !f.source.same_source(&client_source())),
+            "the client's assertion is cancelled"
+        );
+        assert!(
+            live.iter().any(|f| f.value == title()),
+            "the seeded Title of another source stays"
+        );
+    }
+
+    /// A retract that matches no live assertion of that source says so and writes
+    /// nothing: the same value by another source does not count.
+    #[test]
+    fn retract_fact_that_matches_nothing_says_so_and_writes_nothing() {
+        let (service, _metadata_dir, _acid) = make_empty_service();
+        let hash = ContentHash::new("sha256:retract_nothing");
+        seed_track(&service, &hash, "Only By The User");
+        let before = service
+            .acid_client
+            .read_entity(hash.as_str())
+            .unwrap()
+            .len();
+
+        let resp = service.handle_request(LibraryRequest::RetractFact {
+            hash: hash.clone(),
+            fact: MusicValue::Title(Title::new("Only By The User")),
+            source: Some(client_source()),
+        });
+        assert!(
+            matches!(resp, LibraryResponse::NothingToRetract),
+            "{resp:?}"
+        );
+        let after = service
+            .acid_client
+            .read_entity(hash.as_str())
+            .unwrap()
+            .len();
+        assert_eq!(before, after, "nothing is written");
+
+        let resp = service.handle_request(LibraryRequest::RetractFact {
+            hash: hash.clone(),
+            fact: MusicValue::Title(Title::new("Only By The User")),
+            source: None,
+        });
+        assert!(matches!(resp, LibraryResponse::FactRetracted), "{resp:?}");
+    }
+
+    /// Facts without a writer have no source to state them: the ingest is refused.
+    #[test]
+    fn ingest_file_with_facts_and_no_writer_is_refused() {
+        let (service, _metadata_dir, _acid) = make_empty_service();
+        let inbox = service.music_dir.join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        write_test_wav(&inbox.join("a.wav"), 3);
+
+        let resp = service.handle_request(LibraryRequest::IngestFile {
+            path: InboxPath::new("a.wav").unwrap(),
+            source: None,
+            writer: None,
+            facts: client_facts(),
+        });
+        assert!(
+            matches!(
+                resp,
+                LibraryResponse::IngestResult(IngestResult::Failure { .. })
+            ),
+            "{resp:?}"
+        );
+        assert!(inbox.join("a.wav").exists(), "the file is left alone");
+    }
+
+    /// Lines that do not parse are counted, and the count is in the status.
+    #[test]
+    fn unparseable_stream_lines_are_counted_in_the_status() {
+        let (service, _metadata_dir, _acid) = make_empty_service();
+        service.apply_stream_lines(&["not a fact".to_string(), "{}".to_string()]);
+
+        match service.handle_request(LibraryRequest::GetStatus) {
+            LibraryResponse::Status(status) => assert_eq!(status.unparseable_lines, 2),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// A backfilled ItemId survives a resync: it is not in the attribute list.
+    #[test]
+    fn retract_source_facts_never_retracts_a_backfilled_item_id() {
+        let (service, _metadata_dir, _acid) = make_empty_service();
+        let hash = ContentHash::new("sha256:backfill_0003");
+        seed_track(&service, &hash, "Kept");
+        service.handle_request(LibraryRequest::WriteFact {
+            hash: hash.clone(),
+            fact: MusicValue::ItemId("p79".to_string()),
+            source: Some(client_source()),
+        });
+
+        let response = service.handle_request(LibraryRequest::RetractSourceFacts {
+            item_id: "p79".to_string(),
+            source: client_source(),
+            attributes: resync_attributes(),
+        });
+        assert!(matches!(response, LibraryResponse::SourceFactsRetracted));
+
+        assert!(
+            live_item_id_source(&service, &hash).is_some(),
+            "the ItemId must stay live"
+        );
+    }
+
+    /// An ItemId a client backfills, stating the same source as its ingest, is the
+    /// same source as that ingest, so a retract of one matches the other (ADR-018).
+    #[test]
+    fn backfilled_item_id_is_the_same_source_as_the_client_ingest() {
+        let (service, _metadata_dir, _acid) = make_empty_service();
+        let hash = ingest_client_wav(&service);
+        service.handle_request(LibraryRequest::WriteFact {
+            hash: hash.clone(),
+            fact: MusicValue::ItemId("p99".to_string()),
+            source: Some(client_source()),
+        });
+
+        let lines = service.acid_client.read_entity(hash.as_str()).unwrap();
+        let live = dedup::live_facts(&lines);
+        let source_of = |id: &str| {
+            live.iter()
+                .find(|f| f.value == MusicValue::ItemId(id.to_string()))
+                .unwrap_or_else(|| panic!("ItemId {id} is live"))
+                .source
+                .clone()
+        };
+        let ingested = source_of("p42");
+        let backfilled = source_of("p99");
+        assert!(
+            ingested.same_source(&backfilled),
+            "{ingested:?} vs {backfilled:?}"
+        );
+    }
+
+    /// Ingest `03 - Real Artist - Real Title.wav` (same bytes every time) as a client
+    /// that states its source and its facts about item `p42`.
+    fn ingest_client_wav(service: &LibraryService) -> ContentHash {
         let inbox = service.music_dir.join("inbox");
         std::fs::create_dir_all(&inbox).unwrap();
         let path = inbox.join("03 - Real Artist - Real Title.wav");
         write_test_wav(&path, 3);
-        let ingest = IngestSource::Bandcamp {
-            item_id: "p42".to_string(),
-            artist_url: None,
-        };
-        service.ingest_file_internal(&path, Some(&ingest)).unwrap()
+        service
+            .ingest_file_internal(&path, Some(&client_source()), &client_facts())
+            .unwrap()
     }
 
     /// (title, artist, track_number) of the indexed track.
@@ -5417,12 +5634,12 @@ mod tests {
         (t.title.clone(), t.artist.clone(), t.track_number)
     }
 
-    /// A resync retracts what Bandcamp wrote and re-downloads the same bytes: the
-    /// duplicate path must assert the tags again, with origin Bandcamp.
+    /// A resync retracts what the client wrote and re-downloads the same bytes: the
+    /// duplicate path must assert the tags again, as the client's source.
     #[test]
-    fn bandcamp_resync_then_reingest_of_same_bytes_restores_metadata() {
+    fn client_resync_then_reingest_of_same_bytes_restores_metadata() {
         let (service, _metadata_dir, _acid) = make_empty_service();
-        let hash = ingest_bandcamp_wav(&service);
+        let hash = ingest_client_wav(&service);
         assert_eq!(
             indexed_tags(&service, &hash),
             (
@@ -5434,11 +5651,12 @@ mod tests {
 
         service.handle_request(LibraryRequest::RetractSourceFacts {
             item_id: "p42".to_string(),
-            source_name: "bandcamp".to_string(),
+            source: client_source(),
+            attributes: resync_attributes(),
         });
         assert_eq!(indexed_tags(&service, &hash), (None, None, None));
 
-        assert_eq!(ingest_bandcamp_wav(&service), hash, "same bytes, same hash");
+        assert_eq!(ingest_client_wav(&service), hash, "same bytes, same hash");
         assert_eq!(
             indexed_tags(&service, &hash),
             (
@@ -5453,22 +5671,22 @@ mod tests {
             .iter()
             .find(|f| matches!(f.value, MusicValue::Title(_)))
             .expect("Title is live again");
-        assert_eq!(title.source.origin, FactOrigin::bandcamp(None));
+        assert_eq!(title.source.identity(), client_source().identity());
     }
 
     /// Ingesting the same bytes again, with no resync in between, appends no tag
     /// fact a second time.
     #[test]
-    fn bandcamp_reingest_of_same_bytes_appends_no_duplicate_tag_facts() {
+    fn client_reingest_of_same_bytes_appends_no_duplicate_tag_facts() {
         let (service, _metadata_dir, _acid) = make_empty_service();
-        let hash = ingest_bandcamp_wav(&service);
+        let hash = ingest_client_wav(&service);
         let before = service
             .acid_client
             .read_entity(hash.as_str())
             .unwrap()
             .len();
 
-        ingest_bandcamp_wav(&service);
+        ingest_client_wav(&service);
 
         let after = service
             .acid_client
@@ -5478,43 +5696,41 @@ mod tests {
         assert_eq!(before, after, "nothing new to assert");
     }
 
-    /// One ingest writes one tool and version on every fact it writes, whatever the
-    /// facts' origins.
+    /// An ingest with no writer states every fact itself: the library's tool and
+    /// version, read from the file as a scan.
     #[test]
-    fn one_ingest_writes_a_single_tool_and_version_on_all_its_facts() {
+    fn ingest_without_writer_states_every_fact_as_the_library() {
         let (service, _metadata_dir, _acid) = make_empty_service();
         let inbox = service.music_dir.join("inbox");
         std::fs::create_dir_all(&inbox).unwrap();
-
-        let declared = ingest_bandcamp_wav(&service);
         let plain_path = inbox.join("04 - Other Artist - Other Title.wav");
         write_test_wav(&plain_path, 5);
-        let plain = service.ingest_file_internal(&plain_path, None).unwrap();
+        let plain = service
+            .ingest_file_internal(&plain_path, None, &[])
+            .unwrap();
 
-        for hash in [declared, plain] {
-            let lines = service.acid_client.read_entity(hash.as_str()).unwrap();
-            let sources: std::collections::HashSet<(String, String)> = lines
-                .iter()
-                .filter_map(|l| parse_fact_line(l))
-                .map(|f| (f.source().tool.clone(), f.source().version.clone()))
-                .collect();
+        let lines = service.acid_client.read_entity(plain.as_str()).unwrap();
+        for f in lines.iter().filter_map(|l| parse_fact_line(l)) {
+            assert_eq!(f.source().tool, sources::LIBRARY_TOOL, "{:?}", f.value());
+            assert_eq!(f.source().version, env!("CARGO_PKG_VERSION"));
+            // With no writer the tags are the library's scan too.
+            let expected = expected_library_origin(f.value()).unwrap_or(sources::SCAN_ORIGIN);
             assert_eq!(
-                sources,
-                std::collections::HashSet::from([(
-                    "mdma-library".to_string(),
-                    env!("CARGO_PKG_VERSION").to_string()
-                )])
+                f.source().origin.kind,
+                expected,
+                "origin of {:?}",
+                f.value()
             );
         }
     }
 
-    /// A resync retracts what Bandcamp wrote; the same Album value that the user also
+    /// A resync retracts what the client wrote; the same Album value that the user also
     /// asserted stays, because a retract matches value and source.
     #[test]
     fn retract_source_facts_keeps_a_value_another_origin_also_asserts() {
         let hash = ContentHash::new("sha256:retract_shared_album");
-        let bandcamp = FactSource::new("mdma-library", "0.0.0", FactOrigin::bandcamp(None));
-        let user = FactSource::new("mdma-library", "0.0.0", FactOrigin::User);
+        let bandcamp = client_source();
+        let user = sources::user_default();
         let album = || MusicValue::Album(music_facts::Album::new("X"));
 
         let temp = {
@@ -5536,7 +5752,8 @@ mod tests {
 
         let response = service.handle_request(LibraryRequest::RetractSourceFacts {
             item_id: "p888".to_string(),
-            source_name: "bandcamp".to_string(),
+            source: client_source(),
+            attributes: resync_attributes(),
         });
         assert!(matches!(response, LibraryResponse::SourceFactsRetracted));
 
@@ -5551,7 +5768,7 @@ mod tests {
     #[test]
     fn retract_source_facts_noop_for_unknown_item_id() {
         let hash = ContentHash::new("sha256:retractnoop01");
-        let source = FactSource::new("mdma-library", "0.0.0", FactOrigin::bandcamp(None));
+        let source = client_source();
 
         let temp = {
             let t = NamedTempFile::new().unwrap();
@@ -5570,7 +5787,8 @@ mod tests {
         // Requesting retraction for an unknown item_id should still succeed (no-op)
         let response = service.handle_request(LibraryRequest::RetractSourceFacts {
             item_id: "p00000_does_not_exist".to_string(),
-            source_name: "bandcamp".to_string(),
+            source: client_source(),
+            attributes: resync_attributes(),
         });
 
         assert!(
@@ -5597,7 +5815,7 @@ mod tests {
 
         // Inject a fact directly into ACID (not via the file)
         let hash = ContentHash::new("sha256:getfacts_acid_only");
-        let source = FactSource::new("test-injector", "0.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("test-injector", "0.0.0", "Unknown");
         let external = AcidClient::connect(&facts_addr).unwrap();
         external
             .write_music_facts(
@@ -5637,7 +5855,7 @@ mod tests {
     #[test]
     fn get_album_title_by_item_id_returns_album_when_present() {
         let hash = ContentHash::new("sha256:albumbyitemid01");
-        let source = FactSource::new("mdma-library", "0.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("mdma-library", "0.0.0", "Unknown");
         let item_id = "p77777";
 
         let temp = {
@@ -5693,7 +5911,7 @@ mod tests {
         // Two tracks share the same ItemId and album — should return Some(album)
         let hash_a = ContentHash::new("sha256:twotrackalbum01");
         let hash_b = ContentHash::new("sha256:twotrackalbum02");
-        let source = FactSource::new("mdma-library", "0.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("mdma-library", "0.0.0", "Unknown");
         let item_id = "p88888";
         let album_name = "Shared Album Name";
 
@@ -5753,7 +5971,7 @@ mod tests {
     fn write_facts_file_with_operations(
         facts: &[(ContentHash, MusicValue, chrono::DateTime<Utc>, Operation)],
     ) -> NamedTempFile {
-        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("test", "1.0.0", "Unknown");
         let sourced: Vec<_> = facts
             .iter()
             .map(|(hash, value, ts, op)| (hash.clone(), value.clone(), *ts, source.clone(), *op))
@@ -5828,20 +6046,15 @@ mod tests {
     }
 
     // =========================================================================
-    // Blocker 1: retract_source_facts filters by FactOrigin, not tool name
+    // Blocker 1: retract_source_facts filters by source identity
     // =========================================================================
 
-    /// retract_source_facts with source_name="bandcamp" MUST retract facts whose
-    /// origin is FactOrigin::Bandcamp, even though tool="mdma-library".
+    /// retract_source_facts MUST retract facts whose source identity (tool and
+    /// origin kind) is the requested source's.
     #[test]
-    fn retract_source_facts_bandcamp_origin_is_retracted() {
+    fn retract_source_facts_requested_source_is_retracted() {
         let hash = ContentHash::new("sha256:bc_retract_01");
-        // tool is "mdma-library" — this is what production sets; origin carries bandcamp-ness
-        let source = FactSource::new(
-            "mdma-library",
-            "0.0.0",
-            FactOrigin::bandcamp(Some("https://artist.bandcamp.com".to_string())),
-        );
+        let source = client_source();
         let item_id = "p_bc_01";
 
         let temp = {
@@ -5882,10 +6095,11 @@ mod tests {
             assert_eq!(t.album.as_deref(), Some("Bandcamp Album"));
         }
 
-        // Act: retract with source_name="bandcamp" (matches FactOrigin::Bandcamp)
+        // Act: retract as the client's source
         let response = service.handle_request(LibraryRequest::RetractSourceFacts {
             item_id: item_id.to_string(),
-            source_name: "bandcamp".to_string(),
+            source: client_source(),
+            attributes: resync_attributes(),
         });
 
         assert!(
@@ -5902,25 +6116,25 @@ mod tests {
             .expect("track must still be indexed after retraction");
         assert_eq!(
             t.album, None,
-            "album should be cleared when retracted by bandcamp origin"
+            "album should be cleared when retracted by its source"
         );
         assert_eq!(
             t.title, None,
-            "title should be cleared when retracted by bandcamp origin"
+            "title should be cleared when retracted by its source"
         );
         assert_eq!(
             t.artist, None,
-            "artist should be cleared when retracted by bandcamp origin"
+            "artist should be cleared when retracted by its source"
         );
     }
 
-    /// Facts with a NON-bandcamp origin (FactOrigin::User) for the same ItemId
-    /// must NOT be retracted when source_name="bandcamp".
+    /// Facts of another source ("User") for the same ItemId
+    /// must NOT be retracted.
     #[test]
-    fn retract_source_facts_non_bandcamp_origin_is_not_retracted() {
+    fn retract_source_facts_other_source_is_not_retracted() {
         let hash = ContentHash::new("sha256:non_bc_retract_01");
-        let bandcamp_source = FactSource::new("mdma-library", "0.0.0", FactOrigin::bandcamp(None));
-        let user_source = FactSource::new("mdma-library", "0.0.0", FactOrigin::User);
+        let bandcamp_source = client_source();
+        let user_source = sources::user_default();
         let item_id = "p_non_bc_01";
 
         let temp = {
@@ -5954,7 +6168,8 @@ mod tests {
 
         let response = service.handle_request(LibraryRequest::RetractSourceFacts {
             item_id: item_id.to_string(),
-            source_name: "bandcamp".to_string(),
+            source: client_source(),
+            attributes: resync_attributes(),
         });
 
         assert!(
@@ -5972,7 +6187,7 @@ mod tests {
         assert_eq!(
             t.title.as_deref(),
             Some("User Title"),
-            "title from User origin must not be retracted by source_name=bandcamp"
+            "title from another source must not be retracted"
         );
     }
 
@@ -6085,7 +6300,7 @@ mod tests {
         let hash_a = ContentHash::new("sha256:trackcount01");
         let hash_b = ContentHash::new("sha256:trackcount02");
         let hash_c = ContentHash::new("sha256:trackcount03");
-        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("test", "1.0.0", "Unknown");
         let item_id = "p_trackcount";
 
         let temp = {
@@ -6144,7 +6359,7 @@ mod tests {
         let hash_a = ContentHash::new("sha256:itemid_test_aaa");
         let hash_b = ContentHash::new("sha256:itemid_test_bbb");
         let hash_c = ContentHash::new("sha256:itemid_test_ccc");
-        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("test", "1.0.0", "Unknown");
         let target_item_id = "p_target_001";
         let other_item_id = "p_other_002";
 
@@ -6448,6 +6663,7 @@ mod tests {
         let write_resp = service.handle_request(LibraryRequest::WriteFact {
             hash: hash.clone(),
             fact: MusicValue::Title(Title::new("Retractable Title")),
+            source: None,
         });
         assert!(
             matches!(write_resp, LibraryResponse::FactWritten),
@@ -6459,6 +6675,7 @@ mod tests {
         let retract_resp = service.handle_request(LibraryRequest::RetractFact {
             hash: hash.clone(),
             fact: MusicValue::Title(Title::new("Retractable Title")),
+            source: None,
         });
         assert!(
             matches!(retract_resp, LibraryResponse::FactRetracted),
@@ -6511,7 +6728,7 @@ mod tests {
         let mut entry = IndexedTrackInfo::new_empty(hash.as_str().to_owned());
         let ts = chrono::Utc::now();
         let fact = MusicValue::Replaces(old_hash.clone());
-        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("test", "1.0.0", "Unknown");
         apply_fact_to_track(
             &mut entry,
             &fact,
@@ -6540,7 +6757,7 @@ mod tests {
         let mut entry = IndexedTrackInfo::new_empty(hash.as_str().to_owned());
         let ts = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
         let fact = MusicValue::Deleted { timestamp: ts };
-        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("test", "1.0.0", "Unknown");
         apply_fact_to_track(
             &mut entry,
             &fact,
@@ -6558,7 +6775,7 @@ mod tests {
         let mut entry = IndexedTrackInfo::new_empty(hash.as_str().to_owned());
         let ts = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
         let fact = MusicValue::Deleted { timestamp: ts };
-        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("test", "1.0.0", "Unknown");
         // Assert then retract
         apply_fact_to_track(
             &mut entry,
@@ -6887,6 +7104,7 @@ mod tests {
         let resp = service.handle_request(LibraryRequest::RetractFact {
             hash: ContentHash::new(MARK_TRACK),
             fact,
+            source: None,
         });
         assert!(matches!(resp, LibraryResponse::FactRetracted), "{resp:?}");
         assert!(live_bookmarks(&service).is_empty());
@@ -7008,7 +7226,7 @@ mod tests {
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let hash = ContentHash::new(MARK_TRACK);
         let bookmark = stored_bookmark("banger", ts.timestamp());
-        let source = |version: &str| FactSource::new("mdma", version, FactOrigin::User);
+        let source = |version: &str| FactSource::new("mdma", version, "User");
         let temp = write_facts_file_with_sources(&[
             (
                 hash.clone(),
@@ -7045,7 +7263,7 @@ mod tests {
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let hash = ContentHash::new("sha256:retire_two_versions");
         let title = MusicValue::Title(Title::new("T"));
-        let source = |version: &str| FactSource::new("mdma", version, FactOrigin::User);
+        let source = |version: &str| FactSource::new("mdma", version, "User");
         let temp = write_facts_file_with_sources(&[
             (
                 hash.clone(),
@@ -7450,8 +7668,8 @@ mod tests {
         use music_facts::Bpm as BpmValue;
 
         let hash = ContentHash::new("sha256:reg96_wrong_val");
-        let source_a = FactSource::new("source-a", "1.0.0", FactOrigin::Unknown);
-        let source_b = FactSource::new("source-b", "1.0.0", FactOrigin::Unknown);
+        let source_a = FactSource::new("source-a", "1.0.0", "Unknown");
+        let source_b = FactSource::new("source-b", "1.0.0", "Unknown");
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
 
         let temp = NamedTempFile::new().unwrap();
@@ -7494,7 +7712,7 @@ mod tests {
         use music_facts::Bpm as BpmValue;
 
         let hash = ContentHash::new("sha256:reg96_correct_val");
-        let source = FactSource::new("source-a", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("source-a", "1.0.0", "Unknown");
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
 
         let temp = NamedTempFile::new().unwrap();
@@ -7535,8 +7753,8 @@ mod tests {
     #[test]
     fn regression_2_multi_source_title_survives_one_retraction() {
         let hash = ContentHash::new("sha256:reg2_multi_source");
-        let source_a = FactSource::new("source-a", "1.0.0", FactOrigin::Unknown);
-        let source_b = FactSource::new("source-b", "1.0.0", FactOrigin::Unknown);
+        let source_a = FactSource::new("source-a", "1.0.0", "Unknown");
+        let source_b = FactSource::new("source-b", "1.0.0", "Unknown");
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
 
         let temp = NamedTempFile::new().unwrap();
@@ -7584,8 +7802,8 @@ mod tests {
     #[test]
     fn regression_2_both_sources_retract_clears_title() {
         let hash = ContentHash::new("sha256:reg2_both_retract");
-        let source_a = FactSource::new("source-a", "1.0.0", FactOrigin::Unknown);
-        let source_b = FactSource::new("source-b", "1.0.0", FactOrigin::Unknown);
+        let source_a = FactSource::new("source-a", "1.0.0", "Unknown");
+        let source_b = FactSource::new("source-b", "1.0.0", "Unknown");
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
 
         let temp = NamedTempFile::new().unwrap();
@@ -7851,8 +8069,8 @@ mod tests {
         use music_facts::Bpm as BpmValue;
 
         let hash = ContentHash::new("sha256:equiv96_wrong_bpm");
-        let source_a = FactSource::new("source-a", "1.0.0", FactOrigin::Unknown);
-        let source_b = FactSource::new("source-b", "1.0.0", FactOrigin::Unknown);
+        let source_a = FactSource::new("source-a", "1.0.0", "Unknown");
+        let source_b = FactSource::new("source-b", "1.0.0", "Unknown");
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
 
         let facts = vec![
@@ -7891,7 +8109,7 @@ mod tests {
         use music_facts::Bpm as BpmValue;
 
         let hash = ContentHash::new("sha256:equiv96_correct_bpm");
-        let source = FactSource::new("source-a", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("source-a", "1.0.0", "Unknown");
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
 
         let facts = vec![
@@ -7927,8 +8145,8 @@ mod tests {
     #[test]
     fn equivalence_2_multi_source_title_survives_one_retraction_all_paths() {
         let hash = ContentHash::new("sha256:equiv2_title_survives");
-        let source_a = FactSource::new("source-a", "1.0.0", FactOrigin::Unknown);
-        let source_b = FactSource::new("source-b", "1.0.0", FactOrigin::Unknown);
+        let source_a = FactSource::new("source-a", "1.0.0", "Unknown");
+        let source_b = FactSource::new("source-b", "1.0.0", "Unknown");
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
 
         let facts = vec![
@@ -7972,20 +8190,13 @@ mod tests {
         );
     }
 
-    /// A style that two sources both assert (a FilesystemScan ingest, then a Bandcamp
+    /// A style that two sources both assert (a FilesystemScan ingest, then a client's
     /// ingest of the same bytes) is held once, on all paths.
     #[test]
     fn equivalence_styles_asserted_by_two_sources_are_held_once_all_paths() {
         let hash = ContentHash::new("sha256:equiv_styles_once");
-        let scan = FactSource::new(
-            "mdma-library",
-            "0.1.0",
-            FactOrigin::FilesystemScan {
-                scan_time: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
-                inferred_source: None,
-            },
-        );
-        let bandcamp = FactSource::new("mdma-library", "0.4.0", FactOrigin::bandcamp(None));
+        let scan = FactSource::new("mdma-library", "0.1.0", "FilesystemScan");
+        let bandcamp = FactSource::new("test-client", "0.4.0", "Client");
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let style = || MusicValue::StyleDescriptor("techno".to_string());
 
@@ -8008,9 +8219,9 @@ mod tests {
     #[test]
     fn equivalence_retract_rebuilds_styles_and_cues_without_duplicates_all_paths() {
         let hash = ContentHash::new("sha256:equiv_rebuild_once");
-        let a = FactSource::new("mdma-library", "0.1.0", FactOrigin::Unknown);
-        let b = FactSource::new("mdma-library", "0.4.0", FactOrigin::bandcamp(None));
-        let user = FactSource::new("mdma", "0.4.0", FactOrigin::User);
+        let a = FactSource::new("mdma-library", "0.1.0", "Unknown");
+        let b = FactSource::new("test-client", "0.4.0", "Client");
+        let user = FactSource::new("mdma", "0.4.0", "User");
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let style = |s: &str| MusicValue::StyleDescriptor(s.to_string());
         let cue = || MusicValue::MemoryCue {
@@ -8072,13 +8283,13 @@ mod tests {
     }
 
     /// A fact asserted by an older version of a source is cancelled by a retract that
-    /// carries the current version (RetractFact via `user_fact_source()`,
+    /// carries the current version (RetractFact via `sources::user_default()`,
     /// TrackRestore): a new version is not a different source.
     #[test]
     fn retract_cancels_assertion_from_older_source_version_all_paths() {
         let hash = ContentHash::new("sha256:retract_older_version");
-        let old = FactSource::new("mdma-library", "0.1.0", FactOrigin::Unknown);
-        let current = FactSource::new("mdma-library", "9.9.9", FactOrigin::Unknown);
+        let old = FactSource::new("mdma-library", "0.1.0", "Unknown");
+        let current = FactSource::new("mdma-library", "9.9.9", "Unknown");
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
 
         let facts = vec![
@@ -8120,8 +8331,8 @@ mod tests {
     #[test]
     fn retract_by_one_source_leaves_the_same_value_from_another_source_all_paths() {
         let hash = ContentHash::new("sha256:retract_two_sources");
-        let a = FactSource::new("source-a", "1.0.0", FactOrigin::Unknown);
-        let b = FactSource::new("source-b", "2.0.0", FactOrigin::Unknown);
+        let a = FactSource::new("source-a", "1.0.0", "Unknown");
+        let b = FactSource::new("source-b", "2.0.0", "Unknown");
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let title = || MusicValue::Title(Title::new("Twice"));
 
@@ -8157,9 +8368,9 @@ mod tests {
     #[test]
     fn retract_cancels_every_version_of_the_same_source_all_paths() {
         let hash = ContentHash::new("sha256:retract_two_versions");
-        let v1 = FactSource::new("source-a", "1.0.0", FactOrigin::Unknown);
-        let v2 = FactSource::new("source-a", "2.0.0", FactOrigin::Unknown);
-        let v3 = FactSource::new("source-a", "3.0.0", FactOrigin::Unknown);
+        let v1 = FactSource::new("source-a", "1.0.0", "Unknown");
+        let v2 = FactSource::new("source-a", "2.0.0", "Unknown");
+        let v3 = FactSource::new("source-a", "3.0.0", "Unknown");
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let title = || MusicValue::Title(Title::new("Twice"));
 
@@ -8186,20 +8397,17 @@ mod tests {
         assert_scalar_fields_eq("two_versions stream==file", &stream_result, &file_result);
     }
 
-    /// A FilesystemScan fact is cancelled by a retract with another scan time: the
-    /// origin payload does not count towards the source's identity.
+    /// A FilesystemScan fact, as an old log line carries it with an origin `data`
+    /// payload, is cancelled by a retract with another payload: the payload is
+    /// ignored on read and does not count towards the source's identity.
     #[test]
     fn retract_cancels_filesystem_scan_fact_with_a_different_scan_time_all_paths() {
         let hash = ContentHash::new("sha256:retract_scan_time");
         let scan = |h: u32| {
-            FactSource::new(
-                "mdma-library",
-                "1.0.0",
-                FactOrigin::FilesystemScan {
-                    scan_time: Utc.with_ymd_and_hms(2026, 1, 1, h, 0, 0).unwrap(),
-                    inferred_source: None,
-                },
-            )
+            serde_json::from_str::<FactSource>(&format!(
+                r#"{{"tool":"mdma-library","version":"1.0.0","origin":{{"type":"FilesystemScan","data":{{"scan_time":"2026-01-01T0{h}:00:00Z","inferred_source":null}}}}}}"#
+            ))
+            .unwrap()
         };
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
 
@@ -8241,7 +8449,7 @@ mod tests {
     #[test]
     fn retract_of_one_value_leaves_other_value_alone_all_paths() {
         let hash = ContentHash::new("sha256:retract_x_keeps_y");
-        let a = FactSource::new("source-a", "1.0.0", FactOrigin::Unknown);
+        let a = FactSource::new("source-a", "1.0.0", "Unknown");
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
 
         let facts = vec![
@@ -8281,8 +8489,8 @@ mod tests {
     #[test]
     fn equivalence_2_both_sources_retract_clears_title_all_paths() {
         let hash = ContentHash::new("sha256:equiv2_both_retract");
-        let source_a = FactSource::new("source-a", "1.0.0", FactOrigin::Unknown);
-        let source_b = FactSource::new("source-b", "1.0.0", FactOrigin::Unknown);
+        let source_a = FactSource::new("source-a", "1.0.0", "Unknown");
+        let source_b = FactSource::new("source-b", "1.0.0", "Unknown");
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
 
         let facts = vec![
@@ -8332,7 +8540,7 @@ mod tests {
     #[test]
     fn equivalence_added_at_latest_wins_all_paths() {
         let hash = ContentHash::new("sha256:equiv_added_at");
-        let source = FactSource::new("source-a", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("source-a", "1.0.0", "Unknown");
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let older = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
         let newer = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
@@ -8374,7 +8582,7 @@ mod tests {
     #[test]
     fn blob_path_derived_on_all_three_paths() {
         let hash = ContentHash::new("sha256:deadbeef1234");
-        let source = FactSource::new("fs", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("fs", "1.0.0", "Unknown");
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
 
         // A Format fact accompanies every real ingest; it is tracked, which keeps the
@@ -8439,7 +8647,7 @@ mod tests {
     #[test]
     fn blob_path_is_relative_on_ingest_path() {
         let hash = ContentHash::new("sha256:deadbeef1234");
-        let source = FactSource::new("fs", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("fs", "1.0.0", "Unknown");
         let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
 
         let facts = vec![(
@@ -8481,7 +8689,7 @@ mod tests {
         use music_facts::{Bpm as BpmValue, CueKind, EnergyLevel, TrackRole};
 
         let hash = ContentHash::new("sha256:equiv_new_fields_01");
-        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("test", "1.0.0", "Unknown");
         let ts = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
 
         let bpm_128 = BpmValue::from_f32(128.0).unwrap();
@@ -8601,7 +8809,7 @@ mod tests {
         use music_facts::{Bpm as BpmValue, CueKind, EnergyLevel, TrackRole};
 
         let hash = ContentHash::new("sha256:proj_new_fields_indiv");
-        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("test", "1.0.0", "Unknown");
         let ts = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
 
         // Role
@@ -8692,8 +8900,8 @@ mod tests {
         use music_facts::TrackRole;
 
         let hash = ContentHash::new("sha256:proj_role_retract_guard");
-        let source_a = FactSource::new("source-a", "1.0.0", FactOrigin::Unknown);
-        let source_b = FactSource::new("source-b", "1.0.0", FactOrigin::Unknown);
+        let source_a = FactSource::new("source-a", "1.0.0", "Unknown");
+        let source_b = FactSource::new("source-b", "1.0.0", "Unknown");
         let ts = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
 
         // source-a asserts Peak; source-b attempts to retract Opener (no-match).
@@ -8737,7 +8945,7 @@ mod tests {
         use music_facts::CueKind;
 
         let hash = ContentHash::new("sha256:proj_cue_partial_retract");
-        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("test", "1.0.0", "Unknown");
         let ts = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
 
         let cue_drop = MusicValue::MemoryCue {
@@ -8865,7 +9073,7 @@ mod tests {
             }
 
             // Inject Replaces facts into provenance of the new hash entry
-            let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+            let source = FactSource::new("test", "1.0.0", "Unknown");
             for (new_hash, old_hash) in replaces_pairs {
                 if let Some(entry) = tracks
                     .iter_mut()
@@ -9113,7 +9321,7 @@ mod tests {
         {
             let mut tracks = service.tracks.lock().unwrap();
             // Add B to tracks with deleted_at set and with Replaces(A) in provenance
-            let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+            let source = FactSource::new("test", "1.0.0", "Unknown");
             let mut entry_b = IndexedTrackInfo::new_empty(hash_b.as_str().to_owned());
             entry_b.deleted_at = Some(chrono::Utc::now());
             entry_b
@@ -9189,7 +9397,7 @@ mod tests {
         let (service, metadata_dir, _acid) = make_service_with_replaces(&[], &[]);
 
         {
-            let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+            let source = FactSource::new("test", "1.0.0", "Unknown");
             let mut tracks = service.tracks.lock().unwrap();
             let mut entry_a = IndexedTrackInfo::new_empty(hash_a.as_str().to_owned());
             entry_a.deleted_at = Some(chrono::Utc::now());
@@ -9276,7 +9484,7 @@ mod tests {
 
         // Test (a): retract_all_entity_facts clears all facts for a hash
         let old_hash = ContentHash::new("sha256:replace_test_old01");
-        let source = FactSource::new("mdma-library", "0.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("mdma-library", "0.0.0", "Unknown");
 
         let temp = {
             let t = NamedTempFile::new().unwrap();
@@ -9363,7 +9571,7 @@ mod tests {
     #[test]
     fn resolve_hash_fails_after_retract_all_entity_facts() {
         let old_hash = ContentHash::new("sha256:resolve_retract_test01");
-        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("test", "1.0.0", "Unknown");
 
         let temp = {
             let t = NamedTempFile::new().unwrap();
@@ -9403,7 +9611,7 @@ mod tests {
     #[test]
     fn bulk_bootstrap_does_not_set_timestamps_from_placeholder() {
         let hash = ContentHash::new("sha256:bulk_ts_placeholder");
-        let source = FactSource::new("test-playback", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("test-playback", "1.0.0", "Unknown");
         let play_ts = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
 
         // Write TrackStarted + TrackStopped facts with a real historical timestamp.
@@ -9553,7 +9761,7 @@ mod tests {
             let mut tracks = service.tracks.lock().unwrap();
             let mut entry_c = IndexedTrackInfo::new_empty(hash_c.as_str().to_owned());
             entry_c.title = Some("Track C".to_string());
-            let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+            let source = FactSource::new("test", "1.0.0", "Unknown");
             entry_c
                 .provenance
                 .push((MusicValue::Replaces(hash_b.clone()), source));
@@ -9577,7 +9785,7 @@ mod tests {
                 .iter_mut()
                 .find(|t| t.content_hash.as_str() == hash_c.as_str())
             {
-                let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+                let source = FactSource::new("test", "1.0.0", "Unknown");
                 for ancestor in &ancestors {
                     // Dedup: only assert if not already present
                     let already = entry_c.provenance.iter().any(|(v, _)| {
@@ -9801,7 +10009,7 @@ mod tests {
     }
 
     pub(super) fn user_source() -> FactSource {
-        FactSource::new("mdma", "test", FactOrigin::User)
+        FactSource::new("mdma", "test", "User")
     }
 
     /// Hard-retire `h` the way production does: under `retire_gate`.
@@ -9867,7 +10075,7 @@ mod tests {
         std::fs::create_dir_all(&inbox).unwrap();
         let path = inbox.join(name);
         std::fs::write(&path, bytes).unwrap();
-        service.ingest_file_internal(&path, None).unwrap()
+        service.ingest_file_internal(&path, None, &[]).unwrap()
     }
 
     #[test]
@@ -10216,7 +10424,7 @@ mod tests {
         write_test_wav(&wav, 3);
 
         let hash = service
-            .ingest_file_internal(&wav, None)
+            .ingest_file_internal(&wav, None, &[])
             .expect("a generated WAV must pass validate + extract_metadata + import");
 
         // The ingest response path: state is readable right after the call.
@@ -10266,6 +10474,7 @@ mod tests {
             let resp = service.handle_request(LibraryRequest::WriteFact {
                 hash: hash.clone(),
                 fact,
+                source: None,
             });
             assert!(matches!(resp, LibraryResponse::FactWritten), "{:?}", resp);
         }
@@ -10294,10 +10503,12 @@ mod tests {
         service.handle_request(LibraryRequest::WriteFact {
             hash: hash.clone(),
             fact: style.clone(),
+            source: None,
         });
         let resp = service.handle_request(LibraryRequest::RetractFact {
             hash: hash.clone(),
             fact: style,
+            source: None,
         });
         assert!(matches!(resp, LibraryResponse::FactRetracted), "{:?}", resp);
 
@@ -10597,7 +10808,7 @@ mod tests {
 
         let old_wav = inbox.join("Old Artist - Old Song.wav");
         write_test_wav(&old_wav, 5);
-        let old_hash = service.ingest_file_internal(&old_wav, None).unwrap();
+        let old_hash = service.ingest_file_internal(&old_wav, None, &[]).unwrap();
 
         let new_wav = inbox.join("New Artist - New Song.wav");
         write_test_wav(&new_wav, 7);

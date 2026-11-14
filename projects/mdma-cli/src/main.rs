@@ -23,6 +23,7 @@ mod library;
 /// Find and choose the MDMA node to talk to
 #[hicli::group]
 mod node;
+mod origins;
 mod output;
 /// Playback control commands
 #[hicli::group]

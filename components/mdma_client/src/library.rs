@@ -5,7 +5,7 @@ use library_ipc_client::{
     content_to_hashes, interpret_archive_emptied, interpret_archive_listing,
     interpret_dedup_merged, interpret_dedup_scan, interpret_identity_backfill,
     interpret_identity_backfill_status, ArchiveEmptyReport, ArchiveListing, ClientError,
-    ContentHash, DedupApplyReport, DedupScanReport, FactType, IdentityBackfillStart,
+    ContentHash, DedupApplyReport, DedupScanReport, FactSource, FactType, IdentityBackfillStart,
     IdentityBackfillStatus, InboxPath, IngestAllItem, IngestResult, IngestSource, LibraryClient,
     LibraryRequest, LibraryResponse, Mark, MarkFilter, MarkWrite, MusicValue, OrphanInfo,
     PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery, Unmark,
@@ -139,6 +139,28 @@ impl LibraryBackend {
                 interpret_ingest_result(self.request(&LibraryRequest::IngestFile {
                     path: path.clone(),
                     source,
+                    writer: None,
+                    facts: Vec::new(),
+                })?)
+            }
+        }
+    }
+
+    /// Ingest a file as `writer`, who also states its own provenance `facts` about it.
+    pub fn ingest_file_as(
+        &self,
+        path: &InboxPath,
+        writer: &FactSource,
+        facts: Vec<MusicValue>,
+    ) -> Result<IngestResult, ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.ingest_file_as(path, writer, facts),
+            LibraryBackend::Gateway(_) => {
+                interpret_ingest_result(self.request(&LibraryRequest::IngestFile {
+                    path: path.clone(),
+                    source: None,
+                    writer: Some(writer.clone()),
+                    facts,
                 })?)
             }
         }
@@ -300,19 +322,34 @@ impl LibraryBackend {
         })?)
     }
 
-    /// Write a single fact for a track. Used for importing metadata from external sources.
-    pub fn write_fact(&self, hash: &ContentHash, fact: MusicValue) -> Result<(), ClientError> {
+    /// Write a single fact for a track under the writer's own `source` (the binary
+    /// states it, with its own version; the user's is `user_fact_source`). Used for
+    /// importing metadata from external sources.
+    pub fn write_fact_as(
+        &self,
+        hash: &ContentHash,
+        fact: MusicValue,
+        source: &FactSource,
+    ) -> Result<(), ClientError> {
         interpret_fact_written(self.request(&LibraryRequest::WriteFact {
             hash: hash.clone(),
             fact,
+            source: Some(source.clone()),
         })?)
     }
 
-    /// Retract a single fact for a track. Used for removing manually-added metadata.
-    pub fn retract_fact(&self, hash: &ContentHash, fact: MusicValue) -> Result<(), ClientError> {
+    /// Retract a single fact for a track under the writer's own `source`. Used for
+    /// removing metadata. `false` when nothing matched, so nothing was retracted.
+    pub fn retract_fact_as(
+        &self,
+        hash: &ContentHash,
+        fact: MusicValue,
+        source: &FactSource,
+    ) -> Result<bool, ClientError> {
         interpret_fact_retracted(self.request(&LibraryRequest::RetractFact {
             hash: hash.clone(),
             fact,
+            source: Some(source.clone()),
         })?)
     }
 
@@ -608,9 +645,11 @@ fn interpret_fact_written(response: LibraryResponse) -> Result<(), ClientError> 
     }
 }
 
-fn interpret_fact_retracted(response: LibraryResponse) -> Result<(), ClientError> {
+/// `true` when the fact was retracted, `false` when it matched nothing.
+fn interpret_fact_retracted(response: LibraryResponse) -> Result<bool, ClientError> {
     match response {
-        LibraryResponse::FactRetracted => Ok(()),
+        LibraryResponse::FactRetracted => Ok(true),
+        LibraryResponse::NothingToRetract => Ok(false),
         LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
         _ => Err(unexpected("RetractFact")),
     }
@@ -783,7 +822,12 @@ mod tests {
 
     #[test]
     fn interpret_fact_retracted_ok() {
-        assert!(interpret_fact_retracted(LibraryResponse::FactRetracted).is_ok());
+        assert!(interpret_fact_retracted(LibraryResponse::FactRetracted).unwrap());
+    }
+
+    #[test]
+    fn interpret_nothing_to_retract_is_false() {
+        assert!(!interpret_fact_retracted(LibraryResponse::NothingToRetract).unwrap());
     }
 
     #[test]
