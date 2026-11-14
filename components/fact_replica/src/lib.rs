@@ -471,13 +471,34 @@ impl Replica {
     /// Record that a sync is about to be attempted, so the throttle holds across
     /// shells. Keeps everything else in the meta. Does nothing when a sync holds
     /// the lock (that sync records its own attempt).
-    pub fn note_attempt(&self, now: UnixSecs) -> Result<(), ReplicaError> {
+    ///
+    /// Returns whether the attempt was recorded: `false` means a sync is running,
+    /// so there is no need to start another.
+    pub fn note_attempt(&self, now: UnixSecs) -> Result<bool, ReplicaError> {
+        self.note_attempt_if(now, |_| true)
+    }
+
+    /// [`Replica::note_attempt`] when `due` says so. `due` is given the meta as it
+    /// is *under the lock* (`None` without one), so the decision and the record are
+    /// one step: two shells that both saw a stale replica cannot both record an
+    /// attempt, the second finds the first's. `false` when a sync holds the lock or
+    /// when `due` declines.
+    pub fn note_attempt_if(
+        &self,
+        now: UnixSecs,
+        due: impl FnOnce(Option<&Meta>) -> bool,
+    ) -> Result<bool, ReplicaError> {
         let Some(_lock) = self.try_lock()? else {
-            return Ok(());
+            return Ok(false);
         };
-        let mut meta = self.meta()?.unwrap_or_default();
+        let meta = self.meta()?;
+        if !due(meta.as_ref()) {
+            return Ok(false);
+        }
+        let mut meta = meta.unwrap_or_default();
         meta.last_attempt = Some(now);
-        self.write_meta(&meta)
+        self.write_meta(&meta)?;
+        Ok(true)
     }
 
     /// Delete the replica: data, meta, probe and temporary files. Nothing is
@@ -495,6 +516,12 @@ impl Replica {
         let Some(_lock) = self.try_lock()? else {
             return Err(ReplicaError::Busy(self.node.clone()));
         };
+        self.clear()
+    }
+
+    /// Remove everything in the directory except the lock file. Returns whether
+    /// anything was removed.
+    fn clear(&self) -> Result<bool, ReplicaError> {
         let entries = fs::read_dir(&self.dir).map_err(io_at(&self.dir))?;
         let mut removed_any = false;
         for entry in entries {
@@ -1341,7 +1368,7 @@ mod tests {
         let node = FakeNode::new("e1", 2);
         synced(node.sync(&replica, 100));
 
-        replica.note_attempt(UnixSecs::new(500)).unwrap();
+        assert!(replica.note_attempt(UnixSecs::new(500)).unwrap());
 
         let meta = replica.meta().unwrap().unwrap();
         assert_eq!(meta.last_attempt, Some(UnixSecs::new(500)));
@@ -1357,10 +1384,30 @@ mod tests {
         synced(node.sync(&replica, 100));
         let _held = replica.try_lock().unwrap().unwrap();
 
-        replica.note_attempt(UnixSecs::new(500)).unwrap();
+        assert!(
+            !replica.note_attempt(UnixSecs::new(500)).unwrap(),
+            "not recorded: a sync is running"
+        );
 
         let meta = replica.meta().unwrap().unwrap();
         assert_eq!(meta.last_attempt, Some(UnixSecs::new(100)));
+    }
+
+    #[test]
+    fn note_attempt_if_decides_on_the_meta_under_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let replica = replica_in(&dir);
+        let node = FakeNode::new("e1", 2);
+        synced(node.sync(&replica, 100));
+        let due = |meta: Option<&Meta>| should_attempt(UnixSecs::new(130), meta);
+
+        assert!(replica.note_attempt_if(UnixSecs::new(130), due).unwrap());
+        // The same question again sees the attempt the first one recorded.
+        let due = |meta: Option<&Meta>| should_attempt(UnixSecs::new(131), meta);
+        assert!(!replica.note_attempt_if(UnixSecs::new(131), due).unwrap());
+
+        let meta = replica.meta().unwrap().unwrap();
+        assert_eq!(meta.last_attempt, Some(UnixSecs::new(130)));
     }
 
     // --- meta format ---------------------------------------------------------

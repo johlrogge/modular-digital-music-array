@@ -1,5 +1,6 @@
 //! Argument helpers shared by several command modules.
 
+use crate::local_complete::complete_playlists;
 use crate::stdin::is_hash_token;
 use bpaf::{positional, Parser};
 use hicli::Arg;
@@ -84,17 +85,25 @@ impl<T: FromStr> FromStr for Word<T> {
 ///
 /// `usage` is how the usage line shows the pair (`[NAME] [-]`); the list of words
 /// would otherwise read as `[<NAME>]...`, as if repeatable.
+///
+/// `complete` is handed the raw word, like hicli's own `complete = f`, so it must
+/// filter by prefix itself.
 pub(crate) fn value_and_dash<T>(
     metavar: &'static str,
     usage: &'static str,
     help: &'static str,
+    complete: fn(&str) -> Vec<hicli::Candidate>,
 ) -> impl Parser<(Option<T>, Option<StdinDash>)>
 where
     T: FromStr + 'static,
     T::Err: std::fmt::Display,
 {
-    positional::<Word<T>>(metavar)
+    // The completer sees the word as a `String`, before it is parsed (a half-typed
+    // name usually does not parse).
+    positional::<String>(metavar)
         .help(help)
+        .complete(move |word: &String| complete(word))
+        .parse(|word| word.parse::<Word<T>>().map_err(|e| e.to_string()))
         .many()
         .custom_usage(usage)
         .parse(|words| {
@@ -149,7 +158,7 @@ impl FromStr for HashInput {
 ///
 /// Stdin is read only for `-`, so a playlist cannot be named `-` here.
 #[derive(Debug, Clone, PartialEq, Eq, Arg)]
-#[arg(positional = "NAME|-")]
+#[arg(positional = "NAME|-", complete = complete_playlists)]
 pub(crate) struct PlaylistInput(pub OrStdin<PlaylistName>);
 
 impl FromStr for PlaylistInput {
@@ -185,8 +194,23 @@ impl FromStr for TrackArg {
 
 /// Playlist name (only a-z, A-Z, 0-9, `_` and `-` are allowed)
 #[derive(Debug, Clone, PartialEq, Eq, Arg)]
-#[arg(positional = "NAME")]
+#[arg(positional = "NAME", complete = complete_playlists)]
 pub(crate) struct PlaylistArg(pub PlaylistName);
+
+// The name of a playlist that does not exist yet: the same rules as `PlaylistArg`,
+// without its completion of the names that do.
+/// Playlist name (only a-z, A-Z, 0-9, `_` and `-` are allowed)
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(positional = "NAME")]
+pub(crate) struct NewPlaylistArg(pub PlaylistName);
+
+impl FromStr for NewPlaylistArg {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse().map(|PlaylistArg(name)| Self(name))
+    }
+}
 
 /// Why `PlaylistName` refused a name, as a phrase.
 fn playlist_name_reason(error: &PlaylistNameError) -> &'static str {

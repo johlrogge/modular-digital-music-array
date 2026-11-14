@@ -1,5 +1,6 @@
 use crate::args::HashInput;
 use crate::ctx::Ctx;
+use crate::local_complete::{self, merge_unlisted};
 use crate::output::{for_each_track, TrackFailure};
 use crate::stdin::{dedup_hashes, hashes_of_input};
 use bpaf::{construct, Parser};
@@ -200,10 +201,11 @@ pub(crate) fn add(args: FactArgs, ctx: &Ctx) -> Result<hicli::Success> {
 #[arg(long = "origin", metavar = "KIND", complete = complete_origins)]
 pub(crate) struct OriginArg(pub OriginKind);
 
-/// The origin kinds the CLI writes, that start with `typed`.
+/// The origin kinds the CLI writes, that start with `typed`, then the others found in
+/// the replica's facts.
 fn complete_origins(typed: &str) -> Vec<hicli::Candidate> {
     use crate::origins::{REKORDBOX_ORIGIN, UPLOAD_ORIGIN};
-    [
+    let written = [
         (USER_ORIGIN, "manual edits"),
         (REKORDBOX_ORIGIN, "imported from Rekordbox"),
         (UPLOAD_ORIGIN, "tags of uploaded files"),
@@ -211,7 +213,8 @@ fn complete_origins(typed: &str) -> Vec<hicli::Candidate> {
     .into_iter()
     .filter(|(origin, _)| origin.starts_with(typed))
     .map(|(origin, what)| (origin.to_string(), Some(what.to_string())))
-    .collect()
+    .collect();
+    merge_unlisted(written, local_complete::complete_origins(typed))
 }
 
 impl FromStr for OriginArg {

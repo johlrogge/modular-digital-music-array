@@ -8,7 +8,8 @@ All notable changes to MDMA are documented here.
 
 ### Added
 
-- **`mdma replica`: a local copy of the node's fact log** (ADR-021 phase 4), kept under the user's cache directory. `replica status` shows it, `replica reset` deletes it, and a hidden `replica sync` fills it (and probes playlist and source names) with verified, resumable reads; nothing uses it for completion yet.
+- **`mdma replica`: a local copy of the node's fact log** (ADR-021 phase 4), kept under the user's cache directory. `replica status` shows it, `replica reset` deletes it, and a hidden `replica sync` fills it (and probes playlist and source names) with verified, resumable reads. A second `replica reset` of a node with no replica now says there is nothing to reset and exits 0.
+- **Shell completion from the local replica** (ADR-021 phase 5): mark names, playlist names, source names, and artists, titles, albums, labels, genres and styles for the `search` filters and query complete from a snapshot built after each sync, with no network call and in a few milliseconds. A background `mdma replica sync --quiet` is started, detached, when the replica is more than 30 s old (backing off to 5 min after failures) and after commands that write; nothing syncs inline. Fact lines this client cannot read (a newer node) are kept, left out of completion, and counted in `replica status`.
 - **ACID fact log has an identity and `ReadStream` can pin the last line a client has** (ADR-021 phase 3), so a rewritten or replaced log answers `StreamDiverged` instead of looking like "nothing new". The gateway re-serialises typed ACID requests, so a mismatched gateway/ACID deploy fails closed (pinned reads report "node too old" instead of appending unverified lines); upgrade them together for availability, not correctness.
 
 ### Changed

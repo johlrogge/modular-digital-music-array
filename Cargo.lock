@@ -6091,6 +6091,7 @@ dependencies = [
  "inbox-utils",
  "libc",
  "library-ipc-client",
+ "library-projection",
  "library-search",
  "mdma-client",
  "music-facts",

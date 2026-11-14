@@ -1,5 +1,6 @@
-use crate::args::{parse_count, OrStdin, PlaylistArg, PlaylistInput, StdinDash};
+use crate::args::{parse_count, NewPlaylistArg, OrStdin, PlaylistArg, PlaylistInput, StdinDash};
 use crate::ctx::Ctx;
+use crate::local_complete::complete_playlists;
 use crate::output::interpret_library;
 use crate::stdin::{hashes_in, read_stdin_to_string, require_stdin_hashes_or_usage};
 use bpaf::{construct, long, Parser};
@@ -12,15 +13,16 @@ use std::num::NonZeroUsize;
 
 /// Current playlist name
 #[derive(Debug, Clone, PartialEq, Eq, Arg)]
-#[arg(positional = "FROM")]
+#[arg(positional = "FROM", complete = complete_playlists)]
 pub(crate) struct FromPlaylist(pub PlaylistArg);
 
 /// New playlist name
 #[derive(Debug, Clone, PartialEq, Eq, Arg)]
 #[arg(positional = "TO")]
-pub(crate) struct ToPlaylist(pub PlaylistArg);
+pub(crate) struct ToPlaylist(pub NewPlaylistArg);
 
-// Both names are a `PlaylistArg`; spelled apart they read `FROM` and `TO`, not `NAME NAME`.
+// Spelled apart they read `FROM` and `TO`, not `NAME NAME`. TO is a name that does not
+// exist yet, so only FROM completes the existing playlists.
 #[derive(Debug, Clone, PartialEq, Eq, Arg)]
 pub(crate) struct RenameArgs {
     pub(crate) from: FromPlaylist,
@@ -265,10 +267,10 @@ pub(crate) fn contains(mode: ContainsMode, _stdin: StdinDash, ctx: &Ctx) -> Resu
 /// mdma search --genre=Techno | mdma playlist new techno -
 /// ```
 #[hicli::command]
-pub(crate) fn new(name: PlaylistArg, _stdin: StdinDash, ctx: &Ctx) -> Result<()> {
+pub(crate) fn new(name: NewPlaylistArg, _stdin: StdinDash, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     let library = ctx.library()?;
-    let PlaylistArg(pname) = name;
+    let NewPlaylistArg(pname) = name;
     let content = read_stdin_to_string()?;
     interpret_library(
         library.request(&LibraryRequest::PlaylistNew {
@@ -386,7 +388,7 @@ pub(crate) fn rename(args: RenameArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     let library = ctx.library()?;
     let FromPlaylist(PlaylistArg(from_name)) = args.from;
-    let ToPlaylist(PlaylistArg(to_name)) = args.to;
+    let ToPlaylist(NewPlaylistArg(to_name)) = args.to;
     interpret_library(
         library.request(&LibraryRequest::PlaylistRename {
             from: from_name.clone(),
@@ -449,12 +451,12 @@ mod tests {
 
     #[test]
     fn rename_args_parser_reads_from_and_to() {
-        let name = |n: &str| PlaylistArg(PlaylistName::new(n).unwrap());
+        let name = |n: &str| PlaylistName::new(n).unwrap();
         assert_eq!(
             run_arg::<RenameArgs>(&["old", "new"]),
             Ok(RenameArgs {
-                from: FromPlaylist(name("old")),
-                to: ToPlaylist(name("new")),
+                from: FromPlaylist(PlaylistArg(name("old"))),
+                to: ToPlaylist(NewPlaylistArg(name("new"))),
             })
         );
         assert!(run_arg::<RenameArgs>(&["old"]).is_err());

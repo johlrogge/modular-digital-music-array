@@ -25,7 +25,7 @@ Amends ADR-016 §2-3 (this is the first use of the per-node replica; it answers 
   - `sync.lock`: the flock file (§6). It is never deleted: a reset takes the lock, removes everything else and fails as busy while a sync holds it.
 - The node id comes from `Identify` (ADR-009). A node that cannot be identified gets no replica.
 - `meta.json` is the commit point. A sync appends to `facts.jsonl` and fsyncs, then writes `meta.json` with tmp+rename. A crash between the two leaves lines past `meta.lines`.
-- On open, a torn tail is truncated to `meta.lines`. A shorter file, a committed region that is not UTF-8 or a checksum mismatch on the last line wipes the replica and refetches. Per-line parse failures are decided by the phase-5 fold, not by the store.
+- On open, a torn tail is truncated to `meta.lines`. A shorter file, a committed region that is not UTF-8 or a checksum mismatch on the last line wipes the replica and refetches. Per-line parse failures are not the store's business. The fold keeps a line it cannot read (a node newer than this client) in the replica, leaves it out of `completion.json` and counts it there (`unreadable`); `replica status` reports "N lines this mdma cannot read; upgrade mdma". The replica is not discarded for it: that would refetch the whole log at every sync and never back off.
 
 ### 2. Log identity: epoch and pinned reads
 

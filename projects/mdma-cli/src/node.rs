@@ -474,8 +474,13 @@ pub(crate) fn list(_ctx: &Ctx) -> color_eyre::Result<()> {
 /// The remembered node's name, id and host that start with `typed`. Local state only
 /// (the node cache file, no network), and silent when there is none or it is unreadable.
 pub(crate) fn complete_nodes(typed: &str) -> Vec<hicli::Candidate> {
-    let cached = cache_path().and_then(|path| cache::load(&path).ok().flatten());
-    node_candidates(cached.as_ref(), typed)
+    node_candidates(load_cache_quiet().as_ref(), typed)
+}
+
+/// The remembered node, read silently: `None` when there is none or it is unreadable.
+/// For completion and the background refresh, which must not print.
+pub(crate) fn load_cache_quiet() -> Option<NodeCache> {
+    cache::load(&cache_path()?).ok().flatten()
 }
 
 fn node_candidates(cached: Option<&NodeCache>, typed: &str) -> Vec<hicli::Candidate> {

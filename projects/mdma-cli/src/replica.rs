@@ -12,7 +12,7 @@ use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use fact_replica::{
     default_nodes_dir, id_for_host, release_host_elsewhere, should_attempt, Host, Meta, NodeId,
-    ReadFailure, Replica, SyncReport, UnixSecs,
+    ReadFailure, Replica, SyncLock, SyncReport, UnixSecs,
 };
 use gateway_client::{GatewayClient, IdentifyError, NodeIdentity};
 use hicli::Arg;
@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::ctx::{connect_failed, Ctx};
 use crate::node;
 use crate::output::interpret_library;
+use crate::snapshot::CompletionSnapshot;
 
 /// How long the replica waits for the node, per request.
 const LINK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -31,7 +32,7 @@ const LINK_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_HOST: &str = "localhost";
 
 /// How long probed playlist and source names are served.
-const PROBE_TTL_SECS: u64 = 24 * 60 * 60;
+pub(crate) const PROBE_TTL_SECS: u64 = 24 * 60 * 60;
 
 const PROBE_FILE: &str = "probe.json";
 
@@ -48,7 +49,7 @@ pub(crate) struct Probed {
 
 /// Playlists are files and sources are sockets, not facts, so they are probed on
 /// each sync and kept for [`PROBE_TTL_SECS`]. Raw names; the completion snapshot
-/// is built from them later.
+/// is built from them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Probe {
     pub playlists: Option<Probed>,
@@ -195,8 +196,15 @@ fn probe_line(label: &str, probed: Option<&Probed>, now: UnixSecs) -> String {
     }
 }
 
-/// The text of `mdma replica status`.
-fn render_status(id: &NodeId, meta: &Meta, probe: &Probe, now: UnixSecs) -> String {
+/// The text of `mdma replica status`. `unreadable` is the number of lines the fold
+/// could not read; they are kept and reported, never dropped from the replica.
+fn render_status(
+    id: &NodeId,
+    meta: &Meta,
+    probe: &Probe,
+    unreadable: usize,
+    now: UnixSecs,
+) -> String {
     let epoch = meta.epoch().map_or("-".to_string(), |e| e.to_string());
     let hosts = if meta.hosts.is_empty() {
         "-".to_string()
@@ -222,7 +230,7 @@ fn render_status(id: &NodeId, meta: &Meta, probe: &Probe, now: UnixSecs) -> Stri
     } else {
         format!("{attempts} ({} failed attempts in a row)", meta.failures)
     };
-    [
+    let mut rows = vec![
         format!("Node:          {id}"),
         format!("Epoch:         {epoch}"),
         format!("Lines:         {}", meta.lines()),
@@ -232,23 +240,28 @@ fn render_status(id: &NodeId, meta: &Meta, probe: &Probe, now: UnixSecs) -> Stri
         format!("Hosts:         {hosts}"),
         probe_line("Playlists:    ", probe.playlists.as_ref(), now),
         probe_line("Sources:      ", probe.sources.as_ref(), now),
-    ]
-    .join("\n")
+    ];
+    if unreadable > 0 {
+        rows.push(format!(
+            "Unreadable:    {unreadable} lines this mdma cannot read; upgrade mdma"
+        ));
+    }
+    rows.join("\n")
 }
 
 /// Sync the replica of node `id`, remembering `host`, and move the name off any
 /// other replica that still lists it (a different node now answers to it).
 ///
 /// `under_lock` runs after a successful sync while the sync lock is still held,
-/// for anything else written into the replica directory. `None` means another
-/// sync holds the lock and nothing was done.
+/// for anything else written into the replica directory (the probe, the completion
+/// snapshot). `None` means another sync holds the lock and nothing was done.
 fn sync_replica(
     nodes_dir: &Path,
     id: &NodeId,
     host: Option<&Host>,
     now: UnixSecs,
     read: &mut fact_replica::ReadPage,
-    under_lock: impl FnOnce(&Replica, &SyncReport) -> Result<()>,
+    under_lock: impl FnOnce(&Replica, &SyncLock, &SyncReport) -> Result<()>,
 ) -> Result<Option<SyncReport>> {
     if let Some(host) = host {
         release_host_elsewhere(nodes_dir, host, id).map_err(|e| eyre!("{e}"))?;
@@ -260,32 +273,110 @@ fn sync_replica(
     let report = replica
         .sync_locked(&lock, now, host, read)
         .map_err(|e| eyre!("{e}"))?;
-    under_lock(&replica, &report)?;
+    under_lock(&replica, &lock, &report)?;
     Ok(Some(report))
 }
 
-fn nodes_dir() -> Result<PathBuf> {
-    default_nodes_dir().ok_or_else(|| eyre!("no cache directory is available for the replica"))
+/// The directory every replica lives in, `None` when there is no cache directory.
+///
+/// Under test it is also `None` unless the test set `XDG_CACHE_HOME`, so no test can
+/// read or write the real cache of whoever runs it.
+pub(crate) fn replicas_dir() -> Option<PathBuf> {
+    if cfg!(test) && std::env::var_os("XDG_CACHE_HOME").is_none_or(|dir| dir.is_empty()) {
+        return None;
+    }
+    default_nodes_dir()
 }
 
-/// The replica commands act on, decided offline.
-fn current_replica(ctx: &Ctx, nodes_dir: &Path) -> Result<NodeId> {
-    let explicit = ctx.node_flag().map(|spec| spec.host().to_string());
-    let env = node::env_node().map_err(|message| eyre!("{message}"))?;
-    let remembered = node::load_cache();
+fn nodes_dir() -> Result<PathBuf> {
+    replicas_dir().ok_or_else(|| eyre!("no cache directory is available for the replica"))
+}
+
+/// Whether the local services are the node in use, as far as the environment says
+/// (completion has no `Ctx`): a library or playback socket is given by variable, or
+/// the library socket exists here. The same rule as `Ctx::new`, minus the flags.
+fn local_from_environment() -> bool {
+    let given = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let library = given("MDMA_LIBRARY_SOCKET");
+    let sockets_given = library.is_some() || given("MDMA_PLAYBACK_SOCKET").is_some();
+    let library = library.unwrap_or_else(|| crate::ctx::DEFAULT_LIBRARY_SOCKET.to_string());
+    crate::ctx::local_ipc_for(&library, sockets_given)
+}
+
+/// The replica of the node in use, for completion and for the refresh after a
+/// command. Decided offline and silently (no mDNS, no network, nothing printed): on
+/// the node itself the replica synced as `localhost`, else `MDMA_NODE` against the
+/// replicas' hosts, else the remembered node. A malformed `MDMA_NODE` counts as
+/// unset (the command itself reports it).
+///
+/// `named` is the host of a `--node` the command was given. Completion cannot see
+/// one (`None`); the refresh after a command can. As everywhere, a named node has no
+/// fallback: no replica of that name is `None`.
+pub(crate) fn replica_from_environment(nodes_dir: &Path, named: Option<&str>) -> Option<NodeId> {
+    let env = node::env_node().ok().flatten();
+    let remembered = node::load_cache_quiet();
     pick_replica(
         nodes_dir,
-        explicit.as_deref(),
-        ctx.local_ipc(),
+        named,
+        local_from_environment(),
         env.as_ref().map(|spec| spec.host()),
         remembered
             .as_ref()
             .map(|c| (c.id.as_str(), c.host.as_str())),
     )
-    .ok_or_else(|| match explicit {
-        Some(name) => eyre!("no replica for '{name}'"),
-        None => eyre!("no node to find a replica for; use --node NAME or run `mdma node select`"),
-    })
+}
+
+/// Why no replica was found for the node in use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Missing {
+    /// A node was named (by `--node`, else `MDMA_NODE`) and no replica matches it.
+    Named(String),
+    /// No node is named, remembered or running here.
+    NoNode,
+}
+
+impl Missing {
+    fn named(explicit: Option<String>, env: Option<&str>) -> Self {
+        explicit
+            .or_else(|| env.map(str::to_string))
+            .map_or(Missing::NoNode, Missing::Named)
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Missing::Named(name) => format!("no replica for '{name}'"),
+            Missing::NoNode => {
+                "no node to find a replica for; use --node NAME or run `mdma node select`"
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// The replica a command acts on, or what was looked for and not found.
+type Chosen = std::result::Result<NodeId, Missing>;
+
+/// The replica commands act on, decided offline; or what was looked for.
+fn find_replica(ctx: &Ctx, nodes_dir: &Path) -> Result<Chosen> {
+    let explicit = ctx.node_flag().map(|spec| spec.host().to_string());
+    let env = node::env_node().map_err(|message| eyre!("{message}"))?;
+    let env_host = env.as_ref().map(|spec| spec.host());
+    let remembered = node::load_cache();
+    let found = pick_replica(
+        nodes_dir,
+        explicit.as_deref(),
+        ctx.local_ipc(),
+        env_host,
+        remembered
+            .as_ref()
+            .map(|c| (c.id.as_str(), c.host.as_str())),
+    );
+    Ok(found.ok_or_else(|| Missing::named(explicit, env_host)))
+}
+
+/// The replica commands act on, decided offline.
+fn current_replica(ctx: &Ctx, nodes_dir: &Path) -> Result<NodeId> {
+    find_replica(ctx, nodes_dir)?.map_err(|missing| eyre!("{}", missing.message()))
 }
 
 // ---------------------------------------------------------------------------
@@ -389,15 +480,15 @@ pub(crate) fn sync(quiet: Quiet, ctx: &Ctx) -> Result<()> {
             eprintln!("warning: could not probe {what}: {e}");
         }
     };
-    // The probe file is written while the sync lock is held, and so are the
-    // probes themselves: a slow playlist or source probe extends the window in
-    // which a second sync or a reset reports "busy".
-    let probe = |replica: &Replica, _: &SyncReport| {
+    // The probe file and the completion snapshot are written while the sync lock is
+    // held, and so are the probes themselves: a slow playlist or source probe
+    // extends the window in which a second sync or a reset reports "busy".
+    let probe = |replica: &Replica, _lock: &SyncLock, report: &SyncReport| {
         let playlists = probe_playlists(ctx).map_err(|e| warn("playlists", &e)).ok();
         let sources = probe_sources(ctx).map_err(|e| warn("sources", &e)).ok();
-        Probe::load(replica)
-            .updated(now, playlists, sources)
-            .save(replica)
+        let probe = Probe::load(replica).updated(now, playlists, sources);
+        probe.save(replica)?;
+        CompletionSnapshot::refresh(replica, report, &probe).map(|_rebuilt| ())
     };
     let Some(report) = sync_replica(&nodes_dir, &id, host.as_ref(), now, &mut *read, probe)? else {
         if !quiet.0 {
@@ -432,25 +523,41 @@ pub(crate) fn status(ctx: &Ctx) -> Result<()> {
     };
     let now = UnixSecs::now();
     let probe = Probe::load(&replica).live(now);
-    println!("{}", render_status(&id, &meta, &probe, now));
+    let unreadable = CompletionSnapshot::load(&replica).map_or(0, |s| s.unreadable);
+    println!("{}", render_status(&id, &meta, &probe, unreadable, now));
     Ok(())
 }
 
 /// Delete the replica of the current node
 ///
 /// Nothing is lost: the next sync rebuilds it from the node. Name another node
-/// with `--node`.
+/// with `--node`. A node that has no replica is not an error: a second reset
+/// says there is nothing to reset.
 #[hicli::command]
 pub(crate) fn reset(ctx: &Ctx) -> Result<()> {
     let nodes_dir = nodes_dir()?;
-    let id = current_replica(ctx, &nodes_dir)?;
-    let replica = Replica::new(&nodes_dir, &id);
-    if replica.reset().map_err(|e| eyre!("{e}"))? {
-        println!("Deleted the replica of {id}");
-    } else {
-        println!("Nothing to reset: no replica of {id}.");
-    }
+    let chosen = find_replica(ctx, &nodes_dir)?;
+    println!("{}", reset_replica(&nodes_dir, chosen)?);
     Ok(())
+}
+
+/// Reset the replica `chosen` names, and say what happened. A name that matches no
+/// replica (none was ever made, or it was just reset and no host lists it any more)
+/// is "nothing to reset", not a failure; only having no node to look for is.
+fn reset_replica(nodes_dir: &Path, chosen: Chosen) -> Result<String> {
+    let id = match chosen {
+        Ok(id) => id,
+        Err(Missing::Named(name)) => {
+            return Ok(format!("Nothing to reset: no replica for '{name}'."));
+        }
+        Err(missing @ Missing::NoNode) => return Err(eyre!("{}", missing.message())),
+    };
+    let replica = Replica::new(nodes_dir, &id);
+    Ok(if replica.reset().map_err(|e| eyre!("{e}"))? {
+        format!("Deleted the replica of {id}")
+    } else {
+        format!("Nothing to reset: no replica of {id}.")
+    })
 }
 
 #[cfg(test)]
@@ -660,6 +767,71 @@ mod tests {
         assert_eq!(pick(None, false, None, None), None);
     }
 
+    // --- reset ---------------------------------------------------------------
+
+    #[test]
+    fn what_was_looked_for_is_the_flag_else_the_environment() {
+        assert_eq!(
+            Missing::named(Some("flag.local".into()), Some("env.local")),
+            Missing::Named("flag.local".into())
+        );
+        assert_eq!(
+            Missing::named(None, Some("env.local")),
+            Missing::Named("env.local".into())
+        );
+        assert_eq!(Missing::named(None, None), Missing::NoNode);
+    }
+
+    #[test]
+    fn resetting_a_name_that_matches_no_replica_is_nothing_to_reset_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        replica_with_host(dir.path(), "stage", "mdma-stage2.local");
+
+        let say = |chosen| reset_replica(dir.path(), chosen).unwrap();
+
+        assert_eq!(
+            say(Err(Missing::Named("mdma-gone.local".into()))),
+            "Nothing to reset: no replica for 'mdma-gone.local'."
+        );
+        assert_eq!(say(Ok(id("stage"))), "Deleted the replica of stage");
+        assert_eq!(
+            say(Ok(id("stage"))),
+            "Nothing to reset: no replica of stage."
+        );
+        let no_node = reset_replica(dir.path(), Err(Missing::NoNode));
+        assert_eq!(
+            crate::test_support::failure_text(no_node),
+            "no node to find a replica for; use --node NAME or run `mdma node select`"
+        );
+    }
+
+    #[test]
+    fn a_second_reset_of_the_same_node_exits_zero_and_status_still_reports_the_missing_replica() {
+        use crate::ctx::NodeFlag;
+        use crate::test_support::{env_lock, failure_text, globals, EnvVars};
+
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = EnvVars::default();
+        env.set("XDG_CACHE_HOME", dir.path().join("cache"));
+        env.set("XDG_CONFIG_HOME", dir.path().join("config"));
+        env.set("MDMA_NODE", "");
+        let nodes_dir = dir.path().join("cache").join("mdma").join("nodes");
+        replica_with_host(&nodes_dir, "stage", "mdma-stage2.local");
+        let mut given = globals();
+        given.node = NodeFlag(Some("mdma-stage2.local".parse().unwrap()));
+        let ctx = Ctx::with_target(given, node_discovery::Target::LocalIpc);
+
+        reset(&ctx).expect("the first reset deletes the replica");
+        reset(&ctx).expect("the second has nothing to do, and that is not a failure");
+
+        assert_eq!(
+            failure_text(status(&ctx)),
+            "no replica for 'mdma-stage2.local'",
+            "status keeps its error"
+        );
+    }
+
     // --- syncing -------------------------------------------------------------
 
     fn node_with(lines: &[&str]) -> FakeNode {
@@ -673,7 +845,7 @@ mod tests {
         node_id: &str,
         host: Option<&Host>,
         node: &FakeNode,
-        under_lock: impl FnOnce(&Replica, &SyncReport) -> Result<()>,
+        under_lock: impl FnOnce(&Replica, &SyncLock, &SyncReport) -> Result<()>,
     ) -> Result<Option<SyncReport>> {
         sync_replica(
             dir,
@@ -692,7 +864,7 @@ mod tests {
         let host = Host::new("shared.local");
         let node = node_with(&["[\"a\"]"]);
 
-        let report = sync_now(dir.path(), "new-node", Some(&host), &node, |_, _| Ok(()))
+        let report = sync_now(dir.path(), "new-node", Some(&host), &node, |_, _, _| Ok(()))
             .unwrap()
             .expect("not busy");
 
@@ -710,7 +882,7 @@ mod tests {
         let node = node_with(&["[\"a\"]"]);
         let mut lock_was_held = false;
 
-        sync_now(dir.path(), "n", None, &node, |replica, _| {
+        sync_now(dir.path(), "n", None, &node, |replica, _, _| {
             // A reset (or another sync) would get the lock if it were released.
             lock_was_held = replica.try_lock().unwrap().is_none();
             Probe::default()
@@ -732,7 +904,7 @@ mod tests {
         let replica = Replica::new(dir.path(), &id("n"));
         let _held = replica.try_lock().unwrap().unwrap();
 
-        let outcome = sync_now(dir.path(), "n", None, &node, |_, _| {
+        let outcome = sync_now(dir.path(), "n", None, &node, |_, _, _| {
             panic!("nothing to do under a lock we do not hold")
         })
         .unwrap();
@@ -747,7 +919,7 @@ mod tests {
         let mut node = node_with(&["[\"a\"]"]);
         node.versioned = false;
 
-        let err = sync_now(dir.path(), "n", None, &node, |_, _| Ok(())).unwrap_err();
+        let err = sync_now(dir.path(), "n", None, &node, |_, _, _| Ok(())).unwrap_err();
 
         assert_eq!(
             crate::test_support::failure_text(Err::<(), _>(err)),
@@ -792,7 +964,7 @@ mod tests {
             sources: None,
         };
 
-        let text = render_status(&id("mdma-1"), &meta, &probe, now);
+        let text = render_status(&id("mdma-1"), &meta, &probe, 0, now);
 
         assert_eq!(
             text,
@@ -814,8 +986,41 @@ mod tests {
             last_attempt: Some(secs(1_000)),
             ..Meta::default()
         };
-        let text = render_status(&id("n"), &meta, &Probe::default(), secs(2_000));
+        let text = render_status(&id("n"), &meta, &Probe::default(), 0, secs(2_000));
         assert!(text.contains("Next attempt:  due now\n"), "{text}");
         assert!(text.contains("Synced:        never"), "{text}");
+        assert!(!text.contains("Unreadable"), "{text}");
+    }
+
+    #[test]
+    fn status_reports_lines_this_mdma_cannot_read() {
+        let none = Probe::default();
+
+        let text = render_status(&id("n"), &Meta::default(), &none, 3, secs(2_000));
+
+        assert!(
+            text.ends_with("Unreadable:    3 lines this mdma cannot read; upgrade mdma"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_node_picks_its_own_replica_with_no_fallback() {
+        use crate::test_support::{env_lock, EnvVars};
+
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = EnvVars::default();
+        env.set("XDG_CONFIG_HOME", dir.path().join("config"));
+        env.set("MDMA_NODE", "alpha.local");
+        env.set("MDMA_LIBRARY_SOCKET", "");
+        env.set("MDMA_PLAYBACK_SOCKET", "");
+        replica_with_host(dir.path(), "alpha", "alpha.local");
+        replica_with_host(dir.path(), "beta", "beta.local");
+        let pick = |named| replica_from_environment(dir.path(), named);
+
+        assert_eq!(pick(None), Some(id("alpha")), "MDMA_NODE decides");
+        assert_eq!(pick(Some("beta.local")), Some(id("beta")), "--node wins");
+        assert_eq!(pick(Some("gamma.local")), None, "and does not fall back");
     }
 }

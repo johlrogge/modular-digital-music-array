@@ -60,6 +60,29 @@ pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Environment variables set for the length of a test and put back when it ends,
+/// even if it panics. Hold [`env_lock`] first (declare it first, so it drops last).
+#[derive(Default)]
+pub(crate) struct EnvVars(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl EnvVars {
+    pub(crate) fn set(&mut self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) {
+        self.0.push((name, std::env::var_os(name)));
+        std::env::set_var(name, value);
+    }
+}
+
+impl Drop for EnvVars {
+    fn drop(&mut self) {
+        for (name, original) in self.0.drain(..).rev() {
+            match original {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
 /// Global options as given by none of the flags or variables.
 pub(crate) fn globals() -> Globals {
     Globals {

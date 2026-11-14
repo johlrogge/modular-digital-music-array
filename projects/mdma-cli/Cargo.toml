@@ -14,6 +14,7 @@ path = "src/main.rs"
 acid-protocol = { workspace = true }
 client = { path = "../../bases/client" }
 fact-replica = { workspace = true }
+library-projection = { workspace = true }
 private-file = { workspace = true }
 serde = { workspace = true }
 hicli = "0.7.0"

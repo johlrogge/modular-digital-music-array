@@ -115,6 +115,16 @@ pub struct Ctx {
     target: OnceLock<Target>,
 }
 
+/// Whether the local services are the node in use: sockets were given explicitly, or
+/// the library socket (`ipc://<path>` or a bare path) exists here. The one rule for
+/// `Ctx::new` and for completion, which has no `Ctx` and reads the environment.
+pub(crate) fn local_ipc_for(library_socket: &str, sockets_given: bool) -> bool {
+    let path = library_socket
+        .strip_prefix("ipc://")
+        .unwrap_or(library_socket);
+    node::local_ipc_wanted(sockets_given, Path::new(path).exists())
+}
+
 /// `value`, unless it is empty (which counts as not given).
 fn given(value: &Option<String>) -> Option<&str> {
     value.as_deref().filter(|v| !v.is_empty())
@@ -127,12 +137,7 @@ impl Ctx {
             local_ipc: false,
             target: OnceLock::new(),
         };
-        let library_socket = ctx.library_socket();
-        let library_socket = library_socket
-            .strip_prefix("ipc://")
-            .unwrap_or(library_socket);
-        ctx.local_ipc =
-            node::local_ipc_wanted(ctx.sockets_given(), Path::new(library_socket).exists());
+        ctx.local_ipc = local_ipc_for(ctx.library_socket(), ctx.sockets_given());
         ctx
     }
 
