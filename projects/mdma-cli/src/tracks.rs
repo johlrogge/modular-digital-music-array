@@ -227,13 +227,33 @@ pub(crate) fn ping(ctx: &Ctx) -> Result<()> {
 pub(crate) fn status(ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
     let status = library.status().map_err(library_error)?;
-    println!("MDMA Library Service v{}", status.version);
-    println!("{}", "=".repeat(35));
-    println!("Tracks indexed:  {}", status.tracks_indexed);
-    println!("Facts count:     {}", status.facts_count);
-    println!("Inbox queue:     {} files", status.inbox_queue_size);
-    println!("Uptime:          {} seconds", status.uptime_seconds);
+    print!("{}", format_status(&status));
     Ok(())
+}
+
+/// Render the library status block. The unparseable-lines row only appears
+/// when non-zero, so a healthy library keeps the familiar layout.
+fn format_status(status: &library_ipc_client::ServiceStatus) -> String {
+    let mut text = format!(
+        "MDMA Library Service v{}\n{}\n\
+         Tracks indexed:  {}\n\
+         Facts count:     {}\n\
+         Inbox queue:     {} files\n\
+         Uptime:          {} seconds\n",
+        status.version,
+        "=".repeat(35),
+        status.tracks_indexed,
+        status.facts_count,
+        status.inbox_queue_size,
+        status.uptime_seconds,
+    );
+    if status.unparseable_lines > 0 {
+        text.push_str(&format!(
+            "Unparseable:     {} fact-log lines skipped\n",
+            status.unparseable_lines
+        ));
+    }
+    text
 }
 
 /// List tracks in library
@@ -560,6 +580,31 @@ pub(crate) fn view(columns: ViewColumns, ctx: &Ctx) -> Result<()> {
 mod tests {
     use super::*;
     use crate::test_support::{parses, strip_ansi, track, usage_error};
+
+    fn service_status(unparseable_lines: usize) -> library_ipc_client::ServiceStatus {
+        library_ipc_client::ServiceStatus {
+            version: "1.0".into(),
+            tracks_indexed: 1,
+            facts_count: 2,
+            inbox_queue_size: 3,
+            uptime_seconds: 4,
+            unparseable_lines,
+        }
+    }
+
+    #[test]
+    fn status_text_omits_unparseable_lines_when_zero() {
+        assert!(!format_status(&service_status(0)).contains("nparseable"));
+    }
+
+    #[test]
+    fn status_text_shows_unparseable_lines_when_nonzero() {
+        let text = format_status(&service_status(7));
+        assert!(
+            text.contains("Unparseable:     7 fact-log lines skipped"),
+            "{text}"
+        );
+    }
 
     use track_formatter::{render_for_user, ViewColumn};
 

@@ -615,7 +615,7 @@ impl LibraryService {
                 return report;
             }
         };
-        let source = sources::dedup();
+        let source = self.sources.dedup.clone();
 
         for loser in losers {
             match self.merge_into(winner, loser, &source, carry.take().unwrap_or_default()) {

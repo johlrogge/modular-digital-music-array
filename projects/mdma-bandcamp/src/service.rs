@@ -2754,12 +2754,7 @@ mod tests {
             metadata_dir: &std::path::Path,
             socket_path: &std::path::Path,
         ) -> std::thread::JoinHandle<()> {
-            let svc = LibraryService::new(
-                metadata_dir.to_path_buf(),
-                metadata_dir.to_path_buf(),
-                "ipc:///dev/null",
-            )
-            .expect("failed to create stub library");
+            let svc = LibraryService::from_metadata_dir(metadata_dir.to_path_buf());
             let addr = format!("ipc://{}", socket_path.display());
             std::thread::spawn(move || {
                 run_ipc_server(svc, &addr).ok();
@@ -3076,12 +3071,7 @@ mod tests {
                 "Interloper",
                 "p_1",
             );
-            let stub = LibraryService::new(
-                temp.path().to_path_buf(),
-                temp.path().to_path_buf(),
-                "ipc:///dev/null",
-            )
-            .expect("failed to create stub library");
+            let stub = LibraryService::from_metadata_dir(temp.path().to_path_buf());
             let socket_path = temp.path().join("drop-known.sock");
             let socket = format!("ipc://{}", socket_path.display());
             let _srv = {

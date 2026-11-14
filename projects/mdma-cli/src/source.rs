@@ -106,6 +106,11 @@ pub(crate) struct ImportPlaylistArgs {
 /// rate-limited upstream requests (e.g. Bandcamp), well beyond the default 5s.
 const SOURCE_LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Request timeout for long-running source operations (`sync`, `resync`,
+/// `check-item`, `check-updates`): the source fetches the whole upstream
+/// collection (~8s for 700 Bandcamp items) before it can answer.
+const SOURCE_LONG_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// List available music sources
 #[hicli::command]
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
@@ -165,7 +170,7 @@ fn item_error(source: &str, err: SourceError) -> color_eyre::Report {
 #[hicli::command(curried)]
 pub(crate) fn sync(source: SourceArg, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
-    let source = ctx.source(name, None)?;
+    let source = ctx.source(name, Some(SOURCE_LONG_OP_TIMEOUT))?;
     println!("Syncing {}...", name);
     let (total_items, new_items) =
         source_call(
@@ -330,7 +335,7 @@ pub(crate) fn resume(source: SourceArg, ctx: &Ctx) -> Result<()> {
 pub(crate) fn resync(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) -> Result<()> {
     let ItemIdArg(identifier) = identifier;
     let name = source.as_str();
-    let source = ctx.source(name, None)?;
+    let source = ctx.source(name, Some(SOURCE_LONG_OP_TIMEOUT))?;
     println!("Requesting resync of {} from {}...", identifier, name);
     let request = SourceRequest::ResyncItem { identifier };
     let (identifier, tracks_queued) = source_call_with(
@@ -358,7 +363,7 @@ pub(crate) fn resync(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) -> Res
 pub(crate) fn check_item(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) -> Result<()> {
     let ItemIdArg(identifier) = identifier;
     let name = source.as_str();
-    let source = ctx.source(name, None)?;
+    let source = ctx.source(name, Some(SOURCE_LONG_OP_TIMEOUT))?;
     let request = SourceRequest::CheckItem { identifier };
     let (identifier, live_track_count, stored_track_count, stale) = source_call_with(
         &source,
@@ -391,7 +396,7 @@ pub(crate) fn check_item(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) ->
 pub(crate) fn check_updates(source: SourceArg, apply: ApplyUpdates, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
     let apply = apply.0;
-    let source = ctx.source(name, None)?;
+    let source = ctx.source(name, Some(SOURCE_LONG_OP_TIMEOUT))?;
     // Fetch all ItemId values from the library for this source.
     // We use GetFactValues("ItemId") — returns all ItemId values the library knows about.
     let library = ctx.library()?;

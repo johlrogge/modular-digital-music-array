@@ -423,7 +423,7 @@ mod tests {
 
     #[test]
     fn run_exits_one_when_an_admin_command_cannot_reach_the_node() {
-        let (target, _) = crate::test_support::dead_node();
+        let (target, _, _guard) = crate::test_support::dead_node();
         let code = app().run_with_args(["admin", "service-mode", "status"], move |globals| {
             Ok(Ctx::with_target(globals, target))
         });

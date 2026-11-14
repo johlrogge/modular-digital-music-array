@@ -85,21 +85,43 @@ pub(crate) fn local_ctx() -> Ctx {
     )
 }
 
-/// A node on this machine that refuses connections: a port that was bound,
-/// then freed. The target, and its port.
-pub(crate) fn dead_node() -> (node_discovery::Target, u16) {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind a free port")
-        .local_addr()
-        .expect("local address")
-        .port();
+/// Keeps a dead node's port reserved: bound but never listening, so dials are
+/// always refused and no other test can be handed the same port.
+pub(crate) struct PortGuard(#[allow(dead_code)] std::os::fd::OwnedFd);
+
+/// A node on this machine that refuses connections. The target, its port, and
+/// the guard that must be held for as long as the node should stay dead.
+pub(crate) fn dead_node() -> (node_discovery::Target, u16, PortGuard) {
+    use std::os::fd::FromRawFd;
+    // std has no bound-but-not-listening TCP socket, so go through libc.
+    // SAFETY: plain socket/bind/getsockname calls on a descriptor we own and
+    // immediately wrap in an OwnedFd; `addr` outlives every call using it.
+    let (fd, port) = unsafe {
+        let raw = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        assert!(raw >= 0, "create a socket");
+        let fd = std::os::fd::OwnedFd::from_raw_fd(raw);
+        let mut addr: libc::sockaddr_in = std::mem::zeroed();
+        addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        addr.sin_addr.s_addr = u32::from(std::net::Ipv4Addr::LOCALHOST).to_be();
+        let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        let addr_ptr = std::ptr::addr_of_mut!(addr).cast::<libc::sockaddr>();
+        let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
+        assert_eq!(libc::bind(raw, addr_ptr, len), 0, "bind a free port");
+        let mut out_len = len;
+        assert_eq!(
+            libc::getsockname(raw, addr_ptr, &mut out_len),
+            0,
+            "read the bound port"
+        );
+        (fd, u16::from_be(addr.sin_port))
+    };
     let target = node_discovery::Target::Remote(node_discovery::RemoteTarget {
         host: "localhost".to_string(),
         ip: Some(std::net::Ipv4Addr::LOCALHOST),
         port,
         source: node_discovery::Source::Cache,
     });
-    (target, port)
+    (target, port, PortGuard(fd))
 }
 
 /// The text hicli would print (after its `Error: ` prefix) for a failed command result.
