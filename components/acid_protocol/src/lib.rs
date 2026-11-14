@@ -175,6 +175,54 @@ pub enum AcidResponse {
 }
 
 // ============================================================================
+// Pinned reads
+// ============================================================================
+
+/// Outcome of a pinned stream read.
+///
+/// `Chunk` always carries the log identity, so a caller can only ever append
+/// lines that came with an epoch. Lines from an unversioned node are never
+/// exposed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinnedRead {
+    Chunk {
+        lines: Vec<String>,
+        cursor: String,
+        epoch: String,
+        total_lines: usize,
+    },
+    /// The pinned line is gone: the log was rewritten or replaced.
+    Diverged { epoch: String, total_lines: usize },
+    /// The node sent no epoch (an old node that ignores pins). Its lines cannot
+    /// be verified and must not be appended.
+    Unversioned,
+}
+
+/// Interpret the answer to a pinned `ReadStream`, however it was carried
+/// (direct IPC or through the gateway). The error is the service's message.
+pub fn classify_read(response: AcidResponse) -> Result<PinnedRead, String> {
+    match response {
+        AcidResponse::StreamChunk(StreamChunk {
+            lines,
+            cursor,
+            epoch: Some(epoch),
+            total_lines: Some(total_lines),
+        }) => Ok(PinnedRead::Chunk {
+            lines,
+            cursor,
+            epoch,
+            total_lines,
+        }),
+        AcidResponse::StreamChunk(_) => Ok(PinnedRead::Unversioned),
+        AcidResponse::StreamDiverged { epoch, total_lines } => {
+            Ok(PinnedRead::Diverged { epoch, total_lines })
+        }
+        AcidResponse::Error { message } => Err(message),
+        other => Err(format!("unexpected response: {:?}", other)),
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -349,6 +397,54 @@ mod tests {
             parsed,
             AcidResponse::StreamDiverged { total_lines: 9, .. }
         ));
+    }
+
+    #[test]
+    fn classify_read_separates_versioned_chunks_divergence_and_old_nodes() {
+        let chunk = |epoch: Option<&str>, total: Option<usize>| {
+            AcidResponse::StreamChunk(StreamChunk {
+                lines: vec!["a".into()],
+                cursor: "line:1".into(),
+                epoch: epoch.map(String::from),
+                total_lines: total,
+            })
+        };
+        assert_eq!(
+            classify_read(chunk(Some("e"), Some(1))),
+            Ok(PinnedRead::Chunk {
+                lines: vec!["a".into()],
+                cursor: "line:1".into(),
+                epoch: "e".into(),
+                total_lines: 1
+            })
+        );
+        assert_eq!(
+            classify_read(chunk(None, None)),
+            Ok(PinnedRead::Unversioned)
+        );
+        assert_eq!(
+            classify_read(chunk(Some("e"), None)),
+            Ok(PinnedRead::Unversioned)
+        );
+        assert_eq!(
+            classify_read(AcidResponse::StreamDiverged {
+                epoch: "e".into(),
+                total_lines: 4
+            }),
+            Ok(PinnedRead::Diverged {
+                epoch: "e".into(),
+                total_lines: 4
+            })
+        );
+        assert_eq!(
+            classify_read(AcidResponse::Error {
+                message: "boom".into()
+            }),
+            Err("boom".to_string())
+        );
+        assert!(classify_read(AcidResponse::Pong)
+            .unwrap_err()
+            .starts_with("unexpected response"));
     }
 
     #[test]

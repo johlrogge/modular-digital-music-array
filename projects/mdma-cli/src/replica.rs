@@ -1,0 +1,821 @@
+//! `mdma replica`: the client-side copy of a node's fact log (ADR-021).
+//!
+//! The store and the sync rules live in `fact_replica`; this module supplies the
+//! effects (identify, ACID reads, playlist and source probes) and the rendering.
+//! Nothing here blocks completion: `sync` is meant to run detached.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use acid_protocol::AcidRequest;
+use color_eyre::eyre::eyre;
+use color_eyre::Result;
+use fact_replica::{
+    default_nodes_dir, id_for_host, release_host_elsewhere, should_attempt, Host, Meta, NodeId,
+    ReadFailure, Replica, SyncReport, UnixSecs,
+};
+use gateway_client::{GatewayClient, IdentifyError, NodeIdentity};
+use hicli::Arg;
+use library_ipc_client::{LibraryRequest, LibraryResponse};
+use serde::{Deserialize, Serialize};
+
+use crate::ctx::{connect_failed, Ctx};
+use crate::node;
+use crate::output::interpret_library;
+
+/// How long the replica waits for the node, per request.
+const LINK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The name a node reached over local IPC is recorded under, so that `status`
+/// and `reset` can find its replica again without a network.
+const LOCAL_HOST: &str = "localhost";
+
+/// How long probed playlist and source names are served.
+const PROBE_TTL_SECS: u64 = 24 * 60 * 60;
+
+const PROBE_FILE: &str = "probe.json";
+
+// ---------------------------------------------------------------------------
+// Probe: data that is not facts
+// ---------------------------------------------------------------------------
+
+/// Names the node answered with at `at`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Probed {
+    pub at: UnixSecs,
+    pub names: Vec<String>,
+}
+
+/// Playlists are files and sources are sockets, not facts, so they are probed on
+/// each sync and kept for [`PROBE_TTL_SECS`]. Raw names; the completion snapshot
+/// is built from them later.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Probe {
+    pub playlists: Option<Probed>,
+    pub sources: Option<Probed>,
+}
+
+fn live(probed: Option<Probed>, now: UnixSecs) -> Option<Probed> {
+    probed.filter(|p| now.since(p.at).is_none_or(|age| age < PROBE_TTL_SECS))
+}
+
+impl Probe {
+    /// Only what is still within its TTL.
+    pub(crate) fn live(self, now: UnixSecs) -> Probe {
+        Probe {
+            playlists: live(self.playlists, now),
+            sources: live(self.sources, now),
+        }
+    }
+
+    /// Replace each list that was answered; keep the old one when the probe failed
+    /// (it is served until its TTL runs out), and drop what has expired.
+    pub(crate) fn updated(
+        self,
+        now: UnixSecs,
+        playlists: Option<Vec<String>>,
+        sources: Option<Vec<String>>,
+    ) -> Probe {
+        let fresh = |names| Probed { at: now, names };
+        Probe {
+            playlists: playlists.map(fresh).or(self.playlists),
+            sources: sources.map(fresh).or(self.sources),
+        }
+        .live(now)
+    }
+
+    fn path(replica: &Replica) -> PathBuf {
+        replica.dir().join(PROBE_FILE)
+    }
+
+    /// The stored probe; empty when there is none or it is unreadable.
+    pub(crate) fn load(replica: &Replica) -> Probe {
+        std::fs::read(Self::path(replica))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, replica: &Replica) -> Result<()> {
+        let json = serde_json::to_vec_pretty(self).expect("Probe serializes");
+        private_file::write_private_file(&Self::path(replica), &json)
+            .map_err(|e| eyre!("could not write the probe file: {e}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure helpers
+// ---------------------------------------------------------------------------
+
+/// The node id from an identify answer; a node that cannot say gets no replica.
+fn node_id_from(answer: Result<NodeIdentity, IdentifyError>) -> Result<NodeId> {
+    match answer {
+        Ok(NodeIdentity { id: Some(id), .. }) => {
+            NodeId::new(id).map_err(|e| eyre!("the node reported an unusable id: {e}"))
+        }
+        Ok(NodeIdentity { id: None, .. }) => Err(eyre!(
+            "the node has no id configured, so it gets no replica"
+        )),
+        Err(IdentifyError::Unsupported(_)) => Err(eyre!(
+            "the node's gateway is too old to say which node it is, so it gets no replica"
+        )),
+        Err(IdentifyError::Client(e)) => Err(eyre!("could not identify the node: {e}")),
+    }
+}
+
+/// The replica a name stands for: a host name some replica was reached by, or the
+/// id of an existing replica.
+fn replica_named(nodes_dir: &Path, name: &str) -> Option<NodeId> {
+    id_for_host(nodes_dir, &Host::new(name)).or_else(|| {
+        let id = NodeId::new(name).ok()?;
+        Replica::new(nodes_dir, &id).dir().is_dir().then_some(id)
+    })
+}
+
+/// The replica of the node commands talk to, decided offline (no mDNS, no
+/// network):
+///
+/// 1. an explicit name must match a replica, and never falls back to anything else;
+/// 2. on the node itself (`local`), the replica synced as [`LOCAL_HOST`];
+/// 3. `MDMA_NODE` matched against the replicas' hosts, else the remembered node
+///    (`node.json`: id and host) only when its host is the one `MDMA_NODE` names;
+/// 4. without `MDMA_NODE`, the remembered node's id.
+fn pick_replica(
+    nodes_dir: &Path,
+    explicit: Option<&str>,
+    local: bool,
+    env: Option<&str>,
+    remembered: Option<(&str, &str)>,
+) -> Option<NodeId> {
+    if let Some(name) = explicit {
+        return replica_named(nodes_dir, name);
+    }
+    if local {
+        if let Some(id) = id_for_host(nodes_dir, &Host::new(LOCAL_HOST)) {
+            return Some(id);
+        }
+    }
+    let remembered_id = |only_for_host: Option<&str>| {
+        let (id, host) = remembered?;
+        if only_for_host.is_some_and(|name| Host::new(name) != Host::new(host)) {
+            return None;
+        }
+        NodeId::new(id).ok()
+    };
+    match env {
+        Some(name) => replica_named(nodes_dir, name).or_else(|| remembered_id(Some(name))),
+        None => remembered_id(None),
+    }
+}
+
+/// "5 s ago", "3 min ago", "2 h ago", "4 d ago"; "never" without a time.
+fn ago(now: UnixSecs, then: Option<UnixSecs>) -> String {
+    let Some(then) = then else {
+        return "never".to_string();
+    };
+    let Some(secs) = now.since(then) else {
+        return "in the future (clock changed)".to_string();
+    };
+    match secs {
+        0..=89 => format!("{secs} s ago"),
+        90..=5399 => format!("{} min ago", secs / 60),
+        5400..=129_599 => format!("{} h ago", secs / 3600),
+        _ => format!("{} d ago", secs / 86_400),
+    }
+}
+
+fn probe_line(label: &str, probed: Option<&Probed>, now: UnixSecs) -> String {
+    match probed {
+        Some(p) => format!(
+            "{label} {} names, probed {}",
+            p.names.len(),
+            ago(now, Some(p.at))
+        ),
+        None => format!("{label} none"),
+    }
+}
+
+/// The text of `mdma replica status`.
+fn render_status(id: &NodeId, meta: &Meta, probe: &Probe, now: UnixSecs) -> String {
+    let epoch = meta.epoch().map_or("-".to_string(), |e| e.to_string());
+    let hosts = if meta.hosts.is_empty() {
+        "-".to_string()
+    } else {
+        meta.hosts
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let attempts = if should_attempt(now, Some(meta)) {
+        "due now".to_string()
+    } else {
+        let wait = fact_replica::interval_after(meta.failures).as_secs();
+        let elapsed = meta
+            .last_attempt
+            .and_then(|last| now.since(last))
+            .unwrap_or(0);
+        format!("next in {} s", wait.saturating_sub(elapsed))
+    };
+    let backoff = if meta.failures == 0 {
+        attempts
+    } else {
+        format!("{attempts} ({} failed attempts in a row)", meta.failures)
+    };
+    [
+        format!("Node:          {id}"),
+        format!("Epoch:         {epoch}"),
+        format!("Lines:         {}", meta.lines()),
+        format!("Synced:        {}", ago(now, meta.synced_at)),
+        format!("Last attempt:  {}", ago(now, meta.last_attempt)),
+        format!("Next attempt:  {backoff}"),
+        format!("Hosts:         {hosts}"),
+        probe_line("Playlists:    ", probe.playlists.as_ref(), now),
+        probe_line("Sources:      ", probe.sources.as_ref(), now),
+    ]
+    .join("\n")
+}
+
+/// Sync the replica of node `id`, remembering `host`, and move the name off any
+/// other replica that still lists it (a different node now answers to it).
+///
+/// `under_lock` runs after a successful sync while the sync lock is still held,
+/// for anything else written into the replica directory. `None` means another
+/// sync holds the lock and nothing was done.
+fn sync_replica(
+    nodes_dir: &Path,
+    id: &NodeId,
+    host: Option<&Host>,
+    now: UnixSecs,
+    read: &mut fact_replica::ReadPage,
+    under_lock: impl FnOnce(&Replica, &SyncReport) -> Result<()>,
+) -> Result<Option<SyncReport>> {
+    if let Some(host) = host {
+        release_host_elsewhere(nodes_dir, host, id).map_err(|e| eyre!("{e}"))?;
+    }
+    let replica = Replica::new(nodes_dir, id);
+    let Some(lock) = replica.try_lock().map_err(|e| eyre!("{e}"))? else {
+        return Ok(None);
+    };
+    let report = replica
+        .sync_locked(&lock, now, host, read)
+        .map_err(|e| eyre!("{e}"))?;
+    under_lock(&replica, &report)?;
+    Ok(Some(report))
+}
+
+fn nodes_dir() -> Result<PathBuf> {
+    default_nodes_dir().ok_or_else(|| eyre!("no cache directory is available for the replica"))
+}
+
+/// The replica commands act on, decided offline.
+fn current_replica(ctx: &Ctx, nodes_dir: &Path) -> Result<NodeId> {
+    let explicit = ctx.node_flag().map(|spec| spec.host().to_string());
+    let env = node::env_node().map_err(|message| eyre!("{message}"))?;
+    let remembered = node::load_cache();
+    pick_replica(
+        nodes_dir,
+        explicit.as_deref(),
+        ctx.local_ipc(),
+        env.as_ref().map(|spec| spec.host()),
+        remembered
+            .as_ref()
+            .map(|c| (c.id.as_str(), c.host.as_str())),
+    )
+    .ok_or_else(|| match explicit {
+        Some(name) => eyre!("no replica for '{name}'"),
+        None => eyre!("no node to find a replica for; use --node NAME or run `mdma node select`"),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Effects: reaching the node
+// ---------------------------------------------------------------------------
+
+type Reader = Box<fact_replica::ReadPage<'static>>;
+
+/// A connection to the node: who it is, and how to read its fact log.
+struct NodeLink {
+    id: NodeId,
+    host: Option<Host>,
+    read: Reader,
+}
+
+/// Connect to the node's gateway, which says who the node is and serves its ACID
+/// reads. On the node itself that is the local gateway; ACID is never reached
+/// any other way, so the link timeout holds in both cases.
+fn connect(ctx: &Ctx) -> Result<NodeLink> {
+    let (address, host, local) = match ctx.gateway()? {
+        Some(address) => (
+            address,
+            ctx.remote_host()?.map(|(host, _)| Host::new(&host)),
+            false,
+        ),
+        None => (
+            format!("tcp://127.0.0.1:{}", node_discovery::DEFAULT_PORT),
+            Some(Host::new(LOCAL_HOST)),
+            true,
+        ),
+    };
+    // Locally, a dead gateway gets the "Is mdma-gateway running?" hint.
+    let client = GatewayClient::connect_with_timeout(&address, LINK_TIMEOUT)
+        .map_err(|e| connect_failed("gateway", &e, local))?;
+    let id = node_id_from(client.identify())?;
+    let read: Reader = Box::new(move |cursor, limit, expect| {
+        let request = AcidRequest::ReadStream {
+            cursor,
+            limit,
+            expect,
+        };
+        let response = client
+            .acid_request(&request)
+            .map_err(|e| ReadFailure(e.to_string()))?;
+        acid_protocol::classify_read(response).map_err(ReadFailure)
+    });
+    Ok(NodeLink { id, host, read })
+}
+
+/// Playlist names, as the library lists them.
+fn probe_playlists(ctx: &Ctx) -> Result<Vec<String>> {
+    let library = ctx.library()?;
+    interpret_library(
+        library.request(&LibraryRequest::PlaylistList),
+        |response| match response {
+            LibraryResponse::PlaylistNames(names) => {
+                Some(names.iter().map(ToString::to_string).collect())
+            }
+            _ => None,
+        },
+    )
+}
+
+/// Source names, as the gateway (or the sources directory) lists them.
+fn probe_sources(ctx: &Ctx) -> Result<Vec<String>> {
+    let gateway = ctx.gateway()?;
+    mdma_client::list_available_sources(gateway.as_deref(), ctx.sources_dir()?)
+        .map(|names| names.iter().map(ToString::to_string).collect())
+        .map_err(|e| eyre!("could not list sources: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+/// Print nothing unless something fails
+#[derive(Debug, Clone, Arg)]
+#[arg(long = "quiet")]
+pub(crate) struct Quiet(pub bool);
+
+/// Bring the replica up to date with the node
+///
+/// Reads the node's fact log into the local replica, then probes the playlist and
+/// source names. Meant to run detached; a sync already running for the node makes
+/// this one exit at once.
+#[hicli::command(hide)]
+pub(crate) fn sync(quiet: Quiet, ctx: &Ctx) -> Result<()> {
+    let nodes_dir = nodes_dir()?;
+    let now = UnixSecs::now();
+    // Resolve first, so `--quiet` also silences the note about an implicitly
+    // chosen node; everything after reuses the cached target.
+    ctx.target_with(if quiet.0 {
+        node::Notes::Silent
+    } else {
+        node::Notes::Print
+    })?;
+    let NodeLink { id, host, mut read } = connect(ctx)?;
+
+    let warn = |what: &str, e: &color_eyre::Report| {
+        if !quiet.0 {
+            eprintln!("warning: could not probe {what}: {e}");
+        }
+    };
+    // The probe file is written while the sync lock is held, and so are the
+    // probes themselves: a slow playlist or source probe extends the window in
+    // which a second sync or a reset reports "busy".
+    let probe = |replica: &Replica, _: &SyncReport| {
+        let playlists = probe_playlists(ctx).map_err(|e| warn("playlists", &e)).ok();
+        let sources = probe_sources(ctx).map_err(|e| warn("sources", &e)).ok();
+        Probe::load(replica)
+            .updated(now, playlists, sources)
+            .save(replica)
+    };
+    let Some(report) = sync_replica(&nodes_dir, &id, host.as_ref(), now, &mut *read, probe)? else {
+        if !quiet.0 {
+            println!("Another sync of {id} is running.");
+        }
+        return Ok(());
+    };
+
+    if !quiet.0 {
+        let how = if report.reset { ", refetched" } else { "" };
+        println!(
+            "Synced {id}: {} new lines, {} in total{how}",
+            report.added, report.total
+        );
+    }
+    Ok(())
+}
+
+/// Show the replica of the current node
+///
+/// Which node is decided offline: `--node`; on the node itself, the replica synced
+/// as localhost; else `MDMA_NODE`; else the remembered node (when `MDMA_NODE` is
+/// unset or names it).
+#[hicli::command]
+pub(crate) fn status(ctx: &Ctx) -> Result<()> {
+    let nodes_dir = nodes_dir()?;
+    let id = current_replica(ctx, &nodes_dir)?;
+    let replica = Replica::new(&nodes_dir, &id);
+    let Some(meta) = replica.meta().map_err(|e| eyre!("{e}"))? else {
+        println!("No replica of {id} yet; `mdma replica sync` creates it.");
+        return Ok(());
+    };
+    let now = UnixSecs::now();
+    let probe = Probe::load(&replica).live(now);
+    println!("{}", render_status(&id, &meta, &probe, now));
+    Ok(())
+}
+
+/// Delete the replica of the current node
+///
+/// Nothing is lost: the next sync rebuilds it from the node. Name another node
+/// with `--node`.
+#[hicli::command]
+pub(crate) fn reset(ctx: &Ctx) -> Result<()> {
+    let nodes_dir = nodes_dir()?;
+    let id = current_replica(ctx, &nodes_dir)?;
+    let replica = Replica::new(&nodes_dir, &id);
+    if replica.reset().map_err(|e| eyre!("{e}"))? {
+        println!("Deleted the replica of {id}");
+    } else {
+        println!("Nothing to reset: no replica of {id}.");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{help, parses};
+    use fact_replica::test_support::FakeNode;
+    use pretty_assertions::assert_eq;
+
+    fn secs(n: u64) -> UnixSecs {
+        UnixSecs::new(n)
+    }
+
+    fn id(s: &str) -> NodeId {
+        NodeId::new(s).unwrap()
+    }
+
+    fn probed(at: u64, names: &[&str]) -> Probed {
+        Probed {
+            at: secs(at),
+            names: names.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    // --- the command tree ----------------------------------------------------
+
+    #[test]
+    fn the_commands_parse() {
+        assert_eq!(parses(&["replica", "sync", "--quiet"]), ["replica", "sync"]);
+        assert_eq!(parses(&["replica", "sync"]), ["replica", "sync"]);
+        assert_eq!(parses(&["replica", "status"]), ["replica", "status"]);
+        assert_eq!(parses(&["replica", "reset"]), ["replica", "reset"]);
+        assert_eq!(
+            parses(&["replica", "reset", "--node", "mdma-stage.local"]),
+            ["replica", "reset"]
+        );
+    }
+
+    #[test]
+    fn sync_is_hidden_from_help() {
+        let help = help(&["replica", "--help"]);
+        // A command is listed on a line that starts with its name.
+        let lists = |name: &str| help.lines().any(|l| l.trim_start().starts_with(name));
+        assert!(lists("status") && lists("reset"), "{help}");
+        assert!(!lists("sync"), "{help}");
+    }
+
+    // --- probe ---------------------------------------------------------------
+
+    #[test]
+    fn a_probe_answer_replaces_the_old_list_and_a_failed_probe_keeps_it() {
+        let old = Probe {
+            playlists: Some(probed(100, &["old"])),
+            sources: Some(probed(100, &["bandcamp"])),
+        };
+
+        let both = old.clone().updated(
+            secs(200),
+            Some(vec!["new".into()]),
+            Some(vec!["beatport".into()]),
+        );
+        assert_eq!(both.playlists, Some(probed(200, &["new"])));
+        assert_eq!(both.sources, Some(probed(200, &["beatport"])));
+
+        let failed_sources = old.updated(secs(200), Some(vec![]), None);
+        assert_eq!(failed_sources.playlists, Some(probed(200, &[])));
+        assert_eq!(failed_sources.sources, Some(probed(100, &["bandcamp"])));
+    }
+
+    #[test]
+    fn probe_data_expires_after_24_hours() {
+        let probe = Probe {
+            playlists: Some(probed(1000, &["a"])),
+            sources: Some(probed(2000, &["b"])),
+        };
+        let day = PROBE_TTL_SECS;
+
+        let before = probe.clone().live(secs(1000 + day - 1));
+        assert!(before.playlists.is_some() && before.sources.is_some());
+
+        let after = probe.clone().live(secs(1000 + day));
+        assert_eq!(after.playlists, None);
+        assert!(after.sources.is_some(), "its own clock");
+
+        // A failed probe cannot keep expired names alive.
+        let kept = probe.updated(secs(1000 + day), None, None);
+        assert_eq!(kept.playlists, None);
+    }
+
+    #[test]
+    fn a_probe_is_stored_with_the_replica_and_goes_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let replica = Replica::new(dir.path(), &id("n1"));
+        assert_eq!(Probe::load(&replica), Probe::default());
+        std::fs::create_dir_all(replica.dir()).unwrap();
+
+        let probe = Probe::default().updated(secs(5), Some(vec!["p".into()]), None);
+        probe.save(&replica).unwrap();
+        assert_eq!(Probe::load(&replica), probe);
+
+        replica.reset().unwrap();
+        assert_eq!(Probe::load(&replica), Probe::default());
+    }
+
+    // --- identity ------------------------------------------------------------
+
+    fn identity(id: Option<&str>) -> NodeIdentity {
+        NodeIdentity {
+            id: id.map(String::from),
+            name: None,
+            version: "0.37.0".into(),
+            proto: 1,
+        }
+    }
+
+    #[test]
+    fn a_node_that_cannot_say_who_it_is_gets_no_replica() {
+        assert_eq!(
+            node_id_from(Ok(identity(Some("mdma-stage")))).unwrap(),
+            id("mdma-stage")
+        );
+        let none = crate::test_support::failure_text(node_id_from(Ok(identity(None))));
+        assert_eq!(none, "the node has no id configured, so it gets no replica");
+        let old = crate::test_support::failure_text(node_id_from(Err(IdentifyError::Unsupported(
+            "old".into(),
+        ))));
+        assert!(old.starts_with("the node's gateway is too old"), "{old}");
+        let unsafe_id = crate::test_support::failure_text(node_id_from(Ok(identity(Some("../x")))));
+        assert!(unsafe_id.starts_with("the node reported an unusable id"));
+    }
+
+    // --- which replica -------------------------------------------------------
+
+    fn replica_with_host(dir: &Path, node: &str, host: &str) {
+        let fake = FakeNode::new("e", 0);
+        Replica::new(dir, &id(node))
+            .sync(secs(1), Some(&Host::new(host)), &mut |c, l, p| {
+                fake.serve(c, l, p)
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn the_current_replica_is_found_offline_by_flag_then_local_then_env_then_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        replica_with_host(dir.path(), "alpha", "alpha.local");
+        replica_with_host(dir.path(), "beta", "beta.local");
+        replica_with_host(dir.path(), "pi", LOCAL_HOST);
+        let pick = |explicit, local, env, remembered| {
+            pick_replica(dir.path(), explicit, local, env, remembered)
+        };
+        let beta_cached = Some(("beta", "beta.local"));
+
+        // A flag wins, by host or by id, and never falls back to something else.
+        assert_eq!(
+            pick(Some("beta.local"), true, Some("alpha.local"), beta_cached),
+            Some(id("beta"))
+        );
+        assert_eq!(pick(Some("beta"), false, None, None), Some(id("beta")));
+        assert_eq!(
+            pick(Some("gamma.local"), true, Some("alpha.local"), beta_cached),
+            None
+        );
+        // On the node itself, the replica synced as localhost beats MDMA_NODE and node.json.
+        assert_eq!(
+            pick(None, true, Some("alpha.local"), beta_cached),
+            Some(id("pi"))
+        );
+        assert_eq!(pick(None, true, None, None), Some(id("pi")));
+        assert_eq!(
+            pick(None, false, Some("alpha.local"), beta_cached),
+            Some(id("alpha")),
+            "not local: localhost is not tried"
+        );
+        // MDMA_NODE against the hosts.
+        assert_eq!(
+            pick(None, false, Some("alpha.local"), None),
+            Some(id("alpha"))
+        );
+        // node.json only when MDMA_NODE is unset or names its host.
+        assert_eq!(pick(None, false, None, beta_cached), Some(id("beta")));
+        assert_eq!(
+            pick(None, false, Some("unknown.local"), beta_cached),
+            None,
+            "MDMA_NODE names another node: node.json's replica is not it"
+        );
+        assert_eq!(
+            pick(
+                None,
+                false,
+                Some("BETA.local"),
+                Some(("beta-old", "beta.local"))
+            ),
+            Some(id("beta")),
+            "the hosts match first"
+        );
+        assert_eq!(
+            pick(
+                None,
+                false,
+                Some("gone.local"),
+                Some(("zeta", "gone.local"))
+            ),
+            Some(id("zeta")),
+            "node.json's host is the one MDMA_NODE names"
+        );
+        assert_eq!(pick(None, false, None, None), None);
+    }
+
+    // --- syncing -------------------------------------------------------------
+
+    fn node_with(lines: &[&str]) -> FakeNode {
+        let mut node = FakeNode::new("e1", 0);
+        node.lines = lines.iter().map(ToString::to_string).collect();
+        node
+    }
+
+    fn sync_now(
+        dir: &Path,
+        node_id: &str,
+        host: Option<&Host>,
+        node: &FakeNode,
+        under_lock: impl FnOnce(&Replica, &SyncReport) -> Result<()>,
+    ) -> Result<Option<SyncReport>> {
+        sync_replica(
+            dir,
+            &id(node_id),
+            host,
+            secs(10),
+            &mut |c, l, p| node.serve(c, l, p),
+            under_lock,
+        )
+    }
+
+    #[test]
+    fn syncing_remembers_the_host_and_moves_it_off_the_node_that_used_to_have_it() {
+        let dir = tempfile::tempdir().unwrap();
+        replica_with_host(dir.path(), "old-node", "shared.local");
+        let host = Host::new("shared.local");
+        let node = node_with(&["[\"a\"]"]);
+
+        let report = sync_now(dir.path(), "new-node", Some(&host), &node, |_, _| Ok(()))
+            .unwrap()
+            .expect("not busy");
+
+        assert_eq!(report.added, fact_replica::LineCount::new(1));
+        let replica = Replica::new(dir.path(), &id("new-node"));
+        assert_eq!(replica.lines().unwrap(), ["[\"a\"]"]);
+        assert_eq!(id_for_host(dir.path(), &host), Some(id("new-node")));
+        let old = Replica::new(dir.path(), &id("old-node"));
+        assert!(old.meta().unwrap().unwrap().hosts.is_empty());
+    }
+
+    #[test]
+    fn the_probe_is_written_while_the_sync_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = node_with(&["[\"a\"]"]);
+        let mut lock_was_held = false;
+
+        sync_now(dir.path(), "n", None, &node, |replica, _| {
+            // A reset (or another sync) would get the lock if it were released.
+            lock_was_held = replica.try_lock().unwrap().is_none();
+            Probe::default()
+                .updated(secs(10), Some(vec!["p".into()]), None)
+                .save(replica)
+        })
+        .unwrap();
+
+        assert!(lock_was_held);
+        let replica = Replica::new(dir.path(), &id("n"));
+        assert!(Probe::load(&replica).playlists.is_some());
+        assert!(replica.try_lock().unwrap().is_some(), "released afterwards");
+    }
+
+    #[test]
+    fn a_busy_replica_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = node_with(&["[\"a\"]"]);
+        let replica = Replica::new(dir.path(), &id("n"));
+        let _held = replica.try_lock().unwrap().unwrap();
+
+        let outcome = sync_now(dir.path(), "n", None, &node, |_, _| {
+            panic!("nothing to do under a lock we do not hold")
+        })
+        .unwrap();
+
+        assert_eq!(outcome, None);
+        assert!(node.requests().is_empty());
+    }
+
+    #[test]
+    fn a_sync_error_is_a_single_plain_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = node_with(&["[\"a\"]"]);
+        node.versioned = false;
+
+        let err = sync_now(dir.path(), "n", None, &node, |_, _| Ok(())).unwrap_err();
+
+        assert_eq!(
+            crate::test_support::failure_text(Err::<(), _>(err)),
+            "node too old for the replica"
+        );
+    }
+
+    // --- status --------------------------------------------------------------
+
+    #[test]
+    fn ago_reads_in_the_unit_that_fits() {
+        let now = secs(1_000_000);
+        let at = |back: u64| ago(now, Some(secs(1_000_000 - back)));
+        assert_eq!(at(5), "5 s ago");
+        assert_eq!(at(89), "89 s ago");
+        assert_eq!(at(120), "2 min ago");
+        assert_eq!(at(7200), "2 h ago");
+        assert_eq!(at(3 * 86_400), "3 d ago");
+        assert_eq!(ago(now, None), "never");
+        assert_eq!(
+            ago(secs(5), Some(secs(10))),
+            "in the future (clock changed)"
+        );
+    }
+
+    #[test]
+    fn status_shows_the_replica_and_the_backoff() {
+        let now = secs(10_000);
+        let meta = Meta {
+            committed: fact_replica::Committed::Lines {
+                epoch: fact_replica::Epoch::new("e7"),
+                lines: std::num::NonZeroUsize::new(42).unwrap(),
+                last_line_sha256: fact_replica::Digest::of_line("x"),
+            },
+            synced_at: Some(secs(9_000)),
+            last_attempt: Some(secs(9_990)),
+            failures: 2,
+            hosts: vec![Host::new("mdma.local")],
+        };
+        let probe = Probe {
+            playlists: Some(probed(9_000, &["a", "b"])),
+            sources: None,
+        };
+
+        let text = render_status(&id("mdma-1"), &meta, &probe, now);
+
+        assert_eq!(
+            text,
+            "Node:          mdma-1\n\
+             Epoch:         e7\n\
+             Lines:         42\n\
+             Synced:        16 min ago\n\
+             Last attempt:  10 s ago\n\
+             Next attempt:  next in 110 s (2 failed attempts in a row)\n\
+             Hosts:         mdma.local\n\
+             Playlists:     2 names, probed 16 min ago\n\
+             Sources:       none"
+        );
+    }
+
+    #[test]
+    fn status_says_due_now_when_the_interval_has_passed() {
+        let meta = Meta {
+            last_attempt: Some(secs(1_000)),
+            ..Meta::default()
+        };
+        let text = render_status(&id("n"), &meta, &Probe::default(), secs(2_000));
+        assert!(text.contains("Next attempt:  due now\n"), "{text}");
+        assert!(text.contains("Synced:        never"), "{text}");
+    }
+}

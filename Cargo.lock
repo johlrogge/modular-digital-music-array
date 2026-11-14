@@ -3982,6 +3982,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fact-replica"
+version = "0.1.0"
+dependencies = [
+ "acid-protocol",
+ "dirs",
+ "pretty_assertions",
+ "private-file",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "fact-store"
 version = "0.10.1"
 dependencies = [
@@ -6062,6 +6076,7 @@ dependencies = [
 name = "mdma-cli"
 version = "0.37.0"
 dependencies = [
+ "acid-protocol",
  "audio-transcoder",
  "bpaf",
  "chrono",
@@ -6070,6 +6085,7 @@ dependencies = [
  "colored",
  "dirs",
  "event-protocol",
+ "fact-replica",
  "gateway-client",
  "hicli",
  "inbox-utils",
@@ -6083,9 +6099,11 @@ dependencies = [
  "node-discovery",
  "playlist-import",
  "pretty_assertions",
+ "private-file",
  "rekordbox-roundtrip",
  "rekordbox-xml",
  "reqwest",
+ "serde",
  "serde_json",
  "source-protocol",
  "storage_primitives",

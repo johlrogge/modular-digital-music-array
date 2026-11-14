@@ -47,6 +47,11 @@ mod queue;
 /// ```
 #[hicli::group]
 mod rekordbox;
+/// Local copy of the node's facts, kept for offline use
+///
+/// Synced in the background; `status` shows it and `reset` deletes it.
+#[hicli::group]
+mod replica;
 /// Search for tracks
 ///
 /// Filter with options such as --artist, --bpm or --key, or give a free-text query
@@ -96,7 +101,7 @@ fn app() -> hicli::App<ctx::Globals, ctx::Ctx> {
             search, inbox, source, playback, queue, tracks::sort, subscribe::subscribe,
             transfer::upload, transfer::export, rekordbox, playlist, library,
             tracks::mark, tracks::unmark, tracks::marked, fact, tracks::view,
-            completions::generate_completions, admin, node,
+            completions::generate_completions, admin, node, replica,
         ]
     }
     // Fixed, so usage reads `mdma ...` however the binary was invoked (a

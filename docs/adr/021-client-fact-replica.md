@@ -19,12 +19,13 @@ Amends ADR-016 §2-3 (this is the first use of the per-node replica; it answers 
 
 - The client keeps the node's raw fact-log lines under `dirs::cache_dir()/mdma/nodes/<node-id>/`:
   - `facts.jsonl`: the log lines, as served.
-  - `meta.json`: `epoch`, `lines`, `last_line_sha256`, `synced_at`, `last_attempt`, `hosts`.
+  - `meta.json`: `epoch`, `lines`, `last_line_sha256`, `synced_at`, `last_attempt`, `failures` (failed attempts in a row, for the backoff), `hosts`.
+  - `probe.json`: the playlist and source names probed at each sync (§5).
   - `completion.json`: derived (§4).
-  - `sync.lock`: the flock file (§6).
+  - `sync.lock`: the flock file (§6). It is never deleted: a reset takes the lock, removes everything else and fails as busy while a sync holds it.
 - The node id comes from `Identify` (ADR-009). A node that cannot be identified gets no replica.
 - `meta.json` is the commit point. A sync appends to `facts.jsonl` and fsyncs, then writes `meta.json` with tmp+rename. A crash between the two leaves lines past `meta.lines`.
-- On open, a torn tail is truncated to `meta.lines`. A shorter file, an unparseable line or a checksum mismatch on the last line wipes the replica and refetches.
+- On open, a torn tail is truncated to `meta.lines`. A shorter file, a committed region that is not UTF-8 or a checksum mismatch on the last line wipes the replica and refetches. Per-line parse failures are decided by the phase-5 fold, not by the store.
 
 ### 2. Log identity: epoch and pinned reads
 
@@ -61,7 +62,7 @@ Amends ADR-016 §2-3 (this is the first use of the per-node replica; it answers 
 - `last_attempt` is touched before the spawn, so the 30 s window holds across shells.
 - After failures the interval backs off from 30 s to 5 min.
 - One sync per node: a non-blocking flock on `sync.lock`. A second sync exits at once.
-- The node for completion is `MDMA_NODE` matched against `meta.hosts`, else the id in `node.json`. Completion does no mDNS lookup. The sync checks the node id from `Identify` first, and a mismatch means a different node behind that name.
+- The node for completion (and for `replica status` and `reset`) is found offline, in this order: (1) an explicit `--node`, which must match a replica's host or id and has no fallback; (2) on the node itself, the replica synced as `localhost`; (3) `MDMA_NODE` matched against `meta.hosts`; (4) the id in `node.json`, only when `MDMA_NODE` is unset or names that node's host. When several replicas list a host, the most recently synced wins. Completion does no mDNS lookup. The sync checks the node id from `Identify` first, and a mismatch means a different node behind that name.
 
 ### 7. Titles complete as search terms
 

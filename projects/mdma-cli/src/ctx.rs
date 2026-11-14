@@ -168,11 +168,17 @@ impl Ctx {
     /// The node to talk to, resolved on first use. Prints a note for implicit
     /// choices and fails with advice when no node can be resolved.
     pub fn target(&self) -> Result<&Target> {
+        self.target_with(node::Notes::Print)
+    }
+
+    /// Like [`Ctx::target`], choosing whether the note is printed. Only the first
+    /// resolution matters: later calls reuse the cached target.
+    pub fn target_with(&self, notes: node::Notes) -> Result<&Target> {
         // `OnceLock::get_or_try_init` is unstable.
         if let Some(target) = self.target.get() {
             return Ok(target);
         }
-        let resolved = node::resolve_startup(self.globals.node.0.as_ref(), self.local_ipc)?;
+        let resolved = node::resolve_startup(self.globals.node.0.as_ref(), self.local_ipc, notes)?;
         Ok(self.target.get_or_init(|| resolved))
     }
 
@@ -286,7 +292,7 @@ fn connect_text(what: &str, err: &NngClientError) -> String {
 }
 
 /// "Failed to connect to <what> at <address>: <error>", plus a hint when talking directly.
-fn connect_failed(what: &str, err: &NngClientError, direct: bool) -> color_eyre::Report {
+pub(crate) fn connect_failed(what: &str, err: &NngClientError, direct: bool) -> color_eyre::Report {
     let text = connect_text(what, err);
     if direct {
         eyre!("{text}\nIs mdma-{what} running?")

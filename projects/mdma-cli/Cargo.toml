@@ -11,7 +11,11 @@ name = "mdma"
 path = "src/main.rs"
 
 [dependencies]
+acid-protocol = { workspace = true }
 client = { path = "../../bases/client" }
+fact-replica = { workspace = true }
+private-file = { workspace = true }
+serde = { workspace = true }
 hicli = "0.7.0"
 bpaf = { version = "0.9", features = ["derive"] }
 color-eyre = "0.6"
@@ -44,4 +48,5 @@ unicode-normalization = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+fact-replica = { workspace = true, features = ["test-support"] }
 pretty_assertions = "1"
