@@ -63,6 +63,8 @@ impl FactStorage {
             return Ok(StreamChunk {
                 lines: vec![],
                 cursor: cursor_from_offset(after_line),
+                epoch: None,
+                total_lines: None,
             });
         }
         let file = std::fs::File::open(&facts_path)?;
@@ -76,6 +78,8 @@ impl FactStorage {
         Ok(StreamChunk {
             lines,
             cursor: cursor_from_offset(next_offset),
+            epoch: None,
+            total_lines: None,
         })
     }
 

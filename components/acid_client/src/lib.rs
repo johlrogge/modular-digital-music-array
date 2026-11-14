@@ -2,12 +2,59 @@
 //!
 //! NNG client for connecting to the ACID fact store service.
 
-pub use acid_protocol::{AcidRequest, AcidResponse, EntityFacts, FactEntry, StreamChunk};
+pub use acid_protocol::{
+    line_digest, AcidRequest, AcidResponse, EntityFacts, FactEntry, LinePin, StreamChunk,
+};
 pub use nng_transport::NngClientError as ClientError;
 
 use nng::options::{Options, RecvTimeout, SendTimeout};
 use nng_transport::request_response;
 use std::time::Duration;
+
+/// Outcome of a pinned stream read.
+///
+/// `Chunk` always carries the log identity, so a caller can only ever append
+/// lines that came with an epoch. Lines from an unversioned node are never
+/// exposed.
+#[derive(Debug, Clone)]
+pub enum PinnedRead {
+    Chunk {
+        lines: Vec<String>,
+        cursor: String,
+        epoch: String,
+        total_lines: usize,
+    },
+    /// The pinned line is gone: the log was rewritten or replaced.
+    Diverged { epoch: String, total_lines: usize },
+    /// The node sent no epoch (an old node that ignores pins). Its lines cannot
+    /// be verified and must not be appended.
+    Unversioned,
+}
+
+fn classify_read(response: AcidResponse) -> Result<PinnedRead, ClientError> {
+    match response {
+        AcidResponse::StreamChunk(StreamChunk {
+            lines,
+            cursor,
+            epoch: Some(epoch),
+            total_lines: Some(total_lines),
+        }) => Ok(PinnedRead::Chunk {
+            lines,
+            cursor,
+            epoch,
+            total_lines,
+        }),
+        AcidResponse::StreamChunk(_) => Ok(PinnedRead::Unversioned),
+        AcidResponse::StreamDiverged { epoch, total_lines } => {
+            Ok(PinnedRead::Diverged { epoch, total_lines })
+        }
+        AcidResponse::Error { message } => Err(ClientError::Service(message)),
+        other => Err(ClientError::Service(format!(
+            "unexpected response: {:?}",
+            other
+        ))),
+    }
+}
 
 pub struct AcidClient {
     socket: nng::Socket,
@@ -60,7 +107,11 @@ impl AcidClient {
         cursor: Option<String>,
         limit: usize,
     ) -> Result<StreamChunk, ClientError> {
-        let req = AcidRequest::ReadStream { cursor, limit };
+        let req = AcidRequest::ReadStream {
+            cursor,
+            limit,
+            expect: None,
+        };
         match self.request(&req)? {
             AcidResponse::StreamChunk(chunk) => Ok(chunk),
             AcidResponse::Error { message } => Err(ClientError::Service(message)),
@@ -69,6 +120,24 @@ impl AcidClient {
                 other
             ))),
         }
+    }
+
+    /// Read a chunk, pinning the last line the caller already has.
+    ///
+    /// Returns `PinnedRead::Diverged` if the log no longer contains `expect`
+    /// (it was rewritten or replaced); the caller must then resynchronise.
+    pub fn read_stream_pinned(
+        &self,
+        cursor: Option<String>,
+        limit: usize,
+        expect: Option<LinePin>,
+    ) -> Result<PinnedRead, ClientError> {
+        let req = AcidRequest::ReadStream {
+            cursor,
+            limit,
+            expect,
+        };
+        classify_read(self.request(&req)?)
     }
 
     /// Retract a batch of facts for `entity`. Returns the number of retractions appended.
@@ -186,6 +255,8 @@ mod tests {
         let chunk = StreamChunk {
             lines: vec!["line".to_string()],
             cursor: "line:1".to_string(),
+            epoch: None,
+            total_lines: None,
         };
         assert_eq!(chunk.cursor, "line:1");
     }
@@ -202,6 +273,20 @@ mod tests {
     }
 
     fn spawn_acid() -> (AcidGuard, String) {
+        // Own metadata dir per server: a shared one would mix facts across parallel
+        // tests and runs under the file-backed fact store.
+        let dir = tempfile::tempdir().expect("acid metadata dir");
+        let (handle, addr) = spawn_acid_at(dir.path());
+        (
+            AcidGuard {
+                _handle: handle,
+                _dir: dir,
+            },
+            addr,
+        )
+    }
+
+    fn spawn_acid_at(dir: &std::path::Path) -> (acid_service::ServerHandle, String) {
         let id = ACID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pid = std::process::id();
         let addr = format!("ipc:///tmp/mdma-test-acidclient-{pid}-{id}.sock");
@@ -212,18 +297,149 @@ mod tests {
         let pub_sock = nng::Socket::new(nng::Protocol::Pub0).expect("pub socket");
         pub_sock.listen(&events_addr).expect("pub listen");
 
-        // Own metadata dir per server: a shared one would mix facts across parallel
-        // tests and runs under the file-backed fact store.
-        let dir = tempfile::tempdir().expect("acid metadata dir");
-        let handle = acid_service::start(rep, pub_sock, dir.path()).expect("start acid service");
+        let handle = acid_service::start(rep, pub_sock, dir).expect("start acid service");
         std::thread::sleep(std::time::Duration::from_millis(20));
-        (
-            AcidGuard {
-                _handle: handle,
-                _dir: dir,
-            },
-            addr,
-        )
+        (handle, addr)
+    }
+
+    // ---- pinned reads -----------------------------------------------------------
+
+    fn chunk(epoch: Option<&str>, total: Option<usize>) -> AcidResponse {
+        AcidResponse::StreamChunk(StreamChunk {
+            lines: vec!["a".to_string()],
+            cursor: "line:1".to_string(),
+            epoch: epoch.map(str::to_string),
+            total_lines: total,
+        })
+    }
+
+    #[test]
+    fn classify_versioned_chunk() {
+        match classify_read(chunk(Some("e"), Some(7))).unwrap() {
+            PinnedRead::Chunk {
+                lines,
+                cursor,
+                epoch,
+                total_lines,
+            } => {
+                assert_eq!(lines, vec!["a"]);
+                assert_eq!(cursor, "line:1");
+                assert_eq!(epoch, "e");
+                assert_eq!(total_lines, 7);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_chunk_without_epoch_is_unversioned() {
+        assert!(matches!(
+            classify_read(chunk(None, Some(1))).unwrap(),
+            PinnedRead::Unversioned
+        ));
+        assert!(matches!(
+            classify_read(chunk(Some("e"), None)).unwrap(),
+            PinnedRead::Unversioned
+        ));
+    }
+
+    #[test]
+    fn classify_diverged() {
+        let resp = AcidResponse::StreamDiverged {
+            epoch: "e".to_string(),
+            total_lines: 3,
+        };
+        match classify_read(resp).unwrap() {
+            PinnedRead::Diverged { epoch, total_lines } => {
+                assert_eq!(epoch, "e");
+                assert_eq!(total_lines, 3);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_error_is_err() {
+        let resp = AcidResponse::Error {
+            message: "boom".to_string(),
+        };
+        assert!(classify_read(resp).is_err());
+    }
+
+    fn one_fact(v: &str) -> Vec<FactEntry> {
+        vec![FactEntry {
+            value_json: format!("\"{v}\""),
+            source_json: r#""s""#.to_string(),
+        }]
+    }
+
+    #[test]
+    fn pinned_read_succeeds_and_wrong_digest_diverges() {
+        let (_guard, addr) = spawn_acid();
+        let client = AcidClient::connect(&addr).unwrap();
+        client.write_facts("entity:a", &one_fact("1")).unwrap();
+        client.write_facts("entity:b", &one_fact("2")).unwrap();
+        client.write_facts("entity:c", &one_fact("3")).unwrap();
+
+        let first = client.read_stream(None, 1).unwrap();
+        let pin = LinePin {
+            line: 0,
+            sha256: line_digest(&first.lines[0]),
+        };
+        match client
+            .read_stream_pinned(Some(first.cursor.clone()), 10, Some(pin))
+            .unwrap()
+        {
+            PinnedRead::Chunk {
+                lines,
+                total_lines,
+                epoch,
+                ..
+            } => {
+                assert_eq!(lines.len(), 2);
+                assert_eq!(total_lines, 3);
+                assert!(!epoch.is_empty());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let bad = LinePin {
+            line: 0,
+            sha256: line_digest("not the line"),
+        };
+        assert!(matches!(
+            client
+                .read_stream_pinned(Some(first.cursor), 10, Some(bad))
+                .unwrap(),
+            PinnedRead::Diverged { total_lines: 3, .. }
+        ));
+    }
+
+    #[test]
+    fn epoch_survives_restart_on_same_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let epoch_of = |guard_addr: &str| {
+            let client = AcidClient::connect(guard_addr).unwrap();
+            client.write_facts("entity:x", &one_fact("1")).unwrap();
+            let first = client.read_stream(None, 1).unwrap();
+            let pin = LinePin {
+                line: 0,
+                sha256: line_digest(&first.lines[0]),
+            };
+            match client
+                .read_stream_pinned(Some(first.cursor), 10, Some(pin))
+                .unwrap()
+            {
+                PinnedRead::Chunk { epoch, .. } => epoch,
+                other => panic!("unexpected: {other:?}"),
+            }
+        };
+        let (h1, addr1) = spawn_acid_at(dir.path());
+        let e1 = epoch_of(&addr1);
+        drop(h1);
+        let (_h2, addr2) = spawn_acid_at(dir.path());
+        let e2 = epoch_of(&addr2);
+        assert_eq!(e1, e2);
     }
 
     #[test]
