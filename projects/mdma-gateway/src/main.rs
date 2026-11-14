@@ -79,13 +79,24 @@ fn build_identity(node_id: Option<&str>, node_name: Option<&str>) -> NodeIdentit
     }
 }
 
-/// Connect a Req0 socket to a backend with reconnect options.
-fn connect_backend(address: &str) -> Result<nng::Socket, nng::Error> {
+/// How long a request to a backend may wait to be sent.
+const BACKEND_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the gateway waits for a reply from the library, playback, ACID and admin.
+const SERVICE_RECV_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the gateway waits for a reply from a source; sources do slow work
+/// (downloads, scans) and the CLI allows them 60s.
+const SOURCE_RECV_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Connect a Req0 socket to a backend with reconnect options. `recv_timeout` is how
+/// long a reply may take.
+fn connect_backend(address: &str, recv_timeout: Duration) -> Result<nng::Socket, nng::Error> {
     let socket = nng::Socket::new(nng::Protocol::Req0)?;
 
     // Set send/recv timeout so we don't hang forever if a backend is down
-    socket.set_opt::<nng::options::SendTimeout>(Some(Duration::from_secs(5)))?;
-    socket.set_opt::<nng::options::RecvTimeout>(Some(Duration::from_secs(10)))?;
+    socket.set_opt::<nng::options::SendTimeout>(Some(BACKEND_SEND_TIMEOUT))?;
+    socket.set_opt::<nng::options::RecvTimeout>(Some(recv_timeout))?;
 
     // Set reconnect options on the socket before dialing
     socket.set_opt::<nng::options::ReconnectMinTime>(Some(Duration::from_millis(100)))?;
@@ -153,7 +164,7 @@ fn get_or_connect_source<'a>(
         }
 
         let address = format!("ipc://{}", socket_path.display());
-        let socket = connect_backend(&address)
+        let socket = connect_backend(&address, SOURCE_RECV_TIMEOUT)
             .map_err(|e| format!("failed to connect to source '{}': {}", name, e))?;
 
         cache.insert(name.to_string(), socket);
@@ -266,19 +277,19 @@ fn main() -> Result<()> {
     tracing::info!(address = %args.event_listen, "Event publishing on TCP");
 
     // Connect to core backends
-    let library_backend = connect_backend(&args.library_socket)
+    let library_backend = connect_backend(&args.library_socket, SERVICE_RECV_TIMEOUT)
         .map_err(|e| color_eyre::eyre::eyre!("Failed to connect to library: {}", e))?;
     tracing::info!(address = %args.library_socket, "Connected to library backend");
 
-    let playback_backend = connect_backend(&args.playback_socket)
+    let playback_backend = connect_backend(&args.playback_socket, SERVICE_RECV_TIMEOUT)
         .map_err(|e| color_eyre::eyre::eyre!("Failed to connect to playback: {}", e))?;
     tracing::info!(address = %args.playback_socket, "Connected to playback backend");
 
-    let acid_backend = connect_backend(&args.acid_socket)
+    let acid_backend = connect_backend(&args.acid_socket, SERVICE_RECV_TIMEOUT)
         .map_err(|e| color_eyre::eyre::eyre!("Failed to connect to acid: {}", e))?;
     tracing::info!(address = %args.acid_socket, "Connected to acid backend");
 
-    let admin_backend = connect_backend(&args.admin_socket)
+    let admin_backend = connect_backend(&args.admin_socket, SERVICE_RECV_TIMEOUT)
         .map_err(|e| color_eyre::eyre::eyre!("Failed to connect to admin: {}", e))?;
     tracing::info!(address = %args.admin_socket, "Connected to admin backend");
 
@@ -404,6 +415,17 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_recv_timeout_is_the_one_given() {
+        let address = "ipc:///tmp/mdma-gateway-test-no-backend.sock";
+        for timeout in [SERVICE_RECV_TIMEOUT, SOURCE_RECV_TIMEOUT] {
+            let socket = connect_backend(address, timeout).unwrap();
+            let set = socket.get_opt::<nng::options::RecvTimeout>().unwrap();
+            assert_eq!(set, Some(timeout));
+        }
+        assert!(SOURCE_RECV_TIMEOUT > SERVICE_RECV_TIMEOUT);
+    }
 
     #[test]
     fn identity_uses_given_id_and_name() {
