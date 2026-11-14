@@ -1,0 +1,15 @@
+{
+  "item_type": "a",
+  "download_type": "a",
+  "package_release_date": "01 Sep 2023 00:00:00 GMT",
+  "type": "album",
+  "title": "Asteroids",
+  "track_count": 4,
+  "desc_track_count": 4,
+  "artist": "Kryss Hypnowave",
+  "downloads": {
+    "mp3-v0": { "size_mb": "61.6MB", "description": "MP3 V0", "encoding_name": "mp3-v0", "url": "https://example.invalid/mp3-v0" },
+    "flac": { "size_mb": "177.2MB", "description": "FLAC", "encoding_name": "flac", "url": "https://example.invalid/flac" }
+  },
+  "download_type_str": "Album"
+}

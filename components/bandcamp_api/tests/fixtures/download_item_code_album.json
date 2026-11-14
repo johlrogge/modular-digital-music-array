@@ -1,0 +1,13 @@
+{
+  "type": "album",
+  "title": "Elements (incl. Ness Remix)",
+  "artist": "Hydrous",
+  "track_count": 4,
+  "desc_track_count": 4,
+  "item_type": "album",
+  "downloads": {
+    "mp3-v0": { "size_mb": "66.9MB", "description": "MP3 V0", "encoding_name": "mp3-v0", "url": "https://example.invalid/mp3-v0" },
+    "flac": { "size_mb": "197.1MB", "description": "FLAC", "encoding_name": "flac", "url": "https://example.invalid/flac" }
+  },
+  "download_type_str": "album"
+}

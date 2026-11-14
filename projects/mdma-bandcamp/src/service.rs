@@ -398,6 +398,16 @@ fn classify_check_result(live_count: usize, stored_count: usize) -> bool {
     live_count > stored_count
 }
 
+/// Pure helper: turn the live count (if Bandcamp told us) and the stored
+/// count into `(live, stale)`. An unknown live count is an error — it must
+/// never be reported as OK or as zero.
+fn check_outcome(live: Option<usize>, stored: usize) -> Result<(usize, bool), String> {
+    let live = live.ok_or_else(|| {
+        "live track count unknown: the download page gives no item type or track count".to_string()
+    })?;
+    Ok((live, classify_check_result(live, stored)))
+}
+
 /// Pure mapping: bandcamp_api playlist summary -> wire type.
 fn to_source_playlist_summary(summary: bandcamp_api::PlaylistSummary) -> SourcePlaylistSummary {
     SourcePlaylistSummary {
@@ -872,9 +882,16 @@ impl BandcampService {
             }
         };
 
-        let live_track_count = details.tracks.len();
-
-        let stale = classify_check_result(live_track_count, stored_track_count);
+        let (live_track_count, stale) = match check_outcome(
+            details.live_track_count,
+            stored_track_count,
+        ) {
+            Ok(outcome) => outcome,
+            Err(reason) => {
+                tracing::warn!(item_id = %identifier, %reason, "CheckItem: cannot determine live count");
+                return SourceResponse::Error(SourceError::CheckFailed { identifier, reason });
+            }
+        };
 
         if stored_track_count > live_track_count {
             tracing::warn!(
@@ -1891,6 +1908,27 @@ mod tests {
     #[test]
     fn classify_check_result_not_stale_when_both_zero() {
         assert!(!classify_check_result(0, 0));
+    }
+
+    #[test]
+    fn check_outcome_unknown_live_count_is_an_error_not_ok() {
+        let reason = check_outcome(None, 3).unwrap_err();
+        assert!(reason.contains("unknown"), "got: {reason}");
+    }
+
+    #[test]
+    fn check_outcome_stale_when_live_exceeds_stored() {
+        assert_eq!(check_outcome(Some(7), 2), Ok((7, true)));
+    }
+
+    #[test]
+    fn check_outcome_ok_when_equal() {
+        assert_eq!(check_outcome(Some(5), 5), Ok((5, false)));
+    }
+
+    #[test]
+    fn check_outcome_not_stale_when_stored_exceeds_live() {
+        assert_eq!(check_outcome(Some(2), 5), Ok((2, false)));
     }
 
     // =========================================================================

@@ -449,57 +449,7 @@ impl BandcampClient {
 
     /// Parse digital item from download page
     fn parse_digital_item(&self, html: &str) -> Result<DigitalItem, BandcampError> {
-        let data_blob = extract_data_blob(html, "pagedata")?;
-
-        let parsed: serde_json::Value = serde_json::from_str(&data_blob)?;
-
-        // Extract digital_items array
-        let digital_items = parsed
-            .get("digital_items")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| BandcampError::HtmlParse("No digital_items found".to_string()))?;
-
-        let item_data: ParsedDigitalItem =
-            serde_json::from_value(digital_items.first().cloned().ok_or_else(|| {
-                BandcampError::HtmlParse("Empty digital_items array".to_string())
-            })?)?;
-
-        // Parse formats
-        let mut formats = HashMap::new();
-        if let Some(downloads) = item_data.downloads {
-            for (format_name, download) in downloads {
-                if let Some(format) = AudioFormat::from_bandcamp_name(&format_name) {
-                    formats.insert(format, download.url);
-                }
-            }
-        }
-
-        // Determine item type
-        let item_type = if item_data.download_type == Some("t".to_string())
-            || item_data.download_type_str == "track"
-            || item_data.item_type == "track"
-        {
-            ItemType::Track
-        } else {
-            ItemType::Album
-        };
-
-        // Parse release year
-        let release_year = item_data.package_release_date.as_ref().and_then(|d| {
-            d.split('-')
-                .next()
-                .and_then(|y| y.parse().ok())
-                .map(Year::new)
-        });
-
-        Ok(DigitalItem {
-            artist: Artist::new(&item_data.artist),
-            title: Title::new(&item_data.title),
-            item_type,
-            release_year,
-            formats,
-            tracks: Vec::new(), // TODO: Parse track list if needed
-        })
+        parse_digital_page(html)
     }
 
     /// Download an item to the specified path, returning a stream of progress events.
@@ -829,9 +779,142 @@ impl BandcampClient {
     }
 }
 
+/// Parse a digital-download page (`#pagedata` blob, `digital_items[0]`).
+///
+/// The live track count is only reported when the page actually says so:
+/// `type` "track" is one track, `type` "album" needs a positive `track_count`.
+/// Otherwise it is `None` (unknown), never zero.
+fn parse_digital_page(html: &str) -> Result<DigitalItem, BandcampError> {
+    let data_blob = extract_data_blob(html, "pagedata")?;
+
+    let parsed: serde_json::Value = serde_json::from_str(&data_blob)?;
+
+    let digital_items = parsed
+        .get("digital_items")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| BandcampError::HtmlParse("No digital_items found".to_string()))?;
+
+    let raw = digital_items
+        .first()
+        .ok_or_else(|| BandcampError::HtmlParse("Empty digital_items array".to_string()))?;
+    let item_data: ParsedDigitalItem = serde_json::from_value(raw.clone())?;
+
+    let mut formats = HashMap::new();
+    if let Some(downloads) = item_data.downloads {
+        for (format_name, download) in downloads {
+            if let Some(format) = AudioFormat::from_bandcamp_name(&format_name) {
+                formats.insert(format, download.url);
+            }
+        }
+    }
+
+    let item_type = if item_data.kind.as_deref() == Some("track") {
+        ItemType::Track
+    } else {
+        ItemType::Album
+    };
+
+    // "21 Jul 2025 19:30:51 GMT" or "2024-03-01": take the 4-digit token.
+    let release_year = item_data.package_release_date.as_ref().and_then(|d| {
+        d.split(|c: char| !c.is_ascii_digit())
+            .find(|part| part.len() == 4)
+            .and_then(|y| y.parse().ok())
+            .map(Year::new)
+    });
+
+    // `type` is "track" or "album" on every item shape seen (p and c items);
+    // `item_type`/`download_type` differ between shapes, so they are not used.
+    let live_track_count = match item_data.kind.as_deref() {
+        Some("track") => Some(1),
+        Some("album") => item_data.track_count.filter(|n| *n > 0).map(|n| n as usize),
+        _ => None,
+    };
+
+    Ok(DigitalItem {
+        artist: Artist::new(&item_data.artist),
+        title: Title::new(&item_data.title),
+        item_type,
+        release_year,
+        formats,
+        live_track_count,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn download_page(item: serde_json::Value) -> String {
+        let blob = serde_json::json!({ "digital_items": [item] })
+            .to_string()
+            .replace('&', "&amp;")
+            .replace('"', "&quot;");
+        format!(r#"<html><body><div id="pagedata" data-blob="{blob}"></div></body></html>"#)
+    }
+
+    fn fixture(name: &str) -> serde_json::Value {
+        let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn single_track_item_has_one_live_track() {
+        let item = parse_digital_page(&download_page(fixture("download_item_track.json"))).unwrap();
+        assert_eq!(item.item_type, ItemType::Track);
+        assert_eq!(item.live_track_count, Some(1));
+        assert!(item.formats.contains_key(&AudioFormat::Flac));
+    }
+
+    #[test]
+    fn album_item_uses_track_count() {
+        let item = parse_digital_page(&download_page(fixture("download_item_album.json"))).unwrap();
+        assert_eq!(item.item_type, ItemType::Album);
+        assert_eq!(item.live_track_count, Some(4));
+    }
+
+    #[test]
+    fn code_redeemed_album_uses_track_count() {
+        let item =
+            parse_digital_page(&download_page(fixture("download_item_code_album.json"))).unwrap();
+        assert_eq!(item.item_type, ItemType::Album);
+        assert_eq!(item.live_track_count, Some(4));
+    }
+
+    #[test]
+    fn album_without_track_count_is_unknown_not_zero() {
+        let mut raw = fixture("download_item_album.json");
+        raw.as_object_mut().unwrap().remove("track_count");
+        let item = parse_digital_page(&download_page(raw)).unwrap();
+        assert_eq!(item.live_track_count, None);
+    }
+
+    #[test]
+    fn item_type_comes_from_type_alone() {
+        let mut raw = fixture("download_item_track.json");
+        raw.as_object_mut().unwrap().remove("type");
+        let item = parse_digital_page(&download_page(raw)).unwrap();
+        assert_eq!(item.item_type, ItemType::Album);
+        assert_eq!(item.live_track_count, None);
+    }
+
+    #[test]
+    fn unknown_type_is_unknown_count() {
+        let mut raw = fixture("download_item_album.json");
+        raw.as_object_mut().unwrap().remove("type");
+        let item = parse_digital_page(&download_page(raw)).unwrap();
+        assert_eq!(item.live_track_count, None);
+    }
+
+    #[test]
+    fn long_form_release_date_yields_year() {
+        let item = parse_digital_page(&download_page(fixture("download_item_track.json"))).unwrap();
+        assert_eq!(item.release_year, Some(Year::new(2025)));
+    }
+
+    #[test]
+    fn unparseable_page_is_an_error() {
+        assert!(parse_digital_page("<html></html>").is_err());
+    }
 
     #[test]
     fn playlist_url_from_slug() {

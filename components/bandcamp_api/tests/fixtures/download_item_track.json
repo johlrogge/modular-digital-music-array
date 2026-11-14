@@ -1,0 +1,13 @@
+{
+  "item_type": "t",
+  "download_type": "t",
+  "package_release_date": "21 Jul 2025 19:30:51 GMT",
+  "type": "track",
+  "title": "Patterns",
+  "artist": "Brando Lupi",
+  "downloads": {
+    "mp3-v0": { "size_mb": "14.5MB", "description": "MP3 V0", "encoding_name": "mp3-v0", "url": "https://example.invalid/mp3-v0" },
+    "flac": { "size_mb": "38.2MB", "description": "FLAC", "encoding_name": "flac", "url": "https://example.invalid/flac" }
+  },
+  "download_type_str": "Track"
+}

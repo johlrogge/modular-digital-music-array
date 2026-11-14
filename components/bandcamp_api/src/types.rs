@@ -85,8 +85,9 @@ pub struct DigitalItem {
     pub release_year: Option<Year>,
     /// Available download formats mapped to URLs
     pub formats: HashMap<AudioFormat, String>,
-    /// Tracks in the item (for albums)
-    pub tracks: Vec<TrackInfo>,
+    /// Number of tracks Bandcamp reports for the item now; `None` when the
+    /// page does not say (never confused with zero).
+    pub live_track_count: Option<usize>,
 }
 
 /// Audio format options for download
@@ -240,9 +241,11 @@ pub(crate) struct ParsedDigitalItem {
     pub package_release_date: Option<String>,
     pub title: String,
     pub artist: String,
-    pub download_type: Option<String>,
-    pub download_type_str: String,
-    pub item_type: String,
+    /// "track" or "album"
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    /// Present on albums only
+    pub track_count: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
