@@ -809,6 +809,311 @@ fn play_events_under_short_hashes_resolve_to_the_full_hash() {
 }
 
 // ---------------------------------------------------------------------------
+// Merge: the loser's plays and marks survive (ADR-017 §3.9)
+// ---------------------------------------------------------------------------
+
+fn live_plays(service: &LibraryService, h: &ContentHash) -> usize {
+    asserted_in_acid(service, h)
+        .iter()
+        .filter(|(v, _)| is_play_event(v))
+        .count()
+}
+
+fn marked_hashes(service: &LibraryService, mark: Mark) -> Vec<String> {
+    match service.handle_request(LibraryRequest::ListMarked {
+        filter: MarkFilter::Only(mark),
+    }) {
+        LibraryResponse::Tracks(tracks) => tracks
+            .iter()
+            .map(|t| t.content_hash.as_str().to_owned())
+            .collect(),
+        other => panic!("expected Tracks, got {other:?}"),
+    }
+}
+
+/// A loser with plays and a winner, merged: `(loser, winner)`.
+fn merge_played_loser(service: &LibraryService) -> (ContentHash, ContentHash) {
+    let old = seed(service, "old", base(1, Some("p1"), 1));
+    write(
+        service,
+        &old,
+        vec![
+            src(MusicValue::TrackStarted(StartReason::OnRequest)),
+            src(MusicValue::TrackStopped(StopReason::OnSkip)),
+            src(MusicValue::TrackStarted(StartReason::ByQueue)),
+        ],
+    );
+    let new = seed(service, "new", base(1, Some("p1"), 2));
+    apply(service);
+    (old, new)
+}
+
+#[test]
+fn the_losers_play_facts_stay_live_after_a_merge() {
+    let (service, _d, _acid) = make_empty_service();
+    let (old, _new) = merge_played_loser(&service);
+
+    assert_eq!(live_plays(&service, &old), 3);
+}
+
+#[test]
+fn a_loser_kept_alive_by_its_plays_still_does_not_resolve_list_or_search() {
+    let (service, _d, _acid) = make_empty_service();
+    let (old, new) = merge_played_loser(&service);
+
+    assert!(gone(&service, &old));
+    let listed = |tracks: Vec<TrackInfo>| -> Vec<String> {
+        tracks
+            .iter()
+            .map(|t| t.content_hash.as_str().to_owned())
+            .collect()
+    };
+    assert_eq!(listed(service.list_tracks(None)), vec![new.to_string()]);
+    assert_eq!(
+        listed(service.search_tracks(&Default::default())),
+        vec![new.to_string()]
+    );
+}
+
+#[test]
+fn the_winner_shows_the_losers_last_start_and_stop_after_a_merge() {
+    let (service, _d, _acid) = make_empty_service();
+    let (old, new) = merge_played_loser(&service);
+    let times = play_times(&service, &old);
+    let latest = |started: bool| {
+        times
+            .iter()
+            .filter(|t| t.0 == started)
+            .map(|t| t.1)
+            .max()
+            .unwrap()
+            .to_rfc3339()
+    };
+
+    assert_eq!(
+        played(&service, &new),
+        (Some(latest(true)), Some(latest(false)))
+    );
+}
+
+fn liked(d: u32) -> (MusicValue, FactSource) {
+    usr(Mark::Default.fact_value(day(d)))
+}
+
+#[test]
+fn a_losers_mark_shows_on_the_winner_and_marked_lists_it_once() {
+    let (service, _d, _acid) = make_empty_service();
+    let old = seed(
+        &service,
+        "old",
+        [base(1, Some("p1"), 1), vec![liked(3)]].concat(),
+    );
+    let new = seed(&service, "new", base(1, Some("p1"), 2));
+
+    apply(&service);
+
+    assert!(gone(&service, &old));
+    assert_eq!(
+        marked_hashes(&service, Mark::Default),
+        vec![new.to_string()]
+    );
+}
+
+#[test]
+fn a_mark_on_both_loser_and_winner_is_listed_once() {
+    let (service, _d, _acid) = make_empty_service();
+    seed(
+        &service,
+        "old",
+        [base(1, Some("p1"), 1), vec![liked(3)]].concat(),
+    );
+    let new = seed(
+        &service,
+        "new",
+        [base(1, Some("p1"), 2), vec![liked(4)]].concat(),
+    );
+
+    apply(&service);
+
+    assert_eq!(
+        marked_hashes(&service, Mark::Default),
+        vec![new.to_string()]
+    );
+    let held = asserted_in_acid(&service, &new)
+        .iter()
+        .filter(|(v, _)| Mark::Default.matches(v))
+        .count();
+    assert_eq!(held, 1, "carried only when the winner lacks it");
+}
+
+/// Ingest an "old" file, give it `extra` facts, then replace it by a "new" file.
+/// Returns `(old, new)`.
+fn replace_with_facts(service: &LibraryService, extra: Facts) -> (ContentHash, ContentHash) {
+    let inbox = service.music_dir.join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    let old_wav = inbox.join("Old Artist - Old Song.wav");
+    write_test_wav(&old_wav, 5);
+    let old = service.ingest_file_internal(&old_wav, None, &[]).unwrap();
+    write(service, &old, extra);
+    let new_wav = inbox.join("New Artist - New Song.wav");
+    write_test_wav(&new_wav, 7);
+
+    let resp = service.handle_request(LibraryRequest::TrackReplace {
+        old_hash: old.clone(),
+        new_file_path: new_wav.to_string_lossy().to_string(),
+    });
+
+    let LibraryResponse::TrackReplaced { new_hash, .. } = resp else {
+        panic!("expected TrackReplaced, got {resp:?}");
+    };
+    (old, new_hash)
+}
+
+#[test]
+fn track_replace_keeps_the_marks_of_the_replaced_track() {
+    let (service, _d, _acid) = make_empty_service();
+
+    let (_old, new) = replace_with_facts(&service, vec![liked(3)]);
+
+    assert_eq!(
+        marked_hashes(&service, Mark::Default),
+        vec![new.to_string()]
+    );
+}
+
+#[test]
+fn track_replace_carries_cues_item_id_and_user_scalars_like_a_dedup_merge() {
+    let (service, _d, _acid) = make_empty_service();
+    let cue = MusicValue::MemoryCue {
+        position_ms: 1500,
+        kind: CueKind::Hot,
+        label: None,
+        index: None,
+    };
+
+    let (_old, new) = replace_with_facts(
+        &service,
+        vec![
+            usr(cue),
+            src(MusicValue::ItemId("p9".into())),
+            usr(MusicValue::Role(music_facts::TrackRole::Peak)),
+        ],
+    );
+
+    let tracks = service.tracks.lock().unwrap();
+    let t = tracks.iter().find(|t| t.content_hash == new).unwrap();
+    assert_eq!(
+        t.memory_cues
+            .iter()
+            .map(|c| c.position_ms)
+            .collect::<Vec<_>>(),
+        vec![1500]
+    );
+    assert_eq!(t.item_ids().collect::<Vec<_>>(), vec!["p9"]);
+    assert_eq!(t.role, Some(music_facts::TrackRole::Peak));
+}
+
+#[test]
+fn track_replace_keeps_the_new_files_tags_over_the_old_ones() {
+    let (service, _d, _acid) = make_empty_service();
+
+    let (_old, new) = replace_with_facts(&service, vec![]);
+
+    let t = service.get_track(&new).unwrap();
+    assert_eq!(t.title.as_deref(), Some("New Song"));
+    // File-derived facts are never carried: they describe the new file only.
+    let durations = asserted_in_acid(&service, &new)
+        .iter()
+        .filter(|(v, _)| matches!(v, MusicValue::DurationSeconds(_)))
+        .count();
+    assert_eq!(durations, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Merge: restart, unmark, re-ingest
+// ---------------------------------------------------------------------------
+
+#[test]
+fn after_a_restart_the_loser_is_gone_and_the_winner_still_shows_its_plays() {
+    let (service, _d, _acid, addrs) = super::tests::make_empty_service_with_addrs();
+    let (old, new) = merge_played_loser(&service);
+    let times = play_times(&service, &old);
+    let latest = |started: bool| {
+        times
+            .iter()
+            .filter(|t| t.0 == started)
+            .map(|t| t.1)
+            .max()
+            .unwrap()
+            .to_rfc3339()
+    };
+
+    let restarted = super::tests::restart_service(&addrs);
+    restarted.refresh_event_timestamps();
+
+    assert!(gone(&restarted, &old));
+    let listed: Vec<String> = restarted
+        .list_tracks(None)
+        .iter()
+        .map(|t| t.content_hash.to_string())
+        .collect();
+    assert_eq!(listed, vec![new.to_string()]);
+    assert_eq!(
+        played(&restarted, &new),
+        (Some(latest(true)), Some(latest(false)))
+    );
+}
+
+#[test]
+fn unmarking_the_winner_after_a_carried_mark_retracts_it_once() {
+    let (service, _d, _acid) = make_empty_service();
+    seed(
+        &service,
+        "old",
+        [base(1, Some("p1"), 1), vec![liked(3)]].concat(),
+    );
+    let new = seed(&service, "new", base(1, Some("p1"), 2));
+    apply(&service);
+
+    let resp = service.handle_request(LibraryRequest::UnmarkTrack {
+        hash: new,
+        mark: Mark::Default,
+    });
+
+    assert!(
+        matches!(
+            resp,
+            LibraryResponse::TrackUnmarked(Unmark::Retracted { count }) if count.get() == 1
+        ),
+        "{resp:?}"
+    );
+    assert!(marked_hashes(&service, Mark::Default).is_empty());
+}
+
+#[test]
+fn a_reingested_loser_resolves_with_its_own_plays_and_a_second_merge_adds_no_second_replaces() {
+    let (service, _d, _acid) = make_empty_service();
+    let (old, new) = merge_played_loser(&service);
+    assert!(gone(&service, &old));
+
+    // The same bytes arrive again: the loser's identity is back.
+    seed(&service, "old", base(1, Some("p1"), 1));
+    assert!(!gone(&service, &old));
+    service.refresh_event_timestamps();
+    assert!(played(&service, &old).0.is_some(), "its own plays");
+    assert_eq!(live_plays(&service, &old), 3);
+
+    let (report, _) = apply(&service);
+
+    assert_eq!((report.merged, report.errors.len()), (1, 0), "{report:?}");
+    assert_eq!(
+        count_in_acid(&service, &new, &MusicValue::Replaces(old.clone())),
+        1
+    );
+    assert!(gone(&service, &old));
+}
+
+// ---------------------------------------------------------------------------
 // Blob and cover art removal
 // ---------------------------------------------------------------------------
 

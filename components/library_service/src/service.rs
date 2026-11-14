@@ -537,6 +537,16 @@ fn distinct_retractions(
     out
 }
 
+/// Whether `value` is a play event: a start or a stop of playback. Play events are
+/// history with identity, so a merge leaves the loser's in the log (ADR-017 §3.9).
+/// The one place to extend when the play tags change.
+fn is_play_event(value: &MusicValue) -> bool {
+    matches!(
+        value,
+        MusicValue::TrackStarted(_) | MusicValue::TrackStopped(_)
+    )
+}
+
 /// Returns true for `MusicValue` variants whose (value, source) pairs are tracked
 /// in `IndexedTrackInfo::provenance` for correct retraction semantics.
 ///
@@ -548,13 +558,7 @@ fn distinct_retractions(
 /// fall back to), and only ingest's `now()` ever writes it. Projection is
 /// latest-wins (`apply_assert_scalar`).
 fn is_provenance_tracked(value: &MusicValue) -> bool {
-    !matches!(
-        value,
-        MusicValue::TrackStarted(_)
-            | MusicValue::TrackStopped(_)
-            | MusicValue::FilePath(_)
-            | MusicValue::AddedAt(_)
-    )
+    !(is_play_event(value) || matches!(value, MusicValue::FilePath(_) | MusicValue::AddedAt(_)))
 }
 
 /// Apply an Assert fact to the scalar fields of `IndexedTrackInfo`.
@@ -2439,8 +2443,10 @@ impl LibraryService {
         }
     }
 
-    /// Retract ALL currently-asserted facts for `hash` from ACID and remove the
-    /// entry from the in-memory index.
+    /// Retract everything except play events (ADR-017 §3.9) for `hash` from ACID and
+    /// remove the entry from the in-memory index. Play events are history and stay;
+    /// they are not provenance-tracked, so the entry is dropped without them and the
+    /// hash stays unresolvable.
     ///
     /// This is the hard-delete half of `handle_track_replace`. It reads all facts
     /// for `hash` from ACID via `read_entity`, keeps what is still live, and sends one
@@ -2477,11 +2483,12 @@ impl LibraryService {
         let to_retract = distinct_retractions(
             dedup::live_facts(&lines)
                 .into_iter()
+                .filter(|f| !is_play_event(&f.value))
                 .map(|f| (f.value, f.source)),
         );
 
         if to_retract.is_empty() {
-            // Nothing asserted in ACID, hence nothing live in the index either.
+            // Nothing but plays live in ACID, hence nothing live in the index either.
             return Ok(0);
         }
 
@@ -2528,8 +2535,14 @@ impl LibraryService {
             }
         };
 
+        // Carry like a dedup merge: what the user added to the old track (marks, cues,
+        // scalars, ItemId) moves to the new one, and the new file's fresh tags win.
+        let carry = match self.plan_group_carry(&new_hash, std::slice::from_ref(&old_full)) {
+            Ok(carry) => carry,
+            Err(message) => return LibraryResponse::Error(ProtocolError::Internal { message }),
+        };
         let source = self.sources.user_default.clone();
-        match self.merge_into(&new_hash, &old_full, &source, Vec::new()) {
+        match self.merge_into(&new_hash, &old_full, &source, carry) {
             Ok(outcome) => LibraryResponse::TrackReplaced {
                 new_hash,
                 playlists_rewritten: outcome.playlists_rewritten,
@@ -2548,8 +2561,8 @@ impl LibraryService {
     ///    owns are read from the index now, before retracting removes the entry.
     /// 2. The winner is asserted `carry`, `Replaces(loser)` and the forward-inherited
     ///    ancestors (`write_merge_facts`).
-    /// 3. `retract_all_entity_facts_locked(loser)` hard-retracts the loser so it
-    ///    stops resolving. A retire that fails leaves the loser alive and the whole
+    /// 3. `retract_all_entity_facts_locked(loser)` hard-retracts everything except
+    ///    play events (ADR-017 §3.9), so the loser stops resolving. A retire that fails leaves the loser alive and the whole
     ///    merge safely repeatable.
     /// 4. Playlists are rewritten loser -> winner.
     /// 5. Play history is re-projected, so the winner shows the loser's plays.
@@ -3208,10 +3221,9 @@ impl LibraryService {
     /// stream is scanned.  Subsequent calls only read new facts appended since the
     /// previous refresh (incremental / delta reads).
     ///
-    /// Only assertions are plays. A retraction is not one: retiring a track retracts
-    /// its play events too (with the retraction's own, later, timestamp), and those
-    /// must neither count as plays nor erase the originals. A user retracting a
-    /// single play event is not handled; it never happens in production.
+    /// Only assertions are plays. Retracts of plays (the legacy merge retracts,
+    /// ADR-017 §6.7) are not plays and cancel nothing. A user retracting a single
+    /// play event is not handled; it never happens in production.
     ///
     /// A track's play history includes the plays recorded on every hash it
     /// transitively replaces, with their original timestamps (ADR-013), so a merged
@@ -4296,6 +4308,17 @@ mod tests {
     /// Returns `(service, metadata_dir, acid_handle)`. Callers must keep
     /// `_acid` alive for the duration of the test; dropping it shuts the server down.
     pub(super) fn make_empty_service() -> (Arc<LibraryService>, tempfile::TempDir, AcidGuard) {
+        let (service, metadata_dir, acid_handle, _addrs) = make_empty_service_with_addrs();
+        (service, metadata_dir, acid_handle)
+    }
+
+    /// The ACID addresses of a test server: facts, then events.
+    pub(super) type AcidAddrs = (String, String);
+
+    /// `make_empty_service`, plus the ACID addresses so a test can start a second
+    /// service on the same log (`restart_service`).
+    pub(super) fn make_empty_service_with_addrs(
+    ) -> (Arc<LibraryService>, tempfile::TempDir, AcidGuard, AcidAddrs) {
         let music_dir = tempfile::tempdir().unwrap();
         let metadata_dir = tempfile::tempdir().unwrap();
         let (acid_handle, facts_addr, events_addr) = spawn_acid_server();
@@ -4307,7 +4330,25 @@ mod tests {
             test_version(),
         )
         .unwrap();
-        (service, metadata_dir, acid_handle)
+        (
+            service,
+            metadata_dir,
+            acid_handle,
+            (facts_addr, events_addr),
+        )
+    }
+
+    /// A fresh service over the log of a running ACID server: a restart, which
+    /// loads the index by bootstrapping from the stream.
+    pub(super) fn restart_service(addrs: &AcidAddrs) -> Arc<LibraryService> {
+        LibraryService::new_with_events(
+            tempfile::tempdir().unwrap().keep(),
+            tempfile::tempdir().unwrap().keep(),
+            &addrs.0,
+            &addrs.1,
+            test_version(),
+        )
+        .unwrap()
     }
 
     pub(super) fn make_service_with_playlists_dir(
