@@ -19,6 +19,7 @@ thiserror = "1.0"
 
 # Internal components
 library-search = { workspace = true }
+library-projection = { workspace = true }
 library-ingestion = { workspace = true }
 music-facts = { workspace = true }
 music-primitives = { workspace = true }

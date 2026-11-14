@@ -25,6 +25,7 @@ members = [
     "components/library_ingestion",
     "components/library_ipc_client",
     "components/library_ipc_protocol",
+    "components/library_projection",
     "components/library_search",
     "components/library_service",
     "components/library_service_stub",
@@ -101,6 +102,7 @@ inbox-utils = { path = "components/inbox_utils" }
 library-ingestion = { path = "components/library_ingestion" }
 library-ipc-client = { path = "components/library_ipc_client" }
 library-ipc-protocol = { path = "components/library_ipc_protocol" }
+library-projection = { path = "components/library_projection" }
 library-search = { path = "components/library_search" }
 library-service = { path = "components/library_service" }
 library-service-stub = { path = "components/library_service_stub" }

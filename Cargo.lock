@@ -5626,6 +5626,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "library-projection"
+version = "0.4.0"
+dependencies = [
+ "chrono",
+ "library-ipc-protocol",
+ "music-facts",
+ "pretty_assertions",
+ "serde_json",
+ "stainless-facts",
+]
+
+[[package]]
 name = "library-search"
 version = "0.10.1"
 dependencies = [
@@ -5652,6 +5664,7 @@ dependencies = [
  "libc",
  "library-ingestion",
  "library-ipc-protocol",
+ "library-projection",
  "library-search",
  "music-facts",
  "music-primitives",
