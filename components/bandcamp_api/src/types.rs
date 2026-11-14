@@ -244,7 +244,10 @@ pub(crate) struct ParsedDigitalItem {
     /// "track" or "album"
     #[serde(rename = "type")]
     pub kind: Option<String>,
-    /// Present on albums only
+    /// "a" (album) or "t" (track); what a "package" (merch with an attached
+    /// download) includes
+    pub download_type: Option<String>,
+    /// Present on albums, and on packages with an attached album
     pub track_count: Option<u64>,
 }
 

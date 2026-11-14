@@ -8,7 +8,9 @@ use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use hicli::{Arg, Success};
 use mdma_client::SourceClient;
-use source_protocol::{SourceError, SourceRequest, SourceResponse};
+use source_protocol::{
+    CheckPhase, ItemCheckOutcome, ItemCheckResult, SourceError, SourceRequest, SourceResponse,
+};
 use std::convert::Infallible;
 use std::str::FromStr;
 
@@ -101,8 +103,10 @@ pub(crate) struct ImportPlaylistArgs {
 const SOURCE_LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Request timeout for long-running source operations (`sync`, `resync`,
-/// `check-item`, `check-updates`): the source fetches the whole upstream
-/// collection (~8s for 700 Bandcamp items) before it can answer.
+/// `check-item`, and the resyncs of `check-updates --apply`): the source
+/// fetches the whole upstream collection (~8s for 700 Bandcamp items) before
+/// it can answer. The `check-updates` job itself is polled with the default
+/// timeout.
 const SOURCE_LONG_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// List available music sources
@@ -385,6 +389,48 @@ pub(crate) fn check_item(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) ->
     Ok(())
 }
 
+/// How often `check-updates` asks the source for the progress of its job.
+const CHECK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Consecutive failed polls tolerated before giving up: this many polls, one
+/// `CHECK_POLL_INTERVAL` apart (plus the request timeout of each failed one).
+const CHECK_POLL_MAX_FAILURES: u32 = 30;
+
+/// The progress line for one checked item.
+fn check_result_line(result: &ItemCheckResult) -> String {
+    let id = &result.identifier;
+    match &result.outcome {
+        ItemCheckOutcome::UpToDate { .. } => format!("{id} ok"),
+        ItemCheckOutcome::Stale {
+            live_track_count,
+            stored_track_count,
+        } => format!("{id} STALE (live={live_track_count}, stored={stored_track_count})"),
+        ItemCheckOutcome::NotInCollection => format!("{id} not in collection (skipping)"),
+        ItemCheckOutcome::Failed { reason } => format!("{id} ERROR: {reason}"),
+    }
+}
+
+/// Totals of a check-updates run.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CheckTally {
+    stale_ids: Vec<String>,
+    fresh_count: usize,
+    error_count: usize,
+}
+
+impl CheckTally {
+    fn add(&mut self, result: &ItemCheckResult) {
+        match &result.outcome {
+            ItemCheckOutcome::Stale { .. } => self.stale_ids.push(result.identifier.clone()),
+            // An item not in this source's collection is skipped, not an error.
+            ItemCheckOutcome::UpToDate { .. } | ItemCheckOutcome::NotInCollection => {
+                self.fresh_count += 1
+            }
+            ItemCheckOutcome::Failed { .. } => self.error_count += 1,
+        }
+    }
+}
+
 /// Check the whole source collection for stale items
 ///
 /// # Arguments
@@ -394,7 +440,8 @@ pub(crate) fn check_item(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) ->
 pub(crate) fn check_updates(source: SourceArg, apply: Apply, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
     let apply = apply.0;
-    let source = ctx.source(name, Some(SOURCE_LONG_OP_TIMEOUT))?;
+    // Start and polls are short requests: the default timeout is enough.
+    let source = ctx.source(name, None)?;
     // Fetch all ItemId values from the library for this source.
     // We use GetFactValues("ItemId") — returns all ItemId values the library knows about.
     let library = ctx.library()?;
@@ -414,60 +461,96 @@ pub(crate) fn check_updates(source: SourceArg, apply: Apply, ctx: &Ctx) -> Resul
     }
 
     let total = all_item_ids.len();
-    let mut stale_ids: Vec<String> = Vec::new();
-    let mut fresh_count = 0usize;
-    let mut error_count = 0usize;
+    // The source checks the items in a background job (one collection fetch,
+    // spaced requests, rate-limit waits), so every request here is short.
+    let job_id = source_call_with(
+        &source,
+        name,
+        &SourceRequest::CheckUpdates {
+            item_ids: all_item_ids,
+        },
+        |e| match e {
+            SourceError::CheckInProgress { job_id } => eyre!(
+                "Check NOT started: job {} is already running on {}",
+                job_id,
+                name
+            ),
+            e => display_error(e),
+        },
+        |response| match response {
+            SourceResponse::CheckStarted { job_id } => Some(job_id),
+            _ => None,
+        },
+    )?;
+    eprintln!("Checking {} items (job {})...", total, job_id);
 
-    for (idx, item_id) in all_item_ids.iter().enumerate() {
-        eprint!("[{}/{}] checking {} ... ", idx + 1, total, item_id);
-
-        match source.request(
-            name,
-            &SourceRequest::CheckItem {
-                identifier: item_id.clone(),
-            },
-        ) {
-            Ok(SourceResponse::ItemChecked {
-                live_track_count,
-                stored_track_count,
-                stale,
-                ..
-            }) => {
-                if stale {
-                    eprintln!(
-                        "STALE (live={}, stored={})",
-                        live_track_count, stored_track_count
-                    );
-                    stale_ids.push(item_id.clone());
-                } else {
-                    eprintln!("ok");
-                    fresh_count += 1;
+    let mut tally = CheckTally::default();
+    let mut printed = 0usize;
+    let mut failures = 0u32;
+    loop {
+        let status = match source.request(name, &SourceRequest::GetCheckStatus) {
+            Ok(SourceResponse::CheckStatus(Some(s))) if s.job_id == job_id => {
+                failures = 0;
+                s
+            }
+            other => {
+                failures += 1;
+                if failures >= CHECK_POLL_MAX_FAILURES {
+                    let cause = match other {
+                        Ok(SourceResponse::Error(e)) => e.to_string(),
+                        Ok(_) => "no status for the job".to_string(),
+                        Err(e) => e.to_string(),
+                    };
+                    return Err(eyre!(
+                        "Lost contact with check job {} ({}); the source keeps running it",
+                        job_id,
+                        cause
+                    ));
                 }
+                std::thread::sleep(CHECK_POLL_INTERVAL);
+                continue;
             }
-            Ok(SourceResponse::Error(SourceError::ItemNotFound { .. })) => {
-                // Not in this source's collection — skip silently
-                eprintln!("not in collection (skipping)");
-                fresh_count += 1;
-            }
-            Ok(SourceResponse::Error(e)) => {
-                eprintln!("ERROR: {}", e);
-                error_count += 1;
-            }
-            Ok(_) => {
-                eprintln!("unexpected response");
-                error_count += 1;
-            }
-            Err(e) => {
-                eprintln!("transport error: {}", e);
-                error_count += 1;
-            }
+        };
+
+        let Some(new_results) = status.results.get(printed..) else {
+            return Err(eyre!(
+                "Lost contact with check job {}: its status shows {} results after {} were seen",
+                job_id,
+                status.results.len(),
+                printed
+            ));
+        };
+        for result in new_results {
+            printed += 1;
+            eprintln!(
+                "[{}/{}] {}",
+                printed,
+                status.total,
+                check_result_line(result)
+            );
+            tally.add(result);
         }
 
-        // Rate-limit: be polite to bandcamp
-        if idx + 1 < total {
-            std::thread::sleep(std::time::Duration::from_millis(500));
+        match &status.phase {
+            CheckPhase::Done => break,
+            CheckPhase::Failed { message } => {
+                return Err(eyre!(
+                    "Check failed after {} of {} items: {}",
+                    printed,
+                    status.total,
+                    message
+                ));
+            }
+            CheckPhase::FetchingCollection | CheckPhase::Checking => {
+                std::thread::sleep(CHECK_POLL_INTERVAL)
+            }
         }
     }
+    let CheckTally {
+        stale_ids,
+        fresh_count,
+        error_count,
+    } = tally;
 
     println!(
         "\n{} items stale, {} items up-to-date, {} items errored",
@@ -481,6 +564,8 @@ pub(crate) fn check_updates(source: SourceArg, apply: Apply, ctx: &Ctx) -> Resul
     }
 
     if apply {
+        // A resync fetches the whole upstream collection before it answers.
+        let source = ctx.source(name, Some(SOURCE_LONG_OP_TIMEOUT))?;
         for id in &stale_ids {
             match source.request(
                 name,
@@ -710,6 +795,71 @@ mod tests {
         assert!(run_arg::<DownloadArg>(&[]).is_err());
         assert!(run_arg::<ItemIdArg>(&[]).is_err());
         assert!(run_arg::<SourcePlaylistArg>(&[]).is_err());
+    }
+
+    fn checked(id: &str, outcome: ItemCheckOutcome) -> ItemCheckResult {
+        ItemCheckResult {
+            identifier: id.to_string(),
+            outcome,
+        }
+    }
+
+    #[test]
+    fn check_tally_counts_each_outcome() {
+        let mut tally = CheckTally::default();
+        tally.add(&checked("a", ItemCheckOutcome::UpToDate { track_count: 3 }));
+        tally.add(&checked("b", ItemCheckOutcome::NotInCollection));
+        tally.add(&checked(
+            "c",
+            ItemCheckOutcome::Stale {
+                live_track_count: 7,
+                stored_track_count: 2,
+            },
+        ));
+        tally.add(&checked(
+            "d",
+            ItemCheckOutcome::Failed {
+                reason: "rate limited".to_string(),
+            },
+        ));
+        assert_eq!(
+            tally,
+            CheckTally {
+                stale_ids: vec!["c".to_string()],
+                fresh_count: 2,
+                error_count: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn check_result_lines_name_the_item_and_the_outcome() {
+        assert_eq!(
+            check_result_line(&checked(
+                "p1",
+                ItemCheckOutcome::Stale {
+                    live_track_count: 7,
+                    stored_track_count: 2
+                }
+            )),
+            "p1 STALE (live=7, stored=2)"
+        );
+        assert_eq!(
+            check_result_line(&checked(
+                "p2",
+                ItemCheckOutcome::Failed {
+                    reason: "boom".to_string()
+                }
+            )),
+            "p2 ERROR: boom"
+        );
+        assert_eq!(
+            check_result_line(&checked(
+                "p3",
+                ItemCheckOutcome::UpToDate { track_count: 1 }
+            )),
+            "p3 ok"
+        );
     }
 
     #[test]
