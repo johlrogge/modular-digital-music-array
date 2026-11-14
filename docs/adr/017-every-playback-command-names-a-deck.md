@@ -6,6 +6,8 @@ Proposed, 2026-11-10
 
 Amends ADR-014 §9 (play events are asserts-only and unpaired; a merge keeps them, as §9 says, and the code now does the same) and makes a one-off exception to ADR-001's append-only log (§6). Builds on ADR-001 (append-only log), ADR-004 (readers redeploy together), ADR-009 (gateway compatibility) and ADR-016 §5 (upgrade message for old nodes). Adopts the identity rule of stainless_facts ADR-001 (johlrogge/stainless_facts#15). Related: ADR-018 (a retract matches value and source identity).
 
+Amended by ADR-021 (2026-11-14): §6.9 also writes a new log epoch.
+
 ## Context
 
 **Commands (media_protocol::Command, components/media_protocol/src/protocol.rs:14-83).**
@@ -206,9 +208,9 @@ Points marked **Decided** were decided by Joakim. Everything else is **Proposed*
       - live starts and stops per track equal today's, because no migrated retract cancels anything.
 
       It prints the counts and refuses on any other difference.
-   4. Swap the files atomically (rename within the directory), then start the services with the new release (Phasing 3).
+   4. Swap the files atomically (rename within the directory) and write a new `metadata_dir/facts.epoch` (tmp+rename), then start the services with the new release (Phasing 3). ACID reads the epoch at start, and client replicas use it to see the rewrite and refetch (ADR-021 §2).
    - The tool is idempotent (already migrated lines are left alone) and refuses to run while ACID answers on its socket.
-   - **Rollback** means restoring the backup together with the previous release. An old release skips every migrated play line silently (service.rs:921-924).
+   - **Rollback** means restoring the backup together with the previous release, and writing a new `facts.epoch` (ADR-021 §2). An old release skips every migrated play line silently (service.rs:921-924).
 10. This is the only time MDMA rewrites its log. ADR-001's append-only rule otherwise stands.
 
 ## Why
