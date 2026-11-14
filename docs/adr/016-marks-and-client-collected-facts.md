@@ -6,6 +6,8 @@ Proposed, 2026-11-06
 
 Builds on ADR-001 (ACID is the only writer), ADR-009 (node identity), ADR-011 (single projection path) and ADR-014 (merge by fold). Reshapes the unreleased `ListBookmarked` request.
 
+Amended by ADR-021 (2026-11-14): the first use of the per-node replica (§2-3); open question 5 is answered by ADR-021 §2.
+
 ## Context
 
 **Bookmarks today.**
@@ -184,7 +186,7 @@ Points marked **decided** were decided by Joakim. Everything else is **proposed*
 2. **Should the Rust variant be renamed** from `Bookmarked` to `Marked`, with `#[serde(rename = "Bookmarked")]`? The wire format and the attribute stay unchanged, but `mdma facts` would still print `Bookmarked`.
 3. **With two decks, which track does a macro mark:** the focused deck, the one on air, or the one most recently started?
 4. **Cross-node:** should a mark made on stage show up on prod? If so, it needs a node field on `FactSource`, and a merge rule that doesn't compare ACID times across nodes.
-5. **Log identity:** should `ReadStream` expose a log id, such as a hash of the first line? A replica could then detect a different log behind the same node id after a reprovision or rename.
+5. **Log identity (answered by ADR-021 §2):** should `ReadStream` expose a log id, such as a hash of the first line? A replica could then detect a different log behind the same node id after a reprovision or rename.
 6. **What goes on the push whitelist beyond marks** (cues, energy, play events), when, and with what conflict rule?
 7. **Authentication** for gateway writes, push included.
 
