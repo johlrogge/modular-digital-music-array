@@ -3,7 +3,8 @@
 use super::dedup::{live_facts, same_member};
 use super::tests::{
     identity_facts_in_acid, make_empty_service, make_service_with_playlists_dir, replaces_targets,
-    retire, run_backfill, user_source, write_test_wav, FIXTURE_S16_L8, FIXTURE_S16_L8_TAGS,
+    retire, run_backfill, test_sources, user_source, write_test_wav, FIXTURE_S16_L8,
+    FIXTURE_S16_L8_TAGS,
 };
 use super::*;
 use crate::ipc::{
@@ -637,7 +638,7 @@ fn a_rerun_after_a_crash_before_the_retire_completes_without_duplicating_facts()
         .unwrap();
     let gate = service.retire_gate.lock().unwrap();
     service
-        .write_merge_facts(&gate, &new, &old, vec![], &sources::dedup(), carry)
+        .write_merge_facts(&gate, &new, &old, vec![], &test_sources().dedup, carry)
         .unwrap();
     drop(gate);
     assert_eq!(scan(&service).len(), 1, "the group is still detectable");
@@ -1348,7 +1349,7 @@ fn plant(service: &LibraryService, hex: &str) -> std::path::PathBuf {
 #[test]
 fn orphan_cleanup_removes_only_merge_orphans_and_is_idempotent() {
     let (service, _d, _acid) = make_empty_service();
-    let dedup = |v| (v, sources::dedup());
+    let dedup = |v| (v, test_sources().dedup);
     let merge_orphan = plant(&service, "aa11merged");
     let plain_orphan = plant(&service, "bb22plain");
     let replace_leftover = plant(&service, "cc33replaced");

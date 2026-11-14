@@ -219,7 +219,7 @@ impl LibraryService {
                 return;
             }
         };
-        let source = sources::derived();
+        let source = self.sources.derived.clone();
 
         // One projection for the whole run, also on unwind: the fact subscriber
         // projects writes in production anyway, so nothing needs them sooner.

@@ -1,7 +1,7 @@
 //! Test harness — boots real services in-process and creates clients for the World.
 
 use crate::playback_simulator::{start_playback_simulator, PlaybackState};
-use library_service::LibraryService;
+use library_service::{LibraryService, ReleaseVersion};
 use mdma_client::{LibraryBackend, PlaybackBackend};
 use music_facts::{Artist, Bpm, ContentHash, DurationSeconds, FactSource, MusicValue, Title, Year};
 use stainless_facts::{Fact, FactStreamWriter, Operation};
@@ -136,6 +136,7 @@ pub fn boot_test_env(tracks: &[SeedTrack]) -> TestEnv {
         music_dir.clone(),
         metadata_dir,
         "ipc:///tmp/mdma-bdd-acid-nonexistent.sock",
+        ReleaseVersion::new(env!("CARGO_PKG_VERSION")).expect("release version"),
     )
     .expect("failed to create service");
 

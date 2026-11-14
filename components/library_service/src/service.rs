@@ -10,7 +10,7 @@ use crate::ipc::{
     ProtocolError, ServiceStatus, TrackInfo, TrackQuery, Unmark,
 };
 use crate::pipeline::InboxFile;
-use crate::sources;
+use crate::sources::{self, LibrarySources, ReleaseVersion};
 use acid_client::AcidClient;
 use event_protocol::{acid_event_from_topic_message, AcidEvent, TOPIC_ACID};
 use library_search::{matches_query, TrackFields};
@@ -42,6 +42,9 @@ pub enum ServiceError {
 pub struct LibraryService {
     music_dir: PathBuf,
     metadata_dir: PathBuf,
+    /// The sources the library writes under, stamped with the release version of the
+    /// binary hosting it (ADR-020); `GetStatus` reports the same version.
+    sources: LibrarySources,
     start_time: Instant,
     tracks_indexed: AtomicUsize,
     facts_count: AtomicUsize,
@@ -1113,17 +1116,20 @@ fn format_fact_for_display(value: &MusicValue) -> (String, String) {
 }
 
 impl LibraryService {
-    /// Create a new library service
+    /// Create a new library service. `version` is the release version of the binary
+    /// hosting it (ADR-020).
     pub fn new(
         music_dir: PathBuf,
         metadata_dir: PathBuf,
         acid_socket: &str,
+        version: ReleaseVersion,
     ) -> Result<Arc<Self>, ServiceError> {
         Self::new_with_events(
             music_dir,
             metadata_dir,
             acid_socket,
             "ipc:///run/mdma/acid-events.sock",
+            version,
         )
     }
 
@@ -1136,6 +1142,7 @@ impl LibraryService {
         metadata_dir: PathBuf,
         acid_socket: &str,
         acid_events_socket: &str,
+        version: ReleaseVersion,
     ) -> Result<Arc<Self>, ServiceError> {
         // Connect to ACID service for writing and streaming
         let acid_client = AcidClient::connect(acid_socket)?;
@@ -1151,6 +1158,7 @@ impl LibraryService {
         let service = Arc::new_cyclic(|self_ref| Self {
             music_dir,
             metadata_dir,
+            sources: LibrarySources::new(&version),
             start_time: Instant::now(),
             tracks_indexed: AtomicUsize::new(tracks_count),
             facts_count: AtomicUsize::new(loaded.facts_count),
@@ -1454,7 +1462,7 @@ impl LibraryService {
             "Backfilling Format facts for tracks"
         );
 
-        let source = sources::derived();
+        let source = self.sources.derived.clone();
 
         // The batch seam projects the written facts (index, fact_index, counters)
         // through the single path once the closure returns.
@@ -1566,7 +1574,7 @@ impl LibraryService {
             "Backfilling CoverArtPath facts for tracks"
         );
 
-        let fact_source = sources::derived();
+        let fact_source = self.sources.derived.clone();
 
         // Written facts are projected through the single path when the batch ends.
         let backfilled = self.write_batch_and_project_with(&self.acid_client, |w| {
@@ -1861,7 +1869,7 @@ impl LibraryService {
 
             LibraryRequest::GetStatus => {
                 let status = ServiceStatus {
-                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    version: self.sources.version.as_str().to_string(),
                     tracks_indexed: self.tracks_indexed.load(Ordering::Relaxed),
                     facts_count: self.facts_count.load(Ordering::Relaxed),
                     inbox_queue_size: self.get_inbox_queue_internal().len(),
@@ -2160,7 +2168,7 @@ impl LibraryService {
                     Ok(h) => h,
                     Err(e) => return LibraryResponse::Error(e),
                 };
-                let source = source.unwrap_or_else(sources::user_default);
+                let source = source.unwrap_or_else(|| self.sources.user_default.clone());
                 match self.write_and_project(&full_hash, &[(fact, source)]) {
                     Ok(_) => LibraryResponse::FactWritten,
                     Err(e) => LibraryResponse::Error(acid_error(e)),
@@ -2172,7 +2180,7 @@ impl LibraryService {
                     Ok(h) => h,
                     Err(e) => return LibraryResponse::Error(e),
                 };
-                let source = source.unwrap_or_else(sources::user_default);
+                let source = source.unwrap_or_else(|| self.sources.user_default.clone());
                 match self.has_live_assertion(&full_hash, &fact, &source) {
                     Ok(true) => {}
                     Ok(false) => return LibraryResponse::NothingToRetract,
@@ -2390,7 +2398,7 @@ impl LibraryService {
         let fact = MusicValue::Deleted {
             timestamp: chrono::Utc::now(),
         };
-        let source = sources::user_default();
+        let source = self.sources.user_default.clone();
         match self.write_and_project(&full_hash, &[(fact, source)]) {
             Ok(_) => LibraryResponse::TrackDeleted,
             Err(e) => LibraryResponse::Error(acid_error(e)),
@@ -2424,7 +2432,7 @@ impl LibraryService {
         };
 
         let fact = MusicValue::Deleted { timestamp };
-        let source = sources::user_default();
+        let source = self.sources.user_default.clone();
         match self.retract_and_project(&full_hash, &[(fact, source)]) {
             Ok(_) => LibraryResponse::TrackRestored,
             Err(e) => LibraryResponse::Error(acid_error(e)),
@@ -2520,7 +2528,7 @@ impl LibraryService {
             }
         };
 
-        let source = sources::user_default();
+        let source = self.sources.user_default.clone();
         match self.merge_into(&new_hash, &old_full, &source, Vec::new()) {
             Ok(outcome) => LibraryResponse::TrackReplaced {
                 new_hash,
@@ -2665,7 +2673,7 @@ impl LibraryService {
         old_full: &ContentHash,
         inherited_ancestors: Vec<ContentHash>,
     ) -> Result<(), ProtocolError> {
-        let source = sources::user_default();
+        let source = self.sources.user_default.clone();
         let ancestors = inherited_ancestors
             .into_iter()
             .map(|h| (h, source.clone()))
@@ -3019,7 +3027,7 @@ impl LibraryService {
             return Ok(MarkWrite::AlreadyLive);
         }
         let fact = mark.fact_value(chrono::Utc::now());
-        self.write_and_project(&full_hash, &[(fact, sources::user_default())])
+        self.write_and_project(&full_hash, &[(fact, self.sources.user_default.clone())])
             .map_err(acid_error)?;
         Ok(MarkWrite::Written)
     }
@@ -3432,8 +3440,8 @@ impl LibraryService {
 
         // The sources of this ingest: what the library computes carries its own; the
         // tags and the client's facts carry the writer's.
-        let scan_source = sources::scan();
-        let derived_source = sources::derived();
+        let scan_source = self.sources.scan.clone();
+        let derived_source = self.sources.derived.clone();
         let content_source = writer.cloned().unwrap_or_else(|| scan_source.clone());
         let provenance: Vec<(MusicValue, music_facts::FactSource)> = facts
             .iter()
@@ -3933,6 +3941,19 @@ pub fn spawn_fact_subscriber(service: Arc<LibraryService>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The release version the tests hand the service; deliberately not this
+    /// component's own crate version.
+    pub(super) const TEST_VERSION: &str = "9.9.9";
+
+    pub(super) fn test_version() -> ReleaseVersion {
+        ReleaseVersion::new(TEST_VERSION).unwrap()
+    }
+
+    /// The sources a service built with `test_version()` writes under.
+    pub(super) fn test_sources() -> LibrarySources {
+        LibrarySources::new(&test_version())
+    }
     use crate::fact_writer::FactWriter;
     use chrono::{TimeZone, Utc};
     use music_facts::{ContentHash, FactSource, MusicValue, StartReason, StopReason, Title};
@@ -4283,6 +4304,7 @@ mod tests {
             metadata_dir.path().to_path_buf(),
             &facts_addr,
             &events_addr,
+            test_version(),
         )
         .unwrap();
         (service, metadata_dir, acid_handle)
@@ -4300,6 +4322,7 @@ mod tests {
             metadata_dir.path().to_path_buf(),
             &facts_addr,
             &events_addr,
+            test_version(),
         )
         .unwrap();
         (service, metadata_dir, acid_handle)
@@ -4474,6 +4497,7 @@ mod tests {
             metadata_dir.path().to_path_buf(),
             &facts_addr,
             &events_addr,
+            test_version(),
         )
         .expect("service construction must succeed even without playlists dir");
         let _acid_handle = acid_handle; // keep alive
@@ -4918,6 +4942,7 @@ mod tests {
             metadata_dir.path().to_path_buf(),
             &facts_addr,
             &events_addr,
+            test_version(),
         )
         .unwrap();
         // Leak the ACID ServerHandle so the background thread outlives this test.
@@ -4953,6 +4978,7 @@ mod tests {
             metadata_dir.path().to_path_buf(),
             &facts_addr,
             &events_addr,
+            test_version(),
         )
         .unwrap();
         Box::leak(Box::new(handle));
@@ -5381,7 +5407,7 @@ mod tests {
                 &hash,
                 &[(
                     MusicValue::Title(Title::new("Real Title")),
-                    sources::user_default(),
+                    test_sources().user_default,
                 )],
             )
             .unwrap();
@@ -5555,6 +5581,17 @@ mod tests {
         }
     }
 
+    /// The status reports the release version the service was constructed with, not
+    /// this component's own crate version (ADR-020).
+    #[test]
+    fn status_reports_the_constructed_version() {
+        let (service, _metadata_dir, _acid) = make_empty_service();
+        match service.handle_request(LibraryRequest::GetStatus) {
+            LibraryResponse::Status(status) => assert_eq!(status.version, TEST_VERSION),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
     /// A backfilled ItemId survives a resync: it is not in the attribute list.
     #[test]
     fn retract_source_facts_never_retracts_a_backfilled_item_id() {
@@ -5712,7 +5749,7 @@ mod tests {
         let lines = service.acid_client.read_entity(plain.as_str()).unwrap();
         for f in lines.iter().filter_map(|l| parse_fact_line(l)) {
             assert_eq!(f.source().tool, sources::LIBRARY_TOOL, "{:?}", f.value());
-            assert_eq!(f.source().version, env!("CARGO_PKG_VERSION"));
+            assert_eq!(f.source().version, TEST_VERSION);
             // With no writer the tags are the library's scan too.
             let expected = expected_library_origin(f.value()).unwrap_or(sources::SCAN_ORIGIN);
             assert_eq!(
@@ -5730,7 +5767,7 @@ mod tests {
     fn retract_source_facts_keeps_a_value_another_origin_also_asserts() {
         let hash = ContentHash::new("sha256:retract_shared_album");
         let bandcamp = client_source();
-        let user = sources::user_default();
+        let user = test_sources().user_default;
         let album = || MusicValue::Album(music_facts::Album::new("X"));
 
         let temp = {
@@ -6134,7 +6171,7 @@ mod tests {
     fn retract_source_facts_other_source_is_not_retracted() {
         let hash = ContentHash::new("sha256:non_bc_retract_01");
         let bandcamp_source = client_source();
-        let user_source = sources::user_default();
+        let user_source = test_sources().user_default;
         let item_id = "p_non_bc_01";
 
         let temp = {
@@ -6525,6 +6562,7 @@ mod tests {
             metadata_dir.path().to_path_buf(),
             &facts_addr,
             &events_addr,
+            test_version(),
         )
         .unwrap();
         let _acid = acid_handle;
@@ -6580,6 +6618,7 @@ mod tests {
             music_dir.path().to_path_buf(),
             metadata_dir.path().to_path_buf(),
             "ipc:///tmp/mdma-test-acid-nonexistent-bootstrap.sock",
+            test_version(),
         );
         // New code: ACID unreachable => Err(ServiceError::Acid(_)), not Ok with fallback
         assert!(
@@ -6616,6 +6655,7 @@ mod tests {
             music_dir.path().to_path_buf(),
             metadata_dir.path().to_path_buf(),
             "ipc:///tmp/mdma-test-acid-fail-loud.sock",
+            test_version(),
         );
 
         assert!(
@@ -6646,6 +6686,7 @@ mod tests {
             metadata_dir.path().to_path_buf(),
             &facts_addr,
             &events_addr,
+            test_version(),
         )
         .unwrap();
 
@@ -8283,7 +8324,7 @@ mod tests {
     }
 
     /// A fact asserted by an older version of a source is cancelled by a retract that
-    /// carries the current version (RetractFact via `sources::user_default()`,
+    /// carries the current version (RetractFact via `LibrarySources::user_default`,
     /// TrackRestore): a new version is not a different source.
     #[test]
     fn retract_cancels_assertion_from_older_source_version_all_paths() {
@@ -9060,6 +9101,7 @@ mod tests {
             metadata_dir.path().to_path_buf(),
             &facts_addr,
             &events_addr,
+            test_version(),
         )
         .unwrap();
 

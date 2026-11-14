@@ -28,6 +28,29 @@ pub enum ServiceError {
     Io(#[from] std::io::Error),
 }
 
+/// A version string was empty.
+#[derive(Debug, Error)]
+#[error("a release version must not be empty")]
+pub struct EmptyReleaseVersion;
+
+/// The release version of the binary hosting the service (ADR-020); same type as the
+/// real `library_service::ReleaseVersion`, so a caller compiles unchanged against either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseVersion(String);
+
+impl ReleaseVersion {
+    pub fn new(version: &str) -> Result<Self, EmptyReleaseVersion> {
+        if version.trim().is_empty() {
+            return Err(EmptyReleaseVersion);
+        }
+        Ok(Self(version.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Compact track record stored in-memory.
 #[derive(Clone, Default)]
 struct IndexedTrack {
@@ -137,6 +160,8 @@ pub struct LibraryService {
     written: Mutex<Vec<(ContentHash, MusicValue, Option<FactSource>)>>,
     tracks_count: usize,
     facts_count: usize,
+    /// Release version the host binary passed at construction; reported by `GetStatus`.
+    version: ReleaseVersion,
     start_time: Instant,
 }
 
@@ -168,8 +193,9 @@ impl LibraryService {
         music_dir: PathBuf,
         metadata_dir: PathBuf,
         acid_socket: &str,
+        version: ReleaseVersion,
     ) -> Result<Arc<Self>, ServiceError> {
-        Self::build(music_dir, metadata_dir, acid_socket).map(Arc::new)
+        Self::build(music_dir, metadata_dir, acid_socket, version).map(Arc::new)
     }
 
     /// Same as [`new`](Self::new); the events socket is accepted for API
@@ -179,8 +205,21 @@ impl LibraryService {
         metadata_dir: PathBuf,
         acid_socket: &str,
         _acid_events_socket: &str,
+        version: ReleaseVersion,
     ) -> Result<Arc<Self>, ServiceError> {
-        Self::new(music_dir, metadata_dir, acid_socket)
+        Self::new(music_dir, metadata_dir, acid_socket, version)
+    }
+
+    /// A stub for tests that need only the facts in `metadata_dir`: no music dir, no
+    /// ACID, a fixed `0.0.0-stub` release version.
+    pub fn from_metadata_dir(metadata_dir: PathBuf) -> Arc<Self> {
+        Self::new(
+            PathBuf::from("/nonexistent"),
+            metadata_dir,
+            "ipc:///dev/null",
+            ReleaseVersion::new("0.0.0-stub").expect("non-empty"),
+        )
+        .expect("stub from metadata dir")
     }
 
     /// Number of indexed tracks (same accessor as the real service).
@@ -197,6 +236,7 @@ impl LibraryService {
         _music_dir: PathBuf,
         metadata_dir: PathBuf,
         _acid_socket: &str,
+        version: ReleaseVersion,
     ) -> Result<Self, ServiceError> {
         use stainless_facts::FactStreamReader;
 
@@ -220,6 +260,7 @@ impl LibraryService {
                             written: Mutex::new(Vec::new()),
                             tracks_count: 0,
                             facts_count: 0,
+                            version,
                             start_time: Instant::now(),
                         });
                     }
@@ -268,6 +309,7 @@ impl LibraryService {
             written: Mutex::new(Vec::new()),
             tracks_count,
             facts_count,
+            version,
             start_time: Instant::now(),
         })
     }
@@ -279,7 +321,7 @@ impl LibraryService {
 
             LibraryRequest::GetStatus => {
                 let status = ServiceStatus {
-                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    version: self.version.as_str().to_string(),
                     tracks_indexed: self.tracks_count,
                     facts_count: self.facts_count,
                     inbox_queue_size: 0,
@@ -829,12 +871,7 @@ mod tests {
     use super::*;
 
     fn empty_service() -> Arc<LibraryService> {
-        LibraryService::new(
-            PathBuf::from("/nonexistent"),
-            PathBuf::from("/nonexistent"),
-            "ipc:///dev/null",
-        )
-        .expect("empty stub")
+        LibraryService::from_metadata_dir(PathBuf::from("/nonexistent"))
     }
 
     /// Send `payload` on `req` and decode the reply (2s timeout).
@@ -1413,12 +1450,7 @@ mod tests {
             .unwrap()
             .write_batch(&batch)
             .unwrap();
-        let svc = LibraryService::new(
-            PathBuf::from("/nonexistent"),
-            dir.clone(),
-            "ipc:///dev/null",
-        )
-        .expect("stub from facts");
+        let svc = LibraryService::from_metadata_dir(dir.clone());
         std::fs::remove_dir_all(&dir).unwrap();
         svc
     }
