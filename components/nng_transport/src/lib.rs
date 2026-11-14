@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
 
+use nng::options::protocol::reqrep::ResendTime;
 use nng::options::{Options, RecvTimeout, SendTimeout};
 
 /// Default send/receive timeout for NNG Req0 client sockets.
@@ -92,6 +93,14 @@ fn new_req_socket(timeout: Duration) -> Result<nng::Socket, ConnectionError> {
         .set_opt::<RecvTimeout>(Some(timeout))
         .map_err(|cause| ConnectionError::SocketOption {
             option: "recv",
+            cause,
+        })?;
+    // Never let NNG resend an unanswered request (default after 60s): a slow
+    // operation could otherwise run twice. Failure is reported through `timeout`.
+    socket
+        .set_opt::<ResendTime>(None)
+        .map_err(|cause| ConnectionError::SocketOption {
+            option: "resend",
             cause,
         })?;
     Ok(socket)
@@ -376,6 +385,12 @@ mod tests {
 
     fn temp_cache_path(dir: &std::path::Path) -> PathBuf {
         dir.join("mdma").join("dns-cache")
+    }
+
+    #[test]
+    fn req_sockets_never_resend_requests() {
+        let socket = new_req_socket(Duration::from_secs(60)).unwrap();
+        assert_eq!(socket.get_opt::<ResendTime>().unwrap(), None);
     }
 
     #[test]
