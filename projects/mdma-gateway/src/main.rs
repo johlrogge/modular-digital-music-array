@@ -1,3 +1,4 @@
+use acid_protocol::{AcidRequest, AcidResponse};
 use clap::Parser;
 use color_eyre::Result;
 use gateway_protocol::{GatewayRequest, GatewayResponse, NodeIdentity, SourceName, IDENTITY_PROTO};
@@ -533,10 +534,12 @@ impl Gateway {
                 }
             }
 
-            GatewayRequest::Acid { request } => match forward_typed(&self.acid, &request, "acid") {
-                Ok(resp) => GatewayResponse::Acid { response: resp },
-                Err(e) => e.response,
-            },
+            GatewayRequest::Acid { request } => guard_acid(&request, |req| {
+                match forward_typed(&self.acid, req, "acid") {
+                    Ok(resp) => GatewayResponse::Acid { response: resp },
+                    Err(e) => e.response,
+                }
+            }),
 
             GatewayRequest::Admin { request } => {
                 match forward_typed(&self.admin, &request, "admin") {
@@ -618,9 +621,128 @@ fn worker_loop(gateway: &Gateway, io: &BlockingContext) {
     }
 }
 
+/// Message returned when a mutating ACID request arrives over the gateway.
+const ACID_WRITE_REJECTED: &str =
+    "acid writes are not accepted over the gateway; write via the library service";
+
+/// Whether an ACID request may be forwarded from the network.
+///
+/// Exhaustive on purpose: a new `AcidRequest` variant must be classified here.
+fn acid_allowed(request: &AcidRequest) -> bool {
+    match request {
+        AcidRequest::Ping => true,
+        AcidRequest::ReadStream { .. } => true,
+        AcidRequest::ReadEntity { .. } => true,
+        AcidRequest::WriteFacts { .. } => false,
+        AcidRequest::RetractFacts { .. } => false,
+    }
+}
+
+/// Variant name only, so rejections can be logged without the payload.
+fn acid_variant_name(request: &AcidRequest) -> &'static str {
+    match request {
+        AcidRequest::Ping => "Ping",
+        AcidRequest::WriteFacts { .. } => "WriteFacts",
+        AcidRequest::ReadStream { .. } => "ReadStream",
+        AcidRequest::RetractFacts { .. } => "RetractFacts",
+        AcidRequest::ReadEntity { .. } => "ReadEntity",
+    }
+}
+
+/// Forward allowed ACID requests via `forward`; reject everything else
+/// without calling it.
+fn guard_acid(
+    request: &AcidRequest,
+    forward: impl FnOnce(&AcidRequest) -> GatewayResponse,
+) -> GatewayResponse {
+    if acid_allowed(request) {
+        forward(request)
+    } else {
+        tracing::warn!(
+            request = acid_variant_name(request),
+            "Rejected acid request over gateway"
+        );
+        GatewayResponse::Acid {
+            response: AcidResponse::Error {
+                message: ACID_WRITE_REJECTED.to_string(),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use acid_protocol::FactEntry;
+
+    fn fact() -> FactEntry {
+        FactEntry {
+            value_json: "1".to_string(),
+            source_json: "{}".to_string(),
+        }
+    }
+
+    fn forwarded_marker() -> GatewayResponse {
+        GatewayResponse::Acid {
+            response: AcidResponse::Pong,
+        }
+    }
+
+    #[test]
+    fn read_variants_are_forwarded() {
+        let reads = [
+            AcidRequest::Ping,
+            AcidRequest::ReadStream {
+                cursor: None,
+                limit: 10,
+            },
+            AcidRequest::ReadEntity {
+                entity: "e".to_string(),
+            },
+        ];
+        for req in &reads {
+            let mut called = false;
+            let resp = guard_acid(req, |_| {
+                called = true;
+                forwarded_marker()
+            });
+            assert!(called, "{} should be forwarded", acid_variant_name(req));
+            assert!(matches!(
+                resp,
+                GatewayResponse::Acid {
+                    response: AcidResponse::Pong
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn write_variants_are_rejected_and_never_reach_backend() {
+        let writes = [
+            AcidRequest::WriteFacts {
+                entity: "e".to_string(),
+                facts: vec![fact()],
+            },
+            AcidRequest::RetractFacts {
+                entity: "e".to_string(),
+                facts: vec![fact()],
+            },
+        ];
+        for req in &writes {
+            let mut called = false;
+            let resp = guard_acid(req, |_| {
+                called = true;
+                forwarded_marker()
+            });
+            assert!(!called, "{} must not reach backend", acid_variant_name(req));
+            match resp {
+                GatewayResponse::Acid {
+                    response: AcidResponse::Error { message },
+                } => assert_eq!(message, ACID_WRITE_REJECTED),
+                other => panic!("expected acid error, got {other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn backend_never_resends_requests() {

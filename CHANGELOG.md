@@ -6,6 +6,10 @@ All notable changes to MDMA are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **The gateway refuses ACID writes (`WriteFacts`/`RetractFacts`) and forwards only reads.** Write through the library service.
+
 ---
 
 ## [0.37.0] — 2026-11-14
