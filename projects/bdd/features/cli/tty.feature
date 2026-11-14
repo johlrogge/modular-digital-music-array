@@ -28,7 +28,7 @@ Feature: TTY table rendering
 
   Scenario: TTY sort preserves order in tty mode
     When I run mdma search --artist "Carbon Based"
-    And in tty mode I pipe that through mdma sort title -a
+    And in tty mode I pipe that through mdma sort title -a -
     Then the exit code should be 0
     And the stripped output rows should be:
       | hash     | artist                 | title          | duration |

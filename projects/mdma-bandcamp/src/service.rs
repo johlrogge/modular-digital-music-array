@@ -4,15 +4,17 @@
 //! Uses async throughout with NNG IPC bridged via channels.
 
 use crate::cache::DownloadCache;
+use crate::check_updates::{check_item, failure_reason, with_rate_limit_retry};
 use crate::ipc::{
     parse_request, DownloadId, DownloadState, DownloadStatus, IpcServer, SourceError,
     SourcePlaylist, SourcePlaylistSummary, SourcePlaylistTrack, SourceRequest, SourceResponse,
     SourceStatus,
 };
+use crate::job::{spawn_guarded, JobSlot};
 use bandcamp_api::{AudioFormat, BandcampClient, CollectionItem, CookieJar};
 use library_ipc_client::PlaylistName;
 use library_ipc_client::{
-    InboxPath, IngestSource, LibraryClient, MusicValue, TrackInfo, TrackQuery,
+    AttributeList, FactSource, InboxPath, LibraryClient, MusicValue, TrackInfo, TrackQuery,
 };
 use library_search::StringQuery;
 use parking_lot::Mutex;
@@ -21,11 +23,12 @@ use playlist_import::{
     sanitize_playlist_name, to_import_reports, write_playlist, LibraryTrackLookup, TrackOutcome,
 };
 use source_protocol::{
-    ImportJobStatus, ImportPhase, ImportResult, ImportSyncProgress, ImportWritten, SyncWaitEnd,
+    CheckJobStatus, CheckPhase, ImportJobStatus, ImportPhase, ImportResult, ImportSyncProgress,
+    ImportWritten, SyncWaitEnd,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -82,6 +85,35 @@ impl InternalDownloadState {
             InternalDownloadState::Cancelled => DownloadState::Cancelled,
         }
     }
+}
+
+/// Tool of the source this service states for everything it writes to the library.
+const BANDCAMP_TOOL: &str = "mdma-bandcamp";
+
+/// Origin kind of what this service gets from Bandcamp. With the tool it is the source
+/// identity shared by an ingest, an ItemId backfill and a resync retract, so a resync
+/// retracts exactly what this service wrote.
+const BANDCAMP_ORIGIN: &str = "Bandcamp";
+
+/// The source this service states on its ingests, backfills and retracts.
+fn bandcamp_source() -> FactSource {
+    FactSource::new(BANDCAMP_TOOL, env!("CARGO_PKG_VERSION"), BANDCAMP_ORIGIN)
+}
+
+/// The provenance facts this service states about a file it ingests for `item_id`.
+fn bandcamp_provenance(item_id: &str) -> Vec<MusicValue> {
+    vec![
+        MusicValue::Source("bandcamp".to_string()),
+        MusicValue::ItemId(item_id.to_string()),
+    ]
+}
+
+/// The attributes a resync retracts before it re-downloads: what a Bandcamp ingest
+/// writes from the download's tags. ItemId and Source identify the item across
+/// resyncs and stay.
+fn resync_attributes() -> AttributeList {
+    AttributeList::try_new(["Album", "Title", "Artist", "TrackNumber", "Year"])
+        .expect("the resync attributes are known attribute names")
 }
 
 /// Message returned to clients while no usable cookie file exists.
@@ -161,9 +193,9 @@ pub struct BandcampService {
     /// Bandcamp username (read from cookies/config)
     username: Option<String>,
     /// Current or last playlist import job
-    import_status: Mutex<Option<ImportJobStatus>>,
-    /// Last issued import job id
-    last_import_job_id: AtomicU64,
+    import_job: JobSlot<ImportJobStatus>,
+    /// Current or last check-updates job
+    check_job: JobSlot<CheckJobStatus>,
 }
 
 /// How often an import job polls the downloads it is waiting for.
@@ -207,20 +239,6 @@ impl SyncError {
             },
             SyncError::Source(e) => e,
         }
-    }
-}
-
-/// Whether the job is still doing work (not Done or Failed).
-fn import_phase_is_running(phase: &ImportPhase) -> bool {
-    !matches!(phase, ImportPhase::Done(_) | ImportPhase::Failed { .. })
-}
-
-/// Describe why a spawned import task did not return.
-fn join_error_message(e: &tokio::task::JoinError) -> String {
-    if e.is_panic() {
-        format!("import job panicked: {e}")
-    } else {
-        format!("import job cancelled: {e}")
     }
 }
 
@@ -331,10 +349,13 @@ fn drop_items_known_to_library(
                 );
 
                 // Backfill: record the new ItemId so future syncs short-circuit via
-                // the cheap has_facts("ItemId", ...) path.
-                if let Err(e) =
-                    lib_client.write_fact(&matched_hash, MusicValue::ItemId(item_id_str.clone()))
-                {
+                // the cheap has_facts("ItemId", ...) path. The id came from Bandcamp,
+                // so say so, as the same source an ingest of that item states.
+                if let Err(e) = lib_client.write_fact_as(
+                    &matched_hash,
+                    MusicValue::ItemId(item_id_str.clone()),
+                    &bandcamp_source(),
+                ) {
                     tracing::warn!(
                         error = %e,
                         item_id = %item_id_str,
@@ -364,6 +385,16 @@ fn drop_items_known_to_library(
 /// and is NOT flagged as stale here — the caller may wish to log a warning separately.
 fn classify_check_result(live_count: usize, stored_count: usize) -> bool {
     live_count > stored_count
+}
+
+/// Pure helper: turn the live count (if Bandcamp told us) and the stored
+/// count into `(live, stale)`. An unknown live count is an error — it must
+/// never be reported as OK or as zero.
+pub(crate) fn check_outcome(live: Option<usize>, stored: usize) -> Result<(usize, bool), String> {
+    let live = live.ok_or_else(|| {
+        "live track count unknown: the download page gives no item type or track count".to_string()
+    })?;
+    Ok((live, classify_check_result(live, stored)))
 }
 
 /// Pure mapping: bandcamp_api playlist summary -> wire type.
@@ -479,8 +510,8 @@ impl BandcampService {
             format,
             library_socket,
             username,
-            import_status: Mutex::new(None),
-            last_import_job_id: AtomicU64::new(0),
+            import_job: JobSlot::new(),
+            check_job: JobSlot::new(),
         })
     }
 
@@ -543,7 +574,7 @@ impl BandcampService {
     }
 
     /// The number of tracks the library stores for a Bandcamp item.
-    async fn stored_track_count(&self, item_id: &str) -> Result<usize, String> {
+    pub(crate) async fn stored_track_count(&self, item_id: &str) -> Result<usize, String> {
         let socket = self.library_socket.clone();
         let item_id = item_id.to_string();
         tokio::task::spawn_blocking(move || {
@@ -625,9 +656,92 @@ impl BandcampService {
             } => self.handle_import_playlist(playlist, name, dry_run),
 
             SourceRequest::GetImportStatus => {
-                SourceResponse::ImportStatus(self.import_status.lock().clone())
+                SourceResponse::ImportStatus(self.import_job.snapshot())
             }
+
+            SourceRequest::CheckUpdates { item_ids } => self.handle_check_updates(item_ids),
+
+            SourceRequest::GetCheckStatus => SourceResponse::CheckStatus(self.check_job.snapshot()),
         }
+    }
+
+    /// Start a check-updates job in the background and return at once.
+    ///
+    /// Only one job runs at a time. The job ends in Done or Failed, whatever
+    /// happens inside it.
+    fn handle_check_updates(self: &Arc<Self>, item_ids: Vec<String>) -> SourceResponse {
+        let client = match self.client() {
+            Ok(c) => c,
+            Err(e) => return SourceResponse::Error(e),
+        };
+        let username = match self.require_username() {
+            Ok(u) => u,
+            Err(e) => return SourceResponse::Error(e),
+        };
+        let total = item_ids.len();
+        let job_id = match self.check_job.begin(|job_id| CheckJobStatus {
+            job_id,
+            total,
+            phase: CheckPhase::FetchingCollection,
+            results: Vec::new(),
+        }) {
+            Ok(job_id) => job_id,
+            Err(running) => {
+                return SourceResponse::Error(SourceError::CheckInProgress { job_id: running })
+            }
+        };
+        tracing::info!(job_id, items = total, "Check-updates job started");
+
+        let service = Arc::clone(self);
+        spawn_guarded(
+            {
+                let service = Arc::clone(&service);
+                async move {
+                    service
+                        .run_check_job(job_id, client, username, item_ids)
+                        .await
+                }
+            },
+            move |message| {
+                tracing::error!(job_id, error = %message, "Check-updates job failed");
+                service
+                    .check_job
+                    .update(job_id, |s| s.phase = CheckPhase::Failed { message });
+            },
+        );
+
+        SourceResponse::CheckStarted { job_id }
+    }
+
+    /// Fetch the collection once, then check the items against it.
+    async fn run_check_job(
+        &self,
+        job_id: u64,
+        client: BandcampClient,
+        username: String,
+        item_ids: Vec<String>,
+    ) {
+        let collection = match with_rate_limit_retry(|| client.get_collection(&username)).await {
+            Ok(collection) => collection,
+            Err(e) => {
+                tracing::error!(error = %e, "CheckUpdates: failed to fetch collection");
+                self.check_job.update(job_id, |s| {
+                    s.phase = CheckPhase::Failed {
+                        message: format!("fetching the collection failed: {}", failure_reason(&e)),
+                    }
+                });
+                return;
+            }
+        };
+        let client = &client;
+        crate::check_updates::run_check_updates(
+            &collection,
+            &item_ids,
+            |url: String| async move { client.get_item_details(&url).await },
+            |id: String| async move { self.stored_track_count(&id).await },
+            |update| self.check_job.update(job_id, |s| update.apply(s)),
+        )
+        .await;
     }
 
     /// List the configured user's playlists.
@@ -701,7 +815,7 @@ impl BandcampService {
                 }
             })?;
             client
-                .retract_source_facts(&retract_id, "bandcamp")
+                .retract_source_facts(&retract_id, &bandcamp_source(), &resync_attributes())
                 .map_err(|e| {
                     tracing::error!(error = %e, item_id = %retract_id, "Failed to retract, resync refused");
                     SourceError::SyncFailed {
@@ -788,16 +902,13 @@ impl BandcampService {
     /// look stale, so an unavailable library is an error, and it costs no
     /// Bandcamp request.
     async fn handle_check_item(&self, identifier: String) -> SourceResponse {
-        let stored_track_count = match self.stored_track_count(&identifier).await {
-            Ok(count) => count,
-            Err(reason) => {
-                tracing::warn!(item_id = %identifier, %reason, "CheckItem: library unavailable");
-                return SourceResponse::Error(SourceError::CheckFailed {
-                    identifier,
-                    reason: format!("library unavailable: {reason}"),
-                });
-            }
-        };
+        if let Err(reason) = self.ping_library().await {
+            tracing::warn!(item_id = %identifier, %reason, "CheckItem: library unavailable");
+            return SourceResponse::Error(SourceError::CheckFailed {
+                identifier,
+                reason: format!("library unavailable: {reason}"),
+            });
+        }
 
         let client = match self.client() {
             Ok(c) => c,
@@ -810,13 +921,13 @@ impl BandcampService {
         };
 
         // Fetch the collection to find the item's download URL
-        let collection = match client.get_collection(&username).await {
+        let collection = match with_rate_limit_retry(|| client.get_collection(&username)).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "CheckItem: failed to fetch collection");
                 return SourceResponse::Error(SourceError::CheckFailed {
                     identifier,
-                    reason: e.to_string(),
+                    reason: failure_reason(&e),
                 });
             }
         };
@@ -828,36 +939,35 @@ impl BandcampService {
             }
         };
 
-        // Fetch item details to get the live track count
-        let details = match client.get_item_details(&item.download_url).await {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!(error = %e, item_id = %identifier, "CheckItem: failed to fetch item details");
-                return SourceResponse::Error(SourceError::CheckFailed {
-                    identifier,
-                    reason: e.to_string(),
-                });
+        let client = &client;
+        let (checked, _) = check_item(
+            &item,
+            &|url: String| async move { client.get_item_details(&url).await },
+            &|id: String| async move { self.stored_track_count(&id).await },
+        )
+        .await;
+        let checked = match checked {
+            Ok(checked) => checked,
+            Err(reason) => {
+                tracing::warn!(item_id = %identifier, %reason, "CheckItem: check failed");
+                return SourceResponse::Error(SourceError::CheckFailed { identifier, reason });
             }
         };
 
-        let live_track_count = details.tracks.len();
-
-        let stale = classify_check_result(live_track_count, stored_track_count);
-
-        if stored_track_count > live_track_count {
+        if checked.stored > checked.live {
             tracing::warn!(
                 item_id = %identifier,
-                live = live_track_count,
-                stored = stored_track_count,
+                live = checked.live,
+                stored = checked.stored,
                 "CheckItem: stored track count exceeds live count — bandcamp may have removed tracks"
             );
         }
 
         SourceResponse::ItemChecked {
             identifier,
-            live_track_count,
-            stored_track_count,
-            stale,
+            live_track_count: checked.live,
+            stored_track_count: checked.stored,
+            stale: checked.stale,
         }
     }
 
@@ -1025,21 +1135,17 @@ impl BandcampService {
         tracing::info!(job_id, %playlist, dry_run, "Import job started");
 
         let service = Arc::clone(self);
-        tokio::spawn(async move {
-            // The job runs in its own task so a panic surfaces as a JoinError
-            // here instead of leaving the status stuck in a running phase.
-            let job = tokio::spawn({
+        spawn_guarded(
+            {
                 let service = Arc::clone(&service);
                 async move {
                     service
                         .run_import_job(job_id, playlist, target, dry_run)
                         .await
                 }
-            });
-            if let Err(e) = job.await {
-                service.fail_import(job_id, join_error_message(&e));
-            }
-        });
+            },
+            move |message| service.fail_import(job_id, message),
+        );
 
         SourceResponse::ImportStarted { job_id }
     }
@@ -1047,15 +1153,7 @@ impl BandcampService {
     /// Create the status of a new import job (phase Fetching) and return its id.
     /// `Err` carries the id of the job that is still running.
     fn begin_import_job(&self, dry_run: bool) -> Result<u64, u64> {
-        let mut status = self.import_status.lock();
-        if let Some(running) = status
-            .as_ref()
-            .filter(|s| import_phase_is_running(&s.phase))
-        {
-            return Err(running.job_id);
-        }
-        let job_id = self.last_import_job_id.fetch_add(1, Ordering::Relaxed) + 1;
-        *status = Some(ImportJobStatus {
+        self.import_job.begin(|job_id| ImportJobStatus {
             job_id,
             dry_run,
             playlist_title: None,
@@ -1064,8 +1162,7 @@ impl BandcampService {
             phase: ImportPhase::Fetching,
             tracks: Vec::new(),
             sync: None,
-        });
-        Ok(job_id)
+        })
     }
 
     /// End import job `job_id` as Failed.
@@ -1078,14 +1175,7 @@ impl BandcampService {
     /// status belongs to another job, so a stale task cannot overwrite the
     /// status of a newer one.
     fn update_import(&self, job_id: u64, update: impl FnOnce(&mut ImportJobStatus)) {
-        if let Some(status) = self
-            .import_status
-            .lock()
-            .as_mut()
-            .filter(|s| s.job_id == job_id)
-        {
-            update(status);
-        }
+        self.import_job.update(job_id, update);
     }
 
     /// Move import job `job_id` to `phase`, logging the change.
@@ -1463,7 +1553,7 @@ fn run_nng_bridge(
             Ok(r) => r,
             Err(e) => {
                 // Reply so the gateway doesn't stall until its timeout
-                tracing::error!(error = %e, "Failed to parse request");
+                tracing::warn!(error = %e, "Failed to parse request");
                 let reply = SourceResponse::Error(SourceError::unsupported(format!(
                     "unparseable request: {e}"
                 )));
@@ -1664,13 +1754,11 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
 
                                     match InboxPath::new(filename) {
                                         Ok(inbox_path) => {
-                                            let source = IngestSource::Bandcamp {
-                                                item_id: item_id.clone(),
-                                                artist_url: None,
-                                            };
-                                            match lib_client
-                                                .ingest_file_with_source(&inbox_path, Some(source))
-                                            {
+                                            match lib_client.ingest_file_as(
+                                                &inbox_path,
+                                                &bandcamp_source(),
+                                                bandcamp_provenance(&item_id),
+                                            ) {
                                                 Ok(library_ipc_client::IngestResult::Success {
                                                     hash,
                                                     ..
@@ -1799,7 +1887,36 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::{join_error_message, JobStatus};
     use library_ipc_protocol::{ContentHash, TrackInfo};
+
+    // =========================================================================
+    // Source identity
+    // =========================================================================
+
+    #[test]
+    fn bandcamp_states_its_own_source_provenance_and_resync_attributes() {
+        let source = bandcamp_source();
+        assert_eq!(source.tool, "mdma-bandcamp");
+        assert_eq!(source.origin.kind, "Bandcamp");
+        assert_eq!(
+            bandcamp_provenance("p42"),
+            vec![
+                MusicValue::Source("bandcamp".to_string()),
+                MusicValue::ItemId("p42".to_string()),
+            ]
+        );
+        let attributes: Vec<String> = resync_attributes()
+            .as_slice()
+            .iter()
+            .map(|a| a.as_str().to_string())
+            .collect();
+        assert_eq!(
+            attributes,
+            ["Album", "Title", "Artist", "TrackNumber", "Year"]
+        );
+        assert!(!attributes.iter().any(|a| a == "ItemId" || a == "Source"));
+    }
 
     // =========================================================================
     // classify_check_result tests
@@ -1833,6 +1950,27 @@ mod tests {
     #[test]
     fn classify_check_result_not_stale_when_both_zero() {
         assert!(!classify_check_result(0, 0));
+    }
+
+    #[test]
+    fn check_outcome_unknown_live_count_is_an_error_not_ok() {
+        let reason = check_outcome(None, 3).unwrap_err();
+        assert!(reason.contains("unknown"), "got: {reason}");
+    }
+
+    #[test]
+    fn check_outcome_stale_when_live_exceeds_stored() {
+        assert_eq!(check_outcome(Some(7), 2), Ok((7, true)));
+    }
+
+    #[test]
+    fn check_outcome_ok_when_equal() {
+        assert_eq!(check_outcome(Some(5), 5), Ok((5, false)));
+    }
+
+    #[test]
+    fn check_outcome_not_stale_when_stored_exceeds_live() {
+        assert_eq!(check_outcome(Some(2), 5), Ok((2, false)));
     }
 
     // =========================================================================
@@ -2119,9 +2257,8 @@ mod tests {
 
     fn import_status(service: &Arc<BandcampService>) -> ImportJobStatus {
         service
-            .import_status
-            .lock()
-            .clone()
+            .import_job
+            .snapshot()
             .expect("an import job should exist")
     }
 
@@ -2482,7 +2619,7 @@ mod tests {
             }
             other => panic!("expected an error, got {other:?}"),
         }
-        assert!(service.import_status.lock().is_none());
+        assert!(service.import_job.snapshot().is_none());
     }
 
     #[tokio::test]
@@ -2539,7 +2676,7 @@ mod tests {
     async fn wait_for_import_end(service: &Arc<BandcampService>) -> ImportJobStatus {
         for _ in 0..500 {
             let status = import_status(service);
-            if !import_phase_is_running(&status.phase) {
+            if !status.is_running() {
                 return status;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2637,8 +2774,7 @@ mod tests {
         use super::*;
         use library_service_stub::service::{run_ipc_server, LibraryService};
         use music_facts::{
-            Album, Artist, ContentHash as MusicContentHash, FactOrigin, FactSource,
-            MusicValue as MV, Title,
+            Album, Artist, ContentHash as MusicContentHash, MusicValue as MV, Title,
         };
         use stainless_facts::{Fact, FactStreamWriter, Operation};
         use std::sync::Arc;
@@ -2656,7 +2792,7 @@ mod tests {
                 FactStreamWriter::open(&facts_path).expect("failed to open fact stream");
 
             let hash = MusicContentHash::new(format!("sha256:{}", hash_hex));
-            let source = FactSource::new("test-seed", "0.0.0", FactOrigin::Unknown);
+            let source = FactSource::new("test-seed", "0.0.0", "Unknown");
             let now = chrono::Utc::now();
 
             let facts: Vec<Fact<MusicContentHash, MV, FactSource>> = vec![
@@ -2697,12 +2833,7 @@ mod tests {
             metadata_dir: &std::path::Path,
             socket_path: &std::path::Path,
         ) -> std::thread::JoinHandle<()> {
-            let svc = LibraryService::new(
-                metadata_dir.to_path_buf(),
-                metadata_dir.to_path_buf(),
-                "ipc:///dev/null",
-            )
-            .expect("failed to create stub library");
+            let svc = LibraryService::from_metadata_dir(metadata_dir.to_path_buf());
             let addr = format!("ipc://{}", socket_path.display());
             std::thread::spawn(move || {
                 run_ipc_server(svc, &addr).ok();
@@ -2790,11 +2921,12 @@ mod tests {
             // Backfill: write ItemId="p_digital_222" onto the matched track
             let matched_hash = results.first().unwrap().content_hash.clone();
             client
-                .write_fact(
+                .write_fact_as(
                     &matched_hash,
                     MusicValue::ItemId("p_digital_222".to_string()),
+                    &bandcamp_source(),
                 )
-                .expect("write_fact");
+                .expect("write_fact_as");
 
             // Verify backfill: now p_digital_222 is known by ItemId
             let after_backfill = client
@@ -2865,6 +2997,7 @@ mod tests {
         #[case::sync(SourceRequest::Sync)]
         #[case::resync(SourceRequest::ResyncItem { identifier: "x".to_string() })]
         #[case::check(SourceRequest::CheckItem { identifier: "x".to_string() })]
+        #[case::check_updates(SourceRequest::CheckUpdates { item_ids: vec!["x".to_string()] })]
         #[tokio::test]
         async fn request_without_cookies_and_library_up_is_not_authenticated(
             #[case] request: SourceRequest,
@@ -3006,9 +3139,30 @@ mod tests {
 
         #[test]
         fn drop_items_known_to_library_keeps_only_unknown_items_and_backfills() {
-            // The stub was seeded with ItemId "p_1" for the Interloper track.
-            let (_temp, service, client) = service_with_library("drop-known.sock");
-            let socket = service.library_socket.clone();
+            // The stub is seeded with ItemId "p_1" for the Interloper track. It is
+            // built here (not via service_with_library) to keep a handle that
+            // records the source of each WriteFact.
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let seeded_hash = format!("{:0<64}", "deadbeef");
+            seed_track_with_item_id(
+                temp.path(),
+                &seeded_hash,
+                "Carbon Based Lifeforms",
+                "Interloper",
+                "p_1",
+            );
+            let stub = LibraryService::from_metadata_dir(temp.path().to_path_buf());
+            let socket_path = temp.path().join("drop-known.sock");
+            let socket = format!("ipc://{}", socket_path.display());
+            let _srv = {
+                let stub = Arc::clone(&stub);
+                let addr = socket.clone();
+                std::thread::spawn(move || {
+                    run_ipc_server(stub, &addr).ok();
+                })
+            };
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let client = LibraryClient::connect(&socket).expect("connect");
             let items = vec![
                 make_collection_item("p_1", "Carbon Based Lifeforms", "Interloper"),
                 make_collection_item("p_2", "Carbon Based Lifeforms", "Interloper"),
@@ -3023,6 +3177,16 @@ mod tests {
                 .has_facts("ItemId", vec!["p_2".to_string()])
                 .expect("has_facts");
             assert_eq!(known, vec!["p_2".to_string()], "ItemId backfilled");
+            // The backfill states mdma-bandcamp/Bandcamp, the source of an ingest.
+            assert_eq!(
+                stub.written_source(
+                    &MusicContentHash::new(format!("sha256:{seeded_hash}")),
+                    &MV::ItemId("p_2".to_string()),
+                ),
+                Some(Some(bandcamp_source()))
+            );
+            assert_eq!(bandcamp_source().tool, "mdma-bandcamp");
+            assert_eq!(bandcamp_source().origin.kind, "Bandcamp");
         }
 
         #[test]

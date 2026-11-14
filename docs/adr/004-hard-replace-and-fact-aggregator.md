@@ -10,6 +10,8 @@ variant and its "hidden = deleted OR superseded" rule are withdrawn.
 
 Amended by ADR-011 (2026-11-03): the deferred #44 alternative and the sub-second `Replaces`-window consequence are superseded by a single read-your-writes catch-up path.
 
+Amended by ADR-018 (2026-11-11): "source" in retract matching means source identity (tool plus origin kind), not the whole `FactSource`; version and origin details no longer count.
+
 ## Context
 
 ADR-003 modeled replace as a pure-assert `SupersededBy { replacement }` fact on the

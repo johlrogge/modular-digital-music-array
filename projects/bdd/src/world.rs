@@ -126,7 +126,9 @@ impl MdmaWorld {
     /// caller can write data to it later; returns `None`.
     ///
     /// When `stdin_data` is `None`, a PTY slave is attached so the child sees
-    /// a real terminal for stdin (preventing an empty stdin intersection filter).
+    /// a real terminal for stdin, so a command that wrongly read stdin unasked
+    /// would block on the open PTY instead of seeing EOF (the CLI reads stdin
+    /// only for `-`).
     /// Returns `Some(master)` so the caller can keep the master fd alive until
     /// the child exits.
     fn configure_stdin(
@@ -137,9 +139,8 @@ impl MdmaWorld {
             cmd.stdin(std::process::Stdio::piped());
             None
         } else {
-            // Create a PTY so the CLI subprocess sees a real terminal for stdin.
-            // This prevents search from applying an empty stdin intersection filter
-            // (which triggers when stdin is not a terminal).
+            // Create a PTY so the CLI subprocess sees a real, silent terminal for
+            // stdin, like an ssh session: stdin is open but never sends anything.
             let (master, slave) = open_pty();
             cmd.stdin(std::process::Stdio::from(slave));
             Some(master)
@@ -193,8 +194,8 @@ impl MdmaWorld {
     /// triggering corsett table rendering with ANSI colors. The `columns`
     /// parameter sets the `$COLUMNS` env var to control `terminal_width()`.
     ///
-    /// When `stdin_data` is Some, it is piped to stdin. When None, a separate
-    /// PTY is used for stdin (preventing the empty hash filter).
+    /// When `stdin_data` is Some, it is piped to stdin.
+    /// When None, stdin is a separate PTY, so the child sees an interactive terminal as in a shell.
     pub fn run_cli_tty(&mut self, args: &[&str], columns: usize, stdin_data: Option<&str>) {
         use std::os::fd::AsRawFd;
         self.ensure_env();

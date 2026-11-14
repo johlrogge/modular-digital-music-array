@@ -9,6 +9,7 @@ pub mod browse;
 pub mod cache;
 pub mod resolve;
 pub mod select;
+pub mod spec;
 pub mod verify;
 
 pub use browse::{
@@ -22,4 +23,5 @@ pub use resolve::{
     BROWSE_TIMEOUT, DEFAULT_PORT,
 };
 pub use select::{select, SelectEffects, SelectError};
+pub use spec::{NodeSpec, NodeSpecError};
 pub use verify::{verify_candidate, VerifyError};

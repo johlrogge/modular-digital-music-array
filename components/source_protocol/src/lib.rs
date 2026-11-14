@@ -90,6 +90,16 @@ pub enum SourceRequest {
     /// Get the current or last import job.
     /// Answer with `SourceResponse::ImportStatus`.
     GetImportStatus,
+
+    /// Start a background job checking the given items for staleness. The
+    /// source fetches its collection once and spaces its upstream requests.
+    /// Answer with `SourceResponse::CheckStarted`, or
+    /// `SourceError::CheckInProgress` if a job is running.
+    CheckUpdates { item_ids: Vec<String> },
+
+    /// Get the current or last check-updates job.
+    /// Answer with `SourceResponse::CheckStatus`.
+    GetCheckStatus,
 }
 
 // ============================================================================
@@ -149,6 +159,12 @@ pub enum SourceResponse {
 
     /// Result of a GetImportStatus request: the current or last job, if any.
     ImportStatus(Option<ImportJobStatus>),
+
+    /// A check-updates job was started.
+    CheckStarted { job_id: u64 },
+
+    /// Result of a GetCheckStatus request: the current or last job, if any.
+    CheckStatus(Option<CheckJobStatus>),
 
     /// Error response.
     Error(SourceError),
@@ -364,6 +380,60 @@ pub struct ImportJobStatus {
     pub sync: Option<ImportSyncProgress>,
 }
 
+/// Phase of a check-updates job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CheckPhase {
+    /// Fetching the source collection (once per job).
+    FetchingCollection,
+    /// Checking the items one by one.
+    Checking,
+    /// Every item has a result.
+    Done,
+    /// Aborted before every item was checked.
+    Failed { message: String },
+}
+
+/// How checking one item ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ItemCheckOutcome {
+    /// The library has as many tracks as the source.
+    UpToDate { track_count: usize },
+    /// The source has more tracks than the library.
+    Stale {
+        live_track_count: usize,
+        stored_track_count: usize,
+    },
+    /// The item is not in this source's collection.
+    NotInCollection,
+    /// The item could not be checked (never reported as up to date).
+    Failed { reason: String },
+}
+
+/// The result for one item of a check-updates job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemCheckResult {
+    pub identifier: String,
+    pub outcome: ItemCheckOutcome,
+}
+
+/// Status of a check-updates job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckJobStatus {
+    pub job_id: u64,
+    /// How many items the job was asked to check.
+    pub total: usize,
+    pub phase: CheckPhase,
+    /// Results so far, in request order.
+    pub results: Vec<ItemCheckResult>,
+}
+
+impl CheckPhase {
+    /// Whether the job has ended (Done or Failed).
+    pub fn is_finished(&self) -> bool {
+        matches!(self, CheckPhase::Done | CheckPhase::Failed { .. })
+    }
+}
+
 // ============================================================================
 // Error Types
 // ============================================================================
@@ -404,6 +474,10 @@ pub enum SourceError {
     /// A playlist import job is already running.
     #[error("import already running: job {job_id}")]
     ImportInProgress { job_id: u64 },
+
+    /// A check-updates job is already running.
+    #[error("check already running: job {job_id}")]
+    CheckInProgress { job_id: u64 },
 }
 
 impl SourceError {
@@ -963,6 +1037,77 @@ mod tests {
         match parsed {
             SourceResponse::Error(e @ SourceError::ImportInProgress { .. }) => {
                 assert_eq!(e.to_string(), "import already running: job 9");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn check_updates_request_and_status_roundtrip() {
+        let req = SourceRequest::CheckUpdates {
+            item_ids: vec!["p1".to_string(), "p2".to_string()],
+        };
+        let parsed: SourceRequest =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        match parsed {
+            SourceRequest::CheckUpdates { item_ids } => assert_eq!(item_ids, vec!["p1", "p2"]),
+            _ => panic!("wrong variant"),
+        }
+        let json = serde_json::to_string(&SourceRequest::GetCheckStatus).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<SourceRequest>(&json).unwrap(),
+            SourceRequest::GetCheckStatus
+        ));
+
+        let status = CheckJobStatus {
+            job_id: 4,
+            total: 3,
+            phase: CheckPhase::Failed {
+                message: "boom".to_string(),
+            },
+            results: vec![
+                ItemCheckResult {
+                    identifier: "p1".to_string(),
+                    outcome: ItemCheckOutcome::Stale {
+                        live_track_count: 7,
+                        stored_track_count: 2,
+                    },
+                },
+                ItemCheckResult {
+                    identifier: "p2".to_string(),
+                    outcome: ItemCheckOutcome::UpToDate { track_count: 5 },
+                },
+                ItemCheckResult {
+                    identifier: "p3".to_string(),
+                    outcome: ItemCheckOutcome::Failed {
+                        reason: "rate limited".to_string(),
+                    },
+                },
+                ItemCheckResult {
+                    identifier: "p4".to_string(),
+                    outcome: ItemCheckOutcome::NotInCollection,
+                },
+            ],
+        };
+        let resp = SourceResponse::CheckStatus(Some(status.clone()));
+        let parsed: SourceResponse =
+            serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        match parsed {
+            SourceResponse::CheckStatus(Some(s)) => assert_eq!(s, status),
+            _ => panic!("wrong variant"),
+        }
+        assert!(status.phase.is_finished());
+        assert!(!CheckPhase::Checking.is_finished());
+    }
+
+    #[test]
+    fn source_error_check_in_progress_roundtrip() {
+        let resp = SourceResponse::Error(SourceError::CheckInProgress { job_id: 2 });
+        let parsed: SourceResponse =
+            serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        match parsed {
+            SourceResponse::Error(e @ SourceError::CheckInProgress { .. }) => {
+                assert_eq!(e.to_string(), "check already running: job 2");
             }
             _ => panic!("wrong variant"),
         }

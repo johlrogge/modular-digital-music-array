@@ -5,14 +5,15 @@
 //! ACID, ingestion, or file-system side effects.
 
 use crate::ipc::{
-    BeatGridInfo, Bpm, ContentHash, CueInfo, DurationSeconds, FactType, IpcServer, LibraryRequest,
-    LibraryResponse, OrphanInfo, OrphanReason, PlaylistName, ProtocolError, ServiceStatus,
-    TrackInfo, TrackQuery,
+    bookmark_scope_mark, parse_request, BeatGridInfo, Bpm, ContentHash, CueInfo, DurationSeconds,
+    FactType, IpcServer, LibraryRequest, LibraryResponse, Mark, MarkFilter, MarkWrite, OrphanInfo,
+    OrphanReason, PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery, Unmark,
 };
 use library_search::{matches_query, TrackFields};
-use music_facts::MusicValue;
+use music_facts::{FactSource, MusicValue};
 use music_primitives::{EnergyLevel, TrackRole};
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -25,6 +26,29 @@ pub enum ServiceError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// A version string was empty.
+#[derive(Debug, Error)]
+#[error("a release version must not be empty")]
+pub struct EmptyReleaseVersion;
+
+/// The release version of the binary hosting the service (ADR-020); same type as the
+/// real `library_service::ReleaseVersion`, so a caller compiles unchanged against either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseVersion(String);
+
+impl ReleaseVersion {
+    pub fn new(version: &str) -> Result<Self, EmptyReleaseVersion> {
+        if version.trim().is_empty() {
+            return Err(EmptyReleaseVersion);
+        }
+        Ok(Self(version.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Compact track record stored in-memory.
@@ -53,11 +77,22 @@ struct IndexedTrack {
     role: Option<TrackRole>,
     /// Energy level 1–10.
     energy: Option<EnergyLevel>,
+    /// Live `Bookmarked` values, from loaded facts and `WriteMark`/`WriteBookmark`. A loaded
+    /// retract or `UnmarkTrack` removes the matching value, as the real service's
+    /// provenance does. Retracts of every other fact are skipped, not applied.
+    bookmarks: Vec<MusicValue>,
 }
 
 impl IndexedTrack {
     fn is_hidden(&self) -> bool {
         self.deleted_at.is_some()
+    }
+
+    fn has_mark(&self, filter: &MarkFilter) -> bool {
+        self.bookmarks
+            .iter()
+            .filter_map(MusicValue::stored_mark)
+            .any(|m| filter.admits(&m))
     }
 }
 
@@ -121,12 +156,32 @@ pub struct LibraryService {
     /// Playlist name -> content (list/get/new/replace; append, remove and
     /// rename are not supported).
     playlists: Mutex<HashMap<String, String>>,
+    /// Every `WriteFact` received, with the source it stated, in order.
+    written: Mutex<Vec<(ContentHash, MusicValue, Option<FactSource>)>>,
     tracks_count: usize,
     facts_count: usize,
+    /// Release version the host binary passed at construction; reported by `GetStatus`.
+    version: ReleaseVersion,
     start_time: Instant,
 }
 
 impl LibraryService {
+    /// The source the last `WriteFact` of `fact` for `hash` stated: `None` when no
+    /// such write was received, `Some(None)` when it stated no source.
+    pub fn written_source(
+        &self,
+        hash: &ContentHash,
+        fact: &MusicValue,
+    ) -> Option<Option<FactSource>> {
+        self.written
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(h, f, _)| h == hash && f == fact)
+            .map(|(_, _, source)| source.clone())
+    }
+
     /// Create a new stub library service.
     ///
     /// Reads `facts.jsonl` from `metadata_dir` and builds an in-memory index.
@@ -138,8 +193,9 @@ impl LibraryService {
         music_dir: PathBuf,
         metadata_dir: PathBuf,
         acid_socket: &str,
+        version: ReleaseVersion,
     ) -> Result<Arc<Self>, ServiceError> {
-        Self::build(music_dir, metadata_dir, acid_socket).map(Arc::new)
+        Self::build(music_dir, metadata_dir, acid_socket, version).map(Arc::new)
     }
 
     /// Same as [`new`](Self::new); the events socket is accepted for API
@@ -149,8 +205,21 @@ impl LibraryService {
         metadata_dir: PathBuf,
         acid_socket: &str,
         _acid_events_socket: &str,
+        version: ReleaseVersion,
     ) -> Result<Arc<Self>, ServiceError> {
-        Self::new(music_dir, metadata_dir, acid_socket)
+        Self::new(music_dir, metadata_dir, acid_socket, version)
+    }
+
+    /// A stub for tests that need only the facts in `metadata_dir`: no music dir, no
+    /// ACID, a fixed `0.0.0-stub` release version.
+    pub fn from_metadata_dir(metadata_dir: PathBuf) -> Arc<Self> {
+        Self::new(
+            PathBuf::from("/nonexistent"),
+            metadata_dir,
+            "ipc:///dev/null",
+            ReleaseVersion::new("0.0.0-stub").expect("non-empty"),
+        )
+        .expect("stub from metadata dir")
     }
 
     /// Number of indexed tracks (same accessor as the real service).
@@ -167,8 +236,8 @@ impl LibraryService {
         _music_dir: PathBuf,
         metadata_dir: PathBuf,
         _acid_socket: &str,
+        version: ReleaseVersion,
     ) -> Result<Self, ServiceError> {
-        use music_facts::FactSource;
         use stainless_facts::FactStreamReader;
 
         let facts_path = metadata_dir.join("facts.jsonl");
@@ -188,8 +257,10 @@ impl LibraryService {
                             tracks: Mutex::new(vec![]),
                             fact_index: Mutex::new(HashMap::new()),
                             playlists: Mutex::new(HashMap::new()),
+                            written: Mutex::new(Vec::new()),
                             tracks_count: 0,
                             facts_count: 0,
+                            version,
                             start_time: Instant::now(),
                         });
                     }
@@ -219,7 +290,12 @@ impl LibraryService {
                     .insert(value_str);
 
                 // Apply fact to the indexed track
-                apply_fact(entry, fact.value());
+                match fact.operation() {
+                    stainless_facts::Operation::Assert => apply_fact(entry, fact.value()),
+                    stainless_facts::Operation::Retract => {
+                        retract_fact(entry, fact.value());
+                    }
+                }
             }
         }
 
@@ -230,8 +306,10 @@ impl LibraryService {
             tracks: Mutex::new(tracks),
             fact_index: Mutex::new(fact_index),
             playlists: Mutex::new(HashMap::new()),
+            written: Mutex::new(Vec::new()),
             tracks_count,
             facts_count,
+            version,
             start_time: Instant::now(),
         })
     }
@@ -243,26 +321,22 @@ impl LibraryService {
 
             LibraryRequest::GetStatus => {
                 let status = ServiceStatus {
-                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    version: self.version.as_str().to_string(),
                     tracks_indexed: self.tracks_count,
                     facts_count: self.facts_count,
                     inbox_queue_size: 0,
                     uptime_seconds: self.start_time.elapsed().as_secs(),
+                    unparseable_lines: 0,
                 };
                 LibraryResponse::Status(status)
             }
 
             LibraryRequest::ListTracks { limit } => {
-                let tracks = self.tracks.lock().unwrap();
-                let iter = tracks
-                    .iter()
-                    .filter(|t| !t.is_hidden())
-                    .map(|t| t.to_track_info());
-                let results: Vec<TrackInfo> = match limit {
-                    Some(n) => iter.take(n).collect(),
-                    None => iter.collect(),
-                };
-                LibraryResponse::Tracks(results)
+                LibraryResponse::Tracks(self.tracks_where(|_| true, limit))
+            }
+
+            LibraryRequest::ListMarked { filter } => {
+                LibraryResponse::Tracks(self.tracks_where(|t| t.has_mark(&filter), None))
             }
 
             LibraryRequest::GetTrack { hash } => match self.get_track(&hash) {
@@ -388,9 +462,32 @@ impl LibraryService {
                 )
             }
 
-            LibraryRequest::WriteBookmark { .. } => LibraryResponse::BookmarkWritten,
+            // Server-side alias of WriteMark for old clients. They can't decode new
+            // error variants, so a bad scope is an `Internal` error.
+            LibraryRequest::WriteBookmark { hash, scope } => {
+                match bookmark_scope_mark(scope.as_deref())
+                    .and_then(|mark| self.write_mark(&hash, &mark))
+                {
+                    Ok(_) => LibraryResponse::BookmarkWritten,
+                    Err(e) => LibraryResponse::Error(e),
+                }
+            }
 
-            LibraryRequest::WriteFact { hash, fact } => {
+            LibraryRequest::WriteMark { hash, mark } => match self.write_mark(&hash, &mark) {
+                Ok(outcome) => LibraryResponse::MarkWritten(outcome),
+                Err(e) => LibraryResponse::Error(e),
+            },
+
+            LibraryRequest::UnmarkTrack { hash, mark } => match self.unmark(&hash, &mark) {
+                Ok(outcome) => LibraryResponse::TrackUnmarked(outcome),
+                Err(e) => LibraryResponse::Error(e),
+            },
+
+            LibraryRequest::WriteFact { hash, fact, source } => {
+                self.written
+                    .lock()
+                    .unwrap()
+                    .push((hash.clone(), fact.clone(), source));
                 // Store the fact in the fact_index so has_facts probes work in tests.
                 let variant_name = fact.display_name();
                 let value_str = fact.to_string();
@@ -400,11 +497,20 @@ impl LibraryService {
                     .entry(FactType::new(variant_name))
                     .or_default()
                     .insert(value_str);
+                if matches!(fact, MusicValue::Bookmarked { .. }) {
+                    self.with_track(&hash, |t| apply_fact(t, &fact));
+                }
                 tracing::debug!(hash = %hash.as_str(), "Stub: WriteFact stored");
                 LibraryResponse::FactWritten
             }
 
-            LibraryRequest::RetractFact { .. } => LibraryResponse::FactRetracted,
+            LibraryRequest::RetractFact { hash, fact, .. } => {
+                match self.try_with_track(&hash, |t| retract_fact(t, &fact)) {
+                    Ok(true) => LibraryResponse::FactRetracted,
+                    Ok(false) => LibraryResponse::NothingToRetract,
+                    Err(e) => LibraryResponse::Error(e),
+                }
+            }
 
             LibraryRequest::RetractSourceFacts { .. } => LibraryResponse::SourceFactsRetracted,
 
@@ -500,6 +606,79 @@ impl LibraryService {
         }
     }
 
+    /// Visible tracks that match `filter` (hidden tracks excluded), optionally limited.
+    fn tracks_where(
+        &self,
+        filter: impl Fn(&IndexedTrack) -> bool,
+        limit: Option<usize>,
+    ) -> Vec<TrackInfo> {
+        let tracks = self.tracks.lock().unwrap();
+        let iter = tracks
+            .iter()
+            .filter(|t| !t.is_hidden() && filter(t))
+            .map(|t| t.to_track_info());
+        match limit {
+            Some(n) => iter.take(n).collect(),
+            None => iter.collect(),
+        }
+    }
+
+    /// Run `f` on the track `hash` resolves to; an unknown or ambiguous hash is
+    /// skipped.
+    fn with_track(&self, hash: &ContentHash, f: impl FnOnce(&mut IndexedTrack)) {
+        let _ = self.try_with_track(hash, f);
+    }
+
+    /// Run `f` on the track `hash` resolves to; an unknown or ambiguous hash is
+    /// an error.
+    fn try_with_track<T>(
+        &self,
+        hash: &ContentHash,
+        f: impl FnOnce(&mut IndexedTrack) -> T,
+    ) -> Result<T, ProtocolError> {
+        let full_hash = self.resolve_hash(hash)?;
+        let mut tracks = self.tracks.lock().unwrap();
+        tracks
+            .iter_mut()
+            .find(|t| t.content_hash == full_hash.as_str())
+            .map(f)
+            .ok_or_else(|| ProtocolError::TrackNotFound {
+                hash: hash.as_str().to_owned(),
+            })
+    }
+
+    /// Apply `mark` to a track unless the track already carries it live; then
+    /// nothing is stored and the original time is kept.
+    fn write_mark(&self, hash: &ContentHash, mark: &Mark) -> Result<MarkWrite, ProtocolError> {
+        self.try_with_track(hash, |track| {
+            if track.bookmarks.iter().any(|v| mark.matches(v)) {
+                return MarkWrite::AlreadyLive;
+            }
+            track.bookmarks.push(mark.fact_value(chrono::Utc::now()));
+            MarkWrite::Written
+        })
+    }
+
+    /// Remove every live assertion of `mark` from a track. `count` is the number of
+    /// distinct values removed, like the real service's one retract per value (the
+    /// stub keeps no sources).
+    fn unmark(&self, hash: &ContentHash, mark: &Mark) -> Result<Unmark, ProtocolError> {
+        self.try_with_track(hash, |track| {
+            let mut removed: Vec<MusicValue> = Vec::new();
+            track.bookmarks.retain(|v| {
+                if !mark.matches(v) {
+                    return true;
+                }
+                if !removed.contains(v) {
+                    removed.push(v.clone());
+                }
+                false
+            });
+            NonZeroUsize::new(removed.len())
+                .map_or(Unmark::NotLive, |count| Unmark::Retracted { count })
+        })
+    }
+
     /// Resolve a partial hash to a full hash (same algorithm as real service).
     fn resolve_hash(&self, partial: &ContentHash) -> Result<ContentHash, ProtocolError> {
         let normalize = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
@@ -584,13 +763,7 @@ impl LibraryService {
 
     /// Search tracks against a `TrackQuery` (hidden tracks excluded).
     fn search_tracks(&self, query: &TrackQuery) -> Vec<TrackInfo> {
-        let tracks = self.tracks.lock().unwrap();
-        tracks
-            .iter()
-            .filter(|t| !t.is_hidden())
-            .filter(|t| matches_query(query, &t.as_fields()))
-            .map(|t| t.to_track_info())
-            .collect()
+        self.tracks_where(|t| matches_query(query, &t.as_fields()), None)
     }
 }
 
@@ -641,8 +814,21 @@ fn apply_fact(entry: &mut IndexedTrack, value: &MusicValue) {
         }
         MusicValue::Role(v) => entry.role = Some(*v),
         MusicValue::Energy(v) => entry.energy = Some(*v),
+        MusicValue::Bookmarked { .. } => entry.bookmarks.push(value.clone()),
         _ => {} // ignore all other facts (key, format, cover art, timestamps, etc.)
     }
+}
+
+/// Apply a loaded retraction. Only bookmarks honour it: every equal value is removed. The real service also requires the same
+/// source (ADR-018); the stub keeps no sources, so it matches by value alone. Every
+/// other retraction is skipped.
+/// Whether anything was removed.
+fn retract_fact(entry: &mut IndexedTrack, value: &MusicValue) -> bool {
+    let before = entry.bookmarks.len();
+    if let MusicValue::Bookmarked { .. } = value {
+        entry.bookmarks.retain(|b| b != value);
+    }
+    entry.bookmarks.len() != before
 }
 
 /// Run the IPC server loop, handling requests until the socket closes.
@@ -653,9 +839,15 @@ pub fn run_ipc_server(svc: Arc<LibraryService>, address: &str) -> Result<(), Ser
     let server = IpcServer::bind(address)?;
 
     loop {
-        match server.recv() {
-            Ok(request) => {
-                let response = svc.handle_request(request);
+        match server.recv_raw() {
+            Ok(msg) => {
+                let response = match parse_request(&msg) {
+                    Ok(request) => svc.handle_request(request),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Stub: rejected unparsable request");
+                        LibraryResponse::Error(e)
+                    }
+                };
                 if let Err(e) = server.send(&response) {
                     tracing::error!(error = %e, "Stub: failed to send response");
                 }
@@ -679,12 +871,59 @@ mod tests {
     use super::*;
 
     fn empty_service() -> Arc<LibraryService> {
-        LibraryService::new(
-            PathBuf::from("/nonexistent"),
-            PathBuf::from("/nonexistent"),
-            "ipc:///dev/null",
-        )
-        .expect("empty stub")
+        LibraryService::from_metadata_dir(PathBuf::from("/nonexistent"))
+    }
+
+    /// Send `payload` on `req` and decode the reply (2s timeout).
+    fn exchange(req: &nng::Socket, payload: &[u8]) -> LibraryResponse {
+        req.send(nng::Message::from(payload))
+            .map_err(|(_, e)| e)
+            .expect("send");
+        let reply = req.recv().expect("a reply within the timeout");
+        serde_json::from_slice(&reply).expect("reply is a LibraryResponse")
+    }
+
+    #[test]
+    fn unparsable_request_gets_an_error_reply_and_the_server_keeps_serving() {
+        use nng::options::{Options, RecvTimeout};
+        let address = format!(
+            "ipc://{}/stub-invalid-request-{}.sock",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let svc = empty_service();
+        let server_address = address.clone();
+        let server = std::thread::spawn(move || run_ipc_server(svc, &server_address));
+
+        let req = nng::Socket::new(nng::Protocol::Req0).expect("req socket");
+        req.set_opt::<RecvTimeout>(Some(std::time::Duration::from_secs(2)))
+            .expect("timeout");
+        // The server thread binds asynchronously; retry the dial briefly.
+        let mut dialed = false;
+        for _ in 0..50 {
+            if req.dial(&address).is_ok() {
+                dialed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if !dialed {
+            if server.is_finished() {
+                let outcome = server.join().expect("server thread panicked");
+                panic!("stub server exited before it could be dialed: {outcome:?}");
+            }
+            panic!("could not dial the stub server");
+        }
+
+        match exchange(&req, b"not json") {
+            LibraryResponse::Error(ProtocolError::InvalidRequest { .. }) => {}
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+        match exchange(&req, br#"{"type":"Ping"}"#) {
+            LibraryResponse::Pong => {}
+            other => panic!("expected Pong after garbage, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(address.trim_start_matches("ipc://"));
     }
 
     fn name(s: &str) -> PlaylistName {
@@ -698,6 +937,557 @@ mod tests {
             }
             other => panic!("expected PlaylistNames, got {other:?}"),
         }
+    }
+
+    fn service_with_tracks(hashes: &[&str]) -> Arc<LibraryService> {
+        let svc = empty_service();
+        svc.tracks
+            .lock()
+            .unwrap()
+            .extend(hashes.iter().map(|h| IndexedTrack::new(h)));
+        svc
+    }
+
+    /// The content hashes of a `Tracks` response, sorted.
+    fn sorted_hashes(resp: LibraryResponse) -> Vec<String> {
+        match resp {
+            LibraryResponse::Tracks(tracks) => {
+                let mut hashes: Vec<String> = tracks
+                    .iter()
+                    .map(|t| t.content_hash.as_str().to_owned())
+                    .collect();
+                hashes.sort();
+                hashes
+            }
+            other => panic!("expected Tracks, got {other:?}"),
+        }
+    }
+
+    fn marked_any(svc: &LibraryService) -> Vec<String> {
+        marked(svc, MarkFilter::Any)
+    }
+
+    #[test]
+    fn write_bookmark_makes_list_marked_return_the_track() {
+        let svc = service_with_tracks(&["sha256:aaaa", "sha256:bbbb"]);
+        assert!(marked_any(&svc).is_empty());
+        let resp = svc.handle_request(LibraryRequest::WriteBookmark {
+            hash: ContentHash::new("aaaa"),
+            scope: Some("my-set".to_string()),
+        });
+        assert!(matches!(resp, LibraryResponse::BookmarkWritten), "{resp:?}");
+        assert_eq!(marked_any(&svc), vec!["sha256:aaaa".to_string()]);
+    }
+
+    #[test]
+    fn write_bookmark_rejects_an_unknown_track_like_the_real_service() {
+        let svc = service_with_tracks(&["sha256:aaaa"]);
+        let resp = svc.handle_request(LibraryRequest::WriteBookmark {
+            hash: ContentHash::new("ffff"),
+            scope: None,
+        });
+        assert!(
+            matches!(
+                resp,
+                LibraryResponse::Error(ProtocolError::TrackNotFound { .. })
+            ),
+            "{resp:?}"
+        );
+        assert!(marked_any(&svc).is_empty());
+    }
+
+    fn marked(svc: &LibraryService, filter: MarkFilter) -> Vec<String> {
+        sorted_hashes(svc.handle_request(LibraryRequest::ListMarked { filter }))
+    }
+
+    fn named_mark(s: &str) -> music_facts::Mark {
+        music_facts::Mark::Named(music_facts::MarkName::parse(s).unwrap())
+    }
+
+    /// One track per mark kind: default, named (stored as "Banger"), legacy
+    /// (empty scope), plus a hidden and a retracted mark that must never show.
+    fn service_with_one_track_per_mark() -> Arc<LibraryService> {
+        use stainless_facts::Operation::{Assert, Retract};
+        let ts = chrono::DateTime::from_timestamp(1_767_225_600, 0).unwrap();
+        let mark = |scope: Option<&str>| MusicValue::Bookmarked {
+            scope: scope.map(str::to_owned),
+            timestamp: ts,
+        };
+        let svc = service_from_facts(
+            "marks",
+            &[
+                ("sha256:markdefault01", mark(None), Assert),
+                ("sha256:marknamed01", mark(Some("Banger")), Assert),
+                ("sha256:marklegacy01", mark(Some("")), Assert),
+                ("sha256:markhidden01", mark(None), Assert),
+                ("sha256:markretracted01", mark(Some("banger")), Assert),
+                ("sha256:markretracted01", mark(Some("banger")), Retract),
+            ],
+        );
+        let resp = svc.handle_request(LibraryRequest::TrackDelete {
+            hash: ContentHash::new("sha256:markhidden01"),
+        });
+        assert!(matches!(resp, LibraryResponse::TrackDeleted), "{resp:?}");
+        svc
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn list_marked_any_lists_default_named_and_legacy_marks() {
+        let svc = service_with_one_track_per_mark();
+        assert_eq!(
+            marked(&svc, MarkFilter::Any),
+            strs(&[
+                "sha256:markdefault01",
+                "sha256:marklegacy01",
+                "sha256:marknamed01"
+            ])
+        );
+    }
+
+    #[test]
+    fn list_marked_only_default_excludes_named_and_legacy_marks() {
+        let svc = service_with_one_track_per_mark();
+        assert_eq!(
+            marked(&svc, MarkFilter::Only(music_facts::Mark::Default)),
+            strs(&["sha256:markdefault01"])
+        );
+    }
+
+    #[test]
+    fn list_marked_only_named_matches_a_differently_cased_stored_scope() {
+        let svc = service_with_one_track_per_mark();
+        assert_eq!(
+            marked(&svc, MarkFilter::Only(named_mark("banger"))),
+            strs(&["sha256:marknamed01"])
+        );
+    }
+
+    #[test]
+    fn list_marked_excludes_hidden_and_retracted_marks() {
+        let svc = service_with_one_track_per_mark();
+        let any = marked(&svc, MarkFilter::Any);
+        assert!(!any.contains(&"sha256:markhidden01".to_owned()));
+        assert!(!any.contains(&"sha256:markretracted01".to_owned()));
+    }
+
+    const MARK_TRACK: &str = "sha256:writemark01";
+
+    /// A stub holding one track, `MARK_TRACK`, plus `extra` marks loaded as facts.
+    fn service_with_mark_track(extra: &[MusicValue]) -> Arc<LibraryService> {
+        use stainless_facts::Operation::Assert;
+        let mut facts = vec![(
+            MARK_TRACK,
+            MusicValue::Title(music_facts::Title::new("T")),
+            Assert,
+        )];
+        facts.extend(extra.iter().map(|v| (MARK_TRACK, v.clone(), Assert)));
+        service_from_facts("write-mark", &facts)
+    }
+
+    const TRACK_A: &str = "sha256:marktrackA01";
+    const TRACK_B: &str = "sha256:marktrackB01";
+
+    /// A stub holding two titled tracks, `TRACK_A` and `TRACK_B`.
+    fn service_with_two_tracks() -> Arc<LibraryService> {
+        use stainless_facts::Operation::Assert;
+        let title = |h| (h, MusicValue::Title(music_facts::Title::new("T")), Assert);
+        service_from_facts("two-tracks", &[title(TRACK_A), title(TRACK_B)])
+    }
+
+    /// A `Bookmarked` value with a fixed timestamp, as a loaded fact would carry.
+    fn stored_bookmark(scope: &str, secs: i64) -> MusicValue {
+        MusicValue::Bookmarked {
+            scope: Some(scope.to_owned()),
+            timestamp: chrono::DateTime::from_timestamp(secs, 0).unwrap(),
+        }
+    }
+
+    fn assert_track_not_found(resp: LibraryResponse) {
+        assert!(
+            matches!(
+                resp,
+                LibraryResponse::Error(ProtocolError::TrackNotFound { .. })
+            ),
+            "{resp:?}"
+        );
+    }
+
+    fn write_mark(svc: &LibraryService, hash: &str, mark: &Mark) -> LibraryResponse {
+        svc.handle_request(LibraryRequest::WriteMark {
+            hash: ContentHash::new(hash),
+            mark: mark.clone(),
+        })
+    }
+
+    fn assert_mark_written(resp: LibraryResponse, expected: MarkWrite) {
+        match resp {
+            LibraryResponse::MarkWritten(outcome) => assert_eq!(outcome, expected),
+            other => panic!("expected MarkWritten({expected:?}), got {other:?}"),
+        }
+    }
+
+    /// The live bookmark values of `MARK_TRACK`.
+    fn live_bookmarks(svc: &LibraryService) -> Vec<MusicValue> {
+        let tracks = svc.tracks.lock().unwrap();
+        tracks
+            .iter()
+            .find(|t| t.content_hash == MARK_TRACK)
+            .expect("the mark track")
+            .bookmarks
+            .clone()
+    }
+
+    #[test]
+    fn write_mark_lists_the_track_under_that_mark() {
+        let svc = service_with_mark_track(&[]);
+        let banger = named_mark("banger");
+        assert_mark_written(write_mark(&svc, "writemark01", &banger), MarkWrite::Written);
+        assert_eq!(marked(&svc, MarkFilter::Only(banger)), strs(&[MARK_TRACK]));
+        assert!(marked(&svc, MarkFilter::Only(Mark::Default)).is_empty());
+    }
+
+    #[test]
+    fn write_mark_is_per_track() {
+        let svc = service_with_two_tracks();
+        let banger = named_mark("banger");
+        assert_mark_written(write_mark(&svc, TRACK_A, &banger), MarkWrite::Written);
+        assert_mark_written(write_mark(&svc, TRACK_B, &banger), MarkWrite::Written);
+    }
+
+    #[test]
+    fn write_mark_twice_is_already_live_and_changes_nothing() {
+        let svc = service_with_mark_track(&[]);
+        let banger = named_mark("banger");
+        assert_mark_written(write_mark(&svc, MARK_TRACK, &banger), MarkWrite::Written);
+        let before = live_bookmarks(&svc);
+        assert_eq!(before.len(), 1);
+
+        assert_mark_written(
+            write_mark(&svc, MARK_TRACK, &banger),
+            MarkWrite::AlreadyLive,
+        );
+        assert_eq!(live_bookmarks(&svc), before);
+    }
+
+    #[test]
+    fn write_mark_is_already_live_for_a_differently_cased_stored_mark() {
+        let svc = service_with_mark_track(&[stored_bookmark("Banger", 1_767_225_600)]);
+        let before = live_bookmarks(&svc);
+        assert_eq!(before.len(), 1);
+
+        assert_mark_written(
+            write_mark(&svc, MARK_TRACK, &named_mark("banger")),
+            MarkWrite::AlreadyLive,
+        );
+        assert_eq!(live_bookmarks(&svc), before);
+    }
+
+    #[test]
+    fn retract_that_removes_nothing_answers_nothing_to_retract() {
+        let svc = service_with_mark_track(&[]);
+        let resp = svc.handle_request(LibraryRequest::RetractFact {
+            hash: ContentHash::new(MARK_TRACK),
+            fact: MusicValue::Source("nothing".to_string()),
+            source: None,
+        });
+        assert!(
+            matches!(resp, LibraryResponse::NothingToRetract),
+            "{resp:?}"
+        );
+    }
+
+    #[test]
+    fn write_mark_writes_again_after_the_mark_was_retracted() {
+        let svc = service_with_mark_track(&[]);
+        let banger = named_mark("banger");
+        assert_mark_written(write_mark(&svc, MARK_TRACK, &banger), MarkWrite::Written);
+        let fact = live_bookmarks(&svc).remove(0);
+        let resp = svc.handle_request(LibraryRequest::RetractFact {
+            hash: ContentHash::new(MARK_TRACK),
+            fact,
+            source: None,
+        });
+        assert!(matches!(resp, LibraryResponse::FactRetracted), "{resp:?}");
+        assert!(live_bookmarks(&svc).is_empty());
+
+        assert_mark_written(write_mark(&svc, MARK_TRACK, &banger), MarkWrite::Written);
+        assert_eq!(live_bookmarks(&svc).len(), 1);
+    }
+
+    #[test]
+    fn two_marks_coexist_on_one_track() {
+        let svc = service_with_mark_track(&[]);
+        let banger = named_mark("banger");
+        assert_mark_written(write_mark(&svc, MARK_TRACK, &banger), MarkWrite::Written);
+        assert_mark_written(
+            write_mark(&svc, MARK_TRACK, &named_mark("opener")),
+            MarkWrite::Written,
+        );
+        assert_mark_written(
+            write_mark(&svc, MARK_TRACK, &Mark::Default),
+            MarkWrite::Written,
+        );
+        assert_eq!(live_bookmarks(&svc).len(), 3);
+        for mark in [banger, named_mark("opener"), music_facts::Mark::Default] {
+            assert_eq!(marked(&svc, MarkFilter::Only(mark)), strs(&[MARK_TRACK]));
+        }
+    }
+
+    #[test]
+    fn write_mark_rejects_an_unknown_track() {
+        let svc = service_with_mark_track(&[]);
+        assert_track_not_found(write_mark(&svc, "ffff", &music_facts::Mark::Default));
+        assert!(live_bookmarks(&svc).is_empty());
+    }
+
+    fn unmark(svc: &LibraryService, hash: &str, mark: &Mark) -> LibraryResponse {
+        svc.handle_request(LibraryRequest::UnmarkTrack {
+            hash: ContentHash::new(hash),
+            mark: mark.clone(),
+        })
+    }
+
+    fn assert_unmarked(resp: LibraryResponse, expected: Unmark) {
+        match resp {
+            LibraryResponse::TrackUnmarked(outcome) => assert_eq!(outcome, expected),
+            other => panic!("expected TrackUnmarked({expected:?}), got {other:?}"),
+        }
+    }
+
+    fn retracted(count: usize) -> Unmark {
+        Unmark::Retracted {
+            count: std::num::NonZeroUsize::new(count).unwrap(),
+        }
+    }
+
+    #[test]
+    fn unmark_removes_the_track_from_that_mark() {
+        let svc = service_with_mark_track(&[]);
+        let banger = named_mark("banger");
+        assert_mark_written(write_mark(&svc, MARK_TRACK, &banger), MarkWrite::Written);
+        assert_unmarked(unmark(&svc, MARK_TRACK, &banger), retracted(1));
+        assert!(marked(&svc, MarkFilter::Only(banger)).is_empty());
+        assert!(live_bookmarks(&svc).is_empty());
+    }
+
+    #[test]
+    fn unmark_keeps_the_other_marks() {
+        let svc = service_with_mark_track(&[]);
+        let banger = named_mark("banger");
+        for mark in [&banger, &named_mark("opener"), &Mark::Default] {
+            assert_mark_written(write_mark(&svc, MARK_TRACK, mark), MarkWrite::Written);
+        }
+        assert_unmarked(unmark(&svc, MARK_TRACK, &banger), retracted(1));
+        assert_eq!(live_bookmarks(&svc).len(), 2);
+        assert_unmarked(unmark(&svc, MARK_TRACK, &Mark::Default), retracted(1));
+        assert_eq!(
+            marked(&svc, MarkFilter::Only(named_mark("opener"))),
+            strs(&[MARK_TRACK])
+        );
+        assert_eq!(live_bookmarks(&svc).len(), 1);
+    }
+
+    #[test]
+    fn unmark_twice_is_not_live() {
+        let svc = service_with_mark_track(&[]);
+        let banger = named_mark("banger");
+        assert_mark_written(write_mark(&svc, MARK_TRACK, &banger), MarkWrite::Written);
+        assert_unmarked(unmark(&svc, MARK_TRACK, &banger), retracted(1));
+        assert_unmarked(unmark(&svc, MARK_TRACK, &banger), Unmark::NotLive);
+    }
+
+    #[test]
+    fn unmark_removes_a_differently_cased_stored_mark() {
+        let svc = service_with_mark_track(&[stored_bookmark("Banger", 1_767_225_600)]);
+        assert_unmarked(
+            unmark(&svc, MARK_TRACK, &named_mark("banger")),
+            retracted(1),
+        );
+        assert!(live_bookmarks(&svc).is_empty());
+    }
+
+    #[test]
+    fn unmark_removes_every_live_entry_of_the_mark() {
+        // The stub has no sources; two loaded assertions stand in for a merge carry.
+        let svc = service_with_mark_track(&[
+            stored_bookmark("banger", 1_767_225_600),
+            stored_bookmark("banger", 1_767_312_000),
+        ]);
+        assert_eq!(live_bookmarks(&svc).len(), 2);
+        assert_unmarked(
+            unmark(&svc, MARK_TRACK, &named_mark("banger")),
+            retracted(2),
+        );
+        assert!(live_bookmarks(&svc).is_empty());
+    }
+
+    #[test]
+    fn unmark_is_per_track() {
+        let svc = service_with_two_tracks();
+        let banger = named_mark("banger");
+        for hash in [TRACK_A, TRACK_B] {
+            assert_mark_written(write_mark(&svc, hash, &banger), MarkWrite::Written);
+        }
+        assert_unmarked(unmark(&svc, TRACK_A, &banger), retracted(1));
+        assert_eq!(marked(&svc, MarkFilter::Only(banger)), strs(&[TRACK_B]));
+    }
+
+    #[test]
+    fn unmark_rejects_an_unknown_track() {
+        let svc = service_with_mark_track(&[]);
+        assert_track_not_found(unmark(&svc, "ffff", &Mark::Default));
+    }
+
+    #[test]
+    fn write_mark_writes_again_after_unmark() {
+        let svc = service_with_mark_track(&[]);
+        let banger = named_mark("banger");
+        assert_mark_written(write_mark(&svc, MARK_TRACK, &banger), MarkWrite::Written);
+        assert_unmarked(unmark(&svc, MARK_TRACK, &banger), retracted(1));
+        assert_mark_written(write_mark(&svc, MARK_TRACK, &banger), MarkWrite::Written);
+        assert_eq!(live_bookmarks(&svc).len(), 1);
+    }
+
+    fn write_bookmark(svc: &LibraryService, scope: Option<&str>) -> LibraryResponse {
+        svc.handle_request(LibraryRequest::WriteBookmark {
+            hash: ContentHash::new(MARK_TRACK),
+            scope: scope.map(str::to_owned),
+        })
+    }
+
+    #[test]
+    fn write_bookmark_with_a_scope_stores_the_normalised_mark() {
+        let svc = service_with_mark_track(&[]);
+        let resp = write_bookmark(&svc, Some("Friday"));
+        assert!(matches!(resp, LibraryResponse::BookmarkWritten), "{resp:?}");
+        let stored: Vec<_> = live_bookmarks(&svc)
+            .into_iter()
+            .filter_map(|v| match v {
+                MusicValue::Bookmarked { scope, .. } => Some(scope),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stored, vec![Some("friday".to_owned())]);
+    }
+
+    #[test]
+    fn write_bookmark_without_a_scope_stores_the_default_mark() {
+        let svc = service_with_mark_track(&[]);
+        let resp = write_bookmark(&svc, None);
+        assert!(matches!(resp, LibraryResponse::BookmarkWritten), "{resp:?}");
+        assert_eq!(
+            marked(&svc, MarkFilter::Only(music_facts::Mark::Default)),
+            strs(&[MARK_TRACK])
+        );
+    }
+
+    #[test]
+    fn write_bookmark_twice_still_answers_bookmark_written() {
+        let svc = service_with_mark_track(&[]);
+        let first = write_bookmark(&svc, Some("friday"));
+        assert!(
+            matches!(first, LibraryResponse::BookmarkWritten),
+            "{first:?}"
+        );
+        let resp = write_bookmark(&svc, Some("friday"));
+        assert!(matches!(resp, LibraryResponse::BookmarkWritten), "{resp:?}");
+        assert_eq!(live_bookmarks(&svc).len(), 1);
+    }
+
+    #[test]
+    fn write_bookmark_with_an_empty_scope_is_an_internal_error() {
+        let svc = service_with_mark_track(&[]);
+        match write_bookmark(&svc, Some("")) {
+            LibraryResponse::Error(ProtocolError::Internal { message }) => {
+                assert!(message.contains("empty"), "{message}");
+            }
+            other => panic!("expected Internal, got {other:?}"),
+        }
+        assert!(live_bookmarks(&svc).is_empty());
+    }
+
+    #[test]
+    fn list_marked_excludes_hidden_tracks_marked_via_write_bookmark() {
+        let svc = service_with_tracks(&["sha256:aaaa"]);
+        let resp = svc.handle_request(LibraryRequest::WriteBookmark {
+            hash: ContentHash::new("aaaa"),
+            scope: None,
+        });
+        assert!(matches!(resp, LibraryResponse::BookmarkWritten), "{resp:?}");
+        svc.handle_request(LibraryRequest::TrackDelete {
+            hash: ContentHash::new("sha256:aaaa"),
+        });
+        assert!(marked_any(&svc).is_empty());
+    }
+
+    /// Build a stub from a facts.jsonl holding `facts` (`(hash, value, op)`),
+    /// in a fresh temp dir that is removed afterwards.
+    fn service_from_facts(
+        test: &str,
+        facts: &[(&str, MusicValue, stainless_facts::Operation)],
+    ) -> Arc<LibraryService> {
+        use stainless_facts::{Fact, FactStreamWriter};
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Unique per call: tests sharing a `test` name run in parallel.
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("mdma-stub-{test}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = FactSource::new("test", "1.0.0", "Unknown");
+        let ts = chrono::Utc::now();
+        let batch: Vec<Fact<ContentHash, MusicValue, FactSource>> = facts
+            .iter()
+            .map(|(hash, v, op)| {
+                Fact::new(ContentHash::new(*hash), v.clone(), ts, source.clone(), *op)
+            })
+            .collect();
+        FactStreamWriter::open(dir.join("facts.jsonl"))
+            .unwrap()
+            .write_batch(&batch)
+            .unwrap();
+        let svc = LibraryService::from_metadata_dir(dir.clone());
+        std::fs::remove_dir_all(&dir).unwrap();
+        svc
+    }
+
+    fn a_bookmark() -> MusicValue {
+        MusicValue::Bookmarked {
+            scope: None,
+            timestamp: chrono::DateTime::from_timestamp(1_767_225_600, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_loaded_bookmark_fact_marks_the_track() {
+        use stainless_facts::Operation;
+        let svc = service_from_facts(
+            "bookmark-assert",
+            &[("sha256:aaaa", a_bookmark(), Operation::Assert)],
+        );
+        assert_eq!(marked_any(&svc), vec!["sha256:aaaa".to_string()]);
+    }
+
+    #[test]
+    fn a_loaded_bookmark_retract_unmarks_the_track() {
+        use stainless_facts::Operation;
+        let svc = service_from_facts(
+            "bookmark-retract",
+            &[
+                (
+                    "sha256:aaaa",
+                    MusicValue::Title(music_facts::Title::new("Kept")),
+                    Operation::Assert,
+                ),
+                ("sha256:aaaa", a_bookmark(), Operation::Assert),
+                ("sha256:aaaa", a_bookmark(), Operation::Retract),
+            ],
+        );
+        assert!(marked_any(&svc).is_empty());
     }
 
     #[test]

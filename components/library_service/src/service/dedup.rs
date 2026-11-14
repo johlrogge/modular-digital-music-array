@@ -14,24 +14,12 @@ use crate::ipc::{
     DedupDisposition, DedupGroup, DedupMember, DedupScanReport,
 };
 use chrono::{DateTime, Utc};
-use music_facts::{FactOrigin, FactSource};
+use music_facts::FactSource;
 use stainless_facts::Operation;
 use std::collections::BTreeSet;
 use std::mem::{discriminant, Discriminant};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-
-/// `FactSource::tool` of the facts a dedup merge writes itself (`Replaces(loser)`).
-const DEDUP_TOOL: &str = "mdma-dedup";
-
-pub(super) fn dedup_fact_source() -> FactSource {
-    FactSource::new(DEDUP_TOOL, env!("CARGO_PKG_VERSION"), FactOrigin::Unknown)
-}
-
-/// The `FactSource` of facts a user action writes (ADR-004 replace, soft delete).
-pub(super) fn user_fact_source() -> FactSource {
-    FactSource::new("mdma", env!("CARGO_PKG_VERSION"), FactOrigin::User)
-}
 
 // =========================================================================
 // Fact rules (pure)
@@ -46,8 +34,11 @@ pub(super) struct LiveFact {
 }
 
 /// The assertions of an entity that no later retraction has cancelled, in stream
-/// order. A retraction cancels the first assertion with the same value and source,
-/// exactly like the in-memory projection does.
+/// order. A retraction cancels every earlier assertion with an equal value and the
+/// same source (`FactSource::same_source`), through the same `remove_cancelled` the
+/// in-memory projection uses. That holds for provenance-tracked values only: in memory
+/// the retracts of TrackStarted, TrackStopped, FilePath and AddedAt are ignored,
+/// whereas this replay cancels them too.
 pub(super) fn live_facts(lines: &[String]) -> Vec<LiveFact> {
     let mut live: Vec<LiveFact> = Vec::new();
     for line in lines {
@@ -61,12 +52,7 @@ pub(super) fn live_facts(lines: &[String]) -> Vec<LiveFact> {
                 timestamp: *f.timestamp(),
             }),
             Operation::Retract => {
-                if let Some(i) = live
-                    .iter()
-                    .position(|l| &l.value == f.value() && &l.source == f.source())
-                {
-                    live.remove(i);
-                }
+                remove_cancelled(&mut live, f.value(), f.source(), |l| (&l.value, &l.source));
             }
         }
     }
@@ -144,12 +130,11 @@ fn carry_rule(v: &MusicValue) -> CarryRule {
 }
 
 /// Members of a multi-valued attribute are the same when they are equal; a
-/// bookmark is the same bookmark when it has the same scope.
-fn same_member(a: &MusicValue, b: &MusicValue) -> bool {
-    match (a, b) {
-        (MusicValue::Bookmarked { scope: x, .. }, MusicValue::Bookmarked { scope: y, .. }) => {
-            x == y
-        }
+/// bookmark is the same bookmark when it carries the same mark (legacy scopes
+/// compare by their raw text).
+pub(super) fn same_member(a: &MusicValue, b: &MusicValue) -> bool {
+    match (a.stored_mark(), b.stored_mark()) {
+        (Some(x), Some(y)) => x == y,
         _ => a == b,
     }
 }
@@ -630,7 +615,7 @@ impl LibraryService {
                 return report;
             }
         };
-        let source = dedup_fact_source();
+        let source = self.sources.dedup.clone();
 
         for loser in losers {
             match self.merge_into(winner, loser, &source, carry.take().unwrap_or_default()) {
@@ -1005,7 +990,9 @@ impl LibraryService {
             .iter()
             .flat_map(|t| t.provenance.iter())
             .filter_map(|(v, s)| match v {
-                MusicValue::Replaces(h) if s.tool == DEDUP_TOOL => Some(hash_key(h.as_str())),
+                MusicValue::Replaces(h) if s.tool == sources::DEDUP_TOOL => {
+                    Some(hash_key(h.as_str()))
+                }
                 _ => None,
             })
             .filter(|key| !live.contains(key))

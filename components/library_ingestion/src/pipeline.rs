@@ -36,19 +36,6 @@ pub enum IngestError {
     Io(#[from] std::io::Error),
 }
 
-/// Source of the upload (for tracking provenance)
-#[derive(Debug, Clone)]
-pub enum UploadSource {
-    /// Dropped into inbox via SMB/NFS
-    NetworkShare,
-    /// Uploaded via HTTP
-    HttpUpload,
-    /// Downloaded from Bandcamp
-    BandcampDownload { artist_url: Option<String> },
-    /// Extracted from Beatport zip
-    BeatportZip { order_id: Option<String> },
-}
-
 /// Supported audio formats
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioFormat {
@@ -102,13 +89,12 @@ impl AudioFormat {
 /// A file in the inbox, not yet validated
 pub struct InboxFile {
     pub path: PathBuf,
-    pub source: UploadSource,
 }
 
 impl InboxFile {
     /// Create from a path in the inbox
-    pub fn new(path: PathBuf, source: UploadSource) -> Self {
-        Self { path, source }
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
     }
 
     /// Validate the file and compute its hash
@@ -136,7 +122,6 @@ impl InboxFile {
             path: self.path,
             format,
             content_hash,
-            source: self.source,
         })
     }
 }
@@ -150,22 +135,33 @@ pub struct ValidatedAudio {
     pub path: PathBuf,
     pub format: AudioFormat,
     pub content_hash: ContentHash,
-    pub source: UploadSource,
 }
 
 impl ValidatedAudio {
     /// Extract metadata from the audio file
     /// Consumes self, transferring ownership to ExtractedTrack
-    pub fn extract_metadata(self) -> Result<ExtractedTrack, IngestError> {
+    ///
+    /// `library` is the source of the facts the library computes (file path, format,
+    /// import time). `content` is the source of the facts the file's tags state.
+    pub fn extract_metadata(
+        self,
+        library: &FactSource,
+        content: &FactSource,
+    ) -> Result<ExtractedTrack, IngestError> {
         // Only read metadata, not audio data
-        let facts = extract_facts(&self.path, &self.content_hash, self.format)?;
+        let facts = crate::fact_generator::generate_facts(
+            &self.path,
+            &self.content_hash,
+            self.format,
+            library,
+            content,
+        )?;
 
         Ok(ExtractedTrack {
             path: self.path,
             format: self.format,
             content_hash: self.content_hash,
             facts,
-            source: self.source,
         })
     }
 }
@@ -180,7 +176,6 @@ pub struct ExtractedTrack {
     pub format: AudioFormat,
     pub content_hash: ContentHash,
     pub facts: Vec<(MusicValue, FactSource)>,
-    pub source: UploadSource,
 }
 
 impl ExtractedTrack {
@@ -250,15 +245,6 @@ fn compute_hash(path: &std::path::Path) -> Result<ContentHash, IngestError> {
     let result = hasher.finalize();
     let hash_string = hex::encode(result);
     Ok(ContentHash::new(format!("sha256:{}", hash_string)))
-}
-
-/// Extract metadata facts from audio file
-fn extract_facts(
-    path: &std::path::Path,
-    content_hash: &ContentHash,
-    format: AudioFormat,
-) -> Result<Vec<(MusicValue, FactSource)>, IngestError> {
-    crate::fact_generator::generate_facts(path, content_hash, format)
 }
 
 /// Create human-readable symlink in by-artist directory
@@ -361,7 +347,7 @@ mod tests {
         let wav_path = dir.path().join("track.wav");
         std::fs::write(&wav_path, b"RIFF fake wav data").unwrap();
 
-        let inbox = InboxFile::new(wav_path, UploadSource::HttpUpload);
+        let inbox = InboxFile::new(wav_path);
         let result = inbox.validate();
 
         // WAV is now ingestible; validate should NOT return NonIngestibleFormat
@@ -377,7 +363,7 @@ mod tests {
         let m4a_path = dir.path().join("track.m4a");
         std::fs::write(&m4a_path, b"\x00\x00\x00\x20ftyp fake m4a data").unwrap();
 
-        let inbox = InboxFile::new(m4a_path, UploadSource::HttpUpload);
+        let inbox = InboxFile::new(m4a_path);
         let result = inbox.validate();
 
         // M4A is ingestible; validate should NOT return NonIngestibleFormat
@@ -393,7 +379,7 @@ mod tests {
         let aiff_path = dir.path().join("track.aiff");
         std::fs::write(&aiff_path, b"FORM fake aiff data").unwrap();
 
-        let inbox = InboxFile::new(aiff_path, UploadSource::HttpUpload);
+        let inbox = InboxFile::new(aiff_path);
         let result = inbox.validate();
 
         match result {

@@ -23,34 +23,51 @@ mdma search --added "^week"
 
 # Compose with dmenu for keyboard-driven browsing
 mdma search fact-values-for Artist | dmenu | xargs -I{} mdma search --artist {}
-mdma search --artist CBL | dmenu | mdma queue append
+mdma search --artist CBL | dmenu | mdma queue append -
 
 # Pipe composition: search → sort → queue
-mdma search --artist CBL | mdma sort title -a | mdma queue append
+mdma search --artist CBL | mdma sort title -a - | mdma queue append -
 
 # Export a set of tracks as AIFF (e.g. for Rekordbox import)
-mdma search --bpm "128..132" --key "8A" | mdma export --lossless-format aiff --output ./rekordbox-prep/
+mdma search --bpm "128..132" --key "8A" | mdma export --lossless-format aiff --output ./rekordbox-prep/ -
 
 # Playlists — create, populate, and compose with pipes
-mdma playlist create friday-night
-mdma search --genre Techno | mdma playlist add friday-night
-mdma playlist get friday-night | mdma queue replace
+mdma search --genre Techno | mdma playlist new friday-night -
+mdma search --genre Techno | mdma playlist append friday-night -
+mdma playlist get friday-night | mdma queue replace -
 
 # Find which playlists contain a track (or a set of tracks from stdin)
-mdma search --artist CBL | mdma playlist contains --all
+mdma search --artist CBL | mdma playlist contains --all -
 
-# Bookmark the currently playing track
-mdma bookmark
+# Stdin is read only when `-` is given, by every command; without it nothing is read
+mdma search --bpm 120..130 | mdma mark -
+mdma search --genre Techno | mdma search --year 2020..2024 -   # keep only tracks also on stdin
+mdma playlist list | dmenu | mdma playlist get -   # playlist names on stdin
+mdma search --artist CBL | mdma get -              # hashes on stdin: get, facts, fact add/retract,
+mdma search --artist CBL | mdma facts -            # library track delete/restore, queue next/append/remove
 
-# Bookmark a specific track by content hash, associated with a named set
-mdma bookmark sha256:abc123 --scope "friday-night-picks"
+# Mark the playing track "liked" (the default mark)
+mdma mark
 
-# List all bookmarked tracks
-mdma bookmarks
+# Check Bandcamp for changed items; runs as a background job on the node — new in 0.37.0
+mdma source bandcamp check-updates
+
+# Retract Rekordbox-imported facts (origin must be named) — new in 0.37.0
+mdma fact retract sha256:abc12345 --field role --value banger --origin Rekordbox
+
+# Mark tracks piped on stdin with a named mark
+mdma search --artist CBL | mdma mark banger -
+
+# Remove a mark (liked unless a name is given)
+mdma marked banger | mdma unmark banger -
+
+# List tracks with any mark, or with one mark
+mdma marked
+mdma marked banger
 
 # Hand-tag role and energy — new in 0.25.0
-mdma fact set sha256:abc123 role banger
-mdma fact set sha256:abc123 energy 9
+mdma fact set sha256:abc12345 role banger
+mdma fact set sha256:abc12345 energy 9
 
 # Import Rekordbox XML and land beat-grid / memory-cue facts — new in 0.25.0
 mdma rekordbox import --enrich rekordbox.xml
@@ -128,7 +145,7 @@ This is a [Polylith](https://polylith.gitbook.io/polylith/) workspace. Deployabl
 | `mdma-tui` | Terminal UI — multi-pane tabs (nnn-style, `1`–`5`/`6`–`0`), field-aware search grammar (`:artist`, `:bpm`, `:added`, …), DJ shortcuts (`A`, `P`, `d`/`p`, `u`), modal keybindings, command palette, live queue sync, intelligent column compression |
 | `mdma-bandcamp` | Bandcamp source — collection sync into the library inbox, fan playlist listing/fetching, and background playlist import jobs for `mdma source bandcamp` |
 | `mdma-console` | Web management console — player controls, search, queue, upload, export |
-| `mdma-cli` | CLI — search, queue, playlists, playback, export, subscribe, bookmarks, Bandcamp playlist import, shell completions |
+| `mdma-cli` | CLI — search, queue, playlists, playback, export, subscribe, marks, Bandcamp playlist import, shell completions |
 | `dj-workspace` | Bevy GUI app (laptop-only, not packaged for Pi) — playlist browser and BPM/Key/Role/Energy candidate finder with sortable results; connects via gateway (`dj-workspace --node <host>`) |
 
 **Key components** (shared libraries):
@@ -191,6 +208,23 @@ export MDMA_NODE="mdma-909.local"
 mdma ping
 ```
 
+`--node` and `MDMA_NODE` take `host[:port]` (port 1-65535). A bad `--node` is a usage error (exit 2). A bad `MDMA_NODE` is reported only when a command needs a node; it exits 1 and names the variable.
+
+### Help, errors and completions
+
+```bash
+mdma search --help      # help for one command (there is no `mdma help <cmd>`)
+mdma source bandcamp --help   # `source NAME --help` shows the source group's page
+mdma --version          # prints "Version: x.y.z"
+
+# Shell completions: bash, zsh or fish
+mdma generate-completions bash > ~/.local/share/bash-completion/completions/mdma
+```
+
+`generate-completions` is hidden from `--help`. elvish and PowerShell completions are no longer provided. Regenerate any completion script you installed earlier.
+
+Bad argument values are rejected while parsing, before anything connects, with the parser's error text and exit code 2. Runtime failures (node unreachable, service error) exit 1. Track hashes on the command line need at least 8 lowercase hex characters, with an optional `sha256:` prefix. A date option value that starts with a dash must be glued to the flag: `--added=-7` (`--added -7` is rejected).
+
 ---
 
 ## Installing on macOS
@@ -202,7 +236,7 @@ Copy `scripts/install-mdma-macos.sh` from this repo to your Mac and run it. It r
 bash install-mdma-macos.sh
 
 # Install a specific tag
-bash install-mdma-macos.sh v0.36.1
+bash install-mdma-macos.sh v0.37.0
 
 # Install to a user-writable location (no sudo)
 MDMA_INSTALL_DIR=~/.local/bin bash install-mdma-macos.sh
@@ -222,6 +256,33 @@ cp profiles/dev/target/release/mdma /usr/local/bin/
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 
 ---
+
+## What's new in 0.37.0
+
+### Client-owned fact sources, stdin only with `-`, background update checks
+
+- **Client-owned fact sources (ADR-020).** The library no longer knows specific sources; clients state their own. Rekordbox imports are `mdma` / `Rekordbox`, uploads are `mdma` / `Upload`. `mdma fact retract --origin <ORIGIN>` names the origin to retract, and a retract that matches nothing is reported as `NothingToRetract`. A retract matches value and source identity (tool plus origin kind), not the whole source (ADR-018). The library stamps its facts with the release version.
+- **Merges keep plays, and `library track replace` carries facts like a merge** (ADR-017 phase 0).
+- **The gateway is concurrent** and no longer resends a request.
+- **Bandcamp:** `check-item` and `check-updates` read the live track count from the download page, and `check-updates` runs as a background job that handles rate limits.
+- **mdma-cli on hicli 0.7:** errors name the flag, closed value sets are listed, and completions know them. In the devenv shell, `mdma-completions` provides them.
+- **Breaking: stdin is read only when `-` is given.** `mdma mark` and `mdma unmark` without `-` act on the playing track; commands that only take stdin are a usage error without `-`. Example: `mdma search --bpm 120..130 | mdma mark -`.
+
+**Upgrade notes:** BREAKING. Old CLIs do not understand `NothingToRetract`, and scripts that relied on implicit stdin need `-`. Upgrade all mdma-* packages together, by name. See CHANGELOG.md.
+
+---
+
+## Earlier unreleased changes (shipped in 0.37.0)
+
+### Breaking: mdma-cli moves from clap to hicli 0.2 (ADR-015)
+
+Bad argument values are now usage errors (exit 2, parser's error text) raised before anything connects; runtime failures exit 1. Scripts that parse the old messages or depend on the loosened values below need updating. See CHANGELOG.md for the full list.
+
+### Marks replace bookmarks (ADR-016)
+
+- **Marks** — `mdma mark [NAME]` marks the tracks whose hashes are piped on stdin with `-`; without `-` it marks the playing track. With no NAME it applies the default mark, "liked". `mdma unmark [NAME]` removes a mark the same way. `mdma marked [NAME]` lists tracks with that mark, or with any mark when NAME is left out; `mdma marked liked` lists only the default mark. Mark names are lowercase, 1-64 characters. Marks are stored as `Bookmarked` facts in the ACID store with `FactOrigin::User` provenance.
+- **Breaking: `bookmark` and `bookmarks` are now aliases of `mark` and `marked`.** The `--scope` option and the HASH argument are gone; pipe hashes on stdin instead.
+- **TUI mark keybinding** — in Playback mode, pressing `b` marks the playing track "liked". It reports "Marked liked" or "Already marked liked".
 
 ## What's new in 0.36.1
 

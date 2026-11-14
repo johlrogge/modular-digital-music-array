@@ -607,7 +607,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
             key("c"),
             desc("    clear queue"),
         ]),
-        Line::from(vec![key("  b      "), desc(" bookmark current track")]),
+        Line::from(vec![key("  b      "), desc(" mark current track liked")]),
         Line::from(vec![key("  Esc    "), desc(" back to normal")]),
         gap.clone(),
         Line::from(vec![

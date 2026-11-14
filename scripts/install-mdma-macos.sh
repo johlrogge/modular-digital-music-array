@@ -193,6 +193,8 @@ fi
 # --------------------------------------------------------------------------
 
 CLI_VERSION="$("${INSTALL_DIR}/mdma" --version 2>/dev/null || echo "${TAG}")"
+# Newer CLIs print "Version: x.y.z"; keep just the version.
+CLI_VERSION="${CLI_VERSION#Version: }"
 
 echo ""
 echo "Installed:"

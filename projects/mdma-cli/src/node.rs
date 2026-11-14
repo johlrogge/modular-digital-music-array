@@ -10,9 +10,11 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::ctx::Ctx;
+use color_eyre::eyre::{bail, eyre};
 use gateway_client::{GatewayClient, IdentifyError, NodeIdentity};
 use node_discovery::{
-    cache, resolve, select, DiscoveredNode, Effects, IdentityCheck, NodeCache, NodeKind,
+    cache, resolve, DiscoveredNode, Effects, IdentityCheck, NodeCache, NodeKind, NodeSpec,
     RemoteTarget, Request, ResolveError, SelectEffects, SelectError, Source, Target, Unreachable,
     VerifyError, BROWSE_TIMEOUT,
 };
@@ -23,10 +25,6 @@ const IDENTIFY_TIMEOUT: Duration = Duration::from_secs(1);
 /// Environment variable naming the node (split from `--node` so the two can be
 /// told apart).
 const NODE_ENV: &str = "MDMA_NODE";
-
-// =============================================================================
-// Pure parts
-// =============================================================================
 
 /// True when the CLI should talk to the local services over IPC instead of a
 /// gateway: sockets were given explicitly, or the library socket exists here.
@@ -316,10 +314,6 @@ pub fn identity_check(
     }
 }
 
-// =============================================================================
-// Effects
-// =============================================================================
-
 /// Ask the gateway at `ip:port` who it is; connecting and the answer are each
 /// bounded by [`IDENTIFY_TIMEOUT`].
 fn identify_at(ip: Ipv4Addr, port: u16) -> Result<IdentityCheck, Unreachable> {
@@ -371,12 +365,23 @@ fn real_effects() -> Effects<'static> {
     }
 }
 
-// =============================================================================
-// Resolution
-// =============================================================================
+/// How the error for a bad `MDMA_NODE` starts.
+pub const INVALID_ENV_NODE: &str = "invalid MDMA_NODE";
 
-fn env_node() -> Option<String> {
-    std::env::var(NODE_ENV).ok().filter(|v| !v.is_empty())
+/// `MDMA_NODE`. Empty counts as unset, so `MDMA_NODE= mdma ...` overrides a
+/// value exported by the environment (devenv sets one).
+fn parse_env_node(value: Option<&str>) -> Result<Option<NodeSpec>, String> {
+    match value.filter(|v| !v.is_empty()) {
+        None => Ok(None),
+        Some(v) => v
+            .parse()
+            .map(Some)
+            .map_err(|e| format!("{INVALID_ENV_NODE}: {e}")),
+    }
+}
+
+fn env_node() -> Result<Option<NodeSpec>, String> {
+    parse_env_node(std::env::var(NODE_ENV).ok().as_deref())
 }
 
 fn cache_path() -> Option<PathBuf> {
@@ -401,18 +406,21 @@ fn save_cache(update: &NodeCache) {
     }
 }
 
-fn request(explicit: Option<&str>, local_ipc: bool) -> Request {
-    Request {
-        explicit: explicit.filter(|s| !s.is_empty()).map(String::from),
-        env: env_node(),
+/// The resolution request; a bad `MDMA_NODE` is an error.
+fn request(explicit: Option<&NodeSpec>, local_ipc: bool) -> color_eyre::Result<Request> {
+    let env = env_node().map_err(|message| eyre!("{message}"))?;
+    Ok(Request {
+        explicit: explicit.cloned(),
+        env,
         local_ipc,
-    }
+    })
 }
 
 /// Resolve the node once at startup, remembering it when the resolver says
-/// so. Prints a note for implicit choices and exits with advice on failure.
-pub fn resolve_startup(explicit: Option<&str>, local_ipc: bool) -> Target {
-    match resolve(request(explicit, local_ipc), &mut real_effects()) {
+/// so. Prints a note for implicit choices; fails with advice when no node
+/// can be resolved.
+pub fn resolve_startup(explicit: Option<&NodeSpec>, local_ipc: bool) -> color_eyre::Result<Target> {
+    match resolve(request(explicit, local_ipc)?, &mut real_effects()) {
         Ok(resolution) => {
             if let Some(update) = &resolution.cache_update {
                 save_cache(update);
@@ -422,21 +430,15 @@ pub fn resolve_startup(explicit: Option<&str>, local_ipc: bool) -> Target {
                     eprintln!("{note}");
                 }
             }
-            resolution.target
+            Ok(resolution.target)
         }
-        Err(e) => {
-            eprintln!("{}", resolve_error_message(&e));
-            std::process::exit(1);
-        }
+        Err(e) => Err(eyre!("{}", resolve_error_message(&e))),
     }
 }
 
-// =============================================================================
-// `mdma node` subcommands
-// =============================================================================
-
-/// `mdma node list`
-pub fn handle_list() -> color_eyre::Result<()> {
+/// List MDMA nodes on the network (* marks the remembered node)
+#[hicli::command]
+pub(crate) fn list(_ctx: &Ctx) -> color_eyre::Result<()> {
     let nodes = node_discovery::browse(BROWSE_TIMEOUT);
     if nodes.is_empty() {
         println!("No MDMA nodes found on the network.");
@@ -450,29 +452,48 @@ pub fn handle_list() -> color_eyre::Result<()> {
     Ok(())
 }
 
-/// `mdma node select [name|id]`
-pub fn handle_select(query: Option<&str>) -> color_eyre::Result<()> {
+/// The remembered node's name, id and host that start with `typed`. Local state only
+/// (the node cache file, no network), and silent when there is none or it is unreadable.
+pub(crate) fn complete_nodes(typed: &str) -> Vec<hicli::Candidate> {
+    let cached = cache_path().and_then(|path| cache::load(&path).ok().flatten());
+    node_candidates(cached.as_ref(), typed)
+}
+
+fn node_candidates(cached: Option<&NodeCache>, typed: &str) -> Vec<hicli::Candidate> {
+    let Some(node) = cached else {
+        return Vec::new();
+    };
+    let mut out: Vec<hicli::Candidate> = Vec::new();
+    for (value, what) in [(&node.name, "name"), (&node.id, "id"), (&node.host, "host")] {
+        if !value.is_empty() && value.starts_with(typed) && !out.iter().any(|(v, _)| v == value) {
+            out.push((value.clone(), Some(format!("remembered node ({what})"))));
+        }
+    }
+    out
+}
+
+/// Node name or id
+// Stays a String: any text is a valid query; no match is reported by the resolver.
+#[derive(Debug, Clone, PartialEq, Eq, hicli::Arg)]
+#[arg(positional = "NAME", complete = complete_nodes)]
+pub(crate) struct NodeQueryArg(pub Option<String>);
+
+/// Remember a node (by name or id; prompts when omitted)
+#[hicli::command]
+pub(crate) fn select(query: NodeQueryArg, _ctx: &Ctx) -> color_eyre::Result<()> {
+    let NodeQueryArg(query) = query;
     let nodes = node_discovery::browse(BROWSE_TIMEOUT);
     let mut effects = SelectEffects {
         identify_at: Box::new(identify_at),
         pick: Box::new(pick_interactive),
         is_tty: is_tty(),
     };
-    let entry = match select(nodes, query, &mut effects) {
-        Ok(entry) => entry,
-        Err(e) => {
-            eprintln!("{}", select_error_message(&e));
-            std::process::exit(1);
-        }
-    };
+    let entry = node_discovery::select(nodes, query.as_deref(), &mut effects)
+        .map_err(|e| eyre!("{}", select_error_message(&e)))?;
     let Some(path) = cache_path() else {
-        eprintln!("No config directory is available to remember the node in.");
-        std::process::exit(1);
+        bail!("No config directory is available to remember the node in.");
     };
-    if let Err(e) = cache::save(&path, &entry) {
-        eprintln!("Could not remember node: {e}");
-        std::process::exit(1);
-    }
+    cache::save(&path, &entry).map_err(|e| eyre!("Could not remember node: {e}"))?;
     println!(
         "Selected {} ({}, {}:{}), saved to {}",
         entry.name,
@@ -484,17 +505,15 @@ pub fn handle_select(query: Option<&str>) -> color_eyre::Result<()> {
     Ok(())
 }
 
-/// `mdma node forget`
-pub fn handle_forget() -> color_eyre::Result<()> {
+/// Forget the remembered node
+#[hicli::command]
+pub(crate) fn forget(_ctx: &Ctx) -> color_eyre::Result<()> {
     let Some(path) = cache_path() else {
         println!("No config directory; nothing to forget.");
         return Ok(());
     };
     let previous = load_cache();
-    if let Err(e) = cache::forget(&path) {
-        eprintln!("Could not forget node: {e}");
-        std::process::exit(1);
-    }
+    cache::forget(&path).map_err(|e| eyre!("Could not forget node: {e}"))?;
     match previous {
         Some(c) => println!("Forgot {} ({})", c.name, c.id),
         None => println!("No remembered node."),
@@ -502,39 +521,89 @@ pub fn handle_forget() -> color_eyre::Result<()> {
     Ok(())
 }
 
-/// `mdma node show`: resolve like any command would, but save nothing.
-pub fn handle_show(explicit: Option<&str>, local_ipc: bool) -> color_eyre::Result<()> {
-    match resolve(request(explicit, local_ipc), &mut real_effects()) {
-        Ok(resolution) => {
-            match &resolution.target {
-                Target::LocalIpc => println!("Local services over IPC (no node)"),
-                Target::Remote(t) => {
-                    println!("Node:   {}", t.host);
-                    println!(
-                        "IP:     {}",
-                        t.ip.map_or("-".to_string(), |ip| ip.to_string())
-                    );
-                    println!("Port:   {}", t.port);
-                    println!("Source: {}", source_description(&t.source));
-                }
-            }
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("{}", resolve_error_message(&e));
-            std::process::exit(1);
+/// Show which node commands would use, and why
+///
+/// Resolves the node like any command would, but saves nothing.
+#[hicli::command]
+pub(crate) fn show(ctx: &Ctx) -> color_eyre::Result<()> {
+    let resolution = resolve(
+        request(ctx.node_flag(), ctx.local_ipc())?,
+        &mut real_effects(),
+    )
+    .map_err(|e| eyre!("{}", resolve_error_message(&e)))?;
+    match &resolution.target {
+        Target::LocalIpc => println!("Local services over IPC (no node)"),
+        Target::Remote(t) => {
+            println!("Node:   {}", t.host);
+            println!(
+                "IP:     {}",
+                t.ip.map_or("-".to_string(), |ip| ip.to_string())
+            );
+            println!("Port:   {}", t.port);
+            println!("Source: {}", source_description(&t.source));
         }
     }
+    Ok(())
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::run_arg;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn node_query_arg_parser_is_an_optional_positional() {
+        assert_eq!(run_arg::<NodeQueryArg>(&[]), Ok(NodeQueryArg(None)));
+        assert_eq!(
+            run_arg::<NodeQueryArg>(&["johlyroger"]),
+            Ok(NodeQueryArg(Some("johlyroger".to_string())))
+        );
+    }
+
+    #[test]
+    fn env_node_unset_or_empty_is_not_given() {
+        assert_eq!(parse_env_node(None), Ok(None));
+        assert_eq!(parse_env_node(Some("")), Ok(None));
+    }
+
+    #[test]
+    fn env_node_is_parsed_as_host_and_port() {
+        let spec = parse_env_node(Some("mdma.local:6000")).unwrap().unwrap();
+        assert_eq!((spec.host(), spec.port()), ("mdma.local", Some(6000)));
+        let spec = parse_env_node(Some("mdma.local")).unwrap().unwrap();
+        assert_eq!((spec.host(), spec.port()), ("mdma.local", None));
+    }
+
+    #[test]
+    fn bad_env_node_names_the_variable() {
+        assert_eq!(
+            parse_env_node(Some("mdma.local:nope")),
+            Err(
+                "invalid MDMA_NODE: invalid port 'nope' in node 'mdma.local:nope', \
+                 expected 1-65535"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn resolving_with_a_bad_env_node_fails_naming_the_variable() {
+        // One test, because it touches a process-wide environment variable (which
+        // devenv sets, so it is put back).
+        let _env = crate::test_support::env_lock();
+        let original = std::env::var_os(NODE_ENV);
+        std::env::set_var(NODE_ENV, "mdma.local:nope");
+        let result = resolve_startup(None, false);
+        match original {
+            Some(value) => std::env::set_var(NODE_ENV, value),
+            None => std::env::remove_var(NODE_ENV),
+        }
+        assert_eq!(
+            crate::test_support::failure_text(result),
+            "invalid MDMA_NODE: invalid port 'nope' in node 'mdma.local:nope', expected 1-65535"
+        );
+    }
 
     fn stage() -> DiscoveredNode {
         DiscoveredNode {
@@ -858,9 +927,10 @@ mod tests {
 
     #[test]
     fn transport_failure_is_unreachable() {
-        let err = gateway_client::ClientError::Connection(
-            nng_transport::ConnectionError::ConnectionFailed("refused".into()),
-        );
+        let err = gateway_client::ClientError::Connection(nng_transport::ConnectionError::Dial {
+            address: "tcp://10.0.0.2:5555".into(),
+            cause: nng::Error::ConnectionRefused,
+        });
         assert_eq!(
             identity_check(Err(IdentifyError::Client(err))),
             Err(Unreachable)

@@ -3,8 +3,8 @@
 use audio_metadata::{discover_all_fields, extract_metadata, TrackMetadata};
 use music_facts::{
     Album, AlbumArtPresence, Artist, BitDepth, Bitrate, Channels, ContentHash, DiscNumber,
-    DurationSeconds, FactOrigin, FactSource, FileSizeBytes, Isrc, MusicFormat, MusicValue,
-    SampleRate, Title, TrackNumber, Year,
+    DurationSeconds, FactSource, FileSizeBytes, Isrc, MusicFormat, MusicValue, SampleRate, Title,
+    TrackNumber, Year,
 };
 use music_primitives::{Bpm, Key};
 use std::collections::HashMap;
@@ -24,27 +24,40 @@ impl From<AudioFormat> for MusicFormat {
     }
 }
 
-/// Generate facts from audio file metadata
+/// Generate facts from audio file metadata. The facts the library computes or
+/// measures (file path, format, import time, stream properties) are stamped with the
+/// `library` source; the facts the file's tags state are stamped with the `content`
+/// source.
 pub fn generate_facts(
     path: &Path,
     content_hash: &ContentHash,
     format: AudioFormat,
+    library: &FactSource,
+    content: &FactSource,
 ) -> Result<Vec<(MusicValue, FactSource)>, IngestError> {
     let metadata = extract_metadata(path).map_err(|e| IngestError::MetadataError(e.to_string()))?;
 
     let all_fields =
         discover_all_fields(path).map_err(|e| IngestError::MetadataError(e.to_string()))?;
 
-    let mut facts = generate_facts_from_metadata(content_hash, &metadata, &all_fields)?;
+    let mut facts = vec![(
+        MusicValue::FilePath(metadata.file_path.clone()),
+        library.clone(),
+    )];
+    facts.extend(generate_facts_from_metadata(
+        content_hash,
+        &metadata,
+        &all_fields,
+        library,
+        content,
+    )?);
 
     // Add format fact
     let music_format = MusicFormat::from(format);
-    let origin = FactOrigin::infer(&metadata.file_path, &metadata.comment);
-    let source = FactSource::new("mdma-library", env!("CARGO_PKG_VERSION"), origin);
-    facts.push((MusicValue::Format(music_format), source.clone()));
+    facts.push((MusicValue::Format(music_format), library.clone()));
 
     // Record import timestamp
-    facts.push((MusicValue::AddedAt(chrono::Utc::now()), source));
+    facts.push((MusicValue::AddedAt(chrono::Utc::now()), library.clone()));
 
     Ok(facts)
 }
@@ -62,18 +75,12 @@ fn generate_facts_from_metadata(
     _content_hash: &ContentHash,
     metadata: &TrackMetadata,
     all_fields: &HashMap<String, String>,
+    library: &FactSource,
+    content: &FactSource,
 ) -> Result<Vec<(MusicValue, FactSource)>, IngestError> {
     let mut facts = Vec::new();
 
-    // Infer origin from path and comment
-    let origin = FactOrigin::infer(&metadata.file_path, &metadata.comment);
-    let source = FactSource::new("mdma-library", env!("CARGO_PKG_VERSION"), origin);
-
-    // File location
-    facts.push((
-        MusicValue::FilePath(metadata.file_path.clone()),
-        source.clone(),
-    ));
+    let source = content.clone();
 
     // Basic metadata
     if let Some(ref title) = metadata.title {
@@ -212,44 +219,43 @@ fn generate_facts_from_metadata(
         }
     }
 
-    // Audio properties
+    // Stream and file properties: the library measures these, the tags do not state them
     if let Some(bit_depth) = metadata.bit_depth {
         facts.push((
             MusicValue::BitDepth(BitDepth::new(bit_depth)),
-            source.clone(),
+            library.clone(),
         ));
     }
 
     if let Some(channels) = metadata.channels {
         facts.push((
             MusicValue::Channels(Channels::new(channels as u8)),
-            source.clone(),
+            library.clone(),
         ));
     }
 
     if let Some(sample_rate) = metadata.sample_rate {
         facts.push((
             MusicValue::SampleRate(SampleRate::new(sample_rate)),
-            source.clone(),
+            library.clone(),
         ));
     }
 
     if let Some(duration) = metadata.duration {
         facts.push((
             MusicValue::DurationSeconds(DurationSeconds::new(duration.as_secs() as u32)),
-            source.clone(),
+            library.clone(),
         ));
     }
 
     if let Some(bitrate) = metadata.bitrate {
-        facts.push((MusicValue::Bitrate(Bitrate::new(bitrate)), source.clone()));
+        facts.push((MusicValue::Bitrate(Bitrate::new(bitrate)), library.clone()));
     }
 
-    // File properties
     if let Some(file_size) = metadata.file_size_bytes {
         facts.push((
             MusicValue::FileSizeBytes(FileSizeBytes::new(file_size)),
-            source.clone(),
+            library.clone(),
         ));
     }
 
@@ -259,7 +265,7 @@ fn generate_facts_from_metadata(
         } else {
             AlbumArtPresence::Absent
         }),
-        source.clone(),
+        library.clone(),
     ));
 
     // Encoder info
@@ -398,6 +404,35 @@ mod tests {
     }
 
     #[test]
+    fn measured_properties_carry_the_library_source_and_tags_the_content_source() {
+        let mut metadata = make_metadata(Some("Real Title"), None, None, "/music/inbox/x.flac");
+        metadata.sample_rate = Some(44100);
+        metadata.bit_depth = Some(16);
+        let library = FactSource::new("mdma-library", "test", "FilesystemScan");
+        let content = FactSource::new("a-client", "test", "Client");
+        let facts = generate_facts_from_metadata(
+            &ContentHash::new("sha256:abc".to_string()),
+            &metadata,
+            &std::collections::HashMap::new(),
+            &library,
+            &content,
+        )
+        .unwrap();
+        for (value, source) in &facts {
+            let measured = matches!(
+                value,
+                MusicValue::SampleRate(_) | MusicValue::BitDepth(_) | MusicValue::HasAlbumArt(_)
+            );
+            let expected = if measured { &library } else { &content };
+            assert_eq!(source, expected, "source of {value:?}");
+        }
+        assert!(facts
+            .iter()
+            .any(|(v, _)| matches!(v, MusicValue::SampleRate(_))));
+        assert!(facts.iter().any(|(v, _)| matches!(v, MusicValue::Title(_))));
+    }
+
+    #[test]
     fn fallback_emits_title_artist_track_for_three_part_stem() {
         let metadata = make_metadata(
             None,
@@ -406,9 +441,14 @@ mod tests {
             "/music/inbox/01 - Yagya - Empty Streets.flac",
         );
         let hash = ContentHash::new("sha256:abc".to_string());
-        let facts =
-            generate_facts_from_metadata(&hash, &metadata, &std::collections::HashMap::new())
-                .unwrap();
+        let facts = generate_facts_from_metadata(
+            &hash,
+            &metadata,
+            &std::collections::HashMap::new(),
+            &FactSource::new("mdma-library", "test", "FilesystemScan"),
+            &FactSource::new("mdma-library", "test", "Unknown"),
+        )
+        .unwrap();
         assert!(
             has_title(&facts, "Empty Streets"),
             "expected title 'Empty Streets'"
@@ -426,9 +466,14 @@ mod tests {
             "/music/inbox/Yagya - Don't Call - Reprise.flac",
         );
         let hash = ContentHash::new("sha256:abc".to_string());
-        let facts =
-            generate_facts_from_metadata(&hash, &metadata, &std::collections::HashMap::new())
-                .unwrap();
+        let facts = generate_facts_from_metadata(
+            &hash,
+            &metadata,
+            &std::collections::HashMap::new(),
+            &FactSource::new("mdma-library", "test", "FilesystemScan"),
+            &FactSource::new("mdma-library", "test", "Unknown"),
+        )
+        .unwrap();
         assert!(
             has_title(&facts, "Don't Call - Reprise"),
             "expected title with internal dash"
@@ -440,9 +485,14 @@ mod tests {
     fn fallback_emits_only_title_when_no_dash() {
         let metadata = make_metadata(None, None, None, "/music/inbox/Empty Streets.wav");
         let hash = ContentHash::new("sha256:abc".to_string());
-        let facts =
-            generate_facts_from_metadata(&hash, &metadata, &std::collections::HashMap::new())
-                .unwrap();
+        let facts = generate_facts_from_metadata(
+            &hash,
+            &metadata,
+            &std::collections::HashMap::new(),
+            &FactSource::new("mdma-library", "test", "FilesystemScan"),
+            &FactSource::new("mdma-library", "test", "Unknown"),
+        )
+        .unwrap();
         assert!(
             has_title(&facts, "Empty Streets"),
             "expected title 'Empty Streets'"
@@ -463,9 +513,14 @@ mod tests {
             "/music/inbox/Yagya - Empty Streets.wav",
         );
         let hash = ContentHash::new("sha256:abc".to_string());
-        let facts =
-            generate_facts_from_metadata(&hash, &metadata, &std::collections::HashMap::new())
-                .unwrap();
+        let facts = generate_facts_from_metadata(
+            &hash,
+            &metadata,
+            &std::collections::HashMap::new(),
+            &FactSource::new("mdma-library", "test", "FilesystemScan"),
+            &FactSource::new("mdma-library", "test", "Unknown"),
+        )
+        .unwrap();
         // Embedded title should be used, filename fallback should not fire
         assert!(
             has_title(&facts, "Real Title"),
@@ -485,9 +540,14 @@ mod tests {
             "/music/inbox/Yagya - Empty Streets.wav",
         );
         let hash = ContentHash::new("sha256:abc".to_string());
-        let facts =
-            generate_facts_from_metadata(&hash, &metadata, &std::collections::HashMap::new())
-                .unwrap();
+        let facts = generate_facts_from_metadata(
+            &hash,
+            &metadata,
+            &std::collections::HashMap::new(),
+            &FactSource::new("mdma-library", "test", "FilesystemScan"),
+            &FactSource::new("mdma-library", "test", "Unknown"),
+        )
+        .unwrap();
         // Artist is present, so fallback must not fire — no Title or extra Artist from filename
         assert!(
             has_artist(&facts, "Real Artist"),

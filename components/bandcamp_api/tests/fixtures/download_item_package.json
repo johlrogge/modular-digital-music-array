@@ -1,0 +1,20 @@
+{
+  "item_type": "p",
+  "download_type": "a",
+  "type": "package",
+  "package_type_name": "Vinyl LP",
+  "includes_digital": true,
+  "desc": "7 tracks",
+  "title": "Deep Blue",
+  "is_tralbum_attached": true,
+  "track_count": 7,
+  "desc_track_count": 7,
+  "artist": "Luigi Tozzi",
+  "package_release_date": "13 Jan 2016 00:00:00 GMT",
+  "downloads": {
+    "flac": {"description": "FLAC", "encoding_name": "flac", "url": "https://example.invalid/flac"},
+    "mp3-320": {"description": "MP3 320", "encoding_name": "mp3-320", "url": "https://example.invalid/mp3"}
+  },
+  "download_type_str": "Album",
+  "paid_for": true
+}

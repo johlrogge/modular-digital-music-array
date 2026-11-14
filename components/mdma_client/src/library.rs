@@ -5,10 +5,10 @@ use library_ipc_client::{
     content_to_hashes, interpret_archive_emptied, interpret_archive_listing,
     interpret_dedup_merged, interpret_dedup_scan, interpret_identity_backfill,
     interpret_identity_backfill_status, ArchiveEmptyReport, ArchiveListing, ClientError,
-    ContentHash, DedupApplyReport, DedupScanReport, FactType, IdentityBackfillStart,
+    ContentHash, DedupApplyReport, DedupScanReport, FactSource, FactType, IdentityBackfillStart,
     IdentityBackfillStatus, InboxPath, IngestAllItem, IngestResult, IngestSource, LibraryClient,
-    LibraryRequest, LibraryResponse, MusicValue, OrphanInfo, PlaylistName, ProtocolError,
-    ServiceStatus, TrackInfo, TrackQuery,
+    LibraryRequest, LibraryResponse, Mark, MarkFilter, MarkWrite, MusicValue, OrphanInfo,
+    PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery, Unmark,
 };
 use playlist_import::PlaylistWriteOps;
 
@@ -65,9 +65,10 @@ impl LibraryBackend {
     pub fn list_tracks(&self, limit: Option<usize>) -> Result<Vec<TrackInfo>, ClientError> {
         match self {
             LibraryBackend::Direct(c) => c.list_tracks(limit),
-            LibraryBackend::Gateway(_) => {
-                interpret_tracks(self.request(&LibraryRequest::ListTracks { limit })?)
-            }
+            LibraryBackend::Gateway(_) => interpret_tracks(
+                self.request(&LibraryRequest::ListTracks { limit })?,
+                "ListTracks",
+            ),
         }
     }
 
@@ -138,6 +139,28 @@ impl LibraryBackend {
                 interpret_ingest_result(self.request(&LibraryRequest::IngestFile {
                     path: path.clone(),
                     source,
+                    writer: None,
+                    facts: Vec::new(),
+                })?)
+            }
+        }
+    }
+
+    /// Ingest a file as `writer`, who also states its own provenance `facts` about it.
+    pub fn ingest_file_as(
+        &self,
+        path: &InboxPath,
+        writer: &FactSource,
+        facts: Vec<MusicValue>,
+    ) -> Result<IngestResult, ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.ingest_file_as(path, writer, facts),
+            LibraryBackend::Gateway(_) => {
+                interpret_ingest_result(self.request(&LibraryRequest::IngestFile {
+                    path: path.clone(),
+                    source: None,
+                    writer: Some(writer.clone()),
+                    facts,
                 })?)
             }
         }
@@ -273,31 +296,60 @@ impl LibraryBackend {
         }
     }
 
-    /// Write a bookmark fact for a track.
-    pub fn write_bookmark(
-        &self,
-        hash: &ContentHash,
-        scope: Option<String>,
-    ) -> Result<(), ClientError> {
-        interpret_bookmark_written(self.request(&LibraryRequest::WriteBookmark {
+    /// List every visible track that carries a live mark admitted by `filter`.
+    pub fn list_marked(&self, filter: &MarkFilter) -> Result<Vec<TrackInfo>, ClientError> {
+        interpret_tracks(
+            self.request(&LibraryRequest::ListMarked {
+                filter: filter.clone(),
+            })?,
+            "ListMarked",
+        )
+    }
+
+    /// Apply `mark` to a track, unless the track already carries it live.
+    pub fn write_mark(&self, hash: &ContentHash, mark: &Mark) -> Result<MarkWrite, ClientError> {
+        interpret_mark_written(self.request(&LibraryRequest::WriteMark {
             hash: hash.clone(),
-            scope,
+            mark: mark.clone(),
         })?)
     }
 
-    /// Write a single fact for a track. Used for importing metadata from external sources.
-    pub fn write_fact(&self, hash: &ContentHash, fact: MusicValue) -> Result<(), ClientError> {
+    /// Retract every live assertion of `mark` on a track.
+    pub fn unmark(&self, hash: &ContentHash, mark: &Mark) -> Result<Unmark, ClientError> {
+        interpret_track_unmarked(self.request(&LibraryRequest::UnmarkTrack {
+            hash: hash.clone(),
+            mark: mark.clone(),
+        })?)
+    }
+
+    /// Write a single fact for a track under the writer's own `source` (the binary
+    /// states it, with its own version; the user's is `user_fact_source`). Used for
+    /// importing metadata from external sources.
+    pub fn write_fact_as(
+        &self,
+        hash: &ContentHash,
+        fact: MusicValue,
+        source: &FactSource,
+    ) -> Result<(), ClientError> {
         interpret_fact_written(self.request(&LibraryRequest::WriteFact {
             hash: hash.clone(),
             fact,
+            source: Some(source.clone()),
         })?)
     }
 
-    /// Retract a single fact for a track. Used for removing manually-added metadata.
-    pub fn retract_fact(&self, hash: &ContentHash, fact: MusicValue) -> Result<(), ClientError> {
+    /// Retract a single fact for a track under the writer's own `source`. Used for
+    /// removing metadata. `false` when nothing matched, so nothing was retracted.
+    pub fn retract_fact_as(
+        &self,
+        hash: &ContentHash,
+        fact: MusicValue,
+        source: &FactSource,
+    ) -> Result<bool, ClientError> {
         interpret_fact_retracted(self.request(&LibraryRequest::RetractFact {
             hash: hash.clone(),
             fact,
+            source: Some(source.clone()),
         })?)
     }
 
@@ -476,11 +528,14 @@ fn interpret_status(response: LibraryResponse) -> Result<ServiceStatus, ClientEr
     }
 }
 
-fn interpret_tracks(response: LibraryResponse) -> Result<Vec<TrackInfo>, ClientError> {
+fn interpret_tracks(
+    response: LibraryResponse,
+    operation: &str,
+) -> Result<Vec<TrackInfo>, ClientError> {
     match response {
         LibraryResponse::Tracks(tracks) => Ok(tracks),
         LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
-        _ => Err(unexpected("ListTracks")),
+        _ => Err(unexpected(operation)),
     }
 }
 
@@ -566,11 +621,19 @@ fn interpret_playlist_ok(response: LibraryResponse) -> Result<(), ClientError> {
     }
 }
 
-fn interpret_bookmark_written(response: LibraryResponse) -> Result<(), ClientError> {
+fn interpret_mark_written(response: LibraryResponse) -> Result<MarkWrite, ClientError> {
     match response {
-        LibraryResponse::BookmarkWritten => Ok(()),
+        LibraryResponse::MarkWritten(outcome) => Ok(outcome),
         LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
-        _ => Err(unexpected("WriteBookmark")),
+        _ => Err(unexpected("WriteMark")),
+    }
+}
+
+fn interpret_track_unmarked(response: LibraryResponse) -> Result<Unmark, ClientError> {
+    match response {
+        LibraryResponse::TrackUnmarked(outcome) => Ok(outcome),
+        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+        _ => Err(unexpected("UnmarkTrack")),
     }
 }
 
@@ -582,9 +645,11 @@ fn interpret_fact_written(response: LibraryResponse) -> Result<(), ClientError> 
     }
 }
 
-fn interpret_fact_retracted(response: LibraryResponse) -> Result<(), ClientError> {
+/// `true` when the fact was retracted, `false` when it matched nothing.
+fn interpret_fact_retracted(response: LibraryResponse) -> Result<bool, ClientError> {
     match response {
-        LibraryResponse::FactRetracted => Ok(()),
+        LibraryResponse::FactRetracted => Ok(true),
+        LibraryResponse::NothingToRetract => Ok(false),
         LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
         _ => Err(unexpected("RetractFact")),
     }
@@ -665,6 +730,12 @@ mod tests {
     }
 
     #[test]
+    fn interpret_tracks_names_the_operation_on_an_unexpected_response() {
+        let err = interpret_tracks(LibraryResponse::BookmarkWritten, "ListMarked").unwrap_err();
+        assert!(err.to_string().contains("ListMarked"), "{err}");
+    }
+
+    #[test]
     fn unexpected_error_contains_operation_name() {
         let err = unexpected("Ping");
         assert!(err.to_string().contains("Ping"));
@@ -681,21 +752,54 @@ mod tests {
     }
 
     #[test]
-    fn interpret_bookmark_written_ok() {
-        assert!(interpret_bookmark_written(LibraryResponse::BookmarkWritten).is_ok());
+    fn interpret_mark_written_returns_the_outcome() {
+        for outcome in [MarkWrite::Written, MarkWrite::AlreadyLive] {
+            let got = interpret_mark_written(LibraryResponse::MarkWritten(outcome));
+            assert_eq!(got.unwrap(), outcome);
+        }
     }
 
     #[test]
-    fn interpret_bookmark_written_error_propagates() {
+    fn interpret_mark_written_error_propagates() {
         let err = LibraryResponse::Error(ProtocolError::Internal {
             message: "fail".to_string(),
         });
-        assert!(interpret_bookmark_written(err).is_err());
+        assert!(matches!(
+            interpret_mark_written(err),
+            Err(ClientError::Protocol(_))
+        ));
     }
 
     #[test]
-    fn interpret_bookmark_written_unexpected_variant_is_err() {
-        assert!(interpret_bookmark_written(LibraryResponse::Pong).is_err());
+    fn interpret_mark_written_names_the_operation_on_an_unexpected_response() {
+        let err = interpret_mark_written(LibraryResponse::BookmarkWritten).unwrap_err();
+        assert!(err.to_string().contains("WriteMark"), "{err}");
+    }
+
+    #[test]
+    fn interpret_track_unmarked_returns_the_outcome() {
+        let two = std::num::NonZeroUsize::new(2).unwrap();
+        for outcome in [Unmark::Retracted { count: two }, Unmark::NotLive] {
+            let got = interpret_track_unmarked(LibraryResponse::TrackUnmarked(outcome));
+            assert_eq!(got.unwrap(), outcome);
+        }
+    }
+
+    #[test]
+    fn interpret_track_unmarked_error_propagates() {
+        let err = LibraryResponse::Error(ProtocolError::Internal {
+            message: "fail".to_string(),
+        });
+        assert!(matches!(
+            interpret_track_unmarked(err),
+            Err(ClientError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn interpret_track_unmarked_names_the_operation_on_an_unexpected_response() {
+        let err = interpret_track_unmarked(LibraryResponse::Pong).unwrap_err();
+        assert!(err.to_string().contains("UnmarkTrack"), "{err}");
     }
 
     #[test]
@@ -718,7 +822,12 @@ mod tests {
 
     #[test]
     fn interpret_fact_retracted_ok() {
-        assert!(interpret_fact_retracted(LibraryResponse::FactRetracted).is_ok());
+        assert!(interpret_fact_retracted(LibraryResponse::FactRetracted).unwrap());
+    }
+
+    #[test]
+    fn interpret_nothing_to_retract_is_false() {
+        assert!(!interpret_fact_retracted(LibraryResponse::NothingToRetract).unwrap());
     }
 
     #[test]

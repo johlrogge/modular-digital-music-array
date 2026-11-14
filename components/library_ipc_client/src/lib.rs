@@ -20,6 +20,16 @@ pub enum ClientError {
     Protocol(ProtocolError),
 }
 
+impl ClientError {
+    /// True when the node did not understand the request (it is older than this client).
+    pub fn is_unsupported_request(&self) -> bool {
+        matches!(
+            self,
+            ClientError::Protocol(ProtocolError::InvalidRequest { .. })
+        )
+    }
+}
+
 impl From<serde_json::Error> for ClientError {
     fn from(e: serde_json::Error) -> Self {
         ClientError::Transport(nng_transport::NngClientError::Serialization(e))
@@ -181,15 +191,38 @@ impl LibraryClient {
         self.ingest_file_with_source(path, None)
     }
 
-    /// Ingest a file from the inbox with source metadata.
+    /// Ingest a file from the inbox with legacy source metadata.
     pub fn ingest_file_with_source(
         &self,
         path: &InboxPath,
         source: Option<IngestSource>,
     ) -> Result<IngestResult, ClientError> {
+        self.ingest_file_request(path, source, None, Vec::new())
+    }
+
+    /// Ingest a file from the inbox as `writer`, who also states its own provenance
+    /// `facts` about the file.
+    pub fn ingest_file_as(
+        &self,
+        path: &InboxPath,
+        writer: &FactSource,
+        facts: Vec<MusicValue>,
+    ) -> Result<IngestResult, ClientError> {
+        self.ingest_file_request(path, None, Some(writer.clone()), facts)
+    }
+
+    fn ingest_file_request(
+        &self,
+        path: &InboxPath,
+        source: Option<IngestSource>,
+        writer: Option<FactSource>,
+        facts: Vec<MusicValue>,
+    ) -> Result<IngestResult, ClientError> {
         match self.request(&LibraryRequest::IngestFile {
             path: path.clone(),
             source,
+            writer,
+            facts,
         })? {
             LibraryResponse::IngestResult(result) => Ok(result),
             LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
@@ -364,11 +397,41 @@ impl LibraryClient {
         }
     }
 
-    /// Write a single fact for a track. Used for importing metadata from external sources.
-    pub fn write_fact(&self, hash: &ContentHash, fact: MusicValue) -> Result<(), ClientError> {
+    /// Retract a single fact for a track under the writer's own `source` (the binary
+    /// states it, with its own version). `false` when no live assertion of the fact by
+    /// that source existed, so nothing was retracted.
+    pub fn retract_fact_as(
+        &self,
+        hash: &ContentHash,
+        fact: MusicValue,
+        source: &FactSource,
+    ) -> Result<bool, ClientError> {
+        match self.request(&LibraryRequest::RetractFact {
+            hash: hash.clone(),
+            fact,
+            source: Some(source.clone()),
+        })? {
+            LibraryResponse::FactRetracted => Ok(true),
+            LibraryResponse::NothingToRetract => Ok(false),
+            LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+            _ => Err(ClientError::Protocol(ProtocolError::Internal {
+                message: "Unexpected response to RetractFact".to_string(),
+            })),
+        }
+    }
+
+    /// Write a single fact for a track under the writer's own `source` (the binary
+    /// states it, with its own version).
+    pub fn write_fact_as(
+        &self,
+        hash: &ContentHash,
+        fact: MusicValue,
+        source: &FactSource,
+    ) -> Result<(), ClientError> {
         match self.request(&LibraryRequest::WriteFact {
             hash: hash.clone(),
             fact,
+            source: Some(source.clone()),
         })? {
             LibraryResponse::FactWritten => Ok(()),
             LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
@@ -378,19 +441,19 @@ impl LibraryClient {
         }
     }
 
-    /// Retract all facts whose `FactSource.tool` matches `source_name` for every
-    /// content hash that has an `ItemId` fact equal to `item_id`.
-    ///
-    /// Retracted attributes: Album, Title, Artist, TrackNumber, Year.
-    /// ItemId itself is intentionally NOT retracted.
+    /// Retract the live facts of `attributes` that `source` wrote (matched on tool and
+    /// origin kind) for every content hash that has an `ItemId` fact equal to
+    /// `item_id`. A value another source also asserts stays (ADR-018).
     pub fn retract_source_facts(
         &self,
         item_id: &str,
-        source_name: &str,
+        source: &FactSource,
+        attributes: &AttributeList,
     ) -> Result<(), ClientError> {
         match self.request(&LibraryRequest::RetractSourceFacts {
             item_id: item_id.to_string(),
-            source_name: source_name.to_string(),
+            source: source.clone(),
+            attributes: attributes.clone(),
         })? {
             LibraryResponse::SourceFactsRetracted => Ok(()),
             LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
@@ -638,6 +701,22 @@ pub fn content_to_hashes(content: &str) -> Vec<ContentHash> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_request_is_unsupported_request() {
+        let err = ClientError::Protocol(ProtocolError::InvalidRequest {
+            message: "unknown variant".to_string(),
+        });
+        assert!(err.is_unsupported_request());
+    }
+
+    #[test]
+    fn other_protocol_error_is_not_unsupported_request() {
+        let err = ClientError::Protocol(ProtocolError::Internal {
+            message: "boom".to_string(),
+        });
+        assert!(!err.is_unsupported_request());
+    }
 
     #[test]
     fn client_error_display() {

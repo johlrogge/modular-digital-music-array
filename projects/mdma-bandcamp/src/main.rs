@@ -2,7 +2,9 @@ use clap::Parser;
 use color_eyre::Result;
 
 mod cache;
+mod check_updates;
 mod ipc;
+mod job;
 mod service;
 
 use ::service::{ServiceConfig, ServiceSockets};

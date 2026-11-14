@@ -401,6 +401,57 @@ fn rewrite_legacy(raw: &mut serde_json::Value) {
 }
 
 impl MusicValue {
+    /// Every name `display_name` can return, one per variant.
+    pub const ATTRIBUTE_NAMES: &'static [&'static str] = &[
+        "FilePath",
+        "AudioHash",
+        "PcmHash",
+        "Title",
+        "Artist",
+        "Album",
+        "AlbumArtist",
+        "TrackNumber",
+        "DiscNumber",
+        "Year",
+        "BPM",
+        "Key",
+        "MainGenre",
+        "StyleDescriptor",
+        "FullGenre",
+        "ISRC",
+        "Label",
+        "RecordingYear",
+        "RecordingDate",
+        "BeatportTrackUrl",
+        "BeatportLabelUrl",
+        "BandcampUrl",
+        "Source",
+        "ItemId",
+        "Comment",
+        "BeatportTrackId",
+        "BitDepth",
+        "Channels",
+        "SampleRate",
+        "Duration",
+        "Bitrate",
+        "FileSize",
+        "HasAlbumArt",
+        "Format",
+        "EncoderSoftware",
+        "EncodedBy",
+        "CoverArtPath",
+        "TrackStarted",
+        "TrackStopped",
+        "AddedAt",
+        "Bookmarked",
+        "Replaces",
+        "Deleted",
+        "Role",
+        "Energy",
+        "BeatGrid",
+        "MemoryCue",
+    ];
+
     /// Returns the display name for this value (e.g., "Title", "BPM", "Duration")
     pub fn display_name(&self) -> &'static str {
         match self {
@@ -546,6 +597,144 @@ mod tests {
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use stainless_facts::assert_fact_value_format;
+
+    /// Compiles only while every variant is listed: adding a `MusicValue` variant
+    /// breaks this match until it is added here, and then `attribute_samples` and
+    /// `ATTRIBUTE_NAMES` must follow for `attribute_names_are_exactly_the_display_names`.
+    fn assert_variant_listed(value: &MusicValue) {
+        match value {
+            MusicValue::FilePath(_)
+            | MusicValue::AudioHash(_)
+            | MusicValue::PcmHash(_)
+            | MusicValue::Title(_)
+            | MusicValue::Artist(_)
+            | MusicValue::Album(_)
+            | MusicValue::AlbumArtist(_)
+            | MusicValue::TrackNumber(_)
+            | MusicValue::DiscNumber(_)
+            | MusicValue::Year(_)
+            | MusicValue::Bpm(_)
+            | MusicValue::Key(_)
+            | MusicValue::MainGenre(_)
+            | MusicValue::StyleDescriptor(_)
+            | MusicValue::FullGenre(_)
+            | MusicValue::Role(_)
+            | MusicValue::Energy(_)
+            | MusicValue::BeatGrid { .. }
+            | MusicValue::MemoryCue { .. }
+            | MusicValue::Isrc(_)
+            | MusicValue::Label(_)
+            | MusicValue::RecordingYear(_)
+            | MusicValue::RecordingDate(_)
+            | MusicValue::BeatportTrackUrl(_)
+            | MusicValue::BeatportLabelUrl(_)
+            | MusicValue::BandcampUrl(_)
+            | MusicValue::Source(_)
+            | MusicValue::ItemId(_)
+            | MusicValue::Comment(_)
+            | MusicValue::BeatportTrackId(_)
+            | MusicValue::BitDepth(_)
+            | MusicValue::Channels(_)
+            | MusicValue::SampleRate(_)
+            | MusicValue::DurationSeconds(_)
+            | MusicValue::Bitrate(_)
+            | MusicValue::FileSizeBytes(_)
+            | MusicValue::HasAlbumArt(_)
+            | MusicValue::Format(_)
+            | MusicValue::EncoderSoftware(_)
+            | MusicValue::EncodedBy(_)
+            | MusicValue::CoverArtPath(_)
+            | MusicValue::TrackStarted(_)
+            | MusicValue::TrackStopped(_)
+            | MusicValue::AddedAt(_)
+            | MusicValue::Bookmarked { .. }
+            | MusicValue::Replaces(_)
+            | MusicValue::Deleted { .. } => {}
+        }
+    }
+
+    /// One value of every variant.
+    fn attribute_samples() -> Vec<MusicValue> {
+        let now = Utc::now();
+        vec![
+            MusicValue::FilePath(PathBuf::from("a.flac")),
+            MusicValue::AudioHash(music_primitives::AudioHash::from_sha256_v1([0; 32])),
+            MusicValue::PcmHash(music_primitives::PcmHash::from_sha256_v1([0; 32])),
+            MusicValue::Title(Title::new("t")),
+            MusicValue::Artist(Artist::new("a")),
+            MusicValue::Album(Album::new("a")),
+            MusicValue::AlbumArtist(Artist::new("a")),
+            MusicValue::TrackNumber(TrackNumber::new(1)),
+            MusicValue::DiscNumber(DiscNumber::new(1)),
+            MusicValue::Year(Year::new(2020)),
+            MusicValue::Bpm(Bpm::from_u32(128).unwrap()),
+            MusicValue::Key(Key::from_camelot("8A").unwrap()),
+            MusicValue::MainGenre("g".into()),
+            MusicValue::StyleDescriptor("s".into()),
+            MusicValue::FullGenre("g".into()),
+            MusicValue::Role("peak".parse().unwrap()),
+            MusicValue::Energy(EnergyLevel::new(5).unwrap()),
+            MusicValue::BeatGrid {
+                first_beat_ms: 0,
+                bpm: Bpm::from_u32(128).unwrap(),
+                beats_per_bar: 4,
+            },
+            MusicValue::MemoryCue {
+                position_ms: 0,
+                kind: CueKind::Memory,
+                label: None,
+                index: None,
+            },
+            MusicValue::Isrc(Isrc::new("x")),
+            MusicValue::Label("l".into()),
+            MusicValue::RecordingYear(Year::new(2020)),
+            MusicValue::RecordingDate(NaiveDate::from_ymd_opt(2020, 1, 1).unwrap()),
+            MusicValue::BeatportTrackUrl("u".into()),
+            MusicValue::BeatportLabelUrl("u".into()),
+            MusicValue::BandcampUrl("u".into()),
+            MusicValue::Source("s".into()),
+            MusicValue::ItemId("p1".into()),
+            MusicValue::Comment("c".into()),
+            MusicValue::BeatportTrackId("i".into()),
+            MusicValue::BitDepth(BitDepth::new(16)),
+            MusicValue::Channels(Channels::new(2)),
+            MusicValue::SampleRate(SampleRate::new(44100)),
+            MusicValue::DurationSeconds(DurationSeconds::new(1)),
+            MusicValue::Bitrate(Bitrate::new(320)),
+            MusicValue::FileSizeBytes(FileSizeBytes::new(1)),
+            MusicValue::HasAlbumArt(AlbumArtPresence::Present),
+            MusicValue::Format(MusicFormat::Flac),
+            MusicValue::EncoderSoftware("e".into()),
+            MusicValue::EncodedBy("e".into()),
+            MusicValue::CoverArtPath("c.jpg".into()),
+            MusicValue::TrackStarted(StartReason::OnRequest),
+            MusicValue::TrackStopped(StopReason::OnSkip),
+            MusicValue::AddedAt(now),
+            MusicValue::Bookmarked {
+                scope: None,
+                timestamp: now,
+            },
+            MusicValue::Replaces(crate::primitives::ContentHash::new("sha256:a")),
+            MusicValue::Deleted { timestamp: now },
+        ]
+    }
+
+    #[test]
+    fn attribute_names_are_exactly_the_display_names() {
+        let samples = attribute_samples();
+        samples.iter().for_each(assert_variant_listed);
+        let mut from_values: Vec<&str> = samples.iter().map(MusicValue::display_name).collect();
+        let mut listed: Vec<&str> = MusicValue::ATTRIBUTE_NAMES.to_vec();
+        from_values.sort_unstable();
+        listed.sort_unstable();
+        assert_eq!(from_values, listed);
+        listed.dedup();
+        assert_eq!(
+            listed.len(),
+            MusicValue::ATTRIBUTE_NAMES.len(),
+            "no duplicates"
+        );
+    }
 
     #[test]
     fn music_value_has_correct_serde_format() {

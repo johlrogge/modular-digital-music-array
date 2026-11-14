@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "audio-hash"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "claxon",
  "md-5",
@@ -844,7 +844,7 @@ dependencies = [
 
 [[package]]
 name = "bevy-app"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "bevy",
  "bevy_egui",
@@ -2463,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "boot-health"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "pretty_assertions",
  "serde",
@@ -2494,6 +2494,28 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "bpaf"
+version = "0.9.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "597e81e56404b7a3e26ef7b449f82a4b7a661ae76c3cac692b42d6bad06a0fbe"
+dependencies = [
+ "bpaf_derive",
+ "owo-colors",
+ "supports-color",
+]
+
+[[package]]
+name = "bpaf_derive"
+version = "0.5.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f7e98cee839b19076cb3ce1afdb62bb182e04ff5f71f70188827002fae91094"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -2790,15 +2812,6 @@ dependencies = [
  "clap_lex",
  "strsim",
  "terminal_size",
-]
-
-[[package]]
-name = "clap_complete"
-version = "4.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ff7a1dccbdd8b078c2bdebff47e404615151534d5043da397ec50286816f9cb"
-dependencies = [
- "clap",
 ]
 
 [[package]]
@@ -3659,7 +3672,7 @@ checksum = "c9c272297e804878a2a4b707cfcfc6d2328b5bb936944613b4fdf2b9269afdfd"
 
 [[package]]
 name = "dj-workspace"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "bevy-app",
  "clap",
@@ -4743,6 +4756,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
+name = "hicli"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de931669e19d9500c6ec001a34a0762d67cb6777a878aa608d697e058ab7e864"
+dependencies = [
+ "bpaf",
+ "hicli-macros",
+ "strsim",
+]
+
+[[package]]
+name = "hicli-macros"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30fef62b353462bfaf9b8b891cbc9d46c0ece70bfac2a947186240c9488ef6cb"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "hmac"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5263,6 +5298,12 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "is_ci"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7655c9839580ee829dfacba1d1278c2b7883e50a277ff7541299489d6bdfdc45"
 
 [[package]]
 name = "is_terminal_polyfill"
@@ -5862,7 +5903,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-acid"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "acid-service",
  "clap",
@@ -5876,7 +5917,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-admin"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "admin-ipc-protocol",
  "boot-health",
@@ -5895,7 +5936,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-audio"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "clap",
  "color-eyre",
@@ -5916,7 +5957,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-bandcamp"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "bandcamp-api",
  "chrono",
@@ -5972,7 +6013,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-beacon"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "askama",
  "async-stream",
@@ -6004,19 +6045,20 @@ dependencies = [
 
 [[package]]
 name = "mdma-cli"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "audio-transcoder",
+ "bpaf",
  "chrono",
- "clap",
- "clap_complete",
  "client",
  "color-eyre",
  "colored",
  "dirs",
  "event-protocol",
  "gateway-client",
+ "hicli",
  "inbox-utils",
+ "libc",
  "library-ipc-client",
  "library-search",
  "mdma-client",
@@ -6060,7 +6102,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-console"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "admin-ipc-protocol",
  "askama",
@@ -6097,7 +6139,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-gateway"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "acid-protocol",
  "clap",
@@ -6117,7 +6159,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-library"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "clap",
  "color-eyre",
@@ -6130,7 +6172,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-playback"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "acid-client",
  "clap",
@@ -6154,7 +6196,7 @@ dependencies = [
 
 [[package]]
 name = "mdma-tui"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "clap",
  "client",
@@ -7473,7 +7515,7 @@ dependencies = [
 
 [[package]]
 name = "playlist-import"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "library-ipc-client",
  "library-search",
@@ -7641,7 +7683,7 @@ dependencies = [
 
 [[package]]
 name = "private-file"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "tempfile",
 ]
@@ -8245,7 +8287,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-eeprom"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "tempfile",
  "thiserror 1.0.69",
@@ -9055,6 +9097,15 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "supports-color"
+version = "3.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c64fc7232dd8d2e4ac5ce4ef302b1d81e0b80d055b9d77c7c4f51f6aa4c867d6"
+dependencies = [
+ "is_ci",
+]
 
 [[package]]
 name = "svg_fmt"
@@ -10722,7 +10773,7 @@ dependencies = [
 
 [[package]]
 name = "wifi-config"
-version = "0.36.1"
+version = "0.37.0"
 dependencies = [
  "pbkdf2",
  "proptest",

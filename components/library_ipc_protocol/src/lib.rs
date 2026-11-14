@@ -5,7 +5,10 @@
 //! - library-ipc-client (used by CLI and console)
 
 // Re-export types used in the protocol so clients don't need to depend on music-facts
-pub use music_facts::{Bpm, ContentHash, CueKind, DurationSeconds, Key, MusicValue};
+pub use music_facts::{
+    Bpm, ContentHash, CueKind, DurationSeconds, FactSource, Key, Mark, MarkFilter, MarkName,
+    MarkNameError, MusicValue,
+};
 pub use music_primitives::{EnergyLevel, TrackRole};
 // Re-export query types so clients can use them without depending on library-search directly
 pub use library_search::{
@@ -13,6 +16,7 @@ pub use library_search::{
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::num::NonZeroUsize;
 use thiserror::Error;
 
 // ============================================================================
@@ -40,6 +44,69 @@ impl FactType {
 impl fmt::Display for FactType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
+    }
+}
+
+/// Why a list of attributes was refused.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum AttributeListError {
+    #[error("attribute list is empty")]
+    Empty,
+
+    #[error("unknown attribute: {0}")]
+    Unknown(String),
+}
+
+/// A non-empty list of fact attribute names, each one of `MusicValue::ATTRIBUTE_NAMES`.
+///
+/// Validated on construction and on deserialization, so a request that carries one
+/// is already known to name something (a typo would otherwise retract nothing).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<FactType>", into = "Vec<FactType>")]
+pub struct AttributeList(Vec<FactType>);
+
+impl AttributeList {
+    pub fn try_new<S: AsRef<str>>(
+        names: impl IntoIterator<Item = S>,
+    ) -> Result<Self, AttributeListError> {
+        Self::try_from(
+            names
+                .into_iter()
+                .map(|n| FactType::new(n.as_ref()))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Whether `value` is of one of the listed attributes.
+    pub fn contains(&self, value: &MusicValue) -> bool {
+        self.0.iter().any(|a| a.as_str() == value.display_name())
+    }
+
+    pub fn as_slice(&self) -> &[FactType] {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<FactType>> for AttributeList {
+    type Error = AttributeListError;
+
+    fn try_from(names: Vec<FactType>) -> Result<Self, Self::Error> {
+        if names.is_empty() {
+            return Err(AttributeListError::Empty);
+        }
+        if let Some(unknown) = names
+            .iter()
+            .find(|n| !MusicValue::ATTRIBUTE_NAMES.contains(&n.as_str()))
+        {
+            return Err(AttributeListError::Unknown(unknown.to_string()));
+        }
+        Ok(Self(names))
+    }
+}
+
+impl From<AttributeList> for Vec<FactType> {
+    fn from(list: AttributeList) -> Self {
+        list.0
     }
 }
 
@@ -202,25 +269,49 @@ pub enum ProtocolError {
 
     #[error("invalid playlist name: {name}")]
     InvalidPlaylistName { name: String },
+
+    /// The request bytes could not be parsed as a `LibraryRequest`.
+    #[error("invalid request: {message}")]
+    InvalidRequest { message: String },
+}
+
+/// Parse one raw request. Bytes that do not parse give
+/// `ProtocolError::InvalidRequest`, so a request/reply server can still send
+/// the caller a reply.
+pub fn parse_request(bytes: &[u8]) -> Result<LibraryRequest, ProtocolError> {
+    serde_json::from_slice(bytes).map_err(|e| ProtocolError::InvalidRequest {
+        message: e.to_string(),
+    })
 }
 
 // ============================================================================
 // Ingest Source Metadata
 // ============================================================================
 
-/// Source metadata for provenance tracking during ingestion.
+/// Legacy source metadata of an ingest. A client that wants its own provenance
+/// states it with `IngestFile::writer` and `IngestFile::facts` instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "source_type")]
 pub enum IngestSource {
-    /// Downloaded from Bandcamp
-    Bandcamp {
-        item_id: String,
-        artist_url: Option<String>,
-    },
-    /// Extracted from Beatport
-    Beatport { order_id: Option<String> },
     /// Uploaded via HTTP or dropped into inbox
     Upload,
+}
+
+// ============================================================================
+// User Source
+// ============================================================================
+
+/// Tool of the source shared by every user-facing UI (CLI, TUI, console), so a fact
+/// written in one can be retracted from another.
+pub const USER_TOOL: &str = "mdma";
+
+/// Origin kind of the user's source.
+pub const USER_ORIGIN: &str = "User";
+
+/// The source of an unattributed write: what `WriteFact` and `RetractFact` use when
+/// they carry no `source`. `version` is the version of the writer.
+pub fn user_fact_source(version: impl Into<String>) -> FactSource {
+    FactSource::new(USER_TOOL, version, USER_ORIGIN)
 }
 
 // ============================================================================
@@ -241,6 +332,10 @@ pub enum LibraryRequest {
     /// List all tracks (optionally limited).
     ListTracks { limit: Option<usize> },
 
+    /// List every visible track that carries a live mark admitted by `filter`.
+    /// Answered with `LibraryResponse::Tracks`, order unspecified.
+    ListMarked { filter: MarkFilter },
+
     /// Get a specific track by content hash (supports partial hashes).
     GetTrack { hash: ContentHash },
 
@@ -258,10 +353,21 @@ pub enum LibraryRequest {
     GetInboxQueue,
 
     /// Ingest a specific file from inbox.
+    ///
+    /// `writer` is the source of the facts the file's tags state and of `facts`; the
+    /// facts the library computes (file path, format, import time, cover art, identity
+    /// hashes) carry the library's own source. `facts` are the client's own provenance
+    /// facts about the file (e.g. its source and item id). A request with `facts` and
+    /// no `writer` is refused: facts need a source that states them. With no `writer`
+    /// the library states the tags itself.
     IngestFile {
         path: InboxPath,
-        /// Optional source metadata for provenance tracking.
+        /// Legacy source metadata.
         source: Option<IngestSource>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        writer: Option<FactSource>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        facts: Vec<MusicValue>,
     },
 
     /// Delete a file from inbox without ingesting.
@@ -323,22 +429,54 @@ pub enum LibraryRequest {
     CancelIdentityBackfill,
 
     /// Write a bookmark fact for a track.
+    ///
+    /// Deprecated; kept for old clients, use `WriteMark`. The server turns `scope`
+    /// into a mark, so it is an alias of `WriteMark` that always answers
+    /// `BookmarkWritten`.
     WriteBookmark {
         hash: ContentHash,
         scope: Option<String>,
     },
 
+    /// Apply a mark to a track, unless the track already carries it live.
+    /// Answered with `LibraryResponse::MarkWritten`.
+    WriteMark { hash: ContentHash, mark: Mark },
+
+    /// Retract every live assertion of a mark on a track.
+    /// Answered with `LibraryResponse::TrackUnmarked`.
+    UnmarkTrack { hash: ContentHash, mark: Mark },
+
     /// Write a single fact for a track. Used for importing metadata from external sources.
-    WriteFact { hash: ContentHash, fact: MusicValue },
+    ///
+    /// `source` is the writer's own source. Absent, the fact is the user's
+    /// (`user_fact_source`).
+    WriteFact {
+        hash: ContentHash,
+        fact: MusicValue,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<FactSource>,
+    },
 
     /// Retract a single fact for a track. Used for removing manually-added metadata.
-    RetractFact { hash: ContentHash, fact: MusicValue },
+    ///
+    /// Cancels the assertions of an equal value from `source`'s identity. Absent,
+    /// that is the user's source (`user_fact_source`).
+    RetractFact {
+        hash: ContentHash,
+        fact: MusicValue,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<FactSource>,
+    },
 
-    /// Retract all facts whose FactSource.source_name matches `source_name` for every
-    /// ContentHash that has an ItemId fact equal to `item_id`.
+    /// Retract the live facts of the given `attributes` that the source `source`
+    /// wrote (matched on tool and origin kind) for every ContentHash that has an
+    /// ItemId fact equal to `item_id`. Another source's assertion of the same value
+    /// stays (a retract matches value and source, ADR-018). The retracts are stamped
+    /// with `source`. `attributes` is validated on the wire (see `AttributeList`).
     RetractSourceFacts {
         item_id: String,
-        source_name: String,
+        source: FactSource,
+        attributes: AttributeList,
     },
 
     /// Look up the album title(s) stored for any track tagged with this ItemId.
@@ -474,11 +612,21 @@ pub enum LibraryResponse {
     /// Bookmark written successfully.
     BookmarkWritten,
 
+    /// Answer to `WriteMark`.
+    MarkWritten(MarkWrite),
+
+    /// Answer to `UnmarkTrack`.
+    TrackUnmarked(Unmark),
+
     /// Fact written successfully.
     FactWritten,
 
     /// Fact retracted successfully.
     FactRetracted,
+
+    /// A `RetractFact` that matched no live assertion (equal value, same source
+    /// identity); nothing was written.
+    NothingToRetract,
 
     /// Source facts retracted successfully.
     SourceFactsRetracted,
@@ -601,6 +749,9 @@ pub struct ServiceStatus {
     pub facts_count: usize,
     pub inbox_queue_size: usize,
     pub uptime_seconds: u64,
+    /// Fact-log lines skipped since startup because they did not parse.
+    #[serde(default)]
+    pub unparseable_lines: usize,
 }
 
 /// Result of a single file ingestion.
@@ -662,6 +813,35 @@ pub enum IdentityBackfillStart {
     Started(IdentityBackfillProgress),
     /// A run is already in progress and was left untouched.
     AlreadyRunning(IdentityBackfillProgress),
+}
+
+/// The mark an old-client `WriteBookmark` scope stands for. A bad scope is an
+/// `Internal` error because old clients can't decode newer error variants.
+pub fn bookmark_scope_mark(scope: Option<&str>) -> Result<Mark, ProtocolError> {
+    Mark::from_scope(scope).map_err(|e| ProtocolError::Internal {
+        message: format!("invalid bookmark scope: {e}"),
+    })
+}
+
+/// Outcome of `WriteMark`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MarkWrite {
+    /// The mark was applied now.
+    Written,
+    /// The track already carried the mark live; nothing was written and the
+    /// original time is kept.
+    AlreadyLive,
+}
+
+/// Outcome of `UnmarkTrack`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Unmark {
+    /// The mark was live and has been retracted; `count` retracts were written (more
+    /// than one when a merge or an older library carried several distinct values or
+    /// sources).
+    Retracted { count: NonZeroUsize },
+    /// The track did not carry the mark live; nothing was changed.
+    NotLive,
 }
 
 /// One track of a duplicate group.
@@ -800,6 +980,52 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
+
+    fn invalid_message(result: Result<LibraryRequest, ProtocolError>) -> String {
+        match result {
+            Err(ProtocolError::InvalidRequest { message }) => message,
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_request_accepts_a_known_request() {
+        let req = parse_request(br#"{"type":"Ping"}"#);
+        assert!(matches!(req, Ok(LibraryRequest::Ping)), "{req:?}");
+    }
+
+    #[test]
+    fn parse_request_rejects_an_unknown_request_type() {
+        let result = parse_request(br#"{"type":"NoSuch"}"#);
+        assert!(invalid_message(result).contains("unknown variant"));
+    }
+
+    #[test]
+    fn parse_request_rejects_non_json() {
+        assert!(!invalid_message(parse_request(b"not json")).is_empty());
+    }
+
+    #[test]
+    fn parse_request_rejects_a_known_variant_failing_newtype_validation() {
+        let result = parse_request(br#"{"type":"IngestFile","path":"../x","source":null}"#);
+        assert!(!invalid_message(result).is_empty());
+    }
+
+    #[test]
+    fn invalid_request_roundtrips_and_displays() {
+        let err = ProtocolError::InvalidRequest {
+            message: "unknown variant `X`".into(),
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        let back: ProtocolError = serde_json::from_str(&json).unwrap();
+        match &back {
+            ProtocolError::InvalidRequest { message } => {
+                assert_eq!(message, "unknown variant `X`");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(back.to_string(), "invalid request: unknown variant `X`");
+    }
 
     fn progress() -> IdentityBackfillProgress {
         IdentityBackfillProgress {
@@ -1089,15 +1315,296 @@ mod tests {
         let req = LibraryRequest::WriteFact {
             hash: hash.clone(),
             fact: fact.clone(),
+            source: None,
         };
         let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains("source"),
+            "absent source is not sent: {json}"
+        );
         let decoded: LibraryRequest = serde_json::from_str(&json).unwrap();
-        if let LibraryRequest::WriteFact { hash: h, fact: f } = decoded {
+        if let LibraryRequest::WriteFact {
+            hash: h,
+            fact: f,
+            source,
+        } = decoded
+        {
             assert_eq!(h.as_str(), hash.as_str());
             assert_eq!(f, fact);
+            assert_eq!(source, None);
         } else {
             panic!("unexpected variant");
         }
+    }
+
+    #[test]
+    fn write_fact_source_wire_format_is_pinned() {
+        let req = LibraryRequest::WriteFact {
+            hash: ContentHash::new("sha256:abc"),
+            fact: MusicValue::ItemId("p1".to_string()),
+            source: Some(FactSource::new("mdma-bandcamp", "0.4.0", "Bandcamp")),
+        };
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["source"],
+            serde_json::json!({"tool":"mdma-bandcamp","version":"0.4.0","origin":{"type":"Bandcamp"}})
+        );
+        let decoded: LibraryRequest = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            decoded,
+            LibraryRequest::WriteFact {
+                source: Some(s),
+                ..
+            } if s == FactSource::new("mdma-bandcamp", "0.4.0", "Bandcamp")
+        ));
+    }
+
+    /// The JSON of a WriteFact as an old client sends it, no `source` key.
+    fn old_write_fact_json() -> String {
+        let req = LibraryRequest::WriteFact {
+            hash: ContentHash::new("sha256:abc"),
+            fact: MusicValue::ItemId("p1".to_string()),
+            source: None,
+        };
+        serde_json::to_string(&req).unwrap()
+    }
+
+    /// Splice extra top-level keys (a JSON fragment such as `"source":{...}`) into a
+    /// WriteFact's JSON object.
+    fn with_keys(json: &str, fragment: &str) -> String {
+        let body = json.strip_suffix('}').expect("a JSON object");
+        format!("{body},{fragment}}}")
+    }
+
+    /// An old client's WriteFact has no `source` key and decodes to None.
+    #[test]
+    fn write_fact_without_source_key_decodes_to_none() {
+        let json = old_write_fact_json();
+        assert!(!json.contains("source"), "{json}");
+        let decoded: LibraryRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            LibraryRequest::WriteFact { source: None, .. }
+        ));
+    }
+
+    /// A key a newer client adds is ignored, not rejected.
+    #[test]
+    fn write_fact_with_unknown_key_still_decodes() {
+        let json = with_keys(&old_write_fact_json(), r#""future_field":1"#);
+        let decoded: LibraryRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            LibraryRequest::WriteFact { source: None, .. }
+        ));
+    }
+
+    #[test]
+    fn user_fact_source_is_mdma_user() {
+        let source = user_fact_source("1.2.3");
+        assert_eq!(source.tool, USER_TOOL);
+        assert_eq!(source.origin.kind, USER_ORIGIN);
+        assert_eq!(source.version, "1.2.3");
+    }
+
+    fn named(s: &str) -> Mark {
+        Mark::Named(MarkName::parse(s).unwrap())
+    }
+
+    #[test]
+    fn list_marked_wire_format_is_pinned() {
+        for (filter, expected) in [
+            (MarkFilter::Any, r#"{"type":"ListMarked","filter":"Any"}"#),
+            (
+                MarkFilter::Only(Mark::Default),
+                r#"{"type":"ListMarked","filter":{"Only":"Default"}}"#,
+            ),
+            (
+                MarkFilter::Only(named("banger")),
+                r#"{"type":"ListMarked","filter":{"Only":{"Named":"banger"}}}"#,
+            ),
+        ] {
+            let json = serde_json::to_string(&LibraryRequest::ListMarked {
+                filter: filter.clone(),
+            })
+            .unwrap();
+            assert_eq!(json, expected);
+            match serde_json::from_str::<LibraryRequest>(&json).unwrap() {
+                LibraryRequest::ListMarked { filter: decoded } => assert_eq!(decoded, filter),
+                other => panic!("unexpected variant {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn list_marked_with_an_invalid_mark_name_is_an_invalid_request() {
+        let err =
+            parse_request(br#"{"type":"ListMarked","filter":{"Only":{"Named":""}}}"#).unwrap_err();
+        assert!(
+            matches!(err, ProtocolError::InvalidRequest { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn list_marked_with_the_default_name_spelled_out_is_an_invalid_request() {
+        // serde does not map "liked" to Default; only the "Default" variant does.
+        let err = parse_request(br#"{"type":"ListMarked","filter":{"Only":{"Named":"liked"}}}"#)
+            .unwrap_err();
+        assert!(
+            matches!(err, ProtocolError::InvalidRequest { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn write_mark_wire_format_is_pinned() {
+        for (mark, expected) in [
+            (
+                Mark::Default,
+                r#"{"type":"WriteMark","hash":"sha256:abc","mark":"Default"}"#,
+            ),
+            (
+                named("banger"),
+                r#"{"type":"WriteMark","hash":"sha256:abc","mark":{"Named":"banger"}}"#,
+            ),
+        ] {
+            let json = serde_json::to_string(&LibraryRequest::WriteMark {
+                hash: ContentHash::new("sha256:abc"),
+                mark: mark.clone(),
+            })
+            .unwrap();
+            assert_eq!(json, expected);
+            match parse_request(json.as_bytes()).unwrap() {
+                LibraryRequest::WriteMark {
+                    hash,
+                    mark: decoded,
+                } => {
+                    assert_eq!(hash.as_str(), "sha256:abc");
+                    assert_eq!(decoded, mark);
+                }
+                other => panic!("unexpected variant {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn write_mark_with_an_invalid_mark_name_is_an_invalid_request() {
+        let err = parse_request(br#"{"type":"WriteMark","hash":"sha256:abc","mark":{"Named":""}}"#)
+            .unwrap_err();
+        assert!(
+            matches!(err, ProtocolError::InvalidRequest { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn mark_written_wire_format_is_pinned() {
+        for (outcome, expected) in [
+            (
+                MarkWrite::Written,
+                r#"{"type":"MarkWritten","data":"Written"}"#,
+            ),
+            (
+                MarkWrite::AlreadyLive,
+                r#"{"type":"MarkWritten","data":"AlreadyLive"}"#,
+            ),
+        ] {
+            let json = serde_json::to_string(&LibraryResponse::MarkWritten(outcome)).unwrap();
+            assert_eq!(json, expected);
+            match serde_json::from_str::<LibraryResponse>(&json).unwrap() {
+                LibraryResponse::MarkWritten(decoded) => assert_eq!(decoded, outcome),
+                other => panic!("unexpected variant {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unmark_track_wire_format_is_pinned() {
+        for (mark, expected) in [
+            (
+                Mark::Default,
+                r#"{"type":"UnmarkTrack","hash":"sha256:abc","mark":"Default"}"#,
+            ),
+            (
+                named("banger"),
+                r#"{"type":"UnmarkTrack","hash":"sha256:abc","mark":{"Named":"banger"}}"#,
+            ),
+        ] {
+            let json = serde_json::to_string(&LibraryRequest::UnmarkTrack {
+                hash: ContentHash::new("sha256:abc"),
+                mark: mark.clone(),
+            })
+            .unwrap();
+            assert_eq!(json, expected);
+            match parse_request(json.as_bytes()).unwrap() {
+                LibraryRequest::UnmarkTrack {
+                    hash,
+                    mark: decoded,
+                } => {
+                    assert_eq!(hash.as_str(), "sha256:abc");
+                    assert_eq!(decoded, mark);
+                }
+                other => panic!("unexpected variant {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unmark_track_with_an_invalid_mark_name_is_an_invalid_request() {
+        let err =
+            parse_request(br#"{"type":"UnmarkTrack","hash":"sha256:abc","mark":{"Named":""}}"#)
+                .unwrap_err();
+        assert!(
+            matches!(err, ProtocolError::InvalidRequest { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn track_unmarked_wire_format_is_pinned() {
+        for (outcome, expected) in [
+            (
+                Unmark::Retracted {
+                    count: NonZeroUsize::new(2).unwrap(),
+                },
+                r#"{"type":"TrackUnmarked","data":{"Retracted":{"count":2}}}"#,
+            ),
+            (
+                Unmark::NotLive,
+                r#"{"type":"TrackUnmarked","data":"NotLive"}"#,
+            ),
+        ] {
+            let json = serde_json::to_string(&LibraryResponse::TrackUnmarked(outcome)).unwrap();
+            assert_eq!(json, expected);
+            match serde_json::from_str::<LibraryResponse>(&json).unwrap() {
+                LibraryResponse::TrackUnmarked(decoded) => assert_eq!(decoded, outcome),
+                other => panic!("unexpected variant {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn track_unmarked_with_a_zero_count_fails_to_decode() {
+        let json = r#"{"type":"TrackUnmarked","data":{"Retracted":{"count":0}}}"#;
+        assert!(serde_json::from_str::<LibraryResponse>(json).is_err());
+    }
+
+    #[test]
+    fn write_bookmark_wire_format_is_unchanged() {
+        let json = serde_json::to_string(&LibraryRequest::WriteBookmark {
+            hash: ContentHash::new("sha256:abc"),
+            scope: Some("Friday".to_owned()),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"WriteBookmark","hash":"sha256:abc","scope":"Friday"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&LibraryResponse::BookmarkWritten).unwrap(),
+            r#"{"type":"BookmarkWritten"}"#
+        );
     }
 
     #[test]
@@ -1116,10 +1623,14 @@ mod tests {
         let req = LibraryRequest::RetractFact {
             hash: hash.clone(),
             fact: fact.clone(),
+            source: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let decoded: LibraryRequest = serde_json::from_str(&json).unwrap();
-        if let LibraryRequest::RetractFact { hash: h, fact: f } = decoded {
+        if let LibraryRequest::RetractFact {
+            hash: h, fact: f, ..
+        } = decoded
+        {
             assert_eq!(h.as_str(), hash.as_str());
             assert_eq!(f, fact);
         } else {
@@ -1139,19 +1650,121 @@ mod tests {
     fn retract_source_facts_request_roundtrip() {
         let req = LibraryRequest::RetractSourceFacts {
             item_id: "p123456".to_string(),
-            source_name: "bandcamp".to_string(),
+            source: FactSource::new("mdma-bandcamp", "0.4.0", "Bandcamp"),
+            attributes: AttributeList::try_new(["Album", "Title"]).unwrap(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let decoded: LibraryRequest = serde_json::from_str(&json).unwrap();
         match decoded {
             LibraryRequest::RetractSourceFacts {
                 item_id,
-                source_name,
+                source,
+                attributes,
             } => {
                 assert_eq!(item_id, "p123456");
-                assert_eq!(source_name, "bandcamp");
+                assert_eq!(
+                    source,
+                    FactSource::new("mdma-bandcamp", "0.4.0", "Bandcamp")
+                );
+                assert_eq!(
+                    attributes,
+                    AttributeList::try_new(["Album", "Title"]).unwrap()
+                );
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn attribute_list_refuses_empty_and_unknown_names() {
+        assert_eq!(
+            AttributeList::try_new(Vec::<String>::new()),
+            Err(AttributeListError::Empty)
+        );
+        assert_eq!(
+            AttributeList::try_new(["Albm"]),
+            Err(AttributeListError::Unknown("Albm".to_string()))
+        );
+        assert!(serde_json::from_str::<AttributeList>("[]").is_err());
+        assert!(serde_json::from_str::<AttributeList>(r#"["Albm"]"#).is_err());
+        assert_eq!(
+            serde_json::to_string(&AttributeList::try_new(["Album"]).unwrap()).unwrap(),
+            r#"["Album"]"#
+        );
+    }
+
+    #[test]
+    fn service_status_without_unparseable_lines_decodes() {
+        let status: ServiceStatus = serde_json::from_str(
+            r#"{"version":"1","tracks_indexed":1,"facts_count":2,"inbox_queue_size":0,"uptime_seconds":3}"#,
+        )
+        .unwrap();
+        assert_eq!(status.unparseable_lines, 0);
+    }
+
+    #[test]
+    fn retract_fact_source_is_optional_on_the_wire() {
+        let req = LibraryRequest::RetractFact {
+            hash: ContentHash::new("sha256:abc"),
+            fact: MusicValue::ItemId("p1".to_string()),
+            source: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains("source"),
+            "absent source is not sent: {json}"
+        );
+        let decoded: LibraryRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            LibraryRequest::RetractFact { source: None, .. }
+        ));
+    }
+
+    #[test]
+    fn ingest_file_without_writer_or_facts_decodes_as_before() {
+        let decoded =
+            parse_request(br#"{"type":"IngestFile","path":"a.flac","source":null}"#).unwrap();
+        match decoded {
+            LibraryRequest::IngestFile {
+                writer,
+                facts,
+                source,
+                ..
+            } => {
+                assert!(writer.is_none() && source.is_none());
+                assert!(facts.is_empty());
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ingest_file_writer_and_facts_roundtrip() {
+        let req = LibraryRequest::IngestFile {
+            path: InboxPath::new("a.flac").unwrap(),
+            source: None,
+            writer: Some(FactSource::new("mdma-bandcamp", "0.4.0", "Bandcamp")),
+            facts: vec![
+                MusicValue::Source("bandcamp".to_string()),
+                MusicValue::ItemId("p1".to_string()),
+            ],
+        };
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["writer"],
+            serde_json::json!({"tool":"mdma-bandcamp","version":"0.4.0","origin":{"type":"Bandcamp"}})
+        );
+        let decoded: LibraryRequest = serde_json::from_value(value).unwrap();
+        match decoded {
+            LibraryRequest::IngestFile { writer, facts, .. } => {
+                assert_eq!(
+                    writer,
+                    Some(FactSource::new("mdma-bandcamp", "0.4.0", "Bandcamp"))
+                );
+                assert_eq!(facts.len(), 2);
+            }
+            other => panic!("unexpected request: {other:?}"),
         }
     }
 

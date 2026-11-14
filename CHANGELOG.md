@@ -8,6 +8,80 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.37.0] — 2026-11-14
+
+### Fixed
+
+- **Bandcamp `check-item` and `check-updates` now read the live track count from the download page** (`track_count` for albums, 1 for single tracks). The count used to be always 0, so stale items were never found. When the count can't be determined, `check-item` reports an error instead of OK.
+- Release years from Bandcamp download pages are now parsed.
+- **The gateway handles requests concurrently and no longer resends a request.** A slow request no longer blocks the others, and a request that timed out is not sent twice.
+- **Merges keep plays, and `library track replace` carries facts like a merge** (ADR-017 phase 0). A merged-away track's plays and carry are kept.
+
+### Added
+
+- **Client-owned fact sources (ADR-020).** The library is source-agnostic: the client states the source of each fact, with an origin kind it owns. Rekordbox imports are written as `mdma` / `Rekordbox` and uploads as `mdma` / `Upload`.
+  - `mdma fact retract --origin <ORIGIN>` names the origin to retract, for example `--origin Rekordbox` or `--origin Upload`.
+  - A retract that matches nothing is reported as `NothingToRetract`, not as success.
+  - Lines that fail to parse are counted, and the count is shown in library status. Each load logs one summary warning.
+  - **BREAKING for old CLIs:** a CLI from before this release does not understand `NothingToRetract`. Upgrade the CLI together with the node.
+- **The library stamps the facts it writes with the release version.**
+- **Bandcamp `check-updates` runs as a background job** on the node, like playlist import. It handles Bandcamp rate limits instead of failing the whole run.
+- **Shell completions for the devenv shell:** `mdma-completions` in devenv provides the CLI completions.
+
+- **Marks (ADR-016 phases 0-1).** A bookmark is now the default mark, "liked". Named marks such as "banger" or "opener" sit beside it.
+  - `mdma mark [NAME]` and `mdma unmark [NAME]` act on the hashes piped on stdin. Run from a terminal without a pipe, they act on the playing track. A pipe with no hashes is an error ("No hashes provided on stdin."). (Superseded below: stdin is now read only with `-`.)
+  - `mdma marked [NAME]` lists tracks with that mark, or with any mark when NAME is left out. `mdma marked liked` lists only the default mark.
+  - Mark names are lowercase, 1-64 characters, with no control or invisible characters. "liked" is reserved for the default mark.
+  - Marks written before this release, with scopes that are not valid names, are still read, and `marked` lists them. They can't yet be removed from the CLI; removal is a planned follow-up.
+  - New library requests: `ListMarked { filter: Any | Only(mark) }`, `WriteMark` and `UnmarkTrack`. `UnmarkTrack` retracts every live entry of the mark, each with its own source.
+- **TUI:** `b` marks the playing track "liked". It reports "Marked liked" or "Already marked liked".
+- **Hashes on stdin with `-`, for every command that takes track hashes:** `get <HASH|->`, `facts <HASH|->`, `fact add|retract <HASH|-> --field F --value V`, `library track delete|restore <HASH|->`. Each hash is acted on once (fact, delete, restore), one `<short-hash>  <outcome>` line per track on stdout. A track that fails (not found, or a retract that matched nothing) is reported on stderr with its hash, the rest still run, and the exit code is 1. `library dedup merge` and `library track replace` stay explicit: the winner/old hash matters.
+
+### Changed
+
+- **A retract matches value and source identity (ADR-018).** Source identity is the tool plus the origin kind; version and origin details no longer count. This amends ADR-004.
+- **mdma-cli is on hicli 0.7.** Argument errors name the flag, closed sets of values are listed as `Choice`s, and completions know them.
+- **BREAKING: stdin is read only when `-` is given.** Over ssh, stdin is open but never sends EOF, so commands that waited for it hung. This supersedes the stdin and TTY behaviour described in the entries below.
+  - `search [QUERY] [-]`: `-` keeps only tracks among the hashes read from stdin (`--not` inverts).
+  - `mark [NAME] [-]` and `unmark [NAME] [-]`: `-` reads hashes from stdin. Without `-` they act on the playing track.
+  - `queue next|append|remove <HASH|->`, `playlist get <NAME|->`, and `rekordbox export` takes `--playlist X` or `-` (exactly one, a usage error otherwise).
+  - Commands that only took stdin now need `-` too, and are a usage error without it: `sort FIELD -a|-d -`, `view --hash|--artist|--title|--duration... -`, `queue replace -`, `export ... -`, `playlist new|append|replace NAME -`, `playlist contains [--all|--at-least N|--no] -`.
+  - `mark`/`unmark` without `-` print "(playing track: Artist – Title)" on each line, so a forgotten `-` in a pipeline shows.
+  - The `--yes` confirmations (`library dedup merge`, `library archive empty`) no longer read stdin when it is not a terminal: they exit 2 with "not a terminal: pass --yes to confirm".
+  - `--no-stdin` is a hidden no-op, kept for old scripts.
+  - Example: `mdma search --bpm 120..130 | mdma mark -`.
+- **BREAKING: `mdma bookmark` and `mdma bookmarks` are now aliases of `mark` and `marked`.** The `--scope` option and the HASH argument are gone. Pipe hashes on stdin with `-` instead (`mdma … | mdma mark NAME -`), and pass the mark name as NAME.
+- **BREAKING: `ListBookmarked` is removed** (it was never released). Use `ListMarked`. `WriteBookmark` stays as a deprecated alias of `WriteMark`.
+  - Upgrade the node first: gateway and library (and console) together, then the CLI and TUI. A new gateway in front of an old library would time out, which is why those go together.
+  - Older CLIs and TUIs keep working against the new node through `WriteBookmark`: their scopes are lowercased, a repeat writes nothing, and an invalid scope gets an error.
+- **Old nodes.** A node that does not know a request now gives one error: "The node did not understand this request; it may be older than this CLI — upgrade the node." There is no fallback. The TUI shows the same text with "TUI" in place of "CLI". A new CLI against an old node shows this message.
+- **Bookmark behaviour:**
+  - `WriteBookmark` scopes are lowercased.
+  - An empty, too-long or control/invisible scope is rejected with Internal.
+  - Repeating a bookmark or mark writes nothing, and the original time is kept.
+  - Retracted bookmarks no longer appear in listings.
+  - Merge dedup compares bookmarks by mark, so "Banger" equals "banger".
+- The now-playing error text is "Nothing playing".
+
+- **BREAKING: mdma-cli now parses with hicli 0.2; clap is removed (ADR-015).**
+  - Bad argument values are rejected while parsing, with exit code 2, before anything connects. Runtime failures (node unreachable, service error) exit 1.
+  - The parser's error text replaces the old custom messages.
+  - A bad `MDMA_NODE` is reported only when a node is needed. It exits 1 and names the variable.
+  - `--node` (and `MDMA_NODE`) is `host[:port]`, port 1-65535; anything else is a usage error.
+  - Track hashes on argv follow the stdin rule: at least 8 lowercase hex characters, optional `sha256:` prefix.
+  - `search`: `--bpm` and `--year` reject bad values, `--key` and `--duration` now work, `--energy` must be 1-10.
+  - Date options (`--added`, `--started`, `--stopped`) are date expressions. A value starting with a dash must be glued: `--added=-7`. `--added -7` as two words is rejected.
+  - `mdma help <cmd>` is gone; use `mdma <cmd> --help`. `source NAME --help` shows the source group's page.
+  - `--version` prints `Version: x.y.z`.
+  - Completions come from the hidden `mdma generate-completions <bash|zsh|fish>`. elvish and PowerShell completions are dropped. Regenerate any installed completion scripts.
+
+### Fixed
+
+- **The library replies `InvalidRequest` to requests it cannot parse** (#97). Before, it sent no reply, and the stub's server died.
+- `queue edit` and `playlist edit` use a unique temp file.
+
+---
+
 ## [0.36.1] — 2026-11-04
 
 ### Fixed

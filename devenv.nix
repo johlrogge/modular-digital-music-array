@@ -72,6 +72,30 @@ in
   # Shell scripts for things that aren't in mdma-cli (Pi administration via SSH).
   # mdma itself is on PATH via enterShell — use it directly for all library/playback commands.
   scripts = {
+    # Regenerate shell completion scripts for the locally built `mdma` binary
+    # into $DEVENV_STATE/completions (_mdma for zsh, mdma.bash, mdma.fish).
+    # Completion is dynamic (the script calls back into the binary), so the
+    # files only need regenerating when the binary changes.
+    mdma-completions.exec = ''
+      set -euo pipefail
+      root="''${MDMA_PROJECT_ROOT:-$PWD}"
+      bin="$root/target/debug/mdma"
+      dir="''${DEVENV_STATE:-$root/.devenv/state}/completions"
+      if [ ! -x "$bin" ]; then
+        echo "mdma-completions: $bin not built — run: cargo polylith cargo --profile dev build --bin mdma" >&2
+        exit 1
+      fi
+      mkdir -p "$dir"
+      # Skip when up to date, unless forced with --force
+      if [ "''${1:-}" != "--force" ] && [ -f "$dir/_mdma" ] && [ "$dir/_mdma" -nt "$bin" ]; then
+        exit 0
+      fi
+      "$bin" generate-completions zsh  > "$dir/_mdma.tmp"     && mv "$dir/_mdma.tmp" "$dir/_mdma"
+      "$bin" generate-completions bash > "$dir/mdma.bash.tmp" && mv "$dir/mdma.bash.tmp" "$dir/mdma.bash"
+      "$bin" generate-completions fish > "$dir/mdma.fish.tmp" && mv "$dir/mdma.fish.tmp" "$dir/mdma.fish"
+      echo "mdma completions written to $dir"
+    '';
+
     # Set the iFi DAC (or default sink) volume via wpctl on the Pi
     mdma-volume.exec = ''
       set -euo pipefail
@@ -203,7 +227,12 @@ in
         && export PATH="$MDMA_PROJECT_ROOT/target/debug:$PATH" \
         && echo "mdma CLI + TUI ready (gateway mode)" \
         || echo "mdma CLI/TUI not built — run: cargo polylith cargo --profile dev build --bin mdma"
-      eval "$(mdma generate-completions bash 2>/dev/null)" || true
+      # Write completion scripts (zsh/bash/fish) to $DEVENV_STATE/completions
+      mdma-completions >/dev/null 2>&1 || true
+      if [ -n "''${BASH_VERSION:-}" ] && [ -f "$DEVENV_STATE/completions/mdma.bash" ]; then
+        source "$DEVENV_STATE/completions/mdma.bash" 2>/dev/null || true
+      fi
+      echo "zsh completion: fpath=($DEVENV_STATE/completions \$fpath); autoload -Uz _mdma && compdef _mdma mdma"
     fi
 
     echo ""
@@ -444,8 +473,9 @@ in
         IMPORTANT: MDMA_NODE is already set in your environment. The mdma CLI derives
         the gateway address from it automatically. Do NOT set or export MDMA_GATEWAY.
         Run mdma commands directly (e.g. "mdma ping", NOT "MDMA_GATEWAY=... mdma ping").
-        IMPORTANT: Always use --no-stdin with `mdma search` to prevent it from waiting
-        for piped input. Without --no-stdin, search hangs when called from agents.
+        NOTE: mdma reads stdin only when you pass `-` (e.g. `mdma search ... | mdma mark -`),
+        so plain `mdma search` never waits for piped input. Do not pass `-` unless you pipe
+        hashes in. (--no-stdin is a hidden no-op kept for old scripts.)
 
         TOOL USAGE:
         - Pi SSH checks (sv status, logs): use mcp__ssh__ssh_run with host "pi"
@@ -466,12 +496,12 @@ in
            Expected: exit code 0, track count > 0
 
         4. SEARCH — verify search works:
-           mdma search --no-stdin --artist "a" --limit 1
-           Expected: exit code 0, at least 1 result
+           mdma search --artist "a" | head -n 1
+           Expected: at least 1 result line (the exit code is head's, so judge by output)
 
         5. PLAYBACK — verify playback service responds:
            mdma playback now
-           Expected: exit code 0 (may report "nothing playing" — that is fine)
+           Expected: exit 0 with a hash, or exit 1 with 'Nothing playing' on stderr; both PASS
 
         6. SOURCES — verify source discovery works:
            mdma source list

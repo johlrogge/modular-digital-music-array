@@ -2,7 +2,7 @@ use clap::Parser;
 use color_eyre::Result;
 
 use library_service::service::{run_ipc_server, spawn_fact_subscriber};
-use library_service::LibraryService;
+use library_service::{LibraryService, ReleaseVersion};
 use service::ensure_ipc_dir;
 
 #[derive(Parser, Debug)]
@@ -69,6 +69,7 @@ async fn main() -> Result<()> {
         args.metadata_dir,
         &args.acid_socket,
         &args.acid_events_socket,
+        ReleaseVersion::new(env!("CARGO_PKG_VERSION"))?,
     )?;
 
     tracing::info!(

@@ -4,7 +4,7 @@ use acid_client::AcidClient;
 use color_eyre::Result;
 use event_protocol::{to_topic_message, PlaybackEvent};
 use media_protocol::{Command, Response, ResponseData, SourceName};
-use music_facts::{FactOrigin, FactSource, MusicValue};
+use music_facts::{FactSource, MusicValue};
 use nng::Socket;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -37,11 +37,7 @@ struct QueueEntry {
 }
 
 fn write_fact(acid_client: &AcidClient, hash: &media_protocol::ContentHash, value: MusicValue) {
-    let source = FactSource::new(
-        "mdma-playback",
-        env!("CARGO_PKG_VERSION"),
-        FactOrigin::Unknown,
-    );
+    let source = FactSource::new("mdma-playback", env!("CARGO_PKG_VERSION"), "Unknown");
     if let Err(e) = acid_client.write_music_facts(hash, &[(value, source)]) {
         warn!("Failed to write fact via ACID: {}", e);
     }
