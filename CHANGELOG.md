@@ -6,12 +6,27 @@ All notable changes to MDMA are documented here.
 
 ## [Unreleased]
 
+---
+
+## [0.37.0] — 2026-11-14
+
 ### Fixed
 
 - **Bandcamp `check-item` and `check-updates` now read the live track count from the download page** (`track_count` for albums, 1 for single tracks). The count used to be always 0, so stale items were never found. When the count can't be determined, `check-item` reports an error instead of OK.
 - Release years from Bandcamp download pages are now parsed.
+- **The gateway handles requests concurrently and no longer resends a request.** A slow request no longer blocks the others, and a request that timed out is not sent twice.
+- **Merges keep plays, and `library track replace` carries facts like a merge** (ADR-017 phase 0). A merged-away track's plays and carry are kept.
 
 ### Added
+
+- **Client-owned fact sources (ADR-020).** The library is source-agnostic: the client states the source of each fact, with an origin kind it owns. Rekordbox imports are written as `mdma` / `Rekordbox` and uploads as `mdma` / `Upload`.
+  - `mdma fact retract --origin <ORIGIN>` names the origin to retract, for example `--origin Rekordbox` or `--origin Upload`.
+  - A retract that matches nothing is reported as `NothingToRetract`, not as success.
+  - Lines that fail to parse are counted, and the count is shown in library status. Each load logs one summary warning.
+  - **BREAKING for old CLIs:** a CLI from before this release does not understand `NothingToRetract`. Upgrade the CLI together with the node.
+- **The library stamps the facts it writes with the release version.**
+- **Bandcamp `check-updates` runs as a background job** on the node, like playlist import. It handles Bandcamp rate limits instead of failing the whole run.
+- **Shell completions for the devenv shell:** `mdma-completions` in devenv provides the CLI completions.
 
 - **Marks (ADR-016 phases 0-1).** A bookmark is now the default mark, "liked". Named marks such as "banger" or "opener" sit beside it.
   - `mdma mark [NAME]` and `mdma unmark [NAME]` act on the hashes piped on stdin. Run from a terminal without a pipe, they act on the playing track. A pipe with no hashes is an error ("No hashes provided on stdin."). (Superseded below: stdin is now read only with `-`.)
@@ -24,6 +39,8 @@ All notable changes to MDMA are documented here.
 
 ### Changed
 
+- **A retract matches value and source identity (ADR-018).** Source identity is the tool plus the origin kind; version and origin details no longer count. This amends ADR-004.
+- **mdma-cli is on hicli 0.7.** Argument errors name the flag, closed sets of values are listed as `Choice`s, and completions know them.
 - **BREAKING: stdin is read only when `-` is given.** Over ssh, stdin is open but never sends EOF, so commands that waited for it hung. This supersedes the stdin and TTY behaviour described in the entries below.
   - `search [QUERY] [-]`: `-` keeps only tracks among the hashes read from stdin (`--not` inverts).
   - `mark [NAME] [-]` and `unmark [NAME] [-]`: `-` reads hashes from stdin. Without `-` they act on the playing track.
