@@ -72,6 +72,30 @@ in
   # Shell scripts for things that aren't in mdma-cli (Pi administration via SSH).
   # mdma itself is on PATH via enterShell — use it directly for all library/playback commands.
   scripts = {
+    # Regenerate shell completion scripts for the locally built `mdma` binary
+    # into $DEVENV_STATE/completions (_mdma for zsh, mdma.bash, mdma.fish).
+    # Completion is dynamic (the script calls back into the binary), so the
+    # files only need regenerating when the binary changes.
+    mdma-completions.exec = ''
+      set -euo pipefail
+      root="''${MDMA_PROJECT_ROOT:-$PWD}"
+      bin="$root/target/debug/mdma"
+      dir="''${DEVENV_STATE:-$root/.devenv/state}/completions"
+      if [ ! -x "$bin" ]; then
+        echo "mdma-completions: $bin not built — run: cargo polylith cargo --profile dev build --bin mdma" >&2
+        exit 1
+      fi
+      mkdir -p "$dir"
+      # Skip when up to date, unless forced with --force
+      if [ "''${1:-}" != "--force" ] && [ -f "$dir/_mdma" ] && [ "$dir/_mdma" -nt "$bin" ]; then
+        exit 0
+      fi
+      "$bin" generate-completions zsh  > "$dir/_mdma.tmp"     && mv "$dir/_mdma.tmp" "$dir/_mdma"
+      "$bin" generate-completions bash > "$dir/mdma.bash.tmp" && mv "$dir/mdma.bash.tmp" "$dir/mdma.bash"
+      "$bin" generate-completions fish > "$dir/mdma.fish.tmp" && mv "$dir/mdma.fish.tmp" "$dir/mdma.fish"
+      echo "mdma completions written to $dir"
+    '';
+
     # Set the iFi DAC (or default sink) volume via wpctl on the Pi
     mdma-volume.exec = ''
       set -euo pipefail
@@ -203,7 +227,12 @@ in
         && export PATH="$MDMA_PROJECT_ROOT/target/debug:$PATH" \
         && echo "mdma CLI + TUI ready (gateway mode)" \
         || echo "mdma CLI/TUI not built — run: cargo polylith cargo --profile dev build --bin mdma"
-      eval "$(mdma generate-completions bash 2>/dev/null)" || true
+      # Write completion scripts (zsh/bash/fish) to $DEVENV_STATE/completions
+      mdma-completions >/dev/null 2>&1 || true
+      if [ -n "''${BASH_VERSION:-}" ] && [ -f "$DEVENV_STATE/completions/mdma.bash" ]; then
+        source "$DEVENV_STATE/completions/mdma.bash" 2>/dev/null || true
+      fi
+      echo "zsh completion: fpath=($DEVENV_STATE/completions \$fpath); autoload -Uz _mdma && compdef _mdma mdma"
     fi
 
     echo ""
