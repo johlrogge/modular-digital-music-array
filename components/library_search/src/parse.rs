@@ -4,6 +4,8 @@ use crate::query::{
 };
 use chrono::NaiveDate;
 use music_primitives::TrackRole;
+use std::convert::Infallible;
+use std::str::FromStr;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -18,6 +20,57 @@ pub enum ParseError {
     InvalidDateQuery(String),
     #[error("invalid role '{0}': expected one of opener, build-up, peak, banger, cool-down, closer, filler (case-insensitive)")]
     InvalidRole(String),
+}
+
+impl ParseError {
+    /// What was wrong, without the word that was typed: for callers that print the
+    /// word themselves (an argument parser says ``couldn't parse `x`:`` first).
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::InvalidNumeric(_) => {
+                "expected a number, `lo..hi`, `val+-tol`, `val+tol` or `val-tol`"
+            }
+            Self::InvalidDuration(_) => {
+                "expected a duration such as `7m15s`, `7m`, `>5m`, `<8m` or `6m..8m`"
+            }
+            Self::InvalidKey(_) => {
+                "expected a Camelot key (`8B`, `10A`) or a traditional one (`Am`, `C# major`)"
+            }
+            Self::InvalidDateQuery(_) => {
+                "expected a date such as `2026`, `2026-02`, `>2026-02` or `2026-01..2026-06`, a date expression, or `N/A`"
+            }
+            Self::InvalidRole(_) => {
+                "expected one of opener, build-up, peak, banger, cool-down, closer, filler"
+            }
+        }
+    }
+}
+
+/// Parsing a query from a word, with the bare reason as the error (see
+/// [`ParseError::reason`]).
+macro_rules! from_str_query {
+    ($query:ty, $parse:ident) => {
+        impl FromStr for $query {
+            type Err = &'static str;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                $parse(s).map_err(|e| e.reason())
+            }
+        }
+    };
+}
+
+from_str_query!(NumericQuery, parse_numeric_query);
+from_str_query!(DurationQuery, parse_duration_query);
+from_str_query!(KeyQuery, parse_key_query);
+from_str_query!(DateQuery, parse_date_query);
+
+impl FromStr for StringQuery {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(parse_string_query(s))
+    }
 }
 
 /// Splits `s` into `(base, up_str, down_str)` by detecting tolerance suffix patterns.
@@ -418,6 +471,48 @@ pub fn parse_role_query(s: &str) -> Result<TrackRole, ParseError> {
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    // --- FromStr: each query type parses itself, with a bare reason on failure ---
+
+    #[test]
+    fn query_types_parse_through_from_str() {
+        assert!(matches!(
+            "CBL".parse::<StringQuery>(),
+            Ok(StringQuery::Initialism(_))
+        ));
+        assert!(matches!(
+            "128".parse::<NumericQuery>(),
+            Ok(NumericQuery::Exact(v)) if v == 128.0
+        ));
+        assert!(matches!(
+            ">5m".parse::<DurationQuery>(),
+            Ok(DurationQuery::AtLeast(300))
+        ));
+        assert!(matches!(
+            "8B".parse::<KeyQuery>(),
+            Ok(KeyQuery::Exact { .. })
+        ));
+        assert!(matches!("N/A".parse::<DateQuery>(), Ok(DateQuery::NA)));
+    }
+
+    #[test]
+    fn from_str_errors_are_the_reason_without_the_word() {
+        let word = "garbage";
+        let reasons = [
+            "garbage".parse::<NumericQuery>().unwrap_err(),
+            "garbage".parse::<DurationQuery>().unwrap_err(),
+            "garbage".parse::<KeyQuery>().unwrap_err(),
+            "garbage".parse::<DateQuery>().unwrap_err(),
+        ];
+        for reason in reasons {
+            assert!(!reason.is_empty());
+            assert!(!reason.contains(word), "{reason}");
+        }
+        assert!(parse_numeric_query("garbage")
+            .unwrap_err()
+            .to_string()
+            .contains("invalid numeric query 'garbage'"));
+    }
 
     #[rstest]
     #[case("rymden")]

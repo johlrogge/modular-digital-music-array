@@ -1,10 +1,9 @@
 mod import;
 
-use crate::args::{impl_arg, SanitizedPlaylistName};
+use crate::args::{Apply, DryRun, NoWait, SanitizedPlaylistName};
 use crate::ctx::Ctx;
 use crate::output::{display_error, interpret_library, interpret_source, source_label};
 use crate::source::import::{finish_import, follow_import_job, is_terminal_phase};
-use bpaf::Bpaf;
 use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use hicli::{Arg, Success};
@@ -13,9 +12,35 @@ use source_protocol::{SourceError, SourceRequest, SourceResponse};
 use std::convert::Infallible;
 use std::str::FromStr;
 
-/// The music source a per-source command runs against.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Music source name
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(positional = "SOURCE-NAME", complete = complete_local_sources)]
 pub(crate) struct SourceArg(pub mdma_client::SourceName);
+
+/// The sources whose socket is in the local sources directory (`MDMA_SOURCES_DIR`, else
+/// the default), that start with `typed`. Empty when talking to a remote node: asking
+/// the gateway would be a network call per keystroke.
+fn complete_local_sources(typed: &str) -> Vec<hicli::Candidate> {
+    let dir = std::env::var_os("MDMA_SOURCES_DIR")
+        .filter(|dir| !dir.is_empty())
+        .unwrap_or_else(|| crate::ctx::DEFAULT_SOURCES_DIR.into());
+    sources_in(std::path::Path::new(&dir), typed)
+}
+
+fn sources_in(dir: &std::path::Path, typed: &str) -> Vec<hicli::Candidate> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "sock"))
+        .filter_map(|path| Some(path.file_stem()?.to_str()?.to_string()))
+        .filter(|name| name.starts_with(typed))
+        .collect();
+    names.sort();
+    names.into_iter().map(|name| (name, None)).collect()
+}
 
 impl FromStr for SourceArg {
     type Err = Infallible;
@@ -25,26 +50,15 @@ impl FromStr for SourceArg {
     }
 }
 
-impl_arg!(SourceArg, positional "SOURCE-NAME", "Music source name");
-
 impl SourceArg {
     pub(crate) fn as_str(&self) -> &str {
         self.0.as_str()
     }
 }
 
-/// Whether `check-updates` resyncs the stale items it finds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ApplyUpdates(pub bool);
-
-impl_arg!(
-    ApplyUpdates,
-    switch "apply",
-    "Auto-apply resync for any stale items found"
-);
-
-/// A download of a source, as listed by `downloads`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Download ID to cancel, as listed by `downloads`
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(positional = "ID")]
 pub(crate) struct DownloadArg(pub source_protocol::DownloadId);
 
 impl FromStr for DownloadArg {
@@ -55,50 +69,30 @@ impl FromStr for DownloadArg {
     }
 }
 
-impl_arg!(DownloadArg, positional "ID", "Download ID to cancel");
-impl_arg!(ItemIdArg, positional "IDENTIFIER", "Source-specific item identifier");
-impl_arg!(SourcePlaylistArg, positional "PLAYLIST", "Playlist slug or URL");
-
-/// A source-specific item identifier (e.g. "p123456" for bandcamp).
+/// Source-specific item identifier (e.g. p123456 for bandcamp)
 // Stays a String: no domain rule, the source interprets it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(positional = "IDENTIFIER")]
 pub(crate) struct ItemIdArg(pub String);
 
-impl FromStr for ItemIdArg {
-    type Err = Infallible;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        Ok(Self(s.to_string()))
-    }
-}
-
-/// A source playlist to import: a slug or a URL.
+/// Playlist slug or URL
 // Stays a String: no domain rule, the source interprets it (slug or URL).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(positional = "PLAYLIST")]
 pub(crate) struct SourcePlaylistArg(pub String);
 
-impl FromStr for SourcePlaylistArg {
-    type Err = Infallible;
+/// MDMA playlist name (default: sanitised source title)
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(long = "name", metavar = "NAME")]
+pub(crate) struct ImportName(pub Option<SanitizedPlaylistName>);
 
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        Ok(Self(s.to_string()))
-    }
-}
-
-// `playlist` takes its help from its `Arg` impl.
-#[derive(Debug, PartialEq, Bpaf, Arg)]
+#[derive(Debug, PartialEq, Arg)]
 pub(crate) struct ImportPlaylistArgs {
-    /// MDMA playlist name (default: sanitised source title)
-    #[bpaf(argument("NAME"))]
-    name: Option<SanitizedPlaylistName>,
-
+    name: ImportName,
     /// Show the report without syncing or writing the playlist
-    dry_run: bool,
-
+    dry_run: DryRun,
     /// Print the job id and exit once the import has started
-    no_wait: bool,
-
-    #[bpaf(external(SourcePlaylistArg::parser))]
+    no_wait: NoWait,
     playlist: SourcePlaylistArg,
 }
 
@@ -115,7 +109,7 @@ const SOURCE_LONG_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 #[hicli::command]
 pub(crate) fn list(ctx: &Ctx) -> Result<()> {
     let gateway = ctx.gateway()?;
-    let sources = mdma_client::list_available_sources(gateway.as_deref(), ctx.sources_dir())
+    let sources = mdma_client::list_available_sources(gateway.as_deref(), ctx.sources_dir()?)
         .map_err(display_error)?;
     if sources.is_empty() {
         println!("No sources available");
@@ -392,8 +386,12 @@ pub(crate) fn check_item(source: SourceArg, identifier: ItemIdArg, ctx: &Ctx) ->
 }
 
 /// Check the whole source collection for stale items
+///
+/// # Arguments
+///
+/// * `apply` - Resync the stale items found
 #[hicli::command(curried)]
-pub(crate) fn check_updates(source: SourceArg, apply: ApplyUpdates, ctx: &Ctx) -> Result<()> {
+pub(crate) fn check_updates(source: SourceArg, apply: Apply, ctx: &Ctx) -> Result<()> {
     let name = source.as_str();
     let apply = apply.0;
     let source = ctx.source(name, Some(SOURCE_LONG_OP_TIMEOUT))?;
@@ -609,9 +607,9 @@ pub(crate) fn import_playlist(
     let name = source.as_str();
     let source = ctx.source(name, None)?;
     let ImportPlaylistArgs {
-        name: playlist_name,
-        dry_run,
-        no_wait,
+        name: ImportName(playlist_name),
+        dry_run: DryRun(dry_run),
+        no_wait: NoWait(no_wait),
         playlist,
     } = args;
     // --name was validated and sanitised at parse time
@@ -715,13 +713,9 @@ mod tests {
     }
 
     #[test]
-    fn apply_updates_arg_parser_is_a_switch() {
-        assert_eq!(run_arg::<ApplyUpdates>(&[]), Ok(ApplyUpdates(false)));
-        assert_eq!(
-            run_arg::<ApplyUpdates>(&["--apply"]),
-            Ok(ApplyUpdates(true))
-        );
-        assert!(run_arg::<ApplyUpdates>(&["--aply"]).is_err());
+    fn check_updates_words_its_own_apply_help() {
+        let help = help(&["source", "bandcamp", "check-updates", "--help"]);
+        assert!(help.contains("Resync the stale items found"), "{help}");
     }
 
     use playlist_import::sanitize_playlist_name;
@@ -736,10 +730,6 @@ mod tests {
         assert_eq!(
             "d1".parse::<DownloadArg>().unwrap(),
             DownloadArg(source_protocol::DownloadId::new("d1"))
-        );
-        assert_eq!(
-            "p123".parse::<ItemIdArg>().unwrap(),
-            ItemIdArg("p123".to_string())
         );
     }
 
@@ -825,9 +815,9 @@ mod tests {
             run_arg::<ImportPlaylistArgs>(&["my-list", "--name", "x", "--dry-run", "--no-wait"]),
             Ok(ImportPlaylistArgs {
                 playlist: SourcePlaylistArg("my-list".into()),
-                name: Some("x".parse().unwrap()),
-                dry_run: true,
-                no_wait: true,
+                name: ImportName(Some("x".parse().unwrap())),
+                dry_run: DryRun(true),
+                no_wait: NoWait(true),
             })
         );
     }
@@ -838,9 +828,9 @@ mod tests {
             run_arg::<ImportPlaylistArgs>(&["p"]),
             Ok(ImportPlaylistArgs {
                 playlist: SourcePlaylistArg("p".into()),
-                name: None,
-                dry_run: false,
-                no_wait: false,
+                name: ImportName(None),
+                dry_run: DryRun(false),
+                no_wait: NoWait(false),
             })
         );
     }
@@ -848,7 +838,7 @@ mod tests {
     #[test]
     fn import_playlist_name_is_sanitized_at_parse_time() {
         let args = run_arg::<ImportPlaylistArgs>(&["p", "--name", "a/b"]).unwrap();
-        let name = args.name.expect("name given");
+        let name = args.name.0.expect("name given");
         assert!(name.change_note().is_some());
         assert_eq!(name.name().as_str(), sanitize_playlist_name("a/b"));
     }

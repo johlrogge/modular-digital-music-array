@@ -1,42 +1,42 @@
-use crate::args::{choice, choice_names, parse_choice, Choice, ExistingFileArg};
+use crate::args::{ExistingFileArg, OutputDir};
 use crate::ctx::Ctx;
 use crate::origins::upload_source;
 use crate::output::success_unless;
 use crate::stdin::{require_stdin_hashes_or_usage, resolve_tracks_or_abort};
-use bpaf::{construct, long, positional, Bpaf, Parser};
+use bpaf::{construct, long, Bpaf, Parser};
 use color_eyre::eyre::{bail, eyre};
 use color_eyre::Result;
-use hicli::{complete_files, Arg, Success};
+use hicli::{Arg, Choice, Success};
 use library_ipc_client::TrackInfo;
 use music_facts::MusicValue;
 use std::path::Path;
 use track_formatter::short_hash;
 
-// `ssh_key` and `file` take their help from their `Arg` impls.
+// Stays `#[derive(Bpaf)]`: `--ssh-key`, `--ssh-user` and `--inbox-dir` fall back
+// to a default (named in their help text as "(default: X)"), and the key's default is
+// checked like a typed value. `ssh_key` and `file` take their help from their `Arg` impls.
 #[derive(Debug, Bpaf, Arg)]
 pub(crate) struct UploadArgs {
     #[bpaf(external(SshKeyArg::parser))]
     ssh_key: SshKeyArg,
 
     // Stays a String: no domain rule, the Pi's account name.
-    /// SSH user on the Pi
+    /// SSH user on the Pi (default: mdma)
     #[bpaf(
         long,
         env("MDMA_SSH_USER"),
         argument("SSH_USER"),
-        fallback("mdma".to_string()),
-        display_fallback
+        fallback("mdma".to_string())
     )]
     ssh_user: String,
 
     // Stays a String: no domain rule, a path on the remote Pi (not checked locally).
-    /// Remote inbox directory
+    /// Remote inbox directory (default: /music/inbox/)
     #[bpaf(
         long,
         env("MDMA_INBOX_DIR"),
         argument("INBOX_DIR"),
-        fallback("/music/inbox/".to_string()),
-        display_fallback
+        fallback("/music/inbox/".to_string())
     )]
     inbox_dir: String,
 
@@ -53,46 +53,42 @@ pub(crate) enum UploadKind {
     Audio,
 }
 
-/// An existing file that is an audio file or a ZIP archive.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Path to file (audio file or ZIP archive)
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(positional = "FILE", complete = files)]
 pub(crate) struct UploadFileArg {
     pub(crate) path: std::path::PathBuf,
     pub(crate) kind: UploadKind,
 }
 
 impl std::str::FromStr for UploadFileArg {
-    type Err = String;
+    type Err = &'static str;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         let ExistingFileArg(path) = s.parse()?;
         let kind = match inbox_utils::detect_file_type(&path) {
             Some("zip") => UploadKind::Zip,
             Some("flac" | "mp3" | "wav" | "aiff") => UploadKind::Audio,
-            _ => return Err(
-                "Unsupported file type. Expected audio file (FLAC, MP3, WAV, AIFF) or ZIP archive."
-                    .to_string(),
-            ),
+            _ => {
+                return Err(
+                    "unsupported file type: expected an audio file (FLAC, MP3, WAV, AIFF) or a ZIP archive",
+                )
+            }
         };
         Ok(Self { path, kind })
     }
 }
 
-impl Arg for UploadFileArg {
-    fn parser() -> impl Parser<Self> {
-        complete_files(positional::<Self>("FILE").help("Path to file (audio file or ZIP archive)"))
-    }
-}
+/// The directory `export` writes to when `--output` is not given.
+const DEFAULT_EXPORT_DIR: &str = "./export/";
 
 // `formats` reads the three format options together (and rejects mixing
 // `--format` with the per-category options) and takes its help from its `Arg` impl.
-#[derive(Debug, PartialEq, Bpaf, Arg)]
+#[derive(Debug, PartialEq, Arg)]
 pub(crate) struct ExportArgs {
-    #[bpaf(external(ExportFormats::parser))]
     formats: ExportFormats,
-
-    /// Output directory (created if it doesn't exist). Default: ./export/
-    #[bpaf(argument("OUTPUT"), fallback(std::path::PathBuf::from("./export/")))]
-    output: std::path::PathBuf,
+    /// Directory to write to (created if it doesn't exist; default: ./export/)
+    output: OutputDir,
 }
 
 /// Which export format applies to which tracks.
@@ -108,46 +104,46 @@ pub(crate) enum ExportFormats {
     },
 }
 
+// The help rows below end in the accepted formats, which hicli appends.
+
+/// Output format for all tracks (default: original; not with --lossless-format or --lossy-format)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Arg)]
+#[arg(long = "format", metavar = "FORMAT")]
+pub(crate) struct AllFormat(Option<ExportFormat>);
+
+/// Output format for lossless sources (lossy ones pass through unchanged)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Arg)]
+#[arg(long = "lossless-format", metavar = "LOSSLESS_FORMAT")]
+pub(crate) struct LosslessFormat(Option<ExportFormat>);
+
+/// Output format for lossy sources (lossless ones pass through unchanged)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Arg)]
+#[arg(long = "lossy-format", metavar = "LOSSY_FORMAT")]
+pub(crate) struct LossyFormat(Option<ExportFormat>);
+
+// Stays hand-written: the three options are read together, and mixing `--format`
+// with the other two is a parse error, which a composed struct cannot say.
 impl Arg for ExportFormats {
     /// `--format`, or `--lossless-format` / `--lossy-format`; mixing them is an
     /// error, and none at all passes every category through (`PerCategory`).
     fn parser() -> impl Parser<Self> {
-        let all = choice::<ExportFormat>(
-            long("format")
-                .help(
-                    format!(
-                        "Output format for ALL tracks ({}). Default: original. Conflicts with --lossless-format and --lossy-format.",
-                        choice_names::<ExportFormat>().join(", ")
-                    )
-                    .as_str(),
-                )
-                .argument::<String>("FORMAT"),
-        )
-        .optional();
-        let lossless = choice::<ExportFormat>(
-            long("lossless-format")
-                .help("Target format for lossless sources (flac, wav, aiff). Lossy sources pass through unchanged.")
-                .argument::<String>("LOSSLESS_FORMAT"),
-        )
-        .optional();
-        let lossy = choice::<ExportFormat>(
-            long("lossy-format")
-                .help("Target format for lossy sources (mp3, ogg, opus). Lossless sources pass through unchanged.")
-                .argument::<String>("LOSSY_FORMAT"),
-        )
-        .optional();
+        let all = <AllFormat as Arg>::parser();
+        let lossless = <LosslessFormat as Arg>::parser();
+        let lossy = <LossyFormat as Arg>::parser();
         // Not `construct!([all, per_category])`: when the first alternative
         // fails on a bad name, bpaf would fall through to the second and report
         // "`--format` is not expected" instead of the bad name.
-        construct!(all, lossless, lossy).parse(|(all, lossless, lossy)| {
-            match (all, lossless, lossy) {
+        construct!(all, lossless, lossy).parse(
+            |(AllFormat(all), LosslessFormat(lossless), LossyFormat(lossy))| match (
+                all, lossless, lossy,
+            ) {
                 (Some(format), None, None) => Ok(Self::All(format)),
                 (None, lossless, lossy) => Ok(Self::PerCategory { lossless, lossy }),
-                (Some(_), _, _) => {
-                    Err("--format conflicts with --lossless-format and --lossy-format")
-                }
-            }
-        })
+                (Some(_), _, _) => Err(
+                    "`--format` cannot be combined with `--lossless-format` or `--lossy-format`",
+                ),
+            },
+        )
     }
 }
 
@@ -159,7 +155,7 @@ pub(crate) const DEFAULT_SSH_KEY: &str = "~/.ssh/mdma_pi";
 pub(crate) struct SshKeyArg(pub std::path::PathBuf);
 
 impl std::str::FromStr for SshKeyArg {
-    type Err = String;
+    type Err = &'static str;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         let ExistingFileArg(path) = ExistingFileArg::new(expand_tilde(s))?;
@@ -172,11 +168,20 @@ impl std::str::FromStr for SshKeyArg {
 fn ssh_key_option(env: &'static str, default: &'static str) -> impl Parser<SshKeyArg> {
     long("ssh-key")
         .env(env)
-        .help("SSH key for SCP transfer")
+        .help(format!("SSH key for SCP transfer (default: {default})").as_str())
         .argument::<String>("SSH_KEY")
+        .complete_shell(bpaf::ShellComp::File { mask: None })
         .fallback(default.to_string())
-        .display_fallback()
-        .parse(|s| s.parse::<SshKeyArg>())
+        .parse(move |s| {
+            s.parse::<SshKeyArg>().map_err(|reason| {
+                // The default was not typed, so the error must say which path it is.
+                if s == default {
+                    format!("default ssh key {default}: {reason}")
+                } else {
+                    reason.to_string()
+                }
+            })
+        })
 }
 
 impl Arg for SshKeyArg {
@@ -724,14 +729,21 @@ fn resolve_export_format(blob_path: Option<&str>, formats: &ExportFormats) -> Ex
 /// Reads content hashes from stdin (one per line, pipe-friendly).
 /// Compatible with search output: `mdma search --artist CBL | mdma export`
 ///
-/// Examples:
-///   mdma search --artist CBL | mdma export
-///   mdma search --artist CBL | mdma export --format aiff
-///   mdma search --artist CBL | mdma export --format wav --output ./archive/
-///   mdma search --artist CBL | mdma export --lossless-format aiff --lossy-format wav
+/// # Examples
+///
+/// ```sh
+/// mdma search --artist CBL | mdma export
+/// mdma search --artist CBL | mdma export --format aiff
+/// mdma search --artist CBL | mdma export --format wav --output ./archive/
+/// mdma search --artist CBL | mdma export --lossless-format aiff --lossy-format wav
+/// ```
 #[hicli::command]
 pub(crate) fn export(args: ExportArgs, ctx: &Ctx) -> Result<Success> {
-    let ExportArgs { formats, output } = args;
+    let ExportArgs {
+        formats,
+        output: OutputDir(output),
+    } = args;
+    let output = output.unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_EXPORT_DIR));
     let library = ctx.library()?;
 
     let (node, node_ip) = ctx.require_node()?;
@@ -795,11 +807,15 @@ pub(crate) fn export(args: ExportArgs, ctx: &Ctx) -> Result<Success> {
     Ok(success_unless(fail_count > 0))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Audio format (default: original)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Choice, Arg)]
+#[arg(long = "format", metavar = "FORMAT")]
 pub(crate) enum ExportFormat {
     /// Transfer the file without conversion (default)
     Original,
+    /// Convert to AIFF
     Aiff,
+    /// Convert to WAV
     Wav,
 }
 
@@ -815,34 +831,7 @@ impl ExportFormat {
 
     /// Format string to pass in the `?format=` query parameter.
     pub(crate) fn format_param(&self) -> &'static str {
-        match self {
-            Self::Original => "original",
-            Self::Aiff => "aiff",
-            Self::Wav => "wav",
-        }
-    }
-}
-
-impl Choice for ExportFormat {
-    const ALL: &'static [Self] = &[Self::Original, Self::Aiff, Self::Wav];
-    const WHAT: &'static str = "export format";
-
-    fn name(self) -> &'static str {
-        self.format_param()
-    }
-}
-
-impl std::fmt::Display for ExportFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.name())
-    }
-}
-
-impl std::str::FromStr for ExportFormat {
-    type Err = String;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        parse_choice(s)
+        self.name()
     }
 }
 
@@ -872,7 +861,7 @@ mod tests {
         assert_eq!(arg.path, file.path());
 
         let err = run_arg::<UploadFileArg>(&["/definitely/not/here.flac"]).unwrap_err();
-        assert!(err.contains("does not exist"), "{err}");
+        assert!(err.ends_with("`FILE`: file does not exist"), "{err}");
         assert!(run_arg::<UploadFileArg>(&[]).is_err());
     }
 
@@ -884,7 +873,8 @@ mod tests {
             Ok(SshKeyArg(std::path::PathBuf::from(manifest)))
         );
         let err = run_arg::<SshKeyArg>(&["--ssh-key", "/definitely/not/here"]).unwrap_err();
-        assert!(err.contains("does not exist"), "{err}");
+        assert!(err.contains("file does not exist"), "{err}");
+        assert!(!err.contains("'/definitely"), "{err}");
     }
 
     #[test]
@@ -897,7 +887,10 @@ mod tests {
         .run_inner(&[] as &[&str])
         .unwrap_err()
         .unwrap_stderr();
-        assert!(message.contains("does not exist"), "{message}");
+        assert!(
+            message.contains("default ssh key /definitely/not/a/default/key: file does not exist"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -915,7 +908,7 @@ mod tests {
             run_arg::<ExportArgs>(&["--format", "wav", "--output", "out"]).unwrap(),
             ExportArgs {
                 formats: ExportFormats::All(ExportFormat::Wav),
-                output: std::path::PathBuf::from("out"),
+                output: OutputDir(Some(std::path::PathBuf::from("out"))),
             }
         );
         assert_eq!(
@@ -925,9 +918,10 @@ mod tests {
                     lossless: None,
                     lossy: None
                 },
-                output: std::path::PathBuf::from("./export/"),
+                output: OutputDir(None),
             }
         );
+        assert_eq!(DEFAULT_EXPORT_DIR, "./export/");
     }
 
     #[test]
@@ -971,12 +965,49 @@ mod tests {
             ["--format", "wav", "--lossless-format", "wav"],
         ] {
             let err = run_arg::<ExportFormats>(&args).unwrap_err();
-            assert!(err.contains("--format conflicts with"), "{err}");
+            assert!(
+                err.contains(
+                    "`--format` cannot be combined with `--lossless-format` or `--lossy-format`"
+                ),
+                "{err}"
+            );
         }
         let err = run_arg::<ExportFormats>(&["--format", "flac"]).unwrap_err();
+        assert!(err.contains("`--format`"), "{err}");
         assert!(
-            err.contains("unknown export format 'flac' (expected original, aiff or wav)"),
+            err.contains("expected `original`, `aiff` or `wav`"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn upload_help_names_its_defaults_in_the_row_text() {
+        let help = crate::test_support::help(&["upload", "--help"]);
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for row in [
+            "SSH key for SCP transfer (default: ~/.ssh/mdma_pi)",
+            "SSH user on the Pi (default: mdma)",
+            "Remote inbox directory (default: /music/inbox/)",
+        ] {
+            assert!(help.contains(row), "{row}: {help}");
+        }
+        assert!(!help.contains("[default:"), "{help}");
+    }
+
+    #[test]
+    fn export_help_lists_the_formats_that_are_accepted() {
+        let help = crate::test_support::help(&["export", "--help"]);
+        // (the help wraps long rows)
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(help.contains("[original, aiff, wav]"), "{help}");
+        for wrong in ["flac, wav, aiff", "mp3, ogg, opus"] {
+            assert!(!help.contains(wrong), "{wrong}: {help}");
+        }
+        // The appended formats follow a closed remark, so they do not read as
+        // part of the "conflicts" sentence.
+        assert!(
+            help.contains("not with --lossless-format or --lossy-format)"),
+            "{help}"
         );
     }
 
@@ -1023,14 +1054,18 @@ mod tests {
 
     #[test]
     fn ssh_key_expands_a_leading_tilde() {
-        // Cargo sets no HOME guarantee, so only check when it is set.
-        if let Some(home) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) {
-            let err = "~/definitely/not/a/key".parse::<SshKeyArg>().unwrap_err();
-            assert!(
-                err.contains(&format!("{home}/definitely/not/a/key")),
-                "{err}"
-            );
+        let _env = crate::test_support::env_lock();
+        let home = tempfile::tempdir().expect("temp dir");
+        let key = home.path().join("key");
+        std::fs::write(&key, b"key").expect("write key");
+        let original = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let parsed = "~/key".parse::<SshKeyArg>();
+        match original {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
         }
+        assert_eq!(parsed, Ok(SshKeyArg(key)));
     }
 
     fn file_with(bytes: &[u8]) -> tempfile::NamedTempFile {
@@ -1044,7 +1079,7 @@ mod tests {
     fn upload_rejects_a_missing_file() {
         let err = upload_usage_error("/definitely/not/here.flac");
         assert!(
-            err.contains("file '/definitely/not/here.flac' does not exist"),
+            err.contains("`/definitely/not/here.flac`: `FILE`: file does not exist"),
             "message: {err}"
         );
     }
@@ -1053,7 +1088,7 @@ mod tests {
     fn upload_rejects_unsupported_file_types() {
         let file = file_with(b"just some text");
         let err = upload_usage_error(file.path().to_str().unwrap());
-        assert!(err.contains("Unsupported file type"), "{err}");
+        assert!(err.contains("unsupported file type"), "{err}");
     }
 
     #[test]
@@ -1532,9 +1567,11 @@ mod tests {
 
     #[test]
     fn export_format_names_round_trip() {
-        for v in ExportFormat::ALL {
+        for v in ExportFormat::VARIANTS {
             assert_eq!(v.name().parse::<ExportFormat>(), Ok(*v));
             assert_eq!(v.to_string(), v.name());
+            // The word the user types is the word sent to the service.
+            assert_eq!(v.format_param(), v.name());
         }
     }
 

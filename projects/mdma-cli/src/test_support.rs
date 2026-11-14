@@ -1,6 +1,6 @@
 //! Test helpers shared by several modules' tests.
 
-use crate::ctx::{Ctx, Globals};
+use crate::ctx::{Ctx, Globals, LibrarySocket, NodeFlag, PlaybackSocket, SourcesDir};
 use bpaf::{ParseFailure, Parser as _};
 use library_ipc_client::{ContentHash, TrackInfo};
 
@@ -63,10 +63,10 @@ pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 /// Global options as given by none of the flags or variables.
 pub(crate) fn globals() -> Globals {
     Globals {
-        node: None,
-        socket: None,
-        playback_socket: None,
-        sources_dir: "/run/mdma/sources".to_string(),
+        node: NodeFlag(None),
+        socket: LibrarySocket(None),
+        playback_socket: PlaybackSocket(None),
+        sources_dir: SourcesDir(None),
     }
 }
 
@@ -76,10 +76,10 @@ pub(crate) fn local_ctx() -> Ctx {
     let nowhere = "/nonexistent/mdma-test";
     Ctx::with_target(
         Globals {
-            node: None,
-            socket: Some(format!("ipc://{nowhere}/library.sock")),
-            playback_socket: Some(format!("ipc://{nowhere}/playback.sock")),
-            sources_dir: format!("{nowhere}/sources"),
+            node: NodeFlag(None),
+            socket: LibrarySocket(Some(format!("ipc://{nowhere}/library.sock"))),
+            playback_socket: PlaybackSocket(Some(format!("ipc://{nowhere}/playback.sock"))),
+            sources_dir: SourcesDir(Some(std::path::PathBuf::from(format!("{nowhere}/sources")))),
         },
         node_discovery::Target::LocalIpc,
     )

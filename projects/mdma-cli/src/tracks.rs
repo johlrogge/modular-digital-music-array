@@ -1,4 +1,4 @@
-use crate::args::{choice, choice_names, impl_arg, parse_choice, Choice, TrackArg};
+use crate::args::{parse_count, TrackArg};
 use crate::ctx::Ctx;
 use crate::output::{
     format_track_line, library_error, mark_outcome, marked_header, no_marked_tracks, print_tracks,
@@ -7,40 +7,30 @@ use crate::output::{
 use crate::stdin::{
     hashes_from_pipe_or_playing, read_hashes, require_stdin_hashes, resolve_tracks_skip_errors,
 };
-use bpaf::{construct, long, positional, short, Parser};
+use bpaf::{construct, long, short, Parser};
 use color_eyre::Result;
-use hicli::Arg;
+use hicli::{Arg, Choice};
 use library_ipc_client::{ClientError, ContentHash, TrackInfo};
 use mdma_client::{Mark, MarkFilter, MarkNameError};
 use std::num::NonZeroUsize;
 use track_formatter::{render_for_user, short_hash, ViewColumn};
 
-/// A track count of at least 1 (a limit of 0 would show nothing).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Maximum number of tracks to show
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Arg)]
+#[arg(long = "limit", short = 'l', metavar = "LIMIT")]
 pub(crate) struct LimitArg(pub NonZeroUsize);
 
 impl std::str::FromStr for LimitArg {
-    type Err = String;
+    type Err = &'static str;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        s.parse::<usize>()
-            .ok()
-            .and_then(NonZeroUsize::new)
-            .map(Self)
-            .ok_or_else(|| format!("'{s}' must be a whole number of at least 1"))
+        parse_count(s).map(Self)
     }
 }
 
-impl_arg!(LimitArg, long "limit", short 'l', "LIMIT", "Maximum number of tracks to show");
-
-/// Maximum number of tracks to show (all when `None`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OptLimitArg(pub Option<LimitArg>);
-
-impl_arg!(OptLimitArg, optional LimitArg);
-
-/// A mark, as typed: `liked` is the default mark, any other name a named mark.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Mark name (`liked` is the default mark)
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(positional = "NAME")]
 pub(crate) struct MarkArg(pub Mark);
 
 impl std::str::FromStr for MarkArg {
@@ -51,29 +41,14 @@ impl std::str::FromStr for MarkArg {
     }
 }
 
-impl_arg!(
-    MarkArg,
-    positional "NAME",
-    "Mark name (`liked` is the default mark)"
-);
+/// The mark to apply: the one named, else the default mark.
+fn mark_or_default(name: Option<MarkArg>) -> Mark {
+    name.map_or(Mark::Default, |MarkArg(mark)| mark)
+}
 
-/// An optional [`MarkArg`] (none: the default mark, or any mark when listing).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OptMarkArg(pub Option<MarkArg>);
-
-impl_arg!(OptMarkArg, optional MarkArg);
-
-impl OptMarkArg {
-    /// The mark to apply: the one named, else the default mark.
-    fn mark(self) -> Mark {
-        self.0.map_or(Mark::Default, |MarkArg(mark)| mark)
-    }
-
-    /// The marks to list: the one named, else any.
-    fn filter(self) -> MarkFilter {
-        self.0
-            .map_or(MarkFilter::Any, |MarkArg(mark)| MarkFilter::Only(mark))
-    }
+/// The marks to list: the one named, else any.
+fn mark_filter(name: Option<MarkArg>) -> MarkFilter {
+    name.map_or(MarkFilter::Any, |MarkArg(mark)| MarkFilter::Only(mark))
 }
 
 /// The columns `mdma view` shows, in the order their flags were typed; at least one.
@@ -116,14 +91,6 @@ impl Arg for ViewColumns {
     }
 }
 
-impl Arg for SortField {
-    fn parser() -> impl Parser<Self> {
-        let field = positional::<String>("FIELD")
-            .help(format!("Field to sort by: {}", choice_names::<Self>().join(", ")).as_str());
-        choice(field)
-    }
-}
-
 impl Arg for SortDirection {
     /// Exactly one of `-a` / `-d`.
     fn parser() -> impl Parser<Self> {
@@ -137,7 +104,9 @@ impl Arg for SortDirection {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Field to sort by
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Choice, Arg)]
+#[arg(positional = "FIELD")]
 pub(crate) enum SortField {
     Bpm,
     Title,
@@ -153,51 +122,6 @@ pub(crate) enum SortField {
     /// Last stopped datetime. None treated as -∞: ascending puts never-stopped first,
     /// descending puts never-stopped last.
     Stopped,
-}
-
-impl Choice for SortField {
-    const ALL: &'static [Self] = &[
-        SortField::Bpm,
-        SortField::Title,
-        SortField::Artist,
-        SortField::Album,
-        SortField::Duration,
-        SortField::TrackNumber,
-        SortField::DiscNumber,
-        SortField::Added,
-        SortField::Started,
-        SortField::Stopped,
-    ];
-    const WHAT: &'static str = "sort field";
-
-    fn name(self) -> &'static str {
-        match self {
-            SortField::Bpm => "bpm",
-            SortField::Title => "title",
-            SortField::Artist => "artist",
-            SortField::Album => "album",
-            SortField::Duration => "duration",
-            SortField::TrackNumber => "track-number",
-            SortField::DiscNumber => "disc-number",
-            SortField::Added => "added",
-            SortField::Started => "started",
-            SortField::Stopped => "stopped",
-        }
-    }
-}
-
-impl std::fmt::Display for SortField {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.name())
-    }
-}
-
-impl std::str::FromStr for SortField {
-    type Err = String;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        parse_choice(s)
-    }
 }
 
 /// Direction of a sort, built from the mutually exclusive `-a` / `-d` flags.
@@ -258,8 +182,7 @@ fn format_status(status: &library_ipc_client::ServiceStatus) -> String {
 
 /// List tracks in library
 #[hicli::command]
-pub(crate) fn list(limit: OptLimitArg, ctx: &Ctx) -> Result<()> {
-    let OptLimitArg(limit) = limit;
+pub(crate) fn list(limit: Option<LimitArg>, ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
     let tracks = library
         .list_tracks(limit.map(|LimitArg(n)| n.get()))
@@ -368,10 +291,13 @@ fn compare_optional<T: Ord>(
 /// For started and stopped, a missing value counts as -inf: ascending puts never-played
 /// first, descending puts never-played last.
 ///
-/// Examples:
-///   mdma search --artist=CBL | mdma sort title -a
-///   mdma queue list | mdma sort bpm -d | mdma queue append
-///   cat friday.plist | mdma sort title -a | mdma sort artist -a > sorted.plist
+/// # Examples
+///
+/// ```sh
+/// mdma search --artist=CBL | mdma sort title -a
+/// mdma queue list | mdma sort bpm -d | mdma queue append
+/// cat friday.plist | mdma sort title -a | mdma sort artist -a > sorted.plist
+/// ```
 #[hicli::command]
 pub(crate) fn sort(direction: SortDirection, field: SortField, ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
@@ -453,12 +379,15 @@ fn for_each_track(
 /// as it is. Each output line starts with the track hash, so the output can be
 /// piped on.
 ///
-/// Examples:
-///   mdma mark
-///   mdma search --artist CBL | mdma mark banger
+/// # Examples
+///
+/// ```sh
+/// mdma mark
+/// mdma search --artist CBL | mdma mark banger
+/// ```
 #[hicli::command(alias = "bookmark")]
-pub(crate) fn mark(name: OptMarkArg, ctx: &Ctx) -> Result<hicli::Success> {
-    let mark = name.mark();
+pub(crate) fn mark(name: Option<MarkArg>, ctx: &Ctx) -> Result<hicli::Success> {
+    let mark = mark_or_default(name);
     let library = ctx.library()?;
     let hashes = hashes_from_pipe_or_playing(ctx)?;
     for_each_track(hashes, |hash| {
@@ -473,12 +402,15 @@ pub(crate) fn mark(name: OptMarkArg, ctx: &Ctx) -> Result<hicli::Success> {
 /// Unmarks the tracks whose hashes are piped on stdin; run from a terminal without
 /// a pipe, unmarks the playing track. A track without the mark is left as it is.
 ///
-/// Examples:
-///   mdma unmark
-///   mdma marked banger | mdma unmark banger
+/// # Examples
+///
+/// ```sh
+/// mdma unmark
+/// mdma marked banger | mdma unmark banger
+/// ```
 #[hicli::command]
-pub(crate) fn unmark(name: OptMarkArg, ctx: &Ctx) -> Result<hicli::Success> {
-    let mark = name.mark();
+pub(crate) fn unmark(name: Option<MarkArg>, ctx: &Ctx) -> Result<hicli::Success> {
+    let mark = mark_or_default(name);
     let library = ctx.library()?;
     let hashes = hashes_from_pipe_or_playing(ctx)?;
     for_each_track(hashes, |hash| {
@@ -493,12 +425,19 @@ pub(crate) fn unmark(name: OptMarkArg, ctx: &Ctx) -> Result<hicli::Success> {
 /// Lists the tracks that carry the mark NAME, or any mark when NAME is left out;
 /// `mdma marked liked` lists only the default mark.
 ///
-/// Examples:
-///   mdma marked
-///   mdma marked banger | mdma playlist new bangers
+/// # Arguments
+///
+/// * `name` - Only list tracks with this mark (any mark when left out; `liked` is the default mark)
+///
+/// # Examples
+///
+/// ```sh
+/// mdma marked
+/// mdma marked banger | mdma playlist new bangers
+/// ```
 #[hicli::command(alias = "bookmarks")]
-pub(crate) fn marked(name: OptMarkArg, ctx: &Ctx) -> Result<()> {
-    let filter = name.filter();
+pub(crate) fn marked(name: Option<MarkArg>, ctx: &Ctx) -> Result<()> {
+    let filter = mark_filter(name);
     let library = ctx.library()?;
     let tracks = library.list_marked(&filter).map_err(library_error)?;
 
@@ -521,10 +460,13 @@ pub(crate) fn marked(name: OptMarkArg, ctx: &Ctx) -> Result<()> {
 ///
 /// Field order in the output matches the order the flags appear on the command line.
 ///
-/// Examples:
-///   mdma search --artist CBL | mdma view --hash --artist --title
-///   mdma search --genre Techno | mdma view --title --duration
-///   cat friday.plist | mdma view --hash --artist --title --duration
+/// # Examples
+///
+/// ```sh
+/// mdma search --artist CBL | mdma view --hash --artist --title
+/// mdma search --genre Techno | mdma view --title --duration
+/// cat friday.plist | mdma view --hash --artist --title --duration
+/// ```
 #[hicli::command]
 pub(crate) fn view(columns: ViewColumns, ctx: &Ctx) -> Result<()> {
     use std::io::IsTerminal;
@@ -621,14 +563,9 @@ mod tests {
         let three = LimitArg(NonZeroUsize::new(3).unwrap());
         assert_eq!(run_arg::<LimitArg>(&["--limit", "3"]), Ok(three));
         assert_eq!(run_arg::<LimitArg>(&["-l", "3"]), Ok(three));
-        assert_eq!(
-            run_arg::<OptLimitArg>(&["--limit", "3"]),
-            Ok(OptLimitArg(Some(three)))
-        );
-        assert_eq!(run_arg::<OptLimitArg>(&[]), Ok(OptLimitArg(None)));
-        let err = run_arg::<OptLimitArg>(&["--limit", "0"]).unwrap_err();
+        let err = run_arg::<LimitArg>(&["--limit", "0"]).unwrap_err();
         assert!(
-            err.contains("must be a whole number of at least 1"),
+            err.ends_with("`--limit`: must be a whole number of at least 1"),
             "{err}"
         );
         assert!(run_arg::<LimitArg>(&[]).is_err());
@@ -659,27 +596,23 @@ mod tests {
     }
 
     #[test]
-    fn opt_mark_arg_parser_is_an_optional_positional_mark() {
-        assert_eq!(run_arg::<OptMarkArg>(&[]), Ok(OptMarkArg(None)));
+    fn mark_arg_parser_is_a_positional_mark() {
         assert_eq!(
-            run_arg::<OptMarkArg>(&["Banger"]),
-            Ok(OptMarkArg(Some(MarkArg(named("banger")))))
+            run_arg::<MarkArg>(&["Banger"]),
+            Ok(MarkArg(named("banger")))
         );
-        assert_eq!(
-            run_arg::<OptMarkArg>(&["LIKED"]),
-            Ok(OptMarkArg(Some(MarkArg(Mark::Default))))
-        );
-        let err = run_arg::<OptMarkArg>(&[""]).unwrap_err();
+        assert_eq!(run_arg::<MarkArg>(&["LIKED"]), Ok(MarkArg(Mark::Default)));
+        let err = run_arg::<MarkArg>(&[""]).unwrap_err();
         assert!(err.contains("mark name is empty"), "{err}");
     }
 
     #[test]
     fn no_mark_name_means_the_default_mark_or_any_mark() {
-        assert_eq!(OptMarkArg(None).mark(), Mark::Default);
-        assert_eq!(OptMarkArg(None).filter(), MarkFilter::Any);
-        let banger = OptMarkArg(Some(MarkArg(named("banger"))));
-        assert_eq!(banger.clone().mark(), named("banger"));
-        assert_eq!(banger.filter(), MarkFilter::Only(named("banger")));
+        assert_eq!(mark_or_default(None), Mark::Default);
+        assert_eq!(mark_filter(None), MarkFilter::Any);
+        let banger = Some(MarkArg(named("banger")));
+        assert_eq!(mark_or_default(banger.clone()), named("banger"));
+        assert_eq!(mark_filter(banger), MarkFilter::Only(named("banger")));
     }
 
     #[test]
@@ -699,17 +632,17 @@ mod tests {
     fn mark_commands_without_a_connection_fail_cleanly() {
         let ctx = crate::test_support::local_ctx();
         for result in [
-            marked(OptMarkArg(None), &ctx),
-            marked(OptMarkArg(Some(MarkArg(Mark::Default))), &ctx),
+            marked(None, &ctx),
+            marked(Some(MarkArg(Mark::Default)), &ctx),
         ] {
             assert!(result.is_err());
         }
-        assert!(mark(OptMarkArg(None), &ctx).is_err());
-        assert!(unmark(OptMarkArg(None), &ctx).is_err());
+        assert!(mark(None, &ctx).is_err());
+        assert!(unmark(None, &ctx).is_err());
         for text in [
-            crate::test_support::failure_text(marked(OptMarkArg(None), &ctx)),
-            crate::test_support::failure_text(mark(OptMarkArg(None), &ctx)),
-            crate::test_support::failure_text(unmark(OptMarkArg(None), &ctx)),
+            crate::test_support::failure_text(marked(None, &ctx)),
+            crate::test_support::failure_text(mark(None, &ctx)),
+            crate::test_support::failure_text(unmark(None, &ctx)),
         ] {
             assert!(text.starts_with("Failed to connect to library"), "{text}");
         }
@@ -723,14 +656,23 @@ mod tests {
             Ok(SortField::TrackNumber)
         );
         let err = run_arg::<SortField>(&["nope"]).unwrap_err();
+        assert!(err.contains("`FIELD`"), "{err}");
+        assert!(err.contains("expected `bpm`, `title`,"), "{err}");
         assert!(
-            err.contains("unknown sort field 'nope' (expected bpm, title,"),
+            err.contains("`disc-number`, `added`, `started` or `stopped`"),
             "{err}"
         );
-        assert!(
-            err.contains("disc-number, added, started or stopped)"),
-            "{err}"
+    }
+
+    #[test]
+    fn multi_word_sort_fields_are_kebab_case() {
+        assert_eq!(
+            run_arg::<SortField>(&["disc-number"]),
+            Ok(SortField::DiscNumber)
         );
+        // Only the kebab-case spelling parses; the error lists the names.
+        let err = run_arg::<SortField>(&["DiscNumber"]).unwrap_err();
+        assert!(err.contains("`track-number`, `disc-number`"), "{err}");
     }
 
     #[test]
@@ -779,7 +721,7 @@ mod tests {
 
     #[test]
     fn sort_field_names_round_trip() {
-        for v in SortField::ALL {
+        for v in SortField::VARIANTS {
             assert_eq!(v.name().parse::<SortField>(), Ok(*v));
             assert_eq!(v.to_string(), v.name());
         }
@@ -790,18 +732,38 @@ mod tests {
     fn list_limit_must_be_at_least_one() {
         let e = usage_error(&["list", "--limit", "0"]);
         assert!(
-            e.contains("'0' must be a whole number of at least 1"),
+            e.contains("`0`: `--limit`: must be a whole number of at least 1"),
             "{e}"
+        );
+        assert!(
+            !e.contains("'0'"),
+            "the value is echoed once, by hicli: {e}"
         );
         usage_error(&["list", "--limit", "-1"]);
         usage_error(&["list", "--limit", "x"]);
         assert_eq!(parses(&["list", "-l", "3"]), ["list"]);
-        assert_eq!(
-            run_arg::<OptLimitArg>(&["-l", "3"]),
-            Ok(OptLimitArg(Some(LimitArg(NonZeroUsize::new(3).unwrap()))))
-        );
         assert_eq!(parses(&["list"]), ["list"]);
-        assert_eq!(run_arg::<OptLimitArg>(&[]), Ok(OptLimitArg(None)));
+    }
+
+    #[test]
+    fn a_bad_limit_names_the_flag() {
+        let e = usage_error(&["list", "--limit", "0"]);
+        assert!(e.contains("`--limit`"), "{e}");
+        let err = run_arg::<LimitArg>(&["--limit", "x"]).unwrap_err();
+        assert!(err.contains("`--limit`"), "{err}");
+    }
+
+    #[test]
+    fn a_bad_sort_field_names_the_argument_and_the_choices() {
+        let e = usage_error(&["sort", "bmp", "-a"]);
+        assert!(e.contains("`FIELD`"), "{e}");
+        assert!(e.contains("did you mean `bpm`?"), "{e}");
+    }
+
+    #[test]
+    fn a_bad_hash_names_the_argument() {
+        let e = usage_error(&["get", "xyz"]);
+        assert!(e.contains("`HASH`"), "{e}");
     }
 
     #[test]

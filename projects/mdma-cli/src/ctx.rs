@@ -5,14 +5,14 @@
 //! that never talk to a node (`mdma node ...`, completions) never resolve one.
 
 use std::net::Ipv4Addr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use bpaf::Bpaf;
 use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use gateway_client::GatewayClient;
+use hicli::Arg;
 use library_ipc_client::ClientError;
 use mdma_client::{LibraryBackend, PlaybackBackend, SourceClient};
 use nng_transport::NngClientError;
@@ -23,34 +23,86 @@ use crate::output::{connect_failure, connect_failure_text, source_label};
 
 pub const DEFAULT_LIBRARY_SOCKET: &str = "ipc:///run/mdma/library.sock";
 pub const DEFAULT_PLAYBACK_SOCKET: &str = "ipc:///run/mdma/playback.sock";
+pub const DEFAULT_SOURCES_DIR: &str = "/run/mdma/sources";
+
+/// Node hostname (e.g. mdma-909.local), optionally with a port. Also read from
+/// MDMA_NODE. Without either, the remembered or discovered node is used.
+// No `env`: MDMA_NODE is read separately (see `node`), so the flag and the
+// variable can be told apart and an empty variable counts as unset.
+#[derive(Debug, Clone, Arg)]
+#[arg(long = "node", metavar = "NODE", complete = node::complete_nodes)]
+pub struct NodeFlag(pub Option<NodeSpec>);
+
+/// `ipc://` addresses of the sockets in `dir` that start with `typed`, sorted.
+fn ipc_sockets_in(dir: &Path, typed: &str) -> Vec<hicli::Candidate> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "sock"))
+        .map(|path| format!("ipc://{}", path.display()))
+        .filter(|address| address.starts_with(typed))
+        .collect();
+    found.sort();
+    found.into_iter().map(|address| (address, None)).collect()
+}
+
+/// The local services' sockets (`/run/mdma/*.sock`), for `--socket` and `--playback-socket`.
+fn complete_ipc_sockets(typed: &str) -> Vec<hicli::Candidate> {
+    let dir = DEFAULT_LIBRARY_SOCKET
+        .strip_prefix("ipc://")
+        .map(Path::new)
+        .and_then(Path::parent);
+    dir.map(|dir| ipc_sockets_in(dir, typed))
+        .unwrap_or_default()
+}
+
+// The socket addresses stay `String`: the clients take the address text
+// (`ipc://<path>` or `tcp://<host>:<port>`) and no address type exists to parse it into.
+
+/// Library IPC socket address (direct mode, ignored when --node is set; default: ipc:///run/mdma/library.sock)
+#[derive(Debug, Clone, Arg)]
+#[arg(
+    long = "socket",
+    metavar = "SOCKET",
+    env = "MDMA_LIBRARY_SOCKET",
+    complete = complete_ipc_sockets
+)]
+pub struct LibrarySocket(pub Option<String>);
+
+/// Playback server socket address (direct mode, ignored when --node is set; default: ipc:///run/mdma/playback.sock)
+#[derive(Debug, Clone, Arg)]
+#[arg(
+    long = "playback-socket",
+    metavar = "PLAYBACK_SOCKET",
+    env = "MDMA_PLAYBACK_SOCKET",
+    complete = complete_ipc_sockets
+)]
+pub struct PlaybackSocket(pub Option<String>);
+
+/// Sources directory for direct mode, containing *.sock files (default: /run/mdma/sources)
+#[derive(Debug, Clone, Arg)]
+#[arg(
+    long = "sources-dir",
+    metavar = "SOURCES_DIR",
+    env = "MDMA_SOURCES_DIR",
+    complete = dirs
+)]
+pub struct SourcesDir(pub Option<PathBuf>);
 
 // The global options, as given on the command line or in the environment.
 //
-// `socket` and `playback_socket` are `None` when left at their defaults, so
-// that "given explicitly" can be told apart from "defaulted".
-#[derive(Debug, Clone, Bpaf)]
+// Each is `None` when left at its default (applied where it is used), so that
+// "given explicitly" can be told apart from "defaulted". An empty value (a
+// flag or a variable set to nothing) counts as not given, like `MDMA_NODE`.
+#[derive(Debug, Clone, Arg)]
 pub struct Globals {
-    /// Node hostname (e.g. mdma-909.local), optionally with a port. Also read from
-    /// MDMA_NODE. Without either, the remembered or discovered node is used.
-    #[bpaf(long, argument("NODE"))]
-    pub node: Option<NodeSpec>,
-    /// Library IPC socket address (direct mode, ignored when --node is set).
-    /// Default: ipc:///run/mdma/library.sock
-    #[bpaf(long, env("MDMA_LIBRARY_SOCKET"), argument("SOCKET"))]
-    pub socket: Option<String>,
-    /// Playback server socket address (direct mode, ignored when --node is set).
-    /// Default: ipc:///run/mdma/playback.sock
-    #[bpaf(long, env("MDMA_PLAYBACK_SOCKET"), argument("PLAYBACK_SOCKET"))]
-    pub playback_socket: Option<String>,
-    /// Sources directory for direct mode (contains *.sock files)
-    #[bpaf(
-        long,
-        env("MDMA_SOURCES_DIR"),
-        argument("SOURCES_DIR"),
-        fallback("/run/mdma/sources".to_string()),
-        display_fallback
-    )]
-    pub sources_dir: String,
+    pub node: NodeFlag,
+    pub socket: LibrarySocket,
+    pub playback_socket: PlaybackSocket,
+    pub sources_dir: SourcesDir,
 }
 
 /// Why admin commands fail without a gateway (without hicli's `Error: ` prefix).
@@ -63,19 +115,40 @@ pub struct Ctx {
     target: OnceLock<Target>,
 }
 
+/// `value`, unless it is empty (which counts as not given).
+fn given(value: &Option<String>) -> Option<&str> {
+    value.as_deref().filter(|v| !v.is_empty())
+}
+
 impl Ctx {
     pub fn new(globals: Globals) -> Self {
-        let library_socket = globals.socket.as_deref().unwrap_or(DEFAULT_LIBRARY_SOCKET);
+        let mut ctx = Self {
+            globals,
+            local_ipc: false,
+            target: OnceLock::new(),
+        };
+        let library_socket = ctx.library_socket();
         let library_socket = library_socket
             .strip_prefix("ipc://")
             .unwrap_or(library_socket);
-        let sockets_given = globals.socket.is_some() || globals.playback_socket.is_some();
-        let local_ipc = node::local_ipc_wanted(sockets_given, Path::new(library_socket).exists());
-        Self {
-            globals,
-            local_ipc,
-            target: OnceLock::new(),
-        }
+        ctx.local_ipc =
+            node::local_ipc_wanted(ctx.sockets_given(), Path::new(library_socket).exists());
+        ctx
+    }
+
+    /// The library socket: the one given by flag or environment, else the default.
+    pub fn library_socket(&self) -> &str {
+        given(&self.globals.socket.0).unwrap_or(DEFAULT_LIBRARY_SOCKET)
+    }
+
+    /// The playback socket: the one given by flag or environment, else the default.
+    pub fn playback_socket(&self) -> &str {
+        given(&self.globals.playback_socket.0).unwrap_or(DEFAULT_PLAYBACK_SOCKET)
+    }
+
+    /// Whether a library or playback socket was given, as opposed to defaulted.
+    pub fn sockets_given(&self) -> bool {
+        given(&self.globals.socket.0).is_some() || given(&self.globals.playback_socket.0).is_some()
     }
 
     /// A context whose node is already resolved.
@@ -99,13 +172,13 @@ impl Ctx {
         if let Some(target) = self.target.get() {
             return Ok(target);
         }
-        let resolved = node::resolve_startup(self.globals.node.as_ref(), self.local_ipc)?;
+        let resolved = node::resolve_startup(self.globals.node.0.as_ref(), self.local_ipc)?;
         Ok(self.target.get_or_init(|| resolved))
     }
 
     /// The `--node` flag, as given.
     pub fn node_flag(&self) -> Option<&NodeSpec> {
-        self.globals.node.as_ref()
+        self.globals.node.0.as_ref()
     }
 
     /// Whether the local services are to be reached over IPC.
@@ -146,24 +219,14 @@ impl Ctx {
     /// Connect to the library backend (gateway or direct).
     pub fn library(&self) -> Result<LibraryBackend> {
         let gateway = self.gateway()?;
-        let socket = self
-            .globals
-            .socket
-            .as_deref()
-            .unwrap_or(DEFAULT_LIBRARY_SOCKET);
-        LibraryBackend::connect(gateway.as_deref(), socket)
+        LibraryBackend::connect(gateway.as_deref(), self.library_socket())
             .map_err(|e| library_connect_failed(&e, gateway.is_none()))
     }
 
     /// Connect to the playback backend (gateway or direct).
     pub fn playback(&self) -> Result<PlaybackBackend> {
         let gateway = self.gateway()?;
-        let socket = self
-            .globals
-            .playback_socket
-            .as_deref()
-            .unwrap_or(DEFAULT_PLAYBACK_SOCKET);
-        PlaybackBackend::connect(gateway.as_deref(), socket)
+        PlaybackBackend::connect(gateway.as_deref(), self.playback_socket())
             .map_err(|e| connect_failed("playback", &e, gateway.is_none()))
     }
 
@@ -171,14 +234,10 @@ impl Ctx {
     /// timeout or a custom one.
     pub fn source(&self, name: &str, timeout: Option<Duration>) -> Result<SourceClient> {
         let gateway = self.gateway()?;
+        let sources_dir = self.sources_dir()?;
         let connected = match timeout {
-            Some(t) => SourceClient::connect_with_timeout(
-                gateway.as_deref(),
-                &self.globals.sources_dir,
-                name,
-                t,
-            ),
-            None => SourceClient::connect(gateway.as_deref(), &self.globals.sources_dir, name),
+            Some(t) => SourceClient::connect_with_timeout(gateway.as_deref(), sources_dir, name, t),
+            None => SourceClient::connect(gateway.as_deref(), sources_dir, name),
         };
         connected.map_err(|e| {
             let running = if gateway.is_none() {
@@ -194,9 +253,19 @@ impl Ctx {
         })
     }
 
-    /// The directory holding the source sockets (direct mode).
-    pub fn sources_dir(&self) -> &str {
-        &self.globals.sources_dir
+    /// The directory holding the source sockets (direct mode): the one given by
+    /// flag or environment, else the default. The clients take it as text, so a
+    /// path that is not UTF-8 is an error.
+    pub fn sources_dir(&self) -> Result<&str> {
+        let dir = self
+            .globals
+            .sources_dir
+            .0
+            .as_deref()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or(Path::new(DEFAULT_SOURCES_DIR));
+        dir.to_str()
+            .ok_or_else(|| eyre!("the sources directory is not valid UTF-8"))
     }
 
     /// Connect to the admin service via gateway.
@@ -295,13 +364,43 @@ mod tests {
         let dir = dir.path().to_str().expect("utf-8 path");
         Ctx::with_target(
             Globals {
-                node: None,
-                socket: Some(format!("ipc://{dir}/none.sock")),
-                playback_socket: Some(format!("ipc://{dir}/none-playback.sock")),
-                sources_dir: dir.to_string(),
+                node: NodeFlag(None),
+                socket: LibrarySocket(Some(format!("ipc://{dir}/none.sock"))),
+                playback_socket: PlaybackSocket(Some(format!("ipc://{dir}/none-playback.sock"))),
+                sources_dir: SourcesDir(Some(PathBuf::from(dir))),
             },
             Target::LocalIpc,
         )
+    }
+
+    #[test]
+    fn each_default_is_resolved_by_one_accessor_and_empty_means_unset() {
+        let ctx = Ctx::with_target(globals(), Target::LocalIpc);
+        assert_eq!(ctx.library_socket(), DEFAULT_LIBRARY_SOCKET);
+        assert_eq!(ctx.playback_socket(), DEFAULT_PLAYBACK_SOCKET);
+        assert_eq!(ctx.sources_dir().unwrap(), DEFAULT_SOURCES_DIR);
+        assert!(!ctx.sockets_given());
+
+        let empty = Ctx::with_target(
+            Globals {
+                node: NodeFlag(None),
+                socket: LibrarySocket(Some(String::new())),
+                playback_socket: PlaybackSocket(Some(String::new())),
+                sources_dir: SourcesDir(Some(PathBuf::new())),
+            },
+            Target::LocalIpc,
+        );
+        assert_eq!(empty.library_socket(), DEFAULT_LIBRARY_SOCKET);
+        assert_eq!(empty.playback_socket(), DEFAULT_PLAYBACK_SOCKET);
+        assert_eq!(empty.sources_dir().unwrap(), DEFAULT_SOURCES_DIR);
+        assert!(!empty.sockets_given());
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let given = local_ctx_in(&dir);
+        assert!(given.library_socket().ends_with("/none.sock"));
+        assert!(given.playback_socket().ends_with("/none-playback.sock"));
+        assert_eq!(given.sources_dir().unwrap(), dir.path().to_str().unwrap());
+        assert!(given.sockets_given());
     }
 
     #[test]

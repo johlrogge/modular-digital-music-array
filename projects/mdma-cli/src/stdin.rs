@@ -3,7 +3,7 @@
 //! A command connects (and so resolves the node, which may prompt on stdin)
 //! before it reads stdin.
 
-use crate::args::{OptTrackArg, TrackArg};
+use crate::args::TrackArg;
 use crate::ctx::Ctx;
 use crate::playback::playing_track;
 use color_eyre::eyre::{bail, eyre};
@@ -103,12 +103,11 @@ fn no_hashes_on_stdin(usage: &[&str]) -> color_eyre::Report {
 
 /// Return the provided hash as a single-element vec, or the hashes from stdin
 /// (see [`require_stdin_hashes`]).
-pub(crate) fn hashes_arg_or_stdin(hash: OptTrackArg) -> Result<Vec<ContentHash>> {
+pub(crate) fn hashes_arg_or_stdin(hash: Option<TrackArg>) -> Result<Vec<ContentHash>> {
     hashes_arg_or_reader(hash, std::io::stdin().lock())
 }
 
-fn hashes_arg_or_reader(hash: OptTrackArg, reader: impl BufRead) -> Result<Vec<ContentHash>> {
-    let OptTrackArg(hash) = hash;
+fn hashes_arg_or_reader(hash: Option<TrackArg>, reader: impl BufRead) -> Result<Vec<ContentHash>> {
     match hash {
         Some(TrackArg(h)) => Ok(vec![h]),
         None => require_hashes(reader, no_hash_provided),
@@ -209,7 +208,7 @@ pub(crate) fn is_hash_token(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
 
-    use crate::args::{OptTrackArg, TrackArg};
+    use crate::args::TrackArg;
     use color_eyre::eyre::eyre;
 
     use crate::stdin::{
@@ -339,7 +338,7 @@ mod tests {
 
     #[test]
     fn a_hash_argument_wins_over_stdin() {
-        let arg = OptTrackArg(Some(TrackArg(ContentHash::new("abcd1234"))));
+        let arg = Some(TrackArg(ContentHash::new("abcd1234")));
         assert_eq!(
             hashes_arg_or_reader(arg, "deadbeef\n".as_bytes()).unwrap(),
             vec![ContentHash::new("abcd1234")]
@@ -348,13 +347,12 @@ mod tests {
 
     #[test]
     fn without_a_hash_argument_stdin_is_read() {
-        let arg = OptTrackArg(None);
         assert_eq!(
-            hashes_arg_or_reader(arg, "deadbeef\n".as_bytes()).unwrap(),
+            hashes_arg_or_reader(None, "deadbeef\n".as_bytes()).unwrap(),
             vec![ContentHash::new("deadbeef")]
         );
         assert_eq!(
-            failure_text(hashes_arg_or_reader(OptTrackArg(None), "".as_bytes())),
+            failure_text(hashes_arg_or_reader(None, "".as_bytes())),
             "No hash provided and stdin was empty"
         );
     }

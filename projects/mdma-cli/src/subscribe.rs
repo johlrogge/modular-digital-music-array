@@ -1,29 +1,48 @@
-use crate::args::impl_arg;
 use crate::ctx::Ctx;
 use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use colored::Colorize;
 use event_protocol::{from_topic_message, PlaybackEvent, TOPIC_PLAYBACK};
+use hicli::Arg;
 use mdma_client::LibraryBackend;
 use nng::options::Options;
 use track_formatter::short_hash;
 
-/// Topic filter for events (all playback events when `None`).
+/// Topic filter, e.g. "playback/track_started" (default: all playback events)
 // Stays a String: a topic is a free-form subscription prefix with no domain rule.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OptTopicArg(pub Option<String>);
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(long = "topic", metavar = "TOPIC", complete = complete_topics)]
+pub(crate) struct TopicArg(pub Option<String>);
 
-impl_arg!(
-    OptTopicArg,
-    optional_text long "topic",
-    "TOPIC",
-    "Topic filter (e.g. \"playback/track_started\"). Default: all playback events."
-);
+/// The topics the services publish, that start with `typed` (a topic is a prefix, so
+/// the group topics `playback/` and `acid/` are offered too).
+fn complete_topics(typed: &str) -> Vec<hicli::Candidate> {
+    use event_protocol::*;
+    [
+        TOPIC_PLAYBACK,
+        TOPIC_TRACK_STARTED,
+        TOPIC_TRACK_ENDED,
+        TOPIC_TRACK_STOPPED,
+        TOPIC_TRACK_PAUSED,
+        TOPIC_TRACK_RESUMED,
+        TOPIC_QUEUE_CHANGED,
+        TOPIC_POSITION_UPDATE,
+        TOPIC_SESSION_STARTED,
+        TOPIC_SESSION_ENDED,
+        TOPIC_ACID,
+        TOPIC_ACID_FACTS_ASSERTED,
+        TOPIC_ACID_FACTS_RETRACTED,
+    ]
+    .into_iter()
+    .filter(|topic| topic.starts_with(typed))
+    .map(|topic| (topic.to_string(), None))
+    .collect()
+}
 
 /// Subscribe to real-time events from the playback system
 #[hicli::command]
-pub(crate) fn subscribe(topic: OptTopicArg, ctx: &Ctx) -> Result<()> {
-    let OptTopicArg(topic) = topic;
+pub(crate) fn subscribe(topic: TopicArg, ctx: &Ctx) -> Result<()> {
+    let TopicArg(topic) = topic;
     // Event gateway of the resolved node (tcp://<ip>:5556)
     let addr = ctx.event_gateway()?.ok_or_else(needs_remote_node)?;
     let library = ctx.library()?;
@@ -179,13 +198,13 @@ fn print_event_human(event: &PlaybackEvent, library: Option<&LibraryBackend>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{subscribe, OptTopicArg};
+    use super::{subscribe, TopicArg};
     use crate::test_support::{failure_text, local_ctx, run_arg};
 
     #[test]
     fn subscribe_needs_a_remote_node() {
         assert_eq!(
-            failure_text(subscribe(OptTopicArg(None), &local_ctx())),
+            failure_text(subscribe(TopicArg(None), &local_ctx())),
             "Subscribe needs a remote node.\n\
              Set --node or MDMA_NODE to the hostname of your MDMA device"
         );
@@ -193,11 +212,11 @@ mod tests {
 
     #[test]
     fn topic_arg_parser_is_an_optional_option() {
-        assert_eq!(run_arg::<OptTopicArg>(&[]), Ok(OptTopicArg(None)));
+        assert_eq!(run_arg::<TopicArg>(&[]), Ok(TopicArg(None)));
         assert_eq!(
-            run_arg::<OptTopicArg>(&["--topic", "playback/track_started"]),
-            Ok(OptTopicArg(Some("playback/track_started".to_string())))
+            run_arg::<TopicArg>(&["--topic", "playback/track_started"]),
+            Ok(TopicArg(Some("playback/track_started".to_string())))
         );
-        assert!(run_arg::<OptTopicArg>(&["--topic"]).is_err());
+        assert!(run_arg::<TopicArg>(&["--topic"]).is_err());
     }
 }

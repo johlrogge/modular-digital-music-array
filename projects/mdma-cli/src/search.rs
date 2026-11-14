@@ -1,100 +1,125 @@
-use crate::args::{choice, impl_arg, parse_choice, Choice};
 use crate::ctx::Ctx;
 use crate::output::{library_error, print_tracks};
 use crate::stdin::piped_hashes;
-use bpaf::{long, Bpaf, Parser};
 use color_eyre::Result;
-use hicli::Arg;
+use hicli::{Arg, Candidate, Choice};
 use library_ipc_client::{ContentHash, TrackInfo};
-use library_search::{
-    parse_date_query, parse_duration_query, parse_key_query, parse_numeric_query, parse_role_query,
-    parse_string_query, DateQuery, DurationQuery, KeyQuery, NumericQuery, ParseError, TrackQuery,
-};
+use library_search::{DateQuery, DurationQuery, KeyQuery, NumericQuery, StringQuery, TrackQuery};
 use mdma_client::LibraryBackend;
 use music_facts::{EnergyLevel, TrackRole};
+use std::str::FromStr;
 
-// The typed filters take their help from their `Arg` impls, so their field docs
-// are not shown.
-#[derive(Debug, Default, Bpaf, Arg)]
+// Every filter is its own argument type and takes its help from its doc comment.
+#[derive(Debug, Default, Arg)]
 pub(crate) struct SearchArgs {
-    /// Filter by artist name
-    #[bpaf(argument("ARTIST"))]
-    artist: Option<String>,
-
-    /// Filter by track title
-    #[bpaf(argument("TITLE"))]
-    title: Option<String>,
-
-    /// Filter by album name
-    #[bpaf(argument("ALBUM"))]
-    album: Option<String>,
-
-    /// Filter by label name
-    #[bpaf(argument("LABEL"))]
-    label: Option<String>,
-
-    /// Filter by main genre (e.g. "Electronic", "Techno")
-    #[bpaf(argument("GENRE"))]
-    genre: Option<String>,
-
-    /// Filter by style descriptor — matches if any descriptor matches
-    #[bpaf(argument("STYLE"))]
-    style: Option<String>,
-
-    #[bpaf(external(BpmArg::parser), optional)]
+    artist: Option<ArtistFilter>,
+    title: Option<TitleFilter>,
+    album: Option<AlbumFilter>,
+    label: Option<LabelFilter>,
+    genre: Option<GenreFilter>,
+    style: Option<StyleFilter>,
     bpm: Option<BpmArg>,
-
-    #[bpaf(external(KeyArg::parser), optional)]
     key: Option<KeyArg>,
-
-    #[bpaf(external(DurationArg::parser), optional)]
     duration: Option<DurationArg>,
-
-    #[bpaf(external(YearArg::parser), optional)]
     year: Option<YearArg>,
-
-    /// Filter by source (bandcamp, beatport, upload)
-    #[bpaf(argument("SOURCE"))]
-    source: Option<String>,
-
-    /// Ignore stdin (don't read piped hashes as intersection filter)
-    no_stdin: bool,
-
-    /// Filter by last started date. Format: N/A, >2026-02, <2026, 2026-01..2026-06 (dash-leading values: --started=-7)
-    #[bpaf(long("started"), argument("STARTED"))]
-    started: Option<DateArg>,
-
-    /// Filter by last stopped date. Same format as --started (dash-leading values: --stopped=-7).
-    #[bpaf(long("stopped"), argument("STOPPED"))]
-    stopped: Option<DateArg>,
-
-    /// Filter by date added to library. Uses date expression syntax: ~/+1/15 (15th next month), --added=-7 (7 days ago), ^ (1st of month), $ (end of month). Ranges: --added=-7..~ (last 7 days to today).
-    #[bpaf(long("added"), argument("ADDED"))]
-    added: Option<DateArg>,
-
-    #[bpaf(external(PlayedFilter::parser), optional)]
+    source: Option<SourceFilter>,
+    no_stdin: NoStdin,
+    started: Option<StartedFilter>,
+    stopped: Option<StoppedFilter>,
+    added: Option<AddedFilter>,
     played: Option<PlayedFilter>,
-
-    #[bpaf(external(RoleArg::parser), optional)]
     role: Option<RoleArg>,
-
-    #[bpaf(external(EnergyArg::parser), optional)]
     energy: Option<EnergyArg>,
-
-    /// Invert the search results — return tracks that do NOT match the filters.
-    not: bool,
-
-    /// Free-text query applied to all text fields (title, artist, album, label, genre).
-    /// Supports CamelCase initialism (CarbBased) and /regex/ syntax.
-    #[bpaf(positional("QUERY"))]
-    query: Option<String>,
+    not: Invert,
+    query: Option<QueryText>,
 }
 
-/// A fact type name (e.g. MainGenre, Label, Key).
-#[derive(Debug, Clone, PartialEq, Eq)]
+// The filters wrap the query types of `library_search`, which parse themselves:
+// a filter has no `FromStr` of its own, so what a bad value says is theirs.
+
+/// Filter by artist name
+#[derive(Debug, Clone, Arg)]
+#[arg(long = "artist", metavar = "ARTIST")]
+pub(crate) struct ArtistFilter(pub StringQuery);
+
+/// Filter by track title
+#[derive(Debug, Clone, Arg)]
+#[arg(long = "title", metavar = "TITLE")]
+pub(crate) struct TitleFilter(pub StringQuery);
+
+/// Filter by album name
+#[derive(Debug, Clone, Arg)]
+#[arg(long = "album", metavar = "ALBUM")]
+pub(crate) struct AlbumFilter(pub StringQuery);
+
+/// Filter by label name
+#[derive(Debug, Clone, Arg)]
+#[arg(long = "label", metavar = "LABEL")]
+pub(crate) struct LabelFilter(pub StringQuery);
+
+/// Filter by main genre (e.g. "Electronic", "Techno")
+#[derive(Debug, Clone, Arg)]
+#[arg(long = "genre", metavar = "GENRE")]
+pub(crate) struct GenreFilter(pub StringQuery);
+
+/// Filter by style descriptor (matches if any descriptor matches)
+#[derive(Debug, Clone, Arg)]
+#[arg(long = "style", metavar = "STYLE")]
+pub(crate) struct StyleFilter(pub StringQuery);
+
+/// Filter by source (e.g. bandcamp, beatport, upload)
+// Stays a String: a source is any name a source service or the upload registers, so
+// the set is open; completion offers the ones known today.
+#[derive(Debug, Clone, Arg)]
+#[arg(long = "source", metavar = "SOURCE", complete = complete_known_sources)]
+pub(crate) struct SourceFilter(pub String);
+
+/// The sources the library is known to hold tracks from.
+fn complete_known_sources(typed: &str) -> Vec<Candidate> {
+    ["bandcamp", "beatport", "upload"]
+        .into_iter()
+        .filter(|source| source.starts_with(typed))
+        .map(|source| (source.to_string(), None))
+        .collect()
+}
+
+/// Ignore stdin (don't read piped hashes as intersection filter)
+#[derive(Debug, Clone, Copy, Default, Arg)]
+#[arg(long = "no-stdin")]
+pub(crate) struct NoStdin(pub bool);
+
+/// Invert the search results: return tracks that do NOT match the filters
+#[derive(Debug, Clone, Copy, Default, Arg)]
+#[arg(long = "not")]
+pub(crate) struct Invert(pub bool);
+
+/// Free-text query applied to all text fields (title, artist, album, label, genre).
+/// Supports CamelCase initialism (CarbBased) and /regex/ syntax.
+#[derive(Debug, Clone, Arg)]
+#[arg(positional = "QUERY")]
+pub(crate) struct QueryText(pub StringQuery);
+
+/// Filter by last started date (format: N/A, >2026-02, <2026, 2026-01..2026-06; dash-leading values: --started=-7)
+#[derive(Debug, Clone, Arg)]
+#[arg(long = "started", metavar = "STARTED")]
+pub(crate) struct StartedFilter(pub DateQuery);
+
+/// Filter by last stopped date (same format as --started; dash-leading values: --stopped=-7)
+#[derive(Debug, Clone, Arg)]
+#[arg(long = "stopped", metavar = "STOPPED")]
+pub(crate) struct StoppedFilter(pub DateQuery);
+
+/// Filter by date added to library. Uses date expression syntax: ~/+1/15 (15th next month), --added=-7 (7 days ago), ^ (1st of month), $ (end of month). Ranges: --added=-7..~ (last 7 days to today).
+#[derive(Debug, Clone, Arg)]
+#[arg(long = "added", metavar = "ADDED")]
+pub(crate) struct AddedFilter(pub DateQuery);
+
+/// Fact type to inspect (e.g. MainGenre, Label, Key, Source, BPM, StyleDescriptor)
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(positional = "FACT_TYPE")]
 pub(crate) struct FactTypeArg(pub library_ipc_client::FactType);
 
-impl std::str::FromStr for FactTypeArg {
+impl FromStr for FactTypeArg {
     type Err = std::convert::Infallible;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
@@ -104,198 +129,109 @@ impl std::str::FromStr for FactTypeArg {
     }
 }
 
-/// A date filter (e.g. `-7`, `>2026-02`, `2026-01..2026-06`, `N/A`).
-#[derive(Debug, Clone)]
-pub(crate) struct DateArg(pub DateQuery);
+/// Filter by DJ role
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Choice, Arg)]
+#[arg(long = "role", metavar = "ROLE")]
+pub(crate) enum RoleArg {
+    /// Starts a set
+    Opener,
+    /// Raises the energy towards the peak
+    BuildUp,
+    /// The high point of a set
+    Peak,
+    /// A crowd-peak exclamation point before the energy drops
+    Banger,
+    /// Winds the energy down
+    CoolDown,
+    /// Ends a set
+    Closer,
+    /// Used outside the main arc of a set
+    Filler,
+}
 
-impl std::str::FromStr for DateArg {
-    type Err = ParseError;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        parse_date_query(s).map(DateArg)
+impl From<RoleArg> for TrackRole {
+    fn from(role: RoleArg) -> Self {
+        match role {
+            RoleArg::Opener => TrackRole::Opener,
+            RoleArg::BuildUp => TrackRole::BuildUp,
+            RoleArg::Peak => TrackRole::Peak,
+            RoleArg::Banger => TrackRole::Banger,
+            RoleArg::CoolDown => TrackRole::CoolDown,
+            RoleArg::Closer => TrackRole::Closer,
+            RoleArg::Filler => TrackRole::Filler,
+        }
     }
 }
 
-/// A DJ role filter (e.g. `peak`, `cool-down`).
-#[derive(Debug, Clone)]
-pub(crate) struct RoleArg(pub TrackRole);
-
-impl std::str::FromStr for RoleArg {
-    type Err = ParseError;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        parse_role_query(s).map(RoleArg)
-    }
-}
-
-/// An energy filter whose every bound is a valid `EnergyLevel` (e.g. `7`, `5..8`, `7+-2`).
-#[derive(Debug, Clone)]
+/// Filter by energy level (1-10; formats: 7  5..8  7+-2)
+///
+/// Every bound must be a valid `EnergyLevel`.
+#[derive(Debug, Clone, Arg)]
+#[arg(long = "energy", metavar = "ENERGY")]
 pub(crate) struct EnergyArg(pub NumericQuery);
 
-impl std::str::FromStr for EnergyArg {
-    type Err = String;
+impl FromStr for EnergyArg {
+    type Err = &'static str;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        let query = parse_numeric_query(s).map_err(|e| e.to_string())?;
-        let bounds = match &query {
-            NumericQuery::Exact(v) => vec![*v],
-            NumericQuery::Range(lo, hi) => vec![*lo, *hi],
-            NumericQuery::Tolerance { value, .. } => vec![*value],
+        let query: NumericQuery = s.parse()?;
+        let bounds: Vec<(f32, &'static str)> = match &query {
+            NumericQuery::Exact(v) => vec![(*v, "must be a whole level from 1 to 10")],
+            NumericQuery::Range(lo, hi) => vec![
+                (*lo, "lower bound must be a whole level from 1 to 10"),
+                (*hi, "upper bound must be a whole level from 1 to 10"),
+            ],
+            NumericQuery::Tolerance { value, .. } => {
+                vec![(*value, "value must be a whole level from 1 to 10")]
+            }
         };
-        for bound in bounds {
+        for (bound, phrase) in bounds {
             let whole = bound.fract() == 0.0 && (0.0..=255.0).contains(&bound);
-            let level = whole.then_some(bound as u8).ok_or_else(|| {
-                format!("invalid energy '{s}': {bound} is not a whole level 1..=10")
-            })?;
-            EnergyLevel::new(level).map_err(|e| format!("invalid energy '{s}': {e}"))?;
+            whole
+                .then_some(bound as u8)
+                .and_then(|level| EnergyLevel::new(level).ok())
+                .ok_or(phrase)?;
         }
         Ok(EnergyArg(query))
     }
 }
 
-/// A BPM filter (e.g. `128`, `128+-4`, `124..132`).
-#[derive(Debug, Clone)]
+/// Filter by BPM (formats: 128  128+-4  124..132  128+2  128-2)
+#[derive(Debug, Clone, Arg)]
+#[arg(long = "bpm", metavar = "BPM")]
 pub(crate) struct BpmArg(pub NumericQuery);
 
-impl std::str::FromStr for BpmArg {
-    type Err = ParseError;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        parse_numeric_query(s).map(BpmArg)
-    }
-}
-
-/// A release-year filter (e.g. `2022`, `2019..2022`).
-#[derive(Debug, Clone)]
+/// Filter by release year (formats: 2022  2019..2022)
+#[derive(Debug, Clone, Arg)]
+#[arg(long = "year", metavar = "YEAR")]
 pub(crate) struct YearArg(pub NumericQuery);
 
-impl std::str::FromStr for YearArg {
-    type Err = ParseError;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        parse_numeric_query(s).map(YearArg)
-    }
-}
-
-/// A musical key filter (e.g. `Am`, `8B+-1`).
-#[derive(Debug, Clone)]
+/// Filter by musical key (formats: Am  "A minor"  8B  8B+-1  8B+-1~)
+#[derive(Debug, Clone, Arg)]
+#[arg(long = "key", metavar = "KEY")]
 pub(crate) struct KeyArg(pub KeyQuery);
 
-impl std::str::FromStr for KeyArg {
-    type Err = ParseError;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        parse_key_query(s).map(KeyArg)
-    }
-}
-
-/// A duration filter (e.g. `7m15s`, `>5m`, `6m..8m`).
-#[derive(Debug, Clone)]
+/// Filter by duration (formats: 7m  7m15s  >5m  <8m  6m..8m)
+#[derive(Debug, Clone, Arg)]
+#[arg(long = "duration", metavar = "DURATION")]
 pub(crate) struct DurationArg(pub DurationQuery);
-
-impl std::str::FromStr for DurationArg {
-    type Err = ParseError;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        parse_duration_query(s).map(DurationArg)
-    }
-}
-
-// The filter options are spelled as in `SearchArgs`. `DateArg` has no `Arg`
-// impl: it is `--started`, `--stopped` and `--added` (one type, three spellings),
-// so those are fields of the search args struct instead.
-
-impl_arg!(
-    FactTypeArg,
-    positional "FACT_TYPE",
-    "Fact type to inspect (e.g. MainGenre, Label, Key, Source, BPM, StyleDescriptor)"
-);
-impl_arg!(
-    BpmArg,
-    long "bpm",
-    "BPM",
-    "Filter by BPM. Formats: 128  128+-4  124..132  128+2  128-2"
-);
-impl_arg!(
-    KeyArg,
-    long "key",
-    "KEY",
-    "Filter by musical key. Formats: Am  \"A minor\"  8B  8B+-1  8B+-1~"
-);
-impl_arg!(
-    DurationArg,
-    long "duration",
-    "DURATION",
-    "Filter by duration. Formats: 7m  7m15s  >5m  <8m  6m..8m"
-);
-impl_arg!(
-    YearArg,
-    long "year",
-    "YEAR",
-    "Filter by release year. Formats: 2022  2019..2022"
-);
-impl_arg!(
-    RoleArg,
-    long "role",
-    "ROLE",
-    "Filter by DJ role. Accepted values: opener, build-up, peak, banger, cool-down, closer, filler"
-);
-impl_arg!(
-    EnergyArg,
-    long "energy",
-    "ENERGY",
-    "Filter by energy level (1-10). Formats: 7  5..8  7+-2"
-);
-
-impl Arg for PlayedFilter {
-    fn parser() -> impl Parser<Self> {
-        choice(
-            long("played")
-                .help("Filter by playback history. `never` matches tracks with no started fact (never played). When combined with --started, --played=never takes precedence.")
-                .argument::<String>("PLAYED"),
-        )
-    }
-}
 
 /// Search for tracks by filter or free text
 #[hicli::command(default)]
 pub(crate) fn query(args: SearchArgs, ctx: &Ctx) -> Result<()> {
     let library = ctx.library()?;
-    let no_stdin = args.no_stdin;
+    let NoStdin(no_stdin) = args.no_stdin;
     let track_query = build_track_query(args);
     search_tracks(&library, &track_query, no_stdin)
 }
 
-/// Filter by playback history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Filter by playback history (takes precedence over --started); `never` matches
+/// tracks with no started fact
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Choice, Arg)]
+#[arg(long = "played", metavar = "PLAYED")]
 pub(crate) enum PlayedFilter {
-    /// Tracks that have never been played (started fact is absent).
+    /// Tracks that have never been played (no started fact)
     Never,
-}
-
-impl Choice for PlayedFilter {
-    const ALL: &'static [Self] = &[PlayedFilter::Never];
-    const WHAT: &'static str = "played filter";
-
-    fn name(self) -> &'static str {
-        match self {
-            PlayedFilter::Never => "never",
-        }
-    }
-}
-
-impl std::fmt::Display for PlayedFilter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.name())
-    }
-}
-
-impl std::str::FromStr for PlayedFilter {
-    type Err = String;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        parse_choice(s)
-    }
 }
 
 /// Build a TrackQuery from the search arguments (`--no-stdin` is not part of the query).
@@ -328,27 +264,27 @@ fn build_track_query(args: SearchArgs) -> TrackQuery {
         // --played=never is a shortcut for started=N/A and overrides any --started value.
         Some(DateQuery::NA)
     } else {
-        started.map(|DateArg(q)| q)
+        started.map(|StartedFilter(q)| q)
     };
     TrackQuery {
-        any_text: any_text.map(|s| parse_string_query(&s)),
-        artist: artist.map(|s| parse_string_query(&s)),
-        title: title.map(|s| parse_string_query(&s)),
-        album: album.map(|s| parse_string_query(&s)),
-        label: label.map(|s| parse_string_query(&s)),
-        genre: genre.map(|s| parse_string_query(&s)),
-        style: style.map(|s| parse_string_query(&s)),
+        any_text: any_text.map(|QueryText(q)| q),
+        artist: artist.map(|ArtistFilter(q)| q),
+        title: title.map(|TitleFilter(q)| q),
+        album: album.map(|AlbumFilter(q)| q),
+        label: label.map(|LabelFilter(q)| q),
+        genre: genre.map(|GenreFilter(q)| q),
+        style: style.map(|StyleFilter(q)| q),
         bpm: bpm.map(|BpmArg(q)| q),
         key: key.map(|KeyArg(q)| q),
         duration: duration.map(|DurationArg(q)| q),
         year: year.map(|YearArg(q)| q),
-        source,
+        source: source.map(|SourceFilter(s)| s),
         started,
-        stopped: stopped.map(|DateArg(q)| q),
-        added: added.map(|DateArg(q)| q),
-        role: role.map(|RoleArg(r)| r),
+        stopped: stopped.map(|StoppedFilter(q)| q),
+        added: added.map(|AddedFilter(q)| q),
+        role: role.map(TrackRole::from),
         energy: energy.map(|EnergyArg(q)| q),
-        not,
+        not: not.0,
     }
 }
 
@@ -419,10 +355,13 @@ fn search_tracks(library: &LibraryBackend, query: &TrackQuery, no_stdin: bool) -
 
 /// List all distinct values stored for a fact type
 ///
-/// Examples:
-///   mdma search fact-values-for genre
-///   mdma search fact-values-for label | grep -i "ost"
-///   mdma search fact-values-for genre | dmenu | xargs -I{} mdma search --genre {}
+/// # Examples
+///
+/// ```sh
+/// mdma search fact-values-for genre
+/// mdma search fact-values-for label | grep -i "ost"
+/// mdma search fact-values-for genre | dmenu | xargs -I{} mdma search --genre {}
+/// ```
 #[hicli::command]
 pub(crate) fn fact_values_for(fact_type: FactTypeArg, ctx: &Ctx) -> Result<()> {
     use std::io::IsTerminal;
@@ -453,7 +392,7 @@ pub(crate) fn fact_values_for(fact_type: FactTypeArg, ctx: &Ctx) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{parses, track, usage_error};
+    use crate::test_support::{help, parses, track, usage_error};
 
     use pretty_assertions::assert_eq;
 
@@ -490,34 +429,120 @@ mod tests {
     }
 
     #[test]
-    fn invalid_filters_carry_the_from_str_message() {
-        let reason = "garbage".parse::<BpmArg>().unwrap_err().to_string();
-        let err = run_arg::<BpmArg>(&["--bpm", "garbage"]).unwrap_err();
-        assert!(err.contains(&reason), "{err}");
-        let reason = "garbage".parse::<YearArg>().unwrap_err().to_string();
-        let err = run_arg::<YearArg>(&["--year", "garbage"]).unwrap_err();
-        assert!(err.contains(&reason), "{err}");
-        let reason = "garbage".parse::<KeyArg>().unwrap_err().to_string();
-        let err = run_arg::<KeyArg>(&["--key", "garbage"]).unwrap_err();
-        assert!(err.contains(&reason), "{err}");
-        let reason = "garbage".parse::<DurationArg>().unwrap_err().to_string();
-        let err = run_arg::<DurationArg>(&["--duration", "garbage"]).unwrap_err();
-        assert!(err.contains(&reason), "{err}");
-        let reason = "garbage".parse::<RoleArg>().unwrap_err().to_string();
+    fn invalid_filters_carry_the_query_types_reason_without_the_value() {
+        fn reason<T: std::str::FromStr<Err = &'static str> + std::fmt::Debug>() -> String {
+            "garbage".parse::<T>().unwrap_err().to_string()
+        }
+        let cases = [
+            (
+                run_arg::<BpmArg>(&["--bpm", "garbage"]).map(|_| ()),
+                reason::<NumericQuery>(),
+            ),
+            (
+                run_arg::<YearArg>(&["--year", "garbage"]).map(|_| ()),
+                reason::<NumericQuery>(),
+            ),
+            (
+                run_arg::<KeyArg>(&["--key", "garbage"]).map(|_| ()),
+                reason::<KeyQuery>(),
+            ),
+            (
+                run_arg::<DurationArg>(&["--duration", "garbage"]).map(|_| ()),
+                reason::<DurationQuery>(),
+            ),
+        ];
+        for (parsed, reason) in cases {
+            let err = parsed.unwrap_err();
+            assert!(err.ends_with(&reason), "{err}");
+            assert_eq!(
+                err.matches("garbage").count(),
+                1,
+                "echoed once, by hicli: {err}"
+            );
+        }
         let err = run_arg::<RoleArg>(&["--role", "garbage"]).unwrap_err();
-        assert!(err.contains(&reason), "{err}");
+        assert!(err.contains("expected `opener`, `build-up`"), "{err}");
         let err = run_arg::<EnergyArg>(&["--energy", "11"]).unwrap_err();
-        assert!(err.contains("invalid energy '11'"), "{err}");
+        assert!(
+            err.ends_with("`--energy`: must be a whole level from 1 to 10"),
+            "{err}"
+        );
+        let err = run_arg::<EnergyArg>(&["--energy", "5..11"]).unwrap_err();
+        assert!(
+            err.ends_with("`--energy`: upper bound must be a whole level from 1 to 10"),
+            "{err}"
+        );
+        let err = run_arg::<EnergyArg>(&["--energy", "0..5"]).unwrap_err();
+        assert!(err.contains("lower bound must be"), "{err}");
+    }
+
+    #[test]
+    fn a_bad_filter_value_names_the_flag() {
+        for (flag, value) in [
+            ("--bpm", "fast"),
+            ("--key", "H#"),
+            ("--duration", "long"),
+            ("--year", "last-year"),
+            ("--role", "dancer"),
+            ("--energy", "11"),
+        ] {
+            let e = usage_error(&["search", flag, value]);
+            assert!(e.contains(&format!("`{flag}`")), "{flag}: {e}");
+        }
+        let e = usage_error(&["search", "--played", "always"]);
+        assert!(e.contains("`--played`"), "{e}");
+        assert!(e.contains("expected `never`"), "{e}");
     }
 
     #[test]
     fn key_duration_and_role_parsers_accept_valid_values() {
         assert!(run_arg::<KeyArg>(&["--key", "Am"]).is_ok());
         assert!(run_arg::<DurationArg>(&["--duration", ">5m"]).is_ok());
-        assert!(matches!(
-            run_arg::<RoleArg>(&["--role", "peak"]),
-            Ok(RoleArg(TrackRole::Peak))
-        ));
+        assert_eq!(run_arg::<RoleArg>(&["--role", "peak"]), Ok(RoleArg::Peak));
+    }
+
+    #[test]
+    fn role_names_are_the_ones_track_role_parses() {
+        for role in RoleArg::VARIANTS {
+            assert_eq!(
+                role.name().parse::<TrackRole>().ok(),
+                Some(TrackRole::from(*role)),
+                "{}",
+                role.name()
+            );
+        }
+        assert_eq!(
+            run_arg::<RoleArg>(&["--role", "cool-down"]),
+            Ok(RoleArg::CoolDown)
+        );
+    }
+
+    #[test]
+    fn source_is_open_but_completes_the_known_sources() {
+        assert_eq!(
+            run_arg::<SourceFilter>(&["--source", "anything"])
+                .unwrap()
+                .0,
+            "anything"
+        );
+        let offered: Vec<String> = complete_known_sources("b")
+            .into_iter()
+            .map(|c| c.0)
+            .collect();
+        assert_eq!(offered, ["bandcamp", "beatport"]);
+    }
+
+    #[test]
+    fn played_help_says_it_once() {
+        let help = help(&["search", "--help"]);
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(
+                "(takes precedence over --started); `never` matches tracks with no started fact [never]"
+            ),
+            "{flat}"
+        );
+        assert_eq!(flat.matches("[never]").count(), 1, "{flat}");
     }
 
     #[test]
@@ -527,10 +552,7 @@ mod tests {
             Ok(PlayedFilter::Never)
         );
         let err = run_arg::<PlayedFilter>(&["--played", "always"]).unwrap_err();
-        assert!(
-            err.contains("unknown played filter 'always' (expected never)"),
-            "{err}"
-        );
+        assert!(err.contains("expected `never`"), "{err}");
     }
 
     // ── Date arg hyphen-value parsing ────────────────────────────────────────
@@ -558,15 +580,18 @@ mod tests {
     #[test]
     fn search_added_garbage_is_parse_error() {
         let err = usage_error(&["search", "--added=garbage"]);
-        assert!(err.contains("invalid date query 'garbage'"), "{err}");
+        assert!(
+            err.contains("`garbage`: `--added`: expected a date"),
+            "{err}"
+        );
     }
 
     #[test]
     fn search_started_and_stopped_garbage_are_parse_errors() {
-        for flag in ["--started=garbage", "--stopped=garbage"] {
-            let err = usage_error(&["search", flag]);
+        for flag in ["started", "stopped"] {
+            let err = usage_error(&["search", &format!("--{flag}=garbage")]);
             assert!(
-                err.contains("invalid date query 'garbage'"),
+                err.contains(&format!("`garbage`: `--{flag}`: expected a date")),
                 "{flag}: {err}"
             );
         }
@@ -577,9 +602,9 @@ mod tests {
     #[test]
     fn search_role_parses_and_rejects() {
         let args = parse_search(&["--role", "peak"]).unwrap();
-        assert!(args.role.is_some());
+        assert!(args.role.is_some(), "{args:?}");
         let err = parse_search(&["--role", "dancer"]).unwrap_err();
-        assert!(err.contains("invalid role 'dancer'"), "{err}");
+        assert!(err.contains("`--role`: expected `opener`"), "{err}");
     }
 
     #[test]
@@ -627,7 +652,7 @@ mod tests {
     #[test]
     fn search_bpm_invalid_is_parse_error() {
         let err = parse_search(&["--bpm", "fast"]).unwrap_err();
-        assert!(err.contains("invalid numeric query 'fast'"), "{err}");
+        assert!(err.contains("`--bpm`: expected a number"), "{err}");
     }
 
     #[test]
@@ -643,7 +668,7 @@ mod tests {
     #[test]
     fn search_year_invalid_is_parse_error() {
         let err = parse_search(&["--year", "last-year"]).unwrap_err();
-        assert!(err.contains("invalid numeric query 'last-year'"), "{err}");
+        assert!(err.contains("`--year`: expected a number"), "{err}");
     }
 
     #[test]
@@ -655,7 +680,7 @@ mod tests {
     #[test]
     fn search_key_invalid_is_parse_error() {
         let err = parse_search(&["--key", "H#"]).unwrap_err();
-        assert!(err.contains("invalid key query 'H#'"), "{err}");
+        assert!(err.contains("`--key`: expected a Camelot key"), "{err}");
     }
 
     #[test]
@@ -674,7 +699,7 @@ mod tests {
     #[test]
     fn search_duration_invalid_is_parse_error() {
         let err = parse_search(&["--duration", "long"]).unwrap_err();
-        assert!(err.contains("invalid duration query 'long'"), "{err}");
+        assert!(err.contains("`--duration`: expected a duration"), "{err}");
     }
 
     #[test]
@@ -753,7 +778,7 @@ mod tests {
 
     #[test]
     fn played_filter_names_round_trip() {
-        for v in PlayedFilter::ALL {
+        for v in PlayedFilter::VARIANTS {
             assert_eq!(v.name().parse::<PlayedFilter>(), Ok(*v));
             assert_eq!(v.to_string(), v.name());
         }
@@ -779,7 +804,7 @@ mod tests {
     fn search_played_never_overrides_started() {
         // When --played=never and --started are both given, --played=never wins.
         let query = build_track_query(SearchArgs {
-            started: Some("-7".parse().unwrap()),
+            started: Some(StartedFilter("-7".parse().unwrap())),
             played: Some(PlayedFilter::Never),
             ..Default::default()
         });

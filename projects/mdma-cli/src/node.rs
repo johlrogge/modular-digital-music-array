@@ -10,7 +10,6 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::args::impl_arg;
 use crate::ctx::Ctx;
 use color_eyre::eyre::{bail, eyre};
 use gateway_client::{GatewayClient, IdentifyError, NodeIdentity};
@@ -453,17 +452,36 @@ pub(crate) fn list(_ctx: &Ctx) -> color_eyre::Result<()> {
     Ok(())
 }
 
-/// A node name or id as typed, matched against the discovered nodes (none: prompt).
-// Stays a String: any text is a valid query; no match is reported by the resolver.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OptNodeQueryArg(pub Option<String>);
+/// The remembered node's name, id and host that start with `typed`. Local state only
+/// (the node cache file, no network), and silent when there is none or it is unreadable.
+pub(crate) fn complete_nodes(typed: &str) -> Vec<hicli::Candidate> {
+    let cached = cache_path().and_then(|path| cache::load(&path).ok().flatten());
+    node_candidates(cached.as_ref(), typed)
+}
 
-impl_arg!(OptNodeQueryArg, optional_text positional "NAME", "Node name or id");
+fn node_candidates(cached: Option<&NodeCache>, typed: &str) -> Vec<hicli::Candidate> {
+    let Some(node) = cached else {
+        return Vec::new();
+    };
+    let mut out: Vec<hicli::Candidate> = Vec::new();
+    for (value, what) in [(&node.name, "name"), (&node.id, "id"), (&node.host, "host")] {
+        if !value.is_empty() && value.starts_with(typed) && !out.iter().any(|(v, _)| v == value) {
+            out.push((value.clone(), Some(format!("remembered node ({what})"))));
+        }
+    }
+    out
+}
+
+/// Node name or id
+// Stays a String: any text is a valid query; no match is reported by the resolver.
+#[derive(Debug, Clone, PartialEq, Eq, hicli::Arg)]
+#[arg(positional = "NAME", complete = complete_nodes)]
+pub(crate) struct NodeQueryArg(pub Option<String>);
 
 /// Remember a node (by name or id; prompts when omitted)
 #[hicli::command]
-pub(crate) fn select(query: OptNodeQueryArg, _ctx: &Ctx) -> color_eyre::Result<()> {
-    let OptNodeQueryArg(query) = query;
+pub(crate) fn select(query: NodeQueryArg, _ctx: &Ctx) -> color_eyre::Result<()> {
+    let NodeQueryArg(query) = query;
     let nodes = node_discovery::browse(BROWSE_TIMEOUT);
     let mut effects = SelectEffects {
         identify_at: Box::new(identify_at),
@@ -536,10 +554,10 @@ mod tests {
 
     #[test]
     fn node_query_arg_parser_is_an_optional_positional() {
-        assert_eq!(run_arg::<OptNodeQueryArg>(&[]), Ok(OptNodeQueryArg(None)));
+        assert_eq!(run_arg::<NodeQueryArg>(&[]), Ok(NodeQueryArg(None)));
         assert_eq!(
-            run_arg::<OptNodeQueryArg>(&["johlyroger"]),
-            Ok(OptNodeQueryArg(Some("johlyroger".to_string())))
+            run_arg::<NodeQueryArg>(&["johlyroger"]),
+            Ok(NodeQueryArg(Some("johlyroger".to_string())))
         );
     }
 

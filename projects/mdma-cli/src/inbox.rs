@@ -1,15 +1,15 @@
-use crate::args::impl_arg;
 use crate::ctx::Ctx;
 use crate::output::{library_error, success_unless};
 use color_eyre::eyre::eyre;
 use color_eyre::Result;
-use hicli::Success;
+use hicli::{Arg, Success};
 use library_ipc_client::{InboxPath, InboxPathError};
 use std::str::FromStr;
 use track_formatter::short_hash;
 
-/// File name in the inbox, validated by `InboxPath` at parse time.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// File name in inbox
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(positional = "FILENAME")]
 pub(crate) struct InboxFileArg(pub InboxPath);
 
 impl FromStr for InboxFileArg {
@@ -19,8 +19,6 @@ impl FromStr for InboxFileArg {
         InboxPath::new(s).map(Self)
     }
 }
-
-impl_arg!(InboxFileArg, positional "FILENAME", "File name in inbox");
 
 /// List files in inbox
 #[hicli::command]

@@ -1,8 +1,8 @@
-use crate::args::impl_arg;
 use crate::ctx::Ctx;
 use crate::output::interpret_library;
 use color_eyre::eyre::eyre;
 use color_eyre::Result;
+use hicli::Arg;
 
 /// Re-extract and store cover art for tracks that don't have a CoverArtPath fact yet
 ///
@@ -57,11 +57,10 @@ mod dedup;
 #[hicli::group]
 mod archive;
 
-/// Do not ask for confirmation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Do not ask for confirmation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Arg)]
+#[arg(long = "yes", short = 'y')]
 pub(crate) struct Yes(pub bool);
-
-impl_arg!(Yes, switch "yes", short 'y', "Do not ask for confirmation");
 
 #[cfg(test)]
 mod tests {

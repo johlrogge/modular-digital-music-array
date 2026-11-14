@@ -1,4 +1,4 @@
-use crate::args::{choice, choice_names, ExistingFileArg, PlaylistArg, SanitizedPlaylistName};
+use crate::args::{DryRun, ExistingFileArg, OutputDir, PlaylistArg, SanitizedPlaylistName};
 use crate::ctx::Ctx;
 use crate::origins::rekordbox_source;
 use crate::output::library_error;
@@ -7,7 +7,6 @@ use crate::transfer::{
     build_http_client, download_tracks, existing_location_set, export_dest_path_checked,
     export_extension, path_cost, DownloadOutcome, ExportFormat, MAX_LOCATION_URI_BYTES,
 };
-use bpaf::{long, Bpaf, Parser};
 use color_eyre::eyre::{bail, eyre};
 use color_eyre::Result;
 use hicli::Arg;
@@ -17,59 +16,52 @@ use playlist_import::{format_write_outcome, write_playlist, LibraryTrackLookup};
 use rekordbox_xml::{parse_xml, RekordboxTrack};
 use track_matcher::{CandidateTrack, MatchResult};
 
-/// `--format` of `rekordbox export`.
-fn export_format_option() -> impl Parser<ExportFormat> {
-    choice(
-        long("format")
-            .help(
-                format!(
-                    "Audio format ({}; defaults to original)",
-                    choice_names::<ExportFormat>().join(", ")
-                )
-                .as_str(),
-            )
-            .argument::<String>("FORMAT"),
-    )
-}
+/// MDMA playlist to export; repeat for several (reads hashes from stdin when none is given)
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(long = "playlist", metavar = "PLAYLIST")]
+pub(crate) struct ExportPlaylists(pub Vec<PlaylistArg>);
+
+/// Force a fresh XML and re-download everything (discards incremental sync). Also skips
+/// grandfathering of existing paths: tracks whose paths exceed the rekordbox Location
+/// budget get new, shortened paths (rekordbox will see them as new tracks and cues are lost).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Arg)]
+#[arg(long = "replace")]
+pub(crate) struct ReplaceXml(pub bool);
 
 // Values of `rekordbox export`; playlist names are validated at parse time.
-#[derive(Debug, Clone, PartialEq, Eq, Bpaf, Arg)]
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
 pub(crate) struct RekordboxExportArgs {
-    /// MDMA playlist(s) to export. Repeat for multiple: --playlist A --playlist B.
-    /// If none given, falls back to stdin input (existing behaviour).
-    #[bpaf(long("playlist"), argument("PLAYLIST"))]
-    pub(crate) playlist: Vec<PlaylistArg>,
-    /// Output directory. Defaults to ~/Music/mdma_rekordbox.
-    #[bpaf(long("output"), argument("OUTPUT"))]
-    pub(crate) output: Option<std::path::PathBuf>,
-    #[bpaf(external(export_format_option), optional)]
+    pub(crate) playlist: ExportPlaylists,
+    /// Directory to write to (created if it doesn't exist; default: ~/Music/mdma_rekordbox)
+    pub(crate) output: OutputDir,
     pub(crate) format: Option<ExportFormat>,
-    /// Force a fresh XML and re-download everything (discards incremental sync).
-    /// Also skips grandfathering of existing paths: tracks whose paths exceed
-    /// the rekordbox Location budget get new, shortened paths (rekordbox will
-    /// see them as new tracks and cues are lost).
-    #[bpaf(long("replace"), switch)]
-    pub(crate) replace: bool,
+    pub(crate) replace: ReplaceXml,
 }
+
+/// Create an MDMA playlist with the matched tracks. Invalid characters (spaces,
+/// special chars) are replaced with `-`.
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(long = "playlist", metavar = "PLAYLIST")]
+pub(crate) struct ImportPlaylist(pub Option<SanitizedPlaylistName>);
+
+/// Import all playlists found in the XML as MDMA playlists
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Arg)]
+#[arg(long = "all-playlists")]
+pub(crate) struct AllPlaylists(pub bool);
+
+/// Update BPM and Key facts from Rekordbox data for matched tracks
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Arg)]
+#[arg(long = "enrich")]
+pub(crate) struct Enrich(pub bool);
 
 // Values of `rekordbox import`; the file must exist and the playlist name is
 // sanitised, both at parse time. The file is a positional, so it comes last.
-#[derive(Debug, Clone, PartialEq, Eq, Bpaf, Arg)]
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
 pub(crate) struct RekordboxImportArgs {
-    /// Create an MDMA playlist with matched tracks.
-    /// Invalid characters (spaces, special chars) are replaced with `-`.
-    #[bpaf(long("playlist"), argument("PLAYLIST"))]
-    pub(crate) playlist: Option<SanitizedPlaylistName>,
-    /// Import all playlists found in the XML as MDMA playlists
-    #[bpaf(long("all-playlists"), switch)]
-    pub(crate) all_playlists: bool,
-    /// Update BPM and Key facts from Rekordbox data for matched tracks
-    #[bpaf(long("enrich"), switch)]
-    pub(crate) enrich: bool,
-    /// Show what would happen without making changes
-    #[bpaf(long("dry-run"), switch)]
-    pub(crate) dry_run: bool,
-    #[bpaf(external(ExistingFileArg::parser))]
+    pub(crate) playlist: ImportPlaylist,
+    pub(crate) all_playlists: AllPlaylists,
+    pub(crate) enrich: Enrich,
+    pub(crate) dry_run: DryRun,
     pub(crate) path: ExistingFileArg,
 }
 
@@ -185,10 +177,10 @@ pub(crate) fn export(args: RekordboxExportArgs, ctx: &Ctx) -> Result<()> {
     use std::collections::HashSet;
 
     let RekordboxExportArgs {
-        playlist: playlists,
-        output,
+        playlist: ExportPlaylists(playlists),
+        output: OutputDir(output),
         format,
-        replace,
+        replace: ReplaceXml(replace),
     } = args;
     let library = ctx.library()?;
     let output = output.unwrap_or_else(|| {
@@ -537,20 +529,23 @@ fn print_write_outcome(name: &str, track_count: usize, created: bool) {
 /// Matches Rekordbox tracks to MDMA library tracks by metadata,
 /// creates playlists, and optionally enriches BPM/Key facts.
 ///
-/// Examples:
-///   mdma rekordbox import rekordbox.xml
-///   mdma rekordbox import rekordbox.xml --playlist imported-set
-///   mdma rekordbox import rekordbox.xml --enrich --dry-run
+/// # Examples
+///
+/// ```sh
+/// mdma rekordbox import rekordbox.xml
+/// mdma rekordbox import rekordbox.xml --playlist imported-set
+/// mdma rekordbox import rekordbox.xml --enrich --dry-run
+/// ```
 #[hicli::command]
 pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::{Bpm, Key};
     use std::collections::HashMap;
 
     let RekordboxImportArgs {
-        playlist,
-        all_playlists,
-        enrich,
-        dry_run,
+        playlist: ImportPlaylist(playlist),
+        all_playlists: AllPlaylists(all_playlists),
+        enrich: Enrich(enrich),
+        dry_run: DryRun(dry_run),
         path,
     } = args;
     let library = ctx.library()?;
@@ -929,25 +924,30 @@ mod tests {
             "--replace",
         ])
         .unwrap();
-        let names: Vec<&str> = args.playlist.iter().map(|p| p.0.as_str()).collect();
+        let names: Vec<&str> = args.playlist.0.iter().map(|p| p.0.as_str()).collect();
         assert_eq!(names, ["set-1", "set_2"]);
-        assert_eq!(args.output, Some(std::path::PathBuf::from("/tmp/out")));
+        assert_eq!(args.output.0, Some(std::path::PathBuf::from("/tmp/out")));
         assert_eq!(args.format, Some(super::ExportFormat::Wav));
-        assert!(args.replace);
+        assert!(args.replace.0);
 
         let none = run_arg::<super::RekordboxExportArgs>(&[]).unwrap();
-        assert!(none.playlist.is_empty());
-        assert_eq!(none.output, None);
+        assert!(none.playlist.0.is_empty());
+        assert_eq!(none.output.0, None);
         assert_eq!(none.format, None);
-        assert!(!none.replace);
+        assert!(!none.replace.0);
     }
 
     #[test]
     fn export_args_parser_validates_names_and_formats() {
         let err = run_arg::<super::RekordboxExportArgs>(&["--playlist", "has space"]).unwrap_err();
         assert!(err.contains("invalid characters"), "{err}");
+        assert!(err.contains("`--playlist`"), "{err}");
         let err = run_arg::<super::RekordboxExportArgs>(&["--format", "flac"]).unwrap_err();
-        assert!(err.contains("unknown export format 'flac'"), "{err}");
+        assert!(err.contains("`--format`"), "{err}");
+        assert!(
+            err.contains("expected `original`, `aiff` or `wav`"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -963,13 +963,13 @@ mod tests {
             path,
         ])
         .unwrap();
-        assert_eq!(args.playlist.unwrap().name().as_str(), "My-Set");
-        assert!(args.all_playlists && args.enrich && args.dry_run);
+        assert_eq!(args.playlist.0.unwrap().name().as_str(), "My-Set");
+        assert!(args.all_playlists.0 && args.enrich.0 && args.dry_run.0);
         assert_eq!(args.path.0, file.path());
 
         let plain = run_arg::<super::RekordboxImportArgs>(&[path]).unwrap();
-        assert_eq!(plain.playlist, None);
-        assert!(!plain.all_playlists && !plain.enrich && !plain.dry_run);
+        assert_eq!(plain.playlist.0, None);
+        assert!(!plain.all_playlists.0 && !plain.enrich.0 && !plain.dry_run.0);
     }
 
     #[test]
@@ -1025,7 +1025,7 @@ mod tests {
     fn import_rejects_a_directory() {
         let dir = tempfile::tempdir().unwrap();
         let err = usage_error(&["rekordbox", "import", dir.path().to_str().unwrap()]);
-        assert!(err.contains("is not a file"), "message: {err}");
+        assert!(err.contains("`PATH`: not a file"), "message: {err}");
     }
 
     #[test]
@@ -1046,7 +1046,7 @@ mod tests {
         assert_eq!(parses(&argv), ["rekordbox", "import"]);
         let args = run_arg::<super::RekordboxImportArgs>(&["--playlist", "My Set!", path]).unwrap();
         assert_eq!(args.path.0, file.path());
-        let playlist = args.playlist.unwrap();
+        let playlist = args.playlist.0.unwrap();
         assert_eq!(
             playlist.change_note().as_deref(),
             Some("Note: playlist name sanitized from 'My Set!' to 'My-Set'")
