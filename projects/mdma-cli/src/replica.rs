@@ -426,6 +426,30 @@ fn connect(ctx: &Ctx) -> Result<NodeLink> {
     Ok(NodeLink { id, host, read })
 }
 
+/// Run `step`, the part of a sync before the store is reached. If it fails, the
+/// failure is counted against `throttled`, the replica the attempt was throttled on
+/// (nothing is counted when there is none, or when its sync lock is busy). The error
+/// is returned unchanged.
+///
+/// When the node turns out to be another one than `throttled` (the identify answer
+/// names a different id), `step` succeeds and the sync goes on to the new node's
+/// replica, which takes the host from the old one and records its own outcome.
+fn reach<T>(
+    nodes_dir: &Path,
+    throttled: Option<&NodeId>,
+    now: UnixSecs,
+    step: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let reached = step();
+    if reached.is_err() {
+        if let Some(id) = throttled {
+            // Best effort: failing to record must not hide the real error.
+            let _ = Replica::new(nodes_dir, id).note_failure(now);
+        }
+    }
+    reached
+}
+
 /// Playlist names, as the library lists them.
 fn probe_playlists(ctx: &Ctx) -> Result<Vec<String>> {
     let library = ctx.library()?;
@@ -466,14 +490,22 @@ pub(crate) struct Quiet(pub bool);
 pub(crate) fn sync(quiet: Quiet, ctx: &Ctx) -> Result<()> {
     let nodes_dir = nodes_dir()?;
     let now = UnixSecs::now();
-    // Resolve first, so `--quiet` also silences the note about an implicitly
-    // chosen node; everything after reuses the cached target.
-    ctx.target_with(if quiet.0 {
-        node::Notes::Silent
-    } else {
-        node::Notes::Print
+    // Resolving, connecting and identifying all happen before the store is reached,
+    // so none of them counts a failure there. The replica the throttle ran on (the
+    // one `after_command` and completion pick) takes the failure instead. Without
+    // one, the unresolved record already counted this attempt as a failure.
+    let named = ctx.node_flag().map(|spec| spec.host().to_string());
+    let throttled = replica_from_environment(&nodes_dir, named.as_deref());
+    let NodeLink { id, host, mut read } = reach(&nodes_dir, throttled.as_ref(), now, || {
+        // Resolve first, so `--quiet` also silences the note about an implicitly
+        // chosen node; everything after reuses the cached target.
+        ctx.target_with(if quiet.0 {
+            node::Notes::Silent
+        } else {
+            node::Notes::Print
+        })?;
+        connect(ctx)
     })?;
-    let NodeLink { id, host, mut read } = connect(ctx)?;
 
     let warn = |what: &str, e: &color_eyre::Report| {
         if !quiet.0 {
@@ -925,6 +957,71 @@ mod tests {
             crate::test_support::failure_text(Err::<(), _>(err)),
             "node too old for the replica"
         );
+    }
+
+    // --- failures before the store ---------------------------------------------
+
+    fn unreachable(dir: &Path, node: &str, now: u64) {
+        let failed = reach(dir, Some(&id(node)), secs(now), || {
+            Err::<(), _>(eyre!("DNS resolution failed: No IPv4 address found"))
+        });
+        assert!(failed.is_err(), "the error is passed on");
+    }
+
+    fn meta_of(dir: &Path, node: &str) -> Meta {
+        Replica::new(dir, &id(node)).meta().unwrap().unwrap()
+    }
+
+    #[test]
+    fn a_sync_that_cannot_connect_backs_the_replica_off_and_a_success_resets_it() {
+        let dir = tempfile::tempdir().unwrap();
+        replica_with_host(dir.path(), "n", "nonexistent.invalid");
+
+        unreachable(dir.path(), "n", 1_000);
+        let meta = meta_of(dir.path(), "n");
+        assert_eq!(meta.failures, 1);
+        assert_eq!(meta.last_attempt, Some(secs(1_000)));
+        assert!(!should_attempt(secs(1_059), Some(&meta)));
+        assert!(should_attempt(secs(1_060), Some(&meta)), "60 s");
+
+        unreachable(dir.path(), "n", 1_060);
+        let meta = meta_of(dir.path(), "n");
+        assert_eq!(meta.failures, 2);
+        assert!(!should_attempt(secs(1_179), Some(&meta)));
+        assert!(should_attempt(secs(1_180), Some(&meta)), "120 s");
+
+        let node = node_with(&["[\"a\"]"]);
+        sync_now(dir.path(), "n", None, &node, |_, _, _| Ok(()))
+            .unwrap()
+            .expect("not busy");
+        assert_eq!(meta_of(dir.path(), "n").failures, 0);
+    }
+
+    #[test]
+    fn a_step_that_works_or_has_no_replica_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        replica_with_host(dir.path(), "n", "h.local");
+        let before = meta_of(dir.path(), "n");
+
+        let ok = reach(dir.path(), Some(&id("n")), secs(5_000), || Ok(7)).unwrap();
+        assert_eq!(ok, 7);
+        assert_eq!(meta_of(dir.path(), "n"), before);
+
+        let failed = reach(dir.path(), None, secs(5_000), || Err::<(), _>(eyre!("no")));
+        assert!(failed.is_err());
+        assert_eq!(meta_of(dir.path(), "n"), before);
+    }
+
+    #[test]
+    fn a_failure_is_not_counted_while_another_sync_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        replica_with_host(dir.path(), "n", "h.local");
+        let replica = Replica::new(dir.path(), &id("n"));
+        let _running = replica.try_lock().unwrap().unwrap();
+
+        unreachable(dir.path(), "n", 9_000);
+
+        assert_eq!(meta_of(dir.path(), "n").failures, 0);
     }
 
     // --- status --------------------------------------------------------------

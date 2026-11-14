@@ -501,6 +501,24 @@ impl Replica {
         Ok(true)
     }
 
+    /// Record a sync attempt that failed before the store was reached (the node
+    /// could not be resolved, connected to or identified): one more failure in a
+    /// row, so the backoff of [`should_attempt`] grows. Syncs that reach the store
+    /// count their own failures in [`Replica::sync_locked`].
+    ///
+    /// Does nothing when a sync holds the lock (that sync records its own outcome).
+    /// Returns whether the failure was recorded.
+    pub fn note_failure(&self, now: UnixSecs) -> Result<bool, ReplicaError> {
+        let Some(_lock) = self.try_lock()? else {
+            return Ok(false);
+        };
+        let mut meta = self.meta()?.unwrap_or_default();
+        meta.last_attempt = Some(now);
+        meta.failures = meta.failures.saturating_add(1);
+        self.write_meta(&meta)?;
+        Ok(true)
+    }
+
     /// Delete the replica: data, meta, probe and temporary files. Nothing is
     /// lost; it is rebuilt from the node by the next sync.
     ///
@@ -1391,6 +1409,26 @@ mod tests {
 
         let meta = replica.meta().unwrap().unwrap();
         assert_eq!(meta.last_attempt, Some(UnixSecs::new(100)));
+    }
+
+    #[test]
+    fn note_failure_counts_one_more_failure_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let replica = replica_in(&dir);
+        let node = FakeNode::new("e1", 2);
+        synced(node.sync(&replica, 100));
+
+        assert!(replica.note_failure(UnixSecs::new(200)).unwrap());
+        assert!(replica.note_failure(UnixSecs::new(300)).unwrap());
+
+        let meta = replica.meta().unwrap().unwrap();
+        assert_eq!(meta.failures, 2);
+        assert_eq!(meta.last_attempt, Some(UnixSecs::new(300)));
+        assert_eq!(meta.synced_at, Some(UnixSecs::new(100)));
+        assert_eq!(meta.lines(), LineCount::new(2));
+
+        let _held = replica.try_lock().unwrap().unwrap();
+        assert!(!replica.note_failure(UnixSecs::new(400)).unwrap(), "busy");
     }
 
     #[test]
