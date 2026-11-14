@@ -1,0 +1,26 @@
+[package]
+name = "fact-replica"
+version = "0.1.0"
+edition = "2021"
+authors = ["MDMA Development Team"]
+repository = "https://github.com/your-org/mdma"
+license = "MIT"
+
+[package.metadata.polylith]
+interface = "fact-replica"
+
+[dependencies]
+acid-protocol = { workspace = true }
+dirs = { workspace = true }
+private-file = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+
+[features]
+# A fake node that answers like ACID's ReadStream, for this crate's and the CLI's tests.
+test-support = []
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = { workspace = true }

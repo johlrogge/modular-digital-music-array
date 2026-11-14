@@ -1,5 +1,6 @@
 use crate::args::{parse_count, value_and_dash, HashInput, StdinDash};
 use crate::ctx::Ctx;
+use crate::local_complete::complete_marks;
 use crate::output::{
     each_track, for_each_track, format_track_line, library_error, mark_outcome, marked_header,
     no_marked_tracks, playing_note, print_tracks, terminal_width, unmark_outcome, PIPE_TERM_WIDTH,
@@ -31,7 +32,7 @@ impl std::str::FromStr for LimitArg {
 
 /// Mark name (`liked` is the default mark)
 #[derive(Debug, Clone, PartialEq, Eq, Arg)]
-#[arg(positional = "NAME")]
+#[arg(positional = "NAME", complete = complete_marks)]
 pub(crate) struct MarkArg(pub Mark);
 
 impl std::str::FromStr for MarkArg {
@@ -63,6 +64,7 @@ impl Arg for MarkInput {
             "[NAME] [-]",
             "Mark name (`liked` is the default mark), and/or `-` to read track hashes from stdin; \
              at most one of each",
+            complete_marks,
         )
         .map(|(name, stdin)| Self { name, stdin })
     }

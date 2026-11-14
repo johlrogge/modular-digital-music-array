@@ -2,6 +2,7 @@ mod import;
 
 use crate::args::{Apply, DryRun, NoWait, SanitizedPlaylistName};
 use crate::ctx::Ctx;
+use crate::local_complete::{complete_sources, merge_unlisted};
 use crate::output::{display_error, interpret_library, interpret_source, source_label};
 use crate::source::import::{finish_import, follow_import_job, is_terminal_phase};
 use color_eyre::eyre::eyre;
@@ -20,13 +21,16 @@ use std::str::FromStr;
 pub(crate) struct SourceArg(pub mdma_client::SourceName);
 
 /// The sources whose socket is in the local sources directory (`MDMA_SOURCES_DIR`, else
-/// the default), that start with `typed`. Empty when talking to a remote node: asking
-/// the gateway would be a network call per keystroke.
+/// the default), then those the replica's last probe found, that start with `typed`.
+/// Never asks the gateway: that would be a network call per keystroke.
 fn complete_local_sources(typed: &str) -> Vec<hicli::Candidate> {
     let dir = std::env::var_os("MDMA_SOURCES_DIR")
         .filter(|dir| !dir.is_empty())
         .unwrap_or_else(|| crate::ctx::DEFAULT_SOURCES_DIR.into());
-    sources_in(std::path::Path::new(&dir), typed)
+    let local = sources_in(std::path::Path::new(&dir), typed);
+    let mut offered = merge_unlisted(local, complete_sources(typed));
+    offered.sort();
+    offered
 }
 
 fn sources_in(dir: &std::path::Path, typed: &str) -> Vec<hicli::Candidate> {

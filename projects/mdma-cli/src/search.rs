@@ -1,5 +1,9 @@
 use crate::args::{value_and_dash, StdinDash};
 use crate::ctx::Ctx;
+use crate::local_complete::{
+    complete_albums, complete_artists, complete_genres, complete_labels, complete_query,
+    complete_sources, complete_styles, complete_titles, merge_unlisted,
+};
 use crate::output::{library_error, print_tracks};
 use crate::stdin::hashes_if_dash;
 use bpaf::{construct, long, Parser};
@@ -53,6 +57,7 @@ impl Arg for SearchInput {
             "Free-text query applied to all text fields (title, artist, album, label, genre), \
              e.g. CarbBased or /regex/, and/or `-` to read hashes from stdin to search among \
              (no hashes on stdin matches nothing, or everything with --not); at most one of each",
+            complete_query,
         );
         construct!(no_stdin, positionals).map(|(_, (query, stdin))| Self { query, stdin })
     }
@@ -63,48 +68,56 @@ impl Arg for SearchInput {
 
 /// Filter by artist name
 #[derive(Debug, Clone, Arg)]
-#[arg(long = "artist", metavar = "ARTIST")]
+#[arg(long = "artist", metavar = "ARTIST", complete = complete_artists)]
 pub(crate) struct ArtistFilter(pub StringQuery);
 
 /// Filter by track title
 #[derive(Debug, Clone, Arg)]
-#[arg(long = "title", metavar = "TITLE")]
+#[arg(long = "title", metavar = "TITLE", complete = complete_titles)]
 pub(crate) struct TitleFilter(pub StringQuery);
 
 /// Filter by album name
 #[derive(Debug, Clone, Arg)]
-#[arg(long = "album", metavar = "ALBUM")]
+#[arg(long = "album", metavar = "ALBUM", complete = complete_albums)]
 pub(crate) struct AlbumFilter(pub StringQuery);
 
 /// Filter by label name
 #[derive(Debug, Clone, Arg)]
-#[arg(long = "label", metavar = "LABEL")]
+#[arg(long = "label", metavar = "LABEL", complete = complete_labels)]
 pub(crate) struct LabelFilter(pub StringQuery);
 
 /// Filter by main genre (e.g. "Electronic", "Techno")
 #[derive(Debug, Clone, Arg)]
-#[arg(long = "genre", metavar = "GENRE")]
+#[arg(long = "genre", metavar = "GENRE", complete = complete_genres)]
 pub(crate) struct GenreFilter(pub StringQuery);
 
 /// Filter by style descriptor (matches if any descriptor matches)
 #[derive(Debug, Clone, Arg)]
-#[arg(long = "style", metavar = "STYLE")]
+#[arg(long = "style", metavar = "STYLE", complete = complete_styles)]
 pub(crate) struct StyleFilter(pub StringQuery);
 
 /// Filter by source (e.g. bandcamp, beatport, upload)
 // Stays a String: a source is any name a source service or the upload registers, so
-// the set is open; completion offers the ones known today.
+// the set is open; completion offers the ones known today, and the sources the
+// node's source services answered with at the last sync.
 #[derive(Debug, Clone, Arg)]
-#[arg(long = "source", metavar = "SOURCE", complete = complete_known_sources)]
+#[arg(long = "source", metavar = "SOURCE", complete = complete_source_filter)]
 pub(crate) struct SourceFilter(pub String);
 
-/// The sources the library is known to hold tracks from.
+/// The sources the library is known to hold tracks from, ignoring case like the
+/// completions from the replica.
 fn complete_known_sources(typed: &str) -> Vec<Candidate> {
+    let typed = typed.to_lowercase();
     ["bandcamp", "beatport", "upload"]
         .into_iter()
-        .filter(|source| source.starts_with(typed))
+        .filter(|source| source.starts_with(&typed))
         .map(|source| (source.to_string(), None))
         .collect()
+}
+
+/// The known sources, then the probed ones that are not among them.
+fn complete_source_filter(typed: &str) -> Vec<Candidate> {
+    merge_unlisted(complete_known_sources(typed), complete_sources(typed))
 }
 
 /// Invert the search results: return tracks that do NOT match the filters
@@ -115,7 +128,7 @@ pub(crate) struct Invert(pub bool);
 /// Free-text query applied to all text fields (title, artist, album, label, genre).
 /// Supports CamelCase initialism (CarbBased) and /regex/ syntax.
 #[derive(Debug, Clone, Arg)]
-#[arg(positional = "QUERY")]
+#[arg(positional = "QUERY", complete = complete_query)]
 pub(crate) struct QueryText(pub StringQuery);
 
 impl FromStr for QueryText {

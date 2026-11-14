@@ -115,6 +115,16 @@ pub struct Ctx {
     target: OnceLock<Target>,
 }
 
+/// Whether the local services are the node in use: sockets were given explicitly, or
+/// the library socket (`ipc://<path>` or a bare path) exists here. The one rule for
+/// `Ctx::new` and for completion, which has no `Ctx` and reads the environment.
+pub(crate) fn local_ipc_for(library_socket: &str, sockets_given: bool) -> bool {
+    let path = library_socket
+        .strip_prefix("ipc://")
+        .unwrap_or(library_socket);
+    node::local_ipc_wanted(sockets_given, Path::new(path).exists())
+}
+
 /// `value`, unless it is empty (which counts as not given).
 fn given(value: &Option<String>) -> Option<&str> {
     value.as_deref().filter(|v| !v.is_empty())
@@ -127,12 +137,7 @@ impl Ctx {
             local_ipc: false,
             target: OnceLock::new(),
         };
-        let library_socket = ctx.library_socket();
-        let library_socket = library_socket
-            .strip_prefix("ipc://")
-            .unwrap_or(library_socket);
-        ctx.local_ipc =
-            node::local_ipc_wanted(ctx.sockets_given(), Path::new(library_socket).exists());
+        ctx.local_ipc = local_ipc_for(ctx.library_socket(), ctx.sockets_given());
         ctx
     }
 
@@ -168,11 +173,17 @@ impl Ctx {
     /// The node to talk to, resolved on first use. Prints a note for implicit
     /// choices and fails with advice when no node can be resolved.
     pub fn target(&self) -> Result<&Target> {
+        self.target_with(node::Notes::Print)
+    }
+
+    /// Like [`Ctx::target`], choosing whether the note is printed. Only the first
+    /// resolution matters: later calls reuse the cached target.
+    pub fn target_with(&self, notes: node::Notes) -> Result<&Target> {
         // `OnceLock::get_or_try_init` is unstable.
         if let Some(target) = self.target.get() {
             return Ok(target);
         }
-        let resolved = node::resolve_startup(self.globals.node.0.as_ref(), self.local_ipc)?;
+        let resolved = node::resolve_startup(self.globals.node.0.as_ref(), self.local_ipc, notes)?;
         Ok(self.target.get_or_init(|| resolved))
     }
 
@@ -286,7 +297,7 @@ fn connect_text(what: &str, err: &NngClientError) -> String {
 }
 
 /// "Failed to connect to <what> at <address>: <error>", plus a hint when talking directly.
-fn connect_failed(what: &str, err: &NngClientError, direct: bool) -> color_eyre::Report {
+pub(crate) fn connect_failed(what: &str, err: &NngClientError, direct: bool) -> color_eyre::Report {
     let text = connect_text(what, err);
     if direct {
         eyre!("{text}\nIs mdma-{what} running?")

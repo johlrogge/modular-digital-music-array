@@ -3,7 +3,8 @@
 //! NNG client for connecting to the ACID fact store service.
 
 pub use acid_protocol::{
-    line_digest, AcidRequest, AcidResponse, EntityFacts, FactEntry, LinePin, StreamChunk,
+    line_digest, AcidRequest, AcidResponse, EntityFacts, FactEntry, LinePin, PinnedRead,
+    StreamChunk,
 };
 pub use nng_transport::NngClientError as ClientError;
 
@@ -11,49 +12,8 @@ use nng::options::{Options, RecvTimeout, SendTimeout};
 use nng_transport::request_response;
 use std::time::Duration;
 
-/// Outcome of a pinned stream read.
-///
-/// `Chunk` always carries the log identity, so a caller can only ever append
-/// lines that came with an epoch. Lines from an unversioned node are never
-/// exposed.
-#[derive(Debug, Clone)]
-pub enum PinnedRead {
-    Chunk {
-        lines: Vec<String>,
-        cursor: String,
-        epoch: String,
-        total_lines: usize,
-    },
-    /// The pinned line is gone: the log was rewritten or replaced.
-    Diverged { epoch: String, total_lines: usize },
-    /// The node sent no epoch (an old node that ignores pins). Its lines cannot
-    /// be verified and must not be appended.
-    Unversioned,
-}
-
 fn classify_read(response: AcidResponse) -> Result<PinnedRead, ClientError> {
-    match response {
-        AcidResponse::StreamChunk(StreamChunk {
-            lines,
-            cursor,
-            epoch: Some(epoch),
-            total_lines: Some(total_lines),
-        }) => Ok(PinnedRead::Chunk {
-            lines,
-            cursor,
-            epoch,
-            total_lines,
-        }),
-        AcidResponse::StreamChunk(_) => Ok(PinnedRead::Unversioned),
-        AcidResponse::StreamDiverged { epoch, total_lines } => {
-            Ok(PinnedRead::Diverged { epoch, total_lines })
-        }
-        AcidResponse::Error { message } => Err(ClientError::Service(message)),
-        other => Err(ClientError::Service(format!(
-            "unexpected response: {:?}",
-            other
-        ))),
-    }
+    acid_protocol::classify_read(response).map_err(ClientError::Service)
 }
 
 pub struct AcidClient {
