@@ -5,6 +5,7 @@ use color_eyre::Result;
 use hicli::Arg;
 
 #[derive(Debug, PartialEq, Bpaf, Arg)]
+#[bpaf(generate(backfill_args))]
 pub(crate) struct BackfillArgs {
     /// Also compute PcmHash (decodes every lossless track; slow)
     pcm: bool,

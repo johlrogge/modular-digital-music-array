@@ -4757,9 +4757,9 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "hicli"
-version = "0.5.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80af6a607df0f9d6a0651a802497e8d0cbeea447e8e2734645facdd77cb139b9"
+checksum = "de931669e19d9500c6ec001a34a0762d67cb6777a878aa608d697e058ab7e864"
 dependencies = [
  "bpaf",
  "hicli-macros",
@@ -4768,9 +4768,9 @@ dependencies = [
 
 [[package]]
 name = "hicli-macros"
-version = "0.5.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d25a1b3ae2983c13ead5a4bf486836b00537b0443e6d5fb6ebab563edd9cc9c7"
+checksum = "30fef62b353462bfaf9b8b891cbc9d46c0ece70bfac2a947186240c9488ef6cb"
 dependencies = [
  "proc-macro2",
  "quote",
