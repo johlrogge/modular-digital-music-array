@@ -219,7 +219,7 @@ impl LibraryService {
                 return;
             }
         };
-        let source = library_fact_source();
+        let source = sources::derived();
 
         // One projection for the whole run, also on unwind: the fact subscriber
         // projects writes in production anyway, so nothing needs them sooner.

@@ -194,7 +194,6 @@ pub fn lower_current_thread_priority() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use music_facts::FactOrigin;
     use pretty_assertions::assert_eq;
 
     pub const S16_L8: &[u8] = include_bytes!("../../audio_hash/testdata/pcm/fixtures/s16_l8.flac");
@@ -204,7 +203,7 @@ mod tests {
     const S16_AIFF: &[u8] = include_bytes!("../../audio_hash/testdata/pcm/fixtures/s16.aiff");
 
     fn source() -> FactSource {
-        FactSource::new("test", "0", FactOrigin::Unknown)
+        FactSource::new("test", "0", "Unknown")
     }
 
     fn write(dir: &Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {

@@ -1,6 +1,6 @@
 //! Tests of the duplicate scan and merge (ADR-013), against an in-process ACID server.
 
-use super::dedup::{dedup_fact_source, live_facts, same_member};
+use super::dedup::{live_facts, same_member};
 use super::tests::{
     identity_facts_in_acid, make_empty_service, make_service_with_playlists_dir, replaces_targets,
     retire, run_backfill, user_source, write_test_wav, FIXTURE_S16_L8, FIXTURE_S16_L8_TAGS,
@@ -12,8 +12,8 @@ use crate::ipc::{
 };
 use chrono::{DateTime, TimeZone, Utc};
 use music_facts::{
-    Album, Bpm, CueKind, DurationSeconds, FactOrigin, FactSource, Key, MusicValue, StartReason,
-    StopReason, Title,
+    Album, Bpm, CueKind, DurationSeconds, FactSource, Key, MusicValue, StartReason, StopReason,
+    Title,
 };
 use pretty_assertions::assert_eq;
 use std::path::Path;
@@ -32,12 +32,14 @@ fn pcm(n: u8) -> MusicValue {
     MusicValue::PcmHash(music_primitives::PcmHash::from_sha256_v1([n; 32]))
 }
 
-/// A source-origin (Bandcamp) fact, as ingest writes it.
+/// The source of a client that ingests (and resyncs) what it downloads.
+fn client_source() -> FactSource {
+    FactSource::new("test-client", "test", "Client")
+}
+
+/// A client-source fact, as an ingest with a writer writes it.
 fn src(v: MusicValue) -> (MusicValue, FactSource) {
-    (
-        v,
-        FactSource::new("bandcamp-ingest", "test", FactOrigin::bandcamp(None)),
-    )
+    (v, client_source())
 }
 
 fn usr(v: MusicValue) -> (MusicValue, FactSource) {
@@ -398,9 +400,9 @@ fn live_facts_retract_cancels_every_equal_value_of_the_same_source_only() {
         .unwrap()
     };
     // s1 and s3 are two versions of one source, s2 is another source.
-    let s1 = FactSource::new("tool-1", "0.1.0", FactOrigin::Unknown);
-    let s2 = FactSource::new("tool-2", "1.0.0", FactOrigin::Unknown);
-    let s3 = FactSource::new("tool-1", "9.9.9", FactOrigin::Unknown);
+    let s1 = FactSource::new("tool-1", "0.1.0", "Unknown");
+    let s2 = FactSource::new("tool-2", "1.0.0", "Unknown");
+    let s3 = FactSource::new("tool-1", "9.9.9", "Unknown");
     let other = serde_json::to_string(&stainless_facts::Fact::new(
         h.clone(),
         album("Y"),
@@ -635,7 +637,7 @@ fn a_rerun_after_a_crash_before_the_retire_completes_without_duplicating_facts()
         .unwrap();
     let gate = service.retire_gate.lock().unwrap();
     service
-        .write_merge_facts(&gate, &new, &old, vec![], &dedup_fact_source(), carry)
+        .write_merge_facts(&gate, &new, &old, vec![], &sources::dedup(), carry)
         .unwrap();
     drop(gate);
     assert_eq!(scan(&service).len(), 1, "the group is still detectable");
@@ -734,7 +736,7 @@ fn track_replace_keeps_the_plays_of_the_replaced_track() {
     std::fs::create_dir_all(&inbox).unwrap();
     let old_wav = inbox.join("Old Artist - Old Song.wav");
     write_test_wav(&old_wav, 5);
-    let old = service.ingest_file_internal(&old_wav, None).unwrap();
+    let old = service.ingest_file_internal(&old_wav, None, &[]).unwrap();
     write(
         &service,
         &old,
@@ -1346,7 +1348,7 @@ fn plant(service: &LibraryService, hex: &str) -> std::path::PathBuf {
 #[test]
 fn orphan_cleanup_removes_only_merge_orphans_and_is_idempotent() {
     let (service, _d, _acid) = make_empty_service();
-    let dedup = |v| (v, dedup_fact_source());
+    let dedup = |v| (v, sources::dedup());
     let merge_orphan = plant(&service, "aa11merged");
     let plain_orphan = plant(&service, "bb22plain");
     let replace_leftover = plant(&service, "cc33replaced");
@@ -1692,7 +1694,8 @@ fn retract_source_facts_still_finds_a_track_merged_under_another_item_id() {
 
     let resp = service.handle_request(LibraryRequest::RetractSourceFacts {
         item_id: "p1".into(),
-        source_name: "bandcamp".into(),
+        source: client_source(),
+        attributes: AttributeList::try_new(["Album"]).unwrap(),
     });
 
     assert!(
@@ -1905,7 +1908,8 @@ fn tagliabue_prerelease_and_release_merge_into_one_track() {
 // Self-healing merge at ingest (ADR-013, "Where it runs")
 // ---------------------------------------------------------------------------
 
-/// Ingest `bytes` the way Bandcamp does: the ItemId travels with the request.
+/// Ingest `bytes` the way a downloading client does: its source and the ItemId travel
+/// with the request.
 fn ingest_item(
     service: &LibraryService,
     name: &str,
@@ -1916,12 +1920,13 @@ fn ingest_item(
     std::fs::create_dir_all(&inbox).unwrap();
     let path = inbox.join(name);
     std::fs::write(&path, bytes).unwrap();
-    let source = item.map(|item_id| IngestSource::Bandcamp {
-        item_id: item_id.into(),
-        artist_url: None,
-    });
+    let facts: Vec<MusicValue> = item
+        .map(|item_id| MusicValue::ItemId(item_id.into()))
+        .into_iter()
+        .collect();
+    let writer = item.map(|_| client_source());
     service
-        .ingest_file_internal(&path, source.as_ref())
+        .ingest_file_internal(&path, writer.as_ref(), &facts)
         .unwrap()
 }
 
@@ -2047,9 +2052,7 @@ fn upload(service: &LibraryService, name: &str, bytes: &[u8]) -> ContentHash {
     std::fs::create_dir_all(&inbox).unwrap();
     let path = inbox.join(name);
     std::fs::write(&path, bytes).unwrap();
-    service
-        .ingest_file_internal(&path, Some(&IngestSource::Upload))
-        .unwrap()
+    service.ingest_file_internal(&path, None, &[]).unwrap()
 }
 
 #[test]
@@ -2114,7 +2117,7 @@ fn track_replace_is_unaffected_by_the_self_heal() {
     std::fs::create_dir_all(&inbox).unwrap();
     let old_path = inbox.join("A - Song.flac");
     std::fs::write(&old_path, FIXTURE_S16_L8_TAGS).unwrap();
-    let old = service.ingest_file_internal(&old_path, None).unwrap();
+    let old = service.ingest_file_internal(&old_path, None, &[]).unwrap();
     let new_path = inbox.join("A - Song (new).flac");
     std::fs::write(&new_path, FIXTURE_S16_L8).unwrap();
 

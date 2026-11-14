@@ -12,7 +12,7 @@ use crate::ipc::{
 use bandcamp_api::{AudioFormat, BandcampClient, CollectionItem, CookieJar};
 use library_ipc_client::PlaylistName;
 use library_ipc_client::{
-    InboxPath, IngestSource, LibraryClient, MusicValue, TrackInfo, TrackQuery,
+    AttributeList, FactSource, InboxPath, LibraryClient, MusicValue, TrackInfo, TrackQuery,
 };
 use library_search::StringQuery;
 use parking_lot::Mutex;
@@ -82,6 +82,35 @@ impl InternalDownloadState {
             InternalDownloadState::Cancelled => DownloadState::Cancelled,
         }
     }
+}
+
+/// Tool of the source this service states for everything it writes to the library.
+const BANDCAMP_TOOL: &str = "mdma-bandcamp";
+
+/// Origin kind of what this service gets from Bandcamp. With the tool it is the source
+/// identity shared by an ingest, an ItemId backfill and a resync retract, so a resync
+/// retracts exactly what this service wrote.
+const BANDCAMP_ORIGIN: &str = "Bandcamp";
+
+/// The source this service states on its ingests, backfills and retracts.
+fn bandcamp_source() -> FactSource {
+    FactSource::new(BANDCAMP_TOOL, env!("CARGO_PKG_VERSION"), BANDCAMP_ORIGIN)
+}
+
+/// The provenance facts this service states about a file it ingests for `item_id`.
+fn bandcamp_provenance(item_id: &str) -> Vec<MusicValue> {
+    vec![
+        MusicValue::Source("bandcamp".to_string()),
+        MusicValue::ItemId(item_id.to_string()),
+    ]
+}
+
+/// The attributes a resync retracts before it re-downloads: what a Bandcamp ingest
+/// writes from the download's tags. ItemId and Source identify the item across
+/// resyncs and stay.
+fn resync_attributes() -> AttributeList {
+    AttributeList::try_new(["Album", "Title", "Artist", "TrackNumber", "Year"])
+        .expect("the resync attributes are known attribute names")
 }
 
 /// Message returned to clients while no usable cookie file exists.
@@ -331,10 +360,13 @@ fn drop_items_known_to_library(
                 );
 
                 // Backfill: record the new ItemId so future syncs short-circuit via
-                // the cheap has_facts("ItemId", ...) path.
-                if let Err(e) =
-                    lib_client.write_fact(&matched_hash, MusicValue::ItemId(item_id_str.clone()))
-                {
+                // the cheap has_facts("ItemId", ...) path. The id came from Bandcamp,
+                // so say so, as the same source an ingest of that item states.
+                if let Err(e) = lib_client.write_fact_as(
+                    &matched_hash,
+                    MusicValue::ItemId(item_id_str.clone()),
+                    &bandcamp_source(),
+                ) {
                     tracing::warn!(
                         error = %e,
                         item_id = %item_id_str,
@@ -701,7 +733,7 @@ impl BandcampService {
                 }
             })?;
             client
-                .retract_source_facts(&retract_id, "bandcamp")
+                .retract_source_facts(&retract_id, &bandcamp_source(), &resync_attributes())
                 .map_err(|e| {
                     tracing::error!(error = %e, item_id = %retract_id, "Failed to retract, resync refused");
                     SourceError::SyncFailed {
@@ -1664,13 +1696,11 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
 
                                     match InboxPath::new(filename) {
                                         Ok(inbox_path) => {
-                                            let source = IngestSource::Bandcamp {
-                                                item_id: item_id.clone(),
-                                                artist_url: None,
-                                            };
-                                            match lib_client
-                                                .ingest_file_with_source(&inbox_path, Some(source))
-                                            {
+                                            match lib_client.ingest_file_as(
+                                                &inbox_path,
+                                                &bandcamp_source(),
+                                                bandcamp_provenance(&item_id),
+                                            ) {
                                                 Ok(library_ipc_client::IngestResult::Success {
                                                     hash,
                                                     ..
@@ -1800,6 +1830,34 @@ pub async fn run_download_worker(service: Arc<BandcampService>) {
 mod tests {
     use super::*;
     use library_ipc_protocol::{ContentHash, TrackInfo};
+
+    // =========================================================================
+    // Source identity
+    // =========================================================================
+
+    #[test]
+    fn bandcamp_states_its_own_source_provenance_and_resync_attributes() {
+        let source = bandcamp_source();
+        assert_eq!(source.tool, "mdma-bandcamp");
+        assert_eq!(source.origin.kind, "Bandcamp");
+        assert_eq!(
+            bandcamp_provenance("p42"),
+            vec![
+                MusicValue::Source("bandcamp".to_string()),
+                MusicValue::ItemId("p42".to_string()),
+            ]
+        );
+        let attributes: Vec<String> = resync_attributes()
+            .as_slice()
+            .iter()
+            .map(|a| a.as_str().to_string())
+            .collect();
+        assert_eq!(
+            attributes,
+            ["Album", "Title", "Artist", "TrackNumber", "Year"]
+        );
+        assert!(!attributes.iter().any(|a| a == "ItemId" || a == "Source"));
+    }
 
     // =========================================================================
     // classify_check_result tests
@@ -2637,8 +2695,7 @@ mod tests {
         use super::*;
         use library_service_stub::service::{run_ipc_server, LibraryService};
         use music_facts::{
-            Album, Artist, ContentHash as MusicContentHash, FactOrigin, FactSource,
-            MusicValue as MV, Title,
+            Album, Artist, ContentHash as MusicContentHash, MusicValue as MV, Title,
         };
         use stainless_facts::{Fact, FactStreamWriter, Operation};
         use std::sync::Arc;
@@ -2656,7 +2713,7 @@ mod tests {
                 FactStreamWriter::open(&facts_path).expect("failed to open fact stream");
 
             let hash = MusicContentHash::new(format!("sha256:{}", hash_hex));
-            let source = FactSource::new("test-seed", "0.0.0", FactOrigin::Unknown);
+            let source = FactSource::new("test-seed", "0.0.0", "Unknown");
             let now = chrono::Utc::now();
 
             let facts: Vec<Fact<MusicContentHash, MV, FactSource>> = vec![
@@ -2790,11 +2847,12 @@ mod tests {
             // Backfill: write ItemId="p_digital_222" onto the matched track
             let matched_hash = results.first().unwrap().content_hash.clone();
             client
-                .write_fact(
+                .write_fact_as(
                     &matched_hash,
                     MusicValue::ItemId("p_digital_222".to_string()),
+                    &bandcamp_source(),
                 )
-                .expect("write_fact");
+                .expect("write_fact_as");
 
             // Verify backfill: now p_digital_222 is known by ItemId
             let after_backfill = client
@@ -3006,9 +3064,35 @@ mod tests {
 
         #[test]
         fn drop_items_known_to_library_keeps_only_unknown_items_and_backfills() {
-            // The stub was seeded with ItemId "p_1" for the Interloper track.
-            let (_temp, service, client) = service_with_library("drop-known.sock");
-            let socket = service.library_socket.clone();
+            // The stub is seeded with ItemId "p_1" for the Interloper track. It is
+            // built here (not via service_with_library) to keep a handle that
+            // records the source of each WriteFact.
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let seeded_hash = format!("{:0<64}", "deadbeef");
+            seed_track_with_item_id(
+                temp.path(),
+                &seeded_hash,
+                "Carbon Based Lifeforms",
+                "Interloper",
+                "p_1",
+            );
+            let stub = LibraryService::new(
+                temp.path().to_path_buf(),
+                temp.path().to_path_buf(),
+                "ipc:///dev/null",
+            )
+            .expect("failed to create stub library");
+            let socket_path = temp.path().join("drop-known.sock");
+            let socket = format!("ipc://{}", socket_path.display());
+            let _srv = {
+                let stub = Arc::clone(&stub);
+                let addr = socket.clone();
+                std::thread::spawn(move || {
+                    run_ipc_server(stub, &addr).ok();
+                })
+            };
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let client = LibraryClient::connect(&socket).expect("connect");
             let items = vec![
                 make_collection_item("p_1", "Carbon Based Lifeforms", "Interloper"),
                 make_collection_item("p_2", "Carbon Based Lifeforms", "Interloper"),
@@ -3023,6 +3107,16 @@ mod tests {
                 .has_facts("ItemId", vec!["p_2".to_string()])
                 .expect("has_facts");
             assert_eq!(known, vec!["p_2".to_string()], "ItemId backfilled");
+            // The backfill states mdma-bandcamp/Bandcamp, the source of an ingest.
+            assert_eq!(
+                stub.written_source(
+                    &MusicContentHash::new(format!("sha256:{seeded_hash}")),
+                    &MV::ItemId("p_2".to_string()),
+                ),
+                Some(Some(bandcamp_source()))
+            );
+            assert_eq!(bandcamp_source().tool, "mdma-bandcamp");
+            assert_eq!(bandcamp_source().origin.kind, "Bandcamp");
         }
 
         #[test]

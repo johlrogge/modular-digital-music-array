@@ -1,5 +1,6 @@
 use crate::args::{choice, choice_names, ExistingFileArg, PlaylistArg, SanitizedPlaylistName};
 use crate::ctx::Ctx;
+use crate::origins::rekordbox_source;
 use crate::output::library_error;
 use crate::stdin::{require_stdin_hashes_or_usage, resolve_tracks_or_abort};
 use crate::transfer::{
@@ -728,6 +729,8 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
         let mut skipped = 0usize;
         let mut errors = 0usize;
 
+        let source = rekordbox_source();
+
         for (rb_track, hash) in &matched {
             // Fetch current track facts; on failure fall back to writing (safe default).
             let existing = library.get_track(hash).ok();
@@ -749,7 +752,7 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
                             bpm_f32, rb_track.artist, rb_track.name
                         );
                     } else {
-                        match library.write_fact(hash, MusicValue::Bpm(bpm)) {
+                        match library.write_fact_as(hash, MusicValue::Bpm(bpm), &source) {
                             Ok(()) => enriched += 1,
                             Err(e) => {
                                 eprintln!(
@@ -780,7 +783,7 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
                             tonality, rb_track.artist, rb_track.name
                         );
                     } else {
-                        match library.write_fact(hash, MusicValue::Key(key)) {
+                        match library.write_fact_as(hash, MusicValue::Key(key), &source) {
                             Ok(()) => enriched += 1,
                             Err(e) => {
                                 eprintln!(
@@ -827,7 +830,7 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
                             anchor.inizio_seconds, bpm_f32, rb_track.artist, rb_track.name
                         );
                     } else {
-                        match library.write_fact(hash, new_grid) {
+                        match library.write_fact_as(hash, new_grid, &source) {
                             Ok(()) => enriched += 1,
                             Err(e) => {
                                 eprintln!(
@@ -876,7 +879,7 @@ pub(crate) fn import(args: RekordboxImportArgs, ctx: &Ctx) -> Result<()> {
                             cue, rb_track.artist, rb_track.name
                         );
                     } else {
-                        match library.write_fact(hash, cue) {
+                        match library.write_fact_as(hash, cue, &source) {
                             Ok(()) => enriched += 1,
                             Err(e) => {
                                 eprintln!(

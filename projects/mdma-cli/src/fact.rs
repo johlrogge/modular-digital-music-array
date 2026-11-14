@@ -1,13 +1,16 @@
 use crate::args::{choice, choice_names, parse_choice, Choice, TrackArg};
 use crate::ctx::Ctx;
+use crate::origins::{REKORDBOX_ORIGIN, UPLOAD_ORIGIN};
 use crate::output::library_error;
 use bpaf::{construct, long, Parser};
 use chrono::NaiveDate;
+use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use hicli::Arg;
+use library_ipc_client::{USER_ORIGIN, USER_TOOL};
 use music_facts::{
-    Album, Artist, Bpm, DiscNumber, EnergyLevel, Isrc, Key, MusicValue, Title, TrackNumber,
-    TrackRole, Year,
+    Album, Artist, Bpm, DiscNumber, EnergyLevel, FactSource, Isrc, Key, MusicValue, OriginKind,
+    Title, TrackNumber, TrackRole, Year,
 };
 
 /// The value of a fact as typed, with the domain value it parses to for its field.
@@ -250,26 +253,77 @@ pub(crate) fn add(args: FactArgs, ctx: &Ctx) -> Result<()> {
         hash: TrackArg(hash),
     } = args;
     let library = ctx.library()?;
-    library.write_fact(&hash, value).map_err(library_error)?;
+    let source = library_ipc_client::user_fact_source(env!("CARGO_PKG_VERSION"));
+    library
+        .write_fact_as(&hash, value, &source)
+        .map_err(library_error)?;
     println!("Added fact for {}: {:?} = {}", hash, field, raw);
     Ok(())
+}
+
+/// A fact to retract, and the origin that wrote it. The tool is always the user's
+/// (`mdma`); the origin kind tells a manual edit (`User`) from, say, a Rekordbox import.
+#[derive(Debug)]
+pub(crate) struct RetractArgs {
+    fact: FactArgs,
+    origin: OriginKind,
+}
+
+impl Arg for RetractArgs {
+    /// `<HASH> --field <FIELD> --value <VALUE> [--origin <KIND>]`.
+    fn parser() -> impl Parser<Self> {
+        let origin = long("origin")
+            .help(
+                format!(
+                    "Origin kind of the fact to retract: {USER_ORIGIN} (default), {} for imported \
+                     values or {} for uploaded files' tags.",
+                    REKORDBOX_ORIGIN, UPLOAD_ORIGIN
+                )
+                .as_str(),
+            )
+            .argument::<String>("KIND")
+            .parse(|kind| OriginKind::new(kind).map_err(|e| e.to_string()))
+            .fallback(OriginKind::new(USER_ORIGIN).expect("USER_ORIGIN is not empty"));
+        let fact = <FactArgs as Arg>::parser();
+        // The named option first, so its value is not taken for the positional hash.
+        construct!(origin, fact).map(|(origin, fact)| Self { fact, origin })
+    }
 }
 
 /// Retract an existing fact from a track
 ///
 /// Required for collection-type fields (each value is independent).
 /// For scalar fields, retract removes that value from history.
+/// A fact imported from Rekordbox is retracted with `--origin Rekordbox`.
 #[hicli::command]
-pub(crate) fn retract(args: FactArgs, ctx: &Ctx) -> Result<()> {
-    let FactArgs {
-        field,
-        value: FactValueArg { raw, value },
-        hash: TrackArg(hash),
+pub(crate) fn retract(args: RetractArgs, ctx: &Ctx) -> Result<()> {
+    let RetractArgs {
+        fact:
+            FactArgs {
+                field,
+                value: FactValueArg { raw, value },
+                hash: TrackArg(hash),
+            },
+        origin,
     } = args;
     let library = ctx.library()?;
-    library.retract_fact(&hash, value).map_err(library_error)?;
-    println!("Retracted fact for {}: {:?} = {}", hash, field, raw);
-    Ok(())
+    let source = FactSource::new(USER_TOOL, env!("CARGO_PKG_VERSION"), origin.as_str());
+    if library
+        .retract_fact_as(&hash, value, &source)
+        .map_err(library_error)?
+    {
+        println!("Retracted fact for {}: {:?} = {}", hash, field, raw);
+        Ok(())
+    } else {
+        // A retract that matched nothing is a failure, so scripts can tell.
+        Err(eyre!(
+            "Nothing retracted for {}: no live {:?} = {} written by {}",
+            hash,
+            field,
+            raw,
+            origin
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -338,6 +392,29 @@ mod tests {
         );
         assert!(err.contains("bandcamp-url, role or energy)"), "{err}");
         assert!(run_arg::<FactArgs>(&["--field", "year", "--value", "1"]).is_err());
+    }
+
+    #[test]
+    fn retract_origin_defaults_to_user_and_can_name_rekordbox() {
+        use crate::test_support::run_arg;
+        let base = ["--field", "year", "--value", "2024", "abcd1234"];
+        let default = run_arg::<RetractArgs>(&base).unwrap();
+        assert_eq!(default.origin.as_str(), "User");
+        let rb = run_arg::<RetractArgs>(&[
+            "--field",
+            "year",
+            "--value",
+            "2024",
+            "--origin",
+            "Rekordbox",
+            "abcd1234",
+        ])
+        .unwrap();
+        assert_eq!(rb.origin.as_str(), "Rekordbox");
+        assert!(run_arg::<RetractArgs>(&[
+            "--field", "year", "--value", "2024", "--origin", "", "abcd1234",
+        ])
+        .is_err());
     }
 
     // ── parse_field_value ─────────────────────────────────────────────────────

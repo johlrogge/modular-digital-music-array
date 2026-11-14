@@ -13,6 +13,7 @@ pub mod pipeline {
     pub use library_ingestion::pipeline::*;
 }
 pub mod service;
+pub(crate) mod sources;
 
 pub use ipc::IpcServer;
 pub use service::{LibraryService, ServiceError};

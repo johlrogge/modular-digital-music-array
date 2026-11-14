@@ -10,7 +10,7 @@ use crate::ipc::{
     OrphanReason, PlaylistName, ProtocolError, ServiceStatus, TrackInfo, TrackQuery, Unmark,
 };
 use library_search::{matches_query, TrackFields};
-use music_facts::MusicValue;
+use music_facts::{FactSource, MusicValue};
 use music_primitives::{EnergyLevel, TrackRole};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -133,12 +133,30 @@ pub struct LibraryService {
     /// Playlist name -> content (list/get/new/replace; append, remove and
     /// rename are not supported).
     playlists: Mutex<HashMap<String, String>>,
+    /// Every `WriteFact` received, with the source it stated, in order.
+    written: Mutex<Vec<(ContentHash, MusicValue, Option<FactSource>)>>,
     tracks_count: usize,
     facts_count: usize,
     start_time: Instant,
 }
 
 impl LibraryService {
+    /// The source the last `WriteFact` of `fact` for `hash` stated: `None` when no
+    /// such write was received, `Some(None)` when it stated no source.
+    pub fn written_source(
+        &self,
+        hash: &ContentHash,
+        fact: &MusicValue,
+    ) -> Option<Option<FactSource>> {
+        self.written
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(h, f, _)| h == hash && f == fact)
+            .map(|(_, _, source)| source.clone())
+    }
+
     /// Create a new stub library service.
     ///
     /// Reads `facts.jsonl` from `metadata_dir` and builds an in-memory index.
@@ -180,7 +198,6 @@ impl LibraryService {
         metadata_dir: PathBuf,
         _acid_socket: &str,
     ) -> Result<Self, ServiceError> {
-        use music_facts::FactSource;
         use stainless_facts::FactStreamReader;
 
         let facts_path = metadata_dir.join("facts.jsonl");
@@ -200,6 +217,7 @@ impl LibraryService {
                             tracks: Mutex::new(vec![]),
                             fact_index: Mutex::new(HashMap::new()),
                             playlists: Mutex::new(HashMap::new()),
+                            written: Mutex::new(Vec::new()),
                             tracks_count: 0,
                             facts_count: 0,
                             start_time: Instant::now(),
@@ -233,7 +251,9 @@ impl LibraryService {
                 // Apply fact to the indexed track
                 match fact.operation() {
                     stainless_facts::Operation::Assert => apply_fact(entry, fact.value()),
-                    stainless_facts::Operation::Retract => retract_fact(entry, fact.value()),
+                    stainless_facts::Operation::Retract => {
+                        retract_fact(entry, fact.value());
+                    }
                 }
             }
         }
@@ -245,6 +265,7 @@ impl LibraryService {
             tracks: Mutex::new(tracks),
             fact_index: Mutex::new(fact_index),
             playlists: Mutex::new(HashMap::new()),
+            written: Mutex::new(Vec::new()),
             tracks_count,
             facts_count,
             start_time: Instant::now(),
@@ -263,6 +284,7 @@ impl LibraryService {
                     facts_count: self.facts_count,
                     inbox_queue_size: 0,
                     uptime_seconds: self.start_time.elapsed().as_secs(),
+                    unparseable_lines: 0,
                 };
                 LibraryResponse::Status(status)
             }
@@ -419,7 +441,11 @@ impl LibraryService {
                 Err(e) => LibraryResponse::Error(e),
             },
 
-            LibraryRequest::WriteFact { hash, fact } => {
+            LibraryRequest::WriteFact { hash, fact, source } => {
+                self.written
+                    .lock()
+                    .unwrap()
+                    .push((hash.clone(), fact.clone(), source));
                 // Store the fact in the fact_index so has_facts probes work in tests.
                 let variant_name = fact.display_name();
                 let value_str = fact.to_string();
@@ -436,9 +462,12 @@ impl LibraryService {
                 LibraryResponse::FactWritten
             }
 
-            LibraryRequest::RetractFact { hash, fact } => {
-                self.with_track(&hash, |t| retract_fact(t, &fact));
-                LibraryResponse::FactRetracted
+            LibraryRequest::RetractFact { hash, fact, .. } => {
+                match self.try_with_track(&hash, |t| retract_fact(t, &fact)) {
+                    Ok(true) => LibraryResponse::FactRetracted,
+                    Ok(false) => LibraryResponse::NothingToRetract,
+                    Err(e) => LibraryResponse::Error(e),
+                }
             }
 
             LibraryRequest::RetractSourceFacts { .. } => LibraryResponse::SourceFactsRetracted,
@@ -751,10 +780,13 @@ fn apply_fact(entry: &mut IndexedTrack, value: &MusicValue) {
 /// Apply a loaded retraction. Only bookmarks honour it: every equal value is removed. The real service also requires the same
 /// source (ADR-018); the stub keeps no sources, so it matches by value alone. Every
 /// other retraction is skipped.
-fn retract_fact(entry: &mut IndexedTrack, value: &MusicValue) {
+/// Whether anything was removed.
+fn retract_fact(entry: &mut IndexedTrack, value: &MusicValue) -> bool {
+    let before = entry.bookmarks.len();
     if let MusicValue::Bookmarked { .. } = value {
         entry.bookmarks.retain(|b| b != value);
     }
+    entry.bookmarks.len() != before
 }
 
 /// Run the IPC server loop, handling requests until the socket closes.
@@ -1118,6 +1150,20 @@ mod tests {
     }
 
     #[test]
+    fn retract_that_removes_nothing_answers_nothing_to_retract() {
+        let svc = service_with_mark_track(&[]);
+        let resp = svc.handle_request(LibraryRequest::RetractFact {
+            hash: ContentHash::new(MARK_TRACK),
+            fact: MusicValue::Source("nothing".to_string()),
+            source: None,
+        });
+        assert!(
+            matches!(resp, LibraryResponse::NothingToRetract),
+            "{resp:?}"
+        );
+    }
+
+    #[test]
     fn write_mark_writes_again_after_the_mark_was_retracted() {
         let svc = service_with_mark_track(&[]);
         let banger = named_mark("banger");
@@ -1126,6 +1172,7 @@ mod tests {
         let resp = svc.handle_request(LibraryRequest::RetractFact {
             hash: ContentHash::new(MARK_TRACK),
             fact,
+            source: None,
         });
         assert!(matches!(resp, LibraryResponse::FactRetracted), "{resp:?}");
         assert!(live_bookmarks(&svc).is_empty());
@@ -1346,7 +1393,6 @@ mod tests {
         test: &str,
         facts: &[(&str, MusicValue, stainless_facts::Operation)],
     ) -> Arc<LibraryService> {
-        use music_facts::{FactOrigin, FactSource};
         use stainless_facts::{Fact, FactStreamWriter};
 
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1355,7 +1401,7 @@ mod tests {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("mdma-stub-{test}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let source = FactSource::new("test", "1.0.0", FactOrigin::Unknown);
+        let source = FactSource::new("test", "1.0.0", "Unknown");
         let ts = chrono::Utc::now();
         let batch: Vec<Fact<ContentHash, MusicValue, FactSource>> = facts
             .iter()
