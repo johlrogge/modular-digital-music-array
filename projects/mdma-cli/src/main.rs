@@ -39,9 +39,12 @@ mod queue;
 /// Downloads audio files and generates rekordbox.xml for import
 /// via Rekordbox File -> Import Library.
 ///
-/// Examples:
-///   mdma rekordbox export --playlist my-set
-///   mdma search --artist CBL | mdma rekordbox export
+/// # Examples
+///
+/// ```sh
+/// mdma rekordbox export --playlist my-set
+/// mdma search --artist CBL | mdma rekordbox export
+/// ```
 #[hicli::group]
 mod rekordbox;
 /// Search for tracks
@@ -55,14 +58,15 @@ mod search;
 ///
 /// Per-source commands: mdma source <SOURCE-NAME> <COMMAND>
 ///
-/// Commands: sync, status, downloads, cancel, pause, resume, resync, check-item,
-/// check-updates, playlists, import-playlist, import-status.
-/// Run 'mdma source <SOURCE-NAME> --help' for details.
+/// Run 'mdma source <SOURCE-NAME> --help' for the commands.
 /// 'list' is reserved and cannot be a source name.
 ///
-/// Examples:
-///   mdma source list
-///   mdma source bandcamp sync
+/// # Examples
+///
+/// ```sh
+/// mdma source list
+/// mdma source bandcamp sync
+/// ```
 #[hicli::group(args = crate::source::SourceArg)]
 mod source;
 mod stdin;
@@ -116,12 +120,13 @@ mod tests {
 
     fn given(args: &[&str]) -> bool {
         let (globals, _) = parse_cli(args).expect("valid args");
-        globals.socket.is_some() || globals.playback_socket.is_some()
+        Ctx::with_target(globals, node_discovery::Target::LocalIpc).sockets_given()
     }
 
     #[test]
     fn explicit_sockets_are_detected_from_flags_and_environment() {
         // One test, because it touches process-wide environment variables.
+        let _env = crate::test_support::env_lock();
         std::env::remove_var("MDMA_LIBRARY_SOCKET");
         std::env::remove_var("MDMA_PLAYBACK_SOCKET");
 
@@ -137,10 +142,20 @@ mod tests {
 
         std::env::set_var("MDMA_LIBRARY_SOCKET", "ipc:///tmp/lib.sock");
         assert!(given(&["ping"]), "an environment override counts");
+        std::env::set_var("MDMA_LIBRARY_SOCKET", "");
+        assert!(
+            !given(&["ping"]),
+            "an empty variable is unset, like MDMA_NODE"
+        );
         std::env::remove_var("MDMA_LIBRARY_SOCKET");
 
         std::env::set_var("MDMA_PLAYBACK_SOCKET", "ipc:///tmp/pb.sock");
         assert!(given(&["ping"]));
+        std::env::set_var("MDMA_PLAYBACK_SOCKET", "");
+        assert!(
+            !given(&["ping"]),
+            "an empty variable is unset, like MDMA_NODE"
+        );
         std::env::remove_var("MDMA_PLAYBACK_SOCKET");
     }
 
@@ -157,7 +172,7 @@ mod tests {
             Some(value) => std::env::set_var("MDMA_NODE", value),
             None => std::env::remove_var("MDMA_NODE"),
         }
-        assert!(globals.node.is_none());
+        assert!(globals.node.0.is_none());
     }
 
     #[test]
@@ -180,7 +195,7 @@ mod tests {
         }
         for (good, port) in [("host", None), ("host:5555", Some(5555))] {
             let (globals, _) = parse_cli(&["--node", good, "node", "show"]).unwrap();
-            let spec = globals.node.unwrap();
+            let spec = globals.node.0.unwrap();
             assert_eq!((spec.host(), spec.port()), ("host", port), "{good}");
         }
     }
@@ -448,5 +463,97 @@ mod tests {
         }
         assert!(!top.contains("generate-completions"), "hidden: {top}");
         assert!(!top.contains("bookmark"), "alias shown: {top}");
+    }
+
+    fn complete(words: &[&str]) -> Vec<String> {
+        app().complete(words.iter().copied())
+    }
+
+    #[test]
+    fn node_select_completes_the_remembered_node() {
+        use node_discovery::{cache, NodeCache};
+        // One test, because it touches a process-wide environment variable.
+        let _env = crate::test_support::env_lock();
+        let config = tempfile::tempdir().expect("temp dir");
+        let original = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", config.path());
+
+        let empty = complete(&["node", "select", ""]);
+        let node = NodeCache {
+            id: "abc123".into(),
+            name: "mdma-johlyroger".into(),
+            host: "mdma-johlyroger.local".into(),
+            ip: std::net::Ipv4Addr::new(192, 168, 0, 9),
+            port: 5555,
+        };
+        cache::save(&cache::default_path().expect("config dir"), &node).expect("saved");
+        let all = complete(&["node", "select", ""]);
+        let by_prefix = complete(&["node", "select", "mdma-j"]);
+        let none = complete(&["node", "select", "zzz"]);
+        let flag = complete(&["--node", "mdma-johlyroger.l"]);
+
+        match original {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        assert!(empty.is_empty(), "no remembered node: {empty:?}");
+        for offered in ["mdma-johlyroger", "abc123", "mdma-johlyroger.local"] {
+            assert!(all.iter().any(|c| c == offered), "{offered} in {all:?}");
+        }
+        assert_eq!(by_prefix.len(), 2, "{by_prefix:?}");
+        assert!(none.is_empty(), "{none:?}");
+        assert_eq!(flag, ["mdma-johlyroger.local"]);
+    }
+
+    #[test]
+    fn fact_retract_origin_and_subscribe_topic_complete_their_known_values() {
+        assert_eq!(
+            complete(&["fact", "retract", "--origin", ""]),
+            ["User", "Rekordbox", "Upload"]
+        );
+        assert_eq!(
+            complete(&["fact", "retract", "--origin", "Re"]),
+            ["Rekordbox"]
+        );
+        assert_eq!(
+            complete(&["subscribe", "--topic", "playback/track_s"]),
+            ["playback/track_started", "playback/track_stopped"]
+        );
+    }
+
+    #[test]
+    fn source_names_complete_from_the_local_sources_directory() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        for file in ["bandcamp.sock", "beatport.sock", "notes.txt"] {
+            std::fs::write(dir.path().join(file), b"").expect("file");
+        }
+        let original = std::env::var_os("MDMA_SOURCES_DIR");
+        std::env::set_var("MDMA_SOURCES_DIR", dir.path());
+        let by_prefix = complete(&["source", "b"]);
+        let narrowed = complete(&["source", "ban"]);
+        match original {
+            Some(value) => std::env::set_var("MDMA_SOURCES_DIR", value),
+            None => std::env::remove_var("MDMA_SOURCES_DIR"),
+        }
+        assert!(by_prefix.contains(&"bandcamp".to_string()), "{by_prefix:?}");
+        assert!(by_prefix.contains(&"beatport".to_string()), "{by_prefix:?}");
+        assert!(!by_prefix.contains(&"notes".to_string()), "{by_prefix:?}");
+        assert!(narrowed.contains(&"bandcamp".to_string()), "{narrowed:?}");
+        assert!(!narrowed.contains(&"beatport".to_string()), "{narrowed:?}");
+    }
+
+    #[test]
+    fn examples_are_footers_not_details() {
+        for argv in [
+            &["rekordbox", "--help"][..],
+            &["source", "--help"],
+            &["search", "fact-values-for", "--help"],
+            &["export", "--help"],
+        ] {
+            let text = help(argv);
+            assert!(text.contains("Examples:"), "{argv:?}: {text}");
+            assert!(!text.contains("```"), "{argv:?}: {text}");
+        }
     }
 }

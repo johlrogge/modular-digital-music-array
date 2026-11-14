@@ -1,16 +1,19 @@
+use crate::args::NoWait;
 use crate::ctx::Ctx;
 use crate::output::{display_error, lost_contact};
-use bpaf::Bpaf;
 use color_eyre::Result;
 use hicli::Arg;
 
-#[derive(Debug, PartialEq, Bpaf, Arg)]
-#[bpaf(generate(backfill_args))]
+/// Also compute PcmHash (decodes every lossless track; slow)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Arg)]
+#[arg(long = "pcm")]
+pub(crate) struct Pcm(pub bool);
+
+#[derive(Debug, PartialEq, Arg)]
 pub(crate) struct BackfillArgs {
-    /// Also compute PcmHash (decodes every lossless track; slow)
-    pcm: bool,
+    pcm: Pcm,
     /// Start the job and return immediately
-    no_wait: bool,
+    no_wait: NoWait,
 }
 
 const IDENTITY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -81,7 +84,10 @@ fn lost_contact_with_library(cause: &dyn std::fmt::Display) -> color_eyre::Repor
 #[hicli::command]
 pub(crate) fn backfill(args: BackfillArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::IdentityBackfillStart;
-    let BackfillArgs { pcm, no_wait } = args;
+    let BackfillArgs {
+        pcm: Pcm(pcm),
+        no_wait: NoWait(no_wait),
+    } = args;
     let library = ctx.library()?;
     match library.identity_backfill(pcm).map_err(display_error)? {
         IdentityBackfillStart::Started(p) => {
@@ -174,7 +180,10 @@ mod tests {
         ] {
             assert_eq!(
                 run_arg::<BackfillArgs>(&args),
-                Ok(BackfillArgs { pcm, no_wait }),
+                Ok(BackfillArgs {
+                    pcm: Pcm(pcm),
+                    no_wait: NoWait(no_wait)
+                }),
                 "{args:?}"
             );
             let mut argv = vec!["library", "identity", "backfill"];

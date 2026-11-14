@@ -1,8 +1,8 @@
-use crate::args::impl_arg;
 use crate::ctx::Ctx;
 use crate::output::{display_error, library_error};
 use color_eyre::eyre::eyre;
 use color_eyre::Result;
+use hicli::Arg;
 use library_ipc_client::ContentHash;
 use mdma_client::{Deck, PlaybackBackend};
 use track_formatter::short_hash;
@@ -122,24 +122,11 @@ pub(crate) fn outputs(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// An audio output device name as shown by `mdma playback outputs`.
+/// Device name as shown by `mdma playback outputs`
 // Stays a String: device names have no domain rule; the service reports unknown ones.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(positional = "NAME")]
 pub(crate) struct OutputNameArg(pub String);
-
-impl std::str::FromStr for OutputNameArg {
-    type Err = std::convert::Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(s.to_string()))
-    }
-}
-
-impl_arg!(
-    OutputNameArg,
-    positional "NAME",
-    "Device name as shown by `mdma playback outputs`"
-);
 
 /// Select an audio output device by name
 #[hicli::command]

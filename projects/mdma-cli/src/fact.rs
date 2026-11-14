@@ -1,17 +1,17 @@
-use crate::args::{choice, choice_names, parse_choice, Choice, TrackArg};
+use crate::args::TrackArg;
 use crate::ctx::Ctx;
-use crate::origins::{REKORDBOX_ORIGIN, UPLOAD_ORIGIN};
 use crate::output::library_error;
-use bpaf::{construct, long, Parser};
+use bpaf::{construct, Parser};
 use chrono::NaiveDate;
 use color_eyre::eyre::eyre;
 use color_eyre::Result;
-use hicli::Arg;
+use hicli::{Arg, Choice};
 use library_ipc_client::{USER_ORIGIN, USER_TOOL};
 use music_facts::{
     Album, Artist, Bpm, DiscNumber, EnergyLevel, FactSource, Isrc, Key, MusicValue, OriginKind,
     Title, TrackNumber, TrackRole, Year,
 };
+use std::str::FromStr;
 
 /// The value of a fact as typed, with the domain value it parses to for its field.
 #[derive(Debug, Clone, PartialEq)]
@@ -36,36 +36,36 @@ pub(crate) struct FactArgs {
     hash: TrackArg,
 }
 
+/// Value for the field (to retract: must match the existing fact's value)
+// Checked against the field in `FactArgs`, so it is the text as typed here.
+#[derive(Debug, Clone, Arg)]
+#[arg(long = "value", metavar = "VALUE")]
+pub(crate) struct RawValueArg(pub String);
+
+// Stays hand-written: the value is checked against the field, a rule that spans
+// two arguments.
 impl Arg for FactArgs {
     /// `<HASH> --field <FIELD> --value <VALUE>`; the value is checked against
     /// the field, so a bad value is a parse error. `add` and `retract` share it.
     fn parser() -> impl Parser<Self> {
-        let field = choice::<FactField>(
-            long("field")
-                .help(
-                    format!(
-                        "Field name, one of: {}. Tab-completion shows supported fields.",
-                        choice_names::<FactField>().join(", ")
-                    )
-                    .as_str(),
-                )
-                .argument::<String>("FIELD"),
-        );
-        let value = long("value")
-            .help("Value for the field (to retract: must match the existing fact's value).")
-            .argument::<String>("VALUE");
-        let fact = construct!(field, value)
-            .parse(|(field, raw)| FactValueArg::new(field, raw).map(|value| (field, value)));
+        let field = <FactField as Arg>::parser();
+        let value = <RawValueArg as Arg>::parser();
+        let fact = construct!(field, value).parse(|(field, RawValueArg(raw))| {
+            FactValueArg::new(field, raw).map(|value| (field, value))
+        });
         let hash = <TrackArg as Arg>::parser();
         construct!(fact, hash).map(|((field, value), hash)| Self { field, value, hash })
     }
 }
 
+/// Fact field
+///
 /// Metadata fields that can be added or retracted by the user.
 ///
 /// Internal/derived fields (FilePath, Source, ItemId, audio properties, play events,
 /// AddedAt, cover art) are intentionally excluded — they are managed automatically.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Choice, Arg)]
+#[arg(long = "field", metavar = "FIELD")]
 pub(crate) enum FactField {
     Title,
     Artist,
@@ -91,115 +91,42 @@ pub(crate) enum FactField {
     Energy,
 }
 
-impl Choice for FactField {
-    const ALL: &'static [Self] = &[
-        FactField::Title,
-        FactField::Artist,
-        FactField::Album,
-        FactField::AlbumArtist,
-        FactField::TrackNumber,
-        FactField::DiscNumber,
-        FactField::Year,
-        FactField::Bpm,
-        FactField::Key,
-        FactField::MainGenre,
-        FactField::StyleDescriptor,
-        FactField::FullGenre,
-        FactField::Isrc,
-        FactField::Label,
-        FactField::RecordingYear,
-        FactField::RecordingDate,
-        FactField::Comment,
-        FactField::BeatportLabelUrl,
-        FactField::BeatportTrackUrl,
-        FactField::BandcampUrl,
-        FactField::Role,
-        FactField::Energy,
-    ];
-    const WHAT: &'static str = "fact field";
-
-    fn name(self) -> &'static str {
-        match self {
-            FactField::Title => "title",
-            FactField::Artist => "artist",
-            FactField::Album => "album",
-            FactField::AlbumArtist => "album-artist",
-            FactField::TrackNumber => "track-number",
-            FactField::DiscNumber => "disc-number",
-            FactField::Year => "year",
-            FactField::Bpm => "bpm",
-            FactField::Key => "key",
-            FactField::MainGenre => "main-genre",
-            FactField::StyleDescriptor => "style-descriptor",
-            FactField::FullGenre => "full-genre",
-            FactField::Isrc => "isrc",
-            FactField::Label => "label",
-            FactField::RecordingYear => "recording-year",
-            FactField::RecordingDate => "recording-date",
-            FactField::Comment => "comment",
-            FactField::BeatportLabelUrl => "beatport-label-url",
-            FactField::BeatportTrackUrl => "beatport-track-url",
-            FactField::BandcampUrl => "bandcamp-url",
-            FactField::Role => "role",
-            FactField::Energy => "energy",
-        }
-    }
-}
-
-impl std::fmt::Display for FactField {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.name())
-    }
-}
-
-impl std::str::FromStr for FactField {
-    type Err = String;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        parse_choice(s)
-    }
-}
-
 /// Parse a raw string value into a `MusicValue` for the given `FactField`.
 ///
-/// Returns `Err(String)` with an actionable diagnostic if the value cannot be parsed.
+/// The error is a phrase that names the field and says what it must be, without
+/// echoing the value (the argument parser prints that).
 fn parse_field_value(field: FactField, raw: &str) -> Result<MusicValue, String> {
+    let name = field.name();
+    let whole_number = || format!("`{name}` must be a whole number");
     match field {
         FactField::Title => Ok(MusicValue::Title(Title::new(raw))),
         FactField::Artist => Ok(MusicValue::Artist(Artist::new(raw))),
         FactField::Album => Ok(MusicValue::Album(Album::new(raw))),
         FactField::AlbumArtist => Ok(MusicValue::AlbumArtist(Artist::new(raw))),
         FactField::TrackNumber => {
-            let n = raw
-                .parse::<u32>()
-                .map_err(|e| format!("invalid integer for TrackNumber '{raw}': {e}"))?;
+            let n = raw.parse::<u32>().map_err(|_| whole_number())?;
             Ok(MusicValue::TrackNumber(TrackNumber::new(n)))
         }
         FactField::DiscNumber => {
-            let n = raw
-                .parse::<u32>()
-                .map_err(|e| format!("invalid integer for DiscNumber '{raw}': {e}"))?;
+            let n = raw.parse::<u32>().map_err(|_| whole_number())?;
             Ok(MusicValue::DiscNumber(DiscNumber::new(n)))
         }
         FactField::Year => {
-            let n = raw
-                .parse::<u32>()
-                .map_err(|e| format!("invalid integer for Year '{raw}': {e}"))?;
+            let n = raw.parse::<u32>().map_err(|_| whole_number())?;
             Ok(MusicValue::Year(Year::new(n)))
         }
         FactField::Bpm => {
             let b = raw
                 .parse::<f32>()
-                .map_err(|e| format!("invalid float for Bpm '{raw}': {e}"))?;
-            let bpm = Bpm::from_f32(b)
-                .map_err(|e| format!("BPM out of range for '{raw}': {e}"))?;
+                .map_err(|_| format!("`{name}` must be a number"))?;
+            let bpm = Bpm::from_f32(b).map_err(|_| format!("`{name}` is out of range"))?;
             Ok(MusicValue::Bpm(bpm))
         }
         FactField::Key => Key::from_camelot(raw)
             .or_else(|_| Key::from_traditional(raw))
             .map(MusicValue::Key)
             .map_err(|_| {
-                format!("invalid key '{raw}': use Camelot notation (1A-12B) or traditional (e.g. 'C Major', 'A Minor')")
+                format!("`{name}` must be Camelot notation (1A-12B) or traditional (e.g. `C Major`, `A Minor`)")
             }),
         FactField::MainGenre => Ok(MusicValue::MainGenre(raw.to_string())),
         FactField::StyleDescriptor => Ok(MusicValue::StyleDescriptor(raw.to_string())),
@@ -207,34 +134,29 @@ fn parse_field_value(field: FactField, raw: &str) -> Result<MusicValue, String> 
         FactField::Isrc => Ok(MusicValue::Isrc(Isrc::new(raw))),
         FactField::Label => Ok(MusicValue::Label(raw.to_string())),
         FactField::RecordingYear => {
-            let n = raw
-                .parse::<u32>()
-                .map_err(|e| format!("invalid integer for RecordingYear '{raw}': {e}"))?;
+            let n = raw.parse::<u32>().map_err(|_| whole_number())?;
             Ok(MusicValue::RecordingYear(Year::new(n)))
         }
         FactField::RecordingDate => {
             let date = NaiveDate::parse_from_str(raw, "%Y-%m-%d")
-                .map_err(|e| format!("invalid date for RecordingDate '{raw}' (use YYYY-MM-DD): {e}"))?;
+                .map_err(|_| format!("`{name}` must be a date as YYYY-MM-DD"))?;
             Ok(MusicValue::RecordingDate(date))
         }
         FactField::Comment => Ok(MusicValue::Comment(raw.to_string())),
         FactField::BeatportLabelUrl => Ok(MusicValue::BeatportLabelUrl(raw.to_string())),
         FactField::BeatportTrackUrl => Ok(MusicValue::BeatportTrackUrl(raw.to_string())),
         FactField::BandcampUrl => Ok(MusicValue::BandcampUrl(raw.to_string())),
-        FactField::Role => raw
-            .parse::<TrackRole>()
-            .map(MusicValue::Role)
-            .map_err(|_| {
-                format!(
-                    "invalid role '{raw}': accepted values are opener, build-up, peak, banger, cool-down, closer, filler"
-                )
-            }),
+        FactField::Role => raw.parse::<TrackRole>().map(MusicValue::Role).map_err(|_| {
+            format!(
+                "`{name}` must be one of opener, build-up, peak, banger, cool-down, closer, filler"
+            )
+        }),
         FactField::Energy => {
-            let n = raw
+            let level = raw
                 .parse::<u8>()
-                .map_err(|e| format!("invalid integer for Energy '{raw}': {e}"))?;
-            let level = EnergyLevel::new(n)
-                .map_err(|e| format!("energy out of range for '{raw}': {e}"))?;
+                .ok()
+                .and_then(|n| EnergyLevel::new(n).ok())
+                .ok_or_else(|| format!("`{name}` must be a whole number from 1 to 10"))?;
             Ok(MusicValue::Energy(level))
         }
     }
@@ -261,51 +183,69 @@ pub(crate) fn add(args: FactArgs, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// A fact to retract, and the origin that wrote it. The tool is always the user's
-/// (`mdma`); the origin kind tells a manual edit (`User`) from, say, a Rekordbox import.
-#[derive(Debug)]
-pub(crate) struct RetractArgs {
-    fact: FactArgs,
-    origin: OriginKind,
+/// Origin kind of the fact to retract (default: User; Rekordbox for imported values, Upload for uploaded files' tags)
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(long = "origin", metavar = "KIND", complete = complete_origins)]
+pub(crate) struct OriginArg(pub OriginKind);
+
+/// The origin kinds the CLI writes, that start with `typed`.
+fn complete_origins(typed: &str) -> Vec<hicli::Candidate> {
+    use crate::origins::{REKORDBOX_ORIGIN, UPLOAD_ORIGIN};
+    [
+        (USER_ORIGIN, "manual edits"),
+        (REKORDBOX_ORIGIN, "imported from Rekordbox"),
+        (UPLOAD_ORIGIN, "tags of uploaded files"),
+    ]
+    .into_iter()
+    .filter(|(origin, _)| origin.starts_with(typed))
+    .map(|(origin, what)| (origin.to_string(), Some(what.to_string())))
+    .collect()
 }
 
-impl Arg for RetractArgs {
-    /// `<HASH> --field <FIELD> --value <VALUE> [--origin <KIND>]`.
-    fn parser() -> impl Parser<Self> {
-        let origin = long("origin")
-            .help(
-                format!(
-                    "Origin kind of the fact to retract: {USER_ORIGIN} (default), {} for imported \
-                     values or {} for uploaded files' tags.",
-                    REKORDBOX_ORIGIN, UPLOAD_ORIGIN
-                )
-                .as_str(),
-            )
-            .argument::<String>("KIND")
-            .parse(|kind| OriginKind::new(kind).map_err(|e| e.to_string()))
-            .fallback(OriginKind::new(USER_ORIGIN).expect("USER_ORIGIN is not empty"));
-        let fact = <FactArgs as Arg>::parser();
-        // The named option first, so its value is not taken for the positional hash.
-        construct!(origin, fact).map(|(origin, fact)| Self { fact, origin })
+impl FromStr for OriginArg {
+    // A phrase that reads after hicli's `--origin` label, so it does not name the flag.
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        OriginKind::new(s)
+            .map(Self)
+            .map_err(|_| "must not be empty")
     }
+}
+
+/// The origin a retract targets when `--origin` is not given: a manual edit.
+fn user_origin() -> OriginKind {
+    OriginKind::new(USER_ORIGIN).expect("USER_ORIGIN is not empty")
+}
+
+// A fact to retract, and the origin that wrote it. The tool is always the user's
+// (`mdma`); the origin kind tells a manual edit (`User`) from, say, a Rekordbox import.
+// The origin comes first, so its value is not taken for the positional hash. No doc
+// comment: on a composed struct it would be printed as a heading in the help.
+#[allow(missing_docs)]
+#[derive(Debug, Arg)]
+pub(crate) struct RetractArgs {
+    origin: Option<OriginArg>,
+    fact: FactArgs,
 }
 
 /// Retract an existing fact from a track
 ///
 /// Required for collection-type fields (each value is independent).
 /// For scalar fields, retract removes that value from history.
-/// A fact imported from Rekordbox is retracted with `--origin Rekordbox`.
+/// A fact written by an import or an upload is retracted with the matching `--origin`.
 #[hicli::command]
 pub(crate) fn retract(args: RetractArgs, ctx: &Ctx) -> Result<()> {
     let RetractArgs {
+        origin,
         fact:
             FactArgs {
                 field,
                 value: FactValueArg { raw, value },
                 hash: TrackArg(hash),
             },
-        origin,
     } = args;
+    let origin = origin.map_or_else(user_origin, |OriginArg(kind)| kind);
     let library = ctx.library()?;
     let source = FactSource::new(USER_TOOL, env!("CARGO_PKG_VERSION"), origin.as_str());
     if library
@@ -334,7 +274,7 @@ mod tests {
 
     #[test]
     fn fact_field_names_round_trip() {
-        for v in FactField::ALL {
+        for v in FactField::VARIANTS {
             assert_eq!(v.name().parse::<FactField>(), Ok(*v));
             assert_eq!(v.to_string(), v.name());
         }
@@ -363,7 +303,53 @@ mod tests {
     fn fact_value_is_checked_against_the_field_at_parse_time() {
         for verb in ["add", "retract"] {
             let e = usage_error(&fact_argv(verb, "abcd1234", "twenty", "year"));
-            assert!(e.contains("invalid integer for Year 'twenty'"), "{e}");
+            assert!(e.contains("`year` must be a whole number"), "{e}");
+            assert!(!e.contains("'twenty'"), "the value is not echoed: {e}");
+        }
+    }
+
+    #[test]
+    fn multi_word_fact_fields_are_kebab_case() {
+        use crate::test_support::run_arg;
+        for (typed, field) in [
+            ("main-genre", FactField::MainGenre),
+            ("album-artist", FactField::AlbumArtist),
+            ("track-number", FactField::TrackNumber),
+            ("beatport-label-url", FactField::BeatportLabelUrl),
+        ] {
+            assert_eq!(
+                run_arg::<FactField>(&["--field", typed]),
+                Ok(field),
+                "{typed}"
+            );
+        }
+        // Only the kebab-case spelling parses; the error lists the names.
+        let err = run_arg::<FactField>(&["--field", "MainGenre"]).unwrap_err();
+        assert!(err.contains("`album-artist`, `track-number`"), "{err}");
+        assert!(err.contains("`main-genre`"), "{err}");
+    }
+
+    #[test]
+    fn field_value_errors_are_phrases_that_do_not_echo_the_value() {
+        for (field, raw, phrase) in [
+            (FactField::Bpm, "fast", "`bpm` must be a number"),
+            (FactField::Bpm, "5.0", "`bpm` is out of range"),
+            (
+                FactField::Energy,
+                "11",
+                "`energy` must be a whole number from 1 to 10",
+            ),
+            (FactField::Role, "dancer", "`role` must be one of opener"),
+            (FactField::Key, "NotAKey", "`key` must be Camelot notation"),
+            (
+                FactField::RecordingDate,
+                "2024/06/15",
+                "`recording-date` must be a date as YYYY-MM-DD",
+            ),
+        ] {
+            let err = parse_field_value(field, raw).unwrap_err();
+            assert!(err.starts_with(phrase), "{err}");
+            assert!(!err.contains(raw), "{err}");
         }
     }
 
@@ -383,14 +369,12 @@ mod tests {
         use crate::test_support::run_arg;
         let err =
             run_arg::<FactArgs>(&["--field", "year", "--value", "twenty", "abcd1234"]).unwrap_err();
-        assert!(err.contains("invalid integer for Year 'twenty'"), "{err}");
+        assert!(err.contains("`year` must be a whole number"), "{err}");
         let err =
             run_arg::<FactArgs>(&["--field", "nope", "--value", "x", "abcd1234"]).unwrap_err();
-        assert!(
-            err.contains("unknown fact field 'nope' (expected title, artist,"),
-            "{err}"
-        );
-        assert!(err.contains("bandcamp-url, role or energy)"), "{err}");
+        assert!(err.contains("`--field`"), "{err}");
+        assert!(err.contains("expected `title`, `artist`,"), "{err}");
+        assert!(err.contains("`bandcamp-url`, `role` or `energy`"), "{err}");
         assert!(run_arg::<FactArgs>(&["--field", "year", "--value", "1"]).is_err());
     }
 
@@ -399,7 +383,8 @@ mod tests {
         use crate::test_support::run_arg;
         let base = ["--field", "year", "--value", "2024", "abcd1234"];
         let default = run_arg::<RetractArgs>(&base).unwrap();
-        assert_eq!(default.origin.as_str(), "User");
+        assert_eq!(default.origin, None);
+        assert_eq!(user_origin().as_str(), "User");
         let rb = run_arg::<RetractArgs>(&[
             "--field",
             "year",
@@ -410,11 +395,21 @@ mod tests {
             "abcd1234",
         ])
         .unwrap();
-        assert_eq!(rb.origin.as_str(), "Rekordbox");
-        assert!(run_arg::<RetractArgs>(&[
+        assert_eq!(rb.origin.unwrap().0.as_str(), "Rekordbox");
+        let err = run_arg::<RetractArgs>(&[
             "--field", "year", "--value", "2024", "--origin", "", "abcd1234",
         ])
-        .is_err());
+        .unwrap_err();
+        assert!(err.ends_with("`--origin`: must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn retract_help_names_the_origins_it_knows() {
+        use crate::origins::{REKORDBOX_ORIGIN, UPLOAD_ORIGIN};
+        let help = crate::test_support::help(&["fact", "retract", "--help"]);
+        for origin in [USER_ORIGIN, REKORDBOX_ORIGIN, UPLOAD_ORIGIN] {
+            assert!(help.contains(origin), "{origin}: {help}");
+        }
     }
 
     // ── parse_field_value ─────────────────────────────────────────────────────

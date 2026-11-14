@@ -1,8 +1,8 @@
-use crate::args::{impl_arg, OptPlaylistArg, PlaylistArg};
+use crate::args::{parse_count, PlaylistArg};
 use crate::ctx::Ctx;
 use crate::output::interpret_library;
 use crate::stdin::{hashes_in, read_stdin_to_string, require_stdin_hashes_or_usage};
-use bpaf::{construct, long, Bpaf, Parser};
+use bpaf::{construct, long, Parser};
 use color_eyre::eyre::{bail, eyre};
 use color_eyre::Result;
 use colored::Colorize;
@@ -10,38 +10,35 @@ use hicli::Arg;
 use library_ipc_client::{ContentHash, LibraryResponse, PlaylistName};
 use std::num::NonZeroUsize;
 
-#[derive(Debug, Clone, PartialEq, Eq, Bpaf, Arg)]
+/// Current playlist name
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(positional = "FROM")]
+pub(crate) struct FromPlaylist(pub PlaylistArg);
+
+/// New playlist name
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(positional = "TO")]
+pub(crate) struct ToPlaylist(pub PlaylistArg);
+
+// Both names are a `PlaylistArg`; spelled apart they read `FROM` and `TO`, not `NAME NAME`.
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
 pub(crate) struct RenameArgs {
-    /// Current playlist name
-    #[bpaf(positional("FROM"))]
-    pub(crate) from: PlaylistArg,
-    /// New playlist name
-    #[bpaf(positional("TO"))]
-    pub(crate) to: PlaylistArg,
+    pub(crate) from: FromPlaylist,
+    pub(crate) to: ToPlaylist,
 }
 
-/// Minimum number of matching tracks for `--at-least`: a whole number, at least 1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Print playlist only if it contains at least N input tracks
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Arg)]
+#[arg(long = "at-least", metavar = "AT_LEAST")]
 pub(crate) struct AtLeastArg(pub NonZeroUsize);
 
 impl std::str::FromStr for AtLeastArg {
-    type Err = String;
+    type Err = &'static str;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        s.parse::<usize>()
-            .ok()
-            .and_then(NonZeroUsize::new)
-            .map(Self)
-            .ok_or_else(|| format!("'{s}' must be a whole number of at least 1"))
+        parse_count(s).map(Self)
     }
 }
-
-impl_arg!(
-    AtLeastArg,
-    long "at-least",
-    "AT_LEAST",
-    "Print playlist only if it contains at least N input tracks"
-);
 
 impl Arg for ContainsMode {
     /// At most one of `--all`, `--at-least N`, `--no`; none means any.
@@ -163,9 +160,8 @@ pub(crate) fn list(ctx: &Ctx) -> Result<()> {
 /// If name is omitted, reads playlist names from stdin (first whitespace-delimited
 /// token per line - handles both bare names and enriched `playlist list` output).
 #[hicli::command]
-pub(crate) fn get(name: OptPlaylistArg, ctx: &Ctx) -> Result<()> {
+pub(crate) fn get(name: Option<PlaylistArg>, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
-    let OptPlaylistArg(name) = name;
     let library = ctx.library()?;
     match name {
         Some(PlaylistArg(pname)) => {
@@ -351,8 +347,8 @@ pub(crate) fn remove(name: PlaylistArg, ctx: &Ctx) -> Result<()> {
 pub(crate) fn rename(args: RenameArgs, ctx: &Ctx) -> Result<()> {
     use library_ipc_client::LibraryRequest;
     let library = ctx.library()?;
-    let PlaylistArg(from_name) = args.from;
-    let PlaylistArg(to_name) = args.to;
+    let FromPlaylist(PlaylistArg(from_name)) = args.from;
+    let ToPlaylist(PlaylistArg(to_name)) = args.to;
     interpret_library(
         library.request(&LibraryRequest::PlaylistRename {
             from: from_name.clone(),
@@ -408,8 +404,8 @@ mod tests {
         assert_eq!(
             run_arg::<RenameArgs>(&["old", "new"]),
             Ok(RenameArgs {
-                from: name("old"),
-                to: name("new"),
+                from: FromPlaylist(name("old")),
+                to: ToPlaylist(name("new")),
             })
         );
         assert!(run_arg::<RenameArgs>(&["old"]).is_err());
@@ -422,7 +418,7 @@ mod tests {
         assert_eq!(run_arg::<AtLeastArg>(&["--at-least", "2"]), Ok(two));
         let err = run_arg::<AtLeastArg>(&["--at-least", "0"]).unwrap_err();
         assert!(
-            err.contains("must be a whole number of at least 1"),
+            err.ends_with("`--at-least`: must be a whole number of at least 1"),
             "{err}"
         );
         assert!(run_arg::<AtLeastArg>(&[]).is_err());

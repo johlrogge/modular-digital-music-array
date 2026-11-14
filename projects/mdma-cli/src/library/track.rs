@@ -1,19 +1,24 @@
 use crate::args::TrackArg;
 use crate::ctx::Ctx;
 use crate::output::display_error;
-use bpaf::Bpaf;
 use color_eyre::Result;
 use hicli::Arg;
 
-#[derive(Debug, Clone, PartialEq, Eq, Bpaf, Arg)]
+/// Path to the new audio file on the device running the library service
+// Stays a String: it is a path on the library service's device, not checked locally.
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(positional = "NEW_FILE")]
+pub(crate) struct NewFileArg(pub String);
+
+/// Content hash of the old track (prefix accepted, git-style)
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
+#[arg(positional = "OLD_HASH")]
+pub(crate) struct OldHashArg(pub TrackArg);
+
+#[derive(Debug, Clone, PartialEq, Eq, Arg)]
 pub(crate) struct ReplaceArgs {
-    /// Content hash of the old track (prefix accepted, git-style).
-    #[bpaf(positional("OLD_HASH"))]
-    pub(crate) old_hash: TrackArg,
-    // Stays a String: it is a path on the library service's device, not checked locally.
-    /// Path to the new audio file on the device running the library service.
-    #[bpaf(positional("NEW_FILE"))]
-    pub(crate) new_file: String,
+    pub(crate) old_hash: OldHashArg,
+    pub(crate) new_file: NewFileArg,
 }
 
 /// Soft-delete a track (hidden from default views; file retained; recoverable)
@@ -55,8 +60,8 @@ pub(crate) fn restore(hash: TrackArg, ctx: &Ctx) -> Result<()> {
 #[hicli::command]
 pub(crate) fn replace(args: ReplaceArgs, ctx: &Ctx) -> Result<()> {
     let ReplaceArgs {
-        old_hash: TrackArg(old_hash),
-        new_file,
+        old_hash: OldHashArg(TrackArg(old_hash)),
+        new_file: NewFileArg(new_file),
     } = args;
     let library = ctx.library()?;
     let (new_hash, playlists) = library
@@ -110,18 +115,27 @@ mod tests {
 
     #[test]
     fn replace_args_parser_reads_old_hash_and_new_file() {
-        use super::ReplaceArgs;
+        use super::{NewFileArg, OldHashArg, ReplaceArgs};
         use crate::test_support::run_arg;
         assert_eq!(
             run_arg::<ReplaceArgs>(&["abc12345", "/inbox/new.flac"]),
             Ok(ReplaceArgs {
-                old_hash: TrackArg(ContentHash::new("abc12345")),
-                new_file: "/inbox/new.flac".to_string(),
+                old_hash: OldHashArg(TrackArg(ContentHash::new("abc12345"))),
+                new_file: NewFileArg("/inbox/new.flac".to_string()),
             })
         );
         let err = run_arg::<ReplaceArgs>(&["nothash", "/inbox/new.flac"]).unwrap_err();
-        assert!(err.contains("is not a content hash"), "{err}");
+        assert!(err.contains("`OLD_HASH`"), "{err}");
+        assert!(err.contains("not a content hash"), "{err}");
         assert!(run_arg::<ReplaceArgs>(&["abc12345"]).is_err());
+    }
+
+    #[test]
+    fn replace_help_says_the_first_positional_is_the_old_hash() {
+        let help = crate::test_support::help(&["library", "track", "replace", "--help"]);
+        assert!(help.contains("OLD_HASH"), "{help}");
+        assert!(help.contains("Content hash of the old track"), "{help}");
+        assert!(help.contains("NEW_FILE"), "{help}");
     }
 
     // ── track lifecycle parsing ───────────────────────────────────────────────

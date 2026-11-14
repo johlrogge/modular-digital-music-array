@@ -1,4 +1,4 @@
-use crate::args::OptTrackArg;
+use crate::args::TrackArg;
 use crate::ctx::Ctx;
 use crate::output::{display_error, format_track_line, render_track_table};
 use crate::stdin::{hashes_arg_or_stdin, hashes_in, require_stdin_hashes};
@@ -12,7 +12,7 @@ use track_formatter::short_hash;
 ///
 /// Hash may be omitted; if so, reads "{hash}  {display}" from stdin (dmenu output).
 #[hicli::command]
-pub(crate) fn next(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
+pub(crate) fn next(hash: Option<TrackArg>, ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;
     let hashes = hashes_arg_or_stdin(hash)?;
     let count = hashes.len();
@@ -30,7 +30,7 @@ pub(crate) fn next(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
 ///
 /// Hash may be omitted; if so, reads "{hash}  {display}" from stdin (dmenu output).
 #[hicli::command]
-pub(crate) fn append(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
+pub(crate) fn append(hash: Option<TrackArg>, ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;
     let hashes = hashes_arg_or_stdin(hash)?;
     let count = hashes.len();
@@ -128,7 +128,7 @@ pub(crate) fn clear(ctx: &Ctx) -> Result<()> {
 ///
 /// Hash may be omitted; if so, reads one hash per line from stdin.
 #[hicli::command]
-pub(crate) fn remove(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
+pub(crate) fn remove(hash: Option<TrackArg>, ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;
     let content_hashes = hashes_arg_or_stdin(hash)?;
 
@@ -145,10 +145,13 @@ pub(crate) fn remove(hash: OptTrackArg, ctx: &Ctx) -> Result<()> {
 ///
 /// Reads playlist-format lines (8-12 char hex hash as first token).
 ///
-/// Examples:
-///   mdma search --genre=Techno | shuf | mdma queue replace
-///   cat friday.plist | mdma queue replace
-///   mdma queue list | mdma sort bpm -a | mdma queue replace
+/// # Examples
+///
+/// ```sh
+/// mdma search --genre=Techno | shuf | mdma queue replace
+/// cat friday.plist | mdma queue replace
+/// mdma queue list | mdma sort bpm -a | mdma queue replace
+/// ```
 #[hicli::command]
 pub(crate) fn replace(ctx: &Ctx) -> Result<()> {
     let playback = ctx.playback()?;

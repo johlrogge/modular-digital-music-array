@@ -1,4 +1,4 @@
-use crate::args::{impl_arg, TrackArg};
+use crate::args::{Apply, TrackArg};
 use crate::ctx::Ctx;
 use crate::library::Yes;
 use crate::output::{display_error, success_unless};
@@ -11,16 +11,8 @@ use library_ipc_client::{
 };
 use track_formatter::short_hash;
 
-/// Whether the listing also merges the automatic groups.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Apply(pub bool);
-
-impl_arg!(
-    Apply,
-    switch "apply",
-    "Merge the automatic groups (the others are only listed)"
-);
-
+// Stays `#[derive(Bpaf)]`: `some` makes at least one loser a parse error, which a
+// composed struct (zero or more) cannot say.
 #[derive(Debug, Clone, PartialEq, Eq, Bpaf, Arg)]
 pub(crate) struct MergeArgs {
     #[bpaf(external(Yes::parser))]
@@ -135,10 +127,19 @@ fn find_dedup_group<'a>(
     Ok(found)
 }
 
+// A default command takes no `# Arguments`; its own wording is a field doc.
+#[derive(Debug, PartialEq, Arg)]
+pub(crate) struct ScanArgs {
+    /// Merge the automatic groups (the others are only listed)
+    apply: Apply,
+}
+
 /// List duplicate groups, or merge the automatic ones with --apply
 #[hicli::command(default)]
-pub(crate) fn scan(apply: Apply, ctx: &Ctx) -> Result<Success> {
-    let Apply(apply) = apply;
+pub(crate) fn scan(args: ScanArgs, ctx: &Ctx) -> Result<Success> {
+    let ScanArgs {
+        apply: Apply(apply),
+    } = args;
     let library = ctx.library()?;
     let report = library.dedup_scan(apply).map_err(display_error)?;
     let failed = report
@@ -216,10 +217,9 @@ mod tests {
     use crate::test_support::run_arg;
 
     #[test]
-    fn apply_arg_parser_is_a_switch() {
-        assert_eq!(run_arg::<Apply>(&[]), Ok(Apply(false)));
-        assert_eq!(run_arg::<Apply>(&["--apply"]), Ok(Apply(true)));
-        assert!(run_arg::<Apply>(&["--appply"]).is_err());
+    fn dedup_words_its_own_apply_help() {
+        let help = crate::test_support::help(&["library", "dedup", "--help"]);
+        assert!(help.contains("Merge the automatic groups"), "{help}");
     }
 
     #[test]
@@ -249,7 +249,7 @@ mod tests {
         let err = run_arg::<MergeArgs>(&["abc12345"]).unwrap_err();
         assert!(err.contains("at least one duplicate"), "{err}");
         let err = run_arg::<MergeArgs>(&["abc12345", "nothash"]).unwrap_err();
-        assert!(err.contains("is not a content hash"), "{err}");
+        assert!(err.contains("not a content hash"), "{err}");
     }
 
     // ── dedup ─────────────────────────────────────────────────────────────────

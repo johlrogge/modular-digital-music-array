@@ -1,9 +1,8 @@
-use crate::args::impl_arg;
 use crate::ctx::Ctx;
 use crate::output::{interpret_admin, success_unless};
 use color_eyre::Result;
 use gateway_client::{AdminRequest, AdminResponse, GatewayClient};
-use hicli::Success;
+use hicli::{Arg, Success};
 
 /// Send an admin request and interpret the reply with [`interpret_admin`].
 fn admin_call<T>(
@@ -108,15 +107,10 @@ pub(crate) fn boot_health(ctx: &Ctx) -> Result<Success> {
     Ok(success_unless(!verdict.allows_reboot()))
 }
 
-/// Reboot even if the boot-health check fails.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Reboot even if the boot-health check fails
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Arg)]
+#[arg(long = "force")]
 pub(crate) struct Force(pub bool);
-
-impl_arg!(
-    Force,
-    switch "force",
-    "Reboot even if the boot-health check fails"
-);
 
 /// Reboot the host (refused if the boot partition looks unhealthy)
 #[hicli::command]

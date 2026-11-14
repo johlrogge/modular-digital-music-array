@@ -1,23 +1,10 @@
-use crate::args::impl_arg;
 use color_eyre::Result;
+use hicli::Arg;
 
-/// The shell to generate completions for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Shell to generate completions for
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Arg)]
+#[arg(positional = "SHELL")]
 pub(crate) struct ShellArg(pub hicli::Shell);
-
-impl std::str::FromStr for ShellArg {
-    type Err = hicli::UnknownChoice;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        s.parse().map(Self)
-    }
-}
-
-impl_arg!(
-    ShellArg,
-    positional "SHELL",
-    "Shell to generate completions for (bash, zsh or fish)"
-);
 
 /// Generate shell completions
 #[hicli::command(hide)]
