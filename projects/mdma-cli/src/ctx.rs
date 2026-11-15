@@ -307,7 +307,7 @@ pub(crate) fn connect_failed(what: &str, err: &NngClientError, direct: bool) -> 
 }
 
 /// Like [`connect_failed`] for the library client's error, which wraps the transport's.
-fn library_connect_failed(err: &ClientError, direct: bool) -> color_eyre::Report {
+pub(crate) fn library_connect_failed(err: &ClientError, direct: bool) -> color_eyre::Report {
     match err {
         ClientError::Transport(e) => connect_failed("library", e, direct),
         other => eyre!("{}", connect_failure_text("library", other)),

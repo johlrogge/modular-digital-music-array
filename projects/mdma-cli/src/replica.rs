@@ -18,9 +18,10 @@ use gateway_client::{GatewayClient, IdentifyError, NodeIdentity};
 use hicli::Arg;
 use library_ipc_client::{LibraryRequest, LibraryResponse};
 use library_projection::{project_lines, Projection};
+use mdma_client::LibraryBackend;
 use serde::{Deserialize, Serialize};
 
-use crate::ctx::{connect_failed, Ctx};
+use crate::ctx::{connect_failed, library_connect_failed, Ctx};
 use crate::node;
 use crate::output::interpret_library;
 use crate::snapshot::CompletionSnapshot;
@@ -31,6 +32,9 @@ const LINK_TIMEOUT: Duration = Duration::from_secs(10);
 /// The name a node reached over local IPC is recorded under, so that `status`
 /// and `reset` can find its replica again without a network.
 const LOCAL_HOST: &str = "localhost";
+
+/// How a replica comes to exist, for the "no replica yet" messages.
+const HOW_TO_GET_ONE: &str = "a background sync creates it, or run `mdma replica sync`";
 
 /// How long probed playlist and source names are served.
 pub(crate) const PROBE_TTL_SECS: u64 = 24 * 60 * 60;
@@ -332,20 +336,27 @@ pub(crate) fn replica_from_environment(nodes_dir: &Path, named: Option<&str>) ->
 enum Missing {
     /// A node was named (by `--node`, else `MDMA_NODE`) and no replica matches it.
     Named(String),
+    /// On the node itself, and no sync has made its replica yet.
+    LocalNotSynced,
     /// No node is named, remembered or running here.
     NoNode,
 }
 
 impl Missing {
-    fn named(explicit: Option<String>, env: Option<&str>) -> Self {
-        explicit
-            .or_else(|| env.map(str::to_string))
-            .map_or(Missing::NoNode, Missing::Named)
+    /// What was looked for: the `--node` flag; on the node itself, this node;
+    /// else `MDMA_NODE`.
+    fn named(explicit: Option<String>, local: bool, env: Option<&str>) -> Self {
+        match explicit {
+            Some(name) => Missing::Named(name),
+            None if local => Missing::LocalNotSynced,
+            None => env.map_or(Missing::NoNode, |name| Missing::Named(name.to_string())),
+        }
     }
 
     fn message(&self) -> String {
         match self {
             Missing::Named(name) => format!("no replica for '{name}'"),
+            Missing::LocalNotSynced => format!("no replica of this node yet; {HOW_TO_GET_ONE}"),
             Missing::NoNode => {
                 "no node to find a replica for; use --node NAME or run `mdma node select`"
                     .to_string()
@@ -372,7 +383,7 @@ fn find_replica(ctx: &Ctx, nodes_dir: &Path) -> Result<Chosen> {
             .as_ref()
             .map(|c| (c.id.as_str(), c.host.as_str())),
     );
-    Ok(found.ok_or_else(|| Missing::named(explicit, env_host)))
+    Ok(found.ok_or_else(|| Missing::named(explicit, ctx.local_ipc(), env_host)))
 }
 
 /// The replica commands act on, decided offline.
@@ -402,9 +413,7 @@ pub(crate) fn fold_current(ctx: &Ctx) -> Result<ReplicaFold> {
 fn fold_replica(nodes_dir: &Path, id: NodeId) -> Result<ReplicaFold> {
     let replica = Replica::new(nodes_dir, &id);
     let Some(meta) = replica.meta().map_err(|e| eyre!("{e}"))? else {
-        return Err(eyre!(
-            "no replica of {id} yet; a background sync creates it, or run `mdma replica sync`"
-        ));
+        return Err(eyre!("no replica of {id} yet; {HOW_TO_GET_ONE}"));
     };
     let lines = replica.lines().map_err(|e| eyre!("{e}"))?;
     let projection = project_lines(lines.iter().map(String::as_str));
@@ -432,17 +441,13 @@ struct NodeLink {
 /// reads. On the node itself that is the local gateway; ACID is never reached
 /// any other way, so the link timeout holds in both cases.
 fn connect(ctx: &Ctx) -> Result<NodeLink> {
-    let (address, host, local) = match ctx.gateway()? {
-        Some(address) => (
-            address,
-            ctx.remote_host()?.map(|(host, _)| Host::new(&host)),
-            false,
-        ),
-        None => (
-            format!("tcp://127.0.0.1:{}", node_discovery::DEFAULT_PORT),
-            Some(Host::new(LOCAL_HOST)),
-            true,
-        ),
+    let remote = ctx.gateway()?;
+    let local = remote.is_none();
+    let address = sync_gateway(remote);
+    let host = if local {
+        Some(Host::new(LOCAL_HOST))
+    } else {
+        ctx.remote_host()?.map(|(host, _)| Host::new(&host))
     };
     // Locally, a dead gateway gets the "Is mdma-gateway running?" hint.
     let client = GatewayClient::connect_with_timeout(&address, LINK_TIMEOUT)
@@ -486,9 +491,20 @@ fn reach<T>(
     reached
 }
 
-/// Playlist names, as the library lists them.
+/// The gateway a sync talks to, for the ACID reads and the probes alike: the node's
+/// (`remote`), or on the node itself the local one, since the direct IPC sockets
+/// are not open to every user.
+fn sync_gateway(remote: Option<String>) -> String {
+    remote.unwrap_or_else(|| format!("tcp://127.0.0.1:{}", node_discovery::DEFAULT_PORT))
+}
+
+/// Playlist names, as the library lists them (through the sync's gateway).
 fn probe_playlists(ctx: &Ctx) -> Result<Vec<String>> {
-    let library = ctx.library()?;
+    let remote = ctx.gateway()?;
+    let local = remote.is_none();
+    let gateway = sync_gateway(remote);
+    let library = LibraryBackend::connect(Some(&gateway), ctx.library_socket())
+        .map_err(|e| library_connect_failed(&e, local))?;
     interpret_library(
         library.request(&LibraryRequest::PlaylistList),
         |response| match response {
@@ -500,10 +516,10 @@ fn probe_playlists(ctx: &Ctx) -> Result<Vec<String>> {
     )
 }
 
-/// Source names, as the gateway (or the sources directory) lists them.
+/// Source names, as the sync's gateway lists them.
 fn probe_sources(ctx: &Ctx) -> Result<Vec<String>> {
-    let gateway = ctx.gateway()?;
-    mdma_client::list_available_sources(gateway.as_deref(), ctx.sources_dir()?)
+    let gateway = sync_gateway(ctx.gateway()?);
+    mdma_client::list_available_sources(Some(&gateway), ctx.sources_dir()?)
         .map(|names| names.iter().map(ToString::to_string).collect())
         .map_err(|e| eyre!("could not list sources: {e}"))
 }
@@ -617,6 +633,9 @@ fn reset_replica(nodes_dir: &Path, chosen: Chosen) -> Result<String> {
         Ok(id) => id,
         Err(Missing::Named(name)) => {
             return Ok(format!("Nothing to reset: no replica for '{name}'."));
+        }
+        Err(Missing::LocalNotSynced) => {
+            return Ok("Nothing to reset: no replica of this node yet.".to_string());
         }
         Err(missing @ Missing::NoNode) => return Err(eyre!("{}", missing.message())),
     };
@@ -838,16 +857,52 @@ mod tests {
     // --- reset ---------------------------------------------------------------
 
     #[test]
-    fn what_was_looked_for_is_the_flag_else_the_environment() {
+    fn what_was_looked_for_is_the_flag_else_this_node_when_local_else_the_environment() {
         assert_eq!(
-            Missing::named(Some("flag.local".into()), Some("env.local")),
-            Missing::Named("flag.local".into())
+            Missing::named(Some("flag.local".into()), true, Some("env.local")),
+            Missing::Named("flag.local".into()),
+            "a flag is looked for even on the node"
         );
         assert_eq!(
-            Missing::named(None, Some("env.local")),
+            Missing::named(None, false, Some("env.local")),
             Missing::Named("env.local".into())
         );
-        assert_eq!(Missing::named(None, None), Missing::NoNode);
+        assert_eq!(Missing::named(None, false, None), Missing::NoNode);
+        assert_eq!(Missing::named(None, true, None), Missing::LocalNotSynced);
+        assert_eq!(
+            Missing::named(None, true, Some("env.local")),
+            Missing::LocalNotSynced,
+            "locally the node is this one, as in pick_replica"
+        );
+    }
+
+    #[test]
+    fn with_no_replica_yet_the_node_itself_says_so_and_a_non_local_setup_has_no_node() {
+        assert_eq!(
+            Missing::LocalNotSynced.message(),
+            "no replica of this node yet; a background sync creates it, or run `mdma replica sync`"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            reset_replica(dir.path(), Err(Missing::LocalNotSynced)).unwrap(),
+            "Nothing to reset: no replica of this node yet."
+        );
+        assert_eq!(
+            Missing::named(None, false, None).message(),
+            "no node to find a replica for; use --node NAME or run `mdma node select`"
+        );
+    }
+
+    #[test]
+    fn the_probes_use_the_gateway_the_sync_reads_through() {
+        assert_eq!(
+            sync_gateway(Some("tcp://10.0.0.5:5555".into())),
+            "tcp://10.0.0.5:5555"
+        );
+        assert_eq!(
+            sync_gateway(None),
+            format!("tcp://127.0.0.1:{}", node_discovery::DEFAULT_PORT)
+        );
     }
 
     #[test]
