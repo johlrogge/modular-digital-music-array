@@ -17,6 +17,7 @@ use fact_replica::{
 use gateway_client::{GatewayClient, IdentifyError, NodeIdentity};
 use hicli::Arg;
 use library_ipc_client::{LibraryRequest, LibraryResponse};
+use library_projection::{project_lines, Projection};
 use serde::{Deserialize, Serialize};
 
 use crate::ctx::{connect_failed, Ctx};
@@ -170,7 +171,7 @@ fn pick_replica(
 }
 
 /// "5 s ago", "3 min ago", "2 h ago", "4 d ago"; "never" without a time.
-fn ago(now: UnixSecs, then: Option<UnixSecs>) -> String {
+pub(crate) fn ago(now: UnixSecs, then: Option<UnixSecs>) -> String {
     let Some(then) = then else {
         return "never".to_string();
     };
@@ -377,6 +378,41 @@ fn find_replica(ctx: &Ctx, nodes_dir: &Path) -> Result<Chosen> {
 /// The replica commands act on, decided offline.
 fn current_replica(ctx: &Ctx, nodes_dir: &Path) -> Result<NodeId> {
     find_replica(ctx, nodes_dir)?.map_err(|missing| eyre!("{}", missing.message()))
+}
+
+/// The replica of the node in use, folded with `library_projection`.
+pub(crate) struct ReplicaFold {
+    pub(crate) id: NodeId,
+    /// When the replica last synced; `None` if it never has.
+    pub(crate) synced_at: Option<UnixSecs>,
+    pub(crate) projection: Projection,
+}
+
+/// Fold the replica of the node in use (decided offline, like `replica status`), for
+/// the commands that answer from the local facts. Reads only the local copy: a
+/// missing replica is an error that says how to get one, never an inline sync
+/// (ADR-021 §6; `after_command` already starts one in the background).
+pub(crate) fn fold_current(ctx: &Ctx) -> Result<ReplicaFold> {
+    let nodes_dir = nodes_dir()?;
+    let id = current_replica(ctx, &nodes_dir)?;
+    fold_replica(&nodes_dir, id)
+}
+
+/// Fold the replica of node `id` under `nodes_dir`.
+fn fold_replica(nodes_dir: &Path, id: NodeId) -> Result<ReplicaFold> {
+    let replica = Replica::new(nodes_dir, &id);
+    let Some(meta) = replica.meta().map_err(|e| eyre!("{e}"))? else {
+        return Err(eyre!(
+            "no replica of {id} yet; a background sync creates it, or run `mdma replica sync`"
+        ));
+    };
+    let lines = replica.lines().map_err(|e| eyre!("{e}"))?;
+    let projection = project_lines(lines.iter().map(String::as_str));
+    Ok(ReplicaFold {
+        id,
+        synced_at: meta.synced_at,
+        projection,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,6 +1134,89 @@ mod tests {
         assert!(
             text.ends_with("Unreadable:    3 lines this mdma cannot read; upgrade mdma"),
             "{text}"
+        );
+    }
+
+    // --- folding -------------------------------------------------------------
+
+    const TRACK: &str = "sha256:aabbccdd00112233";
+
+    /// A track with one play.
+    fn play_lines() -> Vec<String> {
+        use crate::test_support::asserted;
+        let at = "2026-01-02T10:00:00Z";
+        let title = r#"{"t":"Title","v":"Blue Monday"}"#;
+        let started = r#"{"t":"TrackStarted","v":"OnRequest"}"#;
+        vec![asserted(TRACK, title, at), asserted(TRACK, started, at)]
+    }
+
+    fn replica_with_lines(dir: &Path, node: &str, host: &str, lines: Vec<String>) {
+        let mut fake = FakeNode::new("e1", 0);
+        fake.lines = lines;
+        Replica::new(dir, &id(node))
+            .sync(secs(1), Some(&Host::new(host)), &mut |c, l, p| {
+                fake.serve(c, l, p)
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn folding_a_replica_gives_its_node_its_age_and_its_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        replica_with_lines(dir.path(), "stage", "mdma-stage2.local", play_lines());
+
+        let fold = fold_replica(dir.path(), id("stage")).unwrap();
+
+        assert_eq!(fold.id, id("stage"));
+        assert_eq!(fold.synced_at, Some(secs(1)));
+        assert_eq!(fold.projection.unparseable_lines, 0);
+        let tracks = &fold.projection.tracks;
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(fold.projection.plays.histories(tracks)[0].count(), 1);
+    }
+
+    #[test]
+    fn folding_a_node_with_no_replica_yet_says_how_to_get_one() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = fold_replica(dir.path(), id("fresh"));
+
+        assert_eq!(
+            crate::test_support::failure_text(result),
+            "no replica of fresh yet; a background sync creates it, or run `mdma replica sync`"
+        );
+    }
+
+    #[test]
+    fn the_current_replica_is_folded_from_the_cache_and_a_missing_one_is_an_error() {
+        use crate::ctx::NodeFlag;
+        use crate::test_support::{env_lock, failure_text, globals, EnvVars};
+
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = EnvVars::default();
+        env.set("XDG_CACHE_HOME", dir.path().join("cache"));
+        env.set("XDG_CONFIG_HOME", dir.path().join("config"));
+        env.set("MDMA_NODE", "");
+        let nodes_dir = dir.path().join("cache").join("mdma").join("nodes");
+        replica_with_lines(&nodes_dir, "stage", "mdma-stage2.local", play_lines());
+        // A replica directory that no sync has filled yet.
+        let bare = Replica::new(&nodes_dir, &id("bare"));
+        std::fs::create_dir_all(bare.dir()).unwrap();
+        let ctx_for = |host: &str| {
+            let mut given = globals();
+            given.node = NodeFlag(Some(host.parse().unwrap()));
+            Ctx::with_target(given, node_discovery::Target::LocalIpc)
+        };
+
+        let fold = fold_current(&ctx_for("mdma-stage2.local")).unwrap();
+        let unsynced = fold_current(&ctx_for("bare"));
+
+        assert_eq!(fold.id, id("stage"));
+        assert_eq!(fold.projection.tracks.len(), 1);
+        assert_eq!(
+            failure_text(unsynced),
+            "no replica of bare yet; a background sync creates it, or run `mdma replica sync`"
         );
     }
 

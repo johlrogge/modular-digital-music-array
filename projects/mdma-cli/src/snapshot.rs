@@ -530,14 +530,20 @@ mod tests {
 
     #[test]
     fn building_for_a_log_of_24k_lines_is_quick() {
-        // About the size of the production log: 8 000 tracks of 3 facts each.
+        // About the size of the production log: 8 000 tracks of 3 facts each, with
+        // full-length hashes. The third is a genre, or a play for every other track.
         let log: Vec<String> = (0..8_000)
             .flat_map(|i| {
-                let hash = format!("sha256:{i:08x}");
+                let hash = format!("sha256:{i:08x}{:056}", 0);
+                let third = if i % 2 == 0 {
+                    assert_line(&hash, "MainGenre", &format!("Genre {}", i % 20))
+                } else {
+                    assert_line(&hash, "TrackStarted", "OnRequest")
+                };
                 [
                     assert_line(&hash, "Title", &format!("Track number {i}")),
                     assert_line(&hash, "Artist", &format!("Artist {}", i % 900)),
-                    assert_line(&hash, "MainGenre", &format!("Genre {}", i % 20)),
+                    third,
                 ]
             })
             .collect();
@@ -555,5 +561,14 @@ mod tests {
         assert_eq!(snapshot.artists.len(), 900);
         // A generous bound for an unoptimised test build; the point is "not seconds".
         assert!(total.as_secs() < 10, "fold {folded:?}, total {total:?}");
+
+        // The plays of every track, and the latest of them, as `mdma plays` reads them.
+        let started = std::time::Instant::now();
+        let histories = projection.plays.histories(&projection.tracks);
+        let recent = projection.plays.recent(&projection.tracks, 20);
+        let plays = started.elapsed();
+        assert_eq!(histories.iter().filter(|h| h.count() == 1).count(), 4_000);
+        assert_eq!(recent.len(), 20);
+        assert!(plays.as_secs() < 10, "plays {plays:?}");
     }
 }

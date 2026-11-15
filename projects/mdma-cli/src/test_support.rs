@@ -181,6 +181,13 @@ pub(crate) fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// One line of a fact log, as a replica stores it: an assertion of the JSON `value`
+/// (`{"t": .., "v": ..}`) about `entity` at `time` (RFC 3339).
+pub(crate) fn asserted(entity: &str, value: &str, time: &str) -> String {
+    let source = r#"{"tool":"t","version":"1","origin":{"type":"User"}}"#;
+    format!(r#"["{entity}",{value},"{time}",{source},"Assert"]"#)
+}
+
 /// A track with only its content hash set: everything optional is `None`,
 /// collections are empty. Build variations with `TrackInfo { .., ..track(hash) }`.
 pub(crate) fn track(hash: &str) -> TrackInfo {
