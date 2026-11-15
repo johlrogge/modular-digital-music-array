@@ -6,6 +6,22 @@ The acronym is a nod to electronic music culture. The system exists to keep the 
 
 ---
 
+## Install
+
+Installs `mdma` (CLI) and `mdma-tui` on macOS (arm64) and Linux (x86_64). Needs only curl.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash
+mdma node select   # pick your MDMA node on the network
+mdma ping          # check the node answers
+```
+
+If you installed an old version with cargo, remove it first with `cargo uninstall mdma-cli`. An old `~/.cargo/bin/mdma` would shadow the new one on PATH.
+
+For a specific version or a user-writable install dir, see [Installing on macOS (arm64) and Linux (x86_64)](#installing-on-macos-arm64-and-linux-x86_64). The installer prints shell completion setup for your shell; see also [Help, errors and completions](#help-errors-and-completions).
+
+---
+
 ## What it does
 
 MDMA runs headlessly on a Pi 5 with an NVMe drive. You control it from your laptop over the network.
@@ -254,14 +270,11 @@ Bad argument values are rejected while parsing, before anything connects, with t
 
 ## Installing on macOS (arm64) and Linux (x86_64)
 
-Every `vX.Y.Z` release publishes `mdma-macos-arm64.tar.gz`, `mdma-linux-x86_64.tar.gz` and `SHA256SUMS` as GitHub release assets. The installer needs only `curl`, `tar` and `shasum`/`sha256sum`. It needs no `gh` CLI and no login. It verifies the checksum and installs `mdma` and `mdma-tui` to `/usr/local/bin/` by default.
+Quick install is at the [top](#install). Every `vX.Y.Z` release publishes `mdma-macos-arm64.tar.gz`, `mdma-linux-x86_64.tar.gz` and `SHA256SUMS` as GitHub release assets. The installer needs only `curl`, `tar` and `shasum`/`sha256sum` (no `gh` CLI, no login), verifies the checksum, and installs to `/usr/local/bin/` by default.
 
 ```bash
-# Install the latest release
-curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash
-
 # Install a specific release
-curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash -s v0.38.2
+curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash -s v0.38.3
 
 # Install to a user-writable location (no sudo)
 curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | MDMA_INSTALL_DIR=~/.local/bin bash
@@ -285,6 +298,10 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 ## What's new in 0.38
 
 0.38.1 fixes the portable Linux CLI build, so release tags publish the CLI tarballs again; v0.38.0 has no release assets.
+
+0.38.2 makes the installer suggest `mdma node select` and print shell completion setup.
+
+0.38.3 opens the README with an Install section.
 
 ### A local replica of the fact log, offline completion, play history
 
