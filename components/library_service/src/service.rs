@@ -6,14 +6,23 @@ use crate::identity::{identity_facts_for_blob, IdentityOpts};
 use crate::ipc::{
     bookmark_scope_mark, parse_request, AttributeList, BeatGridInfo, Bpm, ContentHash, CueInfo,
     DurationSeconds, FactType, InboxPath, IngestAllItem, IngestResult, IpcServer, Key,
-    LibraryRequest, LibraryResponse, Mark, MarkFilter, MarkWrite, OrphanInfo, OrphanReason,
-    ProtocolError, ServiceStatus, TrackInfo, TrackQuery, Unmark,
+    LibraryRequest, LibraryResponse, Mark, MarkWrite, OrphanInfo, OrphanReason, ProtocolError,
+    ServiceStatus, TrackInfo, TrackQuery, Unmark,
 };
 use crate::pipeline::InboxFile;
 use crate::sources::{self, LibrarySources, ReleaseVersion};
 use acid_client::AcidClient;
 use event_protocol::{acid_event_from_topic_message, AcidEvent, TOPIC_ACID};
+use library_projection::{
+    ambiguity_message, apply_fact, distinct_retractions, hash_key, is_play_event,
+    is_provenance_tracked, project, remove_cancelled, resolve_prefix, retain_live, retract_matches,
+    try_parse_fact_line, IndexedTrackInfo, MusicFact, PlayLog, Unresolved,
+};
+#[cfg(test)]
+use library_projection::{apply_fact_to_track, blob_path_for, IndexedCue};
 use library_search::{matches_query, TrackFields};
+#[cfg(test)]
+use music_facts::MarkFilter;
 use music_facts::MusicValue;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -91,7 +100,7 @@ pub struct LibraryService {
     /// history is its own plus that of every hash it replaces (ADR-013).
     ///
     /// Lock order: taken after `tracks`, alone or inside it; nothing is taken while holding it.
-    play_events: Mutex<HashMap<String, PlayTimes>>,
+    play_events: Mutex<PlayLog>,
     /// Address of the ACID request socket (used by background subscriber thread).
     acid_socket: String,
     /// Address of the ACID events pub/sub socket.
@@ -223,752 +232,6 @@ impl Drop for ProjectOnDrop<'_> {
     }
 }
 
-/// A single memory cue, hot cue, or loop point stored in the in-memory index.
-///
-/// Stores `kind` as the typed `CueKind` (not a display string) for query-consistency
-/// and correct equality checks during retraction.
-#[derive(Clone, Debug, PartialEq)]
-struct IndexedCue {
-    position_ms: u32,
-    kind: music_facts::CueKind,
-    label: Option<String>,
-    index: Option<u8>,
-}
-
-/// Track info stored in memory for search
-#[derive(Clone)]
-struct IndexedTrackInfo {
-    content_hash: ContentHash,
-    title: Option<String>,
-    artist: Option<String>,
-    album: Option<String>,
-    label: Option<String>,
-    genre: Option<String>,
-    styles: Vec<String>,
-    duration_seconds: Option<u32>,
-    bpm: Option<f32>,
-    key: Option<String>,
-    year: Option<u32>,
-    source: Option<String>,
-    blob_path: PathBuf,
-    cover_art_path: Option<PathBuf>,
-    track_number: Option<u32>,
-    disc_number: Option<u32>,
-    last_started: Option<chrono::DateTime<chrono::Utc>>,
-    last_stopped: Option<chrono::DateTime<chrono::Utc>>,
-    added_at: Option<chrono::DateTime<chrono::Utc>>,
-    item_id: Option<String>,
-    /// Set when a Deleted fact has been asserted (track is hidden).
-    deleted_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// DJ curation role (Opener, BuildUp, Peak, etc.) — typed for query-consistency.
-    role: Option<music_facts::TrackRole>,
-    /// Energy level 1–10
-    energy: Option<music_facts::EnergyLevel>,
-    /// Beat-grid anchor as (first_beat_ms, bpm_f32, beats_per_bar)
-    beat_grid: Option<(u32, f32, u8)>,
-    /// Memory/hot cue and loop points stored as typed structs.
-    memory_cues: Vec<IndexedCue>,
-    /// Per-source provenance: ordered list of (value, source) assertions still live.
-    ///
-    /// Used to correctly handle retractions: Retract(value=V, source=S) removes every
-    /// pair with an equal value and the same source as S (`FactSource::same_source`),
-    /// then the scalar field is re-resolved from whatever remains.
-    /// For multi-valued fields (StyleDescriptor, MemoryCue) each assertion contributes a separate entry.
-    provenance: Vec<(MusicValue, music_facts::FactSource)>,
-    /// Raw FilePath value stored during fact application.
-    ///
-    /// FilePath is excluded from provenance (it never retracts) but the blob_path
-    /// derivation needs the extension.  When content_hash is empty (aggregate_facts
-    /// bulk path) the derivation is deferred; this field holds the path until the
-    /// Phase 3 post-pass calls `derive_blob_path_if_needed`.
-    raw_file_path: Option<PathBuf>,
-}
-
-impl IndexedTrackInfo {
-    /// An entry is live iff it holds at least one tracked assertion. Non-live
-    /// entries (fully retracted, or orphan play events for unknown hashes) are
-    /// dropped by every projection path so such a hash stops resolving (ADR-004).
-    fn is_live(&self) -> bool {
-        !self.provenance.is_empty()
-    }
-
-    /// Whether an assertion of `value` that a retract from `source` would cancel is
-    /// live: an equal value from the same source (the retract rule, ADR-018).
-    fn is_live_from(&self, value: &MusicValue, source: &music_facts::FactSource) -> bool {
-        self.provenance
-            .iter()
-            .any(|(v, s)| retract_matches(v, s, value, source))
-    }
-
-    fn new_empty(entity: String) -> Self {
-        Self {
-            content_hash: ContentHash::new(entity),
-            title: None,
-            artist: None,
-            album: None,
-            label: None,
-            genre: None,
-            styles: vec![],
-            duration_seconds: None,
-            bpm: None,
-            key: None,
-            year: None,
-            source: None,
-            blob_path: PathBuf::new(),
-            cover_art_path: None,
-            track_number: None,
-            disc_number: None,
-            last_started: None,
-            last_stopped: None,
-            added_at: None,
-            item_id: None,
-            deleted_at: None,
-            role: None,
-            energy: None,
-            beat_grid: None,
-            memory_cues: vec![],
-            provenance: Vec::new(),
-            raw_file_path: None,
-        }
-    }
-}
-
-impl Default for IndexedTrackInfo {
-    fn default() -> Self {
-        // Default content_hash is a placeholder; aggregate_facts callers must set it
-        // to the entity key after aggregation.
-        Self::new_empty(String::new())
-    }
-}
-
-/// Derive the blob storage path from a content hash and file path.
-///
-/// Returns `Some(PathBuf)` of the form `blobs/{prefix}/{hash_clean}.{ext}` when
-/// `content_hash` (after stripping the `sha256:` prefix) has at least two characters
-/// and `file_path` has a recognisable extension, otherwise `None`.
-fn blob_path_for(content_hash: &str, file_path: &std::path::Path) -> Option<PathBuf> {
-    let hash_clean = content_hash.strip_prefix("sha256:").unwrap_or(content_hash);
-    if hash_clean.len() < 2 {
-        return None;
-    }
-    let ext = file_path.extension()?.to_str()?;
-    Some(PathBuf::from(format!(
-        "blobs/{}/{}.{}",
-        &hash_clean[..2],
-        hash_clean,
-        ext
-    )))
-}
-
-impl IndexedTrackInfo {
-    /// Every ItemId this track holds. A confirmed merge unions them, so anything that
-    /// matches on an ItemId must use this set, never the last-wins scalar `item_id`
-    /// (which is for display).
-    fn item_ids(&self) -> impl Iterator<Item = &str> {
-        self.provenance.iter().filter_map(|(v, _)| match v {
-            MusicValue::ItemId(id) => Some(id.as_str()),
-            _ => None,
-        })
-    }
-
-    /// Every AudioHash this track holds, as the hash string (version prefix included).
-    fn audio_hashes(&self) -> impl Iterator<Item = &str> {
-        self.provenance.iter().filter_map(|(v, _)| match v {
-            MusicValue::AudioHash(h) => Some(h.as_str()),
-            _ => None,
-        })
-    }
-
-    /// Returns true if this track is hidden from default views.
-    fn is_hidden(&self) -> bool {
-        self.deleted_at.is_some()
-    }
-
-    /// Returns true if this track holds a live mark admitted by `filter`. Reads
-    /// provenance, so a retracted mark no longer counts.
-    fn has_mark(&self, filter: &MarkFilter) -> bool {
-        match filter {
-            MarkFilter::Only(mark) => self.live_marks(mark).next().is_some(),
-            MarkFilter::Any => self
-                .provenance
-                .iter()
-                .filter_map(|(v, _)| v.stored_mark())
-                .any(|m| filter.admits(&m)),
-        }
-    }
-
-    /// The live assertions of `mark` on this track, with their sources. The one
-    /// predicate for "carries this mark live", shared by `write_mark` and `unmark`.
-    fn live_marks<'a>(
-        &'a self,
-        mark: &'a Mark,
-    ) -> impl Iterator<Item = &'a (MusicValue, music_facts::FactSource)> {
-        self.provenance.iter().filter(move |(v, _)| mark.matches(v))
-    }
-
-    /// Derive `blob_path` from `raw_file_path` and `content_hash` if blob_path
-    /// is still empty.
-    ///
-    /// Called in the Phase 3 post-pass of `load_from_acid_stream` after
-    /// `content_hash` has been set from the entity key.  The aggregate_facts
-    /// bulk path initialises entries with an empty content_hash (via Default)
-    /// so the derivation inside `apply_assert_scalar` is skipped; this method
-    /// completes it once the real hash is available.
-    fn derive_blob_path_if_needed(&mut self) {
-        if !self.blob_path.as_os_str().is_empty() {
-            return; // already derived (file/stream paths)
-        }
-        let p = match &self.raw_file_path {
-            Some(p) => p.clone(),
-            None => return,
-        };
-        if let Some(bp) = blob_path_for(self.content_hash.as_str(), &p) {
-            self.blob_path = bp;
-        }
-    }
-}
-
-/// Apply a single `MusicValue` fact (with its source) to a mutable `IndexedTrackInfo`.
-///
-/// ## Assert
-/// Adds `(value, source)` to `entry.provenance`, then updates the corresponding
-/// scalar field via `apply_assert_scalar`.
-///
-/// ## Retract
-/// Removes every `(v, s)` pair from `entry.provenance` where `v == value` and `s` is
-/// the same source as `source` (`FactSource::same_source`: tool and origin kind, not
-/// version or payload), then re-resolves all scalar fields from the surviving
-/// provenance. A retract of a value that is not live, or that only another source
-/// asserted, has no effect (#96, ADR-018).
-///
-/// ## Liveness
-/// An entry whose provenance is empty after a retraction is reset to a pristine
-/// `new_empty` entry, clearing history-dependent state (AddedAt, FilePath,
-/// blob_path, timestamps). Liveness is then purely `!provenance.is_empty()`
-/// (`IndexedTrackInfo::is_live`), independent of how the facts were folded, so
-/// bulk and incremental projections agree.
-fn apply_fact_to_track(
-    entry: &mut IndexedTrackInfo,
-    value: &MusicValue,
-    timestamp: chrono::DateTime<chrono::Utc>,
-    operation: stainless_facts::Operation,
-    source: &music_facts::FactSource,
-) {
-    use stainless_facts::Operation;
-
-    match operation {
-        Operation::Assert => {
-            // Store provenance for value-and-source-identity retraction (ADR-018)
-            // (skip timestamp-only fields)
-            if is_provenance_tracked(value) {
-                entry.provenance.push((value.clone(), source.clone()));
-            }
-            apply_assert_scalar(entry, value, timestamp);
-        }
-        Operation::Retract => {
-            // Remove every assertion with an equal value and the same source.
-            if is_provenance_tracked(value)
-                && !remove_cancelled(&mut entry.provenance, value, source, |(v, s)| (v, s))
-            {
-                // No matching assertion in provenance — retraction has no effect.
-                // This handles the #96 case: Retract(Bpm=120) when only Bpm=128
-                // is asserted finds no match and leaves the field untouched.
-                return;
-            }
-
-            // Re-resolve scalar fields from what remains in provenance.
-            apply_retract_scalar(entry, value);
-
-            // Nothing live remains: forget everything, including untracked state.
-            if entry.provenance.is_empty() {
-                *entry = IndexedTrackInfo::new_empty(entry.content_hash.as_str().to_owned());
-            }
-        }
-    }
-}
-
-/// The one retract-matching rule (ADR-018): remove from `live` every entry whose value
-/// equals `value` and whose source is the same source as `source`
-/// (`FactSource::same_source`). Returns whether anything was removed. `of` reads the
-/// value and source out of an entry, so the in-memory provenance and the ACID replay
-/// (`dedup::live_facts`) share it.
-fn remove_cancelled<T>(
-    live: &mut Vec<T>,
-    value: &MusicValue,
-    source: &music_facts::FactSource,
-    of: impl Fn(&T) -> (&MusicValue, &music_facts::FactSource),
-) -> bool {
-    let before = live.len();
-    live.retain(|e| {
-        let (v, s) = of(e);
-        !retract_matches(v, s, value, source)
-    });
-    live.len() != before
-}
-
-/// Whether a retract of `value` from `source` cancels the assertion `(v, s)`: an equal
-/// value from the same source (`FactSource::same_source`). The one predicate behind
-/// `remove_cancelled`, `distinct_retractions` and `IndexedTrackInfo::is_live_from`.
-fn retract_matches(
-    v: &MusicValue,
-    s: &music_facts::FactSource,
-    value: &MusicValue,
-    source: &music_facts::FactSource,
-) -> bool {
-    v == value && s.same_source(source)
-}
-
-/// One (value, source) per retract to write: assertions with an equal value and the
-/// same source collapse into the first, since a single retract cancels them all.
-/// The retract line carries the first assertion's source (version and payload);
-/// that is fine because matching ignores both (`FactSource::same_source`).
-fn distinct_retractions(
-    live: impl IntoIterator<Item = (MusicValue, music_facts::FactSource)>,
-) -> Vec<(MusicValue, music_facts::FactSource)> {
-    let mut out: Vec<(MusicValue, music_facts::FactSource)> = Vec::new();
-    for (value, source) in live {
-        if !out
-            .iter()
-            .any(|(v, s)| retract_matches(v, s, &value, &source))
-        {
-            out.push((value, source));
-        }
-    }
-    out
-}
-
-/// Whether `value` is a play event: a start or a stop of playback. Play events are
-/// history with identity, so a merge leaves the loser's in the log (ADR-017 §3.9).
-/// The one place to extend when the play tags change.
-fn is_play_event(value: &MusicValue) -> bool {
-    matches!(
-        value,
-        MusicValue::TrackStarted(_) | MusicValue::TrackStopped(_)
-    )
-}
-
-/// Returns true for `MusicValue` variants whose (value, source) pairs are tracked
-/// in `IndexedTrackInfo::provenance` for correct retraction semantics.
-///
-/// Timestamp-only values (TrackStarted, TrackStopped) use a separate most-recent-wins
-/// strategy and are intentionally excluded — retractions for those are not emitted
-/// in production and the timestamp logic is handled elsewhere.
-///
-/// `AddedAt` is excluded too: a retract of it is a no-op (there is no provenance to
-/// fall back to), and only ingest's `now()` ever writes it. Projection is
-/// latest-wins (`apply_assert_scalar`).
-fn is_provenance_tracked(value: &MusicValue) -> bool {
-    !(is_play_event(value) || matches!(value, MusicValue::FilePath(_) | MusicValue::AddedAt(_)))
-}
-
-/// Apply an Assert fact to the scalar fields of `IndexedTrackInfo`.
-fn apply_assert_scalar(
-    entry: &mut IndexedTrackInfo,
-    value: &MusicValue,
-    timestamp: chrono::DateTime<chrono::Utc>,
-) {
-    match value {
-        MusicValue::Title(v) => entry.title = Some(v.as_str().to_string()),
-        MusicValue::Artist(v) => entry.artist = Some(v.as_str().to_string()),
-        MusicValue::Album(v) => entry.album = Some(v.as_str().to_string()),
-        MusicValue::Label(v) => entry.label = Some(v.clone()),
-        MusicValue::MainGenre(v) => entry.genre = Some(v.clone()),
-        MusicValue::StyleDescriptor(v) => push_unique(&mut entry.styles, v.clone()),
-        MusicValue::DurationSeconds(v) => entry.duration_seconds = Some(v.value()),
-        MusicValue::Bpm(v) => entry.bpm = Some(v.as_f32()),
-        MusicValue::Key(v) => entry.key = Some(v.to_string()),
-        MusicValue::Year(v) => entry.year = Some(v.value()),
-        MusicValue::TrackNumber(v) => entry.track_number = Some(v.value()),
-        MusicValue::DiscNumber(v) => entry.disc_number = Some(v.value()),
-        MusicValue::Source(v) => entry.source = Some(v.clone()),
-        MusicValue::TrackStarted(_) => {
-            update_if_more_recent(&mut entry.last_started, timestamp);
-        }
-        MusicValue::TrackStopped(_) => {
-            update_if_more_recent(&mut entry.last_stopped, timestamp);
-        }
-        MusicValue::FilePath(p) => {
-            // Always stash the raw file path for deferred derivation.
-            // When content_hash is already populated (file/stream paths) we can
-            // derive blob_path immediately.  When it is empty (aggregate_facts
-            // bulk path) the helper returns None and the Phase 3 post-pass
-            // calls derive_blob_path_if_needed after content_hash is set.
-            entry.raw_file_path = Some(p.clone());
-            if let Some(bp) = blob_path_for(entry.content_hash.as_str(), p) {
-                entry.blob_path = bp;
-            }
-        }
-        MusicValue::Format(_) => {}
-        MusicValue::CoverArtPath(p) => {
-            entry.cover_art_path = Some(PathBuf::from(p));
-        }
-        // Latest AddedAt value wins (order-independent, so every projection path agrees).
-        MusicValue::AddedAt(dt) => update_if_more_recent(&mut entry.added_at, *dt),
-        MusicValue::ItemId(v) => entry.item_id = Some(v.clone()),
-        MusicValue::Replaces(_) => {
-            // Replaces is stored in provenance only; no scalar field needed.
-            // The new track carries this fact; the old track's facts are retracted separately.
-        }
-        MusicValue::Deleted { timestamp } => {
-            entry.deleted_at = Some(*timestamp);
-        }
-        MusicValue::Role(v) => entry.role = Some(*v),
-        MusicValue::Energy(v) => entry.energy = Some(*v),
-        MusicValue::BeatGrid {
-            first_beat_ms,
-            bpm,
-            beats_per_bar,
-        } => {
-            entry.beat_grid = Some((*first_beat_ms, bpm.as_f32(), *beats_per_bar));
-        }
-        MusicValue::MemoryCue {
-            position_ms,
-            kind,
-            label,
-            index,
-        } => {
-            push_unique(
-                &mut entry.memory_cues,
-                IndexedCue {
-                    position_ms: *position_ms,
-                    kind: kind.clone(),
-                    label: label.clone(),
-                    index: *index,
-                },
-            );
-        }
-        _ => {}
-    }
-}
-
-/// `styles` and `memory_cues` behave as sets: the same value asserted by two sources
-/// (or twice) is held once, in first-assertion order.
-fn push_unique<T: PartialEq>(held: &mut Vec<T>, item: T) {
-    if !held.contains(&item) {
-        held.push(item);
-    }
-}
-
-/// The distinct items, first occurrence kept: what a retract rebuilds a set from.
-fn unique<T: PartialEq>(items: impl IntoIterator<Item = T>) -> Vec<T> {
-    let mut out = Vec::new();
-    for item in items {
-        push_unique(&mut out, item);
-    }
-    out
-}
-
-/// Re-resolve a single scalar field after removing a provenance entry.
-///
-/// For fields that map to a scalar `Option<T>`, we scan the remaining provenance
-/// for the last (most recent) assertion of the same variant and re-set the scalar.
-/// For multi-valued fields (`StyleDescriptor`) we rebuild the Vec from scratch.
-///
-/// Fields not tracked in provenance (TrackStarted/Stopped, FilePath, AddedAt) are
-/// left unchanged — their retraction is either a no-op or handled separately.
-fn apply_retract_scalar(entry: &mut IndexedTrackInfo, retracted: &MusicValue) {
-    // Helper: find last surviving value for a given variant discriminant.
-    // Returns a clone of the last provenance entry whose variant matches `matcher`.
-    let last_surviving = |provenance: &[(MusicValue, music_facts::FactSource)],
-                          matcher: &dyn Fn(&MusicValue) -> bool|
-     -> Option<MusicValue> {
-        provenance
-            .iter()
-            .filter(|(v, _)| matcher(v))
-            .last()
-            .map(|(v, _)| v.clone())
-    };
-
-    match retracted {
-        MusicValue::Title(_) => {
-            entry.title = last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Title(_)))
-                .and_then(|v| {
-                    if let MusicValue::Title(t) = v {
-                        Some(t.as_str().to_string())
-                    } else {
-                        None
-                    }
-                });
-        }
-        MusicValue::Artist(_) => {
-            entry.artist =
-                last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Artist(_)))
-                    .and_then(|v| {
-                        if let MusicValue::Artist(a) = v {
-                            Some(a.as_str().to_string())
-                        } else {
-                            None
-                        }
-                    });
-        }
-        MusicValue::Album(_) => {
-            entry.album = last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Album(_)))
-                .and_then(|v| {
-                    if let MusicValue::Album(a) = v {
-                        Some(a.as_str().to_string())
-                    } else {
-                        None
-                    }
-                });
-        }
-        MusicValue::Label(_) => {
-            entry.label = last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Label(_)))
-                .and_then(|v| {
-                    if let MusicValue::Label(l) = v {
-                        Some(l.clone())
-                    } else {
-                        None
-                    }
-                });
-        }
-        MusicValue::MainGenre(_) => {
-            entry.genre = last_surviving(&entry.provenance, &|v| {
-                matches!(v, MusicValue::MainGenre(_))
-            })
-            .and_then(|v| {
-                if let MusicValue::MainGenre(g) = v {
-                    Some(g.clone())
-                } else {
-                    None
-                }
-            });
-        }
-        MusicValue::StyleDescriptor(_) => {
-            // Rebuild the styles set from surviving provenance
-            entry.styles = unique(entry.provenance.iter().filter_map(|(v, _)| {
-                if let MusicValue::StyleDescriptor(s) = v {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            }));
-        }
-        MusicValue::DurationSeconds(_) => {
-            entry.duration_seconds = last_surviving(&entry.provenance, &|v| {
-                matches!(v, MusicValue::DurationSeconds(_))
-            })
-            .and_then(|v| {
-                if let MusicValue::DurationSeconds(d) = v {
-                    Some(d.value())
-                } else {
-                    None
-                }
-            });
-        }
-        MusicValue::Bpm(_) => {
-            entry.bpm = last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Bpm(_)))
-                .and_then(|v| {
-                    if let MusicValue::Bpm(b) = v {
-                        Some(b.as_f32())
-                    } else {
-                        None
-                    }
-                });
-        }
-        MusicValue::Key(_) => {
-            entry.key = last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Key(_)))
-                .and_then(|v| {
-                    if let MusicValue::Key(k) = v {
-                        Some(k.to_string())
-                    } else {
-                        None
-                    }
-                });
-        }
-        MusicValue::Year(_) => {
-            entry.year = last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Year(_)))
-                .and_then(|v| {
-                    if let MusicValue::Year(y) = v {
-                        Some(y.value())
-                    } else {
-                        None
-                    }
-                });
-        }
-        MusicValue::TrackNumber(_) => {
-            entry.track_number = last_surviving(&entry.provenance, &|v| {
-                matches!(v, MusicValue::TrackNumber(_))
-            })
-            .and_then(|v| {
-                if let MusicValue::TrackNumber(n) = v {
-                    Some(n.value())
-                } else {
-                    None
-                }
-            });
-        }
-        MusicValue::DiscNumber(_) => {
-            entry.disc_number = last_surviving(&entry.provenance, &|v| {
-                matches!(v, MusicValue::DiscNumber(_))
-            })
-            .and_then(|v| {
-                if let MusicValue::DiscNumber(n) = v {
-                    Some(n.value())
-                } else {
-                    None
-                }
-            });
-        }
-        MusicValue::Source(_) => {
-            entry.source =
-                last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Source(_)))
-                    .and_then(|v| {
-                        if let MusicValue::Source(s) = v {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    });
-        }
-        MusicValue::CoverArtPath(_) => {
-            let surviving = last_surviving(&entry.provenance, &|v| {
-                matches!(v, MusicValue::CoverArtPath(_))
-            });
-            match surviving {
-                Some(MusicValue::CoverArtPath(p)) => {
-                    entry.cover_art_path = Some(PathBuf::from(&p));
-                }
-                _ => entry.cover_art_path = None,
-            }
-        }
-        MusicValue::Format(_) => {}
-        MusicValue::ItemId(_) => {
-            entry.item_id =
-                last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::ItemId(_)))
-                    .and_then(|v| {
-                        if let MusicValue::ItemId(id) = v {
-                            Some(id.clone())
-                        } else {
-                            None
-                        }
-                    });
-        }
-        MusicValue::Replaces(_) => {
-            // No scalar field for Replaces; provenance removal is sufficient.
-        }
-        MusicValue::Deleted { .. } => {
-            let surviving = last_surviving(&entry.provenance, &|v| {
-                matches!(v, MusicValue::Deleted { .. })
-            });
-            entry.deleted_at = match surviving {
-                Some(MusicValue::Deleted { timestamp }) => Some(timestamp),
-                _ => None,
-            };
-        }
-        MusicValue::Role(_) => {
-            entry.role = last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Role(_)))
-                .and_then(|v| {
-                    if let MusicValue::Role(r) = v {
-                        Some(r)
-                    } else {
-                        None
-                    }
-                });
-        }
-        MusicValue::Energy(_) => {
-            entry.energy =
-                last_surviving(&entry.provenance, &|v| matches!(v, MusicValue::Energy(_)))
-                    .and_then(|v| {
-                        if let MusicValue::Energy(e) = v {
-                            Some(e)
-                        } else {
-                            None
-                        }
-                    });
-        }
-        MusicValue::BeatGrid { .. } => {
-            entry.beat_grid = last_surviving(&entry.provenance, &|v| {
-                matches!(v, MusicValue::BeatGrid { .. })
-            })
-            .and_then(|v| {
-                if let MusicValue::BeatGrid {
-                    first_beat_ms,
-                    bpm,
-                    beats_per_bar,
-                } = v
-                {
-                    Some((first_beat_ms, bpm.as_f32(), beats_per_bar))
-                } else {
-                    None
-                }
-            });
-        }
-        MusicValue::MemoryCue { .. } => {
-            // Rebuild the full memory_cues Vec from surviving provenance,
-            // mirroring the StyleDescriptor retraction pattern.
-            entry.memory_cues = unique(entry.provenance.iter().filter_map(|(v, _)| {
-                if let MusicValue::MemoryCue {
-                    position_ms,
-                    kind,
-                    label,
-                    index,
-                } = v
-                {
-                    Some(IndexedCue {
-                        position_ms: *position_ms,
-                        kind: kind.clone(),
-                        label: label.clone(),
-                        index: *index,
-                    })
-                } else {
-                    None
-                }
-            }));
-        }
-        // TrackStarted/TrackStopped/FilePath/AddedAt retractions are not
-        // emitted in the current codebase; ignore silently.
-        _ => {}
-    }
-}
-
-/// Implement `FactAggregator` so `stainless_facts::aggregate_facts` can drive
-/// the three fold paths (bulk load, file load, incremental stream).
-impl stainless_facts::FactAggregator<ContentHash, MusicValue, music_facts::FactSource>
-    for IndexedTrackInfo
-{
-    fn assert(&mut self, value: &MusicValue, source: &music_facts::FactSource) {
-        // TrackStarted/TrackStopped carry their real timestamp on the Fact struct,
-        // but the FactAggregator trait only receives the value and source — the
-        // timestamp is not available here. We must not populate last_started /
-        // last_stopped with a bootstrap wall-clock placeholder, because
-        // `refresh_event_timestamps` is the sole authoritative path for those
-        // fields. Skip them here entirely; they will be set on the first
-        // date-filtered search after bootstrap.
-        if matches!(
-            value,
-            MusicValue::TrackStarted(_) | MusicValue::TrackStopped(_)
-        ) {
-            return;
-        }
-        apply_fact_to_track(
-            self,
-            value,
-            chrono::Utc::now(), // timestamp unused for all non-timestamp fields
-            stainless_facts::Operation::Assert,
-            source,
-        );
-    }
-
-    fn retract(&mut self, value: &MusicValue, source: &music_facts::FactSource) {
-        // TrackStarted/TrackStopped retractions are not emitted in production;
-        // and refresh_event_timestamps handles these fields authoritatively.
-        // Skip to keep parity with assert.
-        if matches!(
-            value,
-            MusicValue::TrackStarted(_) | MusicValue::TrackStopped(_)
-        ) {
-            return;
-        }
-        apply_fact_to_track(
-            self,
-            value,
-            chrono::Utc::now(),
-            stainless_facts::Operation::Retract,
-            source,
-        );
-    }
-}
-
 /// Result of loading tracks from the fact stream
 struct LoadResult {
     tracks: Vec<IndexedTrackInfo>,
@@ -983,27 +246,11 @@ struct LoadResult {
     has_cover_art: HashSet<String>,
 }
 
-fn update_if_more_recent(
-    slot: &mut Option<chrono::DateTime<chrono::Utc>>,
-    ts: chrono::DateTime<chrono::Utc>,
-) {
-    if slot.is_none_or(|existing| ts > existing) {
-        *slot = Some(ts);
-    }
-}
-
-/// Normalised form of a content hash for comparisons: no `sha256:` prefix, lowercase.
-fn hash_key(h: &str) -> String {
-    h.strip_prefix("sha256:").unwrap_or(h).to_lowercase()
-}
-
 /// One line of a fact stream, or `None` for a line that is not a fact. Never dropped
 /// silently: a line this library cannot read (written by a newer one, say) is a fact
 /// it does not see.
-fn parse_fact_line(
-    line: &str,
-) -> Option<stainless_facts::Fact<ContentHash, MusicValue, music_facts::FactSource>> {
-    match serde_json::from_str(line) {
+fn parse_fact_line(line: &str) -> Option<MusicFact> {
+    match try_parse_fact_line(line) {
         Ok(fact) => Some(fact),
         Err(e) => {
             tracing::debug!(error = %e, "Skipping a fact-log line that does not parse");
@@ -1015,24 +262,14 @@ fn parse_fact_line(
 /// Every fact among `lines`, and the number of lines that are not facts. Does not warn
 /// about the count: a caller that parses in pages warns once for all of them with
 /// `warn_unparseable`.
-fn parse_fact_lines_quietly(
-    lines: &[String],
-) -> (
-    Vec<stainless_facts::Fact<ContentHash, MusicValue, music_facts::FactSource>>,
-    usize,
-) {
+fn parse_fact_lines_quietly(lines: &[String]) -> (Vec<MusicFact>, usize) {
     let facts: Vec<_> = lines.iter().filter_map(|l| parse_fact_line(l)).collect();
     let unparseable = lines.len() - facts.len();
     (facts, unparseable)
 }
 
 /// [`parse_fact_lines_quietly`], warning about the count of lines that did not parse.
-fn parse_fact_lines(
-    lines: &[String],
-) -> (
-    Vec<stainless_facts::Fact<ContentHash, MusicValue, music_facts::FactSource>>,
-    usize,
-) {
+fn parse_fact_lines(lines: &[String]) -> (Vec<MusicFact>, usize) {
     let (facts, unparseable) = parse_fact_lines_quietly(lines);
     warn_unparseable(unparseable);
     (facts, unparseable)
@@ -1043,68 +280,6 @@ fn warn_unparseable(count: usize) {
     if count > 0 {
         tracing::warn!(count, "Fact-log lines skipped because they do not parse");
     }
-}
-
-/// Latest start and stop recorded under one entity key.
-#[derive(Clone, Copy, Default)]
-struct PlayTimes {
-    started: Option<chrono::DateTime<chrono::Utc>>,
-    stopped: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-/// `key` followed by every hash it transitively replaces. `replaces` maps a live
-/// track's key to the keys it replaces; a cycle ends the walk.
-fn replaces_lineage(key: &str, replaces: &HashMap<String, Vec<String>>) -> Vec<String> {
-    let mut seen = vec![key.to_owned()];
-    let mut queue = vec![key.to_owned()];
-    while let Some(k) = queue.pop() {
-        for replaced in replaces.get(&k).into_iter().flatten() {
-            if !seen.contains(replaced) {
-                seen.push(replaced.clone());
-                queue.push(replaced.clone());
-            }
-        }
-    }
-    seen
-}
-
-/// The shortest key length that is a full hash, not one of the short forms.
-const SHORT_KEY_MAX: usize = 12;
-
-/// For every 8- and 12-character prefix, how many of `full_keys` start with it.
-fn short_prefix_counts<'a>(full_keys: impl Iterator<Item = &'a str>) -> HashMap<&'a str, usize> {
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for key in full_keys.filter(|k| k.len() > SHORT_KEY_MAX) {
-        for prefix in [key.get(..8), key.get(..12)].into_iter().flatten() {
-            *counts.entry(prefix).or_default() += 1;
-        }
-    }
-    counts
-}
-
-/// The play events recorded for `key`: under the full hash, and under the 12- and
-/// 8-character short forms older playback wrote (#86). A short form counts only when
-/// `key` is the single full key it is a prefix of (`prefix_counts`), the same rule
-/// `resolve_hash` applies: an ambiguous short key belongs to nobody.
-fn play_times_for<'a>(
-    events: &'a HashMap<String, PlayTimes>,
-    key: &str,
-    prefix_counts: &HashMap<&str, usize>,
-) -> Vec<&'a PlayTimes> {
-    let shorts = if key.len() > SHORT_KEY_MAX {
-        [key.get(..12), key.get(..8)]
-    } else {
-        [None, None]
-    };
-    std::iter::once(key)
-        .chain(
-            shorts
-                .into_iter()
-                .flatten()
-                .filter(|k| prefix_counts.get(k) == Some(&1)),
-        )
-        .filter_map(|k| events.get(k))
-        .collect()
 }
 
 /// Wrap an ACID client failure as a protocol-level internal error.
@@ -1174,7 +349,7 @@ impl LibraryService {
             content_hashes: Mutex::new(loaded.content_hashes),
             cursor: Mutex::new(final_cursor),
             event_cursor: Mutex::new(None),
-            play_events: Mutex::new(HashMap::new()),
+            play_events: Mutex::new(PlayLog::default()),
             acid_socket: acid_socket.to_string(),
             acid_events_socket: acid_events_socket.to_string(),
             self_ref: self_ref.clone(),
@@ -1217,12 +392,10 @@ impl LibraryService {
         acid_client: &AcidClient,
         start_cursor: Option<String>,
     ) -> Result<(LoadResult, Option<String>), ServiceError> {
-        use stainless_facts::{aggregate_facts, Fact};
-
         const PAGE_SIZE: usize = 10_000;
 
         // Phase 1: collect all raw fact lines from ACID (paged reads)
-        let mut all_facts: Vec<Fact<ContentHash, MusicValue, music_facts::FactSource>> = Vec::new();
+        let mut all_facts: Vec<MusicFact> = Vec::new();
         let mut total = 0usize;
         let mut unparseable = 0usize;
         let mut current_cursor = start_cursor;
@@ -1260,56 +433,16 @@ impl LibraryService {
             tracing::info!("Loaded {} facts from ACID stream", total);
         }
 
-        // Phase 2: single fold via aggregate_facts
-        let mut aggregated: HashMap<ContentHash, IndexedTrackInfo> = aggregate_facts(all_facts);
-
-        // Non-live entities are dropped, exactly as the incremental projection's
-        // sweep (`drop_non_live`) drops them, so a hard-retracted hash stops
-        // resolving after a restart too (ADR-004).
-        aggregated.retain(|_, entry| entry.is_live());
-
-        // Phase 3: post-pass — fix content_hash and build side-effect indexes
-        let mut fact_index: HashMap<FactType, HashSet<String>> = HashMap::new();
-        let mut has_format: HashSet<String> = HashSet::new();
-        let mut has_cover_art: HashSet<String> = HashSet::new();
-
-        for (entity, entry) in &mut aggregated {
-            entry.content_hash = entity.clone();
-
-            // Re-derive blob_path now that content_hash is set.  During aggregation
-            // the content_hash was empty (Default), so the FilePath arm in
-            // apply_assert_scalar could not compute the path.
-            entry.derive_blob_path_if_needed();
-
-            for (value, _source) in &entry.provenance {
-                fact_index
-                    .entry(FactType::new(value.display_name()))
-                    .or_default()
-                    .insert(value.to_string());
-            }
-
-            if entry
-                .provenance
-                .iter()
-                .any(|(v, _)| matches!(v, MusicValue::Format(_)))
-            {
-                has_format.insert(entity.as_str().to_owned());
-            }
-            if entry.cover_art_path.is_some() {
-                has_cover_art.insert(entity.as_str().to_owned());
-            }
-        }
-
-        let content_hashes: HashSet<String> =
-            aggregated.keys().map(|k| k.as_str().to_owned()).collect();
+        // Phase 2: the pure bulk fold (library-projection)
+        let projection = project(all_facts);
         let loaded = LoadResult {
-            tracks: aggregated.into_values().collect(),
+            tracks: projection.tracks,
             facts_count: total,
             unparseable_lines: unparseable,
-            fact_index,
-            content_hashes,
-            has_format,
-            has_cover_art,
+            fact_index: projection.fact_index,
+            content_hashes: projection.content_hashes,
+            has_format: projection.has_format,
+            has_cover_art: projection.has_cover_art,
         };
         Ok((loaded, final_cursor))
     }
@@ -1443,9 +576,10 @@ impl LibraryService {
 
         let tracks = self.tracks.lock().unwrap();
 
-        // Find tracks needing backfill
+        // Find tracks needing backfill; a track a `Replaces` retired gets nothing.
         let needs_backfill: Vec<_> = tracks
             .iter()
+            .filter(|t| !t.is_retired())
             .filter(|t| !has_format.contains(t.content_hash.as_str()))
             .filter(|t| !t.blob_path.as_os_str().is_empty())
             .filter_map(|t| {
@@ -1559,9 +693,11 @@ impl LibraryService {
     fn backfill_cover_art(&self, has_cover_art: &HashSet<String>) -> usize {
         let tracks = self.tracks.lock().unwrap();
 
-        // Collect tracks that need backfill: have a blob_path but no CoverArtPath fact
+        // Collect tracks that need backfill: have a blob_path but no CoverArtPath fact,
+        // and are not retired by a `Replaces`
         let needs_backfill: Vec<_> = tracks
             .iter()
+            .filter(|t| !t.is_retired())
             .filter(|t| !has_cover_art.contains(t.content_hash.as_str()))
             .filter(|t| !t.blob_path.as_os_str().is_empty())
             .map(|t| (t.content_hash.clone(), t.blob_path.clone()))
@@ -1644,62 +780,16 @@ impl LibraryService {
             .map(|(i, t)| (t.content_hash.as_str().to_owned(), i))
             .collect();
 
-        for fact in facts {
-            let entity = fact.entity().as_str().to_owned();
-            let is_retract = fact.operation() == stainless_facts::Operation::Retract;
-
-            // Insert or fetch the track entry using the O(1) index.
-            // A Retract never creates an entry: retracting an unknown (or already
-            // dropped) entity is a no-op, otherwise replaying the retract lines of
-            // a removed entity would resurrect it as an empty ghost (ADR-004).
-            let pos = if let Some(&pos) = index.get(&entity) {
-                pos
-            } else if is_retract {
-                continue;
-            } else {
-                content_hashes.insert(entity.clone());
-                let pos = tracks.len();
-                tracks.push(IndexedTrackInfo::new_empty(entity.clone()));
-                index.insert(entity.clone(), pos);
-                pos
-            };
-
-            let variant_name = fact.value().display_name();
-            let value_str = fact.value().to_string();
-            let fact_type = FactType::new(variant_name);
-
-            // Apply to track fields first (updates provenance)
-            let entry = &mut tracks[pos];
-            apply_fact_to_track(
-                entry,
-                fact.value(),
-                *fact.timestamp(),
-                fact.operation(),
-                fact.source(),
+        // The per-fact fold is the projection component's; this method only owns
+        // the locks.
+        for fact in &facts {
+            apply_fact(
+                &mut tracks,
+                &mut index,
+                &mut content_hashes,
+                &mut fact_index,
+                fact,
             );
-
-            // fact_index mirrors provenance (like the bulk path): untracked values
-            // (FilePath, AddedAt, play events) are never indexed.
-            if !is_provenance_tracked(fact.value()) {
-                continue;
-            }
-            match fact.operation() {
-                stainless_facts::Operation::Assert => {
-                    fact_index.entry(fact_type).or_default().insert(value_str);
-                }
-                stainless_facts::Operation::Retract => {
-                    // Remove from fact_index only when no entity still asserts this
-                    // value (the current entry has already been updated above).
-                    let still_asserted = tracks
-                        .iter()
-                        .any(|t| t.provenance.iter().any(|(v, _)| v.to_string() == value_str));
-                    if !still_asserted {
-                        if let Some(set) = fact_index.get_mut(&fact_type) {
-                            set.remove(&value_str);
-                        }
-                    }
-                }
-            }
         }
 
         // The single place where the counters are settled: every projection of
@@ -1717,13 +807,7 @@ impl LibraryService {
     fn drop_non_live(&self) {
         let mut tracks = self.tracks.lock().unwrap();
         let mut content_hashes = self.content_hashes.lock().unwrap();
-        tracks.retain(|t| {
-            let live = t.is_live();
-            if !live {
-                content_hashes.remove(t.content_hash.as_str());
-            }
-            live
-        });
+        retain_live(&mut tracks, &mut content_hashes);
         self.tracks_indexed.store(tracks.len(), Ordering::Relaxed);
     }
 
@@ -2601,6 +1685,22 @@ impl LibraryService {
                 }
             }
 
+            // A winner that a `Replaces` retired is a ghost: nothing may be written onto it.
+            let winner_key = hash_key(winner.as_str());
+            let winner_retired = self
+                .tracks
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|t| t.is_retired() && hash_key(t.content_hash.as_str()) == winner_key);
+            if winner_retired {
+                return Err(ProtocolError::Internal {
+                    message: format!(
+                        "{winner} is retired by an unfinished merge; run mdma library dedup --apply"
+                    ),
+                });
+            }
+
             // Playlists pointing at any generation of the chain must find the winner.
             let ancestors = self.ancestor_replaces(loser);
             let retired = self.retired_files(loser);
@@ -2642,6 +1742,20 @@ impl LibraryService {
     ) -> Result<(), ProtocolError> {
         let mut seen: HashSet<String> = HashSet::new();
         seen.insert(hash_key(winner.as_str()));
+        // An ancestor that is a live track now was ingested again after its own merge:
+        // it is not replaced by the winner, so the winner must not claim it (and the
+        // projection would otherwise retire it). A retired ancestor is still replaced.
+        let ancestors: Vec<_> = {
+            let tracks = self.tracks.lock().unwrap();
+            ancestors
+                .into_iter()
+                .filter(|(a, _)| {
+                    !tracks.iter().any(|t| {
+                        !t.is_retired() && hash_key(t.content_hash.as_str()) == hash_key(a.as_str())
+                    })
+                })
+                .collect()
+        };
         {
             let tracks = self.tracks.lock().unwrap();
             if let Some(entry) = tracks
@@ -3075,81 +2189,15 @@ impl LibraryService {
 
     /// Resolve a partial hash to a full hash (like git short refs)
     fn resolve_hash(&self, partial: &ContentHash) -> Result<ContentHash, ProtocolError> {
-        let normalize = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
-        let partial_clean = normalize(partial.as_str());
-
         let tracks = self.tracks.lock().unwrap();
-        let matches: Vec<_> = tracks
-            .iter()
-            .filter(|t| {
-                let hash = t
-                    .content_hash
-                    .as_str()
-                    .strip_prefix("sha256:")
-                    .unwrap_or(t.content_hash.as_str());
-                hash.to_lowercase().starts_with(&partial_clean)
-            })
-            .collect();
-
-        match matches.len() {
-            0 => Err(ProtocolError::TrackNotFound {
+        match resolve_prefix(&tracks, partial.as_str()) {
+            Ok(track) => Ok(track.content_hash.clone()),
+            Err(Unresolved::NotFound) => Err(ProtocolError::TrackNotFound {
                 hash: partial.as_str().to_owned(),
             }),
-            1 => Ok(matches[0].content_hash.clone()),
-            _ => {
-                // Multiple matches: check whether all share the exact same hash
-                // value. If so, they are duplicate index entries for the same
-                // content (e.g. legacy short hashes written more than once) and
-                // resolving to the first one is correct.
-                // Normalize by stripping "sha256:" prefix and lowercasing so that
-                // a legacy short-hash entry ("9fb4105e") and a full-hash entry
-                // ("sha256:9fb4105eXXX...") are recognised as the same content:
-                // both normalize to the same prefix, so one starts_with the other.
-                let normalized: Vec<String> = matches
-                    .iter()
-                    .map(|t| normalize(t.content_hash.as_str()))
-                    .collect();
-                // All entries represent the same content if every pair of
-                // normalized hashes has one that is a prefix of the other
-                // (i.e. short legacy hash vs full hash of the same file).
-                let all_same = normalized.iter().all(|a| {
-                    normalized
-                        .iter()
-                        .all(|b| a.starts_with(b.as_str()) || b.starts_with(a.as_str()))
-                });
-                if all_same {
-                    // Prefer the entry with the longest (most complete) hash,
-                    // so a full "sha256:..." hash wins over a legacy 8-char hash.
-                    let best = matches
-                        .iter()
-                        .max_by_key(|t| t.content_hash.as_str().len())
-                        .unwrap();
-                    return Ok(best.content_hash.clone());
-                }
-
-                // Genuinely different hashes share a prefix — real ambiguity.
-                let n = matches.len();
-                let examples: Vec<_> = matches
-                    .iter()
-                    .take(3)
-                    .map(|t| {
-                        let hash_str = t.content_hash.as_str();
-                        // Show 8 chars after "sha256:" prefix; fall back to full string for
-                        // legacy short hashes that lack the prefix.
-                        let short = hash_str.get(7..15).unwrap_or(hash_str);
-                        let name = t.title.as_deref().unwrap_or("Unknown");
-                        format!("  {} ({})", short, name)
-                    })
-                    .collect();
-                Err(ProtocolError::Internal {
-                    message: format!(
-                        "Ambiguous hash '{}' matches {} tracks:\n{}",
-                        partial.as_str(),
-                        n,
-                        examples.join("\n")
-                    ),
-                })
-            }
+            Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::Internal {
+                message: ambiguity_message(partial.as_str(), &found),
+            }),
         }
     }
 
@@ -3241,7 +2289,7 @@ impl LibraryService {
         let mut current_cursor = event_cursor.clone();
 
         // The play events since the last refresh, per normalised entity key.
-        let mut delta: HashMap<String, PlayTimes> = HashMap::new();
+        let mut delta = PlayLog::default();
 
         loop {
             let chunk = match self
@@ -3259,22 +2307,8 @@ impl LibraryService {
             };
 
             for line in &chunk.lines {
-                let Some(fact) = parse_fact_line(line) else {
-                    continue;
-                };
-
-                if fact.operation() != stainless_facts::Operation::Assert {
-                    continue;
-                }
-                let times = delta.entry(hash_key(fact.entity().as_str()));
-                match fact.value() {
-                    MusicValue::TrackStarted(_) => {
-                        update_if_more_recent(&mut times.or_default().started, *fact.timestamp());
-                    }
-                    MusicValue::TrackStopped(_) => {
-                        update_if_more_recent(&mut times.or_default().stopped, *fact.timestamp());
-                    }
-                    _ => {}
+                if let Some(fact) = parse_fact_line(line) {
+                    delta.record(&fact);
                 }
             }
 
@@ -3290,56 +2324,10 @@ impl LibraryService {
 
         let mut tracks = self.tracks.lock().unwrap();
         let mut events = self.play_events.lock().unwrap();
-        for (key, new) in delta {
-            let seen = events.entry(key).or_default();
-            if let Some(ts) = new.started {
-                update_if_more_recent(&mut seen.started, ts);
-            }
-            if let Some(ts) = new.stopped {
-                update_if_more_recent(&mut seen.stopped, ts);
-            }
-        }
+        events.merge(delta);
 
         // Apply each track's lineage (itself and what it replaces) to the index.
-        let replaces: HashMap<String, Vec<String>> = tracks
-            .iter()
-            .map(|t| {
-                let replaced = t
-                    .provenance
-                    .iter()
-                    .filter_map(|(v, _)| match v {
-                        MusicValue::Replaces(h) => Some(hash_key(h.as_str())),
-                        _ => None,
-                    })
-                    .collect();
-                (hash_key(t.content_hash.as_str()), replaced)
-            })
-            .collect();
-        // A short key is resolved only when exactly one full key (live track, replaced
-        // hash or full-length event key) starts with it.
-        let prefix_counts = short_prefix_counts(
-            replaces
-                .keys()
-                .chain(replaces.values().flatten())
-                .chain(events.keys())
-                .map(String::as_str)
-                .collect::<HashSet<_>>()
-                .into_iter(),
-        );
-        for track in tracks.iter_mut() {
-            let lineage = replaces_lineage(&hash_key(track.content_hash.as_str()), &replaces);
-            for times in lineage
-                .iter()
-                .flat_map(|key| play_times_for(&events, key, &prefix_counts))
-            {
-                if let Some(ts) = times.started {
-                    update_if_more_recent(&mut track.last_started, ts);
-                }
-                if let Some(ts) = times.stopped {
-                    update_if_more_recent(&mut track.last_stopped, ts);
-                }
-            }
-        }
+        events.apply_to(&mut tracks);
     }
 
     /// Search tracks by structured query (uses library-search for evaluation; hidden tracks excluded)
@@ -6801,82 +5789,6 @@ mod tests {
     // =========================================================================
     // Track lifecycle tests
     // =========================================================================
-
-    /// apply_fact_to_track stores Replaces in provenance without hiding the track.
-    #[test]
-    fn apply_fact_to_track_stores_replaces_in_provenance() {
-        let hash = ContentHash::new("sha256:new");
-        let old_hash = ContentHash::new("sha256:old");
-        let mut entry = IndexedTrackInfo::new_empty(hash.as_str().to_owned());
-        let ts = chrono::Utc::now();
-        let fact = MusicValue::Replaces(old_hash.clone());
-        let source = FactSource::new("test", "1.0.0", "Unknown");
-        apply_fact_to_track(
-            &mut entry,
-            &fact,
-            ts,
-            stainless_facts::Operation::Assert,
-            &source,
-        );
-        // Replaces is stored in provenance
-        assert!(
-            entry
-                .provenance
-                .iter()
-                .any(|(v, _)| matches!(v, MusicValue::Replaces(_))),
-            "Replaces fact must be stored in provenance"
-        );
-        // The new track is NOT hidden — it is visible, the old track's facts are retracted
-        assert!(
-            !entry.is_hidden(),
-            "new track must not be hidden after Replaces fact"
-        );
-    }
-
-    #[test]
-    fn apply_fact_to_track_sets_deleted_at() {
-        let hash = ContentHash::new("sha256:toDelete");
-        let mut entry = IndexedTrackInfo::new_empty(hash.as_str().to_owned());
-        let ts = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
-        let fact = MusicValue::Deleted { timestamp: ts };
-        let source = FactSource::new("test", "1.0.0", "Unknown");
-        apply_fact_to_track(
-            &mut entry,
-            &fact,
-            ts,
-            stainless_facts::Operation::Assert,
-            &source,
-        );
-        assert_eq!(entry.deleted_at, Some(ts));
-        assert!(entry.is_hidden());
-    }
-
-    #[test]
-    fn apply_fact_to_track_retract_clears_deleted_at() {
-        let hash = ContentHash::new("sha256:restore");
-        let mut entry = IndexedTrackInfo::new_empty(hash.as_str().to_owned());
-        let ts = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
-        let fact = MusicValue::Deleted { timestamp: ts };
-        let source = FactSource::new("test", "1.0.0", "Unknown");
-        // Assert then retract
-        apply_fact_to_track(
-            &mut entry,
-            &fact,
-            ts,
-            stainless_facts::Operation::Assert,
-            &source,
-        );
-        assert!(entry.is_hidden());
-        apply_fact_to_track(
-            &mut entry,
-            &fact,
-            ts,
-            stainless_facts::Operation::Retract,
-            &source,
-        );
-        assert!(!entry.is_hidden());
-        assert_eq!(entry.deleted_at, None);
-    }
 
     /// list_tracks excludes hidden (deleted) tracks.
     #[test]

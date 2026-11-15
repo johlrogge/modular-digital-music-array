@@ -562,6 +562,7 @@ impl LibraryService {
                 LibraryResponse::DedupScan(library_ipc_protocol::DedupScanReport {
                     groups: vec![],
                     applied: apply.then(library_ipc_protocol::DedupApplyReport::default),
+                    unfinished: vec![],
                 })
             }
 

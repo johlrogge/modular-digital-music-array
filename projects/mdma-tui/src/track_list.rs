@@ -1,5 +1,5 @@
 use crate::selection::SelectionState;
-use crate::theme::{ACCENT2, BG_ELEVATED, TEXT_PRIMARY, TEXT_TERTIARY, WARNING};
+use crate::theme::{RowState, ACCENT2, SELECTED_FG, SELECTION_FG, TEXT_PRIMARY, TEXT_TERTIARY};
 use corsett::{
     shortener::{FreeText, RightEllipsis},
     ColumnSizingConfigBuilder, RemovalPolicy, Row, Score, Shorten, ShortenAny,
@@ -7,7 +7,7 @@ use corsett::{
 use mdma_client::TrackInfo;
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, List, ListItem},
     Frame,
@@ -288,14 +288,14 @@ pub fn render_track_list(
                 let is_cursor = selection.cursor_position() == Some(vis_idx);
                 let is_selected = selection.selected.contains(&vis_idx);
 
-                let (artist_color, title_color, meta_color, bg) = if is_cursor && is_selected {
-                    (Color::Black, Color::Black, Color::Black, WARNING)
-                } else if is_cursor {
-                    (Color::Black, Color::Black, Color::Black, ACCENT2)
-                } else if is_selected {
-                    (WARNING, WARNING, TEXT_TERTIARY, Color::Reset)
-                } else {
-                    (ACCENT2, TEXT_PRIMARY, TEXT_TERTIARY, Color::Reset)
+                let state = RowState::from_flags(is_cursor, is_selected);
+                let bg = state.bg();
+                let (artist_color, title_color, meta_color) = match state {
+                    RowState::Cursor | RowState::CursorSelected => {
+                        (SELECTION_FG, SELECTION_FG, SELECTION_FG)
+                    }
+                    RowState::Selected => (SELECTED_FG, SELECTED_FG, TEXT_TERTIARY),
+                    RowState::Normal => (ACCENT2, TEXT_PRIMARY, TEXT_TERTIARY),
                 };
 
                 let mut spans: Vec<Span> = Vec::with_capacity(9);
@@ -342,11 +342,7 @@ pub fn render_track_list(
                     ));
                 }
 
-                ListItem::new(Line::from(spans)).style(Style::default().bg(if is_cursor {
-                    BG_ELEVATED
-                } else {
-                    Color::Reset
-                }))
+                ListItem::new(Line::from(spans)).style(Style::default().bg(bg))
             },
         )
         .collect();

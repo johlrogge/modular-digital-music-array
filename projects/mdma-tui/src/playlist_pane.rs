@@ -1,12 +1,13 @@
 #![allow(dead_code)]
 use crate::pane::{AddPlayingTarget, Pane, PaneAction, PaneKind};
 use crate::selection::SelectionState;
+use crate::theme::MUTED;
 use crate::track_list::render_track_list;
 use crossterm::event::{KeyCode, KeyEvent};
 use mdma_client::{ContentHash, LibraryBackend, PlaylistName, TrackInfo};
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
+    style::Style,
     widgets::{Block, Borders},
     Frame,
 };
@@ -193,7 +194,7 @@ impl Pane for PlaylistPane {
     fn render(&self, f: &mut Frame, area: Rect) {
         if self.tracks.is_empty() {
             let placeholder = ratatui::widgets::Paragraph::new("Playlist is empty")
-                .style(Style::default().fg(Color::DarkGray));
+                .style(Style::default().fg(MUTED));
             f.render_widget(placeholder, area);
             return;
         }

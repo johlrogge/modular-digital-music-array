@@ -18,6 +18,7 @@ members = [
     "components/boot_health",
     "components/date_expression",
     "components/event_protocol",
+    "components/fact_replica",
     "components/fact_store_memory",
     "components/gateway_client",
     "components/gateway_protocol",
@@ -25,6 +26,7 @@ members = [
     "components/library_ingestion",
     "components/library_ipc_client",
     "components/library_ipc_protocol",
+    "components/library_projection",
     "components/library_search",
     "components/library_service",
     "components/library_service_stub",
@@ -71,7 +73,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.37.0"
+version = "0.38.0"
 edition = "2021"
 authors = ["MDMA Development Team"]
 license = "MIT"
@@ -93,6 +95,7 @@ bandcamp-api = { path = "components/bandcamp_api" }
 boot-health = { path = "components/boot_health" }
 date-expression = { path = "components/date_expression" }
 event-protocol = { path = "components/event_protocol" }
+fact-replica = { path = "components/fact_replica" }
 fact-store = { path = "components/fact_store_memory" }
 fact-store-file = { path = "components/fact_store_file" }
 gateway-client = { path = "components/gateway_client" }
@@ -101,6 +104,7 @@ inbox-utils = { path = "components/inbox_utils" }
 library-ingestion = { path = "components/library_ingestion" }
 library-ipc-client = { path = "components/library_ipc_client" }
 library-ipc-protocol = { path = "components/library_ipc_protocol" }
+library-projection = { path = "components/library_projection" }
 library-search = { path = "components/library_search" }
 library-service = { path = "components/library_service" }
 library-service-stub = { path = "components/library_service_stub" }

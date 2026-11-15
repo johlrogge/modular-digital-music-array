@@ -8,8 +8,10 @@
 #[hicli::group]
 mod admin;
 mod args;
+mod background;
 mod completions;
 mod ctx;
+mod detach;
 mod editor;
 /// Add or retract metadata facts on a track
 #[hicli::group]
@@ -20,6 +22,7 @@ mod inbox;
 /// Library maintenance commands
 #[hicli::group]
 mod library;
+mod local_complete;
 /// Find and choose the MDMA node to talk to
 #[hicli::group]
 mod node;
@@ -31,6 +34,7 @@ mod playback;
 /// Manage playlists
 #[hicli::group]
 mod playlist;
+mod plays;
 /// Queue management (feeds deck A)
 #[hicli::group]
 mod queue;
@@ -47,6 +51,11 @@ mod queue;
 /// ```
 #[hicli::group]
 mod rekordbox;
+/// Local copy of the node's facts, kept for offline use
+///
+/// Synced in the background; `status` shows it and `reset` deletes it.
+#[hicli::group]
+mod replica;
 /// Search for tracks
 ///
 /// Filter with options such as --artist, --bpm or --key, or give a free-text query
@@ -63,6 +72,7 @@ mod rekordbox;
 /// ```
 #[hicli::group]
 mod search;
+mod snapshot;
 /// Music source management
 ///
 /// Per-source commands: mdma source <SOURCE-NAME> <COMMAND>
@@ -96,7 +106,7 @@ fn app() -> hicli::App<ctx::Globals, ctx::Ctx> {
             search, inbox, source, playback, queue, tracks::sort, subscribe::subscribe,
             transfer::upload, transfer::export, rekordbox, playlist, library,
             tracks::mark, tracks::unmark, tracks::marked, fact, tracks::view,
-            completions::generate_completions, admin, node,
+            completions::generate_completions, admin, node, replica, plays::plays,
         ]
     }
     // Fixed, so usage reads `mdma ...` however the binary was invoked (a
@@ -117,9 +127,20 @@ fn main() -> std::process::ExitCode {
 
     color_eyre::install().expect("installed once");
 
+    // What `App::run` does with the process arguments, spelled out so the command
+    // that ran is known afterwards.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let command = background::parse_command(&args);
     // The node is resolved once, on first use, so only commands that talk to
     // one resolve it.
-    app().run(|globals| Ok(Ctx::new(globals)))
+    let code = app().run_with_args(args, |globals| Ok(Ctx::new(globals)));
+    // Once, here, for every command that ran (any exit code but 2, a usage error):
+    // start a detached sync if the replica is stale or the command wrote. It never
+    // waits, and never runs inside a command.
+    if let (true, Some(command)) = (code != 2, command) {
+        background::after_command(&command);
+    }
+    std::process::ExitCode::from(code)
 }
 
 #[cfg(test)]
@@ -442,6 +463,9 @@ mod tests {
             ),
             (vec!["admin", "boot-health"], vec!["admin", "boot-health"]),
             (vec!["admin", "reboot", "--force"], vec!["admin", "reboot"]),
+            (vec!["plays", "abcd1234"], vec!["plays"]),
+            (vec!["plays", "-"], vec!["plays"]),
+            (vec!["plays", "--recent", "10"], vec!["plays"]),
             (vec!["node", "list"], vec!["node", "list"]),
             (vec!["node", "select", "host"], vec!["node", "select"]),
             (vec!["node", "forget"], vec!["node", "forget"]),
@@ -567,6 +591,10 @@ mod tests {
 
     #[test]
     fn fact_retract_origin_and_subscribe_topic_complete_their_known_values() {
+        // Origins also come from the replica, which no test may read.
+        let _lock = crate::test_support::env_lock();
+        let mut env = crate::test_support::EnvVars::default();
+        env.set("XDG_CACHE_HOME", "");
         assert_eq!(
             complete(&["fact", "retract", "--origin", ""]),
             ["User", "Rekordbox", "Upload"]
@@ -583,19 +611,20 @@ mod tests {
 
     #[test]
     fn source_names_complete_from_the_local_sources_directory() {
-        let _env = crate::test_support::env_lock();
+        let _lock = crate::test_support::env_lock();
         let dir = tempfile::tempdir().expect("temp dir");
         for file in ["bandcamp.sock", "beatport.sock", "notes.txt"] {
             std::fs::write(dir.path().join(file), b"").expect("file");
         }
-        let original = std::env::var_os("MDMA_SOURCES_DIR");
-        std::env::set_var("MDMA_SOURCES_DIR", dir.path());
-        let by_prefix = complete(&["source", "b"]);
-        let narrowed = complete(&["source", "ban"]);
-        match original {
-            Some(value) => std::env::set_var("MDMA_SOURCES_DIR", value),
-            None => std::env::remove_var("MDMA_SOURCES_DIR"),
-        }
+        // An empty cache and node file, so the user's own replica is not read.
+        let empty = tempfile::tempdir().expect("temp dir");
+        let (by_prefix, narrowed) = {
+            let mut env = crate::test_support::EnvVars::default();
+            env.set("MDMA_SOURCES_DIR", dir.path());
+            env.set("XDG_CACHE_HOME", empty.path().join("cache"));
+            env.set("XDG_CONFIG_HOME", empty.path().join("config"));
+            (complete(&["source", "b"]), complete(&["source", "ban"]))
+        };
         assert!(by_prefix.contains(&"bandcamp".to_string()), "{by_prefix:?}");
         assert!(by_prefix.contains(&"beatport".to_string()), "{by_prefix:?}");
         assert!(!by_prefix.contains(&"notes".to_string()), "{by_prefix:?}");

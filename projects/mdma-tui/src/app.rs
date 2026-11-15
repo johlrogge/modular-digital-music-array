@@ -6,6 +6,7 @@ use crate::pane::{Pane, PaneKind};
 use crate::playlists_pane::PlaylistsPane;
 use crate::queue_pane::QueuePane;
 use crate::search_pane::SearchPane;
+use crate::theme::ColorMode;
 use event_protocol::PlaybackEvent;
 use mdma_client::{ContentHash, LibraryBackend, PlaybackBackend, PlaylistName};
 use std::rc::Rc;
@@ -89,6 +90,8 @@ pub struct App {
     /// Cut/yank clipboard: hashes placed here by `d` (cut) in PlaylistPane.
     /// Paste (`p`) reads from here non-destructively, allowing multi-paste.
     pub clipboard: Vec<ContentHash>,
+    /// How theme colours are sent to the terminal; resolved once at startup.
+    pub color_mode: ColorMode,
 }
 
 impl App {
@@ -98,6 +101,7 @@ impl App {
         library: Rc<LibraryBackend>,
         playback: Rc<PlaybackBackend>,
         event_rx: Option<Receiver<AppEvent>>,
+        color_mode: ColorMode,
     ) -> Self {
         // Build fixed-size slot arrays with only slot 0 populated on each side.
         // We can't use array initializers with non-Copy boxed types so we construct
@@ -129,6 +133,7 @@ impl App {
             palette_cursor: 0,
             event_rx,
             clipboard: Vec::new(),
+            color_mode,
         }
     }
 

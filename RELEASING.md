@@ -120,10 +120,29 @@ creates the tag.
 ### 8. Push everything
 
 ```bash
-git push github master develop --tags
+git push github master develop vX.Y.Z
 ```
 
+Push the named tag rather than `--tags`: GitHub does not create workflow events when
+more than 3 refs are pushed at once, and the tag event is what creates the release.
+
 ### 9. CI builds and publishes
+
+The `v*` tag push starts its own workflow run, which builds the CLI tarballs
+(macOS arm64, portable Linux x86_64), writes `SHA256SUMS`, and creates or updates the
+GitHub release for the tag (`gh release`, `GITHUB_TOKEN`). Check that the release has
+`mdma-macos-arm64.tar.gz`, `mdma-linux-x86_64.tar.gz` and `SHA256SUMS`. If the job
+fails, re-run it; assets are uploaded with `--clobber`. `scripts/install-mdma.sh`
+installs from the latest release. A tag containing `-` (for example `v0.39.0-rc.1`)
+is published as a prerelease. On a tag run CI also checks that `mdma --version`
+equals `Version: <tag without v>`.
+
+**Installer compatibility contract.** Users run `scripts/install-mdma.sh` from
+`master`, so the master version must install every published tag. Keep the asset names
+`mdma-<os>-<arch>.tar.gz` (`mdma-macos-arm64`, `mdma-linux-x86_64`) plus `SHA256SUMS`
+(`<sha256>  <asset>` lines), and the binaries `mdma` and `mdma-tui` at the tarball root.
+If any of that changes, update the installer to handle both the old and new layout in
+the same commit. The matching header is in `scripts/install-mdma.sh`.
 
 GitHub Actions triggers on the `master` push:
 
@@ -212,7 +231,7 @@ message. Merges to `master` AND `develop`, creates the tag.
 ### 6. Push and deploy
 
 ```bash
-git push github master develop --tags
+git push github master develop vX.Y.Z
 ```
 
 Wait for CI to build and publish, then dispatch **devops** to deploy as per steps 10–11

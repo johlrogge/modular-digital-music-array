@@ -8,6 +8,7 @@ use color_eyre::Result;
 use hicli::{Arg, Success};
 use library_ipc_client::{
     ConfirmationReason, ContentHash, DedupApplyReport, DedupDisposition, DedupGroup, DedupMember,
+    LeftoverFact, UnfinishedMerge,
 };
 use track_formatter::short_hash;
 
@@ -92,11 +93,55 @@ fn format_dedup_groups(groups: &[DedupGroup]) -> String {
     out.trim_end().to_string()
 }
 
+/// One leftover fact: `Attribute = value  (tool origin version)`.
+fn format_leftover(f: &LeftoverFact) -> String {
+    let s = &f.source;
+    format!(
+        "{} = {}  ({} {} {})",
+        f.value.display_name(),
+        f.value,
+        s.tool,
+        s.origin.kind,
+        s.version
+    )
+}
+
+/// The merges that left their loser indexed, each with the facts that are still live.
+/// Empty when there are none. After an `--apply` these are the ones it could not finish.
+fn format_unfinished(unfinished: &[UnfinishedMerge], applied: bool) -> String {
+    if unfinished.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(if applied {
+        "Still unfinished (see the errors above)\n"
+    } else {
+        "Unfinished merges (finished by --apply)\n"
+    });
+    for u in unfinished {
+        let whereto = match &u.winner {
+            Some(winner) => format!("was merged into {} but", short_hash(winner)),
+            None => "is retired, has no live winner and".to_owned(),
+        };
+        out.push_str(&format!(
+            "  {} {whereto} has {} live fact(s) left:\n",
+            short_hash(&u.loser),
+            u.leftovers.len()
+        ));
+        for f in &u.leftovers {
+            out.push_str(&format!("    {}\n", format_leftover(f)));
+        }
+    }
+    out.trim_end().to_string()
+}
+
 fn format_dedup_applied(r: &DedupApplyReport) -> String {
     let mut out = format!(
         "Merged {} track(s), archived {} blob(s)",
         r.merged, r.blobs_archived
     );
+    if r.finished > 0 {
+        out.push_str(&format!("\nFinished {} unfinished merge(s)", r.finished));
+    }
     for e in &r.errors {
         out.push_str(&format!("\n  error: {e}"));
     }
@@ -130,11 +175,11 @@ fn find_dedup_group<'a>(
 // A default command takes no `# Arguments`; its own wording is a field doc.
 #[derive(Debug, PartialEq, Arg)]
 pub(crate) struct ScanArgs {
-    /// Merge the automatic groups (the others are only listed)
+    /// Merge the automatic groups and finish unfinished merges (the others are only listed)
     apply: Apply,
 }
 
-/// List duplicate groups, or merge the automatic ones with --apply
+/// List duplicate groups and unfinished merges, or merge and finish them with --apply
 #[hicli::command(default)]
 pub(crate) fn scan(args: ScanArgs, ctx: &Ctx) -> Result<Success> {
     let ScanArgs {
@@ -152,9 +197,18 @@ pub(crate) fn scan(args: ScanArgs, ctx: &Ctx) -> Result<Success> {
             println!("\nLeft for your confirmation:");
         }
     }
-    // After `--apply` an empty list is already said by the summary.
-    if !apply || !report.groups.is_empty() {
+    let unfinished = !report.unfinished.is_empty();
+    // After `--apply` an empty list is already said by the summary, and a list that
+    // holds only unfinished merges says nothing about duplicates.
+    let say_groups = !report.groups.is_empty() || !(apply || unfinished);
+    if say_groups {
         println!("{}", format_dedup_groups(&report.groups));
+        if unfinished {
+            println!();
+        }
+    }
+    if unfinished {
+        println!("{}", format_unfinished(&report.unfinished, apply));
     }
     Ok(success_unless(failed))
 }
@@ -220,6 +274,7 @@ mod tests {
     fn dedup_words_its_own_apply_help() {
         let help = crate::test_support::help(&["library", "dedup", "--help"]);
         assert!(help.contains("Merge the automatic groups"), "{help}");
+        assert!(help.contains("finish unfinished merges"), "{help}");
     }
 
     #[test]
@@ -375,11 +430,71 @@ mod tests {
             merged: 2,
             blobs_archived: 1,
             errors: vec!["boom".into()],
+            finished: 0,
         };
         assert_eq!(
             format_dedup_applied(&r),
             "Merged 2 track(s), archived 1 blob(s)\n  error: boom"
         );
+    }
+
+    #[test]
+    fn dedup_applied_summary_counts_finished_merges() {
+        let r = DedupApplyReport {
+            finished: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            format_dedup_applied(&r),
+            "Merged 0 track(s), archived 0 blob(s)\nFinished 1 unfinished merge(s)"
+        );
+    }
+
+    #[test]
+    fn unfinished_merges_are_listed_with_their_leftover_facts() {
+        use library_ipc_client::{FactSource, MusicValue};
+        let u = UnfinishedMerge {
+            loser: ContentHash::new("sha256:ec9ce8d0aaaaaaaa"),
+            winner: Some(ContentHash::new("sha256:4dfe138ebbbbbbbb")),
+            leftovers: vec![
+                LeftoverFact {
+                    value: MusicValue::HasAlbumArt(music_facts::AlbumArtPresence::Present),
+                    source: FactSource::new("mdma-library", "0.1.0", "FilesystemScan"),
+                },
+                LeftoverFact {
+                    value: MusicValue::Format(music_facts::MusicFormat::Flac),
+                    source: FactSource::new("mdma-library", "0.4.0", "Unknown"),
+                },
+            ],
+        };
+        let listing = format_unfinished(std::slice::from_ref(&u), false);
+        assert!(
+            listing.starts_with("Unfinished merges (finished by --apply)\n"),
+            "{listing}"
+        );
+        assert!(
+            listing.contains("ec9ce8d0aaaa was merged into 4dfe138ebbbb but has 2 live fact(s)"),
+            "{listing}"
+        );
+        assert!(
+            listing.contains("    HasAlbumArt = yes  (mdma-library FilesystemScan 0.1.0)"),
+            "{listing}"
+        );
+        // After an apply that did not finish them, it does not promise --apply again.
+        let after = format_unfinished(std::slice::from_ref(&u), true);
+        assert!(after.starts_with("Still unfinished"), "{after}");
+        assert!(!after.contains("finished by --apply"), "{after}");
+        // A chain that loops has no winner to name.
+        let orphan = UnfinishedMerge {
+            winner: None,
+            ..u.clone()
+        };
+        let text = format_unfinished(&[orphan], false);
+        assert!(
+            text.contains("ec9ce8d0aaaa is retired, has no live winner and has 2 live fact(s)"),
+            "{text}"
+        );
+        assert_eq!(format_unfinished(&[], false), "");
     }
 
     #[test]

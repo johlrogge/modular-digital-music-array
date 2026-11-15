@@ -27,7 +27,14 @@ use std::rc::Rc;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "mdma-tui", about = "MDMA Terminal User Interface")]
+#[command(
+    name = "mdma-tui",
+    about = "MDMA Terminal User Interface",
+    after_help = "ENVIRONMENT:\n  \
+        MDMA_TUI_COLORS  truecolor|24bit|256. Force 24-bit or 256-colour output. Without it\n  \
+        \x20                the TUI uses 24-bit colour only when COLORTERM is truecolor or 24bit.\n  \
+        \x20                Set it when COLORTERM is not forwarded, for example over SSH."
+)]
 struct Cli {
     /// MDMA node hostname (e.g. mdma-909.local). Derives gateway addresses automatically.
     #[arg(long, env = "MDMA_NODE")]
@@ -58,6 +65,10 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Decide once, before the terminal switches to the alternate screen, so a
+    // warning about a bad MDMA_TUI_COLORS stays visible.
+    let color_mode = theme::mode_from_env();
 
     // Derive full NNG gateway/event addresses from node hostname via ClientConfig.
     let client_cfg = client::ClientConfig {
@@ -93,6 +104,7 @@ fn main() -> Result<()> {
         Rc::clone(&library),
         Rc::clone(&playback),
         event_rx,
+        color_mode,
     );
 
     tui_base::run(&mut app, &tui_base::TuiConfig::default())?;

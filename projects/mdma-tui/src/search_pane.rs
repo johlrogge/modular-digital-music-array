@@ -1,12 +1,13 @@
 use crate::pane::{Pane, PaneAction, PaneKind};
 use crate::search_parse::parse_query;
 use crate::selection::SelectionState;
+use crate::theme::{INPUT_ACTIVE, MUTED};
 use crate::track_list::render_track_list;
 use crossterm::event::{KeyCode, KeyEvent};
 use mdma_client::{ContentHash, LibraryBackend, PlaylistName, TrackInfo};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::Style,
     text::Span,
     widgets::{Block, Borders, Paragraph},
     Frame,
@@ -104,9 +105,9 @@ impl Pane for SearchPane {
         let cursor = if self.editing { "_" } else { "" };
         let input_text = format!("> {}{}", self.query_text, cursor);
         let input_style = if self.editing {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(INPUT_ACTIVE)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(MUTED)
         };
         f.render_widget(
             Paragraph::new(Span::styled(input_text, input_style)),
@@ -118,10 +119,7 @@ impl Pane for SearchPane {
         // If a search has been run and returned no results, show a hint.
         if self.tracks.is_empty() && !self.last_executed_query.is_empty() {
             f.render_widget(
-                Paragraph::new(Span::styled(
-                    "(no matches)",
-                    Style::default().fg(Color::DarkGray),
-                )),
+                Paragraph::new(Span::styled("(no matches)", Style::default().fg(MUTED))),
                 list_area,
             );
         } else {

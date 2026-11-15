@@ -2,12 +2,12 @@
 use crate::browse_field::BrowseField;
 use crate::pane::{Pane, PaneAction, PaneKind};
 use crate::selection::SelectionState;
+use crate::theme::RowState;
 use crate::track_list::render_track_list;
 use crossterm::event::{KeyCode, KeyEvent};
 use mdma_client::{ContentHash, LibraryBackend, TrackInfo};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
     text::Span,
     widgets::{Block, Borders, List, ListItem},
     Frame,
@@ -440,15 +440,8 @@ impl BrowserPane {
             .enumerate()
             .map(|(i, &name)| {
                 let is_cursor = i == cursor;
-                let style = if is_cursor {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                ListItem::new(Span::styled(name, style))
+                let state = RowState::from_flags(is_cursor, false);
+                ListItem::new(Span::raw(name)).style(state.style())
             })
             .collect();
 
@@ -474,25 +467,8 @@ impl BrowserPane {
                 let is_cursor = selection.cursor_position() == Some(vis_idx);
                 let is_selected = selection.selected.contains(&vis_idx);
 
-                let style = if is_cursor && is_selected {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                } else if is_cursor {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else if is_selected {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-
-                ListItem::new(Span::styled(line, style))
+                let state = RowState::from_flags(is_cursor, is_selected);
+                ListItem::new(Span::raw(line)).style(state.style())
             })
             .collect();
 

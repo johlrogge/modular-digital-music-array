@@ -1,14 +1,14 @@
 use crate::app::{App, InputMode, PaletteEntry, Side, TABS_PER_SIDE};
 use crate::now_playing::PlaybackStatus;
 use crate::theme::{
-    ACCENT, ACCENT2, BG_ELEVATED, BG_SURFACE, BORDER_SUBTLE, SUCCESS, TEXT_PRIMARY, TEXT_SECONDARY,
-    TEXT_TERTIARY, WARNING,
+    self, RowState, ACCENT, ACCENT2, BG_SURFACE, BORDER_SUBTLE, MUTED, SELECTION_FG, SUCCESS,
+    TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY, WARNING,
 };
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph},
     Frame,
 };
 
@@ -24,6 +24,10 @@ use ratatui::{
 /// ```
 pub fn render(f: &mut Frame, app: &App) {
     let area = f.area();
+
+    // Paint the whole frame first so nothing falls back to the terminal's
+    // own default colours.
+    theme::paint_background(f, area);
 
     // Split vertically: now-playing bar (1) + main content + status bar (1)
     let rows = Layout::default()
@@ -59,6 +63,9 @@ pub fn render(f: &mut Frame, app: &App) {
     if app.mode == InputMode::Help {
         render_help_overlay(f, area);
     }
+
+    // Terminals without truecolor get the nearest 256-colour palette entry.
+    theme::apply_mode(f.buffer_mut(), app.color_mode);
 }
 
 fn render_now_playing_bar(f: &mut Frame, app: &App, area: Rect) {
@@ -99,33 +106,26 @@ fn render_now_playing_bar(f: &mut Frame, app: &App, area: Rect) {
             let artist = np.artist.as_deref().unwrap_or("");
             let title = np.title.as_deref().unwrap_or("Unknown Title");
 
-            let dim = if is_paused {
-                Modifier::DIM
+            // Paused tracks use explicit muted colours (no terminal-dependent DIM).
+            let (artist_fg, sep_fg, title_fg, time_fg) = if is_paused {
+                (MUTED, MUTED, TEXT_TERTIARY, MUTED)
             } else {
-                Modifier::empty()
+                (ACCENT2, TEXT_TERTIARY, TEXT_PRIMARY, TEXT_TERTIARY)
             };
 
             let mut spans = vec![Span::styled(icon, Style::default().fg(icon_color))];
             if !artist.is_empty() {
                 spans.push(Span::styled(
                     artist.to_string(),
-                    Style::default().fg(ACCENT2).add_modifier(dim),
+                    Style::default().fg(artist_fg),
                 ));
-                spans.push(Span::styled(
-                    "  —  ",
-                    Style::default().fg(TEXT_TERTIARY).add_modifier(dim),
-                ));
+                spans.push(Span::styled("  —  ", Style::default().fg(sep_fg)));
             }
             spans.push(Span::styled(
                 title.to_string(),
-                Style::default()
-                    .fg(TEXT_PRIMARY)
-                    .add_modifier(Modifier::BOLD | dim),
+                Style::default().fg(title_fg).add_modifier(Modifier::BOLD),
             ));
-            spans.push(Span::styled(
-                time,
-                Style::default().fg(TEXT_TERTIARY).add_modifier(dim),
-            ));
+            spans.push(Span::styled(time, Style::default().fg(time_fg)));
             Line::from(spans)
         }
     };
@@ -331,8 +331,9 @@ fn render_tab_strip(
         let is_active_tab = i == active_idx;
         let style = if is_active_tab {
             Style::default()
-                .fg(ACCENT)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                .fg(SELECTION_FG)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
         } else if tabs[i].is_some() {
             Style::default().fg(TEXT_SECONDARY)
         } else {
@@ -407,10 +408,23 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// The bordered block shared by the palette and help overlays.
+fn overlay_block<'a>(title: String) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(WARNING))
+        .title(Span::styled(
+            title,
+            Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+        ))
+}
+
+/// Most palette matches shown at once.
+const MAX_MATCHES: usize = 5;
+
 /// Render the floating command palette overlay.
 fn render_palette_overlay(f: &mut Frame, app: &App, area: Rect) {
-    const MAX_MATCHES: usize = 5;
-
     let visible_matches = app.palette_matches.len().min(MAX_MATCHES);
     let height = (2 + 1 + visible_matches) as u16;
 
@@ -422,16 +436,9 @@ fn render_palette_overlay(f: &mut Frame, app: &App, area: Rect) {
         height: height.min(area.height),
     };
 
-    f.render_widget(Clear, overlay_area);
+    theme::clear_overlay(f, overlay_area);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(WARNING))
-        .title(Span::styled(
-            format!(" : {} ", app.palette_query),
-            Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
-        ));
+    let block = overlay_block(format!(" : {} ", app.palette_query));
 
     let inner = block.inner(overlay_area);
     f.render_widget(block, overlay_area);
@@ -453,49 +460,59 @@ fn render_palette_overlay(f: &mut Frame, app: &App, area: Rect) {
     ]);
     f.render_widget(Paragraph::new(input_line), chunks[0]);
 
-    if !app.palette_matches.is_empty() {
-        let items: Vec<ListItem> = app
-            .palette_matches
+    render_palette_rows(f, chunks[1], &app.palette_matches, app.palette_cursor);
+}
+
+/// Index of the first match shown: the window of `MAX_MATCHES` rows follows
+/// the cursor, so the highlighted row is always visible.
+fn palette_window_start(cursor: usize) -> usize {
+    (cursor + 1).saturating_sub(MAX_MATCHES)
+}
+
+fn render_palette_rows(f: &mut Frame, area: Rect, matches: &[PaletteEntry], cursor: usize) {
+    if !matches.is_empty() {
+        let start = palette_window_start(cursor);
+        let items: Vec<ListItem> = matches
             .iter()
+            .enumerate()
+            .skip(start)
             .take(MAX_MATCHES)
-            .map(|entry| match entry {
-                PaletteEntry::Command(cmd) => ListItem::new(Line::from(vec![
-                    Span::styled(format!("{:<10}", cmd.name), Style::default().fg(ACCENT2)),
-                    Span::styled(cmd.description, Style::default().fg(TEXT_SECONDARY)),
-                ])),
-                PaletteEntry::OpenPlaylist(name) => ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("{:<10}", name.as_str()),
-                        Style::default().fg(SUCCESS),
+            .map(|(i, entry)| {
+                let (label, label_fg, description) = match entry {
+                    PaletteEntry::Command(cmd) => {
+                        (cmd.name.to_string(), ACCENT2, cmd.description.to_string())
+                    }
+                    PaletteEntry::OpenPlaylist(name) => (
+                        name.as_str().to_string(),
+                        SUCCESS,
+                        "open playlist".to_string(),
                     ),
-                    Span::styled("open playlist", Style::default().fg(TEXT_SECONDARY)),
-                ])),
-                PaletteEntry::CreatePlaylist(name) => ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("{:<10}", format!("create: {}", name)),
-                        Style::default().fg(ACCENT),
+                    PaletteEntry::CreatePlaylist(name) => (
+                        format!("create: {}", name),
+                        ACCENT,
+                        "new playlist".to_string(),
                     ),
-                    Span::styled("new playlist", Style::default().fg(TEXT_SECONDARY)),
-                ])),
-                PaletteEntry::History(arg) => ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("{:<10}", format!("history {}", arg)),
-                        Style::default().fg(ACCENT2),
+                    PaletteEntry::History(arg) => (
+                        format!("history {}", arg),
+                        ACCENT2,
+                        "history search".to_string(),
                     ),
-                    Span::styled("history search", Style::default().fg(TEXT_SECONDARY)),
-                ])),
+                };
+                // The cursor row is one solid highlight: text uses the row's own fg.
+                let state = RowState::from_flags(i == cursor, false);
+                let (label_fg, description_fg) = match state {
+                    RowState::Cursor => (SELECTION_FG, SELECTION_FG),
+                    _ => (label_fg, TEXT_SECONDARY),
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{:<10}", label), Style::default().fg(label_fg)),
+                    Span::styled(description, Style::default().fg(description_fg)),
+                ]))
+                .style(state.style())
             })
             .collect();
 
-        let list = List::new(items).highlight_style(
-            Style::default()
-                .bg(BG_ELEVATED)
-                .add_modifier(Modifier::REVERSED),
-        );
-
-        let mut list_state = ListState::default();
-        list_state.select(Some(app.palette_cursor));
-        f.render_stateful_widget(list, chunks[1], &mut list_state);
+        f.render_widget(List::new(items), area);
     }
 }
 
@@ -512,7 +529,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )
     };
-    let dim = |s: &'static str| Span::styled(s, Style::default().fg(TEXT_TERTIARY));
+    let dim = |s: &'static str| Span::styled(s, Style::default().fg(MUTED));
     let gap = Line::from("");
 
     let lines: Vec<Line> = vec![
@@ -627,19 +644,94 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         height: height.min(area.height),
     };
 
-    f.render_widget(Clear, overlay_area);
+    theme::clear_overlay(f, overlay_area);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(WARNING))
-        .title(Span::styled(
-            " Help ",
-            Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
-        ));
+    let block = overlay_block(" Help ".to_string());
 
     let inner = block.inner(overlay_area);
     f.render_widget(block, overlay_area);
 
     f.render_widget(Paragraph::new(lines).alignment(Alignment::Left), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::COMMANDS;
+    use crate::theme::{ColorMode, BACKGROUND};
+    use ratatui::{backend::TestBackend, style::Color, Terminal};
+
+    const INDEXED: ColorMode = ColorMode::Indexed256;
+
+    /// Draw the themed background plus the help overlay in the given mode and
+    /// return every cell's (fg, bg).
+    fn render_help(mode: ColorMode) -> Vec<(Color, Color)> {
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                theme::paint_background(f, area);
+                render_help_overlay(f, area);
+                theme::apply_mode(f.buffer_mut(), mode);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        buffer.content.iter().map(|c| (c.fg, c.bg)).collect()
+    }
+
+    /// Draw the palette rows with the given cursor and return, for every
+    /// highlighted row, its text.
+    fn highlighted_palette_rows(cursor: usize) -> Vec<String> {
+        let matches: Vec<PaletteEntry> = COMMANDS.iter().map(PaletteEntry::Command).collect();
+        let mut terminal = Terminal::new(TestBackend::new(40, MAX_MATCHES as u16)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_palette_rows(f, area, &matches, cursor);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width;
+        (0..buffer.area.height)
+            .filter(|&y| buffer[(0, y)].bg == theme::CURSOR_BG)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn palette_highlight_stays_visible_when_cursor_passes_the_window() {
+        assert!(COMMANDS.len() > 7, "needs more commands than rows");
+        for cursor in [0, 4, 5, 6, COMMANDS.len() - 1] {
+            let rows = highlighted_palette_rows(cursor);
+            assert_eq!(rows.len(), 1, "cursor {cursor}: highlighted rows {rows:?}");
+            assert!(
+                rows[0].starts_with(COMMANDS[cursor].name),
+                "cursor {cursor}: highlighted {:?}",
+                rows[0]
+            );
+        }
+    }
+
+    #[test]
+    fn truecolor_render_keeps_rgb_and_themes_every_background() {
+        let cells = render_help(ColorMode::TrueColor);
+        assert!(cells.iter().all(|(_, bg)| *bg == BACKGROUND));
+        assert!(cells.iter().any(|(fg, _)| *fg == ACCENT2));
+    }
+
+    #[test]
+    fn indexed_render_has_no_rgb_and_no_terminal_default_colours() {
+        let cells = render_help(INDEXED);
+        assert_ne!(cells, render_help(ColorMode::TrueColor));
+        let background = theme::adapt(BACKGROUND, INDEXED);
+        for (fg, bg) in cells {
+            // Converting again changes nothing only if no RGB value is left.
+            assert_eq!(theme::adapt(fg, INDEXED), fg);
+            assert_eq!(bg, background);
+        }
+    }
 }

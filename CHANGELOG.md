@@ -8,6 +8,29 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.38.0] — 2026-11-15
+
+### Added
+
+- **`mdma plays HASH|-` and `mdma plays --recent N` show play history from the local replica,** including plays inherited from merged duplicates (#99).
+- **CLI binaries are published as GitHub release assets.** Each `v*` tag attaches `mdma-macos-arm64.tar.gz`, `mdma-linux-x86_64.tar.gz` (portable, glibc 2.31) and `SHA256SUMS`. `scripts/install-mdma.sh` (macOS arm64 and Linux x86_64) installs from them with only `curl`, `tar` and `shasum`, checks the checksum, and takes an optional `vX.Y.Z`; it no longer needs the `gh` CLI or a login, and releases do not expire like Actions artifacts. `install-mdma-macos.sh` forwards to it.
+- **`mdma replica`: a local copy of the node's fact log** (ADR-021 phase 4), kept under the user's cache directory. `replica status` shows it, `replica reset` deletes it, and a hidden `replica sync` fills it (and probes playlist and source names) with verified, resumable reads. A second `replica reset` of a node with no replica now says there is nothing to reset and exits 0.
+- **Shell completion from the local replica** (ADR-021 phase 5): mark names, playlist names, source names, and artists, titles, albums, labels, genres and styles for the `search` filters and query complete from a snapshot built after each sync, with no network call and in a few milliseconds. A background `mdma replica sync --quiet` is started, detached, when the replica is more than 30 s old (backing off to 5 min after failures) and after commands that write; nothing syncs inline. Fact lines this client cannot read (a newer node) are kept, left out of completion, and counted in `replica status`.
+- **ACID fact log has an identity and `ReadStream` can pin the last line a client has** (ADR-021 phase 3), so a rewritten or replaced log answers `StreamDiverged` instead of looking like "nothing new". The gateway re-serialises typed ACID requests, so a mismatched gateway/ACID deploy fails closed (pinned reads report "node too old" instead of appending unverified lines); upgrade them together for availability, not correctness.
+- **`mdma library dedup` finds and finishes unfinished merges.** A merge by an older release could leave its loser with live facts (a `HasAlbumArt` from 0.1.0, say), so it was still listed as a track. The dry-run now lists such losers with their leftover facts under "Unfinished merges"; `--apply` finishes them like a merge (marks and plays carry to the winner, every leftover fact is retracted, chains of unfinished merges converge) and leaves the groups that need confirmation alone. The projection knows them from the log's order, not from timestamps.
+
+### Fixed
+
+- **The TUI uses its own theme colours on every terminal:** all colours come from its theme, the frame paints its own background, and terminals without truecolor get a 256-colour mapping. `MDMA_TUI_COLORS=truecolor|24bit|256` overrides the detection (see `mdma-tui --help`); set it when `COLORTERM` is not forwarded, for example over SSH.
+- **A track a merge has replaced is no longer given new facts.** The startup Format and cover-art backfills and the identity backfill skip a loser that a `Replaces` fact retired while it was live, so they no longer revive it. A track that was ingested again after its merge is not affected, and a later merge no longer claims it.
+- **Retracting a track's file path now clears it** in the library index, so a track that outlives a merge no longer keeps a file it lost.
+
+### Changed
+
+- **The gateway refuses ACID writes (`WriteFacts`/`RetractFacts`) and forwards only reads.** Write through the library service.
+
+---
+
 ## [0.37.0] — 2026-11-14
 
 ### Fixed

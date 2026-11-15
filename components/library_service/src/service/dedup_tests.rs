@@ -51,6 +51,10 @@ fn album(name: &str) -> MusicValue {
     MusicValue::Album(Album::new(name))
 }
 
+fn title(t: &str) -> MusicValue {
+    MusicValue::Title(Title::new(t))
+}
+
 fn bpm(v: f32) -> MusicValue {
     MusicValue::Bpm(Bpm::from_f32(v).unwrap())
 }
@@ -641,11 +645,17 @@ fn a_rerun_after_a_crash_before_the_retire_completes_without_duplicating_facts()
         .write_merge_facts(&gate, &new, &old, vec![], &test_sources().dedup, carry)
         .unwrap();
     drop(gate);
-    assert_eq!(scan(&service).len(), 1, "the group is still detectable");
+    // The loser is retired now: no group any more, but an unfinished merge to find.
+    assert_eq!(dedup_report(&service, false).unfinished.len(), 1);
 
     let (report, _) = apply(&service);
 
-    assert_eq!((report.merged, report.errors.len()), (1, 0), "{report:?}");
+    // The crashed merge is an unfinished merge now: the apply finishes it.
+    assert_eq!(
+        (report.merged, report.finished, report.errors.len()),
+        (0, 1, 0),
+        "{report:?}"
+    );
     assert_eq!(count_in_acid(&service, &new, &bpm(128.0)), 1);
     assert_eq!(
         count_in_acid(&service, &new, &MusicValue::Replaces(old.clone())),
@@ -2504,4 +2514,587 @@ fn a_failed_self_heal_merge_does_not_fail_the_ingest() {
     );
     assert!(old_blob(&service, &new).exists());
     assert!(replaces_targets(&service, &new).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Merge: the loser is left with no live fact but its plays (no ghost)
+// ---------------------------------------------------------------------------
+
+/// What a loser written by an older release carries, in every source kind the library
+/// meets: measured (FilesystemScan), derived (Unknown), tags and a client, the user's
+/// mark, and plays. The versions differ from the ones the merge retracts with.
+fn ghost_loser_facts() -> Facts {
+    let old = |tool: &str, origin: &str| FactSource::new(tool, "0.4.0", origin);
+    let scan = || old("mdma-library", "FilesystemScan");
+    let derived = || old("mdma-library", "Unknown");
+    let tags = || old("test-client", "Client");
+    let older_client = || FactSource::new("test-client", "0.3.0", "Client");
+    let playback = || FactSource::new("mdma-playback", "0.4.0", "Playback");
+    vec![
+        (MusicValue::FilePath("x.flac".into()), scan()),
+        (MusicValue::Format(music_facts::MusicFormat::Flac), scan()),
+        (
+            MusicValue::HasAlbumArt(music_facts::AlbumArtPresence::Present),
+            scan(),
+        ),
+        (
+            MusicValue::DurationSeconds(DurationSeconds::new(201)),
+            scan(),
+        ),
+        (MusicValue::AddedAt(day(1)), scan()),
+        (audio(1), derived()),
+        (pcm(1), derived()),
+        (
+            MusicValue::CoverArtPath("cover-art/ghost.jpg".into()),
+            derived(),
+        ),
+        (MusicValue::Title(Title::new("Ghost")), tags()),
+        (album("Ghost Album"), tags()),
+        (bpm(128.0), tags()),
+        (MusicValue::ItemId("p1".into()), tags()),
+        (MusicValue::ItemId("p1".into()), older_client()),
+        usr(Mark::Default.fact_value(day(3))),
+        (MusicValue::TrackStarted(StartReason::OnRequest), playback()),
+        (MusicValue::TrackStopped(StopReason::OnSkip), playback()),
+    ]
+}
+
+/// Facts as the stage2 ghost carried them: a `HasAlbumArt = true` from release 0.1.0
+/// (the legacy boolean wire form, a scan origin with a `data` payload), and plays
+/// recorded under the 8-character short key by older playback releases.
+fn add_stage2_traces(service: &LibraryService, loser: &ContentHash) {
+    use acid_client::FactEntry;
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    service
+        .acid_client
+        .write_facts(
+            loser.as_str(),
+            &[FactEntry {
+                value_json: r#"{"t":"HasAlbumArt","v":true}"#.into(),
+                source_json: r#"{"tool":"mdma-library","version":"0.1.0","origin":{"type":"FilesystemScan","data":{"scan_time":"2026-01-01T00:00:00Z","inferred_source":null}}}"#.into(),
+            }],
+        )
+        .unwrap();
+    service.catch_up().unwrap();
+    let short = ContentHash::new(&hash_key(loser.as_str())[..8]);
+    for version in ["0.4.0", "0.6.1"] {
+        let playback = FactSource::new("mdma-playback", version, "Playback");
+        write(
+            service,
+            &short,
+            vec![
+                (
+                    MusicValue::TrackStarted(StartReason::OnRequest),
+                    playback.clone(),
+                ),
+                (MusicValue::TrackStopped(StopReason::OnSkip), playback),
+            ],
+        );
+    }
+}
+
+/// The projection of the whole log of `entities`, as a restart would rebuild it.
+fn projected_log(service: &LibraryService, entities: &[&str]) -> library_projection::Projection {
+    let lines: Vec<String> = entities
+        .iter()
+        .flat_map(|e| service.acid_client.read_entity(e).unwrap())
+        .collect();
+    library_projection::project_lines(lines.iter().map(String::as_str))
+}
+
+/// The loser is no track in the log, in the live index or in the ACID replay, keeps no
+/// live fact but its plays, and the winner shows the plays and the mark.
+fn assert_loser_is_not_a_ghost(
+    service: &LibraryService,
+    loser: &ContentHash,
+    winner: &ContentHash,
+) {
+    let short = &hash_key(loser.as_str())[..8];
+    let projection = projected_log(service, &[loser.as_str(), winner.as_str(), short]);
+    let tracks: Vec<String> = projection
+        .tracks
+        .iter()
+        .map(|t| t.content_hash.as_str().to_owned())
+        .collect();
+    assert_eq!(tracks, vec![winner.to_string()], "projected tracks");
+    assert!(!projection.content_hashes.contains(loser.as_str()));
+
+    let live: Vec<_> = asserted_in_acid(service, loser)
+        .into_iter()
+        .filter(|(v, _)| !is_play_event(v))
+        .collect();
+    assert!(live.is_empty(), "facts still live on the loser: {live:?}");
+
+    assert!(gone(service, loser));
+    assert_eq!(live_plays(service, loser), 2);
+    assert_eq!(
+        marked_hashes(service, Mark::Default),
+        vec![winner.to_string()]
+    );
+}
+
+/// The winner shows the latest play of the loser, under its full and its short key.
+fn assert_winner_shows_short_key_plays(
+    service: &LibraryService,
+    loser: &ContentHash,
+    winner: &ContentHash,
+) {
+    let short = ContentHash::new(&hash_key(loser.as_str())[..8]);
+    let latest = |started: bool| {
+        play_times(service, loser)
+            .into_iter()
+            .chain(play_times(service, &short))
+            .filter(|t| t.0 == started)
+            .map(|t| t.1)
+            .max()
+            .unwrap()
+            .to_rfc3339()
+    };
+    assert_eq!(
+        played(service, winner),
+        (Some(latest(true)), Some(latest(false)))
+    );
+    let short_latest = play_times(service, &short)
+        .into_iter()
+        .filter(|t| t.0)
+        .map(|t| t.1)
+        .max()
+        .unwrap()
+        .to_rfc3339();
+    assert_eq!(
+        played(service, winner).0,
+        Some(short_latest),
+        "the short-key plays are the latest, so they must be what the winner shows"
+    );
+}
+
+const GHOST: &str = "ec9ce8d0";
+const KEEPER: &str = "4dfe138e";
+
+fn long_hash(prefix: &str) -> ContentHash {
+    hash(&prefix.repeat(8))
+}
+
+fn seed_ghost_pair(service: &LibraryService) -> (ContentHash, ContentHash) {
+    let loser = seed(
+        service,
+        &long_hash(GHOST).as_str()[7..],
+        ghost_loser_facts(),
+    );
+    add_stage2_traces(service, &loser);
+    let winner = seed(
+        service,
+        &long_hash(KEEPER).as_str()[7..],
+        [base(1, Some("p1"), 2), vec![src(pcm(1))]].concat(),
+    );
+    (loser, winner)
+}
+
+#[test]
+fn a_dedup_merged_loser_with_a_realistic_fact_set_is_not_a_ghost() {
+    let (service, _d, _acid) = make_empty_service();
+    let (loser, winner) = seed_ghost_pair(&service);
+
+    let (report, _) = apply(&service);
+
+    assert_eq!(report.merged, 1, "{:?}", report.errors);
+    assert_loser_is_not_a_ghost(&service, &loser, &winner);
+}
+
+#[test]
+fn short_key_plays_of_a_dedup_merged_loser_show_on_the_winner() {
+    let (service, _d, _acid) = make_empty_service();
+    let (loser, winner) = seed_ghost_pair(&service);
+
+    apply(&service);
+
+    assert_winner_shows_short_key_plays(&service, &loser, &winner);
+}
+
+#[test]
+fn a_replaced_track_with_a_realistic_fact_set_is_not_a_ghost() {
+    let (service, _d, _acid) = make_empty_service();
+
+    let (loser, winner) = replace_with_ghost_traces(&service);
+
+    assert_loser_is_not_a_ghost(&service, &loser, &winner);
+    assert_winner_shows_short_key_plays(&service, &loser, &winner);
+}
+
+/// `replace_with_facts`, with the stage2 traces added to the old track first.
+fn replace_with_ghost_traces(service: &LibraryService) -> (ContentHash, ContentHash) {
+    let inbox = service.music_dir.join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    let old_wav = inbox.join("Old Artist - Old Song.wav");
+    write_test_wav(&old_wav, 5);
+    let old = service.ingest_file_internal(&old_wav, None, &[]).unwrap();
+    write(service, &old, ghost_loser_facts());
+    add_stage2_traces(service, &old);
+    let new_wav = inbox.join("New Artist - New Song.wav");
+    write_test_wav(&new_wav, 7);
+    let resp = service.handle_request(LibraryRequest::TrackReplace {
+        old_hash: old.clone(),
+        new_file_path: new_wav.to_string_lossy().to_string(),
+    });
+    let LibraryResponse::TrackReplaced { new_hash, .. } = resp else {
+        panic!("expected TrackReplaced, got {resp:?}");
+    };
+    (old, new_hash)
+}
+
+/// Every line of the loser's own entity and its short key, to see nothing is written.
+fn loser_log(service: &LibraryService, loser: &ContentHash) -> Vec<String> {
+    [loser.as_str(), &hash_key(loser.as_str())[..8]]
+        .iter()
+        .flat_map(|e| service.acid_client.read_entity(e).unwrap())
+        .collect()
+}
+
+#[test]
+fn no_library_path_writes_facts_for_a_merged_loser_not_even_after_a_restart() {
+    let (service, _d, _acid, addrs) = super::tests::make_empty_service_with_addrs();
+    let (loser, winner) = seed_ghost_pair(&service);
+    apply(&service);
+    let log = loser_log(&service, &loser);
+
+    // Startup backfills Format and cover art for every track that lacks them.
+    let restarted = super::tests::restart_service(&addrs);
+    assert_eq!(loser_log(&restarted, &loser), log, "startup backfill");
+    run_backfill(&restarted, true);
+    assert_eq!(loser_log(&restarted, &loser), log, "identity backfill");
+    restarted.refresh_event_timestamps();
+    assert!(gone(&restarted, &loser));
+    assert_winner_shows_short_key_plays(&restarted, &loser, &winner);
+}
+
+// ---------------------------------------------------------------------------
+// Unfinished merges: finding and finishing a ghost an older release left
+// ---------------------------------------------------------------------------
+
+/// A log shaped like the stage2 ghost: the loser's facts and plays (a legacy 0.1.0
+/// `HasAlbumArt` among them), the winner's `Replaces(loser)` from a 0.4.0 merge, then
+/// that merge's retracts of everything but the `HasAlbumArt` and the plays. With
+/// `format_after`, a Format is derived for the loser after the merge; with `keep_path`,
+/// the merge missed the loser's file path as well.
+fn seed_stage2_ghost(
+    service: &LibraryService,
+    format_after: bool,
+    keep_path: bool,
+) -> (ContentHash, ContentHash) {
+    let loser = seed(
+        service,
+        &long_hash(GHOST).as_str()[7..],
+        ghost_loser_facts(),
+    );
+    add_stage2_traces(service, &loser);
+    let merge = FactSource::new("mdma-dedup", "0.4.0", "Unknown");
+    let winner = seed(
+        service,
+        &long_hash(KEEPER).as_str()[7..],
+        [
+            base(1, Some("p1"), 2),
+            vec![
+                src(pcm(1)),
+                usr(Mark::Default.fact_value(day(3))),
+                (MusicValue::Replaces(loser.clone()), merge),
+            ],
+        ]
+        .concat(),
+    );
+    let missed: Facts = ghost_loser_facts()
+        .into_iter()
+        .filter(|(v, _)| !is_play_event(v) && !matches!(v, MusicValue::HasAlbumArt(_)))
+        .filter(|(v, _)| !(keep_path && matches!(v, MusicValue::FilePath(_))))
+        .collect();
+    service
+        .acid_client
+        .retract_music_facts(&loser, &missed)
+        .unwrap();
+    service.catch_up().unwrap();
+    if format_after {
+        write(
+            service,
+            &loser,
+            vec![(
+                MusicValue::Format(music_facts::MusicFormat::Flac),
+                FactSource::new("mdma-library", "0.4.0", "Unknown"),
+            )],
+        );
+    }
+    (loser, winner)
+}
+
+fn dedup_report(service: &LibraryService, apply: bool) -> crate::ipc::DedupScanReport {
+    match service.handle_request(LibraryRequest::DedupScan { apply }) {
+        LibraryResponse::DedupScan(r) => r,
+        other => panic!("expected DedupScan, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_dry_run_lists_an_unfinished_merge_with_its_leftover_facts() {
+    let (service, _d, _acid) = make_empty_service();
+    let (loser, winner) = seed_stage2_ghost(&service, true, false);
+
+    let report = dedup_report(&service, false);
+
+    assert!(report.applied.is_none());
+    assert_eq!(report.unfinished.len(), 1, "{:?}", report.unfinished);
+    let u = &report.unfinished[0];
+    assert_eq!((&u.loser, u.winner.as_ref()), (&loser, Some(&winner)));
+    let held = |attribute: &str, version: &str| {
+        u.leftovers
+            .iter()
+            .any(|l| l.value.display_name() == attribute && l.source.version == version)
+    };
+    assert!(held("HasAlbumArt", "0.4.0"));
+    assert!(held("HasAlbumArt", "0.1.0"));
+    assert!(held("Format", "0.4.0"));
+    assert!(
+        u.leftovers.iter().all(|l| !is_play_event(&l.value)),
+        "plays are no leftovers: {:?}",
+        u.leftovers
+    );
+    // Listing changes nothing.
+    assert!(!gone(&service, &loser));
+}
+
+#[test]
+fn apply_finishes_an_unfinished_merge_like_a_merge() {
+    let (service, _d, _acid, addrs) = super::tests::make_empty_service_with_addrs();
+    let (loser, winner) = seed_stage2_ghost(&service, true, false);
+    assert!(
+        !gone(&service, &loser),
+        "the ghost is indexed as a track before"
+    );
+
+    let report = dedup_report(&service, true);
+
+    let applied = report.applied.expect("apply report");
+    assert_eq!((applied.finished, applied.merged), (1, 0), "{applied:?}");
+    assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+    assert!(report.unfinished.is_empty());
+    assert_loser_is_not_a_ghost(&service, &loser, &winner);
+    assert_winner_shows_short_key_plays(&service, &loser, &winner);
+    assert_eq!(
+        asserted_in_acid(&service, &winner)
+            .iter()
+            .filter(|(v, _)| matches!(v, MusicValue::Replaces(_)))
+            .count(),
+        1,
+        "no second Replaces"
+    );
+    assert!(dedup_report(&service, false).unfinished.is_empty());
+
+    let restarted = super::tests::restart_service(&addrs);
+    restarted.refresh_event_timestamps();
+    assert!(gone(&restarted, &loser));
+    assert_winner_shows_short_key_plays(&restarted, &loser, &winner);
+}
+
+#[test]
+fn a_replaced_track_is_given_no_derived_fact_by_the_startup_backfills() {
+    let (service, _d, _acid, addrs) = super::tests::make_empty_service_with_addrs();
+    // No Format after the merge: only the leftover HasAlbumArt keeps the loser
+    // indexed, with the file path the merge could not clear.
+    let (loser, _winner) = seed_stage2_ghost(&service, false, true);
+    let log = loser_log(&service, &loser);
+
+    let restarted = super::tests::restart_service(&addrs);
+    assert_eq!(loser_log(&restarted, &loser), log, "startup backfill");
+    run_backfill(&restarted, true);
+    assert_eq!(loser_log(&restarted, &loser), log, "identity backfill");
+}
+
+#[test]
+fn applying_unfinished_merges_leaves_groups_that_need_confirmation_alone() {
+    let (service, _d, _acid) = make_empty_service();
+    let (loser, _winner) = seed_stage2_ghost(&service, true, false);
+    let a = seed(&service, "a", base(7, Some("p1"), 1));
+    let b = seed(&service, "b", base(7, Some("p2"), 2));
+
+    let report = dedup_report(&service, true);
+
+    assert_eq!(report.applied.unwrap().finished, 1);
+    assert!(gone(&service, &loser));
+    assert!(!gone(&service, &a) && !gone(&service, &b));
+    assert_eq!(report.groups.len(), 1);
+    assert!(!report.groups[0].is_automatic());
+}
+
+#[test]
+fn a_loser_that_came_back_after_its_merge_is_not_an_unfinished_merge() {
+    let (service, _d, _acid) = make_empty_service();
+    let old = seed(&service, "old", base(1, Some("p1"), 1));
+    seed(&service, "new", base(1, Some("p1"), 2));
+    apply(&service);
+    // Ingested again after the merge: it was not live at the `Replaces`.
+    write(&service, &old, base(1, Some("p1"), 3));
+
+    assert!(!gone(&service, &old));
+    assert!(dedup_report(&service, false).unfinished.is_empty());
+}
+
+/// A merge of `loser` into `winner` as an older release left it: `Replaces(loser)` on
+/// the winner, then the retract of everything of the loser's but `keep`.
+fn leave_unfinished(
+    service: &LibraryService,
+    winner: &ContentHash,
+    loser: &ContentHash,
+    loser_facts: Facts,
+    keep: impl Fn(&MusicValue) -> bool,
+) {
+    let merge = FactSource::new("mdma-dedup", "0.4.0", "Unknown");
+    write(
+        service,
+        winner,
+        vec![(MusicValue::Replaces(loser.clone()), merge)],
+    );
+    let missed: Facts = loser_facts.into_iter().filter(|(v, _)| !keep(v)).collect();
+    service
+        .acid_client
+        .retract_music_facts(loser, &missed)
+        .unwrap();
+    service.catch_up().unwrap();
+}
+
+#[test]
+fn a_chain_of_unfinished_merges_converges_in_one_apply() {
+    let (service, _d, _acid) = make_empty_service();
+    let of = |n: u8, t: &str| vec![src(audio(n)), src(title(t)), src(bpm(100.0))];
+    let l = seed(&service, "lll", of(11, "L"));
+    let w = seed(&service, "www", of(12, "W"));
+    // W replaces L, and both stay indexed through their bpm.
+    leave_unfinished(&service, &w, &l, of(11, "L"), |v| {
+        matches!(v, MusicValue::Bpm(_))
+    });
+    let w2 = seed(&service, "zzz", of(13, "W2"));
+    // W2 replaces the ghost W, which is itself the winner of the ghost L.
+    leave_unfinished(&service, &w2, &w, of(12, "W"), |v| {
+        matches!(v, MusicValue::Bpm(_))
+    });
+
+    let dry = dedup_report(&service, false);
+    assert_eq!(dry.unfinished.len(), 2, "{:?}", dry.unfinished);
+    assert!(
+        dry.unfinished
+            .iter()
+            .all(|u| u.winner.as_ref() == Some(&w2)),
+        "every winner is the live head: {:?}",
+        dry.unfinished
+    );
+
+    let report = dedup_report(&service, true);
+
+    let applied = report.applied.expect("apply report");
+    assert_eq!((applied.finished, applied.merged), (2, 0), "{applied:?}");
+    assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+    assert!(report.unfinished.is_empty());
+    assert!(gone(&service, &l) && gone(&service, &w));
+    assert!(!gone(&service, &w2));
+    for ancestor in [&w, &l] {
+        assert_eq!(
+            count_in_acid(&service, &w2, &MusicValue::Replaces(ancestor.clone())),
+            1,
+            "W2 replaces {ancestor} once"
+        );
+    }
+    assert!(dedup_report(&service, true).applied.unwrap().finished == 0);
+}
+
+#[test]
+fn a_ghost_that_is_still_in_a_duplicate_group_is_finished_not_merged_twice() {
+    let (service, _d, _acid) = make_empty_service();
+    let l = seed(
+        &service,
+        "lll",
+        [base(1, Some("p1"), 1), vec![src(title("T"))]].concat(),
+    );
+    let w = seed(&service, "www", base(1, Some("p1"), 2));
+    // The merge retracted the title only: the audio hash would keep L in W's group, but
+    // a retired track is in no group (it can never be a winner), only in the findings.
+    leave_unfinished(&service, &w, &l, vec![src(title("T"))], |_| false);
+    let dry = dedup_report(&service, false);
+    assert_eq!((dry.groups.len(), dry.unfinished.len()), (0, 1), "{dry:?}");
+
+    let report = dedup_report(&service, true);
+
+    let applied = report.applied.expect("apply report");
+    assert_eq!((applied.finished, applied.merged), (1, 0), "{applied:?}");
+    assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+    assert!(gone(&service, &l) && !gone(&service, &w));
+    assert!(report.groups.is_empty() && report.unfinished.is_empty());
+}
+
+#[test]
+fn a_retired_ghost_is_never_the_winner_of_a_merge() {
+    let (service, _d, _acid) = make_empty_service();
+    let ghost = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8_TAGS, Some("p1"));
+    // Retired by an unfinished merge, with the newest AddedAt: it would win any group.
+    let merge = FactSource::new("mdma-dedup", "0.4.0", "Unknown");
+    seed(
+        &service,
+        "www",
+        vec![src(audio(77)), (MusicValue::Replaces(ghost.clone()), merge)],
+    );
+    let newest = Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap();
+    write(&service, &ghost, vec![src(MusicValue::AddedAt(newest))]);
+
+    // An ingest of a re-downloaded copy does not self-heal into the ghost.
+    let copy = ingest_item(&service, "A - Song.flac", FIXTURE_S16_L8, Some("p1"));
+    assert!(!gone(&service, &copy), "the copy stays");
+    assert!(replaces_targets(&service, &ghost).is_empty());
+    assert!(
+        !gone(&service, &ghost),
+        "the ghost waits for the dedup apply"
+    );
+
+    // Nor does a direct merge, nor a confirmed one.
+    let direct = service.merge_group(&ghost, std::slice::from_ref(&copy));
+    assert_eq!(direct.merged, 0);
+    assert!(
+        direct
+            .errors
+            .iter()
+            .any(|e| e.contains("retired by an unfinished merge")),
+        "{:?}",
+        direct.errors
+    );
+    let confirmed = service.handle_request(LibraryRequest::DedupMerge {
+        winner: ghost.clone(),
+        losers: vec![copy.clone()],
+    });
+    assert!(
+        matches!(confirmed, LibraryResponse::Error(_)),
+        "{confirmed:?}"
+    );
+    assert!(!gone(&service, &copy));
+}
+
+#[test]
+fn a_merge_does_not_claim_an_ancestor_that_was_ingested_again() {
+    let (service, _d, _acid) = make_empty_service();
+    let a = seed(&service, "aaa", base(1, Some("p1"), 1));
+    let w = seed(&service, "www", base(1, Some("p1"), 2));
+    apply(&service);
+    assert!(gone(&service, &a));
+    // A is ingested again, with another audio file, so it is a track of its own.
+    write(&service, &a, vec![src(audio(5)), src(title("A again"))]);
+    let w2 = seed(&service, "zzz", base(1, Some("p1"), 3));
+
+    let (report, _) = apply(&service);
+
+    assert_eq!((report.merged, report.finished), (1, 0), "{report:?}");
+    assert!(gone(&service, &w) && !gone(&service, &w2));
+    assert!(!gone(&service, &a), "A is still a track");
+    assert_eq!(
+        count_in_acid(&service, &w2, &MusicValue::Replaces(a.clone())),
+        0,
+        "W2 does not replace the track that came back"
+    );
+    assert_eq!(
+        count_in_acid(&service, &w2, &MusicValue::Replaces(w.clone())),
+        1
+    );
+    assert!(dedup_report(&service, false).unfinished.is_empty());
 }

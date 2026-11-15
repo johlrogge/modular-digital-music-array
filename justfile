@@ -964,6 +964,20 @@ cli-cross:
     file target/aarch64-unknown-linux-gnu/release/mdma
     ls -lh target/aarch64-unknown-linux-gnu/release/mdma
 
+# Cross-compile mdma + mdma-tui for portable Linux x86_64 (old glibc, release tarball)
+[group('build')]
+cli-linux-portable glibc="2.31":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    echo "Building mdma + mdma-tui for x86_64 (glibc {{glibc}})..."
+    cargo polylith cargo --profile dev zigbuild --release \
+        --target x86_64-unknown-linux-gnu.{{glibc}} --bin mdma --bin mdma-tui
+    echo ""
+    file target/x86_64-unknown-linux-gnu/release/mdma target/x86_64-unknown-linux-gnu/release/mdma-tui
+    ls -lh target/x86_64-unknown-linux-gnu/release/mdma target/x86_64-unknown-linux-gnu/release/mdma-tui
+
 # Deploy CLI (mdma) to Pi - installs as /usr/bin/mdma, no service required
 [group('dev')]
 deploy-cli host=env_var_or_default("PI_HOST", "mdma-johlyroger.local"): cli-cross

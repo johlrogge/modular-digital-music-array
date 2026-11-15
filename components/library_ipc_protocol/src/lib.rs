@@ -912,15 +912,45 @@ pub struct DedupApplyReport {
     pub blobs_archived: usize,
     /// One message per failed merge or file archiving.
     pub errors: Vec<String>,
+    /// Unfinished merges completed (their losers' leftover facts retracted); not
+    /// counted in `merged`. Absent in reports from before unfinished merges were healed.
+    #[serde(default)]
+    pub finished: usize,
+}
+
+/// A live fact a merged-away track still has.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LeftoverFact {
+    pub value: MusicValue,
+    pub source: FactSource,
+}
+
+/// A merge that did not retract everything of its loser: a `Replaces` fact names the
+/// loser, yet the loser still has live facts (other than plays) from before the merge,
+/// so it is still indexed as a track.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnfinishedMerge {
+    pub loser: ContentHash,
+    /// The live track that ends up holding the loser: the head of the chain of
+    /// `Replaces` that retired the loser (the winner itself may be unfinished too).
+    /// `None` when the chain loops or leaves the index: there is no live winner.
+    pub winner: Option<ContentHash>,
+    /// The loser's live tracked facts; `DedupScan { apply: true }` retracts them (and
+    /// whatever else of the loser's is live, such as its file path).
+    pub leftovers: Vec<LeftoverFact>,
 }
 
 /// Answer to `DedupScan`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DedupScanReport {
     /// Duplicate groups, automatic ones first. With `apply`, the groups left after merging.
     pub groups: Vec<DedupGroup>,
     /// Present when the scan was run with `apply`.
     pub applied: Option<DedupApplyReport>,
+    /// Unfinished merges, a finding of their own: `apply` finishes them whatever the
+    /// state of the groups. With `apply`, the ones left after finishing.
+    #[serde(default)]
+    pub unfinished: Vec<UnfinishedMerge>,
 }
 
 /// One file in the archive.
@@ -1104,7 +1134,16 @@ mod tests {
                 merged: 1,
                 blobs_archived: 1,
                 errors: vec!["boom".into()],
+                finished: 2,
             }),
+            unfinished: vec![UnfinishedMerge {
+                loser: ContentHash::new("sha256:b"),
+                winner: Some(ContentHash::new("sha256:a")),
+                leftovers: vec![LeftoverFact {
+                    value: MusicValue::Format(music_facts::MusicFormat::Flac),
+                    source: FactSource::new("mdma-library", "0.1.0", "FilesystemScan"),
+                }],
+            }],
         };
         let json = serde_json::to_string(&LibraryResponse::DedupScan(report.clone())).unwrap();
         match serde_json::from_str::<LibraryResponse>(&json).unwrap() {
@@ -1129,8 +1168,12 @@ mod tests {
                 merged: 2,
                 blobs_archived: 3,
                 errors: vec!["boom".into()],
+                finished: 0,
             }
         );
+        let old_scan = r#"{"groups":[],"applied":null}"#;
+        let scan: DedupScanReport = serde_json::from_str(old_scan).unwrap();
+        assert!(scan.unfinished.is_empty());
     }
 
     #[test]

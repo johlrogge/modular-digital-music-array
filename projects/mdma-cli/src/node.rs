@@ -26,6 +26,23 @@ const IDENTIFY_TIMEOUT: Duration = Duration::from_secs(1);
 /// told apart).
 const NODE_ENV: &str = "MDMA_NODE";
 
+/// Whether resolving the node may print the note about an implicit choice
+/// ("Using <node>, discovered"). Commands that print nothing on success
+/// (`replica sync --quiet`) ask for `Silent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Notes {
+    Print,
+    Silent,
+}
+
+/// The note to print for `target` under `notes`, if any.
+fn note_to_print(target: &Target, notes: Notes) -> Option<String> {
+    match (target, notes) {
+        (Target::Remote(remote), Notes::Print) => source_note(remote),
+        _ => None,
+    }
+}
+
 /// True when the CLI should talk to the local services over IPC instead of a
 /// gateway: sockets were given explicitly, or the library socket exists here.
 pub fn local_ipc_wanted(sockets_given_explicitly: bool, library_socket_exists: bool) -> bool {
@@ -380,7 +397,7 @@ fn parse_env_node(value: Option<&str>) -> Result<Option<NodeSpec>, String> {
     }
 }
 
-fn env_node() -> Result<Option<NodeSpec>, String> {
+pub(crate) fn env_node() -> Result<Option<NodeSpec>, String> {
     parse_env_node(std::env::var(NODE_ENV).ok().as_deref())
 }
 
@@ -388,7 +405,7 @@ fn cache_path() -> Option<PathBuf> {
     cache::default_path()
 }
 
-fn load_cache() -> Option<NodeCache> {
+pub(crate) fn load_cache() -> Option<NodeCache> {
     let path = cache_path()?;
     match cache::load(&path) {
         Ok(cached) => cached,
@@ -419,16 +436,18 @@ fn request(explicit: Option<&NodeSpec>, local_ipc: bool) -> color_eyre::Result<R
 /// Resolve the node once at startup, remembering it when the resolver says
 /// so. Prints a note for implicit choices; fails with advice when no node
 /// can be resolved.
-pub fn resolve_startup(explicit: Option<&NodeSpec>, local_ipc: bool) -> color_eyre::Result<Target> {
+pub fn resolve_startup(
+    explicit: Option<&NodeSpec>,
+    local_ipc: bool,
+    notes: Notes,
+) -> color_eyre::Result<Target> {
     match resolve(request(explicit, local_ipc)?, &mut real_effects()) {
         Ok(resolution) => {
             if let Some(update) = &resolution.cache_update {
                 save_cache(update);
             }
-            if let Target::Remote(remote) = &resolution.target {
-                if let Some(note) = source_note(remote) {
-                    eprintln!("{note}");
-                }
+            if let Some(note) = note_to_print(&resolution.target, notes) {
+                eprintln!("{note}");
             }
             Ok(resolution.target)
         }
@@ -455,8 +474,13 @@ pub(crate) fn list(_ctx: &Ctx) -> color_eyre::Result<()> {
 /// The remembered node's name, id and host that start with `typed`. Local state only
 /// (the node cache file, no network), and silent when there is none or it is unreadable.
 pub(crate) fn complete_nodes(typed: &str) -> Vec<hicli::Candidate> {
-    let cached = cache_path().and_then(|path| cache::load(&path).ok().flatten());
-    node_candidates(cached.as_ref(), typed)
+    node_candidates(load_cache_quiet().as_ref(), typed)
+}
+
+/// The remembered node, read silently: `None` when there is none or it is unreadable.
+/// For completion and the background refresh, which must not print.
+pub(crate) fn load_cache_quiet() -> Option<NodeCache> {
+    cache::load(&cache_path()?).ok().flatten()
 }
 
 fn node_candidates(cached: Option<&NodeCache>, typed: &str) -> Vec<hicli::Candidate> {
@@ -594,7 +618,7 @@ mod tests {
         let _env = crate::test_support::env_lock();
         let original = std::env::var_os(NODE_ENV);
         std::env::set_var(NODE_ENV, "mdma.local:nope");
-        let result = resolve_startup(None, false);
+        let result = resolve_startup(None, false, Notes::Print);
         match original {
             Some(value) => std::env::set_var(NODE_ENV, value),
             None => std::env::remove_var(NODE_ENV),
@@ -694,6 +718,14 @@ mod tests {
     }
 
     // --- notes -------------------------------------------------------------
+
+    #[test]
+    fn a_silent_resolution_prints_no_note_even_for_an_implicit_choice() {
+        let discovered = target(Source::Discovered);
+        assert!(note_to_print(&discovered, Notes::Print).is_some());
+        assert_eq!(note_to_print(&discovered, Notes::Silent), None);
+        assert_eq!(note_to_print(&Target::LocalIpc, Notes::Print), None);
+    }
 
     #[test]
     fn notes_only_for_implicit_sources() {
