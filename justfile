@@ -971,6 +971,18 @@ cli-linux-portable glibc="2.31":
     set -euo pipefail
     export ZIG_GLOBAL_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zig"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    # Target == host, so cargo-zigbuild sets target-applies-to-host=false (via
+    # cargo's nightly channel override) to keep its zig linker off build
+    # scripts. Host artifacts then ignore devenv's
+    # CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER and fall back to `cc` plus
+    # rustc's self-contained rust-lld, whose nix wrapper is broken (unsubstituted
+    # @mktemp@, hit because devenv sets NIX_LD_USE_RESPONSE_FILE=1). Point the
+    # host linker at devenv's linker, as in every other x86_64 build.
+    # cargo-zigbuild keeps a CARGO_TARGET_*_LINKER that is already set, so the
+    # devenv one must be unset or the target links against nix glibc.
+    export CARGO_UNSTABLE_HOST_CONFIG=true
+    export CARGO_HOST_LINKER="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER:?run inside devenv shell}"
+    unset CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER
     echo "Building mdma + mdma-tui for x86_64 (glibc {{glibc}})..."
     cargo polylith cargo --profile dev zigbuild --release \
         --target x86_64-unknown-linux-gnu.{{glibc}} --bin mdma --bin mdma-tui
