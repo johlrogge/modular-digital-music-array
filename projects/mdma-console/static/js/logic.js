@@ -1,0 +1,161 @@
+// Pure logic: no DOM, no fetch, no globals. Safe to unit-test under any JS runtime.
+//
+// Track shape: the ApiTrack JSON of GET /api/tracks (src/api/library.rs, pinned by a Rust test).
+// Every key is always present; absent facts are null:
+//   { hash, title, artist, album, track_number, disc, bpm, key, duration_secs, added, has_cover }
+//   hash "sha256:..."; bpm number|null; key string|null; added ISO 8601 string|null; has_cover bool.
+// Player shape: GET /api/player is { state: "idle"|"playing"|"paused"|"loading", now: hash|null, queue: [hash] }.
+//
+// Anything that decides what is heard (idle guard, filter semantics, queue CAS) is enforced in
+// Rust; this file only narrows, sorts, pages and groups.
+
+const collator = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
+
+/** The one string ordering used everywhere: case/accent-insensitive, numbers in natural order. */
+export function collate(a, b) {
+  return collator.compare(String(a ?? ""), String(b ?? ""));
+}
+
+const lc = (s) => String(s ?? "").toLowerCase();
+
+/** 32-bit FNV-1a of a string, as an unsigned integer. */
+export function fnv(str) {
+  let x = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    x ^= str.charCodeAt(i);
+    x = Math.imul(x, 0x01000193) >>> 0;
+  }
+  return x >>> 0;
+}
+
+/** Two leading initials of a name, upper-cased ("?" when empty). */
+export function initials(name) {
+  const w = String(name).replace(/[^\p{L}\p{N} ]/gu, "").trim().split(/\s+/);
+  return (((w[0] || "?")[0]) + (w[1] ? w[1][0] : "")).toUpperCase();
+}
+
+/** True when nothing is loaded. The server's `state` is the only source of truth: paused and loading are busy. */
+export function isIdle(player) {
+  return !player || player.state === "idle";
+}
+
+/** Case-insensitive substring match of a query against title, artist and album (null fields never match "null"). */
+export function textMatch(track, query) {
+  const q = lc(query).trim();
+  if (!q) return true;
+  return [track.title, track.artist, track.album].map(lc).join(" ").includes(q);
+}
+
+/** Narrow tracks by text. An empty query returns the input unchanged. */
+export function narrow(tracks, query) {
+  const q = String(query ?? "").trim();
+  return q ? tracks.filter((t) => textMatch(t, q)) : tracks;
+}
+
+// Each key function yields a string (collated) or a number (subtracted).
+const KEYERS = {
+  title: (t) => t.title,
+  artist: (t) => t.artist,
+  album: (t) => t.album,
+  bpm: (t) => (t.bpm == null ? 0 : Number(t.bpm)),
+  added: (t) => t.added,
+};
+
+function compareValues(x, y) {
+  return typeof x === "number" && typeof y === "number" ? x - y : collate(x, y);
+}
+
+/** Comparator for tracks. `by` is title|artist|album|bpm|added, `dir` is "asc"|"desc". Ties break on hash. */
+export function trackComparator(by, dir) {
+  const key = KEYERS[by] || KEYERS.added;
+  const sign = dir === "asc" ? 1 : -1;
+  return (a, b) => compareValues(key(a), key(b)) * sign || collate(a.hash, b.hash);
+}
+
+/** Sorted copy of tracks. */
+export function sortTracks(tracks, by, dir) {
+  return tracks.slice().sort(trackComparator(by, dir));
+}
+
+/** Album order: disc, then track number, then title. */
+export function albumOrder(a, b) {
+  return (
+    (a.disc || 1) - (b.disc || 1) ||
+    (a.track_number || 0) - (b.track_number || 0) ||
+    collate(a.title, b.title)
+  );
+}
+
+/** One slice of a paged list: items [page*size, (page+1)*size) plus whether more remain. */
+export function pageSlice(items, page, size) {
+  const start = Math.max(0, page) * size;
+  const end = Math.min(items.length, start + size);
+  return { items: items.slice(start, end), shown: end, total: items.length, more: end < items.length };
+}
+
+/**
+ * Group tracks into albums by album name (same-named albums by different artists merge, like
+ * the old server route). Tracks are in album order; the cover is the first track in that order
+ * that has one.
+ */
+export function groupAlbums(tracks) {
+  const map = new Map();
+  for (const t of tracks) {
+    if (!t.album) continue;
+    let a = map.get(t.album);
+    if (!a) {
+      a = { name: t.album, artist: t.artist, tracks: [], cover: null };
+      map.set(t.album, a);
+    }
+    a.tracks.push(t);
+  }
+  const out = [...map.values()];
+  for (const a of out) {
+    a.tracks.sort(albumOrder);
+    const first = a.tracks.find((t) => t.has_cover);
+    a.cover = first ? first.hash : null;
+    a.artist = a.tracks[0].artist;
+  }
+  return out.sort((a, b) => collate(a.name, b.name));
+}
+
+/** Group tracks into artists: { name, tracks, albums (distinct names, sorted) }. */
+export function groupArtists(tracks) {
+  const map = new Map();
+  for (const t of tracks) {
+    if (!t.artist) continue;
+    let a = map.get(t.artist);
+    if (!a) {
+      a = { name: t.artist, tracks: [], albums: new Set() };
+      map.set(t.artist, a);
+    }
+    a.tracks.push(t);
+    if (t.album) a.albums.add(t.album);
+  }
+  return [...map.values()]
+    .map((a) => ({ name: a.name, tracks: a.tracks, albums: [...a.albums].sort(collate) }))
+    .sort((a, b) => collate(a.name, b.name));
+}
+
+/** Queue edits by index. All return new arrays; the input is never mutated. */
+export function removeAt(queue, i) {
+  return queue.filter((_, j) => j !== i);
+}
+
+export function moveToNext(queue, i) {
+  if (i <= 0 || i >= queue.length) return queue.slice();
+  return [queue[i], ...queue.filter((_, j) => j !== i)];
+}
+
+/**
+ * Move the item at `from` so that it sits at index `to` in the RESULT (splice semantics: the
+ * item is removed first, then inserted at `to`). Moving [a,b,c,d] from 0 to 2 gives [b,c,a,d].
+ * Out-of-range or equal indices return an unchanged copy.
+ */
+export function reorder(queue, from, to) {
+  if (from === to || from < 0 || from >= queue.length || to < 0 || to >= queue.length) return queue.slice();
+  const q = queue.slice();
+  const [it] = q.splice(from, 1);
+  q.splice(to, 0, it);
+  return q;
+}

@@ -22,8 +22,14 @@ use source_protocol::{DownloadState, SourceRequest, SourceResponse};
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
+use tower_http::compression::CompressionLayer;
 
+mod api;
+mod assets;
 mod packages;
+#[cfg(test)]
+mod test_support;
 mod types;
 
 use packages::{AvailableUpdate, InstalledPackage};
@@ -1757,6 +1763,51 @@ fn reboot_error_status(message: &str) -> StatusCode {
 }
 
 #[cfg(test)]
+mod compression_tests {
+    use super::compress_predicate;
+    use crate::test_support::get_with_encoding;
+    use axum::body::Body;
+    use axum::http::{header, Response};
+    use tower_http::compression::predicate::Predicate;
+
+    fn response(content_type: &str, len: usize) -> Response<Body> {
+        Response::builder()
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(vec![b'x'; len]))
+            .unwrap()
+    }
+
+    #[test]
+    fn predicate_compresses_text_but_not_streams_or_downloads() {
+        let p = compress_predicate();
+        assert!(p.should_compress(&response("text/css", 100)));
+        assert!(p.should_compress(&response("application/json", 100)));
+        assert!(!p.should_compress(&response("text/event-stream", 100)));
+        assert!(!p.should_compress(&response("audio/wav", 100_000)));
+        assert!(!p.should_compress(&response("audio/flac", 100_000)));
+        assert!(!p.should_compress(&response("application/octet-stream", 100_000)));
+        assert!(
+            !p.should_compress(&response("text/css", 10)),
+            "tiny bodies stay plain"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_stream_is_never_compressed() {
+        let res = get_with_encoding("/player/events", Some("gzip")).await;
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            res.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        assert!(
+            res.headers().get(header::CONTENT_ENCODING).is_none(),
+            "gzip would buffer server-sent events"
+        );
+    }
+}
+
+#[cfg(test)]
 mod reboot_status_tests {
     use super::*;
 
@@ -1885,7 +1936,33 @@ async fn main() -> Result<()> {
         *state.packages.lock().await = pkgs;
     }
 
-    let app = Router::new()
+    let app = app(state);
+
+    tracing::info!(
+        "MDMA Console listening on http://[::]:{} (dual-stack)",
+        args.port
+    );
+    http_server::serve(app, &http_server::HttpServerConfig { port: args.port }).await?;
+
+    Ok(())
+}
+
+/// What gets gzipped: the defaults (over 32 B, not images or gRPC), but never server-sent
+/// events (they must not be buffered) and never audio downloads (`/export/:hash`).
+fn compress_predicate() -> impl Predicate {
+    DefaultPredicate::new()
+        .and(NotForContentType::const_new("text/event-stream"))
+        .and(NotForContentType::const_new("audio/"))
+        .and(NotForContentType::const_new("application/octet-stream"))
+}
+
+fn compression() -> CompressionLayer<impl Predicate> {
+    CompressionLayer::new().compress_when(compress_predicate())
+}
+
+/// The whole HTTP application: every route, with state and middleware applied.
+fn app(state: Arc<AppState>) -> Router {
+    Router::new()
         .route("/", get(index))
         .route("/health", get(health))
         .route("/check-updates", post(check_updates))
@@ -1960,15 +2037,11 @@ async fn main() -> Result<()> {
             post(admin_service_mode_disable),
         )
         .route("/admin/reboot", post(admin_reboot))
-        .with_state(state);
-
-    tracing::info!(
-        "MDMA Console listening on http://[::]:{} (dual-stack)",
-        args.port
-    );
-    http_server::serve(app, &http_server::HttpServerConfig { port: args.port }).await?;
-
-    Ok(())
+        // New web UI: JSON API, embedded assets and the app shell
+        .merge(api::routes())
+        .merge(assets::routes())
+        .with_state(state)
+        .layer(compression())
 }
 
 // =============================================================================
