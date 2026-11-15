@@ -22,9 +22,22 @@ gateway-client = { workspace = true }
 source-protocol = { workspace = true }
 nng-transport = { workspace = true }
 playlist-import = { workspace = true }
+node-discovery = { workspace = true }
 
 # NNG + serialization
 nng = "1.0"
 serde_json = "1.0"
 thiserror = "1.0"
 tracing = "0.1"
+
+# Only for the test-support helper (a bound-but-not-listening socket).
+libc = { workspace = true, optional = true }
+
+[features]
+test-support = ["dep:libc"]
+
+[dev-dependencies]
+# cfg(test) compiles test_support without the test-support feature, so libc is needed here too.
+libc = { workspace = true }
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }

@@ -26,7 +26,7 @@ pub(crate) struct SourceArg(pub mdma_client::SourceName);
 fn complete_local_sources(typed: &str) -> Vec<hicli::Candidate> {
     let dir = std::env::var_os("MDMA_SOURCES_DIR")
         .filter(|dir| !dir.is_empty())
-        .unwrap_or_else(|| crate::ctx::DEFAULT_SOURCES_DIR.into());
+        .unwrap_or_else(|| mdma_client::node::DEFAULT_SOURCES_DIR.into());
     let local = sources_in(std::path::Path::new(&dir), typed);
     let mut offered = merge_unlisted(local, complete_sources(typed));
     offered.sort();

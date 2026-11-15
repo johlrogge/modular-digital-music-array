@@ -21,10 +21,10 @@ use library_projection::{project_lines, Projection};
 use mdma_client::LibraryBackend;
 use serde::{Deserialize, Serialize};
 
-use crate::ctx::{connect_failed, library_connect_failed, Ctx};
-use crate::node;
+use crate::ctx::Ctx;
 use crate::output::interpret_library;
 use crate::snapshot::CompletionSnapshot;
+use mdma_client::node::{self, connect_failed, library_connect_failed};
 
 /// How long the replica waits for the node, per request.
 const LINK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -304,8 +304,8 @@ fn local_from_environment() -> bool {
     let given = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
     let library = given("MDMA_LIBRARY_SOCKET");
     let sockets_given = library.is_some() || given("MDMA_PLAYBACK_SOCKET").is_some();
-    let library = library.unwrap_or_else(|| crate::ctx::DEFAULT_LIBRARY_SOCKET.to_string());
-    crate::ctx::local_ipc_for(&library, sockets_given)
+    let library = library.unwrap_or_else(|| node::DEFAULT_LIBRARY_SOCKET.to_string());
+    node::local_ipc_for(&library, sockets_given)
 }
 
 /// The replica of the node in use, for completion and for the refresh after a
@@ -943,7 +943,7 @@ mod tests {
         replica_with_host(&nodes_dir, "stage", "mdma-stage2.local");
         let mut given = globals();
         given.node = NodeFlag(Some("mdma-stage2.local".parse().unwrap()));
-        let ctx = Ctx::with_target(given, node_discovery::Target::LocalIpc);
+        let ctx = Ctx::with_target(given.into(), node_discovery::Target::LocalIpc);
 
         reset(&ctx).expect("the first reset deletes the replica");
         reset(&ctx).expect("the second has nothing to do, and that is not a failure");
@@ -1261,7 +1261,7 @@ mod tests {
         let ctx_for = |host: &str| {
             let mut given = globals();
             given.node = NodeFlag(Some(host.parse().unwrap()));
-            Ctx::with_target(given, node_discovery::Target::LocalIpc)
+            Ctx::with_target(given.into(), node_discovery::Target::LocalIpc)
         };
 
         let fold = fold_current(&ctx_for("mdma-stage2.local")).unwrap();

@@ -2,13 +2,20 @@
 //!
 //! Provides gateway-or-direct transport for library, playback, and source services.
 
+mod client_config;
 mod error;
 pub mod library;
+pub mod node;
 pub mod playback;
 pub mod source;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
-pub use error::upgrade_node_text;
+pub use client_config::ClientConfig;
+pub use error::{source_label, upgrade_node_text};
 pub use library::LibraryBackend;
+pub use node::{Node, NodeError, NodeOptions};
+pub use node_discovery::{NodeSpec, RemoteTarget, Source, Target};
 pub use playback::PlaybackBackend;
 pub use source::{list_available_sources, SourceClient};
 

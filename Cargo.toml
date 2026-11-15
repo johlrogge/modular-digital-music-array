@@ -52,7 +52,6 @@ members = [
     "components/wifi_config",
     "bases/bdd-runner",
     "bases/bevy-app",
-    "bases/client",
     "bases/http_server",
     "bases/service",
     "bases/tui",

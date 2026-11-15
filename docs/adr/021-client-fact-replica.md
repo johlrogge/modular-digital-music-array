@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed, 2026-11-14
+Proposed, 2026-11-14. Amended by ADR-022 (§4, §6) (2026-11-15).
 
 Amends ADR-016 §2-3 (this is the first use of the per-node replica; it answers open question 5) and ADR-017 §6.9 (the migration replaces the log epoch). Related: ADR-001, ADR-009, ADR-011, ADR-014 (§14), ADR-020.
 
