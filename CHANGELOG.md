@@ -8,6 +8,14 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.38.3] — 2026-11-15
+
+### Changed
+
+- **The README opens with an Install section.** It gives the curl installer, `mdma node select` and `mdma ping`, and says to remove an old cargo-installed CLI first.
+
+---
+
 ## [0.38.2] — 2026-11-15
 
 ### Fixed

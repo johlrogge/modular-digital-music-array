@@ -274,7 +274,7 @@ Quick install is at the [top](#install). Every `vX.Y.Z` release publishes `mdma-
 
 ```bash
 # Install a specific release
-curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash -s v0.38.2
+curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash -s v0.38.3
 
 # Install to a user-writable location (no sudo)
 curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | MDMA_INSTALL_DIR=~/.local/bin bash
@@ -298,6 +298,10 @@ See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
 ## What's new in 0.38
 
 0.38.1 fixes the portable Linux CLI build, so release tags publish the CLI tarballs again; v0.38.0 has no release assets.
+
+0.38.2 makes the installer suggest `mdma node select` and print shell completion setup.
+
+0.38.3 opens the README with an Install section.
 
 ### A local replica of the fact log, offline completion, play history
 
