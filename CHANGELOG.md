@@ -8,6 +8,14 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.38.2] — 2026-11-15
+
+### Fixed
+
+- **The curl installer ends with next steps that work.** It now suggests `mdma node select` and `mdma ping` instead of exporting `MDMA_NODE`, warns when the install directory is not on `PATH`, and prints shell completion setup for zsh, fish or bash. The README shows zsh and fish completion setup next to bash.
+
+---
+
 ## [0.38.1] — 2026-11-15
 
 ### Fixed
