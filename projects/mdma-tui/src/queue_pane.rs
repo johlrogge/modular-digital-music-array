@@ -1,6 +1,6 @@
 use crate::pane::{AddPlayingTarget, Pane, PaneAction, PaneKind};
 use crate::selection::SelectionState;
-use crate::theme::TEXT_TERTIARY;
+use crate::theme::MUTED;
 use crate::track_list::render_track_list;
 use crossterm::event::{KeyCode, KeyEvent};
 use mdma_client::{
@@ -60,7 +60,7 @@ impl Pane for QueuePane {
     fn render(&self, f: &mut Frame, area: Rect) {
         if self.tracks.is_empty() {
             let placeholder = Paragraph::new("queue is empty")
-                .style(Style::default().fg(TEXT_TERTIARY))
+                .style(Style::default().fg(MUTED))
                 .alignment(Alignment::Center);
             f.render_widget(placeholder, area);
             return;

@@ -1,11 +1,12 @@
 #![allow(dead_code)]
 use crate::pane::{Pane, PaneAction, PaneKind};
 use crate::selection::SelectionState;
+use crate::theme::{RowState, MUTED};
 use crossterm::event::{KeyCode, KeyEvent};
 use mdma_client::{ContentHash, LibraryBackend, PlaylistName};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::Style,
     text::Span,
     widgets::{Block, Borders, List, ListItem},
     Frame,
@@ -36,8 +37,8 @@ impl PlaylistsPane {
 impl Pane for PlaylistsPane {
     fn render(&self, f: &mut Frame, area: Rect) {
         if self.names.is_empty() {
-            let placeholder = ratatui::widgets::Paragraph::new("No playlists")
-                .style(Style::default().fg(Color::DarkGray));
+            let placeholder =
+                ratatui::widgets::Paragraph::new("No playlists").style(Style::default().fg(MUTED));
             f.render_widget(placeholder, area);
             return;
         }
@@ -55,25 +56,8 @@ impl Pane for PlaylistsPane {
                 let prefix = if is_cursor { "▶ " } else { "  " };
                 let label = format!("{}{}", prefix, name);
 
-                let style = if is_cursor && is_selected {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                } else if is_cursor {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else if is_selected {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-
-                ListItem::new(Span::styled(label, style))
+                let state = RowState::from_flags(is_cursor, is_selected);
+                ListItem::new(Span::raw(label)).style(state.style())
             })
             .collect();
 

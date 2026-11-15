@@ -16,6 +16,7 @@ All notable changes to MDMA are documented here.
 
 ### Fixed
 
+- **The TUI uses its own theme colours on every terminal:** all colours come from its theme, the frame paints its own background, and terminals without truecolor get a 256-colour mapping. `MDMA_TUI_COLORS=truecolor|24bit|256` overrides the detection (see `mdma-tui --help`); set it when `COLORTERM` is not forwarded, for example over SSH.
 - **A track a merge has replaced is no longer given new facts.** The startup Format and cover-art backfills and the identity backfill skip a loser that a `Replaces` fact retired while it was live, so they no longer revive it. A track that was ingested again after its merge is not affected, and a later merge no longer claims it.
 - **Retracting a track's file path now clears it** in the library index, so a track that outlives a merge no longer keeps a file it lost.
 
