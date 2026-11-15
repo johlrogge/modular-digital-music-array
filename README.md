@@ -227,28 +227,28 @@ Bad argument values are rejected while parsing, before anything connects, with t
 
 ---
 
-## Installing on macOS
+## Installing on macOS (arm64) and Linux (x86_64)
 
-Copy `scripts/install-mdma-macos.sh` from this repo to your Mac and run it. It requires the `gh` CLI (authenticated) and installs both `mdma` and `mdma-tui` to `/usr/local/bin/` by default.
+Every `vX.Y.Z` release publishes `mdma-macos-arm64.tar.gz`, `mdma-linux-x86_64.tar.gz` and `SHA256SUMS` as GitHub release assets. The installer needs only `curl`, `tar` and `shasum`/`sha256sum`. It needs no `gh` CLI and no login. It verifies the checksum and installs `mdma` and `mdma-tui` to `/usr/local/bin/` by default.
 
 ```bash
-# Install latest release
-bash install-mdma-macos.sh
+# Install the latest release
+curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash
 
-# Install a specific tag
-bash install-mdma-macos.sh v0.37.0
+# Install a specific release
+curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash -s v0.38.0
 
 # Install to a user-writable location (no sudo)
-MDMA_INSTALL_DIR=~/.local/bin bash install-mdma-macos.sh
+curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | MDMA_INSTALL_DIR=~/.local/bin bash
 ```
 
-The script resolves the tag to its CI run, downloads both macOS arm64 artifacts, strips the quarantine attribute, and installs with correct permissions. Artifacts expire after roughly 90 days; if none are found the script will tell you how to trigger a rebuild via `workflow_dispatch`.
+`scripts/install-mdma-macos.sh` still works and forwards to `install-mdma.sh`. The Linux binaries are built against glibc 2.31, so they run on current distributions and not only on Nix systems.
 
 Or build from source:
 
 ```bash
-cargo polylith cargo --profile dev build --release -p mdma-cli
-cp profiles/dev/target/release/mdma /usr/local/bin/
+cargo polylith cargo --profile dev build --release --bin mdma
+cp target/release/mdma /usr/local/bin/
 ```
 
 ---
