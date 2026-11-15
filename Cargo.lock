@@ -2841,10 +2841,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4bfbf56724aa9eca8afa4fcfadeb479e722935bb2a0900c2d37e0cc477af0688"
 
 [[package]]
-name = "client"
-version = "0.1.0"
-
-[[package]]
 name = "clipboard-win"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3678,7 +3674,7 @@ version = "0.38.3"
 dependencies = [
  "bevy-app",
  "clap",
- "client",
+ "mdma-client",
  "tracing",
  "tracing-subscriber",
 ]
@@ -6080,7 +6076,6 @@ dependencies = [
  "audio-transcoder",
  "bpaf",
  "chrono",
- "client",
  "color-eyre",
  "colored",
  "dirs",
@@ -6120,6 +6115,7 @@ name = "mdma-client"
 version = "0.2.0"
 dependencies = [
  "gateway-client",
+ "libc",
  "library-ipc-client",
  "library-ipc-protocol",
  "library-search",
@@ -6127,9 +6123,12 @@ dependencies = [
  "media-protocol",
  "nng",
  "nng-transport",
+ "node-discovery",
  "playlist-import",
+ "pretty_assertions",
  "serde_json",
  "source-protocol",
+ "tempfile",
  "thiserror 1.0.69",
  "tracing",
 ]
@@ -6233,7 +6232,6 @@ name = "mdma-tui"
 version = "0.38.3"
 dependencies = [
  "clap",
- "client",
  "color-eyre",
  "corsett",
  "crossterm",

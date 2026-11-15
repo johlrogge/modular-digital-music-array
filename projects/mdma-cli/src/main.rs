@@ -133,7 +133,7 @@ fn main() -> std::process::ExitCode {
     let command = background::parse_command(&args);
     // The node is resolved once, on first use, so only commands that talk to
     // one resolve it.
-    let code = app().run_with_args(args, |globals| Ok(Ctx::new(globals)));
+    let code = app().run_with_args(args, |globals| Ok(Ctx::new(globals.into())));
     // Once, here, for every command that ran (any exit code but 2, a usage error):
     // start a detached sync if the replica is stale or the command wrote. It never
     // waits, and never runs inside a command.
@@ -197,7 +197,7 @@ mod tests {
 
     fn given(args: &[&str]) -> bool {
         let (globals, _) = parse_cli(args).expect("valid args");
-        Ctx::with_target(globals, node_discovery::Target::LocalIpc).sockets_given()
+        Ctx::with_target(globals.into(), node_discovery::Target::LocalIpc).sockets_given()
     }
 
     #[test]
@@ -502,7 +502,10 @@ mod tests {
     fn run_exits_zero_for_version_and_two_for_any_parse_failure() {
         let run = |args: &[&str]| {
             app().run_with_args(args.iter().copied(), |globals| {
-                Ok(Ctx::with_target(globals, node_discovery::Target::LocalIpc))
+                Ok(Ctx::with_target(
+                    globals.into(),
+                    node_discovery::Target::LocalIpc,
+                ))
             })
         };
         assert_eq!(run(&["--version"]), 0);
@@ -515,7 +518,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let socket = format!("ipc://{}/none.sock", dir.path().display());
         let code = app().run_with_args(["--socket", socket.as_str(), "ping"], |globals| {
-            Ok(Ctx::with_target(globals, node_discovery::Target::LocalIpc))
+            Ok(Ctx::with_target(
+                globals.into(),
+                node_discovery::Target::LocalIpc,
+            ))
         });
         assert_eq!(code, 1);
     }
@@ -524,7 +530,7 @@ mod tests {
     fn run_exits_one_when_an_admin_command_cannot_reach_the_node() {
         let (target, _, _guard) = crate::test_support::dead_node();
         let code = app().run_with_args(["admin", "service-mode", "status"], move |globals| {
-            Ok(Ctx::with_target(globals, target))
+            Ok(Ctx::with_target(globals.into(), target))
         });
         assert_eq!(code, 1);
     }

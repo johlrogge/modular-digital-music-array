@@ -71,7 +71,7 @@ fn main() -> Result<()> {
     let color_mode = theme::mode_from_env();
 
     // Derive full NNG gateway/event addresses from node hostname via ClientConfig.
-    let client_cfg = client::ClientConfig {
+    let client_cfg = mdma_client::ClientConfig {
         node: cli.node.clone(),
         ..Default::default()
     };

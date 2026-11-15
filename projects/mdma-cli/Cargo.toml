@@ -12,7 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 acid-protocol = { workspace = true }
-client = { path = "../../bases/client" }
 fact-replica = { workspace = true }
 library-projection = { workspace = true }
 private-file = { workspace = true }
@@ -22,7 +21,7 @@ bpaf = { version = "0.9", features = ["derive"] }
 color-eyre = "0.6"
 event-protocol = { path = "../../components/event_protocol" }
 inbox-utils = { path = "../../components/inbox_utils" }
-mdma-client = { path = "../../components/mdma_client" }
+mdma-client = { workspace = true }
 tempfile = "3"
 nng = "1.0"
 nng-transport = { path = "../../components/nng_transport" }
@@ -51,3 +50,4 @@ libc = { workspace = true }
 [dev-dependencies]
 fact-replica = { workspace = true, features = ["test-support"] }
 pretty_assertions = "1"
+mdma-client = { workspace = true, features = ["test-support"] }

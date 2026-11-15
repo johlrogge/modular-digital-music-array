@@ -27,7 +27,7 @@ fn main() {
     let cli = Cli::parse();
 
     // Derive full NNG gateway address from node hostname via ClientConfig.
-    let client_cfg = client::ClientConfig {
+    let client_cfg = mdma_client::ClientConfig {
         node: cli.node.clone(),
         ..Default::default()
     };
