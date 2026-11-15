@@ -93,6 +93,11 @@ mdma library dedup merge <winner> <loser> -y
 mdma library archive
 mdma library archive empty --yes
 
+# Play history from the local replica, including plays from merged duplicates — new in 0.38.0
+mdma plays sha256:abc12345
+mdma plays --recent 20
+mdma replica status
+
 # Subscribe to live events (now playing, queue changes)
 mdma subscribe
 ```
@@ -142,10 +147,10 @@ This is a [Polylith](https://polylith.gitbook.io/polylith/) workspace. Deployabl
 | `mdma-acid` | ACID service — standalone append-only fact stream writer |
 | `mdma-playback` | Queue manager — drives audio sources via StreamClient; persists queue to `/metadata/queue.json` |
 | `mdma-audio` | Audio playback source — wraps PlaybackEngine (Symphonia + rubato + PipeWire), speaks `stream_source_protocol` over NNG |
-| `mdma-tui` | Terminal UI — multi-pane tabs (nnn-style, `1`–`5`/`6`–`0`), field-aware search grammar (`:artist`, `:bpm`, `:added`, …), DJ shortcuts (`A`, `P`, `d`/`p`, `u`), modal keybindings, command palette, live queue sync, intelligent column compression |
+| `mdma-tui` | Terminal UI — multi-pane tabs (nnn-style, `1`–`5`/`6`–`0`), field-aware search grammar (`:artist`, `:bpm`, `:added`, …), DJ shortcuts (`A`, `P`, `d`/`p`, `u`), modal keybindings, command palette, live queue sync, intelligent column compression, own theme colours on every terminal (`MDMA_TUI_COLORS=truecolor\|24bit\|256` overrides detection) |
 | `mdma-bandcamp` | Bandcamp source — collection sync into the library inbox, fan playlist listing/fetching, and background playlist import jobs for `mdma source bandcamp` |
 | `mdma-console` | Web management console — player controls, search, queue, upload, export |
-| `mdma-cli` | CLI — search, queue, playlists, playback, export, subscribe, marks, Bandcamp playlist import, shell completions |
+| `mdma-cli` | CLI — search, queue, playlists, playback, export, subscribe, marks, Bandcamp playlist import, play history, local fact replica, offline shell completions |
 | `dj-workspace` | Bevy GUI app (laptop-only, not packaged for Pi) — playlist browser and BPM/Key/Role/Energy candidate finder with sortable results; connects via gateway (`dj-workspace --node <host>`) |
 
 **Key components** (shared libraries):
@@ -221,6 +226,8 @@ mdma --version          # prints "Version: x.y.z"
 mdma generate-completions bash > ~/.local/share/bash-completion/completions/mdma
 ```
 
+Completion reads a local replica of the node's fact log, so it needs no network: mark, playlist and source names and search filter values complete offline. A background `mdma replica sync` refreshes it. `mdma replica status` shows it and `mdma replica reset` deletes it.
+
 `generate-completions` is hidden from `--help`. elvish and PowerShell completions are no longer provided. Regenerate any completion script you installed earlier.
 
 Bad argument values are rejected while parsing, before anything connects, with the parser's error text and exit code 2. Runtime failures (node unreachable, service error) exit 1. Track hashes on the command line need at least 8 lowercase hex characters, with an optional `sha256:` prefix. A date option value that starts with a dash must be glued to the flag: `--added=-7` (`--added -7` is rejected).
@@ -254,6 +261,22 @@ cp target/release/mdma /usr/local/bin/
 ---
 
 See [ROADMAP.md](ROADMAP.md) for detailed status and planned work.
+
+---
+
+## What's new in 0.38.0
+
+### A local replica of the fact log, offline completion, play history
+
+- **The CLI keeps a local replica of each node's fact log (ADR-021).** It lives under your cache directory. `mdma replica status` shows it and `mdma replica reset` deletes it. A hidden `replica sync` fills it with verified, resumable reads. It runs detached in the background when the replica is more than 30 s old and after commands that write; nothing syncs inline.
+- **Shell completion works offline from the replica:** mark, playlist and source names, and artists, titles, albums, labels, genres and styles for the `search` filters and query. No network call.
+- **`mdma plays HASH|-` and `mdma plays --recent N`** show play history from the replica, including plays inherited from merged duplicates.
+- **`mdma library dedup` finds and finishes "unfinished merges"** left by old releases (`--apply` finishes them). Writers no longer revive merged-away tracks, and retracting a file path clears it from the index.
+- **The ACID log has an epoch and supports pinned reads** (a rewritten log answers `StreamDiverged`). The gateway forwards only ACID reads; write through the library service.
+- **The TUI uses its own theme colours on every terminal,** with a 256-colour fallback. `MDMA_TUI_COLORS=truecolor|24bit|256` overrides detection, for example over SSH.
+- **CLI binaries are published as GitHub release assets** (macOS arm64 and portable Linux x86_64), with a curl-only installer (see "Installing" above).
+
+**Upgrade notes:** Upgrade the gateway and mdma-acid together: a mismatched pair fails closed (pinned reads report "node too old"). Scripts that wrote facts through the gateway's ACID socket must go through the library. See CHANGELOG.md.
 
 ---
 
