@@ -8,6 +8,14 @@ All notable changes to MDMA are documented here.
 
 ---
 
+## [0.38.1] — 2026-11-15
+
+### Fixed
+
+- **The portable Linux CLI build links again, so release tags publish the CLI tarballs.** With target equal to host, cargo-zigbuild hid devenv's linker from build scripts, which then fell back to the toolchain's broken rust-lld wrapper; and a pre-set devenv linker made the target link against nix glibc. `just cli-linux-portable` now gives build scripts the devenv linker and lets zigbuild link the target (glibc ≤ 2.31, no /nix paths). v0.38.0 has no GitHub release assets; 0.38.1 is the first.
+
+---
+
 ## [0.38.0] — 2026-11-15
 
 ### Added
