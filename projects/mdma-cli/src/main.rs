@@ -34,6 +34,7 @@ mod playback;
 /// Manage playlists
 #[hicli::group]
 mod playlist;
+mod plays;
 /// Queue management (feeds deck A)
 #[hicli::group]
 mod queue;
@@ -105,7 +106,7 @@ fn app() -> hicli::App<ctx::Globals, ctx::Ctx> {
             search, inbox, source, playback, queue, tracks::sort, subscribe::subscribe,
             transfer::upload, transfer::export, rekordbox, playlist, library,
             tracks::mark, tracks::unmark, tracks::marked, fact, tracks::view,
-            completions::generate_completions, admin, node, replica,
+            completions::generate_completions, admin, node, replica, plays::plays,
         ]
     }
     // Fixed, so usage reads `mdma ...` however the binary was invoked (a
@@ -462,6 +463,9 @@ mod tests {
             ),
             (vec!["admin", "boot-health"], vec!["admin", "boot-health"]),
             (vec!["admin", "reboot", "--force"], vec!["admin", "reboot"]),
+            (vec!["plays", "abcd1234"], vec!["plays"]),
+            (vec!["plays", "-"], vec!["plays"]),
+            (vec!["plays", "--recent", "10"], vec!["plays"]),
             (vec!["node", "list"], vec!["node", "list"]),
             (vec!["node", "select", "host"], vec!["node", "select"]),
             (vec!["node", "forget"], vec!["node", "forget"]),

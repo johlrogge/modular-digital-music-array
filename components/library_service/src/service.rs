@@ -14,9 +14,9 @@ use crate::sources::{self, LibrarySources, ReleaseVersion};
 use acid_client::AcidClient;
 use event_protocol::{acid_event_from_topic_message, AcidEvent, TOPIC_ACID};
 use library_projection::{
-    apply_fact, distinct_retractions, hash_key, is_play_event, is_provenance_tracked, project,
-    remove_cancelled, retain_live, retract_matches, try_parse_fact_line, EventTimestamps,
-    IndexedTrackInfo, MusicFact,
+    ambiguity_message, apply_fact, distinct_retractions, hash_key, is_play_event,
+    is_provenance_tracked, project, remove_cancelled, resolve_prefix, retain_live, retract_matches,
+    try_parse_fact_line, IndexedTrackInfo, MusicFact, PlayLog, Unresolved,
 };
 #[cfg(test)]
 use library_projection::{apply_fact_to_track, blob_path_for, IndexedCue};
@@ -100,7 +100,7 @@ pub struct LibraryService {
     /// history is its own plus that of every hash it replaces (ADR-013).
     ///
     /// Lock order: taken after `tracks`, alone or inside it; nothing is taken while holding it.
-    play_events: Mutex<EventTimestamps>,
+    play_events: Mutex<PlayLog>,
     /// Address of the ACID request socket (used by background subscriber thread).
     acid_socket: String,
     /// Address of the ACID events pub/sub socket.
@@ -349,7 +349,7 @@ impl LibraryService {
             content_hashes: Mutex::new(loaded.content_hashes),
             cursor: Mutex::new(final_cursor),
             event_cursor: Mutex::new(None),
-            play_events: Mutex::new(EventTimestamps::default()),
+            play_events: Mutex::new(PlayLog::default()),
             acid_socket: acid_socket.to_string(),
             acid_events_socket: acid_events_socket.to_string(),
             self_ref: self_ref.clone(),
@@ -2189,81 +2189,15 @@ impl LibraryService {
 
     /// Resolve a partial hash to a full hash (like git short refs)
     fn resolve_hash(&self, partial: &ContentHash) -> Result<ContentHash, ProtocolError> {
-        let normalize = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
-        let partial_clean = normalize(partial.as_str());
-
         let tracks = self.tracks.lock().unwrap();
-        let matches: Vec<_> = tracks
-            .iter()
-            .filter(|t| {
-                let hash = t
-                    .content_hash
-                    .as_str()
-                    .strip_prefix("sha256:")
-                    .unwrap_or(t.content_hash.as_str());
-                hash.to_lowercase().starts_with(&partial_clean)
-            })
-            .collect();
-
-        match matches.len() {
-            0 => Err(ProtocolError::TrackNotFound {
+        match resolve_prefix(&tracks, partial.as_str()) {
+            Ok(track) => Ok(track.content_hash.clone()),
+            Err(Unresolved::NotFound) => Err(ProtocolError::TrackNotFound {
                 hash: partial.as_str().to_owned(),
             }),
-            1 => Ok(matches[0].content_hash.clone()),
-            _ => {
-                // Multiple matches: check whether all share the exact same hash
-                // value. If so, they are duplicate index entries for the same
-                // content (e.g. legacy short hashes written more than once) and
-                // resolving to the first one is correct.
-                // Normalize by stripping "sha256:" prefix and lowercasing so that
-                // a legacy short-hash entry ("9fb4105e") and a full-hash entry
-                // ("sha256:9fb4105eXXX...") are recognised as the same content:
-                // both normalize to the same prefix, so one starts_with the other.
-                let normalized: Vec<String> = matches
-                    .iter()
-                    .map(|t| normalize(t.content_hash.as_str()))
-                    .collect();
-                // All entries represent the same content if every pair of
-                // normalized hashes has one that is a prefix of the other
-                // (i.e. short legacy hash vs full hash of the same file).
-                let all_same = normalized.iter().all(|a| {
-                    normalized
-                        .iter()
-                        .all(|b| a.starts_with(b.as_str()) || b.starts_with(a.as_str()))
-                });
-                if all_same {
-                    // Prefer the entry with the longest (most complete) hash,
-                    // so a full "sha256:..." hash wins over a legacy 8-char hash.
-                    let best = matches
-                        .iter()
-                        .max_by_key(|t| t.content_hash.as_str().len())
-                        .unwrap();
-                    return Ok(best.content_hash.clone());
-                }
-
-                // Genuinely different hashes share a prefix — real ambiguity.
-                let n = matches.len();
-                let examples: Vec<_> = matches
-                    .iter()
-                    .take(3)
-                    .map(|t| {
-                        let hash_str = t.content_hash.as_str();
-                        // Show 8 chars after "sha256:" prefix; fall back to full string for
-                        // legacy short hashes that lack the prefix.
-                        let short = hash_str.get(7..15).unwrap_or(hash_str);
-                        let name = t.title.as_deref().unwrap_or("Unknown");
-                        format!("  {} ({})", short, name)
-                    })
-                    .collect();
-                Err(ProtocolError::Internal {
-                    message: format!(
-                        "Ambiguous hash '{}' matches {} tracks:\n{}",
-                        partial.as_str(),
-                        n,
-                        examples.join("\n")
-                    ),
-                })
-            }
+            Err(Unresolved::Ambiguous(found)) => Err(ProtocolError::Internal {
+                message: ambiguity_message(partial.as_str(), &found),
+            }),
         }
     }
 
@@ -2355,7 +2289,7 @@ impl LibraryService {
         let mut current_cursor = event_cursor.clone();
 
         // The play events since the last refresh, per normalised entity key.
-        let mut delta = EventTimestamps::default();
+        let mut delta = PlayLog::default();
 
         loop {
             let chunk = match self

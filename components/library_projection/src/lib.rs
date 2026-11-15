@@ -23,14 +23,17 @@
 //!
 //! ## Plays
 //! Play events (start/stop) are history with identity, not tracked provenance. The
-//! bulk fold leaves `last_started`/`last_stopped` unset; [`EventTimestamps`] folds
-//! them separately, keeps every event seen (retired entities included) and credits a
-//! track with the plays of every hash it transitively replaces (ADR-013, ADR-017).
+//! bulk fold leaves `last_started`/`last_stopped` unset; [`PlayLog`] folds them
+//! separately, keeps every event seen (retired entities included) and credits a track
+//! with the plays of every hash it transitively replaces (ADR-013, ADR-017). It is the
+//! one fold of plays: the last times ([`PlayLog::apply_to`]) and the whole history
+//! ([`PlayHistory`]) read the same resolved events. [`resolve_prefix`] is the one
+//! resolution of a partial hash.
 
 use library_ipc_protocol::FactType;
-use music_facts::{ContentHash, Mark, MarkFilter, MusicValue};
+use music_facts::{ContentHash, Mark, MarkFilter, MusicValue, StartReason, StopReason};
 use stainless_facts::{aggregate_facts, Fact, Operation};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 /// A fact of the music domain, as stored in the fact log.
@@ -777,7 +780,7 @@ impl stainless_facts::FactAggregator<ContentHash, MusicValue, music_facts::FactS
         // but the FactAggregator trait only receives the value and source — the
         // timestamp is not available here. We must not populate last_started /
         // last_stopped with a bootstrap wall-clock placeholder, because
-        // `EventTimestamps` is the sole authoritative path for those fields in
+        // `PlayLog` is the sole authoritative path for those fields in
         // the bulk fold. Skip them here entirely.
         if is_play_event(value) {
             return;
@@ -793,7 +796,7 @@ impl stainless_facts::FactAggregator<ContentHash, MusicValue, music_facts::FactS
 
     fn retract(&mut self, value: &MusicValue, source: &music_facts::FactSource) {
         // TrackStarted/TrackStopped retractions are not emitted in production;
-        // and `EventTimestamps` handles these fields authoritatively.
+        // and `PlayLog` handles these fields authoritatively.
         // Skip to keep parity with assert.
         if is_play_event(value) {
             return;
@@ -843,6 +846,9 @@ pub struct Projection {
     pub has_cover_art: HashSet<String>,
     /// Lines that were not facts and were skipped ([`project_lines`]); 0 for [`project`].
     pub unparseable_lines: usize,
+    /// Every play event of the log. Tracks carry no play times (the bulk fold leaves
+    /// `last_started`/`last_stopped` unset); read them from here.
+    pub plays: PlayLog,
 }
 
 /// Bulk-fold facts into a [`Projection`].
@@ -852,8 +858,10 @@ pub struct Projection {
 /// resolving, ADR-004), then `content_hash` is fixed up from the entity key, the
 /// blob path derived and the side-effect indexes built.
 ///
-/// `last_started` / `last_stopped` are left unset; apply [`EventTimestamps`] for those.
+/// `last_started` / `last_stopped` are left unset; the play events are in
+/// [`Projection::plays`], and [`PlayLog::apply_to`] fills those in.
 pub fn project(facts: Vec<MusicFact>) -> Projection {
+    let plays = PlayLog::from_facts(&facts);
     let marks = retirement_marks(&facts);
     let mut aggregated: HashMap<ContentHash, IndexedTrackInfo> = aggregate_facts(facts);
 
@@ -904,6 +912,7 @@ pub fn project(facts: Vec<MusicFact>) -> Projection {
         has_format,
         has_cover_art,
         unparseable_lines: 0,
+        plays,
     }
 }
 
@@ -1054,7 +1063,7 @@ fn note_retirement(
 /// that a `Replaces` retired while live and that has not emptied or been released
 /// since, read in stream order. `aggregate_facts` folds each entity alone, so the
 /// cross-entity question "was the loser live when the `Replaces` came?" needs this
-/// sequential pass (like [`EventTimestamps`]). It shadows the tracked provenance of the
+/// sequential pass (like [`PlayLog`]). It shadows the tracked provenance of the
 /// entities a `Replaces` names or comes from, and nothing else. Everything is keyed by
 /// [`hash_key`], like the incremental half.
 fn retirement_marks(facts: &[MusicFact]) -> HashMap<String, String> {
@@ -1142,11 +1151,139 @@ pub fn retain_live(tracks: &mut Vec<IndexedTrackInfo>, content_hashes: &mut Hash
     });
 }
 
-/// Latest start and stop recorded under one entity key.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct PlayTimes {
-    pub started: Option<chrono::DateTime<chrono::Utc>>,
-    pub stopped: Option<chrono::DateTime<chrono::Utc>>,
+/// One play event, as the fact log recorded it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlayEvent {
+    Started {
+        at: chrono::DateTime<chrono::Utc>,
+        reason: StartReason,
+    },
+    Stopped {
+        at: chrono::DateTime<chrono::Utc>,
+        reason: StopReason,
+    },
+}
+
+impl PlayEvent {
+    /// The order events are read in: by time, and at one instant a start before a
+    /// stop, so a stop and the start it closes never swap.
+    fn order(&self) -> (chrono::DateTime<chrono::Utc>, u8) {
+        match self {
+            PlayEvent::Started { at, .. } => (*at, 0),
+            PlayEvent::Stopped { at, .. } => (*at, 1),
+        }
+    }
+}
+
+/// A stop of playback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stop {
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub reason: StopReason,
+}
+
+/// One play of a track: a start and the stop that closed it, or a stop that no start
+/// preceded (the legacy `Played`/`Skipped` facts are stop-only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Play {
+    /// `stop` is `None` while the play is open, and for a play another start cut off.
+    Started {
+        at: chrono::DateTime<chrono::Utc>,
+        reason: StartReason,
+        stop: Option<Stop>,
+    },
+    StopOnly(Stop),
+}
+
+impl Play {
+    /// When the play happened: its start, or for a stop-only play its stop.
+    pub fn at(&self) -> chrono::DateTime<chrono::Utc> {
+        match self {
+            Play::Started { at, .. } => *at,
+            Play::StopOnly(stop) => stop.at,
+        }
+    }
+}
+
+/// The plays of one track, oldest first. Pairing rule: a start opens a play and the
+/// next stop closes it; a start while a play is open leaves the open one without a
+/// stop; a stop with nothing open is a stop-only play.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlayHistory {
+    pub plays: Vec<Play>,
+}
+
+impl PlayHistory {
+    /// Pair `events`, which must already be in [`PlayEvent::order`].
+    fn from_events(events: impl IntoIterator<Item = PlayEvent>) -> Self {
+        let mut plays = Vec::new();
+        // The start of the play that is open, if any.
+        let mut open: Option<(chrono::DateTime<chrono::Utc>, StartReason)> = None;
+        for event in events {
+            match event {
+                PlayEvent::Started { at, reason } => {
+                    if let Some((at, reason)) = open.replace((at, reason)) {
+                        plays.push(Play::Started {
+                            at,
+                            reason,
+                            stop: None,
+                        });
+                    }
+                }
+                PlayEvent::Stopped { at, reason } => {
+                    let stop = Stop { at, reason };
+                    plays.push(match open.take() {
+                        Some((at, reason)) => Play::Started {
+                            at,
+                            reason,
+                            stop: Some(stop),
+                        },
+                        None => Play::StopOnly(stop),
+                    });
+                }
+            }
+        }
+        if let Some((at, reason)) = open {
+            plays.push(Play::Started {
+                at,
+                reason,
+                stop: None,
+            });
+        }
+        Self { plays }
+    }
+
+    /// How many times the track was played.
+    pub fn count(&self) -> usize {
+        self.plays.len()
+    }
+
+    /// When the latest play happened ([`Play::at`]).
+    pub fn last_played(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.plays.last().map(Play::at)
+    }
+
+    /// The latest start.
+    pub fn last_started(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.plays
+            .iter()
+            .filter_map(|play| match play {
+                Play::Started { at, .. } => Some(*at),
+                Play::StopOnly(_) => None,
+            })
+            .max()
+    }
+
+    /// The latest stop.
+    pub fn last_stopped(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.plays
+            .iter()
+            .filter_map(|play| match play {
+                Play::Started { stop, .. } => stop.map(|s| s.at),
+                Play::StopOnly(stop) => Some(stop.at),
+            })
+            .max()
+    }
 }
 
 /// The play events seen in a fact log, per normalised entity key ([`hash_key`]).
@@ -1154,62 +1291,104 @@ pub struct PlayTimes {
 /// Only assertions are plays. Retracts of plays (the legacy merge retracts, ADR-017
 /// §6.7) are not plays and cancel nothing. Every event seen is remembered, whether or
 /// not its entity is still live, so a merge or replace keeps its predecessors' history
-/// (ADR-013, ADR-017): [`apply_to`](Self::apply_to) credits a track with the plays of
-/// every hash it transitively replaces, with their original timestamps. Events keyed by
-/// the short hashes older playback wrote (#86) resolve to the full hash. The lineage is
-/// re-applied on every `apply_to`, so a `Replaces` asserted after the events were
-/// recorded takes effect too.
+/// (ADR-013, ADR-017): a track is credited with the plays of every hash it
+/// transitively replaces, with their original timestamps. Events keyed by the short
+/// hashes older playback wrote (#86) resolve to the full hash. The lineage is
+/// re-resolved on every read, so a `Replaces` asserted after the events were recorded
+/// takes effect too.
+///
+/// This is the one fold of plays: [`apply_to`](Self::apply_to) (last started/stopped)
+/// and [`history`](Self::history) (every play) read the same resolved events.
 #[derive(Clone, Debug, Default)]
-pub struct EventTimestamps {
-    events: HashMap<String, PlayTimes>,
+pub struct PlayLog {
+    events: HashMap<String, Vec<PlayEvent>>,
 }
 
-impl EventTimestamps {
+impl PlayLog {
     /// Record `fact` if it is a play assertion. Only play events create an entry for
     /// their entity key; other facts are ignored.
     pub fn record(&mut self, fact: &MusicFact) {
         if fact.operation() != Operation::Assert {
             return;
         }
-        let key = hash_key(fact.entity().as_str());
-        match fact.value() {
-            MusicValue::TrackStarted(_) => {
-                let times = self.events.entry(key).or_default();
-                update_if_more_recent(&mut times.started, *fact.timestamp());
-            }
-            MusicValue::TrackStopped(_) => {
-                let times = self.events.entry(key).or_default();
-                update_if_more_recent(&mut times.stopped, *fact.timestamp());
-            }
-            _ => {}
-        }
+        let at = *fact.timestamp();
+        let event = match fact.value() {
+            MusicValue::TrackStarted(reason) => PlayEvent::Started {
+                at,
+                reason: *reason,
+            },
+            MusicValue::TrackStopped(reason) => PlayEvent::Stopped {
+                at,
+                reason: *reason,
+            },
+            _ => return,
+        };
+        self.events
+            .entry(hash_key(fact.entity().as_str()))
+            .or_default()
+            .push(event);
     }
 
     /// The events of `facts`.
     pub fn from_facts<'a>(facts: impl IntoIterator<Item = &'a MusicFact>) -> Self {
-        let mut events = Self::default();
+        let mut log = Self::default();
         for fact in facts {
-            events.record(fact);
+            log.record(fact);
         }
-        events
+        log
     }
 
-    /// Fold the events of `later` into this: the latest start and stop per key win.
-    pub fn merge(&mut self, later: EventTimestamps) {
-        for (key, new) in later.events {
-            let seen = self.events.entry(key).or_default();
-            if let Some(ts) = new.started {
-                update_if_more_recent(&mut seen.started, ts);
-            }
-            if let Some(ts) = new.stopped {
-                update_if_more_recent(&mut seen.stopped, ts);
-            }
+    /// Append the events of `later`, which were recorded after this log's.
+    pub fn merge(&mut self, later: PlayLog) {
+        for (key, mut events) in later.events {
+            self.events.entry(key).or_default().append(&mut events);
         }
     }
 
     /// Set every track's `last_started` / `last_stopped` to the latest over its
-    /// lineage: itself and every hash it transitively replaces.
+    /// lineage: itself and every hash it transitively replaces. A time already set
+    /// stays unless a later one is found.
     pub fn apply_to(&self, tracks: &mut [IndexedTrackInfo]) {
+        let resolved = self.resolved(tracks);
+        for track in tracks.iter_mut() {
+            for event in resolved.events_of(track) {
+                match event {
+                    PlayEvent::Started { at, .. } => {
+                        update_if_more_recent(&mut track.last_started, at)
+                    }
+                    PlayEvent::Stopped { at, .. } => {
+                        update_if_more_recent(&mut track.last_stopped, at)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The play history of every track, aligned with `tracks`.
+    pub fn histories(&self, tracks: &[IndexedTrackInfo]) -> Vec<PlayHistory> {
+        let resolved = self.resolved(tracks);
+        tracks.iter().map(|t| resolved.history(t)).collect()
+    }
+
+    /// The `n` latest plays over all tracks, newest first, each with the index of the
+    /// track in `tracks` that holds it. A play two live tracks both inherit (an
+    /// unfinished merge) is listed for each.
+    pub fn recent(&self, tracks: &[IndexedTrackInfo], n: usize) -> Vec<(usize, Play)> {
+        let mut plays: Vec<(usize, Play)> = self
+            .histories(tracks)
+            .into_iter()
+            .enumerate()
+            .flat_map(|(i, history)| history.plays.into_iter().map(move |play| (i, play)))
+            .collect();
+        plays.sort_by(|(i, a), (j, b)| b.at().cmp(&a.at()).then(i.cmp(j)));
+        plays.truncate(n);
+        plays
+    }
+
+    /// The lineage and short-key resolution for `tracks`, the one place either is
+    /// decided. It costs a pass over `tracks`, so resolve once and ask it for each
+    /// track ([`ResolvedPlays::history`]) rather than once per track.
+    pub fn resolved(&self, tracks: &[IndexedTrackInfo]) -> ResolvedPlays<'_> {
         let replaces: HashMap<String, Vec<String>> = tracks
             .iter()
             .map(|t| {
@@ -1228,20 +1407,68 @@ impl EventTimestamps {
                 .collect::<HashSet<_>>()
                 .into_iter(),
         );
-        for track in tracks.iter_mut() {
-            let lineage = replaces_lineage(&hash_key(track.content_hash.as_str()), &replaces);
-            for times in lineage
-                .iter()
-                .flat_map(|key| play_times_for(&self.events, key, &prefix_counts))
-            {
-                if let Some(ts) = times.started {
-                    update_if_more_recent(&mut track.last_started, ts);
-                }
-                if let Some(ts) = times.stopped {
-                    update_if_more_recent(&mut track.last_stopped, ts);
-                }
-            }
+        ResolvedPlays {
+            log: self,
+            replaces,
+            prefix_counts,
         }
+    }
+}
+
+/// A [`PlayLog`] with the lineage and the short keys of a set of tracks resolved
+/// ([`PlayLog::resolved`]).
+pub struct ResolvedPlays<'a> {
+    log: &'a PlayLog,
+    /// A live track's key -> the keys it replaces.
+    replaces: HashMap<String, Vec<String>>,
+    /// For every 8- and 12-character prefix, how many full keys start with it.
+    prefix_counts: HashMap<String, usize>,
+}
+
+impl ResolvedPlays<'_> {
+    /// The plays of `track`, over its lineage. `track` should be one of the tracks
+    /// this was resolved for.
+    pub fn history(&self, track: &IndexedTrackInfo) -> PlayHistory {
+        PlayHistory::from_events(self.events_of(track))
+    }
+
+    /// The events that belong to `track`, in [`PlayEvent::order`]: those recorded
+    /// under every key of its lineage. Each event key is read once, however many
+    /// lineage members reach it.
+    fn events_of(&self, track: &IndexedTrackInfo) -> Vec<PlayEvent> {
+        let lineage = replaces_lineage(&hash_key(track.content_hash.as_str()), &self.replaces);
+        let keys: BTreeSet<&str> = lineage
+            .iter()
+            .flat_map(|key| self.event_keys(key))
+            .collect();
+        let mut events: Vec<PlayEvent> = keys
+            .into_iter()
+            .filter_map(|key| self.log.events.get(key))
+            .flatten()
+            .copied()
+            .collect();
+        events.sort_by_key(PlayEvent::order);
+        events
+    }
+
+    /// The keys events for `key` are recorded under: the full hash, and the 12- and
+    /// 8-character short forms older playback wrote (#86). A short form counts only
+    /// when `key` is the single full key it is a prefix of, the same rule
+    /// [`resolve_prefix`] applies: an ambiguous short key belongs to nobody.
+    fn event_keys<'k>(&self, key: &'k str) -> Vec<&'k str> {
+        let shorts = if key.len() > SHORT_KEY_MAX {
+            [key.get(..12), key.get(..8)]
+        } else {
+            [None, None]
+        };
+        std::iter::once(key)
+            .chain(
+                shorts
+                    .into_iter()
+                    .flatten()
+                    .filter(|short| self.prefix_counts.get(*short) == Some(&1)),
+            )
+            .collect()
     }
 }
 
@@ -1265,39 +1492,107 @@ fn replaces_lineage(key: &str, replaces: &HashMap<String, Vec<String>>) -> Vec<S
 const SHORT_KEY_MAX: usize = 12;
 
 /// For every 8- and 12-character prefix, how many of `full_keys` start with it.
-fn short_prefix_counts<'a>(full_keys: impl Iterator<Item = &'a str>) -> HashMap<&'a str, usize> {
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+fn short_prefix_counts<'a>(full_keys: impl Iterator<Item = &'a str>) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
     for key in full_keys.filter(|k| k.len() > SHORT_KEY_MAX) {
         for prefix in [key.get(..8), key.get(..12)].into_iter().flatten() {
-            *counts.entry(prefix).or_default() += 1;
+            *counts.entry(prefix.to_owned()).or_default() += 1;
         }
     }
     counts
 }
 
-/// The play events recorded for `key`: under the full hash, and under the 12- and
-/// 8-character short forms older playback wrote (#86). A short form counts only when
-/// `key` is the single full key it is a prefix of (`prefix_counts`), the same rule
-/// `resolve_hash` applies: an ambiguous short key belongs to nobody.
-fn play_times_for<'a>(
-    events: &'a HashMap<String, PlayTimes>,
-    key: &str,
-    prefix_counts: &HashMap<&str, usize>,
-) -> Vec<&'a PlayTimes> {
-    let shorts = if key.len() > SHORT_KEY_MAX {
-        [key.get(..12), key.get(..8)]
-    } else {
-        [None, None]
-    };
-    std::iter::once(key)
-        .chain(
-            shorts
-                .into_iter()
-                .flatten()
-                .filter(|k| prefix_counts.get(k) == Some(&1)),
-        )
-        .filter_map(|k| events.get(k))
-        .collect()
+/// Why a partial hash does not name one track ([`resolve_prefix`]).
+pub enum Unresolved<'a> {
+    /// No track's hash starts with it.
+    NotFound,
+    /// Different hashes start with it: every track that does.
+    Ambiguous(Vec<&'a IndexedTrackInfo>),
+}
+
+/// What to tell the user when `partial` matches several `tracks`: how many, and the
+/// first three.
+pub fn ambiguity_message(partial: &str, tracks: &[&IndexedTrackInfo]) -> String {
+    let examples: Vec<_> = tracks
+        .iter()
+        .take(3)
+        .map(|t| {
+            let hash_str = t.content_hash.as_str();
+            // Show 8 chars after "sha256:" prefix; fall back to full string for
+            // legacy short hashes that lack the prefix.
+            let short = hash_str.get(7..15).unwrap_or(hash_str);
+            let name = t.title.as_deref().unwrap_or("Unknown");
+            format!("  {} ({})", short, name)
+        })
+        .collect();
+    format!(
+        "Ambiguous hash '{}' matches {} tracks:\n{}",
+        partial,
+        tracks.len(),
+        examples.join("\n")
+    )
+}
+
+/// Resolve a partial hash to the track it names (like git short refs). Hidden tracks
+/// resolve too; the one lookup behind the library service and anything reading a
+/// replica.
+pub fn resolve_prefix<'a>(
+    tracks: &'a [IndexedTrackInfo],
+    partial: &str,
+) -> Result<&'a IndexedTrackInfo, Unresolved<'a>> {
+    let normalize = |h: &str| h.strip_prefix("sha256:").unwrap_or(h).to_lowercase();
+    let partial_clean = normalize(partial);
+
+    let matches: Vec<_> = tracks
+        .iter()
+        .filter(|t| {
+            let hash = t
+                .content_hash
+                .as_str()
+                .strip_prefix("sha256:")
+                .unwrap_or(t.content_hash.as_str());
+            hash.to_lowercase().starts_with(&partial_clean)
+        })
+        .collect();
+
+    match matches.len() {
+        0 => Err(Unresolved::NotFound),
+        1 => Ok(matches[0]),
+        _ => {
+            // Multiple matches: check whether all share the exact same hash
+            // value. If so, they are duplicate index entries for the same
+            // content (e.g. legacy short hashes written more than once) and
+            // resolving to the first one is correct.
+            // Normalize by stripping "sha256:" prefix and lowercasing so that
+            // a legacy short-hash entry ("9fb4105e") and a full-hash entry
+            // ("sha256:9fb4105eXXX...") are recognised as the same content:
+            // both normalize to the same prefix, so one starts_with the other.
+            let normalized: Vec<String> = matches
+                .iter()
+                .map(|t| normalize(t.content_hash.as_str()))
+                .collect();
+            // All entries represent the same content if every pair of
+            // normalized hashes has one that is a prefix of the other
+            // (i.e. short legacy hash vs full hash of the same file).
+            let all_same = normalized.iter().all(|a| {
+                normalized
+                    .iter()
+                    .all(|b| a.starts_with(b.as_str()) || b.starts_with(a.as_str()))
+            });
+            if all_same {
+                // Prefer the entry with the longest (most complete) hash,
+                // so a full "sha256:..." hash wins over a legacy 8-char hash.
+                let best = matches
+                    .iter()
+                    .max_by_key(|t| t.content_hash.as_str().len())
+                    .unwrap();
+                return Ok(*best);
+            }
+
+            // Genuinely different hashes share a prefix: real ambiguity.
+            Err(Unresolved::Ambiguous(matches))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1538,7 +1833,7 @@ mod tests {
         ];
         let mut projection = project(facts.clone());
         assert_eq!(projection.tracks.len(), 1);
-        EventTimestamps::from_facts(&facts).apply_to(&mut projection.tracks);
+        PlayLog::from_facts(&facts).apply_to(&mut projection.tracks);
         let winner = &projection.tracks[0];
         assert_eq!(winner.content_hash.as_str(), "sha256:winner00000000");
         assert_eq!(winner.last_started, Some(ts(3)));
@@ -1555,7 +1850,7 @@ mod tests {
             retract_fact("sha256:a1", started, 3, &s),
         ];
         let mut tracks = project(facts.clone()).tracks;
-        EventTimestamps::from_facts(&facts).apply_to(&mut tracks);
+        PlayLog::from_facts(&facts).apply_to(&mut tracks);
         assert_eq!(tracks[0].last_started, Some(ts(2)));
     }
 
@@ -1565,11 +1860,375 @@ mod tests {
         let started = MusicValue::TrackStarted(StartReason::OnRequest);
         let late_play = assert_fact("sha256:a1", started.clone(), 5, &s);
         let early_play = assert_fact("sha256:a1", started, 2, &s);
-        let mut early = EventTimestamps::from_facts(&[late_play]);
-        early.merge(EventTimestamps::from_facts(&[early_play]));
+        let mut early = PlayLog::from_facts(&[late_play]);
+        early.merge(PlayLog::from_facts(&[early_play]));
         let mut tracks = vec![IndexedTrackInfo::new_empty("sha256:a1".to_owned())];
         early.apply_to(&mut tracks);
         assert_eq!(tracks[0].last_started, Some(ts(5)));
+    }
+
+    // ---- play histories --------------------------------------------------------
+
+    fn ingest() -> FactSource {
+        src("ingest", "1.0.0")
+    }
+
+    /// A fact that makes `entity` a live track.
+    fn live(entity: &str) -> MusicFact {
+        assert_fact(entity, title("T"), 1, &ingest())
+    }
+
+    fn started(entity: &str, at: u32) -> MusicFact {
+        let value = MusicValue::TrackStarted(StartReason::OnRequest);
+        assert_fact(entity, value, at, &src("playback", "1.0.0"))
+    }
+
+    fn stopped(entity: &str, at: u32) -> MusicFact {
+        let value = MusicValue::TrackStopped(StopReason::OnSkip);
+        assert_fact(entity, value, at, &src("playback", "1.0.0"))
+    }
+
+    fn replaces(winner: &str, loser: &str, at: u32) -> MusicFact {
+        let value = MusicValue::Replaces(ContentHash::new(loser));
+        assert_fact(winner, value, at, &ingest())
+    }
+
+    /// The history of the live track `hash` in the projection of `facts`.
+    fn history_of(facts: &[MusicFact], hash: &str) -> PlayHistory {
+        let p = project(facts.to_vec());
+        let track = p
+            .tracks
+            .iter()
+            .find(|t| t.content_hash.as_str() == hash)
+            .expect("the track is live");
+        p.plays.resolved(&p.tracks).history(track)
+    }
+
+    /// Each play as `start-stop` by day of the month; either side empty when missing.
+    fn shape(history: &PlayHistory) -> Vec<String> {
+        use chrono::Datelike;
+        history
+            .plays
+            .iter()
+            .map(|play| match play {
+                Play::Started { at, stop, .. } => format!(
+                    "{}-{}",
+                    at.day(),
+                    stop.map_or(String::new(), |s| s.at.day().to_string())
+                ),
+                Play::StopOnly(stop) => format!("-{}", stop.at.day()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_losers_short_key_plays_show_on_the_winner_and_apply_to_agrees() {
+        let winner = "sha256:aabbccdd11223344556677";
+        let loser = "sha256:99887766aabbccddeeff00";
+        let mut facts = vec![live(winner), live(loser)];
+        // Older playback wrote the loser's plays under its 8-character key.
+        for day in [2, 4, 6, 8] {
+            facts.push(started("sha256:99887766", day));
+            facts.push(stopped("sha256:99887766", day + 1));
+        }
+        facts.push(replaces(winner, loser, 20));
+        facts.push(retract_fact(loser, title("T"), 21, &ingest()));
+
+        let p = project(facts.clone());
+        assert_eq!(p.tracks.len(), 1, "the loser is gone");
+        let history = p.plays.resolved(&p.tracks).history(&p.tracks[0]);
+        assert_eq!(history.count(), 4);
+        assert_eq!(shape(&history), ["2-3", "4-5", "6-7", "8-9"]);
+
+        let mut tracks = p.tracks;
+        PlayLog::from_facts(&facts).apply_to(&mut tracks);
+        assert_eq!(tracks[0].last_started, Some(ts(8)));
+        assert_eq!(tracks[0].last_stopped, Some(ts(9)));
+        assert_eq!(tracks[0].last_started, history.last_started());
+        assert_eq!(tracks[0].last_stopped, history.last_stopped());
+    }
+
+    #[test]
+    fn twelve_character_keys_count_and_a_shared_short_key_credits_nobody() {
+        let a = "sha256:aabbccdd0011223344";
+        let b = "sha256:aabbccdd9988776655";
+        let c = "sha256:eeff0011aabbccddee";
+        let facts = vec![
+            live(a),
+            live(b),
+            live(c),
+            // a's 12-character key: only a starts with it.
+            started("sha256:aabbccdd0011", 2),
+            // The 8-character key a and b share: it belongs to nobody.
+            started("sha256:aabbccdd", 3),
+            // c's 8-character key, and its 12-character key.
+            started("sha256:eeff0011", 4),
+            started("sha256:eeff0011aabb", 5),
+        ];
+        assert_eq!(shape(&history_of(&facts, a)), ["2-"]);
+        assert_eq!(shape(&history_of(&facts, b)), Vec::<String>::new());
+        assert_eq!(shape(&history_of(&facts, c)), ["4-", "5-"]);
+    }
+
+    #[test]
+    fn a_full_and_a_short_key_in_one_lineage_count_each_play_once() {
+        let winner = "sha256:aabbccdd11223344556677";
+        // The winner replaces the legacy short hash its own full hash starts with, so
+        // the short key is reached twice: as the winner's 8-character key, and as a
+        // member of its lineage.
+        let facts = vec![
+            live(winner),
+            replaces(winner, "sha256:aabbccdd", 5),
+            started("sha256:aabbccdd", 2),
+            stopped("sha256:aabbccdd", 3),
+            started(winner, 6),
+            stopped(winner, 7),
+        ];
+        let history = history_of(&facts, winner);
+        assert_eq!(history.count(), 2);
+        assert_eq!(shape(&history), ["2-3", "6-7"]);
+    }
+
+    #[test]
+    fn a_transitive_chain_credits_every_ancestor_and_no_descendant() {
+        let (w, m, l) = (
+            "sha256:aaaaaaaaaaaaaaaa",
+            "sha256:bbbbbbbbbbbbbbbb",
+            "sha256:cccccccccccccccc",
+        );
+        // An unfinished merge keeps M live, with its own `Replaces`.
+        let facts = vec![
+            live(w),
+            live(m),
+            replaces(w, m, 8),
+            replaces(m, l, 9),
+            started(l, 2),
+            stopped(l, 3),
+            started(m, 4),
+            stopped(m, 5),
+            started(w, 6),
+            stopped(w, 7),
+        ];
+        assert_eq!(
+            shape(&history_of(&facts, w)),
+            ["2-3", "4-5", "6-7"],
+            "W -> M -> L"
+        );
+        assert_eq!(shape(&history_of(&facts, m)), ["2-3", "4-5"]);
+    }
+
+    #[test]
+    fn a_start_opens_a_play_and_the_next_stop_closes_it() {
+        let w = "sha256:aaaaaaaaaaaaaaaa";
+        // (events in log order, S<day> a start and T<day> a stop; the plays they pair into)
+        let cases: [(&str, &[&str]); 8] = [
+            ("S1 T2", &["1-2"]),
+            ("S1 S2 T3", &["1-", "2-3"]),
+            ("T1", &["-1"]),
+            ("S1 T2 T3", &["1-2", "-3"]),
+            ("S1", &["1-"]),
+            ("T1 S2 T3", &["-1", "2-3"]),
+            // A stop logged before a start of the same instant still closes it.
+            ("T2 S2", &["2-2"]),
+            // Events are paired in time order, not log order.
+            ("T3 S1", &["1-3"]),
+        ];
+        for (script, expected) in cases {
+            let mut facts = vec![live(w)];
+            for word in script.split(' ') {
+                let fact = match word.split_at(1) {
+                    ("S", day) => started(w, day.parse().unwrap()),
+                    (_, day) => stopped(w, day.parse().unwrap()),
+                };
+                facts.push(fact);
+            }
+            assert_eq!(shape(&history_of(&facts, w)), expected, "{script}");
+        }
+    }
+
+    #[test]
+    fn a_history_says_how_many_times_and_when() {
+        let w = "sha256:aaaaaaaaaaaaaaaa";
+        let facts = vec![
+            live(w),
+            started(w, 1),
+            stopped(w, 2),
+            started(w, 5),
+            stopped(w, 9),
+            stopped(w, 11),
+        ];
+        let history = history_of(&facts, w);
+        assert_eq!(history.count(), 3, "a stop with no start is a play too");
+        assert_eq!(history.last_started(), Some(ts(5)));
+        assert_eq!(history.last_stopped(), Some(ts(11)));
+        assert_eq!(history.last_played(), Some(ts(11)));
+
+        let never = history_of(&[live(w)], w);
+        assert_eq!(never.count(), 0);
+        assert_eq!(never.last_played(), None);
+        assert_eq!(never.last_started(), None);
+        assert_eq!(never.last_stopped(), None);
+    }
+
+    #[test]
+    fn retracted_plays_are_not_counted_twice_or_at_all() {
+        let w = "sha256:aaaaaaaaaaaaaaaa";
+        let play = src("playback", "1.0.0");
+        let facts = vec![
+            live(w),
+            started(w, 2),
+            retract_fact(
+                w,
+                MusicValue::TrackStarted(StartReason::OnRequest),
+                3,
+                &play,
+            ),
+            retract_fact(w, MusicValue::TrackStopped(StopReason::OnSkip), 4, &play),
+        ];
+        let history = history_of(&facts, w);
+        assert_eq!(shape(&history), ["2-"], "the retracts are not plays");
+        assert_eq!(history.last_stopped(), None);
+    }
+
+    #[test]
+    fn recent_lists_the_newest_plays_first_with_inherited_ones() {
+        let (a, b, l) = (
+            "sha256:aaaaaaaaaaaaaaaa",
+            "sha256:bbbbbbbbbbbbbbbb",
+            "sha256:cccccccccccccccc",
+        );
+        // A replaces L, which is gone; L's play is A's.
+        let facts = vec![
+            live(a),
+            live(b),
+            replaces(a, l, 20),
+            started(a, 2),
+            stopped(a, 3),
+            started(b, 4),
+            started(l, 5),
+            stopped(l, 6),
+            started(a, 7),
+        ];
+        let p = project(facts);
+        let recent = |n| {
+            p.plays
+                .recent(&p.tracks, n)
+                .into_iter()
+                .map(|(i, play)| {
+                    let hash = p.tracks[i].content_hash.as_str().to_owned();
+                    let history = PlayHistory { plays: vec![play] };
+                    (hash, shape(&history).remove(0))
+                })
+                .collect::<Vec<_>>()
+        };
+        let all = vec![
+            (a.to_owned(), "7-".to_owned()),
+            (a.to_owned(), "5-6".to_owned()),
+            (b.to_owned(), "4-".to_owned()),
+            (a.to_owned(), "2-3".to_owned()),
+        ];
+        assert_eq!(recent(10), all);
+        assert_eq!(recent(3), all[..3], "n cuts the oldest");
+        assert_eq!(recent(0), vec![]);
+    }
+
+    #[test]
+    fn project_lines_records_the_same_plays_as_the_facts() {
+        let w = "sha256:aaaaaaaaaaaaaaaa";
+        let facts = vec![live(w), started(w, 2), stopped(w, 3), started(w, 4)];
+        let lines: Vec<String> = facts
+            .iter()
+            .map(|f| serde_json::to_string(f).unwrap())
+            .collect();
+        let p = project_lines(lines.iter().map(String::as_str));
+        let expected = PlayLog::from_facts(&facts).histories(&p.tracks);
+        assert_eq!(p.plays.histories(&p.tracks), expected);
+        assert_eq!(expected[0].count(), 2, "the fixture has plays");
+    }
+
+    #[test]
+    fn resolving_once_serves_every_track_like_histories_does() {
+        let (a, b, l) = (
+            "sha256:aaaaaaaaaaaaaaaa",
+            "sha256:bbbbbbbbbbbbbbbb",
+            "sha256:cccccccccccccccc",
+        );
+        let facts = vec![
+            live(a),
+            live(b),
+            replaces(a, l, 20),
+            started(a, 2),
+            started(b, 4),
+            started(l, 5),
+            stopped(l, 6),
+        ];
+        let p = project(facts);
+        let resolved = p.plays.resolved(&p.tracks);
+
+        let one_by_one: Vec<PlayHistory> = p.tracks.iter().map(|t| resolved.history(t)).collect();
+
+        assert_eq!(one_by_one, p.plays.histories(&p.tracks));
+        let counts: Vec<usize> = one_by_one.iter().map(PlayHistory::count).collect();
+        assert_eq!(counts.iter().sum::<usize>(), 3, "a has two plays, b one");
+    }
+
+    // ---- resolving a partial hash ----------------------------------------------
+
+    fn entry(hash: &str, name: &str) -> IndexedTrackInfo {
+        let mut t = IndexedTrackInfo::new_empty(hash.to_owned());
+        t.title = Some(name.to_owned());
+        t
+    }
+
+    /// The hash `partial` resolves to; panics when it does not resolve.
+    fn resolved<'a>(tracks: &'a [IndexedTrackInfo], partial: &str) -> &'a str {
+        match resolve_prefix(tracks, partial) {
+            Ok(track) => track.content_hash.as_str(),
+            Err(_) => panic!("{partial} should resolve"),
+        }
+    }
+
+    #[test]
+    fn a_partial_hash_resolves_to_the_one_track_it_starts() {
+        let tracks = [
+            entry("sha256:abcdef0011223344", "A"),
+            entry("sha256:99", "B"),
+        ];
+        let full = "sha256:abcdef0011223344";
+        assert_eq!(resolved(&tracks, "abcdef00"), full);
+        assert_eq!(resolved(&tracks, "sha256:abcdef00"), full);
+        assert_eq!(resolved(&tracks, "ABCDEF00"), full, "case does not matter");
+        let missing = resolve_prefix(&tracks, "ffff");
+        assert!(matches!(missing, Err(Unresolved::NotFound)));
+    }
+
+    #[test]
+    fn duplicate_entries_of_one_hash_resolve_to_it() {
+        let tracks = [entry("10e95ec1", "Track A"), entry("10e95ec1", "Track B")];
+        assert_eq!(resolved(&tracks, "10e95ec1"), "10e95ec1");
+    }
+
+    #[test]
+    fn a_legacy_short_hash_and_its_full_hash_resolve_to_the_full_one() {
+        let full = "sha256:9fb4105eaabbccdd11223344556677889900aabb";
+        let tracks = [entry("9fb4105e", "Unknown"), entry(full, "20 Minutes")];
+        assert_eq!(resolved(&tracks, "9fb4105e"), full);
+    }
+
+    #[test]
+    fn different_hashes_sharing_a_prefix_are_ambiguous() {
+        let tracks = [
+            entry("sha256:abcdef0011223344", "Track A"),
+            entry("sha256:abcdef0099887766", "Track B"),
+        ];
+        let Err(Unresolved::Ambiguous(found)) = resolve_prefix(&tracks, "sha256:abcdef00") else {
+            panic!("a real ambiguity must not resolve");
+        };
+        assert_eq!(found.len(), 2);
+        assert_eq!(
+            ambiguity_message("sha256:abcdef00", &found),
+            "Ambiguous hash 'sha256:abcdef00' matches 2 tracks:\n  abcdef00 (Track A)\n  abcdef00 (Track B)"
+        );
     }
 
     // ---- split-point property (ADR-014 §14) -------------------------------------
@@ -1766,21 +2425,33 @@ mod tests {
         retain_live(&mut part.tracks, &mut part.content_hashes);
     }
 
-    /// The whole log folded in one go: its rendered tracks and its fact index.
-    fn whole_log(facts: &[MusicFact]) -> (Vec<String>, HashMap<FactType, HashSet<String>>) {
-        let mut whole = project(facts.to_vec());
-        EventTimestamps::from_facts(facts).apply_to(&mut whole.tracks);
-        (render(&sorted(whole.tracks)), whole.fact_index)
+    /// The whole log folded in one go: its rendered tracks, its fact index and the
+    /// play history of each track (in the order of the rendered tracks).
+    struct Whole {
+        rendered: Vec<String>,
+        fact_index: HashMap<FactType, HashSet<String>>,
+        histories: Vec<PlayHistory>,
     }
 
-    fn assert_matches_whole(
-        mut part: Projection,
-        events: &EventTimestamps,
-        expected: &(Vec<String>, HashMap<FactType, HashSet<String>>),
-        label: &str,
-    ) {
-        events.apply_to(&mut part.tracks);
+    fn whole_log(facts: &[MusicFact]) -> Whole {
+        let mut whole = project(facts.to_vec());
+        PlayLog::from_facts(facts).apply_to(&mut whole.tracks);
+        let tracks = sorted(whole.tracks);
+        Whole {
+            rendered: render(&tracks),
+            fact_index: whole.fact_index,
+            histories: whole.plays.histories(&tracks),
+        }
+    }
+
+    fn assert_matches_whole(mut part: Projection, log: &PlayLog, expected: &Whole, label: &str) {
+        log.apply_to(&mut part.tracks);
         let tracks = sorted(part.tracks);
+        assert_eq!(
+            log.histories(&tracks),
+            expected.histories,
+            "{label}: play histories"
+        );
         assert_eq!(
             tracks
                 .iter()
@@ -1789,24 +2460,24 @@ mod tests {
             part.content_hashes,
             "{label}: content_hashes must be the live set"
         );
-        assert_eq!(render(&tracks), expected.0, "{label}");
-        assert_eq!(part.fact_index, expected.1, "{label}: fact_index");
+        assert_eq!(render(&tracks), expected.rendered, "{label}");
+        assert_eq!(part.fact_index, expected.fact_index, "{label}: fact_index");
     }
 
     #[test]
     fn every_split_of_the_log_projects_the_same_tracks() {
         let facts = fixture();
         let expected = whole_log(&facts);
-        assert!(!expected.0.is_empty());
+        assert!(!expected.rendered.is_empty());
 
         for k in 0..=facts.len() {
             let (prefix, suffix) = facts.split_at(k);
 
             // Bulk projection of the prefix, then incremental application of the suffix.
             let mut part = project(prefix.to_vec());
-            let mut events = EventTimestamps::from_facts(prefix);
+            let mut events = PlayLog::from_facts(prefix);
             fold_incrementally(&mut part, suffix);
-            events.merge(EventTimestamps::from_facts(suffix));
+            events.merge(PlayLog::from_facts(suffix));
             assert_matches_whole(part, &events, &expected, &format!("split {k}"));
         }
     }
@@ -1823,11 +2494,11 @@ mod tests {
 
                 // prefix bulk, then mid incrementally and swept, then tail incrementally.
                 let mut part = project(prefix.to_vec());
-                let mut events = EventTimestamps::from_facts(prefix);
+                let mut events = PlayLog::from_facts(prefix);
                 fold_incrementally(&mut part, mid);
-                events.merge(EventTimestamps::from_facts(mid));
+                events.merge(PlayLog::from_facts(mid));
                 fold_incrementally(&mut part, tail);
-                events.merge(EventTimestamps::from_facts(tail));
+                events.merge(PlayLog::from_facts(tail));
                 assert_matches_whole(part, &events, &expected, &format!("splits {i}/{j}"));
             }
         }
@@ -1851,7 +2522,7 @@ mod tests {
         ];
         let mut tracks = project(facts.clone()).tracks;
         assert_eq!(tracks.len(), 1);
-        EventTimestamps::from_facts(&facts).apply_to(&mut tracks);
+        PlayLog::from_facts(&facts).apply_to(&mut tracks);
         assert_eq!(tracks[0].last_started, Some(ts(4)));
     }
 
@@ -1859,7 +2530,7 @@ mod tests {
     fn the_fixture_exercises_what_it_claims() {
         let facts = fixture();
         let mut p = project(facts.clone());
-        EventTimestamps::from_facts(&facts).apply_to(&mut p.tracks);
+        PlayLog::from_facts(&facts).apply_to(&mut p.tracks);
         let tracks = sorted(p.tracks);
         let hashes: Vec<_> = tracks.iter().map(|t| t.content_hash.as_str()).collect();
         // B was merged away, D never live.
@@ -1890,6 +2561,8 @@ mod tests {
         // A carries B's plays through the lineage, and its own.
         assert_eq!(a.last_started, Some(ts(4)));
         assert_eq!(a.last_stopped, Some(ts(5)));
+        let history = p.plays.resolved(&tracks).history(a);
+        assert_eq!(shape(&history), ["3-", "4-5"]);
         assert_eq!(a.blob_path, PathBuf::from("blobs/aa/aaaaaaaaaaaaaaaa.flac"));
         // C was reset on retract-to-empty, then re-asserted.
         let c = by("sha256:cccccccccccccccc");
