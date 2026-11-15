@@ -6,7 +6,7 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash
-#   curl -fsSL .../install-mdma.sh | bash -s v0.38.2
+#   curl -fsSL .../install-mdma.sh | bash -s v0.38.3
 #   bash install-mdma.sh [vX.Y.Z]
 #
 #   No argument installs the latest release (resolved once to a concrete tag);
@@ -161,7 +161,7 @@ main() {
     fi
     case "$TAG" in
         v[0-9]*) ;;
-        *) die "expected a release tag like v0.38.2, got: ${TAG}" ;;
+        *) die "expected a release tag like v0.38.3, got: ${TAG}" ;;
     esac
 
     BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
