@@ -87,6 +87,7 @@ Amends ADR-021 §4 (who depends on `library_projection`) and §6 (refresh and no
 ## Consequences
 
 - `bases/client` is deleted. `dj-workspace`, `mdma-cli` and `mdma-tui` depend on `mdma_client` instead.
+- mdma-cli keeps a base: `bases/cli` (`cli-base`) holds process setup (SIGPIPE, color-eyre).
 - `mdma_client` depends on `node-discovery`, so `mdns-sd` and its threads become part of what it pulls in. bevy-app and bdd become heavier. Measure with `cargo_tree` and consider a feature gate if it matters.
 - `TrackInfo` gains genre, label and styles (serde default), so the TUI can group by them without per-track lookups.
 - **Risk, implementation drift:** with only one implementation, nothing checks that a second one would fit the interface. CI building every profile catches this only once a second profile exists.

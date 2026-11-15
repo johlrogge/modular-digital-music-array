@@ -117,15 +117,7 @@ fn app() -> hicli::App<ctx::Globals, ctx::Ctx> {
 }
 
 fn main() -> std::process::ExitCode {
-    // Rust ignores SIGPIPE, so printing to a closed pipe (`mdma ... | head`)
-    // would panic. Restore the default so the process ends quietly instead.
-    #[cfg(unix)]
-    // SAFETY: SIG_DFL installs no handler, and no other thread exists yet to race the change.
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
-
-    color_eyre::install().expect("installed once");
+    cli_base::init();
 
     // What `App::run` does with the process arguments, spelled out so the command
     // that ran is known afterwards.

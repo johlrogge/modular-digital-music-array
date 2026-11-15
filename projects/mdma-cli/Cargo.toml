@@ -45,9 +45,10 @@ dirs = "6"
 colored = "2.0"
 terminal_size = "0.4"
 unicode-normalization = { workspace = true }
-libc = { workspace = true }
+cli-base = { path = "../../bases/cli" }
 
 [dev-dependencies]
+libc = { workspace = true }
 fact-replica = { workspace = true, features = ["test-support"] }
 pretty_assertions = "1"
 mdma-client = { workspace = true, features = ["test-support"] }
