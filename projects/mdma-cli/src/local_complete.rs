@@ -19,11 +19,6 @@ use crate::background::{request_sync, spawn_background_sync, Urgency};
 use crate::replica::{replica_from_environment, replicas_dir, Probed};
 use crate::snapshot::CompletionSnapshot;
 
-/// The most candidates one completion offers. A shell cannot show more than a few
-/// hundred usefully, and an empty prefix over a large library would otherwise offer
-/// every title.
-pub(crate) const MAX_CANDIDATES: usize = 200;
-
 /// A list of names in the snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Field {
@@ -70,7 +65,8 @@ fn names_of(probed: &Option<Probed>) -> &[String] {
 }
 
 /// The names in `fields` that start with `typed`, ignoring case, in the order of
-/// `fields` and then sorted; at most [`MAX_CANDIDATES`], each value once.
+/// `fields` and then sorted; every match, each value once. The shell pages or
+/// prompts for long lists itself.
 ///
 /// The shell inserts the value, and shows the hint only as a description, so a title
 /// completes as the search term it is, not as the track it names (ADR-021 §7).
@@ -80,9 +76,6 @@ fn candidates(snapshot: &CompletionSnapshot, fields: &[Field], typed: &str) -> V
     let mut out: Vec<Candidate> = Vec::new();
     for field in fields {
         for name in field.names(snapshot) {
-            if out.len() >= MAX_CANDIDATES {
-                return out;
-            }
             if name.to_lowercase().starts_with(&typed) && !out.iter().any(|(v, _)| v == name) {
                 let hint = if mixed { field.hint() } else { None };
                 out.push((name.clone(), hint.map(str::to_string)));
@@ -270,17 +263,19 @@ mod tests {
     }
 
     #[test]
-    fn at_most_200_candidates_are_offered() {
+    fn every_match_is_offered_however_many() {
+        let titles: Vec<String> = (0..300).map(|i| format!("title {i:04}")).collect();
+        let artists: Vec<String> = (0..300).map(|i| format!("artist {i:04}")).collect();
         let s = CompletionSnapshot {
-            titles: (0..1_000).map(|i| format!("title {i:04}")).collect(),
+            titles: titles.clone(),
+            artists: artists.clone(),
             ..CompletionSnapshot::default()
         };
-        let all = candidates(&s, &[Field::Titles], "");
-        assert_eq!(all.len(), MAX_CANDIDATES);
-        assert_eq!(all[0].0, "title 0000");
-        assert_eq!(all[199].0, "title 0199");
-        let narrowed = candidates(&s, &[Field::Titles], "title 09");
-        assert_eq!(narrowed.len(), 100, "under the cap, everything matching");
+
+        let offered = values(candidates(&s, &[Field::Titles, Field::Artists], ""));
+
+        let expected: Vec<String> = titles.into_iter().chain(artists).collect();
+        assert_eq!(offered, expected, "titles, then the artists after them");
     }
 
     #[test]
