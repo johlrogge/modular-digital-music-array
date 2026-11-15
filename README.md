@@ -476,7 +476,7 @@ Nodes announce `_mdma._tcp` over mDNS and the gateway answers a new Identify req
 
 New commands: `mdma node list`, `select`, `forget` and `show`. The choice is cached at `~/.config/mdma/node.json` on Linux (under Application Support on macOS, where first use shows a Local Network permission prompt).
 
-Gateways at 0.29.0 or older answer Identify as "unsupported" and are not remembered through discovery; use `--node` until they are updated. The TUI and dj-workspace still use only `MDMA_NODE`.
+Gateways at 0.29.0 or older answer Identify as "unsupported" and are not remembered through discovery; use `--node` until they are updated. The TUI resolves its node the same way as the CLI (including the saved `mdma node select` choice and the interactive pick, shown before the TUI starts); dj-workspace still uses only `MDMA_NODE`.
 
 ### Packaging fix (#75)
 
