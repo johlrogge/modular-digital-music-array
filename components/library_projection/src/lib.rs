@@ -11,6 +11,16 @@
 //! the entry to pristine ([`apply_fact_to_track`]); the bulk fold ([`project`])
 //! drops non-live entries, and so does [`retain_live`] after incremental application.
 //!
+//! ## Retirement
+//! A merge asserts `Replaces(loser)` on the winner and then retracts the loser. A loser
+//! that is live when the `Replaces` is asserted is marked retired
+//! ([`IndexedTrackInfo::is_retired`]) until it empties, which is when the merge is
+//! finished, or the `Replaces` is retracted. A loser that comes back later (a re-ingest
+//! after the merge) was not live at the `Replaces`, so it is never marked. The rule
+//! reads the log in stream order, never timestamps, so a clock that is wrong cannot
+//! change it. Library writers skip retired tracks, and `mdma library dedup` finishes
+//! their merges.
+//!
 //! ## Plays
 //! Play events (start/stop) are history with identity, not tracked provenance. The
 //! bulk fold leaves `last_started`/`last_stopped` unset; [`EventTimestamps`] folds
@@ -80,14 +90,28 @@ pub struct IndexedTrackInfo {
     pub provenance: Vec<(MusicValue, music_facts::FactSource)>,
     /// Raw FilePath value stored during fact application.
     ///
-    /// FilePath is excluded from provenance (it never retracts) but the blob_path
-    /// derivation needs the extension.  When content_hash is empty (aggregate_facts
+    /// FilePath is excluded from provenance (so it is latest-wins, and a retract of the
+    /// current value clears it) but the blob_path derivation needs the extension.  When content_hash is empty (aggregate_facts
     /// bulk path) the derivation is deferred; this field holds the path until the
     /// post-pass in [`project`] calls `derive_blob_path_if_needed`.
     pub raw_file_path: Option<PathBuf>,
+    /// The entity key of the track whose `Replaces` fact retired this one while it was
+    /// live: a merge began for it and has not retracted everything yet (an unfinished
+    /// merge, or one a crash interrupted). Set when `Replaces(this)` is asserted on
+    /// another entity while this entry is live; cleared when the entry empties (the
+    /// liveness reset, so a re-ingested track starts clean) or when that `Replaces` is
+    /// retracted (module docs, "Retirement").
+    pub retired_by: Option<String>,
 }
 
 impl IndexedTrackInfo {
+    /// Whether a `Replaces` fact has retired this track while it was live (see
+    /// [`IndexedTrackInfo::retired_by`]). The one predicate library writers ask before
+    /// adding a fact to a track.
+    pub fn is_retired(&self) -> bool {
+        self.retired_by.is_some()
+    }
+
     /// An entry is live iff it holds at least one tracked assertion. Non-live
     /// entries (fully retracted, or orphan play events for unknown hashes) are
     /// dropped by every projection path so such a hash stops resolving (ADR-004).
@@ -132,6 +156,7 @@ impl IndexedTrackInfo {
             memory_cues: vec![],
             provenance: Vec::new(),
             raw_file_path: None,
+            retired_by: None,
         }
     }
 }
@@ -207,6 +232,15 @@ impl IndexedTrackInfo {
         mark: &'a Mark,
     ) -> impl Iterator<Item = &'a (MusicValue, music_facts::FactSource)> {
         self.provenance.iter().filter(move |(v, _)| mark.matches(v))
+    }
+
+    /// The keys ([`hash_key`]) of the tracks a live `Replaces` fact of this track
+    /// names: the one place that reads the lineage out of the fold.
+    pub fn replaced_keys(&self) -> impl Iterator<Item = String> + '_ {
+        self.provenance.iter().filter_map(|(v, _)| match v {
+            MusicValue::Replaces(h) => Some(hash_key(h.as_str())),
+            _ => None,
+        })
     }
 
     /// Derive `blob_path` from `raw_file_path` and `content_hash` if blob_path
@@ -355,9 +389,10 @@ pub fn is_play_event(value: &MusicValue) -> bool {
 /// strategy and are intentionally excluded — retractions for those are not emitted
 /// in production and the timestamp logic is handled elsewhere.
 ///
-/// `AddedAt` is excluded too: a retract of it is a no-op (there is no provenance to
-/// fall back to), and only ingest's `now()` ever writes it. Projection is
-/// latest-wins (`apply_assert_scalar`).
+/// `AddedAt` is excluded too: it has no provenance, so a retract of it (a merge
+/// writes one) changes nothing in the projection. Projection is latest-wins
+/// (`apply_assert_scalar`). `FilePath` is untracked as well, but a retract of the
+/// current value clears it (`apply_retract_scalar`).
 pub fn is_provenance_tracked(value: &MusicValue) -> bool {
     !(is_play_event(value) || matches!(value, MusicValue::FilePath(_) | MusicValue::AddedAt(_)))
 }
@@ -465,8 +500,9 @@ fn unique<T: PartialEq>(items: impl IntoIterator<Item = T>) -> Vec<T> {
 /// for the last (most recent) assertion of the same variant and re-set the scalar.
 /// For multi-valued fields (`StyleDescriptor`) we rebuild the Vec from scratch.
 ///
-/// Fields not tracked in provenance (TrackStarted/Stopped, FilePath, AddedAt) are
-/// left unchanged — their retraction is either a no-op or handled separately.
+/// Fields not tracked in provenance are left unchanged, except `FilePath`, which a
+/// retract of the current value clears: `TrackStarted`/`TrackStopped` are history and
+/// `AddedAt` is latest-wins.
 fn apply_retract_scalar(entry: &mut IndexedTrackInfo, retracted: &MusicValue) {
     // Helper: find last surviving value for a given variant discriminant.
     // Returns a clone of the last provenance entry whose variant matches `matcher`.
@@ -716,8 +752,17 @@ fn apply_retract_scalar(entry: &mut IndexedTrackInfo, retracted: &MusicValue) {
                 }
             }));
         }
-        // TrackStarted/TrackStopped/FilePath/AddedAt retractions are not
-        // emitted in the current codebase; ignore silently.
+        // A retract of the current path clears it (a merge retracts the loser's), so a
+        // track that outlives its retract holds no file. A retract of another path
+        // changes nothing. The retract's source is ignored: FilePath has no provenance
+        // to match it against, an exception to the source rule of ADR-018.
+        MusicValue::FilePath(p) if entry.raw_file_path.as_ref() == Some(p) => {
+            entry.raw_file_path = None;
+            entry.blob_path = PathBuf::new();
+        }
+        // AddedAt stays latest-wins: a retract leaves it (it has no provenance to fall
+        // back to), and the entry resets when nothing else is live. Play events are
+        // history, not state: their retracts are ignored.
         _ => {}
     }
 }
@@ -809,9 +854,15 @@ pub struct Projection {
 ///
 /// `last_started` / `last_stopped` are left unset; apply [`EventTimestamps`] for those.
 pub fn project(facts: Vec<MusicFact>) -> Projection {
+    let marks = retirement_marks(&facts);
     let mut aggregated: HashMap<ContentHash, IndexedTrackInfo> = aggregate_facts(facts);
 
     aggregated.retain(|_, entry| entry.is_live());
+    if !marks.is_empty() {
+        for (entity, entry) in aggregated.iter_mut() {
+            entry.retired_by = marks.get(&hash_key(entity.as_str())).cloned();
+        }
+    }
 
     let mut fact_index: HashMap<FactType, HashSet<String>> = HashMap::new();
     let mut has_format: HashSet<String> = HashSet::new();
@@ -920,6 +971,7 @@ pub fn apply_fact(
         fact.operation(),
         fact.source(),
     );
+    note_retirement(tracks, positions, pos, fact);
 
     if !is_provenance_tracked(fact.value()) {
         return;
@@ -944,6 +996,134 @@ pub fn apply_fact(
             }
         }
     }
+}
+
+/// The retirement rule, incremental half (see [`retirement_marks`] for the bulk half):
+/// a `Replaces(L)` asserted on the entry at `pos` retires `L` if `L` is live right now;
+/// retracting it (so the entry no longer holds any `Replaces(L)`) lifts that. The entry
+/// emptying clears the mark by itself, because the liveness reset rebuilds the entry.
+///
+/// A release hands the mark to another track that still holds a `Replaces` of the same
+/// loser (the smallest entity key, so the bulk pass agrees) and clears it only when
+/// there is none.
+fn note_retirement(
+    tracks: &mut [IndexedTrackInfo],
+    positions: &HashMap<String, usize>,
+    pos: usize,
+    fact: &MusicFact,
+) {
+    let MusicValue::Replaces(replaced) = fact.value() else {
+        return;
+    };
+    // Entity keys are written as `sha256:<hex>`; the value is read by its hash key.
+    let key = hash_key(replaced.as_str());
+    let Some(&lp) = positions
+        .get(replaced.as_str())
+        .or_else(|| positions.get(&format!("sha256:{key}")))
+        .or_else(|| positions.get(&key))
+    else {
+        return;
+    };
+    if lp == pos {
+        return;
+    }
+    let winner = fact.entity().as_str();
+    match fact.operation() {
+        Operation::Assert => {
+            if tracks[lp].is_live() {
+                tracks[lp].retired_by = Some(winner.to_owned());
+            }
+        }
+        Operation::Retract => {
+            if tracks[lp].retired_by.as_deref() != Some(winner) {
+                return;
+            }
+            let other_holder = tracks
+                .iter()
+                .enumerate()
+                .filter(|(i, t)| *i != lp && t.replaced_keys().any(|k| k == key))
+                .map(|(_, t)| t.content_hash.as_str())
+                .min()
+                .map(str::to_owned);
+            tracks[lp].retired_by = other_holder;
+        }
+    }
+}
+
+/// The retirement rule, bulk half: `loser hash key -> winner entity` for every entity
+/// that a `Replaces` retired while live and that has not emptied or been released
+/// since, read in stream order. `aggregate_facts` folds each entity alone, so the
+/// cross-entity question "was the loser live when the `Replaces` came?" needs this
+/// sequential pass (like [`EventTimestamps`]). It shadows the tracked provenance of the
+/// entities a `Replaces` names or comes from, and nothing else. Everything is keyed by
+/// [`hash_key`], like the incremental half.
+fn retirement_marks(facts: &[MusicFact]) -> HashMap<String, String> {
+    let mut involved: HashSet<String> = HashSet::new();
+    for f in facts {
+        if let MusicValue::Replaces(replaced) = f.value() {
+            involved.insert(hash_key(f.entity().as_str()));
+            involved.insert(hash_key(replaced.as_str()));
+        }
+    }
+    let mut marks: HashMap<String, String> = HashMap::new();
+    if involved.is_empty() {
+        return marks;
+    }
+
+    type Live = Vec<(MusicValue, music_facts::FactSource)>;
+    let holds = |live: &Live, key: &str| {
+        live.iter()
+            .any(|(v, _)| matches!(v, MusicValue::Replaces(h) if hash_key(h.as_str()) == key))
+    };
+    // hash key -> (entity key, tracked provenance)
+    let mut shadow: HashMap<String, (&str, Live)> = HashMap::new();
+    for f in facts {
+        let entity = f.entity().as_str();
+        let entity_key = hash_key(entity);
+        if involved.contains(&entity_key) && is_provenance_tracked(f.value()) {
+            let (_, live) = shadow
+                .entry(entity_key.clone())
+                .or_insert((entity, Vec::new()));
+            match f.operation() {
+                Operation::Assert => live.push((f.value().clone(), f.source().clone())),
+                Operation::Retract => {
+                    let removed = remove_cancelled(live, f.value(), f.source(), |(v, s)| (v, s));
+                    if removed && live.is_empty() {
+                        marks.remove(&entity_key);
+                    }
+                }
+            }
+        }
+        let MusicValue::Replaces(replaced) = f.value() else {
+            continue;
+        };
+        let loser = hash_key(replaced.as_str());
+        if loser == entity_key {
+            continue;
+        }
+        match f.operation() {
+            Operation::Assert => {
+                if shadow.get(&loser).is_some_and(|(_, live)| !live.is_empty()) {
+                    marks.insert(loser, entity.to_owned());
+                }
+            }
+            Operation::Retract => {
+                if marks.get(&loser).is_none_or(|w| w != entity) {
+                    continue;
+                }
+                let other_holder = shadow
+                    .iter()
+                    .filter(|(k, (_, live))| **k != loser && holds(live, &loser))
+                    .map(|(_, (e, _))| *e)
+                    .min();
+                match other_holder {
+                    Some(holder) => marks.insert(loser, holder.to_owned()),
+                    None => marks.remove(&loser),
+                };
+            }
+        }
+    }
+    marks
 }
 
 /// Drop every non-live entry (no tracked provenance): fully retracted entities and
@@ -1033,14 +1213,7 @@ impl EventTimestamps {
         let replaces: HashMap<String, Vec<String>> = tracks
             .iter()
             .map(|t| {
-                let replaced = t
-                    .provenance
-                    .iter()
-                    .filter_map(|(v, _)| match v {
-                        MusicValue::Replaces(h) => Some(hash_key(h.as_str())),
-                        _ => None,
-                    })
-                    .collect();
+                let replaced = t.replaced_keys().collect();
                 (hash_key(t.content_hash.as_str()), replaced)
             })
             .collect();
@@ -1417,6 +1590,18 @@ mod tests {
             "sha256:cccccccccccccccc",
             "sha256:dddddddddddddddd",
         );
+        let (e, f, g, h, i) = (
+            "sha256:eeeeeeeeeeeeeeee",
+            "sha256:ffffffffffffffff",
+            "sha256:0000000000000000",
+            "sha256:1111111111111111",
+            "sha256:2222222222222222",
+        );
+        let (j, k, l) = (
+            "sha256:3333333333333333",
+            "sha256:4444444444444444",
+            "sha256:5555555555555555",
+        );
         let started = MusicValue::TrackStarted(StartReason::OnRequest);
         let stopped = MusicValue::TrackStopped(StopReason::OnSkip);
         let bpm = |v: f32| MusicValue::Bpm(music_facts::Bpm::from_f32(v).unwrap());
@@ -1469,6 +1654,43 @@ mod tests {
                 16,
                 &play,
             ),
+            // An unfinished merge, as an older release left it: F replaces E, and the
+            // merge retracts E's title and path but misses its bpm, so E stays live.
+            assert_fact(e, title("E"), 17, &ingest1),
+            assert_fact(
+                e,
+                MusicValue::FilePath(PathBuf::from("e.flac")),
+                17,
+                &ingest1,
+            ),
+            assert_fact(e, bpm(100.0), 17, &user),
+            assert_fact(f, title("F"), 18, &ingest1),
+            assert_fact(f, MusicValue::Replaces(ContentHash::new(e)), 19, &ingest1),
+            retract_fact(e, title("E"), 20, &ingest1),
+            retract_fact(
+                e,
+                MusicValue::FilePath(PathBuf::from("e.flac")),
+                20,
+                &ingest1,
+            ),
+            // A finished merge whose loser is ingested again afterwards: G is not retired.
+            assert_fact(g, title("G"), 17, &ingest1),
+            assert_fact(f, MusicValue::Replaces(ContentHash::new(g)), 19, &ingest1),
+            retract_fact(g, title("G"), 20, &ingest1),
+            assert_fact(g, title("G again"), 21, &ingest1),
+            // A `Replaces` that is retracted again releases its loser.
+            assert_fact(h, title("H"), 22, &ingest1),
+            assert_fact(i, title("I"), 22, &ingest1),
+            assert_fact(i, MusicValue::Replaces(ContentHash::new(h)), 23, &ingest1),
+            retract_fact(i, MusicValue::Replaces(ContentHash::new(h)), 24, &ingest1),
+            // Two winners hold a `Replaces` of the live L; K's comes first, J's second.
+            // J's is retracted again: L stays retired, by K, the one that still holds it.
+            assert_fact(j, title("J"), 25, &ingest1),
+            assert_fact(k, title("K"), 25, &ingest1),
+            assert_fact(l, bpm(90.0), 25, &user),
+            assert_fact(k, MusicValue::Replaces(ContentHash::new(l)), 26, &ingest1),
+            assert_fact(j, MusicValue::Replaces(ContentHash::new(l)), 26, &ingest1),
+            retract_fact(j, MusicValue::Replaces(ContentHash::new(l)), 27, &ingest1),
         ]
     }
 
@@ -1486,7 +1708,8 @@ mod tests {
                     "{} title={:?} artist={:?} album={:?} label={:?} genre={:?} styles={:?} \
                      duration={:?} bpm={:?} key={:?} year={:?} source={:?} blob={:?} cover={:?} \
                      track={:?} disc={:?} started={:?} stopped={:?} added={:?} item={:?} \
-                     deleted={:?} role={:?} energy={:?} grid={:?} cues={:?} raw={:?} prov={:?}",
+                     deleted={:?} role={:?} energy={:?} grid={:?} cues={:?} raw={:?} \
+                     retired_by={:?} prov={:?}",
                     t.content_hash.as_str(),
                     t.title,
                     t.artist,
@@ -1513,6 +1736,7 @@ mod tests {
                     t.beat_grid,
                     t.memory_cues,
                     t.raw_file_path,
+                    t.retired_by,
                     t.provenance
                         .iter()
                         .map(|(v, s)| format!("{v}|{:?}", s.identity()))
@@ -1641,9 +1865,26 @@ mod tests {
         // B was merged away, D never live.
         assert_eq!(
             hashes,
-            ["sha256:aaaaaaaaaaaaaaaa", "sha256:cccccccccccccccc"]
+            [
+                "sha256:0000000000000000",
+                "sha256:1111111111111111",
+                "sha256:2222222222222222",
+                "sha256:3333333333333333",
+                "sha256:4444444444444444",
+                "sha256:5555555555555555",
+                "sha256:aaaaaaaaaaaaaaaa",
+                "sha256:cccccccccccccccc",
+                "sha256:eeeeeeeeeeeeeeee",
+                "sha256:ffffffffffffffff",
+            ]
         );
-        let a = &tracks[0];
+        let by = |hash: &str| {
+            tracks
+                .iter()
+                .find(|t| t.content_hash.as_str() == hash)
+                .unwrap()
+        };
+        let a = by("sha256:aaaaaaaaaaaaaaaa");
         // Retract by source identity removed ingest's bpm; the user's survives.
         assert_eq!(a.bpm, Some(122.0));
         // A carries B's plays through the lineage, and its own.
@@ -1651,8 +1892,54 @@ mod tests {
         assert_eq!(a.last_stopped, Some(ts(5)));
         assert_eq!(a.blob_path, PathBuf::from("blobs/aa/aaaaaaaaaaaaaaaa.flac"));
         // C was reset on retract-to-empty, then re-asserted.
-        let c = &tracks[1];
+        let c = by("sha256:cccccccccccccccc");
         assert_eq!(c.title.as_deref(), Some("C again"));
         assert_eq!(c.added_at, None);
+    }
+
+    #[test]
+    fn a_loser_a_merge_did_not_finish_is_retired_and_nothing_else_is() {
+        let facts = fixture();
+        for (label, p) in [
+            ("bulk", project(facts.clone()).tracks),
+            ("incremental", {
+                let mut p = project(Vec::new());
+                fold_incrementally(&mut p, &facts);
+                p.tracks
+            }),
+        ] {
+            // (first hex digit of the loser, first hex digit of its winner)
+            let digit = |h: &str| h.chars().nth("sha256:".len()).unwrap();
+            let retired: Vec<(char, char)> = sorted(p.clone())
+                .iter()
+                .filter_map(|t| {
+                    let winner = t.retired_by.as_deref()?;
+                    Some((digit(t.content_hash.as_str()), digit(winner)))
+                })
+                .collect();
+            // L (5) is retired by K (4): J's `Replaces` was retracted, K's still holds it.
+            assert_eq!(retired, [('5', '4'), ('e', 'f')], "{label}");
+            let ghost = p
+                .iter()
+                .find(|t| t.content_hash.as_str().contains("eeee"))
+                .unwrap();
+            assert!(ghost.is_retired() && ghost.is_live(), "{label}");
+            // The retract of its path cleared the file, though the track outlives it.
+            assert!(ghost.blob_path.as_os_str().is_empty(), "{label}");
+            assert_eq!(ghost.raw_file_path, None, "{label}");
+        }
+    }
+
+    #[test]
+    fn a_file_path_retract_of_another_path_changes_nothing() {
+        let s = src("ingest", "1.0.0");
+        let path = |p: &str| MusicValue::FilePath(PathBuf::from(p));
+        let facts = vec![
+            assert_fact("sha256:aabbcc", title("T"), 1, &s),
+            assert_fact("sha256:aabbcc", path("x.flac"), 1, &s),
+            retract_fact("sha256:aabbcc", path("other.flac"), 2, &s),
+        ];
+        let t = project(facts).tracks.remove(0);
+        assert_eq!(t.blob_path, PathBuf::from("blobs/aa/aabbcc.flac"));
     }
 }

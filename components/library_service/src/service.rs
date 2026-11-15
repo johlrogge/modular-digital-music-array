@@ -576,9 +576,10 @@ impl LibraryService {
 
         let tracks = self.tracks.lock().unwrap();
 
-        // Find tracks needing backfill
+        // Find tracks needing backfill; a track a `Replaces` retired gets nothing.
         let needs_backfill: Vec<_> = tracks
             .iter()
+            .filter(|t| !t.is_retired())
             .filter(|t| !has_format.contains(t.content_hash.as_str()))
             .filter(|t| !t.blob_path.as_os_str().is_empty())
             .filter_map(|t| {
@@ -692,9 +693,11 @@ impl LibraryService {
     fn backfill_cover_art(&self, has_cover_art: &HashSet<String>) -> usize {
         let tracks = self.tracks.lock().unwrap();
 
-        // Collect tracks that need backfill: have a blob_path but no CoverArtPath fact
+        // Collect tracks that need backfill: have a blob_path but no CoverArtPath fact,
+        // and are not retired by a `Replaces`
         let needs_backfill: Vec<_> = tracks
             .iter()
+            .filter(|t| !t.is_retired())
             .filter(|t| !has_cover_art.contains(t.content_hash.as_str()))
             .filter(|t| !t.blob_path.as_os_str().is_empty())
             .map(|t| (t.content_hash.clone(), t.blob_path.clone()))
@@ -1682,6 +1685,22 @@ impl LibraryService {
                 }
             }
 
+            // A winner that a `Replaces` retired is a ghost: nothing may be written onto it.
+            let winner_key = hash_key(winner.as_str());
+            let winner_retired = self
+                .tracks
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|t| t.is_retired() && hash_key(t.content_hash.as_str()) == winner_key);
+            if winner_retired {
+                return Err(ProtocolError::Internal {
+                    message: format!(
+                        "{winner} is retired by an unfinished merge; run mdma library dedup --apply"
+                    ),
+                });
+            }
+
             // Playlists pointing at any generation of the chain must find the winner.
             let ancestors = self.ancestor_replaces(loser);
             let retired = self.retired_files(loser);
@@ -1723,6 +1742,20 @@ impl LibraryService {
     ) -> Result<(), ProtocolError> {
         let mut seen: HashSet<String> = HashSet::new();
         seen.insert(hash_key(winner.as_str()));
+        // An ancestor that is a live track now was ingested again after its own merge:
+        // it is not replaced by the winner, so the winner must not claim it (and the
+        // projection would otherwise retire it). A retired ancestor is still replaced.
+        let ancestors: Vec<_> = {
+            let tracks = self.tracks.lock().unwrap();
+            ancestors
+                .into_iter()
+                .filter(|(a, _)| {
+                    !tracks.iter().any(|t| {
+                        !t.is_retired() && hash_key(t.content_hash.as_str()) == hash_key(a.as_str())
+                    })
+                })
+                .collect()
+        };
         {
             let tracks = self.tracks.lock().unwrap();
             if let Some(entry) = tracks

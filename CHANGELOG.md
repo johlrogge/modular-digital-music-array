@@ -12,6 +12,13 @@ All notable changes to MDMA are documented here.
 - **Shell completion from the local replica** (ADR-021 phase 5): mark names, playlist names, source names, and artists, titles, albums, labels, genres and styles for the `search` filters and query complete from a snapshot built after each sync, with no network call and in a few milliseconds. A background `mdma replica sync --quiet` is started, detached, when the replica is more than 30 s old (backing off to 5 min after failures) and after commands that write; nothing syncs inline. Fact lines this client cannot read (a newer node) are kept, left out of completion, and counted in `replica status`.
 - **ACID fact log has an identity and `ReadStream` can pin the last line a client has** (ADR-021 phase 3), so a rewritten or replaced log answers `StreamDiverged` instead of looking like "nothing new". The gateway re-serialises typed ACID requests, so a mismatched gateway/ACID deploy fails closed (pinned reads report "node too old" instead of appending unverified lines); upgrade them together for availability, not correctness.
 
+- **`mdma library dedup` finds and finishes unfinished merges.** A merge by an older release could leave its loser with live facts (a `HasAlbumArt` from 0.1.0, say), so it was still listed as a track. The dry-run now lists such losers with their leftover facts under "Unfinished merges"; `--apply` finishes them like a merge (marks and plays carry to the winner, every leftover fact is retracted, chains of unfinished merges converge) and leaves the groups that need confirmation alone. The projection knows them from the log's order, not from timestamps.
+
+### Fixed
+
+- **A track a merge has replaced is no longer given new facts.** The startup Format and cover-art backfills and the identity backfill skip a loser that a `Replaces` fact retired while it was live, so they no longer revive it. A track that was ingested again after its merge is not affected, and a later merge no longer claims it.
+- **Retracting a track's file path now clears it** in the library index, so a track that outlives a merge no longer keeps a file it lost.
+
 ### Changed
 
 - **The gateway refuses ACID writes (`WriteFacts`/`RetractFacts`) and forwards only reads.** Write through the library service.

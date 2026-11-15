@@ -5,13 +5,15 @@
 //! through `merge_into`, the generalised ADR-004 replace that `track replace` uses
 //! too. Facts are made durable first and the losers' files are moved to
 //! `<music_dir>/archive/` afterwards (never deleted; `archive_empty` is the only
-//! deletion), so a crash leaves either a still-detectable group or a merge orphan
-//! that the cleanup archives.
+//! deletion), so a crash leaves either a merge orphan that the cleanup archives, or,
+//! once the winner holds `Replaces(loser)`, an unfinished merge: the projection marks
+//! the loser retired (`IndexedTrackInfo::is_retired`), library writers leave it alone
+//! and `dedup_scan` with `apply` finishes the merge into the live head of the chain.
 
 use super::*;
 use crate::ipc::{
     ArchiveEmptyReport, ArchiveEntry, ArchiveListing, ConfirmationReason, DedupApplyReport,
-    DedupDisposition, DedupGroup, DedupMember, DedupScanReport,
+    DedupDisposition, DedupGroup, DedupMember, DedupScanReport, LeftoverFact, UnfinishedMerge,
 };
 use chrono::{DateTime, Utc};
 use music_facts::FactSource;
@@ -37,8 +39,9 @@ pub(super) struct LiveFact {
 /// order. A retraction cancels every earlier assertion with an equal value and the
 /// same source (`FactSource::same_source`), through the same `remove_cancelled` the
 /// in-memory projection uses. That holds for provenance-tracked values only: in memory
-/// the retracts of TrackStarted, TrackStopped, FilePath and AddedAt are ignored,
-/// whereas this replay cancels them too.
+/// the retracts of TrackStarted, TrackStopped and AddedAt are ignored, and a retract of
+/// FilePath matches by value only, whereas this replay cancels them all by value and
+/// source.
 pub(super) fn live_facts(lines: &[String]) -> Vec<LiveFact> {
     let mut live: Vec<LiveFact> = Vec::new();
     for line in lines {
@@ -412,6 +415,7 @@ impl LibraryService {
             .lock()
             .unwrap()
             .iter()
+            .filter(|t| !t.is_retired())
             .map(ScanTrack::from)
             .collect();
 
@@ -484,13 +488,14 @@ impl LibraryService {
     }
 
     /// The winner and losers of the automatic duplicate group `new` belongs to, if any.
+    /// Retired tracks (unfinished merges) are in no group: they are never a winner.
     fn self_heal_group(&self, new: &ContentHash) -> Option<(ContentHash, Vec<ContentHash>)> {
         let key = hash_key(new.as_str());
         let tracks = self.tracks.lock().unwrap();
         let entry = tracks
             .iter()
             .find(|t| hash_key(t.content_hash.as_str()) == key)
-            .filter(|t| !t.is_hidden())?;
+            .filter(|t| !t.is_hidden() && !t.is_retired())?;
 
         let new_audio: BTreeSet<&str> = entry.audio_hashes().collect();
         if new_audio.is_empty() {
@@ -501,7 +506,11 @@ impl LibraryService {
             .chain(
                 tracks
                     .iter()
-                    .filter(|t| hash_key(t.content_hash.as_str()) != key && !t.is_hidden())
+                    .filter(|t| {
+                        hash_key(t.content_hash.as_str()) != key
+                            && !t.is_hidden()
+                            && !t.is_retired()
+                    })
                     .filter(|t| t.audio_hashes().any(|h| new_audio.contains(h))),
             )
             .map(ScanTrack::from)
@@ -520,17 +529,107 @@ impl LibraryService {
         Some((group.winner, losers))
     }
 
-    /// Handle `DedupScan`. With `apply`, merge the automatic groups and run the
-    /// merge-orphan cleanup, then report the groups that are left.
+    /// The live head of the chain of `Replaces` that retired `track`: the winner, or
+    /// the winner's winner when that one is unfinished too. `None` when the chain
+    /// leaves the index or loops.
+    fn live_head(tracks: &[IndexedTrackInfo], track: &IndexedTrackInfo) -> Option<ContentHash> {
+        let mut seen = vec![hash_key(track.content_hash.as_str())];
+        let mut current = track;
+        while let Some(winner) = current.retired_by.as_deref() {
+            let key = hash_key(winner);
+            if seen.contains(&key) {
+                return None;
+            }
+            current = tracks
+                .iter()
+                .find(|t| hash_key(t.content_hash.as_str()) == key)?;
+            seen.push(key);
+        }
+        Some(current.content_hash.clone())
+    }
+
+    /// The merges that did not retract everything of their loser, read from the
+    /// projection: the tracks a `Replaces` retired while they were live and that still
+    /// hold facts (`IndexedTrackInfo::is_retired`). A loser that came back after its
+    /// merge is not one. The winner is the live head of the chain, so it is never itself
+    /// a retired track.
+    fn unfinished_report(&self) -> Vec<UnfinishedMerge> {
+        let tracks = self.tracks.lock().unwrap();
+        tracks
+            .iter()
+            .filter(|t| t.is_retired())
+            .map(|t| UnfinishedMerge {
+                loser: t.content_hash.clone(),
+                winner: Self::live_head(&tracks, t),
+                leftovers: t
+                    .provenance
+                    .iter()
+                    .map(|(value, source)| LeftoverFact {
+                        value: value.clone(),
+                        source: source.clone(),
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Finish the unfinished merges, one at a time, re-reading the projection after each
+    /// so that a loser that is also a winner, and chains of them, converge: each loser
+    /// is merged into the live head of its chain, with the same merge as any other (it
+    /// carries marks and plays, retracts every live non-play fact of the loser and
+    /// archives its files).
+    fn finish_unfinished_merges(&self, report: &mut DedupApplyReport) {
+        let attempts = {
+            let tracks = self.tracks.lock().unwrap();
+            tracks.iter().filter(|t| t.is_retired()).count()
+        };
+        for _ in 0..attempts {
+            let next = {
+                let tracks = self.tracks.lock().unwrap();
+                tracks.iter().find(|t| t.is_retired()).map(|t| {
+                    (
+                        t.content_hash.clone(),
+                        Self::live_head(&tracks, t)
+                            .ok_or_else(|| format!("{} has no live winner", t.content_hash)),
+                    )
+                })
+            };
+            let Some((loser, head)) = next else {
+                return;
+            };
+            let head = match head {
+                Ok(head) => head,
+                Err(e) => {
+                    report.errors.push(e);
+                    return;
+                }
+            };
+            let merged = self.merge_group(&head, std::slice::from_ref(&loser));
+            report.finished += merged.merged;
+            report.blobs_archived += merged.blobs_archived;
+            let failed = !merged.errors.is_empty();
+            report.errors.extend(merged.errors);
+            if failed {
+                return;
+            }
+        }
+    }
+
+    /// Handle `DedupScan`. With `apply`, finish the unfinished merges, merge the
+    /// automatic groups and run the merge-orphan cleanup, then report what is left.
     pub(super) fn dedup_scan(&self, apply: bool) -> DedupScanReport {
         if !apply {
             return DedupScanReport {
                 groups: self.scan_duplicate_groups(),
                 applied: None,
+                unfinished: self.unfinished_report(),
             };
         }
 
         let mut report = DedupApplyReport::default();
+        // A different finding from the groups below, which it never touches (it runs
+        // first, so a duplicate group is read after it).
+        self.finish_unfinished_merges(&mut report);
         for group in self
             .scan_duplicate_groups()
             .into_iter()
@@ -547,6 +646,7 @@ impl LibraryService {
         DedupScanReport {
             groups: self.scan_duplicate_groups(),
             applied: Some(report),
+            unfinished: self.unfinished_report(),
         }
     }
 

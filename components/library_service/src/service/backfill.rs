@@ -62,6 +62,7 @@ impl LibraryService {
         let tracks = self.tracks.lock().unwrap();
         tracks
             .iter()
+            .filter(|t| !t.is_retired())
             .filter(|t| !t.blob_path.as_os_str().is_empty())
             .filter_map(|t| {
                 let opts = IdentityOpts::missing(include_pcm, t.provenance.iter().map(|(v, _)| v))?;
@@ -176,6 +177,9 @@ impl LibraryService {
         else {
             return Recheck::Retired;
         };
+        if track.is_retired() {
+            return Recheck::Retired;
+        }
         let Some(missing) = IdentityOpts::missing(true, track.provenance.iter().map(|(v, _)| v))
         else {
             return Recheck::Write(Vec::new());
