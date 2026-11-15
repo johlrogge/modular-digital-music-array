@@ -4,7 +4,7 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma-macos.sh | bash
-#   curl -fsSL .../install-mdma-macos.sh | bash -s v0.38.1
+#   curl -fsSL .../install-mdma-macos.sh | bash -s v0.38.2
 
 set -euo pipefail
 
