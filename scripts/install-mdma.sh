@@ -53,6 +53,62 @@ fetch() {
     curl --proto '=https' --tlsv1.2 -fsSL -o "$2" "$1"
 }
 
+print_next_steps() {
+    # print_next_steps <install dir> <uname -s> <login shell path, may be empty>
+    # Prints instructions only; never writes rc or completion files.
+    local INSTALL_DIR="$1" OS="$2" SHELL_NAME="${3##*/}"
+    local CMD="mdma"
+
+    echo "Done."
+    case ":${PATH}:" in
+        *":${INSTALL_DIR}:"*) ;;
+        *)
+            CMD="${INSTALL_DIR}/mdma"
+            echo ""
+            echo "${INSTALL_DIR} is not on your PATH. Add it, or run ${CMD} by full path."
+            ;;
+    esac
+
+    echo ""
+    echo "Next steps:"
+    echo "  ${CMD} node select    # find MDMA nodes on the network and remember one"
+    echo "  ${CMD} ping"
+    echo ""
+    echo "'node select' asks you to pick when several nodes are found;"
+    echo "'${CMD} node select <name>' picks one directly."
+    echo ""
+    echo "Shell completions (optional):"
+    echo ""
+    case "$SHELL_NAME" in
+        bash)
+            if [ "$OS" = "Darwin" ]; then
+                echo "  (on macOS this needs bash-completion@2, e.g. brew install bash-completion@2)"
+            fi
+            echo "  mkdir -p ~/.local/share/bash-completion/completions"
+            echo "  ${CMD} generate-completions bash > ~/.local/share/bash-completion/completions/mdma"
+            ;;
+        zsh)
+            echo "  mkdir -p ~/.zfunc"
+            echo "  ${CMD} generate-completions zsh > ~/.zfunc/_mdma"
+            echo ""
+            echo "  Then add these two lines to ~/.zshrc if not already present"
+            echo "  (before any existing compinit call):"
+            echo ""
+            echo "  fpath=(~/.zfunc \$fpath)"
+            echo "  autoload -Uz compinit && compinit"
+            ;;
+        fish)
+            echo "  mkdir -p ~/.config/fish/completions"
+            echo "  ${CMD} generate-completions fish > ~/.config/fish/completions/mdma.fish"
+            ;;
+        *)
+            echo "  Run '${CMD} generate-completions <bash|zsh|fish>' for your shell's completion script."
+            ;;
+    esac
+    echo ""
+    echo "Restart your shell afterwards."
+}
+
 main() {
     local INSTALL_DIR="${MDMA_INSTALL_DIR:-/usr/local/bin}"
     local OS ARCH ASSET TAG BASE_URL
@@ -199,9 +255,7 @@ main() {
     echo "  ${INSTALL_DIR}/mdma      ${CLI_VERSION}"
     echo "  ${INSTALL_DIR}/mdma-tui  ${TUI_VERSION}"
     echo ""
-    echo "Done. Set MDMA_NODE to your Pi hostname to start using it:"
-    echo "  export MDMA_NODE=mdma-yourname.local"
-    echo "  mdma ping"
+    print_next_steps "$INSTALL_DIR" "$OS" "${SHELL:-}"
 }
 
 main "$@"
