@@ -222,8 +222,26 @@ mdma search --help      # help for one command (there is no `mdma help <cmd>`)
 mdma source bandcamp --help   # `source NAME --help` shows the source group's page
 mdma --version          # prints "Version: x.y.z"
 
-# Shell completions: bash, zsh or fish
+# Shell completions: bash, zsh or fish (install one)
+
+# bash (on macOS this needs bash-completion@2)
+mkdir -p ~/.local/share/bash-completion/completions
 mdma generate-completions bash > ~/.local/share/bash-completion/completions/mdma
+
+# zsh
+mkdir -p ~/.zfunc
+mdma generate-completions zsh > ~/.zfunc/_mdma
+
+# fish
+mkdir -p ~/.config/fish/completions
+mdma generate-completions fish > ~/.config/fish/completions/mdma.fish
+```
+
+For zsh, also add these two lines to `~/.zshrc` if they are not already there, before any existing `compinit` call:
+
+```zsh
+fpath=(~/.zfunc $fpath)
+autoload -Uz compinit && compinit
 ```
 
 Completion reads a local replica of the node's fact log, so it needs no network: mark, playlist and source names and search filter values complete offline. A background `mdma replica sync` refreshes it. `mdma replica status` shows it and `mdma replica reset` deletes it.
@@ -243,7 +261,7 @@ Every `vX.Y.Z` release publishes `mdma-macos-arm64.tar.gz`, `mdma-linux-x86_64.t
 curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash
 
 # Install a specific release
-curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash -s v0.38.1
+curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | bash -s v0.38.2
 
 # Install to a user-writable location (no sudo)
 curl -fsSL https://raw.githubusercontent.com/johlrogge/modular-digital-music-array/master/scripts/install-mdma.sh | MDMA_INSTALL_DIR=~/.local/bin bash
