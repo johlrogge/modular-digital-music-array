@@ -47,6 +47,19 @@ export function setArt(el, name) {
 }
 
 /**
+ * Layer the real cover (track hash, or null for none) onto a sleeve element, replacing any cover
+ * already there. If the image fails to load it removes itself and the placeholder shows.
+ */
+export function setCover(el, hash) {
+  const old = el.querySelector("img");
+  if (old) old.remove();
+  if (!hash) return;
+  const img = h("img", { src: coverUrl(hash), alt: "" });
+  img.onerror = () => img.remove();
+  el.appendChild(img);
+}
+
+/**
  * A sleeve element for `name`. With `opts.cover` (a track hash) a lazy <img> is layered on top;
  * if it fails to load it removes itself and the placeholder shows.
  */

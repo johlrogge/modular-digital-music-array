@@ -1,9 +1,6 @@
 //! Shared helpers for handler tests: the real `app()` on an `AppState`, optionally wired to a
 //! fake gateway that answers from a script and records everything it was asked.
 
-// The harness is built ahead of the P1 handler tests that use most of it.
-#![allow(dead_code)]
-
 use crate::AppState;
 use axum::{body::Body, http::Request, response::Response, Router};
 use gateway_client::{Command, GatewayRequest, GatewayResponse};
@@ -52,6 +49,69 @@ pub async fn send_post_json(app: Router, path: &str, json: &serde_json::Value) -
         .body(Body::from(serde_json::to_vec(json).unwrap()))
         .unwrap();
     app.oneshot(req).await.unwrap()
+}
+
+/// Parsed JSON body of a response.
+pub async fn body_json(res: Response) -> serde_json::Value {
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Body of a response as text.
+pub async fn body_text(res: Response) -> String {
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+/// A successful playback answer carrying `data`.
+pub fn playback_ok(data: Option<media_protocol::ResponseData>) -> GatewayResponse {
+    GatewayResponse::Playback {
+        response: gateway_client::Response::Ok { data },
+    }
+}
+
+/// A playback service error.
+pub fn playback_err(message: &str) -> GatewayResponse {
+    GatewayResponse::Playback {
+        response: gateway_client::Response::Err {
+            message: message.to_string(),
+        },
+    }
+}
+
+/// A library answer.
+pub fn library_ok(response: gateway_client::LibraryResponse) -> GatewayResponse {
+    GatewayResponse::Library { response }
+}
+
+/// Short form of a playback command for asserting on recorded traffic: `now`, `list`,
+/// `next <hash>`, `append <hash>`, `play`, `replace <hash>,<hash>`; anything else as `{:?}`.
+pub fn describe(command: &Command) -> String {
+    match command {
+        Command::NowPlaying => "now".into(),
+        Command::QueueList => "list".into(),
+        Command::PlayQueue => "play".into(),
+        Command::QueueNext { hash, .. } => format!("next {}", hash.as_str()),
+        Command::QueueAppend { hash, .. } => format!("append {}", hash.as_str()),
+        Command::QueueReplace { entries } => format!(
+            "replace {}",
+            entries
+                .iter()
+                .map(|(h, _)| h.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        other => format!("{other:?}"),
+    }
+}
+
+/// `describe` of every playback command a fake gateway received.
+pub fn described(gw: &FakeGateway) -> Vec<String> {
+    gw.commands().iter().map(describe).collect()
 }
 
 pub async fn get_with_encoding(path: &str, accept_encoding: Option<&str>) -> Response {

@@ -180,10 +180,10 @@ async fn shell() -> Response {
     render_shell(NODE_NAME.clone())
 }
 
-/// Routes for the new UI. `/next` becomes `/` once the new UI replaces the old one.
+/// Routes for the new UI: the shell at `/` (the old UI lives at `/classic`) and the assets.
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/next", get(shell))
+        .route("/", get(shell))
         .route("/static/:tag/*path", get(serve_asset))
 }
 
@@ -518,7 +518,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_is_html_and_never_cached() {
-        let res = get_path("/next").await;
+        let res = get_path("/").await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(header_of(&res, header::CACHE_CONTROL), "no-cache");
         assert!(header_of(&res, header::CONTENT_TYPE).starts_with("text/html"));

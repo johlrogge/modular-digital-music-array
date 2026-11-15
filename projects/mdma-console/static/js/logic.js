@@ -34,6 +34,11 @@ export function initials(name) {
   return (((w[0] || "?")[0]) + (w[1] ? w[1][0] : "")).toUpperCase();
 }
 
+/** The one display title for a track (or a missing one). */
+export function trackTitle(t) {
+  return (t && t.title) || "Unknown track";
+}
+
 /** True when nothing is loaded. The server's `state` is the only source of truth: paused and loading are busy. */
 export function isIdle(player) {
   return !player || player.state === "idle";

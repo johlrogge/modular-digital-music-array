@@ -137,6 +137,97 @@ export function confirmDlg(title, text, ok, fn) {
   $("#cf-cancel").onclick = () => c.classList.remove("open");
 }
 
+/* ============================================================ action menu */
+
+let menuOnClose = null;
+
+/**
+ * Open the action menu (#menu): a bottom sheet on phones, a popover anchored to `anchor` from
+ * 600px up (anchor may be null: then it stays where the CSS puts it). items: [icon, label, fn,
+ * cls?] or the string "-" for a separator. head: [title, subtitle?]. opts.onClose runs once when
+ * the menu closes, however it closes.
+ */
+export function openMenu(anchor, items, head, opts = {}) {
+  if (menuOnClose) closeMenu(); // a menu opened over a menu: finish the first one's cleanup
+  menuOnClose = opts.onClose || null;
+  const m = $("#menu");
+  m.innerHTML = "";
+  if (head) {
+    m.appendChild(
+      h("div", { class: "mh" }, [
+        h("div", { class: "t", text: head[0] }),
+        head[1] ? h("div", { class: "m", text: head[1] }) : null,
+      ]),
+    );
+  }
+  for (const it of items) {
+    if (it === "-") {
+      m.appendChild(h("div", { class: "sep" }));
+      continue;
+    }
+    m.appendChild(
+      h(
+        "button",
+        {
+          role: "menuitem",
+          class: it[3] || null,
+          onclick: (e) => {
+            e.stopPropagation();
+            closeMenu();
+            it[2]();
+          },
+        },
+        [icon(it[0], "sm"), it[1]],
+      ),
+    );
+  }
+  m.classList.add("open");
+  $("#menu-scrim").classList.add("on");
+  if (window.innerWidth >= 600 && anchor) {
+    const r = anchor.getBoundingClientRect();
+    const mw = Math.max(240, m.offsetWidth);
+    const mh = m.offsetHeight;
+    m.style.left = Math.max(8, Math.min(window.innerWidth - mw - 8, r.right - mw)) + "px";
+    m.style.top = (r.bottom + mh + 8 > window.innerHeight ? Math.max(8, r.top - mh - 4) : r.bottom + 4) + "px";
+  }
+  m.setAttribute("tabindex", "-1");
+  m.focus({ preventScroll: true });
+}
+
+const menuIsOpen = () => $("#menu").classList.contains("open");
+
+export function closeMenu() {
+  $("#menu").classList.remove("open");
+  $("#menu-scrim").classList.remove("on");
+  const fn = menuOnClose;
+  menuOnClose = null;
+  if (fn) fn();
+}
+
+document.addEventListener(
+  "click",
+  (e) => {
+    if (menuIsOpen() && !e.target.closest("#menu")) closeMenu();
+  },
+  true,
+);
+$("#menu-scrim").addEventListener("click", closeMenu);
+
+// Esc closes the topmost core overlay (menu, then confirm) and goes no further, so the player
+// or sheet behind it stays. Capture phase: it runs before every other Esc handler.
+document.addEventListener(
+  "keydown",
+  (e) => {
+    if (e.key !== "Escape") return;
+    const cf = $("#confirm");
+    if (menuIsOpen()) closeMenu();
+    else if (cf.classList.contains("open")) cf.classList.remove("open");
+    else return;
+    e.stopPropagation();
+  },
+  true,
+);
+
 /* ============================================================ API client */
 
 /** Error from the API. `status` is the HTTP status (0 when the network failed); `body` the parsed JSON if any. */
@@ -425,48 +516,120 @@ export function startRouter() {
   renderRoute();
 }
 
-/* ============================================================ actions (filled in by P1) */
+/* ============================================================ actions */
 
-// The ONLY ways a click may change what is heard. Each one will: call the API, apply the
-// returned { queue } with applyQueue(), show a toast with Undo, then reconcile with the server.
-// P0 defines the signatures only. Nothing here may call the raw /player/play-queue: playNow and
-// start go through the server's idle guard.
+// The ONLY ways a click may change what is heard. Each one calls the API, applies the returned
+// { queue } with applyQueue(), and shows a toast (with Undo where a queue change can be undone).
+// Nothing here may call the raw /player/play-queue: playNow and start go through the server's
+// idle guard. Each action resolves true when the server did what was asked, false otherwise.
 
-function notWired(name) {
-  toast(name + " is not wired up yet");
-  return Promise.resolve(null);
+const count = (hashes) => (hashes.length === 1 ? "1 track" : hashes.length + " tracks");
+const text = (subject, hashes) => subject || count(hashes);
+
+/** Run a queue mutation. Returns the body of a 2xx answer, or null after toasting the failure. */
+async function queueCall(path, body) {
+  try {
+    return await api(path, { body });
+  } catch (e) {
+    const b = e instanceof ApiError ? e.body : null;
+    if (b && Array.isArray(b.queue)) applyQueue(b.queue);
+    const queued = b && b.queued > 0 ? b.queued : 0;
+    if (b && b.stage === "start") {
+      toast("Queued, but couldn't start: " + (e.message || "error"));
+      refreshPlayer();
+    } else if (e instanceof ApiError && e.status === 409 && e.message === "busy" && queued) {
+      toast("Queued " + queued + "; something else started playing");
+      refreshPlayer();
+    } else if (e instanceof ApiError && e.status === 409 && e.message === "busy") {
+      toast("Something is already playing. Use Queue next or Queue last.");
+      refreshPlayer();
+    } else if (e instanceof ApiError && e.status === 409) {
+      toast("Up next changed, try again");
+    } else {
+      toast("Couldn't change Up next: " + (e.message || "error"));
+      refreshPlayer();
+    }
+    return null;
+  }
+}
+
+/** Apply a successful { queue, queued, error? } body. Returns true unless it was a partial (207). */
+function settle(body, hashes, done) {
+  if (Array.isArray(body.queue)) applyQueue(body.queue);
+  if (body.error) {
+    if (body.stage === "start") toast("Queued, but couldn't start: " + body.error);
+    else toast("Queued " + body.queued + " of " + hashes.length + ": " + body.error);
+    return false;
+  }
+  return done();
+}
+
+/** Toast with an Undo that puts back the queue as it was, but only if it is still as the server returned it. */
+function toastUndo(msg, before, after) {
+  toast(msg, () => editQueue(after, before, "undo"));
 }
 
 /**
  * Compare-and-swap edit of Up next: reorder, remove, move to next, undo.
  * `expect` is the queue snapshot (array of hashes) that the caller's indices were taken from;
  * the server applies `next` only if the live queue still equals `expect`, else it answers 409
- * and the UI refetches. `label` names the change in the Undo toast.
+ * with the live queue (applied here) and nothing changes. `message` is the full sentence for the
+ * Undo toast (e.g. 'Removed "Song"'); the message "undo" shows a plain confirmation instead.
  */
-function editQueue(expect, next, label) {
-  return notWired("Edit Up next");
+async function editQueue(expect, next, message) {
+  const body = await queueCall("/api/queue/edit", { expect, queue: next });
+  if (!body) return false;
+  applyQueue(body.queue);
+  if (message === "undo") toast("Undone");
+  else if (message) toastUndo(message, expect, body.queue);
+  return true;
 }
 
+// `subject` below is a noun phrase naming what was acted on ("Song title", "12 tracks"); the
+// action adds the verb. Defaults to "N tracks".
 export const actions = {
-  /** Insert hashes at the front of Up next, order kept. */
-  queueNext(hashes, label) {
-    return notWired("Queue next");
+  /** Insert hashes at the front of Up next, order kept. subject: noun phrase, toast says "<subject> plays next". */
+  async queueNext(hashes, subject) {
+    const before = store.player.queue.slice();
+    const body = await queueCall("/api/queue/next", { hashes });
+    if (!body) return false;
+    return settle(body, hashes, () => {
+      toastUndo(text(subject, hashes) + (hashes.length === 1 ? " plays next" : " play next"), before, body.queue);
+      return true;
+    });
   },
-  /** Append hashes to Up next. */
-  queueLast(hashes, label) {
-    return notWired("Queue last");
+  /** Append hashes to Up next. subject: noun phrase, toast says "<subject> added to Up next". */
+  async queueLast(hashes, subject) {
+    const before = store.player.queue.slice();
+    const body = await queueCall("/api/queue/last", { hashes });
+    if (!body) return false;
+    return settle(body, hashes, () => {
+      toastUndo(text(subject, hashes) + " added to Up next", before, body.queue);
+      return true;
+    });
   },
-  /** Idle only: queue the hashes and start. The server answers 409 when something is loaded. */
-  playNow(hashes, label) {
-    return notWired("Play now");
+  /** Idle only: queue the hashes and start. The server answers 409 when something is loaded. subject: noun phrase, toast says "Playing <subject>". */
+  async playNow(hashes, subject) {
+    const body = await queueCall("/api/play-now", { hashes });
+    if (!body) return false;
+    const ok = settle(body, hashes, () => {
+      toast("Playing " + text(subject, hashes));
+      return true;
+    });
+    refreshPlayer();
+    return ok;
   },
   /** Idle with a non-empty queue: start the queue. */
-  start() {
-    return notWired("Play");
+  async start() {
+    const body = await queueCall("/api/start", {});
+    if (!body) return false;
+    if (Array.isArray(body.queue)) applyQueue(body.queue);
+    refreshPlayer();
+    return true;
   },
-  /** Replace Up next with `hashes` (caller confirms first). `snapshot` is the queue the user saw. */
-  replaceQueue(snapshot, hashes, label) {
-    return editQueue(snapshot, hashes, label);
+  /** Replace Up next with `hashes` (caller confirms first). `snapshot` is the queue the user saw. message: full sentence for the Undo toast. */
+  replaceQueue(snapshot, hashes, message) {
+    return editQueue(snapshot, hashes, message);
   },
   editQueue,
 };

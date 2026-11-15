@@ -454,7 +454,13 @@ details.more summary{cursor:pointer;min-height:44px;display:flex;align-items:cen
 
 /* Per-feature sections. Each phase adds its rules to its own marker only. */
 /* == player == */
+.npbar[hidden]{visibility:hidden;transition:transform .24s var(--ease),opacity .24s,visibility 0s .24s}
+.npbar .pp:disabled,.npbar [data-next]:disabled,.player [data-next]:disabled{opacity:.4;cursor:default}
+.player .pp:disabled{opacity:.5;cursor:default}
 /* == queue == */
+.qrow{touch-action:pan-y}
+.qrow .icon-btn{flex:none}
+.side .q-scroll .empty{padding:var(--s-5) var(--s-2)}
 /* == lists == */
 /* == narrow == */
 /* == collections == */

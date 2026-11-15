@@ -28,6 +28,7 @@ use tower_http::compression::CompressionLayer;
 mod api;
 mod assets;
 mod packages;
+mod play_now;
 #[cfg(test)]
 mod test_support;
 mod types;
@@ -106,6 +107,8 @@ struct AppState {
     bandcamp_cookies_path: std::path::PathBuf,
     /// Path to the Bandcamp configuration file
     bandcamp_conf_path: std::path::PathBuf,
+    /// Pause state learned from the event stream (shared with the event bridge)
+    transport: Arc<api::player::TransportCache>,
 }
 
 impl AppState {
@@ -128,6 +131,7 @@ impl AppState {
             music_root,
             bandcamp_cookies_path,
             bandcamp_conf_path,
+            transport: Arc::default(),
         }
     }
 
@@ -1401,18 +1405,7 @@ async fn library_playlist_tracks_handler(
         name: playlist_name,
     }) {
         Ok(LibraryResponse::PlaylistContent(content)) => {
-            // Parse hashes from playlist content (one hash per line, first token)
-            let hashes: Vec<ContentHash> = content
-                .lines()
-                .filter_map(|line| {
-                    let token = line.split_whitespace().next()?;
-                    if token.is_empty() {
-                        None
-                    } else {
-                        Some(ContentHash::new(token.to_string()))
-                    }
-                })
-                .collect();
+            let hashes = api::library::playlist_hashes(&content);
             let lib = match state.library_client() {
                 Some(c) => c,
                 None => {
@@ -1473,17 +1466,7 @@ async fn library_playlist_queue_replace_handler(
     let hashes = match client.library_request(&LibraryRequest::PlaylistGet {
         name: playlist_name,
     }) {
-        Ok(LibraryResponse::PlaylistContent(content)) => content
-            .lines()
-            .filter_map(|line| {
-                let token = line.split_whitespace().next()?;
-                if token.is_empty() {
-                    None
-                } else {
-                    Some(ContentHash::new(token.to_string()))
-                }
-            })
-            .collect::<Vec<_>>(),
+        Ok(LibraryResponse::PlaylistContent(content)) => api::library::playlist_hashes(&content),
         Ok(LibraryResponse::Error(e)) => {
             return (
                 StatusCode::NOT_FOUND,
@@ -1517,50 +1500,20 @@ async fn library_playlist_queue_replace_handler(
 // Library Search Handler
 // =============================================================================
 
-#[derive(serde::Deserialize)]
-struct LibrarySearchParams {
-    q: Option<String>,
-    artist: Option<String>,
-    bpm: Option<String>,
-    key: Option<String>,
-}
-
 async fn library_search_handler(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<LibrarySearchParams>,
+    Query(params): Query<api::library::SearchParams>,
 ) -> impl IntoResponse {
-    let mut query = TrackQuery::default();
-
-    if let Some(q) = params.q.filter(|s| !s.is_empty()) {
-        query.any_text = Some(library_search::parse_string_query(&q));
-    }
-    if let Some(artist) = params.artist.filter(|s| !s.is_empty()) {
-        query.artist = Some(library_search::parse_string_query(&artist));
-    }
-    if let Some(bpm) = params.bpm.filter(|s| !s.is_empty()) {
-        match library_search::parse_numeric_query(&bpm) {
-            Ok(nq) => query.bpm = Some(nq),
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": e.to_string()})),
-                )
-                    .into_response()
-            }
+    let query = match api::library::track_query_from(&params) {
+        Ok(q) => q,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": message})),
+            )
+                .into_response()
         }
-    }
-    if let Some(key) = params.key.filter(|s| !s.is_empty()) {
-        match library_search::parse_key_query(&key) {
-            Ok(kq) => query.key = Some(kq),
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": e.to_string()})),
-                )
-                    .into_response()
-            }
-        }
-    }
+    };
 
     if query.is_empty() {
         return Json(serde_json::json!([])).into_response();
@@ -1834,7 +1787,11 @@ struct AdminRebootingTemplate {
 // Event Bridge
 // =============================================================================
 
-fn spawn_event_bridge(event_socket: String, event_tx: broadcast::Sender<String>) {
+fn spawn_event_bridge(
+    event_socket: String,
+    event_tx: broadcast::Sender<String>,
+    transport: Arc<api::player::TransportCache>,
+) {
     use event_protocol::{
         acid_event_from_topic_message, from_topic_message, TOPIC_ACID, TOPIC_PLAYBACK,
     };
@@ -1879,6 +1836,7 @@ fn spawn_event_bridge(event_socket: String, event_tx: broadcast::Sender<String>)
                         let bytes = msg.as_slice();
                         // Try playback events first, then ACID events
                         if let Ok((_topic, event)) = from_topic_message(bytes) {
+                            transport.apply(&event);
                             if let Ok(json) = serde_json::to_string(&event) {
                                 let _ = event_tx.send(json);
                             }
@@ -1919,17 +1877,16 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let (event_tx, _) = broadcast::channel::<String>(64);
-    spawn_event_bridge(args.event_socket, event_tx.clone());
-
     let state = Arc::new(AppState::new(
         args.library_socket,
         args.gateway,
         args.source_name,
-        event_tx,
+        event_tx.clone(),
         args.music_root,
         args.bandcamp_cookies,
         args.bandcamp_conf,
     ));
+    spawn_event_bridge(args.event_socket, event_tx, Arc::clone(&state.transport));
 
     // Initial package list load
     if let Ok(pkgs) = packages::list_installed().await {
@@ -1963,7 +1920,8 @@ fn compression() -> CompressionLayer<impl Predicate> {
 /// The whole HTTP application: every route, with state and middleware applied.
 fn app(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/", get(index))
+        // `/` is the new UI shell (assets::routes); the old UI stays here until settings move over
+        .route("/classic", get(index))
         .route("/health", get(health))
         .route("/check-updates", post(check_updates))
         .route("/update/:name", post(update_package))
@@ -2322,17 +2280,26 @@ async fn cover_art(
 
     let content_hash = ContentHash::new(hash);
 
-    let lib_client = match state.library_client() {
-        Some(c) => c,
-        None => {
+    // The library round trip blocks on NNG; keep it off the async workers.
+    let lookup = {
+        let state = Arc::clone(&state);
+        tokio::task::spawn_blocking(move || {
+            state
+                .library_client()
+                .map(|client| client.get_track(&content_hash))
+        })
+        .await
+    };
+    let track = match lookup {
+        Ok(Some(Ok(t))) => t,
+        Ok(Some(Err(_))) => {
+            return (StatusCode::NOT_FOUND, "Track not found").into_response();
+        }
+        Ok(None) => {
             return (StatusCode::SERVICE_UNAVAILABLE, "Library not available").into_response();
         }
-    };
-
-    let track = match lib_client.get_track(&content_hash) {
-        Ok(t) => t,
-        Err(_) => {
-            return (StatusCode::NOT_FOUND, "Track not found").into_response();
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     };
 
