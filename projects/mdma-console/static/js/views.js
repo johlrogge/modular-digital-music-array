@@ -1,14 +1,13 @@
 // Home and Library views. Library has the tabs Tracks / Albums / Artists / Playlists; only Tracks
 // is fully built here, the other tabs show a plain card grid that the browsing phase replaces.
 // lists.js and narrow.js supply the rows, cards and the narrowing bar.
-import { h, icon, route, routeFallback, appInfo, store, onView, toast, enc, plural } from "./core.js";
+import { h, icon, route, routeFallback, appInfo, store, onView, enc, plural } from "./core.js";
 import { art } from "./art.js";
-import { groupAlbums, groupArtists, sortTracks, collate } from "./logic.js";
+import { groupAlbums, groupArtists, sortTracks, collate, visiblePlaylists } from "./logic.js";
 import { pagedList, thead, bulkBar, albumCard, artistCard, playlistCard, playlistTracks, recentAlbums } from "./lists.js";
-import { narrowBar, matchSet, matchPlaylists, matchQuery, isNarrowed, filterCount, setSort, latest } from "./narrow.js";
+import { narrowedView, matchLibrary, filterCount, setSort, LIBRARY_KEY, SEARCH_FAILED_NOTE } from "./narrow.js";
 
 const GRID_LIMIT = 120;
-let toastedFor = null; // the filter query whose failure was already toasted
 
 function greeting(hour) {
   if (hour < 5) return "Good night";
@@ -93,22 +92,15 @@ const TABS = [
   ["artists", "Artists"],
   ["playlists", "Playlists"],
 ];
-const KEY = "lib";
+const KEY = LIBRARY_KEY;
 
 function viewLibrary(root, params, query) {
   const tab = TABS.some((t) => t[0] === params.tab) ? params.tab : "tracks";
   root.appendChild(topbar("Library"));
-  const barHolder = h("div");
   const segWrap = h("div", { class: "seg-scroll" });
   const region = h("div");
-  root.appendChild(barHolder);
-  root.appendChild(segWrap);
-  root.appendChild(region);
 
-  let alive = true;
-  const next = latest(); // a slower earlier search reply must not overwrite a newer one
   let list = null;
-  let bar = null;
 
   function placeholder() {
     const n = { tracks: store.order.length, albums: groupAlbums(catalogue()).length, artists: groupArtists(catalogue()).length };
@@ -120,42 +112,13 @@ function viewLibrary(root, params, query) {
     return h("div", { class: "empty" }, [h("b", { text: title }), text]);
   }
 
-  /** (Re)build bar, tabs and list. `keep`: a re-render for the same query, so keep rows and scroll. */
-  async function build(rebuildBar, keep) {
-    const fresh = next();
-    if (rebuildBar || !barHolder.firstChild) {
-      if (bar) bar.dispose();
-      barHolder.innerHTML = "";
-      const hint = tab !== "tracks" && filterCount() ? "Showing " + tab + " with at least one matching track" : null;
-      bar = narrowBar({ key: KEY, placeholder: placeholder(), sort: tab === "tracks", onChange: () => build(false, false), hint });
-      barHolder.appendChild(bar);
-    }
-    // Capture the query state now: only these values are used after the await below.
-    const text = store.nb[KEY] || "";
-    const f = store.f;
-    const narrowed = isNarrowed(KEY);
-    const nFilters = filterCount(f);
-    let set = null;
-    let names = null;
-    let filterOnly = null;
-    let failed = false;
-    try {
-      // All matching is the server's: text and filters for tracks, the text alone for playlist names.
-      [set, names, filterOnly] = await Promise.all([
-        matchSet(text, f),
-        matchPlaylists(text),
-        text.trim() && nFilters ? matchSet("", f) : null,
-      ]);
-    } catch (e) {
-      failed = true;
-      const qs = matchQuery(f, text);
-      if (fresh() && toastedFor !== qs) {
-        toastedFor = qs; // once per search state, not on every re-render
-        toast("Couldn't search");
-      }
-    }
-    if (!failed) toastedFor = null;
-    if (!alive || !fresh()) return;
+  /** Draw tabs and list for the server's answer. `keep`: a re-render for the same query, so keep rows and scroll. */
+  function draw(state, { keep, narrowed, nFilters }) {
+    const failed = state.kind === "failed";
+    const data = state.kind === "matched" ? state.data : null;
+    const set = data && data.tracks;
+    const names = data && data.playlists;
+    const filterOnly = data && data.filterTracks;
 
     const initial = keep && list ? list.count() : 0;
     const scrollY = window.scrollY;
@@ -166,10 +129,7 @@ function viewLibrary(root, params, query) {
     // The server's set already covers text, tempo, key and added.
     const tracks = failed ? [] : catalogue().filter((t) => !set || set.has(t.hash));
     const matched = new Set(tracks.map((t) => t.hash));
-    // A playlist shows if it holds a matching track, or its name matched (and, with filters on, it holds a track passing them).
-    const playlists = store.playlists.filter(
-      (p) => !narrowed || p.hashes.some((x) => matched.has(x)) || (names && names.has(p.name) && (!filterOnly || p.hashes.some((x) => filterOnly.has(x)))),
-    );
+    const playlists = visiblePlaylists(store.playlists, { narrowed, matched, names, filterOnly });
     const albums = tab === "albums" || narrowed ? groupAlbums(tracks) : [];
     const artists = tab === "artists" || narrowed ? groupArtists(tracks) : [];
     const counts = { tracks: tracks.length, albums: albums.length, artists: artists.length, playlists: playlists.length };
@@ -190,7 +150,7 @@ function viewLibrary(root, params, query) {
     region.appendChild(box);
 
     if (failed) {
-      box.appendChild(emptyBox("Search unavailable", "The library didn't answer. Try again in a moment."));
+      box.appendChild(emptyBox(...SEARCH_FAILED_NOTE));
     } else if (!store.order.length) {
       box.appendChild(emptyBox("No music yet", "Your library is empty or still loading."));
     } else if (!counts[tab]) {
@@ -214,20 +174,31 @@ function viewLibrary(root, params, query) {
     if (keep) window.scrollTo(0, scrollY);
   }
 
-  build(true, false);
-  if (query.focus) setTimeout(() => barHolder.firstChild && barHolder.firstChild.focusInput(), 60);
+  // The controller owns the bar, the stale guard and the failure policy; it also refreshes on
+  // filter or sort changes (rebuilding the bar: badge, chips, sort label). The Library follows
+  // the global sort on its Tracks tab.
+  const view = narrowedView({
+    key: KEY,
+    placeholder,
+    sort: tab === "tracks",
+    hint: () => (tab !== "tracks" && filterCount(KEY) ? "Showing " + tab + " with at least one matching track" : null),
+    fetch: matchLibrary,
+    render: draw,
+  });
+  root.appendChild(view.el);
+  root.appendChild(segWrap);
+  root.appendChild(region);
 
-  // Filters or sort changed: new query, rebuild the bar too (badge, chips, sort label).
-  onView("filters", () => build(true, false));
+  view.refresh({ bar: true });
+  if (query.focus) setTimeout(view.focus, 60);
+
   // Same query, different data or Play now visibility: keep rows and scroll, and keep typing intact.
-  const refresh = () => build(!barHolder.contains(document.activeElement), true);
-  onView("tracks", refresh);
-  onView("playlists", () => build(false, true));
-  onView("player", () => build(false, true));
+  onView("tracks", () => view.refresh({ bar: !view.el.contains(document.activeElement), keep: true }));
+  onView("playlists", () => view.refresh({ keep: true }));
+  onView("player", () => view.refresh({ keep: true }));
 
   return () => {
-    alive = false;
-    if (bar) bar.dispose();
+    view.dispose();
     if (list) list.destroy();
   };
 }

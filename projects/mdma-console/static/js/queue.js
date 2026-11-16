@@ -8,7 +8,7 @@ import { moveToNext, removeAt, reorder, isIdle, trackTitle } from "./logic.js";
 import { art } from "./art.js";
 import { $, $$, actions, confirmDlg, enc, fmt, h, icon, on, onView, openMenu, plural, route, store } from "./core.js";
 import { swipe } from "./lists.js";
-import { narrowBar, matchSet, latest, clearNarrowing } from "./narrow.js";
+import { narrowedView, matchSet, clearNarrowing } from "./narrow.js";
 
 const KEY = "queue"; // the Up next view's key in store.nb
 
@@ -180,43 +180,29 @@ route(
   (root) => {
     const clear = h("button", { class: "btn ghost", onclick: clearQueue }, [icon("trash", "sm"), "Clear"]);
     root.appendChild(h("div", { class: "topbar" }, [h("h1", { text: "Up next" }), clear]));
-    const barHolder = h("div");
     const box = h("div", { class: "qview" });
-    root.appendChild(barHolder);
-    root.appendChild(box);
-    let alive = true;
-    let bar = null;
-    const next = latest(); // a slower earlier search reply must not overwrite a newer one
     const onClear = () => clearNarrowing(KEY);
-
-    async function build(rebuildBar) {
-      const fresh = next();
-      if (rebuildBar || !bar) {
-        if (bar) bar.dispose();
-        barHolder.innerHTML = "";
-        bar = narrowBar({ key: KEY, placeholder: "Filter Up next", onChange: () => build(false) });
-        barHolder.appendChild(bar);
-      }
-      let narrow = { set: null, failed: false, onClear };
-      try {
-        narrow.set = await matchSet(store.nb[KEY] || "");
-      } catch (e) {
-        narrow = { set: new Set(), failed: true, onClear }; // never show an unfiltered list on failure
-      }
-      if (!alive || !fresh()) return;
-      renderRows(box, { showNow: true, narrow });
-    }
-    build(true);
+    // The controller owns the bar, the stale guard and the failure policy, and rebuilds the bar
+    // (badge, chips, text) when this view's filters change or Clear is pressed.
+    const view = narrowedView({
+      key: KEY,
+      placeholder: "Filter Up next",
+      fetch: matchSet,
+      render: (state) => {
+        const failed = state.kind === "failed";
+        // On failure show no rows (an empty set), never the unfiltered list.
+        const set = failed ? new Set() : state.kind === "matched" ? state.data : null;
+        renderRows(box, { showNow: true, narrow: { set, failed, onClear } });
+      },
+    });
+    root.appendChild(view.el);
+    root.appendChild(box);
+    view.refresh({ bar: true });
     // Queue, player and catalogue changes keep the bar (and its typing) as it is.
-    onView("queue", () => build(false));
-    onView("player", () => build(false));
-    onView("tracks", () => build(false));
-    // Filters changed (or Clear): new query, rebuild the bar too (badge, chips, text).
-    onView("filters", () => build(true));
-    return () => {
-      alive = false;
-      if (bar) bar.dispose();
-    };
+    onView("queue", () => view.refresh());
+    onView("player", () => view.refresh());
+    onView("tracks", () => view.refresh());
+    return view.dispose;
   },
   { nav: "queue" },
 );

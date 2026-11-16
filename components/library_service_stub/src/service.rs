@@ -166,6 +166,19 @@ pub struct LibraryService {
 }
 
 impl LibraryService {
+    /// The names of all playlists, sorted (as the real service lists them).
+    fn playlist_names(&self) -> Vec<PlaylistName> {
+        let mut names: Vec<PlaylistName> = self
+            .playlists
+            .lock()
+            .unwrap()
+            .keys()
+            .filter_map(|n| PlaylistName::new(n).ok())
+            .collect();
+        names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        names
+    }
+
     /// The source the last `WriteFact` of `fact` for `hash` stated: `None` when no
     /// such write was received, `Some(None)` when it stated no source.
     pub fn written_source(
@@ -395,15 +408,12 @@ impl LibraryService {
 
             // Playlists are kept in memory. List, get, new and replace mirror the
             // real service (list is sorted; replace creates a missing playlist).
-            LibraryRequest::PlaylistList => {
-                let mut names: Vec<PlaylistName> = self
-                    .playlists
-                    .lock()
-                    .unwrap()
-                    .keys()
-                    .filter_map(|n| PlaylistName::new(n).ok())
-                    .collect();
-                names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            LibraryRequest::PlaylistList => LibraryResponse::PlaylistNames(self.playlist_names()),
+
+            LibraryRequest::PlaylistSearch { query } => {
+                let matcher = library_search::StringMatcher::new(&query);
+                let mut names = self.playlist_names();
+                names.retain(|n| matcher.matches(n.as_str()));
                 LibraryResponse::PlaylistNames(names)
             }
 
@@ -939,6 +949,31 @@ mod tests {
             }
             other => panic!("expected PlaylistNames, got {other:?}"),
         }
+    }
+
+    fn search_playlists(svc: &LibraryService, text: &str) -> Vec<String> {
+        let query = library_search::parse_string_query(text);
+        match svc.handle_request(LibraryRequest::PlaylistSearch { query }) {
+            LibraryResponse::PlaylistNames(names) => {
+                names.iter().map(|n| n.as_str().to_string()).collect()
+            }
+            other => panic!("expected PlaylistNames, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn playlist_search_uses_the_library_text_rules() {
+        let svc = empty_service();
+        for n in ["Carbon-Based-Lifeforms", "warmup"] {
+            svc.handle_request(LibraryRequest::PlaylistNew {
+                name: name(n),
+                content: String::new(),
+            });
+        }
+        // Upper case is an initialism; lower case is a plain "contains".
+        assert_eq!(search_playlists(&svc, "CBL"), ["Carbon-Based-Lifeforms"]);
+        assert!(search_playlists(&svc, "cbl").is_empty());
+        assert_eq!(search_playlists(&svc, "warm"), ["warmup"]);
     }
 
     fn service_with_tracks(hashes: &[&str]) -> Arc<LibraryService> {
