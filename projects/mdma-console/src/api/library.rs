@@ -3,15 +3,18 @@
 //! `ApiTrack` is the one track shape the browser sees. Its field names are exactly the ones
 //! `static/js/logic.js` reads; the old UI keeps using `TrackInfoJson` and is not affected.
 
-use super::{fail, gw, json_or_failure, library, unexpected_library_response};
+use super::{fail, gw, json_or_failure, lib, library, unexpected_library_response};
 use crate::AppState;
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Response,
 };
 use gateway_client::{GatewayClient, LibraryRequest, LibraryResponse};
-use library_ipc_client::{ClientError, StringQuery, TrackInfo, TrackQuery};
+use library_ipc_client::{
+    track_hashes, unresolved_entries, ClientError, PlaylistEntry, PlaylistName, StringQuery,
+    TrackInfo, TrackQuery,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -69,38 +72,94 @@ pub async fn tracks(State(state): State<Arc<AppState>>) -> Response {
     )
 }
 
+/// A playlist for the cards and counts: the full hash of every entry the library resolved, in
+/// file order with duplicates, and how many entries it could not resolve.
 #[derive(Debug, Serialize)]
 struct ApiPlaylist {
     name: String,
     hashes: Vec<String>,
+    unavailable: usize,
 }
 
-/// `GET /api/playlists`: every playlist with its hashes, over one gateway connection.
-pub async fn playlists(State(state): State<Arc<AppState>>) -> Response {
-    let reply = gw(&state, |client| -> Result<Vec<ApiPlaylist>, ClientError> {
-        let names = match library(client, &LibraryRequest::PlaylistList)? {
-            LibraryResponse::PlaylistNames(names) => names,
-            _ => return Err(unexpected_library_response()),
-        };
-        let mut out = Vec::with_capacity(names.len());
-        for name in names {
-            let content =
-                match library(client, &LibraryRequest::PlaylistGet { name: name.clone() })? {
-                    LibraryResponse::PlaylistContent(content) => content,
-                    _ => return Err(unexpected_library_response()),
-                };
-            out.push(ApiPlaylist {
-                name: name.as_str().to_owned(),
-                hashes: library_ipc_client::content_to_hashes(&content)
-                    .iter()
-                    .map(|h| h.as_str().to_owned())
-                    .collect(),
-            });
+impl ApiPlaylist {
+    fn new(name: &PlaylistName, entries: &[PlaylistEntry]) -> Self {
+        Self {
+            name: name.as_str().to_owned(),
+            hashes: track_hashes(entries)
+                .iter()
+                .map(|h| h.as_str().to_owned())
+                .collect(),
+            unavailable: unresolved_entries(entries).count(),
         }
-        Ok(out)
-    })
-    .await;
-    json_or_failure(reply)
+    }
+}
+
+/// One line of a playlist page, tagged by `status` for the browser.
+#[derive(Debug, Serialize)]
+#[serde(tag = "status")]
+enum ApiEntry {
+    /// The line resolved to this track.
+    Track { hash: String },
+    /// The line did not resolve: the token as stored, and why.
+    Unresolved { token: String, reason: String },
+}
+
+impl From<&PlaylistEntry> for ApiEntry {
+    fn from(entry: &PlaylistEntry) -> Self {
+        match entry {
+            PlaylistEntry::Track { hash } => ApiEntry::Track {
+                hash: hash.as_str().to_owned(),
+            },
+            PlaylistEntry::Unresolved { error } => ApiEntry::Unresolved {
+                token: error.hash().as_str().to_owned(),
+                reason: error.to_string(),
+            },
+        }
+    }
+}
+
+/// The body of `GET /api/playlists/{name}`.
+#[derive(Debug, Serialize)]
+struct ApiPlaylistPage {
+    name: String,
+    entries: Vec<ApiEntry>,
+}
+
+/// `GET /api/playlists`: every playlist with the full hashes of its resolved entries and the
+/// count of unresolved ones, over one gateway connection.
+pub async fn playlists(State(state): State<Arc<AppState>>) -> Response {
+    json_or_failure(
+        lib(&state, |library| {
+            library
+                .playlist_list()?
+                .iter()
+                .map(|name| Ok(ApiPlaylist::new(name, &library.playlist_entries(name)?)))
+                .collect::<Result<Vec<_>, ClientError>>()
+        })
+        .await,
+    )
+}
+
+/// `GET /api/playlists/{name}`: every line of the playlist in file order, duplicates kept, an
+/// unresolved line in its place. 404 for a playlist that does not exist.
+///
+/// A name no playlist can have is 400 here, where the name is in the path (the library is not
+/// asked). A bad name in a create body is planned as 422 instead (slice 3).
+pub async fn playlist(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    let playlist_name = match PlaylistName::new(&name) {
+        Ok(n) => n,
+        Err(e) => return fail(StatusCode::BAD_REQUEST, e.to_string()),
+    };
+    json_or_failure(
+        lib(&state, move |library| {
+            let entries = library.playlist_entries(&playlist_name)?;
+            Ok::<_, ClientError>(ApiPlaylistPage {
+                name: playlist_name.as_str().to_owned(),
+                entries: entries.iter().map(ApiEntry::from).collect(),
+            })
+        })
+        .await,
+    )
 }
 
 /// `GET /api/tracks/match?bpm=&key=&added=&q=&artist=`: hashes of the tracks the library says
@@ -305,15 +364,6 @@ mod tests {
     }
 
     #[test]
-    fn playlist_lines_give_their_first_token_and_skip_comments() {
-        let hashes = library_ipc_client::content_to_hashes(
-            "# a comment\nsha256:a  # Bloom\n\n  sha256:b\nsha256:c\t- x\n",
-        );
-        let got: Vec<_> = hashes.iter().map(|h| h.as_str()).collect();
-        assert_eq!(got, ["sha256:a", "sha256:b", "sha256:c"]);
-    }
-
-    #[test]
     fn query_ignores_empty_params_and_rejects_bad_ones() {
         let q = track_query_from(&SearchParams {
             bpm: Some(String::new()),
@@ -391,7 +441,9 @@ mod tests {
         body_json, library_ok, playback_ok, send_get, test_app, test_app_with, FakeGateway,
     };
     use gateway_client::{GatewayRequest, GatewayResponse, LibraryRequest, LibraryResponse};
-    use library_ipc_client::PlaylistName;
+    use library_ipc_client::{
+        CanonicalHash, ContentHash, EntryError, PlaylistEntry, PlaylistName, ProtocolError,
+    };
     use serde_json::json;
 
     #[tokio::test]
@@ -439,35 +491,148 @@ mod tests {
         assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    #[tokio::test]
-    async fn api_playlists_gives_names_with_hashes_over_one_connection() {
-        let gw = FakeGateway::start(|req| match req {
+    /// A full canonical hash made of `c`.
+    fn full(c: char) -> String {
+        format!("sha256:{}", c.to_string().repeat(64))
+    }
+
+    fn track_entry(c: char) -> PlaylistEntry {
+        PlaylistEntry::Track {
+            hash: CanonicalHash::try_from(ContentHash::new(full(c))).unwrap(),
+        }
+    }
+
+    fn unresolved_entry(token: &str) -> PlaylistEntry {
+        PlaylistEntry::Unresolved {
+            error: EntryError::Unknown {
+                hash: ContentHash::new(token),
+            },
+        }
+    }
+
+    /// A library with `playlists`, each answered as `PlaylistEntries` the way the real one does;
+    /// any other playlist is not found.
+    fn playlist_gateway(playlists: Vec<(&'static str, Vec<PlaylistEntry>)>) -> FakeGateway {
+        FakeGateway::start(move |req| match req {
             GatewayRequest::Library {
                 request: LibraryRequest::PlaylistList,
-            } => library_ok(LibraryResponse::PlaylistNames(vec![
-                PlaylistName::new("warmup").unwrap(),
-                PlaylistName::new("peak").unwrap(),
-            ])),
+            } => library_ok(LibraryResponse::PlaylistNames(
+                playlists
+                    .iter()
+                    .map(|(name, _)| PlaylistName::new(name).unwrap())
+                    .collect(),
+            )),
             GatewayRequest::Library {
-                request: LibraryRequest::PlaylistGet { name },
-            } => library_ok(LibraryResponse::PlaylistContent(match name.as_str() {
-                "warmup" => "sha256:a # one\nsha256:b\n".to_string(),
-                _ => "sha256:c\n".to_string(),
-            })),
+                request: LibraryRequest::PlaylistEntries { name },
+            } => library_ok(match playlists.iter().find(|(n, _)| *n == name.as_str()) {
+                Some((_, entries)) => LibraryResponse::PlaylistEntries(entries.clone()),
+                None => LibraryResponse::Error(ProtocolError::PlaylistNotFound {
+                    name: name.as_str().to_owned(),
+                }),
+            }),
             other => GatewayResponse::Error {
                 message: format!("unexpected {other:?}"),
             },
-        });
+        })
+    }
+
+    /// Short-ID lines arrive resolved: the page gets full hashes, in file order, duplicates kept,
+    /// over one gateway connection (a list request, then one entries request per playlist).
+    #[tokio::test]
+    async fn api_playlists_serves_full_hashes_for_short_lines() {
+        let gw = playlist_gateway(vec![
+            (
+                "warmup",
+                vec![
+                    track_entry('a'),
+                    track_entry('b'),
+                    track_entry('a'),
+                    track_entry('c'),
+                ],
+            ),
+            ("peak", vec![track_entry('c')]),
+        ]);
         let res = send_get(test_app_with(gw.addr()), "/api/playlists", None).await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(
             body_json(res).await,
             json!([
-                {"name": "warmup", "hashes": ["sha256:a", "sha256:b"]},
-                {"name": "peak", "hashes": ["sha256:c"]},
+                {"name": "warmup", "hashes": [full('a'), full('b'), full('a'), full('c')],
+                 "unavailable": 0},
+                {"name": "peak", "hashes": [full('c')], "unavailable": 0},
             ])
         );
         assert_eq!(gw.requests().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn api_playlists_counts_unavailable_entries() {
+        let gw = playlist_gateway(vec![(
+            "set",
+            vec![
+                track_entry('a'),
+                unresolved_entry("0badc0de"),
+                unresolved_entry("deadbeef"),
+                track_entry('b'),
+            ],
+        )]);
+        let res = send_get(test_app_with(gw.addr()), "/api/playlists", None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(res).await,
+            json!([{"name": "set", "hashes": [full('a'), full('b')], "unavailable": 2}])
+        );
+    }
+
+    #[tokio::test]
+    async fn api_playlist_keeps_unavailable_rows_in_place_and_duplicates() {
+        let gw = playlist_gateway(vec![(
+            "set",
+            vec![
+                track_entry('a'),
+                unresolved_entry("0badc0de"),
+                track_entry('b'),
+                track_entry('a'),
+            ],
+        )]);
+        let res = send_get(test_app_with(gw.addr()), "/api/playlists/set", None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(res).await,
+            json!({
+                "name": "set",
+                "entries": [
+                    {"status": "Track", "hash": full('a')},
+                    {"status": "Unresolved", "token": "0badc0de",
+                     "reason": "unknown track 0badc0de"},
+                    {"status": "Track", "hash": full('b')},
+                    {"status": "Track", "hash": full('a')},
+                ],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn api_playlist_missing_is_404() {
+        let gw = playlist_gateway(vec![("set", vec![track_entry('a')])]);
+        let res = send_get(test_app_with(gw.addr()), "/api/playlists/nope", None).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(body_json(res).await["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn api_playlist_with_an_invalid_name_is_400_without_calling_the_library() {
+        let gw = FakeGateway::start(|_| playback_ok(None));
+        let res = send_get(test_app_with(gw.addr()), "/api/playlists/bad%20name", None).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(res).await["error"].is_string());
+        assert!(gw.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_playlist_without_a_gateway_is_503() {
+        let res = send_get(test_app(), "/api/playlists/set", None).await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

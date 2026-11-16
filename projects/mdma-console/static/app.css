@@ -372,6 +372,8 @@ details.more summary{cursor:pointer;min-height:44px;display:flex;align-items:cen
 .trow .m{font-size:var(--fs-sm);color:var(--text-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .trow .m .tech{font-family:var(--font-mono);font-size:var(--fs-xs);color:var(--text-3);margin-left:6px}
 .trow.current .t{color:var(--accent-strong)}
+.trow.unavailable{opacity:.5;cursor:default}
+.trow.unavailable:hover{background:var(--bg)}
 .trow .c{display:none;font-size:var(--fs-sm);color:var(--text-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .trow .c.num{font-size:var(--fs-xs);color:var(--text-3)}
 .trow .end{display:flex;align-items:center;gap:2px}
