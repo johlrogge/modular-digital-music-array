@@ -66,6 +66,11 @@ fn send_response(socket: &nng::Socket, resp: &Response) -> Result<(), nng::Error
 }
 
 fn handle_command(cmd: Command, state: &Arc<Mutex<PlaybackState>>) -> Response {
+    // Like the real playback: a command carrying a hash that is not a full
+    // one is refused whole, so the queue is unchanged.
+    if let Err(refusal) = cmd.check_canonical() {
+        return refusal;
+    }
     let mut s = state.lock().unwrap();
 
     match cmd {

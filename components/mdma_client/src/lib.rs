@@ -21,9 +21,9 @@ pub use source::{list_available_sources, SourceClient};
 
 // Re-export key types so clients don't need to depend on individual protocol crates.
 pub use library_ipc_client::{
-    ClientError as LibraryClientError, ContentHash, InboxPath, IngestAllItem, IngestResult,
-    IngestSource, LibraryRequest, LibraryResponse, Mark, MarkFilter, MarkNameError, MarkWrite,
-    PlaylistName, ProtocolError, ServiceStatus, TrackInfo, Unmark,
+    CanonicalHash, ClientError as LibraryClientError, ContentHash, InboxPath, IngestAllItem,
+    IngestResult, IngestSource, LibraryRequest, LibraryResponse, Mark, MarkFilter, MarkNameError,
+    MarkWrite, PlaylistName, ProtocolError, ResolveError, ServiceStatus, TrackInfo, Unmark,
 };
 pub use library_search::TrackQuery;
 pub use media_client::{

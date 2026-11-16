@@ -4,7 +4,7 @@
 // store.tracks by hash. Nothing here starts or stops audio except an explicit click on a transport
 // button: play/pause toggles pause/resume, and Play while idle goes through actions.start() (never
 // the raw /player/play-queue).
-import { isIdle, trackTitle } from "./logic.js";
+import { isIdle, outputDown, trackTitle } from "./logic.js";
 import { artBg, setArt, setCover } from "./art.js";
 import { $, $$, ApiError, actions, api, appInfo, applyPlayer, enc, fmt, on, openMenu, refreshPlayer, store, toast } from "./core.js";
 
@@ -15,10 +15,29 @@ const DESKTOP = 1024; // px, matches the CSS breakpoint
 // Position between server ticks: `ms` at monotonic time `at`; advances only while `playing`.
 let base = { hash: null, ms: 0, at: 0, playing: false };
 
+// The most the clock runs ahead of the last server position. Bounds the drift on old nodes (no
+// output health) and in the ~1.2 s before a stalled output is noticed.
+const EXTRAPOLATE_CAP_MS = 1500;
+
 const nowMs = () => performance.now();
 
 function localPosition() {
-  return base.ms + (base.playing ? nowMs() - base.at : 0);
+  return base.ms + (base.playing ? Math.min(nowMs() - base.at, EXTRAPOLATE_CAP_MS) : 0);
+}
+
+/** The local clock may run: playing, online, and the output (when the node reports it) is running. */
+function clockRuns(p) {
+  return p.state === "playing" && !p.offline && (p.output == null || p.output === "running");
+}
+
+// Whether the server's position is moving. A position that did not advance (same track, not
+// further on) means audio is not flowing even if the output claims to run.
+let lastPos = null;
+let advancing = true;
+
+function resetAdvancing() {
+  lastPos = null;
+  advancing = true;
 }
 
 function rebase(hash, ms, playing) {
@@ -83,7 +102,7 @@ function render() {
     sub = barTrack ? [trackTitle(barTrack), barTrack.artist].filter(Boolean).join(" · ") : "";
   } else {
     title = track ? trackTitle(track) : "Now playing";
-    sub = p.offline ? "Reconnecting…" : track ? track.artist || "" : "";
+    sub = p.offline ? "Reconnecting…" : outputDown(p) ? "No audio output" : track ? track.artist || "" : "";
   }
   $("#bar-title").textContent = title || "";
   $("#bar-artist").textContent = sub || "";
@@ -129,10 +148,10 @@ function renderProgress() {
     r.style.setProperty("--p", Number(r.value) / 10 + "%");
   });
   $$("[data-el]").forEach((e) => {
-    e.textContent = fmt(pos / 1000);
+    e.textContent = fmt(Math.floor(pos / 1000));
   });
   $$("[data-rem]").forEach((e) => {
-    e.textContent = idle || !dur ? "-0:00" : "-" + fmt((dur - pos) / 1000);
+    e.textContent = idle || !dur ? "-0:00" : "-" + fmt(Math.ceil((dur - pos) / 1000));
   });
 }
 
@@ -206,21 +225,25 @@ function closePlayer() {
 on("tracks", render);
 on("queue", render);
 on("position", (pos) => {
-  rebase(pos.hash, pos.position_ms, store.player.state === "playing");
+  if (pos.hash !== store.player.now) return; // a late tick of the previous track
+  advancing = !(lastPos && lastPos.hash === pos.hash && pos.position_ms <= lastPos.position_ms);
+  lastPos = pos;
+  rebase(pos.hash, pos.position_ms, clockRuns(store.player) && advancing);
   renderProgress();
 });
 
-// Keep the local clock honest across state changes: freeze when not playing, restart on resume,
-// reset on a new track.
+// Keep the local clock honest across state changes: freeze when the clock may not run, restart on
+// resume, reset on a new track.
 on("player", () => {
   const p = store.player;
+  if (base.hash !== p.now) resetAdvancing();
   const ms = base.hash === p.now ? localPosition() : 0;
-  rebase(p.now, ms, p.state === "playing");
+  rebase(p.now, ms, clockRuns(p) && advancing);
   render();
 });
 
 setInterval(() => {
-  if (store.player.state === "playing" && !store.player.offline) renderProgress();
+  if (clockRuns(store.player)) renderProgress();
 }, 500);
 
 document.addEventListener("click", (e) => {
@@ -280,12 +303,13 @@ $$("[data-seek]").forEach((r) => {
   r.addEventListener("input", () => {
     const dur = durationMs();
     if (!dur || !store.player.now) return;
-    rebase(store.player.now, (Number(r.value) / 1000) * dur, store.player.state === "playing");
+    rebase(store.player.now, (Number(r.value) / 1000) * dur, clockRuns(store.player) && advancing);
     renderProgress();
   });
   r.addEventListener("change", () => {
     const dur = durationMs();
     if (!appInfo().seekEnabled || !dur) return;
+    resetAdvancing(); // the next position legitimately jumps
     // TODO(R1): the seek route is not defined yet; this is the assumed shape.
     transport(() => api("/player/seek", { method: "POST", body: { position_ms: Math.round((Number(r.value) / 1000) * dur) } }));
   });

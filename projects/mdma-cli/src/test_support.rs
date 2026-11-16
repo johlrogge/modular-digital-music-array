@@ -152,6 +152,139 @@ pub(crate) fn asserted(entity: &str, value: &str, time: &str) -> String {
     format!(r#"["{entity}",{value},"{time}",{source},"Assert"]"#)
 }
 
+/// Fake library and playback services over IPC, for commands that talk to both.
+///
+/// The library knows the tracks given and resolves a hash the way the real one
+/// does: a unique prefix (with or without `sha256:`) is its track, anything else
+/// is an error. (This prefix matching is a simplification of
+/// `library_projection::resolve_prefix`, which the real library uses.) Playback
+/// answers a queue listing with the queue given and every other command with
+/// success (a removal counts every hash it was given), and keeps what it was
+/// sent, as JSON. A request either fake does not understand gets an error
+/// response, so a failure shows as itself rather than as a timeout.
+pub(crate) struct FakeServices {
+    _dir: tempfile::TempDir,
+    pub(crate) library: mdma_client::LibraryBackend,
+    pub(crate) playback: mdma_client::PlaybackBackend,
+    sent: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+
+impl FakeServices {
+    /// `tracks`: the full hashes the fake library holds.
+    pub(crate) fn new(tracks: &[&str]) -> Self {
+        Self::with_queue(tracks, &[])
+    }
+
+    /// `tracks`: the full hashes the fake library holds; `queue`: what the
+    /// fake playback lists as its queue.
+    pub(crate) fn with_queue(tracks: &[&str], queue: &[&str]) -> Self {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let library_addr = format!("ipc://{}/library.sock", dir.path().display());
+        let playback_addr = format!("ipc://{}/playback.sock", dir.path().display());
+        let tracks: Vec<String> = tracks.iter().map(|t| t.to_string()).collect();
+        let queue: Vec<ContentHash> = queue.iter().map(|h| ContentHash::new(*h)).collect();
+        serve(&library_addr, move |request| {
+            let error = |message: String| {
+                serde_json::to_vec(&library_ipc_client::LibraryResponse::Error(
+                    library_ipc_client::ProtocolError::Internal { message },
+                ))
+                .expect("a response")
+            };
+            let request: library_ipc_client::LibraryRequest = match serde_json::from_slice(request)
+            {
+                Ok(request) => request,
+                Err(e) => return error(format!("the fake library cannot read the request: {e}")),
+            };
+            let hash = match request {
+                library_ipc_client::LibraryRequest::GetTrack { hash } => hash,
+                other => {
+                    return error(format!(
+                        "the fake library only answers GetTrack, got {other:?}"
+                    ))
+                }
+            };
+            let wanted = hash.as_str().trim_start_matches("sha256:");
+            let found: Vec<&String> = tracks
+                .iter()
+                .filter(|t| t.trim_start_matches("sha256:").starts_with(wanted))
+                .collect();
+            let response = match found.as_slice() {
+                [one] => library_ipc_client::LibraryResponse::Track(Box::new(track(one))),
+                [] => library_ipc_client::LibraryResponse::Error(
+                    library_ipc_client::ProtocolError::TrackNotFound {
+                        hash: hash.to_string(),
+                    },
+                ),
+                _ => library_ipc_client::LibraryResponse::Error(
+                    library_ipc_client::ProtocolError::Internal {
+                        message: format!("ambiguous hash prefix: {hash}"),
+                    },
+                ),
+            };
+            serde_json::to_vec(&response).expect("a response")
+        });
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = sent.clone();
+        serve(&playback_addr, move |request| {
+            let command = serde_json::from_slice::<serde_json::Value>(request).and_then(|value| {
+                serde_json::from_value::<mdma_client::Command>(value.clone())
+                    .map(|command| (value, command))
+            });
+            let response = match command {
+                Ok((value, command)) => {
+                    log.lock().unwrap().push(value);
+                    let data = match command {
+                        mdma_client::Command::QueueRemove { hashes } => {
+                            Some(mdma_client::ResponseData::Count(hashes.len()))
+                        }
+                        mdma_client::Command::QueueList => {
+                            Some(mdma_client::ResponseData::Queue(queue.clone()))
+                        }
+                        _ => None,
+                    };
+                    mdma_client::Response::Ok { data }
+                }
+                Err(e) => mdma_client::Response::Err {
+                    message: format!("the fake playback cannot read the command: {e}"),
+                },
+            };
+            serde_json::to_vec(&response).expect("a response")
+        });
+        Self {
+            library: mdma_client::LibraryBackend::connect_direct(&library_addr)
+                .expect("connect to the fake library"),
+            playback: mdma_client::PlaybackBackend::connect_direct(&playback_addr)
+                .expect("connect to the fake playback"),
+            _dir: dir,
+            sent,
+        }
+    }
+
+    /// The playback commands received so far, as JSON, in order.
+    pub(crate) fn sent(&self) -> Vec<serde_json::Value> {
+        self.sent.lock().unwrap().clone()
+    }
+}
+
+/// Answer each request on `address` with `handler`'s reply, on a thread of its own.
+fn serve(address: &str, handler: impl Fn(&[u8]) -> Vec<u8> + Send + 'static) {
+    let socket = nng::Socket::new(nng::Protocol::Rep0).expect("a socket");
+    socket.listen(address).expect("listen");
+    std::thread::spawn(move || {
+        while let Ok(request) = socket.recv() {
+            let reply = handler(&request);
+            if socket.send(nng::Message::from(&reply[..])).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// A command as the fake playback records it.
+pub(crate) fn recorded(command: &mdma_client::Command) -> serde_json::Value {
+    serde_json::to_value(command).expect("a command as JSON")
+}
+
 /// A track with only its content hash set: everything optional is `None`,
 /// collections are empty. Build variations with `TrackInfo { .., ..track(hash) }`.
 pub(crate) fn track(hash: &str) -> TrackInfo {

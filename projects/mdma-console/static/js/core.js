@@ -6,7 +6,7 @@
 // on(evt, fn) / emit(evt, detail). Exactly when each one fires:
 //   tracks     after a successful loadCatalogue(): store.tracks / store.order were replaced.
 //   playlists  after a successful loadPlaylists(): store.playlists was replaced.
-//   player     when store.player.state, .now or .offline changed. Never for queue or position only.
+//   player     when store.player.state, .now, .offline or .output changed. Never for queue or position only.
 //   queue      when the CONTENT of store.player.queue changed (refreshPlayer or applyQueue).
 //              One refresh can fire both player and queue; each fires at most once per refresh.
 //   position   on every PositionUpdate from the server (about once a second while playing).
@@ -29,7 +29,7 @@ export const store = {
   tracks: new Map(), // hash -> Track (see logic.js for the shape)
   order: [], // hashes, catalogue order
   playlists: [], // [{ name, hashes }]
-  player: { state: "idle", now: null, queue: [], offline: false, position: null }, // state: idle|playing|paused|loading
+  player: { state: "idle", now: null, queue: [], offline: false, position: null, output: null }, // state: idle|playing|paused|loading; output: absent|starting|running|stalled|null (unknown)
   nb: {}, // per-view narrowing text, keyed by view key
   f: {}, // per-view filters keyed by view key (like nb); absent means none. Read with narrow.js filtersOf(key). Sticky for the session
   ni: {}, // per-view instance (album or artist name) the narrowing state in nb/f belongs to; see narrow.js claimNarrowing
@@ -306,13 +306,15 @@ export function applyQueue(queue) {
   emit("queue");
 }
 
-/** Apply a GET /api/player body: { state, now, queue }. Fires player and/or queue, see the header. */
+/** Apply a GET /api/player body: { state, now, queue, output }. Fires player and/or queue, see the header. */
 export function applyPlayer(body) {
   const p = store.player;
-  const changed = p.state !== body.state || p.now !== body.now;
+  const out = body.output ?? null;
+  const changed = p.state !== body.state || p.now !== body.now || p.output !== out;
   if (p.now !== body.now) p.position = null;
   p.state = body.state;
   p.now = body.now;
+  p.output = out;
   if (changed) emit("player");
   applyQueue(body.queue || []);
 }
@@ -365,6 +367,12 @@ export function handleServerEvent(ev) {
   if (type === "PositionUpdate") {
     store.player.position = { hash: ev.hash, position_ms: ev.position_ms, duration_ms: ev.duration_ms };
     emit("position", store.player.position);
+  } else if (type === "OutputChanged") {
+    const health = ev.health ?? null;
+    if (store.player.output !== health) {
+      store.player.output = health;
+      emit("player");
+    }
   } else if (type === "QueueChanged" || type === "Connected" || type === "Lagged" || (type || "").startsWith("Track")) {
     refreshPlayer();
   } else if ((type || "").startsWith("Facts")) {

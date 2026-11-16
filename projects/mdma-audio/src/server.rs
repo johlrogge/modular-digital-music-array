@@ -344,6 +344,7 @@ impl Server {
                 status.position_ms,
                 status.duration_ms,
             ),
+            output: Some(status.output),
         }
     }
 
@@ -449,7 +450,21 @@ mod tests {
     async fn loaded_when_nothing_loaded_returns_none() {
         let mut server = make_server();
         let response = server.handle_command(StreamCommand::Loaded).await;
-        assert!(matches!(response, StreamResponse::Loaded { info: None }));
+        assert!(matches!(
+            response,
+            StreamResponse::Loaded { info: None, .. }
+        ));
+    }
+
+    /// With no output created yet the source reports it as absent.
+    #[tokio::test]
+    async fn loaded_reports_absent_output_before_any_load() {
+        let mut server = make_server();
+        let response = server.handle_command(StreamCommand::Loaded).await;
+        let StreamResponse::Loaded { output, .. } = response else {
+            panic!("expected Loaded");
+        };
+        assert_eq!(output, Some(stream_source_protocol::OutputHealth::Absent));
     }
 
     /// Stop with nothing loaded is a no-op returning Ok.

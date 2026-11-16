@@ -52,6 +52,7 @@ Related: ADR-009 §4, ADR-004, ADR-022 §4 (one fold). ADRs 024-028 are reserved
 
 - One implementation of the text rules; changing them changes every client at once.
 - `PlaylistSearch` is a new wire variant. Deploy `mdma-library` and `mdma-console` together: against an old library, text search answers 500 and the console shows its "search unavailable" note.
+- A change to the `library_ipc_protocol` wire also needs `mdma-gateway` redeployed, because the gateway decodes `LibraryRequest` itself. An old gateway rejects `PlaylistSearch` as an invalid request (seen on stage2), so deploy `mdma-gateway` with `mdma-library` and `mdma-console`.
 - Each keystroke is one request. For a new state with text and filters the console makes up to 3 sequential library calls (tracks, filters alone, playlist names). Answers are cached per narrowing state in the browser, so backspacing is instant, and a failed lookup shows a note instead of unfiltered rows.
 - Narrowing state lives in sessionStorage, so it is lost when the tab closes.
 - New pages get their own narrowing by choosing a view key; no shared state to untangle.

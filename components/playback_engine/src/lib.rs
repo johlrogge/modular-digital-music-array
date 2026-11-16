@@ -1,6 +1,7 @@
 pub mod audio_config;
 mod error;
 mod mixer;
+mod output_watch;
 mod playhead;
 mod track;
 
@@ -8,21 +9,24 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc,
     },
+    time::Instant,
 };
 
 pub use audio_config::{load_audio_config, save_audio_config, AudioOutputConfig};
 pub use audio_decoder::{AudioSource, DecoderError, Source};
 pub use audio_output::pipewire_devices::{self, AudioSink};
 use audio_output::pipewire_output::{OutputShared, DEFAULT_CHANNELS};
+use audio_output::StartError;
 pub use audio_output::{AudioOutputError, PipewireOutput};
 pub use audio_types::{AudioSegment, DecodedSegment, SegmentIndex, SEGMENT_SIZE};
 pub use error::PlaybackError;
 use mixer::{Mixer, MixerSnapshot, MixerStatus, Slot};
+use output_watch::OutputWatch;
 use playback_primitives::Db;
-pub use playback_primitives::Volume;
+pub use playback_primitives::{OutputHealth, Volume};
 use playhead::{Playhead, Segment};
 use ringbuf::{HeapConsumer, HeapRb};
 use tracing::info;
@@ -141,6 +145,9 @@ pub struct EngineStatus {
     pub duration_ms: Option<u64>,
     /// The output is emitting silence instead of consuming the mixer ring.
     pub paused: bool,
+    /// Whether the output is pulling samples as of the last
+    /// [`PlaybackEngine::reconcile`]. Independent of `paused`/transport state.
+    pub output: OutputHealth,
 }
 
 /// What a reader saw in one go: playhead (with mixer promotions folded in and
@@ -163,6 +170,8 @@ pub struct PlaybackEngine {
     next_track_id: TrackId,
     mixer_status: Arc<MixerStatus>,
     audio_output: Option<PipewireOutput>,
+    /// Judges the output's callback heartbeat; `None` while there is no output.
+    output_watch: Option<OutputWatch>,
     mixer_consumer: Option<HeapConsumer<f32>>,
     current_sample_rate: Option<u32>,
     command_sender: mpsc::Sender<MixerCommand>,
@@ -301,6 +310,7 @@ impl PlaybackEngine {
             next_track_id: 1,
             mixer_status,
             audio_output: None,
+            output_watch: None,
             mixer_consumer: Some(mixer_consumer),
             current_sample_rate: None,
             command_sender,
@@ -364,37 +374,20 @@ impl PlaybackEngine {
             }
         }
 
-        let recovered_consumer = if let Some(old_output) = self.audio_output.take() {
-            old_output.shutdown()
-        } else {
-            None
-        };
-
+        let had_output = self.audio_output.is_some();
+        // A mid-play hot swap keeps what is buffered. Until a new output
+        // exists there is no output rate (preload's registered-vs-parked
+        // decision reads it); `close_output` resets it.
+        self.close_output(Residue::Keep);
         self.audio_config = new_config.clone();
-        // The old output (if any) is gone; until a new one exists there is
-        // no output rate. Preload's registered-vs-parked decision reads this.
-        self.current_sample_rate = None;
 
-        if let Some(consumer) = recovered_consumer {
+        if had_output {
             tracing::info!(
                 "Hot-swapping PipeWire output to device {:?} at {}Hz",
                 new_config.device_name,
                 new_config.sample_rate
             );
-            let audio_output = PipewireOutput::new(
-                consumer,
-                self.shared.clone(),
-                new_config.sample_rate,
-                Some(device_name.as_str()),
-            )
-            .map_err(|e| {
-                PlaybackError::AudioOutput(audio_output::AudioOutputError::AudioDevice(format!(
-                    "PipeWire error: {}",
-                    e
-                )))
-            })?;
-            self.audio_output = Some(audio_output);
-            self.current_sample_rate = Some(new_config.sample_rate);
+            self.open_output(new_config.sample_rate, Some(device_name.as_str()))?;
         }
 
         Ok(new_config)
@@ -408,54 +401,93 @@ impl PlaybackEngine {
 
     /// Make sure an output exists at `target_rate`, re-creating it (and
     /// recovering the mixer consumer from the old one) when the rate differs.
+    ///
+    /// Never returns `Ok` without an output: a failed start leaves the
+    /// consumer in `mixer_consumer` and the output absent, so the next call
+    /// tries again.
     fn ensure_output(&mut self, target_rate: u32) -> Result<(), PlaybackError> {
-        let need_new_output = match self.current_sample_rate {
-            None => true,
-            Some(current) => current != target_rate,
-        };
-        if !need_new_output {
+        let verdict = self.output_verdict();
+        if !needs_new_output(self.current_sample_rate, target_rate, verdict) {
             return Ok(());
+        }
+        if verdict == Some(OutputHealth::Stalled) {
+            tracing::warn!("ensure_output: output stalled, re-creating the PipeWire stream");
         }
         let target_device = self.audio_config.device_name.clone();
 
-        // Recover the consumer from the old output (if any) so we can
-        // hand it to the new one without touching the mix thread.
+        // Recover the consumer from the old output (if any) so we can hand it
+        // to the new one without touching the mix thread. Audio left in the
+        // ring belongs to the old stream and must not reach the new one.
+        self.close_output(Residue::Discard);
+        info!(
+            "Creating PipeWire output at {}Hz (device: {:?})",
+            target_rate, target_device
+        );
+        self.open_output(target_rate, target_device.as_deref())
+    }
+
+    /// The output watch's verdict, `None` while there is no output.
+    fn output_verdict(&self) -> Option<OutputHealth> {
+        self.output_watch.as_ref().map(OutputWatch::verdict)
+    }
+
+    /// Shut the output down (if any) and take its mixer consumer back. Always
+    /// leaves the engine without an output: no watch, no output rate.
+    fn close_output(&mut self, residue: Residue) {
         if let Some(old_output) = self.audio_output.take() {
-            if let Some(consumer) = old_output.shutdown() {
-                self.mixer_consumer = Some(consumer);
-            } else {
-                tracing::warn!(
-                    "ensure_output: failed to recover consumer from old PipeWire output"
-                );
+            match old_output.shutdown() {
+                Some(consumer) => self.mixer_consumer = Some(consumer),
+                None => tracing::error!(
+                    "close_output: could not recover the mixer consumer from the old PipeWire output"
+                ),
             }
         }
+        if residue == Residue::Discard {
+            if let Some(consumer) = self.mixer_consumer.as_mut() {
+                discard_residue(consumer, &self.shared.consumed_total);
+            }
+        }
+        self.output_watch = None;
+        self.current_sample_rate = None;
+    }
 
-        if self.mixer_consumer.is_none() {
-            tracing::error!(
-                "ensure_output: no mixer consumer available and no audio output — audio will be silent"
-            );
+    /// Create the output at `rate` from the engine's mixer consumer. On
+    /// failure the consumer goes back into `mixer_consumer` (when it could be
+    /// recovered) and the output stays absent.
+    fn open_output(&mut self, rate: u32, device: Option<&str>) -> Result<(), PlaybackError> {
+        self.open_output_on(rate, device, None)
+    }
+
+    /// [`open_output`](Self::open_output) on a named PipeWire remote.
+    fn open_output_on(
+        &mut self,
+        rate: u32,
+        device: Option<&str>,
+        remote: Option<&str>,
+    ) -> Result<(), PlaybackError> {
+        let Some(consumer) = self.mixer_consumer.take() else {
+            tracing::error!("open_output: no mixer consumer available — audio would be silent");
+            return Err(PlaybackError::NoAudioOutput(AudioOutputError::AudioDevice(
+                "the mixer consumer was lost by an earlier failed output start".to_string(),
+            )));
+        };
+        match PipewireOutput::new_with_remote(consumer, self.shared.clone(), rate, device, remote) {
+            Ok(output) => {
+                self.audio_output = Some(output);
+                // Seeded with the live count: the heartbeat survives output
+                // re-creation, only a callback from now on proves the new one.
+                self.output_watch = Some(OutputWatch::new(
+                    self.shared.callbacks.load(Ordering::Acquire),
+                    Instant::now(),
+                ));
+                self.current_sample_rate = Some(rate);
+                Ok(())
+            }
+            Err(StartError { error, consumer }) => {
+                self.mixer_consumer = consumer;
+                Err(PlaybackError::NoAudioOutput(error))
+            }
         }
-        if let Some(consumer) = self.mixer_consumer.take() {
-            info!(
-                "Creating PipeWire output at {}Hz (device: {:?})",
-                target_rate, target_device
-            );
-            let audio_output = PipewireOutput::new(
-                consumer,
-                self.shared.clone(),
-                target_rate,
-                target_device.as_deref(),
-            )
-            .map_err(|e| {
-                PlaybackError::AudioOutput(audio_output::AudioOutputError::AudioDevice(format!(
-                    "PipeWire error: {}",
-                    e
-                )))
-            })?;
-            self.audio_output = Some(audio_output);
-            self.current_sample_rate = Some(target_rate);
-        }
-        Ok(())
     }
 
     /// Observe the engine as of now: the consumed counter is read first, then
@@ -533,6 +565,15 @@ impl PlaybackEngine {
     /// nor the mixer (current/next) references it, so a `ClearNext` that lost
     /// the race against a promotion never kills the track now playing.
     pub fn reconcile(&mut self) {
+        self.reconcile_at(Instant::now());
+    }
+
+    /// [`reconcile`](Self::reconcile) with an explicit clock, so the output
+    /// watch is testable without sleeping.
+    fn reconcile_at(&mut self, now: Instant) {
+        if let Some(watch) = self.output_watch.as_mut() {
+            watch.observe(self.shared.callbacks.load(Ordering::Acquire), now);
+        }
         let obs = self.observe();
         self.playhead = obs.playhead;
         if self
@@ -649,6 +690,12 @@ impl PlaybackEngine {
             return Ok(false);
         }
         let rate = entry.rate;
+
+        // A registered preload plays through the existing output; if that is
+        // stalled (or gone) fall back to a fresh load, which re-creates it.
+        if !parked && needs_new_output(self.current_sample_rate, rate, self.output_verdict()) {
+            return Ok(false);
+        }
 
         let start_sample = if parked {
             // Rate differs from the output: cut everything, re-open the
@@ -924,6 +971,10 @@ impl PlaybackEngine {
             position_ms: audible_segment.map(|s| s.position_ms(obs.consumed)),
             duration_ms: entry.map(|e| e.track.duration_ms()),
             paused: self.is_paused(),
+            output: self
+                .output_watch
+                .as_ref()
+                .map_or(OutputHealth::Absent, OutputWatch::verdict),
         }
     }
 
@@ -944,6 +995,34 @@ impl PlaybackEngine {
         tracing::info!("Seeking to position {}", position);
         self.start_fresh(&path, Some(position))
     }
+}
+
+/// What to do with audio still in the mixer ring when its consumer comes home
+/// from a closed output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Residue {
+    /// A hot swap mid-play keeps its buffer.
+    Keep,
+    /// The ring belongs to the old stream (a stalled one never played it).
+    Discard,
+}
+
+/// Throw away everything in the mixer ring and count it as consumed, the same
+/// accounting a serviced flush does, so `produced == consumed + ring_len`
+/// still holds. Only call while no output callback can run. Returns the
+/// number of samples discarded.
+fn discard_residue(consumer: &mut HeapConsumer<f32>, consumed_total: &AtomicU64) -> usize {
+    let discarded = consumer.clear();
+    if discarded > 0 {
+        consumed_total.fetch_add(discarded as u64, Ordering::Release);
+    }
+    discarded
+}
+
+/// Whether the output must be (re-)created before playing at `target` Hz:
+/// there is none, it runs at another rate, or it is stalled.
+fn needs_new_output(current_rate: Option<u32>, target: u32, verdict: Option<OutputHealth>) -> bool {
+    verdict == Some(OutputHealth::Stalled) || current_rate != Some(target)
 }
 
 /// Whether the engine may report the audible track as finished. `drained` is
@@ -1011,6 +1090,14 @@ mod tests {
                 },
             );
             id
+        }
+
+        /// Pretend an output was created at `t0` (no PipeWire involved).
+        fn start_output_watch_at(&mut self, t0: Instant) {
+            self.output_watch = Some(OutputWatch::new(
+                self.shared.callbacks.load(Ordering::Acquire),
+                t0,
+            ));
         }
 
         /// A test track that is the audible one.
@@ -1352,6 +1439,142 @@ mod tests {
             engine.status().position_ms,
             Some(1000),
             "frozen without consumption"
+        );
+    }
+
+    /// The stage2 symptom: Play with no sink. The stream exists but PipeWire
+    /// never runs the callback, so nothing is consumed.
+    #[test]
+    fn played_track_with_no_callbacks_reports_stalled() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        let t0 = Instant::now();
+        engine.insert_audible_test_track();
+        engine.play().unwrap();
+        engine.start_output_watch_at(t0);
+        engine.reconcile_at(t0 + Duration::from_millis(1100));
+        let st = engine.status();
+        assert_eq!(st.output, OutputHealth::Stalled);
+        assert_eq!(st.position_ms, Some(0));
+        assert!(!st.paused, "transport stays playing; health is separate");
+    }
+
+    #[test]
+    fn output_is_starting_before_the_stall_threshold() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        let t0 = Instant::now();
+        engine.start_output_watch_at(t0);
+        engine.reconcile_at(t0 + Duration::from_millis(500));
+        assert_eq!(engine.status().output, OutputHealth::Starting);
+    }
+
+    #[test]
+    fn advancing_callbacks_report_running() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        let t0 = Instant::now();
+        engine.start_output_watch_at(t0);
+        engine.shared.callbacks.fetch_add(1, Ordering::Release);
+        engine.reconcile_at(t0 + Duration::from_millis(100));
+        assert_eq!(engine.status().output, OutputHealth::Running);
+        engine.shared.callbacks.fetch_add(1, Ordering::Release);
+        engine.reconcile_at(t0 + Duration::from_millis(5000));
+        assert_eq!(engine.status().output, OutputHealth::Running);
+    }
+
+    #[test]
+    fn no_output_created_reports_absent() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        engine.reconcile_at(Instant::now() + Duration::from_secs(60));
+        assert_eq!(engine.status().output, OutputHealth::Absent);
+    }
+
+    #[test]
+    fn watch_after_recreation_is_starting_not_running() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        let t0 = Instant::now();
+        // The heartbeat survives output re-creation.
+        engine.shared.callbacks.store(500, Ordering::Release);
+        engine.start_output_watch_at(t0);
+        engine.reconcile_at(t0 + Duration::from_millis(100));
+        assert_eq!(engine.status().output, OutputHealth::Starting);
+    }
+
+    #[test]
+    fn needs_new_output_table() {
+        use OutputHealth::{Running, Stalled, Starting};
+        assert!(needs_new_output(Some(44_100), 44_100, Some(Stalled)));
+        assert!(!needs_new_output(Some(44_100), 44_100, Some(Running)));
+        assert!(!needs_new_output(Some(44_100), 44_100, Some(Starting)));
+        assert!(needs_new_output(None, 44_100, None));
+        assert!(needs_new_output(Some(48_000), 44_100, Some(Running)));
+    }
+
+    #[test]
+    fn discarding_residue_counts_as_consumed() {
+        let (mut producer, mut consumer) = HeapRb::<f32>::new(64).split();
+        for _ in 0..10 {
+            producer.push(0.5).unwrap();
+        }
+        let consumed = AtomicU64::new(100);
+        assert_eq!(discard_residue(&mut consumer, &consumed), 10);
+        assert_eq!(consumed.load(Ordering::Acquire), 110);
+        assert!(consumer.is_empty());
+    }
+
+    #[test]
+    fn closing_with_discard_empties_the_ring_and_counts_it() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        // Stand in for a stalled output's full ring.
+        let (mut producer, consumer) = HeapRb::<f32>::new(64).split();
+        for _ in 0..10 {
+            producer.push(0.5).unwrap();
+        }
+        engine.mixer_consumer = Some(consumer);
+        engine.close_output(Residue::Discard);
+        assert_eq!(engine.shared.consumed_total.load(Ordering::Acquire), 10);
+        assert!(engine.mixer_consumer.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn closing_with_keep_leaves_the_ring_alone() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        let (mut producer, consumer) = HeapRb::<f32>::new(64).split();
+        for _ in 0..10 {
+            producer.push(0.5).unwrap();
+        }
+        engine.mixer_consumer = Some(consumer);
+        engine.close_output(Residue::Keep);
+        assert_eq!(engine.shared.consumed_total.load(Ordering::Acquire), 0);
+        assert_eq!(engine.mixer_consumer.as_ref().unwrap().len(), 10);
+    }
+
+    #[test]
+    fn failed_open_keeps_the_consumer_reports_absent_and_retries() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        for _ in 0..2 {
+            let r = engine.open_output_on(44_100, None, Some("mdma-test-no-such-remote"));
+            assert!(
+                matches!(r, Err(PlaybackError::NoAudioOutput(_))),
+                "got {r:?}"
+            );
+            assert!(
+                engine.mixer_consumer.is_some(),
+                "the consumer is handed back for the next attempt"
+            );
+            assert!(engine.audio_output.is_none());
+            assert_eq!(engine.current_sample_rate, None);
+            engine.reconcile();
+            assert_eq!(engine.status().output, OutputHealth::Absent);
+        }
+    }
+
+    #[test]
+    fn open_without_a_consumer_is_an_error_not_ok() {
+        let (mut engine, _tmp) = engine_with_tempdir();
+        engine.mixer_consumer = None;
+        let r = engine.open_output(44_100, None);
+        assert!(
+            matches!(r, Err(PlaybackError::NoAudioOutput(_))),
+            "got {r:?}"
         );
     }
 

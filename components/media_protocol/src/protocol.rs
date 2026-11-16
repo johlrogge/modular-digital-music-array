@@ -1,5 +1,6 @@
 use playback_primitives::{
-    AudioOutputConfig, AudioSinkInfo, ContentHash, Deck, SourceName, Volume,
+    AudioOutputConfig, AudioSinkInfo, CanonicalHash, ContentHash, Deck, OutputHealth, SourceName,
+    Volume,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -80,6 +81,9 @@ pub enum Command {
     },
     /// Get the currently selected audio output.
     GetAudioOutput,
+    /// Ask whether the audio output is pulling samples. Deckless: output
+    /// commands are exempt from naming a deck (ADR-017 section 2.5).
+    GetOutputStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +91,34 @@ pub enum Command {
 pub enum Response {
     Ok { data: Option<ResponseData> },
     Err { message: String },
+}
+
+impl Command {
+    /// The content hashes this command carries, for the queue commands.
+    pub fn hashes_held(&self) -> Vec<&ContentHash> {
+        match self {
+            Command::QueueAppend { hash, .. } | Command::QueueNext { hash, .. } => vec![hash],
+            Command::QueueRemove { hashes } => hashes.iter().collect(),
+            Command::QueueReplace { entries } => entries.iter().map(|(h, _)| h).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Refuse the whole command if any hash it carries is not a full one.
+    pub fn check_canonical(&self) -> Result<(), Response> {
+        self.hashes_held()
+            .into_iter()
+            .try_for_each(|hash| require_canonical(hash.clone()).map(drop))
+    }
+}
+
+/// The one place a hash received from a client becomes a [`CanonicalHash`]
+/// (playback holds only full hashes, ADR-026). A prefix is refused with the
+/// error response to send back, which tells the client what to do.
+pub fn require_canonical(hash: ContentHash) -> Result<CanonicalHash, Response> {
+    CanonicalHash::try_from(hash).map_err(|e| Response::Err {
+        message: format!("{e}; resolve it through the library"),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +132,8 @@ pub enum ResponseData {
     Session(Option<String>),
     AudioOutputs(Vec<AudioSinkInfo>),
     AudioOutput(AudioOutputConfig),
+    /// `None` until the source has reported its output health (see ADR-028).
+    OutputStatus(Option<OutputHealth>),
 }
 
 #[cfg(test)]
@@ -107,6 +141,55 @@ mod tests {
     use super::*;
     use playback_primitives::SourceName;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn require_canonical_refusal_names_the_hash_and_the_remedy() {
+        let Err(Response::Err { message }) = require_canonical(ContentHash::new("9fb4105e")) else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(
+            message,
+            "not a full content hash: 9fb4105e; resolve it through the library"
+        );
+    }
+
+    #[test]
+    fn hashes_held_lists_every_hash_of_queue_commands() {
+        let a = ContentHash::new("a");
+        let b = ContentHash::new("b");
+        let replace = Command::QueueReplace {
+            entries: vec![
+                (a.clone(), SourceName::audio()),
+                (b.clone(), SourceName::audio()),
+            ],
+        };
+        assert_eq!(replace.hashes_held(), vec![&a, &b]);
+        let remove = Command::QueueRemove {
+            hashes: vec![a.clone()],
+        };
+        assert_eq!(remove.hashes_held(), vec![&a]);
+        assert!(Command::QueueList.hashes_held().is_empty());
+        assert!(Command::QueueClear.check_canonical().is_ok());
+        assert!(remove.check_canonical().is_err());
+        assert!(Command::GetOutputStatus.hashes_held().is_empty());
+    }
+
+    #[test]
+    fn get_output_status_roundtrips_without_a_deck() {
+        let json = serde_json::to_string(&Command::GetOutputStatus).unwrap();
+        assert_eq!(json, r#""get_output_status""#);
+        let decoded: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, Command::GetOutputStatus));
+    }
+
+    #[test]
+    fn output_status_response_roundtrips() {
+        for health in [None, Some(OutputHealth::Stalled)] {
+            let json = serde_json::to_string(&ResponseData::OutputStatus(health)).unwrap();
+            let decoded: ResponseData = serde_json::from_str(&json).unwrap();
+            assert!(matches!(decoded, ResponseData::OutputStatus(h) if h == health));
+        }
+    }
 
     #[test]
     fn queue_append_without_source_defaults_to_audio() {

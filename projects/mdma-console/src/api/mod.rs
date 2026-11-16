@@ -9,6 +9,7 @@ use axum::{
 };
 use gateway_client::Response as PlaybackResponse;
 use gateway_client::{Command, GatewayClient, LibraryRequest, LibraryResponse};
+use library_ipc_client::{CanonicalHash, ContentHash};
 use media_protocol::ResponseData;
 use serde::Serialize;
 use std::sync::Arc;
@@ -91,6 +92,40 @@ pub fn send(client: &GatewayClient, command: &Command) -> Result<Option<Response
         Ok(PlaybackResponse::Err { message }) => Err(message),
         Err(e) => Err(e.to_string()),
     }
+}
+
+/// A track by hash (or prefix), asked of the library through the gateway.
+fn gateway_get_track(
+    gateway: &GatewayClient,
+    hash: &ContentHash,
+) -> Result<library_ipc_client::TrackInfo, library_ipc_client::ClientError> {
+    use library_ipc_client::{ClientError, ProtocolError};
+    match gateway.library_request(&LibraryRequest::GetTrack { hash: hash.clone() })? {
+        LibraryResponse::Track(track) => Ok(*track),
+        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+        _ => Err(ClientError::Protocol(ProtocolError::Internal {
+            message: "Unexpected response to GetTrack".to_string(),
+        })),
+    }
+}
+
+/// The canonical hash of each of `hashes`: the one resolver for everything bound for playback
+/// (ADR-026). Canonical hashes pass through without a lookup; the first hash the library cannot
+/// resolve fails the lot with 422 `{error}` naming it, or 503 when the library cannot be
+/// reached, before anything is sent.
+pub fn resolve_for_playback(
+    gateway: &GatewayClient,
+    hashes: &[ContentHash],
+) -> Result<Vec<CanonicalHash>, Reply> {
+    library_ipc_client::resolve_full_hashes(hashes, |hash| gateway_get_track(gateway, hash))
+        .map_err(|e| {
+            let status = if e.is_transport() {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::UNPROCESSABLE_ENTITY
+            };
+            error_reply(status, e.to_string())
+        })
 }
 
 /// One library request; a library error answer is folded into `Err`.

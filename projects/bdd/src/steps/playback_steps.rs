@@ -25,6 +25,7 @@ async fn stop_playback(world: &mut MdmaWorld) {
 #[then(regex = r#"^the now playing track should be "([^"]*)"$"#)]
 async fn now_playing_should_be(world: &mut MdmaWorld, expected_hash: String) {
     world.ensure_env();
+    let expected_hash = world.library_hash(&expected_hash).to_string();
     let now = world
         .playback()
         .now_playing()

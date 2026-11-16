@@ -10,4 +10,4 @@ pub mod pipewire_devices;
 pub mod pipewire_output;
 
 pub use pipewire_devices::AudioSink;
-pub use pipewire_output::PipewireOutput;
+pub use pipewire_output::{PipewireOutput, StartError};

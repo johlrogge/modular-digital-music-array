@@ -1,4 +1,4 @@
-use playback_primitives::{ContentHash, SessionId};
+use playback_primitives::{ContentHash, OutputHealth, SessionId};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
@@ -41,6 +41,9 @@ pub const TOPIC_SESSION_STARTED: &str = "playback/session_started";
 /// Topic for session ended events.
 pub const TOPIC_SESSION_ENDED: &str = "playback/session_ended";
 
+/// Topic for audio output health changes (see ADR-028).
+pub const TOPIC_OUTPUT: &str = "playback/output";
+
 /// Events emitted by the playback service.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
@@ -74,6 +77,10 @@ pub enum PlaybackEvent {
     SessionEnded {
         id: SessionId,
     },
+    /// The audio output's health changed (deckless: see ADR-028).
+    OutputChanged {
+        health: OutputHealth,
+    },
 }
 
 impl PlaybackEvent {
@@ -89,6 +96,7 @@ impl PlaybackEvent {
             PlaybackEvent::PositionUpdate { .. } => TOPIC_POSITION_UPDATE,
             PlaybackEvent::SessionStarted { .. } => TOPIC_SESSION_STARTED,
             PlaybackEvent::SessionEnded { .. } => TOPIC_SESSION_ENDED,
+            PlaybackEvent::OutputChanged { .. } => TOPIC_OUTPUT,
         }
     }
 }
@@ -288,6 +296,10 @@ mod tests {
     #[case(
         PlaybackEvent::SessionEnded { id: SessionId::new("2026-02-24T12:00:00+00:00") },
         TOPIC_SESSION_ENDED
+    )]
+    #[case(
+        PlaybackEvent::OutputChanged { health: OutputHealth::Stalled },
+        TOPIC_OUTPUT
     )]
     fn roundtrip(#[case] event: PlaybackEvent, #[case] expected_topic: &str) {
         let bytes = to_topic_message(&event);

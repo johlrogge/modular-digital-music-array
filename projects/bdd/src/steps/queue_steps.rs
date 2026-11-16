@@ -2,12 +2,12 @@
 
 use crate::world::MdmaWorld;
 use cucumber::{given, then, when};
-use mdma_client::{ContentHash, SourceName};
+use mdma_client::SourceName;
 
 #[given(regex = r#"^the queue contains "([^"]*)"$"#)]
 async fn queue_contains(world: &mut MdmaWorld, hash: String) {
     world.ensure_env();
-    let content_hash = ContentHash::new(hash);
+    let content_hash = world.library_hash(&hash);
     if let Err(e) = world
         .playback()
         .queue_append(content_hash, SourceName::audio())
@@ -19,7 +19,7 @@ async fn queue_contains(world: &mut MdmaWorld, hash: String) {
 #[when(regex = r#"^I append "([^"]*)" to the queue$"#)]
 async fn append_to_queue(world: &mut MdmaWorld, hash: String) {
     world.ensure_env();
-    let content_hash = ContentHash::new(hash);
+    let content_hash = world.library_hash(&hash);
     match world
         .playback()
         .queue_append(content_hash, SourceName::audio())
@@ -29,10 +29,23 @@ async fn append_to_queue(world: &mut MdmaWorld, hash: String) {
     }
 }
 
+/// Send `hash` exactly as given, to see playback refuse a prefix.
+#[when(regex = r#"^I append the short hash "([^"]*)" to the queue$"#)]
+async fn append_short_hash_to_queue(world: &mut MdmaWorld, hash: String) {
+    world.ensure_env();
+    match world
+        .playback()
+        .queue_append(mdma_client::ContentHash::new(hash), SourceName::audio())
+    {
+        Ok(()) => world.last_error = None,
+        Err(e) => world.last_error = Some(e.to_string()),
+    }
+}
+
 #[when(regex = r#"^I prepend "([^"]*)" to the queue$"#)]
 async fn prepend_to_queue(world: &mut MdmaWorld, hash: String) {
     world.ensure_env();
-    let content_hash = ContentHash::new(hash);
+    let content_hash = world.library_hash(&hash);
     match world
         .playback()
         .queue_next(content_hash, SourceName::audio())

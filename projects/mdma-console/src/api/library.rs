@@ -11,7 +11,7 @@ use axum::{
     response::Response,
 };
 use gateway_client::{GatewayClient, LibraryRequest, LibraryResponse};
-use library_ipc_client::{ContentHash, StringQuery, TrackInfo, TrackQuery};
+use library_ipc_client::{StringQuery, TrackInfo, TrackQuery};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -54,15 +54,6 @@ pub fn track_query_from(params: &SearchParams) -> Result<TrackQuery, String> {
     Ok(query)
 }
 
-/// Hashes of a playlist file: the first whitespace-separated token of each line.
-pub fn playlist_hashes(content: &str) -> Vec<ContentHash> {
-    content
-        .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .map(|token| ContentHash::new(token.to_string()))
-        .collect()
-}
-
 /// `GET /api/tracks`: the whole catalogue in one response.
 pub async fn tracks(State(state): State<Arc<AppState>>) -> Response {
     json_or_500(
@@ -100,7 +91,7 @@ pub async fn playlists(State(state): State<Arc<AppState>>) -> Response {
                 };
             out.push(ApiPlaylist {
                 name: name.as_str().to_owned(),
-                hashes: playlist_hashes(&content)
+                hashes: library_ipc_client::content_to_hashes(&content)
                     .iter()
                     .map(|h| h.as_str().to_owned())
                     .collect(),
@@ -252,6 +243,7 @@ impl From<&TrackInfo> for ApiTrack {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use library_ipc_client::ContentHash;
     use library_ipc_client::{Bpm, DurationSeconds, Key};
 
     fn bare(hash: &str) -> TrackInfo {
@@ -336,8 +328,10 @@ mod tests {
     }
 
     #[test]
-    fn playlist_lines_give_their_first_token() {
-        let hashes = playlist_hashes("sha256:a  # Bloom\n\n  sha256:b\nsha256:c\t- x\n");
+    fn playlist_lines_give_their_first_token_and_skip_comments() {
+        let hashes = library_ipc_client::content_to_hashes(
+            "# a comment\nsha256:a  # Bloom\n\n  sha256:b\nsha256:c\t- x\n",
+        );
         let got: Vec<_> = hashes.iter().map(|h| h.as_str()).collect();
         assert_eq!(got, ["sha256:a", "sha256:b", "sha256:c"]);
     }

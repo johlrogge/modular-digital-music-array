@@ -88,6 +88,41 @@ pub fn library_ok(response: gateway_client::LibraryResponse) -> GatewayResponse 
     GatewayResponse::Library { response }
 }
 
+/// A library answer to `GetTrack`: a track whose full hash is `full`.
+pub fn track_ok(full: &str) -> GatewayResponse {
+    library_ok(gateway_client::LibraryResponse::Track(Box::new(
+        library_ipc_client::TrackInfo {
+            content_hash: media_protocol::ContentHash::new(full),
+            title: None,
+            artist: None,
+            album: None,
+            duration: None,
+            bpm: None,
+            key: None,
+            blob_path: None,
+            cover_art_path: None,
+            track_number: None,
+            disc_number: None,
+            added: None,
+            started: None,
+            stopped: None,
+            memory_cues: vec![],
+            beat_grid: None,
+            role: None,
+            energy: None,
+        },
+    )))
+}
+
+/// A library answer to `GetTrack` for a hash it does not know.
+pub fn track_not_found(hash: &str) -> GatewayResponse {
+    library_ok(gateway_client::LibraryResponse::Error(
+        library_ipc_client::ProtocolError::TrackNotFound {
+            hash: hash.to_string(),
+        },
+    ))
+}
+
 /// Short form of a playback command for asserting on recorded traffic: `now`, `list`,
 /// `next <hash>`, `append <hash>`, `play`, `replace <hash>,<hash>`; anything else as `{:?}`.
 pub fn describe(command: &Command) -> String {

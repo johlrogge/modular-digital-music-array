@@ -193,6 +193,9 @@ fn print_event_human(event: &PlaybackEvent, library: Option<&LibraryBackend>) {
                 id.to_string().bright_black()
             );
         }
+        PlaybackEvent::OutputChanged { health } => {
+            println!("{} {}", "◈ output".cyan().bold(), health);
+        }
     }
 }
 

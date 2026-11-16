@@ -175,7 +175,9 @@ impl FromStr for PlaylistInput {
 /// Content hash (full or partial, with or without sha256: prefix)
 ///
 /// Follows the stdin rule: at least 8 lowercase hex characters, optional `sha256:`
-/// prefix. A prefix is accepted; the service resolves it.
+/// prefix. A prefix is accepted. A library-bound command sends it as given and the
+/// library resolves it; a command that sends it to playback resolves it through the
+/// library first, because playback holds only full hashes (ADR-026).
 #[derive(Debug, Clone, PartialEq, Eq, Arg)]
 #[arg(positional = "HASH")]
 pub(crate) struct TrackArg(pub ContentHash);

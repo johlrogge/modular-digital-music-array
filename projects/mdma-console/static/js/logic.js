@@ -4,7 +4,8 @@
 // Every key is always present; absent facts are null:
 //   { hash, title, artist, album, track_number, disc, bpm, key, duration_secs, added, has_cover }
 //   hash "sha256:..."; bpm number|null; key string|null; added ISO 8601 string|null; has_cover bool.
-// Player shape: GET /api/player is { state: "idle"|"playing"|"paused"|"loading", now: hash|null, queue: [hash] }.
+// Player shape: GET /api/player is { state: "idle"|"playing"|"paused"|"loading", now: hash|null, queue: [hash],
+//   output: "absent"|"starting"|"running"|"stalled"|null } (null: the node cannot say).
 //
 // Anything that decides what is heard (idle guard, filter semantics, queue CAS) is enforced in
 // Rust (text search included: the browser never matches text); this file only sorts, pages and groups.
@@ -40,6 +41,18 @@ export function trackTitle(t) {
 /** True when nothing is loaded. The server's `state` is the only source of truth: paused and loading are busy. */
 export function isIdle(player) {
   return !player || player.state === "idle";
+}
+
+/**
+ * True when something is loaded but the audio output is not there or not pulling samples.
+ * Idle shows nothing: "absent" is normal before the first load.
+ */
+export function outputDown(player) {
+  return (
+    !!player &&
+    (player.state === "playing" || player.state === "paused") &&
+    (player.output === "stalled" || player.output === "absent")
+  );
 }
 
 // Each key function yields a string (collated) or a number (subtracted).

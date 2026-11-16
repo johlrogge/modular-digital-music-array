@@ -1293,7 +1293,9 @@ impl PlayHistory {
 /// not its entity is still live, so a merge or replace keeps its predecessors' history
 /// (ADR-013, ADR-017): a track is credited with the plays of every hash it
 /// transitively replaces, with their original timestamps. Events keyed by the short
-/// hashes older playback wrote (#86) resolve to the full hash. The lineage is
+/// hashes playback wrote (#86) resolve to the full hash. Playback wrote them until
+/// ADR-026 (the CLI sent prefixes and playback recorded them verbatim), so the log
+/// holds them from before that change, not only from some older playback. The lineage is
 /// re-resolved on every read, so a `Replaces` asserted after the events were recorded
 /// takes effect too.
 ///
@@ -1452,7 +1454,8 @@ impl ResolvedPlays<'_> {
     }
 
     /// The keys events for `key` are recorded under: the full hash, and the 12- and
-    /// 8-character short forms older playback wrote (#86). A short form counts only
+    /// 8-character short forms playback wrote until ADR-026 (#86; the lines stay in the
+    /// log, so this reader workaround stays too). A short form counts only
     /// when `key` is the single full key it is a prefix of, the same rule
     /// [`resolve_prefix`] applies: an ambiguous short key belongs to nobody.
     fn event_keys<'k>(&self, key: &'k str) -> Vec<&'k str> {

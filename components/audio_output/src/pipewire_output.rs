@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -14,8 +14,11 @@ use tracing::{info, warn};
 pub const DEFAULT_CHANNELS: u32 = 2;
 pub const CHAN_SIZE: usize = std::mem::size_of::<f32>();
 
+#[derive(Debug)]
 pub enum StreamCommand {
-    Shutdown(mpsc::SyncSender<HeapConsumer<f32>>),
+    /// Quit the PipeWire thread. The ring consumer comes home through the
+    /// [`ConsumerHome`] guard, not through this command.
+    Shutdown,
     /// Flush PipeWire's own in-flight buffers. The mixer ring is drained by the
     /// RT callback itself (see `PipewireOutput::flush`), not by this command.
     /// The main-loop handler signals the sender once `stream.flush(false)` has
@@ -23,12 +26,36 @@ pub enum StreamCommand {
     Flush(mpsc::SyncSender<()>),
 }
 
-impl std::fmt::Debug for StreamCommand {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StreamCommand::Shutdown(_) => write!(f, "Shutdown(..)"),
-            StreamCommand::Flush(_) => write!(f, "Flush(..)"),
+/// Owns the mixer ring consumer on the PipeWire thread and sends it home when
+/// dropped, on every exit path: a failed setup (any `?`), a normal shutdown, or
+/// a startup timeout. Only a deliberate leak (`mem::forget`) keeps it.
+struct ConsumerHome {
+    consumer: Option<HeapConsumer<f32>>,
+    home: mpsc::SyncSender<HeapConsumer<f32>>,
+}
+
+impl Drop for ConsumerHome {
+    fn drop(&mut self) {
+        if let Some(consumer) = self.consumer.take() {
+            // Capacity 1 and a single send: never blocks.
+            let _ = self.home.try_send(consumer);
         }
+    }
+}
+
+/// A failed [`PipewireOutput::new`]: the error, plus the mixer ring consumer
+/// when it could be recovered so the caller can try again.
+pub struct StartError {
+    pub error: crate::AudioOutputError,
+    pub consumer: Option<HeapConsumer<f32>>,
+}
+
+impl std::fmt::Debug for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StartError")
+            .field("error", &self.error)
+            .field("consumer", &self.consumer.is_some())
+            .finish()
     }
 }
 
@@ -231,6 +258,10 @@ pub struct OutputShared {
     pub consumed_total: Arc<AtomicU64>,
     /// Linear gain as `f32::to_bits`. Applied in the callback with a ramp.
     pub gain: Arc<AtomicU32>,
+    /// Heartbeat: how many times the RT callback has run (paused or not,
+    /// starved or not). The engine's liveness signal for the output; see
+    /// [`render`].
+    pub callbacks: Arc<AtomicU64>,
 }
 
 impl OutputShared {
@@ -240,6 +271,7 @@ impl OutputShared {
             paused,
             consumed_total: Arc::new(AtomicU64::new(0)),
             gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            callbacks: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -321,6 +353,8 @@ pub fn render(
     shared: &OutputShared,
     prev_gain: &mut f32,
 ) -> Rendered {
+    // Heartbeat first: every callback counts, even a paused or starved one.
+    shared.callbacks.fetch_add(1, Ordering::Release);
     let flushed = monitor.service_flush(consumer);
     if flushed > 0 {
         shared
@@ -350,6 +384,12 @@ pub fn render(
 /// How long [`PipewireOutput::flush`] waits for the callback to acknowledge.
 const FLUSH_TIMEOUT: Duration = Duration::from_millis(100);
 const FLUSH_POLL: Duration = Duration::from_millis(1);
+/// How long [`PipewireOutput::new`] waits for the PipeWire thread to report
+/// that its stream is connected.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long [`PipewireOutput::shutdown`] waits for the consumer to come home.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const SHUTDOWN_POLL: Duration = Duration::from_millis(20);
 /// How long [`PipewireOutput::flush`] waits for the PipeWire main loop to
 /// acknowledge its own buffer flush.
 const PW_FLUSH_TIMEOUT: Duration = Duration::from_millis(100);
@@ -359,6 +399,8 @@ pub struct PipewireOutput {
     pw_thread: Option<thread::JoinHandle<Result<(), pw::Error>>>,
     command_sender: pw::channel::Sender<StreamCommand>,
     monitor: Arc<PlayoutMonitor>,
+    /// Where the PipeWire thread's [`ConsumerHome`] guard sends the consumer.
+    home_rx: mpsc::Receiver<HeapConsumer<f32>>,
 }
 
 impl PipewireOutput {
@@ -367,31 +409,61 @@ impl PipewireOutput {
         shared: OutputShared,
         sample_rate: u32,
         target_device: Option<&str>,
-    ) -> Result<Self, pw::Error> {
+    ) -> Result<Self, StartError> {
+        Self::new_with_remote(sample_consumer, shared, sample_rate, target_device, None)
+    }
+
+    /// As [`new`](Self::new), connecting to the named PipeWire remote
+    /// (`None` = the default). Lets tests exercise the real failure path
+    /// without touching process-wide environment variables.
+    pub fn new_with_remote(
+        sample_consumer: HeapConsumer<f32>,
+        shared: OutputShared,
+        sample_rate: u32,
+        target_device: Option<&str>,
+        remote: Option<&str>,
+    ) -> Result<Self, StartError> {
         let (cmd_sender, cmd_receiver) = pw::channel::channel::<StreamCommand>();
         let monitor = Arc::new(PlayoutMonitor::new());
         let monitor_for_cb = monitor.clone();
+        let (home_tx, home_rx) = mpsc::sync_channel::<HeapConsumer<f32>>(1);
 
         // Clone target_device into an owned String so it can move into the thread.
         let target_device: Option<String> = target_device.map(|s| s.to_owned());
+        let remote: Option<String> = remote.map(|s| s.to_owned());
+
+        // Startup handshake: the thread reports whether setup got as far as
+        // connecting the stream, so a missing daemon is an error here instead
+        // of a silent dead thread.
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+        let ready_tx_for_err = ready_tx.clone();
 
         // Create a ring buffer for audio samples
         info!("create pipe wire thread");
-        // Spawn PipeWire thread
-        let pw_thread = thread::spawn(move || {
+        // The PipeWire thread body. Any `?` before the handshake send is
+        // reported to `new()` by the wrapper below.
+        let run = move || -> Result<(), pw::Error> {
+            // First statement: from here on every exit path hands the
+            // consumer back (see `ConsumerHome`).
+            let home = ConsumerHome {
+                consumer: Some(sample_consumer),
+                home: home_tx,
+            };
             pw::init();
             let mainloop = pw::main_loop::MainLoop::new(None)?;
             let context = pw::context::Context::new(&mainloop)?;
-            let core = context.connect(None)?;
+            let core = match remote {
+                Some(ref name) => context.connect(Some(properties! {
+                    *pw::keys::REMOTE_NAME => name.as_str(),
+                }))?,
+                None => context.connect(None)?,
+            };
 
             // The consumer is owned exclusively by the RT callback's user data.
             // On drop (after the stream is disconnected, so the callback can no
-            // longer run) it is handed back through `consumer_return_tx`.
-            let (consumer_return_tx, consumer_return_rx) = mpsc::channel::<HeapConsumer<f32>>();
-
+            // longer run) the guard sends it home.
             struct UserData {
-                consumer: Option<HeapConsumer<f32>>,
-                consumer_return: mpsc::Sender<HeapConsumer<f32>>,
+                home: ConsumerHome,
                 /// Drain / underrun / flush bookkeeping shared with `PipewireOutput`.
                 monitor: Arc<PlayoutMonitor>,
                 /// Engine-owned pause flag, consumed counter and gain.
@@ -402,17 +474,8 @@ impl PipewireOutput {
                 scratch: Vec<f32>,
             }
 
-            impl Drop for UserData {
-                fn drop(&mut self) {
-                    if let Some(c) = self.consumer.take() {
-                        let _ = self.consumer_return.send(c);
-                    }
-                }
-            }
-
             let user_data = UserData {
-                consumer: Some(sample_consumer),
-                consumer_return: consumer_return_tx,
+                home,
                 monitor: monitor_for_cb,
                 prev_gain: f32::from_bits(shared.gain.load(Ordering::Acquire)),
                 shared,
@@ -447,6 +510,17 @@ impl PipewireOutput {
             // Held alive until the mainloop exits; dropping it would detach the process callback.
             let listener = stream
                 .add_local_listener_with_user_data(user_data)
+                .state_changed(|_, _, old, new| {
+                    // Log only: liveness is decided by the callback heartbeat.
+                    // The user data is deliberately not touched here: it is
+                    // `&mut` on the RT thread in `process`.
+                    match &new {
+                        pw::stream::StreamState::Error(msg) => {
+                            warn!(?old, error = %msg, "pw stream entered error state");
+                        }
+                        _ => info!(?old, ?new, "pw stream state changed"),
+                    }
+                })
                 .process(|stream, user_data| match stream.dequeue_buffer() {
                     None => tracing::warn!("No buffer received"),
                     Some(mut buffer) => {
@@ -472,7 +546,7 @@ impl PipewireOutput {
 
                             // Services any pending flush, pops, and records on the
                             // monitor (paused callbacks are not recorded).
-                            let rendered = match user_data.consumer.as_mut() {
+                            let rendered = match user_data.home.consumer.as_mut() {
                                 Some(consumer) => render(
                                     consumer,
                                     f32_buffer,
@@ -571,20 +645,19 @@ impl PipewireOutput {
                 stream_flags,
                 &mut params,
             )?;
+            // Setup got as far as connecting; whether samples flow is judged
+            // by the callback heartbeat.
+            let _ = ready_tx.try_send(Ok(()));
 
             // Attach command receiver to the mainloop. The stream is shared via Rc.
             // Held alive until the mainloop exits; dropping it would detach the channel listener.
             let stream_for_cmd = stream.clone();
             let mainloop_for_cmd = mainloop.clone();
-            // Main-loop-thread only; filled by Shutdown, answered after the loop exits.
-            let shutdown_reply: Rc<RefCell<Option<mpsc::SyncSender<HeapConsumer<f32>>>>> =
-                Rc::new(RefCell::new(None));
-            let shutdown_reply_for_cmd = shutdown_reply.clone();
             // Set if disconnect failed: the RT callback may still be running.
             let disconnect_failed = Rc::new(Cell::new(false));
             let disconnect_failed_for_cmd = disconnect_failed.clone();
             let cmd_attached = cmd_receiver.attach(mainloop.loop_(), move |cmd| match cmd {
-                StreamCommand::Shutdown(tx) => {
+                StreamCommand::Shutdown => {
                     // Disconnect first: this removes the stream from the data
                     // loop, so the RT callback can no longer run once we drop
                     // its user data (and thus recover the consumer) below.
@@ -592,7 +665,6 @@ impl PipewireOutput {
                         tracing::error!("Shutdown: stream.disconnect() failed: {}", e);
                         disconnect_failed_for_cmd.set(true);
                     }
-                    *shutdown_reply_for_cmd.borrow_mut() = Some(tx);
                     mainloop_for_cmd.quit();
                 }
                 StreamCommand::Flush(done) => {
@@ -613,13 +685,13 @@ impl PipewireOutput {
             mainloop.run();
 
             // Stream is disconnected on Shutdown; dropping the listener drops the
-            // user data, which returns the consumer through the channel.
+            // user data, whose guard sends the consumer home.
             if disconnect_failed.get() {
                 // The callback may still be running; dropping its user data
-                // would be a use-after-free. Leak it and report no consumer
-                // (dropping the reply sender makes `shutdown()` return None).
-                // Also leak everything the callback or the command closure
-                // (which holds stream/mainloop clones) may touch.
+                // would be a use-after-free. Leak it, so no consumer goes home
+                // (`shutdown()` then returns None). Also leak everything the
+                // callback or the command closure (which holds stream/mainloop
+                // clones) may touch.
                 tracing::error!("Shutdown: leaking stream state (disconnect failed)");
                 std::mem::forget(listener);
                 std::mem::forget(cmd_attached);
@@ -627,22 +699,58 @@ impl PipewireOutput {
                 std::mem::forget(core);
                 std::mem::forget(context);
                 std::mem::forget(mainloop);
-                shutdown_reply.borrow_mut().take();
                 return Ok(());
             }
             drop(listener);
-            if let Some(tx) = shutdown_reply.borrow_mut().take() {
-                if let Ok(consumer) = consumer_return_rx.try_recv() {
-                    let _ = tx.send(consumer);
-                }
-            }
             Ok(())
+        };
+        let pw_thread = thread::spawn(move || {
+            let result = run();
+            if let Err(e) = &result {
+                tracing::error!("PipeWire thread failed: {}", e);
+                // No-op if the handshake already succeeded (channel is full).
+                let _ = ready_tx_for_err.try_send(Err(e.to_string()));
+            }
+            result
         });
+
+        match ready_rx.recv_timeout(STARTUP_TIMEOUT) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                // The thread has finished `run`, so its guard already sent the
+                // consumer home.
+                let _ = pw_thread.join();
+                return Err(StartError {
+                    error: crate::AudioOutputError::AudioDevice(format!(
+                        "PipeWire failed to start: {e}"
+                    )),
+                    consumer: home_rx.try_recv().ok(),
+                });
+            }
+            Err(e) => {
+                // Ask the thread to quit once its main loop runs. Not joined:
+                // it may be stuck connecting, and `new()` must not hang too.
+                let _ = cmd_sender.send(StreamCommand::Shutdown);
+                let consumer = home_rx.recv_timeout(STARTUP_TIMEOUT).ok();
+                if consumer.is_none() {
+                    tracing::error!(
+                        "PipeWire thread did not return the mixer consumer after a startup timeout"
+                    );
+                }
+                return Err(StartError {
+                    error: crate::AudioOutputError::AudioDevice(format!(
+                        "PipeWire did not start within {STARTUP_TIMEOUT:?}: {e}"
+                    )),
+                    consumer,
+                });
+            }
+        }
 
         Ok(Self {
             pw_thread: Some(pw_thread),
             command_sender: cmd_sender,
             monitor,
+            home_rx,
         })
     }
 
@@ -724,29 +832,45 @@ impl PipewireOutput {
 
     /// Shut down the PipeWire thread and recover the ring-buffer consumer.
     ///
-    /// Sends `Shutdown` to the PW thread which quits the mainloop and sends the
-    /// `HeapConsumer` back via a rendezvous channel.  Returns `Some(consumer)` on
-    /// success, `None` if the thread does not respond within 1 second.
+    /// Sends `Shutdown` to the PW thread which quits the mainloop; the thread's
+    /// [`ConsumerHome`] guard then sends the `HeapConsumer` back. Returns
+    /// `Some(consumer)` on success, `None` if the thread leaked its state or
+    /// does not respond within 1 second.
     pub fn shutdown(mut self) -> Option<HeapConsumer<f32>> {
-        // We use capacity=1 here so the PW thread can send without blocking even
-        // if we are briefly delayed reaching recv.
-        let (tx, rx) = mpsc::sync_channel::<HeapConsumer<f32>>(1);
-
-        if let Err(e) = self.command_sender.send(StreamCommand::Shutdown(tx)) {
+        if let Err(e) = self.command_sender.send(StreamCommand::Shutdown) {
+            // The thread is gone; its guard may already have sent the consumer.
             tracing::warn!("Failed to send Shutdown to PW thread: {:?}", e);
-            return None;
         }
 
-        let consumer = rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .inspect_err(|e| {
-                tracing::warn!("Timeout waiting for PW thread to shut down: {:?}", e);
-            })
-            .ok();
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        let mut consumer = None;
+        loop {
+            match self.home_rx.recv_timeout(SHUTDOWN_POLL) {
+                Ok(c) => {
+                    consumer = Some(c);
+                    break;
+                }
+                Err(_) => {
+                    let finished = self.pw_thread.as_ref().is_none_or(|t| t.is_finished());
+                    if finished {
+                        // Nothing more can arrive (the guard sends before the
+                        // thread ends); a last look covers the race.
+                        consumer = self.home_rx.try_recv().ok();
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        tracing::warn!("Timeout waiting for PW thread to shut down");
+                        break;
+                    }
+                }
+            }
+        }
 
-        // Join the thread regardless of whether we got the consumer back
+        // Join only a thread that is finishing; a stuck one must not hang us.
         if let Some(handle) = self.pw_thread.take() {
-            let _ = handle.join();
+            if consumer.is_some() || handle.is_finished() {
+                let _ = handle.join();
+            }
         }
 
         consumer
@@ -760,11 +884,9 @@ impl PipewireOutput {
 impl Drop for PipewireOutput {
     fn drop(&mut self) {
         if let Some(handle) = self.pw_thread.take() {
-            // Capacity-1 channel: PW thread can send the consumer even if we
-            // never call recv — but we discard it here because there is nobody
-            // left to hand it back to.
-            let (tx, _rx) = mpsc::sync_channel::<HeapConsumer<f32>>(1);
-            let _ = self.command_sender.send(StreamCommand::Shutdown(tx));
+            // The consumer goes home into `home_rx`, which is dropped with
+            // `self`: there is nobody left to hand it to.
+            let _ = self.command_sender.send(StreamCommand::Shutdown);
             let _ = handle.join();
         }
     }
@@ -799,6 +921,32 @@ mod tests {
 
     fn shared() -> OutputShared {
         OutputShared::new(Arc::new(AtomicBool::new(false)))
+    }
+
+    #[test]
+    fn render_counts_callbacks_while_paused() {
+        let m = PlayoutMonitor::new();
+        let (_p, mut c) = ring_with(10);
+        let s = shared();
+        s.paused.store(true, Ordering::Release);
+        let mut out = [0.0f32; 4];
+        super::render(&mut c, &mut out, &m, &s, &mut 1.0);
+        super::render(&mut c, &mut out, &m, &s, &mut 1.0);
+        assert_eq!(s.callbacks.load(Ordering::Acquire), 2);
+        assert_eq!(s.consumed_total.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn render_counts_callbacks_with_empty_ring() {
+        let m = PlayoutMonitor::new();
+        let (_p, mut c) = ring_with(0);
+        let s = shared();
+        let mut out = [0.0f32; 4];
+        super::render(&mut c, &mut out, &m, &s, &mut 1.0);
+        super::render(&mut c, &mut out, &m, &s, &mut 1.0);
+        super::render(&mut c, &mut out, &m, &s, &mut 1.0);
+        assert_eq!(s.callbacks.load(Ordering::Acquire), 3);
+        assert_eq!(s.consumed_total.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -1246,5 +1394,23 @@ mod tests {
         let paused = AtomicBool::new(true);
         render_unity(&mut c, &mut out, &m, &paused);
         assert!(!m.record(4, 4), "flushed partial fill must not be reported");
+    }
+
+    #[test]
+    fn new_without_daemon_returns_err_with_the_consumer() {
+        let (_p, c) = ring_with(10);
+        let err = PipewireOutput::new_with_remote(
+            c,
+            shared(),
+            44_100,
+            None,
+            Some("mdma-test-no-such-remote"),
+        )
+        .err()
+        .expect("connecting to a missing remote must fail");
+        let consumer = err
+            .consumer
+            .expect("the mixer consumer must come home on a failed start");
+        assert_eq!(consumer.len(), 10, "the ring content is intact");
     }
 }

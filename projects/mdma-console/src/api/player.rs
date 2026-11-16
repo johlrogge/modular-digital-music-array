@@ -7,7 +7,7 @@
 //! Every playback command sent here is queue-level, which the protocol routes to deck A and
 //! which carries no `deck` field yet (ADR-017 phase 1); nothing here targets another deck.
 
-use super::{error_reply, fail, gw, json_or_500, respond, send, Reply};
+use super::{error_reply, fail, gw, json_or_500, resolve_for_playback, respond, send, Reply};
 use crate::play_now::{
     queue_last_commands, queue_next_commands, require_idle, start_command, Busy,
 };
@@ -19,7 +19,7 @@ use axum::{
 };
 use event_protocol::PlaybackEvent;
 use gateway_client::{Command, GatewayClient};
-use media_protocol::{ContentHash, Deck, ResponseData, SourceName};
+use media_protocol::{ContentHash, Deck, OutputHealth, ResponseData, SourceName};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
@@ -88,6 +88,25 @@ pub struct ApiPlayer {
     pub now: Option<String>,
     /// Hashes in Up next, next track first.
     pub queue: Vec<String>,
+    /// Audio output health (`absent|starting|running|stalled`), or null when the node cannot
+    /// say (an old node). Reported next to the transport state, never folded into it (ADR-028).
+    pub output: Option<OutputHealth>,
+}
+
+/// What one read of the player found.
+struct Snapshot {
+    now: Option<ContentHash>,
+    queue: Vec<ContentHash>,
+    output: Option<OutputHealth>,
+}
+
+/// The audio output health. Never fails: an old node, an old gateway or an answer that is not
+/// an `OutputStatus` all read as unknown (null), so the player itself never turns into a 500.
+fn output_of(client: &GatewayClient) -> Option<OutputHealth> {
+    match send(client, &Command::GetOutputStatus) {
+        Ok(Some(ResponseData::OutputStatus(health))) => health,
+        _ => None,
+    }
 }
 
 /// The loaded track. An answer that is not a `NowPlaying` is an error, never "idle": the idle
@@ -162,21 +181,22 @@ fn start_failed_reply(client: &GatewayClient, queued: usize, error: String) -> R
     )
 }
 
-/// The player as `GET /api/player` reports it, for a `NowPlaying`/`QueueList` snapshot.
-fn api_player(
-    transport: &TransportCache,
-    now: Option<ContentHash>,
-    queue: &[ContentHash],
-) -> ApiPlayer {
+/// The player as `GET /api/player` reports it.
+fn api_player(transport: &TransportCache, snapshot: Snapshot) -> ApiPlayer {
     ApiPlayer {
-        state: transport.state_for(now.as_ref()),
-        now: now.map(|h| h.as_str().to_owned()),
-        queue: strings(queue),
+        state: transport.state_for(snapshot.now.as_ref()),
+        now: snapshot.now.map(|h| h.as_str().to_owned()),
+        queue: strings(&snapshot.queue),
+        output: snapshot.output,
     }
 }
 
-fn snapshot(client: &GatewayClient) -> Result<(Option<ContentHash>, Vec<ContentHash>), String> {
-    Ok((now_of(client)?, queue_of(client)?))
+fn snapshot(client: &GatewayClient) -> Result<Snapshot, String> {
+    Ok(Snapshot {
+        now: now_of(client)?,
+        queue: queue_of(client)?,
+        output: output_of(client),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,10 +212,18 @@ fn parse_hashes(hashes: Vec<String>) -> Result<Vec<ContentHash>, Response> {
     Ok(hashes.into_iter().map(ContentHash::new).collect())
 }
 
-/// `GET /api/player`: `{state, now, queue}`.
+/// The full form of every hash, resolved before anything is sent to playback (ADR-026). Through
+/// the same resolver as the old UI's handlers; canonical hashes cost no lookup. A failure is the
+/// whole reply: 422 naming the hash, or 503 when the library cannot be reached.
+fn full_hashes(client: &GatewayClient, hashes: &[ContentHash]) -> Result<Vec<ContentHash>, Reply> {
+    resolve_for_playback(client, hashes)
+        .map(|full| full.into_iter().map(ContentHash::from).collect())
+}
+
+/// `GET /api/player`: `{state, now, queue, output}`.
 pub async fn player(State(state): State<Arc<AppState>>) -> Response {
     let read = gw(&state, snapshot).await;
-    json_or_500(read.map(|r| r.map(|(now, queue)| api_player(&state.transport, now, &queue))))
+    json_or_500(read.map(|r| r.map(|snap| api_player(&state.transport, snap))))
 }
 
 /// `POST /api/pause`: pause deck A, then answer like `GET /api/player`. The console remembers
@@ -207,11 +235,11 @@ pub async fn pause(State(state): State<Arc<AppState>>) -> Response {
     })
     .await;
     json_or_500(read.map(|r| {
-        r.map(|(now, queue)| {
-            if let Some(hash) = &now {
+        r.map(|snap| {
+            if let Some(hash) = &snap.now {
                 state.transport.mark_paused(hash);
             }
-            api_player(&state.transport, now, &queue)
+            api_player(&state.transport, snap)
         })
     }))
 }
@@ -224,9 +252,9 @@ pub async fn resume(State(state): State<Arc<AppState>>) -> Response {
     })
     .await;
     json_or_500(read.map(|r| {
-        r.map(|(now, queue)| {
+        r.map(|snap| {
             state.transport.clear();
-            api_player(&state.transport, now, &queue)
+            api_player(&state.transport, snap)
         })
     }))
 }
@@ -241,8 +269,9 @@ pub async fn queue_next(
         Err(response) => return response,
     };
     respond(
-        gw(&state, move |client| {
-            run_batch(client, &queue_next_commands(&hashes))
+        gw(&state, move |client| match full_hashes(client, &hashes) {
+            Ok(full) => run_batch(client, &queue_next_commands(&full)),
+            Err(reply) => reply,
         })
         .await,
     )
@@ -258,8 +287,9 @@ pub async fn queue_last(
         Err(response) => return response,
     };
     respond(
-        gw(&state, move |client| {
-            run_batch(client, &queue_last_commands(&hashes))
+        gw(&state, move |client| match full_hashes(client, &hashes) {
+            Ok(full) => run_batch(client, &queue_last_commands(&full)),
+            Err(reply) => reply,
         })
         .await,
     )
@@ -294,6 +324,10 @@ pub async fn play_now(
             if require_idle(now).is_err() {
                 return busy_reply();
             }
+            let hashes = match full_hashes(client, &hashes) {
+                Ok(full) => full,
+                Err(reply) => return reply,
+            };
             let (queued, failure) = send_all(client, &queue_next_commands(&hashes));
             if failure.is_some() {
                 return batch_reply(client, queued, failure);
@@ -363,11 +397,11 @@ pub async fn queue_edit(
                     serde_json::json!({ "error": "stale", "queue": current }),
                 );
             }
-            let entries = req
-                .queue
-                .into_iter()
-                .map(|h| (ContentHash::new(h), SourceName::audio()))
-                .collect();
+            let requested: Vec<ContentHash> = req.queue.into_iter().map(ContentHash::new).collect();
+            let entries = match full_hashes(client, &requested) {
+                Ok(full) => full.into_iter().map(|h| (h, SourceName::audio())).collect(),
+                Err(reply) => return reply,
+            };
             if let Err(message) = send(client, &Command::QueueReplace { entries }) {
                 return error_reply(StatusCode::INTERNAL_SERVER_ERROR, message);
             }
@@ -388,18 +422,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn player_json_has_exactly_state_now_queue() {
+    fn player_json_has_exactly_state_now_queue_output() {
         let p = ApiPlayer {
             state: PlayerState::Paused,
             now: Some("sha256:a".into()),
             queue: vec!["sha256:b".into()],
+            output: Some(OutputHealth::Running),
         };
         let json = serde_json::to_value(&p).unwrap();
         let mut keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
         keys.sort();
-        assert_eq!(keys, ["now", "queue", "state"]);
+        assert_eq!(keys, ["now", "output", "queue", "state"]);
         assert_eq!(json["state"], "paused");
         assert_eq!(json["queue"][0], "sha256:b");
+        assert_eq!(json["output"], "running");
     }
 
     #[test]
@@ -408,6 +444,7 @@ mod tests {
             state: PlayerState::Idle,
             now: None,
             queue: vec![],
+            output: None,
         };
         let json = serde_json::to_value(&p).unwrap();
         assert!(json["now"].is_null());
@@ -475,17 +512,58 @@ mod tests {
 
     use crate::test_support::{
         body_json, described, playback_err, playback_ok, send_get, send_post_json, test_app_with,
-        FakeGateway,
+        track_not_found, track_ok, FakeGateway,
     };
-    use gateway_client::{GatewayRequest, GatewayResponse};
+    use gateway_client::{GatewayRequest, GatewayResponse, LibraryRequest};
     use serde_json::json;
 
+    // Playback holds only full hashes, so the handlers are given full ones.
+    const A: &str = concat!(
+        "sha256:",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    const B: &str = concat!(
+        "sha256:",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    );
+    const C: &str = concat!(
+        "sha256:",
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    );
+    const X: &str = concat!(
+        "sha256:",
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    );
+    /// A prefix the fake library resolves to `A`.
+    const SHORT_A: &str = "sha256:aaaa";
+
+    #[test]
+    fn the_test_hashes_are_canonical() {
+        for h in [A, B, C, X] {
+            assert!(
+                library_ipc_client::CanonicalHash::try_from(ContentHash::new(h)).is_ok(),
+                "{h}"
+            );
+        }
+    }
+
     /// A playback service with `now` loaded and `queue` queued; everything else succeeds, except
-    /// commands for which `fails` returns true.
+    /// commands for which `fails` returns true. Its library knows `SHORT_A` (it is `A`) and
+    /// nothing else; the output answers unknown.
     fn playback_script(
         now: Option<&'static str>,
         queue: &'static [&'static str],
         fails: fn(&Command) -> bool,
+    ) -> FakeGateway {
+        playback_script_with_output(now, queue, fails, None)
+    }
+
+    /// As `playback_script`, with `GetOutputStatus` answering `output`.
+    fn playback_script_with_output(
+        now: Option<&'static str>,
+        queue: &'static [&'static str],
+        fails: fn(&Command) -> bool,
+        output: Option<OutputHealth>,
     ) -> FakeGateway {
         FakeGateway::start(move |req| match req {
             GatewayRequest::Playback { request } if fails(request) => playback_err("boom"),
@@ -497,7 +575,16 @@ mod tests {
             } => playback_ok(Some(ResponseData::Queue(
                 queue.iter().map(|h| hash(h)).collect(),
             ))),
+            GatewayRequest::Playback {
+                request: Command::GetOutputStatus,
+            } => playback_ok(Some(ResponseData::OutputStatus(output))),
             GatewayRequest::Playback { .. } => playback_ok(None),
+            GatewayRequest::Library {
+                request: LibraryRequest::GetTrack { hash },
+            } if hash.as_str() == SHORT_A => track_ok(A),
+            GatewayRequest::Library {
+                request: LibraryRequest::GetTrack { hash },
+            } => track_not_found(hash.as_str()),
             other => GatewayResponse::Error {
                 message: format!("unexpected {other:?}"),
             },
@@ -510,11 +597,11 @@ mod tests {
 
     #[tokio::test]
     async fn play_now_while_something_is_loaded_is_409_and_sends_nothing_else() {
-        let gw = playback_script(Some("sha256:x"), &[], never);
+        let gw = playback_script(Some(X), &[], never);
         let res = crate::test_support::send_post_json(
             test_app_with(gw.addr()),
             "/api/play-now",
-            &json!({"hashes": ["a", "b"]}),
+            &json!({"hashes": [A, B]}),
         )
         .await;
         assert_eq!(res.status(), StatusCode::CONFLICT);
@@ -524,7 +611,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_while_something_is_loaded_is_409_and_sends_nothing_else() {
-        let gw = playback_script(Some("sha256:x"), &["sha256:q"], never);
+        let gw = playback_script(Some(X), &[A], never);
         let res = send_post_json(test_app_with(gw.addr()), "/api/start", &json!({})).await;
         assert_eq!(res.status(), StatusCode::CONFLICT);
         assert_eq!(body_json(res).await, json!({"error": "busy"}));
@@ -541,24 +628,24 @@ mod tests {
 
     #[tokio::test]
     async fn play_now_when_idle_queues_the_set_in_order_then_plays() {
-        let gw = playback_script(None, &["sha256:a", "sha256:b", "sha256:c"], never);
+        let gw = playback_script(None, &[A, B, C], never);
         let res = send_post_json(
             test_app_with(gw.addr()),
             "/api/play-now",
-            &json!({"hashes": ["sha256:a", "sha256:b", "sha256:c"]}),
+            &json!({"hashes": [A, B, C]}),
         )
         .await;
         assert_eq!(res.status(), StatusCode::OK);
         let body = body_json(res).await;
-        assert_eq!(body["queue"], json!(["sha256:a", "sha256:b", "sha256:c"]));
+        assert_eq!(body["queue"], json!([A, B, C]));
         assert_eq!(body["queued"], 3);
         assert_eq!(
             described(&gw),
             [
                 "now",
-                "next sha256:c",
-                "next sha256:b",
-                "next sha256:a",
+                &format!("next {C}"),
+                &format!("next {B}"),
+                &format!("next {A}"),
                 "now",
                 "play",
                 "list"
@@ -574,53 +661,53 @@ mod tests {
                 request: Command::NowPlaying,
             } => {
                 nows += 1;
-                let now = (nows > 1).then(|| hash("sha256:x"));
+                let now = (nows > 1).then(|| hash(X));
                 playback_ok(Some(ResponseData::NowPlaying(now)))
             }
             GatewayRequest::Playback {
                 request: Command::QueueList,
-            } => playback_ok(Some(ResponseData::Queue(vec![hash("sha256:a")]))),
+            } => playback_ok(Some(ResponseData::Queue(vec![hash(A)]))),
             _ => playback_ok(None),
         });
         let res = send_post_json(
             test_app_with(gw.addr()),
             "/api/play-now",
-            &json!({"hashes": ["sha256:a"]}),
+            &json!({"hashes": [A]}),
         )
         .await;
         assert_eq!(res.status(), StatusCode::CONFLICT);
         assert_eq!(
             body_json(res).await,
-            json!({"error": "busy", "queued": 1, "queue": ["sha256:a"]})
+            json!({"error": "busy", "queued": 1, "queue": [A]})
         );
-        assert_eq!(described(&gw), ["now", "next sha256:a", "now", "list"]);
+        assert_eq!(described(&gw), ["now", &format!("next {A}"), "now", "list"]);
     }
 
     #[tokio::test]
     async fn play_now_whose_start_fails_says_so_with_what_was_queued() {
-        let gw = playback_script(None, &["sha256:a"], |c| matches!(c, Command::PlayQueue));
+        let gw = playback_script(None, &[A], |c| matches!(c, Command::PlayQueue));
         let res = send_post_json(
             test_app_with(gw.addr()),
             "/api/play-now",
-            &json!({"hashes": ["sha256:a"]}),
+            &json!({"hashes": [A]}),
         )
         .await;
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
             body_json(res).await,
-            json!({"error": "boom", "queued": 1, "stage": "start", "queue": ["sha256:a"]})
+            json!({"error": "boom", "queued": 1, "stage": "start", "queue": [A]})
         );
     }
 
     #[tokio::test]
     async fn pause_on_a_cold_console_is_remembered_as_paused() {
-        let gw = playback_script(Some("sha256:x"), &["sha256:a"], never);
+        let gw = playback_script(Some(X), &[A], never);
         let app = test_app_with(gw.addr());
         let res = send_post_json(app.clone(), "/api/pause", &json!({})).await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(
             body_json(res).await,
-            json!({"state": "paused", "now": "sha256:x", "queue": ["sha256:a"]})
+            json!({"state": "paused", "now": X, "queue": [A], "output": null})
         );
         let res = send_get(app, "/api/player", None).await;
         assert_eq!(body_json(res).await["state"], "paused");
@@ -632,7 +719,7 @@ mod tests {
 
     #[tokio::test]
     async fn resume_clears_the_pause() {
-        let gw = playback_script(Some("sha256:x"), &[], never);
+        let gw = playback_script(Some(X), &[], never);
         let app = test_app_with(gw.addr());
         send_post_json(app.clone(), "/api/pause", &json!({})).await;
         let res = send_post_json(app.clone(), "/api/resume", &json!({})).await;
@@ -648,9 +735,7 @@ mod tests {
 
     #[tokio::test]
     async fn pause_failure_is_500_and_leaves_the_cache_alone() {
-        let gw = playback_script(Some("sha256:x"), &[], |c| {
-            matches!(c, Command::Pause { .. })
-        });
+        let gw = playback_script(Some(X), &[], |c| matches!(c, Command::Pause { .. }));
         let app = test_app_with(gw.addr());
         let res = send_post_json(app.clone(), "/api/pause", &json!({})).await;
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -660,7 +745,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_when_idle_sends_play_queue() {
-        let gw = playback_script(None, &["sha256:a"], never);
+        let gw = playback_script(None, &[A], never);
         let res = send_post_json(test_app_with(gw.addr()), "/api/start", &json!({})).await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(described(&gw), ["now", "play", "list"]);
@@ -668,17 +753,87 @@ mod tests {
 
     #[tokio::test]
     async fn queue_next_sends_the_set_in_reverse() {
-        let gw = playback_script(Some("sha256:x"), &["sha256:a", "sha256:b"], never);
+        let gw = playback_script(Some(X), &[A, B], never);
         let res = send_post_json(
             test_app_with(gw.addr()),
             "/api/queue/next",
-            &json!({"hashes": ["sha256:a", "sha256:b"]}),
+            &json!({"hashes": [A, B]}),
         )
         .await;
         assert_eq!(res.status(), StatusCode::OK);
         let body = body_json(res).await;
-        assert_eq!(body["queue"], json!(["sha256:a", "sha256:b"]));
-        assert_eq!(described(&gw), ["next sha256:b", "next sha256:a", "list"]);
+        assert_eq!(body["queue"], json!([A, B]));
+        assert_eq!(
+            described(&gw),
+            [&format!("next {B}"), &format!("next {A}"), "list"]
+        );
+        // Full hashes cost no library lookup.
+        assert!(gw
+            .requests()
+            .iter()
+            .all(|r| matches!(r, GatewayRequest::Playback { .. })));
+    }
+
+    #[tokio::test]
+    async fn queue_next_resolves_a_short_hash_and_sends_the_full_one() {
+        let gw = playback_script(Some(X), &[A], never);
+        let res = send_post_json(
+            test_app_with(gw.addr()),
+            "/api/queue/next",
+            &json!({"hashes": [SHORT_A]}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(described(&gw), [&format!("next {A}"), "list"]);
+    }
+
+    #[tokio::test]
+    async fn queue_last_and_play_now_resolve_short_hashes_too() {
+        let gw = playback_script(None, &[A], never);
+        let res = send_post_json(
+            test_app_with(gw.addr()),
+            "/api/queue/last",
+            &json!({"hashes": [SHORT_A]}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = send_post_json(
+            test_app_with(gw.addr()),
+            "/api/play-now",
+            &json!({"hashes": [SHORT_A]}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let sent: Vec<String> = described(&gw)
+            .into_iter()
+            .filter(|c| c.starts_with("append") || c.starts_with("next"))
+            .collect();
+        assert_eq!(sent, [format!("append {A}"), format!("next {A}")]);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_hash_is_422_naming_it_and_nothing_is_sent() {
+        let gw = playback_script(None, &[], never);
+        // The first hash is fine; the second is unknown: the whole set is refused unsent.
+        for path in ["/api/queue/next", "/api/queue/last", "/api/play-now"] {
+            let res = send_post_json(
+                test_app_with(gw.addr()),
+                path,
+                &json!({"hashes": [A, "sha256:dead"]}),
+            )
+            .await;
+            assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY, "{path}");
+            let body = body_json(res).await;
+            assert!(
+                body["error"].as_str().unwrap().contains("sha256:dead"),
+                "{path}: {body}"
+            );
+        }
+        // Nothing reached playback beyond play-now's idle check.
+        assert!(gw
+            .commands()
+            .iter()
+            .all(|c| matches!(c, Command::NowPlaying)));
     }
 
     #[tokio::test]
@@ -686,21 +841,24 @@ mod tests {
         // Reverse order a, b, c is sent c, b, a; b fails, so only c got in.
         let gw = playback_script(
             None,
-            &["sha256:c"],
-            |c| matches!(c, Command::QueueNext { hash, .. } if hash.as_str() == "sha256:b"),
+            &[C],
+            |c| matches!(c, Command::QueueNext { hash, .. } if hash.as_str() == B),
         );
         let res = send_post_json(
             test_app_with(gw.addr()),
             "/api/queue/next",
-            &json!({"hashes": ["sha256:a", "sha256:b", "sha256:c"]}),
+            &json!({"hashes": [A, B, C]}),
         )
         .await;
         assert_eq!(res.status(), StatusCode::MULTI_STATUS);
         let body = body_json(res).await;
         assert_eq!(body["queued"], 1);
         assert_eq!(body["error"], "boom");
-        assert_eq!(body["queue"], json!(["sha256:c"]));
-        assert_eq!(described(&gw), ["next sha256:c", "next sha256:b", "list"]);
+        assert_eq!(body["queue"], json!([C]));
+        assert_eq!(
+            described(&gw),
+            [&format!("next {C}"), &format!("next {B}"), "list"]
+        );
     }
 
     #[tokio::test]
@@ -709,7 +867,7 @@ mod tests {
         let res = send_post_json(
             test_app_with(gw.addr()),
             "/api/queue/next",
-            &json!({"hashes": ["sha256:a"]}),
+            &json!({"hashes": [A]}),
         )
         .await;
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -718,17 +876,17 @@ mod tests {
 
     #[tokio::test]
     async fn queue_last_appends_in_order() {
-        let gw = playback_script(Some("sha256:x"), &["sha256:a", "sha256:b"], never);
+        let gw = playback_script(Some(X), &[A, B], never);
         let res = send_post_json(
             test_app_with(gw.addr()),
             "/api/queue/last",
-            &json!({"hashes": ["sha256:a", "sha256:b"]}),
+            &json!({"hashes": [A, B]}),
         )
         .await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(
             described(&gw),
-            ["append sha256:a", "append sha256:b", "list"]
+            [&format!("append {A}"), &format!("append {B}"), "list"]
         );
     }
 
@@ -744,48 +902,110 @@ mod tests {
 
     #[tokio::test]
     async fn queue_edit_with_a_stale_expectation_is_409_and_replaces_nothing() {
-        let gw = playback_script(Some("sha256:x"), &["sha256:b"], never);
+        let gw = playback_script(Some(X), &[B], never);
         let res = send_post_json(
             test_app_with(gw.addr()),
             "/api/queue/edit",
-            &json!({"expect": ["sha256:a", "sha256:b"], "queue": ["sha256:b", "sha256:a"]}),
+            &json!({"expect": [A, B], "queue": [B, A]}),
         )
         .await;
         assert_eq!(res.status(), StatusCode::CONFLICT);
-        assert_eq!(body_json(res).await["queue"], json!(["sha256:b"]));
+        assert_eq!(body_json(res).await["queue"], json!([B]));
         assert_eq!(described(&gw), ["list"]);
     }
 
     #[tokio::test]
     async fn queue_edit_with_a_matching_expectation_replaces_the_queue() {
-        let gw = playback_script(Some("sha256:x"), &["sha256:a", "sha256:b"], never);
+        let gw = playback_script(Some(X), &[A, B], never);
         let res = send_post_json(
             test_app_with(gw.addr()),
             "/api/queue/edit",
-            &json!({"expect": ["sha256:a", "sha256:b"], "queue": ["sha256:b"]}),
+            &json!({"expect": [A, B], "queue": [B]}),
         )
         .await;
         assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(described(&gw), ["list", "replace sha256:b", "list"],);
+        assert_eq!(described(&gw), ["list", &format!("replace {B}"), "list"]);
         assert!(body_json(res).await["queue"].is_array());
     }
 
     #[tokio::test]
+    async fn queue_edit_resolves_a_short_hash() {
+        let gw = playback_script(Some(X), &[B], never);
+        let res = send_post_json(
+            test_app_with(gw.addr()),
+            "/api/queue/edit",
+            &json!({"expect": [B], "queue": [SHORT_A, B]}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            described(&gw),
+            ["list", &format!("replace {A},{B}"), "list"]
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_edit_with_an_unknown_hash_is_422_and_replaces_nothing() {
+        let gw = playback_script(Some(X), &[B], never);
+        let res = send_post_json(
+            test_app_with(gw.addr()),
+            "/api/queue/edit",
+            &json!({"expect": [B], "queue": [B, "sha256:dead"]}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body_json(res).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("sha256:dead"));
+        assert_eq!(described(&gw), ["list"]);
+    }
+
+    #[tokio::test]
     async fn player_reports_state_now_and_queue() {
-        let gw = playback_script(Some("sha256:x"), &["sha256:a"], never);
+        let gw = playback_script(Some(X), &[A], never);
         let res = send_get(test_app_with(gw.addr()), "/api/player", None).await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(
             body_json(res).await,
-            json!({"state": "playing", "now": "sha256:x", "queue": ["sha256:a"]})
+            json!({"state": "playing", "now": X, "queue": [A], "output": null})
         );
 
         let idle = playback_script(None, &[], never);
         let res = send_get(test_app_with(idle.addr()), "/api/player", None).await;
         assert_eq!(
             body_json(res).await,
-            json!({"state": "idle", "now": null, "queue": []})
+            json!({"state": "idle", "now": null, "queue": [], "output": null})
         );
+    }
+
+    #[tokio::test]
+    async fn player_reports_output_from_get_output_status() {
+        let gw = playback_script_with_output(Some(X), &[], never, Some(OutputHealth::Stalled));
+        let res = send_get(test_app_with(gw.addr()), "/api/player", None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await["output"], "stalled");
+    }
+
+    #[tokio::test]
+    async fn player_on_an_old_node_has_null_output() {
+        // An old node answers the unknown command with an error: still a 200.
+        let gw = playback_script(Some(X), &[A], |c| matches!(c, Command::GetOutputStatus));
+        let res = send_get(test_app_with(gw.addr()), "/api/player", None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert!(body["output"].is_null());
+        assert_eq!(body["now"], X);
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_replies_carry_the_output() {
+        let gw = playback_script_with_output(Some(X), &[], never, Some(OutputHealth::Running));
+        let app = test_app_with(gw.addr());
+        for path in ["/api/pause", "/api/resume"] {
+            let res = send_post_json(app.clone(), path, &json!({})).await;
+            assert_eq!(body_json(res).await["output"], "running", "{path}");
+        }
     }
 
     #[tokio::test]

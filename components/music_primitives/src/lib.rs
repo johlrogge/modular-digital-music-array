@@ -9,7 +9,8 @@ mod track_role;
 
 pub use audio_hash::{AudioHash, AudioHashParseError};
 pub use bpm::{Bpm, BpmError};
-pub use content_hash::ContentHash;
+// ContentHash is any form of hash; CanonicalHash only the full one.
+pub use content_hash::{CanonicalHash, ContentHash, NotCanonical};
 pub use energy_level::{EnergyLevel, EnergyLevelError};
 pub use key::{Key, KeyError, Mode, PitchClass};
 pub use pcm_hash::PcmHash;
