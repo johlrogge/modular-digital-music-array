@@ -88,29 +88,34 @@ pub fn library_ok(response: gateway_client::LibraryResponse) -> GatewayResponse 
     GatewayResponse::Library { response }
 }
 
+/// A track with `hash` and nothing else set.
+pub fn bare_track(hash: &str) -> library_ipc_client::TrackInfo {
+    library_ipc_client::TrackInfo {
+        content_hash: media_protocol::ContentHash::new(hash),
+        title: None,
+        artist: None,
+        album: None,
+        duration: None,
+        bpm: None,
+        key: None,
+        blob_path: None,
+        cover_art_path: None,
+        track_number: None,
+        disc_number: None,
+        added: None,
+        started: None,
+        stopped: None,
+        memory_cues: vec![],
+        beat_grid: None,
+        role: None,
+        energy: None,
+    }
+}
+
 /// A library answer to `GetTrack`: a track whose full hash is `full`.
 pub fn track_ok(full: &str) -> GatewayResponse {
     library_ok(gateway_client::LibraryResponse::Track(Box::new(
-        library_ipc_client::TrackInfo {
-            content_hash: media_protocol::ContentHash::new(full),
-            title: None,
-            artist: None,
-            album: None,
-            duration: None,
-            bpm: None,
-            key: None,
-            blob_path: None,
-            cover_art_path: None,
-            track_number: None,
-            disc_number: None,
-            added: None,
-            started: None,
-            stopped: None,
-            memory_cues: vec![],
-            beat_grid: None,
-            role: None,
-            energy: None,
-        },
+        bare_track(full),
     )))
 }
 

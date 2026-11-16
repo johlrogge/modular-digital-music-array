@@ -10,7 +10,7 @@ use axum::{
 use gateway_client::Response as PlaybackResponse;
 use gateway_client::{Command, GatewayClient, LibraryRequest, LibraryResponse};
 use library_ipc_client::{CanonicalHash, ContentHash};
-use media_protocol::ResponseData;
+use media_protocol::{ResponseData, SourceName};
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -126,6 +126,14 @@ pub fn resolve_for_playback(
             };
             error_reply(status, e.to_string())
         })
+}
+
+/// Queue entries for resolved `hashes`, all from the audio source.
+pub fn queue_entries(hashes: Vec<CanonicalHash>) -> Vec<(ContentHash, SourceName)> {
+    hashes
+        .into_iter()
+        .map(|h| (h.into(), SourceName::audio()))
+        .collect()
 }
 
 /// One library request; a library error answer is folded into `Err`.

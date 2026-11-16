@@ -243,31 +243,8 @@ impl From<&TrackInfo> for ApiTrack {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use library_ipc_client::ContentHash;
+    use crate::test_support::bare_track as bare;
     use library_ipc_client::{Bpm, DurationSeconds, Key};
-
-    fn bare(hash: &str) -> TrackInfo {
-        TrackInfo {
-            content_hash: ContentHash::new(hash),
-            title: None,
-            artist: None,
-            album: None,
-            duration: None,
-            bpm: None,
-            key: None,
-            blob_path: None,
-            cover_art_path: None,
-            track_number: None,
-            disc_number: None,
-            added: None,
-            started: None,
-            stopped: None,
-            memory_cues: vec![],
-            beat_grid: None,
-            role: None,
-            energy: None,
-        }
-    }
 
     fn keys(v: &serde_json::Value) -> Vec<String> {
         let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();

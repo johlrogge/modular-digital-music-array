@@ -343,7 +343,7 @@ export async function loadPlaylists() {
   }
 }
 
-/** Fetch { state, now, queue } into store.player. Fires "player" and/or "queue". */
+/** Fetch { state, now, queue, output } into store.player. Fires "player" and/or "queue". */
 export async function refreshPlayer() {
   try {
     applyPlayer(await api("/api/player"));

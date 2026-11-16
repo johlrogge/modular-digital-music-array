@@ -2,12 +2,13 @@
 //!
 //! `ApiPlayer` is the shape of `GET /api/player` and the `{queue}` every `/api/queue/*`
 //! mutation returns. `static/js/core.js` reads exactly these keys.
-
 //!
 //! Every playback command sent here is queue-level, which the protocol routes to deck A and
 //! which carries no `deck` field yet (ADR-017 phase 1); nothing here targets another deck.
 
-use super::{error_reply, fail, gw, json_or_500, resolve_for_playback, respond, send, Reply};
+use super::{
+    error_reply, fail, gw, json_or_500, queue_entries, resolve_for_playback, respond, send, Reply,
+};
 use crate::play_now::{
     queue_last_commands, queue_next_commands, require_idle, start_command, Busy,
 };
@@ -19,7 +20,7 @@ use axum::{
 };
 use event_protocol::PlaybackEvent;
 use gateway_client::{Command, GatewayClient};
-use media_protocol::{ContentHash, Deck, OutputHealth, ResponseData, SourceName};
+use media_protocol::{ContentHash, Deck, OutputHealth, ResponseData};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
@@ -212,14 +213,6 @@ fn parse_hashes(hashes: Vec<String>) -> Result<Vec<ContentHash>, Response> {
     Ok(hashes.into_iter().map(ContentHash::new).collect())
 }
 
-/// The full form of every hash, resolved before anything is sent to playback (ADR-026). Through
-/// the same resolver as the old UI's handlers; canonical hashes cost no lookup. A failure is the
-/// whole reply: 422 naming the hash, or 503 when the library cannot be reached.
-fn full_hashes(client: &GatewayClient, hashes: &[ContentHash]) -> Result<Vec<ContentHash>, Reply> {
-    resolve_for_playback(client, hashes)
-        .map(|full| full.into_iter().map(ContentHash::from).collect())
-}
-
 /// `GET /api/player`: `{state, now, queue, output}`.
 pub async fn player(State(state): State<Arc<AppState>>) -> Response {
     let read = gw(&state, snapshot).await;
@@ -260,6 +253,7 @@ pub async fn resume(State(state): State<Arc<AppState>>) -> Response {
 }
 
 /// `POST /api/queue/next {hashes}`: the set goes to the front of Up next, in the order given.
+/// 422/503 when a hash can't be resolved (nothing sent).
 pub async fn queue_next(
     State(state): State<Arc<AppState>>,
     Json(req): Json<HashesRequest>,
@@ -269,15 +263,18 @@ pub async fn queue_next(
         Err(response) => return response,
     };
     respond(
-        gw(&state, move |client| match full_hashes(client, &hashes) {
-            Ok(full) => run_batch(client, &queue_next_commands(&full)),
-            Err(reply) => reply,
+        gw(&state, move |client| {
+            match resolve_for_playback(client, &hashes) {
+                Ok(full) => run_batch(client, &queue_next_commands(&full)),
+                Err(reply) => reply,
+            }
         })
         .await,
     )
 }
 
 /// `POST /api/queue/last {hashes}`: the set goes to the end of Up next, in the order given.
+/// 422/503 when a hash can't be resolved (nothing sent).
 pub async fn queue_last(
     State(state): State<Arc<AppState>>,
     Json(req): Json<HashesRequest>,
@@ -287,9 +284,11 @@ pub async fn queue_last(
         Err(response) => return response,
     };
     respond(
-        gw(&state, move |client| match full_hashes(client, &hashes) {
-            Ok(full) => run_batch(client, &queue_last_commands(&full)),
-            Err(reply) => reply,
+        gw(&state, move |client| {
+            match resolve_for_playback(client, &hashes) {
+                Ok(full) => run_batch(client, &queue_last_commands(&full)),
+                Err(reply) => reply,
+            }
         })
         .await,
     )
@@ -306,7 +305,8 @@ fn busy_reply() -> Reply {
 /// Replies: 200 `{queued, queue}`; 409 `{error: "busy"}` (nothing sent) or 409
 /// `{error: "busy", queued, queue}` (became busy after queueing, so not started); 207/500 as
 /// for `/api/queue/next` when queueing fails; 500 `{error, queued, stage: "start", queue}` when
-/// everything was queued but the start failed.
+/// everything was queued but the start failed; 422/503 when a hash can't be resolved (nothing
+/// sent). The busy check comes first, so a busy player answers 409 before any lookup.
 pub async fn play_now(
     State(state): State<Arc<AppState>>,
     Json(req): Json<HashesRequest>,
@@ -324,7 +324,7 @@ pub async fn play_now(
             if require_idle(now).is_err() {
                 return busy_reply();
             }
-            let hashes = match full_hashes(client, &hashes) {
+            let hashes = match resolve_for_playback(client, &hashes) {
                 Ok(full) => full,
                 Err(reply) => return reply,
             };
@@ -398,8 +398,8 @@ pub async fn queue_edit(
                 );
             }
             let requested: Vec<ContentHash> = req.queue.into_iter().map(ContentHash::new).collect();
-            let entries = match full_hashes(client, &requested) {
-                Ok(full) => full.into_iter().map(|h| (h, SourceName::audio())).collect(),
+            let entries = match resolve_for_playback(client, &requested) {
+                Ok(full) => queue_entries(full),
                 Err(reply) => return reply,
             };
             if let Err(message) = send(client, &Command::QueueReplace { entries }) {
@@ -813,13 +813,19 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_hash_is_422_naming_it_and_nothing_is_sent() {
-        let gw = playback_script(None, &[], never);
-        // The first hash is fine; the second is unknown: the whole set is refused unsent.
-        for path in ["/api/queue/next", "/api/queue/last", "/api/play-now"] {
+        // The unknown hash sits in the middle, so every route (including the reversed ones)
+        // would have sent a resolved neighbour before reaching it if it did not resolve first.
+        for (path, playback) in [
+            ("/api/queue/next", vec![]),
+            ("/api/queue/last", vec![]),
+            // Play-now's idle guard is the only playback command.
+            ("/api/play-now", vec!["now"]),
+        ] {
+            let gw = playback_script(None, &[], never);
             let res = send_post_json(
                 test_app_with(gw.addr()),
                 path,
-                &json!({"hashes": [A, "sha256:dead"]}),
+                &json!({"hashes": [A, "sha256:dead", B]}),
             )
             .await;
             assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY, "{path}");
@@ -828,12 +834,42 @@ mod tests {
                 body["error"].as_str().unwrap().contains("sha256:dead"),
                 "{path}: {body}"
             );
+            assert_eq!(described(&gw), playback, "{path}");
         }
-        // Nothing reached playback beyond play-now's idle check.
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_library_is_503_on_an_api_route_and_nothing_is_sent() {
+        let gw = FakeGateway::start(|req| match req {
+            GatewayRequest::Library { .. } => GatewayResponse::Error {
+                message: "library unavailable".into(),
+            },
+            _ => playback_ok(None),
+        });
+        let res = send_post_json(
+            test_app_with(gw.addr()),
+            "/api/queue/next",
+            &json!({"hashes": [SHORT_A]}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(gw.commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn play_now_on_a_busy_player_is_409_before_any_hash_is_resolved() {
+        let gw = playback_script(Some(X), &[], never);
+        let res = send_post_json(
+            test_app_with(gw.addr()),
+            "/api/play-now",
+            &json!({"hashes": [SHORT_A]}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
         assert!(gw
-            .commands()
+            .requests()
             .iter()
-            .all(|c| matches!(c, Command::NowPlaying)));
+            .all(|r| !matches!(r, GatewayRequest::Library { .. })));
     }
 
     #[tokio::test]

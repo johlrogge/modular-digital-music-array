@@ -1076,7 +1076,7 @@ async fn player_queue_replace(
     };
     let requested: Vec<ContentHash> = req.hashes.into_iter().map(ContentHash::new).collect();
     let entries = match resolve_for_playback(&client, &requested) {
-        Ok(hashes) => queue_entries(hashes),
+        Ok(hashes) => api::queue_entries(hashes),
         Err(e) => return e,
     };
 
@@ -1512,18 +1512,10 @@ async fn library_playlist_queue_replace_handler(
     };
     // Playlist lines carry short hashes: resolve them before playback sees them.
     let entries = match resolve_for_playback(&client, &hashes) {
-        Ok(hashes) => queue_entries(hashes),
+        Ok(hashes) => api::queue_entries(hashes),
         Err(e) => return e,
     };
     playback_success_or_error(&client, &Command::QueueReplace { entries })
-}
-
-/// Queue entries for `hashes`, all from the audio source.
-fn queue_entries(hashes: Vec<library_ipc_client::CanonicalHash>) -> Vec<(ContentHash, SourceName)> {
-    hashes
-        .into_iter()
-        .map(|h| (h.into(), SourceName::audio()))
-        .collect()
 }
 
 // =============================================================================
@@ -2363,6 +2355,7 @@ async fn cover_art(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{library_ok, playback_ok, track_not_found, track_ok, FakeGateway};
     use library_ipc_client::{Bpm, ContentHash, DurationSeconds, Key};
     use pretty_assertions::assert_eq;
     use source_protocol::{AuthStatus, QueueState, SourceResponse, SourceStatus};
@@ -2372,126 +2365,57 @@ mod tests {
     const FULL_A: &str = "sha256:9fb4105e0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5";
     const FULL_B: &str = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 
-    fn track_of(hash: &str) -> TrackInfo {
-        TrackInfo {
-            content_hash: ContentHash::new(hash),
-            title: None,
-            artist: None,
-            album: None,
-            duration: None,
-            bpm: None,
-            key: None,
-            blob_path: None,
-            cover_art_path: None,
-            track_number: None,
-            disc_number: None,
-            added: None,
-            started: None,
-            stopped: None,
-            memory_cues: vec![],
-            beat_grid: None,
-            role: None,
-            energy: None,
-        }
-    }
-
     /// A gateway that answers library lookups by prefix (or, with the library
-    /// down, with a gateway error), serves one playlist, and records the
-    /// playback commands it is sent.
-    struct FakeGateway {
-        _dir: tempfile::TempDir,
-        address: String,
-        sent: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    /// down, with a gateway error), serves one playlist, and answers every
+    /// playback command with success.
+    fn fake_gateway(library_up: bool, playlist: &str) -> FakeGateway {
+        use gateway_client::{GatewayRequest, GatewayResponse, LibraryRequest, LibraryResponse};
+        let playlist = playlist.to_string();
+        FakeGateway::start(move |req| match req {
+            GatewayRequest::Library {
+                request: LibraryRequest::GetTrack { hash },
+            } if library_up => {
+                let wanted = hash.as_str().trim_start_matches("sha256:");
+                let found: Vec<&str> = [FULL_A, FULL_B]
+                    .into_iter()
+                    .filter(|t| t.trim_start_matches("sha256:").starts_with(wanted))
+                    .collect();
+                match found.as_slice() {
+                    [one] => track_ok(one),
+                    _ => track_not_found(hash.as_str()),
+                }
+            }
+            GatewayRequest::Library {
+                request: LibraryRequest::GetTrack { .. },
+            } => GatewayResponse::Error {
+                message: "library unavailable".to_string(),
+            },
+            GatewayRequest::Library {
+                request: LibraryRequest::PlaylistGet { .. },
+            } => library_ok(LibraryResponse::PlaylistContent(playlist.clone())),
+            GatewayRequest::Playback { .. } => playback_ok(None),
+            other => GatewayResponse::Error {
+                message: format!("the fake gateway does not answer {other:?}"),
+            },
+        })
     }
 
-    impl FakeGateway {
-        fn start(library_up: bool, playlist: &str) -> Self {
-            use gateway_client::{
-                GatewayRequest, GatewayResponse, LibraryRequest, LibraryResponse,
-            };
-            let dir = tempfile::tempdir().unwrap();
-            let address = format!("ipc://{}/gateway.sock", dir.path().display());
-            let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
-            socket.listen(&address).unwrap();
-            let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let log = sent.clone();
-            let playlist = playlist.to_string();
-            std::thread::spawn(move || {
-                while let Ok(request) = socket.recv() {
-                    let response = match serde_json::from_slice::<GatewayRequest>(&request) {
-                        Ok(GatewayRequest::Library {
-                            request: LibraryRequest::GetTrack { hash },
-                        }) if library_up => {
-                            let wanted = hash.as_str().trim_start_matches("sha256:");
-                            let found: Vec<&str> = [FULL_A, FULL_B]
-                                .into_iter()
-                                .filter(|t| t.trim_start_matches("sha256:").starts_with(wanted))
-                                .collect();
-                            GatewayResponse::Library {
-                                response: match found.as_slice() {
-                                    [one] => LibraryResponse::Track(Box::new(track_of(one))),
-                                    _ => LibraryResponse::Error(
-                                        library_ipc_client::ProtocolError::TrackNotFound {
-                                            hash: hash.to_string(),
-                                        },
-                                    ),
-                                },
-                            }
-                        }
-                        Ok(GatewayRequest::Library {
-                            request: LibraryRequest::GetTrack { .. },
-                        }) => GatewayResponse::Error {
-                            message: "library unavailable".to_string(),
-                        },
-                        Ok(GatewayRequest::Library {
-                            request: LibraryRequest::PlaylistGet { .. },
-                        }) => GatewayResponse::Library {
-                            response: LibraryResponse::PlaylistContent(playlist.clone()),
-                        },
-                        Ok(GatewayRequest::Playback { request }) => {
-                            log.lock()
-                                .unwrap()
-                                .push(serde_json::to_value(&request).unwrap());
-                            GatewayResponse::Playback {
-                                response: gateway_client::Response::Ok { data: None },
-                            }
-                        }
-                        Ok(other) => GatewayResponse::Error {
-                            message: format!("the fake gateway does not answer {other:?}"),
-                        },
-                        Err(e) => GatewayResponse::Error {
-                            message: format!("the fake gateway cannot read the request: {e}"),
-                        },
-                    };
-                    let reply = serde_json::to_vec(&response).unwrap();
-                    if socket.send(nng::Message::from(&reply[..])).is_err() {
-                        break;
-                    }
-                }
-            });
-            Self {
-                _dir: dir,
-                address,
-                sent,
-            }
-        }
+    fn state_of(gateway: &FakeGateway) -> State<Arc<AppState>> {
+        let dir = std::path::PathBuf::from("/nonexistent/mdma-console-test");
+        State(Arc::new(AppState::new(
+            "ipc:///nonexistent/mdma-console-test/library.sock".to_string(),
+            gateway.addr().to_string(),
+            "bandcamp".to_string(),
+            broadcast::channel(1).0,
+            dir.clone(),
+            dir.join("cookies.json"),
+            dir.join("bandcamp.conf"),
+        )))
+    }
 
-        fn state(&self) -> State<Arc<AppState>> {
-            let dir = std::path::PathBuf::from("/nonexistent/mdma-console-test");
-            State(Arc::new(AppState::new(
-                "ipc:///nonexistent/mdma-console-test/library.sock".to_string(),
-                self.address.clone(),
-                "bandcamp".to_string(),
-                broadcast::channel(1).0,
-                dir.clone(),
-                dir.join("cookies.json"),
-                dir.join("bandcamp.conf"),
-            )))
-        }
-
-        fn sent(&self) -> Vec<serde_json::Value> {
-            self.sent.lock().unwrap().clone()
-        }
+    /// The playback commands the gateway received, as JSON.
+    fn sent(gateway: &FakeGateway) -> Vec<serde_json::Value> {
+        gateway.commands().iter().map(queue_command).collect()
     }
 
     fn queue_command(command: &Command) -> serde_json::Value {
@@ -2511,9 +2435,9 @@ mod tests {
 
     #[tokio::test]
     async fn queue_append_sends_the_full_hash_for_a_short_one() {
-        let gateway = FakeGateway::start(true, "");
+        let gateway = fake_gateway(true, "");
         let response = player_queue_append(
-            gateway.state(),
+            state_of(&gateway),
             Json(QueueAppendRequest {
                 hash: "9fb4105e".to_string(),
             }),
@@ -2522,7 +2446,7 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            gateway.sent(),
+            sent(&gateway),
             vec![queue_command(&Command::QueueAppend {
                 hash: ContentHash::new(FULL_A),
                 source: SourceName::audio(),
@@ -2532,9 +2456,9 @@ mod tests {
 
     #[tokio::test]
     async fn queue_append_of_an_unknown_hash_is_422_and_sends_nothing() {
-        let gateway = FakeGateway::start(true, "");
+        let gateway = fake_gateway(true, "");
         let response = player_queue_append(
-            gateway.state(),
+            state_of(&gateway),
             Json(QueueAppendRequest {
                 hash: "deadbeef".to_string(),
             }),
@@ -2543,14 +2467,14 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(error_text(response).await.contains("deadbeef"));
-        assert_eq!(gateway.sent(), Vec::<serde_json::Value>::new());
+        assert_eq!(sent(&gateway), Vec::<serde_json::Value>::new());
     }
 
     #[tokio::test]
     async fn queue_append_with_the_library_down_is_503_and_sends_nothing() {
-        let gateway = FakeGateway::start(false, "");
+        let gateway = fake_gateway(false, "");
         let response = player_queue_append(
-            gateway.state(),
+            state_of(&gateway),
             Json(QueueAppendRequest {
                 hash: "9fb4105e".to_string(),
             }),
@@ -2558,14 +2482,14 @@ mod tests {
         .await
         .into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(gateway.sent(), Vec::<serde_json::Value>::new());
+        assert_eq!(sent(&gateway), Vec::<serde_json::Value>::new());
     }
 
     #[tokio::test]
     async fn queue_remove_sends_full_hashes() {
-        let gateway = FakeGateway::start(true, "");
+        let gateway = fake_gateway(true, "");
         let response = player_queue_remove(
-            gateway.state(),
+            state_of(&gateway),
             Json(QueueRemoveRequest {
                 hashes: vec!["9fb4105e".to_string(), FULL_B.to_string()],
             }),
@@ -2574,7 +2498,7 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            gateway.sent(),
+            sent(&gateway),
             vec![queue_command(&Command::QueueRemove {
                 hashes: vec![ContentHash::new(FULL_A), ContentHash::new(FULL_B)],
             })]
@@ -2583,9 +2507,9 @@ mod tests {
 
     #[tokio::test]
     async fn queue_replace_sends_full_hashes() {
-        let gateway = FakeGateway::start(true, "");
+        let gateway = fake_gateway(true, "");
         let response = player_queue_replace(
-            gateway.state(),
+            state_of(&gateway),
             Json(QueueReplaceRequest {
                 hashes: vec!["9fb4105e".to_string(), "12345678".to_string()],
             }),
@@ -2594,7 +2518,7 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            gateway.sent(),
+            sent(&gateway),
             vec![queue_command(&Command::QueueReplace {
                 entries: vec![entry(FULL_A), entry(FULL_B)],
             })]
@@ -2603,9 +2527,9 @@ mod tests {
 
     #[tokio::test]
     async fn queue_replace_with_one_unknown_hash_is_422_and_sends_nothing() {
-        let gateway = FakeGateway::start(true, "");
+        let gateway = fake_gateway(true, "");
         let response = player_queue_replace(
-            gateway.state(),
+            state_of(&gateway),
             Json(QueueReplaceRequest {
                 hashes: vec!["9fb4105e".to_string(), "deadbeef".to_string()],
             }),
@@ -2614,21 +2538,21 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(error_text(response).await.contains("deadbeef"));
-        assert_eq!(gateway.sent(), Vec::<serde_json::Value>::new());
+        assert_eq!(sent(&gateway), Vec::<serde_json::Value>::new());
     }
 
     #[tokio::test]
     async fn playlist_queue_replace_skips_comments_and_sends_full_hashes() {
-        let gateway = FakeGateway::start(
+        let gateway = fake_gateway(
             true,
             "# my playlist\n\n9fb4105e  Artist - Title  [3:45]\n12345678\n",
         );
         let response =
-            library_playlist_queue_replace_handler(gateway.state(), Path("friday".to_string()))
+            library_playlist_queue_replace_handler(state_of(&gateway), Path("friday".to_string()))
                 .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            gateway.sent(),
+            sent(&gateway),
             vec![queue_command(&Command::QueueReplace {
                 entries: vec![entry(FULL_A), entry(FULL_B)],
             })]
@@ -2637,23 +2561,23 @@ mod tests {
 
     #[tokio::test]
     async fn playlist_queue_replace_with_an_unknown_hash_is_422_and_sends_nothing() {
-        let gateway = FakeGateway::start(true, "9fb4105e\ndeadbeef\n");
+        let gateway = fake_gateway(true, "9fb4105e\ndeadbeef\n");
         let response =
-            library_playlist_queue_replace_handler(gateway.state(), Path("friday".to_string()))
+            library_playlist_queue_replace_handler(state_of(&gateway), Path("friday".to_string()))
                 .await;
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(error_text(response).await.contains("deadbeef"));
-        assert_eq!(gateway.sent(), Vec::<serde_json::Value>::new());
+        assert_eq!(sent(&gateway), Vec::<serde_json::Value>::new());
     }
 
     #[tokio::test]
     async fn playlist_queue_replace_with_the_library_down_is_503_and_sends_nothing() {
-        let gateway = FakeGateway::start(false, "9fb4105e\n");
+        let gateway = fake_gateway(false, "9fb4105e\n");
         let response =
-            library_playlist_queue_replace_handler(gateway.state(), Path("friday".to_string()))
+            library_playlist_queue_replace_handler(state_of(&gateway), Path("friday".to_string()))
                 .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(gateway.sent(), Vec::<serde_json::Value>::new());
+        assert_eq!(sent(&gateway), Vec::<serde_json::Value>::new());
     }
 
     fn make_source_status() -> SourceStatus {

@@ -4,7 +4,7 @@
 
 Accepted, 2026-11-16 (Joakim decided)
 
-Related: ADR-009 §4, ADR-004, ADR-022 §4 (one fold). ADRs 024-028 are reserved or taken by other branches.
+Related: ADR-009 §4, ADR-004, ADR-022 §4 (one fold).
 
 ## Context
 

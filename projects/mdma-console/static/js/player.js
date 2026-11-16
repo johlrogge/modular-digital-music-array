@@ -1,6 +1,6 @@
 // Now-playing bar, full player overlay and transport (pause/resume/skip, start when idle).
 //
-// Everything shown comes from store.player (state, now, queue, offline, position) joined with
+// Everything shown comes from store.player (state, now, queue, output, offline, position) joined with
 // store.tracks by hash. Nothing here starts or stops audio except an explicit click on a transport
 // button: play/pause toggles pause/resume, and Play while idle goes through actions.start() (never
 // the raw /player/play-queue).
@@ -30,8 +30,9 @@ function clockRuns(p) {
   return p.state === "playing" && !p.offline && (p.output == null || p.output === "running");
 }
 
-// Whether the server's position is moving. A position that did not advance (same track, not
-// further on) means audio is not flowing even if the output claims to run.
+// Whether the server's position is moving. An EQUAL position on the same track means audio is
+// not flowing even if the output claims to run. A backward jump is a restart or a seek, not a
+// stall, so it must not freeze the clock.
 let lastPos = null;
 let advancing = true;
 
@@ -170,14 +171,15 @@ async function transport(fn) {
   try {
     applied = (await fn()) === true;
   } catch (e) {
-    toast(e instanceof ApiError && e.status === 409 ? "The player is busy" : "Couldn't reach the player");
+    const served = e instanceof ApiError && e.body && e.body.error;
+    toast(e instanceof ApiError && e.status === 409 ? "The player is busy" : served || "Couldn't reach the player");
   } finally {
     busy = false;
     if (!applied) refreshPlayer();
   }
 }
 
-/** POST a pause/resume; the reply is the new { state, now, queue }. */
+/** POST a pause/resume; the reply is the new { state, now, queue, output }. */
 async function setPaused(path) {
   applyPlayer(await api(path, { method: "POST" }));
   return true;
@@ -226,7 +228,7 @@ on("tracks", render);
 on("queue", render);
 on("position", (pos) => {
   if (pos.hash !== store.player.now) return; // a late tick of the previous track
-  advancing = !(lastPos && lastPos.hash === pos.hash && pos.position_ms <= lastPos.position_ms);
+  advancing = !(lastPos && lastPos.hash === pos.hash && pos.position_ms === lastPos.position_ms);
   lastPos = pos;
   rebase(pos.hash, pos.position_ms, clockRuns(store.player) && advancing);
   renderProgress();
