@@ -314,6 +314,13 @@ impl LibraryClient {
         }
     }
 
+    /// Get a playlist's entries resolved to full hashes, in file order.
+    pub fn playlist_entries(&self, name: &PlaylistName) -> Result<Vec<PlaylistEntry>, ClientError> {
+        interpret_playlist_entries(
+            self.request(&LibraryRequest::PlaylistEntries { name: name.clone() })?,
+        )
+    }
+
     /// Create a new playlist with pre-formatted content.
     ///
     /// `content` must be in the canonical `{8hash}  {Artist} - {Title}  [{duration}]`
@@ -683,6 +690,19 @@ pub fn interpret_identity_backfill_status(
     }
 }
 
+/// Interpret the answer to `PlaylistEntries`.
+pub fn interpret_playlist_entries(
+    response: LibraryResponse,
+) -> Result<Vec<PlaylistEntry>, ClientError> {
+    match response {
+        LibraryResponse::PlaylistEntries(entries) => Ok(entries),
+        LibraryResponse::Error(e) => Err(ClientError::Protocol(e)),
+        _ => Err(ClientError::Protocol(ProtocolError::Internal {
+            message: "Unexpected response to PlaylistEntries".to_string(),
+        })),
+    }
+}
+
 // =========================================================================
 // Playlist content helpers
 // =========================================================================
@@ -690,13 +710,36 @@ pub fn interpret_identity_backfill_status(
 /// Parse hash-per-line playlist content. Skips empty lines and comment lines.
 /// Takes the first whitespace-separated token per line (hash may be followed by display info).
 pub fn content_to_hashes(content: &str) -> Vec<ContentHash> {
-    content
-        .lines()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter_map(|line| line.split_whitespace().next())
-        .map(ContentHash::new)
+    playlist_hashes(content).map(ContentHash::new).collect()
+}
+
+/// The hashes of a playlist's entries, for sending to playback, which holds
+/// only full hashes. Fails on the first unresolved entry, returning its
+/// position and why, so nothing is half sent.
+pub fn entries_for_playback(
+    entries: &[PlaylistEntry],
+) -> Result<Vec<CanonicalHash>, UnplayableEntry> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| match entry {
+            PlaylistEntry::Track { hash } => Ok(hash.clone()),
+            PlaylistEntry::Unresolved { error } => Err(UnplayableEntry {
+                position: index + 1,
+                error: error.clone(),
+            }),
+        })
         .collect()
+}
+
+/// A playlist entry that cannot be sent to playback.
+#[derive(Debug, Error, PartialEq)]
+#[error("entry {position}: {error}")]
+pub struct UnplayableEntry {
+    /// 1-based position among the playlist's track entries; comments and blank
+    /// lines are not counted.
+    pub position: usize,
+    pub error: EntryError,
 }
 
 /// A hash that could not be resolved to a full hash.
@@ -868,6 +911,57 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.hash(), &ContentHash::new("unknown"));
         assert!(err.to_string().contains("cannot resolve unknown"), "{err}");
+    }
+
+    fn track_entry(tag: &str) -> PlaylistEntry {
+        PlaylistEntry::Track {
+            hash: CanonicalHash::try_from(ContentHash::new(full(tag))).unwrap(),
+        }
+    }
+
+    fn unknown_entry(token: &str) -> PlaylistEntry {
+        PlaylistEntry::Unresolved {
+            error: EntryError::Unknown {
+                hash: ContentHash::new(token),
+            },
+        }
+    }
+
+    #[test]
+    fn entries_for_playback_returns_tracks_in_order_with_duplicates() {
+        let entries = [track_entry("b"), track_entry("a"), track_entry("b")];
+        let got: Vec<ContentHash> = entries_for_playback(&entries)
+            .unwrap()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ContentHash::new(full("b")),
+                ContentHash::new(full("a")),
+                ContentHash::new(full("b")),
+            ]
+        );
+    }
+
+    #[test]
+    fn entries_for_playback_fails_on_first_unresolved_with_its_position() {
+        let entries = [
+            track_entry("a"),
+            unknown_entry("first"),
+            track_entry("b"),
+            unknown_entry("second"),
+        ];
+        let unplayable = entries_for_playback(&entries).unwrap_err();
+        assert_eq!(unplayable.position, 2, "1-based");
+        assert_eq!(
+            unplayable.error,
+            EntryError::Unknown {
+                hash: ContentHash::new("first")
+            }
+        );
+        assert_eq!(unplayable.to_string(), "entry 2: unknown track first");
     }
 
     #[test]

@@ -4,12 +4,12 @@ use crate::error::map_gw_to_lib_error;
 use library_ipc_client::{
     content_to_hashes, interpret_archive_emptied, interpret_archive_listing,
     interpret_dedup_merged, interpret_dedup_scan, interpret_identity_backfill,
-    interpret_identity_backfill_status, resolve_full_hashes, ArchiveEmptyReport, ArchiveListing,
-    CanonicalHash, ClientError, ContentHash, DedupApplyReport, DedupScanReport, FactSource,
-    FactType, IdentityBackfillStart, IdentityBackfillStatus, InboxPath, IngestAllItem,
-    IngestResult, IngestSource, LibraryClient, LibraryRequest, LibraryResponse, Mark, MarkFilter,
-    MarkWrite, MusicValue, OrphanInfo, PlaylistName, ProtocolError, ResolveError, ServiceStatus,
-    TrackInfo, TrackQuery, Unmark,
+    interpret_identity_backfill_status, interpret_playlist_entries, resolve_full_hashes,
+    ArchiveEmptyReport, ArchiveListing, CanonicalHash, ClientError, ContentHash, DedupApplyReport,
+    DedupScanReport, FactSource, FactType, IdentityBackfillStart, IdentityBackfillStatus,
+    InboxPath, IngestAllItem, IngestResult, IngestSource, LibraryClient, LibraryRequest,
+    LibraryResponse, Mark, MarkFilter, MarkWrite, MusicValue, OrphanInfo, PlaylistEntry,
+    PlaylistName, ProtocolError, ResolveError, ServiceStatus, TrackInfo, TrackQuery, Unmark,
 };
 use playlist_import::PlaylistWriteOps;
 
@@ -212,6 +212,16 @@ impl LibraryBackend {
             LibraryBackend::Direct(c) => c.playlist_get(name),
             LibraryBackend::Gateway(_) => interpret_playlist_content(
                 self.request(&LibraryRequest::PlaylistGet { name: name.clone() })?,
+            ),
+        }
+    }
+
+    /// A playlist's entries resolved to full hashes, in file order.
+    pub fn playlist_entries(&self, name: &PlaylistName) -> Result<Vec<PlaylistEntry>, ClientError> {
+        match self {
+            LibraryBackend::Direct(c) => c.playlist_entries(name),
+            LibraryBackend::Gateway(_) => interpret_playlist_entries(
+                self.request(&LibraryRequest::PlaylistEntries { name: name.clone() })?,
             ),
         }
     }
