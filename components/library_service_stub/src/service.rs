@@ -13,7 +13,7 @@ use crate::ipc::{
 use library_projection::{resolve_entry, resolve_prefix, resolve_visible, HashedTrack, Unresolved};
 use library_search::{matches_query, TrackFields};
 use music_facts::{FactSource, MusicValue};
-use music_primitives::{EnergyLevel, TrackRole};
+use music_primitives::{EnergyLevel, Key, TrackRole};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -65,7 +65,7 @@ struct IndexedTrack {
     styles: Vec<String>,
     duration_seconds: Option<u32>,
     bpm: Option<f32>,
-    key: Option<String>,
+    key: Option<Key>,
     year: Option<u32>,
     source: Option<String>,
     track_number: Option<u32>,
@@ -124,7 +124,7 @@ impl IndexedTrack {
             album: self.album.clone(),
             duration: self.duration_seconds.map(DurationSeconds::new),
             bpm: self.bpm.and_then(|b| Bpm::from_f32(b).ok()),
-            key: None,
+            key: self.key,
             blob_path: None,
             cover_art_path: None,
             track_number: self.track_number,
@@ -148,7 +148,7 @@ impl IndexedTrack {
             genre: self.genre.as_deref(),
             styles: &self.styles,
             bpm: self.bpm,
-            key: self.key.as_deref(),
+            key: self.key,
             duration: self.duration_seconds,
             year: self.year,
             source: self.source.as_deref(),
@@ -756,6 +756,7 @@ fn apply_fact(entry: &mut IndexedTrack, value: &MusicValue) {
         MusicValue::StyleDescriptor(v) => entry.styles.push(v.clone()),
         MusicValue::DurationSeconds(v) => entry.duration_seconds = Some(v.value()),
         MusicValue::Bpm(v) => entry.bpm = Some(v.as_f32()),
+        MusicValue::Key(v) => entry.key = Some(*v),
         MusicValue::Year(v) => entry.year = Some(v.value()),
         MusicValue::TrackNumber(v) => entry.track_number = Some(v.value()),
         MusicValue::DiscNumber(v) => entry.disc_number = Some(v.value()),
@@ -793,7 +794,7 @@ fn apply_fact(entry: &mut IndexedTrack, value: &MusicValue) {
         MusicValue::Role(v) => entry.role = Some(*v),
         MusicValue::Energy(v) => entry.energy = Some(*v),
         MusicValue::Bookmarked { .. } => entry.bookmarks.push(value.clone()),
-        _ => {} // ignore all other facts (key, format, cover art, timestamps, etc.)
+        _ => {} // ignore all other facts (format, cover art, timestamps, etc.)
     }
 }
 
@@ -965,6 +966,43 @@ mod tests {
                 other => panic!("expected AmbiguousHash, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn search_by_key_finds_projected_track() {
+        let svc = service_with_tracks(&["sha256:aaaa", "sha256:bbbb", "sha256:cccc"]);
+        for (i, key) in ["A Minor", "C Major", "E Minor"].iter().enumerate() {
+            let mut tracks = svc.tracks.lock().unwrap();
+            apply_fact(
+                &mut tracks[i],
+                &MusicValue::Key(key.parse().expect("valid key")),
+            );
+        }
+        let search = |key: &str| {
+            let query = TrackQuery {
+                key: Some(key.parse().expect("valid key query")),
+                ..Default::default()
+            };
+            match svc.handle_request(LibraryRequest::Search { query }) {
+                LibraryResponse::SearchResults(tracks) => {
+                    let mut hashes: Vec<String> = tracks
+                        .iter()
+                        .map(|t| t.content_hash.as_str().to_owned())
+                        .collect();
+                    hashes.sort();
+                    hashes
+                }
+                other => panic!("expected SearchResults, got {other:?}"),
+            }
+        };
+        assert_eq!(search("8A"), vec!["sha256:aaaa"]);
+        // 8B is a mode switch away (one step); 9A is one step clockwise.
+        assert_eq!(search("8A-1"), vec!["sha256:aaaa", "sha256:bbbb"]);
+        assert_eq!(
+            search("8A+-1"),
+            vec!["sha256:aaaa", "sha256:bbbb", "sha256:cccc"]
+        );
+        assert!(search("1A").is_empty());
     }
 
     #[test]

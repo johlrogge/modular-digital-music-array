@@ -12,7 +12,7 @@ pub use music_facts::{
 pub use music_primitives::{CanonicalHash, EnergyLevel, TrackRole};
 // Re-export query types so clients can use them without depending on library-search directly
 pub use library_search::{
-    CamelotLetter, DurationQuery, DurationUnit, KeyQuery, NumericQuery, StringQuery, TrackQuery,
+    DurationQuery, DurationUnit, KeyQuery, NumericQuery, StringQuery, TrackQuery,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
