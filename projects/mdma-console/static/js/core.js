@@ -32,6 +32,7 @@ export const store = {
   player: { state: "idle", now: null, queue: [], offline: false, position: null }, // state: idle|playing|paused|loading
   nb: {}, // per-view narrowing text, keyed by view key
   f: {}, // per-view filters keyed by view key (like nb); absent means none. Read with narrow.js filtersOf(key). Sticky for the session
+  ni: {}, // per-view instance (album or artist name) the narrowing state in nb/f belongs to; see narrow.js claimNarrowing
   sort: { by: "added", dir: "desc" },
 };
 
